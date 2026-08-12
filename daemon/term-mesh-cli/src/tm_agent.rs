@@ -4319,6 +4319,10 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.task.unblock"
             | "team.task.approve"
             | "team.task.diff"
+            // Unlike a generic team.call.v1 peer, a remote leader carries a
+            // grant bound to one project/team. The owning app additionally
+            // overwrites host and directory from that project's placement.
+            | "team.add_agent"
     )
 }
 
@@ -11179,7 +11183,7 @@ fn run_add_gui(
         params["directory"] = json!(d);
     }
 
-    let resp = match rpc_call_timeout(sock, "team.add_agent", params, 10) {
+    let resp = match rpc_call_with_timeout_secs(sock, "team.add_agent", params, 10) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -17105,7 +17109,7 @@ mod auto_watch_tests {
     }
 
     #[test]
-    fn remote_leader_route_allows_only_scoped_non_lifecycle_team_methods() {
+    fn remote_leader_route_allows_scoped_add_but_not_other_lifecycle_methods() {
         for method in [
             "team.send",
             "team.delegate",
@@ -17120,6 +17124,7 @@ mod auto_watch_tests {
             "team.task.approve",
             "team.task.list",
             "team.task.diff",
+            "team.add_agent",
         ] {
             assert!(remote_leader_method_allowed(method), "{method}");
         }
@@ -17128,7 +17133,6 @@ mod auto_watch_tests {
             "team.destroy",
             "team.list",
             "team.attach",
-            "team.add_agent",
             "team.restart",
             "team.task.reassign",
             "surface.send_key",

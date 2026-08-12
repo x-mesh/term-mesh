@@ -949,7 +949,7 @@ final class PeerProjectBootstrapTests: XCTestCase {
     }
 
     @MainActor
-    func test_remote_leader_launch_exports_route_to_final_cli_without_visible_grant_stage() {
+    func test_remote_leader_launch_exports_route_to_final_cli_without_visible_grant_stage() throws {
         var grant = Termmesh_Peer_V1_TeamLeaderGrant()
         grant.grantID = Data(repeating: 0xab, count: 32)
         grant.projectID = "name:demo"
@@ -967,8 +967,22 @@ final class PeerProjectBootstrapTests: XCTestCase {
 
         XCTAssertFalse(prepare.contains("abab"), "the visible preparation must contain no grant")
         XCTAssertEqual(prepare, "unset HISTFILE; stty -echo")
-        XCTAssertTrue(launch.hasPrefix("export TERMMESH_LEADER_GRANT_ID="))
-        XCTAssertTrue(launch.contains("; exec /bin/sh -lc "))
+        XCTAssertTrue(launch.hasPrefix("export TERMMESH_SAVED_"))
+        XCTAssertTrue(launch.contains(#"getent passwd "$(id -u)""#))
+        XCTAssertTrue(launch.contains(#"exec "$term_mesh_login_shell" -l -c"#))
+        XCTAssertTrue(launch.contains(#"export SHELL="$term_mesh_login_shell""#))
+        XCTAssertTrue(launch.contains("$HOME/.profile"))
+        XCTAssertTrue(launch.contains("$HOME/.config/term-mesh/agent-env"))
+        XCTAssertTrue(launch.contains("[term-mesh environment]"))
+        XCTAssertTrue(launch.contains("present="))
+        let profile = try XCTUnwrap(launch.range(of: "$HOME/.config/term-mesh/agent-env"))
+        let protected = try XCTUnwrap(
+            launch.range(of: "TERMMESH_LEADER_GRANT_ID=", options: .backwards)
+        )
+        XCTAssertLessThan(profile.lowerBound, protected.lowerBound)
+        let loginShell = try XCTUnwrap(launch.range(of: #"exec "$term_mesh_login_shell" -l -c"#))
+        XCTAssertFalse(launch[loginShell.lowerBound...].contains(String(repeating: "ab", count: 32)))
+        XCTAssertFalse(launch.contains("exec /bin/sh -lc"))
         // The model is shell-quoted, and this whole launch is then quoted again
         // for `sh -lc` — so the inner quotes arrive escaped. One level is
         // consumed by that shell, leaving the CLI with `--model gpt-5`.
@@ -2249,5 +2263,26 @@ final class ProjectCreationRecoveryTests: XCTestCase {
         gate.invalidateAll(teamName: "xm-never-began")
         let after = gate.begin(teamName: "xm-never-began")
         XCTAssertTrue(gate.isCurrent(after), "a later attach starts clean")
+    }
+
+    func test_scopedLeaderAddCannotChooseAnotherHostOrDirectory() {
+        let params = GhosttyPaneSurfaceProvider.canonicalizeScopedLeaderParameters(
+            [
+                "team_name": "forged-team",
+                "host": "ssh:attacker",
+                "directory": "/etc",
+                "cli": "codex",
+            ],
+            method: "team.add_agent",
+            teamName: "xm",
+            leaderHostKey: "ssh:root@131.186.23.19",
+            leaderDirectory: "/app/tm-prj/xm"
+        )
+
+        XCTAssertEqual(params["team"] as? String, "xm")
+        XCTAssertEqual(params["team_name"] as? String, "xm")
+        XCTAssertEqual(params["host"] as? String, "ssh:root@131.186.23.19")
+        XCTAssertEqual(params["directory"] as? String, "/app/tm-prj/xm")
+        XCTAssertEqual(params["cli"] as? String, "codex")
     }
 }

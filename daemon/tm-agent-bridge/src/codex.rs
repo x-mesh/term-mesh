@@ -235,6 +235,9 @@ impl<T: Transport> CodexBridge<T> {
     }
 
     pub fn start(&mut self) -> bool {
+        if let Some(event) = self.rpc.child.take_environment_diagnostic() {
+            self.out.emit(event);
+        }
         let init = self.rpc.request(
             "initialize",
             Some(json!({"clientInfo": {"name": "term-mesh-bridge", "version": "0.1.0"}})),

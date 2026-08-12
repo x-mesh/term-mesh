@@ -720,7 +720,7 @@ fn agent_launch_script(
     // after all sourcing has completed.
     let mut saved_env = Vec::new();
     let mut unset_args = Vec::new();
-    let mut assignments = Vec::new();
+    let mut exports = Vec::new();
     for (index, (key, value)) in merged
         .into_iter()
         // Same explicit exception as the SSH bridge: PATH is not an assignment
@@ -741,17 +741,18 @@ fn agent_launch_script(
         // expansion must remain live shell syntax; shell_join would quote the
         // dollar sign itself and pass the placeholder literally.
         unset_args.push(format!("-u {saved}"));
-        assignments.push(format!(r#"{key}="${{{saved}}}""#));
+        exports.push(format!(r#"export {key}="${{{saved}}}";"#));
     }
+    script.push_str(&exports.join(" "));
+    if !exports.is_empty() {
+        script.push(' ');
+    }
+    script.push_str(&tm_agent_bridge::location::environment_diagnostic_event());
     script.push_str("exec env ");
     // BSD env stops parsing options at the first assignment, so every -u
     // must precede every restored KEY=value.
     script.push_str(&unset_args.join(" "));
     if !unset_args.is_empty() {
-        script.push(' ');
-    }
-    script.push_str(&assignments.join(" "));
-    if !assignments.is_empty() {
         script.push(' ');
     }
     let mut command_argv = vec![command.to_string()];
@@ -3411,6 +3412,26 @@ mod tests {
             .is_some_and(|path| path.ends_with(":/forged")));
         assert!(!stdout.contains("login-noise"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("login-secret"));
+    }
+
+    #[test]
+    fn peer_agent_reports_only_environment_key_presence() {
+        let home = tempfile::tempdir().expect("temp home");
+        std::fs::write(home.path().join(".bash_profile"), "").unwrap();
+        let secret = "do-not-print-this-value";
+        let output = run_agent_launch_script(
+            home.path(),
+            &[("AI_MESH_API_KEY".into(), secret.into())],
+            &[],
+        );
+        assert!(output.status.success(), "{:?}", output.status);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let first = stdout.lines().next().expect("environment event");
+        let event: serde_json::Value = serde_json::from_str(first).expect("safe NDJSON");
+        assert_eq!(event["subtype"], "environment");
+        assert_eq!(event["interactive"], false);
+        assert_eq!(event["present_keys"], serde_json::json!(["AI_MESH_API_KEY"]));
+        assert!(!first.contains(secret));
     }
 
     #[test]

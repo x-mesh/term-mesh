@@ -1437,11 +1437,25 @@ extension TeamOrchestrator {
         }
         PeerPaneHostRegistry.shared.release(lease)
 
+        let remoteEnvironment = Self.configuredRemoteAgentEnvironment(
+            profile: CLIPathSettings.env(for: cli),
+            explicitHost: PeerHostEnvironment.stored(forHostKey: host.id)
+        )
         do {
 #if DEBUG
             dlog("leader.attach.stage prepare.begin host=\(hostKey)")
 #endif
-            try await Self.prepareRemoteLeader(cli: cli, host: host)
+            if let environment = try await Self.prepareRemoteLeader(
+                cli: cli,
+                host: host,
+                environment: remoteEnvironment
+            ) {
+                AgentEnvironmentComparisonStore.recordLeader(environment, teamName: teamName)
+                RemoteWorkLog.info(
+                    "Leader environment: \(teamName) [\(cli)] on \(host.displayName) — "
+                        + environment.liveActivityText
+                )
+            }
             try await attempt.ensureCurrent()
 #if DEBUG
             dlog("leader.attach.stage prepare.ok host=\(hostKey)")
@@ -1518,7 +1532,7 @@ extension TeamOrchestrator {
             workingDirectory: workingDirectory,
             grant: grantResponse.grant,
             systemPromptFile: promptFile,
-            environment: PeerHostEnvironment.stored(forHostKey: host.id),
+            environment: remoteEnvironment,
             hostBinDirs: host.hostCLIBinDirs
         )
         let command = Self.remoteLeaderCommandCheckingPrompt(
@@ -2562,11 +2576,12 @@ extension TeamOrchestrator {
     /// from the service that owns the peer surface.
     private static func prepareRemoteLeader(
         cli: String,
-        host: HostEntry
-    ) async throws {
+        host: HostEntry,
+        environment: [String: String]
+    ) async throws -> AgentEnvironmentSummary? {
         guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
             try await ensureRemoteCLIAvailable(cli: cli, host: host)
-            return
+            return nil
         }
         guard AgentRolePreset.knownCLIs.contains(cli) else {
             throw RemoteAgentError.cliUnavailable(cli, host.displayName)
@@ -2592,6 +2607,15 @@ extension TeamOrchestrator {
         // would report a perfectly good host as having no CLI, and no leader
         // would start on it again.
         script += "; " + Self.leaderDaemonDiagnostic
+        let environmentProbe = RemoteAgentEnvironmentShell.loginPrelude(
+            profileFailureAction: "term_mesh_profile_fallback=failed",
+            agentEnvFailureAction: "term_mesh_agent_env=failed"
+        ) + RemoteAgentEnvironmentShell.exportAssignments(
+            RemoteAgentEnvironmentShell.presenceOverlay(environment)
+        )
+            + RemoteAgentEnvironmentShell.diagnosticEvent
+        script += "; ( " + RemoteAgentEnvironmentShell.accountLoginShellExec(environmentProbe)
+            + " ) || true"
         do {
             let output = try await PeerHostReadinessChecker.runScript(
                 sshTarget: sshTarget,
@@ -2607,6 +2631,7 @@ extension TeamOrchestrator {
                 throw RemoteAgentError.cliUnavailable(cli, host.displayName)
             }
             reportStaleDaemons(in: output, host: host)
+            return AgentEnvironmentSummary.parse(from: output)
         } catch let error as RemoteAgentError {
             throw error
         } catch {
@@ -3671,13 +3696,17 @@ extension TeamOrchestrator {
     static func peerAgentSurfaceSpec(
         teamName: String,
         agentInstanceId: String,
+        surfaceInstanceId: String? = nil,
         cli: String,
         workingDirectory: String,
         model: String,
         binaries: RemoteAgentBinaries
     ) -> PeerRunnerSurfaceSpec {
         PeerRunnerSurfaceSpec(
-            key: peerAgentEnsureKey(teamName: teamName, agentInstanceId: agentInstanceId),
+            key: peerAgentEnsureKey(
+                teamName: teamName,
+                agentInstanceId: surfaceInstanceId ?? agentInstanceId
+            ),
             cwd: workingDirectory,
             executable: binaries.bridgePath,
             args: peerAgentBridgeArgs(
@@ -3806,6 +3835,32 @@ extension TeamOrchestrator {
         hostDisplayName: String
     ) {
         panel.runtimeOwnership = .peerOwned(hostName: hostDisplayName)
+        let previousClose = panel.onClose
+        panel.onClose = { [weak panel] in
+            if let id = panel?.id {
+                AgentEnvironmentComparisonStore.removeNative(teamName: teamName, id: id)
+            }
+            previousClose?()
+        }
+        panel.session.onEnvironmentSummary = { [weak panel] environment in
+            RemoteWorkLog.info(
+                "Native environment: \(agentName) [\(panel?.cli ?? "agent")] — "
+                    + environment.liveActivityText
+            )
+            AgentEnvironmentComparisonStore.recordNative(
+                environment,
+                teamName: teamName,
+                id: panel?.id ?? UUID()
+            ) { [weak panel] mismatch in
+                panel?.session.setEnvironmentMismatch(mismatch)
+                if let mismatch {
+                    RemoteWorkLog.warning("\(mismatch) — team=\(teamName), agent=\(agentName)")
+                }
+            }
+        }
+        if let environment = panel.session.environmentSummary {
+            panel.session.onEnvironmentSummary?(environment)
+        }
         workspace.setPanelCustomTitle(
             panelId: panel.id,
             title: "\(Self.colorEmoji(color)) \(agentName) @\(hostDisplayName)"
@@ -4118,13 +4173,23 @@ extension TeamOrchestrator {
     /// that no longer dies with anything local, so committing it to a roster
     /// that was already retired strands a bridge on the peer for good.
     @MainActor
+    static func configuredRemoteAgentEnvironment(
+        profile: [String: String],
+        explicitHost: [String: String]
+    ) -> [String: String] {
+        profile.merging(explicitHost) { _, hostValue in hostValue }
+    }
+
+    @MainActor
     static func peerOwnedAgentEnvironment(
         profile: [String: String],
         explicitHost: [String: String],
         internalIdentity: [String: String]
     ) throws -> [String: String] {
-        let merged = profile
-            .merging(explicitHost) { _, hostValue in hostValue }
+        let merged = configuredRemoteAgentEnvironment(
+            profile: profile,
+            explicitHost: explicitHost
+        )
             .merging(internalIdentity) { _, internalValue in internalValue }
         try PeerEnsureEnvironment.validate(merged)
         return Dictionary(
@@ -4301,6 +4366,231 @@ extension TeamOrchestrator {
             path: workingDirectory
         )
         return member
+    }
+
+    struct PeerOwnedAgentRestart {
+        let panelID: UUID
+        let member: AgentMember
+        let routeGrantID: Data
+    }
+
+    /// Replace exactly the peer-owned member that a hard restart observed.
+    /// The caller may have crossed several network awaits, so every unrelated
+    /// roster mutation must come from `current`, never from its old snapshot.
+    @MainActor
+    static func teamByReplacingPeerOwnedAgent(
+        current: Team,
+        expected: AgentMember,
+        replacement: AgentMember
+    ) -> Team? {
+        guard let index = current.agents.firstIndex(where: {
+            $0.agentInstanceId == expected.agentInstanceId
+                && $0.panelId == expected.panelId
+                && $0.remoteSurfaceID == expected.remoteSurfaceID
+        }) else { return nil }
+        var updated = current
+        updated.agents[index] = replacement
+        return updated
+    }
+
+    @MainActor
+    func discardPeerOwnedAgentRestart(
+        _ replacement: PeerOwnedAgentRestart,
+        workspace: Workspace
+    ) {
+        workspace.discardPanelForRollback(replacement.panelID)
+        Self.releasePeerOwnedAgentSurface(replacement.member)
+        Task {
+            await PeerTeamLeaderControlPlane.shared.revokeGrant(
+                id: replacement.routeGrantID
+            )
+        }
+    }
+
+    @MainActor
+    func activatePeerOwnedAgentRestart(
+        _ replacement: PeerOwnedAgentRestart,
+        teamName: String,
+        agentInstanceID: String
+    ) {
+        startRemoteAgentRouteKeepalive(
+            teamName: teamName,
+            agentInstanceID: agentInstanceID,
+            grantID: replacement.routeGrantID
+        )
+    }
+
+    /// Replace a peer-owned native agent with a fresh bridge/session while
+    /// preserving its durable roster identity. The old surface is deliberately
+    /// left alive until this returns success, so a probe, ensure, attach, or
+    /// pane-allocation failure cannot destroy the user's current conversation.
+    @MainActor
+    func restartPeerOwnedAgentPaneHard(
+        team: Team,
+        agent: AgentMember,
+        workspace: Workspace,
+        splitFrom: (UUID, SplitOrientation, Bool)
+    ) async -> Result<PeerOwnedAgentRestart, RestartHardError> {
+        guard let hostKey = agent.hostKey,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                  $0.id == hostKey
+              }),
+              host.isLaunchable
+        else { return .failure(.peerOwnedAgent) }
+
+        let binaries: RemoteAgentBinaries
+        do {
+            binaries = try await Self.ensureRemoteCLIAvailable(
+                cli: agent.cli, host: host
+            )
+        } catch {
+            return .failure(.spawnFailed)
+        }
+        guard await Self.canUsePeerOwnedAgent(
+            host: host, cli: agent.cli, binaries: binaries
+        ) == .available else {
+            return .failure(.peerOwnedAgent)
+        }
+
+        let routeGrant: Termmesh_Peer_V1_TeamLeaderGrant
+        do {
+            routeGrant = try await bootstrapRemoteAgentRoute(teamName: team.id)
+        } catch {
+            return .failure(.spawnFailed)
+        }
+        var grantOwned = true
+        defer {
+            if grantOwned {
+                Task {
+                    await PeerTeamLeaderControlPlane.shared.revokeGrant(
+                        id: routeGrant.grantID
+                    )
+                }
+            }
+        }
+
+        let workingDirectory = agent.originalAgentWorkDir
+            ?? agent.worktreePath
+            ?? team.workingDirectory
+        let spec = Self.peerAgentSurfaceSpec(
+            teamName: team.id,
+            agentInstanceId: agent.agentInstanceId,
+            // EnsureSurface is idempotent by key. Reusing the durable member
+            // id here would reattach the old bridge and preserve its context.
+            surfaceInstanceId: UUID().uuidString,
+            cli: agent.cli,
+            workingDirectory: workingDirectory,
+            model: agent.model,
+            binaries: binaries
+        )
+        let environment: [String: String]
+        do {
+            environment = try Self.peerOwnedAgentEnvironment(
+                profile: CLIPathSettings.activeProfile(for: agent.cli)?.env ?? [:],
+                explicitHost: PeerHostEnvironment.stored(forHostKey: host.id),
+                internalIdentity: Self.remoteNativeAgentEnvironment(
+                    teamName: team.id,
+                    agentName: agent.name,
+                    agentType: agent.agentType,
+                    agentCli: agent.cli,
+                    workspaceId: workspace.id,
+                    socketPath: nil,
+                    routeGrant: routeGrant
+                )
+            )
+        } catch {
+            return .failure(.spawnFailed)
+        }
+
+        let registry = PeerPaneHostRegistry.shared
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await registry.acquire(host.paneHostSpec)
+        } catch {
+            return .failure(.spawnFailed)
+        }
+        let ensured: (session: PeerPaneSession, outcome: PeerEnsureSurfaceOutcome)
+        do {
+            ensured = try await PeerPaneSession.ensureAndAttach(
+                lease: lease,
+                surfaceSpec: spec,
+                attachment: PeerRunnerAttachment(
+                    title: agent.name, lifetime: .keepAlive
+                ),
+                hostSpec: host.paneHostSpec,
+                agentCli: agent.cli,
+                environment: environment,
+                onAgentPostEnsureFailure: { surfaceID in
+                    Self.enqueuePendingPeerAgentSurfaceCleanup(
+                        hostKey: host.id, surfaceID: surfaceID
+                    )
+                }
+            )
+            registry.release(lease)
+        } catch {
+            registry.release(lease)
+            return .failure(.spawnFailed)
+        }
+
+        let session = ensured.session
+        let surfaceID = ensured.outcome.surfaceID
+        func abandonReplacement() {
+            session.teardown()
+            Self.enqueuePendingPeerAgentSurfaceCleanup(
+                hostKey: host.id, surfaceID: surfaceID
+            )
+        }
+        guard ownsPeerAgentSurface(
+            teamName: team.id,
+            agentInstanceID: agent.agentInstanceId,
+            surfaceID: agent.remoteSurfaceID ?? Data()
+        ) else {
+            abandonReplacement()
+            return .failure(.agentNotFound)
+        }
+        guard let panel = workspace.openRemoteAgentPane(
+            session: session,
+            orientation: splitFrom.1,
+            insertFirst: splitFrom.2,
+            focus: false,
+            from: splitFrom.0
+        ) else {
+            abandonReplacement()
+            return .failure(.spawnFailed)
+        }
+        Self.bindPeerOwnedAgentPanel(
+            panel: panel,
+            workspace: workspace,
+            teamName: team.id,
+            agentName: agent.name,
+            agentInstanceId: agent.agentInstanceId,
+            color: agent.color,
+            hostDisplayName: host.displayName
+        )
+
+        if !agent.instructions.isEmpty {
+            let briefing = Self.withoutTerminalProtocol(agent.instructions)
+                + "\n\nThis is your standing brief, not a task. "
+                + "Do no work now: reply with exactly "
+                + "\"Agent \(agent.name) ready.\" and wait."
+            try? panel.session.send(briefing, from: .leader)
+        }
+
+        var replacement = agent
+        replacement.panelId = panel.id
+        replacement.workspaceId = workspace.id
+        replacement.remoteSurfaceID = surfaceID
+        replacement.remoteSurfaceSpawned = true
+        replacement.remoteAgentSurface = true
+        // Ownership moves to the caller. It starts this grant only after the
+        // roster swap and old-pane close both commit; until then the old
+        // surface's keepalive must remain valid for rollback.
+        grantOwned = false
+        return .success(PeerOwnedAgentRestart(
+            panelID: panel.id,
+            member: replacement,
+            routeGrantID: routeGrant.grantID
+        ))
     }
 
     @MainActor
@@ -5670,14 +5960,23 @@ extension TeamOrchestrator {
         hostBinDirs: [String] = []
     ) -> String {
         let hexGrant = grant.grantID.map { String(format: "%02x", $0) }.joined()
-        let exports = [
-            "TERMMESH_LEADER_GRANT_ID=\(shellQuoted(hexGrant))",
-            "TERMMESH_LEADER_PROJECT_ID=\(shellQuoted(grant.projectID))",
-            "TERMMESH_LEADER_TEAM_UUID=\(shellQuoted(grant.teamUuid))",
-            "TERMMESH_LEADER_EXPIRES_AT=\(grant.expiresAtUnixSecs)",
-            "TERMMESH_LEADER_PEER_ID=\(shellQuoted(PeerIdentity.hexString(PeerIdentity.defaultPeerID())))",
-            "TERMMESH_TEAM=\(shellQuoted(teamName))",
-        ].joined(separator: " ")
+        let protectedValues = [
+            ("TERMMESH_LEADER_GRANT_ID", hexGrant),
+            ("TERMMESH_LEADER_PROJECT_ID", grant.projectID),
+            ("TERMMESH_LEADER_TEAM_UUID", grant.teamUuid),
+            ("TERMMESH_LEADER_EXPIRES_AT", String(grant.expiresAtUnixSecs)),
+            ("TERMMESH_LEADER_PEER_ID", PeerIdentity.hexString(PeerIdentity.defaultPeerID())),
+            ("TERMMESH_TEAM", teamName),
+        ]
+        let savedPrefix = "TERMMESH_SAVED_"
+            + UUID().uuidString.replacingOccurrences(of: "-", with: "_")
+        let savedExports = protectedValues.map { key, value in
+            "\(savedPrefix)_\(key)=\(shellQuoted(value))"
+        }.joined(separator: " ")
+        let restoreProtected = protectedValues.map { key, _ in
+            let saved = "\(savedPrefix)_\(key)"
+            return "export \(key)=\"$\(saved)\"; unset \(saved); "
+        }.joined()
         let launch = remoteAgentCommand(
             cli: cli,
             model: model,
@@ -5685,16 +5984,32 @@ extension TeamOrchestrator {
             teamName: teamName,
             workingDirectory: workingDirectory,
             systemPromptFile: systemPromptFile,
-            environment: environment,
+            environment: environment.filter { $0.key == "PATH" },
             hostBinDirs: hostBinDirs,
             needsSocketAccess: true
         )
         // `export` applies to the final CLI, unlike a shell assignment prefix
         // before `mkdir`, which would have scoped the grant to that one setup
         // command only.
-        // Replace the interactive shell after exporting. That drops the grant
-        // as soon as the CLI exits instead of leaving it in a resumed shell.
-        return "export \(exports); exec /bin/sh -lc \(shellQuoted(launch))"
+        //
+        // A terminal surface can inherit SHELL=/bin/sh from systemd even when
+        // the account is configured for zsh. Resolve the account shell again
+        // here so leaders and peer-owned native agents load the same profile
+        // (`~/.zshenv` included). The current terminal shell remains only as a
+        // portable resolver and is replaced before the CLI starts.
+        let failure = "printf '%s\\n' '[term-mesh environment] failed to load ~/.profile or agent-env'; exit 79"
+        let inner = RemoteAgentEnvironmentShell.loginPrelude(
+            profileFailureAction: failure,
+            agentEnvFailureAction: failure
+        ) + RemoteAgentEnvironmentShell.exportAssignments(environment)
+            + restoreProtected
+            + RemoteAgentEnvironmentShell.terminalDiagnostic
+            + launch
+        return "export \(savedExports); " + remoteAccountLoginShellExec(inner)
+    }
+
+    static func remoteAccountLoginShellExec(_ command: String) -> String {
+        RemoteAgentEnvironmentShell.accountLoginShellExec(command)
     }
 
     /// Secret-free first stage for remote leader launch. The next command is

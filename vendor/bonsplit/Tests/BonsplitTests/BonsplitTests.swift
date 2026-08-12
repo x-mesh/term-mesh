@@ -91,6 +91,24 @@ final class BonsplitTests: XCTestCase {
         }
     }
 
+    private final class CloseVetoDelegateSpy: BonsplitDelegate {
+        private(set) var didClose = false
+
+        func splitTabBar(
+            _ controller: BonsplitController,
+            shouldCloseTab tab: Bonsplit.Tab,
+            inPane pane: PaneID
+        ) -> Bool { false }
+
+        func splitTabBar(
+            _ controller: BonsplitController,
+            didCloseTab tabId: TabID,
+            fromPane pane: PaneID
+        ) {
+            didClose = true
+        }
+    }
+
     @MainActor
     func testControllerCreation() {
         let controller = BonsplitController()
@@ -458,6 +476,20 @@ final class BonsplitTests: XCTestCase {
         let tab = controller.tab(tabId)
         XCTAssertEqual(tab?.kind, "browser")
         XCTAssertEqual(tab?.isPinned, true)
+    }
+
+    @MainActor
+    func testForceCloseTabBypassesVetoAndStillNotifiesCleanup() throws {
+        let controller = BonsplitController()
+        let delegate = CloseVetoDelegateSpy()
+        controller.delegate = delegate
+        let tabID = try XCTUnwrap(controller.createTab(title: "rollback"))
+
+        XCTAssertFalse(controller.closeTab(tabID))
+        XCTAssertNotNil(controller.tab(tabID))
+        XCTAssertTrue(controller.forceCloseTab(tabID))
+        XCTAssertNil(controller.tab(tabID))
+        XCTAssertTrue(delegate.didClose)
     }
 
     @MainActor

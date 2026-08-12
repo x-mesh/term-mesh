@@ -36,6 +36,9 @@ impl<T: Transport> AcpBridge<T> {
     }
 
     pub fn start(&mut self) -> bool {
+        if let Some(event) = self.rpc.child.take_environment_diagnostic() {
+            self.out.emit(event);
+        }
         let init = self.rpc.request(
             "initialize",
             Some(json!({
@@ -257,6 +260,23 @@ mod tests {
 
         assert!(b.start());
         assert_eq!(b.session.as_deref(), Some("session-42"));
+    }
+
+    #[test]
+    fn remote_environment_diagnostic_is_emitted_before_acp_init() {
+        let event = json!({
+            "type": "system", "subtype": "environment", "shell": "zsh",
+            "profile_fallback": "loaded", "agent_env": "loaded", "present_keys": []
+        });
+        let (out, sink) = captured();
+        let child = ScriptedChild::new(vec![
+            json!({"id": 1, "result": {}}),
+            json!({"id": 2, "result": {"sessionId": "session-42"}}),
+        ]).with_environment_diagnostic(event.clone());
+        let mut bridge = AcpBridge::new(child, out, "/tmp/project", None);
+
+        assert!(bridge.start());
+        assert_eq!(sink.lock().unwrap().first(), Some(&event));
     }
 
     #[test]

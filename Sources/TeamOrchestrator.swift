@@ -1610,6 +1610,7 @@ final class TeamOrchestrator: ObservableObject {
             stopRemoteLeaderGrantKeepalive(teamName: name, revoke: true)
             teams.removeValue(forKey: name)
         }
+        AgentEnvironmentComparisonStore.reset(teamName: name)
 
         // Validate that all required CLI binaries are available
         let cliTypes = Set(agents.map { $0.cli.isEmpty ? "claude" : $0.cli })
@@ -5296,8 +5297,8 @@ final class TeamOrchestrator: ObservableObject {
             case .spawnFailed: return "Failed to spawn new agent pane"
             case .alreadyMigrating: return "Another migration is already in progress for this agent"
             case .peerOwnedAgent:
-                return "This agent runs on a peer host; detach and attach it again "
-                    + "instead of recycling"
+                return "The peer host is not ready to restart this agent; "
+                    + "reconnect or update the host, then try again"
             }
         }
     }
@@ -5387,19 +5388,6 @@ final class TeamOrchestrator: ObservableObject {
         guard let oldPid = old.panelId else {
             return .failure(.headlessNoPane)
         }
-        // A peer-owned agent cannot be respawned by this path, and failing
-        // loudly is the repair rather than a limitation. Everything below
-        // builds a LOCAL pane: `agentBinaryPath` resolves this Mac's CLI while
-        // `originalAgentWorkDir` is a directory on the peer, and
-        // `addAgentPaneToWorkspace` takes no host at all. The swap at the end
-        // would then overwrite the member with one carrying no `hostKey` and
-        // no `remoteSurfaceID` — discarding the only copy of the id that can
-        // address the bridge still running on the peer, which is in no
-        // workspace tree and in no `ManagedPeerSurfaceStore` to be found by
-        // any sweep. Recycling this member means detach and attach again.
-        guard !old.remoteAgentSurface else {
-            return .failure(.peerOwnedAgent)
-        }
         // The pane id is replaced by this operation.  The durable instance id
         // keeps migration, paste draining and the post-restart refresh tied to
         // this member rather than a stale pane or duplicate-name sibling.
@@ -5430,6 +5418,96 @@ final class TeamOrchestrator: ObservableObject {
             #if DEBUG
             dlog("[team.restart] mode=hard drain_timeout team=\(teamName) agent=\(agentName) remaining=\(postDrainActive) — proceeding anyway")
             #endif
+        }
+
+        // A peer-owned agent needs a peer-owned replacement. Its bridge is
+        // not a local child, so the ordinary factory below would silently
+        // replace it with a process on this Mac (and lose the only handle to
+        // the old remote surface). Create a fresh, uniquely keyed peer
+        // surface first; only after that succeeds do we close the old viewer
+        // and retire its bridge. The unique ensure key is what makes this a
+        // real context reset instead of EnsureSurface reusing the old thread.
+        if old.remoteAgentSurface {
+            let result = await restartPeerOwnedAgentPaneHard(
+                team: team,
+                agent: old,
+                workspace: workspace,
+                splitFrom: splitFromForRespawn(
+                    workspace: workspace, deadPanelId: oldPid, team: team
+                )
+            )
+            switch result {
+            case .failure(let error):
+                migratingAgents.remove(teamAgentKey)
+                return .failure(error)
+            case .success(let replacement):
+                func discardReplacement() {
+                    discardPeerOwnedAgentRestart(replacement, workspace: workspace)
+                }
+
+                // The remote ensure crossed several awaits. The window may
+                // have closed, or another lifecycle operation may have
+                // replaced/detached this member in the meantime.
+                guard tabManager.tabs.contains(where: { $0 === workspace }),
+                      let current = teams[teamName]
+                else {
+                    discardReplacement()
+                    migratingAgents.remove(teamAgentKey)
+                    return .failure(.workspaceMissing)
+                }
+                var member = replacement.member
+                member.completedTaskCount = 0
+                guard let updated = Self.teamByReplacingPeerOwnedAgent(
+                    current: current,
+                    expected: old,
+                    replacement: member
+                ) else {
+                    discardReplacement()
+                    migratingAgents.remove(teamAgentKey)
+                    return .failure(.agentNotFound)
+                }
+                teams[teamName] = updated
+                // Publish the replacement before closing the old viewer. A
+                // relay teardown can request recovery synchronously; after
+                // this swap, the old surface no longer passes the ownership
+                // check and cannot reappear beside its replacement.
+                let closed = workspace.closePanel(oldPid, force: true)
+                guard closed else {
+                    if let published = teams[teamName],
+                       let rolledBack = Self.teamByReplacingPeerOwnedAgent(
+                           current: published,
+                           expected: member,
+                           replacement: old
+                        ) {
+                        teams[teamName] = rolledBack
+                    }
+                    discardReplacement()
+                    migratingAgents.remove(teamAgentKey)
+                    Logger.team.error(
+                        "[team.restart] mode=hard peer-owned rollback team=\(teamName, privacy: .public) agent=\(agentName, privacy: .public) oldPanel=\(oldPid.uuidString.prefix(8), privacy: .public)"
+                    )
+                    return .failure(.spawnFailed)
+                }
+                TeamDataStore.shared.registerTeam(
+                    teamName,
+                    agents: updated.agents.map {
+                        .init(name: $0.name, instanceId: $0.agentInstanceId)
+                    }
+                )
+                syncTeamStateToDaemon()
+                activatePeerOwnedAgentRestart(
+                    replacement,
+                    teamName: teamName,
+                    agentInstanceID: old.agentInstanceId
+                )
+                Self.releasePeerOwnedAgentSurface(old)
+                scheduleAgentGridEqualization(workspace: workspace)
+                migratingAgents.remove(teamAgentKey)
+                Logger.team.info(
+                    "[team.restart] mode=hard peer-owned ok team=\(teamName, privacy: .public) agent=\(agentName, privacy: .public) oldPanel=\(oldPid.uuidString.prefix(8), privacy: .public) newPanel=\(replacement.panelID.uuidString.prefix(8), privacy: .public) close_ok=\(closed, privacy: .public)"
+                )
+                return .success((old: oldPid, new: replacement.panelID))
+            }
         }
 
         // Pick splitFrom + orientation + insertFirst while the dead pane is still
@@ -5823,7 +5901,7 @@ final class TeamOrchestrator: ObservableObject {
     /// Decide the splitFrom anchor + orientation + insertFirst flag for respawning
     /// a dead pane. When possible, restore the exact slot via the parent-split
     /// snapshot; otherwise fall through a chain of weaker anchors.
-    private func splitFromForRespawn(
+    func splitFromForRespawn(
         workspace: Workspace,
         deadPanelId: UUID,
         team: Team
@@ -6160,6 +6238,7 @@ final class TeamOrchestrator: ObservableObject {
             heartbeats.removeValue(forKey: name)
             TeamDataStore.shared.unregisterTeam(name)
             RemoteProjectLocationStore.shared.forget(teamName: name)
+            AgentEnvironmentComparisonStore.reset(teamName: name)
             syncTeamStateToDaemon()
             return true
         }
@@ -6209,6 +6288,7 @@ final class TeamOrchestrator: ObservableObject {
         // inherit paths it never created. Anything left on a peer is still
         // reclaimable there with `tm-agent gc`.
         RemoteProjectLocationStore.shared.forget(teamName: name)
+        AgentEnvironmentComparisonStore.reset(teamName: name)
 
         // Clean up dynamic kiro agent profiles
         Self.cleanupKiroProfiles(teamName: name)

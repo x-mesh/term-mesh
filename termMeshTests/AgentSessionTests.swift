@@ -239,8 +239,77 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(launch.arguments.last?.contains(
             "$HOME/.local/bin:/opt/homebrew/bin"
         ) == true)
+        XCTAssertTrue(launch.arguments.last?.contains("$HOME/.profile") == true)
+        XCTAssertTrue(launch.arguments.last?.contains(
+            "$HOME/.config/term-mesh/agent-env"
+        ) == true)
+        XCTAssertTrue(launch.arguments.last?.contains("present_keys") == true)
+        XCTAssertTrue(launch.arguments.last?.contains(
+            #"export SHELL="$term_mesh_login_shell""#
+        ) == true)
         XCTAssertTrue(launch.arguments.last?.contains("review") == true)
         XCTAssertNotEqual(launch.workingDirectory, "/app/project with space")
+    }
+
+    func testEnvironmentEventUpdatesPaneWithoutCarryingValues() {
+        let session = AgentSession()
+        var reported: AgentEnvironmentSummary?
+        session.onEnvironmentSummary = { reported = $0 }
+        session.ingestForTesting(event([
+            "type": "system",
+            "subtype": "environment",
+            "shell": "zsh",
+            "login": true,
+            "interactive": false,
+            "profile_fallback": "loaded",
+            "agent_env": "missing",
+            "present_keys": ["AI_MESH_API_KEY", "UNRECOGNIZED_SECRET"],
+        ]))
+
+        XCTAssertEqual(session.environmentSummary?.shell, "zsh")
+        XCTAssertEqual(session.environmentSummary?.profileFallback, "loaded")
+        XCTAssertEqual(session.environmentSummary?.agentEnv, "missing")
+        XCTAssertEqual(session.environmentSummary?.presentKeys, Set(["AI_MESH_API_KEY"]))
+        XCTAssertEqual(reported, session.environmentSummary)
+        XCTAssertFalse(session.environmentSummary?.liveActivityText.contains("UNRECOGNIZED") == true)
+    }
+
+    @MainActor
+    func testEnvironmentPresenceOverlayAndComparisonClearCarryNoValues() {
+        let overlay = RemoteAgentEnvironmentShell.presenceOverlay([
+            "AI_MESH_API_KEY": "super-secret",
+            "UNRELATED": "also-secret",
+        ])
+        XCTAssertEqual(overlay, ["AI_MESH_API_KEY": "present"])
+        XCTAssertFalse(String(describing: overlay).contains("super-secret"))
+
+        let leader = AgentEnvironmentSummary(
+            shell: "zsh", profileFallback: "loaded", agentEnv: "loaded",
+            presentKeys: ["AI_MESH_API_KEY"]
+        )
+        let native = AgentEnvironmentSummary(
+            shell: "zsh", profileFallback: "loaded", agentEnv: "missing",
+            presentKeys: []
+        )
+        AgentEnvironmentComparisonStore.recordLeader(leader, teamName: "reused-team")
+        XCTAssertNotNil(AgentEnvironmentComparisonStore.mismatchForNative(native, teamName: "reused-team"))
+        var observed: String?
+        AgentEnvironmentComparisonStore.recordNative(
+            native, teamName: "reused-team", id: UUID()
+        ) { observed = $0 }
+        XCTAssertNotNil(observed)
+        AgentEnvironmentComparisonStore.clearLeader(teamName: "reused-team")
+        XCTAssertNil(observed)
+        XCTAssertNil(AgentEnvironmentComparisonStore.mismatchForNative(native, teamName: "reused-team"))
+        let removedID = UUID()
+        var removedUpdates = 0
+        AgentEnvironmentComparisonStore.recordNative(
+            native, teamName: "reused-team", id: removedID
+        ) { _ in removedUpdates += 1 }
+        AgentEnvironmentComparisonStore.removeNative(teamName: "reused-team", id: removedID)
+        AgentEnvironmentComparisonStore.recordLeader(leader, teamName: "reused-team")
+        XCTAssertEqual(removedUpdates, 1)
+        AgentEnvironmentComparisonStore.reset(teamName: "reused-team")
     }
 
     func testRemoteBridgeLaunchDescribesSSHChildWithoutMovingLocalBridgeCwd() throws {

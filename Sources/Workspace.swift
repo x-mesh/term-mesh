@@ -459,9 +459,14 @@ final class Workspace: Identifiable {
                             // `executor` panes) resolve to the exact pane the
                             // user clicked rather than the first by name.
                             Task { @MainActor in
-                                _ = await TeamOrchestrator.shared.restartAgentPaneHard(
+                                let result = await TeamOrchestrator.shared.restartAgentPaneHard(
                                     panelId: panelId
                                 )
+                                if case .failure(let error) = result {
+                                    RemoteWorkLog.error(
+                                        "Could not restart \(agent.agentName): \(error.message)"
+                                    )
+                                }
                             }
                         }
                     }
@@ -1633,6 +1638,10 @@ final class Workspace: Identifiable {
         let agentPanel = AgentPanel(agentName: agentName, teamName: teamName,
                                     workingDirectory: workingDirectory,
                                     cli: cli, color: color)
+        agentPanel.onClose = { [weak agentPanel] in
+            guard let id = agentPanel?.id else { return }
+            AgentEnvironmentComparisonStore.removeNative(teamName: teamName, id: id)
+        }
         agentPanel.session.onDiagnostic = { [weak agentPanel] severity, detail in
             let title = agentPanel?.title ?? agentName
             let message = "Native agent \(severity == .error ? "error" : "warning"): "
@@ -1642,6 +1651,22 @@ final class Workspace: Identifiable {
                 RemoteWorkLog.warning(message)
             case .error:
                 RemoteWorkLog.error(message)
+            }
+        }
+        agentPanel.session.onEnvironmentSummary = { [weak agentPanel] environment in
+            let title = agentPanel?.title ?? agentName
+            RemoteWorkLog.info(
+                "Native environment: \(title) [\(cli)] — \(environment.liveActivityText)"
+            )
+            AgentEnvironmentComparisonStore.recordNative(
+                environment,
+                teamName: teamName,
+                id: agentPanel?.id ?? UUID()
+            ) { [weak agentPanel] mismatch in
+                agentPanel?.session.setEnvironmentMismatch(mismatch)
+                if let mismatch {
+                    RemoteWorkLog.warning("\(mismatch) — team=\(teamName), agent=\(agentName)")
+                }
             }
         }
         panels[agentPanel.id] = agentPanel
@@ -1780,6 +1805,24 @@ final class Workspace: Identifiable {
             forceCloseTabIds.insert(selected.id)
         }
         return bonsplitController.closeTab(selected.id)
+    }
+
+    /// Remove a panel created inside a transaction that failed before commit.
+    /// Unlike `closePanel`, this cannot be vetoed by mirror/pin/confirmation
+    /// policy: the panel was never user-owned state. The Bonsplit did-close
+    /// callback remains the single cleanup funnel for all workspace maps.
+    @discardableResult
+    func discardPanelForRollback(_ panelId: UUID) -> Bool {
+        guard let tabId = surfaceIdFromPanelId(panelId) else {
+            if let session = remoteAgentPaneSessions.removeValue(forKey: panelId) {
+                session.relaySession.onPtyData = nil
+                session.teardown()
+            }
+            panels.removeValue(forKey: panelId)?.close()
+            panelTitles.removeValue(forKey: panelId)
+            return false
+        }
+        return bonsplitController.forceCloseTab(tabId)
     }
 
     func paneId(forPanelId panelId: UUID) -> PaneID? {
@@ -2792,6 +2835,7 @@ final class Workspace: Identifiable {
     func openRemoteAgentPane(
         session: PeerPaneSession,
         orientation: SplitOrientation = .horizontal,
+        insertFirst: Bool = false,
         focus: Bool = true,
         from explicitSourcePanelId: UUID? = nil
     ) -> AgentPanel? {
@@ -2816,6 +2860,7 @@ final class Workspace: Identifiable {
         guard let panel = newAgentSplit(
             from: sourcePanelId,
             orientation: orientation,
+            insertFirst: insertFirst,
             agentName: Self.remoteAgentPaneTitle(
                 surfaceTitle: session.surfaceTitle, agentCli: cli, hostLabel: hostLabel
             ),
