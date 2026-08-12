@@ -98,6 +98,10 @@ message Envelope {
     // Host-pushed after the final PtyData for a dead surface. Gated behind
     // capability "surface.exit.v1".
     SurfaceExited surface_exited = 61;
+    // Durable mapping from a peer-owned project to the exact surfaces that
+    // present it. Gated behind capability "project.presentation.v1".
+    UpsertProjectPresentationRequest upsert_project_presentation_request = 62;
+    UpsertProjectPresentationResponse upsert_project_presentation_response = 63;
 
     Error error = 99;
   }
@@ -932,6 +936,48 @@ message Team {
   string project_root = 4;
   repeated string agent_names = 5;
   uint64 created_at_unix_secs = 6;
+  // Exact daemon-owned leader surface. Empty on hosts that predate durable
+  // project presentation, or for a team whose leader is not on this host.
+  bytes leader_surface_id = 7;
+  repeated TeamMember members = 8;
+  // Stable logical project id. This is deliberately distinct from the
+  // display name and team UUID so a renamed project does not become new work.
+  string project_id = 9;
+  uint64 presentation_revision = 10;
+  // Computed per connection; true only when the authenticated requesting
+  // peer_id owns this manifest. The owner id itself is never disclosed.
+  bool presentation_owned_by_requester = 11;
+}
+
+message TeamMember {
+  string name = 1;
+  string agent_instance_id = 2;
+  string cli = 3;
+  string model = 4;
+  string agent_type = 5;
+  string color = 6;
+  string working_directory = 7;
+  bytes surface_id = 8;
+  // Currently "agent" or "terminal". The host validates this against the
+  // live surface before accepting an update.
+  string surface_type = 9;
+}
+
+// The creating app publishes a complete replacement manifest after leader or
+// member topology changes. The host binds the record to the authenticated
+// peer_id on first write; another installation may discover and attach it but
+// cannot silently rewrite ownership.
+message UpsertProjectPresentationRequest {
+  bytes request_id = 1;
+  Team project = 2;
+}
+
+message UpsertProjectPresentationResponse {
+  bytes request_id = 1;
+  bool ok = 2;
+  uint64 revision = 3;
+  string error_code = 4;
+  string error_message = 5;
 }
 
 // ============================================================

@@ -195,6 +195,10 @@ final class TeamOrchestrator: ObservableObject {
         /// runtime ownership state: a project deletion removes these
         /// workspaces after its attached surfaces have been closed.
         var remoteWorkspaceIDs: [String: Data] = [:]
+        /// False when this app merely adopted a daemon manifest created by a
+        /// different installation. Viewers may attach and interact, but only
+        /// the original owner may rewrite the durable topology.
+        var ownsRemotePresentation: Bool = true
     }
 
     struct AgentPaneIdentity: Equatable {
@@ -251,6 +255,10 @@ final class TeamOrchestrator: ObservableObject {
     /// per surface, with the first set of panes orphaned because
     /// `progress.agentPanelIDs` keeps only the last writer.
     var projectRestoreInFlight: Set<String> = []
+    /// Debounced full-manifest publication to the daemon that owns a remote
+    /// project's surfaces. This is separate from local live snapshots: a new
+    /// Mac has no access to those snapshots and discovers through the host.
+    var remoteProjectManifestTasks: [String: Task<Void, Never>] = [:]
     /// Same single-flight need as the two above, one level down: a rewound
     /// stream can drop the same peer-owned agent pane twice before the first
     /// reattach has opened its replacement, and two reattaches would leave two
@@ -485,6 +493,19 @@ final class TeamOrchestrator: ObservableObject {
         teams[teamName] = Self.projectPresentationTeam(
             team,
             movedTo: workspaceID
+        )
+        syncTeamStateToDaemon()
+        return true
+    }
+
+    /// Commit a discovered remote project after every surface attached.
+    /// Kept on the owning type so extensions never widen the `teams` setter.
+    func installAdoptedRemoteProject(_ team: Team) -> Bool {
+        guard teams[team.id] == nil else { return false }
+        teams[team.id] = team
+        TeamDataStore.shared.registerTeam(
+            team.id,
+            agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) }
         )
         syncTeamStateToDaemon()
         return true
@@ -6118,6 +6139,7 @@ final class TeamOrchestrator: ObservableObject {
         // state changed — refresh the on-disk live snapshots (debounced,
         // hash-deduped) so a crash never loses more than the debounce window.
         scheduleLiveTeamSnapshots()
+        scheduleRemoteProjectManifestPublication()
     }
 
     /// Get raw team struct for minimal MainActor access (used by hybrid team.status).

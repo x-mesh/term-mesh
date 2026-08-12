@@ -34,6 +34,20 @@ struct WorkspaceSummary: Identifiable, Equatable {
 /// arranged — so this arrives over its own RPC and is the only way to know
 /// where a project's leader sits on a machine that is not this one.
 struct RemoteTeamSummary: Identifiable, Equatable {
+    struct Member: Identifiable, Equatable {
+        let name: String
+        let agentInstanceID: String
+        let cli: String
+        let model: String
+        let agentType: String
+        let color: String
+        let workingDirectory: String
+        let surfaceID: Data
+        let surfaceType: String
+
+        var id: String { agentInstanceID }
+    }
+
     let name: String
     let teamUUID: String
     let workingDirectory: String
@@ -41,8 +55,37 @@ struct RemoteTeamSummary: Identifiable, Equatable {
     /// the team was not created inside one.
     let projectRootPath: String?
     let agentNames: [String]
+    let projectID: String
+    let leaderSurfaceID: Data
+    let members: [Member]
+    let presentationRevision: UInt64
+    let presentationOwnedByRequester: Bool
 
     var id: String { teamUUID.isEmpty ? name : teamUUID }
+
+    init(
+        name: String,
+        teamUUID: String,
+        workingDirectory: String,
+        projectRootPath: String?,
+        agentNames: [String],
+        projectID: String = "",
+        leaderSurfaceID: Data = Data(),
+        members: [Member] = [],
+        presentationRevision: UInt64 = 0,
+        presentationOwnedByRequester: Bool = false
+    ) {
+        self.name = name
+        self.teamUUID = teamUUID
+        self.workingDirectory = workingDirectory
+        self.projectRootPath = projectRootPath
+        self.agentNames = agentNames
+        self.projectID = projectID
+        self.leaderSurfaceID = leaderSurfaceID
+        self.members = members
+        self.presentationRevision = presentationRevision
+        self.presentationOwnedByRequester = presentationOwnedByRequester
+    }
 }
 
 struct RemotePaneSummary: Identifiable, Equatable {
@@ -1298,7 +1341,24 @@ final class RemoteHostStore: ObservableObject {
                                 teamUUID: team.teamUuid,
                                 workingDirectory: team.workingDirectory,
                                 projectRootPath: team.projectRoot.isEmpty ? nil : team.projectRoot,
-                                agentNames: team.agentNames
+                                agentNames: team.agentNames,
+                                projectID: team.projectID,
+                                leaderSurfaceID: team.leaderSurfaceID,
+                                members: team.members.map { member in
+                                    RemoteTeamSummary.Member(
+                                        name: member.name,
+                                        agentInstanceID: member.agentInstanceID,
+                                        cli: member.cli,
+                                        model: member.model,
+                                        agentType: member.agentType,
+                                        color: member.color,
+                                        workingDirectory: member.workingDirectory,
+                                        surfaceID: member.surfaceID,
+                                        surfaceType: member.surfaceType
+                                    )
+                                },
+                                presentationRevision: team.presentationRevision,
+                                presentationOwnedByRequester: team.presentationOwnedByRequester
                             )
                         }
                     }

@@ -1573,6 +1573,11 @@ private struct SidebarPeerProjectGroup: Identifiable {
 /// and listing it here just reproduced the Host view one toggle away. Host
 /// lifecycle (connect, retry, edit, delete) lives in the Host view alone.
 private struct SidebarPeerProjectsView: View {
+    private struct RemoteManifestItem: Identifiable {
+        let host: HostEntry
+        let team: RemoteTeamSummary
+        var id: String { "\(host.id)|\(team.id)" }
+    }
     @Environment(TabManager.self) private var tabManager
     @ObservedObject private var coordinator = ReviewBoardCoordinatorService.shared
     @ObservedObject private var orchestrator = TeamOrchestrator.shared
@@ -1595,6 +1600,22 @@ private struct SidebarPeerProjectsView: View {
 
     private var connectedHosts: [HostEntry] {
         hosts.filter { $0.isConnected && !$0.workspaces.isEmpty }
+    }
+
+    private var discoverableRemoteProjects: [RemoteManifestItem] {
+        hosts
+            .filter(\.isConnected)
+            .flatMap { host in
+                host.teams.compactMap { team in
+                    guard !team.leaderSurfaceID.isEmpty,
+                          orchestrator.teams[team.name] == nil
+                    else { return nil }
+                    return RemoteManifestItem(host: host, team: team)
+                }
+            }
+            .sorted {
+                $0.team.name.localizedCaseInsensitiveCompare($1.team.name) == .orderedAscending
+            }
     }
 
     /// Every local workspace, paired with the project it belongs to — or an
@@ -1761,6 +1782,50 @@ private struct SidebarPeerProjectsView: View {
         }
     }
 
+    private func remoteManifestRow(_ item: RemoteManifestItem) -> some View {
+        let restoreKey = item.id
+        return Button {
+            guard !restoringTeamNames.contains(restoreKey) else { return }
+            restoringTeamNames.insert(restoreKey)
+            Task { @MainActor in
+                let restored = await orchestrator.adoptRemoteProjectPresentation(
+                    item.team,
+                    host: item.host,
+                    tabManager: tabManager
+                )
+                restoringTeamNames.remove(restoreKey)
+                if !restored {
+                    presentationRestoreFailure =
+                        "The live project surfaces could not be attached from \(item.host.displayName)."
+                }
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Text(item.team.name)
+                        .font(.system(size: 12, weight: .semibold))
+                    Image(systemName: "server.rack")
+                        .font(.system(size: 8))
+                        .foregroundColor(.orange)
+                    Spacer(minLength: 0)
+                    if restoringTeamNames.contains(restoreKey) {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                Text("Open on \(item.host.displayName) · \(item.team.members.count) agents")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(restoringTeamNames.contains(restoreKey))
+        .accessibilityIdentifier("sidebar.projects.remote.\(item.team.name)")
+        .help("Attach the leader and agents already running on this host")
+    }
+
     @ViewBuilder
     private func workspaceRow(
         _ item: SidebarPeerProjectGroup.WorkspaceItem
@@ -1879,9 +1944,10 @@ private struct SidebarPeerProjectsView: View {
     var body: some View {
         let grouped = groupedWorkspaces
         let detached = detachedTeams
+        let remoteProjects = discoverableRemoteProjects
         let groupedLabels = Set(grouped.projects.map { $0.identity.label })
         return VStack(spacing: usesSeparatedPresentation ? 8 : 0) {
-            if grouped.projects.isEmpty && detached.isEmpty {
+            if grouped.projects.isEmpty && detached.isEmpty && remoteProjects.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("No projects yet")
                         .font(.system(size: 10, weight: .semibold))
@@ -1902,6 +1968,10 @@ private struct SidebarPeerProjectsView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 6)
                 .padding(.bottom, 4)
+            }
+
+            ForEach(remoteProjects) { item in
+                remoteManifestRow(item)
             }
 
             ForEach(grouped.projects) { group in

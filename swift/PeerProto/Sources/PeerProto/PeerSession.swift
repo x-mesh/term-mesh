@@ -532,6 +532,33 @@ public actor PeerSession {
         return list.teams
     }
 
+    /// Publish a complete project → surface manifest to the daemon that owns
+    /// those surfaces. The first authenticated installation becomes owner;
+    /// other viewers can discover the manifest through `listTeams()` but
+    /// cannot overwrite it.
+    public func upsertProjectPresentation(
+        _ project: Termmesh_Peer_V1_Team,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Termmesh_Peer_V1_UpsertProjectPresentationResponse {
+        try requireHostCapability(PeerCapability.projectPresentationV1)
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        var request = Termmesh_Peer_V1_UpsertProjectPresentationRequest()
+        request.requestID = Self.makeEnsureRequestID()
+        request.project = project
+        try await sendEnvelope { env in
+            env.upsertProjectPresentationRequest = request
+        }
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "upsertProjectPresentation"
+        )
+        guard case .upsertProjectPresentationResponse(let response) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return response
+    }
+
     /// Run one allow-listed `team.*` method on the host and get its JSON
     /// result. Same single-reader contract as `listTeams()`.
     ///

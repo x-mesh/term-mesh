@@ -785,6 +785,14 @@ final class PeerSessionTests: XCTestCase {
         } catch PeerSessionError.capabilityNotNegotiated(let capability) {
             XCTAssertEqual(capability, PeerCapability.teamLeaderV1)
         }
+        do {
+            _ = try await session.upsertProjectPresentation(
+                Termmesh_Peer_V1_Team()
+            )
+            XCTFail("upsertProjectPresentation must reject an old host")
+        } catch PeerSessionError.capabilityNotNegotiated(let capability) {
+            XCTAssertEqual(capability, PeerCapability.projectPresentationV1)
+        }
         writtenFrameCount = await transport.writtenFrameCount()
         XCTAssertEqual(writtenFrameCount, 2)
     }

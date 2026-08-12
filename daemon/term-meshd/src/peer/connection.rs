@@ -21,7 +21,8 @@ use peer_proto::v1::{
     GridSnapshot, Hello, ScrollbackChunk, SurfaceExited,
     HostStats, Pong, PtyData, SurfaceList, TerminateSurfaceError as WireTerminateError,
     TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
-    Team, TeamCallResponse, TeamList, TerminateSurfaceResult, Workspace, WorkspaceList,
+    Team, TeamCallResponse, TeamList, TeamMember, TerminateSurfaceResult,
+    UpsertProjectPresentationResponse, Workspace, WorkspaceList,
     WorkspaceListChanged,
     WorkspaceMeta, WorkspaceUpdate,
 };
@@ -327,7 +328,7 @@ async fn reader_loop(
                 // arranged — so a client that wants to know where a project's
                 // leader sits has no way to derive it from workspaces alone.
                 // This answers that and nothing else: no command crosses here.
-                let teams = match host.team_manager() {
+                let mut teams = match host.team_manager() {
                     Some(manager) => {
                         let guard = manager.lock().await;
                         guard
@@ -342,6 +343,7 @@ async fn reader_loop(
                                 ),
                                 agent_names: team.agents.clone(),
                                 created_at_unix_secs: team.created_at,
+                                ..Default::default()
                             })
                             .collect()
                     }
@@ -350,12 +352,133 @@ async fn reader_loop(
                     // that asked anyway; an empty roster is the honest answer.
                     None => Vec::new(),
                 };
+                let live_surface_ids: HashSet<Vec<u8>> = host
+                    .pty
+                    .list()
+                    .into_iter()
+                    .filter_map(|surface| surface.info().attachable.then_some(surface.surface_id.clone()))
+                    .collect();
+                for manifest in host.project_presentations() {
+                    let Some(leader_surface_id) = hex::decode(&manifest.leader_surface_id)
+                        .ok()
+                        .filter(|id| live_surface_ids.contains(id))
+                    else {
+                        continue;
+                    };
+                    let members: Vec<TeamMember> = manifest
+                        .members
+                        .iter()
+                        .filter_map(|member| {
+                            let surface_id = hex::decode(&member.surface_id).ok()?;
+                            live_surface_ids.contains(&surface_id).then_some(TeamMember {
+                                name: member.name.clone(),
+                                agent_instance_id: member.agent_instance_id.clone(),
+                                cli: member.cli.clone(),
+                                model: member.model.clone(),
+                                agent_type: member.agent_type.clone(),
+                                color: member.color.clone(),
+                                working_directory: member.working_directory.clone(),
+                                surface_id,
+                                surface_type: member.surface_type.clone(),
+                            })
+                        })
+                        .collect();
+                    if let Some(team) = teams.iter_mut().find(|team| {
+                        team.team_uuid == manifest.team_uuid || team.name == manifest.team_name
+                    }) {
+                        team.project_id = manifest.project_id;
+                        team.leader_surface_id = leader_surface_id;
+                        team.agent_names =
+                            members.iter().map(|member| member.name.clone()).collect();
+                        team.members = members;
+                        team.presentation_revision = manifest.revision;
+                        team.presentation_owned_by_requester =
+                            manifest.owner_peer_id == hex::encode(&peer_id);
+                        if team.project_root.is_empty() {
+                            team.project_root = manifest.project_root;
+                        }
+                    } else {
+                        teams.push(Team {
+                            name: manifest.team_name,
+                            team_uuid: manifest.team_uuid,
+                            working_directory: manifest.working_directory,
+                            project_root: manifest.project_root,
+                            agent_names: members.iter().map(|member| member.name.clone()).collect(),
+                            created_at_unix_secs: 0,
+                            leader_surface_id,
+                            members,
+                            project_id: manifest.project_id,
+                            presentation_revision: manifest.revision,
+                            presentation_owned_by_requester:
+                                manifest.owner_peer_id == hex::encode(&peer_id),
+                        });
+                    }
+                }
                 let reply = Envelope {
                     seq: next_seq(&seq_counter),
                     correlation_id: env.seq,
                     payload: Some(Payload::TeamList(TeamList { teams })),
                 };
                 send(&outgoing_tx, reply).await?;
+            }
+
+            (HandshakeState::Ready, Payload::UpsertProjectPresentationRequest(request)) => {
+                let response = if !peer_capabilities
+                    .has(capability::PROJECT_PRESENTATION_V1)
+                {
+                    UpsertProjectPresentationResponse {
+                        request_id: request.request_id,
+                        ok: false,
+                        error_code: "capability_unavailable".into(),
+                        error_message: "project.presentation.v1 was not negotiated".into(),
+                        ..Default::default()
+                    }
+                } else if request.request_id.len() != 16 {
+                    UpsertProjectPresentationResponse {
+                        request_id: request.request_id,
+                        ok: false,
+                        error_code: "invalid_request".into(),
+                        error_message: "request_id must be 16 bytes".into(),
+                        ..Default::default()
+                    }
+                } else if !lifecycle_request_ids.insert(request.request_id.clone()) {
+                    UpsertProjectPresentationResponse {
+                        request_id: request.request_id,
+                        ok: false,
+                        error_code: "duplicate_request_id".into(),
+                        error_message: "request_id was already used on this connection".into(),
+                        ..Default::default()
+                    }
+                } else if let Some(project) = request.project.as_ref() {
+                    match host.upsert_project_presentation(&peer_id, project) {
+                        Ok(revision) => UpsertProjectPresentationResponse {
+                            request_id: request.request_id,
+                            ok: true,
+                            revision,
+                            ..Default::default()
+                        },
+                        Err(code) => UpsertProjectPresentationResponse {
+                            request_id: request.request_id,
+                            ok: false,
+                            error_code: code.into(),
+                            error_message: "project presentation was rejected".into(),
+                            ..Default::default()
+                        },
+                    }
+                } else {
+                    UpsertProjectPresentationResponse {
+                        request_id: request.request_id,
+                        ok: false,
+                        error_code: "invalid_manifest".into(),
+                        error_message: "project is required".into(),
+                        ..Default::default()
+                    }
+                };
+                send(&outgoing_tx, Envelope {
+                    seq: next_seq(&seq_counter),
+                    correlation_id: env.seq,
+                    payload: Some(Payload::UpsertProjectPresentationResponse(response)),
+                }).await?;
             }
 
             (HandshakeState::Ready, Payload::TeamCallRequest(request)) => {

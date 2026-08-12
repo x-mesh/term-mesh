@@ -113,6 +113,10 @@ pub mod capability {
     /// Project-bound remote leader bootstrap with scoped, expiring grants.
     /// Kept separate so it cannot widen `team.call.v1`'s lifecycle boundary.
     pub const TEAM_LEADER_V1: &str = "team.leader.v1";
+    /// The host durably maps a project/team to its leader and member surface
+    /// ids, allowing a different authenticated viewer to discover and attach
+    /// the already-running presentation without spawning replacement work.
+    pub const PROJECT_PRESENTATION_V1: &str = "project.presentation.v1";
 
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — callers should use
@@ -134,6 +138,7 @@ pub mod capability {
         TEAM_ROSTER_V1,
         TEAM_CALL_V1,
         TEAM_LEADER_V1,
+        PROJECT_PRESENTATION_V1,
     ];
 
     /// `Hello.capabilities` value for an outgoing handshake message.

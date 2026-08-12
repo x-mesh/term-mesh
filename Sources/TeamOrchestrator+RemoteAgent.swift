@@ -291,6 +291,221 @@ final class PeerAgentPaneRecoveryCoordinator {
 }
 
 extension TeamOrchestrator {
+    /// Publish complete remote presentation descriptors after the normal team
+    /// state funnel runs. A viewer restart must learn this from the daemon;
+    /// local UserDefaults/live snapshots are intentionally not part of the
+    /// discovery contract.
+    func scheduleRemoteProjectManifestPublication() {
+        for team in teams.values {
+            guard case .peer = team.leaderEndpoint,
+                  team.ownsRemotePresentation
+            else { continue }
+            remoteProjectManifestTasks[team.id]?.cancel()
+            remoteProjectManifestTasks[team.id] = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled, let self else { return }
+                await self.publishRemoteProjectManifest(teamName: team.id)
+                self.remoteProjectManifestTasks[team.id] = nil
+            }
+        }
+    }
+
+    private func publishRemoteProjectManifest(teamName: String) async {
+        guard let team = teams[teamName],
+              let rawTeamUUID = team.teamUuid,
+              !rawTeamUUID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              case let .peer(hostKey) = team.leaderEndpoint,
+              let leaderSurfaceID = ManagedPeerSurfaceStore.shared.leaderRecord(
+                  hostKey: hostKey,
+                  teamName: teamName
+              )?.surfaceID,
+              !leaderSurfaceID.isEmpty,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              !host.activeSockPath.isEmpty
+        else { return }
+        let teamUUID = rawTeamUUID
+
+        var project = Termmesh_Peer_V1_Team()
+        project.name = team.id
+        project.teamUuid = teamUUID
+        project.workingDirectory = team.workingDirectory
+        project.projectRoot = team.gitRepoRoot ?? ""
+        project.agentNames = team.agents.map(\.name)
+        project.createdAtUnixSecs = UInt64(max(0, team.createdAt.timeIntervalSince1970))
+        project.leaderSurfaceID = leaderSurfaceID
+        project.projectID = "name:\(team.id)"
+        project.members = team.agents.compactMap { agent in
+            guard agent.hostKey == hostKey,
+                  let surfaceID = agent.remoteSurfaceID,
+                  !surfaceID.isEmpty
+            else { return nil }
+            var member = Termmesh_Peer_V1_TeamMember()
+            member.name = agent.name
+            member.agentInstanceID = agent.agentInstanceId
+            member.cli = agent.cli
+            member.model = agent.model
+            member.agentType = agent.agentType
+            member.color = agent.color
+            member.workingDirectory = agent.originalAgentWorkDir ?? team.workingDirectory
+            member.surfaceID = surfaceID
+            member.surfaceType = agent.remoteAgentSurface ? "agent" : "terminal"
+            return member
+        }
+
+        guard let connection = try? await PeerRelaySession.connect(
+            hostSockPath: host.activeSockPath
+        ) else { return }
+        guard connection.hostCapabilities.has(PeerCapability.projectPresentationV1) else {
+            await connection.cancel()
+            return
+        }
+        do {
+            let response = try await connection.session.upsertProjectPresentation(project)
+            await connection.cancel()
+            if !response.ok {
+                RemoteWorkLog.info(
+                    "Could not persist project \(team.id) on \(host.displayName): "
+                        + response.errorCode
+                )
+            }
+        } catch {
+            await connection.cancel()
+            RemoteWorkLog.info(
+                "Could not persist project \(team.id) on \(host.displayName): \(error)"
+            )
+        }
+    }
+
+    /// Adopt a daemon-owned project discovered on a host into this window.
+    /// Every pane attaches by the exact persisted surface id. No ensure,
+    /// split, shell launch, or agent spawn is allowed on this path.
+    @discardableResult
+    func adoptRemoteProjectPresentation(
+        _ remote: RemoteTeamSummary,
+        host: HostEntry,
+        tabManager: TabManager
+    ) async -> Bool {
+        if teams[remote.name] != nil {
+            return await restoreDetachedProjectPresentation(
+                teamName: remote.name,
+                tabManager: tabManager
+            )
+        }
+        guard !remote.leaderSurfaceID.isEmpty,
+              host.isLaunchable
+        else { return false }
+
+        let workspace = tabManager.addWorkspace(
+            workingDirectory: remote.workingDirectory,
+            select: true
+        )
+        workspace.customTitle = "[\(remote.name)]"
+        workspace.title = "[\(remote.name)]"
+
+        guard let leaderPanelID = await attachRestoredRemoteSurface(
+            hostKey: host.id,
+            surfaceID: remote.leaderSurfaceID,
+            title: "Leader",
+            panelTitle: "👑 Leader (Adopted)",
+            workspace: workspace
+        ) else {
+            tabManager.closeWorkspace(workspace)
+            return false
+        }
+        ManagedPeerSurfaceStore.shared.remember(
+            hostKey: host.id,
+            surfaceID: remote.leaderSurfaceID,
+            teamName: remote.name,
+            role: "leader",
+            workingDirectory: remote.workingDirectory
+        )
+
+        var members: [AgentMember] = []
+        for descriptor in remote.members {
+            guard let panelID = await attachRestoredRemoteSurface(
+                hostKey: host.id,
+                surfaceID: descriptor.surfaceID,
+                title: descriptor.name,
+                panelTitle: "\(Self.colorEmoji(descriptor.color)) \(descriptor.name)",
+                workspace: workspace,
+                onAgentPanel: { panel, host in
+                    Self.bindPeerOwnedAgentPanel(
+                        panel: panel,
+                        workspace: workspace,
+                        teamName: remote.name,
+                        agentName: descriptor.name,
+                        agentInstanceId: descriptor.agentInstanceID,
+                        color: descriptor.color,
+                        hostDisplayName: host.displayName
+                    )
+                }
+            ) else {
+                ManagedPeerSurfaceStore.shared.forget(
+                    hostKey: host.id,
+                    surfaceID: remote.leaderSurfaceID
+                )
+                tabManager.closeWorkspace(workspace)
+                return false
+            }
+            members.append(AgentMember(
+                id: "\(descriptor.name)@\(remote.name)",
+                agentInstanceId: descriptor.agentInstanceID,
+                name: descriptor.name,
+                teamName: remote.name,
+                cli: descriptor.cli,
+                launchCommand: descriptor.cli,
+                model: descriptor.model,
+                agentType: descriptor.agentType,
+                color: descriptor.color,
+                instructions: "",
+                workspaceId: workspace.id,
+                panelId: panelID,
+                createdAt: Date(),
+                remoteSurfaceID: descriptor.surfaceID,
+                remoteSurfaceSpawned: false,
+                remoteAgentSurface: descriptor.surfaceType == "agent",
+                hostKey: host.id,
+                originalAgentWorkDir: descriptor.workingDirectory
+            ))
+        }
+
+        let team = Team(
+            id: remote.name,
+            leaderSessionId: UUID().uuidString,
+            leaderMode: "adopted",
+            leaderModel: "",
+            leaderCli: nil,
+            leaderPanelId: leaderPanelID,
+            leaderEndpoint: .peer(host.id),
+            workingDirectory: remote.workingDirectory,
+            workspaceId: workspace.id,
+            agents: members,
+            createdAt: Date(),
+            gitRepoRoot: remote.projectRootPath,
+            worktreeMode: "off",
+            teamUuid: remote.teamUUID,
+            ownsRemotePresentation: remote.presentationOwnedByRequester
+        )
+        guard installAdoptedRemoteProject(team) else {
+            ManagedPeerSurfaceStore.shared.forget(
+                hostKey: host.id,
+                surfaceID: remote.leaderSurfaceID
+            )
+            tabManager.closeWorkspace(workspace)
+            return false
+        }
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: workspace.id,
+            projectName: remote.name
+        )
+        scheduleAgentGridEqualization(workspace: workspace)
+        RemoteWorkLog.info(
+            "Adopted live project \(remote.name) from \(host.displayName): "
+                + "leader + \(members.count) existing agent surfaces"
+        )
+        return true
+    }
+
     struct PeerShellCleanupItem: Identifiable, Equatable {
         enum State: Equatable {
             case inUse

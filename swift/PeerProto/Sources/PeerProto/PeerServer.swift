@@ -1557,6 +1557,12 @@ actor PeerServerSession {
             // `PeerWorkspaceMirror.mirrorHandshakeOptions`. Remove this
             // filter once the Mac host can actually host agent surfaces.
             advertisedCapabilities.removeAll { $0 == PeerCapability.surfaceAgentV1 }
+            // Project manifests promise that the named surfaces outlive this
+            // viewer. A GUI host owns no such lifecycle; only term-meshd may
+            // advertise the durable publication endpoint.
+            advertisedCapabilities.removeAll {
+                $0 == PeerCapability.projectPresentationV1
+            }
             try await sendEnvelope { env in
                 var h = Termmesh_Peer_V1_Hello()
                 h.protocolVersion = self.config.protocolVersion
@@ -1636,6 +1642,19 @@ actor PeerServerSession {
                 var list = Termmesh_Peer_V1_TeamList()
                 list.teams = teams
                 inner.teamList = list
+            }
+
+        case (.ready, .upsertProjectPresentationRequest(let request)):
+            // GUI-hosted surfaces end with this app process and therefore do
+            // not satisfy the durability contract. Advertise a typed refusal
+            // instead of accepting a manifest another Mac could never reopen.
+            try await sendEnvelopeWithCorrelation(env.seq) { inner in
+                var response = Termmesh_Peer_V1_UpsertProjectPresentationResponse()
+                response.requestID = request.requestID
+                response.ok = false
+                response.errorCode = "not_durable_host"
+                response.errorMessage = "this host does not own durable surfaces"
+                inner.upsertProjectPresentationResponse = response
             }
 
         case (.ready, .teamCallRequest(let request)):

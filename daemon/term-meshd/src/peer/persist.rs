@@ -90,6 +90,81 @@ pub fn ensured_surfaces_path(workspaces_path: &Path) -> PathBuf {
     workspaces_path.with_file_name("peer-ensured-surfaces.json")
 }
 
+pub fn project_presentations_path(workspaces_path: &Path) -> PathBuf {
+    workspaces_path.with_file_name("peer-project-presentations.json")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedProjectMember {
+    pub name: String,
+    pub agent_instance_id: String,
+    pub cli: String,
+    pub model: String,
+    pub agent_type: String,
+    pub color: String,
+    pub working_directory: String,
+    pub surface_id: String,
+    pub surface_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedProjectPresentation {
+    pub owner_peer_id: String,
+    pub project_id: String,
+    pub team_name: String,
+    pub team_uuid: String,
+    pub working_directory: String,
+    pub project_root: String,
+    pub leader_surface_id: String,
+    pub members: Vec<PersistedProjectMember>,
+    pub revision: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProjectPresentationFile {
+    version: u32,
+    records: Vec<PersistedProjectPresentation>,
+}
+
+pub fn load_project_presentations(path: &Path) -> Vec<PersistedProjectPresentation> {
+    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    let file: ProjectPresentationFile = match serde_json::from_slice(&bytes) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(
+                "peer-project-presentations.json corrupt ({}): {error}; starting empty",
+                path.display()
+            );
+            return Vec::new();
+        }
+    };
+    if file.version != 1 { return Vec::new(); }
+    let mut project_ids = HashSet::new();
+    file.records
+        .into_iter()
+        .filter(|record| {
+            !record.project_id.is_empty()
+                && !record.team_name.is_empty()
+                && !record.team_uuid.is_empty()
+                && hex::decode(&record.owner_peer_id).is_ok_and(|id| id.len() == 16)
+                && hex::decode(&record.leader_surface_id).is_ok_and(|id| id.len() == 16)
+                && project_ids.insert(record.project_id.clone())
+        })
+        .collect()
+}
+
+pub fn save_project_presentations(
+    path: &Path,
+    records: &[PersistedProjectPresentation],
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(&ProjectPresentationFile {
+        version: 1,
+        records: records.to_vec(),
+    })
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+    atomic_save(path, &bytes)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedEnsuredSurface {
     pub key: String,
@@ -420,6 +495,48 @@ mod tests {
             loaded, entries,
             "id/name/is_default must round-trip exactly"
         );
+    }
+
+    #[test]
+    fn project_presentation_round_trips_exact_surface_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer-project-presentations.json");
+        let record = PersistedProjectPresentation {
+            owner_peer_id: hex::encode([7u8; 16]),
+            project_id: "name:demo".into(),
+            team_name: "demo".into(),
+            team_uuid: "team-uuid".into(),
+            working_directory: "/srv/demo".into(),
+            project_root: "/srv/demo".into(),
+            leader_surface_id: hex::encode([8u8; 16]),
+            members: vec![PersistedProjectMember {
+                name: "executor".into(),
+                agent_instance_id: "agent-instance".into(),
+                cli: "codex".into(),
+                model: "gpt-5".into(),
+                agent_type: "executor".into(),
+                color: "blue".into(),
+                working_directory: "/srv/demo".into(),
+                surface_id: hex::encode([9u8; 16]),
+                surface_type: "agent".into(),
+            }],
+            revision: 3,
+        };
+
+        save_project_presentations(&path, std::slice::from_ref(&record)).unwrap();
+        assert_eq!(load_project_presentations(&path), vec![record]);
+    }
+
+    #[test]
+    fn project_presentation_rejects_invalid_surface_ids_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer-project-presentations.json");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"records":[{"owner_peer_id":"07","project_id":"name:demo","team_name":"demo","team_uuid":"uuid","working_directory":"/srv/demo","project_root":"/srv/demo","leader_surface_id":"08","members":[],"revision":1}]}"#,
+        )
+        .unwrap();
+        assert!(load_project_presentations(&path).is_empty());
     }
 
     #[test]

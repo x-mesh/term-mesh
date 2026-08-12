@@ -1325,6 +1325,10 @@ final class PeerServerTests: XCTestCase {
             hello.hasHostCapability(PeerCapability.teamLeaderV1),
             "an empty host must still accept a leader, or no team can ever start there"
         )
+        XCTAssertFalse(
+            hello.hasHostCapability(PeerCapability.projectPresentationV1),
+            "a GUI host must not promise daemon-owned durable surfaces"
+        )
     }
 }
 
