@@ -3658,7 +3658,7 @@ mod team_call_allow_list_tests {
     }
 
     #[test]
-    fn scoped_task_methods_match_the_cli_allow_list() {
+    fn scoped_leader_methods_match_the_cli_allow_list() {
         let cli = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../term-mesh-cli/src/tm_agent.rs");
         let source = std::fs::read_to_string(&cli)
@@ -3683,6 +3683,11 @@ mod team_call_allow_list_tests {
             .copied()
             .filter(|method| *method != "team.list")
             .collect();
+        // A remote leader is bound to one project/team by its grant. It may
+        // ask that project to add a member, while generic team.call.v1 peers
+        // remain unable to spawn anything. The Swift owner overwrites the
+        // requested host and directory from the granted project's placement.
+        daemon_methods.push("team.add_agent");
         cli_methods.sort();
         daemon_methods.sort();
 

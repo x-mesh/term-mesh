@@ -1696,6 +1696,18 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
 final class PeerOwnedAgentSurfaceTests: XCTestCase {
 
     @MainActor
+    func test_configuredRemoteAgentEnvironmentIncludesProfileAndLetsHostOverride() {
+        let merged = TeamOrchestrator.configuredRemoteAgentEnvironment(
+            profile: ["AI_MESH_API_KEY": "profile-secret", "PROFILE_ONLY": "yes"],
+            explicitHost: ["AI_MESH_API_KEY": "host-secret", "HOST_ONLY": "yes"]
+        )
+
+        XCTAssertEqual(merged["AI_MESH_API_KEY"], "host-secret")
+        XCTAssertEqual(merged["PROFILE_ONLY"], "yes")
+        XCTAssertEqual(merged["HOST_ONLY"], "yes")
+    }
+
+    @MainActor
     func test_peerOwnedEnvironmentPrecedenceAndValidationAreDeterministic() throws {
         let merged = try TeamOrchestrator.peerOwnedAgentEnvironment(
             profile: ["SHARED": "profile", "PROFILE_ONLY": "yes"],

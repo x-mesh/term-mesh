@@ -488,6 +488,88 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         }?.teamUuid
     }
 
+    private struct ScopedLeaderTarget: Sendable {
+        let teamName: String
+        let leaderHostKey: String?
+        let leaderDirectory: String?
+    }
+
+    nonisolated static func canonicalizeScopedLeaderParameters(
+        _ params: [String: Any],
+        method: String,
+        teamName: String,
+        leaderHostKey: String?,
+        leaderDirectory: String?
+    ) -> [String: Any] {
+        var params = params
+        params["team"] = teamName
+        params["team_name"] = teamName
+        if method == "team.add_agent" {
+            params["host"] = leaderHostKey
+            params["directory"] = leaderDirectory
+        }
+        return params
+    }
+
+    /// Resolve every placement value from the granted project. A remote
+    /// leader may choose the new member's role/CLI/model, but it may not use
+    /// `team.add_agent` to choose another machine or an arbitrary path.
+    nonisolated static func scopedLeaderParameters(
+        method: String,
+        paramsJSON: String,
+        teamUUID: String
+    ) async -> Result<[String: Any], PeerTeamCallFailure> {
+        guard let data = paramsJSON.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let params = object as? [String: Any] else {
+            return .failure(PeerTeamCallFailure(
+                code: PeerTeamCall.ErrorCode.invalidParams,
+                message: "params_json must be a JSON object"
+            ))
+        }
+        guard let target = await MainActor.run(body: { () -> ScopedLeaderTarget? in
+            guard let team = TeamOrchestrator.shared.teams.values.first(where: {
+                $0.teamUuid == teamUUID
+            }) else { return nil }
+            guard method == "team.add_agent" else {
+                return ScopedLeaderTarget(
+                    teamName: team.id,
+                    leaderHostKey: nil,
+                    leaderDirectory: nil
+                )
+            }
+            guard case .peer(let hostKey) = team.leaderEndpoint else {
+                return nil
+            }
+            let directory = ManagedPeerSurfaceStore.shared.leaderRecord(
+                hostKey: hostKey,
+                teamName: team.id
+            )?.workingDirectory
+                ?? team.remoteProjectLocations.first(where: {
+                    $0.hostKey == hostKey
+                })?.path
+                ?? team.workingDirectory
+            return ScopedLeaderTarget(
+                teamName: team.id,
+                leaderHostKey: hostKey,
+                leaderDirectory: directory
+            )
+        }) else {
+            return .failure(PeerTeamCallFailure(
+                code: "team_not_found",
+                message: "granted team is not owned by this control plane"
+            ))
+        }
+
+        return .success(canonicalizeScopedLeaderParameters(
+            params,
+            method: method,
+            teamName: target.teamName,
+            leaderHostKey: target.leaderHostKey,
+            leaderDirectory: target.leaderDirectory
+        ))
+    }
+
     /// The control-plane actor has already parsed and validated this request.
     /// Keep the second JSON parse off MainActor, resolve the authoritative
     /// team name with one minimal hop, and overwrite both accepted spelling
@@ -497,27 +579,15 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         paramsJSON: String,
         teamUUID: String
     ) async -> Result<String, PeerTeamCallFailure>? {
-        guard let data = paramsJSON.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data),
-              var params = object as? [String: Any] else {
-            return .failure(PeerTeamCallFailure(
-                code: PeerTeamCall.ErrorCode.invalidParams,
-                message: "params_json must be a JSON object"
-            ))
+        let params: [String: Any]
+        switch await Self.scopedLeaderParameters(
+            method: method,
+            paramsJSON: paramsJSON,
+            teamUUID: teamUUID
+        ) {
+        case .success(let resolved): params = resolved
+        case .failure(let failure): return .failure(failure)
         }
-        guard let teamName = await MainActor.run(body: {
-            TeamOrchestrator.shared.teams.values.first(where: {
-                $0.teamUuid == teamUUID
-            })?.id
-        }) else {
-            return .failure(PeerTeamCallFailure(
-                code: "team_not_found",
-                message: "granted team is not owned by this control plane"
-            ))
-        }
-
-        params["team"] = teamName
-        params["team_name"] = teamName
         let response = await TerminalController.shared.peerTeamCommandAsync(
             method: method,
             params: params
@@ -538,26 +608,15 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             encodedBytes: encodedBytes,
             audiencePeerID: PeerIdentity.defaultPeerID()
         ) { method, paramsJSON, teamUUID in
-            guard let data = paramsJSON.data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data),
-                  var params = object as? [String: Any] else {
-                return .failure(PeerTeamCallFailure(
-                    code: PeerTeamCall.ErrorCode.invalidParams,
-                    message: "params_json must be a JSON object"
-                ))
+            let params: [String: Any]
+            switch await scopedLeaderParameters(
+                method: method,
+                paramsJSON: paramsJSON,
+                teamUUID: teamUUID
+            ) {
+            case .success(let resolved): params = resolved
+            case .failure(let failure): return .failure(failure)
             }
-            guard let teamName = await MainActor.run(body: {
-                TeamOrchestrator.shared.teams.values.first(where: {
-                    $0.teamUuid == teamUUID
-                })?.id
-            }) else {
-                return .failure(PeerTeamCallFailure(
-                    code: "team_not_found",
-                    message: "granted team is not owned by this control plane"
-                ))
-            }
-            params["team"] = teamName
-            params["team_name"] = teamName
             let response = await TerminalController.shared.peerTeamCommandAsync(
                 method: method,
                 params: params

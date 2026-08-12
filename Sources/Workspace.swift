@@ -1633,6 +1633,10 @@ final class Workspace: Identifiable {
         let agentPanel = AgentPanel(agentName: agentName, teamName: teamName,
                                     workingDirectory: workingDirectory,
                                     cli: cli, color: color)
+        agentPanel.onClose = { [weak agentPanel] in
+            guard let id = agentPanel?.id else { return }
+            AgentEnvironmentComparisonStore.removeNative(teamName: teamName, id: id)
+        }
         agentPanel.session.onDiagnostic = { [weak agentPanel] severity, detail in
             let title = agentPanel?.title ?? agentName
             let message = "Native agent \(severity == .error ? "error" : "warning"): "
@@ -1642,6 +1646,22 @@ final class Workspace: Identifiable {
                 RemoteWorkLog.warning(message)
             case .error:
                 RemoteWorkLog.error(message)
+            }
+        }
+        agentPanel.session.onEnvironmentSummary = { [weak agentPanel] environment in
+            let title = agentPanel?.title ?? agentName
+            RemoteWorkLog.info(
+                "Native environment: \(title) [\(cli)] — \(environment.liveActivityText)"
+            )
+            AgentEnvironmentComparisonStore.recordNative(
+                environment,
+                teamName: teamName,
+                id: agentPanel?.id ?? UUID()
+            ) { [weak agentPanel] mismatch in
+                agentPanel?.session.setEnvironmentMismatch(mismatch)
+                if let mismatch {
+                    RemoteWorkLog.warning("\(mismatch) — team=\(teamName), agent=\(agentName)")
+                }
             }
         }
         panels[agentPanel.id] = agentPanel
