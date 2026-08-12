@@ -7092,6 +7092,14 @@ final class TerminalControllerRemoteAgentAddTests: XCTestCase {
 }
 
 final class TerminalControllerSocketTextChunkTests: XCTestCase {
+    func testQueuedTextForNamedKeyMapsControlKeys() {
+        XCTAssertEqual(TerminalController.queuedTextForNamedKey("ctrl-d"), "\u{04}")
+        XCTAssertEqual(TerminalController.queuedTextForNamedKey("EOF"), "\u{04}")
+        XCTAssertEqual(TerminalController.queuedTextForNamedKey("ctrl-a"), "\u{01}")
+        XCTAssertEqual(TerminalController.queuedTextForNamedKey("return"), "\r")
+        XCTAssertNil(TerminalController.queuedTextForNamedKey("left"))
+    }
+
     func testSocketTextChunksReturnsSingleChunkForPlainText() {
         XCTAssertEqual(
             TerminalController.socketTextChunks("echo hello"),

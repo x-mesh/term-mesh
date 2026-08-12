@@ -170,6 +170,32 @@ extension TerminalController {
         }
     }
 
+    nonisolated static func queuedTextForNamedKey(_ keyName: String) -> String? {
+        let normalized = keyName.lowercased()
+        switch normalized {
+        case "ctrl-c", "ctrl+c", "sigint": return "\u{03}"
+        case "ctrl-d", "ctrl+d", "eof": return "\u{04}"
+        case "ctrl-u", "ctrl+u", "kill-line": return "\u{15}"
+        case "ctrl-z", "ctrl+z", "sigtstp": return "\u{1a}"
+        case "ctrl-\\", "ctrl+\\", "sigquit": return "\u{1c}"
+        case "enter", "return": return "\r"
+        case "tab": return "\t"
+        case "escape", "esc": return "\u{1b}"
+        case "backspace": return "\u{7f}"
+        default:
+            guard normalized.hasPrefix("ctrl-") || normalized.hasPrefix("ctrl+") else {
+                return nil
+            }
+            let letter = normalized.dropFirst(5)
+            guard letter.utf8.count == 1, let byte = letter.utf8.first,
+                  byte >= Character("a").asciiValue!, byte <= Character("z").asciiValue!,
+                  let scalar = UnicodeScalar(Int(byte - Character("a").asciiValue! + 1)) else {
+                return nil
+            }
+            return String(scalar)
+        }
+    }
+
     func sendNamedKey(_ surface: ghostty_surface_t, keyName: String) -> Bool {
         switch keyName.lowercased() {
         case "ctrl-c", "ctrl+c", "sigint":

@@ -786,16 +786,24 @@ extension TerminalController {
                 result = .err(code: "invalid_params", message: "Surface is not a terminal", data: ["surface_id": surfaceId.uuidString])
                 return
             }
-            guard let surface = terminalPanel.surface.surface else {
-                result = .err(code: "internal_error", message: "Surface not ready", data: ["surface_id": surfaceId.uuidString])
-                return
-            }
-            guard self.sendNamedKey(surface, keyName: key) else {
+            guard let queuedText = Self.queuedTextForNamedKey(key) else {
                 result = .err(code: "invalid_params", message: "Unknown key", data: ["key": key])
                 return
             }
-            terminalPanel.surface.forceRefresh()
-            result = .ok(["workspace_id": ws.id.uuidString, "workspace_ref": self.v2Ref(kind: .workspace, uuid: ws.id), "surface_id": surfaceId.uuidString, "surface_ref": self.v2Ref(kind: .surface, uuid: surfaceId), "window_id": self.v2OrNull(self.v2ResolveWindowId(tabManager: tabManager)?.uuidString), "window_ref": self.v2Ref(kind: .window, uuid: self.v2ResolveWindowId(tabManager: tabManager))])
+            let queued: Bool
+            if let surface = terminalPanel.surface.surface {
+                guard self.sendNamedKey(surface, keyName: key) else {
+                    result = .err(code: "internal_error", message: "Failed to send key", data: ["key": key])
+                    return
+                }
+                terminalPanel.surface.forceRefresh()
+                queued = false
+            } else {
+                terminalPanel.sendText(queuedText)
+                terminalPanel.surface.requestBackgroundSurfaceStartIfNeeded()
+                queued = true
+            }
+            result = .ok(["workspace_id": ws.id.uuidString, "workspace_ref": self.v2Ref(kind: .workspace, uuid: ws.id), "surface_id": surfaceId.uuidString, "surface_ref": self.v2Ref(kind: .surface, uuid: surfaceId), "queued": queued, "window_id": self.v2OrNull(self.v2ResolveWindowId(tabManager: tabManager)?.uuidString), "window_ref": self.v2Ref(kind: .window, uuid: self.v2ResolveWindowId(tabManager: tabManager))])
         }
         if !completed {
             return .err(code: "timeout", message: "Main thread busy (IME or modal UI active)", data: nil)
