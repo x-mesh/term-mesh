@@ -1882,7 +1882,11 @@ final class AgentSessionTests: XCTestCase {
         ]))
 
         XCTAssertEqual(reported?.0, .error)
-        XCTAssertEqual(reported?.1, "Missing environment variable: AI_MESH_API_KEY")
+        XCTAssertEqual(
+            reported?.1,
+            "Missing environment variable: AI_MESH_API_KEY\n"
+                + "Set it in ~/.config/term-mesh/agent-env on the agent host, then restart this agent."
+        )
     }
 
     func testFailedTurnDiagnosticsRedactCredentials() {
@@ -2928,6 +2932,30 @@ final class AgentSessionTests: XCTestCase {
             return XCTFail("expected the reassembled answer")
         }
         XCTAssertEqual(text, big)
+    }
+
+    func testMissingAPIKeyFailureNamesTheRemoteAgentEnvRecoveryPath() {
+        let detail = AgentSession.failureDetail(
+            final: "AI_MESH_API_KEY is not set",
+            alreadyShown: "",
+            stop: "error"
+        )
+        XCTAssertEqual(
+            detail,
+            "AI_MESH_API_KEY is not set\n"
+                + "Set it in ~/.config/term-mesh/agent-env on the agent host, then restart this agent."
+        )
+    }
+
+    func testOrdinaryProviderFailureDoesNotInventAnEnvironmentFix() {
+        XCTAssertEqual(
+            AgentSession.failureDetail(
+                final: "provider request timed out",
+                alreadyShown: "",
+                stop: "error"
+            ),
+            "provider request timed out"
+        )
     }
 
     /// The bridge's stdout carries `[bridge] …` diagnostics between events,

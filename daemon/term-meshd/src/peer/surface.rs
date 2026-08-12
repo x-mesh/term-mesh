@@ -624,10 +624,21 @@ impl SizeArbiter {
 
 fn agent_login_shell() -> String {
     let passwd_shell = passwd_login_shell();
-    let candidate = resolve_login_shell(
+    resolve_agent_login_shell(
         std::env::var("SHELL").ok().as_deref(),
         passwd_shell.as_deref(),
-    );
+    )
+}
+
+fn resolve_agent_login_shell(env_shell: Option<&str>, passwd_shell: Option<&str>) -> String {
+    // An agent belongs to the account, not to the daemon service manager.
+    // systemd commonly injects SHELL=/bin/sh even when the account is
+    // chsh-ed to zsh. Preferring that process value made agents skip
+    // ~/.zshenv while an SSH login loaded it, so readiness and launch saw
+    // two different environments. Terminal panes keep their historical
+    // process-SHELL precedence in `login_shell_cmd`; daemon-owned agents use
+    // the account's shell first because that is their documented contract.
+    let candidate = resolve_login_shell(passwd_shell, env_shell);
     match candidate.rsplit('/').next().unwrap_or("") {
         "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" => candidate,
         // `agent-env` is explicitly a Bourne-compatible fragment. Accounts
@@ -3960,6 +3971,24 @@ mod tests {
         // A blocked/nonexistent passwd shell is skipped like any other → bash|sh.
         let both_bad = resolve_login_shell(None, Some("/usr/sbin/nologin"));
         assert!(matches!(both_bad.as_str(), "/bin/bash" | "/bin/sh"), "got {both_bad:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_login_shell_prefers_the_account_over_systemd_shell() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temporary shell directory");
+        let account_shell = home.path().join("zsh");
+        std::fs::write(&account_shell, "#!/bin/sh\nexit 0\n").expect("write mock zsh");
+        let mut permissions = std::fs::metadata(&account_shell)
+            .expect("mock zsh metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&account_shell, permissions).expect("make mock zsh executable");
+
+        let selected = resolve_agent_login_shell(Some("/bin/sh"), account_shell.to_str());
+        assert_eq!(selected, account_shell.to_string_lossy());
     }
 
     // --- Container-only end-to-end checks (see scripts/zsh-login-shell-test/) ---

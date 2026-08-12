@@ -107,6 +107,9 @@ struct NewProjectView: View {
     @State private var remoteDirectoryListing: RemoteDirectoryListing?
     @State private var isLoadingRemoteDirectoryBrowser = false
     @State private var remoteDirectoryBrowserError: String?
+    @State private var agentEnvironmentInventory: PeerHostDoctor.BinaryInventory?
+    @State private var isLoadingAgentEnvironment = false
+    @State private var agentEnvironmentProbeFailed = false
     /// How many of `repositoryURLSuggestions` came from disk. The rest are
     /// from the account catalog. Kept as a count rather than a second list so
     /// matching and selection keep working on one array.
@@ -289,6 +292,9 @@ struct NewProjectView: View {
         }
         .task(id: remoteDirectoryAutocompleteID) {
             await loadRemoteDirectorySuggestions()
+        }
+        .task(id: selectedHostAgentEnvironmentID) {
+            await loadSelectedHostAgentEnvironment()
         }
         .onChange(of: agents.map(\.id)) { _, _ in
             adoptProjectMachineForNewRows()
@@ -965,6 +971,13 @@ struct NewProjectView: View {
                     }
                 }
 
+                if runsOnHostKey != nil {
+                    GridRow {
+                        Text("Agent environment")
+                        selectedHostAgentEnvironmentSummary
+                    }
+                }
+
                 if sourceKind == .existingFolder {
                     GridRow {
                         Text("Project folder")
@@ -1329,6 +1342,86 @@ struct NewProjectView: View {
               focusedField == .directory,
               !showsRemoteDirectoryBrowser else { return "" }
         return "\(hostKey)\u{0}\(directory)"
+    }
+
+    private var selectedHostAgentEnvironmentID: String {
+        guard let hostKey = runsOnHostKey,
+              let host = placeableHosts.first(where: { $0.id == hostKey }),
+              let sshTarget = host.sshTarget,
+              !sshTarget.isEmpty else { return "" }
+        return [hostKey, sshTarget, host.sshPort.map(String.init) ?? "",
+                host.identityFile ?? ""].joined(separator: "\u{0}")
+    }
+
+    @ViewBuilder
+    private var selectedHostAgentEnvironmentSummary: some View {
+        if isLoadingAgentEnvironment {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Checking shell and agent-env…")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        } else if let inventory = agentEnvironmentInventory {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Image(systemName: "terminal")
+                    Text(inventory.agentShell.map { "Agent shell: \($0)" }
+                         ?? "Agent shell: account login shell")
+                    Text("·")
+                        .foregroundStyle(.tertiary)
+                    if inventory.agentEnvironmentFileExists == true {
+                        Label("agent-env ready", systemImage: "checkmark.circle")
+                            .foregroundStyle(.green)
+                    } else {
+                        Label("agent-env missing", systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .font(.caption)
+                let path = inventory.agentEnvironmentPath
+                    ?? "~/.config/term-mesh/agent-env"
+                Text("Put API keys in \(path). Change the shell with chsh; new Claude, Codex, Kiro, Cursor, and Agy agents use it.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(agentEnvironmentProbeFailed
+                     ? "Couldn’t inspect this host’s agent environment."
+                     : "Remote agents use the account login shell.")
+                    .font(.caption)
+                    .foregroundStyle(agentEnvironmentProbeFailed ? Color.orange : Color.secondary)
+                Text("Put API keys in ~/.config/term-mesh/agent-env. Change the shell with chsh; restart existing agents after changes.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    private func loadSelectedHostAgentEnvironment() async {
+        agentEnvironmentInventory = nil
+        agentEnvironmentProbeFailed = false
+        isLoadingAgentEnvironment = false
+        let requestID = selectedHostAgentEnvironmentID
+        guard !requestID.isEmpty,
+              let hostKey = runsOnHostKey,
+              let host = placeableHosts.first(where: { $0.id == hostKey }),
+              let sshTarget = host.sshTarget else { return }
+        isLoadingAgentEnvironment = true
+        let inventory = await PeerHostDoctor.binaryInventory(
+            sshTarget: sshTarget,
+            port: host.sshPort,
+            identityFile: host.identityFile
+        )
+        guard !Task.isCancelled, selectedHostAgentEnvironmentID == requestID else { return }
+        agentEnvironmentInventory = inventory
+        agentEnvironmentProbeFailed = inventory == nil
+        isLoadingAgentEnvironment = false
     }
 
     private var remoteDirectoryBrowserLookupID: String {

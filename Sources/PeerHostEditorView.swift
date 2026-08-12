@@ -75,6 +75,10 @@ struct PeerHostEditorView: View {
     /// Empty on a consistent host — a warning shown on healthy hosts is
     /// one people stop reading.
     @State private var binaryWarnings: [String] = []
+    /// Shell and shell-independent environment file measured by the last
+    /// successful SSH inventory probe. Unlike warnings, healthy data remains
+    /// visible because users need to know where agent credentials belong.
+    @State private var binaryInventory: PeerHostDoctor.BinaryInventory?
     /// term-meshd processes this host keeps running while nothing points at
     /// them. Empty on Linux hosts by design (see `refreshDaemonSnapshot`).
     @State private var staleDaemons: [PeerHostDoctor.DaemonInstance] = []
@@ -289,6 +293,7 @@ struct PeerHostEditorView: View {
 
             doctorStatusLine
 
+            agentEnvironmentStatusLine
             agentStackStatusLine
             binaryWarningLines
             staleDaemonLine
@@ -665,6 +670,31 @@ struct PeerHostEditorView: View {
         }
     }
 
+    @ViewBuilder
+    private var agentEnvironmentStatusLine: some View {
+        if let inventory = binaryInventory,
+           let shell = inventory.agentShell {
+            VStack(alignment: .leading, spacing: 2) {
+                Label("Agent shell: \(shell)", systemImage: "terminal")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                let path = inventory.agentEnvironmentPath
+                    ?? "~/.config/term-mesh/agent-env"
+                Text(inventory.agentEnvironmentFileExists == true
+                     ? "Secrets: \(path) — configured"
+                     : "Secrets: \(path) — not created")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(inventory.agentEnvironmentFileExists == true
+                                     ? Color.secondary : Color.orange)
+                    .textSelection(.enabled)
+                Text("Change the account shell with chsh. New agents use it; restart existing agents after a change.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
     /// The agent-stack lane, rendered beneath the daemon status line.
     /// Silent until a Test has run — the whole point is answering "will
     /// an agent in a pane on this host actually notify me", which only
@@ -910,6 +940,7 @@ struct PeerHostEditorView: View {
         testedDraft = nil
         daemonMissingVersion = nil
         binaryWarnings = []
+        binaryInventory = nil
         daemonMissingHostKind = nil
         testedHostKind = nil
         updateAttempted = false
@@ -936,6 +967,7 @@ struct PeerHostEditorView: View {
         doctorState = .testing
         daemonMissingVersion = nil
         binaryWarnings = []
+        binaryInventory = nil
         daemonMissingHostKind = nil
         testedHostKind = nil
         // Snapshot NOW — this is the exact target Install/Update must use
@@ -1039,6 +1071,7 @@ struct PeerHostEditorView: View {
         doctorState = .installing
         daemonMissingVersion = nil
         binaryWarnings = []
+        binaryInventory = nil
         installInFlight = true
         Task {
             do {
@@ -1115,6 +1148,7 @@ struct PeerHostEditorView: View {
             identityFile: draft.identityFile
         )
         guard gen == doctorGeneration else { return }
+        binaryInventory = inventory
         let warnings = inventory.map(PeerHostDoctor.inventoryWarnings) ?? []
         binaryWarnings = warnings
         for warning in warnings {

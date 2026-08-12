@@ -60,6 +60,37 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
         XCTAssertEqual(inventory.cliShadowed.first?.version, "tm-agent 0.170.1")
     }
 
+    func test_parsesAgentShellAndShellIndependentEnvironmentStatus() {
+        let inventory = PeerHostDoctor.parseBinaryInventory("""
+        login-shell=/usr/bin/zsh
+        agent-shell=/usr/bin/zsh
+        home=/root
+        agent-env-path=/root/.config/term-mesh/agent-env
+        agent-env-present=1
+        """)
+        XCTAssertEqual(inventory.loginShell, "/usr/bin/zsh")
+        XCTAssertEqual(inventory.agentShell, "/usr/bin/zsh")
+        XCTAssertEqual(
+            inventory.agentEnvironmentPath,
+            "/root/.config/term-mesh/agent-env"
+        )
+        XCTAssertEqual(inventory.agentEnvironmentFileExists, true)
+    }
+
+    func test_inventoryReportsTheBourneFallbackAsTheActualAgentShell() {
+        let command = PeerHostDoctor.binaryInventoryCommand
+        XCTAssertTrue(command.contains(#"case "${agent_shell##*/}""#))
+        XCTAssertTrue(command.contains("agent_shell=/bin/sh"))
+        XCTAssertTrue(command.contains(#"echo "agent-shell=$agent_shell""#))
+    }
+
+    func test_inventoryChecksAgentEnvPresenceWithoutReadingIt() {
+        let command = PeerHostDoctor.binaryInventoryCommand
+        XCTAssertTrue(command.contains(#"[ -f "$agent_env" ]"#))
+        XCTAssertFalse(command.contains(#"cat "$agent_env""#))
+        XCTAssertFalse(command.contains(#". "$agent_env""#))
+    }
+
     func test_reportsWhenSSHAndDaemonAccountsDifferOnLinux() {
         let warnings = PeerHostDoctor.inventoryWarnings(
             PeerHostDoctor.parseBinaryInventory("""

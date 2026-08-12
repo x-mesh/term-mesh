@@ -247,8 +247,13 @@ enum PeerHostDoctor {
         /// routinely different from the one this probe searches — and when a
         /// CLI is "installed but not found", this is the pair that says why.
         var loginShell: String?
+        var agentShell: String?
         var loginPath: String?
         var homeDirectory: String?
+        /// Shell-independent agent configuration. The probe checks only the
+        /// file's path and presence; it never reads credential values.
+        var agentEnvironmentPath: String?
+        var agentEnvironmentFileExists: Bool?
         /// The `tm-agent` an agent launched here would get.
         var cli: BinaryEntry?
         /// Other `tm-agent` copies on the same PATH, in search order after
@@ -297,6 +302,7 @@ enum PeerHostDoctor {
             + #"pane_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); "#
             + #"case "$pane_shell" in */nologin|*/false|"") pane_shell=/bin/sh;; esac; "#
             + #"echo "login-shell=$pane_shell"; "#
+            + #"agent_shell=$pane_shell; case "${agent_shell##*/}" in sh|bash|zsh|dash|ksh|mksh) ;; *) agent_shell=/bin/sh;; esac; echo "agent-shell=$agent_shell"; "#
             // `\$PATH` so the *login* shell expands it, not this one. Single
             // quotes would be the obvious way to protect it and are exactly
             // what this probe cannot contain — the whole body ships inside
@@ -304,6 +310,7 @@ enum PeerHostDoctor {
             + #"pane_path=$(env -u SHELL "$pane_shell" -lc "printf %s \$PATH" 2>/dev/null | tr -d "\n"); "#
             + #"[ -n "$pane_path" ] && echo "login-path=$pane_path"; "#
             + #"[ -n "$HOME" ] && echo "home=$HOME"; "#
+            + #"agent_env="$HOME/.config/term-mesh/agent-env"; echo "agent-env-path=$agent_env"; if [ -f "$agent_env" ]; then echo agent-env-present=1; else echo agent-env-present=0; fi; "#
             + #"if [ "$(uname -s)" = Darwin ]; then v=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null); [ -n "$v" ] && echo "app=$v"; fi; "#
             // tm-agent-bridge is asked for but never `--version`ed: it is
             // spoken to over a pipe and has no such flag. Presence is the
@@ -686,6 +693,14 @@ enum PeerHostDoctor {
                 inventory.appVersion = value.isEmpty ? nil : value
                 continue
             }
+            if key == "agent-env-path" {
+                inventory.agentEnvironmentPath = value.isEmpty ? nil : value
+                continue
+            }
+            if key == "agent-env-present" {
+                inventory.agentEnvironmentFileExists = value == "1"
+                continue
+            }
             // `path|version`. A binary that ran but printed nothing still
             // gets an entry — where it is matters even when it won't say
             // what it is.
@@ -700,6 +715,7 @@ enum PeerHostDoctor {
             case "ssh-user": inventory.sshUser = value.isEmpty ? nil : value
             case "daemon-user": inventory.daemonUser = value.isEmpty ? nil : value
             case "login-shell": inventory.loginShell = value.isEmpty ? nil : value
+            case "agent-shell": inventory.agentShell = value.isEmpty ? nil : value
             case "login-path": inventory.loginPath = value.isEmpty ? nil : value
             case "home": inventory.homeDirectory = value.isEmpty ? nil : value
             case "tm-agent": inventory.cli = entry

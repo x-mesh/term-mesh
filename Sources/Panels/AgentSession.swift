@@ -2464,17 +2464,35 @@ final class AgentSession {
     ) -> String? {
         let final = final.trimmingCharacters(in: .whitespacesAndNewlines)
         let shown = alreadyShown.trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail: String?
         guard !final.isEmpty else {
             return stop.isEmpty ? "the agent reported a failed turn" : "the agent reported: \(stop)"
         }
-        guard !shown.isEmpty else { return final }
-        guard final != shown else { return nil }
-        if final.hasPrefix(shown) {
+        if shown.isEmpty {
+            detail = final
+        } else if final == shown {
+            detail = nil
+        } else if final.hasPrefix(shown) {
             let remainder = final.dropFirst(shown.count)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            return remainder.isEmpty ? nil : remainder
+            detail = remainder.isEmpty ? nil : remainder
+        } else {
+            detail = final
         }
-        return final
+        return detail.map(environmentFailureGuidance)
+    }
+
+    /// Provider errors name the missing variable but normally stop before
+    /// saying which shell a remote native agent reads. Add the one safe,
+    /// shell-independent recovery path without exposing any credential value.
+    nonisolated static func environmentFailureGuidance(_ detail: String) -> String {
+        let lower = detail.lowercased()
+        let saysMissing = ["missing", "not set", "unset", "not found", "required"]
+            .contains { lower.contains($0) }
+        let mentionsAPIKey = detail.uppercased().contains("_API_KEY")
+        guard saysMissing, mentionsAPIKey else { return detail }
+        return detail
+            + "\nSet it in ~/.config/term-mesh/agent-env on the agent host, then restart this agent."
     }
 
     /// Take the header out of the answers this turn produced, and return it.

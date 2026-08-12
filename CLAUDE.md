@@ -145,6 +145,10 @@ Spike 상세: `docs/spike/agent-pipe-render.md`
 ### Remote native agent environment
 
 Remote native agents start through the account's Bourne-compatible login shell.
+For daemon-owned agents, `/etc/passwd` is authoritative; a systemd-inherited
+`SHELL=/bin/sh` must not override an account that uses zsh. Change the account
+shell with `chsh`; the Project creation screen and Peer Host doctor show the
+resolved shell and `agent-env` status.
 The load order is:
 
 1. the shell's normal login profile;

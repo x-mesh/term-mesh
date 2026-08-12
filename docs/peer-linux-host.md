@@ -88,6 +88,27 @@ journalctl --user -u term-meshd -f
 #               sudo journalctl -u term-meshd -f
 ```
 
+### Native agent shell and secrets
+
+Remote native agents use the daemon account's `/etc/passwd` login shell, not
+the `SHELL` value inherited by `term-meshd` from systemd. Change it with
+`chsh -s /path/to/shell`; newly created agents use the change. Existing agents
+must be restarted.
+
+Shell profiles are useful for interactive setup, but provider credentials have
+a deterministic, shell-independent home:
+
+```bash
+mkdir -p ~/.config/term-mesh
+$EDITOR ~/.config/term-mesh/agent-env
+chmod 600 ~/.config/term-mesh/agent-env
+```
+
+Use Bourne-compatible assignments such as `export NAME=value`. The file is
+loaded for Claude, Codex, Kiro, Cursor, and Agy native agents. Project → New
+Project shows the selected host's shell and whether this file exists; Settings
+→ Peer Hosts → Test Relay shows the same information with its resolved path.
+
 ### Build from source
 
 Only needed if you're not using the installer above — e.g. building from a
