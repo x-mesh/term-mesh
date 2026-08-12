@@ -248,4 +248,3 @@ so they are tested against synthetic sample sets carrying the numbers above.
 ```bash
 ./scripts/test-perf-sample.sh
 ```
-

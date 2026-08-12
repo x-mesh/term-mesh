@@ -77,4 +77,3 @@ check on code that runs `rm -rf`. `test-reload-cleanup.sh` sources reload.sh wit
 path-guard rejections, per-tag isolation, and the two cases where reclamation
 must refuse — a tag whose app is still running behind a stale manifest PID, and a
 rebuild that failed while the previous build is live.
-
