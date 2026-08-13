@@ -677,6 +677,29 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 2)
     }
 
+    @MainActor
+    func test_transportRecovery_coalescesStaleGenerationAndAllowsNextIncident() async {
+        let recovery = PeerPaneTransportRecovery()
+        var refreshCount = 0
+
+        let first = await recovery.refresh(after: 0) { refreshCount += 1 }
+        XCTAssertEqual(first, 1)
+        XCTAssertEqual(refreshCount, 1)
+
+        // A sibling attached through generation 0 reports the same outage
+        // after the first pane already refreshed it. It must join generation
+        // 1 without restarting the replacement transport.
+        let sibling = await recovery.refresh(after: 0) { refreshCount += 100 }
+        XCTAssertEqual(sibling, 1)
+        XCTAssertEqual(refreshCount, 1)
+
+        // A later failure of generation 1 is a new incident and gets one new
+        // refresh of its own.
+        let next = await recovery.refresh(after: first) { refreshCount += 1 }
+        XCTAssertEqual(next, 2)
+        XCTAssertEqual(refreshCount, 2)
+    }
+
     /// Reattach-on-reconnect is for panes a person chose to disconnect. An
     /// accidental transport loss has recovery of its own, and reattaching it
     /// here too would rebuild the pane twice for one failure.

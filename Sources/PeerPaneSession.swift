@@ -127,6 +127,11 @@ final class PeerPaneHostLease {
     /// still exist. Their later releases must not stop it a second time (or,
     /// more importantly, disturb a replacement lease for the same host).
     fileprivate var isTornDown = false
+    /// Coordinates transport resets across every pane sharing this host.
+    /// Each relay remembers the generation it attached through; the first
+    /// relay that reports that generation dead restarts SSH, while siblings
+    /// wait for the same restart instead of killing the replacement again.
+    private let transportRecovery = PeerPaneTransportRecovery()
 
     fileprivate init(key: PeerPaneHostKey, tunnel: PeerSSHTunnel?) {
         self.key = key
@@ -137,6 +142,58 @@ final class PeerPaneHostLease {
         guard !isTornDown else { return }
         isTornDown = true
         tunnel?.stop()
+    }
+
+    var transportGeneration: UInt64 { transportRecovery.generation }
+
+    /// Replace a half-alive SSH forward and wait until its replacement is up.
+    /// Direct Unix sockets have no owned transport to refresh.
+    func refreshTransport(after observedGeneration: UInt64, reason: String) async -> UInt64 {
+        guard let tunnel else { return observedGeneration }
+        return await transportRecovery.refresh(after: observedGeneration) {
+            // `forceReconnect` may spend up to three seconds reaping a stuck
+            // ssh process. Never make that wait on the main actor.
+            await Task.detached { tunnel.forceReconnect(reason: reason) }.value
+
+            // `forceReconnect` schedules its replacement asynchronously. Its
+            // state can still read `.up` for one turn, so require observing a
+            // non-up transition before accepting the replacement `.up`.
+            let deadline = Date().addingTimeInterval(15)
+            var sawRestart = false
+            while Date() < deadline {
+                let state = tunnel.currentState
+                if state != .up { sawRestart = true }
+                if sawRestart, state == .up { return }
+                if case .failed = state { return }
+                if case .stopped = state { return }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+    }
+}
+
+/// Generation gate for pooled transport recovery. Kept separate from the SSH
+/// implementation so the exactly-once rule is deterministic in unit tests.
+@MainActor
+final class PeerPaneTransportRecovery {
+    private(set) var generation: UInt64 = 0
+    private var refresh: (generation: UInt64, task: Task<Void, Never>)?
+
+    func refresh(
+        after observedGeneration: UInt64,
+        action: @escaping @MainActor () async -> Void
+    ) async -> UInt64 {
+        if observedGeneration >= generation {
+            generation &+= 1
+            let nextGeneration = generation
+            let task = Task { await action() }
+            refresh = (nextGeneration, task)
+        }
+        let targetGeneration = generation
+        if let refresh, refresh.generation >= targetGeneration {
+            await refresh.task.value
+        }
+        return targetGeneration
     }
 }
 
@@ -519,6 +576,16 @@ final class PeerPaneSession {
         // the session itself holds a socket path that, over SSH, is a local
         // tunnel end. Host-scoped pushes need the real identity.
         relay.hostKey = lease.key
+        relay.configureOwnedTransportRecovery(
+            generation: lease.transportGeneration,
+            handler: { [weak lease] generation in
+                guard let lease else { return generation }
+                return await lease.refreshTransport(
+                    after: generation,
+                    reason: "owned peer session stopped responding"
+                )
+            }
+        )
         do {
             // Bind the local relay socket BEFORE Ghostty spawns the relay
             // binary as the pane's shell — the binary connects immediately
@@ -651,6 +718,17 @@ final class PeerPaneSession {
             await compensateEnsure()
             throw error
         }
+        relay.hostKey = lease.key
+        relay.configureOwnedTransportRecovery(
+            generation: lease.transportGeneration,
+            handler: { [weak lease] generation in
+                guard let lease else { return generation }
+                return await lease.refreshTransport(
+                    after: generation,
+                    reason: "owned peer session stopped responding"
+                )
+            }
+        )
         do {
             try relay.prepareListener()
         } catch {
@@ -710,6 +788,14 @@ final class PeerPaneSession {
     /// been spawned as its shell).
     func start() async throws {
         try await relaySession.start()
+    }
+
+    /// Explicit pane Retry uses the same pooled reset as automatic heartbeat
+    /// recovery, so it cannot immediately redial a known half-alive socket.
+    func refreshHostTransportForReconnect() async {
+        await relaySession.refreshOwnedTransportForReconnect(
+            reason: "remote pane reconnect requested"
+        )
     }
 
     /// Preserve this pane while its host transport is intentionally ended.

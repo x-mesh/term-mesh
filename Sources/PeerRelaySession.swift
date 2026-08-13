@@ -1337,6 +1337,27 @@ final class PeerRelaySession {
     ) async -> Void)?
     var onReconnecting: (@MainActor (_ attempt: Int) -> Void)?
     var onReconnected: (@MainActor () -> Void)?
+    /// Pooled SSH recovery hook installed by `PeerPaneSession`. The relay
+    /// carries the generation it originally attached through so sibling panes
+    /// coalesce one half-alive tunnel reset instead of restarting each other.
+    private var ownedTransportGeneration: UInt64 = 0
+    private var ownedTransportRecovery: ((UInt64) async -> UInt64)?
+
+    func configureOwnedTransportRecovery(
+        generation: UInt64,
+        handler: @escaping (UInt64) async -> UInt64
+    ) {
+        ownedTransportGeneration = generation
+        ownedTransportRecovery = handler
+    }
+
+    func refreshOwnedTransportForReconnect(reason: String) async {
+        guard ownsSession, let ownedTransportRecovery else { return }
+        ownedTransportGeneration = await ownedTransportRecovery(ownedTransportGeneration)
+        #if DEBUG
+        dlog("peer.relay.transport.refreshed reason=\(reason) generation=\(ownedTransportGeneration)")
+        #endif
+    }
 
     /// How many resume-heals this pane has performed. A pane that dies
     /// mid-flood dies *after* a run of these, and the count is the only
@@ -2890,6 +2911,10 @@ final class PeerRelaySession {
             return session !== failedSession
         }
         await failedSession.stopHeartbeat()
+        await refreshOwnedTransportForReconnect(reason: "owned peer session lost")
+        guard !isTorndown, session === failedSession else {
+            return session !== failedSession
+        }
         var attempt = 0
         while !isTorndown, session === failedSession {
             attempt += 1

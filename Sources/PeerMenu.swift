@@ -1802,6 +1802,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
 
         let spec = oldSession.originSpec
         let wanted = oldSession.originSurface
+        await oldSession.refreshHostTransportForReconnect()
         oldSession.teardown()
 
         let registry = PeerPaneHostRegistry.shared
