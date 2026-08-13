@@ -310,6 +310,11 @@ struct PeerRelayConnectionInfo: Sendable {
     /// SSH target if the relay was opened over an `ssh -L` tunnel,
     /// otherwise nil (direct Unix-socket connection).
     let sshTarget: String?
+    /// Explicit SSH authentication used by this live connection. Keeping it
+    /// with the snapshot lets secondary operations such as remote paste use
+    /// the same route instead of silently falling back to default keys.
+    let sshPort: Int?
+    let identityFile: String?
     /// Remote (host-side) socket path when reached over SSH; nil for direct.
     /// Paired with `sshTarget` so the sidebar can re-derive an `.ssh` spec
     /// that owns its own tunnel instead of borrowing this connection's
@@ -373,6 +378,8 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             hostSockPath: hostSockPath,
             hostDisplayName: hostDisplayName,
             sshTarget: sshTunnel?.sshTarget,
+            sshPort: sshTunnel?.port,
+            identityFile: sshTunnel?.identityFile,
             remoteSockPath: sshTunnel?.remoteSockPath,
             targetTitle: workspaceTitle,
             connectedAt: connectedAt

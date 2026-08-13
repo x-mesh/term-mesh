@@ -2434,6 +2434,8 @@ final class PeerConsoleWindowController: NSWindowController, NSWindowDelegate {
             hostSockPath: hostSockPath,
             hostDisplayName: hostName,
             sshTarget: nil,
+            sshPort: nil,
+            identityFile: nil,
             remoteSockPath: nil,
             targetTitle: surfaceTitle.isEmpty ? "<surface>" : surfaceTitle,
             connectedAt: connectedAt
