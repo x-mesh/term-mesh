@@ -98,8 +98,22 @@ struct Args {
     #[arg(long)]
     exe: Option<String>,
 
-    #[arg(long = "turn-timeout", default_value_t = 600.0)]
-    turn_timeout: f64,
+    /// Optional absolute deadline for one turn. Omitted means unlimited.
+    #[arg(long = "turn-timeout", value_parser = parse_positive_duration)]
+    turn_timeout: Option<Duration>,
+}
+
+fn parse_positive_duration(raw: &str) -> Result<Duration, String> {
+    const ERROR: &str = "turn timeout must be a positive finite number of seconds";
+    let seconds = raw.parse::<f64>().map_err(|_| ERROR.to_string())?;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(ERROR.to_string());
+    }
+    let timeout = Duration::try_from_secs_f64(seconds).map_err(|_| ERROR.to_string())?;
+    if std::time::Instant::now().checked_add(timeout).is_none() {
+        return Err(ERROR.to_string());
+    }
+    Ok(timeout)
 }
 
 /// Colour only for a terminal. When the app hosts this there is nothing to
@@ -117,7 +131,7 @@ pub fn log(message: &str) {
 /// What every protocol bridge has to offer the loop that drives it.
 trait Bridge {
     fn start(&mut self) -> bool;
-    fn turn(&mut self, text: &str, timeout: Duration);
+    fn turn(&mut self, text: &str, timeout: Option<Duration>);
     fn alive(&self) -> bool;
     /// Why the session ended, if the transport knows.
     fn failure(&self) -> Option<String>;
@@ -129,7 +143,7 @@ impl<T: Transport> Bridge for CodexBridge<T> {
     fn start(&mut self) -> bool {
         CodexBridge::start(self)
     }
-    fn turn(&mut self, text: &str, timeout: Duration) {
+    fn turn(&mut self, text: &str, timeout: Option<Duration>) {
         CodexBridge::turn(self, text, timeout)
     }
     fn alive(&self) -> bool {
@@ -147,7 +161,7 @@ impl Bridge for PerTurnBridge {
     fn start(&mut self) -> bool {
         PerTurnBridge::start(self)
     }
-    fn turn(&mut self, text: &str, timeout: Duration) {
+    fn turn(&mut self, text: &str, timeout: Option<Duration>) {
         PerTurnBridge::turn(self, text, timeout)
     }
     fn alive(&self) -> bool {
@@ -167,7 +181,7 @@ impl<T: Transport> Bridge for AcpBridge<T> {
     fn start(&mut self) -> bool {
         AcpBridge::start(self)
     }
-    fn turn(&mut self, text: &str, timeout: Duration) {
+    fn turn(&mut self, text: &str, timeout: Option<Duration>) {
         AcpBridge::turn(self, text, timeout)
     }
     fn alive(&self) -> bool {
@@ -323,7 +337,7 @@ fn main() -> std::process::ExitCode {
     let code = consume(
         &mut *bridge,
         wake_rx,
-        Duration::from_secs_f64(args.turn_timeout),
+        args.turn_timeout,
         args.events.as_deref(),
     );
     std::process::ExitCode::from(code)
@@ -372,7 +386,7 @@ fn spawn_exit_watcher(exit_rx: Receiver<()>, wake: mpsc::Sender<Wake>) {
 fn consume(
     bridge: &mut dyn Bridge,
     wake: Receiver<Wake>,
-    turn_timeout: Duration,
+    turn_timeout: Option<Duration>,
     events: Option<&str>,
 ) -> u8 {
     let mut pending: Vec<u8> = Vec::new();
@@ -438,7 +452,7 @@ fn consume(
 
 /// Run one turn. Returns whether the bridge already reported a failure, so
 /// the caller does not report it twice.
-fn take(bridge: &mut dyn Bridge, line: &str, timeout: Duration) -> bool {
+fn take(bridge: &mut dyn Bridge, line: &str, timeout: Option<Duration>) -> bool {
     let text = turn_text(line);
     if text.is_empty() {
         return false;
@@ -478,5 +492,31 @@ mod tests {
     fn an_envelope_with_no_content_asks_for_nothing() {
         assert_eq!(turn_text(&json!({"message": {}}).to_string()), "");
         assert_eq!(turn_text(&json!({"other": 1}).to_string()), "");
+    }
+
+    #[test]
+    fn turn_timeout_is_optional_and_must_be_positive_and_finite() {
+        let unlimited = Args::try_parse_from(["tm-agent-bridge", "--cli", "codex"])
+            .expect("omitted timeout is valid");
+        assert_eq!(unlimited.turn_timeout, None);
+
+        let bounded =
+            Args::try_parse_from(["tm-agent-bridge", "--cli", "codex", "--turn-timeout", "1.5"])
+                .expect("positive timeout is valid");
+        assert_eq!(bounded.turn_timeout, Some(Duration::from_millis(1500)));
+
+        for invalid in ["0", "-1", "NaN", "inf", "1e300"] {
+            assert!(
+                Args::try_parse_from([
+                    "tm-agent-bridge",
+                    "--cli",
+                    "codex",
+                    "--turn-timeout",
+                    invalid,
+                ])
+                .is_err(),
+                "{invalid} must be rejected"
+            );
+        }
     }
 }
