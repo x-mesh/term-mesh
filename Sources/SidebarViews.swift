@@ -3432,6 +3432,31 @@ struct RemoteWorkspaceRowView: View {
                     .padding(.leading, 10)
                 }
                 .padding(.vertical, 2)
+                // A pane row represents one already-open relay viewer. Export
+                // its backing Bonsplit tab so dropping it into a local
+                // workspace creates another viewer of the same host surface.
+                // The workspace card itself remains draggable for the
+                // separate move-to-another-window interaction.
+                .onDrag {
+                    guard let mirror = mirroredWorkspace,
+                          let panelId = mirror.peerMirror?.panelBySurfaceID[pane.id],
+                          let tabId = mirror.surfaceIdFromPanelId(panelId),
+                          let provider = mirror.bonsplitController
+                              .externalTabDragItemProvider(for: tabId)
+                    else {
+#if DEBUG
+                        dlog("sidebar.onDrag.peerPane.skip reason=noBackingTab host=\(host.displayName)")
+#endif
+                        return NSItemProvider()
+                    }
+#if DEBUG
+                    dlog(
+                        "sidebar.onDrag.peerPane tab=\(tabId.uuid.uuidString.prefix(5)) "
+                            + "host=\(host.displayName)"
+                    )
+#endif
+                    return provider
+                }
             }
         }
         .padding(.leading, 33)

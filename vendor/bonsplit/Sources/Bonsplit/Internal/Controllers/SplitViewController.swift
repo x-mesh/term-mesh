@@ -31,6 +31,15 @@ final class SplitViewController {
     @ObservationIgnored var activeDragTab: TabItem?
     @ObservationIgnored var activeDragSourcePaneId: PaneID?
 
+    /// A drag exported by this controller always records one of the local drag
+    /// states above. If neither exists, the payload came from another
+    /// controller and accepting it materializes a copy instead of moving the
+    /// source tab. Both pane and tab-strip drop delegates must use this single
+    /// decision so their cursor feedback cannot drift.
+    var pendingTabDropOperation: DropOperation {
+        activeDragTab == nil && draggingTab == nil ? .copy : .move
+    }
+
     /// When false, drop delegates reject all drags and NSViews are hidden.
     /// Mirrors BonsplitController.isInteractive. Must be observable so
     /// updateNSView is called to toggle isHidden on the AppKit containers.

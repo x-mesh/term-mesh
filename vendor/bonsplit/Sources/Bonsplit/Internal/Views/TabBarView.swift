@@ -980,13 +980,14 @@ struct TabDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
+        let operation = controller.pendingTabDropOperation
         // Guard against dropUpdated firing after performDrop/dropExited
         // This is the key fix for the lingering indicator bug
         guard dropLifecycle == .hovering else {
 #if DEBUG
             dlog("tab.dropUpdated.skip pane=\(pane.id.id.uuidString.prefix(5)) targetIndex=\(targetIndex) reason=lifecycle_idle")
 #endif
-            return DropProposal(operation: .move)
+            return DropProposal(operation: operation)
         }
         // Only update if this is the active target, and suppress same-pane no-op indicators.
         if shouldSuppressIndicatorForNoopSamePaneDrop() {
@@ -1002,7 +1003,7 @@ struct TabDropDelegate: DropDelegate {
             "dropTarget=\(dropTargetIndex.map(String.init) ?? "nil")"
         )
 #endif
-        return DropProposal(operation: .move)
+        return DropProposal(operation: operation)
     }
 
     func validateDrop(info: DropInfo) -> Bool {

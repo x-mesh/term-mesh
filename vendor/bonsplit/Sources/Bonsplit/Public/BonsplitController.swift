@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Main controller for the split tab bar system
 @MainActor
@@ -692,6 +693,37 @@ public final class BonsplitController {
             return nil
         }
         return Tab(from: selected)
+    }
+
+    /// Build the same-process drag payload used by Bonsplit's tab strip.
+    ///
+    /// Hosts can expose another representation of an existing tab (for
+    /// example, a remote-pane row in a sidebar) without duplicating Bonsplit's
+    /// private transfer encoding. The destination treats this as an external
+    /// controller drop and asks `onExternalTabDrop` to materialize it.
+    ///
+    /// The provider is visible only within the current process. Returns `nil`
+    /// when `tabId` is not present in this controller or its payload cannot be
+    /// encoded.
+    public func externalTabDragItemProvider(for tabId: TabID) -> NSItemProvider? {
+        guard let pane = internalController.rootNode.allPanes.first(where: {
+            $0.tabs.contains(where: { $0.id == tabId.id })
+        }),
+              let tab = pane.tabs.first(where: { $0.id == tabId.id }),
+              let data = try? JSONEncoder().encode(
+                  TabTransferData(tab: tab, sourcePaneId: pane.id.id)
+              )
+        else { return nil }
+
+        let provider = NSItemProvider()
+        provider.registerDataRepresentation(
+            forTypeIdentifier: UTType.tabTransfer.identifier,
+            visibility: .ownProcess
+        ) { completion in
+            completion(data, nil)
+            return nil
+        }
+        return provider
     }
 
     // MARK: - Geometry Query API
