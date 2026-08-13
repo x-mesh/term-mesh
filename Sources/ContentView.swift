@@ -565,6 +565,10 @@ struct ContentView: View {
             lastSidebarSelectionIndex: $lastSidebarSelectionIndex
         )
         .frame(width: sidebarWidth)
+        // A fixed frame constrains layout, but SwiftUI still allows descendants
+        // with a wider intrinsic size to draw outside it. Keep long peer names,
+        // paths, and status labels inside the sidebar boundary.
+        .clipped()
     }
 
     /// Space at top of content area for the titlebar. This must be at least the actual titlebar
