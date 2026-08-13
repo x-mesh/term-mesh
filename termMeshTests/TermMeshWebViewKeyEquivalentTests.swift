@@ -3,6 +3,7 @@ import AppKit
 import SwiftUI
 import WebKit
 import SwiftUI
+import Bonsplit
 import ObjectiveC.runtime
 
 #if canImport(term_mesh_DEV)
@@ -798,6 +799,46 @@ final class AppDelegateWindowContextRoutingTests: XCTestCase {
         )
         window.identifier = NSUserInterfaceItemIdentifier("term-mesh.main.\(id.uuidString)")
         return window
+    }
+
+    func testLocateBonsplitTabResolvesPanelAndRejectsWrongSourcePane() throws {
+        _ = NSApplication.shared
+        let app = AppDelegate()
+        let windowId = UUID()
+        let window = makeMainWindow(id: windowId)
+        defer { window.orderOut(nil) }
+
+        let manager = TabManager()
+        app.registerMainWindow(
+            window,
+            windowId: windowId,
+            tabManager: manager,
+            sidebarState: SidebarState(),
+            sidebarSelectionState: SidebarSelectionState()
+        )
+
+        let workspace = try XCTUnwrap(manager.tabs.first)
+        let paneId = try XCTUnwrap(workspace.bonsplitController.allPaneIds.first)
+        let tabId = try XCTUnwrap(workspace.bonsplitController.tabs(inPane: paneId).first?.id)
+        let panelId = try XCTUnwrap(workspace.panelIdFromSurfaceId(tabId))
+
+        let located = try XCTUnwrap(
+            app.locateBonsplitTab(tabId: tabId, sourcePaneId: paneId)
+        )
+        XCTAssertEqual(located.windowId, windowId)
+        XCTAssertTrue(located.workspace === workspace)
+        XCTAssertEqual(located.panelId, panelId)
+        let provider = try XCTUnwrap(
+            workspace.bonsplitController.externalTabDragItemProvider(for: tabId)
+        )
+        XCTAssertTrue(
+            provider.hasItemConformingToTypeIdentifier("com.splittabbar.tabtransfer"),
+            "A sidebar relay-pane drag must use Bonsplit's external-tab payload"
+        )
+        XCTAssertNil(
+            app.locateBonsplitTab(tabId: tabId, sourcePaneId: PaneID(id: UUID())),
+            "A stale drag payload must not resolve after its source pane changed"
+        )
     }
 
     func testSynchronizeActiveMainWindowContextPrefersProvidedWindowOverStaleActiveManager() {
