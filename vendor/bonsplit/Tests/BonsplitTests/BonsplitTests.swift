@@ -181,8 +181,26 @@ final class BonsplitTests: XCTestCase {
         let pane = try XCTUnwrap(controller.rootNode.allPanes.first)
         let tab = TabItem(title: "Dragged", icon: nil)
         pane.addTab(tab, select: true)
+        XCTAssertEqual(
+            controller.pendingTabDropOperation(
+                for: TabTransferData(tab: tab, sourcePaneId: pane.id.id)
+            ),
+            .move
+        )
+        XCTAssertEqual(
+            controller.pendingTabDropOperation(
+                for: TabTransferData(
+                    tab: tab,
+                    sourcePaneId: pane.id.id,
+                    copiesSource: true
+                )
+            ),
+            .copy
+        )
+
         controller.draggingTab = tab
         XCTAssertEqual(controller.pendingTabDropOperation, .move)
+        XCTAssertEqual(controller.pendingTabDropOperation(for: nil), .move)
 
         controller.draggingTab = nil
         controller.activeDragTab = tab

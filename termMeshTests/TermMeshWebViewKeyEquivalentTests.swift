@@ -847,6 +847,225 @@ final class AppDelegateWindowContextRoutingTests: XCTestCase {
         )
     }
 
+    func testExternalLocalPaneDropMovesExistingPanelBetweenWorkspaces() throws {
+        _ = NSApplication.shared
+        let app = AppDelegate()
+        let windowId = UUID()
+        let window = makeMainWindow(id: windowId)
+        defer { window.orderOut(nil) }
+
+        let manager = TabManager()
+        app.registerMainWindow(
+            window,
+            windowId: windowId,
+            tabManager: manager,
+            sidebarState: SidebarState(),
+            sidebarSelectionState: SidebarSelectionState()
+        )
+
+        let source = try XCTUnwrap(manager.tabs.first)
+        let destination = manager.addWorkspace(select: false)
+        let sourcePane = try XCTUnwrap(source.bonsplitController.allPaneIds.first)
+        let sourceTab = try XCTUnwrap(source.bonsplitController.tabs(inPane: sourcePane).first)
+        let panelId = try XCTUnwrap(source.panelIdFromSurfaceId(sourceTab.id))
+        let panel = try XCTUnwrap(source.panels[panelId])
+        let targetPane = try XCTUnwrap(destination.bonsplitController.allPaneIds.first)
+
+        let handled = destination.bonsplitController.onExternalTabDrop?(
+            .init(
+                tabId: sourceTab.id,
+                sourcePaneId: sourcePane,
+                destination: .insert(targetPane: targetPane, targetIndex: 0)
+            )
+        )
+
+        XCTAssertEqual(handled, true)
+        XCTAssertNil(source.panels[panelId])
+        XCTAssertTrue(destination.panels[panelId] === panel)
+        XCTAssertEqual(
+            destination.bonsplitController.tabs(inPane: targetPane).first.flatMap {
+                destination.panelIdFromSurfaceId($0.id)
+            },
+            panelId
+        )
+        XCTAssertEqual((panel as? TerminalPanel)?.workspaceId, destination.id)
+    }
+
+    func testExternalLocalPaneDropCreatesRequestedSplit() throws {
+        _ = NSApplication.shared
+        let app = AppDelegate()
+        let windowId = UUID()
+        let window = makeMainWindow(id: windowId)
+        defer { window.orderOut(nil) }
+
+        let manager = TabManager()
+        app.registerMainWindow(
+            window,
+            windowId: windowId,
+            tabManager: manager,
+            sidebarState: SidebarState(),
+            sidebarSelectionState: SidebarSelectionState()
+        )
+
+        let source = try XCTUnwrap(manager.tabs.first)
+        let destination = manager.addWorkspace(select: false)
+        let sourcePane = try XCTUnwrap(source.bonsplitController.allPaneIds.first)
+        let sourceTab = try XCTUnwrap(source.bonsplitController.tabs(inPane: sourcePane).first)
+        let panelId = try XCTUnwrap(source.panelIdFromSurfaceId(sourceTab.id))
+        let targetPane = try XCTUnwrap(destination.bonsplitController.allPaneIds.first)
+        let originalPaneCount = destination.bonsplitController.allPaneIds.count
+
+        let handled = destination.bonsplitController.onExternalTabDrop?(
+            .init(
+                tabId: sourceTab.id,
+                sourcePaneId: sourcePane,
+                destination: .split(
+                    targetPane: targetPane,
+                    orientation: .horizontal,
+                    insertFirst: false
+                )
+            )
+        )
+
+        XCTAssertEqual(handled, true)
+        XCTAssertNil(source.panels[panelId])
+        XCTAssertNotNil(destination.panels[panelId])
+        XCTAssertEqual(
+            destination.bonsplitController.allPaneIds.count,
+            originalPaneCount + 1
+        )
+        let movedPane = try XCTUnwrap(destination.paneId(forPanelId: panelId))
+        XCTAssertNotEqual(movedPane, targetPane)
+    }
+
+    func testExternalDropPayloadRecoversSameWorkspacePaneMove() throws {
+        _ = NSApplication.shared
+        let app = AppDelegate()
+        let windowId = UUID()
+        let window = makeMainWindow(id: windowId)
+        defer { window.orderOut(nil) }
+
+        let manager = TabManager()
+        app.registerMainWindow(
+            window,
+            windowId: windowId,
+            tabManager: manager,
+            sidebarState: SidebarState(),
+            sidebarSelectionState: SidebarSelectionState()
+        )
+
+        let workspace = try XCTUnwrap(manager.tabs.first)
+        let sourcePane = try XCTUnwrap(workspace.bonsplitController.allPaneIds.first)
+        let sourceTab = try XCTUnwrap(workspace.bonsplitController.tabs(inPane: sourcePane).first)
+        let panelId = try XCTUnwrap(workspace.panelIdFromSurfaceId(sourceTab.id))
+        let targetPanel = try XCTUnwrap(
+            workspace.newTerminalSplit(
+                from: panelId,
+                orientation: .horizontal,
+                focus: false
+            )
+        )
+        let targetPane = try XCTUnwrap(workspace.paneId(forPanelId: targetPanel.id))
+
+        let handled = workspace.bonsplitController.onExternalTabDrop?(
+            .init(
+                tabId: sourceTab.id,
+                sourcePaneId: sourcePane,
+                destination: .insert(targetPane: targetPane, targetIndex: nil)
+            )
+        )
+
+        XCTAssertEqual(handled, true)
+        XCTAssertEqual(workspace.paneId(forPanelId: panelId), targetPane)
+        XCTAssertNotNil(workspace.panels[panelId])
+    }
+
+    func testExternalDropPayloadKeepsSamePaneCenterDropAsNoop() throws {
+        _ = NSApplication.shared
+        let app = AppDelegate()
+        let windowId = UUID()
+        let window = makeMainWindow(id: windowId)
+        defer { window.orderOut(nil) }
+
+        let manager = TabManager()
+        app.registerMainWindow(
+            window,
+            windowId: windowId,
+            tabManager: manager,
+            sidebarState: SidebarState(),
+            sidebarSelectionState: SidebarSelectionState()
+        )
+
+        let workspace = try XCTUnwrap(manager.tabs.first)
+        let pane = try XCTUnwrap(workspace.bonsplitController.allPaneIds.first)
+        let sourceTab = try XCTUnwrap(workspace.bonsplitController.tabs(inPane: pane).first)
+        let tabsBeforeDrop = workspace.bonsplitController.tabs(inPane: pane).map(\.id)
+
+        let handled = workspace.bonsplitController.onExternalTabDrop?(
+            .init(
+                tabId: sourceTab.id,
+                sourcePaneId: pane,
+                destination: .insert(targetPane: pane, targetIndex: nil)
+            )
+        )
+
+        XCTAssertEqual(handled, true)
+        XCTAssertEqual(workspace.bonsplitController.tabs(inPane: pane).map(\.id), tabsBeforeDrop)
+    }
+
+    func testExternalDropPayloadRecoversSameWorkspacePaneSplit() throws {
+        _ = NSApplication.shared
+        let app = AppDelegate()
+        let windowId = UUID()
+        let window = makeMainWindow(id: windowId)
+        defer { window.orderOut(nil) }
+
+        let manager = TabManager()
+        app.registerMainWindow(
+            window,
+            windowId: windowId,
+            tabManager: manager,
+            sidebarState: SidebarState(),
+            sidebarSelectionState: SidebarSelectionState()
+        )
+
+        let workspace = try XCTUnwrap(manager.tabs.first)
+        let sourcePane = try XCTUnwrap(workspace.bonsplitController.allPaneIds.first)
+        let sourceTab = try XCTUnwrap(workspace.bonsplitController.tabs(inPane: sourcePane).first)
+        let panelId = try XCTUnwrap(workspace.panelIdFromSurfaceId(sourceTab.id))
+        let targetPanel = try XCTUnwrap(
+            workspace.newTerminalSplit(
+                from: panelId,
+                orientation: .horizontal,
+                focus: false
+            )
+        )
+        let targetPane = try XCTUnwrap(workspace.paneId(forPanelId: targetPanel.id))
+        let paneCount = workspace.bonsplitController.allPaneIds.count
+
+        let handled = workspace.bonsplitController.onExternalTabDrop?(
+            .init(
+                tabId: sourceTab.id,
+                sourcePaneId: sourcePane,
+                destination: .split(
+                    targetPane: targetPane,
+                    orientation: .vertical,
+                    insertFirst: true
+                )
+            )
+        )
+
+        XCTAssertEqual(handled, true)
+        // The source pane had only the moved tab, so Bonsplit collapses it
+        // while creating the requested destination split. Net pane count is
+        // unchanged even though the panel has moved into a new pane.
+        XCTAssertEqual(workspace.bonsplitController.allPaneIds.count, paneCount)
+        XCTAssertFalse(workspace.bonsplitController.allPaneIds.contains(sourcePane))
+        XCTAssertNotEqual(workspace.paneId(forPanelId: panelId), sourcePane)
+        XCTAssertNotEqual(workspace.paneId(forPanelId: panelId), targetPane)
+        XCTAssertNotNil(workspace.panels[panelId])
+    }
+
     func testExternalRemotePaneMaterializationCoversInsertSplitAndRollback() throws {
         _ = NSApplication.shared
 
