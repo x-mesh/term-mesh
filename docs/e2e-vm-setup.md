@@ -1,6 +1,6 @@
 # E2E Test Runner Setup (UTM / mac-sub)
 
-term-mesh의 E2E 테스트는 전용 macOS runner에서 실행한다. 기본 runner는 UTM macOS VM(`term-mesh-vm`)이고, 보조 runner로 `mac-sub`를 사용할 수 있다.
+term-mesh의 E2E 테스트는 전용 macOS runner에서 실행한다. Socket E2E의 기본 runner는 `jinwoos-macbook-pro`(`mac-sub` SSH alias)다. UTM macOS VM(`term-mesh-vm`)은 XCUITest와 VM 전용 검증에 사용한다.
 
 테스트 스크립트는 실행 중인 term-mesh 인스턴스를 `pkill`하고 `/tmp/term-mesh*.sock`를 정리한다. 실수로 일상 작업 머신에서 실행되는 것을 막기 위해, `scripts/run-tests-v1.sh`와 `scripts/run-tests-v2.sh`는 기본적으로 다음 중 하나만 허용한다:
 
@@ -113,7 +113,7 @@ ssh term-mesh-vm 'pip3 install --user <패키지>'
 
 ## 7. 테스트 실행
 
-### mac-sub
+### mac-sub (socket E2E 기본)
 
 mac-sub의 repo 경로:
 
@@ -139,19 +139,10 @@ ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && ./scripts/run-tests-v1.sh'
 ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && ./scripts/run-tests-v2.sh tests_v2/test_ctrl_socket.py'
 ```
 
-### term-mesh-vm
+### term-mesh-vm (Xcode 전용)
 
-### Python 통합 테스트 (v1)
-
-```bash
-ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/run-tests-v1.sh'
-```
-
-### Python 통합 테스트 (v2)
-
-```bash
-ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/run-tests-v2.sh'
-```
+Socket E2E v1/v2와 개별 Python socket 테스트는 여기서 실행하지 않는다.
+위의 `mac-sub` 명령을 사용한다.
 
 ### Xcode UI 테스트 (특정 클래스)
 
@@ -169,12 +160,6 @@ ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && xcodebuild \
 
 ```bash
 ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/test-unit.sh'
-```
-
-### 개별 Python 테스트
-
-```bash
-ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && python3 tests/test_ctrl_socket.py'
 ```
 
 ## 8. 테스트 스크립트 동작 방식

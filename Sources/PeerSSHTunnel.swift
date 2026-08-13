@@ -302,13 +302,19 @@ final class PeerSSHTunnel: @unchecked Sendable {
     /// remote peer-server restarts. In that state `Process`
     /// termination will not fire, but every pane session is already
     /// dead from the relay's perspective.
-    func forceReconnect(reason: String) {
+    @discardableResult
+    func forceReconnect(reason: String) -> Bool {
         lock.lock()
+        // `stop()` is an ownership boundary, not a transient failure. A late
+        // pane/mirror heartbeat must never re-arm a tunnel its lease retired.
+        guard wantsRunning else {
+            lock.unlock()
+            return false
+        }
         if restartTask != nil {
             lock.unlock()
-            return
+            return true
         }
-        wantsRunning = true
         let p = process
         process = nil
         lock.unlock()
@@ -326,6 +332,7 @@ final class PeerSSHTunnel: @unchecked Sendable {
             try? FileManager.default.removeItem(atPath: localSockPath)
         }
         scheduleReconnect(reason: reason)
+        return true
     }
 
     /// Tears the ssh subprocess down and disarms auto-restart. Safe to

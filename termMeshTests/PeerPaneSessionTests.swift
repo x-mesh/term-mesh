@@ -682,20 +682,20 @@ final class PeerPaneSessionTests: XCTestCase {
         let recovery = PeerPaneTransportRecovery()
         var refreshCount = 0
 
-        let first = await recovery.refresh(after: 0) { refreshCount += 1 }
+        let first = await recovery.refresh(after: 0) { refreshCount += 1; return true }
         XCTAssertEqual(first, 1)
         XCTAssertEqual(refreshCount, 1)
 
         // A sibling attached through generation 0 reports the same outage
         // after the first pane already refreshed it. It must join generation
         // 1 without restarting the replacement transport.
-        let sibling = await recovery.refresh(after: 0) { refreshCount += 100 }
+        let sibling = await recovery.refresh(after: 0) { refreshCount += 100; return true }
         XCTAssertEqual(sibling, 1)
         XCTAssertEqual(refreshCount, 1)
 
         // A later failure of generation 1 is a new incident and gets one new
         // refresh of its own.
-        let next = await recovery.refresh(after: first) { refreshCount += 1 }
+        let next = await recovery.refresh(after: first) { refreshCount += 1; return true }
         XCTAssertEqual(next, 2)
         XCTAssertEqual(refreshCount, 2)
     }
@@ -708,9 +708,9 @@ final class PeerPaneSessionTests: XCTestCase {
         let recovery = PeerPaneTransportRecovery()
         var refreshCount = 0
 
-        async let pane = recovery.refresh(after: 0) { refreshCount += 1 }
-        async let mirror = recovery.refresh(after: 0) { refreshCount += 1 }
-        async let sidebar = recovery.refresh(after: 0) { refreshCount += 1 }
+        async let pane = recovery.refresh(after: 0) { refreshCount += 1; return true }
+        async let mirror = recovery.refresh(after: 0) { refreshCount += 1; return true }
+        async let sidebar = recovery.refresh(after: 0) { refreshCount += 1; return true }
         let generations = await [pane, mirror, sidebar]
 
         XCTAssertEqual(generations, [1, 1, 1])
@@ -730,13 +730,14 @@ final class PeerPaneSessionTests: XCTestCase {
             await recovery.refresh(after: 0) {
                 refreshCount += 1
                 await withCheckedContinuation { releaseRefresh = $0 }
+                return true
             }
         }
         while releaseRefresh == nil { await Task.yield() }
 
         let observedGeneration = recovery.generation
         let siblingTask = Task { @MainActor in
-            await recovery.refresh(after: observedGeneration) { refreshCount += 100 }
+            await recovery.refresh(after: observedGeneration) { refreshCount += 100; return true }
         }
         await Task.yield()
         XCTAssertEqual(refreshCount, 1)
@@ -745,6 +746,286 @@ final class PeerPaneSessionTests: XCTestCase {
         let generations = await [firstTask.value, siblingTask.value]
         XCTAssertEqual(generations, [1, 1])
         XCTAssertEqual(refreshCount, 1)
+    }
+
+    @MainActor
+    func test_transportRecovery_failureKeepsGenerationRetryable() async {
+        let recovery = PeerPaneTransportRecovery()
+        var refreshCount = 0
+
+        let failed = await recovery.refresh(after: 0) {
+            refreshCount += 1
+            return false
+        }
+        XCTAssertEqual(failed, 0)
+        XCTAssertEqual(recovery.generation, 0)
+
+        let retried = await recovery.refresh(after: 0) {
+            refreshCount += 1
+            return true
+        }
+        XCTAssertEqual(retried, 1)
+        XCTAssertEqual(refreshCount, 2)
+    }
+
+    func test_transportRecovery_failedStoppedAndTimeoutAreNotSuccess() {
+        XCTAssertEqual(
+            PeerPaneHostLease.recoveryResult(
+                for: .failed(reason: "unreachable"), sawRestart: true, timedOut: false
+            ),
+            false
+        )
+        XCTAssertEqual(
+            PeerPaneHostLease.recoveryResult(
+                for: .stopped, sawRestart: true, timedOut: false
+            ),
+            false
+        )
+        XCTAssertEqual(
+            PeerPaneHostLease.recoveryResult(
+                for: .reconnecting(attempt: 1), sawRestart: true, timedOut: true
+            ),
+            false
+        )
+        XCTAssertEqual(
+            PeerPaneHostLease.recoveryResult(
+                for: .up, sawRestart: true, timedOut: false
+            ),
+            true
+        )
+        XCTAssertNil(
+            PeerPaneHostLease.recoveryResult(
+                for: .reconnecting(attempt: 1), sawRestart: true, timedOut: false
+            )
+        )
+        // The pre-restart `.up` the poll loop exists to reject: `forceReconnect`
+        // has been called but the tunnel has not left `.up` yet, so nothing has
+        // been observed that could count as a completed recovery. Without this
+        // row, dropping `sawRestart` from the first guard keeps every other
+        // assertion above green while this input silently flips nil -> true.
+        XCTAssertNil(
+            PeerPaneHostLease.recoveryResult(
+                for: .up, sawRestart: false, timedOut: false
+            )
+        )
+    }
+
+    /// PR255 follow-up regression (logic-1, Medium): `forceReconnect` can report
+    /// "scheduled" for a restart that was already in flight (see
+    /// `PeerSSHTunnel.forceReconnect`'s `restartTask != nil` early return). If
+    /// that restart finishes before the poller in `refreshTransport` takes its
+    /// first read, the tunnel reads `.up` for the entire poll window and
+    /// `sawRestart` never flips true. Timing out on that state must still count
+    /// as recovered, not as a failure — misclassifying it leaves the generation
+    /// un-bumped, so the next sibling failure report re-runs `forceReconnect`
+    /// and kills the (already healthy) replacement tunnel.
+    func test_recoveryResult_joinedInFlightRestartThatWasAlreadyUpCountsAsRecovered() {
+        XCTAssertEqual(
+            PeerPaneHostLease.recoveryResult(for: .up, sawRestart: false, timedOut: true),
+            true
+        )
+    }
+
+    /// Drains queued main-actor work until `condition` holds.
+    ///
+    /// The cancellation tests below assert on a flag a *different* task sets,
+    /// and awaiting the caller does not order that: `cancelWaiter` resumes the
+    /// waiting caller BEFORE it calls `refresh.task.cancel()`, and cancelling
+    /// the action task only schedules the sleeping `Task.sleep` to throw. So
+    /// `await owner.value` can resolve one or more hops before the action's
+    /// catch block runs. Asserting straight after the await is a coin flip —
+    /// it is what made `test_transportRecovery_cancelledOwnerClearsSlotForRetry`
+    /// fail on the mac-sub runner while passing under casual local reads.
+    @MainActor
+    private func waitFor(
+        _ condition: () -> Bool,
+        yields: Int = 1_000
+    ) async -> Bool {
+        for _ in 0..<yields {
+            if condition() { return true }
+            await Task.yield()
+        }
+        return condition()
+    }
+
+    @MainActor
+    func test_transportRecovery_cancelledOwnerClearsSlotForRetry() async {
+        let recovery = PeerPaneTransportRecovery()
+        var actionStarted = false
+        var actionWasCancelled = false
+
+        let owner = Task { @MainActor in
+            await recovery.refresh(after: 0) {
+                actionStarted = true
+                do {
+                    try await Task.sleep(nanoseconds: 30_000_000_000)
+                    return true
+                } catch is CancellationError {
+                    actionWasCancelled = true
+                    return false
+                } catch {
+                    return false
+                }
+            }
+        }
+        while !actionStarted { await Task.yield() }
+        owner.cancel()
+        let cancelledGeneration = await owner.value
+        XCTAssertEqual(cancelledGeneration, 0)
+        let actionCancelled = await waitFor({ actionWasCancelled })
+        XCTAssertTrue(
+            actionCancelled,
+            "owner cancellation must reach the in-flight refresh action"
+        )
+
+        let retried = await recovery.refresh(after: 0) { true }
+        XCTAssertEqual(retried, 1)
+    }
+
+    @MainActor
+    func test_transportRecovery_cancelledWaiterDoesNotCancelSharedOwner() async {
+        let recovery = PeerPaneTransportRecovery()
+        var releaseRefresh: CheckedContinuation<Void, Never>?
+
+        let owner = Task { @MainActor in
+            await recovery.refresh(after: 0) {
+                await withCheckedContinuation { releaseRefresh = $0 }
+                return true
+            }
+        }
+        while releaseRefresh == nil { await Task.yield() }
+        let waiter = Task { @MainActor in
+            await recovery.refresh(after: 0) { XCTFail("waiter ran duplicate action"); return true }
+        }
+        await Task.yield()
+        waiter.cancel()
+        let cancelledGeneration = await waiter.value
+        XCTAssertEqual(cancelledGeneration, 0)
+
+        releaseRefresh?.resume()
+        let recoveredGeneration = await owner.value
+        XCTAssertEqual(recoveredGeneration, 1)
+        XCTAssertEqual(recovery.generation, 1)
+    }
+
+    /// `cancel()` is wired into `PeerPaneHostLease.teardown()` so a pane closed
+    /// mid-recovery releases every caller waiting on `refreshTransport()`
+    /// instead of leaving them parked forever. The cancelled-owner and
+    /// cancelled-waiter tests above only exercise `cancelWaiter()` via
+    /// `Task.cancel()` on one caller; this drives `cancel()` itself, covering
+    /// the owner, a joined waiter, that the shared refresh task is actually
+    /// cancelled, that the slot is cleared for a fresh attempt, and that later
+    /// recovery still works.
+    @MainActor
+    func test_transportRecovery_cancelResumesOwnerAndWaiterAndClearsSlotForRetry() async {
+        let recovery = PeerPaneTransportRecovery()
+        var actionStarted = false
+        var actionWasCancelled = false
+
+        let owner = Task { @MainActor in
+            await recovery.refresh(after: 0) {
+                actionStarted = true
+                do {
+                    try await Task.sleep(nanoseconds: 30_000_000_000)
+                    return true
+                } catch is CancellationError {
+                    actionWasCancelled = true
+                    return false
+                } catch {
+                    return false
+                }
+            }
+        }
+        while !actionStarted { await Task.yield() }
+
+        let waiter = Task { @MainActor in
+            await recovery.refresh(after: 0) {
+                XCTFail("waiter must not run a duplicate action")
+                return true
+            }
+        }
+        await Task.yield()
+
+        let preCancelGeneration = recovery.generation
+        recovery.cancel()
+
+        let ownerResult = await owner.value
+        let waiterResult = await waiter.value
+        XCTAssertEqual(
+            ownerResult, preCancelGeneration,
+            "cancel() must resume the owner with the pre-cancel generation"
+        )
+        XCTAssertEqual(
+            waiterResult, preCancelGeneration,
+            "cancel() must resume every waiter with the pre-cancel generation"
+        )
+        XCTAssertEqual(recovery.generation, preCancelGeneration, "cancel() must not advance the generation")
+
+        var retryCount = 0
+        let retried = await recovery.refresh(after: preCancelGeneration) {
+            retryCount += 1
+            return true
+        }
+        XCTAssertEqual(
+            retryCount, 1,
+            "a later report must start a fresh refresh, not join the cancelled slot"
+        )
+        XCTAssertEqual(
+            retried, preCancelGeneration + 1,
+            "recovery after cancel() must still be able to advance the generation"
+        )
+        let actionCancelled = await waitFor({ actionWasCancelled })
+        XCTAssertTrue(
+            actionCancelled,
+            "cancel() must cancel the shared in-flight refresh task"
+        )
+    }
+
+    func test_forceReconnectDoesNotRearmStoppedTunnel() {
+        let tunnel = PeerSSHTunnel(
+            sshTarget: "example.invalid",
+            remoteSockPath: "/tmp/peer.sock"
+        )
+
+        XCTAssertFalse(tunnel.forceReconnect(reason: "late failure"))
+        XCTAssertEqual(tunnel.currentState, .stopped)
+    }
+
+    /// The case above only proves `forceReconnect` refuses a tunnel that was
+    /// never started — `wantsRunning` is false there for the trivial reason
+    /// that nothing ever set it. The regression the guard exists for is the
+    /// armed-then-retired one named in its own source comment: "a late
+    /// pane/mirror heartbeat must never re-arm a tunnel its lease retired."
+    ///
+    /// `retry()` arms the tunnel without touching the network: it sets
+    /// `wantsRunning` and installs a restart task whose first attempt sleeps a
+    /// second before it would ever call `spawnOnce()`, and `stop()` cancels
+    /// that task well inside the second.
+    func test_forceReconnectDoesNotRearmRetiredTunnel() {
+        let tunnel = PeerSSHTunnel(
+            sshTarget: "example.invalid",
+            remoteSockPath: "/tmp/peer.sock"
+        )
+
+        tunnel.retry()
+        XCTAssertTrue(
+            tunnel.forceReconnect(reason: "live failure"),
+            "an armed tunnel must accept a reconnect, otherwise the case below proves nothing"
+        )
+
+        tunnel.stop()
+
+        XCTAssertFalse(
+            tunnel.forceReconnect(reason: "late failure after stop"),
+            "a heartbeat landing after stop() must not re-arm a retired tunnel"
+        )
+        // Idempotent: a retired tunnel stays retired however often it is asked.
+        XCTAssertFalse(tunnel.forceReconnect(reason: "later failure after stop"))
+
+        // `currentState` is deliberately not asserted here. `stop()` does emit
+        // `.stopped` synchronously, but the restart task `retry()` armed can
+        // still deliver its own queued `.down` afterwards, so the state read is
+        // ordering-dependent in a way the return value is not.
     }
 
     /// Reattach-on-reconnect is for panes a person chose to disconnect. An

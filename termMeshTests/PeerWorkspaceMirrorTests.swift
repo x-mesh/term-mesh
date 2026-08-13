@@ -890,4 +890,65 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             [sid(9)]
         )
     }
+
+    // MARK: - reconnectStep (F2: post-await cancellation/teardown guard)
+
+    /// The one case where `reconnectLoop` may cross a suspension point (the
+    /// transport refresh, the backoff sleep, or the connect/handshake
+    /// window) and keep going: the mirror is still live, still has a
+    /// workspace, and nothing cancelled it.
+    func test_reconnectStep_proceedsWhenLiveWorkspaceUncancelled() {
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.reconnectStep(
+                isTornDown: false, hasWorkspace: true, isCancelled: false
+            ),
+            .proceed
+        )
+    }
+
+    func test_reconnectStep_abandonsWhenTornDown() {
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.reconnectStep(
+                isTornDown: true, hasWorkspace: true, isCancelled: false
+            ),
+            .abandon
+        )
+    }
+
+    func test_reconnectStep_abandonsWhenWorkspaceIsGone() {
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.reconnectStep(
+                isTornDown: false, hasWorkspace: false, isCancelled: false
+            ),
+            .abandon
+        )
+    }
+
+    /// The supersede path: `handleConnectionLost` cancels the prior
+    /// `reconnectTask` before starting a fresh one, and `Task.isCancelled`
+    /// becoming true inside the superseded loop is how that cancellation
+    /// actually reaches it. Every checkpoint in `reconnectLoop` — the entry
+    /// guard, the post-refresh guard, the retry `while`, and the
+    /// post-handshake guard — must abandon once that happens, or a newer
+    /// `handleConnectionLost` would race the old loop into installing a
+    /// duplicate subscription (the exact leak the post-handshake guard's
+    /// comment warns about: a socket plus a 10s heartbeat alive for the
+    /// rest of the process).
+    func test_reconnectStep_abandonsWhenSupersedingReconnectCancelledThisTask() {
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.reconnectStep(
+                isTornDown: false, hasWorkspace: true, isCancelled: true
+            ),
+            .abandon
+        )
+    }
+
+    func test_reconnectStep_abandonsWhenEveryConditionFails() {
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.reconnectStep(
+                isTornDown: true, hasWorkspace: false, isCancelled: true
+            ),
+            .abandon
+        )
+    }
 }
