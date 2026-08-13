@@ -1423,6 +1423,11 @@ final class RemoteHostStore: ObservableObject {
         rosterSubscriptionTasks[key]?.cancel()
         rosterSubscriptionTasks[key] = Task { [weak self] in
             guard let self else { return }
+            // Direct hosts have no sidebar lease. Keep their subscription
+            // working; only SSH-backed rows can replace an owned transport.
+            let lease = self.sidebarLeases[key]
+            guard lease == nil || lease?.hostSockPath == path else { return }
+            let transportGeneration = lease?.transportGeneration
             do {
                 let connection = try await PeerRelaySession.connect(hostSockPath: path)
                 guard connection.hostCapabilities.has(PeerCapability.workspaceListSubscribeV1) else {
@@ -1430,6 +1435,26 @@ final class RemoteHostStore: ObservableObject {
                     return
                 }
                 try await connection.session.subscribeWorkspaceList()
+                let weakTransport = connection.transport
+                await connection.session.startHeartbeat(
+                    intervalSeconds: 10,
+                    deadAfterSeconds: 30,
+                    onFirstMiss: {
+                        #if DEBUG
+                        dlog("peer.sidebar.roster.heartbeat.firstMiss key=\(key)")
+                        #endif
+                    },
+                    onMissRecovered: {
+                        #if DEBUG
+                        dlog("peer.sidebar.roster.heartbeat.recovered key=\(key)")
+                        #endif
+                    }
+                ) {
+                    #if DEBUG
+                    dlog("peer.sidebar.roster.heartbeat.dead key=\(key)")
+                    #endif
+                    Task { await weakTransport.close() }
+                }
                 while !Task.isCancelled {
                     let message = try await connection.session.receiveNextMessage()
                     guard case .workspaceListChanged(let workspaces) = message else { continue }
@@ -1443,7 +1468,9 @@ final class RemoteHostStore: ObservableObject {
                 // Replacement/disconnect owns cleanup; never mark its newer
                 // socket path stale.
             } catch {
-                self.workspaceSubscriptionLost(key: key, path: path, error: error)
+                await self.workspaceSubscriptionLost(
+                    key: key, path: path, transportGeneration: transportGeneration, error: error
+                )
             }
         }
     }
@@ -1535,20 +1562,52 @@ final class RemoteHostStore: ObservableObject {
     }
 
     /// A dead subscription is a stale sidebar, not an empty remote machine.
-    /// Preserve the latest snapshot for context but surface the row as failed;
-    /// an SSH tunnel reconnect updates activeSockPath through `rebuild()`, at
-    /// which point `fetchWorkspaces` establishes a fresh stream.
-    private func workspaceSubscriptionLost(key: String, path: String, error: Error) {
+    /// Refresh the pooled SSH generation and rebuild the roster stream while
+    /// preserving the latest snapshot. Direct sockets cannot be refreshed, so
+    /// their normal fetch failure still surfaces the host as unreachable.
+    private func workspaceSubscriptionLost(
+        key: String,
+        path: String,
+        transportGeneration: UInt64?,
+        error: Error
+    ) async {
         guard hosts[key]?.activeSockPath == path,
               hosts[key]?.isConnected == true
         else { return }
+        #if DEBUG
+        dlog("peer.sidebar.roster.lost key=\(key) error=\(error)")
+        #endif
+        RemoteWorkLog.info(
+            "Workspace roster stream stopped for \(hosts[key]?.displayName ?? key): \(error.localizedDescription) — reconnecting"
+        )
+        if let lease = sidebarLeases[key], let transportGeneration {
+            guard sidebarLeases[key] === lease, lease.hostSockPath == path else { return }
+            _ = await lease.refreshTransport(
+                after: transportGeneration,
+                reason: "sidebar workspace roster stopped responding"
+            )
+            guard !Task.isCancelled,
+                  sidebarLeases[key] === lease,
+                  hosts[key]?.activeSockPath == path,
+                  hosts[key]?.isConnected == true
+            else { return }
+            // Re-run the normal authenticated fetch. It rebuilds the snapshot,
+            // team metadata and a fresh subscription on the replacement tunnel.
+            fetchWorkspaces(
+                for: lease.hostSockPath,
+                key: key,
+                provenance: hosts[key]?.hostCLIBinDirsProvenance
+            )
+            return
+        }
+
+        // A direct/borrowed socket has no process this store can replace. Keep
+        // the old honest failure behavior instead of leaving a green stale row.
         hosts[key]?.connectionState = .failed(Self.unreachableReason)
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
         TeamOrchestrator.shared.markRemoteAgentsUnreachable(
-            hostKey: key,
-            reason: Self.unreachableReason
+            hostKey: key, reason: Self.unreachableReason
         )
-        RemoteWorkLog.info("Workspace roster stream stopped for \(hosts[key]?.displayName ?? key): \(error.localizedDescription)")
     }
 
     /// Keep sidebar pane details and busy state in lockstep with an open live

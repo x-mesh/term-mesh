@@ -43,6 +43,11 @@ final class PeerWorkspaceMirrorController {
     private(set) var hostWorkspaceIDAliases: Set<Data>
     let hostWorkspaceTitle: String
     let connectedAt = Date()
+    /// Pooled SSH generation used by the current subscription. A dead mirror
+    /// must refresh this generation before dialing again; otherwise the local
+    /// Unix socket still accepts connections while its stopped ssh process can
+    /// never answer the handshake.
+    private var subscriptionTransportGeneration: UInt64 = 0
 
     /// Last layout we reconciled to — the baseline for no-op/divider-only
     /// fast paths and for outbound divider diffs.
@@ -132,6 +137,7 @@ final class PeerWorkspaceMirrorController {
     }
 
     func start() async throws {
+        subscriptionTransportGeneration = lease.transportGeneration
         let transport = try await UnixSocketTransport.connect(socketPath: lease.hostSockPath)
         let session = PeerSession(
             read: { try await transport.read() },
@@ -428,8 +434,9 @@ final class PeerWorkspaceMirrorController {
         #endif
         RemoteWorkLog.infoOffMain("Workspace mirror lost its host: \(reason) — reconnecting")
         markWorkspaceTitle(suffix: "reconnecting…")
+        let failedGeneration = subscriptionTransportGeneration
         Task { [weak self] in
-            await self?.reconnectLoop()
+            await self?.reconnectLoop(after: failedGeneration)
         }
     }
 
@@ -437,7 +444,7 @@ final class PeerWorkspaceMirrorController {
     /// `PeerRelaySession`'s own.
     private static let setupReadTimeoutSeconds: TimeInterval = 10
 
-    private func reconnectLoop() async {
+    private func reconnectLoop(after failedGeneration: UInt64) async {
         var attempt = 0
         // "lost its host — reconnecting" is a promise, and this loop can exit
         // without keeping it: when the last pane goes the workspace is torn
@@ -451,6 +458,14 @@ final class PeerWorkspaceMirrorController {
                 )
             }
         }
+        // Refresh once per failed generation. Pane, mirror and sidebar
+        // consumers share this gate, so simultaneous heartbeat failures join
+        // one SSH restart instead of repeatedly killing each other's fresh
+        // tunnel. Direct sockets intentionally no-op here.
+        subscriptionTransportGeneration = await lease.refreshTransport(
+            after: failedGeneration,
+            reason: "workspace mirror subscription stopped responding"
+        )
         while !isTornDown, workspace != nil {
             attempt += 1
             let delaySeconds = min(30.0, pow(2.0, Double(min(attempt, 5))))
@@ -493,6 +508,7 @@ final class PeerWorkspaceMirrorController {
                 subscriptionTransport = transport
                 subscriptionSession = session
                 subscriptionAlive = true
+                subscriptionTransportGeneration = lease.transportGeneration
                 let weakTransport = transport
                 await session.startHeartbeat(
                     intervalSeconds: 10,

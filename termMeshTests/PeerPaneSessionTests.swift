@@ -700,6 +700,23 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertEqual(refreshCount, 2)
     }
 
+    /// Pane, live mirror and sidebar roster all report the same pooled SSH
+    /// generation when one tunnel stalls. Every consumer must join the first
+    /// refresh; otherwise the second heartbeat kills the replacement tunnel.
+    @MainActor
+    func test_transportRecovery_coalescesPaneMirrorAndSidebarFailure() async {
+        let recovery = PeerPaneTransportRecovery()
+        var refreshCount = 0
+
+        async let pane = recovery.refresh(after: 0) { refreshCount += 1 }
+        async let mirror = recovery.refresh(after: 0) { refreshCount += 1 }
+        async let sidebar = recovery.refresh(after: 0) { refreshCount += 1 }
+        let generations = await [pane, mirror, sidebar]
+
+        XCTAssertEqual(generations, [1, 1, 1])
+        XCTAssertEqual(refreshCount, 1)
+    }
+
     /// Reattach-on-reconnect is for panes a person chose to disconnect. An
     /// accidental transport loss has recovery of its own, and reattaching it
     /// here too would rebuild the pane twice for one failure.
