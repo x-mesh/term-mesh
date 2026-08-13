@@ -972,6 +972,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return nil
     }
 
+    /// Resolve a Bonsplit drag payload back to its owning workspace.
+    ///
+    /// Cross-workspace drags carry the Bonsplit tab id, not term-mesh's panel
+    /// id. The two UUIDs are intentionally different, so `locateSurface` cannot
+    /// be used here. Requiring the source pane as well rejects stale payloads
+    /// whose tab id no longer belongs to the pane that started the drag.
+    func locateBonsplitTab(
+        tabId: TabID,
+        sourcePaneId: PaneID
+    ) -> (windowId: UUID, workspace: Workspace, panelId: UUID)? {
+        for ctx in mainWindowContexts.values {
+            for workspace in ctx.tabManager.tabs {
+                guard workspace.bonsplitController.tabs(inPane: sourcePaneId)
+                    .contains(where: { $0.id == tabId }),
+                      let panelId = workspace.panelIdFromSurfaceId(tabId)
+                else { continue }
+                return (ctx.windowId, workspace, panelId)
+            }
+        }
+        return nil
+    }
+
     func locateGhosttySurface(_ surface: ghostty_surface_t?) -> (windowId: UUID, workspaceId: UUID, panelId: UUID, tabManager: TabManager)? {
         guard let surface else { return nil }
         for ctx in mainWindowContexts.values {
