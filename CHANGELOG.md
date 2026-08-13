@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.186.1] - 2026-08-13
+
+### Fixed
+
+- **로컬 workspace의 pane을 끌어도 파란 drop 영역만 보이고 이동하지 않던 문제** ([#265](https://github.com/x-mesh/term-mesh/pull/265)) — v0.186.0에서 relay pane 복사를 추가하면서, 로컬 pane drag가 drop 직전에 내부 상태를 정리하면 외부 drop으로 잘못 분류되어 거부될 수 있었다. 이제 같은 workspace 안의 pane 이동과 workspace 사이 이동 모두 기존 terminal·browser·agent session을 유지한 채 완료된다. relay pane은 계속 복사되고 로컬 pane은 이동되며, 커서도 각각 copy와 move로 구분된다.
+
+- **실패하거나 거부된 drop 뒤 파란 표시가 남던 문제** — drop 결과와 관계없이 mouse-up에서 pane overlay와 tab 삽입 표시를 정리한다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.186.0] - 2026-08-13
 
 **원격 Project가 창이 아니라 호스트에 남는다.** Project를 만든 Mac의 앱을 종료해도 원격 `term-meshd`가 리더·에이전트와 그 배선을 보존한다. 같은 Mac이나 다른 Mac에서 호스트에 다시 연결하면 Projects 목록에서 찾아 정확한 pane들에 다시 붙을 수 있다.
