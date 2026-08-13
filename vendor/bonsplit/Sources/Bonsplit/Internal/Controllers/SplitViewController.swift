@@ -40,6 +40,13 @@ final class SplitViewController {
         activeDragTab == nil && draggingTab == nil ? .copy : .move
     }
 
+    func pendingTabDropOperation(for transfer: TabTransferData?) -> DropOperation {
+        if activeDragTab != nil || draggingTab != nil {
+            return .move
+        }
+        return transfer?.copiesSource == false ? .move : .copy
+    }
+
     /// When false, drop delegates reject all drags and NSViews are hidden.
     /// Mirrors BonsplitController.isInteractive. Must be observable so
     /// updateNSView is called to toggle isHidden on the AppKit containers.

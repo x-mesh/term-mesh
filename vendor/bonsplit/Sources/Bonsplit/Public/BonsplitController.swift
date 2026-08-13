@@ -711,7 +711,11 @@ public final class BonsplitController {
         }),
               let tab = pane.tabs.first(where: { $0.id == tabId.id }),
               let data = try? JSONEncoder().encode(
-                  TabTransferData(tab: tab, sourcePaneId: pane.id.id)
+                  TabTransferData(
+                      tab: tab,
+                      sourcePaneId: pane.id.id,
+                      copiesSource: true
+                  )
               )
         else { return nil }
 
