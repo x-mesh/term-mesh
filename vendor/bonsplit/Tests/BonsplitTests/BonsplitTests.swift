@@ -173,6 +173,23 @@ final class BonsplitTests: XCTestCase {
     }
 
     @MainActor
+    func testPendingTabDropOperationCopiesExternalAndMovesLocalDrags() throws {
+        let controller = BonsplitController().internalController
+
+        XCTAssertEqual(controller.pendingTabDropOperation, .copy)
+
+        let pane = try XCTUnwrap(controller.rootNode.allPanes.first)
+        let tab = TabItem(title: "Dragged", icon: nil)
+        pane.addTab(tab, select: true)
+        controller.draggingTab = tab
+        XCTAssertEqual(controller.pendingTabDropOperation, .move)
+
+        controller.draggingTab = nil
+        controller.activeDragTab = tab
+        XCTAssertEqual(controller.pendingTabDropOperation, .move)
+    }
+
+    @MainActor
     func testTabCreation() {
         let controller = BonsplitController()
         let tabId = controller.createTab(title: "Test Tab", icon: "doc")

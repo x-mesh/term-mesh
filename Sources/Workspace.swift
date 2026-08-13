@@ -2514,12 +2514,46 @@ final class Workspace: Identifiable {
     }
 
     /// Materialize an already-attached remote session at the exact Bonsplit
-    /// drop destination. Tree mutation and session binding happen together on
+    /// drop destination. Layout mutation completes before session binding on
     /// the main actor after the network attach completes.
     private func placeExternalRemotePane(
         session: PeerPaneSession,
         destination: BonsplitController.ExternalTabDropRequest.Destination
     ) -> Bool {
+        // The attach above crosses an async boundary. A workspace can become
+        // a live mirror while it is suspended; in that mode the reconciler is
+        // the only layout writer, so revalidate immediately before mutation.
+        guard !mirrorForwardsLocalActions,
+              let placement = materializeExternalRemotePane(
+                  command: session.relayLaunchCommand,
+                  environment: session.relayEnvironment,
+                  destination: destination
+              )
+        else { return false }
+
+        bindRemotePane(session: session, to: placement.panel)
+        bonsplitController.focusPane(placement.finalPane)
+        bonsplitController.selectTab(placement.tabId)
+        focusPanel(placement.panel.id)
+        scheduleTerminalGeometryReconcile()
+        return true
+    }
+
+    struct ExternalRemotePanePlacement {
+        let panel: TerminalPanel
+        let tabId: TabID
+        let finalPane: PaneID
+    }
+
+    /// Create and place the terminal half of an external relay-pane drop.
+    /// Session binding stays in `placeExternalRemotePane`; keeping layout
+    /// mutation separate makes insert, split, and rollback behavior directly
+    /// verifiable without fabricating a network session.
+    func materializeExternalRemotePane(
+        command: String,
+        environment: [String: String],
+        destination: BonsplitController.ExternalTabDropRequest.Destination
+    ) -> ExternalRemotePanePlacement? {
         let targetPane: PaneID
         switch destination {
         case .insert(let pane, _), .split(let pane, _, _):
@@ -2528,11 +2562,11 @@ final class Workspace: Identifiable {
         guard bonsplitController.allPaneIds.contains(targetPane),
               let panel = newRemoteTerminalTab(
                   inPane: targetPane,
-                  command: session.relayLaunchCommand,
-                  environment: session.relayEnvironment
+                  command: command,
+                  environment: environment
               ),
               let tabId = surfaceIdFromPanelId(panel.id)
-        else { return false }
+        else { return nil }
 
         let finalPane: PaneID
         switch destination {
@@ -2550,17 +2584,16 @@ final class Workspace: Identifiable {
                 insertFirst: insertFirst
             ) else {
                 _ = closePanel(panel.id, force: true)
-                return false
+                return nil
             }
             finalPane = newPane
         }
 
-        bindRemotePane(session: session, to: panel)
-        bonsplitController.focusPane(finalPane)
-        bonsplitController.selectTab(tabId)
-        focusPanel(panel.id)
-        scheduleTerminalGeometryReconcile()
-        return true
+        return ExternalRemotePanePlacement(
+            panel: panel,
+            tabId: tabId,
+            finalPane: finalPane
+        )
     }
 
     /// Phase 2B live mirror: non-nil when this workspace mirrors a host

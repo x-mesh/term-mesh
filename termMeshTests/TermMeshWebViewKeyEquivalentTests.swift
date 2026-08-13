@@ -836,9 +836,72 @@ final class AppDelegateWindowContextRoutingTests: XCTestCase {
             "A sidebar relay-pane drag must use Bonsplit's external-tab payload"
         )
         XCTAssertNil(
+            workspace.bonsplitController.externalTabDragItemProvider(
+                for: TabID(uuid: UUID())
+            ),
+            "An unknown tab must not produce a same-process drag payload"
+        )
+        XCTAssertNil(
             app.locateBonsplitTab(tabId: tabId, sourcePaneId: PaneID(id: UUID())),
             "A stale drag payload must not resolve after its source pane changed"
         )
+    }
+
+    func testExternalRemotePaneMaterializationCoversInsertSplitAndRollback() throws {
+        _ = NSApplication.shared
+
+        let insertWorkspace = Workspace()
+        let insertPane = try XCTUnwrap(insertWorkspace.bonsplitController.allPaneIds.first)
+        let inserted = try XCTUnwrap(
+            insertWorkspace.materializeExternalRemotePane(
+                command: "/usr/bin/true",
+                environment: [:],
+                destination: .insert(targetPane: insertPane, targetIndex: 0)
+            )
+        )
+        XCTAssertEqual(inserted.finalPane, insertPane)
+        XCTAssertEqual(
+            insertWorkspace.bonsplitController.tabs(inPane: insertPane).first?.id,
+            inserted.tabId
+        )
+
+        let splitWorkspace = Workspace()
+        let splitPane = try XCTUnwrap(splitWorkspace.bonsplitController.allPaneIds.first)
+        let originalPaneCount = splitWorkspace.bonsplitController.allPaneIds.count
+        let split = try XCTUnwrap(
+            splitWorkspace.materializeExternalRemotePane(
+                command: "/usr/bin/true",
+                environment: [:],
+                destination: .split(
+                    targetPane: splitPane,
+                    orientation: .horizontal,
+                    insertFirst: true
+                )
+            )
+        )
+        XCTAssertEqual(splitWorkspace.bonsplitController.allPaneIds.count, originalPaneCount + 1)
+        XCTAssertNotEqual(split.finalPane, splitPane)
+        XCTAssertTrue(
+            splitWorkspace.bonsplitController.tabs(inPane: split.finalPane)
+                .contains(where: { $0.id == split.tabId })
+        )
+
+        let rollbackWorkspace = Workspace()
+        let rollbackPane = try XCTUnwrap(rollbackWorkspace.bonsplitController.allPaneIds.first)
+        let originalPanelIds = Set(rollbackWorkspace.panels.keys)
+        rollbackWorkspace.bonsplitController.configuration.allowSplits = false
+        XCTAssertNil(
+            rollbackWorkspace.materializeExternalRemotePane(
+                command: "/usr/bin/true",
+                environment: [:],
+                destination: .split(
+                    targetPane: rollbackPane,
+                    orientation: .vertical,
+                    insertFirst: false
+                )
+            )
+        )
+        XCTAssertEqual(Set(rollbackWorkspace.panels.keys), originalPanelIds)
     }
 
     func testSynchronizeActiveMainWindowContextPrefersProvidedWindowOverStaleActiveManager() {

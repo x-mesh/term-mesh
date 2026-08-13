@@ -504,10 +504,7 @@ struct UnifiedPaneDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        let operation: DropOperation =
-            (controller.activeDragTab == nil && controller.draggingTab == nil)
-                ? .copy
-                : .move
+        let operation = controller.pendingTabDropOperation
         // Guard against dropUpdated firing after performDrop/dropExited
         guard dropLifecycle == .hovering else {
 #if DEBUG

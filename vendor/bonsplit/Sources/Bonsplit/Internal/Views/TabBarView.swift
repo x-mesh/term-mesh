@@ -980,10 +980,7 @@ struct TabDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        let operation: DropOperation =
-            (controller.activeDragTab == nil && controller.draggingTab == nil)
-                ? .copy
-                : .move
+        let operation = controller.pendingTabDropOperation
         // Guard against dropUpdated firing after performDrop/dropExited
         // This is the key fix for the lingering indicator bug
         guard dropLifecycle == .hovering else {
