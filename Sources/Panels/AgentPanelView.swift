@@ -160,10 +160,23 @@ struct AgentPanelView: View {
             // turn is open, and something is arriving right now. A turn can be
             // open and silent for a minute while a tool runs.
             if session.isThinking {
-                Text(session.streamingIds.isEmpty ? "working" : "writing")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .fixedSize()
+                if session.hasExtendedSilence {
+                    Label("no activity 30m", systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Color.orange)
+                        .fixedSize()
+                        .help(
+                            "No protocol activity for 30 minutes. "
+                                + "The agent may still be working and will not be stopped automatically. "
+                                + "Restart clears its conversation context."
+                        )
+                        .accessibilityLabel("No protocol activity for 30 minutes")
+                } else {
+                    Text(session.streamingIds.isEmpty ? "working" : "writing")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                }
             }
         }
         .padding(.horizontal, 10)

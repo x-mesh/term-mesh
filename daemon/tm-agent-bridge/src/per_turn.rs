@@ -145,7 +145,7 @@ impl PerTurnBridge {
         }
     }
 
-    pub fn turn(&mut self, text: &str, timeout: Duration) {
+    pub fn turn(&mut self, text: &str, timeout: Option<Duration>) {
         self.out.sent(text);
 
         let argv = match self.argv(text) {
@@ -216,36 +216,41 @@ impl PerTurnBridge {
         };
         let stdout = child.stdout.take().expect("stdout is piped");
 
-        // A watchdog rather than a reader thread: the answer is drawn as it
+        // An opt-in watchdog rather than a reader thread: the answer is drawn as it
         // arrives, and drawing needs the emitter, which cannot be in two
         // places. Killing on the deadline turns the read into an EOF.
         //
         // It waits on a channel rather than sleeping, so a turn that finishes
         // early ends the thread with it. A plain sleep left one alive for the
-        // rest of the timeout — ten minutes by default — accumulating one per
-        // turn, each holding a pid it no longer owns. `kill(pid, 0)` succeeds
+        // rest of the opt-in timeout, accumulating one per turn, each holding
+        // a pid it no longer owns. `kill(pid, 0)` succeeds
         // for whoever inherited that number, so a late sleeper could signal an
         // unrelated process.
         let killed = Arc::new(AtomicBool::new(false));
-        let pid = child.id();
-        let flag = Arc::clone(&killed);
-        let (finished, wait_for_finish) = std::sync::mpsc::channel::<()>();
-        let watchdog = std::thread::spawn(move || {
-            // Disconnected means the turn ended and the sender was dropped.
-            if wait_for_finish.recv_timeout(timeout)
-                != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            {
-                return;
-            }
-            // SAFETY: signal 0 first — a pid that has been reaped and reused
-            // must not be signalled by mistake.
-            unsafe {
-                if libc::kill(pid as libc::pid_t, 0) == 0 {
-                    flag.store(true, Ordering::SeqCst);
-                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                }
-            }
-        });
+        let (finished, watchdog): (Option<_>, Option<_>) = timeout
+            .map(|timeout| {
+                let pid = child.id();
+                let flag = Arc::clone(&killed);
+                let (finished, wait_for_finish) = std::sync::mpsc::channel::<()>();
+                let watchdog = std::thread::spawn(move || {
+                    // Disconnected means the turn ended and the sender was dropped.
+                    if wait_for_finish.recv_timeout(timeout)
+                        != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    {
+                        return;
+                    }
+                    // SAFETY: signal 0 first — a pid that has been reaped and reused
+                    // must not be signalled by mistake.
+                    unsafe {
+                        if libc::kill(pid as libc::pid_t, 0) == 0 {
+                            flag.store(true, Ordering::SeqCst);
+                            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                        }
+                    }
+                });
+                (finished, watchdog)
+            })
+            .unzip();
 
         let said = match self.cli {
             PerTurnCli::Cursor => {
@@ -256,14 +261,16 @@ impl PerTurnBridge {
         };
         let status = child.wait();
         drop(finished);
-        let _ = watchdog.join();
+        if let Some(watchdog) = watchdog {
+            let _ = watchdog.join();
+        }
 
         if killed.load(Ordering::SeqCst) {
             self.out.result(
                 &format!(
                     "{} did not finish in {}s",
                     self.cli.as_str(),
-                    timeout.as_secs_f64()
+                    timeout.map_or(0.0, |value| value.as_secs_f64())
                 ),
                 "timeout",
                 None,
@@ -756,12 +763,24 @@ Created conversation 22222222-2222-4222-8222-222222222222\n";
         // could be cancelled it slept the whole of this, one thread per turn,
         // each still holding a pid it no longer owned.
         let started = std::time::Instant::now();
-        b.turn("hi", Duration::from_secs(30));
+        b.turn("hi", Some(Duration::from_secs(30)));
 
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the watchdog has to end with the turn, not outlive it"
         );
+    }
+
+    #[test]
+    fn a_turn_without_a_deadline_finishes_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut b, sink) = bridge_with(PerTurnCli::Agy, fake_cli(dir.path(), "echo done"));
+
+        b.turn("hi", None);
+
+        let result = last_result(&sink);
+        assert_eq!(result["stop_reason"], "end_turn");
+        assert_eq!(result["result"], "done");
     }
 
     #[test]
@@ -771,7 +790,7 @@ Created conversation 22222222-2222-4222-8222-222222222222\n";
 echo done"#;
         let (mut b, sink) = bridge_with(PerTurnCli::Agy, fake_cli(dir.path(), body));
 
-        b.turn("hi", Duration::from_secs(10));
+        b.turn("hi", Some(Duration::from_secs(10)));
 
         let events = sink.lock().unwrap();
         assert_eq!(events.iter().filter(|e| e["subtype"] == "environment").count(), 1);
@@ -791,7 +810,7 @@ echo done"#;
             let dir = tempfile::tempdir().unwrap();
             let (mut b, sink) = bridge_with(cli, fake_cli(dir.path(), &format!("exit {code}")));
 
-            b.turn("hi", Duration::from_secs(10));
+            b.turn("hi", Some(Duration::from_secs(10)));
 
             let result = last_result(&sink);
             assert_eq!(result["stop_reason"], "environment_failed", "{cli:?}");
@@ -807,7 +826,7 @@ echo done"#;
     fn the_agy_log_is_removed_when_the_bridge_goes_away() {
         let dir = tempfile::tempdir().unwrap();
         let (mut b, _) = bridge_with(PerTurnCli::Agy, fake_cli(dir.path(), "echo hi"));
-        b.turn("hi", Duration::from_secs(10));
+        b.turn("hi", Some(Duration::from_secs(10)));
 
         let log = b.log_path.clone().expect("agy was given a log to write");
         assert!(log.exists());

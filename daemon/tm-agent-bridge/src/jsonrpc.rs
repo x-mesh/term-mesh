@@ -86,6 +86,25 @@ impl<T: Transport> JsonRpc<T> {
         if !self.send(&payload) {
             return None;
         }
+        self.pump(Some(rid), Some(timeout), on_notify, None)
+    }
+
+    pub fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Option<Duration>,
+        on_notify: Option<&mut dyn FnMut(&Value)>,
+    ) -> Option<Value> {
+        self.next_id += 1;
+        let rid = self.next_id;
+        let mut payload = json!({"jsonrpc": "2.0", "id": rid, "method": method});
+        if let Some(params) = params {
+            payload["params"] = params;
+        }
+        if !self.send(&payload) {
+            return None;
+        }
         self.pump(Some(rid), timeout, on_notify, None)
     }
 
@@ -145,17 +164,26 @@ impl<T: Transport> JsonRpc<T> {
     pub fn pump(
         &mut self,
         until_id: Option<u64>,
-        timeout: Duration,
+        timeout: Option<Duration>,
         mut on_notify: Option<&mut dyn FnMut(&Value)>,
         until_method: Option<&str>,
     ) -> Option<Value> {
-        let deadline = Instant::now() + timeout;
+        let deadline = match timeout {
+            Some(timeout) => Some(Instant::now().checked_add(timeout)?),
+            None => None,
+        };
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return None;
-            }
-            let obj = match self.child.recv_timeout(remaining.min(POLL_SLICE)) {
+            let wait = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return None;
+                    }
+                    remaining.min(POLL_SLICE)
+                }
+                None => POLL_SLICE,
+            };
+            let obj = match self.child.recv_timeout(wait) {
                 Ok(Inbound::Frame(obj)) => obj,
                 Ok(Inbound::Eof) => {
                     self.record_exit_failure();
@@ -252,7 +280,7 @@ mod tests {
         });
 
         assert!(rpc
-            .pump(Some(1), Duration::from_millis(100), None, None)
+            .pump(Some(1), Some(Duration::from_millis(100)), None, None)
             .is_none());
         assert_eq!(
             rpc.failure.as_deref(),
@@ -267,6 +295,19 @@ mod tests {
         assert!(rpc
             .request("turn/start", Some(json!({})), Duration::from_secs(1), None)
             .is_none());
+        assert_eq!(
+            rpc.failure.as_deref(),
+            Some("agent process exited with code 9")
+        );
+    }
+
+    #[test]
+    fn unlimited_pump_still_stops_when_the_child_exits() {
+        let mut rpc = JsonRpc::new(ScriptedChild::dead(9, "agent process exited with code 9"));
+        let started = Instant::now();
+
+        assert!(rpc.pump(None, None, None, None).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(
             rpc.failure.as_deref(),
             Some("agent process exited with code 9")
@@ -321,7 +362,7 @@ mod tests {
         let done = rpc
             .pump(
                 None,
-                Duration::from_secs(1),
+                Some(Duration::from_secs(1)),
                 None,
                 Some("turn/completed"),
             )
@@ -389,12 +430,26 @@ mod tests {
         let mut rpc = JsonRpc::new(ScriptedChild::new(vec![]));
 
         let started = Instant::now();
-        let answer = rpc.pump(Some(1), Duration::from_secs(30), None, None);
+        let answer = rpc.pump(Some(1), Some(Duration::from_secs(30)), None, None);
 
         assert!(answer.is_none());
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "EOF has to end the wait, not wait it out"
+        );
+    }
+
+    #[test]
+    fn an_unlimited_wait_still_stops_when_the_stream_ends() {
+        let mut rpc = JsonRpc::new(ScriptedChild::new(vec![]));
+
+        let started = Instant::now();
+        let answer = rpc.pump(Some(1), None, None, None);
+
+        assert!(answer.is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "unlimited means no deadline, not ignoring EOF"
         );
     }
 }

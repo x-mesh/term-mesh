@@ -87,7 +87,7 @@ impl<T: Transport> AcpBridge<T> {
         true
     }
 
-    pub fn turn(&mut self, text: &str, timeout: Duration) {
+    pub fn turn(&mut self, text: &str, timeout: Option<Duration>) {
         let Self {
             rpc, out, session, ..
         } = self;
@@ -182,7 +182,7 @@ impl<T: Transport> AcpBridge<T> {
             }
         };
 
-        let response = rpc.request(
+        let response = rpc.request_with_timeout(
             "session/prompt",
             Some(json!({
                 "sessionId": session.clone().unwrap_or_default(),
@@ -322,7 +322,7 @@ mod tests {
             json!({"id": 1, "result": {"stopReason": "end_turn"}}),
         ]);
 
-        b.turn("say it", Duration::from_secs(2));
+        b.turn("say it", Some(Duration::from_secs(2)));
 
         let deltas: Vec<String> = sink
             .lock()
@@ -346,7 +346,7 @@ mod tests {
             json!({"id": 1, "result": {"stopReason": "end_turn"}}),
         ]);
 
-        b.turn("edit it", Duration::from_secs(2));
+        b.turn("edit it", Some(Duration::from_secs(2)));
 
         let call = &blocks(&sink, "tool_use")[0];
         assert_eq!(call["input"]["file_path"], "/repo/a.py");
@@ -368,7 +368,7 @@ mod tests {
             json!({"id": 1, "result": {"stopReason": "end_turn"}}),
         ]);
 
-        b.turn("run it", Duration::from_secs(2));
+        b.turn("run it", Some(Duration::from_secs(2)));
 
         let results = blocks(&sink, "tool_result");
         assert_eq!(results.len(), 1);
@@ -385,7 +385,7 @@ mod tests {
             json!({"id": 1, "result": {"stopReason": "end_turn"}}),
         ]);
 
-        b.turn("run it", Duration::from_secs(2));
+        b.turn("run it", Some(Duration::from_secs(2)));
 
         assert_eq!(blocks(&sink, "tool_result")[0]["is_error"], true);
     }
@@ -399,7 +399,7 @@ mod tests {
         let mut b = AcpBridge::new(child, out, "/tmp/project", None);
         b.session = Some("session-1".into());
 
-        b.turn("do work", Duration::from_secs(2));
+        b.turn("do work", Some(Duration::from_secs(2)));
 
         assert_eq!(last_result(&sink)["stop_reason"], "process_exited");
     }

@@ -304,7 +304,7 @@ impl<T: Transport> CodexBridge<T> {
         true
     }
 
-    pub fn turn(&mut self, text: &str, timeout: Duration) {
+    pub fn turn(&mut self, text: &str, timeout: Option<Duration>) {
         // Split the borrows: the notify callback writes events while the rpc
         // reads frames, and they are different fields of the same struct.
         let Self {
@@ -659,7 +659,7 @@ mod tests {
             json!({"method": "turn/completed", "params": {"threadId": "t", "turn": {}}}),
         ]);
 
-        b.turn("edit those files", Duration::from_secs(2));
+        b.turn("edit those files", Some(Duration::from_secs(2)));
 
         assert_eq!(blocks(&sink, "tool_use").len(), 2);
     }
@@ -760,7 +760,7 @@ mod tests {
                    "params": {"turn": {"status": "completed"}}}),
         ]);
 
-        b.turn("say it", Duration::from_secs(2));
+        b.turn("say it", Some(Duration::from_secs(2)));
 
         let result = last_result(&sink);
         assert_eq!(result["result"], "SMOKE_OK");
@@ -778,7 +778,7 @@ mod tests {
             json!({"method": "turn/completed", "params": {"turn": {"status": "failed"}}}),
         ]);
 
-        b.turn("do work", Duration::from_secs(2));
+        b.turn("do work", Some(Duration::from_secs(2)));
 
         let result = last_result(&sink);
         assert_eq!(result["stop_reason"], "failed");
@@ -794,7 +794,7 @@ mod tests {
                                        "error": {"message": "model not found"}}}}),
         ]);
 
-        b.turn("do work", Duration::from_secs(2));
+        b.turn("do work", Some(Duration::from_secs(2)));
 
         assert_eq!(last_result(&sink)["result"], "model not found");
     }
@@ -810,7 +810,7 @@ mod tests {
                                        "error": {"message": "404: model not found"}}}}),
         ]);
 
-        b.turn("do work", Duration::from_secs(2));
+        b.turn("do work", Some(Duration::from_secs(2)));
 
         assert_eq!(last_result(&sink)["result"], "404: model not found");
     }
@@ -825,7 +825,7 @@ mod tests {
             json!({"method": "turn/completed", "params": {"turn": {"status": "failed"}}}),
         ]);
 
-        b.turn("do work", Duration::from_secs(2));
+        b.turn("do work", Some(Duration::from_secs(2)));
 
         let body = last_result(&sink)["result"].as_str().unwrap().to_string();
         assert!(body.contains("got this far"));
@@ -839,7 +839,7 @@ mod tests {
             json!({"method": "turn/completed", "params": {"turn": {"status": "completed"}}}),
         ]);
 
-        b.turn("do work", Duration::from_secs(2));
+        b.turn("do work", Some(Duration::from_secs(2)));
 
         let result = last_result(&sink);
         assert_eq!(result["stop_reason"], "empty");
@@ -852,7 +852,7 @@ mod tests {
             json!({"id": 1, "error": {"code": -32602, "message": "unusable model"}}),
         ]);
 
-        b.turn("do work", Duration::from_secs(2));
+        b.turn("do work", Some(Duration::from_secs(2)));
 
         let result = last_result(&sink);
         assert_eq!(result["stop_reason"], "rejected");
@@ -871,7 +871,7 @@ mod tests {
         let mut b = CodexBridge::new(child, out, "/tmp/project", None);
         b.thread_id = Some("thread-1".into());
 
-        b.turn("do work", Duration::from_secs(2));
+        b.turn("do work", Some(Duration::from_secs(2)));
 
         let result = last_result(&sink);
         assert_eq!(result["stop_reason"], "process_exited");
@@ -886,7 +886,7 @@ mod tests {
         let mut b = CodexBridge::new(child, out, "/tmp/project", None);
         b.thread_id = Some("thread-1".into());
 
-        b.turn("do work", Duration::from_millis(150));
+        b.turn("do work", Some(Duration::from_millis(150)));
 
         assert_eq!(last_result(&sink)["stop_reason"], "timeout");
     }
@@ -901,7 +901,7 @@ mod tests {
             json!({"method": "turn/completed", "params": {"turn": {"status": "completed"}}}),
         ]);
 
-        b.turn("run it", Duration::from_secs(2));
+        b.turn("run it", Some(Duration::from_secs(2)));
 
         let call = &blocks(&sink, "tool_use")[0];
         assert_eq!(call["input"]["command"], "ls -l");
