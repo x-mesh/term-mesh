@@ -35,6 +35,144 @@ def _wait(predicate, timeout_s: float = 45.0, interval_s: float = 0.2):
     return None
 
 
+def _hold(check, until, timeout_s: float = 20.0, interval_s: float = 0.2) -> bool:
+    """Keep asserting `check` until `until` is observed, then assert it once more.
+
+    `check` raises on violation, so an invariant that only holds because the
+    asynchronous work has not started yet cannot pass unnoticed.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        check()
+        if until():
+            # Re-assert after the completion is observed: the check above ran
+            # before it, so a mutation landing in between would go unseen.
+            check()
+            return True
+        time.sleep(interval_s)
+    check()
+    return bool(until())
+
+
+_SHARED_DEBUG_LOGS = (
+    "/tmp/cmux-debug-com.termmesh.app.debug.log",
+    "/tmp/term-mesh-debug.log",
+    "/tmp/cmux-debug.log",
+)
+
+
+def _debug_log_candidates() -> list[Path]:
+    """Paths the DEBUG build can resolve its event log to (bonsplit DebugEventLog).
+
+    Resolution is tiered and returns the first tier that exists, never a union,
+    so a run-specific log is never watched alongside anything else:
+
+    1. `TERMMESH_DEBUG_LOG`, this process's own environment;
+    2. the log named by this process's socket stem;
+    3. untrusted — the `/tmp/term-mesh-last-debug-log-path` pointer and the
+       shared logs, collapsed to the single most recently written path.
+
+    Only the first two tiers identify the instance under test. The pointer does
+    not: `scripts/reload.sh` is its only writer and it holds whichever DEBUG
+    build ran last, so a leftover from an earlier session would otherwise
+    outrank the socket this test is actually driving and answer `grew()` /
+    `contains()` for a foreign app.
+    """
+    env_log = os.environ.get("TERMMESH_DEBUG_LOG", "").strip()
+    if env_log and Path(env_log).exists():
+        return [Path(env_log)]
+
+    socket_derived: list[Path] = []
+    for key in ("TERMMESH_SOCKET_PATH", "TERMMESH_SOCKET"):
+        socket_path = os.environ.get(key, "").strip()
+        if not socket_path:
+            continue
+        stem = Path(socket_path).stem
+        if not (stem.startswith("term-mesh-debug-") or stem.startswith("cmux-debug-")):
+            continue
+        path = Path(f"/tmp/{stem}.log")
+        if path not in socket_derived and path.exists():
+            socket_derived.append(path)
+    if socket_derived:
+        return socket_derived
+
+    untrusted = list(_SHARED_DEBUG_LOGS)
+    try:
+        pointer = Path("/tmp/term-mesh-last-debug-log-path").read_text().strip()
+    except OSError:
+        pointer = ""
+    if pointer:
+        untrusted.insert(0, pointer)
+
+    newest: tuple[float, Path] | None = None
+    for candidate in untrusted:
+        path = Path(candidate)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if newest is None or mtime > newest[0]:
+            newest = (mtime, path)
+    return [] if newest is None else [newest[1]]
+
+
+class _DebugLogTail:
+    """Follows the app debug log from a baseline offset.
+
+    A debug RPC that only acknowledges scheduling gives the test no way to tell
+    "the async attempt failed as required" from "the async attempt has not run
+    yet". The app logs the completed attempt, so tailing the log turns that into
+    positive evidence.
+
+    Construction fails when no log resolves. Without one there is no evidence to
+    wait for, and a run that quietly falls back to a settle window reads exactly
+    like a verified one. Resolution gets a short bounded retry first, so a log
+    the app has named but not yet written is waited for rather than reported as
+    a missing one.
+    """
+
+    def __init__(self, resolve_timeout_s: float = 5.0, interval_s: float = 0.2) -> None:
+        self._baselines: dict[Path, int] = {}
+        deadline = time.time() + resolve_timeout_s
+        while True:
+            for path in _debug_log_candidates():
+                try:
+                    self._baselines[path] = path.stat().st_size
+                except OSError:
+                    continue
+            if self._baselines or time.time() >= deadline:
+                break
+            time.sleep(interval_s)
+        if not self._baselines:
+            raise termmeshError(
+                "no app debug log resolved; set TERMMESH_DEBUG_LOG or run against a "
+                "DEBUG build that writes /tmp/term-mesh-last-debug-log-path"
+            )
+
+    def _tail_text(self, path: Path, baseline: int) -> str:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return ""
+        # A rotated log is shorter than the baseline; re-read it from the top.
+        start = baseline if size >= baseline else 0
+        try:
+            with path.open("rb") as handle:
+                handle.seek(start)
+                return handle.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def grew(self) -> bool:
+        """True once a watched log advanced, i.e. this really is the live log."""
+        return any(self._tail_text(path, baseline)
+                   for path, baseline in self._baselines.items())
+
+    def contains(self, marker: str) -> bool:
+        return any(marker in self._tail_text(path, baseline)
+                   for path, baseline in self._baselines.items())
+
+
 def _connect(c, host: str) -> None:
     row = next((item for item in c.peer_host_list() if item.get("id") == host), None)
     if row is None:
@@ -95,6 +233,71 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
     if project.get("leader_surface_id") != state["leader_surface_id"]:
         raise termmeshError(f"leader surface changed across restart: {project!r}")
 
+    # A stale id must be rejected before any asynchronous presentation work
+    # starts. Pin the observable invariant as well: a rejected adoption cannot
+    # add a pane or a partial local team.
+    panes_before = len(c.list_panes())
+    teams_before = {item.get("team_name") for item in c.team_list()}
+    stale_id = f"{state['project_id']}-stale"
+    try:
+        c.debug_project_adopt_remote(host, stale_id)
+    except termmeshError:
+        pass
+    else:
+        raise termmeshError("stale remote project adoption was accepted")
+    if len(c.list_panes()) != panes_before:
+        raise termmeshError("stale adoption left a stray pane")
+    if {item.get("team_name") for item in c.team_list()} != teams_before:
+        raise termmeshError("stale adoption left a partial or duplicate team")
+
+    # The debug RPC acknowledges scheduling before adoption completes, so the
+    # failure it is meant to pin happens asynchronously inside the app. With the
+    # host disconnected either outcome is legitimate: the RPC is rejected
+    # outright (the roster no longer resolves the project), or it is accepted and
+    # the scheduled attempt fails. Both must leave the current presentation
+    # untouched and keep the project adoptable after reconnect.
+    c.peer_host_disconnect(host)
+    disconnected = _wait(lambda: next((item for item in c.peer_host_list()
+                                        if item.get("id") == host
+                                        and item.get("state") != "connected"), None),
+                         timeout_s=10)
+    if disconnected is None:
+        raise termmeshError("peer host did not disconnect before adoption failure test")
+
+    def presentation_unchanged() -> None:
+        if len(c.list_panes()) != panes_before:
+            raise termmeshError("disconnected adoption left a stray pane")
+        if {item.get("team_name") for item in c.team_list()} != teams_before:
+            raise termmeshError("disconnected adoption left a partial or duplicate team")
+
+    tail = _DebugLogTail()
+    try:
+        scheduled = c.debug_project_adopt_remote(host, state["project_id"])
+    except termmeshError:
+        # Rejected before any presentation work started: nothing is in flight,
+        # so the invariant is already final.
+        presentation_unchanged()
+    else:
+        if not scheduled.get("started"):
+            raise termmeshError(
+                f"disconnected adoption was neither rejected nor scheduled: {scheduled!r}"
+            )
+        # Hold the invariant until the app logs the finished attempt, so the
+        # check cannot pass merely because the failure path has not run yet.
+        marker = f"debug.project.adopt_remote project={state['project_id']} adopted="
+        completed = _hold(presentation_unchanged, lambda: tail.contains(marker))
+        if not completed:
+            raise termmeshError(
+                "scheduled adoption never completed while the host was disconnected "
+                f"(watched log advanced={tail.grew()})"
+            )
+
+    _connect(c, host)
+    republished = _wait(lambda: next((item for item in c.debug_project_remote_presentations(host)
+                                      if item.get("project_id") == state["project_id"]), None),
+                        timeout_s=25)
+    if republished is None:
+        raise termmeshError("remote project manifest did not return after reconnect")
     adopted = c.debug_project_adopt_remote(host, state["project_id"])
     if adopted.get("leader_surface_id") != state["leader_surface_id"]:
         raise termmeshError(f"adopt selected a different leader surface: {adopted!r}")

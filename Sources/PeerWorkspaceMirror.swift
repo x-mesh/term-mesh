@@ -69,6 +69,7 @@ final class PeerWorkspaceMirrorController {
     private var subscriptionTransport: UnixSocketTransport?
     private var subscriptionSession: PeerSession?
     private var receiveTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
     /// Apply serialization (relay-window pattern): one reconcile at a
     /// time; a newer push cancels a stale queued one.
     private var applyTask: Task<Void, Never>?
@@ -435,7 +436,8 @@ final class PeerWorkspaceMirrorController {
         RemoteWorkLog.infoOffMain("Workspace mirror lost its host: \(reason) — reconnecting")
         markWorkspaceTitle(suffix: "reconnecting…")
         let failedGeneration = subscriptionTransportGeneration
-        Task { [weak self] in
+        reconnectTask?.cancel()
+        reconnectTask = Task { [weak self] in
             await self?.reconnectLoop(after: failedGeneration)
         }
     }
@@ -444,20 +446,47 @@ final class PeerWorkspaceMirrorController {
     /// `PeerRelaySession`'s own.
     private static let setupReadTimeoutSeconds: TimeInterval = 10
 
+    /// Whether a reconnect attempt may proceed past a suspension point (the
+    /// transport refresh, the backoff sleep, or the connect/handshake
+    /// window) or must abandon. Shared by every guard in `reconnectLoop`,
+    /// including the one a superseding `handleConnectionLost` trips: it
+    /// cancels the prior `reconnectTask`, and `isCancelled` becoming true is
+    /// exactly how that supersede reaches this loop.
+    enum ReconnectStep: Equatable {
+        case proceed
+        case abandon
+    }
+
+    nonisolated static func reconnectStep(
+        isTornDown: Bool,
+        hasWorkspace: Bool,
+        isCancelled: Bool
+    ) -> ReconnectStep {
+        (!isTornDown && hasWorkspace && !isCancelled) ? .proceed : .abandon
+    }
+
     private func reconnectLoop(after failedGeneration: UInt64) async {
         var attempt = 0
         // "lost its host — reconnecting" is a promise, and this loop can exit
         // without keeping it: when the last pane goes the workspace is torn
         // down, the condition below is false on the first pass, and not one
         // attempt is ever made. Saying so is the difference between "gave up"
-        // and "there was nothing left to reconnect to".
+        // and "there was nothing left to reconnect to". A loop a newer
+        // handleConnectionLost cancelled is a third thing again, so name the
+        // cause that actually fired rather than blaming a teardown that never
+        // happened. Registered before the first guard so that exit is
+        // diagnosable too.
         defer {
             if attempt == 0 {
+                let cause = (isTornDown || workspace == nil)
+                    ? "the workspace was already gone"
+                    : "a newer reconnect superseded it"
                 RemoteWorkLog.debugOffMain(
-                    "Workspace mirror stopped reconnecting before the first attempt — the workspace was already gone"
+                    "Workspace mirror stopped reconnecting before the first attempt — \(cause)"
                 )
             }
         }
+        guard Self.reconnectStep(isTornDown: isTornDown, hasWorkspace: workspace != nil, isCancelled: Task.isCancelled) == .proceed else { return }
         // Refresh once per failed generation. Pane, mirror and sidebar
         // consumers share this gate, so simultaneous heartbeat failures join
         // one SSH restart instead of repeatedly killing each other's fresh
@@ -466,11 +495,16 @@ final class PeerWorkspaceMirrorController {
             after: failedGeneration,
             reason: "workspace mirror subscription stopped responding"
         )
-        while !isTornDown, workspace != nil {
+        guard Self.reconnectStep(isTornDown: isTornDown, hasWorkspace: workspace != nil, isCancelled: Task.isCancelled) == .proceed else { return }
+        while Self.reconnectStep(isTornDown: isTornDown, hasWorkspace: workspace != nil, isCancelled: Task.isCancelled) == .proceed {
             attempt += 1
             let delaySeconds = min(30.0, pow(2.0, Double(min(attempt, 5))))
-            try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
-            if isTornDown { return }
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+            } catch {
+                return
+            }
+            if isTornDown || Task.isCancelled { return }
             do {
                 let transport = try await UnixSocketTransport.connect(socketPath: lease.hostSockPath)
                 // A host that is frozen rather than gone — asleep, behind a
@@ -496,6 +530,18 @@ final class PeerWorkspaceMirrorController {
                     // behind.
                     await transport.close()
                     throw error
+                }
+                // Cancellation is only honored where it is checked, and the
+                // connect/handshake/listWorkspaces awaits above are a window
+                // the peer host controls (the setup budget is 10s). A teardown
+                // or a newer handleConnectionLost that lands inside it cannot
+                // undo what happens after it: `teardown()` is isTornDown-guarded
+                // and never runs twice, so a subscription installed here would
+                // keep its socket and 10s heartbeat alive for the rest of the
+                // process — on a host the user explicitly disconnected.
+                guard Self.reconnectStep(isTornDown: isTornDown, hasWorkspace: workspace != nil, isCancelled: Task.isCancelled) == .proceed else {
+                    await transport.close()
+                    return
                 }
                 guard let target = matchAndAdoptWorkspace(workspaces) else {
                     await transport.close()
@@ -623,6 +669,8 @@ final class PeerWorkspaceMirrorController {
         subscriptionAlive = false
         receiveTask?.cancel()
         receiveTask = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
         applyTask?.cancel()
         applyTask = nil
         for (_, task) in dividerDebounce { task.cancel() }

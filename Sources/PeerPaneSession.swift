@@ -141,6 +141,7 @@ final class PeerPaneHostLease {
     fileprivate func teardown() {
         guard !isTornDown else { return }
         isTornDown = true
+        transportRecovery.cancel()
         tunnel?.stop()
     }
 
@@ -149,26 +150,57 @@ final class PeerPaneHostLease {
     /// Replace a half-alive SSH forward and wait until its replacement is up.
     /// Direct Unix sockets have no owned transport to refresh.
     func refreshTransport(after observedGeneration: UInt64, reason: String) async -> UInt64 {
-        guard let tunnel else { return observedGeneration }
+        guard !isTornDown, let tunnel else { return transportGeneration }
         return await transportRecovery.refresh(after: observedGeneration) {
+            guard !self.isTornDown, !Task.isCancelled else { return false }
             // `forceReconnect` may spend up to three seconds reaping a stuck
             // ssh process. Never make that wait on the main actor.
-            await Task.detached { tunnel.forceReconnect(reason: reason) }.value
+            let scheduled = await Task.detached {
+                tunnel.forceReconnect(reason: reason)
+            }.value
+            guard scheduled, !self.isTornDown, !Task.isCancelled else { return false }
 
             // `forceReconnect` schedules its replacement asynchronously. Its
             // state can still read `.up` for one turn, so require observing a
-            // non-up transition before accepting the replacement `.up`.
+            // non-up transition before accepting the replacement `.up` — or,
+            // failing that, a tunnel that is still up when the budget expires.
             let deadline = Date().addingTimeInterval(15)
             var sawRestart = false
-            while Date() < deadline {
+            while true {
                 let state = tunnel.currentState
                 if state != .up { sawRestart = true }
-                if sawRestart, state == .up { return }
-                if case .failed = state { return }
-                if case .stopped = state { return }
-                try? await Task.sleep(nanoseconds: 100_000_000)
+                if let result = Self.recoveryResult(
+                    for: state, sawRestart: sawRestart, timedOut: Date() >= deadline
+                ) {
+                    return result
+                }
+                do {
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                } catch {
+                    return false
+                }
             }
         }
+    }
+
+    nonisolated static func recoveryResult(
+        for state: PeerSSHTunnelState,
+        sawRestart: Bool,
+        timedOut: Bool
+    ) -> Bool? {
+        if sawRestart, state == .up { return true }
+        if case .failed = state { return false }
+        if case .stopped = state { return false }
+        // `forceReconnect` also returns true when it only joined a restart
+        // that was already in flight, and that restart can finish before the
+        // first poll — the tunnel then never leaves `.up` and the transition
+        // this loop waits for never arrives. Calling that healthy tunnel a
+        // failed recovery leaves the generation stale, so the next sibling
+        // failure at the same observed generation runs a real forceReconnect
+        // and SIGKILLs a working replacement. A tunnel that is up when the
+        // budget expires is the outcome recovery asked for; take it.
+        if timedOut { return state == .up }
+        return nil
     }
 }
 
@@ -177,28 +209,82 @@ final class PeerPaneHostLease {
 @MainActor
 final class PeerPaneTransportRecovery {
     private(set) var generation: UInt64 = 0
-    private var refresh: (generation: UInt64, task: Task<Void, Never>)?
+    private struct InFlightRefresh {
+        let id: UUID
+        let nextGeneration: UInt64
+        let task: Task<Void, Never>
+        var waiters: [UUID: CheckedContinuation<UInt64, Never>]
+    }
+    private var inFlight: InFlightRefresh?
 
     func refresh(
         after observedGeneration: UInt64,
-        action: @escaping @MainActor () async -> Void
+        action: @escaping @MainActor () async -> Bool
     ) async -> UInt64 {
-        if let inFlight = refresh {
-            await inFlight.task.value
-            return inFlight.generation
-        }
-        if observedGeneration >= generation {
-            generation &+= 1
-            let nextGeneration = generation
-            let task = Task { await action() }
-            refresh = (nextGeneration, task)
-            await task.value
-            if refresh?.generation == nextGeneration {
-                refresh = nil
+        if observedGeneration < generation { return generation }
+
+        let refreshID: UUID
+        if let inFlight {
+            refreshID = inFlight.id
+        } else {
+            let id = UUID()
+            let nextGeneration = generation &+ 1
+            let task = Task { [weak self] in
+                let succeeded = await action()
+                self?.finish(id: id, succeeded: succeeded)
             }
-            return nextGeneration
+            inFlight = InFlightRefresh(
+                id: id, nextGeneration: nextGeneration, task: task, waiters: [:]
+            )
+            refreshID = id
         }
-        return generation
+
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled, var refresh = inFlight, refresh.id == refreshID else {
+                    continuation.resume(returning: generation)
+                    return
+                }
+                refresh.waiters[waiterID] = continuation
+                inFlight = refresh
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancelWaiter(id: waiterID, refreshID: refreshID)
+            }
+        }
+    }
+
+    func cancel() {
+        guard let refresh = inFlight else { return }
+        inFlight = nil
+        refresh.task.cancel()
+        for continuation in refresh.waiters.values {
+            continuation.resume(returning: generation)
+        }
+    }
+
+    private func cancelWaiter(id: UUID, refreshID: UUID) {
+        guard var refresh = inFlight, refresh.id == refreshID,
+              let continuation = refresh.waiters.removeValue(forKey: id)
+        else { return }
+        continuation.resume(returning: generation)
+        if refresh.waiters.isEmpty {
+            inFlight = nil
+            refresh.task.cancel()
+        } else {
+            inFlight = refresh
+        }
+    }
+
+    private func finish(id: UUID, succeeded: Bool) {
+        guard let refresh = inFlight, refresh.id == id else { return }
+        inFlight = nil
+        if succeeded { generation = refresh.nextGeneration }
+        for continuation in refresh.waiters.values {
+            continuation.resume(returning: generation)
+        }
     }
 }
 
@@ -558,6 +644,7 @@ final class PeerPaneSession {
         title: String,
         spec: PeerPaneHostSpec
     ) async throws -> PeerPaneSession {
+        let transportGeneration = lease.transportGeneration
         let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
         if lease.hostDisplayName.isEmpty {
             lease.hostDisplayName = conn.hostDisplayName
@@ -582,7 +669,7 @@ final class PeerPaneSession {
         // tunnel end. Host-scoped pushes need the real identity.
         relay.hostKey = lease.key
         relay.configureOwnedTransportRecovery(
-            generation: lease.transportGeneration,
+            generation: transportGeneration,
             handler: { [weak lease] generation in
                 guard let lease else { return generation }
                 return await lease.refreshTransport(
@@ -643,6 +730,7 @@ final class PeerPaneSession {
         // diagnosis instead of misreporting invalid saved/profile data as a
         // generic refusal by the host. Validation errors never include values.
         try PeerEnsureEnvironment.validate(environment)
+        let transportGeneration = lease.transportGeneration
         let conn = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
         if lease.hostDisplayName.isEmpty {
             lease.hostDisplayName = conn.hostDisplayName
@@ -725,7 +813,7 @@ final class PeerPaneSession {
         }
         relay.hostKey = lease.key
         relay.configureOwnedTransportRecovery(
-            generation: lease.transportGeneration,
+            generation: transportGeneration,
             handler: { [weak lease] generation in
                 guard let lease else { return generation }
                 return await lease.refreshTransport(
