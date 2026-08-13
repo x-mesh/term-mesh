@@ -1380,6 +1380,9 @@ final class AgentSession {
     @ObservationIgnored private var extendedSilenceWatchdog: DispatchWorkItem?
     @ObservationIgnored private var extendedSilenceGeneration: UInt64 = 0
     @ObservationIgnored private let extendedSilenceThreshold: TimeInterval
+    /// When the turn last produced a protocol event. The pending watchdog
+    /// reads this instead of being rescheduled per event.
+    @ObservationIgnored private var lastProtocolActivity = Date.distantPast
     #if DEBUG
     /// Synchronous decoder behind `consumeForTesting` only — production
     /// bytes (local pipe and remote pipeline alike) decode off-main on
@@ -2822,34 +2825,58 @@ final class AgentSession {
 
     /// Restart the warning clock after a real protocol event. Raw stderr and
     /// malformed lines are diagnostics, not evidence that the turn progressed.
+    ///
+    /// Only the timestamp moves. Scheduling a fresh 30-minute timer per event
+    /// left one live GCD timer behind for every streamed delta — thousands in
+    /// a long turn, each outliving its cancelled work item by the whole
+    /// window. The pending watchdog re-reads the clock when it fires instead.
     private func noteProtocolActivity() {
         guard turnInFlight else { return }
-        armExtendedSilenceWatchdog()
+        lastProtocolActivity = Date()
+        setExtendedSilence(false)
+        guard extendedSilenceWatchdog == nil else { return }
+        scheduleExtendedSilenceWatchdog(after: extendedSilenceThreshold)
     }
 
     private func armExtendedSilenceWatchdog() {
         extendedSilenceWatchdog?.cancel()
         extendedSilenceGeneration &+= 1
-        let generation = extendedSilenceGeneration
         setExtendedSilence(false)
+        lastProtocolActivity = Date()
         guard turnInFlight else {
             extendedSilenceWatchdog = nil
             return
         }
+        scheduleExtendedSilenceWatchdog(after: extendedSilenceThreshold)
+    }
+
+    /// A timer that wakes before the window has actually run out re-arms for
+    /// what is left, so activity costs a timestamp write rather than a timer.
+    private func scheduleExtendedSilenceWatchdog(after delay: TimeInterval) {
+        let generation = extendedSilenceGeneration
         let item = DispatchWorkItem { [weak self] in
             guard let self,
                   self.extendedSilenceGeneration == generation,
                   self.extendedSilenceWatchdog != nil,
                   self.turnInFlight else { return }
+            let remaining = self.extendedSilenceThreshold
+                - Date().timeIntervalSince(self.lastProtocolActivity)
+            guard remaining <= Self.extendedSilenceTolerance else {
+                self.scheduleExtendedSilenceWatchdog(after: remaining)
+                return
+            }
             self.extendedSilenceWatchdog = nil
             self.setExtendedSilence(true)
         }
         extendedSilenceWatchdog = item
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + extendedSilenceThreshold,
-            execute: item
-        )
+        #if DEBUG
+        extendedSilenceArmsForTesting += 1
+        #endif
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
+
+    /// Below this, re-arming would only schedule another immediate wake.
+    private static let extendedSilenceTolerance: TimeInterval = 0.005
 
     private func cancelExtendedSilenceWatchdog() {
         extendedSilenceWatchdog?.cancel()
@@ -2922,7 +2949,22 @@ final class AgentSession {
         extendedSilenceWatchdog != nil
     }
 
+    /// How many timers the silence watchdog has actually scheduled. A turn
+    /// that streams thousands of events must still cost one.
+    @ObservationIgnored private(set) var extendedSilenceArmsForTesting = 0
+
+    /// Fire the pending item with the idle window already spent. The watchdog
+    /// re-reads the clock, so a test that wants the warning has to move the
+    /// clock rather than only run the timer.
     func fireExtendedSilenceWatchdogForTesting() {
+        lastProtocolActivity = Date()
+            .addingTimeInterval(-extendedSilenceThreshold)
+        extendedSilenceWatchdog?.perform()
+    }
+
+    /// Fire it as the timer would before the window ran out: the turn has
+    /// been quiet for less than the threshold, so this must not warn.
+    func fireExtendedSilenceWatchdogEarlyForTesting() {
         extendedSilenceWatchdog?.perform()
     }
 

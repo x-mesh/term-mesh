@@ -1318,6 +1318,49 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(stoppedSession.hasExtendedSilenceWatchdogForTesting)
     }
 
+    /// Re-arming per event left a live 30-minute GCD timer behind for every
+    /// streamed delta. Cancelling the work item does not take the timer with
+    /// it, so a long turn accumulated thousands of them.
+    func testStreamedProtocolEventsCostOneSilenceTimerNotOnePerEvent() throws {
+        let s = AgentSession(extendedSilenceThreshold: 60)
+        s.startRemote(cli: "codex") { _ in }
+        try s.send("stream a long answer", from: .person)
+        let armsAfterSend = s.extendedSilenceArmsForTesting
+        XCTAssertEqual(armsAfterSend, 1)
+
+        for chunk in 0..<50 {
+            s.ingestForTesting(event([
+                "type": "assistant",
+                "message": ["content": [["type": "text", "text": "chunk \(chunk)"]]],
+            ]))
+        }
+
+        XCTAssertEqual(
+            s.extendedSilenceArmsForTesting, armsAfterSend,
+            "activity moves the timestamp, it does not schedule another timer"
+        )
+        XCTAssertTrue(s.hasExtendedSilenceWatchdogForTesting)
+        XCTAssertFalse(s.hasExtendedSilence)
+        s.stop()
+    }
+
+    func testSilenceWatchdogThatWakesEarlyRearmsInsteadOfWarning() throws {
+        let s = AgentSession(extendedSilenceThreshold: 60)
+        s.startRemote(cli: "codex") { _ in }
+        try s.send("keep working", from: .person)
+        let armsBeforeWake = s.extendedSilenceArmsForTesting
+
+        s.fireExtendedSilenceWatchdogEarlyForTesting()
+
+        XCTAssertFalse(s.hasExtendedSilence, "the quiet window had not run out")
+        XCTAssertTrue(s.hasExtendedSilenceWatchdogForTesting)
+        XCTAssertEqual(
+            s.extendedSilenceArmsForTesting, armsBeforeWake + 1,
+            "an early wake re-arms for whatever is left of the window"
+        )
+        s.stop()
+    }
+
     /// A PEM key spans lines, and a line-bounded pattern took only its header
     /// — the one part an attacker can retype. The body has to go with it.
     func testVisibleTranscriptRemovesMultiLinePrivateKeyBodies() {
