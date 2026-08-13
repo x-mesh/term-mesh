@@ -439,6 +439,8 @@ final class PeerPaneSession {
             hostSockPath: relaySession.hostSockPath,
             hostDisplayName: relaySession.hostDisplayName,
             sshTarget: lease.key.sshTarget,
+            sshPort: lease.tunnel?.port,
+            identityFile: lease.tunnel?.identityFile,
             remoteSockPath: lease.key.remoteSockPath,
             targetTitle: surfaceTitle.isEmpty ? "<surface>" : surfaceTitle,
             connectedAt: connectedAt

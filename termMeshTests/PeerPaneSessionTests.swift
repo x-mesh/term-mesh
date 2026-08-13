@@ -1064,6 +1064,8 @@ final class RemoteHostForceDisconnectOrderTests: XCTestCase {
             hostSockPath: "/tmp/tm-peer-test.sock",
             hostDisplayName: "test-host",
             sshTarget: "root@test-host",
+            sshPort: nil,
+            identityFile: nil,
             remoteSockPath: "/run/user/0/tm-peer.sock",
             targetTitle: title,
             connectedAt: Date()

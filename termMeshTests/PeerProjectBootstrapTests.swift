@@ -1080,6 +1080,49 @@ final class PeerProjectBootstrapTests: XCTestCase {
         }
     }
 
+    func test_remote_paste_uses_saved_port_and_identity_for_every_ssh_call() throws {
+        let identity = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-paste-key-\(UUID().uuidString)")
+        try Data("key".utf8).write(to: identity)
+        defer { try? FileManager.default.removeItem(at: identity) }
+
+        let destination = RemotePasteTransfer.Destination(
+            sshTarget: "root@example.com",
+            port: 2222,
+            identityFile: identity.path
+        )
+        let command = "printf ready"
+
+        XCTAssertEqual(
+            RemotePasteTransfer.sshArguments(to: destination, command: command),
+            ["-p", "2222", "-i", identity.path, "--", "root@example.com", command]
+        )
+    }
+
+    func test_remote_paste_ssh_arguments_keep_default_auth_when_profile_omits_it() {
+        let destination = RemotePasteTransfer.Destination(
+            sshTarget: "builder",
+            port: nil,
+            identityFile: nil
+        )
+
+        XCTAssertEqual(
+            RemotePasteTransfer.sshArguments(to: destination, command: "true"),
+            ["--", "builder", "true"]
+        )
+    }
+
+    func test_remote_paste_rejects_invalid_auth_arguments() {
+        XCTAssertNil(RemotePasteTransfer.sshArguments(
+            to: .init(sshTarget: "builder", port: 0, identityFile: nil),
+            command: "true"
+        ))
+        XCTAssertNil(RemotePasteTransfer.sshArguments(
+            to: .init(sshTarget: "builder", port: nil, identityFile: "-oProxyCommand=bad"),
+            command: "true"
+        ))
+    }
+
     @MainActor
     func test_remote_leader_prompt_streams_to_shared_cache_atomically() throws {
         let prompt = Data(String(repeating: "leader 정책\n", count: 1_500).utf8)

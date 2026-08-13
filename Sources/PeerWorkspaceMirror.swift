@@ -88,6 +88,8 @@ final class PeerWorkspaceMirrorController {
             hostSockPath: lease.hostSockPath,
             hostDisplayName: lease.hostDisplayName,
             sshTarget: lease.key.sshTarget,
+            sshPort: lease.tunnel?.port,
+            identityFile: lease.tunnel?.identityFile,
             remoteSockPath: lease.key.remoteSockPath,
             targetTitle: hostWorkspaceTitle.isEmpty ? "<workspace>" : hostWorkspaceTitle,
             connectedAt: connectedAt
