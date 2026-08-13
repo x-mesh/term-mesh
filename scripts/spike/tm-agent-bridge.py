@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 import json
+import math
 import os
 import queue
 import re
@@ -65,6 +66,25 @@ DIFF_LIMIT = 65536
 # agent pane is exactly where that is worth nothing to an attacker and fatal
 # to the user. Real capsules are kilobytes; a megabyte is already generous.
 MAX_FRAME_BYTES = 1_048_576
+
+
+def positive_timeout(raw: str) -> float:
+    """Parse an opt-in absolute turn deadline; omission means unlimited."""
+    try:
+        seconds = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "turn timeout must be a positive finite number of seconds"
+        ) from exc
+    if (
+        not math.isfinite(seconds)
+        or seconds <= 0
+        or seconds > threading.TIMEOUT_MAX
+    ):
+        raise argparse.ArgumentTypeError(
+            "turn timeout must be a positive finite number of seconds"
+        )
+    return seconds
 
 
 def split_input_frames(pending: bytes, chunk: bytes):
@@ -494,7 +514,7 @@ class JsonRpc:
             self.failure = str(exc) or "agent process exited"
             return False
 
-    def request(self, method: str, params: dict | None, timeout: float,
+    def request(self, method: str, params: dict | None, timeout: float | None,
                 on_notify=None) -> dict | None:
         self._id += 1
         rid = self._id
@@ -543,7 +563,7 @@ class JsonRpc:
         else:
             self.respond(rid, result=answer)
 
-    def pump(self, until_id: int | None, timeout: float, on_notify=None,
+    def pump(self, until_id: int | None, timeout: float | None, on_notify=None,
              until_method: str | None = None) -> dict | None:
         """Read until the answer we want, handing notifications to a callback.
 
@@ -556,13 +576,14 @@ class JsonRpc:
         before anything else, because everything queued behind one is waiting
         too.
         """
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
                 break
             try:
-                obj = self.child.inbox.get(timeout=min(0.25, remaining))
+                wait = 0.25 if remaining is None else min(0.25, remaining)
+                obj = self.child.inbox.get(timeout=wait)
             except queue.Empty:
                 if not self.child.alive:
                     self._record_exit_failure()
@@ -655,7 +676,7 @@ class PerTurnBridge:
             pass
         return argv + ["--print", text]
 
-    def turn(self, text: str, timeout: float) -> None:
+    def turn(self, text: str, timeout: float | None) -> None:
         self.out.sent(text)
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)
@@ -670,7 +691,7 @@ class PerTurnBridge:
                             stop="spawn_failed", failed=True)
             return
 
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         read_done: queue.Queue[tuple[str, BaseException | None]] = queue.Queue()
 
         def read_stdout() -> None:
@@ -684,7 +705,8 @@ class PerTurnBridge:
         reader = threading.Thread(target=read_stdout, daemon=True)
         reader.start()
         try:
-            code = p.wait(timeout=max(0, deadline - time.monotonic()))
+            wait = None if deadline is None else max(0, deadline - time.monotonic())
+            code = p.wait(timeout=wait)
         except subprocess.TimeoutExpired:
             stop_process(p, timeout=0.1)
             reader.join(timeout=0.1)
@@ -692,9 +714,9 @@ class PerTurnBridge:
                             stop="timeout", failed=True)
             return
 
-        remaining = deadline - time.monotonic()
+        remaining = None if deadline is None else max(0, deadline - time.monotonic())
         try:
-            said, read_error = read_done.get(timeout=max(0, remaining))
+            said, read_error = read_done.get(timeout=remaining)
         except queue.Empty:
             stop_process(p, timeout=0.1)
             self.out.result(f"{self.cli} did not finish in {timeout:g}s",
@@ -1022,7 +1044,7 @@ class CodexBridge:
                 return detail
         return cls._turn_failure(done) or (errors[-1][1] if errors else None)
 
-    def turn(self, text: str, timeout: float) -> None:
+    def turn(self, text: str, timeout: float | None) -> None:
         self.out.sent(text)
         self.out.turn_begins()
         said: list[str] = []
@@ -1230,7 +1252,7 @@ class AcpBridge:
                        "model": self.model or "", "tools": []})
         return True
 
-    def turn(self, text: str, timeout: float) -> None:
+    def turn(self, text: str, timeout: float | None) -> None:
         self.out.sent(text)
         self.out.turn_begins()
         said: list[str] = []
@@ -1306,7 +1328,12 @@ def main() -> int:
     # The app resolves a CLI's path from Settings; without this the bridge would
     # find a different binary on PATH than the one the user chose.
     ap.add_argument("--exe", default=None, help="path to the CLI binary")
-    ap.add_argument("--turn-timeout", type=float, default=600.0)
+    ap.add_argument(
+        "--turn-timeout",
+        type=positive_timeout,
+        default=None,
+        help="optional positive absolute turn deadline in seconds; omitted is unlimited",
+    )
     args = ap.parse_args()
 
     cwd = args.cwd or os.getcwd()

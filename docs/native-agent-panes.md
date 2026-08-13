@@ -30,6 +30,8 @@ Named CLI profile sets (path + extraArgs + env + modelOverride) stored in `~/Lib
 - `tm-agent delegate` / `send` / `broadcast`는 CLI 이름 그대로; delivery만 paste+Return → pipe/native stdin으로 바뀐다.
 - 턴 완료는 `AgentPipeCompletion`이 `<fifo>.events`의 `{"type":"result"}`를 읽는다. Standard Reply Header(5-field) 계약은 동일.
 - 지원 CLI: claude(직접 NDJSON), codex/kiro/cursor/agy(기본: compiled Rust `tm-agent-bridge`; `TERMMESH_BRIDGE_IMPL=python`은 compatibility fallback).
+- 진행 중인 turn에는 기본 wall-clock timeout이 없다. 긴 build/test와 `/goal`은 시간이 지났다는 이유만으로 종료되지 않는다. Bridge를 직접 실행하는 진단·자동화에서만 `--turn-timeout <positive-seconds>`로 absolute deadline을 opt-in할 수 있으며, 앱과 CLI profile은 이 값을 주입하지 않는다.
+- Native pane은 turn 중 마지막 정상 protocol event 이후 30분간 조용하면 `no activity 30m`를 표시한다. 이는 hang 판정이 아닌 비파괴 경고다. agent, task, `/goal`은 계속 실행되고 후속 event가 오면 경고가 사라진다. 복구가 필요하면 pane header의 `↻` hard restart를 사용하되 conversation context가 지워진다.
 - Shell Integration health: native agent pane은 **agentMode**(파란색) — shell integration N/A.
 
 Spike 상세: `docs/spike/agent-pipe-render.md`

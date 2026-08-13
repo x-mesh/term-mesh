@@ -15,6 +15,49 @@ final class GhosttyConfigTests: XCTestCase {
         let blue: Int
     }
 
+    func testPeerRelayTerminalLinkRoutesEmbeddedBrowserTargetExternally() throws {
+        let url = try XCTUnwrap(URL(string: "https://example.com/relay-link"))
+
+        XCTAssertEqual(
+            routeTerminalOpenURLTarget(.embeddedBrowser(url), context: .peerRelay),
+            .external(url)
+        )
+    }
+
+    func testStandardTerminalLinkPreservesEmbeddedBrowserTarget() throws {
+        let url = try XCTUnwrap(URL(string: "https://example.com/local-link"))
+        let target = TerminalOpenURLTarget.embeddedBrowser(url)
+
+        XCTAssertEqual(
+            routeTerminalOpenURLTarget(target, context: .standard),
+            target
+        )
+    }
+
+    func testPeerRelayTerminalLinkKeepsExternalTargetExternal() throws {
+        let url = try XCTUnwrap(URL(string: "mailto:support@example.com"))
+
+        XCTAssertEqual(
+            routeTerminalOpenURLTarget(.external(url), context: .peerRelay),
+            .external(url)
+        )
+    }
+
+    func testGhosttyOpenURLDecodingHonorsExplicitLengthWithoutNullTerminator() {
+        let expected = "https://example.com/relay-link"
+        let bytes = Array((expected + "-trailing-memory").utf8)
+
+        let decoded = bytes.withUnsafeBytes { rawBuffer -> String? in
+            guard let baseAddress = rawBuffer.baseAddress else { return nil }
+            return decodeGhosttyOpenURL(
+                baseAddress.assumingMemoryBound(to: CChar.self),
+                length: UInt(expected.utf8.count)
+            )
+        }
+
+        XCTAssertEqual(decoded, expected)
+    }
+
     func testResolveThemeNamePrefersLightEntryForPairedTheme() {
         let resolved = GhosttyConfig.resolveThemeName(
             from: "light:Builtin Solarized Light,dark:Builtin Solarized Dark",

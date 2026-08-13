@@ -3,6 +3,7 @@ import AppKit
 import SwiftUI
 import WebKit
 import SwiftUI
+import Bonsplit
 import ObjectiveC.runtime
 
 #if canImport(term_mesh_DEV)
@@ -798,6 +799,153 @@ final class AppDelegateWindowContextRoutingTests: XCTestCase {
         )
         window.identifier = NSUserInterfaceItemIdentifier("term-mesh.main.\(id.uuidString)")
         return window
+    }
+
+    func testLocateBonsplitTabResolvesPanelAndRejectsWrongSourcePane() throws {
+        _ = NSApplication.shared
+        let app = AppDelegate()
+        let windowId = UUID()
+        let window = makeMainWindow(id: windowId)
+        defer { window.orderOut(nil) }
+
+        let manager = TabManager()
+        app.registerMainWindow(
+            window,
+            windowId: windowId,
+            tabManager: manager,
+            sidebarState: SidebarState(),
+            sidebarSelectionState: SidebarSelectionState()
+        )
+
+        let workspace = try XCTUnwrap(manager.tabs.first)
+        let paneId = try XCTUnwrap(workspace.bonsplitController.allPaneIds.first)
+        let tabId = try XCTUnwrap(workspace.bonsplitController.tabs(inPane: paneId).first?.id)
+        let panelId = try XCTUnwrap(workspace.panelIdFromSurfaceId(tabId))
+
+        let located = try XCTUnwrap(
+            app.locateBonsplitTab(tabId: tabId, sourcePaneId: paneId)
+        )
+        XCTAssertEqual(located.windowId, windowId)
+        XCTAssertTrue(located.workspace === workspace)
+        XCTAssertEqual(located.panelId, panelId)
+        let provider = try XCTUnwrap(
+            workspace.bonsplitController.externalTabDragItemProvider(for: tabId)
+        )
+        XCTAssertTrue(
+            provider.hasItemConformingToTypeIdentifier("com.splittabbar.tabtransfer"),
+            "A sidebar relay-pane drag must use Bonsplit's external-tab payload"
+        )
+        XCTAssertNil(
+            workspace.bonsplitController.externalTabDragItemProvider(
+                for: TabID(uuid: UUID())
+            ),
+            "An unknown tab must not produce a same-process drag payload"
+        )
+        XCTAssertNil(
+            app.locateBonsplitTab(tabId: tabId, sourcePaneId: PaneID(id: UUID())),
+            "A stale drag payload must not resolve after its source pane changed"
+        )
+    }
+
+    func testExternalRemotePaneMaterializationCoversInsertSplitAndRollback() throws {
+        _ = NSApplication.shared
+
+        let insertWorkspace = Workspace()
+        let insertPane = try XCTUnwrap(insertWorkspace.bonsplitController.allPaneIds.first)
+        let inserted = try XCTUnwrap(
+            insertWorkspace.materializeExternalRemotePane(
+                command: "/usr/bin/true",
+                environment: [:],
+                destination: .insert(targetPane: insertPane, targetIndex: 0)
+            )
+        )
+        XCTAssertEqual(inserted.finalPane, insertPane)
+        XCTAssertEqual(
+            insertWorkspace.bonsplitController.tabs(inPane: insertPane).first?.id,
+            inserted.tabId
+        )
+
+        let splitWorkspace = Workspace()
+        let splitPane = try XCTUnwrap(splitWorkspace.bonsplitController.allPaneIds.first)
+        let originalPaneCount = splitWorkspace.bonsplitController.allPaneIds.count
+        let split = try XCTUnwrap(
+            splitWorkspace.materializeExternalRemotePane(
+                command: "/usr/bin/true",
+                environment: [:],
+                destination: .split(
+                    targetPane: splitPane,
+                    orientation: .horizontal,
+                    insertFirst: true
+                )
+            )
+        )
+        XCTAssertEqual(splitWorkspace.bonsplitController.allPaneIds.count, originalPaneCount + 1)
+        XCTAssertNotEqual(split.finalPane, splitPane)
+        XCTAssertTrue(
+            splitWorkspace.bonsplitController.tabs(inPane: split.finalPane)
+                .contains(where: { $0.id == split.tabId })
+        )
+
+        let rollbackWorkspace = Workspace()
+        let rollbackPane = try XCTUnwrap(rollbackWorkspace.bonsplitController.allPaneIds.first)
+        let originalPanelIds = Set(rollbackWorkspace.panels.keys)
+        rollbackWorkspace.bonsplitController.configuration.allowSplits = false
+        XCTAssertNil(
+            rollbackWorkspace.materializeExternalRemotePane(
+                command: "/usr/bin/true",
+                environment: [:],
+                destination: .split(
+                    targetPane: rollbackPane,
+                    orientation: .vertical,
+                    insertFirst: false
+                )
+            )
+        )
+        XCTAssertEqual(Set(rollbackWorkspace.panels.keys), originalPanelIds)
+    }
+
+    func testExternalRemotePaneFinalizeRevalidatesDestinationAndOwnsTeardown() {
+        var placementCount = 0
+        var teardownCount = 0
+
+        XCTAssertFalse(
+            Workspace.finalizeExternalRemotePaneDrop(
+                isDestinationWritable: false,
+                place: {
+                    placementCount += 1
+                    return true
+                },
+                teardown: { teardownCount += 1 }
+            )
+        )
+        XCTAssertEqual(placementCount, 0, "Mirror mode must reject before layout mutation")
+        XCTAssertEqual(teardownCount, 1, "A rejected attached session must be torn down once")
+
+        XCTAssertTrue(
+            Workspace.finalizeExternalRemotePaneDrop(
+                isDestinationWritable: true,
+                place: {
+                    placementCount += 1
+                    return true
+                },
+                teardown: { teardownCount += 1 }
+            )
+        )
+        XCTAssertEqual(placementCount, 1)
+        XCTAssertEqual(teardownCount, 1, "Successful placement transfers session ownership")
+
+        XCTAssertFalse(
+            Workspace.finalizeExternalRemotePaneDrop(
+                isDestinationWritable: true,
+                place: {
+                    placementCount += 1
+                    return false
+                },
+                teardown: { teardownCount += 1 }
+            )
+        )
+        XCTAssertEqual(placementCount, 2)
+        XCTAssertEqual(teardownCount, 2, "Placement failure must tear down once")
     }
 
     func testSynchronizeActiveMainWindowContextPrefersProvidedWindowOverStaleActiveManager() {

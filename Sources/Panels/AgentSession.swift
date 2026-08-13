@@ -1111,6 +1111,11 @@ final class AgentSession {
     /// Whether this agent's turn can be stopped. See `Launch.interruptible`.
     private(set) var canInterrupt = false
 
+    /// The turn has produced no protocol event for the extended-silence window.
+    /// This is a warning only: silence cannot distinguish a hung provider from
+    /// a legitimate long-running tool, so it never completes or stops a turn.
+    private(set) var hasExtendedSilence = false
+
     /// Rows still being written, so the view can show a caret on them.
     ///
     /// Nothing else can say this. A terminal shows characters arriving and
@@ -1158,6 +1163,11 @@ final class AgentSession {
     private func setCanInterrupt(_ value: Bool) {
         guard canInterrupt != value else { return }
         canInterrupt = value
+    }
+
+    private func setExtendedSilence(_ value: Bool) {
+        guard hasExtendedSilence != value else { return }
+        hasExtendedSilence = value
     }
 
     private func clearStreamingIds() {
@@ -1367,6 +1377,12 @@ final class AgentSession {
     /// Recent non-protocol output. Remote bridges send startup/provider
     /// diagnostics on this same byte stream rather than a separate stderr.
     @ObservationIgnored private var streamDiagnostic: String?
+    @ObservationIgnored private var extendedSilenceWatchdog: DispatchWorkItem?
+    @ObservationIgnored private var extendedSilenceGeneration: UInt64 = 0
+    @ObservationIgnored private let extendedSilenceThreshold: TimeInterval
+    /// When the turn last produced a protocol event. The pending watchdog
+    /// reads this instead of being rescheduled per event.
+    @ObservationIgnored private var lastProtocolActivity = Date.distantPast
     #if DEBUG
     /// Synchronous decoder behind `consumeForTesting` only — production
     /// bytes (local pipe and remote pipeline alike) decode off-main on
@@ -1378,6 +1394,10 @@ final class AgentSession {
     /// Split on newlines in the bytes; decode only what is whole.
     @ObservationIgnored private var directDecoder = AgentStreamDecoder(maxLineBytes: AgentSession.maxLineBytes)
     #endif
+
+    init(extendedSilenceThreshold: TimeInterval = 30 * 60) {
+        self.extendedSilenceThreshold = extendedSilenceThreshold
+    }
 
     /// A line that never arrives must not grow forever. Far above any real
     /// event: a long tool result is tens of kilobytes.
@@ -2018,6 +2038,7 @@ final class AgentSession {
         // Same reasoning as `teardownRemote`: an ended session reports itself,
         // so a pending silence alarm has nothing left to add.
         cancelStartupWatchdog()
+        cancelExtendedSilenceWatchdog()
 
         // A deliberate stop owns completion and must not later become a second
         // process-exited finish when Foundation reports the signal.
@@ -2065,6 +2086,7 @@ final class AgentSession {
         // A session that ended has already said why, or is about to through
         // the exit notice. Either way the silence question is settled.
         cancelStartupWatchdog()
+        cancelExtendedSilenceWatchdog()
         remoteSink = nil
         remoteGeneration &+= 1
         remoteSendTail = nil
@@ -2084,6 +2106,7 @@ final class AgentSession {
         stopped: Bool = false,
         failureAlreadyReported: Bool = false
     ) {
+        cancelExtendedSilenceWatchdog()
         setThinking(false)
         streamOpen.removeAll()
         clearStreamingIds()
@@ -2184,6 +2207,7 @@ final class AgentSession {
         turnInFlight = true
         if speaker == .leader { currentTaskId = taskId }
         setThinking(true)
+        armExtendedSilenceWatchdog()
         return payload.count
     }
 
@@ -2384,6 +2408,7 @@ final class AgentSession {
             append(.notice(id: UUID(), diagnostic))
             return
         }
+        noteProtocolActivity()
         handle(object, preparedChanges: parsed.preparedChanges,
                preparedToolIDs: parsed.preparedToolIDs)
     }
@@ -2585,6 +2610,7 @@ final class AgentSession {
     }
 
     private func result(_ o: [String: Any]) {
+        cancelExtendedSilenceWatchdog()
         let usage = o["usage"] as? [String: Any] ?? [:]
         let completedAt = Date()
         // A turn we stopped on purpose is not a failure.
@@ -2797,6 +2823,68 @@ final class AgentSession {
         startupWatchdog = nil
     }
 
+    /// Restart the warning clock after a real protocol event. Raw stderr and
+    /// malformed lines are diagnostics, not evidence that the turn progressed.
+    ///
+    /// Only the timestamp moves. Scheduling a fresh 30-minute timer per event
+    /// left one live GCD timer behind for every streamed delta — thousands in
+    /// a long turn, each outliving its cancelled work item by the whole
+    /// window. The pending watchdog re-reads the clock when it fires instead.
+    private func noteProtocolActivity() {
+        guard turnInFlight else { return }
+        lastProtocolActivity = Date()
+        setExtendedSilence(false)
+        guard extendedSilenceWatchdog == nil else { return }
+        scheduleExtendedSilenceWatchdog(after: extendedSilenceThreshold)
+    }
+
+    private func armExtendedSilenceWatchdog() {
+        extendedSilenceWatchdog?.cancel()
+        extendedSilenceGeneration &+= 1
+        setExtendedSilence(false)
+        lastProtocolActivity = Date()
+        guard turnInFlight else {
+            extendedSilenceWatchdog = nil
+            return
+        }
+        scheduleExtendedSilenceWatchdog(after: extendedSilenceThreshold)
+    }
+
+    /// A timer that wakes before the window has actually run out re-arms for
+    /// what is left, so activity costs a timestamp write rather than a timer.
+    private func scheduleExtendedSilenceWatchdog(after delay: TimeInterval) {
+        let generation = extendedSilenceGeneration
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.extendedSilenceGeneration == generation,
+                  self.extendedSilenceWatchdog != nil,
+                  self.turnInFlight else { return }
+            let remaining = self.extendedSilenceThreshold
+                - Date().timeIntervalSince(self.lastProtocolActivity)
+            guard remaining <= Self.extendedSilenceTolerance else {
+                self.scheduleExtendedSilenceWatchdog(after: remaining)
+                return
+            }
+            self.extendedSilenceWatchdog = nil
+            self.setExtendedSilence(true)
+        }
+        extendedSilenceWatchdog = item
+        #if DEBUG
+        extendedSilenceArmsForTesting += 1
+        #endif
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    /// Below this, re-arming would only schedule another immediate wake.
+    private static let extendedSilenceTolerance: TimeInterval = 0.005
+
+    private func cancelExtendedSilenceWatchdog() {
+        extendedSilenceWatchdog?.cancel()
+        extendedSilenceGeneration &+= 1
+        extendedSilenceWatchdog = nil
+        setExtendedSilence(false)
+    }
+
     /// Drop the oldest entries once the session exceeds its cap.
     ///
     /// A long session is a memory leak with a scrollbar. The terminal had the
@@ -2856,6 +2944,35 @@ final class AgentSession {
     /// Fire it now rather than waiting out `startupSilenceGrace`. A cancelled
     /// work item performs nothing, which is exactly the behaviour under test.
     func fireStartupWatchdogForTesting() { startupWatchdog?.perform() }
+
+    var hasExtendedSilenceWatchdogForTesting: Bool {
+        extendedSilenceWatchdog != nil
+    }
+
+    /// How many timers the silence watchdog has actually scheduled. A turn
+    /// that streams thousands of events must still cost one.
+    @ObservationIgnored private(set) var extendedSilenceArmsForTesting = 0
+
+    /// Fire the pending item with the idle window already spent. The watchdog
+    /// re-reads the clock, so a test that wants the warning has to move the
+    /// clock rather than only run the timer.
+    func fireExtendedSilenceWatchdogForTesting() {
+        lastProtocolActivity = Date()
+            .addingTimeInterval(-extendedSilenceThreshold)
+        extendedSilenceWatchdog?.perform()
+    }
+
+    /// Fire it as the timer would before the window ran out: the turn has
+    /// been quiet for less than the threshold, so this must not warn.
+    func fireExtendedSilenceWatchdogEarlyForTesting() {
+        extendedSilenceWatchdog?.perform()
+    }
+
+    func replaceThenFirePreviousExtendedSilenceWatchdogForTesting() {
+        let previous = extendedSilenceWatchdog
+        armExtendedSilenceWatchdog()
+        previous?.perform()
+    }
 
     /// Where the transcript's bottom marker actually sat the last time the
     /// view measured it, alongside the follow decision that measurement fed.

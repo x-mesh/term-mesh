@@ -19,17 +19,17 @@ term-mesh는 Unix socket으로 앱을 **완전히 구동**할 수 있다. window
 - **새 테스트는 반드시 `tests_v2/`에 작성한다.** v1에만 있는 영역(team/peer/shell/ime)을 v2로 옮길 때도 v2 클라이언트를 쓴다.
 - v2는 workspace/pane/surface를 **안정적인 UUID handle**로 다룬다. 단발 호출 외에 재사용되는 참조는 index가 아닌 handle을 보관한다.
 
-## 실행 — VM에서만
+## 실행 — 전용 mac-sub runner에서만
 
-호스트(`/Users/jinwoo/work/project/term-mesh`)에서 절대 실행하지 않는다. 러너가 `pkill term-mesh`로 **내 작업용 앱을 죽인다.** 러너는 VM 유저(`term-mesh`)에서만 동작하도록 `id -un` 가드가 걸려 있다.
+호스트(`/Users/jinwoo/work/project/term-mesh`)에서 절대 실행하지 않는다. 러너가 `pkill term-mesh`로 **내 작업용 앱을 죽인다.** Socket E2E의 기본 실행 머신은 `jinwoos-macbook-pro`이며 `mac-sub` SSH alias로 접근한다.
 
 ```bash
 # 전체 스위트 (빌드 → 매 테스트마다 launch → 3회 재시도 → cleanup)
-ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/run-tests-v2.sh'
-ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && ./scripts/run-tests-v1.sh'
+ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && ./scripts/run-tests-v2.sh'
+ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && ./scripts/run-tests-v1.sh'
 
-# 단일 테스트 (개발 중) — VM에서 앱을 socket 강제 모드로 띄운 뒤
-ssh term-mesh-vm 'cd /Users/jinwoo/term-mesh/GhosttyTabs && python3 tests_v2/test_trigger_flash.py'
+# 단일 테스트 (개발 중)
+ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && ./scripts/run-tests-v2.sh tests_v2/test_trigger_flash.py'
 ```
 
 러너는 launch 시 `socketControlMode full`(레거시 alias; `migrateMode`가 변환) + `TERMMESH_UI_TEST_MODE=1`(결정론적 startup)로 socket 접근을 강제하고, 신선한 workspace 하나로 부트스트랩한다. 단일 실행 시 socket을 켜려면 launch에 `--env TERMMESH_SOCKET_MODE=allowAll`를 준다. socket 경로는 `TERMMESH_SOCKET`/`TERMMESH_SOCKET_PATH`로 주입(레거시 `CMUX_*`도 허용되나 **새 코드에서 쓰지 않는다**).

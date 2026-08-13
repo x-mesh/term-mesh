@@ -15,6 +15,12 @@ import Foundation
 /// so no conflict to resolve — the whole class of problem a mirrored folder
 /// creates simply does not arise here.
 enum RemotePasteTransfer {
+    struct Destination: Equatable, Sendable {
+        let sshTarget: String
+        let port: Int?
+        let identityFile: String?
+    }
+
     /// Resolve a scratch directory that both the SSH login and the peer pane
     /// can see. A system service with `PrivateTmp=true` gets a private /tmp
     /// (and /var/tmp), so either of those silently produces a path that exists
@@ -35,7 +41,7 @@ enum RemotePasteTransfer {
     /// pane would be shipped away and pasted back as a path that exists only
     /// on the peer. A pane knows its own host, so ask the pane.
     @MainActor
-    static func destination(for context: GhosttySurfaceCallbackContext) -> String? {
+    static func destination(for context: GhosttySurfaceCallbackContext) -> Destination? {
         // Relay-window panes live outside every tabManager workspace, so the
         // panel lookup below cannot see them; their host is the window's own
         // connection. The debug single-pane relay window has no ssh target by
@@ -43,14 +49,28 @@ enum RemotePasteTransfer {
         // there is nowhere to send the bytes.
         if let window = context.surfaceView?.window {
             if let controller = window.windowController as? PeerRelayWorkspaceWindowController {
-                return controller.connectionInfo.sshTarget.flatMap { $0.isEmpty ? nil : $0 }
+                return destination(from: controller.connectionInfo)
             }
             if window.windowController is PeerRelayWindowController { return nil }
         }
 
-        guard let panel = terminalPanel(for: context) else { return nil }
-        guard let target = panel.remoteHostKey?.sshTarget, !target.isEmpty else { return nil }
-        return target
+        guard let tunnel = terminalPanel(for: context)?.peerPaneSession?.lease.tunnel,
+              !tunnel.sshTarget.isEmpty else { return nil }
+        return Destination(
+            sshTarget: tunnel.sshTarget,
+            port: tunnel.port,
+            identityFile: tunnel.identityFile
+        )
+    }
+
+    @MainActor
+    private static func destination(from info: PeerRelayConnectionInfo) -> Destination? {
+        guard let target = info.sshTarget, !target.isEmpty else { return nil }
+        return Destination(
+            sshTarget: target,
+            port: info.sshPort,
+            identityFile: info.identityFile
+        )
     }
 
     /// The panel that owns `context`'s surface, searched across every window.
@@ -89,9 +109,13 @@ enum RemotePasteTransfer {
     /// keeps its state alive until completed, and it runs off the main thread.
     /// A failed copy returns nil so the caller can fall back to pasting the
     /// original text rather than silently pasting nothing.
-    static func send(localPath: String, to sshTarget: String) -> String? {
-        guard validTarget(sshTarget) else {
-            RemoteWorkLog.infoOffMain("Paste not sent: refused the host name \(sshTarget)")
+    static func send(localPath: String, to destination: Destination) -> String? {
+        let sshTarget = destination.sshTarget
+        guard let directoryArguments = sshArguments(
+            to: destination,
+            command: remoteDirectoryCommand
+        ) else {
+            RemoteWorkLog.infoOffMain("Paste not sent: invalid SSH settings for \(sshTarget)")
             return nil
         }
         let name = uniqueName(for: localPath)
@@ -99,15 +123,14 @@ enum RemotePasteTransfer {
         let started = Date()
         RemoteWorkLog.debugOffMain("Sending \(label) (\(describeSize(of: localPath))) → \(sshTarget)")
 
-        guard let remoteDirectory = capture(
-            "/usr/bin/ssh", [sshTarget, remoteDirectoryCommand]
-        ), validRemoteDirectory(remoteDirectory) else {
+        guard let remoteDirectory = capture("/usr/bin/ssh", directoryArguments),
+              validRemoteDirectory(remoteDirectory) else {
             log("mkdir failed on \(sshTarget)")
             RemoteWorkLog.infoOffMain("Paste failed: could not create a shared cache on \(sshTarget)")
             return nil
         }
         let remotePath = "\(remoteDirectory)/\(name)"
-        guard sendFile(localPath, to: remotePath, on: sshTarget) else {
+        guard sendFile(localPath, to: remotePath, using: destination) else {
             log("stream failed \(localPath) -> \(sshTarget)")
             RemoteWorkLog.infoOffMain("Paste failed: could not copy \(label) to \(sshTarget)")
             return nil
@@ -167,16 +190,17 @@ enum RemotePasteTransfer {
     private static func sendFile(
         _ localPath: String,
         to remotePath: String,
-        on target: String
+        using destination: Destination
     ) -> Bool {
         guard let input = FileHandle(forReadingAtPath: localPath) else { return false }
         defer { try? input.close() }
+        guard let arguments = sshArguments(
+            to: destination,
+            command: serviceAccountCommand("umask 077; cat > \(shellQuote(remotePath))")
+        ) else { return false }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        process.arguments = [
-            target,
-            serviceAccountCommand("umask 077; cat > \(shellQuote(remotePath))")
-        ]
+        process.arguments = arguments
         process.standardInput = input
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -187,6 +211,26 @@ enum RemotePasteTransfer {
         } catch {
             return false
         }
+    }
+
+    /// Build one SSH argv for every phase of the transfer so cache creation
+    /// and byte streaming cannot disagree about port or identity.
+    static func sshArguments(to destination: Destination, command: String) -> [String]? {
+        guard validTarget(destination.sshTarget) else { return nil }
+        if let port = destination.port,
+           (try? PeerSSHTunnel.validatePort(port)) == nil { return nil }
+        if let identityFile = destination.identityFile,
+           (try? PeerSSHTunnel.validateIdentityFile(identityFile)) == nil { return nil }
+
+        var arguments: [String] = []
+        if let port = destination.port {
+            arguments += ["-p", String(port)]
+        }
+        if let identityFile = destination.identityFile {
+            arguments += ["-i", (identityFile as NSString).expandingTildeInPath]
+        }
+        arguments += ["--", destination.sshTarget, command]
+        return arguments
     }
 
     private static func capture(_ executable: String, _ arguments: [String]) -> String? {

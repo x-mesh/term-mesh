@@ -394,6 +394,9 @@ final class Workspace: Identifiable {
 
         // Set ourselves as delegate
         bonsplitController.delegate = self
+        bonsplitController.onExternalTabDrop = { [weak self] request in
+            self?.handleExternalTabDrop(request) ?? false
+        }
         configurePaneHeaderActions()
 
         // Ensure bonsplit has a focused pane and our didSelectTab handler runs for the
@@ -2463,6 +2466,152 @@ final class Workspace: Identifiable {
     }
 
     // MARK: - Remote peer panes (Phase 1 remote pane primitive)
+
+    /// Handle a tab dragged from another Bonsplit controller.
+    ///
+    /// A mirrored relay pane is a viewer of a host-owned surface. Dragging it
+    /// into a local workspace therefore creates another viewer; it must not
+    /// detach the mirror's panel or mutate the host-owned layout. The drop
+    /// delegate is synchronous, so accepting the drop schedules the attach and
+    /// placement while keeping the original relay pane in place.
+    private func handleExternalTabDrop(
+        _ request: BonsplitController.ExternalTabDropRequest
+    ) -> Bool {
+        guard !mirrorForwardsLocalActions,
+              let located = AppDelegate.shared?.locateBonsplitTab(
+                  tabId: request.tabId,
+                  sourcePaneId: request.sourcePaneId
+              ),
+              located.workspace !== self,
+              let sourcePanel = located.workspace.terminalPanel(for: located.panelId),
+              let sourceSession = sourcePanel.peerPaneSession
+        else { return false }
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let session = try await PeerPaneSession.attach(
+                    lease: sourceSession.lease,
+                    surface: sourceSession.originSurface,
+                    title: sourceSession.surfaceTitle,
+                    spec: sourceSession.originSpec
+                )
+                guard Self.finalizeExternalRemotePaneDrop(
+                    isDestinationWritable: !self.mirrorForwardsLocalActions,
+                    place: {
+                        self.placeExternalRemotePane(
+                            session: session,
+                            destination: request.destination
+                        )
+                    },
+                    teardown: { session.teardown() }
+                ) else {
+                    RemoteWorkLog.info("Remote pane drop failed because the destination changed.")
+                    return
+                }
+            } catch {
+                RemoteWorkLog.info(
+                    "Remote pane drop failed: \(error.localizedDescription)"
+                )
+            }
+        }
+        return true
+    }
+
+    /// Complete the synchronous half of an already-attached remote-pane drop.
+    /// The writable flag is captured after the async attach returns. Rejection
+    /// and placement failure both own exactly one teardown, while success
+    /// transfers session ownership to the newly bound panel.
+    static func finalizeExternalRemotePaneDrop(
+        isDestinationWritable: Bool,
+        place: () -> Bool,
+        teardown: () -> Void
+    ) -> Bool {
+        guard isDestinationWritable, place() else {
+            teardown()
+            return false
+        }
+        return true
+    }
+
+    /// Materialize an already-attached remote session at the exact Bonsplit
+    /// drop destination. Layout mutation completes before session binding on
+    /// the main actor after the network attach completes.
+    private func placeExternalRemotePane(
+        session: PeerPaneSession,
+        destination: BonsplitController.ExternalTabDropRequest.Destination
+    ) -> Bool {
+        guard let placement = materializeExternalRemotePane(
+            command: session.relayLaunchCommand,
+            environment: session.relayEnvironment,
+            destination: destination
+        )
+        else { return false }
+
+        bindRemotePane(session: session, to: placement.panel)
+        bonsplitController.focusPane(placement.finalPane)
+        bonsplitController.selectTab(placement.tabId)
+        focusPanel(placement.panel.id)
+        scheduleTerminalGeometryReconcile()
+        return true
+    }
+
+    struct ExternalRemotePanePlacement {
+        let panel: TerminalPanel
+        let tabId: TabID
+        let finalPane: PaneID
+    }
+
+    /// Create and place the terminal half of an external relay-pane drop.
+    /// Session binding stays in `placeExternalRemotePane`; keeping layout
+    /// mutation separate makes insert, split, and rollback behavior directly
+    /// verifiable without fabricating a network session.
+    func materializeExternalRemotePane(
+        command: String,
+        environment: [String: String],
+        destination: BonsplitController.ExternalTabDropRequest.Destination
+    ) -> ExternalRemotePanePlacement? {
+        let targetPane: PaneID
+        switch destination {
+        case .insert(let pane, _), .split(let pane, _, _):
+            targetPane = pane
+        }
+        guard bonsplitController.allPaneIds.contains(targetPane),
+              let panel = newRemoteTerminalTab(
+                  inPane: targetPane,
+                  command: command,
+                  environment: environment
+              ),
+              let tabId = surfaceIdFromPanelId(panel.id)
+        else { return nil }
+
+        let finalPane: PaneID
+        switch destination {
+        case .insert(_, let targetIndex):
+            if let targetIndex {
+                _ = bonsplitController.reorderTab(tabId, toIndex: targetIndex)
+            }
+            finalPane = targetPane
+
+        case .split(_, let orientation, let insertFirst):
+            guard let newPane = bonsplitController.splitPane(
+                targetPane,
+                orientation: orientation,
+                movingTab: tabId,
+                insertFirst: insertFirst
+            ) else {
+                discardPanelForRollback(panel.id)
+                return nil
+            }
+            finalPane = newPane
+        }
+
+        return ExternalRemotePanePlacement(
+            panel: panel,
+            tabId: tabId,
+            finalPane: finalPane
+        )
+    }
 
     /// Phase 2B live mirror: non-nil when this workspace mirrors a host
     /// workspace. The HOST owns the layout — local structural actions

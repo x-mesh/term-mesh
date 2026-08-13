@@ -19,6 +19,40 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(BRIDGE)
 
 
+class TurnTimeoutArgumentTests(unittest.TestCase):
+    def test_timeout_is_opt_in_and_must_be_positive_and_finite(self):
+        self.assertEqual(BRIDGE.positive_timeout("1.5"), 1.5)
+        for invalid in ("0", "-1", "nan", "inf", "1e300", "forever"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(Exception):
+                    BRIDGE.positive_timeout(invalid)
+
+
+class UnlimitedJsonRpcTests(unittest.TestCase):
+    def test_unlimited_pump_still_stops_when_the_child_exits(self):
+        class Child:
+            def __init__(self):
+                self.inbox = queue.Queue()
+                self.inbox.put({"__eof__": True})
+
+            @property
+            def alive(self):
+                return False
+
+            def exit_code(self):
+                return 7
+
+            def failure_message(self):
+                return "agent process exited with code 7"
+
+        rpc = BRIDGE.JsonRpc(Child(), BRIDGE.Emitter(None))
+        started = time.monotonic()
+
+        self.assertIsNone(rpc.pump(until_id=None, timeout=None))
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(rpc.failure, "agent process exited with code 7")
+
+
 class RemoteProcessLocationTests(unittest.TestCase):
     def remote_command(
         self,

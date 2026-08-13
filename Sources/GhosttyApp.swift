@@ -22,6 +22,30 @@ enum TerminalOpenURLTarget: Equatable {
     }
 }
 
+enum TerminalOpenURLContext: Equatable {
+    case standard
+    case peerRelay
+}
+
+/// Relay surfaces are local renderers for a workspace owned by another host.
+/// They have no local Workspace to receive an embedded browser panel, so never
+/// let their links enter the synchronous workspace/browser mutation path.
+func routeTerminalOpenURLTarget(
+    _ target: TerminalOpenURLTarget,
+    context: TerminalOpenURLContext
+) -> TerminalOpenURLTarget {
+    guard context == .peerRelay else { return target }
+    return .external(target.url)
+}
+
+func decodeGhosttyOpenURL(
+    _ pointer: UnsafePointer<CChar>?,
+    length: UInt
+) -> String? {
+    guard let pointer, let count = Int(exactly: length) else { return nil }
+    return String(data: Data(bytes: pointer, count: count), encoding: .utf8)
+}
+
 enum GhosttyDefaultBackgroundUpdateScope: Int {
     case unscoped = 0
     case app = 1
@@ -1522,27 +1546,49 @@ class GhosttyApp {
             return true
         case GHOSTTY_ACTION_OPEN_URL:
             let openUrl = action.action.open_url
-            guard let cstr = openUrl.url else { return false }
-            let urlString = String(cString: cstr)
-            guard let target = resolveTerminalOpenURLTarget(urlString) else { return false }
+            // ghostty_action_open_url_s is pointer + length, not a C string.
+            // Copy it while the synchronous Ghostty callback still owns the bytes.
+            guard let urlString = decodeGhosttyOpenURL(openUrl.url, length: openUrl.len),
+                  let resolvedTarget = resolveTerminalOpenURLTarget(urlString) else {
+                return false
+            }
+            let context: TerminalOpenURLContext = surfaceView.window is PeerRelayWorkspaceWindow
+                ? .peerRelay
+                : .standard
+            let target = routeTerminalOpenURLTarget(resolvedTarget, context: context)
+
+            // A relay surface has no local workspace in which to create an
+            // embedded browser. Return handled before leaving this callback so
+            // Ghostty does not run its fallback opener while holding the
+            // renderer mutex; the actual OS open happens asynchronously.
+            if context == .peerRelay {
+                let urlToOpen = target.url
+                #if DEBUG
+                dlog("relay.link.open external scheme=\(urlToOpen.scheme ?? "unknown")")
+                #endif
+                DispatchQueue.main.async {
+                    _ = NSWorkspace.shared.open(urlToOpen)
+                }
+                return true
+            }
             if !BrowserLinkOpenSettings.openTerminalLinksInTermMeshBrowser() {
                 let urlToOpen = target.url
-                DispatchQueue.main.async { NSWorkspace.shared.open(urlToOpen) }
+                DispatchQueue.main.async { _ = NSWorkspace.shared.open(urlToOpen) }
                 return true
             }
             switch target {
             case let .external(url):
-                DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+                DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
                 return true
             case let .embeddedBrowser(url):
                 guard let host = BrowserInsecureHTTPSettings.normalizeHost(url.host ?? "") else {
-                    DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+                    DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
                     return true
                 }
 
                 // If a host whitelist is configured and this host isn't in it, open externally.
                 if !BrowserLinkOpenSettings.hostMatchesWhitelist(host) {
-                    DispatchQueue.main.async { NSWorkspace.shared.open(url) }
+                    DispatchQueue.main.async { _ = NSWorkspace.shared.open(url) }
                     return true
                 }
                 guard let tabId = surfaceView.tabId,

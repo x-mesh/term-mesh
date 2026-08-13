@@ -504,19 +504,20 @@ struct UnifiedPaneDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
+        let operation = controller.pendingTabDropOperation
         // Guard against dropUpdated firing after performDrop/dropExited
         guard dropLifecycle == .hovering else {
 #if DEBUG
             dlog("pane.dropUpdated.skip pane=\(pane.id.id.uuidString.prefix(5)) reason=lifecycle_idle")
 #endif
-            return DropProposal(operation: .move)
+            return DropProposal(operation: operation)
         }
         let zone = effectiveZone(for: info)
         activeDropZone = zone
 #if DEBUG
         dlog("pane.dropUpdated pane=\(pane.id.id.uuidString.prefix(5)) zone=\(zone)")
 #endif
-        return DropProposal(operation: .move)
+        return DropProposal(operation: operation)
     }
 
     func validateDrop(info: DropInfo) -> Bool {
