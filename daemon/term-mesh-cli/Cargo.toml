@@ -1,6 +1,6 @@
 [package]
 name = "term-mesh-cli"
-version = "0.185.2"
+version = "0.186.0"
 edition = "2021"
 description = "term-mesh CLI — PTY wrapper for AI agents"
 
