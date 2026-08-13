@@ -717,6 +717,36 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertEqual(refreshCount, 1)
     }
 
+    /// A consumer can attach after the generation counter advances but before
+    /// that transport restart finishes. Reporting its failure with the current
+    /// generation must join the in-flight restart, not start another one.
+    @MainActor
+    func test_transportRecovery_currentGenerationJoinsInFlightRefresh() async {
+        let recovery = PeerPaneTransportRecovery()
+        var refreshCount = 0
+        var releaseRefresh: CheckedContinuation<Void, Never>?
+
+        let firstTask = Task { @MainActor in
+            await recovery.refresh(after: 0) {
+                refreshCount += 1
+                await withCheckedContinuation { releaseRefresh = $0 }
+            }
+        }
+        while releaseRefresh == nil { await Task.yield() }
+
+        let observedGeneration = recovery.generation
+        let siblingTask = Task { @MainActor in
+            await recovery.refresh(after: observedGeneration) { refreshCount += 100 }
+        }
+        await Task.yield()
+        XCTAssertEqual(refreshCount, 1)
+
+        releaseRefresh?.resume()
+        let generations = await [firstTask.value, siblingTask.value]
+        XCTAssertEqual(generations, [1, 1])
+        XCTAssertEqual(refreshCount, 1)
+    }
+
     /// Reattach-on-reconnect is for panes a person chose to disconnect. An
     /// accidental transport loss has recovery of its own, and reattaching it
     /// here too would rebuild the pane twice for one failure.

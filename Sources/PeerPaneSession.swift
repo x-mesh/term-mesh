@@ -183,17 +183,22 @@ final class PeerPaneTransportRecovery {
         after observedGeneration: UInt64,
         action: @escaping @MainActor () async -> Void
     ) async -> UInt64 {
+        if let inFlight = refresh {
+            await inFlight.task.value
+            return inFlight.generation
+        }
         if observedGeneration >= generation {
             generation &+= 1
             let nextGeneration = generation
             let task = Task { await action() }
             refresh = (nextGeneration, task)
+            await task.value
+            if refresh?.generation == nextGeneration {
+                refresh = nil
+            }
+            return nextGeneration
         }
-        let targetGeneration = generation
-        if let refresh, refresh.generation >= targetGeneration {
-            await refresh.task.value
-        }
-        return targetGeneration
+        return generation
     }
 }
 
