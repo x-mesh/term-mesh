@@ -2482,40 +2482,209 @@ final class Workspace: Identifiable {
                   tabId: request.tabId,
                   sourcePaneId: request.sourcePaneId
               ),
-              located.workspace !== self,
-              let sourcePanel = located.workspace.terminalPanel(for: located.panelId),
-              let sourceSession = sourcePanel.peerPaneSession
+              let sourcePanel = located.workspace.panels[located.panelId]
         else { return false }
 
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let session = try await PeerPaneSession.attach(
-                    lease: sourceSession.lease,
-                    surface: sourceSession.originSurface,
-                    title: sourceSession.surfaceTitle,
-                    spec: sourceSession.originSpec
-                )
-                guard Self.finalizeExternalRemotePaneDrop(
-                    isDestinationWritable: !self.mirrorForwardsLocalActions,
-                    place: {
-                        self.placeExternalRemotePane(
-                            session: session,
-                            destination: request.destination
-                        )
-                    },
-                    teardown: { session.teardown() }
-                ) else {
-                    RemoteWorkLog.info("Remote pane drop failed because the destination changed.")
-                    return
-                }
-            } catch {
-                RemoteWorkLog.info(
-                    "Remote pane drop failed: \(error.localizedDescription)"
-                )
-            }
+        // A local drag can arrive here even when its source and destination
+        // use the same Bonsplit controller. The mouse-up monitor intentionally
+        // clears the in-memory drag state; if that cleanup wins the race with
+        // performDrop, Bonsplit recovers from the encoded transfer payload and
+        // calls this external-drop hook. Treat that as the original local move
+        // instead of rejecting it and leaving the user with only drop feedback.
+        if located.workspace === self {
+            return recoverLocalPanelDrop(
+                panelId: located.panelId,
+                destination: request.destination
+            )
         }
-        return true
+
+        // Relay terminals are viewers of a host-owned surface. Preserve the
+        // original viewer and attach another one at the destination.
+        if let sourcePanel = sourcePanel as? TerminalPanel,
+           let sourceSession = sourcePanel.peerPaneSession {
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let session = try await PeerPaneSession.attach(
+                        lease: sourceSession.lease,
+                        surface: sourceSession.originSurface,
+                        title: sourceSession.surfaceTitle,
+                        spec: sourceSession.originSpec
+                    )
+                    guard Self.finalizeExternalRemotePaneDrop(
+                        isDestinationWritable: !self.mirrorForwardsLocalActions,
+                        place: {
+                            self.placeExternalRemotePane(
+                                session: session,
+                                destination: request.destination
+                            )
+                        },
+                        teardown: { session.teardown() }
+                    ) else {
+                        RemoteWorkLog.info("Remote pane drop failed because the destination changed.")
+                        return
+                    }
+                } catch {
+                    RemoteWorkLog.info(
+                        "Remote pane drop failed: \(error.localizedDescription)"
+                    )
+                }
+            }
+            return true
+        }
+
+        // A normal tab-strip drag transfers the existing panel. Use the same
+        // detach/attach ownership path as the socket surface.move command so
+        // the terminal/browser/agent object and its live process survive.
+        return moveExternalLocalPanel(
+            from: located.workspace,
+            panelId: located.panelId,
+            destination: request.destination
+        )
+    }
+
+    private func recoverLocalPanelDrop(
+        panelId: UUID,
+        destination: BonsplitController.ExternalTabDropRequest.Destination
+    ) -> Bool {
+        guard !mirrorForwardsLocalActions,
+              panels[panelId] != nil,
+              let tabId = surfaceIdFromPanelId(panelId)
+        else { return false }
+
+        switch destination {
+        case .insert(let targetPane, let targetIndex):
+            // A center drop back onto the source pane is the same no-op as
+            // UnifiedPaneDropDelegate's normal in-memory path. In particular,
+            // do not reinterpret nil as "move this tab to the end".
+            if paneId(forPanelId: panelId) == targetPane, targetIndex == nil {
+                return true
+            }
+            guard moveSurface(
+                panelId: panelId,
+                toPane: targetPane,
+                atIndex: targetIndex,
+                focus: true
+            ) else { return false }
+            return true
+
+        case .split(let targetPane, let orientation, let insertFirst):
+            guard bonsplitController.configuration.allowSplits,
+                  bonsplitController.allPaneIds.contains(targetPane),
+                  let newPane = bonsplitController.splitPane(
+                      targetPane,
+                      orientation: orientation,
+                      movingTab: tabId,
+                      insertFirst: insertFirst
+                  )
+            else { return false }
+
+            bonsplitController.focusPane(newPane)
+            bonsplitController.selectTab(tabId)
+            focusPanel(panelId)
+            scheduleTerminalGeometryReconcile()
+            return true
+        }
+    }
+
+    private func moveExternalLocalPanel(
+        from sourceWorkspace: Workspace,
+        panelId: UUID,
+        destination: BonsplitController.ExternalTabDropRequest.Destination
+    ) -> Bool {
+        guard sourceWorkspace !== self,
+              !sourceWorkspace.mirrorForwardsLocalActions,
+              sourceWorkspace.panels[panelId] != nil,
+              panels[panelId] == nil,
+              let sourcePane = sourceWorkspace.paneId(forPanelId: panelId)
+        else { return false }
+
+        let sourceIndex = sourceWorkspace.indexInPane(forPanelId: panelId)
+        let targetPane: PaneID
+        switch destination {
+        case .insert(let pane, _):
+            targetPane = pane
+        case .split(let pane, _, _):
+            guard bonsplitController.configuration.allowSplits else { return false }
+            targetPane = pane
+        }
+        guard bonsplitController.allPaneIds.contains(targetPane),
+              let transfer = sourceWorkspace.detachSurface(panelId: panelId)
+        else { return false }
+
+        let restoreToSource: (DetachedSurfaceTransfer) -> Bool = { detached in
+            let rollbackPane = sourceWorkspace.bonsplitController.allPaneIds.contains(sourcePane)
+                ? sourcePane
+                : sourceWorkspace.bonsplitController.focusedPaneId
+                    ?? sourceWorkspace.bonsplitController.allPaneIds.first
+            guard let rollbackPane else { return false }
+            return sourceWorkspace.attachDetachedSurface(
+                detached,
+                inPane: rollbackPane,
+                atIndex: sourceIndex,
+                focus: true
+            ) != nil
+        }
+
+        switch destination {
+        case .insert(_, let targetIndex):
+            guard attachDetachedSurface(
+                transfer,
+                inPane: targetPane,
+                atIndex: targetIndex,
+                focus: true
+            ) != nil else {
+                _ = restoreToSource(transfer)
+                return false
+            }
+            return true
+
+        case .split(_, let orientation, let insertFirst):
+            guard attachDetachedSurface(
+                transfer,
+                inPane: targetPane,
+                focus: false
+            ) != nil else {
+                _ = restoreToSource(transfer)
+                return false
+            }
+            guard let movedTabId = surfaceIdFromPanelId(panelId),
+                  let newPane = bonsplitController.splitPane(
+                      targetPane,
+                      orientation: orientation,
+                      movingTab: movedTabId,
+                      insertFirst: insertFirst
+                  )
+            else {
+                // Split refusal must not strand the live panel in a partially
+                // applied destination. Detach it again and restore its source
+                // position. If detaching unexpectedly fails, the panel remains
+                // safely visible in this workspace and the drop is accepted.
+                guard let rollbackTransfer = detachSurface(panelId: panelId) else {
+                    focusPanel(panelId)
+                    return true
+                }
+                if restoreToSource(rollbackTransfer) {
+                    return false
+                }
+                // Last-resort visibility recovery: keep the live panel in the
+                // destination instead of leaving the transfer unowned.
+                if attachDetachedSurface(
+                    rollbackTransfer,
+                    inPane: targetPane,
+                    focus: true
+                ) != nil {
+                    return true
+                }
+                return false
+            }
+
+            bonsplitController.focusPane(newPane)
+            bonsplitController.selectTab(movedTabId)
+            focusPanel(panelId)
+            scheduleTerminalGeometryReconcile()
+            return true
+        }
     }
 
     /// Complete the synchronous half of an already-attached remote-pane drop.

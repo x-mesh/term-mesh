@@ -113,11 +113,22 @@ struct TabTransferData: Codable, Transferable {
     let tab: TabItem
     let sourcePaneId: UUID
     let sourceProcessId: Int32
+    /// `true` for host-exported representations that materialize another
+    /// viewer, `false` for a tab-strip drag that transfers the existing tab.
+    /// Keeping this in the payload lets a different Bonsplit controller show
+    /// the correct copy/move cursor before the host handles the drop.
+    let copiesSource: Bool
 
-    init(tab: TabItem, sourcePaneId: UUID, sourceProcessId: Int32 = Int32(ProcessInfo.processInfo.processIdentifier)) {
+    init(
+        tab: TabItem,
+        sourcePaneId: UUID,
+        sourceProcessId: Int32 = Int32(ProcessInfo.processInfo.processIdentifier),
+        copiesSource: Bool = false
+    ) {
         self.tab = tab
         self.sourcePaneId = sourcePaneId
         self.sourceProcessId = sourceProcessId
+        self.copiesSource = copiesSource
     }
 
     var isFromCurrentProcess: Bool {
@@ -128,6 +139,7 @@ struct TabTransferData: Codable, Transferable {
         case tab
         case sourcePaneId
         case sourceProcessId
+        case copiesSource
     }
 
     init(from decoder: Decoder) throws {
@@ -136,6 +148,9 @@ struct TabTransferData: Codable, Transferable {
         self.sourcePaneId = try container.decode(UUID.self, forKey: .sourcePaneId)
         // Legacy payloads won't include this field. Treat as foreign process to reject cross-instance drops.
         self.sourceProcessId = try container.decodeIfPresent(Int32.self, forKey: .sourceProcessId) ?? -1
+        // Legacy tab-strip payloads were moves. Host-exported copy payloads are
+        // same-version and always carry this field.
+        self.copiesSource = try container.decodeIfPresent(Bool.self, forKey: .copiesSource) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -143,6 +158,7 @@ struct TabTransferData: Codable, Transferable {
         try container.encode(tab, forKey: .tab)
         try container.encode(sourcePaneId, forKey: .sourcePaneId)
         try container.encode(sourceProcessId, forKey: .sourceProcessId)
+        try container.encode(copiesSource, forKey: .copiesSource)
     }
 
     static var transferRepresentation: some TransferRepresentation {

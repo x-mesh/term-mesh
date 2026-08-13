@@ -431,10 +431,11 @@ struct UnifiedPaneDropDelegate: DropDelegate {
                 destination: destination
             )
             let handled = bonsplitController.onExternalTabDrop?(request) ?? false
-            if handled {
-                dropLifecycle = .idle
-                activeDropZone = nil
-            }
+            // Mouse-up ends this target's visual lifecycle even when the host
+            // rejects the payload. Otherwise a rejected external drop leaves
+            // the pane covered by the blue drop overlay indefinitely.
+            dropLifecycle = .idle
+            activeDropZone = nil
             return handled
         }
 
@@ -504,7 +505,7 @@ struct UnifiedPaneDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        let operation = controller.pendingTabDropOperation
+        let operation = controller.pendingTabDropOperation(for: decodeTransfer(from: info))
         // Guard against dropUpdated firing after performDrop/dropExited
         guard dropLifecycle == .hovering else {
 #if DEBUG

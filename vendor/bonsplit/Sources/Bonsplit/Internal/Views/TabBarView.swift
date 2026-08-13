@@ -908,10 +908,11 @@ struct TabDropDelegate: DropDelegate {
                 destination: .insert(targetPane: pane.id, targetIndex: targetIndex)
             )
             let handled = bonsplitController.onExternalTabDrop?(request) ?? false
-            if handled {
-                dropLifecycle = .idle
-                dropTargetIndex = nil
-            }
+            // Mouse-up ends this target's visual lifecycle even when the host
+            // rejects the payload. Otherwise a rejected external drop leaves
+            // a stale insertion indicator behind.
+            dropLifecycle = .idle
+            dropTargetIndex = nil
             return handled
         }
 
@@ -980,7 +981,7 @@ struct TabDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        let operation = controller.pendingTabDropOperation
+        let operation = controller.pendingTabDropOperation(for: decodeTransfer(from: info))
         // Guard against dropUpdated firing after performDrop/dropExited
         // This is the key fix for the lingering indicator bug
         guard dropLifecycle == .hovering else {
