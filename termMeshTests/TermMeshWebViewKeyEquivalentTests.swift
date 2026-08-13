@@ -904,6 +904,50 @@ final class AppDelegateWindowContextRoutingTests: XCTestCase {
         XCTAssertEqual(Set(rollbackWorkspace.panels.keys), originalPanelIds)
     }
 
+    func testExternalRemotePaneFinalizeRevalidatesDestinationAndOwnsTeardown() {
+        var placementCount = 0
+        var teardownCount = 0
+
+        XCTAssertFalse(
+            Workspace.finalizeExternalRemotePaneDrop(
+                isDestinationWritable: false,
+                place: {
+                    placementCount += 1
+                    return true
+                },
+                teardown: { teardownCount += 1 }
+            )
+        )
+        XCTAssertEqual(placementCount, 0, "Mirror mode must reject before layout mutation")
+        XCTAssertEqual(teardownCount, 1, "A rejected attached session must be torn down once")
+
+        XCTAssertTrue(
+            Workspace.finalizeExternalRemotePaneDrop(
+                isDestinationWritable: true,
+                place: {
+                    placementCount += 1
+                    return true
+                },
+                teardown: { teardownCount += 1 }
+            )
+        )
+        XCTAssertEqual(placementCount, 1)
+        XCTAssertEqual(teardownCount, 1, "Successful placement transfers session ownership")
+
+        XCTAssertFalse(
+            Workspace.finalizeExternalRemotePaneDrop(
+                isDestinationWritable: true,
+                place: {
+                    placementCount += 1
+                    return false
+                },
+                teardown: { teardownCount += 1 }
+            )
+        )
+        XCTAssertEqual(placementCount, 2)
+        XCTAssertEqual(teardownCount, 2, "Placement failure must tear down once")
+    }
+
     func testSynchronizeActiveMainWindowContextPrefersProvidedWindowOverStaleActiveManager() {
         _ = NSApplication.shared
         let app = AppDelegate()

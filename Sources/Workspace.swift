@@ -2496,11 +2496,16 @@ final class Workspace: Identifiable {
                     title: sourceSession.surfaceTitle,
                     spec: sourceSession.originSpec
                 )
-                guard self.placeExternalRemotePane(
-                    session: session,
-                    destination: request.destination
+                guard Self.finalizeExternalRemotePaneDrop(
+                    isDestinationWritable: !self.mirrorForwardsLocalActions,
+                    place: {
+                        self.placeExternalRemotePane(
+                            session: session,
+                            destination: request.destination
+                        )
+                    },
+                    teardown: { session.teardown() }
                 ) else {
-                    session.teardown()
                     RemoteWorkLog.info("Remote pane drop failed because the destination changed.")
                     return
                 }
@@ -2513,6 +2518,22 @@ final class Workspace: Identifiable {
         return true
     }
 
+    /// Complete the synchronous half of an already-attached remote-pane drop.
+    /// The writable flag is captured after the async attach returns. Rejection
+    /// and placement failure both own exactly one teardown, while success
+    /// transfers session ownership to the newly bound panel.
+    static func finalizeExternalRemotePaneDrop(
+        isDestinationWritable: Bool,
+        place: () -> Bool,
+        teardown: () -> Void
+    ) -> Bool {
+        guard isDestinationWritable, place() else {
+            teardown()
+            return false
+        }
+        return true
+    }
+
     /// Materialize an already-attached remote session at the exact Bonsplit
     /// drop destination. Layout mutation completes before session binding on
     /// the main actor after the network attach completes.
@@ -2520,15 +2541,11 @@ final class Workspace: Identifiable {
         session: PeerPaneSession,
         destination: BonsplitController.ExternalTabDropRequest.Destination
     ) -> Bool {
-        // The attach above crosses an async boundary. A workspace can become
-        // a live mirror while it is suspended; in that mode the reconciler is
-        // the only layout writer, so revalidate immediately before mutation.
-        guard !mirrorForwardsLocalActions,
-              let placement = materializeExternalRemotePane(
-                  command: session.relayLaunchCommand,
-                  environment: session.relayEnvironment,
-                  destination: destination
-              )
+        guard let placement = materializeExternalRemotePane(
+            command: session.relayLaunchCommand,
+            environment: session.relayEnvironment,
+            destination: destination
+        )
         else { return false }
 
         bindRemotePane(session: session, to: placement.panel)
@@ -2583,7 +2600,7 @@ final class Workspace: Identifiable {
                 movingTab: tabId,
                 insertFirst: insertFirst
             ) else {
-                _ = closePanel(panel.id, force: true)
+                discardPanelForRollback(panel.id)
                 return nil
             }
             finalPane = newPane
