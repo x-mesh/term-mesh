@@ -1236,6 +1236,88 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(text.contains("no output from"), text)
     }
 
+    // MARK: - A running turn that stays quiet is warned, never killed
+
+    func testExtendedProtocolSilenceWarnsWithoutCompletingTheTurn() throws {
+        var completions = 0
+        let s = AgentSession(extendedSilenceThreshold: 0.01)
+        s.onTurnEnd = { _, _, _ in completions += 1 }
+        s.startRemote(cli: "codex") { _ in }
+        try s.send("run the long build", from: .person)
+
+        XCTAssertTrue(s.hasExtendedSilenceWatchdogForTesting)
+        s.fireExtendedSilenceWatchdogForTesting()
+
+        XCTAssertTrue(s.hasExtendedSilence)
+        XCTAssertTrue(s.isThinking)
+        XCTAssertTrue(s.isRunning)
+        XCTAssertEqual(completions, 0, "silence is not a completion or failure")
+        s.stop()
+    }
+
+    func testProtocolActivityClearsAndRearmsExtendedSilenceWarning() throws {
+        let s = AgentSession(extendedSilenceThreshold: 60)
+        s.startRemote(cli: "codex") { _ in }
+        try s.send("keep working", from: .person)
+        s.fireExtendedSilenceWatchdogForTesting()
+        XCTAssertTrue(s.hasExtendedSilence)
+
+        s.ingestForTesting(event([
+            "type": "assistant",
+            "message": ["content": [["type": "text", "text": "progress"]]],
+        ]))
+
+        XCTAssertFalse(s.hasExtendedSilence)
+        XCTAssertTrue(s.hasExtendedSilenceWatchdogForTesting)
+        s.stop()
+    }
+
+    func testReplacedExtendedSilenceWatchdogCannotFireEarly() throws {
+        let s = AgentSession(extendedSilenceThreshold: 60)
+        s.startRemote(cli: "codex") { _ in }
+        try s.send("keep working", from: .person)
+
+        s.replaceThenFirePreviousExtendedSilenceWatchdogForTesting()
+
+        XCTAssertFalse(s.hasExtendedSilence)
+        XCTAssertTrue(s.hasExtendedSilenceWatchdogForTesting)
+        s.stop()
+    }
+
+    func testRawDiagnosticDoesNotPretendTheTurnMadeProtocolProgress() throws {
+        let s = AgentSession(extendedSilenceThreshold: 60)
+        s.startRemote(cli: "codex") { _ in }
+        try s.send("keep working", from: .person)
+        s.fireExtendedSilenceWatchdogForTesting()
+        XCTAssertTrue(s.hasExtendedSilence)
+
+        s.ingestForTesting("[bridge] unrelated diagnostic")
+
+        XCTAssertTrue(s.hasExtendedSilence)
+        XCTAssertFalse(s.hasExtendedSilenceWatchdogForTesting)
+        s.stop()
+    }
+
+    func testResultAndStopClearExtendedSilenceState() throws {
+        let resultSession = AgentSession(extendedSilenceThreshold: 60)
+        resultSession.startRemote(cli: "codex") { _ in }
+        try resultSession.send("finish", from: .person)
+        resultSession.fireExtendedSilenceWatchdogForTesting()
+        resultSession.ingestForTesting(event([
+            "type": "result", "stop_reason": "end_turn", "result": "done",
+        ]))
+        XCTAssertFalse(resultSession.hasExtendedSilence)
+        XCTAssertFalse(resultSession.hasExtendedSilenceWatchdogForTesting)
+
+        let stoppedSession = AgentSession(extendedSilenceThreshold: 60)
+        stoppedSession.startRemote(cli: "codex") { _ in }
+        try stoppedSession.send("keep working", from: .person)
+        stoppedSession.fireExtendedSilenceWatchdogForTesting()
+        stoppedSession.stop()
+        XCTAssertFalse(stoppedSession.hasExtendedSilence)
+        XCTAssertFalse(stoppedSession.hasExtendedSilenceWatchdogForTesting)
+    }
+
     /// A PEM key spans lines, and a line-bounded pattern took only its header
     /// — the one part an attacker can retype. The body has to go with it.
     func testVisibleTranscriptRemovesMultiLinePrivateKeyBodies() {
