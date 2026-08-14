@@ -76,22 +76,33 @@ summary of fork deltas. Trust the diff against `upstream/main` over either.
 - Upstreamable: yes, in principle — it adds an export and changes no behavior
   for anyone who does not call it.
 
-### 4) Bound subprocess teardown for SIGHUP-resistant children
+### 4) Bound POSIX fork/exec subprocess teardown
 
-- Commit: `c495aadb2` (fix(termio): bound subprocess teardown)
+- Commits:
+  - `c495aadb2` (fix(termio): bound subprocess teardown)
+  - `3f755ee80` (fix(termio): harden bounded subprocess teardown)
 - Files:
   - `src/termio/Exec.zig`
 - Summary:
-  - Keeps the existing graceful process-group shutdown, but escalates from
-    repeated `SIGHUP` to `SIGKILL` after approximately one second.
-  - Prevents `ghostty_surface_free` from waiting forever on the terminal IO
-    thread when a pane command ignores `SIGHUP`. In an embedded app that
-    synchronous wait otherwise blocks the host's main thread and makes every
-    window and control socket unresponsive.
-  - Adds a regression test with a child process that explicitly ignores
-    `SIGHUP` and verifies that teardown escalates and reaps it.
-- Upstreamable: yes — the change bounds an existing synchronous cleanup path
-  without changing normal graceful-exit behavior.
+  - Gives the child process group a bounded `SIGHUP` grace period, then sends
+    `SIGKILL` once and observes it for a separately bounded force period.
+  - Never sends a group signal to the embedding app's own process group. If
+    child pre-exec setup fails it exits immediately; if group discovery still
+    does not produce the expected `pgid == pid`, cleanup uses a bounded direct
+    child fallback.
+  - Continues checking same-group descendants after the direct child is
+    signaled, while preserving the direct child's wait status through the grace
+    period so its PID cannot be reused as an unrelated process-group ID before
+    `SIGKILL`. If the force deadline expires, cleanup logs the residual process
+    group and returns instead of keeping synchronous surface teardown blocked.
+    Descendants that move into another process group remain out of scope.
+  - A `SIGHUP` cleanup handler that exceeds the grace period may be interrupted
+    by `SIGKILL`; this is the intentional tradeoff for a bounded UI teardown.
+  - Regression tests observe real `SIGHUP` delivery before escalation, cover a
+    same-group descendant outliving its parent, verify bounded own-PGID
+    discovery/direct fallback, and confirm direct-child reaping.
+- Upstreamable: yes, subject to agreement on the grace/force deadlines and the
+  intentional residual-process tradeoff.
 
 ## Merge conflict notes
 
@@ -105,7 +116,8 @@ These files change frequently upstream; be careful when rebasing the fork:
   - OSC dispatch logic moves often. Re-check the integration points for the OSC 99 parser.
 
 - `src/termio/Exec.zig`
-  - Preserve the bounded `SIGHUP` grace period and escalation when upstream
-    changes subprocess/process-group cleanup.
+  - Preserve bounded group discovery, `SIGHUP` grace, one-shot `SIGKILL`
+    escalation, force-period observation, and the own-PGID safety fallback
+    when upstream changes subprocess/process-group cleanup.
 
 If you resolve a conflict, update this doc with what changed.
