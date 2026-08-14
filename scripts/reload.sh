@@ -501,29 +501,26 @@ if [[ "$MANAGED_DERIVED" -eq 1 && -e "$DERIVED_DATA" ]]; then
 fi
 trap cleanup_failed_build EXIT
 
-# Gate the build on ghostty ABI consistency. reload.sh never runs setup.sh, so
-# nothing else re-links GhosttyKit.xcframework after a submodule move: the
-# symlink can still point at an older build while the root ghostty.h Swift
-# compiles against has already advanced. That combination builds cleanly and
-# crashes in ghostty_surface_new seconds after launch (2026-08-04), so check it
-# here and repair via setup.sh rather than shipping a poisoned binary.
+# Gate the build on both the GhosttyKit implementation SHA and C ABI. A header
+# comparison catches layout drift, while the SHA checks also catch code-only
+# ghostty changes such as the bounded teardown fix omitted from v0.186.2.
 RELOAD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RELOAD_PROJECT_DIR="$(dirname "$RELOAD_SCRIPT_DIR")"
 # shellcheck source=lib/ghostty-abi.sh
 . "$RELOAD_SCRIPT_DIR/lib/ghostty-abi.sh"
 # shellcheck source=lib/cargo.sh
 . "$RELOAD_SCRIPT_DIR/lib/cargo.sh"
-if ! ghostty_abi_is_consistent "$RELOAD_PROJECT_DIR"; then
-  echo "==> ghostty ABI mismatch detected before build:"
-  ghostty_abi_report "$RELOAD_PROJECT_DIR"
+if ! ghostty_kit_is_consistent "$RELOAD_PROJECT_DIR"; then
+  echo "==> stale or inconsistent GhosttyKit detected before build:"
+  ghostty_kit_report "$RELOAD_PROJECT_DIR"
   echo "==> Repairing via ./scripts/setup.sh ..."
   "$RELOAD_SCRIPT_DIR/setup.sh"
-  if ! ghostty_abi_is_consistent "$RELOAD_PROJECT_DIR"; then
-    echo "error: ghostty ABI still inconsistent after setup.sh; refusing to build" >&2
-    ghostty_abi_report "$RELOAD_PROJECT_DIR"
+  if ! ghostty_kit_is_consistent "$RELOAD_PROJECT_DIR"; then
+    echo "error: GhosttyKit still inconsistent after setup.sh; refusing to build" >&2
+    ghostty_kit_report "$RELOAD_PROJECT_DIR"
     exit 1
   fi
-  echo "==> ghostty ABI repaired; continuing build"
+  echo "==> GhosttyKit repaired; continuing build"
 fi
 
 XCODEBUILD_ARGS=(

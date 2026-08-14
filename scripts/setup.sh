@@ -231,14 +231,14 @@ fi
 echo "==> Creating symlink for GhosttyKit.xcframework..."
 ln -sfn "$CACHE_XCFRAMEWORK" GhosttyKit.xcframework
 
-# Final ABI assert: the declarations Swift compiles must match the archive it
-# links. True by construction above, so a failure here means a future edit
-# broke the invariant — catch it now instead of in a runtime segfault.
+# Final implementation + ABI assert. This verifies not only the declarations
+# Swift compiles, but also that the linked archive was built from this exact
+# ghostty commit.
 # shellcheck source=lib/ghostty-abi.sh
 . "$SCRIPT_DIR/lib/ghostty-abi.sh"
-if ! ghostty_abi_is_consistent "$PROJECT_DIR"; then
-    echo "ERROR: ghostty ABI check failed after setup." >&2
-    ghostty_abi_report "$PROJECT_DIR"
+if ! ghostty_kit_is_consistent "$PROJECT_DIR"; then
+    echo "ERROR: GhosttyKit check failed after setup." >&2
+    ghostty_kit_report "$PROJECT_DIR"
     exit 1
 fi
 
