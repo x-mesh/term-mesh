@@ -4,6 +4,16 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.186.2] - 2026-08-14
+
+### Fixed
+
+- **종료되지 않는 pane 때문에 term-mesh 전체가 응답하지 않던 문제** ([#267](https://github.com/x-mesh/term-mesh/pull/267)) — pane 안의 프로세스가 `SIGHUP`을 무시하면 terminal surface 정리가 끝없이 기다리면서 모든 창과 control socket까지 멈출 수 있었다. 이제 정상 종료 시간을 먼저 보장한 뒤에도 남은 프로세스만 제한된 시간 안에 정리하므로, 문제 있는 pane을 닫아도 앱이 계속 응답한다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.186.1] - 2026-08-13
 
 ### Fixed
