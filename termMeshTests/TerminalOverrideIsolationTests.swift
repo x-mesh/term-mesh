@@ -159,6 +159,12 @@ final class TerminalOverrideIsolationTests: XCTestCase {
         XCTAssertTrue(lines.contains("unfocused-split-opacity = 1.00"), "got \(lines)")
     }
 
+    func test_configLines_setSplitDividerColorIsWritten() throws {
+        defaults.set("#5A6370", forKey: TerminalSettingsOverride.splitDividerColorKey)
+        let lines = try XCTUnwrap(TerminalSettingsOverride.configLines(defaults: defaults, mode: .dark))
+        XCTAssertTrue(lines.contains("split-divider-color = #5A6370"), "got \(lines)")
+    }
+
     /// `-1` is the sentinel @AppStorage declares as its default for this key,
     /// so a domain carrying it explicitly means "not set" just as absence does.
     func test_configLines_negativeSentinelProducesNoLine() {

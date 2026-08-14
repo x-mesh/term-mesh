@@ -273,13 +273,29 @@ final class Workspace: Identifiable {
     }
 
     static func bonsplitAppearance(from config: GhosttyConfig) -> BonsplitConfiguration.Appearance {
-        bonsplitAppearance(from: config.backgroundColor)
+        let chromeColors = resolvedChromeColors(from: config)
+        return BonsplitConfiguration.Appearance(
+            splitButtonTooltips: Self.currentSplitButtonTooltips(),
+            enableAnimations: false,
+            chromeColors: chromeColors
+        )
+    }
+
+    nonisolated static func resolvedChromeColors(
+        from config: GhosttyConfig
+    ) -> BonsplitConfiguration.Appearance.ChromeColors {
+        .init(
+            backgroundHex: config.backgroundColor.hexString(),
+            borderHex: config.splitDividerColor?.hexString()
+        )
     }
 
     nonisolated static func resolvedChromeColors(
         from backgroundColor: NSColor
     ) -> BonsplitConfiguration.Appearance.ChromeColors {
-        .init(backgroundHex: backgroundColor.hexString())
+        var config = GhosttyConfig()
+        config.backgroundColor = backgroundColor
+        return resolvedChromeColors(from: config)
     }
 
     static func bonsplitAppearance(from backgroundColor: NSColor) -> BonsplitConfiguration.Appearance {
@@ -292,12 +308,18 @@ final class Workspace: Identifiable {
     }
 
     func applyGhosttyChrome(from config: GhosttyConfig, reason: String = "unspecified") {
-        applyGhosttyChrome(backgroundColor: config.backgroundColor, reason: reason)
+        applyGhosttyChrome(colors: Self.resolvedChromeColors(from: config), reason: reason)
     }
 
     func applyGhosttyChrome(backgroundColor: NSColor, reason: String = "unspecified") {
+        applyGhosttyChrome(colors: Self.resolvedChromeColors(from: backgroundColor), reason: reason)
+    }
+
+    private func applyGhosttyChrome(
+        colors nextChromeColors: BonsplitConfiguration.Appearance.ChromeColors,
+        reason: String
+    ) {
         let currentChromeColors = bonsplitController.configuration.appearance.chromeColors
-        let nextChromeColors = Self.resolvedChromeColors(from: backgroundColor)
         let isNoOp = currentChromeColors.backgroundHex == nextChromeColors.backgroundHex &&
             currentChromeColors.borderHex == nextChromeColors.borderHex
 
@@ -309,6 +331,9 @@ final class Workspace: Identifiable {
             return
         }
         bonsplitController.configuration.appearance.chromeColors = nextChromeColors
+        DispatchQueue.main.async {
+            TerminalWindowPortalRegistry.refreshDividerOverlays()
+        }
         configProvider.logBackgroundIfEnabled(
             "theme applied workspace=\(id.uuidString) reason=\(reason) resultingBg=\(bonsplitController.configuration.appearance.chromeColors.backgroundHex ?? "nil") resultingBorder=\(bonsplitController.configuration.appearance.chromeColors.borderHex ?? "nil")"
         )

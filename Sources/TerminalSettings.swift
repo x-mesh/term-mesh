@@ -135,6 +135,7 @@ enum TerminalSettingsOverride {
         let cursorStyle = defaults.string(forKey: cursorStyleKey) ?? ""
         let scrollback = defaults.integer(forKey: scrollbackLimitKey)
         let unfocusedOpacity = storedDouble(defaults, forKey: unfocusedSplitOpacityKey)
+        let splitDividerColor = defaults.string(forKey: splitDividerColorKey) ?? ""
 
         var lines: [String] = ["# Term-Mesh terminal settings override (auto-generated)"]
 
@@ -169,7 +170,9 @@ enum TerminalSettingsOverride {
         if let unfocusedOpacity, unfocusedOpacity >= 0 {
             lines.append("unfocused-split-opacity = \(String(format: "%.2f", unfocusedOpacity))")
         }
-        // split-divider-color: requires Bonsplit public API — not supported yet
+        if !splitDividerColor.isEmpty {
+            lines.append("split-divider-color = \(splitDividerColor)")
+        }
 
         // Only the header means nothing is overridden.
         return lines.count <= 1 ? nil : lines

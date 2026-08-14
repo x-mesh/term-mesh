@@ -307,6 +307,16 @@ final class WorkspaceChromeThemeTests: XCTestCase {
         XCTAssertEqual(colors.backgroundHex, "#272822")
         XCTAssertNil(colors.borderHex)
     }
+
+    func testResolvedChromeColorsUsesExplicitSplitDividerColor() {
+        var config = GhosttyConfig()
+        config.backgroundColor = NSColor(hex: "#272822")!
+        config.splitDividerColor = NSColor(hex: "#5A6370")!
+
+        let colors = Workspace.resolvedChromeColors(from: config)
+        XCTAssertEqual(colors.backgroundHex, "#272822")
+        XCTAssertEqual(colors.borderHex, "#5A6370")
+    }
 }
 
 final class WorkspaceAppearanceConfigResolutionTests: XCTestCase {
