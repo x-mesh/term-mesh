@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared ABI guard for the ghostty C API.
+# Shared build guard for the GhosttyKit implementation and C API.
 #
 # Swift compiles the ghostty API *declarations* from the root ghostty.h
 # (imported via term-mesh-Bridging-Header.h) but links the *code* from
@@ -18,6 +18,13 @@
 # The xcframework ships the header it was built from, so comparing that
 # against the root copy tests the invariant directly — no SHA bookkeeping,
 # and it holds no matter how the checkout drifted.
+
+# The ABI check alone is not sufficient when a ghostty change only alters the
+# implementation. The v0.186.2 build demonstrated that failure mode: the
+# headers still matched, but the root symlink pointed at a framework built from
+# an older ghostty commit and omitted the bounded subprocess teardown fix. The
+# full guard below therefore also requires the parent pin, submodule checkout,
+# framework stamp, and cache symlink SHA to agree.
 
 # Usage: ghostty_abi_is_consistent <project_dir>
 # Returns 0 when the root header matches every header shipped in the
@@ -72,5 +79,71 @@ ghostty_abi_report() {
 
     if [ "$found" -eq 0 ]; then
         echo "  no ghostty.h found inside the xcframework" >&2
+    fi
+}
+
+# Usage: ghostty_kit_is_consistent <project_dir>
+# Returns 0 only when both the implementation identity and C ABI are current.
+ghostty_kit_is_consistent() {
+    local project_dir="$1"
+    local xcframework="$project_dir/GhosttyKit.xcframework"
+    local parent_sha worktree_sha framework_sha linked_sha archive
+
+    parent_sha="$(git -C "$project_dir" rev-parse HEAD:ghostty 2>/dev/null)" || return 1
+    worktree_sha="$(git -C "$project_dir/ghostty" rev-parse HEAD 2>/dev/null)" || return 1
+
+    [ -L "$xcframework" ] || return 1
+    [ -f "$xcframework/.ghostty_sha" ] || return 1
+    framework_sha="$(tr -d '[:space:]' < "$xcframework/.ghostty_sha")"
+    linked_sha="$(basename "$(dirname "$(readlink "$xcframework")")")"
+
+    [ -n "$parent_sha" ] || return 1
+    [ "$parent_sha" = "$worktree_sha" ] || return 1
+    [ "$parent_sha" = "$framework_sha" ] || return 1
+    [ "$parent_sha" = "$linked_sha" ] || return 1
+
+    archive="$(find -L "$xcframework" -path '*/macos-*/*' -type f \
+        \( -name ghostty-internal.a -o -name libghostty.a -o -name libghostty-internal.a \) \
+        -print -quit 2>/dev/null)"
+    [ -n "$archive" ] || return 1
+
+    ghostty_abi_is_consistent "$project_dir"
+}
+
+# Usage: ghostty_kit_report <project_dir>
+# Prints every implementation/ABI mismatch so one setup run can repair all of
+# them rather than exposing failures one at a time.
+ghostty_kit_report() {
+    local project_dir="$1"
+    local xcframework="$project_dir/GhosttyKit.xcframework"
+    local parent_sha worktree_sha framework_sha linked_sha archive
+
+    parent_sha="$(git -C "$project_dir" rev-parse HEAD:ghostty 2>/dev/null || true)"
+    worktree_sha="$(git -C "$project_dir/ghostty" rev-parse HEAD 2>/dev/null || true)"
+    framework_sha="$([ -f "$xcframework/.ghostty_sha" ] && tr -d '[:space:]' < "$xcframework/.ghostty_sha" || true)"
+    linked_sha="$([ -L "$xcframework" ] && basename "$(dirname "$(readlink "$xcframework")")" || true)"
+
+    echo "  parent ghostty pin : ${parent_sha:-missing}" >&2
+    echo "  submodule HEAD     : ${worktree_sha:-missing}" >&2
+    echo "  framework stamp    : ${framework_sha:-missing}" >&2
+    echo "  symlink cache SHA  : ${linked_sha:-missing}" >&2
+
+    if [ ! -L "$xcframework" ]; then
+        echo "  GhosttyKit.xcframework is missing or is not the managed cache symlink" >&2
+    fi
+    if [ -n "$parent_sha" ] && { [ "$parent_sha" != "$worktree_sha" ] || \
+        [ "$parent_sha" != "$framework_sha" ] || [ "$parent_sha" != "$linked_sha" ]; }; then
+        echo "  implementation SHA mismatch: run ./scripts/setup.sh" >&2
+    fi
+
+    archive="$(find -L "$xcframework" -path '*/macos-*/*' -type f \
+        \( -name ghostty-internal.a -o -name libghostty.a -o -name libghostty-internal.a \) \
+        -print -quit 2>/dev/null || true)"
+    if [ -z "$archive" ]; then
+        echo "  no macOS Ghostty static archive found inside the xcframework" >&2
+    fi
+
+    if ! ghostty_abi_is_consistent "$project_dir"; then
+        ghostty_abi_report "$project_dir"
     fi
 }

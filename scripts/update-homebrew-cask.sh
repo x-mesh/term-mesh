@@ -87,11 +87,19 @@ cask "term-mesh" do
   # copy could still be holding the bundle when brew moves the new one in.
   # pkill matches on process name only, so unlike AppleScript it can never
   # put up a GUI prompt — see the uninstall comment for why that matters.
+  #
+  # Scope it to the bundle this install actually replaces. Matching on process
+  # name alone means an unguarded preflight kills every running term-mesh on
+  # the machine, including one launched from outside appdir that this install
+  # never touches. That is what lets an isolated \`--appdir\` install — the
+  # release smoke test — run beside a live app instead of taking it down.
   preflight do
-    quit = system_command "/usr/bin/pkill",
-                          args:         ["-x", "term-mesh"],
-                          must_succeed: false
-    sleep 2 if quit.success?
+    if File.exist?("#{appdir}/term-mesh.app")
+      quit = system_command "/usr/bin/pkill",
+                            args:         ["-x", "term-mesh"],
+                            must_succeed: false
+      sleep 2 if quit.success?
+    end
   end
 
   postflight do
@@ -175,21 +183,26 @@ echo "================================================"
 # push both succeed but brew install silently leaves the user on the old
 # version (see preflight block above for the race we hit on 0.100.0).
 #
-# How it verifies depends on whether term-mesh is running, because the cask
-# quits it: `uninstall quit:` plus a preflight `pkill`, which is correct for a
-# user upgrading and wrong for a release check. Releasing used to take the
-# maintainer's own session down mid-work.
+# The default path verifies the published *artifact* and touches nothing on
+# this machine. `brew install` cannot be made safe to run here: it replaces the
+# bundle in /Applications, rewrites a machine-wide Caskroom receipt, and its
+# preflight quits a running term-mesh — the maintainer's own session. Isolating
+# it behind `--appdir` does not fix the receipt, which a later `brew upgrade`
+# would then follow into a throwaway directory.
+#
+# This used to install whenever `pgrep` found no running app, so a missed match
+# cost the maintainer their session. Process detection is no longer in the
+# blast path at all: installing is opt-in.
 #
 #   SMOKE_TEST=0      skip entirely
-#   SMOKE_TEST=full   always install, even over a running app
-#   otherwise         install when nothing is running, inspect the DMG when
-#                     something is
+#   SMOKE_TEST=full   really install — replaces /Applications/term-mesh.app and
+#                     quits a running app. Use a test machine.
+#   otherwise         verify the artifact only; changes nothing locally
 if [[ "${SMOKE_TEST:-1}" != "0" ]]; then
   echo ""
   # The cask was pushed seconds ago; `brew update` can still serve the previous
-  # revision, and then `brew install` happily installs the old version and the
-  # check below fails on a release that is actually fine. Wait for the tap to
-  # report the version we just published.
+  # revision, and then the checks below fail on a release that is actually
+  # fine. Wait for the tap to report the version we just published.
   for _ in 1 2 3 4 5 6; do
     brew update >/dev/null 2>&1 || true
     if brew info --cask "${TAP_REPO%%/*}/tap/term-mesh" 2>/dev/null | head -1 | grep -q "$VERSION"; then
@@ -198,50 +211,61 @@ if [[ "${SMOKE_TEST:-1}" != "0" ]]; then
     sleep 5
   done
 
-  # Match the bundle's own executable path, not the bare name: `pgrep -f
-  # term-mesh` also matches this script, every tm-agent, and any editor with
-  # the word in its command line.
-  RUNNING_PIDS=$(pgrep -f '/term-mesh\.app/Contents/MacOS/term-mesh' 2>/dev/null || true)
+  echo "==> Smoke test: verifying the published artifact"
 
-  if [[ -n "$RUNNING_PIDS" && "${SMOKE_TEST:-1}" != "full" ]]; then
-    echo "==> Smoke test: term-mesh is running (pid $(echo "$RUNNING_PIDS" | tr '\n' ' '))"
-    echo "    verifying the DMG instead of installing over it — the cask quits the app"
-
-    # What `brew install` would have proven is that the artifact the cask
-    # points at carries this version. Read that out of the artifact directly:
-    # the sha256 below ties the cask to this exact file, so the bundle inside
-    # it is what a user receives.
-    MOUNT_POINT=$(mktemp -d -t term-mesh-smoke)
-    if ! hdiutil attach "$DMG_PATH" -nobrowse -readonly -quiet -mountpoint "$MOUNT_POINT"; then
-      echo "ERROR: smoke test could not mount $DMG_PATH" >&2
-      rmdir "$MOUNT_POINT" 2>/dev/null || true
-      exit 2
-    fi
-    ACTUAL=$(/usr/bin/defaults read "$MOUNT_POINT/term-mesh.app/Contents/Info" \
-      CFBundleShortVersionString 2>/dev/null || echo "<missing>")
-    hdiutil detach "$MOUNT_POINT" -quiet || true
+  # 1. The DMG the cask points at carries this version. The sha256 checked
+  #    below ties the cask to this exact file, so the bundle inside it is what
+  #    a user receives.
+  MOUNT_POINT=$(mktemp -d -t term-mesh-smoke)
+  if ! hdiutil attach "$DMG_PATH" -nobrowse -readonly -quiet -mountpoint "$MOUNT_POINT"; then
+    echo "ERROR: smoke test could not mount $DMG_PATH" >&2
     rmdir "$MOUNT_POINT" 2>/dev/null || true
+    exit 2
+  fi
+  ACTUAL=$(/usr/bin/defaults read "$MOUNT_POINT/term-mesh.app/Contents/Info" \
+    CFBundleShortVersionString 2>/dev/null || echo "<missing>")
+  hdiutil detach "$MOUNT_POINT" -quiet || true
+  rmdir "$MOUNT_POINT" 2>/dev/null || true
 
-    if [[ "$ACTUAL" != "$VERSION" ]]; then
-      echo "ERROR: smoke test failed — DMG bundle reports $ACTUAL, expected $VERSION" >&2
-      echo "       The cask points at a DMG that does not carry this version." >&2
-      exit 2
+  if [[ "$ACTUAL" != "$VERSION" ]]; then
+    echo "ERROR: smoke test failed — DMG bundle reports $ACTUAL, expected $VERSION" >&2
+    echo "       The cask points at a DMG that does not carry this version." >&2
+    exit 2
+  fi
+
+  # 2. The cask the tap serves is the one holding that file's hash.
+  TAP_SHA=$(brew info --cask --json=v2 "${TAP_REPO%%/*}/tap/term-mesh" 2>/dev/null \
+    | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["casks"][0].get("sha256",""))' \
+    2>/dev/null || echo "")
+  if [[ -n "$TAP_SHA" && "$TAP_SHA" != "$SHA256" ]]; then
+    echo "ERROR: smoke test failed — tap serves sha256 $TAP_SHA, published DMG is $SHA256" >&2
+    exit 2
+  fi
+
+  # 3. brew can load the cask and actually retrieve what it publishes. `fetch`
+  #    runs the same download and checksum path as `install` and stops before
+  #    anything is staged, so a missing release asset, an unreachable URL, or a
+  #    sha256 that does not match the uploaded file all fail right here —
+  #    without staging a bundle or writing a receipt.
+  if ! brew fetch --cask "${TAP_REPO%%/*}/tap/term-mesh" >/dev/null; then
+    echo "ERROR: smoke test failed — brew could not fetch the published cask" >&2
+    echo "       The release asset is missing, unreachable, or its sha256 does" >&2
+    echo "       not match the file GitHub is serving." >&2
+    exit 2
+  fi
+
+  echo "==> Smoke test OK: DMG reports $ACTUAL, tap sha256 matches, brew fetch succeeds"
+
+  if [[ "${SMOKE_TEST:-1}" == "full" ]]; then
+    echo ""
+    # Match the bundle's own executable path, not the bare name: `pgrep -f
+    # term-mesh` also matches this script, every tm-agent, and any editor with
+    # the word in its command line.
+    RUNNING_PIDS=$(pgrep -f '/term-mesh\.app/Contents/MacOS/term-mesh' 2>/dev/null || true)
+    if [[ -n "$RUNNING_PIDS" ]]; then
+      echo "==> SMOKE_TEST=full: quitting running term-mesh (pid $(echo "$RUNNING_PIDS" | tr '\n' ' '))"
     fi
-
-    # And that the cask the tap serves is the one holding that file's hash.
-    TAP_SHA=$(brew info --cask --json=v2 "${TAP_REPO%%/*}/tap/term-mesh" 2>/dev/null \
-      | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["casks"][0].get("sha256",""))' \
-      2>/dev/null || echo "")
-    if [[ -n "$TAP_SHA" && "$TAP_SHA" != "$SHA256" ]]; then
-      echo "ERROR: smoke test failed — tap serves sha256 $TAP_SHA, published DMG is $SHA256" >&2
-      exit 2
-    fi
-
-    echo "==> Smoke test OK: DMG bundle reports $ACTUAL, tap sha256 matches"
-    echo "    (brew install itself unexercised; quit term-mesh and re-run with"
-    echo "     SMOKE_TEST=full to cover it)"
-  else
-    echo "==> Smoke test: fresh brew install + version check"
+    echo "==> SMOKE_TEST=full: installing over /Applications/term-mesh.app"
     brew uninstall --cask --force term-mesh >/dev/null 2>&1 || true
     if ! brew install --cask "${TAP_REPO%%/*}/tap/term-mesh"; then
       echo "ERROR: smoke test brew install failed" >&2

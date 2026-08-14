@@ -184,13 +184,17 @@ Prepare a new release for term-mesh. This command updates the changelog, bumps t
     - Run `./scripts/update-homebrew-cask.sh X.Y.Z ./term-mesh-macos-X.Y.Z.dmg`
       - Computes sha256, rewrites `Casks/term-mesh.rb` in `x-mesh/homebrew-tap`, commits as `term-mesh X.Y.Z`, and pushes to `main`.
       - Set `DRY_RUN=1` to stage the change locally without pushing.
-    - **The smoke test at the end adapts to whether term-mesh is running.** The cask
-      quits the app (`uninstall quit:` plus a preflight `pkill`) — correct for a user
-      upgrading, wrong for a release check, and it used to take the maintainer's own
-      session down mid-work. So: nothing running → real `brew install` as before;
-      something running → mount the DMG and verify the bundle's version plus the tap's
-      sha256 instead. `SMOKE_TEST=full` forces the install anyway (quit the app first),
-      `SMOKE_TEST=0` skips it.
+    - **The smoke test at the end never installs by default.** The cask quits the app
+      (`uninstall quit:` plus a preflight `pkill`) — correct for a user upgrading,
+      wrong for a release check, and it used to take the maintainer's own session down
+      mid-work. It used to install whenever `pgrep` found no running app, so one missed
+      match cost you your session. Now it verifies the published artifact instead:
+      mounts the DMG and checks the bundle's version, compares the tap's sha256 against
+      the file just published, and runs `brew fetch` to prove brew can load the cask and
+      retrieve the asset. None of that touches `/Applications`, the Caskroom, or a
+      running app. `SMOKE_TEST=full` does a real `brew install` — it replaces
+      `/Applications/term-mesh.app` and quits a running term-mesh, so use a test machine.
+      `SMOKE_TEST=0` skips the block entirely.
     - Verify: `brew update && brew info --cask x-mesh/tap/term-mesh` should report the new version.
 
 15. **Return to the working branch, and re-sync `develop`**

@@ -22,6 +22,14 @@ fi
 TAG="v${VERSION}"
 DMG_PATH="${2:-./term-mesh-macos-${VERSION}.dmg}"
 REPO="${REPO:-x-mesh/term-mesh}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# A release must not publish an app linked against a cached GhosttyKit from a
+# different submodule commit. Xcode also enforces this before compilation, but
+# keep a final explicit release boundary so alternate packaging paths cannot
+# bypass the invariant.
+"$SCRIPT_DIR/check-ghostty-kit.sh"
 
 if [[ ! -f "$DMG_PATH" ]]; then
   echo "ERROR: DMG not found at $DMG_PATH" >&2
