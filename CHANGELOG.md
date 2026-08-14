@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.186.3] - 2026-08-14
+
+### Fixed
+
+- **v0.186.2에서도 종료되지 않는 pane 때문에 앱 전체가 멈추던 문제** — v0.186.2의 소스에는 bounded subprocess teardown 수정이 있었지만, 실제 macOS 앱은 이전 ghostty commit으로 만든 stale `GhosttyKit`을 링크해 수정 전 무한 대기 구현을 그대로 배포했다. 이번 빌드는 hardened 구현을 실제로 포함하며, 앞으로는 parent submodule pin·checkout·framework stamp·cache symlink·archive·C ABI가 모두 일치하지 않으면 Xcode build와 release publish가 중단된다. 개발용 `reload.sh`는 같은 불일치를 발견하면 `setup.sh`로 자동 복구한다.
+
+- **릴리스 확인 중 설치된 term-mesh가 종료될 수 있던 문제** — Homebrew cask smoke test가 기본적으로 실제 설치를 수행하면서 maintainer의 실행 중 앱과 세션을 종료할 수 있었다. 이제 기본 검증은 DMG version·sha256·`brew fetch`만 확인하며 `/Applications`와 실행 중 앱을 건드리지 않는다. 실제 설치 검증은 명시적으로 요청한 테스트 머신에서만 수행한다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.186.2] - 2026-08-14
 
 ### Fixed
