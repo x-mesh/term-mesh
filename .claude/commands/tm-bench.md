@@ -24,6 +24,9 @@ Parse `$ARGUMENTS` to determine the subcommand:
 | `agent --terminal` | `python3 scripts/bench-agent.py --leader terminal --mode pane` |
 | `agent --rpc` | `python3 scripts/bench-agent.py --rpc-only --mode pane --leader terminal` |
 | `agent --e2e` | `python3 scripts/bench-agent.py --e2e-only --mode pane --leader terminal` |
+| `effectiveness [flags]` | `python3 scripts/bench-agent-effectiveness.py run [flags]` |
+| `effectiveness-validate [flags]` | `python3 scripts/bench-agent-effectiveness.py validate-suite [flags]` |
+| `effectiveness-report RUN` | `python3 scripts/bench-agent-effectiveness.py report RUN` |
 | `agent --note "..."` | append `--note "..."` to the command |
 | `history` | `python3 scripts/bench-agent.py --history` |
 | `compare A B` | `python3 scripts/bench-agent.py --compare A B` |
@@ -35,6 +38,9 @@ Map the first word of `$ARGUMENTS`:
 - **`agent` (with flags)** → Map `--pane` to `--mode pane`, `--headless` to `--mode headless`, `--llm` to `--leader llm`, `--terminal` to `--leader terminal`. If a bare number is present among flags, extract it as `--repeat N`. Pass remaining flags through.
 - **`history`** → Show history: `python3 scripts/bench-agent.py --history`
 - **`compare`** → Compare runs: `python3 scripts/bench-agent.py --compare` followed by the remaining args.
+- **`effectiveness`** → Run the paired 18-run single-session vs three-worker decision benchmark.
+- **`effectiveness-validate`** → Prove baseline failure, oracle success, and history isolation.
+- **`effectiveness-report`** → Regenerate metrics; pass `--evaluate` for blinded quality judges.
 
 ## Argument Parsing Precedence
 
@@ -116,6 +122,9 @@ When `$ARGUMENTS` is empty or just `agent` with no flags:
 | `agent --rpc` | RPC latency benchmarks only |
 | `agent --e2e` | E2E agent communication only |
 | `agent --note "msg"` | Attach a change description to the benchmark run |
+| `effectiveness --dry-run` | Validate fixture metadata and print the paired 18-run matrix |
+| `effectiveness-validate` | Validate baseline/oracle behavior and history isolation |
+| `effectiveness-report RUN --evaluate` | Generate blinded quality comparison and final report |
 | `history` | Show last 10 benchmark results in a table |
 | `compare A B` | Side-by-side comparison of two runs by timestamp prefix |
 
@@ -131,8 +140,14 @@ When `$ARGUMENTS` is empty or just `agent` with no flags:
 
 ## Execution
 
-1. Parse `$ARGUMENTS` and run the appropriate `python3 scripts/bench-agent.py` command via Bash
+For `effectiveness`, use isolated teams and repositories owned by the runner. Never reuse or
+destroy the user's current team. A full run makes 18 paid leader calls plus corrections and worker
+calls; run `effectiveness --dry-run` first unless the user explicitly requested execution. The
+protocol and adoption gates are in `docs/multi-agent-effectiveness-benchmark.md`.
+
+1. Parse `$ARGUMENTS` and run the mapped Python command via Bash
 2. If no flags → show interactive menu for configuration
 3. Show the output to the user
-4. Results are automatically saved to `~/.term-mesh/benchmarks/YYYY-MM-DDTHH-MM-SS.json`
+4. Agent transport results go to `~/.term-mesh/benchmarks/`; effectiveness artifacts go to
+   `~/.term-mesh/benchmarks/effectiveness/<run-id>/`.
 5. If a previous run exists, a comparison delta is printed automatically
