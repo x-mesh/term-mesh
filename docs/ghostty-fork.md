@@ -76,6 +76,23 @@ summary of fork deltas. Trust the diff against `upstream/main` over either.
 - Upstreamable: yes, in principle — it adds an export and changes no behavior
   for anyone who does not call it.
 
+### 4) Bound subprocess teardown for SIGHUP-resistant children
+
+- Commit: `c495aadb2` (fix(termio): bound subprocess teardown)
+- Files:
+  - `src/termio/Exec.zig`
+- Summary:
+  - Keeps the existing graceful process-group shutdown, but escalates from
+    repeated `SIGHUP` to `SIGKILL` after approximately one second.
+  - Prevents `ghostty_surface_free` from waiting forever on the terminal IO
+    thread when a pane command ignores `SIGHUP`. In an embedded app that
+    synchronous wait otherwise blocks the host's main thread and makes every
+    window and control socket unresponsive.
+  - Adds a regression test with a child process that explicitly ignores
+    `SIGHUP` and verifies that teardown escalates and reaps it.
+- Upstreamable: yes — the change bounds an existing synchronous cleanup path
+  without changing normal graceful-exit behavior.
+
 ## Merge conflict notes
 
 These files change frequently upstream; be careful when rebasing the fork:
@@ -86,5 +103,9 @@ These files change frequently upstream; be careful when rebasing the fork:
 
 - `src/terminal/osc.zig`
   - OSC dispatch logic moves often. Re-check the integration points for the OSC 99 parser.
+
+- `src/termio/Exec.zig`
+  - Preserve the bounded `SIGHUP` grace period and escalation when upstream
+    changes subprocess/process-group cleanup.
 
 If you resolve a conflict, update this doc with what changed.
