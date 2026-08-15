@@ -30,11 +30,12 @@ pub mod watch_config;
 /// watcher (an LLM call) every second. Always `>= SWEEP_GRANULARITY_SECS`.
 const MIN_WATCH_INTERVAL_SECS: u64 = 30;
 
-/// Pair Review diffs must fit the one-shot prompt's existing 16,000-byte
-/// delta boundary in full. Unlike autonomous Watch output, a selected git
-/// diff is never useful when silently tail-truncated, so oversize snapshots
-/// are rejected before a reviewer is started.
-const PAIR_REVIEW_MAX_SNAPSHOT_BYTES: usize = 16_000;
+/// Pair Review snapshots must fit this prompt budget in full. Unlike
+/// autonomous Watch output, a user-selected snapshot is never useful when
+/// silently tail-truncated, so oversize input is rejected before a reviewer
+/// is started. This is large enough for normal PRs while still bounding git
+/// output and prompt memory.
+const PAIR_REVIEW_MAX_SNAPSHOT_BYTES: usize = 128 * 1024;
 const PAIR_REVIEW_MAX_GIT_ERROR_BYTES: usize = 16 * 1024;
 const PAIR_REVIEW_MAX_UNTRACKED_LIST_BYTES: usize = 256 * 1024;
 const PAIR_REVIEW_MAX_UNTRACKED_FILES: usize = 128;
@@ -513,10 +514,16 @@ async fn capture_pair_review_scope(
     app_socket: Option<&str>,
 ) -> Result<String, String> {
     if scope == "current-task" {
-        return crate::headless::one_shot::capture_target_delta(
-            manager, team, "leader", app_socket,
-        )
-        .await;
+        let snapshot =
+            crate::headless::one_shot::capture_target_delta(manager, team, "leader", app_socket)
+                .await?;
+        if snapshot.len() > PAIR_REVIEW_MAX_SNAPSHOT_BYTES {
+            return Err(format!(
+                "selected task output exceeds safe limit of {} bytes; narrow the Pair Review scope",
+                PAIR_REVIEW_MAX_SNAPSHOT_BYTES
+            ));
+        }
+        return Ok(snapshot);
     }
     timeout(
         PAIR_REVIEW_CAPTURE_TIMEOUT,
@@ -752,6 +759,44 @@ mod pair_review_scope_tests {
         .unwrap_err();
         assert!(error.contains("exceeds safe limit"), "{error}");
         assert!(!error.contains("delta truncated"));
+    }
+
+    #[tokio::test]
+    async fn pair_review_accepts_diff_larger_than_the_watch_tail_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["init"]).status.success());
+        assert!(run(&["config", "user.email", "pair@example.invalid"])
+            .status
+            .success());
+        assert!(run(&["config", "user.name", "Pair Test"]).status.success());
+        std::fs::write(dir.path().join("large.txt"), "before\n").unwrap();
+        assert!(run(&["add", "large.txt"]).status.success());
+        assert!(run(&["commit", "-m", "fixture"]).status.success());
+        std::fs::write(dir.path().join("large.txt"), "x".repeat(80_000)).unwrap();
+
+        let manager = Arc::new(tokio::sync::Mutex::new(HeadlessManager::new()));
+        let delta = capture_pair_review_scope(
+            &manager,
+            "fixture",
+            "current-changes",
+            dir.path().to_str().unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(delta.len() > 16_000);
+        assert!(delta.contains("large.txt"));
+        assert!(!delta.contains("delta truncated"));
     }
 
     #[tokio::test]

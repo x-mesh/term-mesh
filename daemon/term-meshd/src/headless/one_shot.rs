@@ -62,9 +62,11 @@ pub(crate) fn bound_delta(delta: &str) -> String {
     format!("…[delta truncated]…\n{}", &delta[start..])
 }
 
-/// Freeze the watched target's bounded output before a user-triggered review
-/// starts. This is deliberately separate from `run_check_impl`, whose fallback
-/// may collect later, because Pair Review promises a start-time snapshot.
+/// Freeze the watched target's output before a user-triggered review starts.
+/// The Pair Review caller applies its own complete-or-reject byte limit; this
+/// function must not silently tail-truncate the selected snapshot. This is
+/// deliberately separate from `run_check_impl`, whose fallback may collect
+/// later, because Pair Review promises a start-time snapshot.
 pub(crate) async fn capture_target_delta(
     manager: &Arc<Mutex<HeadlessManager>>,
     team: &str,
@@ -81,7 +83,7 @@ pub(crate) async fn capture_target_delta(
     if !lines.is_empty() {
         let text = extract_verdict_text(&lines);
         if !text.trim().is_empty() {
-            return Ok(bound_delta(&text));
+            return Ok(text);
         }
     }
     let socket =
@@ -90,7 +92,7 @@ pub(crate) async fn capture_target_delta(
     if text.trim().is_empty() {
         return Err(format!("no output available for {target}"));
     }
-    Ok(bound_delta(&text))
+    Ok(text)
 }
 
 /// Which class of drift this tick is checking for.
