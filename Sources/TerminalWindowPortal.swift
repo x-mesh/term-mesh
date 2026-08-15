@@ -127,6 +127,17 @@ func terminalPortalBindNeedsGeometrySeed(
     !hasPreviousEntry || didChangeAnchor || requiredHostedViewAttachment
 }
 
+func terminalPortalShouldRenderDividerOverlay(
+    dividerAlpha: CGFloat,
+    surfaceOccludesDivider: Bool
+) -> Bool {
+    // Bonsplit's theme-derived separators are translucent and need the portal
+    // overlay only when a hosted terminal overlaps the native divider. A
+    // user-selected split-divider-color is opaque and must remain visible
+    // above the portal surfaces along the entire divider.
+    dividerAlpha >= 0.999 || surfaceOccludesDivider
+}
+
 #if DEBUG
 private func portalDebugToken(_ view: NSView?) -> String {
     guard let view else { return "nil" }
@@ -533,6 +544,7 @@ private final class SplitDividerOverlayView: NSView {
     private struct DividerSegment {
         let rect: NSRect
         let color: NSColor
+        let sourceAlpha: CGFloat
         let isVertical: Bool
     }
 
@@ -575,6 +587,8 @@ private final class SplitDividerOverlayView: NSView {
 
         if let splitView = view as? NSSplitView {
             let dividerCount = max(0, splitView.arrangedSubviews.count - 1)
+            let sourceDividerColor = splitView.dividerColor.usingColorSpace(.deviceRGB)
+                ?? splitView.dividerColor
             let dividerColor = overlayDividerColor(for: splitView)
             for dividerIndex in 0..<dividerCount {
                 let first = splitView.arrangedSubviews[dividerIndex].frame
@@ -603,6 +617,7 @@ private final class SplitDividerOverlayView: NSView {
                         DividerSegment(
                             rect: dividerRectInOverlay,
                             color: dividerColor,
+                            sourceAlpha: sourceDividerColor.alphaComponent,
                             isVertical: splitView.isVertical
                         )
                     )
@@ -625,8 +640,9 @@ private final class SplitDividerOverlayView: NSView {
     }
 
     private func shouldRenderOverlay(for segment: DividerSegment, hostedFrames: [NSRect]) -> Bool {
-        // Draw only when a hosted surface actually intrudes across the divider centerline.
-        // This preserves tiny-pane visibility fixes without darkening regular dividers.
+        // Default separators are drawn only when a hosted surface actually
+        // intrudes across the divider centerline. Explicit opaque colors are
+        // always drawn here because the portal sits above the NSSplitView.
         let axisEpsilon: CGFloat = 0.01
         let axis = segment.isVertical ? segment.rect.midX : segment.rect.midY
         let extentRect = segment.rect.insetBy(
@@ -634,16 +650,22 @@ private final class SplitDividerOverlayView: NSView {
             dy: segment.isVertical ? -1 : 0
         )
 
+        var surfaceOccludesDivider = false
         for frame in hostedFrames where frame.intersects(extentRect) {
             if segment.isVertical {
                 if frame.minX < axis - axisEpsilon && frame.maxX > axis + axisEpsilon {
-                    return true
+                    surfaceOccludesDivider = true
+                    break
                 }
             } else if frame.minY < axis - axisEpsilon && frame.maxY > axis + axisEpsilon {
-                return true
+                surfaceOccludesDivider = true
+                break
             }
         }
-        return false
+        return terminalPortalShouldRenderDividerOverlay(
+            dividerAlpha: segment.sourceAlpha,
+            surfaceOccludesDivider: surfaceOccludesDivider
+        )
     }
 
     private func overlayDividerColor(for splitView: NSSplitView) -> NSColor {
@@ -987,6 +1009,10 @@ final class WindowTerminalPortal: NSObject {
             dividerOverlayView.frame = hostView.bounds
         }
         dividerOverlayView.needsDisplay = true
+    }
+
+    func refreshDividerOverlay() {
+        ensureDividerOverlayOnTop()
     }
 
     @discardableResult
@@ -1887,6 +1913,12 @@ enum TerminalWindowPortalRegistry {
         guard let windowId = hostedToWindowId[hostedId],
               let portal = portalsByWindowId[windowId] else { return }
         portal.updateEntryVisibility(forHostedId: hostedId, visibleInUI: visibleInUI)
+    }
+
+    static func refreshDividerOverlays() {
+        for portal in portalsByWindowId.values {
+            portal.refreshDividerOverlay()
+        }
     }
 
     static func viewAtWindowPoint(_ windowPoint: NSPoint, in window: NSWindow) -> NSView? {

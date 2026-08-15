@@ -8,6 +8,24 @@ import AppKit
 #endif
 
 final class GhosttyTerminalViewComposingTests: XCTestCase {
+    func testDividerOverlayAlwaysRendersOpaqueUserColor() {
+        XCTAssertTrue(terminalPortalShouldRenderDividerOverlay(
+            dividerAlpha: 1,
+            surfaceOccludesDivider: false
+        ))
+    }
+
+    func testDividerOverlayKeepsDefaultSeparatorOcclusionPolicy() {
+        XCTAssertFalse(terminalPortalShouldRenderDividerOverlay(
+            dividerAlpha: 0.36,
+            surfaceOccludesDivider: false
+        ))
+        XCTAssertTrue(terminalPortalShouldRenderDividerOverlay(
+            dividerAlpha: 0.36,
+            surfaceOccludesDivider: true
+        ))
+    }
+
     func testAutoBlankRecoveryPolicyCoversHealthyConfirmationCooldownAndRebuild() {
         XCTAssertEqual(
             terminalAutoBlankRecoveryDecision(

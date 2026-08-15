@@ -51,12 +51,12 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "4")
+        XCTAssertEqual(LeaderParallelPolicy.version, "8")
         XCTAssertEqual(LeaderParallelPolicy.activation, "runtime-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 4"))
+        XCTAssertTrue(first.contains("policy_version: 8"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(first.contains("policy_activation: runtime-enforced"))
     }
@@ -65,10 +65,17 @@ final class AgentSessionTests: XCTestCase {
         let policy = LeaderParallelPolicy.renderedInstructions
 
         [
-            "parallel-default",
+            "adaptive-single-default",
+            "parallel-admission-gate",
+            "structured-routing-decision",
             "dag-readiness",
             "unified-placement-pool",
             "same-checkout-isolation",
+            "bounded-handoff",
+            "leader-integration-lane",
+            "actual-diff-review-gate",
+            "cross-model-validation",
+            "no-progress-recovery",
             "branch-merge-boundary",
             "isolated-checkout-ref-contract",
             "policy-parity",
@@ -76,6 +83,21 @@ final class AgentSessionTests: XCTestCase {
             "external-event-wait",
         ].forEach { XCTAssertTrue(policy.contains("[\($0)]"), "missing \($0)") }
         XCTAssertTrue(policy.contains("This policy is active."))
+        XCTAssertTrue(policy.contains("default executor"))
+        XCTAssertTrue(policy.contains("--worktree always"))
+        XCTAssertTrue(policy.contains("avoid turn-by-turn ping-pong"))
+        XCTAssertTrue(policy.contains("\"route\": \"direct|probe|parallel\""))
+        XCTAssertTrue(policy.contains("probe has exactly one read-only implementation task"))
+        XCTAssertTrue(policy.contains("parallel has two or three implementation tasks"))
+        XCTAssertTrue(policy.contains("wait --mode any --tasks"))
+        XCTAssertTrue(policy.contains("at most one additional wait/collect"))
+        XCTAssertTrue(policy.contains("After the actual diff is integrated"))
+        XCTAssertTrue(policy.contains("\"validation_gates\""))
+        XCTAssertTrue(policy.contains("security plus tester"))
+        XCTAssertTrue(policy.contains("cross_model_independence_unavailable"))
+        XCTAssertTrue(policy.contains("at most three primary files"))
+        XCTAssertTrue(policy.contains("`review_ready` without that final reply is partial evidence"))
+        XCTAssertTrue(policy.contains("no task-cancel primitive"))
     }
 
     func testLeaderParallelPolicyUsesOneCanonicalLaunchDirective() {
@@ -84,7 +106,7 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(directive.contains("/tmp/policy.md"))
         XCTAssertTrue(directive.contains("version \(LeaderParallelPolicy.version)"))
         XCTAssertTrue(directive.contains("digest \(LeaderParallelPolicy.digest)"))
-        XCTAssertTrue(directive.contains("canonical Leader Parallel Routing Policy"))
+        XCTAssertTrue(directive.contains("canonical Leader Adaptive Execution Policy"))
     }
 
     /// Two same-named instances used to both write `<agent>-reply.md`,

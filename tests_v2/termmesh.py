@@ -1280,7 +1280,8 @@ class termmesh:
                              leader_cli: str = "claude",
                              leader_model: str = "sonnet",
                              leader_host: Optional[str] = None,
-                             leader_directory: Optional[str] = None) -> dict:
+                             leader_directory: Optional[str] = None,
+                             preset_id: Optional[str] = None) -> dict:
         params: Dict[str, Any] = {
             "directory": directory,
             "roles": roles,
@@ -1291,6 +1292,8 @@ class termmesh:
             params["leader_host"] = leader_host
         if leader_directory:
             params["leader_directory"] = leader_directory
+        if preset_id:
+            params["preset_id"] = preset_id
         return dict(self._call("debug.project.create", params) or {})
 
     def debug_project_delete(self, team_name: str) -> dict:

@@ -1128,7 +1128,38 @@ struct SettingsView: View {
                 }
             }
 
-            // Split Divider Color requires Bonsplit public API — deferred for now
+            if settingsMatch("split", "divider", "color", "border", "separator", "terminal") {
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Split Divider Color",
+                    subtitle: terminalDividerColor.isEmpty ? "Using ghostty config value" : nil,
+                    controlWidth: pickerColumnWidth
+                ) {
+                    HStack(spacing: 6) {
+                        ColorPicker(
+                            "",
+                            selection: Binding(
+                                get: {
+                                    if terminalDividerColor.isEmpty { return .gray }
+                                    return Color(nsColor: NSColor(hex: terminalDividerColor) ?? .gray)
+                                },
+                                set: { newValue in
+                                    terminalDividerColor = NSColor(newValue).hexString()
+                                }
+                            ),
+                            supportsOpacity: false
+                        )
+                        .labelsHidden()
+                        if !terminalDividerColor.isEmpty {
+                            Button("Reset") { terminalDividerColor = "" }
+                                .buttonStyle(.borderless)
+                                .foregroundColor(.accentColor)
+                                .font(.caption)
+                        }
+                    }
+                }
+            }
 
             if settingsMatch("scrollback", "limit", "history", "buffer", "terminal") {
                 SettingsCardDivider()

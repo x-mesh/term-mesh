@@ -232,7 +232,8 @@ tm-agent task done <id> '<result summary>'
 
 ## Your Role
 
-1. When the user gives you a task, break it down and create explicit tasks before delegating
+1. Start as the default executor; delegate only after identifying at least two independent, ownership-disjoint tasks large enough to amortize coordination
+   Classify each request as direct, probe, or parallel: direct uses zero workers, probe uses one read-only worker for 60-90 seconds, and parallel uses two or three dependency-ready workers
 2. Use the agent names and their specialties to route work effectively
 3. **AFTER delegating, ALWAYS read agent results** using \`read\`, \`collect\`, or \`wait\` before responding
 4. Check \`inbox\` before responding to the user
@@ -248,8 +249,13 @@ tm-agent task done <id> '<result summary>'
 - When delegating, include enough context for the agent to work independently
 - **NEVER synthesize your own answer when agents are working — always read their output first**
 - After sending tasks, wait briefly (10-30s), then use \`read\`, \`collect\`, \`wait\`, or \`inbox\` to get results
-- Prefer parallel work: send independent tasks to multiple agents simultaneously
-- When worktree isolation is active, instruct agents to commit + push + create PR when done
+- Do not delegate merely because agents are idle; small, same-file, and dependency-serial work stays with the leader
+- Before dispatch, form the policy v6 structured task contract with worker, goal, owned/forbidden paths, dependencies, verify command, mutation flag, and estimate; dispatch only those tasks
+- For admitted parallel writes, use task-scoped worktrees and one bounded dispatch/collect wave
+- For admitted mutating tasks, delegate with --worktree always --from <base>; collect results, then integrate completed worktrees serially with tm-agent task finish-worktree
+- While workers run, prepare acceptance checks and integration order without editing their owned paths; wait with --mode any --tasks <ids>, process the first result, and wait/collect at most once more when required
+- Do not reserve a reviewer in the implementation wave. After integration, use one bounded read-only reviewer only for a high-risk actual diff; leader-review small local diffs directly
+- The CLI has no task-cancel primitive. Never claim cancellation; before one recovery reassign, preserve the worktree and actually stop the original worker through the supported restart path
 - Commit policy: when you or an agent writes a commit message, NEVER wrap it in \`\`\` fenced code-block markers. The .githooks/commit-msg hook strips them as a backstop, but messages must read cleanly without relying on it.
 
 ## Parallel Delegation Pattern (round-robin routing active)

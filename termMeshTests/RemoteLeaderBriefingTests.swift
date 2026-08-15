@@ -18,6 +18,46 @@ import XCTest
 /// leader is told.
 @MainActor
 final class RemoteLeaderBriefingTests: XCTestCase {
+    func test_localTUILeaderIsNotReadyUntilAComposerExists() {
+        XCTAssertTrue(TeamOrchestrator.localLeaderNeedsReadinessProbe(
+            launchLeaderLocally: true, leaderMode: "claude"
+        ))
+        XCTAssertTrue(TeamOrchestrator.localLeaderNeedsReadinessProbe(
+            launchLeaderLocally: true, leaderMode: "codex"
+        ))
+        XCTAssertFalse(TeamOrchestrator.localLeaderNeedsReadinessProbe(
+            launchLeaderLocally: true, leaderMode: "repl"
+        ))
+        XCTAssertFalse(TeamOrchestrator.localLeaderNeedsReadinessProbe(
+            launchLeaderLocally: false, leaderMode: "claude"
+        ))
+
+        XCTAssertFalse(TeamOrchestrator.localLeaderPaneLooksReady(
+            "Claude Code v2\nInitializing MCP servers…"
+        ))
+        XCTAssertTrue(TeamOrchestrator.localLeaderPaneLooksReady(
+            "Claude Code v2\n────────\n❯ \n────────"
+        ))
+        XCTAssertTrue(TeamOrchestrator.localLeaderPaneLooksReady(
+            "Codex CLI\n› Ask anything"
+        ))
+        XCTAssertFalse(TeamOrchestrator.localLeaderPaneLooksReady(
+            "Starting tools\n> initialization detail"
+        ))
+        XCTAssertFalse(TeamOrchestrator.localLeaderPaneLooksReady(
+            "Not logged in · Run /login\n❯ "
+        ))
+    }
+
+    func test_durableWakeUsesTheExactLeaderCLIPath() {
+        XCTAssertEqual(
+            TeamOrchestrator.leaderRequestWake(
+                requestId: "req-1", tmAgent: "'/Applications/term mesh/bin/tm-agent'"
+            ),
+            "New durable request req-1. First run exactly: '/Applications/term mesh/bin/tm-agent' leader request take req-1. "
+                + "After the requested work succeeds, run exactly: '/Applications/term mesh/bin/tm-agent' leader request complete req-1 immediately before your final response."
+        )
+    }
 
     private func row(_ name: String, cli: String, summary: String = "") -> TeamAgentRow {
         TeamAgentRow(
@@ -64,12 +104,26 @@ final class RemoteLeaderBriefingTests: XCTestCase {
 
     /// The roster is the whole difference between a leader and a lone CLI.
     func test_theLeaderIsToldWhoItsAgentsAre() {
-        let prompt = nonClaudePrompt()
+        let exactRows = rows
+        let prompt = TeamOrchestrator.remoteLeaderNonClaudeSystemPrompt(
+            teamName: "xm", rows: exactRows,
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
         for name in ["executor", "architect", "reviewer"] {
             XCTAssertTrue(
                 prompt.contains(name),
                 "the leader was never told about \(name), so it cannot delegate to it"
             )
+        }
+        XCTAssertTrue(prompt.contains("instance="))
+        XCTAssertTrue(prompt.contains("cli=codex"))
+        XCTAssertTrue(prompt.contains("model=sonnet"))
+        XCTAssertTrue(prompt.contains("host=ssh:peer"))
+        XCTAssertTrue(prompt.contains("mode=read-only-default"))
+        XCTAssertTrue(prompt.contains("--agent-instance-id"))
+        for row in exactRows {
+            XCTAssertTrue(prompt.contains(row.id.uuidString), "roster lost the preallocated instance id")
         }
     }
 
@@ -97,6 +151,34 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         )
     }
 
+    func test_bothLeaderKindsStartSingleAndEscalateWithWorktreeEvidence() {
+        let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
+            teamName: "xm",
+            rows: rows,
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        for prompt in [claude, nonClaudePrompt()] {
+            XCTAssertTrue(prompt.contains("default executor"))
+            XCTAssertTrue(prompt.contains("Do not delegate merely because agents exist or are idle"))
+            XCTAssertTrue(prompt.contains("at least two dependency-ready"))
+            XCTAssertTrue(prompt.contains("direct, probe, or parallel"))
+            XCTAssertTrue(prompt.contains("\"route\": \"direct|probe|parallel\""))
+            XCTAssertTrue(prompt.contains("--worktree always --from <base_ref>"))
+            XCTAssertTrue(prompt.contains("wait --mode any --tasks"))
+            XCTAssertTrue(prompt.contains("at most once more"))
+            XCTAssertTrue(prompt.contains("actual diff is integrated"))
+            XCTAssertTrue(prompt.contains("security plus tester"))
+            XCTAssertTrue(prompt.contains("differs from every implementation owner"))
+            XCTAssertFalse(prompt.contains("When in doubt, DELEGATE"))
+            XCTAssertFalse(prompt.contains("An idle agent is a wasted resource"))
+            XCTAssertFalse(prompt.contains("Delegate IMMEDIATELY to idle agents"))
+            XCTAssertFalse(prompt.contains("Always parallel when possible"))
+            XCTAssertFalse(prompt.contains("do NOT analyze the problem yourself first"))
+            XCTAssertFalse(prompt.contains("After each user message, check: are any agents idle?"))
+        }
+    }
+
     // MARK: - The asymmetry itself
 
     /// The regression, stated directly: a peer leader's briefing must not
@@ -118,14 +200,15 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         }
 
         // Not equality — the Claude prompt also bans Claude Code's built-in
-        // team tools, which mean nothing to codex. Length is the crude proxy
-        // for "a briefing, not a policy sheet": the old failure produced a
-        // string a fraction of this size.
-        XCTAssertGreaterThan(
-            other.count,
-            LeaderParallelPolicy.renderedInstructions.count * 2,
-            "a prompt barely longer than the policy is the bug this test exists for"
-        )
+        // team tools, which mean nothing to codex. Assert the surrounding
+        // briefing sections directly instead of comparing lengths: the policy
+        // includes a structured JSON schema and can legitimately be more than
+        // half of a complete prompt.
+        for section in ["## Your Agents", "## How to Command Agents",
+                        "## Reading Agent Results", "## Task Board",
+                        "## Your Workflow", "## Warm Capacity, Not Utilization"] {
+            XCTAssertTrue(other.contains(section), "non-claude prompt lost \(section)")
+        }
     }
 
     func test_bothLeaderKindsUseTheSingleCallAgentAddFastPath() {
@@ -141,6 +224,25 @@ final class RemoteLeaderBriefingTests: XCTestCase {
             XCTAssertTrue(prompt.contains("tm-agent add <role> --cli <cli> --name <name> --warmup"))
             XCTAssertTrue(prompt.contains("Do not probe `status`, `--help`, presets, or runbooks first."))
             XCTAssertTrue(prompt.contains("Do not run a second `status` or `warmup`"))
+        }
+    }
+
+    func test_bothLeaderKindsTreatDurableRequestCommandsAsAClosedProtocol() {
+        let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
+            teamName: "xm",
+            rows: rows,
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        let other = nonClaudePrompt()
+
+        for prompt in [claude, other] {
+            XCTAssertTrue(prompt.contains("durable-request command set is CLOSED"), prompt)
+            XCTAssertTrue(prompt.contains("leader request take <id>` once"), prompt)
+            XCTAssertTrue(prompt.contains("leader request complete <id>` once"), prompt)
+            XCTAssertTrue(prompt.contains("Specifically forbidden: `--help`, `list`, `recover`, `get`, `status`")
+                || prompt.contains("In particular, do not run `--help`, `list`, `recover`, `get`, `status`"), prompt)
+            XCTAssertTrue(prompt.contains("no verification command afterward"), prompt)
         }
     }
 

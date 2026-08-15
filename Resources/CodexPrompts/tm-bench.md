@@ -12,8 +12,8 @@ Measures RPC infrastructure latency and end-to-end agent response times across
 Results are saved to `~/.term-mesh/benchmarks/YYYY-MM-DDTHH-MM-SS.json` and compared
 with previous runs automatically.
 
-All benchmark runs go through `python3 scripts/bench-agent.py`. Do not use Codex native
-sub-agents for term-mesh teams.
+Communication benchmarks use `scripts/bench-agent.py`; validated development throughput uses
+`scripts/bench-agent-effectiveness.py`. Do not use Codex native sub-agents for term-mesh teams.
 
 ## Empty input
 
@@ -30,12 +30,18 @@ If `$ARGUMENTS` is empty, show the menu and stop:
   agent --e2e        E2E 통신 만 측정
   agent --repeat N   N회 반복
   agent --note "..." 변경 메모 첨부
+  effectiveness              실제 회귀 3개로 single vs leader+worker3 비교
+  effectiveness --dry-run    paired 18회 matrix만 검증
+  effectiveness-validate     baseline fail/oracle pass/history 격리 검증
+  effectiveness-report RUN   결과 재집계 (`--evaluate`로 blinded quality 평가)
   history            최근 10개 결과 표
   compare A B        두 실행 비교 (타임스탬프 prefix)
 
 예:
   /tm-bench agent --e2e
   /tm-bench agent --pane --repeat 5 --note "렌더링 ON"
+  /tm-bench effectiveness --dry-run
+  /tm-bench effectiveness-report ~/.term-mesh/benchmarks/effectiveness/<run-id> --evaluate
   /tm-bench history
   /tm-bench compare 2026-05-23T10 2026-05-23T14
 ```
@@ -54,6 +60,9 @@ invocation:
 | `agent --terminal` | `python3 scripts/bench-agent.py --leader terminal --mode pane` |
 | `agent --rpc` | `python3 scripts/bench-agent.py --rpc-only --mode pane --leader terminal` |
 | `agent --e2e` | `python3 scripts/bench-agent.py --e2e-only --mode pane --leader terminal` |
+| `effectiveness [flags]` | `python3 scripts/bench-agent-effectiveness.py run [flags]` |
+| `effectiveness-validate [flags]` | `python3 scripts/bench-agent-effectiveness.py validate-suite [flags]` |
+| `effectiveness-report RUN` | `python3 scripts/bench-agent-effectiveness.py report RUN` |
 | `history` | `python3 scripts/bench-agent.py --history` |
 | `compare A B` | `python3 scripts/bench-agent.py --compare A B` |
 
@@ -67,6 +76,14 @@ invocation:
 4. **Pass through `--note "..."`** unchanged.
 
 ## Execution
+
+For `effectiveness`, do not require or reuse the current team. The runner owns uniquely named
+headless teams and history-free repositories and destroys only those resources. A full default run
+makes 18 paid leader calls plus corrections and worker calls, so show `effectiveness --dry-run`
+first unless the user explicitly requested execution. The experiment protocol is documented in
+`docs/multi-agent-effectiveness-benchmark.md`.
+
+For `agent` modes:
 
 1. Run `tm-agent status` first. For E2E modes that reuse an existing team
    (`--e2e`, `--terminal`, bare `agent`), if no team exists, ask the user to run:

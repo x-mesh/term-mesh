@@ -628,8 +628,16 @@ extension TerminalController {
             return .err(code: "invalid_params", message: "directory is required", data: nil)
         }
         let templateName = params["template"] as? String
-        let leaderMode = params["leader_cli"] as? String ?? "claude"
-        let leaderModel = params["leader_model"] as? String ?? AgentRolePreset.defaultModel(for: leaderMode)
+        let smartPreset = (params["preset_id"] as? String).flatMap { presetId in
+            SmartTeamPreset.builtIn.first { $0.id == presetId }
+        }
+        if params["preset_id"] != nil, smartPreset == nil {
+            return .err(code: "invalid_params", message: "unknown smart preset_id", data: nil)
+        }
+        let leaderMode = params["leader_cli"] as? String ?? smartPreset?.leaderMode ?? "claude"
+        let leaderModel = params["leader_model"] as? String
+            ?? smartPreset?.leaderModel
+            ?? AgentRolePreset.defaultModel(for: leaderMode)
         let leaderEndpoint: LeaderEndpoint = if let hostKey = params["leader_host"] as? String,
                                                 !hostKey.isEmpty {
             .peer(hostKey: hostKey)
@@ -717,9 +725,33 @@ extension TerminalController {
                         return
                     }
                     let presets = AgentRolePresetManager.shared.presets
-                    let rows: [TeamAgentRow] = roles.compactMap { role in
-                        guard let preset = presets.first(where: { $0.name == role }) else { return nil }
-                        return TeamAgentRow(preset: preset, customInstructions: "")
+                    let rows: [TeamAgentRow]
+                    if let smartPreset {
+                        let resolved = smartPreset.usesExactResolution
+                            ? smartPreset.resolveExactly()
+                            : smartPreset.resolve(with: ProviderDetector.shared)
+                        rows = resolved.compactMap { agent in
+                            guard var role = presets.first(where: { $0.name == agent.role }) else {
+                                return nil
+                            }
+                            role.cli = agent.cli
+                            role.model = agent.model
+                            let badge: TeamAgentRow.ProviderBadge = switch agent.status {
+                            case .normal: .none
+                            case .best: .best(reason: agent.reason)
+                            case .fallback(let wanted): .fallback(wanted: wanted)
+                            }
+                            return TeamAgentRow(
+                                preset: role,
+                                customInstructions: agent.customInstructions,
+                                providerBadge: badge
+                            )
+                        }
+                    } else {
+                        rows = roles.compactMap { role in
+                            guard let preset = presets.first(where: { $0.name == role }) else { return nil }
+                            return TeamAgentRow(preset: preset, customInstructions: "")
+                        }
                     }
                     guard let tabManager = self.tabManager else {
                         result = .err(code: "unavailable", message: "no TabManager", data: nil)
