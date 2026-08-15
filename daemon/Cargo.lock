@@ -2422,7 +2422,7 @@ dependencies = [
 
 [[package]]
 name = "term-mesh-cli"
-version = "0.186.3"
+version = "0.187.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "term-meshd"
-version = "0.186.3"
+version = "0.187.0"
 dependencies = [
  "anyhow",
  "axum",
