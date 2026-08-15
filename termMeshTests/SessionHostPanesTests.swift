@@ -421,4 +421,97 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
             PeerCapabilities(required)
         ))
     }
+
+    // MARK: - Session-host redirect
+
+    /// The exact set a Swift GUI peer host advertises: everything this build
+    /// supports, minus the two `PeerServer` strips. If that filter ever
+    /// changes, this is what should fail — the discriminator below is derived
+    /// from it, not guessed alongside it.
+    private static var guiHostCapabilities: PeerCapabilities {
+        PeerCapabilities(PeerCapability.supported.filter {
+            $0 != PeerCapability.surfaceAgentV1
+                && $0 != PeerCapability.projectPresentationV1
+        })
+    }
+
+    @MainActor
+    func test_guiPeerHostIsDistinguishedFromADaemonPredatingAgentSurfaces() {
+        XCTAssertTrue(
+            TeamOrchestrator.looksLikeGUIPeerHost(Self.guiHostCapabilities),
+            "a GUI host keeps the ensure-env/exit halves and drops only agent + presentation"
+        )
+        // A daemon old enough to predate peer-owned agents is missing the
+        // whole group. Calling that a GUI host would tell its user to start a
+        // daemon that is already running.
+        let oldDaemon = PeerCapabilities([
+            PeerCapability.ptyDataCoalesceV1,
+            PeerCapability.replayRingV1,
+            PeerCapability.surfaceEnsureV1,
+            PeerCapability.workspaceLifecycleV1,
+        ])
+        XCTAssertFalse(TeamOrchestrator.looksLikeGUIPeerHost(oldDaemon))
+        XCTAssertFalse(
+            TeamOrchestrator.looksLikeGUIPeerHost(PeerCapabilities(PeerCapability.supported)),
+            "a host that can own agents is never reported as unable to by design"
+        )
+    }
+
+    @MainActor
+    func test_guiHostBlockNamesStartingADaemonRatherThanUpdating() {
+        let message = TeamOrchestrator.peerOwnedAgentFallbackMessage(
+            .guiHostNoSessionOwner, cli: "codex", hostName: "mac-peer"
+        )
+        XCTAssertTrue(message.contains("Start its daemon"))
+        XCTAssertTrue(
+            message.contains("Updating term-mesh there will not change this"),
+            "the old wording sent users to an update that cannot fix a GUI host"
+        )
+    }
+
+    private func hostEntry(
+        sshTarget: String? = "mac-peer",
+        sessionHostRemoteSockPath: String = ""
+    ) -> HostEntry {
+        var entry = HostEntry(
+            id: "host",
+            displayName: "mac-peer",
+            connectionState: .connected,
+            workspaces: [],
+            activeSockPath: "/tmp/local-tunnel.sock",
+            sshTarget: sshTarget,
+            remoteSockPath: "/tmp/term-mesh-peer-501/peer.sock"
+        )
+        entry.sessionHostRemoteSockPath = sessionHostRemoteSockPath
+        return entry
+    }
+
+    func test_teamWorkFollowsTheAdvertisedSessionOwnerWhileMirroringDoesNot() {
+        let redirected = hostEntry(sessionHostRemoteSockPath: "/tmp/T/term-meshd-peer.sock")
+        XCTAssertEqual(
+            redirected.teamHostSpec.hostKey.remoteSockPath,
+            "/tmp/T/term-meshd-peer.sock"
+        )
+        XCTAssertEqual(
+            redirected.paneHostSpec.hostKey.remoteSockPath,
+            "/tmp/term-mesh-peer-501/peer.sock",
+            "the sidebar keeps mirroring the host's own surfaces"
+        )
+        XCTAssertTrue(redirected.redirectsTeamWorkToSessionHost)
+    }
+
+    func test_teamWorkStaysPutWithoutASessionOwnerOrWithoutSSH() {
+        let plain = hostEntry()
+        XCTAssertEqual(plain.teamHostSpec.hostKey, plain.paneHostSpec.hostKey)
+        XCTAssertFalse(plain.redirectsTeamWorkToSessionHost)
+
+        // A direct (non-SSH) host has no second path to tunnel to, so the
+        // advertisement cannot be honoured and must not be half-applied.
+        let direct = hostEntry(
+            sshTarget: nil,
+            sessionHostRemoteSockPath: "/tmp/T/term-meshd-peer.sock"
+        )
+        XCTAssertEqual(direct.teamHostSpec.hostKey, direct.paneHostSpec.hostKey)
+        XCTAssertFalse(direct.redirectsTeamWorkToSessionHost)
+    }
 }

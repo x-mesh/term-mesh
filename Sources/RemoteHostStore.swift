@@ -438,6 +438,15 @@ struct HostEntry: Identifiable, Equatable {
     /// newer tm-agent in its login PATH while the serving daemon is older;
     /// only the authenticated handshake answers this correctly.
     var supportsRemoteTeamRoute: Bool? = nil
+    /// Remote path this host names as the owner of sessions that outlive it
+    /// (`Hello.session_host_socket`), empty when it owns its own.
+    ///
+    /// A Mac serving peers from the app publishes its term-meshd here: its
+    /// own peer server strips `surface.agent.v1` and
+    /// `project.presentation.v1` because a GUI process implements neither, so
+    /// team work addressed to it can only fall back. Live-session state, like
+    /// the capability flags above — cleared with the socket, never persisted.
+    var sessionHostRemoteSockPath: String = ""
     /// Authenticated host CLI directories. Live-session cache only: never
     /// written to PeerHostProfile/UserDefaults and cleared with the socket.
     var hostCLIBinDirs: [String] = []
@@ -525,6 +534,7 @@ struct HostEntry: Identifiable, Equatable {
         servingAppVersion = nil
         supportsPeerOwnedAgentHosting = nil
         supportsRemoteTeamRoute = nil
+        sessionHostRemoteSockPath = ""
     }
 
     /// Detach profile-owned configuration without letting a still-live
@@ -555,6 +565,44 @@ struct HostEntry: Identifiable, Equatable {
             )
         }
         return .direct(sockPath: activeSockPath)
+    }
+
+    /// Host spec for team work: leader panes, agent surfaces, the project
+    /// manifest, and their cleanup.
+    ///
+    /// Identical to `paneHostSpec` except on a host that named a separate
+    /// session owner, where it points at that owner instead. Ordinary
+    /// terminal panes and workspace mirroring keep using `paneHostSpec`,
+    /// because what the two endpoints publish is not the same thing: a GUI
+    /// host publishes its own windows, its daemon publishes the sessions it
+    /// holds. Moving only team work keeps the visible workspace list exactly
+    /// as it was while giving agents a host that can actually own them.
+    ///
+    /// One spec for all of team work, not one per member, is the point:
+    /// `hostKey` embeds the remote socket path, and
+    /// `remoteManifestCoversEveryAgent` refuses a manifest whose members do
+    /// not share the leader's key. Splitting leader and agents across the two
+    /// sockets would trade the old failure for a subtler one.
+    ///
+    /// Falls back whenever the redirect cannot be expressed — a direct
+    /// (non-SSH) host has no second path to tunnel to.
+    var teamHostSpec: PeerPaneHostSpec {
+        guard !sessionHostRemoteSockPath.isEmpty,
+              let sshTarget, !sshTarget.isEmpty
+        else { return paneHostSpec }
+        return .ssh(
+            target: sshTarget,
+            remoteSockPath: sessionHostRemoteSockPath,
+            port: sshPort,
+            identityFile: identityFile
+        )
+    }
+
+    /// Whether team work is being redirected away from the serving socket.
+    /// Callers that cannot reuse `activeSockPath` for team RPCs check this
+    /// rather than re-deriving the comparison.
+    var redirectsTeamWorkToSessionHost: Bool {
+        teamHostSpec.hostKey != paneHostSpec.hostKey
     }
 }
 
@@ -1313,6 +1361,13 @@ final class RemoteHostStore: ObservableObject {
                         Self.hostSupportsPeerOwnedAgentFactory(conn.hostCapabilities)
                     self.hosts[key]?.supportsRemoteTeamRoute =
                         conn.hostCapabilities.has(PeerCapability.teamLeaderV1)
+                    // Only meaningful when this host cannot own agents itself.
+                    // A host that can is already the right place for team work,
+                    // and recording a redirect there would tunnel a second time
+                    // to reach the socket we are already talking to.
+                    self.hosts[key]?.sessionHostRemoteSockPath =
+                        Self.hostSupportsPeerOwnedAgentFactory(conn.hostCapabilities)
+                            ? "" : conn.sessionHostSockPath
                     if let provenance {
                         _ = self.hosts[key]?.acceptAuthenticatedHostCLIBinDirs(
                             conn.hostCLIBinDirs, provenance: provenance

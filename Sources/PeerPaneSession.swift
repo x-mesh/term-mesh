@@ -315,6 +315,19 @@ final class PeerPaneHostRegistry {
     private(set) var teardownCountForTests = 0
     #endif
 
+    /// Local socket of a lease that already exists for `key`, or nil.
+    ///
+    /// Read-only and refcount-free on purpose: it answers "is there already a
+    /// tunnel to this endpoint, and where is it" for callers that must not
+    /// start one. Teardown is the case — closing surfaces on an endpoint whose
+    /// tunnel is already gone has nothing left to close, and dialling a fresh
+    /// tunnel to discover that would outlive the work it was opened for.
+    func existingLocalSockPath(for key: PeerPaneHostKey) -> String? {
+        guard let lease = leases[key] else { return nil }
+        let path = lease.hostSockPath
+        return path.isEmpty ? nil : path
+    }
+
     /// Acquire a lease for the host (+1 ref). Starts the SSH tunnel on
     /// first acquire; later acquires reuse the live lease.
     func acquire(_ spec: PeerPaneHostSpec) async throws -> PeerPaneHostLease {
