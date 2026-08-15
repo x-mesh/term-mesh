@@ -3452,17 +3452,34 @@ class TerminalController {
         guard let agentName = params["agent_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
         }
-        let selection = await resolveTeamAgentInstance(params: params, teamName: teamName, agentName: agentName)
-        if let failure = selection.failure { return v2Result(id: id, failure) }
-        guard let agentInstanceId = selection.instanceId else {
-            return v2Error(id: id, code: "not_found", message: "Agent not found")
+        let isLeader = agentName == "leader"
+        let agentInstanceId: String
+        if isLeader {
+            // The leader is stored on Team, outside `agents[]`. Sending it
+            // through the ordinary instance resolver rejects a real attached
+            // leader before `agentPanel` can use its dedicated lookup path.
+            guard let leaderIdentity = await MainActor.run(body: {
+                TeamOrchestrator.shared.leaderReadIdentity(teamName: teamName)
+            }) else {
+                return v2Error(id: id, code: "not_found", message: "Leader not found")
+            }
+            agentInstanceId = leaderIdentity
+        } else {
+            let selection = await resolveTeamAgentInstance(
+                params: params, teamName: teamName, agentName: agentName
+            )
+            if let failure = selection.failure { return v2Result(id: id, failure) }
+            guard let resolved = selection.instanceId else {
+                return v2Error(id: id, code: "not_found", message: "Agent not found")
+            }
+            agentInstanceId = resolved
         }
         let lineLimit = params["lines"] as? Int
 
         // Minimal MainActor hold: snapshot either native transcript rows or
         // terminal raw bytes. Terminal base64 decoding remains off-main.
         let (response, isNative, errResult): (String?, Bool, V2CallResult?) = await MainActor.run {
-            if let session = TeamOrchestrator.shared.nativeAgentSession(
+            if !isLeader, let session = TeamOrchestrator.shared.nativeAgentSession(
                 teamName: teamName,
                 agentName: agentName,
                 agentInstanceId: agentInstanceId

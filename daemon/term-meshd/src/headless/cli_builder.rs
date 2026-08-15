@@ -369,12 +369,17 @@ pub fn build_codex_command(
     extra_env: &std::collections::HashMap<String, String>,
 ) -> CliCommand {
     let program = resolve_cli_path(cli_path, "CODEX_PATH", "codex");
+    let sandbox = extra_args
+        .windows(2)
+        .find(|pair| pair[0] == "--sandbox")
+        .map(|pair| pair[1].as_str())
+        .unwrap_or("danger-full-access");
 
     let codex_model = codex_model_name(model);
     let mut args: Vec<OsString> = vec![
         "exec".into(),
         "--sandbox".into(),
-        "danger-full-access".into(),
+        OsString::from(sandbox),
         "--model".into(),
         OsString::from(codex_model),
     ];
@@ -385,7 +390,16 @@ pub fn build_codex_command(
     args.push("--json".into());
     args.push("-".into()); // read prompt from stdin
 
+    let mut skip_next = false;
     for arg in extra_args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--sandbox" {
+            skip_next = true;
+            continue;
+        }
         args.push(OsString::from(arg));
     }
 
@@ -484,6 +498,33 @@ mod tests {
             canonical_executable_parent(Path::new("relative/missing")),
             None
         );
+    }
+
+    #[test]
+    fn codex_sandbox_can_be_narrowed_without_duplicate_flags() {
+        let cmd = build_codex_command(
+            "pair",
+            "team",
+            "sonnet",
+            "/tmp/daemon.sock",
+            None,
+            None,
+            &["--sandbox".into(), "read-only".into()],
+            &std::collections::HashMap::new(),
+        );
+        let args: Vec<String> = cmd
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "--sandbox")
+                .count(),
+            1
+        );
+        let index = args.iter().position(|arg| arg == "--sandbox").unwrap();
+        assert_eq!(args[index + 1], "read-only");
     }
 
     #[test]
