@@ -414,6 +414,10 @@ async fn sweep_once(
                     cli_path: st.cli_path.clone(),
                     app_socket_path: st.app_socket_path.clone(),
                     reply_timeout: Duration::from_secs(st.reply_timeout_secs),
+                    allow_gui_watcher_pane: true,
+                    pair_scope: None,
+                    pair_lens: None,
+                    extra_cli_args: vec![],
                 });
             }
         }
@@ -525,6 +529,10 @@ pub async fn trigger_now(
                     cli_path: st.cli_path.clone(),
                     app_socket_path: st.app_socket_path.clone(),
                     reply_timeout: Duration::from_secs(st.reply_timeout_secs),
+                    allow_gui_watcher_pane: true,
+                    pair_scope: None,
+                    pair_lens: None,
+                    extra_cli_args: vec![],
                 }
             })
             .collect();

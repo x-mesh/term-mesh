@@ -33,6 +33,13 @@ is on-track or drifting, and distinguish execution drift (doing the task wrong) 
 from direction drift (doing the wrong task). Report to the leader only; never \
 edit files or message other agents. If nothing is wrong, say so in one line.";
 
+const PAIR_REVIEW_ONESHOT_DIRECTIVE: &str = "\
+You are a stateless Pair Reviewer for a term-mesh project. Review exactly one \
+immutable, bounded snapshot through the user-selected lens. You are read-only: \
+never edit files, run mutating commands, commit, or message another agent. Base \
+every finding on evidence present in the snapshot. Prefer no finding over a \
+speculative one. Return only the requested structured review.";
+
 /// Tail length (lines) of the watched agent's output used as the review delta.
 /// Bounded by construction (R6): only the most recent N lines, never history.
 const DELTA_TAIL_LINES: usize = 200;
@@ -43,7 +50,7 @@ const DELTA_MAX_CHARS: usize = 16_000;
 
 /// Truncate the delta to [`DELTA_MAX_CHARS`], keeping the most recent tail
 /// (drift shows up in the latest output). Prefixed with an elision marker when cut.
-fn bound_delta(delta: &str) -> String {
+pub(crate) fn bound_delta(delta: &str) -> String {
     if delta.len() <= DELTA_MAX_CHARS {
         return delta.to_string();
     }
@@ -53,6 +60,37 @@ fn bound_delta(delta: &str) -> String {
         .find(|&i| delta.is_char_boundary(i))
         .unwrap_or(delta.len());
     format!("…[delta truncated]…\n{}", &delta[start..])
+}
+
+/// Freeze the watched target's bounded output before a user-triggered review
+/// starts. This is deliberately separate from `run_check_impl`, whose fallback
+/// may collect later, because Pair Review promises a start-time snapshot.
+pub(crate) async fn capture_target_delta(
+    manager: &Arc<Mutex<HeadlessManager>>,
+    team: &str,
+    target: &str,
+    app_socket: Option<&str>,
+) -> Result<String, String> {
+    let agent_id = format!("{target}@{team}");
+    let lines = manager
+        .lock()
+        .await
+        .read_output(&agent_id, DELTA_TAIL_LINES)
+        .await
+        .unwrap_or_default();
+    if !lines.is_empty() {
+        let text = extract_verdict_text(&lines);
+        if !text.trim().is_empty() {
+            return Ok(bound_delta(&text));
+        }
+    }
+    let socket =
+        app_socket.ok_or_else(|| "app socket required to snapshot GUI leader".to_string())?;
+    let text = app_read_pane(socket, team, target, DELTA_TAIL_LINES).await?;
+    if text.trim().is_empty() {
+        return Err(format!("no output available for {target}"));
+    }
+    Ok(bound_delta(&text))
 }
 
 /// Which class of drift this tick is checking for.
@@ -116,6 +154,17 @@ pub struct WatchCheckInput {
     pub app_socket_path: Option<String>,
     /// Upper bound on how long to wait for the watcher's verdict.
     pub reply_timeout: Duration,
+    /// Autonomous Watch may reuse the team's GUI watcher pane. A user-triggered
+    /// Pair Review sets this to false so every run is a fresh, disposable
+    /// subprocess and can never depend on or mutate continuous Watch state.
+    pub allow_gui_watcher_pane: bool,
+    /// Optional one-shot Pair Review framing. Autonomous drift checks leave
+    /// these empty and retain the established drift verdict contract.
+    pub pair_scope: Option<String>,
+    pub pair_lens: Option<String>,
+    /// Extra CLI arguments owned by the caller's safety policy. Pair Review
+    /// uses this to override Codex's normal worker sandbox to read-only.
+    pub extra_cli_args: Vec<String>,
 }
 
 /// Result of one check. `verdict_text` is raw — P5 parses it.
@@ -170,6 +219,10 @@ pub fn compose_watcher_instructions(spec: &str) -> Option<String> {
     merge_instructions(Some(WATCHER_ONESHOT_DIRECTIVE), Some(spec))
 }
 
+pub fn compose_pair_review_instructions(spec: &str) -> Option<String> {
+    merge_instructions(Some(PAIR_REVIEW_ONESHOT_DIRECTIVE), Some(spec))
+}
+
 /// Per-tick REVIEW message. The spec lives in the system prompt
 /// (see [`compose_watcher_instructions`]); this carries only the framing plus a
 /// delta instruction.
@@ -214,6 +267,30 @@ pub fn build_review_message(input: &WatchCheckInput) -> String {
     } else {
         ""
     };
+    if let Some(scope) = input.pair_scope.as_deref() {
+        let lens = input.pair_lens.as_deref().unwrap_or("general");
+        return format!(
+            "PAIR REVIEW NOW\n\
+             check_id: {check_id}\n\
+             scope: {scope}\n\
+             lens: {lens}\n\
+             target: {target}\n\n\
+             {delta_section}\n\n\
+             {leader_note}\
+             Review only the stated scope through the stated lens. Treat this as \
+             read-only review: never edit files, commit, or message another agent. \
+             Output one structured result and nothing else:\n\
+             [VERDICT] approve | changes-requested | blocked\n\
+             [FINDINGS] numbered findings with severity and concrete evidence, or none\n\
+             [RECOMMENDED_ACTIONS] numbered bounded actions, or none",
+            check_id = input.check_id,
+            scope = scope,
+            lens = lens,
+            target = input.target,
+            delta_section = delta_section,
+            leader_note = leader_note,
+        );
+    }
     format!(
         "REVIEW NOW\n\
          check_id: {check_id}\n\
@@ -291,7 +368,9 @@ impl HeadlessOneShotRunner {
         // path. Pure-headless teams — and GUI teams without an app socket — keep
         // the one-shot spawn below.
         let is_headless_team = self.manager.lock().await.has_team(&input.team_name);
-        if should_use_gui_pane_path(is_headless_team, input.app_socket_path.as_deref()) {
+        if input.allow_gui_watcher_pane
+            && should_use_gui_pane_path(is_headless_team, input.app_socket_path.as_deref())
+        {
             let app_socket = input.app_socket_path.clone().unwrap_or_default();
             tracing::debug!(
                 "watch: team {} → §4 GUI pane-recycle path (watcher pane over app socket)",
@@ -302,7 +381,11 @@ impl HeadlessOneShotRunner {
 
         // Unique per-tick name → a fresh subprocess every check (no context reuse).
         let agent_name = format!("watcher-{}", super::meta::new_uuid());
-        let instructions = compose_watcher_instructions(&input.spec);
+        let instructions = if input.pair_scope.is_some() {
+            compose_pair_review_instructions(&input.spec)
+        } else {
+            compose_watcher_instructions(&input.spec)
+        };
 
         let spawn_params = SpawnParams {
             name: agent_name,
@@ -316,6 +399,7 @@ impl HeadlessOneShotRunner {
             // The watcher must report under a distinct identity so its reply does
             // not collide with the watched agent in the team namespace.
             agent_name_override: None,
+            extra_args: input.extra_cli_args.clone(),
         };
 
         // 1. Spawn (hold the manager lock only for the spawn itself).
@@ -883,7 +967,11 @@ async fn wait_for_verdict(
     const POLL: Duration = Duration::from_millis(200);
     const QUIET_PERIOD: Duration = Duration::from_millis(1500);
     // Claude emits a definitive `result` event; never settle on quiet for it.
-    let use_quiet_fallback = !cli.eq_ignore_ascii_case("claude");
+    // Claude and Codex both expose definitive terminal events. Treating a
+    // short quiet gap after Codex's thread.started/turn.started events as a
+    // completed answer returned raw protocol JSON as the Pair Review verdict.
+    let use_quiet_fallback =
+        !cli.eq_ignore_ascii_case("claude") && !cli.eq_ignore_ascii_case("codex");
 
     let deadline = Instant::now() + timeout;
     let mut last_len: usize = 0;
@@ -942,6 +1030,10 @@ mod tests {
             cli_path: None,
             app_socket_path: None,
             reply_timeout: Duration::from_millis(800),
+            allow_gui_watcher_pane: true,
+            pair_scope: None,
+            pair_lens: None,
+            extra_cli_args: vec![],
         }
     }
 
@@ -951,6 +1043,24 @@ mod tests {
         assert!(out.contains(WATCHER_ONESHOT_DIRECTIVE));
         assert!(out.contains("## Custom Instructions"));
         assert!(out.contains("SPEC-SENTINEL-ONE-SHOT"));
+    }
+
+    #[test]
+    fn pair_review_message_has_read_only_structured_contract() {
+        let mut input = sample_input("diff --git a/a b/a");
+        input.target = "leader".into();
+        input.pair_scope = Some("current-changes".into());
+        input.pair_lens = Some("security".into());
+        input.allow_gui_watcher_pane = false;
+
+        let message = build_review_message(&input);
+        assert!(message.contains("PAIR REVIEW NOW"));
+        assert!(message.contains("scope: current-changes"));
+        assert!(message.contains("lens: security"));
+        assert!(message.contains("never edit files"));
+        assert!(message.contains("[VERDICT] approve | changes-requested | blocked"));
+        assert!(message.contains("[FINDINGS]"));
+        assert!(message.contains("[RECOMMENDED_ACTIONS]"));
     }
 
     #[test]

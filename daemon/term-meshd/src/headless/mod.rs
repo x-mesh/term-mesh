@@ -302,6 +302,9 @@ pub struct SpawnParams {
     /// Override TERMMESH_AGENT_NAME env var (for autonomous tasks that report as a different agent).
     #[serde(default)]
     pub agent_name_override: Option<String>,
+    /// Caller-owned safety flags appended after the standard CLI arguments.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 fn default_cli() -> String {
@@ -560,7 +563,7 @@ impl HeadlessManager {
             claude_session_id: session_id.clone(),
             resume_claude: false,
             preloaded_usage: None,
-            extra_args: Vec::new(),
+            extra_args: params.extra_args.clone(),
             extra_env: std::collections::HashMap::new(),
             auto_recycle_every: None,
             preloaded_completed_task_count: 0,
@@ -1472,7 +1475,11 @@ impl HeadlessManager {
                 schema: meta::SCHEMA_VERSION,
                 team_uuid: team_uuid.clone(),
                 name: a.name.clone(),
-                agent_instance_id: a.agent_instance_id.clone().filter(|id| !id.trim().is_empty()).or_else(|| Some(meta::new_uuid())),
+                agent_instance_id: a
+                    .agent_instance_id
+                    .clone()
+                    .filter(|id| !id.trim().is_empty())
+                    .or_else(|| Some(meta::new_uuid())),
                 agent_type: a.agent_type.clone(),
                 cli: a.cli.clone(),
                 model: a.model.clone(),
@@ -1581,7 +1588,11 @@ impl HeadlessManager {
                 schema: meta::SCHEMA_VERSION,
                 team_uuid: team_uuid.clone(),
                 name: a.name.clone(),
-                agent_instance_id: a.agent_instance_id.clone().filter(|id| !id.trim().is_empty()).or_else(|| Some(meta::new_uuid())),
+                agent_instance_id: a
+                    .agent_instance_id
+                    .clone()
+                    .filter(|id| !id.trim().is_empty())
+                    .or_else(|| Some(meta::new_uuid())),
                 agent_type: a.agent_type.clone(),
                 cli: a.cli.clone(),
                 model: a.model.clone(),
@@ -3062,7 +3073,8 @@ pub struct ArchivePaneParams {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ArchivePaneAgent {
     pub name: String,
-    #[serde(default)] pub agent_instance_id: Option<String>,
+    #[serde(default)]
+    pub agent_instance_id: Option<String>,
     pub cli: String,
     pub model: String,
     pub agent_type: String,
@@ -3126,7 +3138,8 @@ pub struct SnapshotPaneParams {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SnapshotPaneAgent {
     pub name: String,
-    #[serde(default)] pub agent_instance_id: Option<String>,
+    #[serde(default)]
+    pub agent_instance_id: Option<String>,
     pub cli: String,
     pub model: String,
     pub agent_type: String,
@@ -4138,17 +4151,28 @@ mod tests {
 
         // Missing is a legacy payload: snapshot persistence assigns exactly one
         // durable UUID and writes it back to agent metadata.
-        mgr.snapshot_pane_team(sample_snapshot_params(team_uuid)).unwrap();
+        mgr.snapshot_pane_team(sample_snapshot_params(team_uuid))
+            .unwrap();
         let migrated = meta::read_agent_meta(team_uuid, "explorer").unwrap();
-        let instance_id = migrated.agent_instance_id.clone().expect("legacy ID migrated");
+        let instance_id = migrated
+            .agent_instance_id
+            .clone()
+            .expect("legacy ID migrated");
         assert!(uuid::Uuid::parse_str(&instance_id).is_ok());
 
         // A subsequent archive/resume exposes the persisted same identity.
         let mut archive = sample_archive_params(Some(team_uuid.into()));
         archive.agents[0].agent_instance_id = Some(instance_id.clone());
         let archived = mgr.archive_pane_team(archive).unwrap();
-        let resumed = mgr.resume_pane(ResumePaneParams { team_uuid: archived.team_uuid }).unwrap();
-        assert_eq!(resumed.agents[0].agent_instance_id.as_deref(), Some(instance_id.as_str()));
+        let resumed = mgr
+            .resume_pane(ResumePaneParams {
+                team_uuid: archived.team_uuid,
+            })
+            .unwrap();
+        assert_eq!(
+            resumed.agents[0].agent_instance_id.as_deref(),
+            Some(instance_id.as_str())
+        );
     }
 
     #[test]

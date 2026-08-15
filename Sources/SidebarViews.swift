@@ -1593,6 +1593,7 @@ private struct SidebarPeerProjectsView: View {
     @State private var delegateTarget: SidebarProjectDelegateTarget?
     /// Non-nil presents the remote-agent sheet.
     @State private var remoteAgentTarget: SidebarRemoteAgentTarget?
+    @State private var pairReviewTarget: PairReviewTarget?
     @State private var deletionTarget: SidebarProjectDeletionTarget?
     @State private var deletionFailure: String?
     @State private var presentationRestoreFailure: String?
@@ -1910,6 +1911,21 @@ private struct SidebarPeerProjectsView: View {
     /// What can be done to a project, wherever it is right-clicked.
     @ViewBuilder
     private func projectActions(for group: SidebarPeerProjectGroup) -> some View {
+        Button("Pair Review…") {
+            guard let teamName = teamName(for: group),
+                  let team = TeamOrchestrator.shared.teams[teamName]
+            else { return }
+            pairReviewTarget = PairReviewTarget(
+                projectLabel: group.identity.label,
+                teamName: teamName,
+                workingDirectory: team.workingDirectory,
+                leaderCLI: team.leaderMode == "adopted" ? (team.leaderCli ?? "") : team.leaderMode,
+                baseRef: team.projectTargetBranch
+            )
+        }
+        .disabled(teamName(for: group) == nil)
+        .accessibilityIdentifier("project.pairReview")
+        Divider()
         Button("Delegate Work to \(group.identity.label)…") {
             delegateTarget = SidebarProjectDelegateTarget(
                 label: group.identity.label,
@@ -2075,6 +2091,9 @@ private struct SidebarPeerProjectsView: View {
         }
         .sheet(item: $remoteAgentTarget) { target in
             SidebarRemoteAgentSheet(target: target) { remoteAgentTarget = nil }
+        }
+        .sheet(item: $pairReviewTarget) { target in
+            PairReviewSheet(target: target) { pairReviewTarget = nil }
         }
         .alert(
             "Delete “\(deletionTarget?.label ?? "Project")”?",

@@ -223,11 +223,199 @@ pub struct Context {
     pub watch_runner: Option<Arc<dyn crate::headless::one_shot::WatchCheckRunner>>,
     pub watch_sink:
         Option<tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>>,
+    /// User-triggered, non-persistent Pair Reviews. This registry is separate
+    /// from autonomous Watch so a one-shot review cannot enable, disable, or
+    /// otherwise perturb a team's continuous configuration.
+    pub pair_reviews: Arc<tokio::sync::Mutex<HashMap<String, PairReviewRun>>>,
     pub pane_tracker: PaneTracker,
     pub event_tx: EventSender,
     pub project_registry: Arc<crate::sync::ProjectRegistry>,
     pub paused_sync_projects: Arc<RwLock<HashSet<String>>>,
     pub operation_manager: crate::sync::OperationManager,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PairReviewRun {
+    review_id: String,
+    team_id: String,
+    status: String,
+    scope: String,
+    lens: String,
+    cli: String,
+    model: String,
+    /// SHA-256 of the exact bounded snapshot sent to the reviewer. Exposed so
+    /// tests and clients can prove start-time immutability without trusting
+    /// the reviewer's prose as an oracle.
+    snapshot_digest: Option<String>,
+    started_at: u64,
+    finished_at: Option<u64>,
+    duration_ms: Option<u64>,
+    verdict: Option<String>,
+    error: Option<String>,
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+async fn capture_pair_review_scope(
+    manager: &Arc<tokio::sync::Mutex<HeadlessManager>>,
+    team: &str,
+    scope: &str,
+    working_directory: &str,
+    base_ref: Option<&str>,
+    app_socket: Option<&str>,
+) -> Result<String, String> {
+    if scope == "current-task" {
+        return crate::headless::one_shot::capture_target_delta(
+            manager, team, "leader", app_socket,
+        )
+        .await;
+    }
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(working_directory)
+        .arg("diff")
+        .arg("--no-ext-diff");
+    match scope {
+        "current-changes" => {
+            command.arg("HEAD").arg("--");
+        }
+        "branch-diff" => {
+            let base = base_ref
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("develop");
+            command.arg(format!("{base}...HEAD")).arg("--");
+        }
+        _ => return Err(format!("unsupported Pair Review scope: {scope}")),
+    }
+    let output = command
+        .output()
+        .await
+        .map_err(|e| format!("run git diff: {e}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    if scope == "current-changes" {
+        let untracked = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(working_directory)
+            .args(["ls-files", "--others", "--exclude-standard", "-z"])
+            .output()
+            .await
+            .map_err(|e| format!("list untracked files: {e}"))?;
+        if !untracked.status.success() {
+            return Err(String::from_utf8_lossy(&untracked.stderr)
+                .trim()
+                .to_string());
+        }
+        for path in untracked
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let path = String::from_utf8_lossy(path);
+            let diff = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(working_directory)
+                .args(["diff", "--no-index", "--no-ext-diff", "--", "/dev/null"])
+                .arg(path.as_ref())
+                .output()
+                .await
+                .map_err(|e| format!("capture untracked file {path}: {e}"))?;
+            // `git diff --no-index` returns 1 when it successfully found a diff.
+            if !matches!(diff.status.code(), Some(0 | 1)) {
+                return Err(String::from_utf8_lossy(&diff.stderr).trim().to_string());
+            }
+            text.push_str(&String::from_utf8_lossy(&diff.stdout));
+        }
+    }
+    if text.trim().is_empty() {
+        return Err("selected scope has no changes to review".to_string());
+    }
+    Ok(crate::headless::one_shot::bound_delta(&text))
+}
+
+#[cfg(test)]
+mod pair_review_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn current_changes_captures_a_frozen_git_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["init"]).status.success());
+        assert!(run(&["config", "user.email", "pair@example.invalid"])
+            .status
+            .success());
+        assert!(run(&["config", "user.name", "Pair Test"]).status.success());
+        std::fs::write(dir.path().join("fixture.txt"), "before\n").unwrap();
+        assert!(run(&["add", "fixture.txt"]).status.success());
+        assert!(run(&["commit", "-m", "fixture"]).status.success());
+        std::fs::write(dir.path().join("fixture.txt"), "after\n").unwrap();
+
+        let manager = Arc::new(tokio::sync::Mutex::new(HeadlessManager::new()));
+        let delta = capture_pair_review_scope(
+            &manager,
+            "fixture",
+            "current-changes",
+            dir.path().to_str().unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(delta.contains("-before"));
+        assert!(delta.contains("+after"));
+    }
+
+    #[tokio::test]
+    async fn current_changes_includes_untracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(run(&["init"]).status.success());
+        assert!(run(&["config", "user.email", "pair@example.invalid"])
+            .status
+            .success());
+        assert!(run(&["config", "user.name", "Pair Test"]).status.success());
+        std::fs::write(dir.path().join("tracked.txt"), "tracked\n").unwrap();
+        assert!(run(&["add", "tracked.txt"]).status.success());
+        assert!(run(&["commit", "-m", "fixture"]).status.success());
+        std::fs::write(dir.path().join("new-file.txt"), "untracked pair content\n").unwrap();
+
+        let manager = Arc::new(tokio::sync::Mutex::new(HeadlessManager::new()));
+        let delta = capture_pair_review_scope(
+            &manager,
+            "fixture",
+            "current-changes",
+            dir.path().to_str().unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(delta.contains("new-file.txt"));
+        assert!(delta.contains("+untracked pair content"));
+    }
 }
 
 /// Open the project registry, recovering from a quarantined (corrupt or
@@ -241,9 +429,7 @@ pub struct Context {
 /// registry). "Quarantined" is the registry's own word for "move it aside":
 /// so do that, then open a fresh one. The daemon comes up with sync starting
 /// from empty rather than with no control plane at all.
-fn open_project_registry_recovering(
-    path: PathBuf,
-) -> anyhow::Result<crate::sync::ProjectRegistry> {
+fn open_project_registry_recovering(path: PathBuf) -> anyhow::Result<crate::sync::ProjectRegistry> {
     match crate::sync::ProjectRegistry::open(&path) {
         Ok(registry) => Ok(registry),
         Err(crate::sync::RegistryError::Quarantined { reason, .. }) => {
@@ -260,7 +446,8 @@ fn open_project_registry_recovering(
             for suffix in ["", "-wal", "-shm"] {
                 let from = PathBuf::from(format!("{}{suffix}", path.display()));
                 if from.exists() {
-                    let to = PathBuf::from(format!("{}.quarantined-{stamp}{suffix}", path.display()));
+                    let to =
+                        PathBuf::from(format!("{}.quarantined-{stamp}{suffix}", path.display()));
                     if let Err(error) = std::fs::rename(&from, &to) {
                         tracing::error!("could not move {} aside: {error}", from.display());
                     }
@@ -330,8 +517,8 @@ pub async fn serve(
     let project_registry = Arc::new(open_project_registry_recovering(
         crate::sync::default_registry_db_path(),
     )?);
-    let operation_manager = build_sync_operation_manager(project_registry.clone())
-        .map_err(|error| {
+    let operation_manager =
+        build_sync_operation_manager(project_registry.clone()).map_err(|error| {
             tracing::error!("sync operation manager setup failed: {error:?}");
             error
         })?;
@@ -347,6 +534,7 @@ pub async fn serve(
         watch_registry,
         watch_runner,
         watch_sink,
+        pair_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         pane_tracker,
         event_tx,
         project_registry,
@@ -3215,6 +3403,175 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
+        "pair.review.start" => {
+            #[derive(Deserialize)]
+            struct P {
+                team_id: String,
+                #[serde(default = "default_pair_scope")]
+                scope: String,
+                #[serde(default = "default_pair_lens")]
+                lens: String,
+                #[serde(default = "default_pair_cli")]
+                cli: String,
+                #[serde(default = "default_pair_model")]
+                model: String,
+                spec: String,
+                working_directory: String,
+                #[serde(default)]
+                base_ref: Option<String>,
+                #[serde(default)]
+                cli_path: Option<String>,
+                #[serde(default)]
+                app_socket_path: Option<String>,
+                #[serde(default)]
+                reply_timeout_secs: Option<u64>,
+            }
+            fn default_pair_scope() -> String { "current-task".into() }
+            fn default_pair_lens() -> String { "general".into() }
+            fn default_pair_cli() -> String { "codex".into() }
+            fn default_pair_model() -> String { "gpt-5.6-sol".into() }
+
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) if p.team_id.trim().is_empty() => Err("team_id required".to_string()),
+                Ok(p) if p.spec.trim().is_empty() => Err("review instructions required".to_string()),
+                Ok(p) if p.working_directory.trim().is_empty() => Err("working_directory required".to_string()),
+                Ok(p) if p.cli != "codex" => Err("Pair Review currently requires the Codex read-only sandbox".to_string()),
+                Ok(p) if p.model.trim().is_empty() => Err("Pair Review model required".to_string()),
+                Ok(p) => match &ctx.watch_runner {
+                    None => Err("pair review runner not available".to_string()),
+                    Some(runner) => {
+                        let mut reviews = ctx.pair_reviews.lock().await;
+                        if reviews.values().any(|run| run.team_id == p.team_id && run.status == "running") {
+                            Ok(serde_json::json!({
+                                "status": "rejected",
+                                "started": false,
+                                "reason": "a Pair Review is already running for this project",
+                            }))
+                        } else {
+                        let review_id = crate::headless::meta::new_uuid();
+                        let started_at = unix_millis();
+                        reviews.insert(review_id.clone(), PairReviewRun {
+                            review_id: review_id.clone(),
+                            team_id: p.team_id.clone(),
+                            status: "running".into(),
+                            scope: p.scope.clone(),
+                            lens: p.lens.clone(),
+                            cli: p.cli.clone(),
+                            model: p.model.clone(),
+                            snapshot_digest: None,
+                            started_at,
+                            finished_at: None,
+                            duration_ms: None,
+                            verdict: None,
+                            error: None,
+                        });
+                        drop(reviews);
+
+                        // Freeze the review input before acknowledging `started`.
+                        // Capturing inside the spawned task would let edits made
+                        // after the response leak into this supposedly immutable run.
+                        let delta = capture_pair_review_scope(
+                            &ctx.headless,
+                            &p.team_id,
+                            &p.scope,
+                            &p.working_directory,
+                            p.base_ref.as_deref(),
+                            p.app_socket_path.as_deref(),
+                        ).await;
+                        match delta {
+                            Err(error) => {
+                                let mut reviews = ctx.pair_reviews.lock().await;
+                                reviews.remove(&review_id);
+                                Ok(serde_json::json!({
+                                    "status": "rejected",
+                                    "started": false,
+                                    "reason": format!("snapshot failed: {error}"),
+                                }))
+                            }
+                            Ok(delta) => {
+                                use sha2::{Digest, Sha256};
+                                let snapshot_digest = format!("{:x}", Sha256::digest(delta.as_bytes()));
+                                let mut reviews = ctx.pair_reviews.lock().await;
+                                if let Some(run) = reviews.get_mut(&review_id) {
+                                    run.snapshot_digest = Some(snapshot_digest);
+                                }
+                                drop(reviews);
+                                let runner = Arc::clone(runner);
+                                let reviews = Arc::clone(&ctx.pair_reviews);
+                                let review_id_task = review_id.clone();
+                                tokio::spawn(async move {
+                                    use crate::headless::one_shot::{WatchCheckInput, WatchCheckKind};
+                                    let outcome = runner.run_check(WatchCheckInput {
+                                        team_name: p.team_id.clone(),
+                                        target: "leader".into(),
+                                        check_id: format!("pair:{}", review_id_task),
+                                        check_kind: WatchCheckKind::Execution,
+                                        stance: "critic".into(),
+                                        spec: p.spec.clone(),
+                                        delta,
+                                        cli: p.cli.clone(),
+                                        model: p.model.clone(),
+                                        working_directory: p.working_directory.clone(),
+                                        cli_path: p.cli_path.clone(),
+                                        app_socket_path: p.app_socket_path.clone(),
+                                        reply_timeout: Duration::from_secs(p.reply_timeout_secs.unwrap_or(180).clamp(30, 600)),
+                                        allow_gui_watcher_pane: false,
+                                        pair_scope: Some(p.scope.clone()),
+                                        pair_lens: Some(p.lens.clone()),
+                                        extra_cli_args: vec!["--sandbox".into(), "read-only".into()],
+                                    }).await;
+                                    let finished = unix_millis();
+                                    let verdict = outcome.verdict_text.trim().to_string();
+                                    let error = outcome.error.clone().or_else(|| {
+                                        if verdict.is_empty() { Some("review returned no verdict".into()) } else { None }
+                                    });
+                                    let mut runs = reviews.lock().await;
+                                    if let Some(run) = runs.get_mut(&review_id_task) {
+                                        run.status = if error.is_some() { "failed" } else { "completed" }.into();
+                                        run.finished_at = Some(finished);
+                                        run.duration_ms = Some(finished.saturating_sub(run.started_at));
+                                        run.verdict = if verdict.is_empty() { None } else { Some(verdict.clone()) };
+                                        run.error = error.clone();
+                                    }
+                                    drop(runs);
+                                    if error.is_none() {
+                                        if let Some(socket) = p.app_socket_path.as_deref() {
+                                            let message = format!(
+                                                "Pair Review completed ({}/{} via {} {})\n{}",
+                                                p.scope, p.lens, p.cli, p.model, verdict
+                                            );
+                                            let _ = crate::watch_controller::post_team_message(socket, &p.team_id, &message).await;
+                                        }
+                                    }
+                                });
+                                Ok(serde_json::json!({
+                                    "status": "ok",
+                                    "started": true,
+                                    "review_id": review_id,
+                                }))
+                            }
+                        }
+                        }
+                    }
+                },
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "pair.review.status" => {
+            #[derive(Deserialize)]
+            struct P { review_id: String }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) if p.review_id.trim().is_empty() => Err("review_id required".to_string()),
+                Ok(p) => {
+                    let reviews = ctx.pair_reviews.lock().await;
+                    match reviews.get(&p.review_id) {
+                        Some(run) => Ok(serde_json::to_value(run).unwrap_or_else(|_| serde_json::json!({}))),
+                        None => Err(format!("Pair Review not found: {}", p.review_id)),
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
         "watch.trigger_now" => {
             #[derive(Deserialize)]
             struct P {
@@ -3876,14 +4233,20 @@ async fn handle_sync_bootstrap_trust(
     for entry in &params.roster {
         roster.push(crate::sync::BootstrapDevice {
             device_id: parse_hex_bytes::<32>(&entry.device_id, "roster.device_id")?,
-            certificate_hash: parse_hex_bytes::<32>(&entry.certificate_hash, "roster.certificate_hash")?,
+            certificate_hash: parse_hex_bytes::<32>(
+                &entry.certificate_hash,
+                "roster.certificate_hash",
+            )?,
             epoch: entry.epoch,
         });
     }
     let mut peers = Vec::with_capacity(params.peers.len());
     for entry in &params.peers {
         let addr: std::net::SocketAddr = entry.addr.parse().map_err(|_| {
-            format!("INVALID_PARAMS: peer addr '{}' is not a socket address", entry.addr)
+            format!(
+                "INVALID_PARAMS: peer addr '{}' is not a socket address",
+                entry.addr
+            )
         })?;
         peers.push((entry.peer_id.clone(), addr));
     }
@@ -3956,10 +4319,12 @@ async fn handle_conflict_get(
         crate::sync::summarize_conflicts(&set)
             .into_iter()
             .find(|summary| summary.conflict_id == wanted)
-            .map(|summary| serde_json::json!({
-                "project_id": domain.project_id.to_string(),
-                "conflict": summary,
-            }))
+            .map(|summary| {
+                serde_json::json!({
+                    "project_id": domain.project_id.to_string(),
+                    "conflict": summary,
+                })
+            })
             .ok_or_else(|| {
                 "CONFLICT_NOT_FOUND: no durable conflict record matches the request".to_string()
             })
@@ -4114,7 +4479,10 @@ async fn handle_sync_serve(
 
     let project_id = parse_project_id(&params.project_id)?;
     let bind: std::net::SocketAddr = params.bind_addr.parse().map_err(|_| {
-        format!("INVALID_PARAMS: bind_addr '{}' is not a socket address", params.bind_addr)
+        format!(
+            "INVALID_PARAMS: bind_addr '{}' is not a socket address",
+            params.bind_addr
+        )
     })?;
     let project_bytes = *project_id.as_bytes();
     let registry = ctx.project_registry.clone();
@@ -4150,12 +4518,7 @@ async fn handle_sync_serve(
         .map_err(|error| format!("SYNC_SERVE_BIND_FAILED: {error:?}"))?;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     tokio::spawn(crate::sync::serve_project(
-        server,
-        context,
-        root,
-        dek.key,
-        dek.key_id,
-        stop,
+        server, context, root, dek.key, dek.key_id, stop,
     ));
 
     Ok(serde_json::json!({
@@ -5281,7 +5644,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("term-meshd.sock");
         std::os::unix::fs::symlink(dir.path().join("gone.sock"), &socket).unwrap();
-        assert!(!socket.exists(), "the target is absent, so exists() is false");
+        assert!(
+            !socket.exists(),
+            "the target is absent, so exists() is false"
+        );
 
         super::clear_stale_socket_entry(&socket).unwrap();
 
