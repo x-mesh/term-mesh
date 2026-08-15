@@ -51,12 +51,12 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "8")
+        XCTAssertEqual(LeaderParallelPolicy.version, "9")
         XCTAssertEqual(LeaderParallelPolicy.activation, "runtime-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 8"))
+        XCTAssertTrue(first.contains("policy_version: 9"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(first.contains("policy_activation: runtime-enforced"))
     }
@@ -74,6 +74,7 @@ final class AgentSessionTests: XCTestCase {
             "bounded-handoff",
             "leader-integration-lane",
             "actual-diff-review-gate",
+            "review-only-fast-path",
             "cross-model-validation",
             "no-progress-recovery",
             "branch-merge-boundary",
@@ -92,6 +93,10 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(policy.contains("wait --mode any --tasks"))
         XCTAssertTrue(policy.contains("at most one additional wait/collect"))
         XCTAssertTrue(policy.contains("After the actual diff is integrated"))
+        XCTAssertTrue(policy.contains("bounded manifest-level triage"))
+        XCTAssertTrue(policy.contains("same frozen target"))
+        XCTAssertTrue(policy.contains("Do not enter tm-agent wait while useful leader-lane work remains"))
+        XCTAssertTrue(policy.contains("Small single-domain reviews stay leader-direct"))
         XCTAssertTrue(policy.contains("\"validation_gates\""))
         XCTAssertTrue(policy.contains("security plus tester"))
         XCTAssertTrue(policy.contains("cross_model_independence_unavailable"))

@@ -1294,7 +1294,11 @@ final class TermMeshDaemon: ObservableObject {
 
     /// Raw RPC call that returns the result as a JSON string (for injecting into WKWebView).
     func rpcCallRaw(method: String, params: [String: Any]) -> String? {
-        guard let response = rpcCall(method: method, params: params) else { return nil }
+        rpcCallRaw(method: method, params: params, timeout: 5)
+    }
+
+    func rpcCallRaw(method: String, params: [String: Any], timeout: Int) -> String? {
+        guard let response = rpcCall(method: method, params: params, timeout: timeout) else { return nil }
         guard let data = try? JSONSerialization.data(withJSONObject: response, options: [.fragmentsAllowed]) else { return nil }
         return String(data: data, encoding: .utf8)
     }

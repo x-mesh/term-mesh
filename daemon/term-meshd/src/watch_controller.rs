@@ -245,7 +245,11 @@ impl LeaderInbox for AppSocketInbox {
 /// Focus-free `team.message.post` over the app Unix socket. NO `to` field, so the
 /// app routes it to the leader inbox; this is a data command and never activates
 /// or raises any window (NFR2).
-async fn post_team_message(app_socket: &str, team_id: &str, content: &str) -> std::io::Result<()> {
+pub(crate) async fn post_team_message(
+    app_socket: &str,
+    team_id: &str,
+    content: &str,
+) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::UnixStream::connect(app_socket).await?;
     let req = serde_json::json!({
@@ -782,6 +786,10 @@ mod tests {
             cli_path: Some(fake_cli.to_string_lossy().to_string()),
             app_socket_path: None,
             reply_timeout: Duration::from_secs(4),
+            allow_gui_watcher_pane: true,
+            pair_scope: None,
+            pair_lens: None,
+            extra_cli_args: vec![],
         };
 
         let outcome = runner.run_check(input).await;

@@ -7856,6 +7856,10 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Read terminal text from a specific agent's pane.
     /// Returns the panel for external callers to use with readTerminalTextBase64.
+    func leaderReadIdentity(teamName: String) -> String? {
+        teams[teamName]?.leaderSessionId
+    }
+
     func agentPanel(teamName: String, agentName: String, agentInstanceId: String? = nil, tabManager: TabManager) -> TerminalPanel? {
         guard let team = teams[teamName] else { return nil }
         // Leader-as-watch-target: the leader lives in `leaderPanelId`, outside the

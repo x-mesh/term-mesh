@@ -51,8 +51,8 @@ def main() -> int:
             instance_ids = [row.get("agent_instance_id") for row in status["agents"]]
             if len(set(instance_ids)) != len(instance_ids) or any(not item for item in instance_ids):
                 raise termmeshError(f"agent instance IDs are not unique: {instance_ids!r}")
-            if status.get("leader_policy_version") != "8":
-                raise termmeshError(f"leader policy v8 not injected: {status!r}")
+            if status.get("leader_policy_version") != "9":
+                raise termmeshError(f"leader policy v9 not injected: {status!r}")
             if any(row.get("read_only_default") is not True for row in status["agents"]):
                 raise termmeshError(f"validator mutation defaults are unsafe: {status['agents']!r}")
 

@@ -5,7 +5,7 @@ import Foundation
 /// renderer consumes `renderedInstructions`; no renderer owns a fork of these
 /// scheduling rules.
 enum LeaderParallelPolicy {
-    static let version = "8"
+    static let version = "9"
     static let activation = "runtime-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do
@@ -46,7 +46,11 @@ enum LeaderParallelPolicy {
         ),
         (
             "actual-diff-review-gate",
-            "Do not occupy validation roles in the implementation wave by default. After the actual diff is integrated, derive validation gates from changed behavior and trust boundaries: behavior or API regressions use tester; concurrency, persistence, protocol, cross-subsystem, or agent-prompt changes use reviewer; sockets, permissions, auth, shell execution, or external input use security plus tester; release-critical changes use tester plus reviewer. Small local diffs receive leader review and final verification directly. Dispatch at most two read-only validators in one wave. Give each validator one risk question, at most three primary files, and a 90-second target; split or let the leader cover broader diffs instead of duplicating a full review."
+            "For implementation requests, do not occupy validation roles in the implementation wave by default. After the actual diff is integrated, derive validation gates from changed behavior and trust boundaries: behavior or API regressions use tester; concurrency, persistence, protocol, cross-subsystem, or agent-prompt changes use reviewer; sockets, permissions, auth, shell execution, or external input use security plus tester; release-critical changes use tester plus reviewer. Small local diffs receive leader review and final verification directly. Dispatch at most two read-only validators in one wave. Give each validator one risk question, at most three primary files, and a 90-second target; split or let the leader cover broader diffs instead of duplicating a full review."
+        ),
+        (
+            "review-only-fast-path",
+            "For an explicit review-only request against an existing diff, do not complete a full leader review before dispatch. Perform bounded manifest-level triage only: freeze the target commit or diff, inspect changed paths and test locations, and identify separable risk lenses. When two independent trust boundaries exist, immediately dispatch up to two read-only validators against that same frozen target while the leader concurrently reviews the end-to-end contract and runs independent verification. Initial validator capsules contain a fixed lens and invariants rather than leader-discovered suspicions, preserving independent discovery. Do not enter tm-agent wait while useful leader-lane work remains; collect once after that work, and allow at most one targeted follow-up only for conflicting or insufficient evidence. Small single-domain reviews stay leader-direct."
         ),
         (
             "cross-model-validation",
@@ -134,7 +138,7 @@ enum LeaderParallelPolicy {
           ]
         }
         ```
-        Route invariants: direct has zero implementation tasks; probe has exactly one read-only implementation task (`mutates=false`) estimated at 60-90 seconds; parallel has two or three implementation tasks whose `depends_on` prerequisites are already satisfied. `validation_gates` are a later wave derived from the integrated diff, never speculative implementation capacity. Dispatch at most two gates once, collect once, and keep every gate read-only. A validator capsule covers one risk question and at most three primary files with a 90-second target. Require the normal final 5-field reply; `review_ready` without that final reply is partial evidence, not completion.
+        Route invariants: direct has zero implementation tasks; probe has exactly one read-only implementation task (`mutates=false`) estimated at 60-90 seconds; parallel has two or three implementation tasks whose `depends_on` prerequisites are already satisfied. For implementation requests, `validation_gates` are a later wave derived from the integrated diff, never speculative implementation capacity. For explicit review-only requests, `review-only-fast-path` may start validators after bounded manifest triage against one frozen target while the leader works concurrently. Dispatch at most two gates once, collect once, and keep every gate read-only. A validator capsule covers one risk question and at most three primary files with a 90-second target. Require the normal final 5-field reply; `review_ready` without that final reply is partial evidence, not completion.
 
         \(renderedRules)
         """
