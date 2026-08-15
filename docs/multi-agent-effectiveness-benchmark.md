@@ -74,6 +74,45 @@ per-run result/trace/log/patch files, `quality-eval.json`, `summary.json`, and `
 Trace JSONL contains metadata only. Judge inputs randomize A/B order; at least two ready vendors
 enable cross-vendor evaluation, otherwise the report records the single-vendor fallback.
 
+## Project leader policy A/B
+
+The original matrix compares one session with a controller-dispatched three-worker team. It does
+not measure the Project leader policy because the controller decides to parallelize before the
+leader starts. Use `policy-ab` to compare the previous delegate-first prompt with adaptive policy
+v6 while keeping the Project shape fixed: both conditions create the same idle explorer, executor,
+and reviewer pool, and only the leader instruction changes. The leader first records a blinded
+structured `direct`, `probe`, or `parallel` routing decision. `direct` dispatches no worker, `probe`
+dispatches exactly one read-only 60-90 second task, and `parallel` dispatches the decision's two or
+three dependency-ready tasks. Each task names its worker, goal, owned/forbidden scope, dependencies,
+verification, mutation flag, and estimate. The controller delivers only those tasks and resumes the
+same leader session with result envelopes. This avoids treating the
+headless benchmark daemon as an app-visible Project board while still measuring policy choice.
+
+Inspect the 18-run, counterbalanced matrix without model calls:
+
+```bash
+python3 scripts/bench-agent-effectiveness.py policy-ab \
+  --fixtures homebrew-smoke,ghostty-kit-guard,split-divider-color \
+  --trials 3 --seed 20260814 --dry-run
+```
+
+Run a cheap smoke pair first, then the complete matrix:
+
+```bash
+python3 scripts/bench-agent-effectiveness.py policy-ab \
+  --fixtures homebrew-smoke --trials 1 --timeout 1200
+
+python3 scripts/bench-agent-effectiveness.py policy-ab \
+  --trials 3 --seed 20260814
+```
+
+Results are written below `~/.term-mesh/benchmarks/effectiveness/policy-ab/`. In addition to hidden
+acceptance, wall time, tokens, corrections, and timeout censoring, the report records routing
+decision time, selected task schema, delegation rate, worker task count, and controller
+dispatch/collect waves. Team
+creation is included in both conditions' end-to-end time. A timeout remains censored and is never
+substituted as a completion time.
+
 ## Decision rule
 
 Timeouts and failed acceptance reduce pass rate and do not enter successful latency medians.
@@ -87,3 +126,10 @@ Multi becomes the global default only when its pass rate is no lower, paired med
 at least 1.20x, and blinded quality has no regression. Otherwise routing stays single by default;
 an individual fixture class may route multi at 1.15x with the same pass/quality gate. Cost is
 reported but is not an adoption gate.
+
+A fixture where neither condition completes has no comparative latency evidence and routes as
+`insufficient_evidence`, not `single`. A timeout is a right-censored observation: it may count against an
+explicit 45-minute completion SLA, but it must never be treated as a measured completion time or
+as evidence that the other condition is faster when that condition also timed out. Paired token
+amplification and cost ratio likewise use only pairs where both conditions completed; timeout
+spend remains visible in the per-condition failure ledger.

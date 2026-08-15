@@ -20,6 +20,23 @@ SPEC.loader.exec_module(module)
 
 
 class EffectivenessBenchmarkTests(unittest.TestCase):
+    def test_non_dry_run_experiment_executes_under_cleanup_and_lock(self):
+        args = unittest.mock.Mock(dry_run=False, results_dir=Path("/tmp/results"))
+        cleanup = unittest.mock.MagicMock()
+        lock = unittest.mock.MagicMock()
+        with unittest.mock.patch.object(module, "benchmark_signal_cleanup", return_value=cleanup) as cleanup_factory, \
+             unittest.mock.patch.object(module, "benchmark_run_lock", return_value=lock) as lock_factory, \
+             unittest.mock.patch.object(module, "_run_experiment", return_value=17) as runner:
+            result = module.run_experiment(args)
+        self.assertEqual(result, 17)
+        cleanup_factory.assert_called_once_with()
+        lock_factory.assert_called_once_with(args.results_dir)
+        cleanup.__enter__.assert_called_once_with()
+        cleanup.__exit__.assert_called_once()
+        lock.__enter__.assert_called_once_with()
+        lock.__exit__.assert_called_once()
+        runner.assert_called_once_with(args)
+
     def test_default_matrix_is_18_paired_counterbalanced_runs(self):
         specs = module.build_matrix(module.FIXTURES, 3, module.DEFAULT_SEED)
         self.assertEqual(len(specs), 18)
@@ -40,6 +57,14 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
     def test_matrix_can_select_multi_only_for_protocol_smoke(self):
         specs = module.build_matrix(("homebrew-smoke",), 1, 42, ("multi",))
         self.assertEqual(specs, [module.RunSpec("homebrew-smoke", 1, "multi", 2)])
+
+    def test_policy_matrix_counterbalances_legacy_and_adaptive(self):
+        specs = module.build_policy_matrix(("homebrew-smoke",), 3, 42)
+        self.assertEqual([(row.condition, row.order) for row in specs[:4]], [
+            ("legacy", 1), ("adaptive", 2),
+            ("adaptive", 1), ("legacy", 2),
+        ])
+        self.assertEqual(len(specs), 6)
 
     def test_resume_skips_only_cells_with_usable_durable_results(self):
         rows = [
@@ -438,6 +463,121 @@ end
         self.assertNotIn("for result_file in", prompt)
         self.assertNotIn("/bin/sleep", prompt)
 
+    def test_policy_prompts_change_only_the_leader_execution_strategy(self):
+        fixture = module.FIXTURES["homebrew-smoke"]
+        decision = Path("/tmp/policy-decision.json")
+        legacy = module.policy_leader_prompt(fixture, "legacy", decision)
+        adaptive = module.policy_leader_prompt(fixture, "adaptive", decision)
+        for prompt in (legacy, adaptive):
+            self.assertIn(fixture.prompt, prompt)
+            self.assertIn("explorer, executor, reviewer", prompt)
+            self.assertIn(str(decision), prompt)
+            self.assertIn("controller", prompt)
+            self.assertIn('\"route\": \"direct|probe|parallel\"', prompt)
+            self.assertIn('\"tasks\"', prompt)
+        self.assertIn("coordinator, not a worker", legacy)
+        self.assertIn("default executor", adaptive)
+        self.assertIn("at least two dependency-ready", adaptive)
+        self.assertIn("one controller-managed wave", adaptive)
+        self.assertIn("POLICY V6", adaptive)
+
+    def test_structured_routing_contract_enforces_dynamic_worker_counts(self):
+        direct = {"route": "direct", "reason": "same-file edit", "tasks": []}
+        self.assertEqual(module.validate_routing_decision(direct), (
+            "direct", "same-file edit", [],
+        ))
+        probe_task = {
+            "id": "probe-config", "worker": "explorer", "goal": "locate config flow",
+            "owned": ["Sources/"], "forbidden": ["all writes"], "depends_on": [],
+            "verify": "rg config Sources", "mutates": False, "estimated_seconds": 75,
+        }
+        route, _, tasks = module.validate_routing_decision({
+            "route": "probe", "reason": "ownership unclear", "tasks": [probe_task],
+        })
+        self.assertEqual((route, [task["worker"] for task in tasks]), ("probe", ["explorer"]))
+        second = dict(probe_task, id="implement", worker="executor", goal="implement fix",
+                      mutates=True, estimated_seconds=300)
+        route, _, tasks = module.validate_routing_decision({
+            "route": "parallel", "reason": "two independent subsystems",
+            "tasks": [probe_task, second],
+        })
+        self.assertEqual((route, len(tasks)), ("parallel", 2))
+
+    def test_structured_routing_rejects_invalid_probe_and_unready_parallel_task(self):
+        task = {
+            "id": "bad", "worker": "explorer", "goal": "probe",
+            "owned": ["Sources/"], "forbidden": [], "depends_on": [],
+            "verify": "rg thing Sources", "mutates": True, "estimated_seconds": 120,
+        }
+        with self.assertRaisesRegex(ValueError, "probe task must be read-only"):
+            module.validate_routing_decision({
+                "route": "probe", "reason": "uncertain", "tasks": [task],
+            })
+        ready = dict(task, mutates=False, estimated_seconds=90)
+        blocked = dict(task, id="blocked", worker="executor", depends_on=["bad"],
+                       estimated_seconds=300)
+        with self.assertRaisesRegex(ValueError, "not dependency-ready"):
+            module.validate_routing_decision({
+                "route": "parallel", "reason": "invalid DAG",
+                "tasks": [ready, blocked],
+            })
+        mutating_reviewer = dict(ready, id="review-write", worker="reviewer",
+                                 mutates=True, estimated_seconds=300)
+        with self.assertRaisesRegex(ValueError, "is read-only"):
+            module.validate_routing_decision({
+                "route": "parallel", "reason": "invalid role",
+                "tasks": [ready, mutating_reviewer],
+            })
+
+    def test_dynamic_dispatch_targets_only_decision_workers(self):
+        tasks = [{
+            "id": "inspect", "worker": "explorer", "goal": "inspect safety",
+            "owned": ["scripts/"], "forbidden": ["all writes"], "depends_on": [],
+            "verify": "rg SMOKE_TEST scripts", "mutates": False, "estimated_seconds": 75,
+        }]
+        process = unittest.mock.Mock(returncode=0)
+        process.communicate.return_value = ("ok", "")
+        trace = unittest.mock.Mock()
+        with unittest.mock.patch.object(module, "tm_environment", return_value={}), \
+             unittest.mock.patch.object(module.subprocess, "Popen", return_value=process) as popen:
+            delivered = module.dispatch_benchmark_workers(
+                module.FIXTURES["homebrew-smoke"], "bench-test", Path("/tmp/checkout"),
+                trace, tasks=tasks,
+            )
+        self.assertEqual((delivered, popen.call_count), (1, 1))
+        command = popen.call_args.args[0]
+        self.assertEqual(command[2], "explorer")
+        self.assertIn("task id: inspect", command[3])
+        self.assertEqual(module.dispatch_benchmark_workers(
+            module.FIXTURES["homebrew-smoke"], "bench-test", Path("/tmp/checkout"),
+            trace, tasks=[],
+        ), 0)
+
+    def test_policy_run_declares_a_routing_decision_artifact(self):
+        source = SCRIPT.read_text()
+        policy_body = source[source.index("def run_policy_one("):source.index("def apply_solution(")]
+        self.assertIn('"decision": str(relative_run / "routing-decision.json")', policy_body)
+        self.assertIn("total_started_epoch = time.time()", policy_body)
+
+    def test_coordination_counter_measures_policy_overhead_and_isolation(self):
+        stream = json.dumps({"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "name": "Bash",
+            "input": {"command": (
+                "tm-agent status --team t; "
+                "tm-agent delegate executor fix --worktree always --from HEAD --team t; "
+                "tm-agent wait --timeout 120 --mode any --team t; "
+                "tm-agent collect --headers --team t; "
+                "tm-agent task finish-worktree abc --team t"
+            )},
+        }]}})
+        counts = module.tm_agent_command_counts(stream)
+        self.assertEqual(counts["status"], 1)
+        self.assertEqual(counts["delegate"], 1)
+        self.assertEqual(counts["isolated_delegate"], 1)
+        self.assertEqual(counts["wait"], 1)
+        self.assertEqual(counts["collect"], 1)
+        self.assertEqual(counts["finish_worktree"], 1)
+
     def test_controller_waits_once_and_returns_bounded_worker_headers(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -460,6 +600,7 @@ end
         for role, instruction in (("explorer", explorer), ("executor", executor), ("reviewer", reviewer)):
             self.assertIn(f"bench-test-{role}.result.tmp.$$", instruction)
             self.assertIn("atomic `mv`", instruction)
+            self.assertIn("task id:", instruction)
 
     def test_claude_command_disables_external_mcp_servers(self):
         command = module.claude_command(
@@ -634,6 +775,15 @@ end
         self.assertFalse(module.classify_infra_failure("KeyError: broken result schema"))
         self.assertTrue(module.classify_infra_failure("Team not found on daemon socket"))
 
+    def test_stale_remote_coresimulator_is_infra_invalid(self):
+        self.assertTrue(module.classify_infra_failure(
+            "remote Xcode acceptance failed: Unable to load simulator devices. "
+            "DVTCoreSimulatorAdditionsErrorDomain: CoreSimulator is out of date"
+        ))
+        self.assertFalse(module.classify_infra_failure(
+            "remote Xcode acceptance failed: TerminalOverrideIsolationTests failed"
+        ))
+
     def test_failure_redaction_masks_home_and_secrets(self):
         value = module.safe_failure(f"{Path.home()}/repo token=abc123")
         self.assertNotIn(str(Path.home()), value)
@@ -648,6 +798,83 @@ end
         self.assertEqual(summary["paired_speedup_median"], 2.0)
         self.assertEqual(summary["conditions"]["multi"]["pass_rate"], 0.5)
         self.assertFalse(summary["default_gate_passed"])
+
+    def test_failed_pairs_stay_out_of_token_and_cost_ratios(self):
+        failed_single = self.row("single", 1, 2700000, False)
+        failed_multi = self.row("multi", 1, 2700000, False)
+        failed_single["tokens"] = {"input_tokens": 1}
+        failed_multi["tokens"] = {"input_tokens": 1000}
+        failed_single["cost_usd"] = 1.0
+        failed_multi["cost_usd"] = 1000.0
+        passed_single = self.row("single", 2, 1000, True)
+        passed_multi = self.row("multi", 2, 500, True)
+        passed_single["tokens"] = {"input_tokens": 10}
+        passed_multi["tokens"] = {"input_tokens": 20}
+        passed_single["cost_usd"] = 2.0
+        passed_multi["cost_usd"] = 6.0
+        summary = module.summarize(
+            [failed_single, failed_multi, passed_single, passed_multi], seed=7
+        )
+        self.assertEqual(summary["token_amplification_median"], 2.0)
+        self.assertEqual(summary["cost_ratio_median"], 3.0)
+        failed_pair = summary["pairs"][0]
+        self.assertIsNone(failed_pair["token_amplification"])
+        self.assertIsNone(failed_pair["cost_ratio"])
+        successful_pair = summary["pairs"][1]
+        self.assertEqual(
+            summary["token_amplification_median"],
+            successful_pair["token_amplification"],
+        )
+        self.assertEqual(summary["cost_ratio_median"], successful_pair["cost_ratio"])
+
+    def test_policy_failed_pair_stays_out_of_token_ratio(self):
+        legacy = {
+            "run_id": "legacy", "fixture": "homebrew-smoke", "trial": 1,
+            "condition": "legacy", "acceptance_passed": False,
+            "infra_invalid": False, "total_wall_ms": 1000,
+            "tokens": {"input_tokens": 10}, "finished_at": "2026-08-15T00:00:00Z",
+        }
+        adaptive = {
+            "run_id": "adaptive", "fixture": "homebrew-smoke", "trial": 1,
+            "condition": "adaptive", "acceptance_passed": True,
+            "infra_invalid": False, "total_wall_ms": 2000,
+            "tokens": {"input_tokens": 100}, "finished_at": "2026-08-15T00:00:01Z",
+        }
+        summary = module.summarize_policy([legacy, adaptive], seed=7)
+        self.assertEqual(summary["pairs"][0]["outcome"], "adaptive_only")
+        self.assertIsNone(summary["pairs"][0]["token_ratio"])
+        self.assertIsNone(summary["token_ratio_median"])
+
+    def test_report_regeneration_preserves_policy_ab_schema(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            experiment = Path(temporary)
+            manifest = {
+                "experiment_type": "project-leader-policy-ab",
+                "run_id": "policy-test", "model": "sonnet", "effort": "medium",
+                "seed": 7, "matrix": [{}, {}],
+            }
+            legacy = {
+                "run_id": "legacy", "fixture": "homebrew-smoke", "trial": 1,
+                "condition": "legacy", "acceptance_passed": False,
+                "infra_invalid": False, "total_wall_ms": 1000,
+                "tokens": {}, "finished_at": "2026-08-15T00:00:00Z",
+            }
+            adaptive = {
+                "run_id": "adaptive", "fixture": "homebrew-smoke", "trial": 1,
+                "condition": "adaptive", "acceptance_passed": True,
+                "infra_invalid": False, "total_wall_ms": 2000,
+                "routing_decision": "direct", "tokens": {},
+                "finished_at": "2026-08-15T00:00:01Z",
+            }
+            report = module.regenerate_experiment_report(
+                experiment, manifest, [legacy, adaptive]
+            )
+            self.assertIn("Project leader policy A/B", report)
+            self.assertIn("| legacy |", report)
+            self.assertIn("| adaptive |", report)
+            summary = json.loads((experiment / "summary.json").read_text())
+            self.assertIn("legacy", summary["conditions"])
+            self.assertNotIn("single", summary["conditions"])
 
     def test_adoption_requires_quality_result(self):
         rows = []
@@ -676,6 +903,22 @@ end
             for trial in (1, 2)
         ]}
         self.assertEqual(module.summarize(rows, seed=7, quality=quality)["fixture_routes"]["homebrew-smoke"], "single")
+
+    def test_fixture_route_has_insufficient_evidence_when_both_conditions_timeout(self):
+        rows = []
+        for trial in range(1, 4):
+            rows.extend((
+                self.row("single", trial, 2700000, False),
+                self.row("multi", trial, 2700000, False),
+            ))
+        summary = module.summarize(rows, seed=7)
+        self.assertIsNone(summary["paired_speedup_median"])
+        self.assertEqual(
+            summary["fixture_routes"]["homebrew-smoke"], "insufficient_evidence"
+        )
+        self.assertEqual(summary["latency_pairs"], 0)
+        self.assertEqual(summary["censored_pairs"], 3)
+        self.assertEqual(summary["fixture_evidence"]["homebrew-smoke"]["censored_pairs"], 3)
 
     def test_bootstrap_is_seeded_and_ordered(self):
         values = [1.1, 1.2, 1.5]

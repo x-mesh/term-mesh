@@ -1029,6 +1029,12 @@ class TerminalController {
             return v2Result(id: id, self.v2TeamStatus(params: params))
         case "team.leader.send":
             return v2Result(id: id, self.v2TeamLeaderSend(params: params))
+        case "team.leader.request.list":
+            return v2Result(id: id, self.v2TeamLeaderRequestList(params: params))
+        case "team.leader.request.take":
+            return v2Result(id: id, self.v2TeamLeaderRequestTake(params: params))
+        case "team.leader.request.complete":
+            return v2Result(id: id, self.v2TeamLeaderRequestComplete(params: params))
         case "team.send":
             return v2Result(id: id, self.v2TeamSend(params: params))
         case "team.broadcast":
@@ -1083,6 +1089,8 @@ class TerminalController {
             return v2Result(id: id, self.v2TeamTaskUpdate(params: params))
         case "team.task.list":
             return v2Result(id: id, self.v2TeamTaskList(params: params))
+        case "team.task.metrics":
+            return v2Result(id: id, self.v2TeamTaskMetrics(params: params))
         case "team.task.clear":
             return v2Result(id: id, self.v2TeamTaskClear(params: params))
         case "team.context.set":
@@ -2390,6 +2398,12 @@ class TerminalController {
         switch method {
         case "team.message.post":
             return teamDataMessagePost(params: params, id: id, store: store)
+        case "team.leader.request.list":
+            return teamDataLeaderRequestList(params: params, id: id, store: store)
+        case "team.leader.request.take":
+            return teamDataLeaderRequestTake(params: params, id: id, store: store)
+        case "team.leader.request.complete":
+            return teamDataLeaderRequestComplete(params: params, id: id, store: store)
         case "team.message.list":
             return teamDataMessageList(params: params, id: id, store: store)
         case "team.message.clear":
@@ -2414,6 +2428,8 @@ class TerminalController {
             return teamDataTaskGet(params: params, id: id, store: store)
         case "team.task.list":
             return teamDataTaskList(params: params, id: id, store: store)
+        case "team.task.metrics":
+            return teamDataTaskMetrics(params: params, id: id, store: store)
         case "team.task.dependents":
             return teamDataTaskDependents(params: params, id: id, store: store)
         case "team.task.clear":
@@ -3293,6 +3309,36 @@ class TerminalController {
         guard let text = params["text"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
+        let requestId = params["request_id"] as? String
+        let stored: (request: TeamDataStore.LeaderRequest, replayed: Bool, persisted: Bool)
+        switch TeamDataStore.shared.enqueueLeaderRequest(
+            teamName: teamName, content: text, requestId: requestId
+        ) {
+        case .created(let request, let persisted): stored = (request, false, persisted)
+        case .replayed(let request, let persisted): stored = (request, true, persisted)
+        case .conflict:
+            return v2Error(id: id, code: "request_id_conflict", message: "request_id already names different content")
+        case .invalidRequest(let message):
+            return v2Error(id: id, code: "invalid_params", message: message)
+        case .teamNotFound:
+            return v2Error(id: id, code: "not_found", message: "Leader or team not found")
+        }
+        guard stored.persisted else {
+            return v2Error(
+                id: id, code: "persistence_failed",
+                message: "Leader request was retained in memory but could not be written to the durable board",
+                data: [
+                    "request_id": stored.request.id, "stored_in_memory": true,
+                    "persisted": false, "wake_dispatched": false,
+                ]
+            )
+        }
+        let wake = await MainActor.run {
+            TeamOrchestrator.shared.leaderRequestWake(
+                teamName: teamName, requestId: stored.request.id
+            )
+        }
+        let shouldWake = stored.request.status == "queued"
         // Stagger: dynamic gap based on team size to prevent GCD main-queue saturation.
         let staggerNs = await MainActor.run {
             let count = TeamOrchestrator.shared.teams[teamName]?.agents.count ?? 1
@@ -3301,14 +3347,26 @@ class TerminalController {
         if staggerNs > 0 {
             try? await Task.sleep(nanoseconds: staggerNs)
         }
-        let success = await MainActor.run {
-            let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
-            guard let tabManager else { return false }
-            return TeamOrchestrator.shared.sendToLeader(teamName: teamName, text: text, tabManager: tabManager)
-        }
-        return success
-            ? v2Ok(id: id, result: ["sent": true, "team_name": teamName, "target": "leader"])
-            : v2Error(id: id, code: "not_found", message: "Leader or team not found")
+        let success = if shouldWake {
+            await MainActor.run {
+                let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
+                guard let tabManager else { return false }
+                return TeamOrchestrator.shared.sendToLeader(teamName: teamName, text: wake, tabManager: tabManager)
+            }
+        } else { false }
+        return v2Ok(id: id, result: [
+            "request_id": stored.request.id,
+            "stored": stored.persisted,
+            "stored_in_memory": true,
+            "persisted": stored.persisted,
+            "request_replayed": stored.replayed,
+            "wake_dispatched": success,
+            "claimed_by_leader": stored.request.status != "queued",
+            "content_bytes": stored.request.contentBytes,
+            "content_sha256": stored.request.contentSHA256,
+            "team_name": teamName,
+            "target": "leader",
+        ])
     }
 
     private func asyncTeamBroadcast(params: [String: Any], id: Any?) async -> String {
@@ -3603,6 +3661,7 @@ class TerminalController {
                 "cli": agent.cli,
                 "model": agent.model,
                 "agent_type": agent.agentType,
+                "read_only_default": TeamOrchestrator.roleDefaultsToReadOnly(agent.agentType),
                 "workspace_id": agent.workspaceId,
                 "completed_task_count": agent.completedTaskCount,
             ]
@@ -4772,6 +4831,9 @@ class TerminalController {
 
     /// Data-only team commands that are safe to run off the main thread.
     private static let teamDataCommands: Set<String> = [
+        "team.leader.request.list",
+        "team.leader.request.take",
+        "team.leader.request.complete",
         "team.message.post",
         "team.message.list",
         "team.message.clear",
@@ -4786,6 +4848,7 @@ class TerminalController {
         "team.watch_drift.post",
         "team.task.get",
         "team.task.list",
+        "team.task.metrics",
         "team.task.dependents",
         "team.task.clear",
         "team.task.create",
@@ -4813,6 +4876,12 @@ class TerminalController {
 
         return teamDataQueue.sync {
             switch method {
+            case "team.leader.request.list":
+                return teamDataLeaderRequestList(params: params, id: id, store: store)
+            case "team.leader.request.take":
+                return teamDataLeaderRequestTake(params: params, id: id, store: store)
+            case "team.leader.request.complete":
+                return teamDataLeaderRequestComplete(params: params, id: id, store: store)
             case "team.message.post":
                 return teamDataMessagePost(params: params, id: id, store: store)
             case "team.message.list":
@@ -4837,6 +4906,8 @@ class TerminalController {
                 return teamDataTaskGet(params: params, id: id, store: store)
             case "team.task.list":
                 return teamDataTaskList(params: params, id: id, store: store)
+            case "team.task.metrics":
+                return teamDataTaskMetrics(params: params, id: id, store: store)
             case "team.task.dependents":
                 return teamDataTaskDependents(params: params, id: id, store: store)
             case "team.task.clear":
@@ -4866,6 +4937,78 @@ class TerminalController {
     }
 
     // MARK: - Team Data Command Handlers (off-main-thread safe)
+
+    private func teamDataLeaderRequestList(
+        params: [String: Any], id: Any?, store: TeamDataStore
+    ) -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard store.isAuthorizedLeaderRequestToken(
+            teamName: teamName, token: params["leader_request_token"] as? String
+        ) else {
+            return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
+        }
+        let includeCompleted = params["include_completed"] as? Bool ?? false
+        guard let requests = store.listLeaderRequests(
+            teamName: teamName, includeCompleted: includeCompleted
+        ) else {
+            return v2Error(id: id, code: "not_found", message: "Team not found")
+        }
+        return v2Ok(id: id, result: [
+            "team_name": teamName,
+            "count": requests.count,
+            "requests": requests.map { store.leaderRequestDictionary($0, includeContent: false) },
+        ])
+    }
+
+    private func teamDataLeaderRequestTake(
+        params: [String: Any], id: Any?, store: TeamDataStore
+    ) -> String {
+        guard let teamName = params["team_name"] as? String,
+              let requestId = params["request_id"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name or request_id")
+        }
+        guard store.isAuthorizedLeaderRequestToken(
+            teamName: teamName, token: params["leader_request_token"] as? String
+        ) else {
+            return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
+        }
+        switch store.takeLeaderRequest(teamName: teamName, requestId: requestId) {
+        case .succeeded(let request):
+            return v2Ok(id: id, result: store.leaderRequestDictionary(request, includeContent: true))
+        case .notFound:
+            return v2Error(id: id, code: "not_found", message: "Leader request not found")
+        case .invalidState(let status):
+            return v2Error(id: id, code: "invalid_state", message: "Leader request is already \(status)")
+        case .persistenceFailed:
+            return v2Error(id: id, code: "persistence_failed", message: "Could not persist leader request claim")
+        }
+    }
+
+    private func teamDataLeaderRequestComplete(
+        params: [String: Any], id: Any?, store: TeamDataStore
+    ) -> String {
+        guard let teamName = params["team_name"] as? String,
+              let requestId = params["request_id"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name or request_id")
+        }
+        guard store.isAuthorizedLeaderRequestToken(
+            teamName: teamName, token: params["leader_request_token"] as? String
+        ) else {
+            return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
+        }
+        switch store.completeLeaderRequest(teamName: teamName, requestId: requestId) {
+        case .succeeded(let request):
+            return v2Ok(id: id, result: store.leaderRequestDictionary(request, includeContent: false))
+        case .notFound:
+            return v2Error(id: id, code: "not_found", message: "Leader request not found")
+        case .invalidState(let status):
+            return v2Error(id: id, code: "invalid_state", message: "Leader request must be claimed, not \(status)")
+        case .persistenceFailed:
+            return v2Error(id: id, code: "persistence_failed", message: "Could not persist leader request completion")
+        }
+    }
 
     private func teamDataInbox(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
         guard let teamName = params["team_name"] as? String else {
@@ -5185,6 +5328,18 @@ class TerminalController {
             "tasks": tasks.map { store.taskDictionary($0) },
             "count": tasks.count,
         ])
+    }
+
+    private func teamDataTaskMetrics(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
+        guard let teamName = params["team_name"] as? String else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let metrics = store.coordinationMetrics(
+            teamName: teamName, requestId: params["request_id"] as? String
+        ) else {
+            return v2Error(id: id, code: "not_found", message: "No durable leader request found")
+        }
+        return v2Ok(id: id, result: metrics)
     }
 
     private func teamDataTaskDependents(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
@@ -5748,17 +5903,115 @@ class TerminalController {
             return .err(code: "invalid_params", message: "Missing text", data: nil)
         }
 
-        var success = false
-        v2MainSync {
-            success = TeamOrchestrator.shared.sendToLeader(
-                teamName: teamName,
-                text: text,
-                tabManager: tabManager
+        let stored: (request: TeamDataStore.LeaderRequest, replayed: Bool, persisted: Bool)
+        switch TeamDataStore.shared.enqueueLeaderRequest(
+            teamName: teamName, content: text, requestId: params["request_id"] as? String
+        ) {
+        case .created(let request, let persisted): stored = (request, false, persisted)
+        case .replayed(let request, let persisted): stored = (request, true, persisted)
+        case .conflict:
+            return .err(code: "request_id_conflict", message: "request_id already names different content", data: nil)
+        case .invalidRequest(let message):
+            return .err(code: "invalid_params", message: message, data: nil)
+        case .teamNotFound:
+            return .err(code: "not_found", message: "Leader or team not found", data: nil)
+        }
+        guard stored.persisted else {
+            return .err(
+                code: "persistence_failed",
+                message: "Leader request was retained in memory but could not be written to the durable board",
+                data: [
+                    "request_id": stored.request.id, "stored_in_memory": true,
+                    "persisted": false, "wake_dispatched": false,
+                ]
             )
         }
-        return success
-            ? .ok(["sent": true, "team_name": teamName, "target": "leader"])
-            : .err(code: "not_found", message: "Leader or team not found", data: nil)
+        let wake = TeamOrchestrator.shared.leaderRequestWake(
+            teamName: teamName, requestId: stored.request.id
+        )
+        var success = false
+        if stored.request.status == "queued" {
+            v2MainSync {
+                success = TeamOrchestrator.shared.sendToLeader(
+                    teamName: teamName,
+                    text: wake,
+                    tabManager: tabManager
+                )
+            }
+        }
+        return .ok([
+            "request_id": stored.request.id, "stored": stored.persisted,
+            "stored_in_memory": true, "persisted": stored.persisted,
+            "request_replayed": stored.replayed, "wake_dispatched": success,
+            "claimed_by_leader": stored.request.status != "queued",
+            "content_bytes": stored.request.contentBytes,
+            "content_sha256": stored.request.contentSHA256,
+            "team_name": teamName, "target": "leader",
+        ])
+    }
+
+    private func v2TeamLeaderRequestList(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard TeamDataStore.shared.isAuthorizedLeaderRequestToken(
+            teamName: teamName, token: params["leader_request_token"] as? String
+        ) else {
+            return .err(code: "unauthorized", message: "Leader request capability required", data: nil)
+        }
+        guard let requests = TeamDataStore.shared.listLeaderRequests(
+            teamName: teamName, includeCompleted: params["include_completed"] as? Bool ?? false
+        ) else {
+            return .err(code: "not_found", message: "Team not found", data: nil)
+        }
+        return .ok([
+            "team_name": teamName, "count": requests.count,
+            "requests": requests.map { TeamDataStore.shared.leaderRequestDictionary($0, includeContent: false) },
+        ] as [String: Any])
+    }
+
+    private func v2TeamLeaderRequestTake(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String,
+              let requestId = params["request_id"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name or request_id", data: nil)
+        }
+        guard TeamDataStore.shared.isAuthorizedLeaderRequestToken(
+            teamName: teamName, token: params["leader_request_token"] as? String
+        ) else {
+            return .err(code: "unauthorized", message: "Leader request capability required", data: nil)
+        }
+        switch TeamDataStore.shared.takeLeaderRequest(teamName: teamName, requestId: requestId) {
+        case .succeeded(let request):
+            return .ok(TeamDataStore.shared.leaderRequestDictionary(request, includeContent: true))
+        case .notFound:
+            return .err(code: "not_found", message: "Leader request not found", data: nil)
+        case .invalidState(let status):
+            return .err(code: "invalid_state", message: "Leader request is already \(status)", data: nil)
+        case .persistenceFailed:
+            return .err(code: "persistence_failed", message: "Could not persist leader request claim", data: nil)
+        }
+    }
+
+    private func v2TeamLeaderRequestComplete(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String,
+              let requestId = params["request_id"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name or request_id", data: nil)
+        }
+        guard TeamDataStore.shared.isAuthorizedLeaderRequestToken(
+            teamName: teamName, token: params["leader_request_token"] as? String
+        ) else {
+            return .err(code: "unauthorized", message: "Leader request capability required", data: nil)
+        }
+        switch TeamDataStore.shared.completeLeaderRequest(teamName: teamName, requestId: requestId) {
+        case .succeeded(let request):
+            return .ok(TeamDataStore.shared.leaderRequestDictionary(request, includeContent: false))
+        case .notFound:
+            return .err(code: "not_found", message: "Leader request not found", data: nil)
+        case .invalidState(let status):
+            return .err(code: "invalid_state", message: "Leader request must be claimed, not \(status)", data: nil)
+        case .persistenceFailed:
+            return .err(code: "persistence_failed", message: "Could not persist leader request completion", data: nil)
+        }
     }
 
     private func v2TeamSend(params: [String: Any]) -> V2CallResult {
@@ -6482,6 +6735,18 @@ class TerminalController {
             result = .ok(["team_name": teamName, "tasks": formatted, "count": formatted.count])
         }
         return result
+    }
+
+    private func v2TeamTaskMetrics(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String else {
+            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
+        }
+        guard let metrics = TeamDataStore.shared.coordinationMetrics(
+            teamName: teamName, requestId: params["request_id"] as? String
+        ) else {
+            return .err(code: "not_found", message: "No durable leader request found", data: nil)
+        }
+        return .ok(metrics)
     }
 
     // Feature D: Clear tasks

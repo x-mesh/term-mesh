@@ -8,6 +8,12 @@ import os
 @MainActor
 final class TeamOrchestrator: ObservableObject {
     static let shared = TeamOrchestrator()
+    private static let localLeaderReadinessQueue = DispatchQueue(
+        label: "term-mesh.leader-readiness", qos: .userInitiated
+    )
+    private static let localLeaderReadinessPollInterval: TimeInterval = 0.25
+    private static let localLeaderReadinessTimeout: TimeInterval = 60
+    private static let localLeaderStablePromptObservations = 4
 
     private init() {
         // Native turn state lives in the thread-safe data store rather than in
@@ -1120,7 +1126,6 @@ final class TeamOrchestrator: ObservableObject {
         }
         let currentPath = orderedPaths.joined(separator: ":")
         let socketPath = SocketControlSettings.socketPath()
-
         var env: [String: String] = [
             "TERMMESH_TEAM_AGENT": "1",
             "CMUX_TEAM_AGENT": "1",
@@ -1599,6 +1604,10 @@ final class TeamOrchestrator: ObservableObject {
         launchLeaderLocally: Bool = true,
         adoptedLeaderSurfaceId: UUID? = nil,
         skipRunbookPromptForInteractiveAgents: Bool = false,
+        /// Optional preallocated durable identities. Project creation uses the
+        /// row UUIDs so the leader briefing and the eventual panes share one
+        /// exact routing identity from the first turn.
+        agentInstanceIds: [String]? = nil,
         /// Phase 2 (pane-mode resume): agent name → claude session id, used to
         /// invoke each agent CLI with `--resume <sid>`. Pane-mode resume passes
         /// this; fresh team creation leaves it nil.
@@ -1628,6 +1637,10 @@ final class TeamOrchestrator: ObservableObject {
             && pairMode != "none"
             && executionMode == "pane"
         var agents = agents
+        var reservedAgentInstanceIds = agentInstanceIds ?? agents.map { _ in UUID().uuidString }
+        if reservedAgentInstanceIds.count != agents.count {
+            reservedAgentInstanceIds = agents.map { _ in UUID().uuidString }
+        }
         if pairEligible {
             let watcherInstructions = AgentRolePresetManager.builtInPresets.first { $0.name == "watcher" }?.instructions ?? ""
             let watcherModel = pairModel.isEmpty ? "sonnet" : pairModel
@@ -1641,6 +1654,7 @@ final class TeamOrchestrator: ObservableObject {
                 customInstructions: pairSpec
             )
             agents.insert(watcherTuple, at: 0)
+            reservedAgentInstanceIds.insert(UUID().uuidString, at: 0)
         }
 
         // Always clear stale on-disk state for this team name before creating.
@@ -1732,6 +1746,7 @@ final class TeamOrchestrator: ObservableObject {
         let missingPaths = essentialPaths.filter { !existingPaths.contains($0) }
         let currentPath = (appPath.isEmpty ? essentialPaths : appPath.split(separator: ":").map(String.init) + missingPaths).joined(separator: ":")
         let socketPath = SocketControlSettings.socketPath()
+        let leaderRequestToken = TeamDataStore.shared.prepareLeaderRequestToken(teamName: name)
         let baseEnv: [String: String] = [
             "TERMMESH_TEAM_AGENT": "1",
             "CMUX_TEAM_AGENT": "1",
@@ -1754,9 +1769,10 @@ final class TeamOrchestrator: ObservableObject {
         // (Claude Code refuses to start inside another CLAUDECODE session).
         // Non-claude CLI leaders (kiro, codex, gemini) also clear it.
         // REPL leader gets claudeAgentEnv so nested `claude` calls work.
-        let leaderEnv = leaderMode == "repl"
+        var leaderEnv = leaderMode == "repl"
             ? claudeAgentEnv
             : baseEnv.merging(["CLAUDECODE": ""]) { _, new in new }
+        leaderEnv["TERMMESH_LEADER_REQUEST_TOKEN"] = leaderRequestToken
 
         // Worktree isolation based on team-level mode.
         // Created early so both leader and agent panels can use the worktree path.
@@ -1897,16 +1913,17 @@ final class TeamOrchestrator: ObservableObject {
                     // Build system prompt from input agent specs (available before panes are created)
                     let scriptDir = Self.findScriptsDir(workingDirectory: workingDirectory)
                     let agentListStr = agents.enumerated().map { i, a in
-                        let summary = Self.oneLinerFromInstructions(a.instructions)
-                        return summary.isEmpty
-                            ? "  \(i + 1). \(a.name) (\(a.agentType))"
-                            : "  \(i + 1). \(a.name) (\(a.agentType)) — \(summary)"
+                        Self.leaderRosterLine(
+                            index: i, name: a.name, role: a.agentType, cli: a.cli,
+                            model: a.model, agentInstanceId: reservedAgentInstanceIds[i],
+                            host: "local", instructions: a.instructions
+                        )
                     }.joined(separator: "\n")
                     let runbookSection = Self.runbookLeaderSection(
                         workingDirectory: leaderWorkDir,
                         roles: agents.map(\.agentType)
                     )
-                    let tmAgent = "tm-agent"
+                    let tmAgent = Self.localTMAgentCommand()
                     let systemPrompt = Self.buildLeaderClaudeSystemPrompt(
                         teamName: name,
                         agentList: agentListStr,
@@ -2106,6 +2123,7 @@ final class TeamOrchestrator: ObservableObject {
                 )
                 let member = AgentMember(
                     id: "\(agent.name)@\(name)",
+                    agentInstanceId: reservedAgentInstanceIds[index],
                     name: agent.name,
                     teamName: name,
                     cli: agentCli,
@@ -2158,11 +2176,17 @@ final class TeamOrchestrator: ObservableObject {
                 sharedWorktreePath: nil,
                 sharedWorktreeBranch: nil
             )
-            team.leaderReady = launchLeaderLocally
+            team.leaderReady = launchLeaderLocally && !Self.localLeaderNeedsReadinessProbe(
+                launchLeaderLocally: launchLeaderLocally, leaderMode: leaderMode
+            )
             team.leaderPolicyState = leaderMode == "claude" ? "injected" : "pending"
             teams[name] = team
             TeamDataStore.shared.registerTeam(name, agents: headlessMembers.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
             syncTeamStateToDaemon()
+            scheduleLocalLeaderReadinessProbeIfNeeded(
+                teamName: name, leaderMode: leaderMode, workspaceId: workspace.id,
+                panelId: leaderPanelId, tabManager: tabManager
+            )
             Logger.team.info("created headless team '\(name, privacy: .public)' with \(headlessMembers.count, privacy: .public) agent(s) + leader console")
             return team
         }
@@ -2281,6 +2305,7 @@ final class TeamOrchestrator: ObservableObject {
                 splitFrom: splitFrom,
                 orientation: orientation,
                 resumeSessionId: agentResumeSid,
+                agentInstanceId: reservedAgentInstanceIds[index],
                 extraArgs: profileExtraArgs,
                 extraEnv: profileExtraEnv,
                 tabManager: tabManager
@@ -2342,12 +2367,18 @@ final class TeamOrchestrator: ObservableObject {
             pairModel: pairEligible ? pairModel : "",
             pairPanelId: pairEligible ? members.first?.panelId : nil
         )
-        team.leaderReady = launchLeaderLocally
+        team.leaderReady = launchLeaderLocally && !Self.localLeaderNeedsReadinessProbe(
+            launchLeaderLocally: launchLeaderLocally, leaderMode: leaderMode
+        )
         team.leaderPolicyState = leaderMode == "claude" ? "injected" : "pending"
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
         TeamDataStore.shared.registerTeam(name, agents: members.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
         syncTeamStateToDaemon()
+        scheduleLocalLeaderReadinessProbeIfNeeded(
+            teamName: name, leaderMode: leaderMode, workspaceId: workspace.id,
+            panelId: leaderPanelId, tabManager: tabManager
+        )
         Logger.team.info("created team '\(name, privacy: .public)' with \(members.count, privacy: .public) agent(s) + leader console")
 
         // For non-Claude CLI leaders (kiro, codex, gemini), inject team instructions.
@@ -3041,6 +3072,47 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     /// Build system prompt for Claude leader (launched directly, no shell script wrapper).
+    static func roleDefaultsToReadOnly(_ role: String) -> Bool {
+        ["reviewer", "tester", "security", "explorer", "planner", "architect", "watcher"]
+            .contains(role.lowercased())
+    }
+
+    private static func leaderRosterLine(
+        index: Int,
+        name: String,
+        role: String,
+        cli: String,
+        model: String,
+        agentInstanceId: String,
+        host: String,
+        instructions: String
+    ) -> String {
+        let summary = oneLinerFromInstructions(instructions)
+        let mode = roleDefaultsToReadOnly(role) ? "read-only-default" : "may-mutate"
+        let metadata = "role=\(role) instance=\(agentInstanceId) cli=\(cli) model=\(model) host=\(host) mode=\(mode)"
+        return summary.isEmpty
+            ? "  \(index + 1). \(name) [\(metadata)]"
+            : "  \(index + 1). \(name) [\(metadata)] — \(summary)"
+    }
+
+    private static func leaderRosterLine(index: Int, row: TeamAgentRow) -> String {
+        let instructions = row.customInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        return leaderRosterLine(
+            index: index, name: row.preset.name, role: row.preset.name,
+            cli: row.preset.cli, model: row.preset.model,
+            agentInstanceId: row.id.uuidString, host: row.hostKey ?? "local",
+            instructions: instructions.isEmpty ? row.preset.instructions : instructions
+        )
+    }
+
+    private static func leaderRosterLine(index: Int, agent: AgentMember) -> String {
+        leaderRosterLine(
+            index: index, name: agent.name, role: agent.agentType, cli: agent.cli,
+            model: agent.model, agentInstanceId: agent.agentInstanceId,
+            host: agent.hostKey ?? "local", instructions: agent.instructions
+        )
+    }
+
     private static func buildLeaderClaudeSystemPrompt(
         teamName: String,
         agentList: String,
@@ -3051,27 +3123,26 @@ final class TeamOrchestrator: ObservableObject {
         return """
         You are the TEAM LEADER for team '\(teamName)'. You direct a group of Claude agent workers running in terminal split panes.
 
-        ## DELEGATE-FIRST PRINCIPLE (CRITICAL)
+        ## ADAPTIVE EXECUTION PRINCIPLE (CRITICAL)
 
-        You are a COORDINATOR, not a worker. Your agents are your hands and eyes.
+        You are both the default executor and the coordinator for this Project. Start single-agent:
+        inspect, reason, edit, and validate directly when the request is small, same-file, or dependency-serial.
+        Do not delegate merely because agents exist or are idle.
 
-        **MANDATORY:** For ANY substantive work — reading code, exploring the codebase, analyzing architecture,
-        writing code, debugging, reviewing — you MUST delegate to an appropriate agent.
+        Escalate only when you can name at least two dependency-ready, independently verifiable subtasks
+        with disjoint file or subsystem ownership and enough work to repay coordination cost. When you do,
+        record the positive decomposition evidence, dispatch one bounded wave, collect once, then review and
+        integrate worktrees serially. Use worker follow-ups only for blockers or ownership expansion.
+        Classify the request as direct, probe, or parallel using the canonical structured decision below.
+        Dispatch exactly the tasks in that decision: zero for direct, one read-only worker for probe, and two
+        or three dependency-ready workers for parallel.
 
-        **NEVER do these yourself:**
-        - Read or grep source files (delegate to an explorer/researcher agent)
-        - Analyze architecture or design (delegate to an architect agent)
-        - Write or modify code (delegate to an executor/implementer agent)
-        - Debug or investigate issues (delegate to a debugger agent)
-        - Review code quality (delegate to a reviewer agent)
-
-        **You may do these yourself:**
+        **You retain direct execution authority:**
+        - Inspect, reason, edit, debug, review, and validate directly for work that does not pass the parallel admission gate
         - Run `\(tmAgent)` commands (status, delegate, read, wait, inbox, task)
         - Synthesize and summarize agent results for the user
         - Break down tasks and create task plans
         - Coordinate dependencies between agents
-
-        **When in doubt, DELEGATE.** An idle agent is a wasted resource.
 
         ## Team Composition Fast Path
 
@@ -3094,9 +3165,12 @@ final class TeamOrchestrator: ObservableObject {
         ## Your Agents
         \(agentList)
 
-        Match each task to the agent whose specialty fits best.
-        When multiple agents are available, prefer parallel delegation over serial.
-        If an agent is idle and there is pending work, assign them a task immediately.
+        Route duplicate names with the roster's durable selector:
+        `\(tmAgent) delegate <agent_name> '<instruction>' --agent-instance-id <instance>`.
+        Validation-role members are read-only by default; grant mutation explicitly only when the task requires it.
+
+        Match admitted parallel tasks to the agent whose specialty fits best. Idle capacity is optional;
+        never manufacture tasks to occupy it.
 
         \(LeaderParallelPolicy.renderedInstructions)
 
@@ -3104,12 +3178,17 @@ final class TeamOrchestrator: ObservableObject {
 
         ## How to Command Agents
 
-        Create a task and delegate it to a specific agent (PREFERRED — creates trackable task):
+        Delegate an admitted mutating task in an isolated worktree:
         ```
-        \(tmAgent) delegate <agent_name> '<your instruction>'
+        \(tmAgent) delegate <agent_name> '<your instruction>' --worktree always --from <base_ref>
         ```
 
-        Send a raw direct message (lightweight, for follow-ups or clarifications):
+        Delegate read-only investigation without a worktree, or send a follow-up:
+        ```
+        \(tmAgent) delegate <agent_name> '<read-only instruction>' --worktree off
+        ```
+
+        Send a raw direct message (lightweight, for blockers or ownership expansion):
         ```
         \(tmAgent) send <agent_name> '<your instruction>'
         ```
@@ -3130,7 +3209,9 @@ final class TeamOrchestrator: ObservableObject {
         A good delegation includes:
         - WHAT: clear description of the task
         - WHERE: specific file paths or directories to look at
-        - HOW MUCH: scope boundaries (what NOT to touch)
+        - OWNERSHIP: explicit owned and forbidden paths
+        - HOW MUCH: scope boundaries and dependency assumptions
+        - VERIFY: one concrete verification command
         - OUTPUT: what format the result should be in
 
         Good: `\(tmAgent) delegate explorer 'Find all socket command handlers in TerminalController.swift. Search for case patterns in the RPC dispatch switch. Report: method name, line number, and threading (MainActor or off-main). Focus only on TerminalController.swift.'`
@@ -3172,19 +3253,24 @@ final class TeamOrchestrator: ObservableObject {
 
         For EVERY user message, execute these steps IN ORDER:
 
-        1. `\(tmAgent) status` — check which agents are idle
-        2. Decompose the request into 1-3 concrete subtasks
-        3. Delegate IMMEDIATELY to idle agents — do NOT analyze the problem yourself first
-        4. `\(tmAgent) wait --timeout 120 --mode report` — wait for results
-        5. `\(tmAgent) read <agent> --lines 100` — read each agent's output
-        6. Synthesize results and respond to the user
-
-        **CRITICAL:** Step 3 must happen BEFORE you read any source files or form your own analysis. Your job is to write good delegation instructions, not to do the work.
+        1. If the prompt says `New durable request <id>`, the durable-request command set is CLOSED:
+           - First run exactly `\(tmAgent) leader request take <id>` once.
+           - A successful `take` has already verified `content_bytes` and `content_sha256`; its full `content` is the user request.
+           - Never run any other `leader request` command between `take` and `complete`. In particular, do not run `--help`, `list`, `recover`, `get`, `status`, a second `take`, or digest/byte-count checks. Do not inspect or discover the CLI syntax; the only valid final acknowledgement is the exact `complete` command shown in step 10.
+        2. Inspect the request and the minimum source context needed to identify dependencies and ownership
+        3. Form the structured direct/probe/parallel decision from the canonical policy
+        4. Execute direct yourself, run one 60-90 second read-only probe, or dispatch the admitted two-to-three-task parallel wave
+        5. While workers run, prepare acceptance checks and integration order without editing worker-owned paths
+        6. `\(tmAgent) wait --timeout 120 --mode any --tasks <comma-separated-task-ids>` then `\(tmAgent) collect --headers`
+        7. Process the first completed result; wait/collect at most once more only for results required to finish
+        8. Review and integrate completed worktrees serially, validate, and respond to the user
+        9. For a high-risk integrated diff only, run one bounded read-only reviewer gate against the actual diff
+        10. For a durable request, after all work and validation succeed, run exactly `\(tmAgent) leader request complete <id>` once, immediately before the final response, with no verification command afterward. Do not complete blocked or failed work.
 
         **Anti-patterns to AVOID:**
-        - Answering a question by reading files yourself when an explorer agent exists
-        - Providing architecture advice yourself when an architect agent exists
-        - Saying "I'll look into this" without delegating to an agent
+        - Delegating only because a matching role or idle worker exists
+        - Splitting same-file or dependency-serial work into artificial parallel tasks
+        - Starting a parallel wave before ownership and independent verification are explicit
         - Waiting for one agent to finish before starting another independent task
         - Responding to the user before collecting agent results
 
@@ -3196,7 +3282,7 @@ final class TeamOrchestrator: ObservableObject {
         **Serial:** task B needs task A's result as input
         - Example: architect designs API → THEN executor implements it
 
-        **Always parallel when possible.** After each delegation round, check `\(tmAgent) status` — if any agent is idle and there is remaining work, delegate to them immediately.
+        Parallelism is an escalation, not a utilization target. Leave agents idle when the remaining work does not pass the admission gate.
 
         ## Error Recovery
 
@@ -3209,14 +3295,12 @@ final class TeamOrchestrator: ObservableObject {
 
         User: "IME 입력창에서 방향키가 동작하지 않는 버그를 고쳐줘"
 
-        Step 1: `\(tmAgent) status` → explorer idle, executor idle, tester idle
-        Step 2: Decompose → (a) 원인 조사, (b) 수정 구현, (c) 테스트
-        Step 3: Parallel delegation:
-          `\(tmAgent) delegate explorer 'Sources/에서 IME 키 이벤트 처리를 찾아라. performKeyEquivalent, keyDown, flagsChanged에서 방향키 처리. NSEvent.keyCode 123-126 관련 코드 보고.'`
-          `\(tmAgent) delegate architect 'IME markedText 상태에서 방향키 이벤트의 올바른 처리 흐름 분석. NSTextInputClient 관점에서 정리.'`
-        Step 4: `\(tmAgent) wait --timeout 120 --mode report`
-        Step 5: Read results → delegate executor with fix instructions
-        Step 6: After fix → delegate tester to verify
+        Step 1: Read the relevant IME handling and tests to identify ownership and dependencies
+        Step 2: If diagnosis, edit, and test are serial or touch the same files, handle them directly
+        Step 3: Only if two independent subsystems need substantial investigation, delegate them with explicit ownership and verification
+        Step 4: Prepare the combined verification while workers run, without touching their owned paths
+        Step 5: `\(tmAgent) collect --headers`
+        Step 6: Review, integrate worktrees serially, and run the combined verification; add a reviewer only if the actual diff is high-risk
 
         Environment: TERMMESH_SOCKET=\(socketPath)
         """
@@ -3236,15 +3320,8 @@ final class TeamOrchestrator: ObservableObject {
         remoteSocketPath: String,
         hostCLIBinDirs: [String] = []
     ) -> String {
-        let agentList = rows.enumerated().map { index, row in
-            let instructions = row.customInstructions
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let source = instructions.isEmpty ? row.preset.instructions : instructions
-            let summary = oneLinerFromInstructions(source)
-            return summary.isEmpty
-                ? "  \(index + 1). \(row.preset.name) (\(row.preset.name))"
-                : "  \(index + 1). \(row.preset.name) (\(row.preset.name)) — \(summary)"
-        }.joined(separator: "\n")
+        let agentList = rows.enumerated().map { leaderRosterLine(index: $0.offset, row: $0.element) }
+            .joined(separator: "\n")
         let remoteRunbooks = """
         ## Agent Runbooks
 
@@ -3299,6 +3376,12 @@ final class TeamOrchestrator: ObservableObject {
         return (dir as NSString).appendingPathComponent("tm-agent")
     }
 
+    static func localTMAgentCommand() -> String {
+        guard let resourcePath = Bundle.main.resourcePath else { return "tm-agent" }
+        let bundled = (resourcePath as NSString).appendingPathComponent("bin/tm-agent")
+        return FileManager.default.isExecutableFile(atPath: bundled) ? shellQuoted(bundled) : "tm-agent"
+    }
+
     static func remoteLeaderNonClaudeSystemPrompt(
         teamName: String,
         rows: [TeamAgentRow],
@@ -3306,15 +3389,8 @@ final class TeamOrchestrator: ObservableObject {
         remoteSocketPath: String,
         hostCLIBinDirs: [String] = []
     ) -> String {
-        let agentList = rows.enumerated().map { index, row in
-            let instructions = row.customInstructions
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let source = instructions.isEmpty ? row.preset.instructions : instructions
-            let summary = oneLinerFromInstructions(source)
-            return summary.isEmpty
-                ? "  \(index + 1). \(row.preset.name) (\(row.preset.name))"
-                : "  \(index + 1). \(row.preset.name) (\(row.preset.name)) — \(summary)"
-        }.joined(separator: "\n")
+        let agentList = rows.enumerated().map { leaderRosterLine(index: $0.offset, row: $0.element) }
+            .joined(separator: "\n")
         // Deliberately the same wording the Claude peer prompt uses: the
         // runbooks live on the peer, not here, so the path is the peer's.
         let remoteRunbooks = """
@@ -3353,12 +3429,8 @@ final class TeamOrchestrator: ObservableObject {
         remoteSocketPath: String,
         hostCLIBinDirs: [String] = []
     ) -> String {
-        let agentList = agents.enumerated().map { index, agent in
-            let summary = oneLinerFromInstructions(agent.instructions)
-            return summary.isEmpty
-                ? "  \(index + 1). \(agent.name) (\(agent.agentType))"
-                : "  \(index + 1). \(agent.name) (\(agent.agentType)) — \(summary)"
-        }.joined(separator: "\n")
+        let agentList = agents.enumerated().map { leaderRosterLine(index: $0.offset, agent: $0.element) }
+            .joined(separator: "\n")
         return renderNonClaudeLeaderPrompt(
             teamName: teamName,
             agentList: agentList,
@@ -3382,12 +3454,8 @@ final class TeamOrchestrator: ObservableObject {
         remoteSocketPath: String,
         hostCLIBinDirs: [String] = []
     ) -> String {
-        let agentList = agents.enumerated().map { index, agent in
-            let summary = oneLinerFromInstructions(agent.instructions)
-            return summary.isEmpty
-                ? "  \(index + 1). \(agent.name) (\(agent.agentType))"
-                : "  \(index + 1). \(agent.name) (\(agent.agentType)) — \(summary)"
-        }.joined(separator: "\n")
+        let agentList = agents.enumerated().map { leaderRosterLine(index: $0.offset, agent: $0.element) }
+            .joined(separator: "\n")
         return buildLeaderClaudeSystemPrompt(
             teamName: teamName,
             agentList: agentList,
@@ -3412,14 +3480,10 @@ final class TeamOrchestrator: ObservableObject {
         sharedWorktreeBranch: String? = nil,
         sharedWorktreePath: String? = nil
     ) -> String {
-        let agentList = agents.enumerated().map { i, a in
-            let summary = Self.oneLinerFromInstructions(a.instructions)
-            return summary.isEmpty
-                ? "  \(i + 1). \(a.name) (\(a.agentType))"
-                : "  \(i + 1). \(a.name) (\(a.agentType)) — \(summary)"
-        }.joined(separator: "\n")
+        let agentList = agents.enumerated().map { Self.leaderRosterLine(index: $0.offset, agent: $0.element) }
+            .joined(separator: "\n")
 
-        let tmAgent = "tm-agent"
+        let tmAgent = Self.localTMAgentCommand()
         let runbookSection = Self.runbookLeaderSection(
             workingDirectory: workingDirectory,
             roles: agents.map(\.agentType)
@@ -3484,27 +3548,26 @@ final class TeamOrchestrator: ObservableObject {
         return """
         You are the TEAM LEADER for team '\(teamName)'. You direct agent workers running in terminal split panes.
 
-        ## DELEGATE-FIRST PRINCIPLE (CRITICAL)
+        ## ADAPTIVE EXECUTION PRINCIPLE (CRITICAL)
 
-        You are a COORDINATOR, not a worker. Your agents are your hands and eyes.
+        You are both the default executor and the coordinator for this Project. Start single-agent:
+        inspect, reason, edit, and validate directly when the request is small, same-file, or dependency-serial.
+        Do not delegate merely because agents exist or are idle.
 
-        **MANDATORY:** For ANY substantive work — reading code, exploring the codebase, analyzing architecture,
-        writing code, debugging, reviewing — you MUST delegate to an appropriate agent.
+        Escalate only when you can name at least two dependency-ready, independently verifiable subtasks
+        with disjoint file or subsystem ownership and enough work to repay coordination cost. When you do,
+        record the positive decomposition evidence, dispatch one bounded wave, collect once, then review and
+        integrate worktrees serially. Use worker follow-ups only for blockers or ownership expansion.
+        Classify the request as direct, probe, or parallel using the canonical structured decision below.
+        Dispatch exactly the tasks in that decision: zero for direct, one read-only worker for probe, and two
+        or three dependency-ready workers for parallel.
 
-        **NEVER do these yourself:**
-        - Read or grep source files (delegate to an explorer/researcher agent)
-        - Analyze architecture or design (delegate to an architect agent)
-        - Write or modify code (delegate to an executor/implementer agent)
-        - Debug or investigate issues (delegate to a debugger agent)
-        - Review code quality (delegate to a reviewer agent)
-
-        **You may do these yourself:**
+        **You retain direct execution authority:**
+        - Inspect, reason, edit, debug, review, and validate directly for work that does not pass the parallel admission gate
         - Run `\(tmAgent)` commands (status, delegate, read, wait, inbox, task)
         - Synthesize and summarize agent results for the user
         - Break down tasks and create task plans
         - Coordinate dependencies between agents
-
-        **When in doubt, DELEGATE.** An idle agent is a wasted resource.
 
         ## Team Composition Fast Path
 
@@ -3519,9 +3582,12 @@ final class TeamOrchestrator: ObservableObject {
         ## Your Agents
         \(agentList)
 
-        Match each task to the agent whose specialty fits best.
-        When multiple agents are available, prefer parallel delegation over serial.
-        If an agent is idle and there is pending work, assign them a task immediately.
+        Route duplicate names with the roster's durable selector:
+        `\(tmAgent) delegate <agent_name> '<instruction>' --agent-instance-id <instance>`.
+        Validation-role members are read-only by default; grant mutation explicitly only when the task requires it.
+
+        Match admitted parallel tasks to the agent whose specialty fits best. Idle capacity is optional;
+        never manufacture tasks to occupy it.
 
         \(LeaderParallelPolicy.renderedInstructions)
 
@@ -3529,12 +3595,17 @@ final class TeamOrchestrator: ObservableObject {
 
         ## How to Command Agents
 
-        Create a task and delegate it to a specific agent (PREFERRED — creates trackable task):
+        Delegate an admitted mutating task in an isolated worktree:
         ```
-        \(tmAgent) delegate <agent_name> '<your instruction>'
+        \(tmAgent) delegate <agent_name> '<your instruction>' --worktree always --from <base_ref>
         ```
 
-        Send a raw direct message (lightweight, for follow-ups or clarifications):
+        Delegate read-only investigation without a worktree, or send a follow-up:
+        ```
+        \(tmAgent) delegate <agent_name> '<read-only instruction>' --worktree off
+        ```
+
+        Send a raw direct message (lightweight, for blockers or ownership expansion):
         ```
         \(tmAgent) send <agent_name> '<your instruction>'
         ```
@@ -3585,24 +3656,30 @@ final class TeamOrchestrator: ObservableObject {
 
         For EVERY user request, follow this pattern:
 
-        1. **Decompose** — Break the request into concrete subtasks
-        2. **Route** — Match each subtask to the best-fit agent by specialty
-        3. **Delegate** — Send tasks to agents in parallel when independent
-        4. **Monitor** — Use `wait`/`inbox`/`read` to track progress; unblock stuck agents
-        5. **Synthesize** — Collect all results and present a unified answer to the user
+        1. **Recover** — For `New durable request <id>`, the durable-request command set is CLOSED:
+           - First run exactly `\(tmAgent) leader request take <id>` once
+           - Success means the CLI already verified byte count and SHA-256; its full `content` is the user request
+           - Never run any other `leader request` command between `take` and `complete`. Specifically forbidden: `--help`, `list`, `recover`, `get`, `status`, a second `take`, and digest/byte-count checks. Do not inspect or discover syntax; the only valid acknowledgement is the exact `complete` command in step 9
+        2. **Inspect** — Read only enough context to identify dependencies and ownership
+        3. **Decide** — Form the canonical direct/probe/parallel decision
+        4. **Execute** — Work directly, run one read-only probe, or dispatch exactly two to three admitted tasks
+        5. **Prepare** — Build acceptance checks and integration order while workers run; do not edit their owned paths
+        6. **Collect** — Wait by task ID in `any` mode, process the first result, and wait/collect at most once more if required
+        7. **Integrate** — Review completed worktrees serially and validate the combined result
+        8. **Review gate** — Only for a high-risk actual diff, dispatch one bounded read-only reviewer after integration
+        9. **Acknowledge** — After all work and validation succeed, run exactly `\(tmAgent) leader request complete <id>` once immediately before the final response, with no verification command afterward; leave blocked or failed work incomplete
 
         **Anti-patterns to AVOID:**
-        - Answering a question by reading files yourself when an explorer agent exists
-        - Providing architecture advice yourself when an architect agent exists
-        - Saying "I'll look into this" without delegating to an agent
+        - Delegating merely because a matching agent exists or is idle
+        - Creating probe work that mutates files or exceeds the 60-90 second budget
+        - Dispatching a parallel task whose dependencies are not ready
         - Waiting for one agent to finish before starting another independent task
         - Responding to the user before collecting agent results
 
-        ## Keeping Agents Busy
+        ## Warm Capacity, Not Utilization
 
-        After each user message, check: are any agents idle? If yes and there is work to do, delegate to them.
-        After completing a task cycle, check inbox and task board — reassign or create follow-up tasks as needed.
-        Proactively break large tasks into parallel subtasks to maximize throughput.
+        Idle agents are available capacity, not wasted capacity. Do not create work to occupy them. After a
+        bounded wave, check inbox and the task board only for blockers, ownership expansion, or completed results.
 
         Environment: TERMMESH_SOCKET=\(socketPath)
         """
@@ -4015,6 +4092,140 @@ final class TeamOrchestrator: ObservableObject {
         )
     }
 
+    static func localLeaderNeedsReadinessProbe(
+        launchLeaderLocally: Bool, leaderMode: String
+    ) -> Bool {
+        launchLeaderLocally && leaderMode != "repl" && leaderMode != "adopted"
+    }
+
+    /// A pane existing is not the same as its TUI accepting input. Project
+    /// creation can finish several seconds before Claude/Codex paints a
+    /// composer; a wake pasted in that interval is acknowledged by Ghostty and
+    /// discarded by the CLI. Keep `leader_ready` false until a real composer
+    /// prompt is visible.
+    nonisolated static func localLeaderPaneLooksReady(_ text: String) -> Bool {
+        let unavailable = ["Not logged in", "Login expired", "Please run /login"]
+        guard !unavailable.contains(where: text.contains) else { return false }
+        // `>` is intentionally excluded. Startup banners and progress hints
+        // contain ordinary greater-than characters before the TUI composer
+        // exists, which recreated the very startup race this probe guards.
+        let markers: Set<Character> = ["❯", "›", "»"]
+        return text.split(separator: "\n", omittingEmptySubsequences: false).contains { raw in
+            guard let first = raw.trimmingCharacters(in: .whitespaces).first else { return false }
+            return markers.contains(first)
+        }
+    }
+
+    private nonisolated static func readLocalLeaderPane(
+        _ surface: ghostty_surface_t
+    ) -> String? {
+        let topLeft = ghostty_point_s(
+            tag: GHOSTTY_POINT_SCREEN, coord: GHOSTTY_POINT_COORD_TOP_LEFT, x: 0, y: 0
+        )
+        let bottomRight = ghostty_point_s(
+            tag: GHOSTTY_POINT_SCREEN, coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT, x: 0, y: 0
+        )
+        let selection = ghostty_selection_s(
+            top_left: topLeft, bottom_right: bottomRight, rectangle: true
+        )
+        var text = ghostty_text_s()
+        guard ghostty_surface_read_text(surface, selection, &text) else { return nil }
+        defer { ghostty_surface_free_text(surface, &text) }
+        guard let pointer = text.text, text.text_len > 0 else { return "" }
+        return String(data: Data(bytes: pointer, count: Int(text.text_len)), encoding: .utf8)
+    }
+
+    private func scheduleLocalLeaderReadinessProbeIfNeeded(
+        teamName: String, leaderMode: String, workspaceId: UUID, panelId: UUID,
+        tabManager: TabManager
+    ) {
+        guard Self.localLeaderNeedsReadinessProbe(
+            launchLeaderLocally: true, leaderMode: leaderMode
+        ) else { return }
+        pollLocalLeaderReadiness(
+            teamName: teamName, workspaceId: workspaceId, panelId: panelId,
+            tabManager: tabManager, deadline: Date().addingTimeInterval(Self.localLeaderReadinessTimeout),
+            readyObservations: 0
+        )
+    }
+
+    private func pollLocalLeaderReadiness(
+        teamName: String, workspaceId: UUID, panelId: UUID, tabManager: TabManager,
+        deadline: Date, readyObservations: Int
+    ) {
+        guard let team = teams[teamName], team.leaderPanelId == panelId, !team.leaderReady else { return }
+        guard Date() < deadline else {
+            var failed = team
+            failed.leaderFailureDescription = "Leader TUI did not expose an input prompt within 60 seconds."
+            teams[teamName] = failed
+            syncTeamStateToDaemon()
+            return
+        }
+        let panel = tabManager.tabs.first(where: { $0.id == workspaceId })?.terminalPanel(for: panelId)
+            ?? AppDelegate.shared?.locateSurface(surfaceId: panelId).flatMap { located in
+                located.tabManager.tabs.first(where: { $0.id == located.workspaceId })?.terminalPanel(for: panelId)
+            }
+        guard let lease = panel?.surface.beginReadLease() else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.localLeaderReadinessPollInterval) { [weak self] in
+                self?.pollLocalLeaderReadiness(
+                    teamName: teamName, workspaceId: workspaceId, panelId: panelId,
+                    tabManager: tabManager, deadline: deadline, readyObservations: 0
+                )
+            }
+            return
+        }
+        Self.localLeaderReadinessQueue.async { [weak self] in
+            let snapshot = Self.readLocalLeaderPane(lease.surface)
+            lease.release()
+            DispatchQueue.main.async {
+                guard let self, var current = self.teams[teamName],
+                      current.leaderPanelId == panelId, !current.leaderReady else { return }
+                let promptVisible = snapshot.map(Self.localLeaderPaneLooksReady) == true
+                let nextReadyObservations = promptVisible ? readyObservations + 1 : 0
+                if nextReadyObservations >= Self.localLeaderStablePromptObservations
+                    && current.leaderPolicyState == "injected" {
+                    current.leaderReady = true
+                    current.leaderFailureDescription = nil
+                    self.teams[teamName] = current
+                    self.syncTeamStateToDaemon()
+                    self.wakeFirstQueuedLeaderRequest(teamName: teamName, tabManager: tabManager)
+                } else {
+                    DispatchQueue.main.asyncAfter(
+                        deadline: .now() + Self.localLeaderReadinessPollInterval
+                    ) { [weak self] in
+                        self?.pollLocalLeaderReadiness(
+                            teamName: teamName, workspaceId: workspaceId, panelId: panelId,
+                            tabManager: tabManager, deadline: deadline,
+                            readyObservations: nextReadyObservations
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func wakeFirstQueuedLeaderRequest(teamName: String, tabManager: TabManager) {
+        guard let request = TeamDataStore.shared.listLeaderRequests(teamName: teamName)?
+            .first(where: { $0.status == "queued" }) else { return }
+        let wake = leaderRequestWake(teamName: teamName, requestId: request.id)
+        _ = sendToLeader(teamName: teamName, text: wake, tabManager: tabManager)
+    }
+
+    static func leaderRequestWake(requestId: String, tmAgent: String) -> String {
+        "New durable request \(requestId). First run exactly: \(tmAgent) leader request take \(requestId). "
+            + "After the requested work succeeds, run exactly: \(tmAgent) leader request complete \(requestId) immediately before your final response."
+    }
+
+    func leaderRequestWake(teamName: String, requestId: String) -> String {
+        let tmAgent: String
+        if let team = teams[teamName], case .local = team.leaderEndpoint {
+            tmAgent = Self.localTMAgentCommand()
+        } else {
+            tmAgent = "tm-agent"
+        }
+        return Self.leaderRequestWake(requestId: requestId, tmAgent: tmAgent)
+    }
+
     func sendToLeader(teamName: String, text: String, tabManager: TabManager) -> Bool {
         guard let team = teams[teamName], team.leaderReady else { return false }
         if case .peer = team.leaderEndpoint {
@@ -4043,13 +4254,39 @@ final class TeamOrchestrator: ObservableObject {
             }
             return true
         }
+        func sendLocalLeader(
+            workspaceId: UUID, panelId: UUID, manager: TabManager
+        ) -> Bool {
+            sendTextToPanel(
+                workspaceId: workspaceId, panelId: panelId, text: text,
+                tabManager: manager, withReturn: false
+            ) { pasted in
+                guard pasted,
+                      let located = AppDelegate.shared?.locateSurface(surfaceId: panelId),
+                      let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                      let panel = workspace.terminalPanel(for: panelId) else { return }
+                // `ghostty_surface_text` draining is not a model-composer
+                // acknowledgement. A separate, named Return after the drain
+                // window avoids the observed local Claude failure where the
+                // inline Return was reported handled but submitted nothing.
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.localLeaderReturnGap) {
+                    TerminalController.shared.sendNamedKeyWithRetry(
+                        on: panel.surface, keyName: "return"
+                    ) { _, _ in }
+                }
+            }
+        }
         // Adopted mode: leader lives in a different workspace than the agent workspace.
         // Use AppDelegate to locate the leader panel across all windows.
         if let leaderWsId = team.leaderWorkspaceId {
             guard let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId) else { return false }
-            return sendTextToPanel(workspaceId: leaderWsId, panelId: team.leaderPanelId, text: text, tabManager: located.tabManager)
+            return sendLocalLeader(
+                workspaceId: leaderWsId, panelId: team.leaderPanelId, manager: located.tabManager
+            )
         }
-        return sendTextToPanel(workspaceId: team.workspaceId, panelId: team.leaderPanelId, text: text, tabManager: tabManager)
+        return sendLocalLeader(
+            workspaceId: team.workspaceId, panelId: team.leaderPanelId, manager: tabManager
+        )
     }
 
     @discardableResult
@@ -5181,6 +5418,7 @@ final class TeamOrchestrator: ObservableObject {
     /// arrive in that order. Well past a peer round trip, well under the
     /// unsubmitted-paste deadline below.
     private static let remoteReturnGap: TimeInterval = 1.5
+    private static let localLeaderReturnGap: TimeInterval = 0.15
     private static let remoteLeaderReturnGap: TimeInterval = 5.0
 
     /// How long a paste may sit unsubmitted before this side presses Return.
@@ -6040,9 +6278,13 @@ final class TeamOrchestrator: ObservableObject {
                     var info: [String: Any] = [
                         "id": agent.id,
                         "name": agent.name,
+                        "agent_instance_id": agent.agentInstanceId,
                         "cli": agent.cli,
                         "model": agent.model,
                         "agent_type": agent.agentType,
+                        "read_only_default": Self.roleDefaultsToReadOnly(agent.agentType),
+                        "host": agent.hostKey as Any? ?? NSNull(),
+                        "locality": Self.agentLocality(hostKey: agent.hostKey),
                         "color": agent.color,
                         "active_task_id": activeTask?.id as Any? ?? NSNull(),
                         "active_task_title": activeTask?.title as Any? ?? NSNull(),

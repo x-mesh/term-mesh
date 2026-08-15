@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Combine
 import os
 
@@ -126,6 +127,32 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         var updatedAt: Date
     }
 
+    struct LeaderRequest: Codable, Equatable {
+        let id: String
+        let content: String
+        let contentSHA256: String
+        let contentBytes: Int
+        var status: String       // queued | claimed | completed
+        let createdAt: Date
+        var claimedAt: Date?
+        var completedAt: Date?
+    }
+
+    enum LeaderRequestEnqueueResult {
+        case created(LeaderRequest, persisted: Bool)
+        case replayed(LeaderRequest, persisted: Bool)
+        case conflict
+        case invalidRequest(String)
+        case teamNotFound
+    }
+
+    enum LeaderRequestTransitionResult {
+        case succeeded(LeaderRequest)
+        case notFound
+        case invalidState(String)
+        case persistenceFailed
+    }
+
     // Data collections (previously in TeamOrchestrator, now lock-protected)
     private var messages: [String: [TeamOrchestrator.TeamMessage]] = [:]
     /// One-shot bearer-capability mailboxes used by `send --expect-reply`.
@@ -135,6 +162,13 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     private var taskBoards: [String: [TeamOrchestrator.TeamTask]] = [:]
     private var heartbeats: [String: [String: (at: Date, summary: String?)]] = [:]
     private var contextStore: [String: [String: ContextEntry]] = [:]
+    /// Lossless user-to-leader command channel. Terminal input carries only a
+    /// short wake-up; the full body lives here and is claimed through RPC.
+    private var leaderRequests: [String: [LeaderRequest]] = [:]
+    /// Bearer capability injected only into a Project leader process. Workers
+    /// share the team socket and name, so neither is sufficient authorization
+    /// to read user-to-leader request bodies.
+    private var leaderRequestTokens: [String: String] = [:]
     /// Phase 2 idle-park: per-team / per-agent flag mirrored from daemon
     /// (`agents/<name>.json:parked`). Set via `setAgentParked` whenever the
     /// daemon emits a parked-state update.
@@ -167,6 +201,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// bearer-mailbox growth. Normal `send --expect-reply` fan-out is far below
     /// this per-team ceiling.
     private let maxCorrelationMailboxesPerTeam = 512
+    private let maxLeaderRequestBytes = 256 * 1024
+    private let maxLeaderRequestsPerTeam = 256
 
     /// Called after data changes to sync state to the daemon (fire-and-forget).
     var onDataChanged: (() -> Void)?
@@ -202,6 +238,23 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         notifyChanged()
     }
 
+    func prepareLeaderRequestToken(teamName: String) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        if let existing = leaderRequestTokens[teamName] { return existing }
+        let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        leaderRequestTokens[teamName] = token
+        return token
+    }
+
+    func isAuthorizedLeaderRequestToken(teamName: String, token: String?) -> Bool {
+        guard let token, !token.isEmpty else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        return leaderRequestTokens[teamName] == token
+    }
+
     func unregisterTeam(_ name: String) {
         lock.lock()
         teamRegistry.removeValue(forKey: name)
@@ -210,6 +263,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         taskBoards.removeValue(forKey: name)
         heartbeats.removeValue(forKey: name)
         contextStore.removeValue(forKey: name)
+        leaderRequests.removeValue(forKey: name)
+        leaderRequestTokens.removeValue(forKey: name)
         parkedAgents.removeValue(forKey: name)
         watchDrifts.removeValue(forKey: name)
         let boardUuid = boardUuids.removeValue(forKey: name)
@@ -234,8 +289,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     // deduped). See docs/design/restore-fleet-session-persistence.md §3.2.
     //
     // Inter-agent messages are deliberately NOT persisted: the leader inbox is
-    // re-synthesized from task state (`inboxItems`), so tasks are the durable
-    // record. Heartbeats/usage are ephemeral or daemon-owned.
+    // re-synthesized from task state (`inboxItems`). Durable user-to-leader
+    // requests are persisted because terminal wake-ups are intentionally not
+    // the command body. Heartbeats/usage are ephemeral or daemon-owned.
 
     struct PersistedContextEntry: Codable {
         var value: String
@@ -250,6 +306,13 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         var savedAt: Date
         var tasks: [TeamOrchestrator.TeamTask]
         var context: [String: PersistedContextEntry]
+        /// Optional for backward compatibility with schema-1 boards written
+        /// before the durable leader request channel existed.
+        var leaderRequests: [LeaderRequest]?
+        /// Decode-only compatibility with boards written by the short-lived
+        /// capability prototype. Never restore or write this same-user-readable
+        /// secret; Project leaders receive a fresh in-memory token at launch.
+        var leaderRequestToken: String?
     }
 
     /// Dedup payload — everything in `PersistedBoard` except `savedAt`, so an
@@ -257,6 +320,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     private struct BoardContent: Codable {
         var tasks: [TeamOrchestrator.TeamTask]
         var context: [String: PersistedContextEntry]
+        var leaderRequests: [LeaderRequest]
     }
 
     static let boardSchemaVersion = 1
@@ -312,46 +376,77 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     private func saveAllBoardsNow() {
         lock.lock()
         let uuids = boardUuids
-        let boards = taskBoards
-        let contexts = contextStore
+        lock.unlock()
+
+        for teamName in uuids.keys {
+            _ = saveBoardNow(teamName: teamName, requireFile: false)
+        }
+    }
+
+    /// Persist one team's latest state while running on `boardIOQueue`. The
+    /// snapshot is taken inside the serialized IO operation so two concurrent
+    /// enqueues cannot write a newer request and then overwrite it with an
+    /// older snapshot.
+    private func saveBoardNow(teamName: String, requireFile: Bool) -> Bool {
+        lock.lock()
+        guard let teamUuid = boardUuids[teamName] else {
+            lock.unlock()
+            return false
+        }
+        let tasks = taskBoards[teamName] ?? []
+        let context = (contextStore[teamName] ?? [:]).mapValues {
+            PersistedContextEntry(value: $0.value, setBy: $0.setBy, updatedAt: $0.updatedAt)
+        }
+        let requests = leaderRequests[teamName] ?? []
         lock.unlock()
 
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
 
-        for (teamName, teamUuid) in uuids {
-            let tasks = boards[teamName] ?? []
-            let context = (contexts[teamName] ?? [:]).mapValues {
-                PersistedContextEntry(value: $0.value, setBy: $0.setBy, updatedAt: $0.updatedAt)
-            }
-            guard let contentBytes = try? encoder.encode(BoardContent(tasks: tasks, context: context))
-            else { continue }
-            if lastBoardContentBytes[teamUuid] == contentBytes { continue }
+        guard let contentBytes = try? encoder.encode(BoardContent(
+            tasks: tasks, context: context, leaderRequests: requests
+        )) else { return false }
+        let url = Self.boardFileURL(teamUuid: teamUuid)
+        if lastBoardContentBytes[teamUuid] == contentBytes,
+           (!requireFile || FileManager.default.fileExists(atPath: url.path)) {
+            return true
+        }
 
-            let board = PersistedBoard(
-                schema: Self.boardSchemaVersion,
-                teamUuid: teamUuid,
-                teamName: teamName,
-                savedAt: Date(),
-                tasks: tasks,
-                context: context
+        let board = PersistedBoard(
+            schema: Self.boardSchemaVersion,
+            teamUuid: teamUuid,
+            teamName: teamName,
+            savedAt: Date(),
+            tasks: tasks,
+            context: context,
+            leaderRequests: requests,
+            leaderRequestToken: nil
+        )
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
             )
-            do {
-                let url = Self.boardFileURL(teamUuid: teamUuid)
-                try FileManager.default.createDirectory(
-                    at: url.deletingLastPathComponent(),
-                    withIntermediateDirectories: true,
-                    attributes: [.posixPermissions: 0o700]
-                )
-                let data = try encoder.encode(board)
-                try data.write(to: url, options: .atomic)
-                lastBoardContentBytes[teamUuid] = contentBytes
-            } catch {
-                Logger.team.warning(
-                    "[board.persist] save failed team=\(teamName, privacy: .public): \(error.localizedDescription, privacy: .public)"
-                )
-            }
+            let data = try encoder.encode(board)
+            try data.write(to: url, options: .atomic)
+            lastBoardContentBytes[teamUuid] = contentBytes
+            return true
+        } catch {
+            Logger.team.warning(
+                "[board.persist] save failed team=\(teamName, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+            return false
+        }
+    }
+
+    /// Wait for the request body to reach the atomic board file before the
+    /// terminal wake-up is sent. This intentionally bypasses the normal 0.5s
+    /// debounce: the wake-up contains no recoverable copy of the body.
+    private func persistLeaderRequestNow(teamName: String) -> Bool {
+        boardIOQueue.sync {
+            saveBoardNow(teamName: teamName, requireFile: true)
         }
     }
 
@@ -391,12 +486,16 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
                 updatedAt: kv.value.updatedAt
             )
         }
+        let restoredRequests = board.leaderRequests ?? []
 
         lock.lock()
         taskBoards[teamName] = restored
         noteTasksChanged()
         if !context.isEmpty {
             contextStore[teamName] = context
+        }
+        if !restoredRequests.isEmpty {
+            leaderRequests[teamName] = restoredRequests
         }
         boardUuids[teamName] = teamUuid
         lock.unlock()
@@ -405,6 +504,154 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "[board.persist] restored \(restored.count) task(s) for team=\(teamName, privacy: .public)"
         )
         return restored.count
+    }
+
+    // MARK: - Durable Leader Requests
+
+    static func leaderRequestDigest(_ content: String) -> String {
+        SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func enqueueLeaderRequest(
+        teamName: String, content: String, requestId: String? = nil, now: Date = Date()
+    ) -> LeaderRequestEnqueueResult {
+        let requestedId = requestId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let id = requestedId.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString.lowercased()
+        guard id.count <= 64, id.unicodeScalars.allSatisfy({ scalar in
+            let value = scalar.value
+            return (48...57).contains(value) || (65...90).contains(value)
+                || (97...122).contains(value) || value == 46 || value == 95 || value == 45
+        }) else {
+            return .invalidRequest("request_id must match [A-Za-z0-9._-]{1,64}")
+        }
+        guard content.lengthOfBytes(using: .utf8) <= maxLeaderRequestBytes else {
+            return .invalidRequest("leader request exceeds 256 KiB")
+        }
+        let digest = Self.leaderRequestDigest(content)
+
+        lock.lock()
+        guard teamRegistry[teamName] != nil else {
+            lock.unlock()
+            return .teamNotFound
+        }
+        if let existing = leaderRequests[teamName, default: []].first(where: { $0.id == id }) {
+            lock.unlock()
+            guard existing.contentSHA256 == digest && existing.content == content else {
+                return .conflict
+            }
+            let persisted = persistLeaderRequestNow(teamName: teamName)
+            return .replayed(existing, persisted: persisted)
+        }
+        let request = LeaderRequest(
+            id: id, content: content, contentSHA256: digest,
+            contentBytes: content.lengthOfBytes(using: .utf8), status: "queued",
+            createdAt: now, claimedAt: nil, completedAt: nil
+        )
+        var requests = leaderRequests[teamName, default: []]
+        if requests.count >= maxLeaderRequestsPerTeam {
+            requests.removeAll { $0.status == "completed" }
+        }
+        guard requests.count < maxLeaderRequestsPerTeam else {
+            lock.unlock()
+            return .invalidRequest("leader request queue limit reached")
+        }
+        requests.append(request)
+        leaderRequests[teamName] = requests
+        lock.unlock()
+        let persisted = persistLeaderRequestNow(teamName: teamName)
+        notifyChanged()
+        return .created(request, persisted: persisted)
+    }
+
+    func listLeaderRequests(teamName: String, includeCompleted: Bool = false) -> [LeaderRequest]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard teamRegistry[teamName] != nil else { return nil }
+        let requests = leaderRequests[teamName] ?? []
+        return includeCompleted ? requests : requests.filter { $0.status != "completed" }
+    }
+
+    func takeLeaderRequest(
+        teamName: String, requestId: String, now: Date = Date()
+    ) -> LeaderRequestTransitionResult {
+        lock.lock()
+        guard var requests = leaderRequests[teamName],
+              let index = requests.firstIndex(where: { $0.id == requestId }) else {
+            lock.unlock()
+            return .notFound
+        }
+        guard requests[index].status == "queued" else {
+            let status = requests[index].status
+            lock.unlock()
+            return .invalidState(status)
+        }
+        let previous = requests[index]
+        requests[index].status = "claimed"
+        requests[index].claimedAt = now
+        leaderRequests[teamName] = requests
+        let request = requests[index]
+        lock.unlock()
+        guard persistLeaderRequestNow(teamName: teamName) else {
+            rollbackLeaderRequestTransition(teamName: teamName, proposed: request, previous: previous)
+            return .persistenceFailed
+        }
+        notifyChanged()
+        return .succeeded(request)
+    }
+
+    func completeLeaderRequest(
+        teamName: String, requestId: String, now: Date = Date()
+    ) -> LeaderRequestTransitionResult {
+        lock.lock()
+        guard var requests = leaderRequests[teamName],
+              let index = requests.firstIndex(where: { $0.id == requestId }) else {
+            lock.unlock()
+            return .notFound
+        }
+        guard requests[index].status == "claimed" else {
+            let status = requests[index].status
+            lock.unlock()
+            return .invalidState(status)
+        }
+        let previous = requests[index]
+        requests[index].status = "completed"
+        requests[index].completedAt = now
+        leaderRequests[teamName] = requests
+        let request = requests[index]
+        lock.unlock()
+        guard persistLeaderRequestNow(teamName: teamName) else {
+            rollbackLeaderRequestTransition(teamName: teamName, proposed: request, previous: previous)
+            return .persistenceFailed
+        }
+        notifyChanged()
+        return .succeeded(request)
+    }
+
+    private func rollbackLeaderRequestTransition(
+        teamName: String, proposed: LeaderRequest, previous: LeaderRequest
+    ) {
+        lock.lock()
+        if var requests = leaderRequests[teamName],
+           let index = requests.firstIndex(where: { $0.id == proposed.id }),
+           requests[index] == proposed {
+            requests[index] = previous
+            leaderRequests[teamName] = requests
+        }
+        lock.unlock()
+    }
+
+    func leaderRequestDictionary(_ request: LeaderRequest, includeContent: Bool) -> [String: Any] {
+        var result: [String: Any] = [
+            "request_id": request.id,
+            "status": request.status,
+            "content_sha256": request.contentSHA256,
+            "content_bytes": request.contentBytes,
+            "created_at": ISO8601DateFormatter().string(from: request.createdAt),
+            "claimed_at": request.claimedAt.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
+            "completed_at": request.completedAt.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
+        ]
+        if includeContent { result["content"] = request.content }
+        return result
     }
 
     /// Remove a board file after a deliberate destroy.
@@ -1333,6 +1580,88 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             filtered = filtered.filter { $0.dependsOn.contains(dependsOn) }
         }
         return filtered
+    }
+
+    /// Board-clock coordination measurements. Agent-reported durations are
+    /// intentionally excluded; only persisted request, task, and message
+    /// timestamps participate.
+    func coordinationMetrics(teamName: String, requestId: String? = nil) -> [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        let request = requestId.flatMap { id in
+            leaderRequests[teamName]?.first(where: { $0.id == id })
+        } ?? leaderRequests[teamName]?.last
+        guard let request else { return nil }
+
+        let upperBound = request.completedAt ?? Date()
+        let tasks = taskBoards[teamName, default: []].filter {
+            $0.createdAt >= request.createdAt && $0.createdAt <= upperBound
+        }
+        let requestMessages = messages[teamName, default: []].filter {
+            $0.timestamp >= request.createdAt && $0.timestamp <= upperBound
+        }
+        let firstTaskCreated = tasks.map(\.createdAt).min()
+        let intervals = tasks.compactMap { task -> (Date, Date)? in
+            guard let start = task.startedAt, let end = task.completedAt, end >= start else { return nil }
+            return (start, end)
+        }
+        let firstStart = intervals.map(\.0).min()
+        let lastComplete = intervals.map(\.1).max()
+        let waveSeconds = firstStart.flatMap { start in
+            lastComplete.map { max(0, $0.timeIntervalSince(start)) }
+        }
+        let overlapSeconds = Self.overlapSeconds(intervals)
+        let round: (TimeInterval) -> Double = { value in
+            (value * 1000).rounded() / 1000
+        }
+        let seconds: (Date?, Date?) -> Any = { start, end in
+            guard let start, let end else { return NSNull() }
+            return round(max(0, end.timeIntervalSince(start)))
+        }
+        return [
+            "team_name": teamName,
+            "request_id": request.id,
+            "request_status": request.status,
+            "source": "board_timestamps",
+            "dispatch_latency_seconds": seconds(request.createdAt, firstTaskCreated),
+            "worker_runtime_seconds": round(intervals.reduce(0) { $0 + $1.1.timeIntervalSince($1.0) }),
+            "wave_duration_seconds": waveSeconds.map(round) as Any? ?? NSNull(),
+            "overlap_seconds": round(overlapSeconds),
+            "overlap_ratio": waveSeconds.map { $0 > 0 ? round(overlapSeconds / $0) : 0 } as Any? ?? NSNull(),
+            "synthesis_latency_seconds": seconds(lastComplete, request.completedAt),
+            "total_duration_seconds": seconds(request.createdAt, request.completedAt),
+            "task_count": tasks.count,
+            "completed_task_count": tasks.filter { $0.status == "completed" }.count,
+            "reassignment_count": tasks.reduce(0) { $0 + $1.reassignmentCount },
+            "message_count": requestMessages.count,
+            "report_count": requestMessages.filter { $0.type == "report" }.count,
+        ]
+    }
+
+    private static func overlapSeconds(_ intervals: [(Date, Date)]) -> TimeInterval {
+        struct Boundary {
+            let date: Date
+            let delta: Int
+        }
+        var events: [Boundary] = []
+        events.reserveCapacity(intervals.count * 2)
+        for interval in intervals {
+            events.append(Boundary(date: interval.0, delta: 1))
+            events.append(Boundary(date: interval.1, delta: -1))
+        }
+        events.sort { lhs, rhs in
+            if lhs.date == rhs.date { return lhs.delta < rhs.delta }
+            return lhs.date < rhs.date
+        }
+        var active = 0
+        var overlap: TimeInterval = 0
+        var previous: Date?
+        for event in events {
+            if active >= 2, let previous { overlap += event.date.timeIntervalSince(previous) }
+            active += event.delta
+            previous = event.date
+        }
+        return max(0, overlap)
     }
 
     func dependentTasks(teamName: String, taskId: String) -> [TeamOrchestrator.TeamTask] {

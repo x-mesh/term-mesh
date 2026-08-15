@@ -1999,6 +1999,7 @@ extension TeamOrchestrator {
             teamName: teamName,
             workingDirectory: workingDirectory,
             grant: grantResponse.grant,
+            leaderRequestToken: TeamDataStore.shared.prepareLeaderRequestToken(teamName: teamName),
             systemPromptFile: promptFile,
             environment: remoteEnvironment,
             hostBinDirs: host.hostCLIBinDirs
@@ -3399,7 +3400,8 @@ extension TeamOrchestrator {
         workingDirectory: String,
         agentType: String = "executor",
         model: String = "sonnet",
-        cli: String = "claude"
+        cli: String = "claude",
+        agentInstanceId reservedAgentInstanceId: String? = nil
     ) async throws -> AgentMember {
         guard let team = teams[teamName] else { throw RemoteAgentError.teamNotFound(teamName) }
         guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) else {
@@ -3485,7 +3487,7 @@ extension TeamOrchestrator {
         let hostSSHTarget = host.sshTarget
         let hostSSHPort = host.sshPort
         let hostIdentityFile = host.identityFile
-        let agentInstanceId = UUID().uuidString
+        let agentInstanceId = reservedAgentInstanceId ?? UUID().uuidString
         var unownedRouteGrant: Termmesh_Peer_V1_TeamLeaderGrant?
 
         do {
@@ -5774,6 +5776,7 @@ extension TeamOrchestrator {
             executionMode: executionMode,
             leaderEndpoint: initialLeaderEndpoint,
             launchLeaderLocally: launchLeaderLocally,
+            agentInstanceIds: rows.filter { $0.hostKey == nil }.map { $0.id.uuidString },
             tabManager: tabManager
         ) else { return nil }
 
@@ -5920,7 +5923,8 @@ extension TeamOrchestrator {
                         workingDirectory: resolved.workingDirectory,
                         agentType: row.preset.name,
                         model: row.preset.model,
-                        cli: row.preset.cli
+                        cli: row.preset.cli,
+                        agentInstanceId: row.id.uuidString
                     )
                     onRemoteAttach?(.agentAttached(name: row.preset.name, host: hostKey))
                 } catch {
@@ -6534,6 +6538,7 @@ extension TeamOrchestrator {
         teamName: String,
         workingDirectory: String,
         grant: Termmesh_Peer_V1_TeamLeaderGrant,
+        leaderRequestToken: String,
         systemPromptFile: String? = nil,
         environment: [String: String] = [:],
         hostBinDirs: [String] = []
@@ -6545,6 +6550,7 @@ extension TeamOrchestrator {
             ("TERMMESH_LEADER_TEAM_UUID", grant.teamUuid),
             ("TERMMESH_LEADER_EXPIRES_AT", String(grant.expiresAtUnixSecs)),
             ("TERMMESH_LEADER_PEER_ID", PeerIdentity.hexString(PeerIdentity.defaultPeerID())),
+            ("TERMMESH_LEADER_REQUEST_TOKEN", leaderRequestToken),
             ("TERMMESH_TEAM", teamName),
         ]
         let savedPrefix = "TERMMESH_SAVED_"
