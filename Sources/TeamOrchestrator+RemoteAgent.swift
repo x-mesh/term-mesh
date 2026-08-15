@@ -50,7 +50,15 @@ enum RemoteLeaderReattachOutcome: Equatable {
 @MainActor
 final class PendingPeerAgentSurfaceCleanupStore {
     typealias HostSockPath = @MainActor (String) -> String?
-    typealias Terminator = @MainActor (String, Data) async -> Bool
+    /// `(hostKey, servingSockPath, surfaceID)`.
+    ///
+    /// The host key rides along because the serving socket is not always where
+    /// the surface is. A redirected host ensured it on its session owner, and a
+    /// `TerminateSurface` sent to the socket that merely *served* the handshake
+    /// names a surface that endpoint never created — the tombstone would then
+    /// retry forever against a host that keeps answering "not mine" while the
+    /// `tm-agent-bridge` it was meant to kill stays up.
+    typealias Terminator = @MainActor (String, String, Data) async -> Bool
     struct Record: Codable, Equatable, Identifiable {
         let hostKey: String
         let surfaceIDBase64: String
@@ -97,9 +105,10 @@ final class PendingPeerAgentSurfaceCleanupStore {
                 in: RemoteHostStore.shared.sortedHosts
             )
         },
-        terminator: @escaping Terminator = { sockPath, surfaceID in
-            await TeamOrchestrator.terminatePeerAgentSurfaceConfirmed(
-                hostSockPath: sockPath,
+        terminator: @escaping Terminator = { hostKey, sockPath, surfaceID in
+            await TeamOrchestrator.terminatePeerAgentSurfaceOnOwningEndpoint(
+                hostKey: hostKey,
+                servingSockPath: sockPath,
                 surfaceID: surfaceID
             )
         }
@@ -182,14 +191,14 @@ final class PendingPeerAgentSurfaceCleanupStore {
     /// relay transition starts another pass.
     func retryPending(
         hostSockPath: (String) -> String?,
-        terminate: (String, Data) async -> Bool
+        terminate: (String, String, Data) async -> Bool
     ) async {
         let snapshot = records
         for record in snapshot {
             guard let surfaceID = record.surfaceID,
                   let sockPath = hostSockPath(record.hostKey),
                   !sockPath.isEmpty,
-                  await terminate(sockPath, surfaceID)
+                  await terminate(record.hostKey, sockPath, surfaceID)
             else { continue }
             records.removeAll { $0.id == record.id }
             persist()
@@ -1582,8 +1591,18 @@ extension TeamOrchestrator {
         }
     }
 
+    /// Sweeps leftover *shells*, which is why this one keeps the serving
+    /// endpoint while the team lifecycle above moved to the session owner.
+    ///
+    /// Its targets come from `inspectPeerShells`, which reads `host.workspaces`
+    /// — the roster the sidebar fetched over `activeSockPath`. Those surfaces
+    /// belong to whatever is serving that socket, so a `ClosePane` addressed to
+    /// a redirected host's daemon names a pane that daemon never published. The
+    /// guard is worse than the send: `liveTeamSockPath` is empty until some
+    /// pane has leased the team tunnel, so a perfectly connected GUI host would
+    /// report itself disconnected before a single shell was tried.
     func closePeerShells(host: HostEntry, surfaceIDs: Set<Data>) async throws -> Int {
-        guard !Self.liveTeamSockPath(for: host).isEmpty else {
+        guard !host.activeSockPath.isEmpty else {
             throw RemoteAgentError.hostNotConnected(host.displayName)
         }
         let protected = claimedRemoteSurfaceIDs(host: host)
@@ -1602,7 +1621,7 @@ extension TeamOrchestrator {
         // stays attached to a stream that will never produce another byte, and
         // the sweep counts it as a clean close.
         var borrowed = borrowedRelaySession(
-            hostKey: host.teamHostSpec.hostKey, excluding: targets
+            hostKey: host.paneHostSpec.hostKey, excluding: targets
         )
         var opened: PeerRelayConnection?
         var dialFailed = false
@@ -1622,7 +1641,7 @@ extension TeamOrchestrator {
                 }
                 do {
                     opened = try await PeerRelaySession.connect(
-                        hostSockPath: Self.liveTeamSockPath(for: host)
+                        hostSockPath: host.activeSockPath
                     )
                 } catch {
                     // Remember it: without this every remaining target pays for
@@ -4352,6 +4371,79 @@ extension TeamOrchestrator {
             hostSockPath: hostSockPath,
             surfaceID: surfaceID
         )
+    }
+
+    /// Terminate an agent surface on the endpoint that actually created it.
+    ///
+    /// `liveTeamSockPath` is not usable here, and that difference is the whole
+    /// reason this exists. It only *finds* a tunnel, and the case this serves is
+    /// precisely the one with no tunnel left to find: the ensure succeeded, the
+    /// local attach failed, the pane that would have held the lease was never
+    /// opened. Left to a lookup, the tombstone would wait for a lease nothing
+    /// is going to take, while the bridge it names keeps running.
+    ///
+    /// So this leases the session owner itself, and releases it as soon as the
+    /// answer is in. On a host that is not redirected the serving socket is the
+    /// owning socket, and the old direct path is kept — no tunnel is started to
+    /// reach a socket already open.
+    /// Where a tombstone's `TerminateSurface` has to be sent.
+    ///
+    /// Split out from the send so the choice can be tested without a socket —
+    /// it is the whole defect, and the surrounding code is transport.
+    enum PeerAgentCleanupEndpoint {
+        /// The socket that served the handshake already owns the surface.
+        case serving(String)
+        /// The surface was ensured on this host's session owner; a tunnel to it
+        /// has to be leased before anything can be addressed there.
+        case sessionOwner(PeerPaneHostSpec)
+
+        /// What the endpoint resolves to on the wire, for assertions and logs.
+        /// A serving endpoint is already a local path; a session owner is a
+        /// remote path that only becomes dialable once leased.
+        var describedTarget: String {
+            switch self {
+            case .serving(let sockPath): return sockPath
+            case .sessionOwner(let spec): return spec.hostKey.remoteSockPath ?? ""
+            }
+        }
+
+        var leasesSessionOwner: Bool {
+            if case .sessionOwner = self { return true }
+            return false
+        }
+    }
+
+    static func peerAgentCleanupEndpoint(
+        host: HostEntry?,
+        servingSockPath: String
+    ) -> PeerAgentCleanupEndpoint {
+        guard let host, host.redirectsTeamWorkToSessionHost else {
+            return .serving(servingSockPath)
+        }
+        return .sessionOwner(host.teamHostSpec)
+    }
+
+    static func terminatePeerAgentSurfaceOnOwningEndpoint(
+        hostKey: String,
+        servingSockPath: String,
+        surfaceID: Data
+    ) async -> Bool {
+        switch peerAgentCleanupEndpoint(
+            host: RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+            servingSockPath: servingSockPath
+        ) {
+        case .serving(let sockPath):
+            return await terminatePeerAgentSurfaceConfirmed(
+                hostSockPath: sockPath, surfaceID: surfaceID
+            )
+        case .sessionOwner(let spec):
+            guard let lease = try? await PeerPaneHostRegistry.shared.acquire(spec)
+            else { return false }
+            defer { PeerPaneHostRegistry.shared.release(lease) }
+            return await terminatePeerAgentSurfaceConfirmed(
+                hostSockPath: lease.hostSockPath, surfaceID: surfaceID
+            )
+        }
     }
 
     /// Returns true only when the host authoritatively says the surface is gone.

@@ -500,6 +500,70 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
         XCTAssertTrue(redirected.redirectsTeamWorkToSessionHost)
     }
 
+    /// Ensure succeeded on the session owner, the local attach then failed, and
+    /// nothing holds a lease any more. The tombstone must still reach the
+    /// endpoint that created the surface — sending `TerminateSurface` to the
+    /// socket that merely served the handshake names a surface that endpoint
+    /// never made, so the retry loops forever while the `tm-agent-bridge` it
+    /// was meant to kill keeps running.
+    @MainActor
+    func test_orphanedAgentCleanupTargetsTheEndpointThatCreatedTheSurface() {
+        let redirected = hostEntry(sessionHostRemoteSockPath: "/tmp/T/term-meshd-peer.sock")
+        let endpoint = TeamOrchestrator.peerAgentCleanupEndpoint(
+            host: redirected,
+            servingSockPath: redirected.activeSockPath
+        )
+        XCTAssertTrue(
+            endpoint.leasesSessionOwner,
+            "a redirected host must lease its session owner rather than reuse the serving socket"
+        )
+        XCTAssertEqual(endpoint.describedTarget, "/tmp/T/term-meshd-peer.sock")
+    }
+
+    /// The direct path stays direct. A host that owns its own surfaces must not
+    /// pay for a second tunnel to reach a socket that is already open, and an
+    /// unknown host must still be attempted on whatever served it.
+    @MainActor
+    func test_cleanupOnAnUnredirectedOrUnknownHostKeepsTheServingSocket() {
+        let plain = hostEntry()
+        let direct = TeamOrchestrator.peerAgentCleanupEndpoint(
+            host: plain, servingSockPath: plain.activeSockPath
+        )
+        XCTAssertFalse(direct.leasesSessionOwner)
+        XCTAssertEqual(direct.describedTarget, plain.activeSockPath)
+
+        let unknown = TeamOrchestrator.peerAgentCleanupEndpoint(
+            host: nil, servingSockPath: "/tmp/served.sock"
+        )
+        XCTAssertFalse(unknown.leasesSessionOwner)
+        XCTAssertEqual(unknown.describedTarget, "/tmp/served.sock")
+    }
+
+    /// The shell sweep reads `host.workspaces`, which the sidebar fetched over
+    /// the serving socket — so it must keep addressing that socket even on a
+    /// redirected host. Routing it to the session owner sent `ClosePane` for
+    /// panes that endpoint never published, and the guard failed sooner still:
+    /// the team tunnel does not exist until some pane leases it, so a connected
+    /// GUI host reported itself disconnected before one shell was tried.
+    @MainActor
+    func test_theShellSweepEndpointIsNotTheTeamEndpointOnARedirectedHost() {
+        let redirected = hostEntry(sessionHostRemoteSockPath: "/tmp/T/term-meshd-peer.sock")
+        XCTAssertNotEqual(
+            redirected.paneHostSpec.hostKey,
+            redirected.teamHostSpec.hostKey,
+            "this test is meaningless unless the two endpoints really differ"
+        )
+        XCTAssertFalse(
+            redirected.activeSockPath.isEmpty,
+            "the sweep's guard reads this, and it is non-empty whenever the host is connected"
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.liveTeamSockPath(for: redirected).isEmpty,
+            "with no pane holding the team lease there is no team socket — which is exactly "
+                + "why the sweep must not gate on one"
+        )
+    }
+
     func test_teamWorkStaysPutWithoutASessionOwnerOrWithoutSSH() {
         let plain = hostEntry()
         XCTAssertEqual(plain.teamHostSpec.hostKey, plain.paneHostSpec.hostKey)
