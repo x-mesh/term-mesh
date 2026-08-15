@@ -962,7 +962,8 @@ final class PeerProjectBootstrapTests: XCTestCase {
             model: "gpt-5",
             teamName: "demo",
             workingDirectory: "/srv/demo",
-            grant: grant
+            grant: grant,
+            leaderRequestToken: "leader-request-token"
         )
 
         XCTAssertFalse(prepare.contains("abab"), "the visible preparation must contain no grant")
@@ -1458,6 +1459,7 @@ final class PeerProjectBootstrapTests: XCTestCase {
             teamName: "demo",
             workingDirectory: "/srv/demo",
             grant: grant,
+            leaderRequestToken: "leader-request-token",
             systemPromptFile: "/tmp/term-mesh-leader-prompt-team-uuid.txt"
         )
 

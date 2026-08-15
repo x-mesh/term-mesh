@@ -39,6 +39,7 @@ DEFAULT_SEED = 20260814
 DEFAULT_TIMEOUT = 45 * 60
 DEFAULT_INFRA_RETRIES = 1
 CONDITIONS = ("single", "multi")
+POLICIES = ("legacy", "adaptive")
 TOKEN_KEYS = (
     "input_tokens", "output_tokens", "reasoning_output_tokens",
     "cache_read_input_tokens", "cache_creation_input_tokens",
@@ -134,6 +135,11 @@ class RunResult:
     worker_tasks: int = 0
     worker_active_critical_path_ms: Optional[int] = None
     worker_utilization: Optional[float] = None
+    coordination_commands: dict[str, int] = field(default_factory=dict)
+    routing_decision: Optional[str] = None
+    routing_reason: Optional[str] = None
+    routing_decision_ms: Optional[int] = None
+    routing_tasks: list[dict[str, Any]] = field(default_factory=list)
     rework_count: int = 0
     tokens: dict[str, int] = field(default_factory=dict)
     token_precision: str = "actual"
@@ -207,6 +213,28 @@ def build_matrix(
                 RunSpec(fixture, trial, condition, index)
                 for index, condition in enumerate(order, 1)
                 if condition in selected_conditions
+            )
+    return specs
+
+
+def build_policy_matrix(
+    fixtures: Iterable[str], trials: int, seed: int, policies: Iterable[str] = POLICIES,
+) -> list[RunSpec]:
+    """Build counterbalanced legacy/adaptive pairs without changing the old matrix."""
+    rng = random.Random(seed)
+    selected = tuple(policies)
+    specs: list[RunSpec] = []
+    for fixture in fixtures:
+        for trial in range(1, trials + 1):
+            if trial == 1:
+                order = POLICIES
+            elif trial == 2:
+                order = tuple(reversed(POLICIES))
+            else:
+                order = POLICIES if rng.random() < 0.5 else tuple(reversed(POLICIES))
+            specs.extend(
+                RunSpec(fixture, trial, policy, index)
+                for index, policy in enumerate(order, 1) if policy in selected
             )
     return specs
 
@@ -609,6 +637,37 @@ def count_worker_dispatches(text: str) -> int:
     return count
 
 
+def tm_agent_command_counts(text: str) -> dict[str, int]:
+    """Count leader coordination commands from streamed shell tool calls."""
+    counts = {name: 0 for name in (
+        "delegate", "send", "wait", "collect", "read", "status",
+        "finish_worktree", "isolated_delegate", "other",
+    )}
+    command_pattern = re.compile(
+        r"(?:^|[\n;&|()])\s*(?:[^\s;&|()]*/)?tm-agent\s+"
+        r"(delegate|send|wait|collect|read|status|task\s+finish-worktree|[a-z][\w-]*)\b",
+        re.MULTILINE,
+    )
+    for line in text.splitlines():
+        with contextlib.suppress(json.JSONDecodeError):
+            event = json.loads(line)
+            message = event.get("message", {})
+            for block in message.get("content", []) if isinstance(message, dict) else []:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                payload = block.get("input", {})
+                command = payload.get("command", "") if isinstance(payload, dict) else ""
+                counts["isolated_delegate"] += len(re.findall(
+                    r"tm-agent\s+delegate\b(?:(?![\n;&|]).)*--worktree\s+always\b",
+                    command, re.MULTILINE,
+                ))
+                for match in command_pattern.finditer(command):
+                    verb = match.group(1)
+                    key = "finish_worktree" if verb == "task finish-worktree" else verb
+                    counts[key if key in counts else "other"] += 1
+    return counts
+
+
 def first_tool_dispatch_count(text: str) -> Optional[int]:
     """Return worker sends in the first assistant tool call, if any."""
     for line in text.splitlines():
@@ -839,7 +898,86 @@ def create_benchmark_team(team: str, checkout: Path, model: str) -> Any:
     )
 
 
-def worker_instruction(fixture: Fixture, team: str, role: str) -> str:
+def default_worker_tasks() -> list[dict[str, Any]]:
+    """The legacy fixed wave, represented in the structured v6 schema."""
+    return [
+        {
+            "id": role, "worker": role, "goal": f"{role} 역할로 task를 완료",
+            "owned": ["repository read surface" if role != "executor" else "required implementation files"],
+            "forbidden": ["all repository writes" if role != "executor" else "unrelated files"],
+            "depends_on": [], "verify": "task-specific verification",
+            "mutates": role == "executor", "estimated_seconds": 300,
+        }
+        for role in ("explorer", "executor", "reviewer")
+    ]
+
+
+def validate_routing_decision(
+    payload: Any, *, available_workers: Iterable[str] = ("explorer", "executor", "reviewer"),
+) -> tuple[str, str, list[dict[str, Any]]]:
+    """Validate the Project policy v6 decision before any worker is dispatched."""
+    if not isinstance(payload, dict):
+        raise ValueError("decision must be a JSON object")
+    route = payload.get("route")
+    if route not in {"direct", "probe", "parallel"}:
+        raise ValueError(f"invalid route {route!r}")
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("reason must be a non-empty string")
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list):
+        raise ValueError("tasks must be an array")
+    expected = {"direct": (0, 0), "probe": (1, 1), "parallel": (2, 3)}[route]
+    if not expected[0] <= len(tasks) <= expected[1]:
+        raise ValueError(f"{route} requires {expected[0]}..{expected[1]} tasks, got {len(tasks)}")
+
+    workers = set(available_workers)
+    required_fields = (
+        "id", "worker", "goal", "owned", "forbidden", "depends_on",
+        "verify", "mutates", "estimated_seconds",
+    )
+    required = set(required_fields)
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_workers: set[str] = set()
+    for index, task in enumerate(tasks):
+        if not isinstance(task, dict) or not required.issubset(task):
+            missing = sorted(required - set(task) if isinstance(task, dict) else required)
+            raise ValueError(f"task {index} missing fields: {missing}")
+        task_id = task["id"]
+        worker = task["worker"]
+        if not isinstance(task_id, str) or not task_id.strip() or task_id in seen_ids:
+            raise ValueError(f"task {index} has invalid or duplicate id")
+        if worker not in workers or worker in seen_workers:
+            raise ValueError(f"task {index} has unavailable or duplicate worker {worker!r}")
+        if not isinstance(task["goal"], str) or not task["goal"].strip():
+            raise ValueError(f"task {index} goal must be non-empty")
+        for field_name in ("owned", "forbidden", "depends_on"):
+            value = task[field_name]
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ValueError(f"task {index} {field_name} must be a string array")
+        if task["depends_on"]:
+            raise ValueError(f"task {index} is not dependency-ready")
+        if not isinstance(task["verify"], str) or not task["verify"].strip():
+            raise ValueError(f"task {index} verify must be non-empty")
+        if not isinstance(task["mutates"], bool):
+            raise ValueError(f"task {index} mutates must be boolean")
+        estimate = task["estimated_seconds"]
+        if isinstance(estimate, bool) or not isinstance(estimate, int) or estimate <= 0:
+            raise ValueError(f"task {index} estimated_seconds must be a positive integer")
+        if route == "probe" and (task["mutates"] or not 60 <= estimate <= 90):
+            raise ValueError("probe task must be read-only and estimated at 60..90 seconds")
+        if task["mutates"] and worker != "executor":
+            raise ValueError(f"benchmark worker {worker!r} is read-only")
+        seen_ids.add(task_id)
+        seen_workers.add(worker)
+        normalized.append({key: task[key] for key in required_fields})
+    return route, reason.strip(), normalized
+
+
+def worker_instruction(
+    fixture: Fixture, team: str, role: str, task: Optional[dict[str, Any]] = None,
+) -> str:
     result_file = f"/tmp/term-mesh-bench-{team}-{role}.result"
     report_file = f"~/.term-mesh/results/{team}/{role}-{uuid.uuid4().hex[:8]}-full.md"
     role_work = {
@@ -856,6 +994,11 @@ def worker_instruction(fixture: Fixture, team: str, role: str) -> str:
             "확인할 법한 조건과 검증 방법을 분석하되 어떤 repo 파일도 수정하지 마라."
         ),
     }[role]
+    task = task or next(item for item in default_worker_tasks() if item["worker"] == role)
+    mutation_rule = (
+        "owned에 명시된 범위만 수정하고 forbidden 범위는 수정하지 마라."
+        if task["mutates"] else "read-only task다. 어떤 repo 파일도 수정하지 마라."
+    )
     return f"""
 실제 개발 benchmark worker다. 현재 checkout만 사용하고 git history, benchmark controller, solution
 commit, 외부 checkout에서 정답을 찾지 마라. 외부 remote에 push/publish/release하지 마라.
@@ -863,6 +1006,13 @@ commit, 외부 checkout에서 정답을 찾지 마라. 외부 remote에 push/pub
 작업: {fixture.prompt}
 
 역할: {role_work}
+task id: {task['id']}
+goal: {task['goal']}
+owned: {json.dumps(task['owned'], ensure_ascii=False)}
+forbidden: {json.dumps(task['forbidden'], ensure_ascii=False)}
+verify: {task['verify']}
+time budget: {task['estimated_seconds']} seconds
+{mutation_rule}
 긴 세부 결과는 먼저 `{report_file}`에 작성하라. 마지막에 아래 정확한 5-line envelope를 stdout에
 출력하고, 같은 5줄을 `{result_file}.tmp.$$`에 쓴 뒤 atomic `mv`로 `{result_file}`에 저장하라.
 STATUS: DONE|BLOCKED|NEEDS_REVIEW
@@ -875,15 +1025,20 @@ FULL_REPORT: {report_file}
 
 def dispatch_benchmark_workers(
     fixture: Fixture, team: str, checkout: Path, trace: TraceWriter, timeout: float = 120,
+    tasks: Optional[list[dict[str, Any]]] = None,
 ) -> int:
-    """Submit all three worker tasks concurrently and verify each delivery."""
+    """Submit only the structured decision's tasks and verify each delivery."""
     env = tm_environment()
-    roles = ("explorer", "executor", "reviewer")
+    selected = default_worker_tasks() if tasks is None else tasks
+    if not selected:
+        return 0
+    roles = tuple(task["worker"] for task in selected)
+    by_worker = {task["worker"]: task for task in selected}
     started = time.perf_counter()
     processes = {
         role: subprocess.Popen(
             (
-                "tm-agent", "send", role, worker_instruction(fixture, team, role),
+                "tm-agent", "send", role, worker_instruction(fixture, team, role, by_worker[role]),
                 "--no-report", "--team", team,
             ),
             cwd=checkout, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
@@ -907,7 +1062,7 @@ def dispatch_benchmark_workers(
         else:
             failures.append(f"{role}: {safe_failure(stderr or stdout)}")
     trace.write(
-        "workers_dispatched", count=delivered,
+        "workers_dispatched", count=delivered, workers=list(roles),
         duration_ms=round((time.perf_counter() - started) * 1000),
     )
     if failures:
@@ -1054,6 +1209,66 @@ worker envelopes:
     return protocol + "\n\n" + common
 
 
+LEGACY_POLICY = """
+## DELEGATE-FIRST PRINCIPLE
+You are a coordinator, not a worker. For substantive reading, analysis, implementation, debugging,
+review, and verification, delegate to the Project workers before doing the work yourself. Prefer
+parallel delegation whenever possible. If a worker is idle and pending work exists, assign it.
+Request controller delegation, consume every returned result, then integrate and validate.
+Shared-checkout edits must have explicit disjoint ownership or run sequentially.
+""".strip()
+
+ADAPTIVE_POLICY = """
+## ADAPTIVE EXECUTION PRINCIPLE — POLICY V6
+You are the default executor and coordinator. Inspect, reason, edit, and validate directly for small,
+same-file, or dependency-serial work. Worker presence or idleness is not a reason to delegate.
+Escalate only when at least two dependency-ready, independently verifiable subtasks have disjoint
+file or subsystem ownership and enough work to amortize dispatch, worktree, handoff, and merge cost.
+For admitted work request one controller-managed wave with explicit ownership and independent
+verification. Use one dispatch, one independent work interval, and one bounded result collection;
+use follow-ups only for blockers or ownership expansion. Review, integrate, and validate the final result.
+""".strip()
+
+
+def policy_leader_prompt(fixture: Fixture, policy: str, decision_file: Path) -> str:
+    if policy not in POLICIES:
+        raise ValueError(f"unknown policy: {policy}")
+    instructions = LEGACY_POLICY if policy == "legacy" else ADAPTIVE_POLICY
+    return f"""
+실제 Project leader policy A/B benchmark다. explorer, executor, reviewer worker가 이미 idle 상태로
+Project에 존재한다. 오직 아래 POLICY에 따라 직접 실행할지 위임할지 판단하라. 현재 checkout만
+사용하고 `tm-agent`, Agent/Task/Monitor 같은 별도 agent 도구는 호출하지 마라. controller가 worker
+전달과 결과 수집을 대행한다. 최소한의 source context를 확인한 뒤 `{decision_file}`에 아래 schema의
+JSON을 atomic하게 기록하라. direct이면 tasks는 빈 배열이다. probe이면 read-only task 정확히 1개와
+60~90초 estimate를, parallel이면 dependency-ready task 2~3개를 기록하라. worker는 explorer, executor,
+reviewer 중 겹치지 않게 선택한다. probe/parallel이면 repo를 수정하지 말고 decision 파일 기록 직후 turn을
+끝내라. controller가 worker 결과를 전달하면 같은 session에서 통합과 최종 검증을 수행한다.
+commit, push, publish, release 및 외부 서비스 변경은 금지한다. release script 테스트는 local bare repository와 stub
+command만 사용하는 hermetic test여야 한다. solution commit, git history, benchmark controller, 다른
+checkout에서 정답을 찾지 마라.
+
+ROUTING JSON SCHEMA:
+{{
+  "route": "direct|probe|parallel",
+  "reason": "...",
+  "tasks": [{{
+    "id": "stable-task-id", "worker": "explorer|executor|reviewer",
+    "goal": "self-contained outcome", "owned": ["path or subsystem"],
+    "forbidden": ["path or subsystem"], "depends_on": [],
+    "verify": "one command", "mutates": false, "estimated_seconds": 90
+  }}]
+}}
+
+POLICY:
+{instructions}
+
+TASK:
+{fixture.prompt}
+
+working tree에서 구현과 관련 테스트, 가능한 검증까지 완료하라.
+""".strip()
+
+
 def wait_for_worker_results(
     result_files: list[Path], *, timeout: float, trace: Optional[TraceWriter] = None,
 ) -> tuple[str, int, int]:
@@ -1136,7 +1351,9 @@ def worker_timing(task_rows: list[dict[str, Any]]) -> tuple[Optional[int], Optio
 def classify_infra_failure(reason: str) -> bool:
     return bool(re.search(
         r"provider|overloaded|rate limit|authentication|connection reset|network is unreachable|"
-        r"remote Xcode runner unavailable|snapshot setup failed|submodule failed|daemon.*unavailable|"
+        r"remote Xcode runner unavailable|CoreSimulator.*out[- ]of[- ]date|"
+        r"DVTCoreSimulatorAdditionsErrorDomain|Unable to load simulator devices|"
+        r"snapshot setup failed|submodule failed|daemon.*unavailable|"
         r"team not found|socket.*(?:missing|unavailable|refused)|"
         r"BenchmarkTerminated|benchmark interrupted by signal",
         reason, re.IGNORECASE,
@@ -1271,6 +1488,10 @@ def run_one(
                     record.failure_reason = None
                     break
                 record.failure_reason = safe_failure(reason)
+                if classify_infra_failure(record.failure_reason):
+                    record.infra_invalid = True
+                    record.status = "infra_invalid"
+                    break
                 record.correction_count += 1
                 prompt = (
                     "숨은 acceptance가 실패했다. 같은 작업과 session을 이어서 수정하고 검증하라. "
@@ -1301,8 +1522,14 @@ def run_one(
                 record.cost_precision = "token_estimate"
         record.changed_files = write_patch(checkout, experiment / paths["patch"])
         if record.status != "passed":
-            record.status = "timeout" if record.timed_out else "failed"
-            record.infra_invalid = classify_infra_failure(record.failure_reason or "")
+            record.infra_invalid = record.infra_invalid or classify_infra_failure(
+                record.failure_reason or ""
+            )
+            record.status = (
+                "infra_invalid" if record.infra_invalid
+                else "timeout" if record.timed_out
+                else "failed"
+            )
     except KeyboardInterrupt as error:
         record.failure_reason = safe_failure(f"KeyboardInterrupt: {error or 'benchmark controller interrupted'}")
         record.infra_invalid = True
@@ -1326,6 +1553,221 @@ def run_one(
         record.finished_at = utc_now()
         trace.write("session_end", status=record.status, total_wall_ms=record.total_wall_ms, tokens=record.tokens)
         (experiment / paths["result"]).write_text(json.dumps(asdict(record), indent=2, ensure_ascii=False) + "\n")
+        if checkout.exists() and not keep_checkouts:
+            shutil.rmtree(checkout, ignore_errors=True)
+        if guard_root is not None:
+            shutil.rmtree(guard_root, ignore_errors=True)
+        for result_file in result_files:
+            result_file.unlink(missing_ok=True)
+    return record
+
+
+def run_policy_one(
+    spec: RunSpec, *, experiment: Path, scratch: Path, model: str, effort: str,
+    timeout: int, xcode_host: str, keep_checkouts: bool,
+) -> RunResult:
+    """Run one Project with an idle worker pool; vary only the leader policy."""
+    fixture = FIXTURES[spec.fixture]
+    run_id = f"{fixture.name}-{spec.condition}-t{spec.trial}-{uuid.uuid4().hex[:8]}"
+    run_dir = experiment / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    checkout = scratch / run_id
+    relative_run = Path("runs") / run_id
+    paths = {
+        "result": str(relative_run / "result.json"),
+        "trace": str(relative_run / "trace.jsonl"),
+        "patch": str(relative_run / "candidate.patch"),
+        "stdout": str(relative_run / "stdout.log"),
+        "acceptance": str(relative_run / "acceptance.log"),
+        "decision": str(relative_run / "routing-decision.json"),
+    }
+    record = RunResult(
+        run_id=run_id, fixture=fixture.name, parallelism=fixture.parallelism,
+        trial=spec.trial, condition=spec.condition, order=spec.order, started_at=utc_now(),
+        tokens={key: 0 for key in TOKEN_KEYS}, paths=paths,
+    )
+    trace = TraceWriter(experiment / paths["trace"], run_id)
+    team: Optional[str] = None
+    guard_root: Optional[Path] = None
+    result_files: list[Path] = []
+    total_started: Optional[float] = None
+    try:
+        create_snapshot(fixture, checkout)
+        agent_env, guard_root = benchmark_agent_environment(checkout)
+        session_id = str(uuid.uuid4())
+        team = f"bench-policy-{uuid.uuid4().hex[:10]}"
+        total_started = time.perf_counter()
+        total_started_epoch = time.time()
+        init_started = time.perf_counter()
+        create_benchmark_team(team, checkout, model)
+        record.team_init_ms = round((time.perf_counter() - init_started) * 1000)
+        trace.write(
+            "session_start", condition=spec.condition, fixture=fixture.name,
+            model=model, effort=effort, team_init_ms=record.team_init_ms,
+        )
+        decision_file = experiment / paths["decision"]
+        prompt = policy_leader_prompt(fixture, spec.condition, decision_file)
+        active_started = time.perf_counter()
+        with (experiment / paths["stdout"]).open("w") as stdout_log, (
+            experiment / paths["acceptance"]
+        ).open("w") as acceptance_log:
+            resume = False
+            routed = False
+            while True:
+                remaining = timeout - (time.perf_counter() - total_started)
+                if remaining <= 0:
+                    record.timed_out = True
+                    record.failure_reason = f"end-to-end timeout after {timeout}s"
+                    break
+                command = claude_command(
+                    prompt, model=model, effort=effort, session_id=session_id,
+                    resume=resume, condition="policy",
+                )
+                try:
+                    completed, first_action, _ = run_stream(
+                        command, cwd=checkout, timeout=remaining, log=stdout_log,
+                        trace=trace, label="correction" if resume else "initial", env=agent_env,
+                    )
+                except subprocess.TimeoutExpired:
+                    record.timed_out = True
+                    record.failure_reason = f"leader timeout after {timeout}s"
+                    break
+                if record.time_to_first_action_ms is None:
+                    record.time_to_first_action_ms = first_action
+                parsed = parse_stream(completed.stdout)
+                add_tokens(record.tokens, parsed["tokens"])
+                record.leader_turns += parsed["turns"]
+                if parsed["cost_usd"] is not None:
+                    record.cost_usd = (record.cost_usd or 0.0) + float(parsed["cost_usd"])
+                counts = tm_agent_command_counts(completed.stdout)
+                for key, value in counts.items():
+                    record.coordination_commands[key] = record.coordination_commands.get(key, 0) + value
+                record.worker_tasks += counts["delegate"] + counts["send"]
+                if completed.returncode != 0:
+                    record.failure_reason = safe_failure(completed.stderr or f"leader exit {completed.returncode}")
+                    break
+                if not routed:
+                    if not decision_file.is_file():
+                        record.failure_reason = "policy protocol violation: routing decision file missing"
+                        break
+                    try:
+                        decision = json.loads(decision_file.read_text())
+                    except (OSError, json.JSONDecodeError) as error:
+                        record.failure_reason = f"policy protocol violation: invalid routing decision: {error}"
+                        break
+                    try:
+                        route, reason, routing_tasks = validate_routing_decision(decision)
+                    except ValueError as error:
+                        record.failure_reason = f"policy protocol violation: {error}"
+                        break
+                    record.routing_decision = route
+                    record.routing_reason = reason[:1000]
+                    record.routing_tasks = routing_tasks
+                    record.routing_decision_ms = max(
+                        0, round((decision_file.stat().st_mtime - total_started_epoch) * 1000),
+                    )
+                    trace.write(
+                        "routing_decision", route=route, tasks=len(routing_tasks),
+                        workers=[task["worker"] for task in routing_tasks],
+                        duration_ms=record.routing_decision_ms,
+                    )
+                    routed = True
+                    if route in {"probe", "parallel"}:
+                        record.worker_tasks = dispatch_benchmark_workers(
+                            fixture, team, checkout, trace, timeout=min(120, remaining),
+                            tasks=routing_tasks,
+                        )
+                        result_files = [
+                            Path(f"/tmp/term-mesh-bench-{team}-{task['worker']}.result")
+                            for task in routing_tasks
+                        ]
+                        remaining = timeout - (time.perf_counter() - total_started)
+                        estimate = max(task["estimated_seconds"] for task in routing_tasks)
+                        wave_timeout = min(10 * 60, estimate + 60, max(0, remaining))
+                        headers, wait_ms, ready = wait_for_worker_results(
+                            result_files, timeout=wave_timeout, trace=trace,
+                        )
+                        record.worker_active_critical_path_ms = wait_ms
+                        record.coordination_commands["controller_dispatch"] = record.worker_tasks
+                        record.coordination_commands["controller_collect"] = 1
+                        prompt = f"""
+controller가 선택한 {route} route에 따라 worker wave를 실행했다. ready={ready}/{len(routing_tasks)}. 아래 bounded
+envelope와 필요한 FULL_REPORT만 읽어 구현을 통합·수정하고 최종 검증하라. worker를 다시 dispatch하거나
+기다리지 말고 남은 일은 직접 완료하라.
+
+{headers}
+""".strip()
+                        resume = True
+                        continue
+                remaining = timeout - (time.perf_counter() - total_started)
+                if remaining <= 0:
+                    record.timed_out = True
+                    record.failure_reason = f"end-to-end timeout after {timeout}s"
+                    break
+                passed, acceptance_ms, reason = run_acceptance(
+                    fixture, checkout, acceptance_log, remaining,
+                    xcode_host=xcode_host, run_id=run_id,
+                )
+                record.acceptance_ms += acceptance_ms
+                if passed:
+                    record.acceptance_passed = True
+                    record.status = "passed"
+                    record.failure_reason = None
+                    break
+                record.failure_reason = safe_failure(reason)
+                if classify_infra_failure(record.failure_reason):
+                    record.infra_invalid = True
+                    record.status = "infra_invalid"
+                    break
+                record.correction_count += 1
+                prompt = (
+                    "숨은 acceptance가 실패했다. 같은 policy와 session을 유지하여 직접 수정하거나 "
+                    "필요한 worker를 조정하고 다시 검증하라. 실패 항목:\n" + record.failure_reason
+                )
+                resume = True
+        record.active_task_ms = round((time.perf_counter() - active_started) * 1000)
+        record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)
+        selected_workers = [task["worker"] for task in record.routing_tasks]
+        worker_tokens, _, observed, expected = team_usage(team, checkout, selected_workers)
+        add_tokens(record.tokens, worker_tokens)
+        worker_cost = estimate_cost(worker_tokens, model) if observed else None
+        if worker_cost is not None:
+            record.cost_usd = (record.cost_usd or 0.0) + worker_cost
+        record.token_precision = "actual_all" if observed == expected else (
+            "leader_actual_workers_partial" if observed else "leader_actual_workers_unavailable"
+        )
+        record.cost_precision = "leader_actual_workers_estimate" if observed == expected else record.token_precision
+        if record.cost_usd is None:
+            record.cost_usd = estimate_cost(record.tokens, model)
+            if record.cost_usd is not None:
+                record.cost_precision = "token_estimate"
+        record.changed_files = write_patch(checkout, experiment / paths["patch"])
+        if record.status != "passed":
+            record.infra_invalid = record.infra_invalid or classify_infra_failure(record.failure_reason or "")
+            record.status = "infra_invalid" if record.infra_invalid else (
+                "timeout" if record.timed_out else "failed"
+            )
+    except Exception as error:
+        record.failure_reason = safe_failure(f"{type(error).__name__}: {error}")
+        record.infra_invalid = classify_infra_failure(record.failure_reason)
+        record.status = "infra_invalid" if record.infra_invalid else "failed"
+        if total_started is not None:
+            record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)
+        with contextlib.suppress(Exception):
+            if checkout.exists():
+                record.changed_files = write_patch(checkout, experiment / paths["patch"])
+    finally:
+        if team and checkout.exists():
+            with contextlib.suppress(Exception):
+                daemon_json("headless.destroy_team", {"team_name": team}, timeout=90)
+        record.finished_at = utc_now()
+        trace.write(
+            "session_end", status=record.status, total_wall_ms=record.total_wall_ms,
+            tokens=record.tokens, coordination=record.coordination_commands,
+        )
+        (experiment / paths["result"]).write_text(
+            json.dumps(asdict(record), indent=2, ensure_ascii=False) + "\n"
+        )
         if checkout.exists() and not keep_checkouts:
             shutil.rmtree(checkout, ignore_errors=True)
         if guard_root is not None:
@@ -1430,9 +1872,20 @@ def pair_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "fixture": fixture, "parallelism": FIXTURES[fixture].parallelism, "trial": trial,
             "single_passed": bool(single.get("acceptance_passed")),
             "multi_passed": bool(multi.get("acceptance_passed")),
+            "outcome": (
+                "both_success" if single.get("acceptance_passed") and multi.get("acceptance_passed")
+                else "single_only" if single.get("acceptance_passed")
+                else "multi_only" if multi.get("acceptance_passed")
+                else "neither_success"
+            ),
             "speedup": speedup,
-            "token_amplification": (multi_tokens / single_tokens) if single_tokens else None,
-            "cost_ratio": (float(multi_cost) / float(single_cost)) if single_cost and multi_cost is not None else None,
+            "token_amplification": (
+                (multi_tokens / single_tokens) if valid_latency and single_tokens else None
+            ),
+            "cost_ratio": (
+                (float(multi_cost) / float(single_cost))
+                if valid_latency and single_cost and multi_cost is not None else None
+            ),
             "single_run_id": single["run_id"], "multi_run_id": multi["run_id"],
         })
     return pairs
@@ -1471,9 +1924,15 @@ def summarize(rows: list[dict[str, Any]], *, seed: int, quality: Optional[dict[s
     for pair in pairs:
         pair["quality"] = qindex.get((pair["fixture"], pair["trial"]))
     speedups = [float(pair["speedup"]) for pair in pairs if pair["speedup"] is not None]
-    token_amps = [float(pair["token_amplification"]) for pair in pairs if pair["token_amplification"] is not None]
-    cost_ratios = [float(pair["cost_ratio"]) for pair in pairs if pair["cost_ratio"] is not None]
     successful_pairs = [pair for pair in pairs if pair["single_passed"] and pair["multi_passed"]]
+    token_amps = [
+        float(pair["token_amplification"]) for pair in successful_pairs
+        if pair["token_amplification"] is not None
+    ]
+    cost_ratios = [
+        float(pair["cost_ratio"]) for pair in successful_pairs
+        if pair["cost_ratio"] is not None
+    ]
     quality_ready = bool(quality) and bool(successful_pairs) and all(
         pair.get("quality")
         and int(pair["quality"].get("valid_judges", 0)) >= 3
@@ -1499,6 +1958,7 @@ def summarize(rows: list[dict[str, Any]], *, seed: int, quality: Optional[dict[s
         and overall_speedup >= 1.20 and quality_regression is False
     )
     routes: dict[str, str] = {}
+    fixture_evidence: dict[str, Any] = {}
     for fixture in FIXTURES:
         all_fixture_pairs = [pair for pair in pairs if pair["fixture"] == fixture]
         latency_pairs = [pair for pair in all_fixture_pairs if pair["speedup"] is not None]
@@ -1510,10 +1970,27 @@ def summarize(rows: list[dict[str, Any]], *, seed: int, quality: Optional[dict[s
         single_passes = sum(pair["single_passed"] for pair in all_fixture_pairs)
         multi_passes = sum(pair["multi_passed"] for pair in all_fixture_pairs)
         enough_evidence = len(all_fixture_pairs) >= 3
-        routes[fixture] = "multi" if (
-            enough_evidence and values and statistics.median(values) >= 1.15
+        fixture_evidence[fixture] = {
+            "pairs": len(all_fixture_pairs),
+            "latency_pairs": len(latency_pairs),
+            "censored_pairs": sum(pair["outcome"] == "neither_success" for pair in all_fixture_pairs),
+            "single_only_pairs": sum(pair["outcome"] == "single_only" for pair in all_fixture_pairs),
+            "multi_only_pairs": sum(pair["outcome"] == "multi_only" for pair in all_fixture_pairs),
+            "both_success_pairs": sum(pair["outcome"] == "both_success" for pair in all_fixture_pairs),
+        }
+        if not enough_evidence or (single_passes == 0 and multi_passes == 0):
+            routes[fixture] = "insufficient_evidence"
+        elif single_passes == 0 < multi_passes:
+            routes[fixture] = "multi"
+        elif multi_passes == 0 < single_passes:
+            routes[fixture] = "single"
+        elif (
+            values and statistics.median(values) >= 1.15
             and no_regression and multi_passes >= single_passes
-        ) else "single"
+        ):
+            routes[fixture] = "multi"
+        else:
+            routes[fixture] = "single"
     return {
         "conditions": conditions, "pairs": pairs,
         "paired_speedup_median": overall_speedup,
@@ -1524,6 +2001,9 @@ def summarize(rows: list[dict[str, Any]], *, seed: int, quality: Optional[dict[s
         "complete_experiment": complete_experiment,
         "default_route": "multi" if default_multi else "single",
         "default_gate_passed": default_multi, "fixture_routes": routes,
+        "fixture_evidence": fixture_evidence,
+        "latency_pairs": len(speedups),
+        "censored_pairs": sum(pair["outcome"] == "neither_success" for pair in pairs),
         "attempt_runs": len(attempts), "usable_runs": len(usable),
         "infra_invalid_runs": sum(
             bool(row.get("infra_invalid")) or row.get("total_wall_ms") is None
@@ -1703,9 +2183,12 @@ def render_report(experiment: Path, manifest: dict[str, Any], rows: list[dict[st
         f"Bootstrap 95% CI: {summary['paired_speedup_bootstrap_95ci']}",
         f"Median token amplification: {value(summary['token_amplification_median'], 'x')}",
         f"Median cost ratio: {value(summary['cost_ratio_median'], 'x')}",
+        f"Latency-comparable pairs: {summary['latency_pairs']} / {len(summary['pairs'])} "
+        f"(both-failed/censored {summary['censored_pairs']})",
         f"Quality evaluation ready: {summary['quality_ready']} (regression={summary['quality_regression']})", "",
         "## Conditions", "",
-        "| condition | pass | median wall | median tokens | median cost | corrections | timeouts |",
+        "Wall, token, and cost medians below use successful runs only; pass, corrections, and timeouts use all usable cells.", "",
+        "| condition | pass | successful median wall | successful median tokens | successful median cost | corrections | timeouts |",
         "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for condition in CONDITIONS:
@@ -1718,12 +2201,162 @@ def render_report(experiment: Path, manifest: dict[str, Any], rows: list[dict[st
         )
     lines.extend(("", "## Routing", ""))
     for fixture, route in summary["fixture_routes"].items():
-        lines.append(f"- `{fixture}` ({FIXTURES[fixture].parallelism}): **{route}**")
+        evidence = summary["fixture_evidence"][fixture]
+        lines.append(
+            f"- `{fixture}` ({FIXTURES[fixture].parallelism}): **{route}** "
+            f"— latency pairs {evidence['latency_pairs']}/{evidence['pairs']}, "
+            f"single-only {evidence['single_only_pairs']}, multi-only {evidence['multi_only_pairs']}, "
+            f"censored {evidence['censored_pairs']}"
+        )
     lines.extend(("", "Default multi adoption requires no pass-rate loss, median speedup ≥1.20x, and no blinded quality regression. Per-fixture routing requires ≥1.15x and the same quality gate.", ""))
     report = "\n".join(lines)
     (experiment / "report.md").write_text(report)
     (experiment / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     return report
+
+
+def policy_pair_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    usable = latest_effectiveness_rows(rows)
+    grouped: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+    for row in usable:
+        if not row.get("infra_invalid"):
+            grouped.setdefault((row["fixture"], int(row["trial"])), {})[row["condition"]] = row
+    pairs = []
+    for (fixture, trial), policies in sorted(grouped.items()):
+        if set(policies) != set(POLICIES):
+            continue
+        legacy, adaptive = policies["legacy"], policies["adaptive"]
+        both_passed = bool(legacy.get("acceptance_passed") and adaptive.get("acceptance_passed"))
+        ratio = None
+        if both_passed and legacy.get("total_wall_ms") and adaptive.get("total_wall_ms"):
+            ratio = legacy["total_wall_ms"] / adaptive["total_wall_ms"]
+        legacy_tokens = sum(int(legacy.get("tokens", {}).get(key, 0) or 0) for key in TOKEN_KEYS)
+        adaptive_tokens = sum(int(adaptive.get("tokens", {}).get(key, 0) or 0) for key in TOKEN_KEYS)
+        pairs.append({
+            "fixture": fixture, "trial": trial,
+            "legacy_passed": bool(legacy.get("acceptance_passed")),
+            "adaptive_passed": bool(adaptive.get("acceptance_passed")),
+            "outcome": (
+                "both_success" if both_passed
+                else "legacy_only" if legacy.get("acceptance_passed")
+                else "adaptive_only" if adaptive.get("acceptance_passed")
+                else "neither_success"
+            ),
+            "speedup": ratio,
+            "token_ratio": (
+                adaptive_tokens / legacy_tokens
+                if both_passed and legacy_tokens else None
+            ),
+            "legacy_run_id": legacy["run_id"],
+            "adaptive_run_id": adaptive["run_id"],
+        })
+    return pairs
+
+
+def summarize_policy(rows: list[dict[str, Any]], *, seed: int) -> dict[str, Any]:
+    usable = latest_effectiveness_rows(rows)
+    conditions: dict[str, Any] = {}
+    for policy in POLICIES:
+        selected = [row for row in usable if row["condition"] == policy]
+        passed = [row for row in selected if row.get("acceptance_passed")]
+        latencies = [float(row["total_wall_ms"]) for row in passed if row.get("total_wall_ms") is not None]
+        tokens = [sum(int(row.get("tokens", {}).get(key, 0) or 0) for key in TOKEN_KEYS) for row in passed]
+        delegated = [row for row in selected if int(row.get("worker_tasks", 0) or 0) > 0]
+        route_counts = {route: sum(row.get("routing_decision") == route for row in selected)
+                        for route in ("direct", "probe", "parallel")}
+        command_total = lambda key: sum(
+            int(row.get("coordination_commands", {}).get(key, 0) or 0) for row in selected
+        )
+        conditions[policy] = {
+            "runs": len(selected), "passed": len(passed),
+            "pass_rate": len(passed) / len(selected) if selected else None,
+            "median_wall_ms": statistics.median(latencies) if latencies else None,
+            "median_tokens": statistics.median(tokens) if tokens else None,
+            "delegated_runs": len(delegated),
+            "delegation_rate": len(delegated) / len(selected) if selected else None,
+            "route_counts": route_counts,
+            "worker_tasks": sum(int(row.get("worker_tasks", 0) or 0) for row in selected),
+            "wait_commands": command_total("wait"),
+            "collect_commands": command_total("collect"),
+            "read_commands": command_total("read"),
+            "isolated_delegates": command_total("isolated_delegate"),
+            "controller_dispatches": command_total("controller_dispatch"),
+            "controller_collects": command_total("controller_collect"),
+            "corrections": sum(int(row.get("correction_count", 0) or 0) for row in selected),
+            "timeouts": sum(bool(row.get("timed_out")) for row in selected),
+        }
+    pairs = policy_pair_rows(usable)
+    speedups = [float(pair["speedup"]) for pair in pairs if pair["speedup"] is not None]
+    token_ratios = [float(pair["token_ratio"]) for pair in pairs if pair["token_ratio"] is not None]
+    return {
+        "conditions": conditions, "pairs": pairs,
+        "paired_speedup_median": statistics.median(speedups) if speedups else None,
+        "paired_speedup_bootstrap_95ci": bootstrap_ci(speedups, seed=seed),
+        "token_ratio_median": statistics.median(token_ratios) if token_ratios else None,
+        "latency_pairs": len(speedups),
+        "censored_pairs": sum(pair["outcome"] == "neither_success" for pair in pairs),
+        "attempt_runs": len(rows), "usable_runs": len(usable),
+        "infra_invalid_runs": sum(
+            bool(row.get("infra_invalid")) or row.get("total_wall_ms") is None for row in rows
+        ),
+    }
+
+
+def render_policy_report(
+    experiment: Path, manifest: dict[str, Any], rows: list[dict[str, Any]], summary: dict[str, Any],
+) -> str:
+    def ratio(value: Optional[float]) -> str:
+        return "-" if value is None else f"{value:.2f}x"
+    lines = [
+        "# Project leader policy A/B", "",
+        f"- Experiment: `{manifest['run_id']}`",
+        f"- Model/effort: `{manifest['model']}` / `{manifest['effort']}`",
+        f"- Usable cells: {summary['usable_runs']} / {len(manifest['matrix'])}", "",
+        "## Result", "",
+        f"Paired median speedup (legacy/adaptive): {ratio(summary['paired_speedup_median'])}",
+        f"Bootstrap 95% CI: {summary['paired_speedup_bootstrap_95ci']}",
+        f"Median token ratio (adaptive/legacy): {ratio(summary['token_ratio_median'])}",
+        f"Latency-comparable pairs: {summary['latency_pairs']} / {len(summary['pairs'])} "
+        f"(both-failed/censored {summary['censored_pairs']})", "",
+        "## Conditions", "",
+        "| policy | pass | median wall | median tokens | routes d/p/p | delegated runs | worker tasks | controller dispatch/collect | corrections | timeouts |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for policy in POLICIES:
+        item = summary["conditions"][policy]
+        wall = "-" if item["median_wall_ms"] is None else f"{item['median_wall_ms'] / 1000:.1f}s"
+        lines.append(
+            f"| {policy} | {item['passed']}/{item['runs']} | {wall} | {item['median_tokens'] or '-'} | "
+            f"{item['route_counts']['direct']}/{item['route_counts']['probe']}/{item['route_counts']['parallel']} | "
+            f"{item['delegated_runs']}/{item['runs']} | {item['worker_tasks']} | "
+            f"{item['controller_dispatches']}/{item['controller_collects']} | "
+            f"{item['corrections']} | {item['timeouts']} |"
+        )
+    lines.extend((
+        "",
+        "Timeout은 완료시간으로 대입하지 않으며 successful pair만 latency/token ratio에 포함한다. "
+        "Team 생성 시간은 양쪽 모두 end-to-end wall time에 포함된다.", "",
+    ))
+    report = "\n".join(lines)
+    (experiment / "report.md").write_text(report)
+    (experiment / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+    return report
+
+
+def regenerate_experiment_report(
+    experiment: Path, manifest: dict[str, Any], rows: list[dict[str, Any]],
+    quality: Optional[dict[str, Any]] = None,
+) -> str:
+    """Render the schema selected by the immutable experiment manifest."""
+    if manifest.get("experiment_type") == "project-leader-policy-ab":
+        return render_policy_report(
+            experiment, manifest, rows,
+            summarize_policy(rows, seed=int(manifest["seed"])),
+        )
+    return render_report(
+        experiment, manifest, rows,
+        summarize(rows, seed=int(manifest["seed"]), quality=quality),
+    )
 
 
 def run_rpc_probe(experiment: Path, phase: str) -> dict[str, Any]:
@@ -1839,6 +2472,61 @@ def run_experiment(args: argparse.Namespace) -> int:
         return _run_experiment(args)
 
 
+def run_policy_experiment(args: argparse.Namespace) -> int:
+    fixtures = tuple(item for item in args.fixtures.split(",") if item)
+    policies = tuple(item for item in args.policies.split(",") if item)
+    unknown = set(fixtures) - set(FIXTURES)
+    unknown_policies = set(policies) - set(POLICIES)
+    if unknown or unknown_policies or not policies or args.trials < 1 or args.timeout < 1:
+        raise ValueError(
+            f"invalid fixtures={sorted(unknown)} policies={sorted(unknown_policies)} "
+            f"trials={args.trials} timeout={args.timeout}"
+        )
+    specs = build_policy_matrix(fixtures, args.trials, args.seed, policies)
+    print(f"policy A/B matrix: {len(specs)} runs")
+    for index, spec in enumerate(specs, 1):
+        print(f"  {index:02d}. {spec.fixture:<22} pair={spec.trial} order={spec.order} {spec.condition}")
+    if args.dry_run:
+        return 0
+    if not shutil.which("claude") or not shutil.which("tm-agent"):
+        raise RuntimeError("claude and tm-agent CLIs are required")
+    run_id = args.run_id or datetime.now().strftime("%Y%m%dT%H%M%S") + "-policy-" + uuid.uuid4().hex[:6]
+    experiment = args.results_dir / run_id
+    experiment.mkdir(parents=True, exist_ok=False)
+    (experiment / "runs").mkdir()
+    manifest = {
+        "schema": 1, "experiment_type": "project-leader-policy-ab",
+        "run_id": run_id, "created_at": utc_now(), "root_head": git("rev-parse", "HEAD"),
+        "model": args.model, "effort": args.effort, "workers": 3,
+        "trials": args.trials, "seed": args.seed, "timeout_seconds": args.timeout,
+        "xcode_host": args.xcode_host, "host": os.uname().nodename,
+        "architecture": os.uname().machine, "policies": list(policies),
+        "policy_prompts": {"legacy": LEGACY_POLICY, "adaptive": ADAPTIVE_POLICY},
+        "fixtures": [row for row in validate_fixture_metadata() if row["fixture"] in fixtures],
+        "matrix": [asdict(spec) for spec in specs],
+    }
+    manifest_path = experiment / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    manifest_path.chmod(0o444)
+    rows: list[dict[str, Any]] = []
+    scratch = Path(tempfile.mkdtemp(prefix="term-mesh-policy-ab-"))
+    try:
+        for index, spec in enumerate(specs, 1):
+            print(f"[{index}/{len(specs)}] {spec.fixture} {spec.condition} pair {spec.trial}", flush=True)
+            result = run_policy_one(
+                spec, experiment=experiment, scratch=scratch, model=args.model, effort=args.effort,
+                timeout=args.timeout, xcode_host=args.xcode_host, keep_checkouts=args.keep_checkouts,
+            )
+            rows.append(asdict(result))
+            print(f"  {result.status.upper()} {(result.total_wall_ms or 0) / 1000:.1f}s {result.failure_reason or ''}")
+            render_policy_report(experiment, manifest, rows, summarize_policy(rows, seed=args.seed))
+    finally:
+        if not args.keep_checkouts:
+            shutil.rmtree(scratch, ignore_errors=True)
+    print(f"Saved: {experiment}")
+    return 0 if all(row["acceptance_passed"] for row in latest_effectiveness_rows(rows)) else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Single-session vs 3-worker effectiveness benchmark")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1865,6 +2553,19 @@ def main() -> int:
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--keep-checkouts", action="store_true")
     run.add_argument("--skip-rpc-probe", action="store_true")
+    policy = sub.add_parser("policy-ab", help="compare legacy delegate-first and adaptive Project leaders")
+    policy.add_argument("--fixtures", default=",".join(FIXTURES))
+    policy.add_argument("--policies", default=",".join(POLICIES))
+    policy.add_argument("--trials", type=int, default=3)
+    policy.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    policy.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    policy.add_argument("--model", default="sonnet")
+    policy.add_argument("--effort", default="medium", choices=("low", "medium", "high", "xhigh", "max"))
+    policy.add_argument("--xcode-host", default="mac-sub")
+    policy.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS / "policy-ab")
+    policy.add_argument("--run-id")
+    policy.add_argument("--dry-run", action="store_true")
+    policy.add_argument("--keep-checkouts", action="store_true")
     report = sub.add_parser("report", help="regenerate metrics and optionally run blinded quality judges")
     report.add_argument("experiment", type=Path)
     report.add_argument("--evaluate", action="store_true")
@@ -1882,13 +2583,15 @@ def main() -> int:
         return 0 if result["passed"] else 1
     if args.command == "run":
         return run_experiment(args)
+    if args.command == "policy-ab":
+        with benchmark_signal_cleanup(), benchmark_run_lock(args.results_dir):
+            return run_policy_experiment(args)
     experiment = args.experiment if args.experiment.is_dir() else args.experiment.parent
     manifest, rows = load_experiment(experiment)
     quality = evaluate_quality(experiment, rows, int(manifest["seed"])) if args.evaluate else None
     if quality is None and (experiment / "quality-eval.json").exists():
         quality = json.loads((experiment / "quality-eval.json").read_text())
-    summary = summarize(rows, seed=int(manifest["seed"]), quality=quality)
-    print(render_report(experiment, manifest, rows, summary))
+    print(regenerate_experiment_report(experiment, manifest, rows, quality))
     return 0
 
 

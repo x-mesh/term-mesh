@@ -20,6 +20,7 @@ mod prompts;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -431,6 +432,24 @@ mod project_sync_cli_tests {
             } if id == "instance-2"
         ));
 
+        let delegate = Cli::try_parse_from([
+            "tm-agent",
+            "delegate",
+            "reviewer",
+            "inspect",
+            "--agent-instance-id",
+            "instance-2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            delegate.command,
+            Commands::Delegate {
+                panel: None,
+                agent_instance_id: Some(ref id),
+                ..
+            } if id == "instance-2"
+        ));
+
         let detach =
             Cli::try_parse_from(["tm-agent", "detach", "builder", "--panel", "panel-2"]).unwrap();
         assert!(matches!(
@@ -601,7 +620,8 @@ mod project_sync_cli_tests {
     fn correlated_reply_mailbox_is_typed_identity_bound_and_deadline_aware() {
         let token = std::iter::repeat_n('a', 64).collect::<String>();
         let params =
-            correlated_reply_params("team-a", "reviewer", &token, "instance-7", "finished").unwrap();
+            correlated_reply_params("team-a", "reviewer", &token, "instance-7", "finished")
+                .unwrap();
         assert_eq!(params["to"], "leader");
         assert_eq!(params["type"], "note");
         assert_eq!(params["agent_instance_id"], "instance-7");
@@ -630,12 +650,17 @@ mod project_sync_cli_tests {
 
         let pending = json!({ "ok": true, "result": { "ready": false } });
         let mut polled = false;
-        let timeout =
-            wait_for_correlated_reply_with("reviewer", "instance-7", &token, Duration::ZERO, |_| {
+        let timeout = wait_for_correlated_reply_with(
+            "reviewer",
+            "instance-7",
+            &token,
+            Duration::ZERO,
+            |_| {
                 polled = true;
                 Ok(pending.clone())
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(timeout.contains("timed out"));
         assert!(!polled, "an expired deadline must not start an RPC");
 
@@ -736,6 +761,43 @@ mod project_sync_cli_tests {
     }
 
     #[test]
+    fn explicit_instance_resolves_one_duplicate_name_without_a_panel() {
+        let agents = vec![
+            json!({"name": "reviewer", "agent_instance_id": "instance-1"}),
+            json!({"name": "reviewer", "agent_instance_id": "instance-2"}),
+        ];
+        let target =
+            delegate_target_from_agents(&agents, "reviewer", None, Some("instance-2")).unwrap();
+        assert_eq!(target.agent_instance_id.as_deref(), Some("instance-2"));
+        assert!(
+            delegate_target_from_agents(&agents, "reviewer", None, Some("missing"))
+                .unwrap_err()
+                .contains("not registered")
+        );
+    }
+
+    #[test]
+    fn create_init_uses_the_created_instance_and_panel_by_slot() {
+        let created = vec![
+            json!({"name": "executor", "agent_instance_id": "instance-1", "panel_id": "panel-1"}),
+            json!({"name": "executor", "agent_instance_id": "instance-2", "panel_id": "panel-2"}),
+        ];
+        assert_eq!(
+            created_agent_selector(&created, 1),
+            (Some("instance-2"), Some("panel-2"))
+        );
+        let params = send_return_key_params(
+            "team-a",
+            "executor",
+            Some("panel-2"),
+            Some("instance-2"),
+            Some("seq-2"),
+        );
+        assert_eq!(params["agent_instance_id"], "instance-2");
+        assert_eq!(params["panel_id"], "panel-2");
+    }
+
+    #[test]
     fn worktree_delegate_uses_panel_resolved_instance_for_task_owner() {
         let agents = vec![
             json!({
@@ -751,7 +813,7 @@ mod project_sync_cli_tests {
                 "working_directory": "/repo/two",
             }),
         ];
-        let target = delegate_target_from_agents(&agents, "executor", Some("panel-2"))
+        let target = delegate_target_from_agents(&agents, "executor", Some("panel-2"), None)
             .expect("panel-2 resolves");
         assert!(should_acquire_worktree(
             WorktreePolicyArg::Auto,
@@ -786,7 +848,7 @@ mod project_sync_cli_tests {
             "agent_instance_id": "instance-1",
         })];
         let mut task_create_calls = 0;
-        let resolution = delegate_target_from_agents(&agents, "executor", Some("missing"));
+        let resolution = delegate_target_from_agents(&agents, "executor", Some("missing"), None);
         if resolution.is_ok() {
             task_create_calls += 1;
         }
@@ -797,9 +859,9 @@ mod project_sync_cli_tests {
         let dir = tempfile::tempdir().unwrap();
         let missing_socket = dir.path().join("missing.sock");
         let error =
-            selected_delegate_target(&missing_socket, "team-a", "executor", Some("panel-2"))
+            selected_delegate_target(&missing_socket, "team-a", "executor", Some("panel-2"), None)
                 .unwrap_err();
-        assert!(error.contains("cannot resolve --panel before delegate"));
+        assert!(error.contains("cannot resolve delegate target before dispatch"));
     }
 
     #[test]
@@ -1076,6 +1138,9 @@ enum Commands {
     /// Message operations (send, list, clear)
     #[command(subcommand)]
     Msg(MsgCommands),
+    /// Durable leader request operations
+    #[command(subcommand)]
+    Leader(LeaderCommands),
     /// Shared context store
     #[command(subcommand)]
     Context(ContextCommands),
@@ -1362,6 +1427,9 @@ enum Commands {
         /// Target a specific pane by panel_id (deterministic; overrides name round-robin). Task assignee stays the agent name.
         #[arg(long)]
         panel: Option<String>,
+        /// Durable agent instance selector (required when the role name is duplicated)
+        #[arg(long = "agent-instance-id", conflicts_with = "panel")]
+        agent_instance_id: Option<String>,
         /// gk worktree policy for this task: auto isolates mutating executor work.
         #[arg(long, value_enum, default_value_t = WorktreePolicyArg::Auto)]
         worktree: WorktreePolicyArg,
@@ -2120,6 +2188,12 @@ enum TaskCommands {
         #[arg(long)]
         active: bool,
     },
+    /// Compute coordination timings from durable board timestamps
+    Metrics {
+        /// Durable leader request id (defaults to the latest request)
+        #[arg(long)]
+        request_id: Option<String>,
+    },
     /// Show this agent's current active task (one-line summary)
     Current {
         /// Force raw JSON output
@@ -2180,6 +2254,26 @@ enum MsgCommands {
     },
     /// Clear message queue
     Clear,
+}
+
+#[derive(Subcommand)]
+enum LeaderCommands {
+    /// Durable request queue
+    #[command(subcommand)]
+    Request(LeaderRequestCommands),
+}
+
+#[derive(Subcommand)]
+enum LeaderRequestCommands {
+    /// List queued and claimed requests
+    List {
+        #[arg(long)]
+        include_completed: bool,
+    },
+    /// Atomically claim and print one full request
+    Take { request_id: String },
+    /// Mark a request completed
+    Complete { request_id: String },
 }
 
 #[derive(Subcommand)]
@@ -4242,6 +4336,86 @@ fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String
     rpc_call_with_timeout_secs(sock, method, params, timeout)
 }
 
+/// The durable request body crosses a file/RPC boundary before it reaches the
+/// leader. Refuse to expose it to the model unless both integrity fields match
+/// the bytes actually returned by the owning app.
+fn verify_leader_request_response(response: Value) -> Result<Value, String> {
+    // Integrity fields exist only on a successful claim. Preserve an RPC
+    // failure envelope verbatim so the caller sees `invalid_state`,
+    // `unauthorized`, etc. instead of replacing it with a misleading missing
+    // result/content protocol error.
+    if rpc_response_failed(&response) {
+        return Ok(response);
+    }
+    let result = response
+        .get("result")
+        .ok_or_else(|| "PROTOCOL_ERROR: leader request response has no result".to_string())?;
+    let content = result["content"]
+        .as_str()
+        .ok_or_else(|| "PROTOCOL_ERROR: leader request response has no content".to_string())?;
+    let expected_bytes = result["content_bytes"].as_u64().ok_or_else(|| {
+        "PROTOCOL_ERROR: leader request response has no content_bytes".to_string()
+    })?;
+    let expected_sha = result["content_sha256"].as_str().ok_or_else(|| {
+        "PROTOCOL_ERROR: leader request response has no content_sha256".to_string()
+    })?;
+    let actual_bytes = content.len() as u64;
+    let actual_sha = format!("{:x}", Sha256::digest(content.as_bytes()));
+    if actual_bytes != expected_bytes || actual_sha != expected_sha {
+        return Err(format!(
+            "INTEGRITY_ERROR: durable leader request mismatch \
+             (bytes expected={expected_bytes} actual={actual_bytes}, \
+             sha256 expected={expected_sha} actual={actual_sha})"
+        ));
+    }
+    Ok(response)
+}
+
+#[cfg(test)]
+mod durable_leader_request_tests {
+    use super::*;
+
+    #[test]
+    fn verifies_long_unicode_content() {
+        let content = "한글🙂 quoted payload".repeat(80);
+        let response = json!({
+            "ok": true,
+            "result": {
+                "content": content,
+                "content_bytes": content.len(),
+                "content_sha256": format!("{:x}", Sha256::digest(content.as_bytes())),
+            }
+        });
+        assert!(verify_leader_request_response(response).is_ok());
+    }
+
+    #[test]
+    fn rejects_truncated_content() {
+        let full = "한글🙂 payload".repeat(80);
+        let boundary = full.char_indices().nth(40).unwrap().0;
+        let truncated = &full[..boundary];
+        let response = json!({
+            "ok": true,
+            "result": {
+                "content": truncated,
+                "content_bytes": full.len(),
+                "content_sha256": format!("{:x}", Sha256::digest(full.as_bytes())),
+            }
+        });
+        let error = verify_leader_request_response(response).unwrap_err();
+        assert!(error.contains("INTEGRITY_ERROR"));
+    }
+
+    #[test]
+    fn preserves_rpc_failure_before_integrity_validation() {
+        let response = json!({
+            "ok": false,
+            "error": {"code": "invalid_state", "message": "already claimed"}
+        });
+        assert_eq!(verify_leader_request_response(response.clone()).unwrap(), response);
+    }
+}
+
 fn rpc_call_with_timeout_secs(
     sock: &PathBuf,
     method: &str,
@@ -4367,6 +4541,9 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.result.status"
             | "team.result.collect"
             | "team.inbox"
+            | "team.leader.request.list"
+            | "team.leader.request.take"
+            | "team.leader.request.complete"
             | "team.message.list"
             | "team.correlation.register"
             | "team.correlation.get"
@@ -4377,6 +4554,7 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.delegate"
             | "team.message.post"
             | "team.task.list"
+            | "team.task.metrics"
             | "team.task.get"
             | "team.task.create"
             | "team.task.update"
@@ -6035,6 +6213,14 @@ fn send_return_key_params(
     })
 }
 
+fn created_agent_selector(created_agents: &[Value], index: usize) -> (Option<&str>, Option<&str>) {
+    let created = created_agents.get(index);
+    (
+        created.and_then(|value| value["agent_instance_id"].as_str()),
+        created.and_then(|value| value["panel_id"].as_str()),
+    )
+}
+
 fn send_return_key_with_retry(
     sock: &PathBuf,
     team: &str,
@@ -6094,30 +6280,56 @@ fn selected_delegate_target(
     team: &str,
     target: &str,
     panel_id: Option<&str>,
+    explicit_instance_id: Option<&str>,
 ) -> Result<ResolvedDelegateTarget, String> {
     let status = match rpc_call(sock, "team.status", json!({ "team_name": team })) {
         Ok(status) => status,
-        Err(error) if panel_id.is_some() => {
-            return Err(format!("cannot resolve --panel before delegate: {error}"));
+        Err(error) if panel_id.is_some() || explicit_instance_id.is_some() => {
+            return Err(format!(
+                "cannot resolve delegate target before dispatch: {error}"
+            ));
         }
         Err(_) => return Ok(ResolvedDelegateTarget::default()),
     };
     let agents = match status["result"]["agents"].as_array() {
         Some(agents) => agents,
-        None if panel_id.is_some() => {
-            return Err("team.status response has no agents array; cannot resolve --panel".into());
+        None if panel_id.is_some() || explicit_instance_id.is_some() => {
+            return Err(
+                "team.status response has no agents array; cannot resolve exact delegate target"
+                    .into(),
+            );
         }
         None => return Ok(ResolvedDelegateTarget::default()),
     };
-    delegate_target_from_agents(agents, target, panel_id)
+    delegate_target_from_agents(agents, target, panel_id, explicit_instance_id)
 }
 
 fn delegate_target_from_agents(
     agents: &[Value],
     target: &str,
     panel_id: Option<&str>,
+    explicit_instance_id: Option<&str>,
 ) -> Result<ResolvedDelegateTarget, String> {
-    let instance = instance_id_from_agents(agents, target, panel_id)?;
+    let instance = if let Some(explicit) = explicit_instance_id {
+        let matches = agents
+            .iter()
+            .filter(|agent| {
+                agent["name"].as_str() == Some(target)
+                    && agent["agent_instance_id"].as_str() == Some(explicit)
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [_] => Some(explicit.to_string()),
+            [] => {
+                return Err(format!(
+                    "agent instance {explicit} is not registered as {target} in the selected team"
+                ))
+            }
+            _ => return Err(format!("agent instance {explicit} is not unique")),
+        }
+    } else {
+        instance_id_from_agents(agents, target, panel_id)?
+    };
     let placement = instance.as_deref().and_then(|instance_id| {
         agents.iter().find(|agent| {
             agent["agent_instance_id"].as_str() == Some(instance_id)
@@ -6839,6 +7051,38 @@ fn main() {
                 rpc_call(&sock, "team.message.clear", json!({ "team_name": team }))
             }
         },
+        Commands::Leader(sub) => match sub {
+            LeaderCommands::Request(action) => match action {
+                LeaderRequestCommands::List { include_completed } => rpc_call(
+                    &sock,
+                    "team.leader.request.list",
+                    json!({
+                        "team_name": team,
+                        "include_completed": include_completed,
+                        "leader_request_token": env::var("TERMMESH_LEADER_REQUEST_TOKEN").unwrap_or_default(),
+                    }),
+                ),
+                LeaderRequestCommands::Take { request_id } => rpc_call(
+                    &sock,
+                    "team.leader.request.take",
+                    json!({
+                        "team_name": team,
+                        "request_id": request_id,
+                        "leader_request_token": env::var("TERMMESH_LEADER_REQUEST_TOKEN").unwrap_or_default(),
+                    }),
+                )
+                .and_then(verify_leader_request_response),
+                LeaderRequestCommands::Complete { request_id } => rpc_call(
+                    &sock,
+                    "team.leader.request.complete",
+                    json!({
+                        "team_name": team,
+                        "request_id": request_id,
+                        "leader_request_token": env::var("TERMMESH_LEADER_REQUEST_TOKEN").unwrap_or_default(),
+                    }),
+                ),
+            },
+        },
         Commands::Context(sub) => match sub {
             ContextCommands::Set { key, value } => {
                 let agent = agent.clone();
@@ -7028,6 +7272,13 @@ fn main() {
                             process::exit(1);
                         }
                     }
+                }
+                TaskCommands::Metrics { request_id } => {
+                    let mut params = json!({ "team_name": team });
+                    if let Some(request_id) = request_id {
+                        params["request_id"] = json!(request_id);
+                    }
+                    rpc_call(&sock, "team.task.metrics", params)
                 }
                 TaskCommands::Current { json: as_json } => {
                     let task_resp = rpc_call(
@@ -8021,9 +8272,16 @@ fn main() {
             auto_fix_budget,
             autonomous,
             panel,
+            agent_instance_id,
             worktree,
             from_ref,
         } => {
+            if agent_instance_id.is_some() && (target.contains(',') || autonomous) {
+                eprintln!(
+                    "Error: --agent-instance-id targets one pane and cannot be combined with comma fan-out or --autonomous"
+                );
+                process::exit(2);
+            }
             // Auto-detect comma-separated agents and route to parallel fan-out.
             // Fan-out resolves its OWN per-thread panel_ids from team.status, so the
             // single CLI --panel is intentionally NOT forwarded here.
@@ -8070,6 +8328,7 @@ fn main() {
                         context: context.as_deref(),
                         fix_budget: auto_fix_budget,
                         panel_id: panel.as_deref(),
+                        agent_instance_id: agent_instance_id.as_deref(),
                         worktree_policy: worktree,
                         from_ref: from_ref.as_deref(),
                         request_id: request_id.as_deref(),
@@ -10488,9 +10747,14 @@ fn run_create(
             }
         }
 
-        let non_kiro: Vec<&Value> = agents
+        let created_agents = r["result"]["agents"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let non_kiro: Vec<(usize, &Value)> = agents
             .iter()
-            .filter(|a| a["cli"].as_str().unwrap_or("claude") != "kiro")
+            .enumerate()
+            .filter(|(_, a)| a["cli"].as_str().unwrap_or("claude") != "kiro")
             .collect();
         if !non_kiro.is_empty() {
             // Poll until all agent panels are spawned (max 60 × 100ms = 6s)
@@ -10529,9 +10793,11 @@ fn run_create(
             // Cold-start protection moved to Swift: the TerminalSurface gates
             // the first paste on each surface until ghostty's pty_data_callback
             // confirms the child has started outputting. No fixed warmup here.
-            for a in &non_kiro {
+            for (agent_index, a) in &non_kiro {
                 let name = a["name"].as_str().unwrap_or("");
                 let role = a["agent_type"].as_str().unwrap_or(name);
+                let (agent_instance_id, panel_id) =
+                    created_agent_selector(&created_agents, *agent_index);
                 let init_text =
                     agent_init_prompt(name, role, team, &workdir, &sock.to_string_lossy());
                 match rpc_call_timeout(
@@ -10539,6 +10805,8 @@ fn run_create(
                     "team.send",
                     json!({
                         "team_name": team, "agent_name": name,
+                        "agent_instance_id": agent_instance_id,
+                        "panel_id": panel_id,
                         "text": format!("{init_text}\n"),
                         "send_sequence_aware": true,
                     }),
@@ -10558,8 +10826,8 @@ fn run_create(
                             name,
                             text_delivered,
                             "team.create.init",
-                            None,
-                            None,
+                            panel_id,
+                            agent_instance_id,
                             r["result"]["send_sequence_id"].as_str(),
                         );
                         eprintln!("  \u{2713} {name}: init prompt sent");
@@ -11917,6 +12185,7 @@ struct DelegateOptions<'a> {
     context: Option<&'a str>,
     fix_budget: Option<u8>,
     panel_id: Option<&'a str>,
+    agent_instance_id: Option<&'a str>,
     worktree_policy: WorktreePolicyArg,
     from_ref: Option<&'a str>,
     request_id: Option<&'a str>,
@@ -11939,6 +12208,7 @@ fn run_delegate_result(
         context,
         fix_budget,
         panel_id,
+        agent_instance_id,
         worktree_policy,
         from_ref,
         request_id,
@@ -11947,7 +12217,8 @@ fn run_delegate_result(
     let resolved_priority = priority.unwrap_or(2);
     // Resolve the pane once, before either task creation path. An explicit
     // panel must never degrade into name-only routing on status failure.
-    let selected_target = selected_delegate_target(sock, team, target, panel_id)?;
+    let selected_target =
+        selected_delegate_target(sock, team, target, panel_id, agent_instance_id)?;
     let selected_instance_id = selected_target.agent_instance_id.as_deref();
     let request_id = request_id
         .filter(|value| !value.trim().is_empty())
@@ -13356,6 +13627,7 @@ fn run_fan_out(
                             context,
                             fix_budget,
                             panel_id,
+                            agent_instance_id: None,
                             worktree_policy,
                             from_ref,
                             request_id: None,
@@ -15693,6 +15965,7 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
                 context: None,
                 fix_budget: None,
                 panel_id: None,
+                agent_instance_id: None,
                 worktree_policy: WorktreePolicyArg::Off,
                 from_ref: None,
                 request_id: None,
@@ -16379,6 +16652,7 @@ fn dispatch_and_wait(
                     context: None,
                     fix_budget: None,
                     panel_id: None,
+                    agent_instance_id: None,
                     worktree_policy: WorktreePolicyArg::Off,
                     from_ref: None,
                     request_id: None,
@@ -16744,6 +17018,7 @@ fn run_autonomous(
                     context: None,
                     fix_budget: None,
                     panel_id: None,
+                    agent_instance_id: None,
                     worktree_policy: WorktreePolicyArg::Off,
                     from_ref: None,
                     request_id: None,
@@ -17226,9 +17501,13 @@ mod auto_watch_tests {
             "team.task.unblock",
             "team.task.approve",
             "team.task.list",
+            "team.task.metrics",
             "team.task.diff",
             "team.add_agent",
             "team.send_key",
+            "team.leader.request.list",
+            "team.leader.request.take",
+            "team.leader.request.complete",
         ] {
             assert!(remote_leader_method_allowed(method), "{method}");
         }

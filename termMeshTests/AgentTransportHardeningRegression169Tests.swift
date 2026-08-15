@@ -424,4 +424,180 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
             teamName: team, token: consumedToken, consume: true, now: now
         ), .notFound)
     }
+
+    func testDurableLeaderRequestPreservesLongUnicodeAndIsIdempotent() {
+        let store = TeamDataStore.shared
+        let team = "leader-request-\(UUID().uuidString)"
+        let requestId = "request-\(UUID().uuidString)"
+        let content = String(repeating: "한글🙂/quoted `payload` ", count: 80)
+        store.registerTeam(team, agentNames: [])
+        store.updateBoardUuids([team: UUID().uuidString])
+        defer { store.unregisterTeam(team) }
+
+        guard case .created(let created, _) = store.enqueueLeaderRequest(
+            teamName: team, content: content, requestId: requestId
+        ) else { return XCTFail("request was not created") }
+        XCTAssertEqual(created.content, content)
+        XCTAssertEqual(created.contentBytes, content.lengthOfBytes(using: .utf8))
+        XCTAssertEqual(created.contentSHA256, TeamDataStore.leaderRequestDigest(content))
+
+        guard case .replayed(let replayed, _) = store.enqueueLeaderRequest(
+            teamName: team, content: content, requestId: requestId
+        ) else { return XCTFail("identical request_id was not replayed") }
+        XCTAssertEqual(replayed.id, created.id)
+        guard case .conflict = store.enqueueLeaderRequest(
+            teamName: team, content: content + "different", requestId: requestId
+        ) else { return XCTFail("different content reused request_id") }
+
+        guard case .succeeded(let taken) = store.takeLeaderRequest(
+            teamName: team, requestId: requestId
+        ) else { return XCTFail("queued request was not claimed") }
+        XCTAssertEqual(taken.content, content)
+        XCTAssertEqual(taken.status, "claimed")
+        guard case .invalidState("claimed") = store.takeLeaderRequest(
+            teamName: team, requestId: requestId
+        ) else { return XCTFail("a claimed request was claimable twice") }
+        guard case .succeeded(let completed) = store.completeLeaderRequest(
+            teamName: team, requestId: requestId
+        ) else { return XCTFail("claimed request was not completed") }
+        XCTAssertEqual(completed.status, "completed")
+        guard case .invalidState("completed") = store.completeLeaderRequest(
+            teamName: team, requestId: requestId
+        ) else { return XCTFail("a completed request was completable twice") }
+        guard case .replayed(let completedReplay, _) = store.enqueueLeaderRequest(
+            teamName: team, content: content, requestId: requestId
+        ) else { return XCTFail("completed request was not replayed") }
+        XCTAssertEqual(completedReplay.status, "completed")
+        XCTAssertEqual(store.listLeaderRequests(teamName: team)?.count, 0)
+        XCTAssertEqual(store.listLeaderRequests(teamName: team, includeCompleted: true)?.count, 1)
+    }
+
+    func testDurableLeaderRequestRejectsUnsafeIdentifiersAndOversizedBodies() {
+        let store = TeamDataStore.shared
+        let team = "leader-request-bounds-\(UUID().uuidString)"
+        store.registerTeam(team, agentNames: [])
+        store.updateBoardUuids([team: UUID().uuidString])
+        defer { store.unregisterTeam(team) }
+
+        for requestId in ["line\nbreak", "한글", String(repeating: "x", count: 65)] {
+            guard case .invalidRequest = store.enqueueLeaderRequest(
+                teamName: team, content: "payload", requestId: requestId
+            ) else { return XCTFail("unsafe request id was accepted: \(requestId)") }
+        }
+        guard case .invalidRequest = store.enqueueLeaderRequest(
+            teamName: team,
+            content: String(repeating: "x", count: 256 * 1024 + 1),
+            requestId: "oversized"
+        ) else { return XCTFail("oversized leader request was accepted") }
+    }
+
+    func testLeaderRequestCapabilityIsExactAndNeverPersisted() throws {
+        let store = TeamDataStore.shared
+        let sourceTeam = "leader-token-source-\(UUID().uuidString)"
+        let teamUuid = UUID().uuidString
+        store.registerTeam(sourceTeam, agentNames: [])
+        store.updateBoardUuids([sourceTeam: teamUuid])
+        defer { store.unregisterTeam(sourceTeam) }
+
+        let token = store.prepareLeaderRequestToken(teamName: sourceTeam)
+        XCTAssertFalse(store.isAuthorizedLeaderRequestToken(teamName: sourceTeam, token: nil))
+        XCTAssertFalse(store.isAuthorizedLeaderRequestToken(teamName: sourceTeam, token: "wrong"))
+        XCTAssertTrue(store.isAuthorizedLeaderRequestToken(teamName: sourceTeam, token: token))
+        guard case .created(_, let persisted) = store.enqueueLeaderRequest(
+            teamName: sourceTeam, content: "persist token", requestId: "token-restore"
+        ) else { return XCTFail("request was not created") }
+        XCTAssertTrue(persisted)
+
+        let data = try Data(contentsOf: TeamDataStore.boardFileURL(teamUuid: teamUuid))
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains(token))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let board = try decoder.decode(TeamDataStore.PersistedBoard.self, from: data)
+        XCTAssertNil(board.leaderRequestToken)
+    }
+
+    func testDurableLeaderRequestCannotCompleteBeforeClaim() {
+        let store = TeamDataStore.shared
+        let team = "leader-request-transition-\(UUID().uuidString)"
+        let requestId = "request-\(UUID().uuidString)"
+        store.registerTeam(team, agentNames: [])
+        store.updateBoardUuids([team: UUID().uuidString])
+        defer { store.unregisterTeam(team) }
+        guard case .created = store.enqueueLeaderRequest(
+            teamName: team, content: "queued", requestId: requestId
+        ) else { return XCTFail("request was not created") }
+        guard case .invalidState("queued") = store.completeLeaderRequest(
+            teamName: team, requestId: requestId
+        ) else { return XCTFail("queued request completed without a claim") }
+    }
+
+    func testDurableLeaderRequestIsOnDiskBeforeEnqueueReturns() throws {
+        let store = TeamDataStore.shared
+        let team = "leader-request-disk-\(UUID().uuidString)"
+        let teamUuid = UUID().uuidString
+        let requestId = "request-\(UUID().uuidString)"
+        let content = String(repeating: "끝까지 보존🙂 `quoted` ", count: 96) + "UNIQUE-END-SENTINEL"
+        store.registerTeam(team, agentNames: [])
+        store.updateBoardUuids([team: teamUuid])
+        defer { store.unregisterTeam(team) }
+
+        guard case .created(let created, let persisted) = store.enqueueLeaderRequest(
+            teamName: team, content: content, requestId: requestId
+        ) else { return XCTFail("request was not created") }
+        XCTAssertTrue(persisted)
+
+        let data = try Data(contentsOf: TeamDataStore.boardFileURL(teamUuid: teamUuid))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let board = try decoder.decode(TeamDataStore.PersistedBoard.self, from: data)
+        let stored = try XCTUnwrap(board.leaderRequests?.first { $0.id == requestId })
+        XCTAssertEqual(stored.content, content)
+        XCTAssertEqual(stored.contentBytes, created.contentBytes)
+        XCTAssertEqual(stored.contentSHA256, created.contentSHA256)
+    }
+
+    func testCoordinationMetricsUseBoardTimestampsAndMeasureOverlap() throws {
+        let store = TeamDataStore.shared
+        let team = "metrics-\(UUID().uuidString)"
+        let requestId = "request-\(UUID().uuidString)"
+        store.registerTeam(team, agents: [
+            .init(name: "executor", instanceId: "instance-1"),
+            .init(name: "tester", instanceId: "instance-2"),
+        ])
+        store.updateBoardUuids([team: UUID().uuidString])
+        defer { store.unregisterTeam(team) }
+
+        guard case .created = store.enqueueLeaderRequest(
+            teamName: team, content: "parallel work", requestId: requestId,
+            now: Date().addingTimeInterval(-10)
+        ) else { return XCTFail("request missing") }
+        let first = try XCTUnwrap(store.createTask(
+            teamName: team, title: "one", assignee: "executor",
+            assigneeInstanceId: "instance-1"
+        ))
+        let second = try XCTUnwrap(store.createTask(
+            teamName: team, title: "two", assignee: "tester",
+            assigneeInstanceId: "instance-2"
+        ))
+        XCTAssertNotNil(store.updateTask(teamName: team, taskId: first.id, status: "in_progress"))
+        XCTAssertNotNil(store.updateTask(teamName: team, taskId: second.id, status: "in_progress"))
+        XCTAssertNotNil(store.updateTask(teamName: team, taskId: first.id, status: "completed"))
+        XCTAssertNotNil(store.updateTask(teamName: team, taskId: second.id, status: "completed"))
+        guard case .succeeded = store.takeLeaderRequest(teamName: team, requestId: requestId) else {
+            return XCTFail("metrics request was not claimed")
+        }
+        guard case .succeeded = store.completeLeaderRequest(teamName: team, requestId: requestId) else {
+            return XCTFail("metrics request was not completed")
+        }
+
+        let metrics = try XCTUnwrap(store.coordinationMetrics(
+            teamName: team, requestId: requestId
+        ))
+        XCTAssertEqual(metrics["source"] as? String, "board_timestamps")
+        XCTAssertEqual(metrics["task_count"] as? Int, 2)
+        XCTAssertEqual(metrics["completed_task_count"] as? Int, 2)
+        XCTAssertGreaterThanOrEqual(metrics["overlap_seconds"] as? Double ?? -1, 0)
+        XCTAssertNotNil(metrics["dispatch_latency_seconds"])
+        XCTAssertNotNil(metrics["total_duration_seconds"])
+    }
 }

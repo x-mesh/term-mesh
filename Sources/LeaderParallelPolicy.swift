@@ -5,7 +5,7 @@ import Foundation
 /// renderer consumes `renderedInstructions`; no renderer owns a fork of these
 /// scheduling rules.
 enum LeaderParallelPolicy {
-    static let version = "4"
+    static let version = "8"
     static let activation = "runtime-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do
@@ -13,8 +13,16 @@ enum LeaderParallelPolicy {
     /// new digest for diagnostics and launch parity checks.
     static let rules: [(id: String, text: String)] = [
         (
-            "parallel-default",
-            "For substantive requests, inspect team status, idle workers, placement, and checkout metadata before work. Decompose independent work into a parallel wave; record a reason when delegation is safely skipped."
+            "adaptive-single-default",
+            "Start each request with the leader as the default executor. The presence or idleness of workers is never by itself a reason to delegate, and small, same-file, or dependency-serial work stays with the leader."
+        ),
+        (
+            "parallel-admission-gate",
+            "Escalate to a parallel wave only when there are at least two dependency-ready subtasks that are independently verifiable, have disjoint file or subsystem ownership, and contain enough work to amortize dispatch, worktree, handoff, and merge cost. Record this positive evidence when delegating; do not require a justification for staying single."
+        ),
+        (
+            "structured-routing-decision",
+            "Classify execution as direct, probe, or parallel before dispatch. Direct has no worker tasks. Probe has exactly one read-only task with a 60-90 second budget. Parallel has two or three dependency-ready tasks. Every worker task names its worker, goal, owned and forbidden paths, dependencies, verification command, mutation flag, and time estimate."
         ),
         (
             "dag-readiness",
@@ -26,7 +34,27 @@ enum LeaderParallelPolicy {
         ),
         (
             "same-checkout-isolation",
-            "Allow concurrent read-only work in one checkout. For concurrent writes in the same checkout, require clear disjoint ownership; otherwise use an isolated worktree or run sequentially."
+            "Allow concurrent read-only work in one checkout. For concurrent writes, give every task explicit owned and forbidden paths and use task-scoped tm-agent delegate --worktree always --from <base> unless the writes are provably disjoint in the same checkout; if isolation is unavailable, block or run sequentially rather than silently sharing a checkout."
+        ),
+        (
+            "bounded-handoff",
+            "Use one dispatch, one independent work interval, and one result collection per parallel wave. Worker-to-worker communication is for blockers or ownership expansion only; avoid turn-by-turn ping-pong. The leader reviews and integrates completed worktrees serially, validating after each merge boundary and once across the integrated result."
+        ),
+        (
+            "leader-integration-lane",
+            "After dispatch, the leader remains active: prepare acceptance checks, inspect only unowned paths, stage integration order, and review completed evidence. Never edit a worker-owned path concurrently. Wait for named task IDs with tm-agent wait --mode any --tasks, process the first completed result, and perform at most one additional wait/collect for results still required to finish."
+        ),
+        (
+            "actual-diff-review-gate",
+            "Do not occupy validation roles in the implementation wave by default. After the actual diff is integrated, derive validation gates from changed behavior and trust boundaries: behavior or API regressions use tester; concurrency, persistence, protocol, cross-subsystem, or agent-prompt changes use reviewer; sockets, permissions, auth, shell execution, or external input use security plus tester; release-critical changes use tester plus reviewer. Small local diffs receive leader review and final verification directly. Dispatch at most two read-only validators in one wave. Give each validator one risk question, at most three primary files, and a 90-second target; split or let the leader cover broader diffs instead of duplicating a full review."
+        ),
+        (
+            "cross-model-validation",
+            "For each validation gate, prefer a roster member whose CLI/provider differs from every implementation owner; otherwise prefer a different model, then an independent validation role. Route with agent_instance_id. If no independent provider or model exists, continue with the best role match and record cross_model_independence_unavailable instead of pretending cross-model review occurred."
+        ),
+        (
+            "no-progress-recovery",
+            "At a soft deadline, inspect the named task and one bounded transcript tail. Never reassign while the original worker is still running. If explicit recovery is necessary, preserve its task worktree, stop that worker with the supported restart path, then reassign once; otherwise converge on completed evidence at the hard deadline. The current CLI has no task-cancel primitive, so never claim cancellation unless a stop actually succeeded."
         ),
         (
             "branch-merge-boundary",
@@ -69,12 +97,44 @@ enum LeaderParallelPolicy {
         let renderedRules = rules.map { "- [\($0.id)] \($0.text)" }
             .joined(separator: "\n")
         return """
-        ## Leader Parallel Routing Policy
+        ## Leader Adaptive Execution Policy
         policy_version: \(version)
         policy_digest: \(digest)
         policy_activation: \(activation)
 
-        This policy is active. Treat these rules as the scheduling contract for local and peer workers; report a degraded policy state rather than silently bypassing them.
+        This policy is active. Treat these rules as the execution and scheduling contract for local and peer workers; report a degraded policy state rather than silently bypassing them.
+
+        Before dispatch, form this machine-readable decision internally and retain it in the task/run log when that surface is available:
+        ```json
+        {
+          "route": "direct|probe|parallel",
+          "reason": "positive evidence for escalation, or a short direct rationale",
+          "tasks": [
+            {
+              "id": "stable-task-id",
+              "worker": "project worker name",
+              "goal": "self-contained outcome",
+              "owned": ["path or subsystem"],
+              "forbidden": ["path or subsystem"],
+              "depends_on": [],
+              "verify": "one concrete command",
+              "mutates": true,
+              "estimated_seconds": 300
+            }
+          ],
+          "validation_gates": [
+            {
+              "role": "reviewer|tester|security",
+              "reason": "risk evidence from the integrated diff",
+              "preferred_provider": "different-from-implementer|any",
+              "read_only": true,
+              "owned": ["integrated diff or verification scope"],
+              "verify": "one concrete command"
+            }
+          ]
+        }
+        ```
+        Route invariants: direct has zero implementation tasks; probe has exactly one read-only implementation task (`mutates=false`) estimated at 60-90 seconds; parallel has two or three implementation tasks whose `depends_on` prerequisites are already satisfied. `validation_gates` are a later wave derived from the integrated diff, never speculative implementation capacity. Dispatch at most two gates once, collect once, and keep every gate read-only. A validator capsule covers one risk question and at most three primary files with a 90-second target. Require the normal final 5-field reply; `review_ready` without that final reply is partial evidence, not completion.
 
         \(renderedRules)
         """
@@ -84,6 +144,6 @@ enum LeaderParallelPolicy {
     /// system-prompt flag. Keeping the version and digest here lets every
     /// renderer prove that it consumed this policy source rather than a copy.
     static func launchDirective(promptFile: String) -> String {
-        "Read \(promptFile) before doing any work. It contains your team-leader instructions and the canonical Leader Parallel Routing Policy (version \(version), digest \(digest)). Follow it for all team coordination."
+        "Read \(promptFile) before doing any work. It contains your team-leader instructions and the canonical Leader Adaptive Execution Policy (version \(version), digest \(digest)). Follow it for all team coordination."
     }
 }
