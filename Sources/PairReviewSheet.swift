@@ -21,6 +21,7 @@ struct PairReviewSheet: View {
     @State private var reviewerCLI = "codex"
     @State private var reviewerModel = AgentRolePreset.defaultModel(for: "codex")
     @State private var isStarting = false
+    @State private var startRequestID: String?
     @State private var reviewID: String?
     @State private var run: PairReviewRunInfo?
     @State private var errorMessage: String?
@@ -73,14 +74,19 @@ struct PairReviewSheet: View {
                 Spacer()
                 if run == nil {
                     Button("Cancel") { close() }.keyboardShortcut(.cancelAction)
-                    Button("Run Pair Review") { startReview() }
+                    Button(startRequestID == nil ? "Run Pair Review" : "Retry Pair Review") { startReview() }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.return)
                         .disabled(isBusy || instructions.isEmpty)
                         .accessibilityIdentifier("pairReview.run")
                 } else {
-                    Button("Run Another Review") { reviewID = nil; run = nil; errorMessage = nil }
-                        .disabled(isRunning)
+                    Button("Run Another Review") {
+                        startRequestID = nil
+                        reviewID = nil
+                        run = nil
+                        errorMessage = nil
+                    }
+                    .disabled(isRunning)
                 }
             }
             .padding()
@@ -146,7 +152,7 @@ struct PairReviewSheet: View {
 
     private var scopeHelp: String {
         switch scope {
-        case "current-changes": return "Reviews the uncommitted diff captured when the review starts."
+        case "current-changes": return "Reviews tracked and non-ignored untracked changes captured when the review starts."
         case "branch-diff": return "Reviews the branch diff from \(target.baseRef ?? "develop") captured when the review starts."
         default: return "Reviews the leader’s last 200 terminal lines captured when the review starts."
         }
@@ -176,22 +182,40 @@ struct PairReviewSheet: View {
         guard !isBusy else { return }
         isStarting = true
         errorMessage = nil
+        let requestID = startRequestID ?? UUID().uuidString
+        startRequestID = requestID
         var params: [String: Any] = [
             "team_id": target.teamName, "scope": scope, "lens": lens,
             "cli": reviewerCLI, "model": reviewerModel, "spec": instructions,
             "working_directory": target.workingDirectory, "reply_timeout_secs": 180,
+            "request_id": requestID,
         ]
         if let baseRef = target.baseRef { params["base_ref"] = baseRef }
         if let path = CLIPathSettings.resolvedPath(for: reviewerCLI) { params["cli_path"] = path }
         let appSocket = SocketControlSettings.socketPath()
         if !appSocket.isEmpty { params["app_socket_path"] = appSocket }
         DispatchQueue.global(qos: .userInitiated).async {
-            let raw = TermMeshDaemon.shared.rpcCallRaw(method: "pair.review.start", params: params)
+            // Snapshot capture intentionally completes before the daemon returns
+            // a review ID. Keep the same request ID across a transport timeout so
+            // retry reconnects to that run instead of starting a second reviewer.
+            let raw = TermMeshDaemon.shared.rpcCallRaw(
+                method: "pair.review.start",
+                params: params,
+                timeout: 60
+            )
             let result = raw.flatMap(PairReviewStartInfo.init)
             DispatchQueue.main.async {
                 isStarting = false
-                guard let result else { errorMessage = "Couldn’t start Pair Review. The daemon may be unavailable."; return }
-                guard result.started, let id = result.reviewID else { errorMessage = result.reason ?? "Pair Review was rejected."; return }
+                guard let result else {
+                    errorMessage = "Couldn’t confirm Pair Review start. Retry to reconnect to the same request."
+                    return
+                }
+                guard result.started, let id = result.reviewID else {
+                    startRequestID = nil
+                    errorMessage = result.reason ?? "Pair Review was rejected."
+                    return
+                }
+                startRequestID = nil
                 reviewID = id
                 poll(id)
             }
@@ -201,11 +225,35 @@ struct PairReviewSheet: View {
     private func poll(_ id: String) {
         pollTask?.cancel()
         pollTask = Task {
+            var consecutiveFailures = 0
+            let deadline = Date().addingTimeInterval(11 * 60)
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 700_000_000)
                 guard !Task.isCancelled else { return }
+                guard Date() < deadline else {
+                    await MainActor.run {
+                        guard reviewID == id else { return }
+                        reviewID = nil
+                        run = nil
+                        errorMessage = "Pair Review status timed out. You can run it again."
+                    }
+                    return
+                }
                 let raw = await Task.detached { TermMeshDaemon.shared.rpcCallRaw(method: "pair.review.status", params: ["review_id": id]) }.value
-                guard let info = raw.flatMap(PairReviewRunInfo.init) else { continue }
+                guard let info = raw.flatMap(PairReviewRunInfo.init) else {
+                    consecutiveFailures += 1
+                    if consecutiveFailures >= 5 {
+                        await MainActor.run {
+                            guard reviewID == id else { return }
+                            reviewID = nil
+                            run = nil
+                            errorMessage = "Pair Review status is no longer available. You can run it again."
+                        }
+                        return
+                    }
+                    continue
+                }
+                consecutiveFailures = 0
                 await MainActor.run { run = info }
                 if info.status != "running" { return }
             }
