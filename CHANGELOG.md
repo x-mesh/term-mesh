@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.190.0] - 2026-08-17
+
+### Changed
+
+- **Project 리더가 이미 있는 worker를 먼저 활용한다** — 지금까지 리더는 worker가 준비돼 있어도 비사소 작업을 직접 처리하는 경우가 있어 병렬 팀의 이점이 줄어들었다. 이제 요청을 독립적으로 검증할 수 있는 단위로 먼저 나누고, 파일 소유권이 겹치지 않는 작업은 적합한 worker에게 맡긴다. 작거나 순차적인 작업은 계속 직접 처리해 불필요한 분배 비용을 만들지 않는다.
+
+### Fixed
+
+- **Mac peer에서 Project를 만들 때 term-mesh의 메모리가 끝없이 늘어날 수 있던 문제** — GUI가 제공하는 workspace socket과 daemon의 session-owner socket이 같은 호스트로 합쳐지면서 연결과 roster 조회가 반복되고, 느려진 peer의 큰 workspace snapshot이 송수신 대기열에 제한 없이 쌓일 수 있었다. 이제 두 endpoint를 구분하고 roster 조회를 한 번씩만 수행하며, 송수신 대기열·시간·snapshot 수에 상한을 둔다. 응답하지 않는 peer가 있어도 메모리가 계속 증가하지 않고 Project 목록이 올바른 endpoint를 따른다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.189.0] - 2026-08-16
 
 ### Fixed
