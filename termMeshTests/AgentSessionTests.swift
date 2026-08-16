@@ -51,12 +51,12 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "9")
+        XCTAssertEqual(LeaderParallelPolicy.version, "10")
         XCTAssertEqual(LeaderParallelPolicy.activation, "runtime-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 9"))
+        XCTAssertTrue(first.contains("policy_version: 10"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(first.contains("policy_activation: runtime-enforced"))
     }
@@ -65,7 +65,7 @@ final class AgentSessionTests: XCTestCase {
         let policy = LeaderParallelPolicy.renderedInstructions
 
         [
-            "adaptive-single-default",
+            "team-aware-decomposition-default",
             "parallel-admission-gate",
             "structured-routing-decision",
             "dag-readiness",
@@ -84,7 +84,10 @@ final class AgentSessionTests: XCTestCase {
             "external-event-wait",
         ].forEach { XCTAssertTrue(policy.contains("[\($0)]"), "missing \($0)") }
         XCTAssertTrue(policy.contains("This policy is active."))
-        XCTAssertTrue(policy.contains("default executor"))
+        XCTAssertTrue(policy.contains("start each non-trivial request by decomposing"))
+        XCTAssertTrue(policy.contains("assign eligible units before doing that work in the leader lane"))
+        XCTAssertTrue(policy.contains("Direct execution is the explicit exception"))
+        XCTAssertTrue(policy.contains("constraint that prevented a useful parallel split"))
         XCTAssertTrue(policy.contains("--worktree always"))
         XCTAssertTrue(policy.contains("avoid turn-by-turn ping-pong"))
         XCTAssertTrue(policy.contains("\"route\": \"direct|probe|parallel\""))

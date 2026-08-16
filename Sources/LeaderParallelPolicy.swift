@@ -5,7 +5,7 @@ import Foundation
 /// renderer consumes `renderedInstructions`; no renderer owns a fork of these
 /// scheduling rules.
 enum LeaderParallelPolicy {
-    static let version = "9"
+    static let version = "10"
     static let activation = "runtime-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do
@@ -13,12 +13,12 @@ enum LeaderParallelPolicy {
     /// new digest for diagnostics and launch parity checks.
     static let rules: [(id: String, text: String)] = [
         (
-            "adaptive-single-default",
-            "Start each request with the leader as the default executor. The presence or idleness of workers is never by itself a reason to delegate, and small, same-file, or dependency-serial work stays with the leader."
+            "team-aware-decomposition-default",
+            "When the Project roster has available workers, start each non-trivial request by decomposing it into independently completable units and assign eligible units before doing that work in the leader lane. Prefer a two- or three-worker parallel wave whenever at least two units are dependency-ready, independently verifiable, and ownership-disjoint. The leader owns coordination, integration, and any distinct unowned lane. Direct execution is the explicit exception for trivial, same-file, dependency-serial, or worker-ineligible work; record a concise reason. Never manufacture work solely to occupy an idle worker."
         ),
         (
             "parallel-admission-gate",
-            "Escalate to a parallel wave only when there are at least two dependency-ready subtasks that are independently verifiable, have disjoint file or subsystem ownership, and contain enough work to amortize dispatch, worktree, handoff, and merge cost. Record this positive evidence when delegating; do not require a justification for staying single."
+            "Admit a parallel wave when there are at least two dependency-ready subtasks that are independently verifiable, have disjoint file or subsystem ownership, and are large enough that dispatch and integration do not clearly dominate the work. Record this positive evidence when delegating. When choosing direct or probe despite an available roster, record the concrete constraint that prevented a useful parallel split."
         ),
         (
             "structured-routing-decision",
@@ -112,7 +112,7 @@ enum LeaderParallelPolicy {
         ```json
         {
           "route": "direct|probe|parallel",
-          "reason": "positive evidence for escalation, or a short direct rationale",
+          "reason": "positive evidence for parallel work, or the concrete constraint requiring direct or probe",
           "tasks": [
             {
               "id": "stable-task-id",

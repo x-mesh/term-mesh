@@ -151,7 +151,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         )
     }
 
-    func test_bothLeaderKindsStartSingleAndEscalateWithWorktreeEvidence() {
+    func test_bothLeaderKindsDecomposeFirstAndKeepDirectAsAnExplicitException() {
         let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
             teamName: "xm",
             rows: rows,
@@ -159,9 +159,13 @@ final class RemoteLeaderBriefingTests: XCTestCase {
             remoteSocketPath: "/tmp/term-mesh.sock"
         )
         for prompt in [claude, nonClaudePrompt()] {
-            XCTAssertTrue(prompt.contains("default executor"))
-            XCTAssertTrue(prompt.contains("Do not delegate merely because agents exist or are idle"))
-            XCTAssertTrue(prompt.contains("at least two dependency-ready"))
+            XCTAssertTrue(prompt.contains("coordinator and integration owner"))
+            XCTAssertTrue(prompt.contains("begin each non-trivial request by finding independently completable units"))
+            XCTAssertTrue(prompt.contains("assign eligible"))
+            XCTAssertTrue(prompt.contains("before doing that work yourself"))
+            XCTAssertTrue(prompt.contains("Direct execution is the explicit exception"))
+            XCTAssertTrue(prompt.contains("State the concrete constraint when choosing it"))
+            XCTAssertTrue(prompt.contains("at least two units are"))
             XCTAssertTrue(prompt.contains("direct, probe, or parallel"))
             XCTAssertTrue(prompt.contains("\"route\": \"direct|probe|parallel\""))
             XCTAssertTrue(prompt.contains("--worktree always --from <base_ref>"))
@@ -176,6 +180,8 @@ final class RemoteLeaderBriefingTests: XCTestCase {
             XCTAssertFalse(prompt.contains("Always parallel when possible"))
             XCTAssertFalse(prompt.contains("do NOT analyze the problem yourself first"))
             XCTAssertFalse(prompt.contains("After each user message, check: are any agents idle?"))
+            XCTAssertFalse(prompt.contains("Start single-agent"))
+            XCTAssertFalse(prompt.contains("default executor"))
         }
     }
 
@@ -206,7 +212,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         // half of a complete prompt.
         for section in ["## Your Agents", "## How to Command Agents",
                         "## Reading Agent Results", "## Task Board",
-                        "## Your Workflow", "## Warm Capacity, Not Utilization"] {
+                        "## Your Workflow", "## Use Available Capacity Deliberately"] {
             XCTAssertTrue(other.contains(section), "non-claude prompt lost \(section)")
         }
     }
