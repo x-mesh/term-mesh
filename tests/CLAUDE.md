@@ -97,7 +97,7 @@ if __name__ == "__main__":
 
 - **socket e2e (`tests_v2/`, 기본)** — 앱 로직, 레이아웃, focus, split, workspace, 브라우저, 알림, CLI parity, 회귀. 빠르고 결정론적.
 - **XCUITest (`termMeshUITests/`)** — socket이 닿지 못하는 것만: 실제 OS 키 라우팅/메뉴 key-equivalent, 시스템 다이얼로그, Accessibility 기반 상호작용, 실제 렌더 픽셀. 더 느리고 flaky하니 최소화.
-- **basic tests (루트 `CLAUDE.md`의 one-liner)** — `TERMMESH_SOCKET_MODE=allowAll`로 직접 띄워 돌리는 빠른 스모크 부분집합.
+- **basic tests** — `TERMMESH_SOCKET_MODE=allowAll`로 직접 띄워 돌리는 빠른 스모크 부분집합. 기존 v1 스크립트는 필요한 범위만 선택해 실행한다.
 
 ## flaky 처리
 
