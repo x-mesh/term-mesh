@@ -289,6 +289,51 @@ final class TermMeshDaemon: ObservableObject {
         peerServingEnabled
     }
 
+    /// The one line to log when adopting a daemon that is not this build's.
+    ///
+    /// Adoption exists so peer sessions survive a quit, and that is worth
+    /// keeping even against a mismatch — restarting to fix the version is
+    /// exactly the session loss adoption prevents. What is not acceptable is
+    /// doing it silently: a released app has run for hours against a leftover
+    /// Debug daemon from a test harness, and the only visible symptom was
+    /// peer features behaving like an older build.
+    ///
+    /// Pure so the wording and the comparison are pinned by a test rather
+    /// than by whoever reads the adopt branch next. `nil` means "no warning":
+    /// the versions match, or the running daemon could not be asked (an
+    /// unknown version is not evidence of a mismatch).
+    static func adoptedDaemonVersionWarning(
+        runningVersion: String?,
+        appVersion: String?
+    ) -> String? {
+        guard let runningVersion, !runningVersion.isEmpty,
+              let appVersion, !appVersion.isEmpty,
+              runningVersion != appVersion
+        else { return nil }
+        return "adopted daemon is version \(runningVersion) but this app is "
+            + "\(appVersion) — peer features follow the daemon, not the app. "
+            + "Quit every term-mesh on this machine and reopen it to replace "
+            + "the daemon."
+    }
+
+    /// This build's marketing version, or nil when the bundle has none.
+    static var appMarketingVersion: String? {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+    }
+
+    /// Version of whatever daemon currently answers on the socket.
+    ///
+    /// Asks `daemon.status` rather than `ping`, which answers only `pong`.
+    /// A daemon too old to carry the field, or one that does not answer,
+    /// reports nil — treated as "unknown", never as a mismatch.
+    func runningDaemonVersion() -> String? {
+        guard let response = rpcCall(method: "daemon.status", params: [:]) as? [String: Any],
+              let version = response["version"] as? String,
+              !version.isEmpty
+        else { return nil }
+        return version
+    }
+
     /// Spawn the term-meshd daemon process if not already running.
     func startDaemon() {
         queue.async { [weak self] in
@@ -315,6 +360,17 @@ final class TermMeshDaemon: ObservableObject {
                     Logger.daemon.info(
                         "adopting the running daemon; settings changed since it started are not applied"
                     )
+                    // Adoption is version-blind by construction: it trusts
+                    // whatever answers the socket. Say so when that is not this
+                    // build, in the log the user actually reads, because every
+                    // downstream symptom looks like an app bug instead.
+                    if let warning = Self.adoptedDaemonVersionWarning(
+                        runningVersion: self.runningDaemonVersion(),
+                        appVersion: Self.appMarketingVersion
+                    ) {
+                        Logger.daemon.error("\(warning, privacy: .public)")
+                        RemoteWorkLog.infoOffMain(warning)
+                    }
                     if let pid = self.getDaemonPeerPid() {
                         DispatchQueue.main.async {
                             TerminalController.shared.trustedDaemonPid = pid

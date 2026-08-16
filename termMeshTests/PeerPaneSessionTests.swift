@@ -90,22 +90,27 @@ final class PeerPaneSessionTests: XCTestCase {
     }
 
     @MainActor
-    func testRemotePresentationAttachNeedsConnectionButNotLaunchProvenance() {
+    func testRemotePresentationAttachNeedsAResolvedRouteButNotAnExistingTunnel() {
         let leaderID = Data(repeating: 0x42, count: 16)
         XCTAssertTrue(TeamOrchestrator.remotePresentationCanAttach(
             leaderSurfaceID: leaderID,
             isConnected: true,
-            activeSockPath: "/tmp/direct-peer.sock"
+            hasResolvedTeamRoute: true
         ))
         XCTAssertFalse(TeamOrchestrator.remotePresentationCanAttach(
             leaderSurfaceID: leaderID,
             isConnected: false,
-            activeSockPath: "/tmp/direct-peer.sock"
+            hasResolvedTeamRoute: true
         ))
         XCTAssertFalse(TeamOrchestrator.remotePresentationCanAttach(
             leaderSurfaceID: Data(),
             isConnected: true,
-            activeSockPath: "/tmp/direct-peer.sock"
+            hasResolvedTeamRoute: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.remotePresentationCanAttach(
+            leaderSurfaceID: leaderID,
+            isConnected: true,
+            hasResolvedTeamRoute: false
         ))
         XCTAssertTrue(TeamOrchestrator.shouldOfferRemoteManifest(
             hasLocalTeam: false,
@@ -3227,7 +3232,7 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             observeNotifications: false,
             automaticRetryDelay: 60,
             hostSockPathProvider: { _ in "/tmp/unreachable-peer.sock" },
-            terminator: { _, _ in
+            terminator: { _, _, _ in
                 cleanupAttempts += 1
                 return false
             }
@@ -3613,7 +3618,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             defaults: defaults,
             observeNotifications: false,
             hostSockPathProvider: { _ in nil },
-            terminator: { _, _ in false }
+            terminator: { _, _, _ in false }
         )
         func member(
             remoteAgentSurface: Bool,
@@ -3685,7 +3690,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
 
         await restored.retryPending(
             hostSockPath: { _ in "/tmp/peer.sock" },
-            terminate: { _, _ in false }
+            terminate: { _, _, _ in false }
         )
         XCTAssertEqual(
             restored.pendingRecords.count, 1,
@@ -3694,7 +3699,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
 
         await restored.retryPending(
             hostSockPath: { _ in "/tmp/peer.sock" },
-            terminate: { _, _ in true }
+            terminate: { _, _, _ in true }
         )
         XCTAssertTrue(restored.pendingRecords.isEmpty)
         let afterConfirmation = PendingPeerAgentSurfaceCleanupStore(
@@ -3723,6 +3728,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
         )
         XCTAssertFalse(host.isLaunchable, "the launch metadata fixture must remain unresolved")
         var attemptedSocket: String?
+        var attemptedHostKey: String?
         let cleanup = PendingPeerAgentSurfaceCleanupStore(
             defaults: defaults,
             observeNotifications: false,
@@ -3733,7 +3739,8 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
                     in: [host]
                 )
             },
-            terminator: { resolvedSocket, _ in
+            terminator: { resolvedHostKey, resolvedSocket, _ in
+                attemptedHostKey = resolvedHostKey
                 attemptedSocket = resolvedSocket
                 return true
             }
@@ -3746,6 +3753,10 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
         }
 
         XCTAssertEqual(attemptedSocket, socketPath)
+        // The host key rides along so cleanup can resolve the endpoint that
+        // actually created the surface. Without it a redirected host's
+        // tombstone is sent to the socket that merely served the handshake.
+        XCTAssertEqual(attemptedHostKey, hostKey)
         XCTAssertTrue(cleanup.pendingRecords.isEmpty, "confirmed termination removes the tombstone")
         XCTAssertNil(
             PendingPeerAgentSurfaceCleanupStore.connectedHostSockPath(
@@ -3775,7 +3786,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             defaults: defaults,
             observeNotifications: false,
             hostSockPathProvider: { _ in nil },
-            terminator: { _, _ in false }
+            terminator: { _, _, _ in false }
         )
         let surfaceID = Data(repeating: 0x52, count: 16)
 
@@ -3806,7 +3817,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             observeNotifications: false,
             automaticRetryDelay: 0.01,
             hostSockPathProvider: { _ in "/tmp/peer.sock" },
-            terminator: { _, _ in
+            terminator: { _, _, _ in
                 attempts += 1
                 return attempts >= 2
             }

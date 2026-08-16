@@ -438,6 +438,27 @@ struct HostEntry: Identifiable, Equatable {
     /// newer tm-agent in its login PATH while the serving daemon is older;
     /// only the authenticated handshake answers this correctly.
     var supportsRemoteTeamRoute: Bool? = nil
+    /// Remote path this host names as the owner of sessions that outlive it
+    /// (`Hello.session_host_socket`).
+    ///
+    /// A Mac serving peers from the app publishes its term-meshd here: its
+    /// own peer server strips `surface.agent.v1` and
+    /// `project.presentation.v1` because a GUI process implements neither, so
+    /// team work addressed to it can only fall back.
+    ///
+    /// Three states, and the third is why this is optional. `nil` = no
+    /// authenticated handshake has answered yet; `""` = answered, the host owns
+    /// its own sessions; a path = answered, team work belongs there. Collapsing
+    /// the first two loses a reconnect: `connectionState` and `activeSockPath`
+    /// are set synchronously when the lease is acquired, while this only lands
+    /// after `fetchWorkspaces` completes — so for that window a redirecting
+    /// host reads as a non-redirecting one, and team work aimed at surfaces
+    /// living on its daemon would be addressed to the GUI socket instead. Same
+    /// hazard `hostCLIBinDirsResolved` exists for, same shape of answer.
+    ///
+    /// Live-session state, like the capability flags above — cleared with the
+    /// socket, never persisted.
+    var sessionHostRemoteSockPath: String?
     /// Authenticated host CLI directories. Live-session cache only: never
     /// written to PeerHostProfile/UserDefaults and cleared with the socket.
     var hostCLIBinDirs: [String] = []
@@ -525,6 +546,7 @@ struct HostEntry: Identifiable, Equatable {
         servingAppVersion = nil
         supportsPeerOwnedAgentHosting = nil
         supportsRemoteTeamRoute = nil
+        sessionHostRemoteSockPath = nil
     }
 
     /// Detach profile-owned configuration without letting a still-live
@@ -555,6 +577,64 @@ struct HostEntry: Identifiable, Equatable {
             )
         }
         return .direct(sockPath: activeSockPath)
+    }
+
+    /// Host spec for team work: leader panes, agent surfaces, the project
+    /// manifest, and their cleanup.
+    ///
+    /// Identical to `paneHostSpec` except on a host that named a separate
+    /// session owner, where it points at that owner instead. Ordinary
+    /// terminal panes and workspace mirroring keep using `paneHostSpec`,
+    /// because what the two endpoints publish is not the same thing: a GUI
+    /// host publishes its own windows, its daemon publishes the sessions it
+    /// holds. Moving only team work keeps the visible workspace list exactly
+    /// as it was while giving agents a host that can actually own them.
+    ///
+    /// One spec for all of team work, not one per member, is the point:
+    /// `hostKey` embeds the remote socket path, and
+    /// `remoteManifestCoversEveryAgent` refuses a manifest whose members do
+    /// not share the leader's key. Splitting leader and agents across the two
+    /// sockets would trade the old failure for a subtler one.
+    ///
+    /// Falls back whenever the redirect cannot be expressed — a direct
+    /// (non-SSH) host has no second path to tunnel to.
+    ///
+    /// **nil while the route is unresolved, and that is the whole reason this
+    /// is optional.** A non-optional version returned `paneHostSpec` in that
+    /// window, which reads as "no redirect" and is the GUI socket — the one
+    /// endpoint that owns none of this team's surfaces. Every caller then
+    /// leased and ensured there, reintroducing the defect this type was added
+    /// to fix, for the round trip between a reconnect and its handshake.
+    /// Optional makes the compiler ask each of them what to do instead.
+    var teamHostSpec: PeerPaneHostSpec? {
+        guard teamRouteResolved else { return nil }
+        guard let sessionHostRemoteSockPath, !sessionHostRemoteSockPath.isEmpty,
+              let sshTarget, !sshTarget.isEmpty
+        else { return paneHostSpec }
+        return .ssh(
+            target: sshTarget,
+            remoteSockPath: sessionHostRemoteSockPath,
+            port: sshPort,
+            identityFile: identityFile
+        )
+    }
+
+    /// Whether an authenticated handshake has said where team work belongs.
+    ///
+    /// Team callers must gate on this and not on `isConnected`: the connection
+    /// is live a round trip before the answer is, and during that window
+    /// "no redirect recorded" is indistinguishable from "no redirect exists".
+    var teamRouteResolved: Bool { sessionHostRemoteSockPath != nil }
+
+    /// Whether team work is being redirected away from the serving socket.
+    /// Callers that cannot reuse `activeSockPath` for team RPCs check this
+    /// rather than re-deriving the comparison.
+    ///
+    /// False while unresolved — ask `teamRouteResolved` to tell that apart from
+    /// a host that genuinely owns its own sessions.
+    var redirectsTeamWorkToSessionHost: Bool {
+        guard let teamHostSpec else { return false }
+        return teamHostSpec.hostKey != paneHostSpec.hostKey
     }
 }
 
@@ -1313,6 +1393,17 @@ final class RemoteHostStore: ObservableObject {
                         Self.hostSupportsPeerOwnedAgentFactory(conn.hostCapabilities)
                     self.hosts[key]?.supportsRemoteTeamRoute =
                         conn.hostCapabilities.has(PeerCapability.teamLeaderV1)
+                    // Always non-nil from here: this handshake is the answer,
+                    // and "" means "this host owns its own sessions" rather
+                    // than "nobody has asked yet".
+                    //
+                    // Only meaningful when this host cannot own agents itself.
+                    // A host that can is already the right place for team work,
+                    // and recording a redirect there would tunnel a second time
+                    // to reach the socket we are already talking to.
+                    self.hosts[key]?.sessionHostRemoteSockPath =
+                        Self.hostSupportsPeerOwnedAgentFactory(conn.hostCapabilities)
+                            ? "" : conn.sessionHostSockPath
                     if let provenance {
                         _ = self.hosts[key]?.acceptAuthenticatedHostCLIBinDirs(
                             conn.hostCLIBinDirs, provenance: provenance
@@ -1331,17 +1422,17 @@ final class RemoteHostStore: ObservableObject {
                     }
                     return
                 }
-                // Same connection, same round trip: a team roster is only
-                // meaningful next to the workspaces it leads, and opening a
-                // second connection to ask would race the first one's teardown.
-                // Hosts predating team.roster.v1 are never asked.
-                var teams: [RemoteTeamSummary] = []
-                if conn.hostCapabilities.has(PeerCapability.teamRosterV1) {
-                    if let reported = try? await conn.session.listTeams() {
-                        teams = reported.map(Self.remoteTeamSummary)
-                    }
-                }
                 await conn.cancel()
+                // Workspaces belong to the serving GUI socket, but durable
+                // project manifests belong to the endpoint that owns team
+                // sessions. On a redirected Mac those are deliberately
+                // different daemons, so reading ListTeams beside
+                // ListWorkspaces made every successfully-published manifest
+                // invisible after restart. Resolve and lease the team endpoint
+                // only for this one-shot roster read.
+                let teams = await self.fetchTeamRoster(
+                    hostKey: key, servingSockPath: path
+                ) ?? []
                 // Stale-path guard: a reconnect may have superseded this fetch with a
                 // newer ephemeral path. Drop the result if this task was cancelled or the
                 // host's active path no longer matches the path we fetched against.
@@ -1515,21 +1606,62 @@ final class RemoteHostStore: ObservableObject {
                   self.hosts[key]?.activeSockPath == path,
                   self.hosts[key]?.isConnected == true
             else { return }
-            guard let connection = try? await PeerRelaySession.connect(hostSockPath: path)
-            else { return }
-            guard connection.hostCapabilities.has(PeerCapability.teamRosterV1),
-                  let reported = try? await connection.session.listTeams()
-            else {
-                await connection.cancel()
-                return
-            }
-            await connection.cancel()
+            guard let teams = await self.fetchTeamRoster(
+                hostKey: key, servingSockPath: path
+            ) else { return }
             guard !Task.isCancelled,
                   self.hosts[key]?.activeSockPath == path,
                   self.hosts[key]?.isConnected == true
             else { return }
-            self.hosts[key]?.teams = reported.map(Self.remoteTeamSummary)
+            self.hosts[key]?.teams = teams
         }
+    }
+
+    /// Re-read the project roster after a manifest upsert/delete. The daemon
+    /// has no team-roster push event, while the serving GUI's workspace stream
+    /// cannot observe changes on the separate session owner.
+    func refreshTeamRoster(forHostKey key: String) {
+        guard let host = hosts[key], host.isConnected, !host.activeSockPath.isEmpty else {
+            return
+        }
+        scheduleTeamRosterRefresh(for: host.activeSockPath, key: key)
+    }
+
+    /// Read team/project manifests from their owning endpoint. Ordinary hosts
+    /// reuse the serving socket. A redirecting Mac gets a short registry lease
+    /// to its advertised session owner for the whole ListTeams RPC.
+    private func fetchTeamRoster(
+        hostKey key: String,
+        servingSockPath: String
+    ) async -> [RemoteTeamSummary]? {
+        guard let host = hosts[key], host.teamRouteResolved else { return nil }
+
+        var lease: PeerPaneHostLease?
+        let rosterSockPath: String
+        if host.redirectsTeamWorkToSessionHost {
+            guard let spec = host.teamHostSpec,
+                  let acquired = try? await PeerPaneHostRegistry.shared.acquire(spec)
+            else { return nil }
+            lease = acquired
+            rosterSockPath = acquired.hostSockPath
+        } else {
+            rosterSockPath = servingSockPath
+        }
+        defer { lease.map { PeerPaneHostRegistry.shared.release($0) } }
+
+        guard !Task.isCancelled,
+              let connection = try? await PeerRelaySession.connect(hostSockPath: rosterSockPath)
+        else { return nil }
+        guard connection.hostCapabilities.has(PeerCapability.teamRosterV1) else {
+            await connection.cancel()
+            return []
+        }
+        guard let reported = try? await connection.session.listTeams() else {
+            await connection.cancel()
+            return nil
+        }
+        await connection.cancel()
+        return reported.map(Self.remoteTeamSummary)
     }
 
     private nonisolated static func remoteTeamSummary(
