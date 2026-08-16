@@ -106,4 +106,87 @@ final class AcceptedUnixConnectionWriteTests: XCTestCase {
         XCTAssertEqual(Set(seenMarkers), Set(markers), "every writer's frame must arrive exactly once")
         XCTAssertEqual(seenMarkers.count, writerCount)
     }
+
+    func testStalledReaderTimesOutInsteadOfRetainingTheFrameForever() async throws {
+        var fds: [Int32] = [0, 0]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds), 0)
+        let writeFD = fds[0]
+        let readFD = fds[1]
+        defer { Darwin.close(readFD) }
+
+        var bufSize: Int32 = 4096
+        _ = setsockopt(writeFD, SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+        _ = setsockopt(readFD, SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+        let connection = AcceptedUnixConnection(
+            fd: writeFD, maxPendingWrites: 2, writeTimeoutSeconds: 0.05
+        )
+
+        do {
+            try await connection.write(Data(repeating: 0xA5, count: 4 * 1024 * 1024))
+            XCTFail("a peer that never drains must not hold a frame forever")
+        } catch PeerServerError.writeTimedOut {
+            // expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        await connection.close()
+    }
+
+    func testPendingWriterCountIsBoundedUnderBackpressure() async throws {
+        var fds: [Int32] = [0, 0]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds), 0)
+        let writeFD = fds[0]
+        let readFD = fds[1]
+        defer { Darwin.close(readFD) }
+
+        var bufSize: Int32 = 4096
+        _ = setsockopt(writeFD, SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+        _ = setsockopt(readFD, SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+        let connection = AcceptedUnixConnection(
+            fd: writeFD, maxPendingWrites: 1, writeTimeoutSeconds: 0.2
+        )
+        let frame = Data(repeating: 0x5A, count: 4 * 1024 * 1024)
+        let first = Task { try await connection.write(frame) }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        let queued = Task { try await connection.write(frame) }
+        try await Task.sleep(nanoseconds: 10_000_000)
+
+        do {
+            try await connection.write(frame)
+            XCTFail("a third retained frame must exceed the one-waiter bound")
+        } catch PeerServerError.writeBackpressureExceeded {
+            // expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        await connection.close()
+        _ = try? await first.value
+        _ = try? await queued.value
+    }
+
+    func testCloseDuringActiveWriteReleasesEveryQueuedWriter() async throws {
+        var fds: [Int32] = [0, 0]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds), 0)
+        let writeFD = fds[0]
+        let readFD = fds[1]
+        defer { Darwin.close(readFD) }
+
+        var bufSize: Int32 = 4096
+        _ = setsockopt(writeFD, SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+        _ = setsockopt(readFD, SOL_SOCKET, SO_RCVBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size))
+        let connection = AcceptedUnixConnection(
+            fd: writeFD, maxPendingWrites: 4, writeTimeoutSeconds: 5
+        )
+        let frame = Data(repeating: 0x7B, count: 4 * 1024 * 1024)
+        let writers = (0..<5).map { _ in
+            Task { try await connection.write(frame) }
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        await connection.close()
+        for writer in writers {
+            _ = try? await writer.value
+        }
+    }
 }

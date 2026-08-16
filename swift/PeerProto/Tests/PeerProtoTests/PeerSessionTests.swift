@@ -429,6 +429,33 @@ actor TeamRPCMockHost {
 }
 
 final class PeerSessionTests: XCTestCase {
+    func testControlOnlyIncomingBufferHasAHardCountCap() {
+        var buffered: [PeerIncomingMessage] = []
+        for index in 0..<1_000 {
+            PeerSession.appendBufferedIncoming(
+                .workspaceRemoved(workspaceID: Data(repeating: UInt8(index & 0xFF), count: 16)),
+                to: &buffered
+            )
+        }
+        XCTAssertEqual(buffered.count, 256)
+    }
+
+    func testWorkspaceRosterSnapshotsCoalesceToLatestValue() {
+        var buffered: [PeerIncomingMessage] = []
+        var first = Termmesh_Peer_V1_Workspace()
+        first.title = "old"
+        var latest = Termmesh_Peer_V1_Workspace()
+        latest.title = "latest"
+        PeerSession.appendBufferedIncoming(.workspaceListChanged([first]), to: &buffered)
+        PeerSession.appendBufferedIncoming(.workspaceListChanged([latest]), to: &buffered)
+
+        XCTAssertEqual(buffered.count, 1)
+        guard case .workspaceListChanged(let workspaces) = buffered[0] else {
+            return XCTFail("expected a coalesced roster snapshot")
+        }
+        XCTAssertEqual(workspaces.map(\.title), ["latest"])
+    }
+
     func testResizeSerializesAuthorityClaimAndDefaultsToFalse() async throws {
         let transport = MockTransport()
         let session = PeerSession(
