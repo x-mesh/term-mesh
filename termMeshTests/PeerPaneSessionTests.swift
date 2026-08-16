@@ -90,22 +90,27 @@ final class PeerPaneSessionTests: XCTestCase {
     }
 
     @MainActor
-    func testRemotePresentationAttachNeedsConnectionButNotLaunchProvenance() {
+    func testRemotePresentationAttachNeedsAResolvedRouteButNotAnExistingTunnel() {
         let leaderID = Data(repeating: 0x42, count: 16)
         XCTAssertTrue(TeamOrchestrator.remotePresentationCanAttach(
             leaderSurfaceID: leaderID,
             isConnected: true,
-            activeSockPath: "/tmp/direct-peer.sock"
+            hasResolvedTeamRoute: true
         ))
         XCTAssertFalse(TeamOrchestrator.remotePresentationCanAttach(
             leaderSurfaceID: leaderID,
             isConnected: false,
-            activeSockPath: "/tmp/direct-peer.sock"
+            hasResolvedTeamRoute: true
         ))
         XCTAssertFalse(TeamOrchestrator.remotePresentationCanAttach(
             leaderSurfaceID: Data(),
             isConnected: true,
-            activeSockPath: "/tmp/direct-peer.sock"
+            hasResolvedTeamRoute: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.remotePresentationCanAttach(
+            leaderSurfaceID: leaderID,
+            isConnected: true,
+            hasResolvedTeamRoute: false
         ))
         XCTAssertTrue(TeamOrchestrator.shouldOfferRemoteManifest(
             hasLocalTeam: false,

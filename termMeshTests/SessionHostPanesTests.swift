@@ -624,6 +624,22 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
         XCTAssertTrue(redirected.redirectsTeamWorkToSessionHost)
     }
 
+    /// Project discovery is team work too. Workspaces remain on the serving
+    /// GUI, while ListTeams must follow the same owner as manifest upsert and
+    /// delete or a persisted project becomes write-only after app restart.
+    func test_projectManifestDiscoveryFollowsTheAdvertisedSessionOwner() {
+        let redirected = hostEntry(sessionHostRemoteSockPath: "/tmp/T/term-meshd-peer.sock")
+        XCTAssertNotEqual(
+            redirected.paneHostSpec.hostKey,
+            redirected.teamHostSpec?.hostKey
+        )
+        XCTAssertEqual(
+            redirected.teamHostSpec?.hostKey.remoteSockPath,
+            "/tmp/T/term-meshd-peer.sock",
+            "manifest discovery must read the endpoint that stores the manifest"
+        )
+    }
+
     /// Ensure succeeded on the session owner, the local attach then failed, and
     /// nothing holds a lease any more. The tombstone must still reach the
     /// endpoint that created the surface — sending `TerminateSurface` to the

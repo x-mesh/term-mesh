@@ -1422,17 +1422,17 @@ final class RemoteHostStore: ObservableObject {
                     }
                     return
                 }
-                // Same connection, same round trip: a team roster is only
-                // meaningful next to the workspaces it leads, and opening a
-                // second connection to ask would race the first one's teardown.
-                // Hosts predating team.roster.v1 are never asked.
-                var teams: [RemoteTeamSummary] = []
-                if conn.hostCapabilities.has(PeerCapability.teamRosterV1) {
-                    if let reported = try? await conn.session.listTeams() {
-                        teams = reported.map(Self.remoteTeamSummary)
-                    }
-                }
                 await conn.cancel()
+                // Workspaces belong to the serving GUI socket, but durable
+                // project manifests belong to the endpoint that owns team
+                // sessions. On a redirected Mac those are deliberately
+                // different daemons, so reading ListTeams beside
+                // ListWorkspaces made every successfully-published manifest
+                // invisible after restart. Resolve and lease the team endpoint
+                // only for this one-shot roster read.
+                let teams = await self.fetchTeamRoster(
+                    hostKey: key, servingSockPath: path
+                ) ?? []
                 // Stale-path guard: a reconnect may have superseded this fetch with a
                 // newer ephemeral path. Drop the result if this task was cancelled or the
                 // host's active path no longer matches the path we fetched against.
@@ -1606,21 +1606,62 @@ final class RemoteHostStore: ObservableObject {
                   self.hosts[key]?.activeSockPath == path,
                   self.hosts[key]?.isConnected == true
             else { return }
-            guard let connection = try? await PeerRelaySession.connect(hostSockPath: path)
-            else { return }
-            guard connection.hostCapabilities.has(PeerCapability.teamRosterV1),
-                  let reported = try? await connection.session.listTeams()
-            else {
-                await connection.cancel()
-                return
-            }
-            await connection.cancel()
+            guard let teams = await self.fetchTeamRoster(
+                hostKey: key, servingSockPath: path
+            ) else { return }
             guard !Task.isCancelled,
                   self.hosts[key]?.activeSockPath == path,
                   self.hosts[key]?.isConnected == true
             else { return }
-            self.hosts[key]?.teams = reported.map(Self.remoteTeamSummary)
+            self.hosts[key]?.teams = teams
         }
+    }
+
+    /// Re-read the project roster after a manifest upsert/delete. The daemon
+    /// has no team-roster push event, while the serving GUI's workspace stream
+    /// cannot observe changes on the separate session owner.
+    func refreshTeamRoster(forHostKey key: String) {
+        guard let host = hosts[key], host.isConnected, !host.activeSockPath.isEmpty else {
+            return
+        }
+        scheduleTeamRosterRefresh(for: host.activeSockPath, key: key)
+    }
+
+    /// Read team/project manifests from their owning endpoint. Ordinary hosts
+    /// reuse the serving socket. A redirecting Mac gets a short registry lease
+    /// to its advertised session owner for the whole ListTeams RPC.
+    private func fetchTeamRoster(
+        hostKey key: String,
+        servingSockPath: String
+    ) async -> [RemoteTeamSummary]? {
+        guard let host = hosts[key], host.teamRouteResolved else { return nil }
+
+        var lease: PeerPaneHostLease?
+        let rosterSockPath: String
+        if host.redirectsTeamWorkToSessionHost {
+            guard let spec = host.teamHostSpec,
+                  let acquired = try? await PeerPaneHostRegistry.shared.acquire(spec)
+            else { return nil }
+            lease = acquired
+            rosterSockPath = acquired.hostSockPath
+        } else {
+            rosterSockPath = servingSockPath
+        }
+        defer { lease.map { PeerPaneHostRegistry.shared.release($0) } }
+
+        guard !Task.isCancelled,
+              let connection = try? await PeerRelaySession.connect(hostSockPath: rosterSockPath)
+        else { return nil }
+        guard connection.hostCapabilities.has(PeerCapability.teamRosterV1) else {
+            await connection.cancel()
+            return []
+        }
+        guard let reported = try? await connection.session.listTeams() else {
+            await connection.cancel()
+            return nil
+        }
+        await connection.cancel()
+        return reported.map(Self.remoteTeamSummary)
     }
 
     private nonisolated static func remoteTeamSummary(

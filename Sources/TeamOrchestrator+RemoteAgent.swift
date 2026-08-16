@@ -454,6 +454,8 @@ extension TeamOrchestrator {
                     "Could not persist project \(team.id) on \(host.displayName): "
                         + response.errorCode
                 )
+            } else {
+                RemoteHostStore.shared.refreshTeamRoster(forHostKey: hostKey)
             }
             return response.ok
                 || !Self.remoteProjectManifestShouldRetry(errorCode: response.errorCode)
@@ -515,11 +517,11 @@ extension TeamOrchestrator {
     static func remotePresentationCanAttach(
         leaderSurfaceID: Data,
         isConnected: Bool,
-        activeSockPath: String
+        hasResolvedTeamRoute: Bool
     ) -> Bool {
         !leaderSurfaceID.isEmpty
             && isConnected
-            && !activeSockPath.isEmpty
+            && hasResolvedTeamRoute
     }
 
     nonisolated static func shouldOfferRemoteManifest(
@@ -599,7 +601,7 @@ extension TeamOrchestrator {
         guard Self.remotePresentationCanAttach(
             leaderSurfaceID: remote.leaderSurfaceID,
             isConnected: host.isConnected,
-            activeSockPath: TeamOrchestrator.liveTeamSockPath(for: host)
+            hasResolvedTeamRoute: host.teamHostSpec != nil
         )
         else { return false }
 
@@ -6608,6 +6610,9 @@ extension TeamOrchestrator {
                     throw RemoteAgentError.projectDeletionIncomplete(
                         "manifest \(hostKey): \(response?.errorCode ?? "unknown")"
                     )
+                }
+                if response?.ok == true {
+                    RemoteHostStore.shared.refreshTeamRoster(forHostKey: hostKey)
                 }
             } catch {
                 await connection.cancel()
