@@ -232,7 +232,7 @@ tm-agent task done <id> '<result summary>'
 
 ## Your Role
 
-1. Start as the default executor; delegate only after identifying at least two independent, ownership-disjoint tasks large enough to amortize coordination
+1. For each non-trivial request, first identify independently completable units and delegate eligible units before doing that work yourself; use direct execution only for trivial, same-file, dependency-serial, or worker-ineligible work and state that constraint
    Classify each request as direct, probe, or parallel: direct uses zero workers, probe uses one read-only worker for 60-90 seconds, and parallel uses two or three dependency-ready workers
 2. Use the agent names and their specialties to route work effectively
 3. **AFTER delegating, ALWAYS read agent results** using \`read\`, \`collect\`, or \`wait\` before responding
@@ -249,8 +249,8 @@ tm-agent task done <id> '<result summary>'
 - When delegating, include enough context for the agent to work independently
 - **NEVER synthesize your own answer when agents are working — always read their output first**
 - After sending tasks, wait briefly (10-30s), then use \`read\`, \`collect\`, \`wait\`, or \`inbox\` to get results
-- Do not delegate merely because agents are idle; small, same-file, and dependency-serial work stays with the leader
-- Before dispatch, form the policy v6 structured task contract with worker, goal, owned/forbidden paths, dependencies, verify command, mutation flag, and estimate; dispatch only those tasks
+- Prefer a bounded parallel wave when at least two dependency-ready units have disjoint ownership and independent verification; never manufacture work merely because agents are idle
+- Before dispatch, form the policy v10 structured task contract with worker, goal, owned/forbidden paths, dependencies, verify command, mutation flag, and estimate; dispatch only those tasks
 - For admitted parallel writes, use task-scoped worktrees and one bounded dispatch/collect wave
 - For admitted mutating tasks, delegate with --worktree always --from <base>; collect results, then integrate completed worktrees serially with tm-agent task finish-worktree
 - While workers run, prepare acceptance checks and integration order without editing their owned paths; wait with --mode any --tasks <ids>, process the first result, and wait/collect at most once more when required

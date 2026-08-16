@@ -343,6 +343,8 @@ public enum PeerServerError: Error, Equatable {
     case bindFailed(errno: Int32, message: String)
     case listenFailed(errno: Int32)
     case acceptFailed(errno: Int32)
+    case writeBackpressureExceeded
+    case writeTimedOut
     case alreadyRunning
     case notRunning
     case noMatchingLeaderSession
@@ -943,10 +945,18 @@ actor AcceptedUnixConnection {
     private let queue: DispatchQueue
     private var readSource: DispatchSourceRead?
     private var writeSource: DispatchSourceWrite?
+    private let maxPendingWrites: Int
+    private let writeTimeoutSeconds: TimeInterval
 
-    init(fd: Int32) {
+    init(
+        fd: Int32,
+        maxPendingWrites: Int = 8,
+        writeTimeoutSeconds: TimeInterval = 5
+    ) {
         self.holder = UnixFdHolder(fd: fd)
         self.queue = DispatchQueue(label: "term-mesh.peer.server.conn.\(fd)", qos: .userInitiated)
+        self.maxPendingWrites = max(1, maxPendingWrites)
+        self.writeTimeoutSeconds = max(0.05, writeTimeoutSeconds)
         // Make fd non-blocking so read/write return EAGAIN instead of
         // sleeping; the readiness sources wake us when the kernel has work.
         let flags = fcntl(fd, F_GETFL, 0)
@@ -1024,10 +1034,15 @@ actor AcceptedUnixConnection {
     private var writeInFlight = false
     private var writeWaiters: [CheckedContinuation<Void, Never>] = []
 
-    private func acquireWriteSlot() async {
+    private func acquireWriteSlot() async throws {
         guard writeInFlight else {
             writeInFlight = true
             return
+        }
+        guard writeWaiters.count < maxPendingWrites else {
+            // Each caller already owns its encoded protobuf frame. Bounding
+            // the waiter count therefore bounds retained frame bytes too.
+            throw PeerServerError.writeBackpressureExceeded
         }
         await withCheckedContinuation { continuation in
             writeWaiters.append(continuation)
@@ -1038,6 +1053,16 @@ actor AcceptedUnixConnection {
     }
 
     private func releaseWriteSlot() {
+        if holder.isClosed {
+            // Timeout closes the fd directly from the active writer. Drain
+            // every queued frame here as well as in `close()` so cancellation
+            // and timeout do not depend on an actor-scheduling handoff chain.
+            let waiters = writeWaiters
+            writeWaiters.removeAll()
+            writeInFlight = false
+            for waiter in waiters { waiter.resume() }
+            return
+        }
         if writeWaiters.isEmpty {
             writeInFlight = false
         } else {
@@ -1047,14 +1072,21 @@ actor AcceptedUnixConnection {
 
     func write(_ data: Data) async throws {
         if holder.isClosed { return }
-        await acquireWriteSlot()
+        try Task.checkCancellation()
+        try await acquireWriteSlot()
         defer { releaseWriteSlot() }
         if holder.isClosed { return }
         let bytes = Array(data)
         var offset = 0
         var remaining = bytes.count
+        let deadline = ProcessInfo.processInfo.systemUptime + writeTimeoutSeconds
         while remaining > 0 {
+            try Task.checkCancellation()
             if holder.isClosed { return }
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                holder.close()
+                throw PeerServerError.writeTimedOut
+            }
             let n = bytes.withUnsafeBytes { bp -> Int in
                 let base = bp.baseAddress!.advanced(by: offset)
                 return Darwin.write(holder.fd, base, remaining)
@@ -1078,6 +1110,13 @@ actor AcceptedUnixConnection {
 
     func close() {
         holder.close()
+        // A closed fd makes every queued frame obsolete. Wake all bounded
+        // waiters now instead of handing the slot through one by one; each
+        // observes holder.isClosed before touching the wire.
+        let waiters = writeWaiters
+        writeWaiters.removeAll()
+        writeInFlight = false
+        for waiter in waiters { waiter.resume() }
     }
 }
 

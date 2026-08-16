@@ -25,8 +25,8 @@ When we change the fork, update this document and the parent submodule SHA.
 
 ## Current fork changes
 
-This list has fallen behind before; `CLAUDE.md` carries the shorter running
-summary of fork deltas. Trust the diff against `upstream/main` over either.
+This list has fallen behind before. Trust the diff against `upstream/main`
+over this summary.
 
 ### 1) OSC 99 (kitty) notification parser
 

@@ -1049,12 +1049,43 @@ public actor PeerSession {
     /// push the buffer past the limit unchecked, which is the unbounded growth
     /// the cap exists to prevent.
     private func bufferIncoming(_ message: PeerIncomingMessage) {
-        if bufferedIncomingMessages.count >= Self.maxBufferedIncomingMessages,
-           let oldestPty = bufferedIncomingMessages.firstIndex(where: {
-               if case .ptyData = $0 { return true }
+        Self.appendBufferedIncoming(message, to: &bufferedIncomingMessages)
+    }
+
+    /// Internal pure seam for the queue policy. The receive actor calls this
+    /// synchronously; tests can exercise thousands of control frames without
+    /// manufacturing a live socket and heartbeat pump.
+    static func appendBufferedIncoming(
+        _ message: PeerIncomingMessage,
+        to bufferedIncomingMessages: inout [PeerIncomingMessage]
+    ) {
+        // Complete rosters are replacement values. Keeping an older one has
+        // no semantic value and can retain a full recursive workspace tree.
+        if case .workspaceListChanged = message,
+           let olderSnapshot = bufferedIncomingMessages.firstIndex(where: {
+               if case .workspaceListChanged = $0 { return true }
                return false
            }) {
-            bufferedIncomingMessages.remove(at: oldestPty)
+            bufferedIncomingMessages.remove(at: olderSnapshot)
+        }
+
+        if bufferedIncomingMessages.count >= Self.maxBufferedIncomingMessages {
+            let oldestPty = bufferedIncomingMessages.firstIndex(where: {
+               if case .ptyData = $0 { return true }
+               return false
+            })
+            // Preserve terminal errors/goodbye when possible, but the hard
+            // count bound is non-negotiable: a control-only stream must not
+            // turn a slow UI consumer into unbounded process memory.
+            let oldestDroppableControl = bufferedIncomingMessages.firstIndex(where: {
+                switch $0 {
+                case .error, .goodbye: return false
+                default: return true
+                }
+            })
+            bufferedIncomingMessages.remove(
+                at: oldestPty ?? oldestDroppableControl ?? bufferedIncomingMessages.startIndex
+            )
         }
         bufferedIncomingMessages.append(message)
     }
