@@ -4,6 +4,16 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.189.0] - 2026-08-16
+
+### Fixed
+
+- **Mac peer의 원격 Project가 앱 종료 뒤에도 agent와 manifest를 잃지 않는다** ([#279](https://github.com/x-mesh/term-mesh/pull/279)) — 지금까지 Mac peer에 만든 Project는 화면을 제공하는 GUI socket만 보고 agent session을 소유할 수 없다고 판단해, agent를 SSH 자식으로 실행하고 Project manifest 저장도 거부했다. 이제 GUI가 알려 준 session owner daemon에서 leader·agent pane과 manifest를 함께 관리한다. Project를 만든 Mac의 앱을 종료해도 작업이 계속 살아 있고, 다시 연결하거나 다른 client에서 열면 정확한 surface에 붙는다. 재연결 직후 owner tunnel이 아직 준비 중인 경우에도 자동으로 연결을 완성하며, Project 삭제 뒤에는 원격 manifest도 목록에서 사라진다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.188.0] - 2026-08-15
 
 ### Added
