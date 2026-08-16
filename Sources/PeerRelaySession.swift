@@ -48,6 +48,16 @@ struct PeerRelayConnection: Sendable {
     let hostCapabilities: PeerCapabilities
     /// Authenticated, validated host CLI directories for this connection.
     let hostCLIBinDirs: [String]
+    /// Remote path of the daemon this host names as the owner of sessions
+    /// that outlive it (`Hello.session_host_socket`), or empty when the host
+    /// owns its own sessions.
+    ///
+    /// Non-empty means "I am serving you, but I am not what a durable session
+    /// should be created on" — the Swift GUI host, whose peer server can
+    /// neither create agent surfaces nor publish a project manifest, and
+    /// which advertises its term-meshd here instead. A path, not a promise:
+    /// it is only advertised while something is listening on it.
+    let sessionHostSockPath: String
     let session: PeerSession
     let transport: UnixSocketTransport
     let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
@@ -1491,6 +1501,7 @@ final class PeerRelaySession {
             hostAppVersion: connection.hostAppVersion,
             hostCapabilities: connection.hostCapabilities,
             hostCLIBinDirs: connection.hostCLIBinDirs,
+            sessionHostSockPath: connection.sessionHostSockPath,
             session: connection.session,
             transport: connection.transport,
             surfaces: surfaces
@@ -1528,6 +1539,7 @@ final class PeerRelaySession {
             hostAppVersion: info.hostAppVersion,
             hostCapabilities: info.hostCapabilities,
             hostCLIBinDirs: info.hostCLIBinDirs,
+            sessionHostSockPath: info.sessionHostSocketPath,
             session: session,
             transport: transport,
             surfaces: []

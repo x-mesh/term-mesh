@@ -50,7 +50,15 @@ enum RemoteLeaderReattachOutcome: Equatable {
 @MainActor
 final class PendingPeerAgentSurfaceCleanupStore {
     typealias HostSockPath = @MainActor (String) -> String?
-    typealias Terminator = @MainActor (String, Data) async -> Bool
+    /// `(hostKey, servingSockPath, surfaceID)`.
+    ///
+    /// The host key rides along because the serving socket is not always where
+    /// the surface is. A redirected host ensured it on its session owner, and a
+    /// `TerminateSurface` sent to the socket that merely *served* the handshake
+    /// names a surface that endpoint never created — the tombstone would then
+    /// retry forever against a host that keeps answering "not mine" while the
+    /// `tm-agent-bridge` it was meant to kill stays up.
+    typealias Terminator = @MainActor (String, String, Data) async -> Bool
     struct Record: Codable, Equatable, Identifiable {
         let hostKey: String
         let surfaceIDBase64: String
@@ -97,9 +105,10 @@ final class PendingPeerAgentSurfaceCleanupStore {
                 in: RemoteHostStore.shared.sortedHosts
             )
         },
-        terminator: @escaping Terminator = { sockPath, surfaceID in
-            await TeamOrchestrator.terminatePeerAgentSurfaceConfirmed(
-                hostSockPath: sockPath,
+        terminator: @escaping Terminator = { hostKey, sockPath, surfaceID in
+            await TeamOrchestrator.terminatePeerAgentSurfaceOnOwningEndpoint(
+                hostKey: hostKey,
+                servingSockPath: sockPath,
                 surfaceID: surfaceID
             )
         }
@@ -182,14 +191,14 @@ final class PendingPeerAgentSurfaceCleanupStore {
     /// relay transition starts another pass.
     func retryPending(
         hostSockPath: (String) -> String?,
-        terminate: (String, Data) async -> Bool
+        terminate: (String, String, Data) async -> Bool
     ) async {
         let snapshot = records
         for record in snapshot {
             guard let surfaceID = record.surfaceID,
                   let sockPath = hostSockPath(record.hostKey),
                   !sockPath.isEmpty,
-                  await terminate(sockPath, surfaceID)
+                  await terminate(record.hostKey, sockPath, surfaceID)
             else { continue }
             records.removeAll { $0.id == record.id }
             persist()
@@ -390,7 +399,7 @@ extension TeamOrchestrator {
               !leaderSurfaceID.isEmpty,
               let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey })
         else { return true }
-        guard host.isConnected, !host.activeSockPath.isEmpty else { return false }
+        guard host.isConnected, !Self.liveTeamSockPath(for: host).isEmpty else { return false }
         let teamUUID = rawTeamUUID
 
         // v1 manifests live on the daemon that owns the leader and contain
@@ -431,7 +440,7 @@ extension TeamOrchestrator {
         }
 
         guard let connection = try? await PeerRelaySession.connect(
-            hostSockPath: host.activeSockPath
+            hostSockPath: Self.liveTeamSockPath(for: host)
         ) else { return false }
         guard connection.hostCapabilities.has(PeerCapability.projectPresentationV1) else {
             await connection.cancel()
@@ -445,6 +454,8 @@ extension TeamOrchestrator {
                     "Could not persist project \(team.id) on \(host.displayName): "
                         + response.errorCode
                 )
+            } else {
+                RemoteHostStore.shared.refreshTeamRoster(forHostKey: hostKey)
             }
             return response.ok
                 || !Self.remoteProjectManifestShouldRetry(errorCode: response.errorCode)
@@ -506,11 +517,11 @@ extension TeamOrchestrator {
     static func remotePresentationCanAttach(
         leaderSurfaceID: Data,
         isConnected: Bool,
-        activeSockPath: String
+        hasResolvedTeamRoute: Bool
     ) -> Bool {
         !leaderSurfaceID.isEmpty
             && isConnected
-            && !activeSockPath.isEmpty
+            && hasResolvedTeamRoute
     }
 
     nonisolated static func shouldOfferRemoteManifest(
@@ -590,7 +601,7 @@ extension TeamOrchestrator {
         guard Self.remotePresentationCanAttach(
             leaderSurfaceID: remote.leaderSurfaceID,
             isConnected: host.isConnected,
-            activeSockPath: host.activeSockPath
+            hasResolvedTeamRoute: host.teamHostSpec != nil
         )
         else { return false }
 
@@ -1041,7 +1052,7 @@ extension TeamOrchestrator {
             self.hostKey = hostKey
             self.workspace = workspace
             self.promptFile = promptFile
-            hostSockPath = host.activeSockPath
+            hostSockPath = TeamOrchestrator.liveTeamSockPath(for: host)
         }
 
         func cleanup() async {
@@ -1254,7 +1265,7 @@ extension TeamOrchestrator {
                 )
             }
         }
-        let hostSockPath = controlSockPath ?? host.activeSockPath
+        let hostSockPath = controlSockPath ?? TeamOrchestrator.liveTeamSockPath(for: host)
         guard !hostSockPath.isEmpty else {
             throw RemoteAgentError.hostNotConnected(host.displayName)
         }
@@ -1582,6 +1593,16 @@ extension TeamOrchestrator {
         }
     }
 
+    /// Sweeps leftover *shells*, which is why this one keeps the serving
+    /// endpoint while the team lifecycle above moved to the session owner.
+    ///
+    /// Its targets come from `inspectPeerShells`, which reads `host.workspaces`
+    /// — the roster the sidebar fetched over `activeSockPath`. Those surfaces
+    /// belong to whatever is serving that socket, so a `ClosePane` addressed to
+    /// a redirected host's daemon names a pane that daemon never published. The
+    /// guard is worse than the send: `liveTeamSockPath` is empty until some
+    /// pane has leased the team tunnel, so a perfectly connected GUI host would
+    /// report itself disconnected before a single shell was tried.
     func closePeerShells(host: HostEntry, surfaceIDs: Set<Data>) async throws -> Int {
         guard !host.activeSockPath.isEmpty else {
             throw RemoteAgentError.hostNotConnected(host.displayName)
@@ -1752,10 +1773,19 @@ extension TeamOrchestrator {
                 result.insert(session.originSurface.surfaceID)
             }
         }
-        result.formUnion(
-            peerPaneSessions(hostKey: host.paneHostSpec.hostKey)
-                .map(\.originSurface.surfaceID)
-        )
+        // Both endpoints, because a redirected host has panes on each: ordinary
+        // remote terminals lease `paneHostSpec`, team agents lease the session
+        // owner. Asking only the team key was a regression with the sweep's own
+        // failure mode — an on-screen pane it could not see was bucketed
+        // `unclaimed`, and Select All closed it. Asking only the pane key would
+        // lose agent surfaces the same way.
+        var protectedKeys: Set<PeerPaneHostKey> = [host.paneHostSpec.hostKey]
+        if let teamKey = host.teamHostSpec?.hostKey { protectedKeys.insert(teamKey) }
+        for key in protectedKeys {
+            result.formUnion(
+                peerPaneSessions(hostKey: key).map(\.originSurface.surfaceID)
+            )
+        }
         return result
     }
 
@@ -1827,7 +1857,7 @@ extension TeamOrchestrator {
         attempt.installCleanup { await resources.cleanup() }
         try await attempt.ensureCurrent()
 
-        let lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
+        let lease = try await PeerPaneHostRegistry.shared.acquire(Self.requireTeamHostSpec(host))
         resources.hostSockPath = lease.hostSockPath
         try await attempt.ensureCurrent()
 #if DEBUG
@@ -1891,7 +1921,7 @@ extension TeamOrchestrator {
                 lease: lease,
                 surface: chosen,
                 title: "Leader",
-                spec: host.paneHostSpec
+                spec: Self.requireTeamHostSpec(host)
             )
             resources.session = session
             try await attempt.ensureCurrent()
@@ -2346,7 +2376,7 @@ extension TeamOrchestrator {
 
         let lease: PeerPaneHostLease
         do {
-            lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
+            lease = try await PeerPaneHostRegistry.shared.acquire(Self.requireTeamHostSpec(host))
         } catch {
             RemoteWorkLog.info("Cannot restore \(teamName) leader: \(error)")
             return .temporarilyUnavailable
@@ -2388,7 +2418,7 @@ extension TeamOrchestrator {
                 lease: lease,
                 surface: surface,
                 title: "Leader",
-                spec: host.paneHostSpec
+                spec: Self.requireTeamHostSpec(host)
             )
         } catch {
             // The surface is on the host's own roster; only this attach failed.
@@ -2771,7 +2801,7 @@ extension TeamOrchestrator {
               host.isConnected else { return nil }
         let lease: PeerPaneHostLease
         do {
-            lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
+            lease = try await PeerPaneHostRegistry.shared.acquire(Self.requireTeamHostSpec(host))
         } catch {
             RemoteWorkLog.info("Cannot restore \(title) on \(hostKey): \(error)")
             return nil
@@ -2789,7 +2819,7 @@ extension TeamOrchestrator {
                 lease: lease,
                 surface: surface,
                 title: title,
-                spec: host.paneHostSpec
+                spec: Self.requireTeamHostSpec(host)
             )
         } catch {
             PeerPaneHostRegistry.shared.release(lease)
@@ -2849,15 +2879,21 @@ extension TeamOrchestrator {
               ),
               let surfaceID = record.surfaceID,
               let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-              !host.activeSockPath.isEmpty
+              host.teamRouteResolved
         else { return }
 
+        // Leases rather than looks up: this runs while a project is being torn
+        // down, which is after its panes — and therefore the team tunnel they
+        // held — are gone. Requiring a live tunnel here would skip exactly the
+        // case it was written for.
         Task { @MainActor in
-            await Self.closeManagedRemoteSurface(
-                hostSockPath: host.activeSockPath,
-                hostKey: hostKey,
-                surfaceID: surfaceID
-            )
+            _ = await Self.withTeamSockPath(host: host) { sockPath in
+                await Self.closeManagedRemoteSurface(
+                    hostSockPath: sockPath,
+                    hostKey: hostKey,
+                    surfaceID: surfaceID
+                )
+            }
         }
     }
 
@@ -3668,7 +3704,7 @@ extension TeamOrchestrator {
         }
 
         let registry = PeerPaneHostRegistry.shared
-        let lease = try await registry.acquire(host.paneHostSpec)
+        let lease = try await registry.acquire(Self.requireTeamHostSpec(host))
         let panel: TerminalPanel
         let attachedSurfaceID: Data
         var spawnedSurface = false
@@ -3746,7 +3782,7 @@ extension TeamOrchestrator {
                 lease: lease,
                 surface: chosen,
                 title: agentName,
-                spec: host.paneHostSpec
+                spec: Self.requireTeamHostSpec(host)
             )
             registry.release(lease)
             guard let opened = workspace.openRemotePane(
@@ -3768,11 +3804,18 @@ extension TeamOrchestrator {
         } catch {
             registry.release(lease)
             if let spawnedSurfaceID {
-                await Self.closeManagedRemoteSurface(
-                    hostSockPath: host.activeSockPath,
-                    hostKey: hostKey,
-                    surfaceID: spawnedSurfaceID
-                )
+                // Leases rather than looks up. Both callers reach here having
+                // just given up the thing that held the team tunnel — one
+                // released the lease, the other closed the pane — so a lookup
+                // finds nothing and the surface this is compensating for stays
+                // up on the host.
+                _ = await Self.withTeamSockPath(host: host) { sockPath in
+                    await Self.closeManagedRemoteSurface(
+                        hostSockPath: sockPath,
+                        hostKey: hostKey,
+                        surfaceID: spawnedSurfaceID
+                    )
+                }
             }
             throw error
         }
@@ -3812,11 +3855,18 @@ extension TeamOrchestrator {
         guard adoptAgentMember(member, teamName: teamName) else {
             _ = workspace.closePanel(panel.id, force: true)
             if let spawnedSurfaceID {
-                await Self.closeManagedRemoteSurface(
-                    hostSockPath: host.activeSockPath,
-                    hostKey: hostKey,
-                    surfaceID: spawnedSurfaceID
-                )
+                // Leases rather than looks up. Both callers reach here having
+                // just given up the thing that held the team tunnel — one
+                // released the lease, the other closed the pane — so a lookup
+                // finds nothing and the surface this is compensating for stays
+                // up on the host.
+                _ = await Self.withTeamSockPath(host: host) { sockPath in
+                    await Self.closeManagedRemoteSurface(
+                        hostSockPath: sockPath,
+                        hostKey: hostKey,
+                        surfaceID: spawnedSurfaceID
+                    )
+                }
             }
             throw RemoteAgentError.duplicateInstance(member.agentInstanceId)
         }
@@ -4089,6 +4139,97 @@ extension TeamOrchestrator {
         /// It was open at the check and refused at the ensure — the host
         /// changed underneath, or said no for its own reason.
         case ensureRefused
+        /// The host is serving the peer protocol from the term-mesh app, and
+        /// named no `term-meshd` to take durable work. A GUI process owns no
+        /// lifecycle past its own, so no version of it can host an agent —
+        /// which makes "update term-mesh there" the wrong instruction and
+        /// "start its daemon" the right one.
+        case guiHostNoSessionOwner
+    }
+
+    /// `host.teamHostSpec`, or the retryable failure every team call site
+    /// already raises for a socket it cannot reach.
+    ///
+    /// An unresolved route and a dead socket deserve the same response — wait
+    /// and try again — so they raise the same error rather than a second one
+    /// callers would have to learn. Lives here rather than on `HostEntry`
+    /// because the error is the orchestrator's; a host row should not have to
+    /// know how team work reports failure.
+    static func requireTeamHostSpec(_ host: HostEntry) throws -> PeerPaneHostSpec {
+        guard let spec = host.teamHostSpec else {
+            throw RemoteAgentError.hostNotConnected(host.displayName)
+        }
+        return spec
+    }
+
+    /// Local socket to dial for a team RPC on `host`, without starting a
+    /// tunnel.
+    ///
+    /// Team surfaces live on `teamHostSpec`, which on a redirected host is not
+    /// the socket the sidebar mirrors from. Addressing such a surface through
+    /// `activeSockPath` reaches a peer server that never created it and
+    /// reports success for closing nothing. Empty means "no live route" —
+    /// every caller already treats that as "skip", the same as a disconnected
+    /// host.
+    /// Run `body` against a local socket for team RPCs on `host`, holding a
+    /// tunnel lease for its duration.
+    ///
+    /// `liveTeamSockPath` only *finds* a tunnel, which is right for the hot
+    /// paths that run beside a live pane and wrong for everything that runs
+    /// after the panes are gone. Project deletion is the case that named this:
+    /// it closes the team's panes, which drops the last lease, and only then
+    /// asks the host to remove the workspace and the manifest — so the endpoint
+    /// it needs is the one its own earlier steps just tore down.
+    ///
+    /// Returns nil without calling `body` when the route is unresolved or the
+    /// tunnel cannot be established; callers already treat that as the
+    /// retryable "host not connected".
+    static func withTeamSockPath<T>(
+        host: HostEntry,
+        _ body: (String) async throws -> T
+    ) async rethrows -> T? {
+        guard let spec = host.teamHostSpec else { return nil }
+        guard host.redirectsTeamWorkToSessionHost else {
+            guard !host.activeSockPath.isEmpty else { return nil }
+            return try await body(host.activeSockPath)
+        }
+        guard let lease = try? await PeerPaneHostRegistry.shared.acquire(spec)
+        else { return nil }
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+        let sockPath = lease.hostSockPath
+        guard !sockPath.isEmpty else { return nil }
+        return try await body(sockPath)
+    }
+
+    static func liveTeamSockPath(for host: HostEntry) -> String {
+        // Empty while the route is unknown, which callers already treat as
+        // "host not connected" and retry. Answering `activeSockPath` here
+        // instead would aim team RPCs at the serving socket for the window
+        // between a reconnect and its handshake — and on a redirecting host
+        // that socket did not create any of the surfaces being named.
+        guard host.teamRouteResolved else { return "" }
+        guard host.redirectsTeamWorkToSessionHost,
+              let teamKey = host.teamHostSpec?.hostKey
+        else { return host.activeSockPath }
+        return PeerPaneHostRegistry.shared
+            .existingLocalSockPath(for: teamKey) ?? ""
+    }
+
+    /// Whether a handshake came from the Swift GUI peer server rather than a
+    /// `term-meshd`.
+    ///
+    /// `PeerServer` strips exactly `surface.agent.v1` and
+    /// `project.presentation.v1` from an otherwise complete list, because a
+    /// GUI host publishes TerminalPanels and owns nothing past its own quit.
+    /// A daemon old enough to predate peer-owned agents is missing that whole
+    /// group — the ensure-environment and authoritative-exit halves too — so
+    /// requiring those to be *present* is what separates "cannot, by design"
+    /// from "cannot, for now".
+    static func looksLikeGUIPeerHost(_ capabilities: PeerCapabilities) -> Bool {
+        !capabilities.has(PeerCapability.surfaceAgentV1)
+            && !capabilities.has(PeerCapability.projectPresentationV1)
+            && capabilities.has(PeerCapability.surfaceEnsureEnvV1)
+            && capabilities.has(PeerCapability.surfaceExitV1)
     }
 
     /// Whether the peer-owned path is open for this member.
@@ -4132,6 +4273,12 @@ extension TeamOrchestrator {
             return lead + ": the host refused to start its bridge, so this agent "
                 + "will not survive quitting this Mac. Nothing was left running "
                 + "there; attach again to retry peer ownership."
+        case .guiHostNoSessionOwner:
+            return lead + ": \(hostName) is serving the peer protocol from the "
+                + "term-mesh app, which owns nothing past its own quit, and named "
+                + "no term-meshd to take durable work. Updating term-mesh there "
+                + "will not change this. Start its daemon — reopen term-mesh on "
+                + "\(hostName) with peer auto-start enabled — to make the peer own it."
         }
     }
 
@@ -4167,16 +4314,48 @@ extension TeamOrchestrator {
               let sshTarget = host.sshTarget, !sshTarget.isEmpty
         else { return .notApplicable }
         guard !binaries.bridgePath.isEmpty else { return .blocked(.bridgeMissing) }
-        guard !host.activeSockPath.isEmpty,
+        // Probe the endpoint the ensure will actually use, not the one the
+        // sidebar is mirroring from. On a host that named a session owner
+        // those differ, and asking the wrong one is how a capable machine
+        // reported itself incapable.
+        // Unresolved is not "no redirect": probing the serving socket here
+        // would report a capable machine as incapable for the window between a
+        // reconnect and its handshake, and the caller would then open the
+        // SSH-owned fallback pane that this whole path exists to avoid.
+        guard host.teamRouteResolved else { return .blocked(.hostUnreachable) }
+        var teamLease: PeerPaneHostLease?
+        let probeSockPath: String
+        if host.redirectsTeamWorkToSessionHost {
+            guard let teamSpec = host.teamHostSpec,
+                  let lease = try? await PeerPaneHostRegistry.shared.acquire(teamSpec)
+            else { return .blocked(.hostUnreachable) }
+            teamLease = lease
+            probeSockPath = lease.hostSockPath
+        } else {
+            probeSockPath = host.activeSockPath
+        }
+        func releaseTeamLease() {
+            if let teamLease { PeerPaneHostRegistry.shared.release(teamLease) }
+        }
+        guard !probeSockPath.isEmpty,
               let connection = try? await PeerRelaySession.connect(
-                  hostSockPath: host.activeSockPath
+                  hostSockPath: probeSockPath
               )
-        else { return .blocked(.hostUnreachable) }
-        let supported = RemoteHostStore.hostSupportsPeerOwnedAgentFactory(
-            connection.hostCapabilities
-        )
+        else {
+            releaseTeamLease()
+            return .blocked(.hostUnreachable)
+        }
+        let capabilities = connection.hostCapabilities
+        let supported = RemoteHostStore.hostSupportsPeerOwnedAgentFactory(capabilities)
         await connection.cancel()
-        return supported ? .available : .blocked(.daemonTooOld)
+        releaseTeamLease()
+        if supported { return .available }
+        // Reached without a redirect: this host offered no daemon to fall
+        // forward to. Naming which of the two situations it is decides
+        // whether the user should update something or start something.
+        return .blocked(Self.looksLikeGUIPeerHost(capabilities)
+            ? .guiHostNoSessionOwner
+            : .daemonTooOld)
     }
 
     /// The logical key an agent surface is ensured under.
@@ -4281,6 +4460,102 @@ extension TeamOrchestrator {
             hostSockPath: hostSockPath,
             surfaceID: surfaceID
         )
+    }
+
+    /// Terminate an agent surface on the endpoint that actually created it.
+    ///
+    /// `liveTeamSockPath` is not usable here, and that difference is the whole
+    /// reason this exists. It only *finds* a tunnel, and the case this serves is
+    /// precisely the one with no tunnel left to find: the ensure succeeded, the
+    /// local attach failed, the pane that would have held the lease was never
+    /// opened. Left to a lookup, the tombstone would wait for a lease nothing
+    /// is going to take, while the bridge it names keeps running.
+    ///
+    /// So this leases the session owner itself, and releases it as soon as the
+    /// answer is in. On a host that is not redirected the serving socket is the
+    /// owning socket, and the old direct path is kept — no tunnel is started to
+    /// reach a socket already open.
+    /// Where a tombstone's `TerminateSurface` has to be sent.
+    ///
+    /// Split out from the send so the choice can be tested without a socket —
+    /// it is the whole defect, and the surrounding code is transport.
+    enum PeerAgentCleanupEndpoint {
+        /// The socket that served the handshake already owns the surface.
+        case serving(String)
+        /// The surface was ensured on this host's session owner; a tunnel to it
+        /// has to be leased before anything can be addressed there.
+        case sessionOwner(PeerPaneHostSpec)
+        /// The host is reachable but has not yet said where its sessions live.
+        /// Keep the tombstone and retry; guessing costs a `TerminateSurface`
+        /// sent to an endpoint that never created the surface, which the host
+        /// answers as "not mine" — indistinguishable from a real confirmation
+        /// unless the caller happens to check, and the bridge keeps running.
+        case unresolved
+
+        /// What the endpoint resolves to on the wire, for assertions and logs.
+        /// A serving endpoint is already a local path; a session owner is a
+        /// remote path that only becomes dialable once leased.
+        var describedTarget: String {
+            switch self {
+            case .serving(let sockPath): return sockPath
+            case .sessionOwner(let spec): return spec.hostKey.remoteSockPath ?? ""
+            case .unresolved: return ""
+            }
+        }
+
+        var leasesSessionOwner: Bool {
+            if case .sessionOwner = self { return true }
+            return false
+        }
+
+        var isUnresolved: Bool {
+            if case .unresolved = self { return true }
+            return false
+        }
+    }
+
+    static func peerAgentCleanupEndpoint(
+        host: HostEntry?,
+        servingSockPath: String
+    ) -> PeerAgentCleanupEndpoint {
+        // An unknown host is not an unresolved one: nothing is coming that
+        // would answer, so the socket that served this tombstone is the only
+        // address there will ever be. Attempt it.
+        guard let host else { return .serving(servingSockPath) }
+        guard host.teamRouteResolved else { return .unresolved }
+        guard host.redirectsTeamWorkToSessionHost else {
+            return .serving(servingSockPath)
+        }
+        guard let teamSpec = host.teamHostSpec else { return .unresolved }
+        return .sessionOwner(teamSpec)
+    }
+
+    static func terminatePeerAgentSurfaceOnOwningEndpoint(
+        hostKey: String,
+        servingSockPath: String,
+        surfaceID: Data
+    ) async -> Bool {
+        switch peerAgentCleanupEndpoint(
+            host: RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+            servingSockPath: servingSockPath
+        ) {
+        case .serving(let sockPath):
+            return await terminatePeerAgentSurfaceConfirmed(
+                hostSockPath: sockPath, surfaceID: surfaceID
+            )
+        case .sessionOwner(let spec):
+            guard let lease = try? await PeerPaneHostRegistry.shared.acquire(spec)
+            else { return false }
+            defer { PeerPaneHostRegistry.shared.release(lease) }
+            return await terminatePeerAgentSurfaceConfirmed(
+                hostSockPath: lease.hostSockPath, surfaceID: surfaceID
+            )
+        case .unresolved:
+            // Not a failure to report — the handshake that answers this is
+            // already in flight, and the tombstone is durable precisely so it
+            // can wait for it.
+            return false
+        }
     }
 
     /// Returns true only when the host authoritatively says the surface is gone.
@@ -4561,7 +4836,7 @@ extension TeamOrchestrator {
 
         let lease: PeerPaneHostLease
         do {
-            lease = try await PeerPaneHostRegistry.shared.acquire(host.paneHostSpec)
+            lease = try await PeerPaneHostRegistry.shared.acquire(Self.requireTeamHostSpec(host))
         } catch {
             RemoteWorkLog.info("Cannot reattach \(agent.name) on \(host.displayName): \(error)")
             return .transientFailure
@@ -4585,7 +4860,7 @@ extension TeamOrchestrator {
                 lease: lease,
                 surface: surface,
                 title: agent.name,
-                spec: host.paneHostSpec
+                spec: Self.requireTeamHostSpec(host)
             )
         } catch {
             PeerPaneHostRegistry.shared.release(lease)
@@ -4796,14 +5071,14 @@ extension TeamOrchestrator {
         )
 
         let registry = PeerPaneHostRegistry.shared
-        let lease = try await registry.acquire(host.paneHostSpec)
+        let lease = try await registry.acquire(Self.requireTeamHostSpec(host))
         let ensured: (session: PeerPaneSession, outcome: PeerEnsureSurfaceOutcome)
         do {
             ensured = try await PeerPaneSession.ensureAndAttach(
                 lease: lease,
                 surfaceSpec: spec,
                 attachment: PeerRunnerAttachment(title: agentName, lifetime: .keepAlive),
-                hostSpec: host.paneHostSpec,
+                hostSpec: Self.requireTeamHostSpec(host),
                 agentCli: cli,
                 environment: environment,
                 onAgentPostEnsureFailure: { surfaceID in
@@ -5048,7 +5323,7 @@ extension TeamOrchestrator {
         let registry = PeerPaneHostRegistry.shared
         let lease: PeerPaneHostLease
         do {
-            lease = try await registry.acquire(host.paneHostSpec)
+            lease = try await registry.acquire(Self.requireTeamHostSpec(host))
         } catch {
             return .failure(.spawnFailed)
         }
@@ -5060,7 +5335,7 @@ extension TeamOrchestrator {
                 attachment: PeerRunnerAttachment(
                     title: agent.name, lifetime: .keepAlive
                 ),
-                hostSpec: host.paneHostSpec,
+                hostSpec: Self.requireTeamHostSpec(host),
                 agentCli: agent.cli,
                 environment: environment,
                 onAgentPostEnsureFailure: { surfaceID in
@@ -5981,6 +6256,40 @@ extension TeamOrchestrator {
         // and cannot be retired this way — see attachRemoteAgent.
         LeaderAttachGenerationGate.shared.invalidateAll(teamName: teamName)
 
+        // Hold the team tunnel for the whole teardown, before a single pane is
+        // closed.
+        //
+        // Deletion is the one flow that destroys its own transport: it closes
+        // the team's panes, which drops the last lease on a redirected host's
+        // session owner, and only *then* asks that host to remove surfaces, the
+        // workspace, and the manifest. Resolving the socket per step therefore
+        // found nothing exactly when it mattered, and every remote object
+        // survived a "successful" delete. One lease up front, released when the
+        // function returns, keeps every step below addressing the endpoint that
+        // owns what it is deleting.
+        var teamLeases: [String: PeerPaneHostLease] = [:]
+        defer {
+            for lease in teamLeases.values { PeerPaneHostRegistry.shared.release(lease) }
+        }
+        var teamLeaseHostKeys = Set(team.remoteWorkspaceIDs.keys)
+        if case let .peer(leaderHostKey) = team.leaderEndpoint {
+            teamLeaseHostKeys.insert(leaderHostKey)
+        }
+        for agent in team.agents { agent.hostKey.map { teamLeaseHostKeys.insert($0) } }
+        for hostKey in teamLeaseHostKeys {
+            guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+                  let spec = host.teamHostSpec,
+                  let lease = try? await PeerPaneHostRegistry.shared.acquire(spec)
+            else { continue }
+            teamLeases[hostKey] = lease
+        }
+        /// Local socket for team RPCs against `hostKey`, empty when no lease
+        /// could be taken. Callers already report empty as "host not
+        /// connected" and leave the object in `remaining`.
+        func teamSock(_ hostKey: String) -> String {
+            teamLeases[hostKey]?.hostSockPath ?? ""
+        }
+
         // Read through the durable record: after a restart the team's
         // in-memory list is empty while its checkouts are still on the peers.
         let grouped = Dictionary(
@@ -6030,7 +6339,7 @@ extension TeamOrchestrator {
                     teamName: teamName
                 )?.surfaceID
             if let surfaceID {
-                remoteSurfaces.append((host.activeSockPath, hostKey, surfaceID, false))
+                remoteSurfaces.append((teamSock(hostKey), hostKey, surfaceID, false))
             }
         }
 
@@ -6049,7 +6358,7 @@ extension TeamOrchestrator {
                let hostKey = agent.hostKey,
                let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) {
                 peerSurface = (
-                    host.activeSockPath, hostKey, surfaceID, agent.remoteAgentSurface
+                    teamSock(hostKey), hostKey, surfaceID, agent.remoteAgentSurface
                 )
             } else {
                 peerSurface = nil
@@ -6070,13 +6379,13 @@ extension TeamOrchestrator {
         for (hostKey, workspaceID) in team.remoteWorkspaceIDs {
             let label = "workspace \(hostKey):\(workspaceID.base64EncodedString())"
             guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-                  !host.activeSockPath.isEmpty
+                  !teamSock(hostKey).isEmpty
             else {
                 continue
             }
             do {
                 let connection = try await PeerRelaySession.connect(
-                    hostSockPath: host.activeSockPath
+                    hostSockPath: teamSock(hostKey)
                 )
                 let workspaces: [Termmesh_Peer_V1_Workspace]
                 do {
@@ -6117,13 +6426,13 @@ extension TeamOrchestrator {
             ) else {
                 continue
             }
-            guard !remote.socket.isEmpty else {
+            guard !teamSock(remote.hostKey).isEmpty else {
                 failures.append("\(label): host not connected")
                 remaining.append(label)
                 continue
             }
             do {
-                let connection = try await PeerRelaySession.connect(hostSockPath: remote.socket)
+                let connection = try await PeerRelaySession.connect(hostSockPath: teamSock(remote.hostKey))
                 if remote.isAgent {
                     // An agent surface is never placed in the workspace tree,
                     // so ClosePane finds nothing and reports success — and
@@ -6158,7 +6467,7 @@ extension TeamOrchestrator {
                     // poll opens its own probes.
                     await connection.cancel()
                     guard try await waitForRemoteRemoval(
-                        hostSockPath: remote.socket,
+                        hostSockPath: teamSock(remote.hostKey),
                         surfaceID: remote.surfaceID
                     ) else {
                         throw RemoteAgentError.projectDeletionIncomplete(
@@ -6186,7 +6495,7 @@ extension TeamOrchestrator {
                 continue
             }
             guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-                  !host.activeSockPath.isEmpty
+                  !teamSock(hostKey).isEmpty
             else {
                 failures.append("\(label): host not connected")
                 remaining.append(label)
@@ -6194,7 +6503,7 @@ extension TeamOrchestrator {
             }
             do {
                 let connection = try await PeerRelaySession.connect(
-                    hostSockPath: host.activeSockPath
+                    hostSockPath: teamSock(hostKey)
                 )
                 do {
                     try await connection.session.deleteWorkspace(workspaceID: workspaceID)
@@ -6206,7 +6515,7 @@ extension TeamOrchestrator {
                 // poll opens its own probes.
                 await connection.cancel()
                 guard try await waitForRemoteRemoval(
-                    hostSockPath: host.activeSockPath,
+                    hostSockPath: teamSock(hostKey),
                     workspaceID: workspaceID
                 ) else {
                     throw RemoteAgentError.projectDeletionIncomplete(
@@ -6280,13 +6589,13 @@ extension TeamOrchestrator {
            let teamUUID = team.teamUuid,
            !teamUUID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-                  !host.activeSockPath.isEmpty
+                  !teamSock(hostKey).isEmpty
             else {
                 throw RemoteAgentError.projectDeletionIncomplete(
                     "manifest \(hostKey): host not connected"
                 )
             }
-            let connection = try await PeerRelaySession.connect(hostSockPath: host.activeSockPath)
+            let connection = try await PeerRelaySession.connect(hostSockPath: teamSock(hostKey))
             do {
                 let response: Termmesh_Peer_V1_UpsertProjectPresentationResponse?
                 if connection.hostCapabilities.has(PeerCapability.projectPresentationV1) {
@@ -6301,6 +6610,9 @@ extension TeamOrchestrator {
                     throw RemoteAgentError.projectDeletionIncomplete(
                         "manifest \(hostKey): \(response?.errorCode ?? "unknown")"
                     )
+                }
+                if response?.ok == true {
+                    RemoteHostStore.shared.refreshTeamRoster(forHostKey: hostKey)
                 }
             } catch {
                 await connection.cancel()
