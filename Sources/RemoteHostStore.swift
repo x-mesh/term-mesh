@@ -439,14 +439,26 @@ struct HostEntry: Identifiable, Equatable {
     /// only the authenticated handshake answers this correctly.
     var supportsRemoteTeamRoute: Bool? = nil
     /// Remote path this host names as the owner of sessions that outlive it
-    /// (`Hello.session_host_socket`), empty when it owns its own.
+    /// (`Hello.session_host_socket`).
     ///
     /// A Mac serving peers from the app publishes its term-meshd here: its
     /// own peer server strips `surface.agent.v1` and
     /// `project.presentation.v1` because a GUI process implements neither, so
-    /// team work addressed to it can only fall back. Live-session state, like
-    /// the capability flags above — cleared with the socket, never persisted.
-    var sessionHostRemoteSockPath: String = ""
+    /// team work addressed to it can only fall back.
+    ///
+    /// Three states, and the third is why this is optional. `nil` = no
+    /// authenticated handshake has answered yet; `""` = answered, the host owns
+    /// its own sessions; a path = answered, team work belongs there. Collapsing
+    /// the first two loses a reconnect: `connectionState` and `activeSockPath`
+    /// are set synchronously when the lease is acquired, while this only lands
+    /// after `fetchWorkspaces` completes — so for that window a redirecting
+    /// host reads as a non-redirecting one, and team work aimed at surfaces
+    /// living on its daemon would be addressed to the GUI socket instead. Same
+    /// hazard `hostCLIBinDirsResolved` exists for, same shape of answer.
+    ///
+    /// Live-session state, like the capability flags above — cleared with the
+    /// socket, never persisted.
+    var sessionHostRemoteSockPath: String?
     /// Authenticated host CLI directories. Live-session cache only: never
     /// written to PeerHostProfile/UserDefaults and cleared with the socket.
     var hostCLIBinDirs: [String] = []
@@ -534,7 +546,7 @@ struct HostEntry: Identifiable, Equatable {
         servingAppVersion = nil
         supportsPeerOwnedAgentHosting = nil
         supportsRemoteTeamRoute = nil
-        sessionHostRemoteSockPath = ""
+        sessionHostRemoteSockPath = nil
     }
 
     /// Detach profile-owned configuration without letting a still-live
@@ -587,7 +599,7 @@ struct HostEntry: Identifiable, Equatable {
     /// Falls back whenever the redirect cannot be expressed — a direct
     /// (non-SSH) host has no second path to tunnel to.
     var teamHostSpec: PeerPaneHostSpec {
-        guard !sessionHostRemoteSockPath.isEmpty,
+        guard let sessionHostRemoteSockPath, !sessionHostRemoteSockPath.isEmpty,
               let sshTarget, !sshTarget.isEmpty
         else { return paneHostSpec }
         return .ssh(
@@ -598,11 +610,21 @@ struct HostEntry: Identifiable, Equatable {
         )
     }
 
+    /// Whether an authenticated handshake has said where team work belongs.
+    ///
+    /// Team callers must gate on this and not on `isConnected`: the connection
+    /// is live a round trip before the answer is, and during that window
+    /// "no redirect recorded" is indistinguishable from "no redirect exists".
+    var teamRouteResolved: Bool { sessionHostRemoteSockPath != nil }
+
     /// Whether team work is being redirected away from the serving socket.
     /// Callers that cannot reuse `activeSockPath` for team RPCs check this
     /// rather than re-deriving the comparison.
+    ///
+    /// False while unresolved — ask `teamRouteResolved` to tell that apart from
+    /// a host that genuinely owns its own sessions.
     var redirectsTeamWorkToSessionHost: Bool {
-        teamHostSpec.hostKey != paneHostSpec.hostKey
+        teamRouteResolved && teamHostSpec.hostKey != paneHostSpec.hostKey
     }
 }
 
@@ -1361,6 +1383,10 @@ final class RemoteHostStore: ObservableObject {
                         Self.hostSupportsPeerOwnedAgentFactory(conn.hostCapabilities)
                     self.hosts[key]?.supportsRemoteTeamRoute =
                         conn.hostCapabilities.has(PeerCapability.teamLeaderV1)
+                    // Always non-nil from here: this handshake is the answer,
+                    // and "" means "this host owns its own sessions" rather
+                    // than "nobody has asked yet".
+                    //
                     // Only meaningful when this host cannot own agents itself.
                     // A host that can is already the right place for team work,
                     // and recording a redirect there would tunnel a second time

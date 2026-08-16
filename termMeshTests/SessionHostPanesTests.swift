@@ -469,9 +469,12 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
         )
     }
 
+    /// `sessionHostRemoteSockPath` defaults to `""` — *answered, no redirect* —
+    /// because that is what almost every case here means. Pass `nil` for the
+    /// window where the connection is live and the handshake is not.
     private func hostEntry(
         sshTarget: String? = "mac-peer",
-        sessionHostRemoteSockPath: String = ""
+        sessionHostRemoteSockPath: String? = ""
     ) -> HostEntry {
         var entry = HostEntry(
             id: "host",
@@ -484,6 +487,67 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
         )
         entry.sessionHostRemoteSockPath = sessionHostRemoteSockPath
         return entry
+    }
+
+    /// The reconnect window. `connectionState` and `activeSockPath` are set
+    /// synchronously when the sidebar lease is acquired
+    /// (`RemoteHostStore.swift`), while the session-owner answer only lands
+    /// after `fetchWorkspaces` completes. Between those two, a redirecting host
+    /// reads as a plain one — and team work aimed at surfaces living on its
+    /// daemon would be addressed to the GUI socket instead.
+    @MainActor
+    func test_teamWorkWaitsWhileTheRouteIsStillUnknownOnALiveConnection() {
+        let reconnecting = hostEntry(sessionHostRemoteSockPath: nil)
+        XCTAssertTrue(reconnecting.isConnected)
+        XCTAssertFalse(reconnecting.activeSockPath.isEmpty)
+        XCTAssertFalse(
+            reconnecting.teamRouteResolved,
+            "no handshake has answered yet"
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.liveTeamSockPath(for: reconnecting).isEmpty,
+            "team RPCs must wait for the answer rather than fall back to the serving socket"
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.peerAgentCleanupEndpoint(
+                host: reconnecting, servingSockPath: reconnecting.activeSockPath
+            ).isUnresolved,
+            "a tombstone must be kept and retried, never guessed onto the serving socket"
+        )
+    }
+
+    /// Disconnect clears the route while daemon-owned panes and their lease can
+    /// still be alive. The surfaces did not move, so the honest answer is "not
+    /// addressable right now" — never the serving socket, which is what the
+    /// cleared field would otherwise collapse to.
+    @MainActor
+    func test_disconnectLeavesTeamWorkUnaddressableRatherThanMisaddressed() {
+        var host = hostEntry(sessionHostRemoteSockPath: "/tmp/T/term-meshd-peer.sock")
+        XCTAssertTrue(host.redirectsTeamWorkToSessionHost)
+
+        host.clearServingMetadata()
+        host.activeSockPath = ""
+
+        XCTAssertFalse(host.teamRouteResolved, "the route is forgotten, not answered as none")
+        XCTAssertFalse(host.redirectsTeamWorkToSessionHost)
+        XCTAssertTrue(TeamOrchestrator.liveTeamSockPath(for: host).isEmpty)
+        XCTAssertTrue(
+            TeamOrchestrator.peerAgentCleanupEndpoint(
+                host: host, servingSockPath: "/tmp/stale.sock"
+            ).isUnresolved
+        )
+    }
+
+    /// A host with no entry at all is not the same as one whose answer is
+    /// pending: nothing is coming, so the socket that served the tombstone is
+    /// the only address it will ever have. Attempt it rather than stall.
+    @MainActor
+    func test_anUnknownHostIsAttemptedRatherThanTreatedAsPending() {
+        let endpoint = TeamOrchestrator.peerAgentCleanupEndpoint(
+            host: nil, servingSockPath: "/tmp/served.sock"
+        )
+        XCTAssertFalse(endpoint.isUnresolved)
+        XCTAssertEqual(endpoint.describedTarget, "/tmp/served.sock")
     }
 
     func test_teamWorkFollowsTheAdvertisedSessionOwnerWhileMirroringDoesNot() {

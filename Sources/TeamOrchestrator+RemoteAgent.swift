@@ -4126,6 +4126,12 @@ extension TeamOrchestrator {
     /// every caller already treats that as "skip", the same as a disconnected
     /// host.
     static func liveTeamSockPath(for host: HostEntry) -> String {
+        // Empty while the route is unknown, which callers already treat as
+        // "host not connected" and retry. Answering `activeSockPath` here
+        // instead would aim team RPCs at the serving socket for the window
+        // between a reconnect and its handshake — and on a redirecting host
+        // that socket did not create any of the surfaces being named.
+        guard host.teamRouteResolved else { return "" }
         guard host.redirectsTeamWorkToSessionHost else { return host.activeSockPath }
         return PeerPaneHostRegistry.shared
             .existingLocalSockPath(for: host.teamHostSpec.hostKey) ?? ""
@@ -4396,6 +4402,12 @@ extension TeamOrchestrator {
         /// The surface was ensured on this host's session owner; a tunnel to it
         /// has to be leased before anything can be addressed there.
         case sessionOwner(PeerPaneHostSpec)
+        /// The host is reachable but has not yet said where its sessions live.
+        /// Keep the tombstone and retry; guessing costs a `TerminateSurface`
+        /// sent to an endpoint that never created the surface, which the host
+        /// answers as "not mine" — indistinguishable from a real confirmation
+        /// unless the caller happens to check, and the bridge keeps running.
+        case unresolved
 
         /// What the endpoint resolves to on the wire, for assertions and logs.
         /// A serving endpoint is already a local path; a session owner is a
@@ -4404,11 +4416,17 @@ extension TeamOrchestrator {
             switch self {
             case .serving(let sockPath): return sockPath
             case .sessionOwner(let spec): return spec.hostKey.remoteSockPath ?? ""
+            case .unresolved: return ""
             }
         }
 
         var leasesSessionOwner: Bool {
             if case .sessionOwner = self { return true }
+            return false
+        }
+
+        var isUnresolved: Bool {
+            if case .unresolved = self { return true }
             return false
         }
     }
@@ -4417,7 +4435,12 @@ extension TeamOrchestrator {
         host: HostEntry?,
         servingSockPath: String
     ) -> PeerAgentCleanupEndpoint {
-        guard let host, host.redirectsTeamWorkToSessionHost else {
+        // An unknown host is not an unresolved one: nothing is coming that
+        // would answer, so the socket that served this tombstone is the only
+        // address there will ever be. Attempt it.
+        guard let host else { return .serving(servingSockPath) }
+        guard host.teamRouteResolved else { return .unresolved }
+        guard host.redirectsTeamWorkToSessionHost else {
             return .serving(servingSockPath)
         }
         return .sessionOwner(host.teamHostSpec)
@@ -4443,6 +4466,11 @@ extension TeamOrchestrator {
             return await terminatePeerAgentSurfaceConfirmed(
                 hostSockPath: lease.hostSockPath, surfaceID: surfaceID
             )
+        case .unresolved:
+            // Not a failure to report — the handshake that answers this is
+            // already in flight, and the tombstone is durable precisely so it
+            // can wait for it.
+            return false
         }
     }
 
