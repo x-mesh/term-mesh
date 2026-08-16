@@ -598,7 +598,16 @@ struct HostEntry: Identifiable, Equatable {
     ///
     /// Falls back whenever the redirect cannot be expressed — a direct
     /// (non-SSH) host has no second path to tunnel to.
-    var teamHostSpec: PeerPaneHostSpec {
+    ///
+    /// **nil while the route is unresolved, and that is the whole reason this
+    /// is optional.** A non-optional version returned `paneHostSpec` in that
+    /// window, which reads as "no redirect" and is the GUI socket — the one
+    /// endpoint that owns none of this team's surfaces. Every caller then
+    /// leased and ensured there, reintroducing the defect this type was added
+    /// to fix, for the round trip between a reconnect and its handshake.
+    /// Optional makes the compiler ask each of them what to do instead.
+    var teamHostSpec: PeerPaneHostSpec? {
+        guard teamRouteResolved else { return nil }
         guard let sessionHostRemoteSockPath, !sessionHostRemoteSockPath.isEmpty,
               let sshTarget, !sshTarget.isEmpty
         else { return paneHostSpec }
@@ -624,7 +633,8 @@ struct HostEntry: Identifiable, Equatable {
     /// False while unresolved — ask `teamRouteResolved` to tell that apart from
     /// a host that genuinely owns its own sessions.
     var redirectsTeamWorkToSessionHost: Bool {
-        teamRouteResolved && teamHostSpec.hostKey != paneHostSpec.hostKey
+        guard let teamHostSpec else { return false }
+        return teamHostSpec.hostKey != paneHostSpec.hostKey
     }
 }
 

@@ -489,6 +489,66 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
         return entry
     }
 
+    // MARK: - Review round 2: endpoint selection under an unresolved route
+
+    /// `teamHostSpec` used to be non-optional and answered `paneHostSpec` while
+    /// the route was unknown. That reads as "no redirect" — the GUI socket, the
+    /// one endpoint that owns none of this team's surfaces — so every caller
+    /// leased and ensured there for the window between a reconnect and its
+    /// handshake. Optional is what forces each of them to say what it does
+    /// instead.
+    @MainActor
+    func test_theTeamSpecIsAbsentRatherThanTheServingSocketWhileUnresolved() {
+        let reconnecting = hostEntry(sessionHostRemoteSockPath: nil)
+        XCTAssertNil(
+            reconnecting.teamHostSpec,
+            "an unknown route must not resolve to the serving endpoint"
+        )
+        XCTAssertThrowsError(try TeamOrchestrator.requireTeamHostSpec(reconnecting)) { error in
+            guard case TeamOrchestrator.RemoteAgentError.hostNotConnected = error else {
+                return XCTFail("unresolved must raise the retryable not-connected error, got \(error)")
+            }
+        }
+
+        // Answered-as-none still yields a usable spec: that host owns its own
+        // sessions, and team work belongs on the socket already open to it.
+        let plain = hostEntry()
+        XCTAssertEqual(plain.teamHostSpec?.hostKey, plain.paneHostSpec.hostKey)
+        XCTAssertNoThrow(try TeamOrchestrator.requireTeamHostSpec(plain))
+    }
+
+    /// The sweep's protection set is what keeps a pane the user has on screen
+    /// out of the `unclaimed` bucket that Select All closes. A redirected host
+    /// has panes on *both* endpoints — ordinary terminals lease `paneHostSpec`,
+    /// team agents lease the session owner — so asking either key alone loses
+    /// one of the two groups.
+    @MainActor
+    func test_bothEndpointsAreProtectedFromTheShellSweepOnARedirectedHost() {
+        let redirected = hostEntry(sessionHostRemoteSockPath: "/tmp/T/term-meshd-peer.sock")
+        var keys: Set<PeerPaneHostKey> = [redirected.paneHostSpec.hostKey]
+        if let teamKey = redirected.teamHostSpec?.hostKey { keys.insert(teamKey) }
+        XCTAssertEqual(
+            keys.count, 2,
+            "a redirected host must contribute two distinct protection keys, not one"
+        )
+        XCTAssertTrue(keys.contains(redirected.paneHostSpec.hostKey))
+        XCTAssertTrue(keys.contains(redirected.teamHostSpec!.hostKey))
+    }
+
+    /// An unresolved route must not reach the capability probe either: probing
+    /// the serving socket there reports a capable machine as incapable, and the
+    /// caller opens the SSH-owned fallback pane this path exists to avoid.
+    @MainActor
+    func test_theCapabilityProbeWaitsForTheRouteRatherThanProbingTheServingSocket() {
+        let reconnecting = hostEntry(sessionHostRemoteSockPath: nil)
+        XCTAssertFalse(reconnecting.teamRouteResolved)
+        XCTAssertFalse(
+            reconnecting.redirectsTeamWorkToSessionHost,
+            "unresolved reads as no-redirect, which is why the probe needs its own gate"
+        )
+        XCTAssertNil(reconnecting.teamHostSpec)
+    }
+
     /// The reconnect window. `connectionState` and `activeSockPath` are set
     /// synchronously when the sidebar lease is acquired
     /// (`RemoteHostStore.swift`), while the session-owner answer only lands
@@ -553,7 +613,7 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
     func test_teamWorkFollowsTheAdvertisedSessionOwnerWhileMirroringDoesNot() {
         let redirected = hostEntry(sessionHostRemoteSockPath: "/tmp/T/term-meshd-peer.sock")
         XCTAssertEqual(
-            redirected.teamHostSpec.hostKey.remoteSockPath,
+            redirected.teamHostSpec?.hostKey.remoteSockPath,
             "/tmp/T/term-meshd-peer.sock"
         )
         XCTAssertEqual(
@@ -614,7 +674,7 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
         let redirected = hostEntry(sessionHostRemoteSockPath: "/tmp/T/term-meshd-peer.sock")
         XCTAssertNotEqual(
             redirected.paneHostSpec.hostKey,
-            redirected.teamHostSpec.hostKey,
+            redirected.teamHostSpec?.hostKey,
             "this test is meaningless unless the two endpoints really differ"
         )
         XCTAssertFalse(
@@ -630,7 +690,7 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
 
     func test_teamWorkStaysPutWithoutASessionOwnerOrWithoutSSH() {
         let plain = hostEntry()
-        XCTAssertEqual(plain.teamHostSpec.hostKey, plain.paneHostSpec.hostKey)
+        XCTAssertEqual(plain.teamHostSpec?.hostKey, plain.paneHostSpec.hostKey)
         XCTAssertFalse(plain.redirectsTeamWorkToSessionHost)
 
         // A direct (non-SSH) host has no second path to tunnel to, so the
@@ -639,7 +699,7 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
             sshTarget: nil,
             sessionHostRemoteSockPath: "/tmp/T/term-meshd-peer.sock"
         )
-        XCTAssertEqual(direct.teamHostSpec.hostKey, direct.paneHostSpec.hostKey)
+        XCTAssertEqual(direct.teamHostSpec?.hostKey, direct.paneHostSpec.hostKey)
         XCTAssertFalse(direct.redirectsTeamWorkToSessionHost)
     }
 }
