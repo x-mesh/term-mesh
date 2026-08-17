@@ -597,6 +597,68 @@ final class RelayResumeTransitionGateTests: XCTestCase {
     }
 }
 
+final class PeerTerminalReplayBufferTests: XCTestCase {
+    func testExactResumeReturnsOnlyUnseenTail() {
+        var replay = PeerTerminalReplayBuffer()
+        replay.push(Data("hello".utf8))
+        replay.push(Data(" world".utf8))
+
+        XCTAssertEqual(
+            replay.exactBytes(from: 6, tapSeqAtCall: 11),
+            Data("world".utf8)
+        )
+        XCTAssertEqual(
+            replay.exactBytes(from: 11, tapSeqAtCall: 11),
+            Data(),
+            "a caught-up viewer has an exact empty continuation"
+        )
+    }
+
+    func testEvictedResumeNeverFallsBackToOldTailReplay() {
+        var replay = PeerTerminalReplayBuffer()
+        replay.push(Data(repeating: 0x41, count: PtyTapHub.replayCapacityBytes))
+        replay.push(Data("new".utf8))
+
+        XCTAssertTrue(replay.hasEvicted)
+        XCTAssertNil(
+            replay.exactBytes(
+                from: 0,
+                tapSeqAtCall: UInt64(PtyTapHub.replayCapacityBytes + 3)
+            ),
+            "an evicted resume must repaint the viewport, not replay retained PTY history"
+        )
+    }
+
+    func testSnapshotReconciliationAppendsOutputBeforeRegistration() {
+        var replay = PeerTerminalReplayBuffer()
+        replay.push(Data("old".utf8))
+        let snapshotSeq: UInt64 = 3
+        replay.push(Data("new".utf8))
+
+        XCTAssertEqual(
+            replay.snapshotBytes(
+                Data("screen".utf8),
+                capturedAt: snapshotSeq,
+                tapSeqAtCall: 6
+            ),
+            Data("screennew".utf8)
+        )
+    }
+
+    func testSnapshotReconciliationFailsAfterInterveningTailEviction() {
+        var replay = PeerTerminalReplayBuffer()
+        replay.push(Data(repeating: 0x41, count: PtyTapHub.replayCapacityBytes + 1))
+
+        XCTAssertNil(
+            replay.snapshotBytes(
+                Data("stale".utf8),
+                capturedAt: 0,
+                tapSeqAtCall: UInt64(PtyTapHub.replayCapacityBytes + 1)
+            )
+        )
+    }
+}
+
 final class RelayResizeCoalescerHealTests: XCTestCase {
 
     /// Accumulates the `cols` of every `Resize` frame the coalescer sends

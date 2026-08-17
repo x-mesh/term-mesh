@@ -35,6 +35,36 @@ enum PeerHostKind: String, Equatable {
     case app
 }
 
+enum PeerHostHealthVerdict: String, Equatable {
+    case healthy
+    case degraded
+    case unhealthy
+    case unknown
+}
+
+/// A measured Linux-peer baseline. A peer handshake alone is insufficient:
+/// the daemon control plane must also have a reachable pathname, and recent
+/// protocol mismatches must be absent.
+struct PeerHostHealthBaseline: Equatable {
+    var serviceActive = false
+    var controlPath = "/tmp/term-meshd.sock"
+    var controlPathPresent = false
+    var controlRPC = false
+    var peerPath = ""
+    var peerPathPresent = false
+    var relayLagCount = 0
+    var resumeHealCount = 0
+    var protocolMismatchCount = 0
+
+    var verdict: PeerHostHealthVerdict {
+        guard serviceActive, controlPathPresent, controlRPC, peerPathPresent else {
+            return .unhealthy
+        }
+        guard protocolMismatchCount == 0 else { return .unhealthy }
+        return relayLagCount > 0 || resumeHealCount > 0 ? .degraded : .healthy
+    }
+}
+
 /// What the agent-notification stack looks like on a remote host: the
 /// two in-band scripts, whether Claude's hooks reference them, and the
 /// prerequisites the stack leans on. One probe fills all of it — the
@@ -90,6 +120,20 @@ enum PeerHostDoctor {
     /// The journal tail comes from whichever scope is actually active.
     static let diagnoseCommand =
         #"sh -c 'u=$(systemctl --user is-active term-meshd 2>/dev/null); s=$(systemctl is-active term-meshd 2>/dev/null); echo "service: user=${u:-none} system=${s:-none}"; if [ "$s" = active ]; then journalctl -u term-meshd --no-pager -n 6 2>&1 | tail -n 6; else journalctl --user -u term-meshd --no-pager -n 6 2>&1 | tail -n 6; fi'"#
+
+    /// Linux peer health baseline. Key/value output is secret-free and makes
+    /// a split-brain host (working peer socket, missing daemon control path)
+    /// unambiguously unhealthy. The tm-agent call is a real JSON-RPC round
+    /// trip; checking -S alone would false-green an orphaned socket.
+    static var healthBaselineCommand: String {
+        healthBaselineCommandTemplate.replacingOccurrences(
+            of: #"[ -n "$control" ] || control=/tmp/term-meshd.sock"#,
+            with: #"if [ -z "$control" ] && [ "$u" = active ]; then control=/run/user/$(id -u)/term-meshd.sock; fi; [ -n "$control" ] || control=/tmp/term-meshd.sock"#
+        )
+    }
+
+    private static let healthBaselineCommandTemplate =
+        #"sh -c 'if [ "$(uname -s)" != Linux ]; then exit 44; fi; u=$(systemctl --user is-active term-meshd 2>/dev/null); s=$(systemctl is-active term-meshd 2>/dev/null); if [ "$s" = active ] || [ "$u" = active ]; then active=1; else active=0; fi; control=${TERMMESH_DAEMON_UNIX_PATH:-}; if [ -z "$control" ]; then control=$(sed -n "s/^TERMMESH_DAEMON_UNIX_PATH=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$control" ] || control=/tmp/term-meshd.sock; peer=${TERMMESH_PEER_SOCKET:-}; if [ -z "$peer" ]; then peer=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$peer" ] || peer=/run/term-mesh/tm-peer.sock; [ -S "$control" ] && cpresent=1 || cpresent=0; [ -S "$peer" ] && ppresent=1 || ppresent=0; cli=$(command -v tm-agent 2>/dev/null); [ -x "$cli" ] || cli=$HOME/.local/bin/tm-agent; if [ -x "$cli" ] && TERMMESH_DAEMON_UNIX_PATH="$control" "$cli" daemon replay-capacity >/dev/null 2>&1; then crpc=1; else crpc=0; fi; if [ "$s" = active ]; then logs=$(journalctl -u term-meshd --since=-5min --no-pager 2>/dev/null); else logs=$(journalctl --user -u term-meshd --since=-5min --no-pager 2>/dev/null); fi; lag=$(printf "%s\n" "$logs" | grep -c "attach relay lagged"); heal=$(printf "%s\n" "$logs" | grep -c "resume-heal reconnect"); proto=$(printf "%s\n" "$logs" | grep -c "frame length .* exceeds"); echo "health-service-active=$active"; echo "health-control-path=$control"; echo "health-control-present=$cpresent"; echo "health-control-rpc=$crpc"; echo "health-peer-path=$peer"; echo "health-peer-present=$ppresent"; echo "health-relay-lag-5m=$lag"; echo "health-resume-heal-5m=$heal"; echo "health-protocol-mismatch-5m=$proto"'"#
 
     /// Sentinel exit code for "no term-meshd binary found" — distinct
     /// from PeerSocketProber.noSocketExitCode (43) so the two probes'
@@ -684,7 +728,7 @@ enum PeerHostDoctor {
     /// future key must not turn the whole report into an error.
     static func parseBinaryInventory(_ stdout: String) -> BinaryInventory {
         var inventory = BinaryInventory()
-        for line in stdout.split(whereSeparator: \.isNewline) {
+        for line in stdout.split(whereSeparator: { $0.isNewline }) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             guard let separator = trimmed.firstIndex(of: "=") else { continue }
             let key = String(trimmed[trimmed.startIndex..<separator])
@@ -833,6 +877,50 @@ enum PeerHostDoctor {
             command: binaryInventoryCommand, timeoutSeconds: 20
         ) else { return nil }
         return parseBinaryInventory(output)
+    }
+
+    static func parseHealthBaseline(_ stdout: String) -> PeerHostHealthBaseline? {
+        let expectedKeys: Set<String> = [
+            "health-service-active", "health-control-path", "health-control-present",
+            "health-control-rpc", "health-peer-path", "health-peer-present",
+            "health-relay-lag-5m", "health-resume-heal-5m",
+            "health-protocol-mismatch-5m",
+        ]
+        var fields: [String: String] = [:]
+        for line in stdout.split(whereSeparator: { $0.isNewline }) {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            guard let split = text.firstIndex(of: "=") else { continue }
+            let key = String(text[..<split])
+            guard expectedKeys.contains(key) else { continue }
+            // Login output may contain a stale-looking sentinel before the
+            // fixed probe runs. The probe block is last, matching the version
+            // parser's established "last valid line wins" contract.
+            fields[key] = String(text[text.index(after: split)...])
+        }
+        guard expectedKeys.allSatisfy({ fields[$0] != nil }) else { return nil }
+        return PeerHostHealthBaseline(
+            serviceActive: fields["health-service-active"] == "1",
+            controlPath: fields["health-control-path"] ?? "/tmp/term-meshd.sock",
+            controlPathPresent: fields["health-control-present"] == "1",
+            controlRPC: fields["health-control-rpc"] == "1",
+            peerPath: fields["health-peer-path"] ?? "",
+            peerPathPresent: fields["health-peer-present"] == "1",
+            relayLagCount: Int(fields["health-relay-lag-5m"] ?? "") ?? 0,
+            resumeHealCount: Int(fields["health-resume-heal-5m"] ?? "") ?? 0,
+            protocolMismatchCount: Int(fields["health-protocol-mismatch-5m"] ?? "") ?? 0
+        )
+    }
+
+    static func healthBaseline(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?
+    ) async -> PeerHostHealthBaseline? {
+        guard let output = try? await runRemote(
+            sshTarget: sshTarget, port: port, identityFile: identityFile,
+            command: healthBaselineCommand, timeoutSeconds: 20
+        ) else { return nil }
+        return parseHealthBaseline(output)
     }
 
     /// Post-install health check: service state + journal tail. Used

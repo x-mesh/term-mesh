@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1130,10 +1131,81 @@ pub fn default_socket_path() -> PathBuf {
 /// rather than about what it points at.
 fn clear_stale_socket_entry(path: &std::path::Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(_) => std::fs::remove_file(path),
+        Ok(metadata) => {
+            let probe_connectivity =
+                metadata.file_type().is_socket() || metadata.file_type().is_symlink();
+            // A pathname is not stale merely because a second daemon wants
+            // it. Probing first prevents a newer process from unlinking the
+            // live control plane of the instance that already owns it. This
+            // includes a compatibility symlink pointing at a live runtime-dir
+            // socket; removing that alias and binding a second listener at the
+            // same pathname would create a split-brain daemon pair.
+            let observed = SocketIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            };
+            if probe_connectivity {
+                match std::os::unix::net::UnixStream::connect(path) {
+                    Ok(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            format!("live Unix socket already owns {}", path.display()),
+                        ));
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            if remove_owned_socket(path, observed)? {
+                Ok(())
+            } else if std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("Unix socket ownership changed at {}", path.display()),
+                ))
+            }
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+#[derive(Clone, Copy)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn socket_identity(path: &Path) -> std::io::Result<SocketIdentity> {
+    // Compare the pathname entry itself. Following a symlink here would let
+    // an attacker or racing process swap only the link while preserving the
+    // target inode, defeating the ownership guard.
+    let metadata = std::fs::symlink_metadata(path)?;
+    Ok(SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn remove_owned_socket(path: &Path, owner: SocketIdentity) -> std::io::Result<bool> {
+    let current = match socket_identity(path) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if current.device != owner.device || current.inode != owner.inode {
+        return Ok(false);
+    }
+    std::fs::remove_file(path)?;
+    Ok(true)
 }
 
 pub async fn serve(
@@ -1156,6 +1228,7 @@ pub async fn serve(
     clear_stale_socket_entry(&path)?;
 
     let listener = bind_with_tight_umask(&path)?;
+    let socket_owner = socket_identity(&path)?;
     harden_socket_permissions(&path);
     tracing::info!("listening on {}", path.display());
 
@@ -1278,13 +1351,16 @@ pub async fn serve(
         .await;
     }
 
-    // Clean up socket file
-    if path.exists() {
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::warn!("failed to remove socket file: {e}");
-        } else {
-            tracing::info!("removed socket file {}", path.display());
-        }
+    // Remove only the directory entry this listener bound. If another
+    // instance replaced the pathname while shutdown was in flight, its
+    // control socket must survive.
+    match remove_owned_socket(&path, socket_owner) {
+        Ok(true) => tracing::info!("removed socket file {}", path.display()),
+        Ok(false) => tracing::warn!(
+            "socket path changed ownership; leaving {} intact",
+            path.display()
+        ),
+        Err(e) => tracing::warn!("failed to remove socket file: {e}"),
     }
 
     Ok(())
@@ -6325,6 +6401,24 @@ mod tests {
     }
 
     #[test]
+    fn live_socket_symlink_is_never_replaced_by_a_second_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("runtime.sock");
+        let alias = dir.path().join("term-meshd.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+
+        let error = super::clear_stale_socket_entry(&alias).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::os::unix::net::UnixStream::connect(&alias).is_ok());
+    }
+
+    #[test]
     fn stale_socket_entry_clears_a_real_socket_and_tolerates_an_absent_path() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("term-meshd.sock");
@@ -6336,5 +6430,55 @@ mod tests {
 
         super::clear_stale_socket_entry(&dir.path().join("never-existed.sock"))
             .expect("an absent path is not an error");
+    }
+
+    #[test]
+    fn live_socket_entry_is_never_unlinked_by_a_second_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("term-meshd.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let error = super::clear_stale_socket_entry(&socket).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(std::fs::symlink_metadata(&socket).is_ok());
+    }
+
+    #[test]
+    fn stale_socket_entry_is_removed_after_connection_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("term-meshd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        drop(listener);
+
+        super::clear_stale_socket_entry(&socket).unwrap();
+        assert!(std::fs::symlink_metadata(&socket).is_err());
+    }
+
+    #[test]
+    fn shutdown_removes_only_the_socket_inode_it_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("term-meshd.sock");
+        let first = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let first_identity = super::socket_identity(&socket).unwrap();
+        drop(first);
+        std::fs::remove_file(&socket).unwrap();
+        let _replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        assert!(!super::remove_owned_socket(&socket, first_identity).unwrap());
+        assert!(std::fs::symlink_metadata(&socket).is_ok());
+    }
+
+    #[test]
+    fn stale_cleanup_refuses_to_remove_a_replacement_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("term-meshd.sock");
+        let stale = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let stale_identity = super::socket_identity(&socket).unwrap();
+        drop(stale);
+        std::fs::remove_file(&socket).unwrap();
+        let _replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        assert!(!super::remove_owned_socket(&socket, stale_identity).unwrap());
+        assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
     }
 }
