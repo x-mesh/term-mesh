@@ -2395,7 +2395,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 #if DEBUG
                 dlog("surface.free.perform surface=\(surfaceId.uuidString.prefix(8)) reason=\(reason)")
                 #endif
-                ghostty_surface_free(surface)
+                freeGhosttySurface(surface, id: surfaceId)
                 callbackContext?.release()
             }
         }
@@ -2432,12 +2432,31 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 dlog("surface.free.perform.deinit surface=\(capturedId.uuidString.prefix(8))")
                 #endif
                 if let s = capturedSurface {
-                    ghostty_surface_free(s)
+                    freeGhosttySurface(s, id: capturedId)
                 }
                 capturedContext?.release()
             }
         }
     }
+}
+
+/// Single entry point for the synchronous free so both teardown paths — the
+/// explicit release above and `deinit` — are timed identically. Routing them
+/// through one function is what keeps the started and completed counts paired;
+/// incrementing at each call site invites a path that reports a start it never
+/// finishes.
+///
+/// This call blocks the caller until Ghostty joins the surface's renderer and IO
+/// threads, and the caller here is the MainActor. That is the block the
+/// telemetry exists to measure.
+private func freeGhosttySurface(_ surface: ghostty_surface_t, id: UUID) {
+    #if DEBUG
+    SurfaceFreeTelemetry.shared.recordStarted(surfaceId: id)
+    #endif
+    ghostty_surface_free(surface)
+    #if DEBUG
+    SurfaceFreeTelemetry.shared.recordCompleted(surfaceId: id)
+    #endif
 }
 
 // MARK: - Ghostty Surface View

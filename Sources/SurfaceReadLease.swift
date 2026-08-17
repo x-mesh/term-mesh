@@ -1,6 +1,93 @@
 import Foundation
 import Bonsplit
 
+#if DEBUG
+struct SurfaceFreeTelemetrySnapshot {
+    let startedCount: Int
+    let completedCount: Int
+    let lastDurationMs: Double?
+}
+
+/// DEBUG-only, lock-protected timing for the synchronous `ghostty_surface_free`
+/// window, so a test can observe that window instead of guessing when it opens.
+///
+/// `surface.close` does not perform the free. It schedules it on the MainActor
+/// and returns in about a millisecond, so a fixed sleep before probing is a
+/// guess: probe too early and the probe records a short, meaningless value while
+/// still satisfying an upper bound, and the assertion passes having measured
+/// nothing.
+///
+/// Readers must never hop to the MainActor. During the free that thread sits in
+/// `pthread_join` waiting on Ghostty's renderer and IO threads, so a query
+/// isolated to the MainActor would block for exactly as long as the window it is
+/// trying to observe — the measurement swallowed by the measured.
+///
+/// Unlike this project's other test-only counters (`GhosttySurfaceScrollView`'s
+/// flash and draw counts, which are MainActor-only), these are written by the
+/// MainActor and read from a socket connection thread, so every access is
+/// lock-guarded.
+final class SurfaceFreeTelemetry: @unchecked Sendable {
+    static let shared = SurfaceFreeTelemetry()
+
+    /// Records outlive their surface on purpose — the interesting read happens
+    /// after the surface is gone — but they are capped rather than unbounded,
+    /// because one DEBUG E2E session opens and closes panes continuously and no
+    /// test reads a surface it closed long ago.
+    private static let retainedSurfaceLimit = 256
+
+    private struct Record {
+        var startedCount = 0
+        var completedCount = 0
+        var startedAt: TimeInterval?
+        var lastDurationMs: Double?
+    }
+
+    private let lock = NSLock()
+    private var records: [UUID: Record] = [:]
+    private var insertionOrder: [UUID] = []
+
+    func recordStarted(surfaceId: UUID) {
+        lock.lock()
+        if records[surfaceId] == nil {
+            insertionOrder.append(surfaceId)
+            if insertionOrder.count > Self.retainedSurfaceLimit {
+                records.removeValue(forKey: insertionOrder.removeFirst())
+            }
+        }
+        var record = records[surfaceId, default: Record()]
+        record.startedCount += 1
+        record.startedAt = ProcessInfo.processInfo.systemUptime
+        records[surfaceId] = record
+        lock.unlock()
+    }
+
+    func recordCompleted(surfaceId: UUID) {
+        // Read the clock before contending for the lock, so lock contention
+        // cannot inflate the duration this exists to measure.
+        let completedAt = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        var record = records[surfaceId, default: Record()]
+        record.completedCount += 1
+        if let startedAt = record.startedAt {
+            record.lastDurationMs = (completedAt - startedAt) * 1_000.0
+        }
+        records[surfaceId] = record
+        lock.unlock()
+    }
+
+    func snapshot(surfaceId: UUID) -> SurfaceFreeTelemetrySnapshot {
+        lock.lock()
+        let record = records[surfaceId, default: Record()]
+        lock.unlock()
+        return SurfaceFreeTelemetrySnapshot(
+            startedCount: record.startedCount,
+            completedCount: record.completedCount,
+            lastDurationMs: record.lastDurationMs
+        )
+    }
+}
+#endif
+
 // MARK: - SurfaceFreeCoordinator
 
 /// Coordinates deferred ghostty_surface_free with active read leases.
