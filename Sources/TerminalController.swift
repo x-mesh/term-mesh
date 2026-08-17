@@ -1363,6 +1363,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugReadTerminalText(params: params))
         case "debug.terminal.render_stats":
             return v2Result(id: id, self.v2DebugRenderStats(params: params))
+        case "debug.surface_free.status":
+            return v2Result(id: id, self.v2DebugSurfaceFreeStatus(params: params))
         case "debug.terminal.drop_overlay_probe":
             return v2Result(id: id, self.v2DebugTerminalDropOverlayProbe(params: params))
         case "debug.layout":
@@ -1656,6 +1658,7 @@ class TerminalController {
             "debug.terminal.is_focused",
             "debug.terminal.read_text",
             "debug.terminal.render_stats",
+            "debug.surface_free.status",
             "debug.terminal.drop_overlay_probe",
             "debug.layout",
             "debug.bonsplit_underflow.count",
