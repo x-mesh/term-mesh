@@ -4,6 +4,16 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.192.0] - 2026-08-18
+
+### Fixed
+
+- **pane을 닫을 때 앱이 수 초간 멈추던 문제** ([#287](https://github.com/x-mesh/term-mesh/pull/287)) — 종료를 거부하는 shell이나 자식 프로세스가 있어도 Ghostty의 renderer·IO thread를 기다리는 시간이 길어지지 않도록 종료 대기 상한을 줄였다. 닫힌 terminal surface가 view 정리 중 다시 생성돼 teardown을 두 번 수행하던 경로도 막아, 관측된 pane close 지연을 약 2.9초에서 0.3초대로 줄였다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.191.0] - 2026-08-17
 
 ### Fixed
