@@ -86,6 +86,12 @@ over this summary.
 - Summary:
   - Gives the child process group a bounded `SIGHUP` grace period, then sends
     `SIGKILL` once and observes it for a separately bounded force period.
+    Group discovery, graceful shutdown, and forced-shutdown observation each
+    use 20 ten-millisecond attempts (about 200 ms per phase). The shorter
+    deadlines reduced the deterministic embedded teardown probe from about
+    2.9 seconds to about 0.65 seconds, keeping that workload below term-mesh's
+    two-second main-thread response budget. The surrounding thread joins are
+    still synchronous and are not made generally bounded by this change.
   - Never sends a group signal to the embedding app's own process group. If
     child pre-exec setup fails it exits immediately; if group discovery still
     does not produce the expected `pgid == pid`, cleanup uses a bounded direct
