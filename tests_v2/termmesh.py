@@ -1053,6 +1053,17 @@ class termmesh:
         # Server wraps the underlying stats object under "stats".
         return dict(res.get("stats") or {})
 
+    def surface_free_status(self, surface_id: str) -> dict:
+        """Counters and last duration for a surface's synchronous ghostty free.
+
+        Answers while the app's main thread is blocked inside that free, which is
+        the point: it lets a test see when the block starts instead of sleeping
+        and hoping.
+        """
+        return dict(
+            self._call("debug.surface_free.status", {"surface_id": str(surface_id)}) or {}
+        )
+
     def layout_debug(self) -> dict:
         res = self._call("debug.layout") or {}
         # Server wraps LayoutDebugResponse under "layout".

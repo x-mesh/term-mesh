@@ -541,6 +541,24 @@ extension TerminalController {
         return .ok(["stats": obj])
     }
 
+    /// Deliberately off-main: this is the one query that must answer while the
+    /// main thread is blocked inside `ghostty_surface_free`. Wrapping it in
+    /// `v2MainExec` would make it time out for precisely as long as the window
+    /// it reports on, which is what it exists to observe.
+    func v2DebugSurfaceFreeStatus(params: [String: Any]) -> V2CallResult {
+        guard let surfaceId = v2UUID(params, "surface_id") else {
+            return .err(code: "invalid_params", message: "Missing or invalid surface_id", data: nil)
+        }
+        let snapshot = SurfaceFreeTelemetry.shared.snapshot(surfaceId: surfaceId)
+        return .ok([
+            "surface_id": surfaceId.uuidString,
+            "started_count": snapshot.startedCount,
+            "completed_count": snapshot.completedCount,
+            "last_duration_ms": v2OrNull(snapshot.lastDurationMs),
+            "max_duration_ms": v2OrNull(snapshot.maxDurationMs),
+        ])
+    }
+
     func v2DebugLayout() -> V2CallResult {
         let resp = layoutDebug()
         guard resp.hasPrefix("OK ") else {
