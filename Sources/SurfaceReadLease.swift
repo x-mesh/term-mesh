@@ -6,6 +6,15 @@ struct SurfaceFreeTelemetrySnapshot {
     let startedCount: Int
     let completedCount: Int
     let lastDurationMs: Double?
+    /// Longest free seen for this surface.
+    ///
+    /// One `TerminalSurface` id can outlive more than one ghostty surface: the
+    /// explicit release nils the stored pointer, and a surface realized again
+    /// afterwards is freed a second time by `deinit`. Those are different
+    /// pointers under one id, not a double free — but the second free is fast,
+    /// so it can overwrite `lastDurationMs` before a reader sees the slow one.
+    /// A test asserting on how long a resistant teardown took should use this.
+    let maxDurationMs: Double?
 }
 
 /// DEBUG-only, lock-protected timing for the synchronous `ghostty_surface_free`
@@ -40,6 +49,7 @@ final class SurfaceFreeTelemetry: @unchecked Sendable {
         var completedCount = 0
         var startedAt: TimeInterval?
         var lastDurationMs: Double?
+        var maxDurationMs: Double?
     }
 
     private let lock = NSLock()
@@ -69,7 +79,9 @@ final class SurfaceFreeTelemetry: @unchecked Sendable {
         var record = records[surfaceId, default: Record()]
         record.completedCount += 1
         if let startedAt = record.startedAt {
-            record.lastDurationMs = (completedAt - startedAt) * 1_000.0
+            let elapsed = (completedAt - startedAt) * 1_000.0
+            record.lastDurationMs = elapsed
+            record.maxDurationMs = max(record.maxDurationMs ?? 0, elapsed)
         }
         records[surfaceId] = record
         lock.unlock()
@@ -82,7 +94,8 @@ final class SurfaceFreeTelemetry: @unchecked Sendable {
         return SurfaceFreeTelemetrySnapshot(
             startedCount: record.startedCount,
             completedCount: record.completedCount,
-            lastDurationMs: record.lastDurationMs
+            lastDurationMs: record.lastDurationMs,
+            maxDurationMs: record.maxDurationMs
         )
     }
 }

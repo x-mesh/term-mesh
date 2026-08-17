@@ -555,6 +555,7 @@ extension TerminalController {
             "started_count": snapshot.startedCount,
             "completed_count": snapshot.completedCount,
             "last_duration_ms": v2OrNull(snapshot.lastDurationMs),
+            "max_duration_ms": v2OrNull(snapshot.maxDurationMs),
         ])
     }
 

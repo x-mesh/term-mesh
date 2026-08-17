@@ -130,13 +130,18 @@ def measure_iteration(index: int) -> tuple[float, float]:
 
     started_delta = int(status.get("started_count") or 0) - baseline_started
     completed_delta = int(status.get("completed_count") or 0) - baseline_completed
-    if started_delta != 1 or completed_delta != 1:
+    if started_delta < 1 or completed_delta < 1:
         raise termmeshError(
-            "expected exactly one free for this surface, got "
+            "no free was recorded for this surface: "
             f"started={started_delta}, completed={completed_delta}"
         )
 
-    duration_ms = status.get("last_duration_ms")
+    # More than one free per surface id is normal: the explicit release nils the
+    # stored pointer, and a surface realized again afterwards is freed a second
+    # time by deinit. Those are different pointers under one id. The second free
+    # is fast and would overwrite `last_duration_ms`, so assert on the longest
+    # one — that is the resistant teardown this test is about.
+    duration_ms = status.get("max_duration_ms")
     if duration_ms is None:
         raise termmeshError("surface free completed without a duration")
     return float(duration_ms), probe_seconds
