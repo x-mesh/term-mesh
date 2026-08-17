@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -45,6 +47,9 @@ const PAIR_REVIEW_MAX_REQUEST_ID_BYTES: usize = 128;
 const PAIR_REVIEW_MAX_VERDICT_BYTES: usize = 8 * 1024;
 const PAIR_REVIEW_MAX_RETAINED_COMPLETED: usize = 128;
 const PAIR_REVIEW_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
+const STALE_SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
+const STALE_SOCKET_REFUSAL_PROBES: usize = 3;
+const STALE_SOCKET_REFUSAL_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Count distinct `check_id`s recorded in `<working_dir>/.xm/watch/board.jsonl`
 /// (P12 #6). Each drift finding is one JSONL line; the controller (P5) keys them
@@ -1145,7 +1150,7 @@ fn clear_stale_socket_entry(path: &std::path::Path) -> std::io::Result<()> {
                 inode: metadata.ino(),
             };
             if probe_connectivity {
-                match std::os::unix::net::UnixStream::connect(path) {
+                match probe_existing_socket(path) {
                     Ok(_) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::AddrInUse,
@@ -1175,6 +1180,131 @@ fn clear_stale_socket_entry(path: &std::path::Path) -> std::io::Result<()> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+/// A dead listener refuses every probe. A live BSD/macOS listener whose accept
+/// queue is briefly full can also report ECONNREFUSED, so require repeated
+/// refusal before declaring the observed pathname stale. Linux reports EAGAIN
+/// for that queue-full condition; classify it as live immediately.
+fn probe_existing_socket(path: &Path) -> std::io::Result<()> {
+    for attempt in 0..STALE_SOCKET_REFUSAL_PROBES {
+        match connect_unix_socket_with_timeout(path, STALE_SOCKET_CONNECT_TIMEOUT) {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                if attempt + 1 == STALE_SOCKET_REFUSAL_PROBES {
+                    return Err(error);
+                }
+                std::thread::sleep(STALE_SOCKET_REFUSAL_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the refusal loop always returns")
+}
+
+/// Probe a possibly-live listener without allowing daemon startup to block on
+/// a full accept queue. Timeout and indeterminate errors are intentionally not
+/// classified as stale by the caller: preserving a possibly-live pathname is
+/// safer than creating a second daemon behind a replacement inode.
+fn connect_unix_socket_with_timeout(path: &Path, timeout: Duration) -> std::io::Result<()> {
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= address.sun_path.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Unix socket path is too long",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes.iter().copied()) {
+        *slot = byte as libc::c_char;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let socket_type = libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let socket_type = libc::SOCK_STREAM;
+    let raw_fd = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+    let status_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if status_flags < 0
+        || unsafe {
+            libc::fcntl(
+                fd.as_raw_fd(),
+                libc::F_SETFL,
+                status_flags | libc::O_NONBLOCK,
+            )
+        } < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    }
+    let result = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EAGAIN) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "Unix socket accept queue is full",
+        ));
+    }
+    if !matches!(error.raw_os_error(), Some(libc::EINPROGRESS)) {
+        return Err(error);
+    }
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    let mut poll_fd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    loop {
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if ready == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Unix socket connect probe timed out",
+            ));
+        }
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        let mut socket_error: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut socket_error as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        return if socket_error == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(socket_error))
+        };
     }
 }
 
@@ -6441,6 +6571,19 @@ mod tests {
         let error = super::clear_stale_socket_entry(&socket).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
         assert!(std::fs::symlink_metadata(&socket).is_ok());
+    }
+
+    #[test]
+    fn stale_socket_probe_has_a_bounded_connect_deadline() {
+        assert_eq!(
+            super::STALE_SOCKET_CONNECT_TIMEOUT,
+            std::time::Duration::from_millis(300)
+        );
+        assert_eq!(super::STALE_SOCKET_REFUSAL_PROBES, 3);
+        assert_eq!(
+            super::STALE_SOCKET_REFUSAL_RETRY_DELAY,
+            std::time::Duration::from_millis(100)
+        );
     }
 
     #[test]

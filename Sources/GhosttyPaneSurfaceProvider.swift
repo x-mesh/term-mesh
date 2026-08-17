@@ -129,6 +129,28 @@ struct PeerTerminalReplayBuffer {
         }
         return snapshot + tail
     }
+
+    /// Initial frame for a viewer that has no prior screen. A missing/empty
+    /// viewport is a valid blank pane; an observed snapshot still has to be
+    /// reconciled with output that arrived before subscriber registration.
+    func freshInitialBytes(
+        snapshot: Data?,
+        capturedAt snapshotSeq: UInt64,
+        tapSeqAtCall: UInt64
+    ) -> Data? {
+        guard let snapshot else {
+            return snapshotBytes(
+                Data(),
+                capturedAt: snapshotSeq,
+                tapSeqAtCall: tapSeqAtCall
+            ) ?? Data()
+        }
+        return snapshotBytes(
+            snapshot,
+            capturedAt: snapshotSeq,
+            tapSeqAtCall: tapSeqAtCall
+        )
+    }
 }
 
 /// One Ghostty PTY callback per surface, fan-out to bounded per-peer streams.
@@ -260,16 +282,20 @@ final class PtyTapHub: @unchecked Sendable {
             if usedBufferReplay {
                 initial = replay.concatenatedBytes()
             } else {
-                guard let fallbackSnapshot,
-                      let reconciled = replay.snapshotBytes(
-                    fallbackSnapshot,
+                // A fresh attach has no previous screen to preserve. An empty
+                // viewport is therefore a valid empty initial frame, not a
+                // missing surface. Resume still fails closed above because it
+                // must replace an already-populated viewer without replaying
+                // stale bytes into it.
+                guard let freshInitial = replay.freshInitialBytes(
+                    snapshot: fallbackSnapshot,
                     capturedAt: fallbackSnapshotSeq,
                     tapSeqAtCall: tapSeq
                 ) else {
                     lock.unlock()
                     return nil
                 }
-                initial = reconciled
+                initial = freshInitial
             }
         }
         if let initialPrefix, !initialPrefix.isEmpty {
@@ -319,17 +345,38 @@ final class PtyTapHub: @unchecked Sendable {
         attempts: Int = 3,
         capture: () -> Data?
     ) -> (bytes: Data?, seq: UInt64) {
-        var lastBoundary = snapshotBoundary()
+        Self.stableSnapshot(
+            attempts: attempts,
+            boundary: snapshotBoundary,
+            capture: capture
+        )
+    }
+
+    /// Pure retry policy used by `stableSnapshot`, exposed for regression
+    /// tests without constructing a Ghostty surface. If a continuously busy
+    /// pane never presents a quiet boundary, use the last captured repaint at
+    /// its pre-capture boundary. `makeStream` then appends the entire concurrent
+    /// tail. That may repeat bytes already reflected in the viewport, but the
+    /// snapshot begins with clear+home, so it cannot replay old scrollback and
+    /// it avoids turning the heal itself into a permanent attach failure.
+    static func stableSnapshot(
+        attempts: Int,
+        boundary: () -> UInt64,
+        capture: () -> Data?
+    ) -> (bytes: Data?, seq: UInt64) {
+        var lastBytes: Data?
+        var lastBefore = boundary()
         for _ in 0..<max(1, attempts) {
-            let before = snapshotBoundary()
+            let before = boundary()
             let bytes = capture()
-            let after = snapshotBoundary()
-            lastBoundary = after
+            let after = boundary()
+            lastBytes = bytes
+            lastBefore = before
             if before == after {
                 return (bytes, after)
             }
         }
-        return (nil, lastBoundary)
+        return (lastBytes, lastBefore)
     }
 
     func broadcast(_ bytes: Data) {
@@ -2987,9 +3034,15 @@ private func readPaneSnapshot(_ surface: ghostty_surface_t) -> Data? {
     var out = ghostty_text_s()
     guard ghostty_surface_read_text(surface, selection, &out) else { return nil }
     defer { ghostty_surface_free_text(surface, &out) }
-    guard let ptr = out.text, out.text_len > 0 else { return nil }
-
-    let raw = Data(bytes: ptr, count: Int(out.text_len))
+    let raw: Data
+    if let ptr = out.text, out.text_len > 0 {
+        raw = Data(bytes: ptr, count: Int(out.text_len))
+    } else {
+        // A successful read of an empty viewport is a real blank screen. It
+        // still needs clear+home so a resume-heal replaces the viewer's old
+        // contents instead of treating the surface as absent.
+        raw = Data()
+    }
     // Convert bare LFs to CR+LF so each line lands on column 0 in the
     // remote terminal emulator. Already-CRLF input is left untouched.
     var body = Data()

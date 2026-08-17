@@ -598,6 +598,53 @@ final class RelayResumeTransitionGateTests: XCTestCase {
 }
 
 final class PeerTerminalReplayBufferTests: XCTestCase {
+    func testFreshAttachAllowsAnEmptyViewport() {
+        var replay = PeerTerminalReplayBuffer()
+
+        XCTAssertEqual(
+            replay.freshInitialBytes(snapshot: nil, capturedAt: 0, tapSeqAtCall: 0),
+            Data(),
+            "a fresh empty pane is an attachable empty surface"
+        )
+    }
+
+    func testFreshAttachReconcilesOutputAfterAnEmptyViewportRead() {
+        var replay = PeerTerminalReplayBuffer()
+        replay.push(Data("late".utf8))
+
+        XCTAssertEqual(
+            replay.freshInitialBytes(snapshot: nil, capturedAt: 0, tapSeqAtCall: 4),
+            Data("late".utf8)
+        )
+    }
+
+    func testBusySnapshotFallsBackToLastCaptureAndItsEarlierBoundary() {
+        var boundaries: [UInt64] = [0, 1, 2, 3, 4, 5, 6]
+        var captures = [Data("first".utf8), Data("second".utf8), Data("last".utf8)]
+
+        let result = PtyTapHub.stableSnapshot(
+            attempts: 3,
+            boundary: { boundaries.removeFirst() },
+            capture: { captures.removeFirst() }
+        )
+
+        XCTAssertEqual(result.bytes, Data("last".utf8))
+        XCTAssertEqual(result.seq, 5)
+    }
+
+    func testStableSnapshotUsesQuietPostCaptureBoundary() {
+        var boundaries: [UInt64] = [7, 8, 8]
+
+        let result = PtyTapHub.stableSnapshot(
+            attempts: 3,
+            boundary: { boundaries.removeFirst() },
+            capture: { Data("screen".utf8) }
+        )
+
+        XCTAssertEqual(result.bytes, Data("screen".utf8))
+        XCTAssertEqual(result.seq, 8)
+    }
+
     func testExactResumeReturnsOnlyUnseenTail() {
         var replay = PeerTerminalReplayBuffer()
         replay.push(Data("hello".utf8))

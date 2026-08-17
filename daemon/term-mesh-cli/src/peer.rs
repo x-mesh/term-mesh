@@ -42,7 +42,11 @@ const REMOTE_SOCKET_PROBE: &str = r#"sh -c 'p=$(sed -n "s/^TERMMESH_PEER_SOCKET=
 /// peer plane. A host is operational only when both pathname entries exist;
 /// checking this separately also prevents callers from ever probing the peer
 /// socket with JSON-RPC.
-const REMOTE_CONTROL_SOCKET_PROBE: &str = r#"sh -c 'p=$(sed -n "s/^TERMMESH_DAEMON_UNIX_PATH=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -n 1 | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^\"//;s/\"$//"); cli=$(command -v tm-agent 2>/dev/null); [ -x "$cli" ] || cli=$HOME/.local/bin/tm-agent; t=${TMPDIR:-}; [ -n "$t" ] || t=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null); for c in "$p" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/term-meshd.sock}" "/run/user/$(id -u)/term-meshd.sock" "/run/term-mesh/term-meshd.sock" "${t:+${t%/}/term-meshd.sock}" "/tmp/term-meshd.sock"; do [ -n "$c" ] && [ -S "$c" ] && [ -x "$cli" ] && TERMMESH_DAEMON_UNIX_PATH="$c" "$cli" daemon replay-capacity >/dev/null 2>&1 && { printf "%s" "$c"; exit 0; }; done; exit 45'"#;
+
+/// Discover only the control pathname. RPC health is checked separately over
+/// the forwarded socket, so a missing remote CLI, a failed RPC, and a missing
+/// pathname cannot collapse into the same diagnostic.
+const REMOTE_CONTROL_SOCKET_DISCOVERY: &str = r#"sh -c 'p=$(sed -n "s/^TERMMESH_DAEMON_UNIX_PATH=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -n 1 | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^\"//;s/\"$//"); t=${TMPDIR:-}; [ -n "$t" ] || t=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null); for c in "$p" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/term-meshd.sock}" "/run/user/$(id -u)/term-meshd.sock" "/run/term-mesh/term-meshd.sock" "${t:+${t%/}/term-meshd.sock}" "/tmp/term-meshd.sock"; do [ -n "$c" ] && [ -S "$c" ] && { printf "%s" "$c"; exit 0; }; done; exit 45'"#;
 
 #[derive(Clone, Copy)]
 pub enum RestartPolicy {
@@ -104,6 +108,9 @@ struct ResolvedSshConfig {
 fn public_error_context(code: &str) -> &'static str {
     match code {
         "SSH_AUTH_FAILED" | "PEER_AUTH_FAILED" => "authentication failed",
+        "SSH_SPAWN_FAILED" => "SSH could not be started",
+        "SSH_PROBE_FAILED" => "SSH probe failed",
+        "SSH_PROBE_TIMEOUT" => "SSH probe timed out",
         "DAEMON_UNAVAILABLE" => "remote daemon is unavailable",
         "SOCKET_UNAVAILABLE" | "SOCKET_CONNECT_FAILED" | "SOCKET_FORWARD_TIMEOUT" => {
             "peer socket is unavailable"
@@ -642,17 +649,33 @@ fn ssh_fixed_probe_args(host: &str, command: &str) -> Vec<String> {
 }
 
 fn probe_remote_control_socket(host: &str) -> Result<String, PeerCliError> {
-    let output = Command::new("/usr/bin/ssh")
-        .args(ssh_fixed_probe_args(host, REMOTE_CONTROL_SOCKET_PROBE))
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| PeerCliError::new("SSH_PROBE_FAILED", "control", e.to_string()))?;
-    if !output.status.success() {
-        return Err(PeerCliError::new(
-            "CONTROL_SOCKET_UNAVAILABLE",
-            "control",
-            "term-meshd control socket pathname is missing",
-        ));
+    let output = run_fixed_ssh_probe(host, REMOTE_CONTROL_SOCKET_DISCOVERY, 15)?;
+    match output.status.code().unwrap_or(-1) {
+        0 => {}
+        45 => {
+            return Err(PeerCliError::new(
+                "CONTROL_SOCKET_UNAVAILABLE",
+                "control",
+                "term-meshd control socket pathname is missing",
+            ))
+        }
+        255 if String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("permission denied") =>
+        {
+            return Err(PeerCliError::new(
+                "SSH_AUTH_FAILED",
+                "auth",
+                "SSH authentication failed",
+            ))
+        }
+        code => {
+            return Err(PeerCliError::new(
+                "SSH_PROBE_FAILED",
+                "ssh",
+                format!("control socket discovery exited with status {code}"),
+            ))
+        }
     }
     let path = String::from_utf8(output.stdout).map_err(|_| {
         PeerCliError::new(
@@ -664,6 +687,43 @@ fn probe_remote_control_socket(host: &str) -> Result<String, PeerCliError> {
     let path = path.trim().to_string();
     validate_remote_socket(&path)?;
     Ok(path)
+}
+
+fn run_fixed_ssh_probe(
+    host: &str,
+    command: &str,
+    timeout_seconds: u64,
+) -> Result<std::process::Output, PeerCliError> {
+    let mut child = Command::new("/usr/bin/ssh")
+        .args(ssh_fixed_probe_args(host, command))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| PeerCliError::new("SSH_SPAWN_FAILED", "ssh", e.to_string()))?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    loop {
+        match child
+            .try_wait()
+            .map_err(|e| PeerCliError::new("SSH_PROBE_FAILED", "ssh", e.to_string()))?
+        {
+            Some(_) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|e| PeerCliError::new("SSH_PROBE_FAILED", "ssh", e.to_string()))
+            }
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(PeerCliError::new(
+                    "SSH_PROBE_TIMEOUT",
+                    "ssh",
+                    "remote control socket discovery timed out",
+                ));
+            }
+        }
+    }
 }
 
 fn daemon_version_from_status_response(value: &Value) -> Result<String, PeerCliError> {
@@ -2920,10 +2980,16 @@ mod tests {
 
     #[test]
     fn operational_socket_probes_cover_linux_user_scope_and_macos_app() {
-        assert!(REMOTE_CONTROL_SOCKET_PROBE.contains("/run/user/$(id -u)/term-meshd.sock"));
-        assert!(REMOTE_CONTROL_SOCKET_PROBE.contains("DARWIN_USER_TEMP_DIR"));
-        assert!(REMOTE_CONTROL_SOCKET_PROBE.contains("${t%/}/term-meshd.sock"));
         assert!(REMOTE_SOCKET_PROBE.contains("${t%/}/term-meshd-peer.sock"));
+        assert!(REMOTE_CONTROL_SOCKET_DISCOVERY.contains("/run/user/$(id -u)/term-meshd.sock"));
+        assert!(REMOTE_CONTROL_SOCKET_DISCOVERY.contains("DARWIN_USER_TEMP_DIR"));
+        assert!(REMOTE_CONTROL_SOCKET_DISCOVERY.contains("${t%/}/term-meshd.sock"));
+        assert!(!REMOTE_CONTROL_SOCKET_DISCOVERY.contains("tm-agent"));
+        assert!(!REMOTE_CONTROL_SOCKET_DISCOVERY.contains("replay-capacity"));
+        assert!(!REMOTE_CONTROL_SOCKET_DISCOVERY.contains(r#"\\\""#));
+        assert_eq!(public_error_context("SSH_SPAWN_FAILED"), "SSH could not be started");
+        assert_eq!(public_error_context("SSH_PROBE_FAILED"), "SSH probe failed");
+        assert_eq!(public_error_context("SSH_PROBE_TIMEOUT"), "SSH probe timed out");
     }
 
     #[test]
