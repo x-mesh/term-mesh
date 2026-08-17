@@ -513,6 +513,30 @@ final class PeerRelayWorkspaceShortcutActionTests: XCTestCase {
 }
 
 final class TermMeshWebViewKeyEquivalentTests: XCTestCase {
+    func testIMEMessageRoutingRequiresCorrelatedReplies() {
+        let one = GhosttySurfaceScrollView.imeCorrelatedRoutingHint(
+            mention: "reviewer", targetCount: 1, isPing: false
+        )
+        let many = GhosttySurfaceScrollView.imeCorrelatedRoutingHint(
+            mention: "all", targetCount: 2, isPing: false
+        )
+        let ping = GhosttySurfaceScrollView.imeCorrelatedRoutingHint(
+            mention: "reviewer", targetCount: 1, isPing: true
+        )
+
+        for hint in [one, many, ping] {
+            XCTAssertTrue(hint.contains("--expect-reply"))
+            XCTAssertTrue(hint.contains("--reply-timeout 300"))
+            XCTAssertTrue(hint.contains("--agent-instance-id"))
+            XCTAssertTrue(hint.contains("Do not use plain `send`"))
+            XCTAssertFalse(hint.contains("then check `tm-agent msg list`"))
+        }
+        XCTAssertTrue(one.contains("@reviewer"))
+        XCTAssertTrue(many.contains("each target"))
+        XCTAssertTrue(many.contains("concurrently"))
+        XCTAssertTrue(many.contains("explicit timeouts"))
+        XCTAssertTrue(ping.contains("Send the ping"))
+    }
     private final class ActionSpy: NSObject {
         private(set) var invoked: Bool = false
 

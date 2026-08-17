@@ -17,9 +17,9 @@ mod paste_cleanup;
 mod peer;
 mod socket;
 mod supervisor;
-mod task_diff;
 #[allow(dead_code)]
 mod sync;
+mod task_diff;
 mod tokens;
 // watcher Phase 2 (P1): autonomous drift-watch scheduler. The file is
 // `watch.rs` but the module is named `drift_watch` so it does not collide with
@@ -527,10 +527,9 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => tracing::warn!("server shutdown timed out after 5s"),
     }
 
-    // e. Final cleanup: ensure socket file is removed
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(&socket_path);
-    }
+    // `socket::serve` removes only the pathname inode it bound. Do not add a
+    // second unconditional cleanup here: another daemon may have replaced
+    // the pathname while this instance was shutting down.
 
     tracing::info!("shutdown complete");
     Ok(())

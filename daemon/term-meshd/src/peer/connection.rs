@@ -35,7 +35,7 @@ use super::framing::{read_envelope, write_envelope};
 use super::layout::{self, PeerHost};
 use super::surface::{
     EnsureDisposition, EnsureError, EnsureOutcome, EnsureRestartPolicy, PtyChunk, PtySurface,
-    SurfaceKind, SurfaceSpec,
+    ResumeReplay, SurfaceKind, SurfaceSpec,
 };
 use crate::headless::cli_builder::executable_bin_dir;
 use crate::monitor::SystemSnapshot;
@@ -934,7 +934,35 @@ async fn reader_loop(
                 // (untyped ANSI chunks, typed (ansi, snap_seq) — exactly one
                 // of the two carries the fresh screen.)
                 let (replay, typed_snapshot) = if resume_from_seq != 0 {
-                    (surface.replay_snapshot_from(resume_from_seq), None)
+                    match surface.replay_snapshot_from(resume_from_seq) {
+                        ResumeReplay::Exact(bytes) => (bytes, None),
+                        // A terminal resume outside the retained ring must
+                        // repaint the current screen. Feeding the ring tail
+                        // into an existing viewer re-executes cursor controls
+                        // and makes old output visibly scroll past again.
+                        ResumeReplay::Unavailable if surface.kind() == SurfaceKind::Pty => {
+                            match surface.screen_snapshot() {
+                                Some((bytes, snap_seq))
+                                    if !bytes.is_empty() && typed_snapshot_ok =>
+                                {
+                                    (Vec::new(), Some((bytes, snap_seq)))
+                                }
+                                Some((bytes, snap_seq)) if !bytes.is_empty() => (
+                                    vec![PtyChunk {
+                                        seq: snap_seq.wrapping_sub(bytes.len() as u64),
+                                        bytes,
+                                    }],
+                                    None,
+                                ),
+                                _ => (Vec::new(), None),
+                            }
+                        }
+                        // AgentSession restarts its non-idempotent NDJSON
+                        // consumer when initial_seq differs from the requested
+                        // resume point, so retaining the old full-ring fallback
+                        // is correct for agent surfaces.
+                        ResumeReplay::Unavailable => (surface.replay_snapshot(), None),
+                    }
                 } else if fresh_attach_uses_bytes() {
                     (surface.replay_snapshot_fresh(), None)
                 } else {
@@ -4580,8 +4608,7 @@ mod agent_surface_tests {
                 Some(Payload::PtyData(data)) => {
                     assert_eq!(data.surface_id, surface_id);
                     assert_eq!(
-                        data.byte_seq,
-                        wire_bytes,
+                        data.byte_seq, wire_bytes,
                         "wire byte_seq must tile the payload bytes"
                     );
                     wire_bytes += data.payload.len() as u64;

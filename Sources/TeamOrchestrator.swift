@@ -1425,7 +1425,8 @@ final class TeamOrchestrator: ObservableObject {
                     bridgedCli: agentCli, bridgePath: bridge,
                     model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
                     cliPath: cliPath,
-                    environment: nativeEnvironment
+                    environment: nativeEnvironment,
+                    protectedEnvironmentKeys: Set(paneEnv.keys)
                 )
                 // A bridged CLI has no `--append-system-prompt`, and none of
                 // them agree on an equivalent, so its role has to arrive as a
@@ -1456,7 +1457,8 @@ final class TeamOrchestrator: ObservableObject {
                     model: Self.resolveClaudeModelArg(agentModel),
                     instructions: agentInstructions,
                     extraArgs: extraArgs,
-                    environment: nativeEnvironment
+                    environment: nativeEnvironment,
+                    protectedEnvironmentKeys: Set(paneEnv.keys)
                 )
             }
             // The turn states its own end and carries its final text, so the

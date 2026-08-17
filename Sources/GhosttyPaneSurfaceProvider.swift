@@ -45,7 +45,7 @@ private func ptyTapCallback(
 /// (no per-chunk element shift): required because `push` runs inside
 /// `PtyTapHub.broadcast(_:)`'s lock, called directly from Ghostty's IO
 /// reader thread (see file header — must be non-blocking).
-private struct ReplayBuffer {
+struct PeerTerminalReplayBuffer {
     private var chunks: [Data] = []
     private var head: Int = 0
     private(set) var totalBytes: Int = 0
@@ -103,19 +103,53 @@ private struct ReplayBuffer {
     /// `totalBytes` (how many contiguous bytes are behind it). PTY output
     /// has no internal gaps, so that subtraction is exact.
     ///
-    /// `fromSeq` outside `[oldest, tapSeqAtCall]` — already evicted, or
-    /// newer than anything buffered (seq-space mismatch) — falls back to
-    /// the full buffer rather than resending nothing, same as the Rust
-    /// side. `fromSeq == tapSeqAtCall` (caught up exactly) returns empty.
-    func concatenatedBytes(from fromSeq: UInt64, tapSeqAtCall: UInt64) -> Data {
+    /// `fromSeq` outside `[oldest, tapSeqAtCall]` means exact continuation is
+    /// unavailable. Returning nil is deliberate: the caller must repaint
+    /// the current viewport instead of feeding old ring bytes into an
+    /// already-populated terminal and visibly replaying history.
+    /// `fromSeq == tapSeqAtCall` (caught up exactly) returns empty data.
+    func exactBytes(from fromSeq: UInt64, tapSeqAtCall: UInt64) -> Data? {
         let oldest = tapSeqAtCall - UInt64(totalBytes)
         guard fromSeq >= oldest, fromSeq <= tapSeqAtCall else {
-            return concatenatedBytes()
+            return nil
         }
         let skip = Int(fromSeq - oldest)
         let all = concatenatedBytes()
         guard skip < all.count else { return Data() }
         return all.suffix(from: all.startIndex + skip)
+    }
+
+    func snapshotBytes(
+        _ snapshot: Data,
+        capturedAt snapshotSeq: UInt64,
+        tapSeqAtCall: UInt64
+    ) -> Data? {
+        guard let tail = exactBytes(from: snapshotSeq, tapSeqAtCall: tapSeqAtCall) else {
+            return nil
+        }
+        return snapshot + tail
+    }
+
+    /// Initial frame for a viewer that has no prior screen. A missing/empty
+    /// viewport is a valid blank pane; an observed snapshot still has to be
+    /// reconciled with output that arrived before subscriber registration.
+    func freshInitialBytes(
+        snapshot: Data?,
+        capturedAt snapshotSeq: UInt64,
+        tapSeqAtCall: UInt64
+    ) -> Data? {
+        guard let snapshot else {
+            return snapshotBytes(
+                Data(),
+                capturedAt: snapshotSeq,
+                tapSeqAtCall: tapSeqAtCall
+            ) ?? Data()
+        }
+        return snapshotBytes(
+            snapshot,
+            capturedAt: snapshotSeq,
+            tapSeqAtCall: tapSeqAtCall
+        )
     }
 }
 
@@ -133,7 +167,7 @@ final class PtyTapHub: @unchecked Sendable {
     /// callback order across both filtered output and sequence offsets.
     private let filterLock = NSLock()
     private var continuations: [UUID: AsyncStream<PtyTapChunk>.Continuation] = [:]
-    private var replay = ReplayBuffer()
+    private var replay = PeerTerminalReplayBuffer()
     /// Strips terminal-control queries before anything downstream sees them.
     ///
     /// Held here rather than per-consumer because its state is a property of
@@ -195,9 +229,12 @@ final class PtyTapHub: @unchecked Sendable {
     /// live. Now nothing can interleave, and even if a producer-side
     /// drop hits immediately after, the seq stamps make it visible.
     ///
-    /// `fallbackSnapshot` must be computed BEFORE calling (it reads
-    /// Ghostty's grid on MainActor — never under this lock, which the IO
-    /// reader thread contends on).
+    /// `fallbackSnapshot` must be computed outside this lock because Ghostty's
+    /// IO callback takes its renderer lock before calling `broadcast`. The
+    /// caller also supplies the tap boundary captured before that grid read.
+    /// If output lands before registration, the older boundary makes the next
+    /// live chunk expose a byte-seq gap instead of silently claiming the stale
+    /// snapshot included those bytes.
     ///
     /// `resumeFromSeq` (R1, peer-relay-bulk-loss): when nonzero, replay
     /// only the tail starting at that absolute tap seq instead of the full
@@ -211,6 +248,7 @@ final class PtyTapHub: @unchecked Sendable {
     /// seq mapping.
     func makeStream(
         fallbackSnapshot: Data?,
+        fallbackSnapshotSeq: UInt64,
         initialPrefix: Data?,
         resumeFromSeq: UInt64 = 0
     ) -> (
@@ -220,15 +258,45 @@ final class PtyTapHub: @unchecked Sendable {
         initialByteCount: Int,
         replayChunkCount: Int,
         initialSeq: UInt64
-    ) {
+    )? {
         let attachID = UUID()
         lock.lock()
-        let usedBufferReplay = replay.isSafeForCompleteReplay
         var initial: Data
-        if resumeFromSeq != 0, usedBufferReplay {
-            initial = replay.concatenatedBytes(from: resumeFromSeq, tapSeqAtCall: tapSeq)
+        var usedBufferReplay = replay.isSafeForCompleteReplay
+        if resumeFromSeq != 0, usedBufferReplay,
+           let exact = replay.exactBytes(from: resumeFromSeq, tapSeqAtCall: tapSeq) {
+            initial = exact
+        } else if resumeFromSeq != 0 {
+            usedBufferReplay = false
+            guard let fallbackSnapshot,
+                  let reconciled = replay.snapshotBytes(
+                fallbackSnapshot,
+                capturedAt: fallbackSnapshotSeq,
+                tapSeqAtCall: tapSeq
+            ) else {
+                lock.unlock()
+                return nil
+            }
+            initial = reconciled
         } else {
-            initial = usedBufferReplay ? replay.concatenatedBytes() : (fallbackSnapshot ?? Data())
+            if usedBufferReplay {
+                initial = replay.concatenatedBytes()
+            } else {
+                // A fresh attach has no previous screen to preserve. An empty
+                // viewport is therefore a valid empty initial frame, not a
+                // missing surface. Resume still fails closed above because it
+                // must replace an already-populated viewer without replaying
+                // stale bytes into it.
+                guard let freshInitial = replay.freshInitialBytes(
+                    snapshot: fallbackSnapshot,
+                    capturedAt: fallbackSnapshotSeq,
+                    tapSeqAtCall: tapSeq
+                ) else {
+                    lock.unlock()
+                    return nil
+                }
+                initial = freshInitial
+            }
         }
         if let initialPrefix, !initialPrefix.isEmpty {
             initial = initialPrefix + initial
@@ -258,6 +326,57 @@ final class PtyTapHub: @unchecked Sendable {
         }
         lock.unlock()
         return (attachID, stream, usedBufferReplay, initial.count, replayChunkCount, initialSeq)
+    }
+
+    func snapshotBoundary() -> UInt64 {
+        lock.lock()
+        let boundary = tapSeq
+        lock.unlock()
+        return boundary
+    }
+
+    /// Capture a viewport whose grid contents and PTY sequence refer to the
+    /// same quiet boundary. A callback may run between either side of the
+    /// grid read; in that case the snapshot may already contain the callback's
+    /// bytes, so appending the ring tail would duplicate visible output.
+    /// Retry a few times instead and let the attach fail cleanly under a
+    /// continuously busy producer.
+    func stableSnapshot(
+        attempts: Int = 3,
+        capture: () -> Data?
+    ) -> (bytes: Data?, seq: UInt64) {
+        Self.stableSnapshot(
+            attempts: attempts,
+            boundary: snapshotBoundary,
+            capture: capture
+        )
+    }
+
+    /// Pure retry policy used by `stableSnapshot`, exposed for regression
+    /// tests without constructing a Ghostty surface. If a continuously busy
+    /// pane never presents a quiet boundary, use the last captured repaint at
+    /// its pre-capture boundary. `makeStream` then appends the entire concurrent
+    /// tail. That may repeat bytes already reflected in the viewport, but the
+    /// snapshot begins with clear+home, so it cannot replay old scrollback and
+    /// it avoids turning the heal itself into a permanent attach failure.
+    static func stableSnapshot(
+        attempts: Int,
+        boundary: () -> UInt64,
+        capture: () -> Data?
+    ) -> (bytes: Data?, seq: UInt64) {
+        var lastBytes: Data?
+        var lastBefore = boundary()
+        for _ in 0..<max(1, attempts) {
+            let before = boundary()
+            let bytes = capture()
+            let after = boundary()
+            lastBytes = bytes
+            lastBefore = before
+            if before == after {
+                return (bytes, after)
+            }
+        }
+        return (lastBytes, lastBefore)
     }
 
     func broadcast(_ bytes: Data) {
@@ -715,8 +834,6 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // rare. ANSI styling is lost on this path (text only); fullscreen
         // TUIs (vim, less, htop) won't redraw without SIGWINCH and
         // require manual refresh.
-        let fallbackSnapshot = readPaneSnapshot(sfcPtr)
-
         // Replay mouse-mode state the viewer missed. Apps that enabled
         // mouse reporting before this attach (Claude Code, vim, htop)
         // sent their DECSET sequences long before the PTY tap existed,
@@ -733,6 +850,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // re-send must not overwrite an exact mode (e.g. ?1003h) with
         // this guess. Applies uniformly whether the initial bytes come
         // from the buffer replay or the plain-text fallback.
+        let fallback = hub.stableSnapshot(capture: { readPaneSnapshot(sfcPtr) })
+        let fallbackSnapshotSeq = fallback.seq
+        let fallbackSnapshot = fallback.bytes
         var initialPrefix = peerTerminalPalettePrefix(
             foreground: GhosttyApp.shared.defaultForegroundColor,
             background: GhosttyApp.shared.defaultBackgroundColor
@@ -741,12 +861,15 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             initialPrefix.append(Data("\u{1b}[?1002h\u{1b}[?1006h".utf8))
         }
 
-        let (attachID, stream, usedBufferReplay, initialByteCount, replayChunkCount, initialSeq) =
+        guard let (attachID, stream, usedBufferReplay, initialByteCount, replayChunkCount, initialSeq) =
             hub.makeStream(
                 fallbackSnapshot: fallbackSnapshot,
+                fallbackSnapshotSeq: fallbackSnapshotSeq,
                 initialPrefix: initialPrefix,
                 resumeFromSeq: resumeFromSeq
-            )
+            ) else {
+                return nil
+            }
         #if DEBUG
         dlog("peer.replay.attach mode=\(usedBufferReplay ? "buffer" : "snapshot") bytes=\(initialByteCount) chunks=\(replayChunkCount) resumeFromSeq=\(resumeFromSeq) initialSeq=\(initialSeq)")
         #endif
@@ -2911,9 +3034,15 @@ private func readPaneSnapshot(_ surface: ghostty_surface_t) -> Data? {
     var out = ghostty_text_s()
     guard ghostty_surface_read_text(surface, selection, &out) else { return nil }
     defer { ghostty_surface_free_text(surface, &out) }
-    guard let ptr = out.text, out.text_len > 0 else { return nil }
-
-    let raw = Data(bytes: ptr, count: Int(out.text_len))
+    let raw: Data
+    if let ptr = out.text, out.text_len > 0 {
+        raw = Data(bytes: ptr, count: Int(out.text_len))
+    } else {
+        // A successful read of an empty viewport is a real blank screen. It
+        // still needs clear+home so a resume-heal replaces the viewer's old
+        // contents instead of treating the surface as absent.
+        raw = Data()
+    }
     // Convert bare LFs to CR+LF so each line lands on column 0 in the
     // remote terminal emulator. Already-CRLF input is left untouched.
     var body = Data()

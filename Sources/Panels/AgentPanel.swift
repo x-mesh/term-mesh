@@ -104,11 +104,14 @@ final class AgentPanel: ObservableObject, Panel {
     /// path that has always passed their environment through.
     func start(claudePath: String, model: String, instructions: String,
                extraArgs: [String] = [],
-               environment: [String: String] = ProcessInfo.processInfo.environment) {
+               environment: [String: String] = ProcessInfo.processInfo.environment,
+               protectedEnvironmentKeys: Set<String> = []) {
         session.start(AgentSession.claudeLaunch(
             claudePath: claudePath, model: model, instructions: instructions,
             extraArgs: extraArgs, workingDirectory: workingDirectory,
-            environment: environment
+            environment: environment,
+            loadsAccountEnvironment: true,
+            protectedEnvironmentKeys: protectedEnvironmentKeys
         ))
     }
 
@@ -120,11 +123,14 @@ final class AgentPanel: ObservableObject, Panel {
     /// above, and for the same reason.
     func start(bridgedCli: String, bridgePath: String, model: String,
                cliPath: String = "",
-               environment: [String: String] = ProcessInfo.processInfo.environment) {
+               environment: [String: String] = ProcessInfo.processInfo.environment,
+               protectedEnvironmentKeys: Set<String> = []) {
         session.start(AgentSession.bridgeLaunch(
             cli: bridgedCli, bridgePath: bridgePath, model: model,
             cliPath: cliPath, workingDirectory: workingDirectory,
-            environment: environment
+            environment: environment,
+            loadsAccountEnvironment: true,
+            protectedEnvironmentKeys: protectedEnvironmentKeys
         ))
     }
 

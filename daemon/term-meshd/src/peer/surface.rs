@@ -222,6 +222,17 @@ struct ReplayBuffer {
     bytes: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ResumeReplay {
+    /// The requested byte is still in the ring; these bytes are an exact
+    /// continuation of what the viewer already rendered.
+    Exact(Vec<PtyChunk>),
+    /// The requested byte has fallen out of the ring (or belongs to another
+    /// seq space). Replaying the ring tail here would visibly re-run old PTY
+    /// output. Terminal callers must repaint from the screen model instead.
+    Unavailable,
+}
+
 impl ReplayBuffer {
     fn push(&mut self, chunk: PtyChunk) {
         if chunk.bytes.is_empty() {
@@ -301,25 +312,23 @@ impl ReplayBuffer {
     ///   whole, so no already-seen byte is resent and no buffered byte is
     ///   skipped.
     /// - When `from_seq` is outside that range — older than what the ring
-    ///   still holds (the gap between it and the resume point was already
-    ///   evicted, so an exact resume is impossible) or newer than anything
-    ///   ever buffered (seq-space mismatch) — an exact cut can't be honored,
-    ///   so this falls back to the full snapshot. Resending bytes the
-    ///   client may already have is preferable to the silent drop this
-    ///   whole mechanism exists to fix.
+    ///   still holds or newer than anything buffered — exact continuation is
+    ///   impossible. The caller must choose a kind-aware recovery: terminals
+    ///   repaint from their screen model; agent streams restart their
+    ///   consumer before accepting a replay fallback.
     ///
     /// All arithmetic saturates instead of panicking on overflow, so a seq
     /// value near `u64::MAX` (never reached in practice — it would take
     /// exabytes of PTY output — but defended against here) degrades to a
     /// safe fallback instead of a panic.
-    fn snapshot_from(&self, from_seq: u64) -> Vec<PtyChunk> {
+    fn snapshot_from(&self, from_seq: u64) -> ResumeReplay {
         let (Some(first), Some(last)) = (self.chunks.front(), self.chunks.back()) else {
-            return Vec::new();
+            return ResumeReplay::Exact(Vec::new());
         };
         let oldest_seq = first.seq;
         let end = last.seq.saturating_add(last.bytes.len() as u64);
         if from_seq < oldest_seq || from_seq > end {
-            return self.snapshot();
+            return ResumeReplay::Unavailable;
         }
         let mut out = Vec::with_capacity(self.chunks.len());
         for chunk in &self.chunks {
@@ -339,7 +348,7 @@ impl ReplayBuffer {
                 });
             }
         }
-        out
+        ResumeReplay::Exact(out)
     }
 }
 
@@ -665,9 +674,7 @@ fn agent_environment_failure_action(message: &'static str, code: i32) -> String 
 fn is_agent_env_name(key: &str) -> bool {
     !key.is_empty()
         && key.bytes().enumerate().all(|(index, byte)| {
-            byte == b'_'
-                || byte.is_ascii_alphabetic()
-                || (index > 0 && byte.is_ascii_digit())
+            byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
         })
 }
 
@@ -1506,9 +1513,7 @@ impl PtySurface {
                 reap_owners.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
-            if result < 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
-            {
+            if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
                 child.exit = Some(SurfaceExitInfo {
                     reason: "unknown",
                     ..Default::default()
@@ -1557,16 +1562,15 @@ impl PtySurface {
             .unwrap_or_default()
     }
 
-    /// `replay_snapshot()`, cut to the tail starting at `from_seq`. See
-    /// `ReplayBuffer::snapshot_from` for the exact cut/fallback semantics
-    /// (in short: `from_seq == 0` matches `replay_snapshot()` exactly; a
-    /// `from_seq` outside the ring's currently buffered range falls back to
-    /// the full snapshot rather than resending nothing).
-    pub fn replay_snapshot_from(&self, from_seq: u64) -> Vec<PtyChunk> {
+    /// `replay_snapshot()`, cut to the tail starting at `from_seq`. Reports
+    /// `Unavailable` when an exact continuation has fallen outside the ring,
+    /// allowing the connection layer to choose screen repaint for terminals
+    /// or consumer restart + replay for agent streams.
+    pub(super) fn replay_snapshot_from(&self, from_seq: u64) -> ResumeReplay {
         self.replay
             .lock()
             .map(|replay| replay.snapshot_from(from_seq))
-            .unwrap_or_default()
+            .unwrap_or(ResumeReplay::Unavailable)
     }
 
     /// `replay_snapshot()`, bounded to the newest `FRESH_ATTACH_REPLAY_BYTES`.
@@ -1646,7 +1650,10 @@ impl PtySurface {
         // the only way the total is observable through vt100's public API.
         screen.parser.screen_mut().set_scrollback(usize::MAX);
         let total = screen.parser.screen().scrollback();
-        screen.parser.screen_mut().set_scrollback(offset_rows as usize);
+        screen
+            .parser
+            .screen_mut()
+            .set_scrollback(offset_rows as usize);
         let effective = screen.parser.screen().scrollback();
         let ansi = screen.parser.screen().contents_formatted();
         screen.parser.screen_mut().set_scrollback(0);
@@ -1692,19 +1699,17 @@ impl PtySurface {
     pub fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
         match &self.io {
             SurfaceIo::Pty(pty) => pty::write_all(pty.master_fd, bytes),
-            SurfaceIo::Agent(agent) => {
-                match agent.input_tx.try_send(bytes.to_vec()) {
-                    Ok(()) => Ok(()),
-                    Err(std_mpsc::TrySendError::Full(_)) => Err(std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        "agent input queue full",
-                    )),
-                    Err(std_mpsc::TrySendError::Disconnected(_)) => Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "agent input writer closed",
-                    )),
-                }
-            }
+            SurfaceIo::Agent(agent) => match agent.input_tx.try_send(bytes.to_vec()) {
+                Ok(()) => Ok(()),
+                Err(std_mpsc::TrySendError::Full(_)) => Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "agent input queue full",
+                )),
+                Err(std_mpsc::TrySendError::Disconnected(_)) => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "agent input writer closed",
+                )),
+            },
         }
     }
 
@@ -2073,7 +2078,9 @@ fn identity_environment(surface_id: &[u8]) -> Vec<(String, String)> {
     // reverse team.leader.v1 route.
     env.push((
         "TERMMESH_SOCKET".to_string(),
-        crate::socket::default_socket_path().to_string_lossy().into_owned(),
+        crate::socket::default_socket_path()
+            .to_string_lossy()
+            .into_owned(),
     ));
     // A root daemon's panes are where term-mesh types agent launches, and
     // Claude Code refuses `--dangerously-skip-permissions` as root unless
@@ -2941,11 +2948,7 @@ impl PtyManager {
         let Ok(mut map) = self.attachers.lock() else {
             return usize::MAX;
         };
-        let remaining = map
-            .get(surface_id)
-            .copied()
-            .unwrap_or(0)
-            .saturating_sub(1);
+        let remaining = map.get(surface_id).copied().unwrap_or(0).saturating_sub(1);
         if remaining == 0 {
             map.remove(surface_id);
         } else {
@@ -3404,9 +3407,11 @@ mod tests {
         // the CLIs term-mesh installs, the second would let a host setting
         // shadow them with a same-named file.
         assert_ne!(values.get("PATH"), Some(&"/forged"));
-        assert!(values
-            .get("PATH")
-            .is_some_and(|path| path.starts_with(home.path().join(".local/bin").to_str().unwrap())));
+        assert!(
+            values.get("PATH").is_some_and(
+                |path| path.starts_with(home.path().join(".local/bin").to_str().unwrap())
+            )
+        );
         assert!(values
             .get("PATH")
             .is_some_and(|path| path.ends_with(":/forged")));
@@ -3430,7 +3435,10 @@ mod tests {
         let event: serde_json::Value = serde_json::from_str(first).expect("safe NDJSON");
         assert_eq!(event["subtype"], "environment");
         assert_eq!(event["interactive"], false);
-        assert_eq!(event["present_keys"], serde_json::json!(["AI_MESH_API_KEY"]));
+        assert_eq!(
+            event["present_keys"],
+            serde_json::json!(["AI_MESH_API_KEY"])
+        );
         assert!(!first.contains(secret));
     }
 
@@ -3510,9 +3518,13 @@ mod tests {
         assert!(!stdout.contains("/private/control.sock"));
         assert!(!stdout.contains("SSH_AUTH_SOCK"));
         assert!(!stdout.contains("/private/agent.sock"));
-        assert!(stdout.lines().any(|line| line == "TERMMESH_SURFACE_ID=internal-id"));
+        assert!(stdout
+            .lines()
+            .any(|line| line == "TERMMESH_SURFACE_ID=internal-id"));
         assert!(stdout.lines().any(|line| line.starts_with("PATH=")));
-        assert!(!stdout.lines().any(|line| line.starts_with("TERMMESH_LAUNCH_")));
+        assert!(!stdout
+            .lines()
+            .any(|line| line.starts_with("TERMMESH_LAUNCH_")));
     }
 
     #[test]
@@ -3715,30 +3727,36 @@ mod tests {
 
         // from_seq == 0 (no resume) still returns everything.
         assert_eq!(surface.replay_snapshot().len(), 2);
-        assert_eq!(surface.replay_snapshot_from(0), surface.replay_snapshot());
+        assert_eq!(
+            surface.replay_snapshot_from(0),
+            ResumeReplay::Exact(surface.replay_snapshot())
+        );
 
         // A resume point inside the buffered range replays only what the
         // client hasn't already seen.
         assert_eq!(
             surface.replay_snapshot_from(6),
-            vec![PtyChunk {
+            ResumeReplay::Exact(vec![PtyChunk {
                 seq: 6,
                 bytes: b"world".to_vec(),
-            }]
+            }])
         );
 
         // Mid-chunk resume trims the straddling chunk instead of resending
         // whole chunks the client is already partway through.
         assert_eq!(
             surface.replay_snapshot_from(8),
-            vec![PtyChunk {
+            ResumeReplay::Exact(vec![PtyChunk {
                 seq: 8,
                 bytes: b"rld".to_vec(),
-            }]
+            }])
         );
 
         // Fully caught up: nothing left to replay.
-        assert!(surface.replay_snapshot_from(11).is_empty());
+        assert_eq!(
+            surface.replay_snapshot_from(11),
+            ResumeReplay::Exact(Vec::new())
+        );
     }
 
     /// `current_byte_seq()` is what `AttachResult.initial_seq` falls back to
@@ -3754,7 +3772,9 @@ mod tests {
             "fresh surface has produced nothing yet"
         );
 
-        surface.write_all(b"ping\n").expect("write to /bin/cat's pty");
+        surface
+            .write_all(b"ping\n")
+            .expect("write to /bin/cat's pty");
 
         // /bin/cat under a PTY echoes the write back on its output side;
         // wait for the reader task to observe it and advance byte_seq.
@@ -3986,12 +4006,21 @@ mod tests {
         // instead of bash. This is the exact bug this fallback fixes.
         assert_eq!(resolve_login_shell(None, passwd), "/bin/sh");
         // SHELL is a login blocker (service account) → passwd shell still wins.
-        assert_eq!(resolve_login_shell(Some("/usr/sbin/nologin"), passwd), "/bin/sh");
+        assert_eq!(
+            resolve_login_shell(Some("/usr/sbin/nologin"), passwd),
+            "/bin/sh"
+        );
         // A usable $SHELL still takes precedence over passwd.
-        assert_eq!(resolve_login_shell(Some("/bin/sh"), Some("/no/such/shell")), "/bin/sh");
+        assert_eq!(
+            resolve_login_shell(Some("/bin/sh"), Some("/no/such/shell")),
+            "/bin/sh"
+        );
         // A blocked/nonexistent passwd shell is skipped like any other → bash|sh.
         let both_bad = resolve_login_shell(None, Some("/usr/sbin/nologin"));
-        assert!(matches!(both_bad.as_str(), "/bin/bash" | "/bin/sh"), "got {both_bad:?}");
+        assert!(
+            matches!(both_bad.as_str(), "/bin/bash" | "/bin/sh"),
+            "got {both_bad:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -4255,9 +4284,8 @@ mod tests {
         let manager = PtyManager::new();
         // 2 × cap + 3 'x's, then the newline: expect cap, cap, 4.
         let line_len = AGENT_CHUNK_MAX_BYTES * 2 + 3;
-        let script = format!(
-            "sleep 0.3; head -c {line_len} /dev/zero | tr '\\0' x; printf '\\n'; sleep 5"
-        );
+        let script =
+            format!("sleep 0.3; head -c {line_len} /dev/zero | tr '\\0' x; printf '\\n'; sleep 5");
         let outcome = manager
             .ensure("agent-oversized", &agent_ensure_spec(&script))
             .expect("ensure agent surface");
@@ -4402,7 +4430,10 @@ mod tests {
             "the flush happens exactly at the cap"
         );
         assert!(chunk.bytes.iter().all(|&b| b == b'x'));
-        assert!(!chunk.bytes.ends_with(b"\n"), "mid-line flush carries no newline");
+        assert!(
+            !chunk.bytes.ends_with(b"\n"),
+            "mid-line flush carries no newline"
+        );
         // The sub-cap remainder stays pending in the reader — bounded,
         // not emitted: no newline has arrived and neither has EOF.
         assert_eq!(surface.current_byte_seq(), AGENT_CHUNK_MAX_BYTES as u64);
@@ -4446,7 +4477,10 @@ mod tests {
     async fn agent_input_backpressure_fails_fast_instead_of_blocking_control_plane() {
         let manager = PtyManager::new();
         let outcome = manager
-            .ensure("agent-input-backpressure", &agent_ensure_spec("exec sleep 30"))
+            .ensure(
+                "agent-input-backpressure",
+                &agent_ensure_spec("exec sleep 30"),
+            )
             .expect("ensure non-reading agent");
         let surface = outcome.surface.clone();
         let payload = vec![b'x'; 64 * 1024];
@@ -4467,9 +4501,7 @@ mod tests {
     #[tokio::test]
     async fn requested_env_reaches_agent_but_internal_identity_wins() {
         let manager = PtyManager::new();
-        let spec = agent_ensure_spec(
-            r#"printf '%s|%s\n' "$PROFILE_ONLY" "$TERMMESH_SURFACE_ID""#,
-        );
+        let spec = agent_ensure_spec(r#"printf '%s|%s\n' "$PROFILE_ONLY" "$TERMMESH_SURFACE_ID""#);
         let env = vec![
             ("PROFILE_ONLY".into(), "present".into()),
             ("TERMMESH_SURFACE_ID".into(), "forged".into()),
@@ -5148,7 +5180,11 @@ mod tests {
 
         let written = std::fs::read_to_string(&out).expect("the pane wrote its environment");
         let lines: Vec<&str> = written.lines().collect();
-        assert_eq!(lines.len(), 3, "every variable must be set, got {written:?}");
+        assert_eq!(
+            lines.len(),
+            3,
+            "every variable must be set, got {written:?}"
+        );
         assert!(
             lines[0] == PREFERRED_TERM || lines[0] == FALLBACK_TERM,
             "TERM must name a terminal this machine can describe, got {:?}",
@@ -5229,35 +5265,41 @@ mod tests {
     #[test]
     fn snapshot_from_empty_buffer_is_empty() {
         let buf = ReplayBuffer::default();
-        assert!(buf.snapshot_from(0).is_empty());
-        assert!(buf.snapshot_from(999).is_empty());
+        assert_eq!(buf.snapshot_from(0), ResumeReplay::Exact(Vec::new()));
+        assert_eq!(buf.snapshot_from(999), ResumeReplay::Exact(Vec::new()));
     }
 
     #[test]
     fn snapshot_from_zero_matches_full_snapshot() {
         let buf = three_chunk_buffer();
-        assert_eq!(buf.snapshot_from(0), buf.snapshot());
+        assert_eq!(buf.snapshot_from(0), ResumeReplay::Exact(buf.snapshot()));
     }
 
     #[test]
     fn snapshot_from_exact_chunk_boundary_drops_earlier_chunks() {
         let buf = three_chunk_buffer();
         let out = buf.snapshot_from(4);
-        assert_eq!(out, vec![chunk(4, b"bbbb"), chunk(8, b"cccc")]);
+        assert_eq!(
+            out,
+            ResumeReplay::Exact(vec![chunk(4, b"bbbb"), chunk(8, b"cccc")])
+        );
     }
 
     #[test]
     fn snapshot_from_mid_chunk_trims_the_straddling_chunk() {
         let buf = three_chunk_buffer();
         let out = buf.snapshot_from(6);
-        assert_eq!(out, vec![chunk(6, b"bb"), chunk(8, b"cccc")]);
+        assert_eq!(
+            out,
+            ResumeReplay::Exact(vec![chunk(6, b"bb"), chunk(8, b"cccc")])
+        );
     }
 
     #[test]
     fn snapshot_from_last_byte_returns_only_the_tail_byte() {
         let buf = three_chunk_buffer();
         let out = buf.snapshot_from(11);
-        assert_eq!(out, vec![chunk(11, b"c")]);
+        assert_eq!(out, ResumeReplay::Exact(vec![chunk(11, b"c")]));
     }
 
     /// `from_seq == end` (one past the last buffered byte) means "caller is
@@ -5266,34 +5308,27 @@ mod tests {
     #[test]
     fn snapshot_from_caught_up_point_is_empty_not_a_fallback() {
         let buf = three_chunk_buffer();
-        assert!(buf.snapshot_from(12).is_empty());
+        assert_eq!(buf.snapshot_from(12), ResumeReplay::Exact(Vec::new()));
     }
 
     /// Older than anything the ring still holds: the gap was already
-    /// evicted, so an exact resume is impossible. Falls back to resending
-    /// everything still buffered rather than silently dropping bytes.
+    /// evicted, so an exact resume is impossible. The connection layer must
+    /// choose a kind-aware recovery instead of blindly replaying old bytes.
     #[test]
-    fn snapshot_from_before_ring_start_falls_back_to_full_snapshot() {
+    fn snapshot_from_before_ring_start_reports_unavailable() {
         // A ring that has evicted its earliest bytes starts later than 0.
         let mut evicted = ReplayBuffer::default();
         evicted.push(chunk(100, b"dddd"));
         evicted.push(chunk(104, b"eeee"));
-        let out = evicted.snapshot_from(50);
-        assert_eq!(
-            out,
-            evicted.snapshot(),
-            "from_seq older than the ring's oldest chunk must fall back to full snapshot"
-        );
+        assert_eq!(evicted.snapshot_from(50), ResumeReplay::Unavailable);
     }
 
     /// Newer than anything ever buffered (seq-space mismatch or a stale
-    /// caller): also out of range, also falls back rather than returning
-    /// nothing.
+    /// caller): also out of range and requires kind-aware recovery.
     #[test]
-    fn snapshot_from_past_the_end_falls_back_to_full_snapshot() {
+    fn snapshot_from_past_the_end_reports_unavailable() {
         let buf = three_chunk_buffer();
-        let out = buf.snapshot_from(999);
-        assert_eq!(out, buf.snapshot());
+        assert_eq!(buf.snapshot_from(999), ResumeReplay::Unavailable);
     }
 
     /// Defends the saturating arithmetic: a chunk whose seq sits near
@@ -5308,20 +5343,20 @@ mod tests {
 
         // In range, mid-chunk: still slices correctly right up to the edge.
         let out = buf.snapshot_from(near_max + 2);
-        assert_eq!(out, vec![chunk(near_max + 2, b"yz")]);
+        assert_eq!(out, ResumeReplay::Exact(vec![chunk(near_max + 2, b"yz")]));
 
         // Exactly at the end (one past the last byte) saturates instead of
         // overflowing, and correctly reads as "caught up" (empty), not a
         // fallback.
         let end = near_max.saturating_add(4);
         assert_eq!(end, u64::MAX);
-        assert!(buf.snapshot_from(end).is_empty());
+        assert_eq!(buf.snapshot_from(end), ResumeReplay::Exact(Vec::new()));
 
         // Past `u64::MAX` cannot exist as a `u64` value, so `u64::MAX`
         // itself is the highest possible from_seq — already covered above.
         // A from_seq before the chunk still trims normally.
         let out = buf.snapshot_from(near_max);
-        assert_eq!(out, vec![chunk(near_max, b"wxyz")]);
+        assert_eq!(out, ResumeReplay::Exact(vec![chunk(near_max, b"wxyz")]));
     }
 
     // -- ReplayBuffer::snapshot_tail -----------------------------------
@@ -5379,10 +5414,7 @@ mod tests {
         let chunk_len = 4 * 1024usize;
         let chunk_count = 64; // 256 KiB total — 4x the fresh budget
         for i in 0..chunk_count {
-            buf.push(chunk(
-                (i * chunk_len) as u64,
-                &vec![b'x'; chunk_len],
-            ));
+            buf.push(chunk((i * chunk_len) as u64, &vec![b'x'; chunk_len]));
         }
         let total: usize = buf.snapshot().iter().map(|c| c.bytes.len()).sum();
         assert_eq!(total, chunk_count * chunk_len);
@@ -5502,9 +5534,7 @@ mod tests {
                 Some(pair) => pair,
                 None => continue,
             };
-            let contains = snapshot
-                .windows(MARKER.len())
-                .any(|w| w == MARKER);
+            let contains = snapshot.windows(MARKER.len()).any(|w| w == MARKER);
             if contains && fed_through == surface.current_byte_seq() {
                 synced = true;
                 break;
@@ -5579,14 +5609,15 @@ mod tests {
         // 40 lines + prompt on a 24-row screen => 17+ rows of scrollback.
         // A window 10 rows up must show lines the live screen no longer
         // holds, as a full replacement render (clear+home preamble).
-        let (ansi, effective, _at_top, total) =
-            surface.scrollback_render(10).expect("render");
+        let (ansi, effective, _at_top, total) = surface.scrollback_render(10).expect("render");
         assert_eq!(effective, 10);
         assert!(total >= 10, "expected >=10 rows of scrollback, got {total}");
-        assert!(ansi.windows(6).any(|w| w == b"\x1b[H\x1b[J".as_slice())
-            || ansi.windows(6).any(|w| w == b"\x1b[J\x1b[H".as_slice())
-            || ansi.starts_with(b"\x1b[m"),
-            "scrollback window must be a full replacement render");
+        assert!(
+            ansi.windows(6).any(|w| w == b"\x1b[H\x1b[J".as_slice())
+                || ansi.windows(6).any(|w| w == b"\x1b[J\x1b[H".as_slice())
+                || ansi.starts_with(b"\x1b[m"),
+            "scrollback window must be a full replacement render"
+        );
         // The window shows OLDER lines than the live bottom.
         assert!(
             ansi.windows(7).any(|w| w == b"LINE-30".as_slice())
@@ -5596,8 +5627,7 @@ mod tests {
 
         // Clamp: asking far past the retained history reports at_top and an
         // effective offset no larger than the total.
-        let (_, effective, at_top, total2) =
-            surface.scrollback_render(1_000_000).expect("render");
+        let (_, effective, at_top, total2) = surface.scrollback_render(1_000_000).expect("render");
         assert!(at_top);
         assert!(effective <= total2);
 
@@ -5620,7 +5650,10 @@ mod tests {
             surface_id_from_name("sb-paging"),
             "sb-paging".into(),
             "/bin/sh",
-            &["-c", "for i in $(seq 1 300); do echo SBLINE-$i; done; sleep 5"],
+            &[
+                "-c",
+                "for i in $(seq 1 300); do echo SBLINE-$i; done; sleep 5",
+            ],
             80,
             24,
             None,
@@ -5662,7 +5695,10 @@ mod tests {
             let (ansi, effective, at_top, _total) =
                 surface.scrollback_render(offset).expect("render");
             assert_eq!(effective, offset, "offset {offset} must apply verbatim");
-            assert!(!at_top, "offset {offset} is nowhere near 300 lines of history");
+            assert!(
+                !at_top,
+                "offset {offset} is nowhere near 300 lines of history"
+            );
             let this_max = max_line_no(&ansi);
             assert!(
                 this_max > 0,
@@ -5706,8 +5742,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(on_alt);
-        let (ansi, effective, at_top, _total) =
-            surface.scrollback_render(5).expect("render");
+        let (ansi, effective, at_top, _total) = surface.scrollback_render(5).expect("render");
         assert!(ansi.is_empty());
         assert_eq!(effective, 0);
         assert!(at_top);
@@ -5733,7 +5768,12 @@ mod tests {
         {
             let surface = surface.clone();
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                let _guard = surface.pty_io().expect("pty surface").screen.lock().unwrap();
+                let _guard = surface
+                    .pty_io()
+                    .expect("pty surface")
+                    .screen
+                    .lock()
+                    .unwrap();
                 panic!("deliberate poison");
             }));
         }

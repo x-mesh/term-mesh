@@ -386,8 +386,9 @@ final class TermMeshDaemon: ObservableObject {
                 Thread.sleep(forTimeInterval: 0.3)
             }
 
-            // Clean up stale socket before starting
-            try? FileManager.default.removeItem(atPath: self.socketPath)
+            // The daemon probes and removes only a stale pathname whose inode
+            // it observed. The app must not unlink here: a slow ping can be a
+            // live daemon, and replacing its pathname creates split-brain.
 
             // Find the daemon binary next to the app bundle, or in the daemon build dir
             let binaryPath = self.daemonBinaryPath()
@@ -537,8 +538,8 @@ final class TermMeshDaemon: ObservableObject {
             }
         }
 
-        // Clean up socket file
-        try? FileManager.default.removeItem(atPath: path)
+        // The daemon removes only the pathname inode it bound. Never unlink
+        // from the app after a timeout: ownership may already have changed.
     }
 
     /// Poll `pid` after a SIGTERM and escalate to SIGKILL if it hasn't exited
