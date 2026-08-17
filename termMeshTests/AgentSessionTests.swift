@@ -697,13 +697,57 @@ final class AgentSessionTests: XCTestCase {
         let claude = AgentSession.claudeLaunch(
             claudePath: "/usr/local/bin/claude", model: "sonnet",
             instructions: "", extraArgs: [], workingDirectory: "/tmp",
-            environment: environment)
+            environment: environment, loadsAccountEnvironment: true)
         let bridged = AgentSession.bridgeLaunch(
             cli: "codex", bridgePath: "/bundle/bridge", model: "gpt-5",
-            workingDirectory: "/tmp", environment: environment)
+            workingDirectory: "/tmp", environment: environment,
+            loadsAccountEnvironment: true)
 
         XCTAssertEqual(claude.environment, environment)
         XCTAssertEqual(bridged.environment, environment)
+        XCTAssertTrue(claude.loadsAccountEnvironment)
+        XCTAssertTrue(bridged.loadsAccountEnvironment)
+    }
+
+    func testLocalNativeLaunchLoadsAgentEnvWithoutPuttingSecretInArgv() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-agent-env-\(UUID().uuidString)")
+        let config = root.appendingPathComponent(".config/term-mesh")
+        try FileManager.default.createDirectory(at: config, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "AI_MESH_API_KEY=from-agent-env\n".write(
+            to: config.appendingPathComponent("agent-env"),
+            atomically: true, encoding: .utf8
+        )
+
+        let command = AgentSession.localAccountEnvironmentCommand(
+            executable: "/bin/sh",
+            arguments: ["-c", "printf 'key=%s explicit=%s' \"$AI_MESH_API_KEY\" \"$EXPLICIT_VALUE\""],
+            protectedEnvironmentKeys: ["EXPLICIT_VALUE"]
+        )
+        XCTAssertFalse(command.contains("profile-secret"))
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", command]
+        process.environment = [
+            "HOME": root.path,
+            "ZDOTDIR": root.path,
+            "SHELL": "/bin/zsh",
+            "TERMMESH_LAUNCH_ENV_0": "profile-secret",
+        ]
+        let output = Pipe()
+        process.standardOutput = output
+        try process.run()
+        process.waitUntilExit()
+        let text = String(
+            data: output.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+
+        XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertTrue(text.contains(#""agent_env":"loaded""#))
+        XCTAssertTrue(text.hasSuffix("key=from-agent-env explicit=profile-secret"))
     }
 
     func testNativeTranscriptCanBeReadWithLineLimit() {

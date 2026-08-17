@@ -1438,6 +1438,14 @@ final class AgentSession {
         let arguments: [String]
         let workingDirectory: String
         let environment: [String: String]
+        /// Local native panes do not have a terminal shell to load the account
+        /// environment for them. Run these launches through the same login /
+        /// `agent-env` prelude as leaders and remote native agents.
+        var loadsAccountEnvironment = false
+        /// App-owned routing and explicit CLI-profile values win after the
+        /// account environment is loaded. Only names travel in argv; values
+        /// stay in the child process environment.
+        var protectedEnvironmentKeys: Set<String> = []
         /// Whether a turn can be cancelled without killing the session.
         ///
         /// Claude takes `control_request` / `interrupt` on the same stdin as
@@ -1461,7 +1469,9 @@ final class AgentSession {
         instructions: String,
         extraArgs: [String],
         workingDirectory: String,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        loadsAccountEnvironment: Bool = false,
+        protectedEnvironmentKeys: Set<String> = []
     ) -> Launch {
         var args = [
             "--print",
@@ -1481,6 +1491,8 @@ final class AgentSession {
         args += extraArgs
         return Launch(executable: claudePath, arguments: args,
                       workingDirectory: workingDirectory, environment: environment,
+                      loadsAccountEnvironment: loadsAccountEnvironment,
+                      protectedEnvironmentKeys: protectedEnvironmentKeys,
                       interruptible: true)
     }
 
@@ -1501,7 +1513,9 @@ final class AgentSession {
         model: String,
         cliPath: String = "",
         workingDirectory: String,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        loadsAccountEnvironment: Bool = false,
+        protectedEnvironmentKeys: Set<String> = []
     ) -> Launch {
         var args = [bridgePath, "--cli", cli, "--cwd", workingDirectory]
         if !model.isEmpty { args += ["--model", model] }
@@ -1511,7 +1525,32 @@ final class AgentSession {
         return Launch(executable: "/usr/bin/env",
                       arguments: AgentPipeTransport.bridgeInterpreter(for: bridgePath) + args,
                       workingDirectory: workingDirectory,
-                      environment: environment)
+                      environment: environment,
+                      loadsAccountEnvironment: loadsAccountEnvironment,
+                      protectedEnvironmentKeys: protectedEnvironmentKeys)
+    }
+
+    /// Command run by a local native pane's login shell. The shell supplies
+    /// the same account environment as a Project leader; the explicit launch
+    /// overlay is restored afterward from temporary environment slots so API
+    /// key values never appear in the process argument list.
+    static func localAccountEnvironmentCommand(
+        executable: String,
+        arguments: [String],
+        protectedEnvironmentKeys: [String]
+    ) -> String {
+        let failure = "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"environment_error\"}'; exit 79"
+        var command = RemoteAgentEnvironmentShell.loginPrelude(
+            profileFailureAction: failure,
+            agentEnvFailureAction: failure
+        )
+        for (index, key) in protectedEnvironmentKeys.enumerated()
+            where isSafeEnvironmentKey(key) {
+            let slot = "TERMMESH_LAUNCH_ENV_\(index)"
+            command += "export \(key)=\"$\(slot)\"; unset \(slot); "
+        }
+        let launch = ([executable] + arguments).map(shellQuoted).joined(separator: " " )
+        return command + RemoteAgentEnvironmentShell.diagnosticEvent + "exec \(launch)"
     }
 
     /// Hold a Claude process on an SSH peer in this app's native pane.
@@ -1728,14 +1767,35 @@ final class AgentSession {
                 + "If it never starts, it is usually missing from that path, or waiting on "
                 + "something that will not arrive — a credential, a login prompt."
         )
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: launch.executable)
-        p.arguments = launch.arguments
-        p.currentDirectoryURL = URL(fileURLWithPath: launch.workingDirectory)
         var env = launch.environment
         // A nested agent CLI refuses to start when it thinks it is inside one.
         env.removeValue(forKey: "CLAUDECODE")
         env.removeValue(forKey: "CLAUDE_CODE_ENTRYPOINT")
+
+        let p = Process()
+        if launch.loadsAccountEnvironment {
+            let protectedKeys = launch.protectedEnvironmentKeys
+                .filter { env[$0] != nil && Self.isSafeEnvironmentKey($0) }
+                .sorted()
+            for (index, key) in protectedKeys.enumerated() {
+                env["TERMMESH_LAUNCH_ENV_\(index)"] = env[key]
+            }
+            let requestedShell = env["SHELL"] ?? "/bin/zsh"
+            let shell = requestedShell.hasPrefix("/") ? requestedShell : "/bin/zsh"
+            p.executableURL = URL(fileURLWithPath: shell)
+            p.arguments = [
+                "-l", "-c",
+                Self.localAccountEnvironmentCommand(
+                    executable: launch.executable,
+                    arguments: launch.arguments,
+                    protectedEnvironmentKeys: protectedKeys
+                ),
+            ]
+        } else {
+            p.executableURL = URL(fileURLWithPath: launch.executable)
+            p.arguments = launch.arguments
+        }
+        p.currentDirectoryURL = URL(fileURLWithPath: launch.workingDirectory)
         p.environment = env
 
         let out = Pipe(), input = Pipe(), err = Pipe()
