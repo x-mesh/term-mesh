@@ -33,6 +33,7 @@ from termmesh import termmesh, termmeshError
 
 ITERATIONS = 5
 READY_TIMEOUT_SECONDS = 8.0
+FREE_COUNT_QUIET_SECONDS = 1.0
 
 # The floor proves the resistant path actually ran. With the fork's current
 # deadlines a HUP-ignoring child costs one grace period plus one force period
@@ -66,6 +67,29 @@ def wait_for_count(
             return status
         time.sleep(0.005)
     raise termmeshError(f"{key} never advanced past {baseline}: {surface_id}")
+
+
+def assert_free_count_stays_exactly_one(
+    client: termmesh,
+    surface_id: str,
+    baseline_started: int,
+    baseline_completed: int,
+) -> dict:
+    """Observe the post-close window where a stale view update used to
+    realize a second Ghostty surface under the same TerminalSurface id."""
+    deadline = time.monotonic() + FREE_COUNT_QUIET_SECONDS
+    latest: dict = {}
+    while time.monotonic() < deadline:
+        latest = client.surface_free_status(surface_id)
+        started_delta = int(latest.get("started_count") or 0) - baseline_started
+        completed_delta = int(latest.get("completed_count") or 0) - baseline_completed
+        if started_delta != 1 or completed_delta != 1:
+            raise termmeshError(
+                "closing one terminal must free exactly one ghostty surface: "
+                f"started={started_delta}, completed={completed_delta}"
+            )
+        time.sleep(0.01)
+    return latest
 
 
 def start_resistant_pane(index: int) -> str:
@@ -120,27 +144,20 @@ def measure_iteration(index: int) -> tuple[float, float]:
             probe.list_surfaces()
         probe_seconds = time.monotonic() - probe_started
 
-        status = wait_for_count(observer, victim, "completed_count", baseline_completed)
+        wait_for_count(observer, victim, "completed_count", baseline_completed)
         close_thread.join(timeout=12.0)
+        status = assert_free_count_stays_exactly_one(
+            observer, victim, baseline_started, baseline_completed
+        )
 
     if close_thread.is_alive():
         raise termmeshError(f"surface.close did not return: {victim}")
     if close_error:
         raise termmeshError(f"surface.close failed: {close_error[0]!r}")
 
-    started_delta = int(status.get("started_count") or 0) - baseline_started
-    completed_delta = int(status.get("completed_count") or 0) - baseline_completed
-    if started_delta < 1 or completed_delta < 1:
-        raise termmeshError(
-            "no free was recorded for this surface: "
-            f"started={started_delta}, completed={completed_delta}"
-        )
-
-    # More than one free per surface id is normal: the explicit release nils the
-    # stored pointer, and a surface realized again afterwards is freed a second
-    # time by deinit. Those are different pointers under one id. The second free
-    # is fast and would overwrite `last_duration_ms`, so assert on the longest
-    # one — that is the resistant teardown this test is about.
+    # The close path is terminal, so this id must not realize another surface
+    # before deinit. max_duration_ms remains the stable duration field exposed
+    # by the shared DEBUG telemetry.
     duration_ms = status.get("max_duration_ms")
     if duration_ms is None:
         raise termmeshError("surface free completed without a duration")
