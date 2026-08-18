@@ -844,10 +844,15 @@ enum PeerHostDoctor {
         // native panels, which otherwise shows up only as "why is this a
         // terminal pane" with nothing to answer it.
         //
-        // Only said when the host runs a daemon at all: a Mac peer serves from
-        // the app bundle, which carries its own bridge, so asking about PATH
-        // there would report a problem that does not exist.
-        if inventory.daemon != nil, inventory.bridge == nil {
+        // Only said for a Linux daemon host. A Mac peer's app starts its own
+        // bundled daemon and bridge from Resources/bin; the SSH inventory
+        // PATH can see one without the other while the app still has the full
+        // pair. Treating that partial PATH view as a missing capability is a
+        // false warning. An unknown OS stays silent for the same reason: the
+        // probe did not collect enough evidence to prescribe a reinstall.
+        if inventory.hostOS == "Linux",
+           inventory.daemon != nil,
+           inventory.bridge == nil {
             warnings.append(
                 "tm-agent-bridge is not installed here — codex/kiro/cursor/agy agents "
                     + "on this host stay plain terminal panes. Reinstall term-meshd to add it."

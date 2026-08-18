@@ -62,6 +62,7 @@ enum RemoteShellPath {
     /// the Swift peer protocol and `tm-agent` routing policy can disagree
     /// after an app-only upgrade. The path is harmless on Linux.
     static let binDirs = [
+        "/Applications/term-mesh.app/Contents/Resources/bin",
         "$HOME/.local/bin",
         "$HOME/.cargo/bin",
         "$HOME/bin",
