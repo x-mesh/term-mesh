@@ -503,18 +503,46 @@ async fn reader_loop(
                             false,
                         )
                     } else {
+                        // Retiring a manifest also drops the durable reference
+                        // that kept its surfaces out of the abandoned-surface
+                        // reap. Collected before the delete so each one can be
+                        // re-evaluated afterwards; otherwise a deleted project
+                        // would strand every spawned pane it had named.
+                        let released: Vec<Vec<u8>> = host
+                            .project_presentations()
+                            .into_iter()
+                            .find(|record| record.project_id == request.delete_project_id)
+                            .map(|record| {
+                                std::iter::once(record.leader_surface_id.clone())
+                                    .chain(
+                                        record
+                                            .members
+                                            .iter()
+                                            .map(|member| member.surface_id.clone()),
+                                    )
+                                    .filter_map(|encoded| hex::decode(encoded).ok())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         match host.delete_project_presentation(
                             &project_owner_peer_ids,
                             &request.delete_project_id,
                         ) {
-                            Ok(changed) => (
-                                UpsertProjectPresentationResponse {
-                                    request_id: request.request_id,
-                                    ok: true,
-                                    ..Default::default()
-                                },
-                                changed,
-                            ),
+                            Ok(changed) => {
+                                if changed {
+                                    for surface_id in &released {
+                                        reap_if_abandoned(&host, surface_id);
+                                    }
+                                }
+                                (
+                                    UpsertProjectPresentationResponse {
+                                        request_id: request.request_id,
+                                        ok: true,
+                                        ..Default::default()
+                                    },
+                                    changed,
+                                )
+                            }
                             Err(code) => (
                                 UpsertProjectPresentationResponse {
                                     request_id: request.request_id,
@@ -1598,6 +1626,14 @@ pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
     if !host.pty.is_ephemeral(surface_id) {
         return;
     }
+    // A published project manifest refers to this surface for as long as it
+    // exists, which is the whole point of project.presentation.v1: the Mac
+    // that created the project is disposable, and the next viewer must find
+    // the same live panes. Reclaiming one because its publisher went away
+    // would delete the project out from under everyone else.
+    if host.presentation_references_surface(surface_id) {
+        return;
+    }
     let host = Arc::downgrade(host);
     let sid = surface_id.to_vec();
     let grace = abandoned_surface_grace();
@@ -1608,6 +1644,11 @@ pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
             return;
         }
         if !host.pty.is_ephemeral(&sid) {
+            return;
+        }
+        // Re-checked with the count: a manifest published during the grace
+        // claims the surface just as much as one published before it.
+        if host.presentation_references_surface(&sid) {
             return;
         }
         tracing::info!(

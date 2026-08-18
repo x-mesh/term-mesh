@@ -1226,7 +1226,12 @@ impl PeerHost {
         Ok(true)
     }
 
-    fn presentation_references_surface(&self, surface_id: &[u8]) -> bool {
+    /// Whether any durable project manifest still names this surface.
+    ///
+    /// Read by the roster watcher below and by `reap_if_abandoned`: a
+    /// published manifest is itself a live reference, so a surface it names
+    /// is never abandoned merely because the viewer that published it left.
+    pub(crate) fn presentation_references_surface(&self, surface_id: &[u8]) -> bool {
         let encoded = hex::encode(surface_id);
         self.project_presentations
             .lock()
