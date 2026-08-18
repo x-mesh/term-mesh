@@ -2336,6 +2336,62 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
     }
 }
 
+// MARK: - Relay stall production logging
+
+/// The gate behind the release-build stall lines. The DEBUG `dlog` edges
+/// vanish from release builds, so this gate is the only thing standing
+/// between "pane froze" and "every log is silent" — and the only thing
+/// standing between a stall storm and a log flood.
+final class RelayStallLogGateTests: XCTestCase {
+    func testIgnoresJitterAndLogsTheFirstSustainedEpisode() {
+        var gate = RelayStallLogGate(thresholdNanos: 100, minIntervalNanos: 1_000)
+        XCTAssertFalse(gate.recordEpisode(durationNanos: 99, now: 0),
+                       "below the threshold: neither counted nor logged")
+        XCTAssertEqual(gate.episodeCount, 0,
+                       "call sites time every operation — jitter in the totals would report ordinary traffic as stalls")
+        XCTAssertEqual(gate.stalledNanosTotal, 0)
+        XCTAssertTrue(gate.recordEpisode(durationNanos: 100, now: 10),
+                      "the first sustained episode logs")
+        XCTAssertEqual(gate.episodeCount, 1)
+    }
+
+    func testMinIntervalSuppressesAStormButNotForever() {
+        var gate = RelayStallLogGate(thresholdNanos: 100, minIntervalNanos: 1_000)
+        XCTAssertTrue(gate.recordEpisode(durationNanos: 500, now: 10))
+        XCTAssertFalse(gate.recordEpisode(durationNanos: 500, now: 500),
+                       "inside the interval: suppressed even though sustained")
+        XCTAssertTrue(gate.recordEpisode(durationNanos: 500, now: 1_010),
+                      "interval measured from the last EMITTED line, so the storm logs again")
+        XCTAssertEqual(gate.episodeCount, 3)
+        XCTAssertEqual(gate.stalledNanosTotal, 1_500,
+                       "suppressed episodes still accumulate into the totals the next line reports")
+    }
+
+    func testSuppressedEpisodesDoNotAdvanceTheInterval() {
+        var gate = RelayStallLogGate(thresholdNanos: 100, minIntervalNanos: 1_000)
+        XCTAssertTrue(gate.recordEpisode(durationNanos: 200, now: 0))
+        XCTAssertFalse(gate.recordEpisode(durationNanos: 200, now: 999))
+        XCTAssertTrue(gate.recordEpisode(durationNanos: 200, now: 1_000),
+                      "a suppressed episode must not push the next line further away")
+    }
+
+    /// The locked wrapper the host-side input closure uses: the verdict and
+    /// the totals for the log line must come out of the same lock hold.
+    func testGateBoxReportsTheTotalsTheLogLineNeeds() {
+        let box = RelayStallLogGateBox(
+            gate: RelayStallLogGate(thresholdNanos: 100, minIntervalNanos: 1_000)
+        )
+        let first = box.recordEpisode(durationNanos: 200, now: 0)
+        XCTAssertTrue(first.shouldLog)
+        XCTAssertEqual(first.episodeCount, 1)
+        XCTAssertEqual(first.stalledNanosTotal, 200)
+        let second = box.recordEpisode(durationNanos: 300, now: 10)
+        XCTAssertFalse(second.shouldLog, "inside the interval")
+        XCTAssertEqual(second.episodeCount, 2)
+        XCTAssertEqual(second.stalledNanosTotal, 500)
+    }
+}
+
 // MARK: - Peer-owned agent surfaces (Phase 3, T3.1)
 
 /// The third remote-agent factory: `ensure(kind: "agent")` against a peer
