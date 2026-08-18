@@ -35,6 +35,11 @@ struct AgentPanelView: View {
     /// back — barely visible on a one-line result, impossible to miss on a
     /// diff someone was reading.
     @State private var openTools: Set<UUID> = []
+    /// Completed tool runs collapse into one activity row. Keep only explicit
+    /// choices here: running groups open themselves, completed groups close
+    /// themselves, and a group the user opens stays open as it ages.
+    @State private var openToolGroups: Set<UUID> = []
+    @State private var closedRunningToolGroups: Set<UUID> = []
 
     private var session: AgentSession { panel.session }
 
@@ -336,30 +341,29 @@ struct AgentPanelView: View {
                                 )
                         }
                         if session.rows.isEmpty { emptyState }
-                        ForEach(session.rows) { item in
-                            TranscriptRow(
-                                item: item,
-                                streaming: session.streamingIds.contains(item.id),
-                                open: openTools.contains(item.id),
-                                root: panel.workingDirectory,
-                                setOpen: { open in
-                                    // Opening a row grows the transcript exactly
-                                    // as an append does, and the bottom anchor
-                                    // cannot tell the two apart. Without touching
-                                    // `grewAt` the anchor reads its own
-                                    // disappearance as the user scrolling away,
-                                    // and the "Latest" pill appears because
-                                    // somebody expanded a diff.
-                                    grewAt = Date()
-                                    if open {
-                                        openTools.insert(item.id)
-                                    } else {
-                                        openTools.remove(item.id)
-                                    }
-                                }
-                            )
-                            .equatable()
-                            .id(item.id)
+                        ForEach(AgentSession.transcriptItems(for: session.rows)) { item in
+                            switch item {
+                            case .row(let row):
+                                TranscriptRow(
+                                    item: row,
+                                    streaming: session.streamingIds.contains(row.id),
+                                    open: openTools.contains(row.id),
+                                    root: panel.workingDirectory,
+                                    setOpen: { setToolOpen(row.id, $0) }
+                                )
+                                .equatable()
+                                .id(row.id)
+                            case .toolGroup(let group):
+                                ToolGroupRow(
+                                    group: group,
+                                    open: toolGroupIsOpen(group),
+                                    root: panel.workingDirectory,
+                                    openTools: openTools,
+                                    setOpen: { setToolGroupOpen(group, $0) },
+                                    setToolOpen: setToolOpen
+                                )
+                                .id(group.id)
+                            }
                         }
                         // A normal VStack mounts this marker even while it is
                         // off screen, so visibility is measured in the scroll
@@ -375,6 +379,13 @@ struct AgentPanelView: View {
                     }
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    // Native panes are SwiftUI transcript views rather than
+                    // Ghostty surfaces, so terminal selection does not apply.
+                    // Enable the standard macOS text-selection environment at
+                    // the transcript boundary: dragging selects across all row
+                    // kinds and Cmd+C copies through the system pasteboard,
+                    // while the composer remains an independent text field.
+                    .textSelection(.enabled)
                 }
                 .coordinateSpace(name: Self.scrollSpace)
                 .onPreferenceChange(TranscriptBottomPreferenceKey.self) { bottomY in
@@ -442,6 +453,38 @@ struct AgentPanelView: View {
                         .padding(10)
                     }
                 }
+            }
+        }
+    }
+
+    private func setToolOpen(_ id: UUID, _ open: Bool) {
+        // Opening a row grows the transcript exactly as an append does, and
+        // the bottom anchor cannot tell the two apart. Without touching
+        // `grewAt` the "Latest" pill appears because somebody opened a diff.
+        grewAt = Date()
+        if open {
+            openTools.insert(id)
+        } else {
+            openTools.remove(id)
+        }
+    }
+
+    private func toolGroupIsOpen(_ group: AgentSession.ToolGroup) -> Bool {
+        openToolGroups.contains(group.id)
+            || (group.isRunning && !closedRunningToolGroups.contains(group.id))
+    }
+
+    private func setToolGroupOpen(_ group: AgentSession.ToolGroup, _ open: Bool) {
+        grewAt = Date()
+        if open {
+            openToolGroups.insert(group.id)
+            closedRunningToolGroups.remove(group.id)
+        } else {
+            openToolGroups.remove(group.id)
+            if group.isRunning {
+                closedRunningToolGroups.insert(group.id)
+            } else {
+                closedRunningToolGroups.remove(group.id)
             }
         }
     }
@@ -1379,6 +1422,107 @@ private struct Caret: View {
             // A blinking rectangle is exactly what a screen reader should not
             // be asked to announce.
             .accessibilityHidden(true)
+    }
+}
+
+/// A tool call, which a terminal could only ever show as two unrelated lines.
+private struct ToolGroupRow: View {
+    let group: AgentSession.ToolGroup
+    let open: Bool
+    let root: String
+    let openTools: Set<UUID>
+    let setOpen: (Bool) -> Void
+    let setToolOpen: (UUID, Bool) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Button { setOpen(!open) } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: open ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .frame(width: 10)
+                    statusMark
+                    Text("tool activity")
+                        .font(.system(size: 11, weight: .medium))
+                    Text("\(group.rows.count) tools")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Text(group.kindSummary)
+                        .font(.system(size: 9).monospaced())
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 4)
+                    if group.failureCount > 0 {
+                        Text("\(group.failureCount) failed")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(Color.red)
+                            .fixedSize()
+                    } else if group.isRunning {
+                        Text("running")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize()
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(accessibilityLabel)
+            .accessibilityHint(open ? "Collapse tool activity" : "Expand tool activity")
+
+            if open {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(group.rows) { row in
+                        if case .tool(_, let call) = row.entry {
+                            if let change = call.change {
+                                ChangeRow(
+                                    call: call,
+                                    change: change,
+                                    root: root,
+                                    open: toolBinding(row.id)
+                                )
+                            } else {
+                                ToolRow(call: call, open: toolBinding(row.id))
+                            }
+                        }
+                    }
+                }
+                .padding(.leading, 20)
+                .padding(.top, 1)
+            }
+        }
+        .padding(.top, group.topGap)
+    }
+
+    @ViewBuilder
+    private var statusMark: some View {
+        if group.isRunning {
+            ProgressView().controlSize(.small).scaleEffect(0.5).frame(width: 12)
+        } else {
+            Image(systemName: group.failureCount > 0 ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                .font(.system(size: 10))
+                .foregroundStyle(group.failureCount > 0 ? Color.red : Color.green)
+        }
+    }
+
+    private var accessibilityLabel: String {
+        var parts = ["Tool activity", "\(group.rows.count) tools", group.kindSummary]
+        if group.failureCount > 0 {
+            parts.append("\(group.failureCount) failed")
+        } else if group.isRunning {
+            parts.append("running")
+        } else {
+            parts.append("completed")
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    private func toolBinding(_ id: UUID) -> Binding<Bool> {
+        Binding(
+            get: { openTools.contains(id) },
+            set: { setToolOpen(id, $0) }
+        )
     }
 }
 
