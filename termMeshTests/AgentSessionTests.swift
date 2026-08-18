@@ -80,7 +80,7 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(rolledBack, ["team/demo/executor/one"])
     }
 
-    func testUnownedIsolatedWorktreesRollBackNewestFirstAndSpareOwnedPanes() {
+    func testUncommittedIsolatedWorktreesRollBackNewestFirst() {
         let provisioned: [WorktreeInfo?] = [
             WorktreeInfo(name: "wt-one", path: "/tmp/one", branch: "team/demo/executor/one"),
             WorktreeInfo(name: "wt-two", path: "/tmp/two", branch: "team/demo/reviewer/two"),
@@ -92,7 +92,6 @@ final class AgentSessionTests: XCTestCase {
 
         let retained = TeamOrchestrator.rollbackUnownedIsolatedWorktrees(
             provisioned: provisioned,
-            ownedNames: ["wt-one"],
             rollback: { info in
                 rolledBack.append(info.name)
                 return true
@@ -100,11 +99,12 @@ final class AgentSessionTests: XCTestCase {
             log: { info, outcome in logged.append((info.name, outcome)) }
         )
 
-        // Reverse provisioning order, and the pane-owned checkout is untouched.
-        XCTAssertEqual(rolledBack, ["wt-three", "wt-two"])
+        // A pane is not ownership until the complete roster commits, so every
+        // provisioned checkout participates in rollback.
+        XCTAssertEqual(rolledBack, ["wt-three", "wt-two", "wt-one"])
         XCTAssertTrue(retained.isEmpty)
         XCTAssertEqual(logged.map(\.0), ["wt-three", "wt-two", "wt-one"])
-        XCTAssertEqual(logged.map(\.1), [.removed, .removed, .owned])
+        XCTAssertEqual(logged.map(\.1), [.removed, .removed, .removed])
     }
 
     func testRetainedIsolatedWorktreeIsReportedInsteadOfForcedAway() {
@@ -119,7 +119,6 @@ final class AgentSessionTests: XCTestCase {
 
         let retained = TeamOrchestrator.rollbackUnownedIsolatedWorktrees(
             provisioned: [dirty, clean],
-            ownedNames: [],
             // The daemon removes with `force: false`, so a checkout carrying
             // uncommitted work answers false rather than being deleted.
             rollback: { info in
