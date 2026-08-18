@@ -482,7 +482,10 @@ mod integration_tests {
     fn uid_gate_admits_the_owner_and_root_and_nobody_else() {
         let owner = 996;
         assert!(peer_uid_allowed(owner, owner), "the daemon's own user");
-        assert!(peer_uid_allowed(0, owner), "root, e.g. an ssh-forwarded client");
+        assert!(
+            peer_uid_allowed(0, owner),
+            "root, e.g. an ssh-forwarded client"
+        );
         assert!(!peer_uid_allowed(1000, owner), "an unrelated local user");
         assert!(!peer_uid_allowed(997, owner), "an adjacent service account");
     }
@@ -495,6 +498,12 @@ mod integration_tests {
         assert!(!peer_uid_allowed(501, 0));
     }
 
+    /// `TERMMESH_PEER_ABANDONED_GRACE_MS` is process-global while these tests
+    /// run in parallel, so one test's `remove_var` restores the 60 s default
+    /// under another's feet — which reads exactly like "the reap never fired".
+    /// Every test that tunes the grace holds this for its duration.
+    static ABANDONED_GRACE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A surface the host made on request goes away once nobody holds it, and
     /// one the operator declared does not.
     ///
@@ -504,6 +513,7 @@ mod integration_tests {
     /// declared surface is published for anyone, and an empty one is idle.
     #[tokio::test]
     async fn reaps_a_spawned_surface_once_nobody_is_attached() {
+        let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");
         let manager = Arc::new(crate::peer::surface::PtyManager::new());
         let declared = b"declared-surface".to_vec();
@@ -541,10 +551,149 @@ mod integration_tests {
         std::env::remove_var("TERMMESH_PEER_ABANDONED_GRACE_MS");
     }
 
+    /// A published project outlives the viewer that published it.
+    ///
+    /// The manifest is the durable reference: `project.presentation.v1` exists
+    /// so a second machine finds the SAME live leader and member panes, and a
+    /// spawned surface named by one is therefore not abandoned when its
+    /// publisher disconnects. Deleting the manifest gives that surface back to
+    /// the ordinary reap, so protection cannot outlive the project.
+    #[tokio::test]
+    async fn a_surface_named_by_a_project_manifest_outlives_its_publisher() {
+        let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");
+        let manager = Arc::new(crate::peer::surface::PtyManager::new());
+        let leader = vec![0xA1; 16];
+        manager.register_and_spawn_ephemeral(
+            leader.clone(),
+            crate::peer::surface::SpawnSpec {
+                title: "project-leader".into(),
+                command: "/bin/cat".into(),
+                args: vec![],
+                cols: 80,
+                rows: 24,
+                cwd: None,
+                kind: crate::peer::surface::SurfaceKind::Pty,
+                agent_cli: String::new(),
+            },
+        );
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        let project = peer_proto::v1::Team {
+            name: "durable".into(),
+            team_uuid: "uuid-durable".into(),
+            working_directory: "/tmp".into(),
+            leader_surface_id: leader.clone(),
+            project_id: "team:uuid-durable".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            host.upsert_project_presentation(&[vec![7; 16]], &project),
+            Ok((1, true))
+        );
+
+        let alive = |id: &[u8]| manager.list().iter().any(|s| s.surface_id == id);
+        manager.note_attached(&leader);
+        assert_eq!(manager.note_detached(&leader), 0);
+        crate::peer::connection::reap_if_abandoned(&host, &leader);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            alive(&leader),
+            "a published project's pane must survive the viewer that named it"
+        );
+
+        assert_eq!(
+            host.delete_project_presentation(&[vec![7; 16]], "team:uuid-durable"),
+            Ok(true)
+        );
+        crate::peer::connection::reap_if_abandoned(&host, &leader);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            !alive(&leader),
+            "a retired project must not keep its pane alive forever"
+        );
+        std::env::remove_var("TERMMESH_PEER_ABANDONED_GRACE_MS");
+    }
+
+    #[tokio::test]
+    async fn manifest_replacement_reaps_only_surfaces_with_no_remaining_project_reference() {
+        let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");
+        let manager = Arc::new(crate::peer::surface::PtyManager::new());
+        let first = vec![0xB1; 16];
+        let replacement = vec![0xB2; 16];
+        let spec = |title: &str| crate::peer::surface::SpawnSpec {
+            title: title.into(),
+            command: "/bin/cat".into(),
+            args: vec![],
+            cols: 80,
+            rows: 24,
+            cwd: None,
+            kind: crate::peer::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        manager.register_and_spawn_ephemeral(first.clone(), spec("first"));
+        manager.register_and_spawn_ephemeral(replacement.clone(), spec("replacement"));
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        let owner = vec![vec![8; 16]];
+        let project = |id: &str, leader: Vec<u8>| peer_proto::v1::Team {
+            name: id.into(),
+            team_uuid: format!("uuid-{id}"),
+            working_directory: "/tmp".into(),
+            leader_surface_id: leader,
+            project_id: format!("team:{id}"),
+            ..Default::default()
+        };
+        let primary = project("primary", first.clone());
+        let shared = project("shared", first.clone());
+        assert_eq!(
+            host.upsert_project_presentation(&owner, &primary),
+            Ok((1, true))
+        );
+        assert_eq!(
+            host.upsert_project_presentation(&owner, &shared),
+            Ok((1, true))
+        );
+
+        manager.note_attached(&first);
+        assert_eq!(manager.note_detached(&first), 0);
+        let changed = project("primary", replacement.clone());
+        let (_, _, released) = host
+            .upsert_project_presentation_with_released(&owner, &changed)
+            .expect("replace manifest");
+        assert_eq!(released, vec![first.clone()]);
+        for surface_id in &released {
+            crate::peer::connection::reap_if_abandoned(&host, surface_id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let alive = |id: &[u8]| manager.list().iter().any(|s| s.surface_id == id);
+        assert!(
+            alive(&first),
+            "the second manifest still references the old surface"
+        );
+        assert!(alive(&replacement));
+
+        assert_eq!(
+            host.delete_project_presentation(&owner, "team:shared"),
+            Ok(true)
+        );
+        crate::peer::connection::reap_if_abandoned(&host, &first);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            !alive(&first),
+            "the last released reference must be reclaimed"
+        );
+        assert!(
+            alive(&replacement),
+            "the replacement manifest still owns its surface"
+        );
+        std::env::remove_var("TERMMESH_PEER_ABANDONED_GRACE_MS");
+    }
+
     /// Detaching is not leaving for good. A client that comes back inside the
     /// grace — a dropped link, a restart — finds its pane still there.
     #[tokio::test]
     async fn a_reconnect_inside_the_grace_saves_the_surface() {
+        let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "300");
         let manager = Arc::new(crate::peer::surface::PtyManager::new());
         let sid = b"rejoined-surface".to_vec();
@@ -704,12 +853,10 @@ mod integration_tests {
                 &Envelope {
                     seq,
                     correlation_id: 0,
-                    payload: Some(Payload::TeamCallRequest(
-                        peer_proto::v1::TeamCallRequest {
-                            method: method.into(),
-                            params_json: params_json.into(),
-                        },
-                    )),
+                    payload: Some(Payload::TeamCallRequest(peer_proto::v1::TeamCallRequest {
+                        method: method.into(),
+                        params_json: params_json.into(),
+                    })),
                 },
             )
             .await
@@ -796,8 +943,7 @@ mod integration_tests {
         // The board that knows where it is. Only the host reads this; the
         // caller never names the directory.
         let board = Arc::new(
-            crate::agent::AgentSessionManager::new(tmp.path().join("agents.db"))
-                .expect("agent db"),
+            crate::agent::AgentSessionManager::new(tmp.path().join("agents.db")).expect("agent db"),
         );
         let task = board
             .task_create(crate::agent::TaskCreateParams {
@@ -903,12 +1049,10 @@ mod integration_tests {
                 &Envelope {
                     seq,
                     correlation_id: 0,
-                    payload: Some(Payload::TeamCallRequest(
-                        peer_proto::v1::TeamCallRequest {
-                            method: "team.task.diff".into(),
-                            params_json: params_json.into(),
-                        },
-                    )),
+                    payload: Some(Payload::TeamCallRequest(peer_proto::v1::TeamCallRequest {
+                        method: "team.task.diff".into(),
+                        params_json: params_json.into(),
+                    })),
                 },
             )
             .await
@@ -1053,12 +1197,10 @@ mod integration_tests {
                 &Envelope {
                     seq,
                     correlation_id: 0,
-                    payload: Some(Payload::TeamCallRequest(
-                        peer_proto::v1::TeamCallRequest {
-                            method: "team.task.diff".into(),
-                            params_json,
-                        },
-                    )),
+                    payload: Some(Payload::TeamCallRequest(peer_proto::v1::TeamCallRequest {
+                        method: "team.task.diff".into(),
+                        params_json,
+                    })),
                 },
             )
             .await
@@ -1092,11 +1234,20 @@ mod integration_tests {
         let value: serde_json::Value = serde_json::from_str(&answered.result_json).expect("json");
         println!(
             "head={} base={} branch={}\ndigest={} truncated={}",
-            value["head_sha"], value["base_sha"], value["branch"], value["diff_digest"],
+            value["head_sha"],
+            value["base_sha"],
+            value["branch"],
+            value["diff_digest"],
             value["truncated"]
         );
-        println!("--- numstat ---\n{}", value["numstat"].as_str().unwrap_or(""));
-        println!("--- name_status ---\n{}", value["name_status"].as_str().unwrap_or(""));
+        println!(
+            "--- numstat ---\n{}",
+            value["numstat"].as_str().unwrap_or("")
+        );
+        println!(
+            "--- name_status ---\n{}",
+            value["name_status"].as_str().unwrap_or("")
+        );
         println!("--- patch ---\n{}", value["patch"].as_str().unwrap_or(""));
 
         assert_eq!(value["head_sha"].as_str().unwrap().len(), 40);
@@ -1124,10 +1275,19 @@ mod integration_tests {
         .await;
         assert!(!unknown.ok, "an unknown task must not answer ok");
         assert!(unknown.result_json.is_empty());
-        println!("unknown task -> {} {}", unknown.error_code, unknown.error_message);
+        println!(
+            "unknown task -> {} {}",
+            unknown.error_code, unknown.error_message
+        );
 
         // And a path is not a parameter, across the link as much as in process.
-        let no_id = diff(&mut reader, &mut writer, 5, r#"{"worktree_path":"/etc"}"#.into()).await;
+        let no_id = diff(
+            &mut reader,
+            &mut writer,
+            5,
+            r#"{"worktree_path":"/etc"}"#.into(),
+        )
+        .await;
         assert!(!no_id.ok);
         assert_eq!(no_id.error_code, "invalid_params");
         println!("path-only -> {} {}", no_id.error_code, no_id.error_message);
@@ -1533,7 +1693,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sp_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sp_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sp_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -1649,7 +1811,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sp_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sp_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sp_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -1735,7 +1899,10 @@ mod integration_tests {
             surface_id_from_name("sb-gate"),
             "sb-gate".into(),
             "/bin/sh",
-            &["-c", "for i in $(seq 1 40); do echo SBLINE-$i; done; sleep 5"],
+            &[
+                "-c",
+                "for i in $(seq 1 40); do echo SBLINE-$i; done; sleep 5",
+            ],
             80,
             24,
             None,
@@ -1755,7 +1922,9 @@ mod integration_tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sp_task = sock_path.clone();
         let server_task = tokio::spawn(async move {
-            serve_with_manager(sp_task, shutdown_rx, manager).await.unwrap();
+            serve_with_manager(sp_task, shutdown_rx, manager)
+                .await
+                .unwrap();
         });
         for _ in 0..50 {
             if sock_path.exists() {
@@ -1790,8 +1959,7 @@ mod integration_tests {
         ) -> Option<peer_proto::v1::ScrollbackChunk> {
             let deadline = tokio::time::Instant::now() + timeout;
             loop {
-                let remaining =
-                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     return None;
                 }
@@ -2185,10 +2353,7 @@ mod integration_tests {
                     Some(Payload::SurfaceList(sl)) => sl.surfaces,
                     other => panic!("{display}: expected SurfaceList, got {other:?}"),
                 };
-                assert!(
-                    !surfaces.is_empty(),
-                    "{display}: host listed no surfaces"
-                );
+                assert!(!surfaces.is_empty(), "{display}: host listed no surfaces");
                 surfaces[0].surface_id.clone()
             }
         };

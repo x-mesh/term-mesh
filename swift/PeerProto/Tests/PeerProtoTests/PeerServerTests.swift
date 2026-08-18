@@ -332,6 +332,7 @@ final class PeerServerTests: XCTestCase {
         XCTAssertTrue(PeerCapability.supported.contains(PeerCapability.surfaceAgentV1))
         XCTAssertTrue(PeerCapability.supported.contains(PeerCapability.surfaceExitV1))
         XCTAssertTrue(PeerCapability.supported.contains(PeerCapability.surfaceEnsureEnvV1))
+        XCTAssertTrue(PeerCapability.supported.contains(PeerCapability.teamRouteFileV1))
         // `supported` feeds Hello.capabilities verbatim; a duplicate entry
         // would be advertised twice on the wire.
         XCTAssertEqual(Set(PeerCapability.supported).count, PeerCapability.supported.count)
@@ -1328,6 +1329,10 @@ final class PeerServerTests: XCTestCase {
         XCTAssertFalse(
             hello.hasHostCapability(PeerCapability.projectPresentationV1),
             "a GUI host must not promise daemon-owned durable surfaces"
+        )
+        XCTAssertFalse(
+            hello.hasHostCapability(PeerCapability.teamRouteFileV1),
+            "a GUI host cannot stage transferable worker route files"
         )
     }
 }

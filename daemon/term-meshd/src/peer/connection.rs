@@ -503,18 +503,33 @@ async fn reader_loop(
                             false,
                         )
                     } else {
-                        match host.delete_project_presentation(
+                        // Retiring a manifest also drops the durable reference
+                        // that kept its surfaces out of the abandoned-surface
+                        // reap, so each one is re-evaluated here; otherwise a
+                        // deleted project would strand every spawned pane it
+                        // had named. The ids come back FROM the delete rather
+                        // than from a read before it: the record removed under
+                        // the lock is the only one whose surfaces this call may
+                        // release, and a concurrent replace must not be able to
+                        // redirect the reap at another manifest's panes.
+                        match host.delete_project_presentation_with_released(
                             &project_owner_peer_ids,
                             &request.delete_project_id,
                         ) {
-                            Ok(changed) => (
-                                UpsertProjectPresentationResponse {
-                                    request_id: request.request_id,
-                                    ok: true,
-                                    ..Default::default()
-                                },
-                                changed,
-                            ),
+                            Ok(released) => {
+                                let changed = released.is_some();
+                                for surface_id in released.into_iter().flatten() {
+                                    reap_if_abandoned(&host, &surface_id);
+                                }
+                                (
+                                    UpsertProjectPresentationResponse {
+                                        request_id: request.request_id,
+                                        ok: true,
+                                        ..Default::default()
+                                    },
+                                    changed,
+                                )
+                            }
                             Err(code) => (
                                 UpsertProjectPresentationResponse {
                                     request_id: request.request_id,
@@ -529,16 +544,23 @@ async fn reader_loop(
                         }
                     }
                 } else if let Some(project) = request.project.as_ref() {
-                    match host.upsert_project_presentation(&project_owner_peer_ids, project) {
-                        Ok((revision, changed)) => (
-                            UpsertProjectPresentationResponse {
-                                request_id: request.request_id,
-                                ok: true,
-                                revision,
-                                ..Default::default()
-                            },
-                            changed,
-                        ),
+                    match host
+                        .upsert_project_presentation_with_released(&project_owner_peer_ids, project)
+                    {
+                        Ok((revision, changed, released)) => {
+                            for surface_id in &released {
+                                reap_if_abandoned(&host, surface_id);
+                            }
+                            (
+                                UpsertProjectPresentationResponse {
+                                    request_id: request.request_id,
+                                    ok: true,
+                                    revision,
+                                    ..Default::default()
+                                },
+                                changed,
+                            )
+                        }
                         Err(code) => (
                             UpsertProjectPresentationResponse {
                                 request_id: request.request_id,
@@ -1626,6 +1648,14 @@ pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
     if !host.pty.is_ephemeral(surface_id) {
         return;
     }
+    // A published project manifest refers to this surface for as long as it
+    // exists, which is the whole point of project.presentation.v1: the Mac
+    // that created the project is disposable, and the next viewer must find
+    // the same live panes. Reclaiming one because its publisher went away
+    // would delete the project out from under everyone else.
+    if host.presentation_references_surface(surface_id) {
+        return;
+    }
     let host = Arc::downgrade(host);
     let sid = surface_id.to_vec();
     let grace = abandoned_surface_grace();
@@ -1636,6 +1666,11 @@ pub(crate) fn reap_if_abandoned(host: &Arc<PeerHost>, surface_id: &[u8]) {
             return;
         }
         if !host.pty.is_ephemeral(&sid) {
+            return;
+        }
+        // Re-checked with the count: a manifest published during the grace
+        // claims the surface just as much as one published before it.
+        if host.presentation_references_surface(&sid) {
             return;
         }
         tracing::info!(

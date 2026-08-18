@@ -1271,6 +1271,53 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(AgentSession.rows(for: []).isEmpty)
     }
 
+    func testTranscriptItemsGroupThreeConsecutiveToolsWithStableIdentity() {
+        let firstID = UUID()
+        let entries: [AgentSession.Entry] = [
+            .thought(id: UUID(), "checking"),
+            .tool(id: firstID, .init(name: "shell", headline: "rg foo", result: "")),
+            .tool(id: UUID(), .init(name: "shell", headline: "sed -n 1,20p", result: "")),
+            .tool(id: UUID(), .init(name: "read", headline: "AgentPanelView.swift", result: nil)),
+            .answered(id: UUID(), "done"),
+        ]
+
+        let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
+
+        XCTAssertEqual(items.count, 3)
+        guard case .toolGroup(let group) = items[1] else {
+            return XCTFail("three consecutive tools should become one group")
+        }
+        XCTAssertEqual(group.id, firstID)
+        XCTAssertEqual(group.rows.count, 3)
+        XCTAssertEqual(group.kindSummary, "shell 2 · read")
+        XCTAssertTrue(group.isRunning)
+        XCTAssertEqual(group.failureCount, 0)
+    }
+
+    func testTranscriptItemsKeepShortRunsInlineAndSplitAtProse() {
+        let entries: [AgentSession.Entry] = [
+            .tool(id: UUID(), .init(name: "shell", headline: "one", result: "")),
+            .tool(id: UUID(), .init(name: "shell", headline: "two", result: "")),
+            .thought(id: UUID(), "next"),
+            .tool(id: UUID(), .init(name: "shell", headline: "three", result: "")),
+            .tool(id: UUID(), .init(name: "edit", headline: "four", result: "")),
+            .tool(id: UUID(), .init(name: "shell", headline: "five", result: "failed", failed: true)),
+        ]
+
+        let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
+
+        XCTAssertEqual(items.count, 4)
+        guard case .row = items[0], case .row = items[1], case .row = items[2] else {
+            return XCTFail("two tools and intervening prose should remain individual rows")
+        }
+        guard case .toolGroup(let group) = items[3] else {
+            return XCTFail("the later run of three tools should form its own group")
+        }
+        XCTAssertFalse(group.isRunning)
+        XCTAssertEqual(group.failureCount, 1)
+        XCTAssertEqual(group.kindSummary, "shell 2 · edit")
+    }
+
     /// The panel uses a regular VStack to avoid SwiftUI's non-converging lazy
     /// placement path. Keep its mounted view tree bounded independently from
     /// the longer model transcript.
