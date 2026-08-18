@@ -9,6 +9,73 @@ import XCTest
 
 final class PeerDaemonVersionTests: XCTestCase {
 
+    func test_healthBaselineCommand_isFixedQuotedAndMeasuresBothPlanes() {
+        let command = PeerHostDoctor.healthBaselineCommand
+        XCTAssertTrue(command.hasPrefix("sh -c '"))
+        XCTAssertTrue(command.hasSuffix("'"))
+        let body = String(command.dropFirst("sh -c '".count).dropLast())
+        XCTAssertFalse(body.contains("'"))
+        XCTAssertTrue(body.contains("health-control-rpc"))
+        XCTAssertTrue(body.contains("health-peer-present"))
+        XCTAssertTrue(body.contains("attach relay lagged"))
+        XCTAssertTrue(body.contains("frame length .* exceeds"))
+        XCTAssertTrue(body.contains("/run/user/$(id -u)/term-meshd.sock"))
+    }
+
+    func test_healthBaseline_requiresControlAndProtocolIntegrity() {
+        let healthy = PeerHostDoctor.parseHealthBaseline("""
+        health-service-active=1
+        health-control-path=/tmp/term-meshd.sock
+        health-control-present=1
+        health-control-rpc=1
+        health-peer-path=/run/term-mesh/tm-peer.sock
+        health-peer-present=1
+        health-relay-lag-5m=0
+        health-resume-heal-5m=0
+        health-protocol-mismatch-5m=0
+        """)
+        XCTAssertEqual(healthy?.verdict, .healthy)
+
+        var missingControl = healthy!
+        missingControl.controlPathPresent = false
+        XCTAssertEqual(missingControl.verdict, .unhealthy)
+
+        var protocolMismatch = healthy!
+        protocolMismatch.protocolMismatchCount = 1
+        XCTAssertEqual(protocolMismatch.verdict, .unhealthy)
+
+        var lagging = healthy!
+        lagging.relayLagCount = 2
+        XCTAssertEqual(lagging.verdict, .degraded)
+    }
+
+    func test_healthBaseline_duplicateBannerKeysUseFinalProbeBlock() {
+        let parsed = PeerHostDoctor.parseHealthBaseline("""
+        health-service-active=0
+        health-control-path=/banner/stale.sock
+        health-service-active=1
+        health-control-path=/run/user/501/term-meshd.sock
+        health-control-present=1
+        health-control-rpc=1
+        health-peer-path=/run/user/501/tm-peer.sock
+        health-peer-present=1
+        health-relay-lag-5m=0
+        health-resume-heal-5m=0
+        health-protocol-mismatch-5m=0
+        """)
+
+        XCTAssertEqual(parsed?.serviceActive, true)
+        XCTAssertEqual(parsed?.controlPath, "/run/user/501/term-meshd.sock")
+        XCTAssertEqual(parsed?.verdict, .healthy)
+    }
+
+    func test_healthBaseline_rejectsPartialProbeOutput() {
+        XCTAssertNil(PeerHostDoctor.parseHealthBaseline("""
+        health-service-active=1
+        health-control-present=1
+        """))
+    }
+
     // MARK: - PeerHostDoctor.versionProbeCommand script invariants
 
     /// Same structural constraint as PeerSocketProber.remoteCommand:
@@ -590,6 +657,34 @@ final class PeerDaemonVersionTests: XCTestCase {
 
         let exited = await PeerHostDoctor.waitForExit(proc, timeout: 1.0)
         XCTAssertTrue(exited)
+    }
+
+    /// The picker labels a host with whatever the serving process answers in
+    /// the Hello handshake. The app-hosted server used to answer a hardcoded
+    /// "debug-server" — on every build, updated or not.
+    func test_appHostedServerAdvertisesTheBundleVersionNotAPlaceholder() {
+        let version = PeerHostCoordinator.advertisedAppVersion(
+            bundle: Bundle(for: PeerHostCoordinator.self)
+        )
+        XCTAssertNotNil(
+            PeerDaemonVersion.parseComponents(version),
+            "must be a real X.Y.Z version, got: \(version)"
+        )
+        XCTAssertNotEqual(version, "0.0.0", "the fallback must not be what ships")
+        XCTAssertNotEqual(version, "debug-server")
+    }
+
+    /// The raw plist value is untrusted: whitespace-only must fall back like
+    /// a missing key (advertising " \n" verbatim is how a picker shows an
+    /// empty version chip), and surrounding whitespace must not survive into
+    /// the wire string a client parses.
+    func test_advertisedAppVersionTrimsAndFallsBackHonestly() {
+        XCTAssertEqual(PeerHostCoordinator.advertisedAppVersion(rawBundleVersion: nil), "0.0.0")
+        XCTAssertEqual(PeerHostCoordinator.advertisedAppVersion(rawBundleVersion: " \n"), "0.0.0")
+        XCTAssertEqual(
+            PeerHostCoordinator.advertisedAppVersion(rawBundleVersion: " 0.194.0 "),
+            "0.194.0"
+        )
     }
 
     // MARK: - Helpers (mirrors PeerSocketProberTests' local script runner)

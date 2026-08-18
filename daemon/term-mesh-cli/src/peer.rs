@@ -9,7 +9,7 @@
 //!   - All outgoing frames serialized through a single writer thread so
 //!     SIGWINCH, stdin, and handshake-follow-up writes don't race.
 
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
@@ -37,7 +37,16 @@ const DEFAULT_COLS: u32 = 80;
 const DEFAULT_ROWS: u32 = 24;
 /// Ctrl-] — same convention as telnet. One keystroke, no two-step escape.
 const DETACH_KEY: u8 = 0x1d;
-const REMOTE_SOCKET_PROBE: &str = r#"sh -c 'p=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" 2>/dev/null | tail -n 1 | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^\"//;s/\"$//"); for c in "$p" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/tm-peer.sock}" "/run/user/$(id -u)/tm-peer.sock" "/tmp/term-mesh-peer-$(id -u)/peer.sock"; do [ -n "$c" ] && [ -S "$c" ] && { printf "%s" "$c"; exit 0; }; done; if (command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet term-meshd) || pgrep -u "$(id -u)" -x term-meshd >/dev/null 2>&1; then exit 44; fi; exit 43'"#;
+const REMOTE_SOCKET_PROBE: &str = r#"sh -c 'p=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -n 1 | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^\"//;s/\"$//"); t=${TMPDIR:-}; [ -n "$t" ] || t=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null); for c in "$p" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/tm-peer.sock}" "/run/term-mesh/tm-peer.sock" "/run/user/$(id -u)/tm-peer.sock" "${t:+${t%/}/term-meshd-peer.sock}" "/tmp/term-mesh-peer-$(id -u)/peer.sock"; do [ -n "$c" ] && [ -S "$c" ] && { printf "%s" "$c"; exit 0; }; done; if (command -v systemctl >/dev/null 2>&1 && { systemctl is-active --quiet term-meshd || systemctl --user is-active --quiet term-meshd; }) || pgrep -u "$(id -u)" -x term-meshd >/dev/null 2>&1; then exit 44; fi; exit 43'"#;
+/// The control plane is a different protocol and socket from the protobuf
+/// peer plane. A host is operational only when both pathname entries exist;
+/// checking this separately also prevents callers from ever probing the peer
+/// socket with JSON-RPC.
+
+/// Discover only the control pathname. RPC health is checked separately over
+/// the forwarded socket, so a missing remote CLI, a failed RPC, and a missing
+/// pathname cannot collapse into the same diagnostic.
+const REMOTE_CONTROL_SOCKET_DISCOVERY: &str = r#"sh -c 'p=$(sed -n "s/^TERMMESH_DAEMON_UNIX_PATH=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -n 1 | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^\"//;s/\"$//"); t=${TMPDIR:-}; [ -n "$t" ] || t=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null); for c in "$p" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/term-meshd.sock}" "/run/user/$(id -u)/term-meshd.sock" "/run/term-mesh/term-meshd.sock" "${t:+${t%/}/term-meshd.sock}" "/tmp/term-meshd.sock"; do [ -n "$c" ] && [ -S "$c" ] && { printf "%s" "$c"; exit 0; }; done; exit 45'"#;
 
 #[derive(Clone, Copy)]
 pub enum RestartPolicy {
@@ -99,10 +108,18 @@ struct ResolvedSshConfig {
 fn public_error_context(code: &str) -> &'static str {
     match code {
         "SSH_AUTH_FAILED" | "PEER_AUTH_FAILED" => "authentication failed",
+        "SSH_SPAWN_FAILED" => "SSH could not be started",
+        "SSH_PROBE_FAILED" => "SSH probe failed",
+        "SSH_PROBE_TIMEOUT" => "SSH probe timed out",
         "DAEMON_UNAVAILABLE" => "remote daemon is unavailable",
         "SOCKET_UNAVAILABLE" | "SOCKET_CONNECT_FAILED" | "SOCKET_FORWARD_TIMEOUT" => {
             "peer socket is unavailable"
         }
+        "CONTROL_SOCKET_UNAVAILABLE" => "control socket is unavailable",
+        "CONTROL_RPC_FAILED" | "CONTROL_PROTOCOL_MISMATCH" => {
+            "control socket does not answer the term-mesh JSON-RPC protocol"
+        }
+        "VERSION_PROBE_FAILED" => "daemon version could not be verified",
         "INVALID_HOST"
         | "INVALID_SOCKET_PATH"
         | "INVALID_SURFACE_ID"
@@ -606,6 +623,10 @@ fn decode_ssh_g_stdout(output: Vec<u8>) -> Result<String, PeerCliError> {
 }
 
 fn ssh_probe_args(host: &str) -> Vec<String> {
+    ssh_fixed_probe_args(host, REMOTE_SOCKET_PROBE)
+}
+
+fn ssh_fixed_probe_args(host: &str, command: &str) -> Vec<String> {
     vec![
         "-T".into(),
         "-x".into(),
@@ -623,8 +644,136 @@ fn ssh_probe_args(host: &str) -> Vec<String> {
         "BatchMode=yes".into(),
         "--".into(),
         host.into(),
-        REMOTE_SOCKET_PROBE.into(),
+        command.into(),
     ]
+}
+
+fn probe_remote_control_socket(host: &str) -> Result<String, PeerCliError> {
+    let output = run_fixed_ssh_probe(host, REMOTE_CONTROL_SOCKET_DISCOVERY, 15)?;
+    match output.status.code().unwrap_or(-1) {
+        0 => {}
+        45 => {
+            return Err(PeerCliError::new(
+                "CONTROL_SOCKET_UNAVAILABLE",
+                "control",
+                "term-meshd control socket pathname is missing",
+            ))
+        }
+        255 if String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("permission denied") =>
+        {
+            return Err(PeerCliError::new(
+                "SSH_AUTH_FAILED",
+                "auth",
+                "SSH authentication failed",
+            ))
+        }
+        code => {
+            return Err(PeerCliError::new(
+                "SSH_PROBE_FAILED",
+                "ssh",
+                format!("control socket discovery exited with status {code}"),
+            ))
+        }
+    }
+    let path = String::from_utf8(output.stdout).map_err(|_| {
+        PeerCliError::new(
+            "INVALID_SOCKET_PATH",
+            "control",
+            "probe output is not UTF-8",
+        )
+    })?;
+    let path = path.trim().to_string();
+    validate_remote_socket(&path)?;
+    Ok(path)
+}
+
+fn run_fixed_ssh_probe(
+    host: &str,
+    command: &str,
+    timeout_seconds: u64,
+) -> Result<std::process::Output, PeerCliError> {
+    let mut child = Command::new("/usr/bin/ssh")
+        .args(ssh_fixed_probe_args(host, command))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| PeerCliError::new("SSH_SPAWN_FAILED", "ssh", e.to_string()))?;
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    loop {
+        match child
+            .try_wait()
+            .map_err(|e| PeerCliError::new("SSH_PROBE_FAILED", "ssh", e.to_string()))?
+        {
+            Some(_) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|e| PeerCliError::new("SSH_PROBE_FAILED", "ssh", e.to_string()))
+            }
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(PeerCliError::new(
+                    "SSH_PROBE_TIMEOUT",
+                    "ssh",
+                    "remote control socket discovery timed out",
+                ));
+            }
+        }
+    }
+}
+
+fn daemon_version_from_status_response(value: &Value) -> Result<String, PeerCliError> {
+    if value.get("id").and_then(Value::as_i64) != Some(1) {
+        return Err(PeerCliError::new(
+            "CONTROL_PROTOCOL_MISMATCH",
+            "control",
+            "daemon.status returned an unexpected JSON-RPC id",
+        ));
+    }
+    if value.get("error").is_some() {
+        return Err(PeerCliError::new(
+            "CONTROL_RPC_FAILED",
+            "control",
+            "daemon.status returned an error",
+        ));
+    }
+    value
+        .pointer("/result/version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            PeerCliError::new(
+                "VERSION_PROBE_FAILED",
+                "version",
+                "serving daemon did not report a version",
+            )
+        })
+}
+
+fn probe_control_rpc(host: &str, socket_path: &str) -> Result<String, PeerCliError> {
+    let tunnel = RemotePeer::open(host, Some(socket_path))?;
+    let mut stream = UnixStream::connect(&tunnel.local_socket)
+        .map_err(|error| PeerCliError::new("CONTROL_RPC_FAILED", "control", error.to_string()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| PeerCliError::new("CONTROL_RPC_FAILED", "control", error.to_string()))?;
+    stream
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"daemon.status\",\"params\":{}}\n")
+        .map_err(|error| PeerCliError::new("CONTROL_RPC_FAILED", "control", error.to_string()))?;
+    let mut response = String::new();
+    io::BufReader::new(stream)
+        .read_line(&mut response)
+        .map_err(|error| PeerCliError::new("CONTROL_RPC_FAILED", "control", error.to_string()))?;
+    let value: Value = serde_json::from_str(&response).map_err(|error| {
+        PeerCliError::new("CONTROL_PROTOCOL_MISMATCH", "control", error.to_string())
+    })?;
+    daemon_version_from_status_response(&value)
 }
 
 fn validate_ssh_target(host: &str) -> Result<(), PeerCliError> {
@@ -876,25 +1025,60 @@ pub fn status_cmd(host: &str, remote_socket: Option<&str>) -> i32 {
         let tunnel = RemotePeer::open(host, remote_socket)?;
         let (_, _, _, capabilities) =
             connect_and_authenticate(&tunnel.local_socket, false).map_err(handshake_error)?;
+        let control_socket = probe_remote_control_socket(host)?;
+        let daemon_version = probe_control_rpc(host, &control_socket)?;
+        let client_version = env!("CARGO_PKG_VERSION");
+        let version_match = daemon_version == client_version;
+        let missing = missing_operational_capabilities(&capabilities);
+        let healthy = missing.is_empty() && version_match;
         Ok(json!({
             "authenticated": true,
             "host": host,
-            "ok": true,
+            "ok": healthy,
             "peer_socket": tunnel.remote_socket,
-            "status": "ready",
+            "control_socket": control_socket,
+            "daemon_version": daemon_version,
+            "client_version": client_version,
+            "version_match": version_match,
+            "status": if healthy { "healthy" } else { "degraded" },
+            "missing_capabilities": missing,
+            "replay_ring": capabilities.has(capability::REPLAY_RING_V1),
+            "grid_snapshot": capabilities.has(capability::GRID_SNAPSHOT_V1),
             "surface_ensure": capabilities.has(capability::SURFACE_ENSURE_V1),
+            "surface_agent": capabilities.has(capability::SURFACE_AGENT_V1),
         }))
     })();
     match result {
         Ok(value) => {
             print_json(&value);
-            0
+            if value["ok"].as_bool() == Some(true) {
+                0
+            } else {
+                2
+            }
         }
         Err(error) => {
             print_json(&error.json(host));
             1
         }
     }
+}
+
+/// Minimum contract for a host that can carry Project agents without the two
+/// incident shapes this command is meant to catch: lossy resume that replays
+/// old terminal bytes, and an old daemon that cannot host native agent
+/// surfaces deterministically. Authentication alone is reachability, not
+/// health.
+fn missing_operational_capabilities(capabilities: &PeerCapabilities) -> Vec<&'static str> {
+    [
+        capability::REPLAY_RING_V1,
+        capability::GRID_SNAPSHOT_V1,
+        capability::SURFACE_ENSURE_V1,
+        capability::SURFACE_AGENT_V1,
+    ]
+    .into_iter()
+    .filter(|required| !capabilities.has(required))
+    .collect()
 }
 
 pub fn ensure_cmd(
@@ -1262,7 +1446,9 @@ fn probe_local_peer_socket() -> anyhow::Result<PathBuf> {
     }
     let uid = unsafe { libc::getuid() };
     candidates.push(PathBuf::from(format!("/run/user/{uid}/tm-peer.sock")));
-    candidates.push(PathBuf::from(format!("/tmp/term-mesh-peer-{uid}/peer.sock")));
+    candidates.push(PathBuf::from(format!(
+        "/tmp/term-mesh-peer-{uid}/peer.sock"
+    )));
 
     for c in &candidates {
         if std::fs::metadata(c)
@@ -2078,8 +2264,16 @@ pub fn snapshot_cmd(
 
     // Use the surface's own dimensions so the emulated grid matches what other
     // viewers see and attaching does not resize/reflow the shared PTY.
-    let cols = if chosen.cols == 0 { DEFAULT_COLS } else { chosen.cols };
-    let rows = if chosen.rows == 0 { DEFAULT_ROWS } else { chosen.rows };
+    let cols = if chosen.cols == 0 {
+        DEFAULT_COLS
+    } else {
+        chosen.cols
+    };
+    let rows = if chosen.rows == 0 {
+        DEFAULT_ROWS
+    } else {
+        chosen.rows
+    };
     write_envelope(
         &mut write_stream,
         &Envelope {
@@ -2119,8 +2313,7 @@ pub fn snapshot_cmd(
                 _ => {}
             },
             Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut =>
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
                 break; // quiescent — repaint finished
             }
@@ -2764,6 +2957,66 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn peer_health_requires_continuity_and_agent_capabilities() {
+        let healthy = PeerCapabilities::from_hello(vec![
+            capability::REPLAY_RING_V1.into(),
+            capability::GRID_SNAPSHOT_V1.into(),
+            capability::SURFACE_ENSURE_V1.into(),
+            capability::SURFACE_AGENT_V1.into(),
+        ]);
+        assert!(missing_operational_capabilities(&healthy).is_empty());
+
+        let reachable_but_old =
+            PeerCapabilities::from_hello(vec![capability::SURFACE_ENSURE_V1.into()]);
+        assert_eq!(
+            missing_operational_capabilities(&reachable_but_old),
+            vec![
+                capability::REPLAY_RING_V1,
+                capability::GRID_SNAPSHOT_V1,
+                capability::SURFACE_AGENT_V1,
+            ]
+        );
+    }
+
+    #[test]
+    fn operational_socket_probes_cover_linux_user_scope_and_macos_app() {
+        assert!(REMOTE_SOCKET_PROBE.contains("${t%/}/term-meshd-peer.sock"));
+        assert!(REMOTE_CONTROL_SOCKET_DISCOVERY.contains("/run/user/$(id -u)/term-meshd.sock"));
+        assert!(REMOTE_CONTROL_SOCKET_DISCOVERY.contains("DARWIN_USER_TEMP_DIR"));
+        assert!(REMOTE_CONTROL_SOCKET_DISCOVERY.contains("${t%/}/term-meshd.sock"));
+        assert!(!REMOTE_CONTROL_SOCKET_DISCOVERY.contains("tm-agent"));
+        assert!(!REMOTE_CONTROL_SOCKET_DISCOVERY.contains("replay-capacity"));
+        assert!(!REMOTE_CONTROL_SOCKET_DISCOVERY.contains(r#"\\\""#));
+        assert_eq!(public_error_context("SSH_SPAWN_FAILED"), "SSH could not be started");
+        assert_eq!(public_error_context("SSH_PROBE_FAILED"), "SSH probe failed");
+        assert_eq!(public_error_context("SSH_PROBE_TIMEOUT"), "SSH probe timed out");
+    }
+
+    #[test]
+    fn health_uses_version_reported_by_serving_daemon() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"version": "0.191.0"}
+        });
+        assert_eq!(
+            daemon_version_from_status_response(&response).unwrap(),
+            "0.191.0"
+        );
+    }
+
+    #[test]
+    fn health_rejects_status_without_serving_version() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"pid": 42}
+        });
+        let error = daemon_version_from_status_response(&response).unwrap_err();
+        assert_eq!(error.code, "VERSION_PROBE_FAILED");
+    }
+
+    #[test]
     fn framing_roundtrip_via_pipe() {
         use std::io::Cursor;
         let env = Envelope {
@@ -2904,7 +3157,10 @@ mod tests {
         let beta = surface_info(0x22, "beta");
         let surfaces = vec![alpha.clone(), beta.clone()];
 
-        assert_eq!(select_surface(&surfaces, None, None).unwrap().surface_id, alpha.surface_id);
+        assert_eq!(
+            select_surface(&surfaces, None, None).unwrap().surface_id,
+            alpha.surface_id
+        );
         assert_eq!(
             select_surface(&surfaces, Some("beta"), None)
                 .unwrap()

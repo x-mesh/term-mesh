@@ -1440,7 +1440,8 @@ final class TeamOrchestrator: ObservableObject {
                     bridgedCli: agentCli, bridgePath: bridge,
                     model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
                     cliPath: cliPath,
-                    environment: nativeEnvironment
+                    environment: nativeEnvironment,
+                    protectedEnvironmentKeys: Set(paneEnv.keys)
                 )
                 // A bridged CLI has no `--append-system-prompt`, and none of
                 // them agree on an equivalent, so its role has to arrive as a
@@ -1471,7 +1472,8 @@ final class TeamOrchestrator: ObservableObject {
                     model: Self.resolveClaudeModelArg(agentModel),
                     instructions: agentInstructions,
                     extraArgs: extraArgs,
-                    environment: nativeEnvironment
+                    environment: nativeEnvironment,
+                    protectedEnvironmentKeys: Set(paneEnv.keys)
                 )
             }
             // The turn states its own end and carries its final text, so the
@@ -1597,6 +1599,98 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     // MARK: - Team Lifecycle
+
+    nonisolated static func isolatedWorktreeBranch(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String
+    ) -> String {
+        func component(_ value: String, fallback: String) -> String {
+            let mapped = value.lowercased().unicodeScalars.map { scalar -> Character in
+                CharacterSet.alphanumerics.contains(scalar) || scalar == "-" || scalar == "_"
+                    ? Character(String(scalar)) : "-"
+            }
+            let normalized = String(mapped)
+                .split(separator: "-", omittingEmptySubsequences: true)
+                .joined(separator: "-")
+            return normalized.isEmpty ? fallback : normalized
+        }
+        return "team/\(component(teamName, fallback: "team"))/\(component(agentName, fallback: "agent"))/\(component(agentInstanceId, fallback: "instance"))"
+    }
+
+    struct IsolatedWorktreeProvisioningFailure: Error {
+        let agentName: String
+        let agentInstanceId: String
+        let branch: String
+        let underlying: WorktreeCreateError
+    }
+
+    nonisolated static func provisionIsolatedWorktrees(
+        teamName: String,
+        agents: [(name: String, instanceId: String)],
+        create: (String) -> Result<WorktreeInfo, WorktreeCreateError>,
+        rollback: (WorktreeInfo) -> Void
+    ) -> Result<[WorktreeInfo], IsolatedWorktreeProvisioningFailure> {
+        var created: [WorktreeInfo] = []
+        for agent in agents {
+            let branch = isolatedWorktreeBranch(
+                teamName: teamName, agentName: agent.name,
+                agentInstanceId: agent.instanceId
+            )
+            switch create(branch) {
+            case .success(let info):
+                created.append(info)
+            case .failure(let error):
+                for worktree in created.reversed() { rollback(worktree) }
+                return .failure(IsolatedWorktreeProvisioningFailure(
+                    agentName: agent.name, agentInstanceId: agent.instanceId,
+                    branch: branch, underlying: error
+                ))
+            }
+        }
+        return .success(created)
+    }
+
+    /// What one rollback attempt did to a pre-provisioned checkout.
+    ///
+    /// `retained` is the case that must never be silent: the daemon removes a
+    /// created worktree with `force: false`, so it refuses anything carrying
+    /// uncommitted work. That refusal is the correct outcome — the checkout
+    /// stays on disk — but only if somebody can see it in the log afterwards.
+    enum IsolatedWorktreeRollbackOutcome: Equatable {
+        /// The checkout and its created branch are gone; the slot is reusable.
+        case removed
+        /// The daemon declined (dirty work, RPC failure). Left alone on disk.
+        case retained
+    }
+
+    /// Give back every checkout that was provisioned but never claimed by a
+    /// final roster, newest first.
+    ///
+    /// Provisioning happens before any process starts, so between it and the
+    /// committed team roster the worktrees belong to the transaction, not to
+    /// the team. A pane alone is not durable ownership: if a later pane fails,
+    /// the workspace is closed and every checkout must go back or the next
+    /// attempt collides with its own leftovers. Reverse order mirrors creation.
+    ///
+    /// Returns the checkouts that are still on disk, i.e. the ones a caller
+    /// must not assume it can recreate.
+    nonisolated static func rollbackUnownedIsolatedWorktrees(
+        provisioned: [WorktreeInfo?],
+        rollback: (WorktreeInfo) -> Bool,
+        log: (WorktreeInfo, IsolatedWorktreeRollbackOutcome) -> Void
+    ) -> [WorktreeInfo] {
+        var retained: [WorktreeInfo] = []
+        for info in provisioned.compactMap({ $0 }).reversed() {
+            if rollback(info) {
+                log(info, .removed)
+            } else {
+                retained.append(info)
+                log(info, .retained)
+            }
+        }
+        return retained
+    }
 
     /// Create a team of Claude agents in split panes within a single workspace.
     /// Layout: leader console on left, agents stacked vertically on right.
@@ -1799,6 +1893,7 @@ final class TeamOrchestrator: ObservableObject {
         var sharedWtName: String?
         var sharedWtPath: String?
         var sharedWtBranch: String?
+        var isolatedWorktrees = [WorktreeInfo?](repeating: nil, count: agents.count)
 
         if useWorktrees {
             WorktreeLog.log("team.create mode=\(worktreeMode) team=\(name) gitRoot=\(gitRepoRoot ?? "nil")")
@@ -1829,6 +1924,78 @@ final class TeamOrchestrator: ObservableObject {
             }
         }
 
+        // Provision every isolated checkout before any leader or agent process
+        // starts. Partial success is rolled back, and isolated mode never falls
+        // through to the source checkout: a failed sandbox is a failed team
+        // creation, not permission to run two agents in the user's working tree.
+        if worktreeMode == "isolated", executionMode != "headless", !agents.isEmpty {
+            guard let repoRoot = gitRepoRoot else {
+                Logger.team.error("isolated worktrees require a Git repository")
+                tabManager.closeWorkspace(workspace)
+                return nil
+            }
+            let identities = agents.enumerated().map { index, agent in
+                (name: agent.name, instanceId: reservedAgentInstanceIds[index])
+            }
+            switch Self.provisionIsolatedWorktrees(
+                teamName: name, agents: identities,
+                create: { branch in
+                    daemon.createWorktreeWithError(repoPath: repoRoot, branch: branch)
+                },
+                rollback: { info in
+                    _ = daemon.rollbackCreatedWorktree(repoPath: repoRoot, name: info.name)
+                }
+            ) {
+            case .success(let worktrees):
+                for (index, info) in worktrees.enumerated() {
+                    let agent = agents[index]
+                    let instanceId = reservedAgentInstanceIds[index]
+                    isolatedWorktrees[index] = info
+                    Logger.team.info(
+                        "worktree prepared agent=\(agent.name, privacy: .public) instance=\(instanceId, privacy: .public) path=\(info.path, privacy: .public) branch=\(info.branch, privacy: .public)"
+                    )
+                    WorktreeLog.log(
+                        "team.isolated.ok team=\(name) agent=\(agent.name) instance=\(instanceId) path=\(info.path) branch=\(info.branch)"
+                    )
+                }
+            case .failure(let failure):
+                WorktreeLog.log(
+                    "team.isolated.REFUSED team=\(name) agent=\(failure.agentName) instance=\(failure.agentInstanceId) branch=\(failure.branch) error=\(failure.underlying)"
+                )
+                tabManager.closeWorkspace(workspace)
+                let alert = NSAlert()
+                alert.messageText = "Isolated Worktree Creation Failed"
+                alert.informativeText = "Agent '\(failure.agentName)' (\(failure.agentInstanceId)) could not start.\nBranch: \(failure.branch)\n\(failure.underlying)"
+                alert.alertStyle = .critical
+                alert.addButton(withTitle: "OK")
+                alert.presentAsSheet()
+                return nil
+            }
+        }
+
+        // Checkouts provisioned above belong to this call until the final team
+        // roster is committed. Any failure below closes the workspace first,
+        // then returns every checkout provisioned by this transaction.
+        func rollbackProvisionedWorktrees(reason: String) {
+            guard worktreeMode == "isolated", let repoRoot = gitRepoRoot else { return }
+            let retained = Self.rollbackUnownedIsolatedWorktrees(
+                provisioned: isolatedWorktrees,
+                rollback: { daemon.rollbackCreatedWorktree(repoPath: repoRoot, name: $0.name) },
+                log: { info, outcome in
+                    WorktreeLog.log(
+                        "team.isolated.rollback team=\(name) reason=\(reason) outcome=\(outcome) path=\(info.path) branch=\(info.branch)"
+                    )
+                }
+            )
+            for info in retained {
+                // Not a failure to recover from — `force: false` is what keeps
+                // uncommitted work alive — but the leftover has to be findable.
+                Logger.team.error(
+                    "isolated worktree retained after \(reason, privacy: .public): path=\(info.path, privacy: .public) branch=\(info.branch, privacy: .public)"
+                )
+            }
+        }
+
         // Leader working directory: use shared worktree when active
         let leaderWorkDir = sharedWorkDir ?? workingDirectory
 
@@ -1836,6 +2003,8 @@ final class TeamOrchestrator: ObservableObject {
         // Close the default panel and create a new one with the leader script as command
         guard let defaultPanelId = workspace.focusedPanelId else {
             Logger.team.error("no initial panel in workspace")
+            tabManager.closeWorkspace(workspace)
+            rollbackProvisionedWorktrees(reason: "no-initial-panel")
             return nil
         }
 
@@ -1863,6 +2032,8 @@ final class TeamOrchestrator: ObservableObject {
         } else if leaderMode == "adopted" {
             guard let adoptedSurfaceId = adoptedLeaderSurfaceId else {
                 Logger.team.error("[team] adopted mode requires adoptedLeaderSurfaceId")
+                tabManager.closeWorkspace(workspace)
+                rollbackProvisionedWorktrees(reason: "adopted-leader-missing")
                 return nil
             }
             // Look up the adopted leader's workspace so cross-workspace sends work correctly.
@@ -2018,6 +2189,8 @@ final class TeamOrchestrator: ObservableObject {
                 environment: leaderEnv
             ) else {
                 Logger.team.error("failed to create leader panel")
+                tabManager.closeWorkspace(workspace)
+                rollbackProvisionedWorktrees(reason: "leader-pane-failed")
                 return nil
             }
             leaderPanelId = leaderPanel.id
@@ -2234,29 +2407,11 @@ final class TeamOrchestrator: ObservableObject {
             var wtPath = sharedWtPath
             var wtBranch = sharedWtBranch
 
-            if worktreeMode == "isolated", let repoRoot = gitRepoRoot {
-                let branchName = "team/\(name)/\(agent.name)"
-                let result = daemon.createWorktreeWithError(repoPath: repoRoot, branch: branchName)
-                switch result {
-                case .success(let info):
-                    agentWorkDir = info.path
-                    wtName = info.name
-                    wtPath = info.path
-                    wtBranch = info.branch
-                    Logger.team.info("worktree for \(agent.name, privacy: .public): \(info.path, privacy: .public) [\(info.branch, privacy: .public)]")
-                    WorktreeLog.log("team.isolated.ok team=\(name) agent=\(agent.name) path=\(info.path) branch=\(info.branch)")
-                case .failure(let error):
-                    Logger.team.error("worktree failed for \(agent.name, privacy: .public): \(error, privacy: .public), using original directory")
-                    WorktreeLog.log("team.isolated.FAIL team=\(name) agent=\(agent.name) error=\(error)")
-                    DispatchQueue.main.async {
-                        let alert = NSAlert()
-                        alert.messageText = "Worktree Creation Failed"
-                        alert.informativeText = "Worktree for agent '\(agent.name)' could not be created: \(error). Agent will use the original directory."
-                        alert.alertStyle = .warning
-                        alert.addButton(withTitle: "OK")
-                        alert.presentAsSheet()
-                    }
-                }
+            if worktreeMode == "isolated", let info = isolatedWorktrees[index] {
+                agentWorkDir = info.path
+                wtName = info.name
+                wtPath = info.path
+                wtBranch = info.branch
             }
 
             let agentCli = agent.cli.isEmpty ? "claude" : agent.cli
@@ -2327,9 +2482,22 @@ final class TeamOrchestrator: ObservableObject {
             ) else {
                 if index == 0 {
                     Logger.team.error("failed to create first agent split pane")
+                    tabManager.closeWorkspace(workspace)
+                    rollbackProvisionedWorktrees(reason: "first-agent-pane-failed")
                     return nil
                 }
                 Logger.team.error("failed to create split pane for agent '\(agent.name, privacy: .public)'")
+                if worktreeMode == "isolated" {
+                    // An isolated team is all-or-nothing. Continuing here would
+                    // hand back a roster that quietly lost a member while that
+                    // member's checkout sat on disk with nothing pointing at it.
+                    WorktreeLog.log(
+                        "team.isolated.ABORT team=\(name) agent=\(agent.name) instance=\(reservedAgentInstanceIds[index]) reason=pane-failed"
+                    )
+                    tabManager.closeWorkspace(workspace)
+                    rollbackProvisionedWorktrees(reason: "agent-pane-failed")
+                    return nil
+                }
                 continue
             }
             members.append(member)
@@ -3140,20 +3308,23 @@ final class TeamOrchestrator: ObservableObject {
 
         ## ADAPTIVE EXECUTION PRINCIPLE (CRITICAL)
 
-        You are both the default executor and the coordinator for this Project. Start single-agent:
-        inspect, reason, edit, and validate directly when the request is small, same-file, or dependency-serial.
-        Do not delegate merely because agents exist or are idle.
+        You are the coordinator and integration owner for this Project. When the roster above provides workers,
+        begin each non-trivial request by finding independently completable units and assign eligible units
+        before doing that work yourself. Prefer a bounded parallel wave when at least two units are
+        dependency-ready, independently verifiable, and ownership-disjoint. Keep a distinct leader lane for
+        coordination, acceptance checks, integration, or unowned work.
 
-        Escalate only when you can name at least two dependency-ready, independently verifiable subtasks
-        with disjoint file or subsystem ownership and enough work to repay coordination cost. When you do,
-        record the positive decomposition evidence, dispatch one bounded wave, collect once, then review and
-        integrate worktrees serially. Use worker follow-ups only for blockers or ownership expansion.
+        Direct execution is the explicit exception for trivial, same-file, dependency-serial, or worker-ineligible
+        work. State the concrete constraint when choosing it; never create artificial work merely to fill idle
+        capacity. For parallel work, record the positive decomposition evidence, dispatch one bounded wave,
+        collect once, then review and integrate worktrees serially. Use worker follow-ups only for blockers or
+        ownership expansion.
         Classify the request as direct, probe, or parallel using the canonical structured decision below.
         Dispatch exactly the tasks in that decision: zero for direct, one read-only worker for probe, and two
         or three dependency-ready workers for parallel.
 
         **You retain direct execution authority:**
-        - Inspect, reason, edit, debug, review, and validate directly for work that does not pass the parallel admission gate
+        - Inspect, reason, edit, debug, review, and validate directly in the explicit direct exception or a distinct leader lane
         - Run `\(tmAgent)` commands (status, delegate, read, wait, inbox, task)
         - Synthesize and summarize agent results for the user
         - Break down tasks and create task plans
@@ -3184,8 +3355,8 @@ final class TeamOrchestrator: ObservableObject {
         `\(tmAgent) delegate <agent_name> '<instruction>' --agent-instance-id <instance>`.
         Validation-role members are read-only by default; grant mutation explicitly only when the task requires it.
 
-        Match admitted parallel tasks to the agent whose specialty fits best. Idle capacity is optional;
-        never manufacture tasks to occupy it.
+        Match admitted parallel tasks to the agent whose specialty fits best. Use available capacity for real,
+        independent work; never manufacture tasks to occupy it.
 
         \(LeaderParallelPolicy.renderedInstructions)
 
@@ -3297,7 +3468,8 @@ final class TeamOrchestrator: ObservableObject {
         **Serial:** task B needs task A's result as input
         - Example: architect designs API → THEN executor implements it
 
-        Parallelism is an escalation, not a utilization target. Leave agents idle when the remaining work does not pass the admission gate.
+        Parallel delegation is the default for genuinely independent Project work, not a utilization target.
+        Leave agents idle only when the remaining work has no useful ownership-disjoint unit.
 
         ## Error Recovery
 
@@ -3565,20 +3737,23 @@ final class TeamOrchestrator: ObservableObject {
 
         ## ADAPTIVE EXECUTION PRINCIPLE (CRITICAL)
 
-        You are both the default executor and the coordinator for this Project. Start single-agent:
-        inspect, reason, edit, and validate directly when the request is small, same-file, or dependency-serial.
-        Do not delegate merely because agents exist or are idle.
+        You are the coordinator and integration owner for this Project. When the roster above provides workers,
+        begin each non-trivial request by finding independently completable units and assign eligible units
+        before doing that work yourself. Prefer a bounded parallel wave when at least two units are
+        dependency-ready, independently verifiable, and ownership-disjoint. Keep a distinct leader lane for
+        coordination, acceptance checks, integration, or unowned work.
 
-        Escalate only when you can name at least two dependency-ready, independently verifiable subtasks
-        with disjoint file or subsystem ownership and enough work to repay coordination cost. When you do,
-        record the positive decomposition evidence, dispatch one bounded wave, collect once, then review and
-        integrate worktrees serially. Use worker follow-ups only for blockers or ownership expansion.
+        Direct execution is the explicit exception for trivial, same-file, dependency-serial, or worker-ineligible
+        work. State the concrete constraint when choosing it; never create artificial work merely to fill idle
+        capacity. For parallel work, record the positive decomposition evidence, dispatch one bounded wave,
+        collect once, then review and integrate worktrees serially. Use worker follow-ups only for blockers or
+        ownership expansion.
         Classify the request as direct, probe, or parallel using the canonical structured decision below.
         Dispatch exactly the tasks in that decision: zero for direct, one read-only worker for probe, and two
         or three dependency-ready workers for parallel.
 
         **You retain direct execution authority:**
-        - Inspect, reason, edit, debug, review, and validate directly for work that does not pass the parallel admission gate
+        - Inspect, reason, edit, debug, review, and validate directly in the explicit direct exception or a distinct leader lane
         - Run `\(tmAgent)` commands (status, delegate, read, wait, inbox, task)
         - Synthesize and summarize agent results for the user
         - Break down tasks and create task plans
@@ -3601,8 +3776,8 @@ final class TeamOrchestrator: ObservableObject {
         `\(tmAgent) delegate <agent_name> '<instruction>' --agent-instance-id <instance>`.
         Validation-role members are read-only by default; grant mutation explicitly only when the task requires it.
 
-        Match admitted parallel tasks to the agent whose specialty fits best. Idle capacity is optional;
-        never manufacture tasks to occupy it.
+        Match admitted parallel tasks to the agent whose specialty fits best. Use available capacity for real,
+        independent work; never manufacture tasks to occupy it.
 
         \(LeaderParallelPolicy.renderedInstructions)
 
@@ -3691,10 +3866,11 @@ final class TeamOrchestrator: ObservableObject {
         - Waiting for one agent to finish before starting another independent task
         - Responding to the user before collecting agent results
 
-        ## Warm Capacity, Not Utilization
+        ## Use Available Capacity Deliberately
 
-        Idle agents are available capacity, not wasted capacity. Do not create work to occupy them. After a
-        bounded wave, check inbox and the task board only for blockers, ownership expansion, or completed results.
+        For non-trivial work, assign every useful dependency-ready, ownership-disjoint unit that fits the bounded
+        wave. Idle agents are still capacity, not a reason to invent tasks. After a bounded wave, check inbox and
+        the task board only for blockers, ownership expansion, or completed results.
 
         Environment: TERMMESH_SOCKET=\(socketPath)
         """
@@ -5828,7 +6004,7 @@ final class TeamOrchestrator: ObservableObject {
                     }
                 )
                 syncTeamStateToDaemon()
-                activatePeerOwnedAgentRestart(
+                await activatePeerOwnedAgentRestart(
                     replacement,
                     teamName: teamName,
                     agentInstanceID: old.agentInstanceId

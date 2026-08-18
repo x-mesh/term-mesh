@@ -127,6 +127,9 @@ final class PeerPaneHostLease {
     /// still exist. Their later releases must not stop it a second time (or,
     /// more importantly, disturb a replacement lease for the same host).
     fileprivate var isTornDown = false
+    /// Whether consumers may still recover through this lease. Exposes the
+    /// lifecycle fact without allowing another file to mutate ownership.
+    var canReconnectTransport: Bool { !isTornDown }
     /// Coordinates transport resets across every pane sharing this host.
     /// Each relay remembers the generation it attached through; the first
     /// relay that reports that generation dead restarts SSH, while siblings
@@ -685,6 +688,7 @@ final class PeerPaneSession {
         relay.hostKey = lease.key
         relay.configureOwnedTransportRecovery(
             generation: transportGeneration,
+            mayReconnect: { [weak lease] in lease?.canReconnectTransport == true },
             handler: { [weak lease] generation in
                 guard let lease else { return generation }
                 return await lease.refreshTransport(
@@ -829,6 +833,7 @@ final class PeerPaneSession {
         relay.hostKey = lease.key
         relay.configureOwnedTransportRecovery(
             generation: transportGeneration,
+            mayReconnect: { [weak lease] in lease?.canReconnectTransport == true },
             handler: { [weak lease] generation in
                 guard let lease else { return generation }
                 return await lease.refreshTransport(

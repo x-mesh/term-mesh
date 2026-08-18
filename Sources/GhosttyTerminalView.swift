@@ -359,6 +359,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     private var backgroundSurfaceStartQueued = false
     private var backgroundSurfaceStartToken: UUID?
     private var surfaceCreationInProgress = false
+    /// A panel close is terminal. Once set, late SwiftUI/AppKit updates must
+    /// not interpret `surface == nil` as permission to create another PTY.
+    private var permanentlyClosed = false
     private var surfaceCreationFailureCount = 0
     private var surfaceCreationRetryNotBefore: TimeInterval = 0
     private var surfaceCallbackContext: Unmanaged<GhosttySurfaceCallbackContext>?
@@ -516,6 +519,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
             "inWindow=\(view.window != nil ? 1 : 0) defer=\(deferCreation ? 1 : 0)"
         )
 #endif
+        guard !permanentlyClosed else {
+            #if DEBUG
+            dlog("surface.attach.skip surface=\(id.uuidString.prefix(5)) reason=permanentlyClosed")
+            #endif
+            return
+        }
 
         // If already attached to this view, nothing to do.
         // Still re-assert the display id: during split close tree restructuring, the view can be
@@ -631,6 +640,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     private func createSurface(for view: GhosttyNSView) {
+        guard !permanentlyClosed else { return }
         guard !surfaceCreationInProgress else { return }
 
         let now = ProcessInfo.processInfo.systemUptime
@@ -1545,6 +1555,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     @MainActor func closeGhosttySurface() {
+        permanentlyClosed = true
+        // Invalidate creation work queued while the panel was still mounted.
+        // The deferred closure also checks `permanentlyClosed`; clearing the
+        // token makes cancellation explicit and prevents stale retries.
+        backgroundSurfaceStartToken = nil
+        backgroundSurfaceStartQueued = false
         releaseGhosttySurfaceAsync(reason: "panelClose")
     }
 
@@ -2244,6 +2260,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
             return
         }
 
+        guard !permanentlyClosed else { return }
         guard surface == nil, attachedView != nil else { return }
         guard !surfaceCreationInProgress else { return }
         guard !backgroundSurfaceStartQueued else { return }
@@ -2258,6 +2275,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
             guard self.backgroundSurfaceStartToken == token else { return }
             self.backgroundSurfaceStartToken = nil
             self.backgroundSurfaceStartQueued = false
+            guard !self.permanentlyClosed else { return }
             guard self.surface == nil, let view = self.attachedView, view.window != nil else { return }
             sentryBreadcrumb("surface.create.deferredStart", category: "terminal", data: [
                 "surface": self.id.uuidString,
@@ -2395,7 +2413,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 #if DEBUG
                 dlog("surface.free.perform surface=\(surfaceId.uuidString.prefix(8)) reason=\(reason)")
                 #endif
-                ghostty_surface_free(surface)
+                freeGhosttySurface(surface, id: surfaceId)
                 callbackContext?.release()
             }
         }
@@ -2432,12 +2450,31 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 dlog("surface.free.perform.deinit surface=\(capturedId.uuidString.prefix(8))")
                 #endif
                 if let s = capturedSurface {
-                    ghostty_surface_free(s)
+                    freeGhosttySurface(s, id: capturedId)
                 }
                 capturedContext?.release()
             }
         }
     }
+}
+
+/// Single entry point for the synchronous free so both teardown paths — the
+/// explicit release above and `deinit` — are timed identically. Routing them
+/// through one function is what keeps the started and completed counts paired;
+/// incrementing at each call site invites a path that reports a start it never
+/// finishes.
+///
+/// This call blocks the caller until Ghostty joins the surface's renderer and IO
+/// threads, and the caller here is the MainActor. That is the block the
+/// telemetry exists to measure.
+private func freeGhosttySurface(_ surface: ghostty_surface_t, id: UUID) {
+    #if DEBUG
+    SurfaceFreeTelemetry.shared.recordStarted(surfaceId: id)
+    #endif
+    ghostty_surface_free(surface)
+    #if DEBUG
+    SurfaceFreeTelemetry.shared.recordCompleted(surfaceId: id)
+    #endif
 }
 
 // MARK: - Ghostty Surface View

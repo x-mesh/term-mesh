@@ -1374,13 +1374,13 @@ final class GhosttySurfaceScrollView: NSView {
         let commandHint: String
         switch mode {
         case .ping:
-            commandHint = targetNames.count > 1
-                ? "Send a short ping to each target, ask them to reply with `tm-agent msg send 'PONG <agent>: ready'`, then check `tm-agent msg list` and summarize who responded."
-                : "Send a short ping to @\(mention), ask them to reply with `tm-agent msg send 'PONG \(mention): ready'`, then check `tm-agent msg list` and summarize the response."
+            commandHint = Self.imeCorrelatedRoutingHint(
+                mention: mention, targetCount: targetNames.count, isPing: true
+            )
         case .message:
-            commandHint = targetNames.count > 1
-                ? "Forward this as a leader-mediated message to each target, then track replies with `tm-agent msg list` if a response is expected."
-                : "Forward this as a leader-mediated message to @\(mention), then track replies with `tm-agent msg list` if a response is expected."
+            commandHint = Self.imeCorrelatedRoutingHint(
+                mention: mention, targetCount: targetNames.count, isPing: false
+            )
         case .task:
             commandHint = targetNames.count > 1
                 ? "Create/delegate a trackable task for each listed target with `tm-agent delegate`, then wait/collect and summarize results."
@@ -1399,6 +1399,32 @@ final class GhosttySurfaceScrollView: NSView {
         \(commandHint)
         Keep the leader in the loop. Do not treat this as already completed just because the IME box sent it.
         """
+    }
+
+    /// MESSAGE is conversational, so its completion is the response rather
+    /// than a task-board transition. A plain `send` only submits the turn; a
+    /// native pane's answer then remains in its transcript and result file.
+    /// Require the CLI's one-shot correlation mailbox so the answer returns
+    /// to the leader process that issued the send.
+    static func imeCorrelatedRoutingHint(
+        mention: String,
+        targetCount: Int,
+        isPing: Bool
+    ) -> String {
+        let target = targetCount > 1 ? "each target" : "@\(mention)"
+        let action = isPing
+            ? "Send the ping to \(target) with"
+            : "Forward this as a leader-mediated message to \(target) with"
+        let fanout = targetCount > 1
+            ? " Run one correlated command per roster instance concurrently and apply a 300-second bounded deadline to each; summarize completed replies and explicit timeouts."
+            : ""
+        return "\(action) "
+            + "`tm-agent send <target> '<USER_TEXT>' --expect-reply --reply-timeout 300` "
+            + "(for a duplicated name, read its durable ID from the supplied roster or "
+            + "`tm-agent status` and include `--agent-instance-id <id>`), then summarize "
+            + "the correlated reply returned by each command. Do not use plain `send` plus "
+            + "`tm-agent msg list`: plain sends do not publish native-pane turn results to "
+            + "the leader message channel." + fanout
     }
 
     private func sendIMEAgentMention(mention: String, text: String) -> Bool {

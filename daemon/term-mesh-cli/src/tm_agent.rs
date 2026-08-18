@@ -4497,6 +4497,26 @@ thread_local! {
     static REMOTE_LEADER_ENV_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Names the file holding this process's scoped route. The value is a path,
+/// never a bearer, so it is safe in a process environment that outlives the
+/// app that wrote it.
+const REMOTE_LEADER_ROUTE_FILE_ENV: &str = "TERMMESH_LEADER_ROUTE_FILE";
+
+/// The route a long-lived remote worker actually follows.
+///
+/// A worker's environment is fixed at spawn. The grant inside it is not: it
+/// belongs to the app that minted it, and dies when that viewer exits. A
+/// second client adopting the same durable project therefore inherited
+/// workers whose `tm-agent send`/`inbox`/`reply` addressed a revoked bearer,
+/// with no way to correct it short of restarting every process and losing its
+/// context.
+///
+/// So the environment names a *file* instead, and this is read on every
+/// invocation. The adopting app replaces that file's contents atomically and
+/// the very next `tm-agent` call follows the new grant. The five plain
+/// variables remain the fallback, which is what keeps workers spawned by an
+/// older app — and any host where staging a file was not possible — working
+/// exactly as before.
 fn remote_leader_route() -> Option<RemoteLeaderRoute> {
     // Tests that temporarily isolate the process-global leader route hold this
     // lock for their duration. Other test threads must not observe the cleared
@@ -4510,25 +4530,304 @@ fn remote_leader_route() -> Option<RemoteLeaderRoute> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         })
     });
-    let grant_id_hex = env::var("TERMMESH_LEADER_GRANT_ID").ok()?;
-    let project_id = env::var("TERMMESH_LEADER_PROJECT_ID").ok()?;
-    let team_uuid = env::var("TERMMESH_LEADER_TEAM_UUID").ok()?;
-    let expires_at_unix_secs = env::var("TERMMESH_LEADER_EXPIRES_AT").ok()?.parse().ok()?;
-    let target_peer_id_hex = env::var("TERMMESH_LEADER_PEER_ID").ok()?;
-    if grant_id_hex.len() != 64
-        || target_peer_id_hex.len() != 32
-        || project_id.is_empty()
-        || team_uuid.is_empty()
+    if let Some(path) = env::var(REMOTE_LEADER_ROUTE_FILE_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if let Some(route) = remote_leader_route_from_file(Path::new(path.trim())) {
+            return Some(route);
+        }
+    }
+    remote_leader_route_from_env()
+}
+
+fn remote_leader_route_from_env() -> Option<RemoteLeaderRoute> {
+    validated_remote_leader_route(RemoteLeaderRoute {
+        grant_id_hex: env::var("TERMMESH_LEADER_GRANT_ID").ok()?,
+        project_id: env::var("TERMMESH_LEADER_PROJECT_ID").ok()?,
+        team_uuid: env::var("TERMMESH_LEADER_TEAM_UUID").ok()?,
+        expires_at_unix_secs: env::var("TERMMESH_LEADER_EXPIRES_AT").ok()?.parse().ok()?,
+        target_peer_id_hex: env::var("TERMMESH_LEADER_PEER_ID").ok()?,
+    })
+}
+
+/// Read a staged route, refusing anything another account could have written.
+///
+/// The file carries a bearer, so a mode that grants group or other any bit —
+/// or an owner that is not this user — is treated as absent rather than
+/// trusted. Falling back to the environment is the safe answer: it is the
+/// route this process was born with.
+fn remote_leader_route_from_file(path: &Path) -> Option<RemoteLeaderRoute> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    // No `follow` question to answer: the metadata is read from the same
+    // handle the bytes come from, so a symlink swapped in between the two
+    // cannot move the check off the file that is actually parsed.
+    let mut file = fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return None;
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return None;
+    }
+    // A staged route is a few hundred bytes. Reading a bounded prefix keeps a
+    // wrong or hostile path from turning one `tm-agent` call into a full read
+    // of an arbitrary file.
+    const MAX_ROUTE_FILE_BYTES: u64 = 64 * 1024;
+    let mut text = String::new();
+    Read::take(&mut file, MAX_ROUTE_FILE_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let string_field = |key: &str| -> Option<String> {
+        value.get(key)?.as_str().map(|text| text.to_string())
+    };
+    validated_remote_leader_route(RemoteLeaderRoute {
+        grant_id_hex: string_field("grant_id_hex")?,
+        project_id: string_field("project_id")?,
+        team_uuid: string_field("team_uuid")?,
+        expires_at_unix_secs: value.get("expires_at_unix_secs")?.as_u64()?,
+        target_peer_id_hex: string_field("target_peer_id_hex")?,
+    })
+}
+
+fn validated_remote_leader_route(route: RemoteLeaderRoute) -> Option<RemoteLeaderRoute> {
+    if route.grant_id_hex.len() != 64
+        || route.target_peer_id_hex.len() != 32
+        || route.project_id.is_empty()
+        || route.team_uuid.is_empty()
     {
         return None;
     }
-    Some(RemoteLeaderRoute {
-        grant_id_hex,
-        project_id,
-        team_uuid,
-        expires_at_unix_secs,
-        target_peer_id_hex,
-    })
+    Some(route)
+}
+
+#[cfg(test)]
+mod remote_leader_route_file_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const ROUTE_ENV: [&str; 5] = [
+        "TERMMESH_LEADER_GRANT_ID",
+        "TERMMESH_LEADER_PROJECT_ID",
+        "TERMMESH_LEADER_TEAM_UUID",
+        "TERMMESH_LEADER_EXPIRES_AT",
+        "TERMMESH_LEADER_PEER_ID",
+    ];
+
+    /// Same contract as `xk_bridge_tests::LocalRpcEnv`: hold the process-global
+    /// route lock, mark it held so `remote_leader_route()` does not deadlock on
+    /// the non-reentrant mutex, and put every original value back on drop.
+    struct RouteEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl RouteEnv {
+        fn new() -> Self {
+            let lock = REMOTE_LEADER_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            REMOTE_LEADER_ENV_LOCK_HELD.with(|held| held.set(true));
+            let mut saved: Vec<(&'static str, Option<std::ffi::OsString>)> = ROUTE_ENV
+                .iter()
+                .map(|key| (*key, env::var_os(key)))
+                .collect();
+            saved.push((
+                REMOTE_LEADER_ROUTE_FILE_ENV,
+                env::var_os(REMOTE_LEADER_ROUTE_FILE_ENV),
+            ));
+            for (key, _) in &saved {
+                env::remove_var(key);
+            }
+            Self { saved, _lock: lock }
+        }
+
+        fn set_env_route(&self, grant: &str) {
+            env::set_var("TERMMESH_LEADER_GRANT_ID", grant);
+            env::set_var("TERMMESH_LEADER_PROJECT_ID", "name:env-project");
+            env::set_var("TERMMESH_LEADER_TEAM_UUID", "env-team");
+            env::set_var("TERMMESH_LEADER_EXPIRES_AT", "42");
+            env::set_var("TERMMESH_LEADER_PEER_ID", "ef".repeat(16));
+        }
+    }
+
+    impl Drop for RouteEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(original) => env::set_var(key, original),
+                    None => env::remove_var(key),
+                }
+            }
+            REMOTE_LEADER_ENV_LOCK_HELD.with(|held| held.set(false));
+        }
+    }
+
+    fn route_json(grant: &str) -> String {
+        json!({
+            "version": 1,
+            "grant_id_hex": grant,
+            "project_id": "name:file-project",
+            "team_uuid": "file-team",
+            "expires_at_unix_secs": 4_102_444_800u64,
+            "target_peer_id_hex": "ab".repeat(16),
+        })
+        .to_string()
+    }
+
+    fn stage(dir: &tempfile::TempDir, name: &str, body: &str, mode: u32) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, body).expect("write staged route");
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("chmod staged route");
+        path
+    }
+
+    #[test]
+    fn owner_only_route_file_parses_every_scoped_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = stage(&dir, "route.json", &route_json(&"cd".repeat(32)), 0o600);
+
+        let route = remote_leader_route_from_file(&path).expect("staged route");
+
+        assert_eq!(route.grant_id_hex, "cd".repeat(32));
+        assert_eq!(route.project_id, "name:file-project");
+        assert_eq!(route.team_uuid, "file-team");
+        assert_eq!(route.expires_at_unix_secs, 4_102_444_800);
+        assert_eq!(route.target_peer_id_hex, "ab".repeat(16));
+    }
+
+    #[test]
+    fn group_or_world_readable_route_file_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for mode in [0o640, 0o604, 0o666, 0o660] {
+            let path = stage(&dir, "route.json", &route_json(&"cd".repeat(32)), mode);
+            assert!(
+                remote_leader_route_from_file(&path).is_none(),
+                "mode {mode:o} must not be trusted with a bearer"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_short_route_fields_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            ("not json at all".to_string(), "garbage"),
+            (route_json("cd"), "short grant"),
+            (
+                json!({
+                    "grant_id_hex": "cd".repeat(32),
+                    "project_id": "",
+                    "team_uuid": "file-team",
+                    "expires_at_unix_secs": 1u64,
+                    "target_peer_id_hex": "ab".repeat(16),
+                })
+                .to_string(),
+                "empty project",
+            ),
+            (
+                json!({
+                    "grant_id_hex": "cd".repeat(32),
+                    "project_id": "name:file-project",
+                    "team_uuid": "file-team",
+                    "expires_at_unix_secs": "42",
+                    "target_peer_id_hex": "ab".repeat(16),
+                })
+                .to_string(),
+                "string expiry",
+            ),
+        ];
+        for (body, label) in cases {
+            let path = stage(&dir, "route.json", &body, 0o600);
+            assert!(
+                remote_leader_route_from_file(&path).is_none(),
+                "{label} must not resolve to a route"
+            );
+        }
+        assert!(
+            remote_leader_route_from_file(&dir.path().join("absent.json")).is_none(),
+            "a missing route file is not an error, only an absence"
+        );
+        assert!(
+            remote_leader_route_from_file(dir.path()).is_none(),
+            "a directory is not a route file"
+        );
+    }
+
+    #[test]
+    fn staged_route_wins_over_the_spawn_time_environment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = stage(&dir, "route.json", &route_json(&"cd".repeat(32)), 0o600);
+        let guard = RouteEnv::new();
+        guard.set_env_route(&"11".repeat(32));
+        env::set_var(REMOTE_LEADER_ROUTE_FILE_ENV, &path);
+
+        let route = remote_leader_route().expect("route");
+        assert_eq!(
+            route.grant_id_hex,
+            "cd".repeat(32),
+            "an adopting app replaces the file, never the frozen environment"
+        );
+        assert_eq!(route.team_uuid, "file-team");
+    }
+
+    #[test]
+    fn replacing_the_file_moves_a_live_worker_to_the_new_grant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = stage(&dir, "route.json", &route_json(&"cd".repeat(32)), 0o600);
+        let guard = RouteEnv::new();
+        guard.set_env_route(&"11".repeat(32));
+        env::set_var(REMOTE_LEADER_ROUTE_FILE_ENV, &path);
+        assert_eq!(
+            remote_leader_route().expect("first route").grant_id_hex,
+            "cd".repeat(32)
+        );
+
+        // Exactly what adoption does on the far side: write a sibling, then
+        // rename over the live path.
+        let staged = dir.path().join("route.json.tmp");
+        fs::write(&staged, route_json(&"99".repeat(32))).expect("stage replacement");
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).expect("chmod replacement");
+        fs::rename(&staged, &path).expect("atomic replace");
+
+        assert_eq!(
+            remote_leader_route().expect("second route").grant_id_hex,
+            "99".repeat(32),
+            "the next invocation must follow the adopting app's grant"
+        );
+    }
+
+    #[test]
+    fn an_unusable_route_file_falls_back_to_the_spawn_time_environment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = stage(&dir, "route.json", "{ truncated", 0o600);
+        let guard = RouteEnv::new();
+        guard.set_env_route(&"11".repeat(32));
+        env::set_var(REMOTE_LEADER_ROUTE_FILE_ENV, &path);
+
+        let route = remote_leader_route().expect("environment fallback");
+        assert_eq!(route.grant_id_hex, "11".repeat(32));
+        assert_eq!(route.team_uuid, "env-team");
+
+        env::set_var(REMOTE_LEADER_ROUTE_FILE_ENV, dir.path().join("absent.json"));
+        assert_eq!(
+            remote_leader_route().expect("environment fallback").team_uuid,
+            "env-team",
+            "a worker spawned before route files existed keeps its own route"
+        );
+    }
+
+    #[test]
+    fn no_route_file_and_no_environment_means_no_route() {
+        let _guard = RouteEnv::new();
+        assert!(remote_leader_route().is_none());
+    }
 }
 
 fn remote_leader_method_allowed(method: &str) -> bool {

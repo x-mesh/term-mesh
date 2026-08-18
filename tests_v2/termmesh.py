@@ -1053,6 +1053,17 @@ class termmesh:
         # Server wraps the underlying stats object under "stats".
         return dict(res.get("stats") or {})
 
+    def surface_free_status(self, surface_id: str) -> dict:
+        """Counters and last duration for a surface's synchronous ghostty free.
+
+        Answers while the app's main thread is blocked inside that free, which is
+        the point: it lets a test see when the block starts instead of sleeping
+        and hoping.
+        """
+        return dict(
+            self._call("debug.surface_free.status", {"surface_id": str(surface_id)}) or {}
+        )
+
     def layout_debug(self) -> dict:
         res = self._call("debug.layout") or {}
         # Server wraps LayoutDebugResponse under "layout".
@@ -1281,6 +1292,8 @@ class termmesh:
                              leader_model: str = "sonnet",
                              leader_host: Optional[str] = None,
                              leader_directory: Optional[str] = None,
+                             remote_host: Optional[str] = None,
+                             remote_path: Optional[str] = None,
                              preset_id: Optional[str] = None) -> dict:
         params: Dict[str, Any] = {
             "directory": directory,
@@ -1292,6 +1305,10 @@ class termmesh:
             params["leader_host"] = leader_host
         if leader_directory:
             params["leader_directory"] = leader_directory
+        if remote_host:
+            params["host"] = remote_host
+        if remote_path:
+            params["remote_path"] = remote_path
         if preset_id:
             params["preset_id"] = preset_id
         return dict(self._call("debug.project.create", params) or {})

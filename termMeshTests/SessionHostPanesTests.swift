@@ -379,6 +379,50 @@ final class RemoteAgentPaneRoutingTests: XCTestCase {
 /// a host whose Hello never advertised the capability at all.
 final class RemoteHostAgentSurfaceGateTests: XCTestCase {
 
+    func test_sessionOwnerConnectionDoesNotReplaceServingSocket() {
+        XCTAssertTrue(
+            RemoteHostStore.isAuxiliarySessionOwnerConnection(
+                servingRemoteSocket: "/tmp/term-mesh-peer-501/peer.sock",
+                sessionOwnerRemoteSocket: "/private/var/folders/x/T/term-meshd-peer.sock",
+                configuredRemoteSocket: nil,
+                incomingRemoteSocket: "/private/var/folders/x/T/term-meshd-peer.sock"
+            )
+        )
+    }
+
+    func test_sameSocketSpellingIsNotMisclassifiedAsSessionOwner() {
+        XCTAssertFalse(
+            RemoteHostStore.isAuxiliarySessionOwnerConnection(
+                servingRemoteSocket: "/tmp/peer/../peer/peer.sock",
+                sessionOwnerRemoteSocket: "/tmp/session-owner.sock",
+                configuredRemoteSocket: nil,
+                incomingRemoteSocket: "/tmp/peer/peer.sock"
+            )
+        )
+    }
+
+    func test_autoDetectedServingSocketCanMoveWithoutFirstConnectionWinningForever() {
+        XCTAssertFalse(
+            RemoteHostStore.isAuxiliarySessionOwnerConnection(
+                servingRemoteSocket: "/tmp/old-serving.sock",
+                sessionOwnerRemoteSocket: nil,
+                configuredRemoteSocket: nil,
+                incomingRemoteSocket: "/tmp/new-serving.sock"
+            )
+        )
+    }
+
+    func test_explicitProfileSocketRejectsAStaleDifferentConnection() {
+        XCTAssertTrue(
+            RemoteHostStore.isAuxiliarySessionOwnerConnection(
+                servingRemoteSocket: "/tmp/configured-serving.sock",
+                sessionOwnerRemoteSocket: nil,
+                configuredRemoteSocket: "/tmp/configured-serving.sock",
+                incomingRemoteSocket: "/tmp/stale-serving.sock"
+            )
+        )
+    }
+
     /// A host that never advertised `surface.agent.v1` is an older daemon:
     /// the agent path must not be issued against it, and the terminal path
     /// stays exactly as it was.
@@ -411,6 +455,7 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
             PeerCapability.surfaceAgentV1,
             PeerCapability.surfaceExitV1,
             PeerCapability.surfaceEnsureEnvV1,
+            PeerCapability.teamRouteFileV1,
         ]
         for missing in required {
             XCTAssertFalse(RemoteHostStore.hostSupportsPeerOwnedAgentFactory(

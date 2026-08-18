@@ -15,6 +15,126 @@ import Observation
 /// parsing: turning the stream into things a view can draw as what they are.
 @MainActor
 final class AgentSessionTests: XCTestCase {
+    func testIsolatedWorktreeBranchUsesDurableInstanceIdentity() {
+        let first = TeamOrchestrator.isolatedWorktreeBranch(
+            teamName: "term-mesh", agentName: "executor",
+            agentInstanceId: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        )
+        let second = TeamOrchestrator.isolatedWorktreeBranch(
+            teamName: "term-mesh", agentName: "executor",
+            agentInstanceId: "11111111-2222-3333-4444-555555555555"
+        )
+
+        XCTAssertEqual(
+            first, "team/term-mesh/executor/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        )
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(
+            first,
+            TeamOrchestrator.isolatedWorktreeBranch(
+                teamName: "term-mesh", agentName: "executor",
+                agentInstanceId: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+            )
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.isolatedWorktreeBranch(
+                teamName: "Team / Demo", agentName: "executor/one",
+                agentInstanceId: "INSTANCE / ONE"
+            ),
+            "team/team-demo/executor-one/instance-one"
+        )
+    }
+
+    func testIsolatedProvisioningRollsBackPartialSuccessAndStops() {
+        var attempted: [String] = []
+        var rolledBack: [String] = []
+        let agents = [
+            (name: "executor", instanceId: "one"),
+            (name: "reviewer", instanceId: "two"),
+            (name: "planner", instanceId: "three"),
+        ]
+
+        let result = TeamOrchestrator.provisionIsolatedWorktrees(
+            teamName: "demo", agents: agents,
+            create: { branch in
+                attempted.append(branch)
+                if branch.hasSuffix("/two") {
+                    return .failure(.rpcError("conflict at /existing/path"))
+                }
+                return .success(WorktreeInfo(
+                    name: "wt-\(branch)", path: "/tmp/\(branch)", branch: branch
+                ))
+            },
+            rollback: { rolledBack.append($0.branch) }
+        )
+
+        guard case .failure(let failure) = result else {
+            return XCTFail("partial provisioning unexpectedly succeeded")
+        }
+        XCTAssertEqual(failure.agentName, "reviewer")
+        XCTAssertEqual(failure.agentInstanceId, "two")
+        XCTAssertEqual(attempted, [
+            "team/demo/executor/one",
+            "team/demo/reviewer/two",
+        ])
+        XCTAssertEqual(rolledBack, ["team/demo/executor/one"])
+    }
+
+    func testUncommittedIsolatedWorktreesRollBackNewestFirst() {
+        let provisioned: [WorktreeInfo?] = [
+            WorktreeInfo(name: "wt-one", path: "/tmp/one", branch: "team/demo/executor/one"),
+            WorktreeInfo(name: "wt-two", path: "/tmp/two", branch: "team/demo/reviewer/two"),
+            nil,
+            WorktreeInfo(name: "wt-three", path: "/tmp/three", branch: "team/demo/planner/three"),
+        ]
+        var rolledBack: [String] = []
+        var logged: [(String, TeamOrchestrator.IsolatedWorktreeRollbackOutcome)] = []
+
+        let retained = TeamOrchestrator.rollbackUnownedIsolatedWorktrees(
+            provisioned: provisioned,
+            rollback: { info in
+                rolledBack.append(info.name)
+                return true
+            },
+            log: { info, outcome in logged.append((info.name, outcome)) }
+        )
+
+        // A pane is not ownership until the complete roster commits, so every
+        // provisioned checkout participates in rollback.
+        XCTAssertEqual(rolledBack, ["wt-three", "wt-two", "wt-one"])
+        XCTAssertTrue(retained.isEmpty)
+        XCTAssertEqual(logged.map(\.0), ["wt-three", "wt-two", "wt-one"])
+        XCTAssertEqual(logged.map(\.1), [.removed, .removed, .removed])
+    }
+
+    func testRetainedIsolatedWorktreeIsReportedInsteadOfForcedAway() {
+        let dirty = WorktreeInfo(
+            name: "wt-dirty", path: "/tmp/dirty", branch: "team/demo/executor/one"
+        )
+        let clean = WorktreeInfo(
+            name: "wt-clean", path: "/tmp/clean", branch: "team/demo/reviewer/two"
+        )
+        var attempts: [String] = []
+        var logged: [(String, TeamOrchestrator.IsolatedWorktreeRollbackOutcome)] = []
+
+        let retained = TeamOrchestrator.rollbackUnownedIsolatedWorktrees(
+            provisioned: [dirty, clean],
+            // The daemon removes with `force: false`, so a checkout carrying
+            // uncommitted work answers false rather than being deleted.
+            rollback: { info in
+                attempts.append(info.name)
+                return info.name != "wt-dirty"
+            },
+            log: { info, outcome in logged.append((info.name, outcome)) }
+        )
+
+        XCTAssertEqual(attempts, ["wt-clean", "wt-dirty"])
+        XCTAssertEqual(retained.map(\.name), ["wt-dirty"])
+        XCTAssertEqual(logged.map(\.1), [.removed, .retained])
+        // A refusal stops the sweep from lying about what is still on disk,
+        // and never turns into a forced delete of the user's work.
+        XCTAssertEqual(retained.first?.path, "/tmp/dirty")
+    }
 
     func testNativeAgentPaneExposesContextClearingRestart() throws {
         let presentation = try XCTUnwrap(Workspace.agentRestartPresentation(
@@ -51,12 +171,12 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "9")
+        XCTAssertEqual(LeaderParallelPolicy.version, "10")
         XCTAssertEqual(LeaderParallelPolicy.activation, "runtime-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 9"))
+        XCTAssertTrue(first.contains("policy_version: 10"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(first.contains("policy_activation: runtime-enforced"))
     }
@@ -65,7 +185,7 @@ final class AgentSessionTests: XCTestCase {
         let policy = LeaderParallelPolicy.renderedInstructions
 
         [
-            "adaptive-single-default",
+            "team-aware-decomposition-default",
             "parallel-admission-gate",
             "structured-routing-decision",
             "dag-readiness",
@@ -84,7 +204,10 @@ final class AgentSessionTests: XCTestCase {
             "external-event-wait",
         ].forEach { XCTAssertTrue(policy.contains("[\($0)]"), "missing \($0)") }
         XCTAssertTrue(policy.contains("This policy is active."))
-        XCTAssertTrue(policy.contains("default executor"))
+        XCTAssertTrue(policy.contains("start each non-trivial request by decomposing"))
+        XCTAssertTrue(policy.contains("assign eligible units before doing that work in the leader lane"))
+        XCTAssertTrue(policy.contains("Direct execution is the explicit exception"))
+        XCTAssertTrue(policy.contains("constraint that prevented a useful parallel split"))
         XCTAssertTrue(policy.contains("--worktree always"))
         XCTAssertTrue(policy.contains("avoid turn-by-turn ping-pong"))
         XCTAssertTrue(policy.contains("\"route\": \"direct|probe|parallel\""))
@@ -694,13 +817,57 @@ final class AgentSessionTests: XCTestCase {
         let claude = AgentSession.claudeLaunch(
             claudePath: "/usr/local/bin/claude", model: "sonnet",
             instructions: "", extraArgs: [], workingDirectory: "/tmp",
-            environment: environment)
+            environment: environment, loadsAccountEnvironment: true)
         let bridged = AgentSession.bridgeLaunch(
             cli: "codex", bridgePath: "/bundle/bridge", model: "gpt-5",
-            workingDirectory: "/tmp", environment: environment)
+            workingDirectory: "/tmp", environment: environment,
+            loadsAccountEnvironment: true)
 
         XCTAssertEqual(claude.environment, environment)
         XCTAssertEqual(bridged.environment, environment)
+        XCTAssertTrue(claude.loadsAccountEnvironment)
+        XCTAssertTrue(bridged.loadsAccountEnvironment)
+    }
+
+    func testLocalNativeLaunchLoadsAgentEnvWithoutPuttingSecretInArgv() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-agent-env-\(UUID().uuidString)")
+        let config = root.appendingPathComponent(".config/term-mesh")
+        try FileManager.default.createDirectory(at: config, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "AI_MESH_API_KEY=from-agent-env\n".write(
+            to: config.appendingPathComponent("agent-env"),
+            atomically: true, encoding: .utf8
+        )
+
+        let command = AgentSession.localAccountEnvironmentCommand(
+            executable: "/bin/sh",
+            arguments: ["-c", "printf 'key=%s explicit=%s' \"$AI_MESH_API_KEY\" \"$EXPLICIT_VALUE\""],
+            protectedEnvironmentKeys: ["EXPLICIT_VALUE"]
+        )
+        XCTAssertFalse(command.contains("profile-secret"))
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", command]
+        process.environment = [
+            "HOME": root.path,
+            "ZDOTDIR": root.path,
+            "SHELL": "/bin/zsh",
+            "TERMMESH_LAUNCH_ENV_0": "profile-secret",
+        ]
+        let output = Pipe()
+        process.standardOutput = output
+        try process.run()
+        process.waitUntilExit()
+        let text = String(
+            data: output.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+
+        XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertTrue(text.contains(#""agent_env":"loaded""#))
+        XCTAssertTrue(text.hasSuffix("key=from-agent-env explicit=profile-secret"))
     }
 
     func testNativeTranscriptCanBeReadWithLineLimit() {
@@ -1101,6 +1268,53 @@ final class AgentSessionTests: XCTestCase {
         // The first row has no neighbour to depend on.
         XCTAssertEqual(rows.first?.topGap, AgentSession.topGap(before: say, after: nil))
         XCTAssertTrue(AgentSession.rows(for: []).isEmpty)
+    }
+
+    func testTranscriptItemsGroupThreeConsecutiveToolsWithStableIdentity() {
+        let firstID = UUID()
+        let entries: [AgentSession.Entry] = [
+            .thought(id: UUID(), "checking"),
+            .tool(id: firstID, .init(name: "shell", headline: "rg foo", result: "")),
+            .tool(id: UUID(), .init(name: "shell", headline: "sed -n 1,20p", result: "")),
+            .tool(id: UUID(), .init(name: "read", headline: "AgentPanelView.swift", result: nil)),
+            .answered(id: UUID(), "done"),
+        ]
+
+        let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
+
+        XCTAssertEqual(items.count, 3)
+        guard case .toolGroup(let group) = items[1] else {
+            return XCTFail("three consecutive tools should become one group")
+        }
+        XCTAssertEqual(group.id, firstID)
+        XCTAssertEqual(group.rows.count, 3)
+        XCTAssertEqual(group.kindSummary, "shell 2 · read")
+        XCTAssertTrue(group.isRunning)
+        XCTAssertEqual(group.failureCount, 0)
+    }
+
+    func testTranscriptItemsKeepShortRunsInlineAndSplitAtProse() {
+        let entries: [AgentSession.Entry] = [
+            .tool(id: UUID(), .init(name: "shell", headline: "one", result: "")),
+            .tool(id: UUID(), .init(name: "shell", headline: "two", result: "")),
+            .thought(id: UUID(), "next"),
+            .tool(id: UUID(), .init(name: "shell", headline: "three", result: "")),
+            .tool(id: UUID(), .init(name: "edit", headline: "four", result: "")),
+            .tool(id: UUID(), .init(name: "shell", headline: "five", result: "failed", failed: true)),
+        ]
+
+        let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
+
+        XCTAssertEqual(items.count, 4)
+        guard case .row = items[0], case .row = items[1], case .row = items[2] else {
+            return XCTFail("two tools and intervening prose should remain individual rows")
+        }
+        guard case .toolGroup(let group) = items[3] else {
+            return XCTFail("the later run of three tools should form its own group")
+        }
+        XCTAssertFalse(group.isRunning)
+        XCTAssertEqual(group.failureCount, 1)
+        XCTAssertEqual(group.kindSummary, "shell 2 · edit")
     }
 
     /// The panel uses a regular VStack to avoid SwiftUI's non-converging lazy

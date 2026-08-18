@@ -76,6 +76,42 @@ final class DaemonLifetimeTests: XCTestCase {
             runningVersion: "0.185.2", appVersion: nil
         ))
     }
+
+    // MARK: - Subscribe-loop watchdog (the one observer of a dead daemon)
+
+    /// Neither an adopted daemon (no Process handle) nor a spawned one (no
+    /// termination handler) reports its own death; the subscribe reconnect
+    /// loop is the only reliable observer. These pin when that observation
+    /// may re-run `startDaemon` — and, just as deliberately, when it must not.
+    func test_watchdogRespawnsOnlyAfterSustainedSilence() {
+        XCTAssertFalse(TermMeshDaemon.watchdogShouldRespawn(
+            consecutiveFailures: TermMeshDaemon.watchdogFailureThreshold - 1,
+            runIntended: true, nowNanos: 0, lastRespawnNanos: nil
+        ), "a daemon mid-restart is not a dead daemon")
+        XCTAssertTrue(TermMeshDaemon.watchdogShouldRespawn(
+            consecutiveFailures: TermMeshDaemon.watchdogFailureThreshold,
+            runIntended: true, nowNanos: 0, lastRespawnNanos: nil
+        ))
+    }
+
+    func test_watchdogRespectsADeliberateStop() {
+        XCTAssertFalse(TermMeshDaemon.watchdogShouldRespawn(
+            consecutiveFailures: 30, runIntended: false,
+            nowNanos: 0, lastRespawnNanos: nil
+        ), "a Settings stop must stay stopped, however long the socket is silent")
+    }
+
+    func test_watchdogDoesNotThrashACrashLoopingDaemon() {
+        let interval = TermMeshDaemon.watchdogRespawnIntervalNanos
+        XCTAssertFalse(TermMeshDaemon.watchdogShouldRespawn(
+            consecutiveFailures: 9, runIntended: true,
+            nowNanos: interval - 1, lastRespawnNanos: 0
+        ), "inside the interval a failed respawn is not retried on every backoff tick")
+        XCTAssertTrue(TermMeshDaemon.watchdogShouldRespawn(
+            consecutiveFailures: 9, runIntended: true,
+            nowNanos: interval, lastRespawnNanos: 0
+        ))
+    }
 }
 
 /// The daemon has always been able to serve the peer protocol — `main.rs`

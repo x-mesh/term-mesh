@@ -78,8 +78,8 @@ enable cross-vendor evaluation, otherwise the report records the single-vendor f
 
 The original matrix compares one session with a controller-dispatched three-worker team. It does
 not measure the Project leader policy because the controller decides to parallelize before the
-leader starts. Use `policy-ab` to compare the previous delegate-first prompt with adaptive policy
-v6 while keeping the Project shape fixed: both conditions create the same idle explorer, executor,
+leader starts. Use `policy-ab` to compare the previous delegate-first prompt with the team-aware
+policy v10 while keeping the Project shape fixed: both conditions create the same idle explorer, executor,
 and reviewer pool, and only the leader instruction changes. The leader first records a blinded
 structured `direct`, `probe`, or `parallel` routing decision. `direct` dispatches no worker, `probe`
 dispatches exactly one read-only 60-90 second task, and `parallel` dispatches the decision's two or

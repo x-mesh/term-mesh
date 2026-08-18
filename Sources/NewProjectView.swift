@@ -229,6 +229,7 @@ struct NewProjectView: View {
                                 onComposionChanged: {},
                                 defaultModel: AgentRolePreset.defaultModel(for: "claude"),
                                 usesCompactRows: true,
+                                requiresDurableRemoteMembers: true,
                                 supportsDefaultPlacement: true,
                                 defaultHostKey: defaultAgentHostKey,
                                 defaultHostDirectory: defaultAgentHostDirectory,
@@ -1433,7 +1434,6 @@ struct NewProjectView: View {
         RepositoryBranchLookup.matches(
             repositoryBranches,
             query: gitBranch,
-            excluding: gitBranch,
             limit: 8
         )
     }
@@ -1445,7 +1445,8 @@ struct NewProjectView: View {
                     selectRepositoryBranch(branch)
                 } label: {
                     HStack(spacing: 7) {
-                        Image(systemName: "arrow.triangle.branch")
+                        Image(systemName: branch.caseInsensitiveCompare(gitBranch) == .orderedSame
+                            ? "checkmark" : "arrow.triangle.branch")
                             .foregroundStyle(.secondary)
                         Text(branch)
                             .lineLimit(1)
@@ -2064,7 +2065,8 @@ struct NewProjectView: View {
                     .disabled(
                         !canCreate || !placementHostsAreReady
                             || TeamAgentComposer.blocksRemoteTeamCreation(
-                                agents: agents, hosts: hostStore.sortedHosts
+                                agents: agents, hosts: hostStore.sortedHosts,
+                                requiresDurableProject: true
                             )
                     )
                 }
@@ -2267,11 +2269,19 @@ struct NewProjectView: View {
         let allConnected = remoteKeys.allSatisfy { hostKey in
             selectablePeers.first(where: { $0.id == hostKey })?.isLaunchable == true
         }
-        return allConnected && agentsMissingHostDirectory.isEmpty
+        return allConnected
+            && agentsMissingHostDirectory.isEmpty
+            && agentsOutsideRemoteLeaderHost.isEmpty
     }
 
     /// Why the create button is off, when placement is the reason.
     private var placementBlockerMessage: String? {
+        let outsideLeaderHost = agentsOutsideRemoteLeaderHost
+        if !outsideLeaderHost.isEmpty {
+            let names = outsideLeaderHost.map(\.preset.displayName).joined(separator: ", ")
+            return "A remote Project can reopen on another client only when every agent "
+                + "runs with its leader on \(machineLabel(runsOnHostKey)). Move these agents there: \(names)."
+        }
         let missing = agentsMissingHostDirectory
         if !missing.isEmpty {
             let names = missing.map(\.preset.displayName).joined(separator: ", ")
@@ -2421,6 +2431,21 @@ struct NewProjectView: View {
                 ? defaultAgentHostDirectory
                 : agent.hostDirectory
             return resolved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    /// v1 manifests contain daemon-local surface ids, so a remote Project is
+    /// portable between viewers only when leader and members share one host.
+    private var agentsOutsideRemoteLeaderHost: [TeamAgentRow] {
+        guard let leaderHostKey = runsOnHostKey else { return [] }
+        return agents.filter { agent in
+            Self.resolvedAgentHostKey(
+                mode: agentPlacementMode,
+                leaderHostKey: leaderHostKey,
+                allAgentsHostKey: allAgentsHostKey,
+                explicitHostKey: agent.hostKey,
+                inheritsDefault: inheritedAgentIDs.contains(agent.id)
+            ) != leaderHostKey
         }
     }
 
@@ -3150,21 +3175,26 @@ enum RepositoryBranchLookup {
         return branches.contains { $0.caseInsensitiveCompare(branch) == .orderedSame }
     }
 
+    /// A branch equal to the query stays listed and sorts first. Hiding it
+    /// while sibling substring matches remain visible reads as "no branch
+    /// named this" — the opposite of the truth. Pinning it first also keeps
+    /// it visible when more than `limit` branches match.
     static func matches(
         _ branches: [String],
         query rawQuery: String,
-        excluding selected: String? = nil,
         limit: Int
     ) -> [String] {
         guard limit > 0 else { return [] }
         let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        return Array(branches.lazy.filter { branch in
-            if let selected,
-               branch.caseInsensitiveCompare(selected) == .orderedSame {
-                return false
-            }
-            return query.isEmpty || branch.localizedCaseInsensitiveContains(query)
-        }.prefix(limit))
+        var matched = branches.filter { branch in
+            query.isEmpty || branch.localizedCaseInsensitiveContains(query)
+        }
+        if let exact = matched.firstIndex(where: {
+            $0.caseInsensitiveCompare(query) == .orderedSame
+        }), exact != matched.startIndex {
+            matched.insert(matched.remove(at: exact), at: 0)
+        }
+        return Array(matched.prefix(limit))
     }
 
     static func parse(_ output: String) -> Result {

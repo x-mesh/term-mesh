@@ -21,16 +21,27 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TYPE_PTY_DATA: u8 = 0x01;
 const TYPE_KEY_INPUT: u8 = 0x02;
 const TYPE_RESIZE: u8 = 0x03;
+// Relay → app telemetry: our stdout write to the local Ghostty PTY stalled.
+// The app logs it; an app that predates the type ignores it (`default:` in
+// its frame switch), and this side never expects a reply.
+const TYPE_STALL: u8 = 0x04;
 const TYPE_GOODBYE: u8 = 0xFF;
 const TYPE_AUTH: u8 = 0xFE;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_PENDING: usize = 256;
 const RESIZE_COALESCE_MS: u64 = 16;
+// A stdout write below this is scheduling jitter; at or above it the local
+// renderer visibly failed to drain. Mirrors the app's RelayStallLogGate
+// threshold so the two sides of the timeline use the same definition.
+const STALL_REPORT_THRESHOLD_MS: u64 = 200;
+// At most one report per interval, so a renderer that stays wedged is one
+// line per 5s in the app log, not one per chunk.
+const STALL_REPORT_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 // ── Debug logging (measurement instrumentation) ─────────────────────
 //
@@ -897,6 +908,7 @@ fn main() {
     let stdout = io::stdout();
     let mut total_out: u64 = 0;
     let mut next_mark: u64 = 1 << 20; // log cumulative throughput every 1 MiB
+    let mut last_stall_report: Option<Instant> = None;
     loop {
         match read_frame(&mut sock) {
             Err(e) => {
@@ -907,6 +919,7 @@ fn main() {
                 break;
             }
             Ok((TYPE_PTY_DATA, payload)) => {
+                let write_started = Instant::now();
                 let mut out = stdout.lock();
                 if let Err(e) = out.write_all(&payload) {
                     rlog(&format!(
@@ -922,7 +935,33 @@ fn main() {
                     ));
                     break;
                 }
+                drop(out);
                 total_out += payload.len() as u64;
+                // A slow write here means the LOCAL side (Ghostty's PTY /
+                // renderer) is not draining — the one segment of the chain
+                // the app cannot observe on its own. Report the episode back
+                // over the socket so it lands in the app's production log
+                // with the rest of the stall timeline. The report rides the
+                // writer channel, so it never interleaves with a concurrent
+                // resize/key frame mid-write.
+                let stall_ms = write_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                if stall_ms >= STALL_REPORT_THRESHOLD_MS {
+                    rlog(&format!(
+                        "stdout write stalled {stall_ms}ms bytes={} total_out={total_out}",
+                        payload.len()
+                    ));
+                    let due = last_stall_report
+                        .map_or(true, |at| at.elapsed() >= STALL_REPORT_MIN_INTERVAL);
+                    if due {
+                        last_stall_report = Some(Instant::now());
+                        let mut frame = Vec::with_capacity(1 + 4 + 16);
+                        frame.push(TYPE_STALL);
+                        frame.extend_from_slice(&16u32.to_le_bytes());
+                        frame.extend_from_slice(&stall_ms.to_le_bytes());
+                        frame.extend_from_slice(&total_out.to_le_bytes());
+                        let _ = tx.send(frame);
+                    }
+                }
                 if total_out >= next_mark {
                     rlog(&format!("pty out cumulative={total_out} bytes"));
                     next_mark += 1 << 20;

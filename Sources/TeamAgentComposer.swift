@@ -62,6 +62,9 @@ struct TeamAgentComposer: View {
     /// when it has several members. The original card presentation stays the
     /// default for the dedicated team editor.
     var usesCompactRows = false
+    /// New Project promises that every remote member survives every viewer.
+    /// Dedicated team creation retains its compatibility fallback.
+    var requiresDurableRemoteMembers = false
     /// New Project has a transient default machine that members can inherit.
     /// Other callers leave this off and retain the original explicit host UI.
     var supportsDefaultPlacement = false
@@ -137,8 +140,6 @@ struct TeamAgentComposer: View {
             let affectedCLIs = Set(rows.map { $0.1 }.filter { cli in
                 blocksTeamMessaging || (
                     AgentPipeTransport.canHoldNatively(cli: cli)
-                        && AgentPipeTransport.needsBridge(cli: cli)
-                        && !AgentPipeTransport.isPipeOnly(cli: cli)
                 )
             }).sorted()
             guard !affectedCLIs.isEmpty else { return nil }
@@ -154,14 +155,37 @@ struct TeamAgentComposer: View {
 
     static func blocksRemoteTeamCreation(
         agents: [TeamAgentRow],
-        hosts: [HostEntry]
+        hosts: [HostEntry],
+        requiresDurableProject: Bool = false
     ) -> Bool {
-        peerOwnedFallbackNotices(agents: agents, hosts: hosts)
+        if requiresDurableProject {
+            let hostByKey = Dictionary(uniqueKeysWithValues: hosts.map { ($0.id, $0) })
+            return agents.contains { agent in
+                guard let hostKey = agent.hostKey,
+                      let host = hostByKey[hostKey],
+                      AgentPipeTransport.usesNativePanel,
+                      AgentPipeTransport.canHoldNatively(
+                        cli: agent.preset.cli.isEmpty ? "claude" : agent.preset.cli
+                      )
+                else { return false }
+                return host.supportsPeerOwnedAgentHosting == false
+            }
+        }
+        return peerOwnedFallbackNotices(agents: agents, hosts: hosts)
             .contains(where: \.blocksTeamMessaging)
     }
 
     private var peerOwnedFallbackNotices: [TeamAgentHostCompatibilityNotice] {
         Self.peerOwnedFallbackNotices(agents: agents, hosts: hostStore.sortedHosts)
+    }
+
+    private func compatibilityMessage(_ notice: TeamAgentHostCompatibilityNotice) -> String {
+        guard requiresDurableRemoteMembers else { return notice.message }
+        let version = notice.servingVersion.map { "term-mesh \($0)" }
+            ?? "an unknown term-mesh version"
+        return "\(notice.hostName) is serving \(version), which cannot own every selected "
+            + "agent after this app quits. Update and restart term-mesh on that host "
+            + "before creating this Project."
     }
 
     var body: some View {
@@ -355,9 +379,12 @@ struct TeamAgentComposer: View {
                     ForEach(peerOwnedFallbackNotices) { notice in
                         HStack(alignment: .top, spacing: 6) {
                             Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundStyle(notice.blocksTeamMessaging ? .red : .orange)
+                                .foregroundStyle(
+                                    notice.blocksTeamMessaging || requiresDurableRemoteMembers
+                                        ? .red : .orange
+                                )
                                 .accessibilityHidden(true)
-                            Text(notice.message)
+                            Text(compatibilityMessage(notice))
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                         }

@@ -3063,6 +3063,18 @@ final class Workspace: Identifiable {
         session.requestPaneClose = { [weak self] in
             _ = self?.closePanel(panelId, force: true)
         }
+        // Disconnect Host preserves this pane. Once the sidebar establishes a
+        // replacement lease, rebuild the terminal against that lease exactly
+        // as the banner's explicit Reconnect action does. Mirror panes stay
+        // under their controller's one-subscription reconnect path.
+        session.requestHostReconnectReattach = { [weak self, weak panel, weak session] in
+            guard let self, let panel, let session, self.peerMirror == nil else { return }
+            Task { @MainActor in
+                await PeerClientCoordinator.shared.reconnectRemotePane(
+                    oldSession: session, panelId: panel.id, workspace: self
+                )
+            }
+        }
         // Disconnect banner (portal-layer overlay): keep the pane's slot,
         // offer Reconnect (attach a fresh session + swap the pane) and
         // Close. Skipped when the pane itself initiated teardown.

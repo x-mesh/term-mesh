@@ -17,6 +17,7 @@ HOST_ENV = "TERMMESH_E2E_REMOTE_LEADER_HOST"
 DIR_ENV = "TERMMESH_E2E_REMOTE_LEADER_DIR"
 PHASE_ENV = "TERMMESH_E2E_REATTACH_PHASE"
 STATE_ENV = "TERMMESH_E2E_REATTACH_STATE"
+ROLES_ENV = "TERMMESH_E2E_REATTACH_ROLES"
 
 
 def _wait(predicate, timeout_s: float = 45.0, interval_s: float = 0.2):
@@ -190,13 +191,25 @@ def _connect(c, host: str) -> None:
 
 def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
     team_name = f"remote-reattach-e2e-{uuid.uuid4().hex[:8]}"
+    roles = [
+        role.strip()
+        for role in os.environ.get(ROLES_ENV, "executor,reviewer").split(",")
+        if role.strip()
+    ]
+    if not roles:
+        raise termmeshError(
+            f"{ROLES_ENV} must name at least one worker; a leader-only Project "
+            "cannot verify member persistence"
+        )
     created = c.debug_project_create(
         directory=f"/tmp/{team_name}",
-        roles=[],
+        roles=roles,
         leader_cli="claude",
         leader_model="sonnet",
         leader_host=host,
         leader_directory=remote_dir,
+        remote_host=host,
+        remote_path=remote_dir,
     )
     if created.get("team") != team_name:
         raise termmeshError(f"remote project was not created: {created!r}")
@@ -205,21 +218,52 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
         team = next((item for item in c.team_list() if item.get("team_name") == team_name), None)
         if team and team.get("leader_failure"):
             raise termmeshError(f"remote leader failed: {team['leader_failure']}")
-        return team if team and team.get("leader_ready") and team.get("leader_panel_id") else None
+        agents = team.get("agents") if team else None
+        agents_ready = (
+            isinstance(agents, list)
+            and len(agents) == len(roles)
+            and all(agent.get("panel_id") and agent.get("agent_instance_id") for agent in agents)
+        )
+        return (
+            team
+            if team and team.get("leader_ready") and team.get("leader_panel_id") and agents_ready
+            else None
+        )
 
     team = _wait(ready_team)
     if team is None:
         raise termmeshError("remote leader never became ready")
-    project = _wait(lambda: next((item for item in c.debug_project_remote_presentations(host)
-                                  if item.get("name") == team_name
-                                  and item.get("project_id")
-                                  and item.get("leader_surface_id")), None))
+    expected_instances = {
+        agent["name"]: agent["agent_instance_id"]
+        for agent in team["agents"]
+    }
+
+    def complete_project():
+        project = next((item for item in c.debug_project_remote_presentations(host)
+                        if item.get("name") == team_name
+                        and item.get("project_id")
+                        and item.get("leader_surface_id")), None)
+        if project is None:
+            return None
+        members = project.get("members")
+        if not isinstance(members, list) or len(members) != len(expected_instances):
+            return None
+        actual = {member.get("name"): member.get("agent_instance_id") for member in members}
+        return project if actual == expected_instances and all(member.get("surface_id") for member in members) else None
+
+    project = _wait(complete_project)
     if project is None:
-        raise termmeshError("remote project manifest was not published")
+        raise termmeshError("complete remote project manifest was not published")
+    member_surfaces = {
+        member["name"]: member["surface_id"]
+        for member in project["members"]
+    }
     state_path.write_text(json.dumps({
         "team_name": team_name,
         "project_id": project["project_id"],
         "leader_surface_id": project["leader_surface_id"],
+        "member_instances": expected_instances,
+        "member_surfaces": member_surfaces,
     }))
 
 
@@ -232,6 +276,19 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
         raise termmeshError("remote project manifest did not survive app restart")
     if project.get("leader_surface_id") != state["leader_surface_id"]:
         raise termmeshError(f"leader surface changed across restart: {project!r}")
+    remote_members = {
+        member.get("name"): (member.get("agent_instance_id"), member.get("surface_id"))
+        for member in project.get("members", [])
+    }
+    expected_members = {
+        name: (state["member_instances"][name], surface_id)
+        for name, surface_id in state["member_surfaces"].items()
+    }
+    if remote_members != expected_members:
+        raise termmeshError(
+            "worker descriptors changed or disappeared across app/client restart: "
+            f"expected={expected_members!r} actual={remote_members!r}"
+        )
 
     # A stale id must be rejected before any asynchronous presentation work
     # starts. Pin the observable invariant as well: a rejected adoption cannot
@@ -307,6 +364,17 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
                                and item.get("leader_panel_id")), None))
     if team is None:
         raise termmeshError("remote Project did not reattach after app restart")
+    restored_instances = {
+        agent.get("name"): agent.get("agent_instance_id")
+        for agent in team.get("agents", [])
+    }
+    if restored_instances != state["member_instances"]:
+        raise termmeshError(
+            "adopted Project did not restore the exact remote workers: "
+            f"expected={state['member_instances']!r} actual={restored_instances!r}"
+        )
+    if any(not agent.get("panel_id") for agent in team.get("agents", [])):
+        raise termmeshError(f"an adopted remote worker has no pane: {team!r}")
     c.debug_project_delete(team_name)
     if _wait(lambda: not any(item.get("project_id") == state["project_id"]
                              for item in c.debug_project_remote_presentations(host))):

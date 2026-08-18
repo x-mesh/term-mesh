@@ -26,11 +26,18 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
     /// agent on it ran 0.167.0 out of $HOME/.local/bin.
     func test_command_searchesTheLaunchPathInOrder() {
         let cmd = PeerHostDoctor.binaryInventoryCommand
-        guard let home = cmd.range(of: "$HOME/.local/bin"),
+        guard let bundled = cmd.range(
+                  of: "/Applications/term-mesh.app/Contents/Resources/bin"
+              ),
+              let home = cmd.range(of: "$HOME/.local/bin"),
               let brew = cmd.range(of: "/opt/homebrew/bin")
         else {
             return XCTFail("the launch PATH directories must appear in the probe")
         }
+        XCTAssertTrue(
+            bundled.lowerBound < home.lowerBound,
+            "a Mac peer must prefer the tools shipped with its app over user installs"
+        )
         XCTAssertTrue(
             home.lowerBound < brew.lowerBound,
             "the probe must search in the launcher's order, or it reports a binary that never runs"
@@ -252,6 +259,7 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
     func test_aDaemonHostWithoutABridgeIsReported() {
         let warnings = PeerHostDoctor.inventoryWarnings(
             PeerHostDoctor.parseBinaryInventory("""
+            os=Linux
             term-meshd=/usr/local/bin/term-meshd|term-meshd 0.179.0
             tm-agent=/usr/local/bin/tm-agent|tm-agent 0.179.0
             """)
@@ -263,6 +271,7 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
     func test_aDaemonHostWithABridgeIsSilent() {
         let warnings = PeerHostDoctor.inventoryWarnings(
             PeerHostDoctor.parseBinaryInventory("""
+            os=Linux
             term-meshd=/usr/local/bin/term-meshd|term-meshd 0.179.0
             tm-agent=/usr/local/bin/tm-agent|tm-agent 0.179.0
             tm-agent-bridge=/usr/local/bin/tm-agent-bridge|
@@ -279,6 +288,21 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
             PeerHostDoctor.parseBinaryInventory("""
             app=0.179.0
             tm-agent=/opt/homebrew/bin/tm-agent|tm-agent 0.179.0
+            """)
+        )
+        XCTAssertEqual(warnings, [])
+    }
+
+    /// A Mac app launches its bundled daemon and bundled bridge together. The
+    /// fixed SSH PATH may expose only the daemon, but that is not evidence the
+    /// app is missing its bridge (observed on mac-sub with app v0.193.0).
+    func test_aMacBundledDaemonWithoutAPathBridgeStaysSilent() {
+        let warnings = PeerHostDoctor.inventoryWarnings(
+            PeerHostDoctor.parseBinaryInventory("""
+            os=Darwin
+            app=0.193.0
+            term-meshd=/Applications/term-mesh.app/Contents/Resources/bin/term-meshd|term-meshd 0.193.0
+            tm-agent=/opt/homebrew/bin/tm-agent|tm-agent 0.193.0
             """)
         )
         XCTAssertEqual(warnings, [])

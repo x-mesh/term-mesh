@@ -712,6 +712,7 @@ final class RemoteHostStore: ObservableObject {
         hostCapabilities.has(PeerCapability.surfaceAgentV1)
             && hostCapabilities.has(PeerCapability.surfaceExitV1)
             && hostCapabilities.has(PeerCapability.surfaceEnsureEnvV1)
+            && hostCapabilities.has(PeerCapability.teamRouteFileV1)
     }
 
     /// Fired after a successful sidebar connect so the mounted host
@@ -748,6 +749,15 @@ final class RemoteHostStore: ObservableObject {
     /// Debounced one-shot ListTeams refreshes triggered by roster pushes.
     /// Layout updates can be frequent, so never query once per frame.
     private var teamRosterRefreshTasks: [String: Task<Void, Never>] = [:]
+    /// Identifies the task currently installed for each host. A cancelled
+    /// task can finish after a reconnect has already installed its successor;
+    /// its `defer` must not clear the successor's state.
+    private var teamRosterRefreshGenerations: [String: UUID] = [:]
+    /// A push that arrives while the host already has a roster RPC in flight
+    /// requests one more read after that RPC finishes. Replacing the task on
+    /// every workspace snapshot used to strand cancelled transports and SSH
+    /// leases under a busy or unresponsive session owner.
+    private var teamRosterRefreshDirtyKeys = Set<String>()
     /// Sidebar-held lease per host key: one ref that keeps the tunnel
     /// alive while the user browses workspaces. Panes/mirrors opened
     /// from here hold their own refs, so a sidebar disconnect never
@@ -862,8 +872,9 @@ final class RemoteHostStore: ObservableObject {
     /// hostSockPath would insert a new HostEntry on every reconnect. Instead:
     ///   SSH connection  → "ssh:<sshTarget>" (stable across reconnects)
     ///   Direct socket   → hostSockPath (already stable)
-    /// LIMITATION: same sshTarget with different remote sockets collapse into
-    /// one entry; needs remoteSockPath in connectionInfo to distinguish them.
+    /// Connections that share the target still collapse into one sidebar row;
+    /// `syncFromCoordinator` uses authenticated/configured socket identity to
+    /// keep a session-owner connection from replacing that row's serving data.
     private func stableKey(for conn: PeerRelayConnectionInfo) -> String {
         if let ssh = conn.sshTarget, !ssh.isEmpty { return "ssh:\(ssh)" }
         // Borrowed-socket connections carry no SSH identity — e.g. a
@@ -904,6 +915,30 @@ final class RemoteHostStore: ObservableObject {
                 else { continue }
                 disconnectedSockPaths[key]?.remove(conn.hostSockPath)
             }
+            // A Mac GUI serving socket and its daemon session-owner socket
+            // deliberately share one SSH target. The latter appears in the
+            // coordinator when a team pane is attached, but it is not a new
+            // discovery source for the sidebar host. Let it keep the host row
+            // connected while refusing to replace the serving socket,
+            // capabilities, workspaces, or authenticated launch metadata.
+            //
+            // Profiles establish the serving endpoint before coordinator sync.
+            // Ad-hoc hosts require the authenticated session-owner path to
+            // distinguish this row; otherwise a legitimate serving reconnect
+            // to a new socket must be allowed to replace the old endpoint.
+            if let host = hosts[key],
+               Self.isAuxiliarySessionOwnerConnection(
+                   servingRemoteSocket: host.remoteSockPath,
+                   sessionOwnerRemoteSocket: host.sessionHostRemoteSockPath,
+                   configuredRemoteSocket: host.configuredEndpoint?.remoteSocket,
+                   incomingRemoteSocket: conn.remoteSockPath
+               ) {
+                hosts[key]?.connectionState = .connected
+                continue
+            }
+            // Only the serving endpoint keeps the sidebar host active. A
+            // session-owner pane may outlive a dead GUI tunnel, but must not
+            // leave the row pointing at that dead serving socket as connected.
             activeKeys.insert(key)
             if hosts[key] == nil {
                 hosts[key] = HostEntry(
@@ -975,6 +1010,46 @@ final class RemoteHostStore: ObservableObject {
                 hosts[key]?.clearAuthenticatedHostCLIBinDirs()
             }
         }
+    }
+
+    /// Compare endpoint identity without letting path spelling create a false
+    /// mismatch. Kept nonisolated so the collision rule can be unit tested
+    /// without constructing the singleton store or live tunnels.
+    nonisolated static func normalizedRemoteSocket(_ path: String) -> String {
+        (path as NSString).standardizingPath
+    }
+
+    /// Whether a coordinator row is the separate session owner rather than
+    /// the endpoint that serves the sidebar's workspaces and launch metadata.
+    ///
+    /// Prefer the authenticated `Hello.session_host_socket` answer. An
+    /// explicitly configured profile socket is also authoritative while an
+    /// older connection to a different path is still winding down. For an
+    /// ad-hoc/auto-detected host without either signal, a changed socket is a
+    /// legitimate new serving endpoint and must be allowed to replace the old
+    /// one instead of making "first connection wins" permanent.
+    nonisolated static func isAuxiliarySessionOwnerConnection(
+        servingRemoteSocket: String?,
+        sessionOwnerRemoteSocket: String?,
+        configuredRemoteSocket: String?,
+        incomingRemoteSocket: String?
+    ) -> Bool {
+        guard let serving = servingRemoteSocket, !serving.isEmpty,
+              let incoming = incomingRemoteSocket, !incoming.isEmpty
+        else { return false }
+        let normalizedServing = normalizedRemoteSocket(serving)
+        let normalizedIncoming = normalizedRemoteSocket(incoming)
+        guard normalizedServing != normalizedIncoming else { return false }
+
+        if let sessionOwnerRemoteSocket, !sessionOwnerRemoteSocket.isEmpty,
+           normalizedRemoteSocket(sessionOwnerRemoteSocket) == normalizedIncoming {
+            return true
+        }
+        if let configuredRemoteSocket, !configuredRemoteSocket.isEmpty,
+           normalizedRemoteSocket(configuredRemoteSocket) == normalizedServing {
+            return true
+        }
+        return false
     }
 
     // MARK: - Sidebar connect / disconnect (saved hosts)
@@ -1581,6 +1656,8 @@ final class RemoteHostStore: ObservableObject {
         rosterSubscriptionTasks[key] = nil
         teamRosterRefreshTasks[key]?.cancel()
         teamRosterRefreshTasks[key] = nil
+        teamRosterRefreshGenerations[key] = nil
+        teamRosterRefreshDirtyKeys.remove(key)
     }
 
     private func applyWorkspaceRoster(
@@ -1608,22 +1685,42 @@ final class RemoteHostStore: ObservableObject {
     }
 
     private func scheduleTeamRosterRefresh(for path: String, key: String) {
-        teamRosterRefreshTasks[key]?.cancel()
+        teamRosterRefreshDirtyKeys.insert(key)
+        guard teamRosterRefreshTasks[key] == nil else { return }
+        let generation = UUID()
+        teamRosterRefreshGenerations[key] = generation
         teamRosterRefreshTasks[key] = Task { [weak self] in
             guard let self else { return }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-            guard !Task.isCancelled,
-                  self.hosts[key]?.activeSockPath == path,
-                  self.hosts[key]?.isConnected == true
-            else { return }
-            guard let teams = await self.fetchTeamRoster(
-                hostKey: key, servingSockPath: path
-            ) else { return }
-            guard !Task.isCancelled,
-                  self.hosts[key]?.activeSockPath == path,
-                  self.hosts[key]?.isConnected == true
-            else { return }
-            self.hosts[key]?.teams = teams
+            defer {
+                if self.teamRosterRefreshGenerations[key] == generation {
+                    self.teamRosterRefreshTasks[key] = nil
+                    self.teamRosterRefreshGenerations[key] = nil
+                    self.teamRosterRefreshDirtyKeys.remove(key)
+                }
+            }
+            while !Task.isCancelled {
+                // Coalesce a burst before opening the remote team endpoint.
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard !Task.isCancelled,
+                      self.hosts[key]?.activeSockPath == path,
+                      self.hosts[key]?.isConnected == true
+                else { return }
+                self.teamRosterRefreshDirtyKeys.remove(key)
+                let teams = await self.fetchTeamRoster(
+                    hostKey: key, servingSockPath: path
+                )
+                guard !Task.isCancelled,
+                      self.hosts[key]?.activeSockPath == path,
+                      self.hosts[key]?.isConnected == true
+                else { return }
+                if let teams {
+                    self.hosts[key]?.teams = teams
+                }
+                // A push that arrived during even a failed RPC still owns a
+                // retry. Dropping it here would make one transient session-
+                // owner failure leave the project roster stale indefinitely.
+                guard self.teamRosterRefreshDirtyKeys.contains(key) else { return }
+            }
         }
     }
 
@@ -1662,16 +1759,23 @@ final class RemoteHostStore: ObservableObject {
         guard !Task.isCancelled,
               let connection = try? await PeerRelaySession.connect(hostSockPath: rosterSockPath)
         else { return nil }
-        guard connection.hostCapabilities.has(PeerCapability.teamRosterV1) else {
+        return await withTaskCancellationHandler {
+            guard connection.hostCapabilities.has(PeerCapability.teamRosterV1) else {
+                await connection.cancel()
+                return []
+            }
+            guard let reported = try? await connection.session.listTeams() else {
+                await connection.cancel()
+                return nil
+            }
             await connection.cancel()
-            return []
+            return reported.map(Self.remoteTeamSummary)
+        } onCancel: {
+            // Cooperative cancellation does not wake an NWConnection read by
+            // itself. Closing the transport is what releases listTeams, its
+            // timeout helper, and the session-owner SSH lease promptly.
+            Task { await connection.cancel() }
         }
-        guard let reported = try? await connection.session.listTeams() else {
-            await connection.cancel()
-            return nil
-        }
-        await connection.cancel()
-        return reported.map(Self.remoteTeamSummary)
     }
 
     private nonisolated static func remoteTeamSummary(

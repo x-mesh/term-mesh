@@ -9,6 +9,25 @@ final class TermMeshDaemon: ObservableObject {
     static let shared = TermMeshDaemon()
 
     private var daemonProcess: Process?
+    /// Whether a daemon is currently WANTED on this machine. `startDaemon`
+    /// intends one; an explicit `stopDaemon` that actually proceeds does
+    /// not. Read by the subscribe loop's watchdog, which must never respawn
+    /// a daemon the user just stopped from Settings. Locked because start,
+    /// stop, and the watchdog run on three different threads.
+    private let intentLock = NSLock()
+    private var daemonRunIntendedStorage = false
+    var daemonRunIntended: Bool {
+        get {
+            intentLock.lock()
+            defer { intentLock.unlock() }
+            return daemonRunIntendedStorage
+        }
+        set {
+            intentLock.lock()
+            defer { intentLock.unlock() }
+            daemonRunIntendedStorage = newValue
+        }
+    }
     private let queue = DispatchQueue(label: "term-mesh.daemon", qos: .utility)
     /// Telemetry reads that nothing waits on, kept off `queue`.
     ///
@@ -316,6 +335,37 @@ final class TermMeshDaemon: ObservableObject {
             + "the daemon."
     }
 
+    /// Whether the subscribe loop's consecutive connect failures warrant
+    /// re-running `startDaemon`. This loop is the one place that reliably
+    /// observes "the daemon is gone": an adopted daemon has no Process
+    /// handle and a spawned one has no termination handler, so without this
+    /// the app watches its daemon die and does nothing (observed: 39
+    /// daemon-less minutes after a brew upgrade adopted a daemon that was
+    /// mid-shutdown). Three failures ≈ eight seconds of the 1s/2s/5s
+    /// backoff — long enough not to mistake a daemon mid-restart for a dead
+    /// one. The interval keeps a daemon that cannot come back (missing
+    /// binary, crash loop) from being respawned every backoff tick.
+    /// `startDaemon` itself is ping-gated, so a daemon that returned on its
+    /// own is adopted, never doubled.
+    static let watchdogFailureThreshold = 3
+    static let watchdogRespawnIntervalNanos: UInt64 = 30 * 1_000_000_000
+
+    /// Cap on the appended daemon log before it is truncated on the next
+    /// spawn. Sized for weeks of ordinary output (a busy session writes a
+    /// few MB) while bounding what an append-only file in /tmp can grow to.
+    static let daemonLogMaxBytes: Int64 = 50 * 1024 * 1024
+
+    static func watchdogShouldRespawn(
+        consecutiveFailures: Int,
+        runIntended: Bool,
+        nowNanos: UInt64,
+        lastRespawnNanos: UInt64?
+    ) -> Bool {
+        guard runIntended, consecutiveFailures >= watchdogFailureThreshold else { return false }
+        guard let lastRespawnNanos else { return true }
+        return nowNanos &- lastRespawnNanos >= watchdogRespawnIntervalNanos
+    }
+
     /// This build's marketing version, or nil when the bundle has none.
     static var appMarketingVersion: String? {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
@@ -336,8 +386,24 @@ final class TermMeshDaemon: ObservableObject {
 
     /// Spawn the term-meshd daemon process if not already running.
     func startDaemon() {
+        startDaemon(assertIntent: true)
+    }
+
+    /// `assertIntent: false` is the watchdog's entry. Its decision to start
+    /// was made earlier, off the control queue — by the time this block runs,
+    /// the user may have pressed Stop in Settings. Re-check the intent HERE,
+    /// on the control queue, and never rewrite it: an unconditional
+    /// `daemonRunIntended = true` in this position is exactly how a queued
+    /// watchdog start would resurrect a daemon the user just stopped.
+    private func startDaemon(assertIntent: Bool) {
         queue.async { [weak self] in
             guard let self else { return }
+            if assertIntent {
+                self.daemonRunIntended = true
+            } else if !self.daemonRunIntended {
+                Logger.daemon.info("watchdog start dropped — the daemon was deliberately stopped")
+                return
+            }
 
             // Already running (tracked process)?
             if let proc = self.daemonProcess, proc.isRunning { return }
@@ -364,12 +430,25 @@ final class TermMeshDaemon: ObservableObject {
                     // whatever answers the socket. Say so when that is not this
                     // build, in the log the user actually reads, because every
                     // downstream symptom looks like an app bug instead.
+                    let runningVersion = self.runningDaemonVersion()
                     if let warning = Self.adoptedDaemonVersionWarning(
-                        runningVersion: self.runningDaemonVersion(),
+                        runningVersion: runningVersion,
                         appVersion: Self.appMarketingVersion
                     ) {
                         Logger.daemon.error("\(warning, privacy: .public)")
                         RemoteWorkLog.infoOffMain(warning)
+                    } else if runningVersion == nil {
+                        // An unknown version is not evidence of a mismatch,
+                        // but it is evidence worth keeping: a daemon that
+                        // cannot answer a version probe may already be
+                        // mid-shutdown, and adopting one leaves this app
+                        // daemon-less minutes later with nothing in any log.
+                        Logger.daemon.error(
+                            "adopted a daemon that did not answer the version probe — it may be shutting down"
+                        )
+                        RemoteWorkLog.infoOffMain(
+                            "Adopted this machine's daemon without a version answer; if its sessions vanish shortly, it was already shutting down"
+                        )
                     }
                     if let pid = self.getDaemonPeerPid() {
                         DispatchQueue.main.async {
@@ -382,12 +461,16 @@ final class TermMeshDaemon: ObservableObject {
                 // are applied.
                 Logger.daemon.info("daemon already running on socket — restarting with current settings")
                 self.stopDaemon()
+                // stopDaemon records "no daemon wanted"; this path stops only
+                // to start again, so the intent stays on.
+                self.daemonRunIntended = true
                 // Brief pause so the socket file is fully released
                 Thread.sleep(forTimeInterval: 0.3)
             }
 
-            // Clean up stale socket before starting
-            try? FileManager.default.removeItem(atPath: self.socketPath)
+            // The daemon probes and removes only a stale pathname whose inode
+            // it observed. The app must not unlink here: a slow ping can be a
+            // live daemon, and replacing its pathname creates split-brain.
 
             // Find the daemon binary next to the app bundle, or in the daemon build dir
             let binaryPath = self.daemonBinaryPath()
@@ -468,9 +551,28 @@ final class TermMeshDaemon: ObservableObject {
             // Log daemon stdout/stderr — isolated per tag
             let tag = termMeshEnv("TAG") ?? ""
             let logPath = tag.isEmpty ? "/tmp/term-meshd.log" : "/tmp/term-meshd-\(tag).log"
-            FileManager.default.createFile(atPath: logPath, contents: nil)
-            let logHandle = FileHandle(forWritingAtPath: logPath)
-            logHandle?.seekToEndOfFile()
+            // Append, never truncate: every launch used to REPLACE this file
+            // (`createFile`), destroying exactly the evidence a "why was the
+            // daemon down" investigation needs. O_NOFOLLOW because the name
+            // is predictable in sticky /tmp — a pre-planted symlink must not
+            // redirect daemon output into an arbitrary file (open fails and
+            // the daemon logs to null instead). The size cap is what makes
+            // append-forever safe: one bounded truncation at the cap beats
+            // losing the log on every spawn, and beats filling /tmp.
+            let fd = open(logPath, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0o644)
+            let logHandle: FileHandle?
+            if fd >= 0 {
+                var info = stat()
+                if fstat(fd, &info) == 0, info.st_size > Self.daemonLogMaxBytes {
+                    ftruncate(fd, 0)
+                }
+                logHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+            } else {
+                Logger.daemon.error(
+                    "could not open daemon log at \(logPath, privacy: .public) (errno \(errno, privacy: .public)) — daemon output goes to /dev/null"
+                )
+                logHandle = nil
+            }
             process.standardOutput = logHandle ?? FileHandle.nullDevice
             process.standardError = logHandle ?? FileHandle.nullDevice
 
@@ -485,6 +587,9 @@ final class TermMeshDaemon: ObservableObject {
                     TerminalController.shared.trustedDaemonPid = daemonPid
                 }
             } catch {
+                // The fd was never handed to a child; close it here or a
+                // failing spawn (repeated by the watchdog) leaks one per try.
+                try? logHandle?.close()
                 Logger.daemon.error("failed to start daemon: \(error, privacy: .public)")
             }
         }
@@ -501,6 +606,10 @@ final class TermMeshDaemon: ObservableObject {
             Logger.daemon.info("leaving the daemon running; it holds sessions for other machines")
             return
         }
+        // Only a stop that actually proceeds withdraws the intent — the
+        // subscribe watchdog must not resurrect a daemon the user stopped,
+        // and must keep resurrecting one the outlive policy declined to stop.
+        daemonRunIntended = false
 
         // Case 1: We spawned the daemon — terminate directly
         if let proc = daemonProcess, proc.isRunning {
@@ -537,8 +646,8 @@ final class TermMeshDaemon: ObservableObject {
             }
         }
 
-        // Clean up socket file
-        try? FileManager.default.removeItem(atPath: path)
+        // The daemon removes only the pathname inode it bound. Never unlink
+        // from the app after a timeout: ownership may already have changed.
     }
 
     /// Poll `pid` after a SIGTERM and escalate to SIGKILL if it hasn't exited
@@ -708,11 +817,15 @@ final class TermMeshDaemon: ObservableObject {
         var params: [String: Any] = ["repo_path": gitRoot, "base_dir": worktreeBaseDir]
         if let branch { params["branch"] = branch }
         if let baseBranch { params["base_ref"] = baseBranch }
-        guard let response = rpcCall(method: "worktree.create", params: params),
-              let info = parseWorktreeInfo(response) else {
-            return .failure(.rpcError("Worktree creation failed"))
+        switch rpcCallResult(method: "worktree.create", params: params) {
+        case .success(let response):
+            guard let info = parseWorktreeInfo(response) else {
+                return .failure(.rpcError("Worktree creation returned an invalid response"))
+            }
+            return .success(info)
+        case .failure(let error):
+            return .failure(error)
         }
-        return .success(info)
     }
 
     /// List local branches for a repo.
@@ -743,6 +856,19 @@ final class TermMeshDaemon: ObservableObject {
     /// Remove a worktree by name. Refuses if dirty unless `force` is true.
     func removeWorktree(repoPath: String, name: String, force: Bool = false) -> Bool {
         let params: [String: Any] = ["repo_path": repoPath, "name": name, "force": force]
+        return rpcCall(method: "worktree.remove", params: params) != nil
+    }
+
+    /// Remove one untouched worktree created during a failed provisioning
+    /// transaction and delete its just-created branch so the durable instance
+    /// identity can be retried. The daemon still refuses dirty worktrees.
+    func rollbackCreatedWorktree(repoPath: String, name: String) -> Bool {
+        let params: [String: Any] = [
+            "repo_path": repoPath,
+            "name": name,
+            "force": false,
+            "delete_branch": true,
+        ]
         return rpcCall(method: "worktree.remove", params: params) != nil
     }
 
@@ -1249,6 +1375,7 @@ final class TermMeshDaemon: ObservableObject {
         eventSubscriptionTask = Task.detached(priority: .utility) { [weak self] in
             let backoffSequence = [1.0, 2.0, 5.0]
             var attempt = 0
+            var lastWatchdogRespawn: UInt64?
             while !Task.isCancelled {
                 guard let self else { return }
                 let path = self.socketPath
@@ -1292,8 +1419,28 @@ final class TermMeshDaemon: ObservableObject {
                 guard connectOK else {
                     close(fd)
                     let delay = backoffSequence[min(attempt, backoffSequence.count - 1)]
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     attempt += 1
+                    // This reconnect loop is the one place that reliably
+                    // observes a dead daemon (adopted daemons have no Process
+                    // handle; spawned ones have no termination handler), so
+                    // it is also where recovery must start — see
+                    // `watchdogShouldRespawn` for the thresholds.
+                    if Self.watchdogShouldRespawn(
+                        consecutiveFailures: attempt,
+                        runIntended: self.daemonRunIntended,
+                        nowNanos: DispatchTime.now().uptimeNanoseconds,
+                        lastRespawnNanos: lastWatchdogRespawn
+                    ) {
+                        lastWatchdogRespawn = DispatchTime.now().uptimeNanoseconds
+                        Logger.daemon.error(
+                            "daemon socket unanswered after \(attempt, privacy: .public) subscribe attempts — re-running startDaemon"
+                        )
+                        RemoteWorkLog.warningOffMain(
+                            "This machine's daemon stopped answering — restarting it"
+                        )
+                        self.startDaemon(assertIntent: false)
+                    }
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     continue
                 }
 
@@ -1362,6 +1509,20 @@ final class TermMeshDaemon: ObservableObject {
     // MARK: - Private
 
     private func rpcCall(method: String, params: [String: Any], timeout timeoutSec: Int = 5) -> Any? {
+        switch rpcCallResult(method: method, params: params, timeout: timeoutSec) {
+        case .success(let result):
+            return result
+        case .failure(let error):
+            Logger.daemon.error("RPC error: \(error.description, privacy: .public)")
+            return nil
+        }
+    }
+
+    private func rpcCallResult(
+        method: String,
+        params: [String: Any],
+        timeout timeoutSec: Int = 5
+    ) -> Result<Any, WorktreeCreateError> {
         // Serialised by `idLock`, not by `queue`: this method is called from
         // `queue` and from arbitrary threads (telemetry, WebView, callers of
         // `monitorSnapshot()`), so the bare read-modify-write it used to do
@@ -1370,18 +1531,22 @@ final class TermMeshDaemon: ObservableObject {
 
         let request: [String: Any] = ["id": id, "method": method, "params": params]
         guard let data = try? JSONSerialization.data(withJSONObject: request),
-              var jsonString = String(data: data, encoding: .utf8) else { return nil }
+              var jsonString = String(data: data, encoding: .utf8) else {
+            return .failure(.rpcError("could not encode RPC request"))
+        }
         jsonString += "\n"
 
         // Connect to Unix socket
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
+        guard fd >= 0 else { return .failure(.daemonNotConnected) }
         defer { close(fd) }
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = socketPath.utf8CString
-        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { return nil }
+        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
+            return .failure(.rpcError("daemon socket path is too long"))
+        }
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { dest in
                 for (i, byte) in pathBytes.enumerated() {
@@ -1395,7 +1560,9 @@ final class TermMeshDaemon: ObservableObject {
                 connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        guard connectResult == 0 else { return nil }
+        guard connectResult == 0 else {
+            return .failure(.daemonNotConnected)
+        }
 
         // Set timeout
         var timeout = timeval(tv_sec: timeoutSec, tv_usec: 0)
@@ -1406,7 +1573,7 @@ final class TermMeshDaemon: ObservableObject {
         let sent = jsonString.withCString { ptr in
             write(fd, ptr, strlen(ptr))
         }
-        guard sent > 0 else { return nil }
+        guard sent > 0 else { return .failure(.rpcError("could not send daemon request")) }
 
         // Read response (line-delimited)
         var responseData = Data()
@@ -1420,18 +1587,18 @@ final class TermMeshDaemon: ObservableObject {
 
         guard !responseData.isEmpty,
               let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
-            return nil
+            return .failure(.rpcError("daemon returned no valid JSON response"))
         }
 
         if let error = json["error"] as? [String: Any] {
             let msg = (error["message"] as? String) ?? "unknown"
-            Logger.daemon.error("RPC error: \(msg, privacy: .public)")
-            return nil
+            return .failure(.rpcError(msg))
         }
 
-        let result = json["result"]
-        if result is NSNull { return nil }
-        return result
+        guard let result = json["result"], !(result is NSNull) else {
+            return .failure(.rpcError("daemon returned an empty result"))
+        }
+        return .success(result)
     }
 
     private func daemonBinaryPath() -> String? {
@@ -1584,10 +1751,18 @@ struct WorktreeInfo {
     let branch: String
 }
 
-enum WorktreeCreateError: Error {
+enum WorktreeCreateError: Error, CustomStringConvertible {
     case daemonNotConnected
     case notGitRepo
     case rpcError(String)
+
+    var description: String {
+        switch self {
+        case .daemonNotConnected: return "daemon is not connected"
+        case .notGitRepo: return "working directory is not a Git repository"
+        case .rpcError(let message): return message
+        }
+    }
 }
 
 struct AgentSessionInfo {

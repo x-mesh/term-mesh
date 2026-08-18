@@ -222,10 +222,19 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
 
     /// The other half of `preparePanesForHostDisconnect`. Panes kept across a
     /// Disconnect Host are live views of a transport that no longer exists;
-    /// this is the moment one can be made real again. Only native agent panes
-    /// act on it — a terminal pane offers Reconnect in its own banner.
+    /// this is the moment one can be made real again. Terminal and agent panes
+    /// rebuild against the replacement lease; mirrors replace their shared
+    /// subscription and reconcile all panes from the host layout.
     @discardableResult
     func resumePanesAfterHostReconnect(_ hostKey: PeerPaneHostKey) -> Int {
+        guard let replacement = PeerPaneHostRegistry.shared.activeLease(forKey: hostKey) else {
+            return 0
+        }
+        var reattached = 0
+        for mirror in openWorkspaceMirrors
+        where mirror.spec.hostKey == hostKey && mirror.resumeAfterHostReconnect(using: replacement) {
+            reattached += 1
+        }
         let sessions = openPaneSessions.filter {
             Self.shouldReattachAfterHostReconnect(
                 leaseKey: $0.lease.key,
@@ -234,7 +243,6 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 isTorndown: $0.isTorndown
             )
         }
-        var reattached = 0
         for session in sessions where session.requestHostReconnectReattach != nil {
             session.requestHostReconnectReattach?()
             reattached += 1
@@ -1174,15 +1182,18 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             // up front, before any workspace is materialized, with an
             // actionable "update the host" message.
             if live, !conn.hostCapabilities.has(PeerCapability.workspaceLifecycleV1) {
-                let ver = conn.hostAppVersion.map { "term-meshd \($0)" }
-                    ?? "an older term-meshd build"
+                // The serving process can be term-meshd OR an app-hosted
+                // server — both answer `hostAppVersion` now — so the label
+                // must not attribute the version to the daemon by name.
+                let ver = conn.hostAppVersion.map { "term-mesh host \($0)" }
+                    ?? "an older term-mesh build"
                 await conn.cancel()
                 registry.release(lease)
                 reportFailure(
                     "Host Too Old for Live Mirror",
                     "This host is running \(ver), which doesn't support "
                         + "live workspace mirroring (needs workspace.lifecycle.v1). "
-                        + "Update the host's term-meshd and reconnect."
+                        + "Update term-mesh on the host and reconnect."
                 )
                 return
             }

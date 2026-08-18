@@ -79,6 +79,10 @@ struct PeerHostEditorView: View {
     /// successful SSH inventory probe. Unlike warnings, healthy data remains
     /// visible because users need to know where agent credentials belong.
     @State private var binaryInventory: PeerHostDoctor.BinaryInventory?
+    /// Linux control/data-plane baseline from the same host as the last Test.
+    /// A relay handshake no longer paints the whole host green when its daemon
+    /// control pathname has vanished.
+    @State private var healthBaseline: PeerHostHealthBaseline?
     /// term-meshd processes this host keeps running while nothing points at
     /// them. Empty on Linux hosts by design (see `refreshDaemonSnapshot`).
     @State private var staleDaemons: [PeerHostDoctor.DaemonInstance] = []
@@ -292,6 +296,7 @@ struct PeerHostEditorView: View {
             }
 
             doctorStatusLine
+            healthBaselineLine
 
             agentEnvironmentStatusLine
             agentStackStatusLine
@@ -671,6 +676,39 @@ struct PeerHostEditorView: View {
     }
 
     @ViewBuilder
+    private var healthBaselineLine: some View {
+        if let health = healthBaseline {
+            switch health.verdict {
+            case .healthy:
+                Label(
+                    "Host healthy — peer and daemon control planes respond; no relay faults in 5 min",
+                    systemImage: "checkmark.shield"
+                )
+                .font(.caption).foregroundStyle(.green)
+            case .degraded:
+                Label(
+                    "Host degraded — relay lag \(health.relayLagCount), recovery \(health.resumeHealCount) in 5 min",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption).foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            case .unhealthy:
+                let control = health.controlPathPresent && health.controlRPC
+                    ? "control OK" : "control unavailable at \(health.controlPath)"
+                Label(
+                    "Host unhealthy — \(control); protocol mismatches \(health.protocolMismatchCount) in 5 min",
+                    systemImage: "xmark.shield"
+                )
+                .font(.caption).foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+            case .unknown:
+                Label("Host health baseline unavailable", systemImage: "questionmark.circle")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
     private var agentEnvironmentStatusLine: some View {
         if let inventory = binaryInventory,
            let shell = inventory.agentShell {
@@ -941,6 +979,7 @@ struct PeerHostEditorView: View {
         daemonMissingVersion = nil
         binaryWarnings = []
         binaryInventory = nil
+        healthBaseline = nil
         daemonMissingHostKind = nil
         testedHostKind = nil
         updateAttempted = false
@@ -968,6 +1007,7 @@ struct PeerHostEditorView: View {
         daemonMissingVersion = nil
         binaryWarnings = []
         binaryInventory = nil
+        healthBaseline = nil
         daemonMissingHostKind = nil
         testedHostKind = nil
         // Snapshot NOW — this is the exact target Install/Update must use
@@ -991,6 +1031,7 @@ struct PeerHostEditorView: View {
                 ) else { return }
                 guard gen == doctorGeneration else { return }
                 doctorState = resolved
+                await refreshHealthBaseline(draft: draft, gen: gen)
                 await refreshAgentStack(draft: draft, gen: gen)
                 await refreshBinaryInventory(draft: draft, gen: gen)
                 await refreshDaemonSnapshot(draft: draft, gen: gen)
@@ -1111,6 +1152,7 @@ struct PeerHostEditorView: View {
                 ) else { return }
                 guard gen == doctorGeneration else { return }
                 doctorState = resolved
+                await refreshHealthBaseline(draft: draft, gen: gen)
             case .daemonMissing:
                 doctorState = .diagnosing
                 let raw = await PeerHostDoctor.diagnose(
@@ -1153,6 +1195,19 @@ struct PeerHostEditorView: View {
         binaryWarnings = warnings
         for warning in warnings {
             RemoteWorkLog.info("\(draft.sshTarget): \(warning)")
+        }
+    }
+
+    private func refreshHealthBaseline(draft: PeerHostProfile, gen: Int) async {
+        guard gen == doctorGeneration else { return }
+        let measured = await PeerHostDoctor.healthBaseline(
+            sshTarget: draft.sshTarget, port: draft.sshPort,
+            identityFile: draft.identityFile
+        )
+        guard gen == doctorGeneration else { return }
+        healthBaseline = measured
+        if let measured, measured.verdict != .healthy {
+            RemoteWorkLog.info("\(draft.sshTarget): peer health \(measured.verdict.rawValue)")
         }
     }
 

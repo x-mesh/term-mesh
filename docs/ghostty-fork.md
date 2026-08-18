@@ -25,8 +25,8 @@ When we change the fork, update this document and the parent submodule SHA.
 
 ## Current fork changes
 
-This list has fallen behind before; `CLAUDE.md` carries the shorter running
-summary of fork deltas. Trust the diff against `upstream/main` over either.
+This list has fallen behind before. Trust the diff against `upstream/main`
+over this summary.
 
 ### 1) OSC 99 (kitty) notification parser
 
@@ -81,11 +81,28 @@ summary of fork deltas. Trust the diff against `upstream/main` over either.
 - Commits:
   - `c495aadb2` (fix(termio): bound subprocess teardown)
   - `3f755ee80` (fix(termio): harden bounded subprocess teardown)
+  - `e3854c249` (fix(termio): shorten embedded teardown deadlines)
+  - `54d11c14c` (fix(termio): keep process-group discovery long, shutdown short)
 - Files:
   - `src/termio/Exec.zig`
 - Summary:
   - Gives the child process group a bounded `SIGHUP` grace period, then sends
     `SIGKILL` once and observes it for a separately bounded force period.
+    Graceful shutdown and forced-shutdown observation use 20 ten-millisecond
+    attempts each (about 200 ms per phase); group discovery keeps 100 (about
+    one second). The asymmetry is deliberate: the first two run on every close
+    and the embedder waits on them, while discovery only sleeps in the rare
+    window before the child calls `setsid`, and giving up on it early forces
+    the direct-child fallback that lets same-group descendants survive.
+  - This shortens, and does not remove, the teardown stall. It reduced the
+    deterministic `SIGHUP`-resistant probe from about 2.9 seconds to about
+    0.65 seconds. The worst case is longer than one phase: a late `setsid`
+    followed by `child_moved` at the end of the force phase can chain
+    discovery, both group phases, and both direct-fallback phases, so polling
+    alone can approach 1.8 seconds, and the renderer and read-thread joins are
+    added on top. Those joins are still synchronous and are not made bounded
+    by this change, so pane close remains a main-thread block — a shorter one.
+    Describe it that way to users rather than as a fixed freeze.
   - Never sends a group signal to the embedding app's own process group. If
     child pre-exec setup fails it exits immediately; if group discovery still
     does not produce the expected `pgid == pid`, cleanup uses a bounded direct
@@ -98,9 +115,15 @@ summary of fork deltas. Trust the diff against `upstream/main` over either.
     Descendants that move into another process group remain out of scope.
   - A `SIGHUP` cleanup handler that exceeds the grace period may be interrupted
     by `SIGKILL`; this is the intentional tradeoff for a bounded UI teardown.
+    Shortening the grace period from one second to about 200 ms raises how
+    often that interruption happens, so shell exit work that is slower than
+    that — history writes, `zshexit`-style hooks, an editor flushing state —
+    can be cut short when its pane is closed. Suspect this first if a user
+    reports losing shell history on close.
   - Regression tests observe real `SIGHUP` delivery before escalation, cover a
     same-group descendant outliving its parent, verify bounded own-PGID
-    discovery/direct fallback, and confirm direct-child reaping.
+    discovery/direct fallback, confirm direct-child reaping, and pin the
+    deadline asymmetry so a later edit cannot unify the three periods.
 - Upstreamable: yes, subject to agreement on the grace/force deadlines and the
   intentional residual-process tradeoff.
 

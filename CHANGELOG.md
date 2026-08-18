@@ -4,6 +4,111 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.195.0] - 2026-08-18
+
+**Project 삭제가 host의 leader까지 정리하고, 죽은 daemon은 15초 안에 스스로 돌아온다.**
+
+### Fixed
+
+- **다른 client에서 이어받은 Project를 삭제해도 host에 leader 프로세스가 남던 문제** ([#305](https://github.com/x-mesh/term-mesh/pull/305)) — 이어받은(adopt) Project는 전용 workspace 정보가 없어 삭제가 host의 workspace를 건너뛰었고, leader 프로세스가 daemon 아래 계속 살아 있었다. 이제 삭제 시 host의 workspace 목록에서 이 Project의 것을 다시 찾아 leader까지 확실히 정리한다.
+
+- **함께 실행되는 daemon이 죽으면 앱이 알아채지 못하던 문제** ([#305](https://github.com/x-mesh/term-mesh/pull/305)) — 업데이트 직후처럼 daemon이 조용히 사라지면 원격 Project 생성이 계속 거부되고 앱을 재시작해야만 복구됐다. 이제 daemon이 응답을 멈추면 15초 안에 자동으로 다시 시작하거나 다시 붙는다. Settings에서 직접 정지한 daemon은 되살리지 않는다.
+
+- **연결 화면이 앱이 서비스하는 host를 "debug-server"로 표시하던 문제** ([#304](https://github.com/x-mesh/term-mesh/pull/304)) — 버전 자리에 placeholder가 박혀 있어 어떤 버전이 서비스 중인지 알 수 없었다. 이제 실제 앱 버전(예: v0.195.0)이 표시되고, 너무 오래된 host 안내 문구도 daemon과 앱을 구분해 정확히 알려준다.
+
+### Changed
+
+- **daemon 로그가 앱을 다시 열 때마다 지워지지 않는다** ([#305](https://github.com/x-mesh/term-mesh/pull/305)) — `/tmp/term-meshd.log`가 실행마다 초기화돼 문제 조사 근거가 사라졌다. 이제 이어서 기록하고, 50MB를 넘으면 한 번에 비운다.
+
+### Thanks to 2 contributors!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+- [@lkasa5546](https://github.com/lkasa5546)
+
+## [0.194.0] - 2026-08-18
+
+**Disconnect Host 후 재연결이 보존된 pane을 실제로 되살리고, relay가 잠깐 멈추면 그 이유가 로그에 남는다.**
+
+### Added
+
+- **원격 pane이 잠깐 멈추면 그 이유가 릴리스 빌드 로그에 남는다** ([#301](https://github.com/x-mesh/term-mesh/pull/301)) — 지금까지 relay 정체 계측은 개발 빌드에만 있어서, 릴리스 앱에서 pane이 잠깐 얼었다 풀리면 아무 기록도 남지 않았다. 이제 출력이 막힌 구간(앱→relay 쓰기 정체, relay helper가 로컬 터미널에 쓰는 지연)과 입력이 밀린 구간(키 전송 지연, host 쪽 주입 지연)이 각각 지속시간과 함께 Remote Work 로그에 남아, 네 구간 중 어디가 병목이었는지 로그만으로 가릴 수 있다. 200ms 미만은 기록하지 않고 5초당 한 줄로 제한해 로그가 넘치지 않는다.
+
+### Fixed
+
+- **Disconnect Host 후 다시 연결하면 보존된 pane과 workspace mirror가 되살아난다** ([#300](https://github.com/x-mesh/term-mesh/pull/300)) — 이전에는 host 연결을 끊으면 남겨둔 terminal pane과 mirror가 이미 은퇴한 socket에 재시도를 반복하거나 죽은 채로 남았다. 이제 재연결하면 terminal·agent pane은 교체된 lease로 다시 붙고, mirror는 구독을 교체해 host의 현재 layout대로 pane을 재구성한다.
+
+- **peer host의 번들 CLI 도구를 찾지 못하던 문제** ([#297](https://github.com/x-mesh/term-mesh/pull/297)) — macOS host에서 앱 번들의 `Resources/bin`을 우선 탐색해 peer 도구를 찾고, macOS에는 해당 없는 Linux 전용 bridge 설치 안내가 더 이상 뜨지 않는다.
+
+- **New Project에서 브랜치 이름을 끝까지 입력하면 제안 목록에서 사라지던 문제** ([#298](https://github.com/x-mesh/term-mesh/pull/298)) — "develop"을 다 치면 develop만 목록에서 빠져 그런 브랜치가 없는 것처럼 보였다. 이제 정확히 일치하는 브랜치가 체크 표시와 함께 목록 맨 위에 남는다.
+
+### Thanks to 2 contributors!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+- [@lkasa5546](https://github.com/lkasa5546)
+
+## [0.193.0] - 2026-08-18
+
+**원격 Project와 agent가 이제 viewer의 수명에 묶이지 않는다.** 앱을 종료하거나 다른 Mac에서 다시 열어도 leader와 worker를 그대로 이어가고, relay 복구 중인 명령 응답과 duplicate agent의 격리 checkout도 잃지 않는다.
+
+### Added
+
+- **native agent pane에서 텍스트를 드래그해 복사할 수 있다** ([#291](https://github.com/x-mesh/term-mesh/pull/291)) — 일반 답변, 지시문, 도구 출력과 코드까지 macOS 표준 텍스트 선택으로 긁을 수 있다. 연속된 도구 호출은 한 활동 묶음으로 접혀 긴 작업 기록도 훨씬 짧게 훑는다.
+
+### Fixed
+
+- **원격 Project를 다른 client에서 열어도 같은 leader와 worker가 그대로 이어진다** ([#291](https://github.com/x-mesh/term-mesh/pull/291)) — Project manifest가 모든 surface와 agent instance를 보존하고, 원래 viewer가 종료돼도 host daemon이 작업을 계속 소유한다. 다른 인증된 client가 Project를 열면 worker의 team route도 새 viewer의 grant로 넘겨져 `send`, `inbox`, `reply`가 계속 동작한다. 정확히 복원할 수 없는 multi-host 배치나 구버전 daemon은 Project 생성 전에 막는다.
+
+- **relay가 화면을 복구하는 동안 원격 leader 응답이 사라지던 문제** ([#293](https://github.com/x-mesh/term-mesh/pull/293)) — 출력 누락을 복구하려고 peer session을 교체할 때 진행 중인 leader command의 응답 연결까지 닫혀 timeout이 날 수 있었다. 이제 응답이 원래 연결로 돌아갈 때까지 session 교체를 직렬화하고, 끊긴 요청 ID는 즉시 풀어 새 연결에서 안전하게 재시도한다.
+
+- **같은 역할의 agent를 여러 명 만들면 서로의 isolated worktree를 덮거나 고아 checkout을 남기던 문제** ([#294](https://github.com/x-mesh/term-mesh/pull/294)) — branch identity에 durable agent instance를 포함하고 모든 checkout을 process 시작 전에 준비한다. live worktree는 절대 stale로 오인해 지우지 않으며, pane 생성이 중간에 실패하면 아직 roster가 소유하지 않은 checkout과 branch를 역순으로 되돌린다.
+
+### Thanks to 2 contributors!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+- [@lkasa5546](https://github.com/lkasa5546)
+
+## [0.192.0] - 2026-08-18
+
+### Fixed
+
+- **pane을 닫을 때 앱이 수 초간 멈추던 문제** ([#287](https://github.com/x-mesh/term-mesh/pull/287)) — 종료를 거부하는 shell이나 자식 프로세스가 있어도 Ghostty의 renderer·IO thread를 기다리는 시간이 길어지지 않도록 종료 대기 상한을 줄였다. 닫힌 terminal surface가 view 정리 중 다시 생성돼 teardown을 두 번 수행하던 경로도 막아, 관측된 pane close 지연을 약 2.9초에서 0.3초대로 줄였다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
+## [0.191.0] - 2026-08-17
+
+### Fixed
+
+- **원격 pane에 다시 붙을 때 지난 출력이 화면에 다시 흘러가던 문제** ([#284](https://github.com/x-mesh/term-mesh/pull/284)) — 연결이 끊겼다가 복구될 때, 이어받을 지점이 daemon이 보관하는 출력 버퍼 범위를 벗어나면 남아 있는 예전 바이트를 그대로 다시 밀어 넣었다. 이미 내용이 그려진 터미널에 옛 출력이 눈에 보이게 재생되고 화면이 위로 튀는 증상이 여기서 나왔다. 이제 끊긴 지점부터 정확히 이어붙일 수 있을 때만 버퍼를 사용하고, 그럴 수 없으면 현재 화면을 그대로 다시 그린다. 화면을 다시 그릴 때는 출력이 멈춘 순간을 기준으로 잡아 붙는 순간의 출력과 겹치지 않게 한다. agent pane은 성격이 달라 지금처럼 소비자를 다시 시작한 뒤 전체를 재생한다.
+
+- **살아 있는 daemon의 socket이 다른 인스턴스에 빼앗기던 문제** — 앱이 daemon을 시작하거나 종료할 때 socket 파일을 조건 없이 지웠다. 응답이 조금 느린 daemon도 죽은 것으로 취급돼 경로가 교체되면, 이후 명령과 화면이 서로 다른 daemon을 보게 되는 split-brain 상태가 됐다. 이제 앱은 socket을 지우지 않고, daemon이 자기가 만든 socket만 정리한다. 이미 있는 socket이 살아 있는지 판단할 때도 짧은 제한 시간을 두고 여러 번 확인해서, accept 대기열이 잠깐 찬 정상 daemon을 죽었다고 오판하지 않는다.
+
+- **Linux peer 호스트가 실제로 정상인지 확인할 수 있다** — Edit Peer Host의 Test는 지금까지 peer 접속만 성공하면 전부 초록불로 표시해서, daemon 제어 경로가 사라진 호스트도 정상처럼 보였다. 이제 서비스 상태, daemon 제어 socket의 실제 응답, 최근 5분간의 relay 이상·복구·프로토콜 불일치 횟수를 함께 측정해 healthy / degraded / unhealthy로 나눠 보여 준다. `peer status` 명령도 daemon 버전과 필요한 기능 지원 여부를 함께 보고하므로, 버전이 오래된 호스트를 붙이기 전에 알 수 있다.
+
+- **native pane으로 띄운 agent가 계정 환경을 못 읽던 문제** — 로컬 native pane은 터미널 셸을 거치지 않아서 profile과 `agent-env`가 적용되지 않았고, 그래서 같은 agent가 pane에서만 인증이나 경로 문제로 실패할 수 있었다. 이제 리더와 원격 native agent가 쓰는 것과 동일한 로그인 절차를 거친다. 앱이 지정한 값은 그 뒤에 다시 덮어써서 우선순위를 유지하며, API key 같은 값은 프로세스 인자에 노출되지 않게 환경으로만 전달한다.
+
+- **IME 입력창으로 보낸 메시지의 답장이 돌아오지 않던 문제** — `@agent`로 메시지나 ping을 보내면 리더가 답장 없는 방식으로 전달해서, native pane의 답이 리더 채널에 올라오지 않았다. 결과적으로 답장을 계속 기다리거나 응답 없음으로 처리됐다. 이제 답장을 짝지어 받는 방식으로 보내고 300초 기한 안에 온 답을 모아 요약한다. 이름이 겹치는 agent는 고유 ID로 정확히 지정하며, 여러 대상에게 보낼 때는 각각 동시에 보내고 응답과 시간 초과를 구분해 보고한다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
+## [0.190.0] - 2026-08-17
+
+### Changed
+
+- **Project 리더가 이미 있는 worker를 먼저 활용한다** — 지금까지 리더는 worker가 준비돼 있어도 비사소 작업을 직접 처리하는 경우가 있어 병렬 팀의 이점이 줄어들었다. 이제 요청을 독립적으로 검증할 수 있는 단위로 먼저 나누고, 파일 소유권이 겹치지 않는 작업은 적합한 worker에게 맡긴다. 작거나 순차적인 작업은 계속 직접 처리해 불필요한 분배 비용을 만들지 않는다.
+
+### Fixed
+
+- **Mac peer에서 Project를 만들 때 term-mesh의 메모리가 끝없이 늘어날 수 있던 문제** — GUI가 제공하는 workspace socket과 daemon의 session-owner socket이 같은 호스트로 합쳐지면서 연결과 roster 조회가 반복되고, 느려진 peer의 큰 workspace snapshot이 송수신 대기열에 제한 없이 쌓일 수 있었다. 이제 두 endpoint를 구분하고 roster 조회를 한 번씩만 수행하며, 송수신 대기열·시간·snapshot 수에 상한을 둔다. 응답하지 않는 peer가 있어도 메모리가 계속 증가하지 않고 Project 목록이 올바른 endpoint를 따른다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.189.0] - 2026-08-16
 
 ### Fixed
