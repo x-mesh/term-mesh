@@ -917,7 +917,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // peerPendingInputTail even if the TerminalSurface is already freed.
         let sfcPtrKey = UInt(bitPattern: sfcPtr)
 
+        let inputStallGate = RelayStallLogGateBox()
         let input: @Sendable (Data) async -> Void = { [weakTS] bytes in
+            let arrivedAt = DispatchTime.now().uptimeNanoseconds
             await MainActor.run {
                 guard let terminalSurface = weakTS.value,
                       let ptr = terminalSurface.surface else { return }
@@ -929,6 +931,20 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                 // flushed later without capturing the raw (non-Sendable) pointer.
                 peerSurfaceRefForKey[UInt(bitPattern: ptr)] = weakTS
                 sendPeerInputBytes(ptr, bytes: bytes)
+            }
+            // Arrival → PTY-write latency on the HOST side. A viewer whose
+            // keys "hang" cannot tell whether they never got here or got here
+            // and waited on a busy main thread; this episode record — the
+            // only production trace of host-side injection — is what tells
+            // those apart when read against the viewer's own stall lines.
+            let injectedAt = DispatchTime.now().uptimeNanoseconds
+            let record = inputStallGate.recordEpisode(
+                durationNanos: injectedAt &- arrivedAt, now: injectedAt
+            )
+            if record.shouldLog {
+                RemoteWorkLog.infoOffMain(
+                    "Peer input injection stalled — \((injectedAt &- arrivedAt) / 1_000_000)ms from arrival to PTY write (\(record.episodeCount) stalls, \(record.stalledNanosTotal / 1_000_000)ms total); the host main thread was busy"
+                )
             }
         }
 
