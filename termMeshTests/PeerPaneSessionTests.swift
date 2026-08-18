@@ -2291,10 +2291,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
 
     /// The whole routing table in one place.
     ///
-    /// The two exclusions are the ones most likely to be "simplified" away
-    /// later, so they are asserted rather than described: claude never takes
-    /// the peer-owned path (`tm-agent-bridge --cli` has no claude value), and
-    /// cursor/agy stay on the local bridge until their own change lands.
+    /// Claude speaks stream-json directly from a daemon-owned agent surface;
+    /// every other native CLI uses the bridge on that daemon.
     @MainActor
     func test_factoryMatrix_capabilityTimesBridgeTimesCLI() {
         func route(
@@ -2329,12 +2327,12 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             )
         }
 
-        // Turn-per-process CLIs keep today's local bridge (R8).
+        // Turn-per-process CLIs can be owned by the peer bridge too.
         for cli in ["cursor", "agy"] {
-            XCTAssertEqual(route(cli, capability: true), .localNativeBridge, cli)
+            XCTAssertEqual(route(cli, capability: true), .peerOwnedAgent, cli)
             XCTAssertEqual(
                 route(cli, capability: false), .localNativeBridge,
-                "\(cli): unaffected by the host capability — nothing runs there"
+                "\(cli): an old daemon keeps the existing SSH-owned fallback"
             )
             XCTAssertEqual(
                 route(cli, capability: true, sshTarget: nil), .terminal,
@@ -2342,8 +2340,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             )
         }
 
-        // Claude speaks NDJSON directly and already has an SSH-native path.
-        XCTAssertEqual(route("claude", capability: true), .localNativeBridge)
+        // Claude needs no bridge, only an agent-capable daemon.
+        XCTAssertEqual(route("claude", capability: true), .peerOwnedAgent)
         XCTAssertEqual(route("claude", capability: false), .localNativeBridge)
         // gemini: the bridge speaks it, but no native panel holds it today.
         XCTAssertEqual(route("gemini", capability: true), .terminal)
@@ -2399,16 +2397,14 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         //                     ---------------  ---------------
         //   (cap, bridge) →   00  01  10  11   00  01  10  11
         let table: [(String, [Factory])] = [
-            // Claude has no peer-owned recipe, but its direct SSH stream is native.
-            ("claude", [T, T, T, T, L, L, L, L]),
+            // Claude's direct stream-json recipe does not depend on the bridge.
+            ("claude", [T, T, T, T, L, L, P, P]),
             ("gemini", [T, T, T, T, T, T, T, T]),
             // Peer ownership only in the last cell; every other SSH cell remains native.
             ("codex", [T, T, T, T, L, L, L, P]),
             ("kiro", [T, T, T, T, L, L, L, P]),
-            // Unmoved (R8). The bridge these run is this Mac's, so the peer's
-            // capability and the peer's bridge are both irrelevant to them.
-            ("cursor", [T, T, T, T, L, L, L, L]),
-            ("agy", [T, T, T, T, L, L, L, L]),
+            ("cursor", [T, T, T, T, L, L, L, P]),
+            ("agy", [T, T, T, T, L, L, L, P]),
         ]
 
         for (cli, expected) in table {
@@ -2581,7 +2577,7 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         )
         XCTAssertEqual(notices.count, 1, "one host gets one preflight warning")
         XCTAssertEqual(notices[0].servingVersion, "v0.179.0")
-        XCTAssertEqual(notices[0].clis, ["codex", "kiro"])
+        XCTAssertEqual(notices[0].clis, ["claude", "codex", "kiro"])
         XCTAssertTrue(notices[0].message.contains("mac-sub"))
         XCTAssertTrue(notices[0].message.contains("term-mesh v0.179.0"))
         XCTAssertTrue(notices[0].message.contains("through this Mac over SSH"))
@@ -2620,15 +2616,21 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             ).isEmpty,
             "a compatible serving daemon needs no warning"
         )
-        XCTAssertTrue(
+        var staleHost = oldHost
+        staleHost.supportsPeerOwnedAgentHosting = false
+        XCTAssertEqual(
             TeamAgentComposer.peerOwnedFallbackNotices(
-                agents: [row("claude")], hosts: [{
-                    var host = oldHost
-                    host.supportsPeerOwnedAgentHosting = false
-                    return host
-                }()]
-            ).isEmpty,
-            "Claude is SSH-owned by design, not because this host is stale"
+                agents: [row("claude")], hosts: [staleHost]
+            ).first?.clis,
+            ["claude"],
+            "Claude now has a durable peer-owned recipe too"
+        )
+        XCTAssertTrue(
+            TeamAgentComposer.blocksRemoteTeamCreation(
+                agents: [row("claude")], hosts: [staleHost],
+                requiresDurableProject: true
+            ),
+            "New Project must not silently create a viewer-owned Claude worker"
         )
     }
 
@@ -2694,6 +2696,426 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         XCTAssertEqual(first.remote, "/tmp/term-mesh-agent-route-a1b2-c3d4.sock")
         XCTAssertNotEqual(first.remote, second.remote)
         XCTAssertLessThan(first.remote.utf8.count, 104)
+    }
+
+    // MARK: - Transferable route file
+
+    /// The environment names a path, and `tm-agent` reads the grant out of it
+    /// on every invocation. That indirection is the whole fix: a second viewer
+    /// adopting the project can replace the file, and cannot replace the
+    /// environment of a process that is already running.
+    @MainActor
+    func test_remoteNativeAgentEnvironmentNamesTheTransferableRouteFile() {
+        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+        grant.grantID = Data(repeating: 0xab, count: PeerTeamLeader.grantIDBytes)
+        grant.projectID = "name:mesh-test"
+        grant.teamUuid = "team-uuid"
+        grant.expiresAtUnixSecs = 123_456
+
+        let env = TeamOrchestrator.remoteNativeAgentEnvironment(
+            teamName: "mesh-test",
+            agentName: "executor",
+            agentType: "executor",
+            agentCli: "codex",
+            workspaceId: UUID(),
+            socketPath: nil,
+            routeGrant: grant,
+            routeFilePath: "/home/agent/.term-mesh/agent-routes/abc.json"
+        )
+
+        XCTAssertEqual(
+            env[TeamOrchestrator.remoteTeamRouteFileEnvName],
+            "/home/agent/.term-mesh/agent-routes/abc.json"
+        )
+        XCTAssertEqual(
+            env["TERMMESH_LEADER_GRANT_ID"],
+            String(repeating: "ab", count: 32),
+            "the frozen variables stay as the fallback for an older worker"
+        )
+    }
+
+    @MainActor
+    func test_remoteRouteFileEnvironmentIsOmittedWhenNothingWasStaged() {
+        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+        grant.grantID = Data(repeating: 0xab, count: PeerTeamLeader.grantIDBytes)
+        grant.projectID = "name:mesh-test"
+        grant.teamUuid = "team-uuid"
+
+        for staged in [nil, "", "relative/path.json", "$HOME/route.json"] as [String?] {
+            let env = TeamOrchestrator.remoteNativeAgentEnvironment(
+                teamName: "mesh-test",
+                agentName: "executor",
+                agentType: "executor",
+                agentCli: "codex",
+                workspaceId: UUID(),
+                socketPath: nil,
+                routeGrant: grant,
+                routeFilePath: staged
+            )
+            XCTAssertNil(
+                env[TeamOrchestrator.remoteTeamRouteFileEnvName],
+                "\(staged ?? "nil") is not a path tm-agent can open"
+            )
+        }
+    }
+
+    /// The adopting app has the roster, not the launch, so the path has to be
+    /// a pure function of the agent instance id — and sanitised, because an
+    /// instance id must not be able to name a file of its choosing.
+    @MainActor
+    func test_remoteAgentRouteFileNameIsDeterministicAndSanitised() {
+        XCTAssertEqual(
+            TeamOrchestrator.remoteAgentRouteFileName(agentInstanceID: "A1B2-C3D4"),
+            "a1b2-c3d4.json"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.remoteAgentRouteFileName(agentInstanceID: "A1B2-C3D4"),
+            TeamOrchestrator.remoteAgentRouteFileName(agentInstanceID: "a1b2-c3d4")
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.remoteAgentRouteFileName(
+                agentInstanceID: "../../etc/pass wd;rm -rf /"
+            ),
+            "etcpasswdrm-rf.json",
+            "no separator, no space, and no shell metacharacter survives"
+        )
+        let long = TeamOrchestrator.remoteAgentRouteFileName(
+            agentInstanceID: String(repeating: "a", count: 200)
+        )
+        XCTAssertEqual(long.count, 48 + ".json".count)
+    }
+
+    /// Exactly the object `remote_leader_route_from_file` in tm_agent.rs
+    /// parses. A renamed or retyped field here is a route the worker silently
+    /// refuses, falling back to the dead environment grant.
+    @MainActor
+    func test_routeFilePayloadMatchesTheFieldsTmAgentParses() throws {
+        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+        grant.grantID = Data(repeating: 0xcd, count: PeerTeamLeader.grantIDBytes)
+        grant.projectID = "name:mesh-test"
+        grant.teamUuid = "team-uuid"
+        grant.expiresAtUnixSecs = 4_102_444_800
+
+        let payload = TeamOrchestrator.remoteAgentRouteFilePayload(grant)
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: payload) as? [String: Any]
+        )
+
+        XCTAssertEqual(object["grant_id_hex"] as? String, String(repeating: "cd", count: 32))
+        XCTAssertEqual(object["project_id"] as? String, "name:mesh-test")
+        XCTAssertEqual(object["team_uuid"] as? String, "team-uuid")
+        XCTAssertEqual(object["expires_at_unix_secs"] as? UInt64, 4_102_444_800)
+        XCTAssertEqual((object["target_peer_id_hex"] as? String)?.count, 32)
+    }
+
+    /// A bearer in the remote command line would sit in `ps` output and in
+    /// shell history on a machine this app does not own.
+    @MainActor
+    func test_routeStagingScriptCarriesNoSecretAndReplacesAtomically() {
+        let script = TeamOrchestrator.remoteAgentRouteStagingScript(
+            agentInstanceID: "A1B2-C3D4"
+        )
+
+        XCTAssertTrue(script.contains("cat > \"$tmp\""), "the grant arrives on stdin")
+        XCTAssertTrue(script.contains("mv -f \"$tmp\" \"$path\""), "rename, never truncate")
+        XCTAssertTrue(script.contains("chmod 600 \"$tmp\""))
+        XCTAssertTrue(script.contains("chmod 700 \"$dir\""))
+        XCTAssertTrue(script.contains("umask 077"))
+        XCTAssertTrue(script.contains("a1b2-c3d4.json"))
+        XCTAssertTrue(
+            script.hasPrefix("/bin/sh -c "),
+            "the account login shell may be csh or fish, which cannot parse this"
+        )
+        XCTAssertFalse(
+            script.lowercased().contains("grant_id"),
+            "no part of the grant may appear in the remote argv"
+        )
+    }
+
+    @MainActor
+    func test_adoptedRouteBatchStagesEverythingBeforeCommitAndRollsBackPartialMoves() {
+        // The batch helper is remote I/O, but its security boundary is the
+        // generated transaction: decode every route first, back up every live
+        // file, then move, with an EXIT trap restoring partial commits. Keep
+        // those ordering tokens pinned so a later simplification cannot return
+        // to one-worker-at-a-time replacement.
+        let body = TeamOrchestrator.adoptedRemoteAgentRouteTransactionScript()
+        let decode = body.range(of: "base64 $flag >")
+        XCTAssertNotNil(decode)
+        XCTAssertFalse(body.contains("mv -f \"$p\" \"$dir/$n\""))
+        XCTAssertTrue(body.contains("trap rollback EXIT HUP INT TERM"))
+        XCTAssertTrue(body.contains("mv -f \"$tx/$n.old\" \"$dir/$n\""))
+        XCTAssertTrue(body.contains("__TERMMESH_ROUTE_DIR__="))
+    }
+
+    @MainActor
+    func test_adoptedRouteFinishTargetsTheValidatedTransactionDirectory() {
+        let rollback = TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+            transaction: ".tx.1234", commit: false
+        )
+        let commit = TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+            transaction: ".tx.1234", commit: true
+        )
+        XCTAssertNotNil(rollback)
+        XCTAssertTrue(rollback?.contains("tx=\"$dir/.tx.1234\"") == true)
+        XCTAssertTrue(
+            rollback?.contains("mv -f \"$tx/$n.old\" \"$dir/$n\"") == true
+        )
+        XCTAssertTrue(commit?.contains("mv -f \"$p\" \"$dir/$n\"") == true)
+        XCTAssertTrue(commit?.contains("[ -f \"$tx.done\" ] && exit 0") == true)
+        XCTAssertTrue(commit?.contains("[ -d \"$tx\" ] || exit 67") == true)
+        XCTAssertNil(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: "../routes", commit: false
+            )
+        )
+    }
+
+    @MainActor
+    func test_adoptedRouteMarkersRequireSafeTransactionAndAbsoluteDirectory() {
+        let output = "noise\n__TERMMESH_ROUTE_TX__=.tx.42\n"
+            + "__TERMMESH_ROUTE_DIR__=/srv/agent/.term-mesh/agent-routes\n"
+        XCTAssertEqual(TeamOrchestrator.parseAdoptedRouteTransaction(output), ".tx.42")
+        XCTAssertEqual(
+            TeamOrchestrator.parseAdoptedRouteDirectory(output),
+            "/srv/agent/.term-mesh/agent-routes"
+        )
+        XCTAssertNil(
+            TeamOrchestrator.parseAdoptedRouteDirectory(
+                "__TERMMESH_ROUTE_DIR__=relative/routes\n"
+            )
+        )
+    }
+
+    @MainActor
+    func test_adoptedRouteTransactionCanRestoreThePreviousLiveRoute() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-route-tx-\(UUID().uuidString)")
+        let directory = home.appendingPathComponent(".term-mesh/agent-routes")
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: home) }
+        let live = directory.appendingPathComponent("worker.json")
+        try Data("old".utf8).write(to: live)
+
+        let staged = Process()
+        staged.executableURL = URL(fileURLWithPath: "/bin/sh")
+        staged.arguments = ["-c", TeamOrchestrator.adoptedRemoteAgentRouteTransactionScript()]
+        staged.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+        let input = Pipe()
+        let output = Pipe()
+        staged.standardInput = input
+        staged.standardOutput = output
+        staged.standardError = Pipe()
+        try staged.run()
+        input.fileHandleForWriting.write(Data("worker.json\tdGVzdA==\n".utf8))
+        try input.fileHandleForWriting.close()
+        let stagedOutput = String(
+            decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self
+        )
+        staged.waitUntilExit()
+        XCTAssertEqual(staged.terminationStatus, 0)
+        XCTAssertEqual(try Data(contentsOf: live), Data("old".utf8))
+
+        let transaction = try XCTUnwrap(
+            TeamOrchestrator.parseAdoptedRouteTransaction(stagedOutput)
+        )
+        let rollback = Process()
+        rollback.executableURL = URL(fileURLWithPath: "/bin/sh")
+        rollback.arguments = [
+            "-c",
+            try XCTUnwrap(
+                TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                    transaction: transaction, commit: false
+                )
+            ),
+        ]
+        rollback.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+        try rollback.run()
+        rollback.waitUntilExit()
+        XCTAssertEqual(rollback.terminationStatus, 0)
+        XCTAssertEqual(try Data(contentsOf: live), Data("old".utf8))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(transaction).path
+            )
+        )
+    }
+
+    @MainActor
+    func test_adoptedRouteCommitMovesPreparedBytesOnlyAtCommitTime() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-route-commit-\(UUID().uuidString)")
+        let directory = home.appendingPathComponent(".term-mesh/agent-routes")
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: home) }
+        let live = directory.appendingPathComponent("worker.json")
+        try Data("old".utf8).write(to: live)
+
+        let staged = Process()
+        staged.executableURL = URL(fileURLWithPath: "/bin/sh")
+        staged.arguments = ["-c", TeamOrchestrator.adoptedRemoteAgentRouteTransactionScript()]
+        staged.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+        let input = Pipe()
+        let output = Pipe()
+        staged.standardInput = input
+        staged.standardOutput = output
+        staged.standardError = Pipe()
+        try staged.run()
+        input.fileHandleForWriting.write(Data("worker.json\tdGVzdA==\n".utf8))
+        try input.fileHandleForWriting.close()
+        let stagedOutput = String(
+            decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self
+        )
+        staged.waitUntilExit()
+        XCTAssertEqual(staged.terminationStatus, 0)
+        XCTAssertEqual(try Data(contentsOf: live), Data("old".utf8))
+
+        let transaction = try XCTUnwrap(
+            TeamOrchestrator.parseAdoptedRouteTransaction(stagedOutput)
+        )
+        let commit = Process()
+        commit.executableURL = URL(fileURLWithPath: "/bin/sh")
+        commit.arguments = [
+            "-c",
+            try XCTUnwrap(
+                TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                    transaction: transaction, commit: true
+                )
+            ),
+        ]
+        commit.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+        try commit.run()
+        commit.waitUntilExit()
+        XCTAssertEqual(commit.terminationStatus, 0)
+        XCTAssertEqual(try Data(contentsOf: live), Data("test".utf8))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(transaction).path
+            )
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(transaction + ".done").path
+            )
+        )
+
+        let retry = Process()
+        retry.executableURL = URL(fileURLWithPath: "/bin/sh")
+        retry.arguments = [
+            "-c",
+            try XCTUnwrap(
+                TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                    transaction: transaction, commit: true
+                )
+            ),
+        ]
+        retry.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+        try retry.run()
+        retry.waitUntilExit()
+        XCTAssertEqual(retry.terminationStatus, 0)
+        XCTAssertEqual(try Data(contentsOf: live), Data("test".utf8))
+    }
+
+    @MainActor
+    func test_stagedRoutePathIsReadOnlyFromAnAbsoluteMarkerLine() {
+        XCTAssertEqual(
+            TeamOrchestrator.parseRemoteAgentRouteFilePath(
+                "some login noise\n__TERMMESH_ROUTE_FILE__=/home/a/.term-mesh/agent-routes/x.json\n"
+            ),
+            "/home/a/.term-mesh/agent-routes/x.json"
+        )
+        XCTAssertNil(
+            TeamOrchestrator.parseRemoteAgentRouteFilePath("__TERMMESH_ROUTE_FILE__=\n"),
+            "an empty path means $HOME never resolved"
+        )
+        XCTAssertNil(
+            TeamOrchestrator.parseRemoteAgentRouteFilePath("__TERMMESH_ROUTE_FILE__=x.json\n"),
+            "a relative path is not something the worker environment can name"
+        )
+        XCTAssertNil(TeamOrchestrator.parseRemoteAgentRouteFilePath("ok\n"))
+    }
+
+    /// Run the script the peer would run. This is the one check that proves
+    /// the shell text itself — permissions, `$HOME` resolution, the echoed
+    /// path, and that a second staging replaces the first in place.
+    @MainActor
+    func test_routeStagingScriptWritesAnOwnerOnlyFileAndReplacesItInPlace() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-route-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        func stage(_ grantByte: UInt8) throws -> String {
+            var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+            grant.grantID = Data(repeating: grantByte, count: PeerTeamLeader.grantIDBytes)
+            grant.projectID = "name:mesh-test"
+            grant.teamUuid = "team-uuid"
+            grant.expiresAtUnixSecs = 4_102_444_800
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = [
+                "-c",
+                TeamOrchestrator.remoteAgentRouteStagingScript(agentInstanceID: "A1B2-C3D4"),
+            ]
+            process.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+            let input = Pipe()
+            let output = Pipe()
+            process.standardInput = input
+            process.standardOutput = output
+            process.standardError = Pipe()
+            try process.run()
+            input.fileHandleForWriting.write(TeamOrchestrator.remoteAgentRouteFilePayload(grant))
+            try input.fileHandleForWriting.close()
+            let text = String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self
+            )
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0)
+            return try XCTUnwrap(TeamOrchestrator.parseRemoteAgentRouteFilePath(text))
+        }
+
+        let path = try stage(0xcd)
+        XCTAssertEqual(path, home.path + "/.term-mesh/agent-routes/a1b2-c3d4.json")
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        XCTAssertEqual(
+            (attributes[.posixPermissions] as? NSNumber)?.int16Value, 0o600,
+            "tm-agent refuses any route file another account could have written"
+        )
+        let dirAttributes = try FileManager.default.attributesOfItem(
+            atPath: home.path + "/.term-mesh/agent-routes"
+        )
+        XCTAssertEqual((dirAttributes[.posixPermissions] as? NSNumber)?.int16Value, 0o700)
+
+        let first = try XCTUnwrap(
+            try JSONSerialization.jsonObject(
+                with: Data(contentsOf: URL(fileURLWithPath: path))
+            ) as? [String: Any]
+        )
+        XCTAssertEqual(first["grant_id_hex"] as? String, String(repeating: "cd", count: 32))
+
+        // What adoption does: same worker, same path, a grant the new viewer
+        // owns. Nothing about the running process changes.
+        let replaced = try stage(0x99)
+        XCTAssertEqual(replaced, path, "the path must not move under a live worker")
+        let second = try XCTUnwrap(
+            try JSONSerialization.jsonObject(
+                with: Data(contentsOf: URL(fileURLWithPath: path))
+            ) as? [String: Any]
+        )
+        XCTAssertEqual(second["grant_id_hex"] as? String, String(repeating: "99", count: 32))
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(
+                atPath: home.path + "/.term-mesh/agent-routes"
+            ),
+            ["a1b2-c3d4.json"],
+            "the staging temporary must not be left behind"
+        )
     }
 
     @MainActor
@@ -3441,6 +3863,36 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
         XCTAssertFalse(
             spec.args.contains("--exe"),
             "the role's own path is not a substitute for the executable's"
+        )
+    }
+
+    @MainActor
+    func test_claudeEnsureSpecRunsDirectStreamJsonAndKeepsRendererMetadataOutOfArgv() {
+        let spec = TeamOrchestrator.peerAgentSurfaceSpec(
+            teamName: "team",
+            agentInstanceId: "claude-instance",
+            cli: "claude",
+            workingDirectory: "/root/work",
+            model: "opus",
+            binaries: TeamOrchestrator.RemoteAgentBinaries(
+                cliPath: "/root/.local/bin/claude",
+                bridgePath: "",
+                cliAvailable: true
+            )
+        )
+
+        XCTAssertEqual(spec.executable, "/bin/sh")
+        XCTAssertEqual(spec.kind, SessionHostPanes.agentSurfaceType)
+        XCTAssertEqual(spec.args.prefix(2), ["-c", spec.args[1]])
+        XCTAssertTrue(spec.args[1].contains("/root/.local/bin/claude"))
+        XCTAssertTrue(spec.args[1].contains("--input-format"))
+        XCTAssertTrue(spec.args[1].contains("stream-json"))
+        XCTAssertTrue(spec.args[1].contains("--model"))
+        XCTAssertTrue(spec.args[1].contains("opus"))
+        XCTAssertEqual(Array(spec.args.suffix(2)), ["--cli", "claude"])
+        XCTAssertFalse(
+            spec.args[1].contains("--cli"),
+            "renderer metadata must stay in shell positional args, not Claude's argv"
         )
     }
 

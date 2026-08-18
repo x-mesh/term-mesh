@@ -804,6 +804,59 @@ final class AgentSession {
         let entry: Entry
     }
 
+    /// What the transcript mounts after consecutive tool calls have been
+    /// compressed into one disclosure row. The source `rows` stay unchanged:
+    /// socket reads, completion parsing and incremental streaming still see
+    /// every event, while the view pays for one header when a tool-heavy turn
+    /// would otherwise become a wall of shell commands.
+    enum TranscriptItem: Identifiable, Equatable {
+        case row(Row)
+        case toolGroup(ToolGroup)
+
+        var id: UUID {
+            switch self {
+            case .row(let row): return row.id
+            case .toolGroup(let group): return group.id
+            }
+        }
+    }
+
+    struct ToolGroup: Identifiable, Equatable {
+        /// The first tool is stable while results stream into the run. Using it
+        /// as the disclosure identity keeps a user's expanded/collapsed choice
+        /// attached to the same work rather than to a transient array index.
+        let id: UUID
+        let topGap: CGFloat
+        let rows: [Row]
+
+        var isRunning: Bool { calls.contains(where: \.isRunning) }
+        var failureCount: Int { calls.lazy.filter(\.failed).count }
+
+        /// Compact enough for a narrow pane: `shell 7 · read 1`, retaining the
+        /// first-seen order so the summary follows the work rather than sorting
+        /// it into an unrelated alphabet.
+        var kindSummary: String {
+            var names: [String] = []
+            var counts: [String: Int] = [:]
+            for call in calls {
+                let name = call.name.lowercased()
+                if counts[name] == nil { names.append(name) }
+                counts[name, default: 0] += 1
+            }
+            return names.map { name in
+                let count = counts[name, default: 0]
+                return count == 1 ? name : "\(name) \(count)"
+            }.joined(separator: " · ")
+        }
+
+        private var calls: [ToolCall] {
+            rows.compactMap { row in
+                guard case .tool(_, let call) = row.entry else { return nil }
+                return call
+            }
+        }
+    }
+
     /// The recent transcript window as the view consumes it.
     ///
     /// The complete, capped transcript remains in `entries` for result parsing
@@ -836,6 +889,41 @@ final class AgentSession {
                        topGap: topGap(before: entry, after: previous),
                        entry: entry)
         }
+    }
+
+    /// Fold only runs large enough to be visual noise. One or two calls remain
+    /// inline because opening a disclosure to inspect two short commands costs
+    /// more attention than it saves. Any prose, reasoning or turn boundary
+    /// closes the run, so tools never migrate across the explanation they
+    /// belong to.
+    static func transcriptItems(for rows: [Row], minimumToolCount: Int = 3) -> [TranscriptItem] {
+        var items: [TranscriptItem] = []
+        var toolRun: [Row] = []
+
+        func flushTools() {
+            guard !toolRun.isEmpty else { return }
+            if toolRun.count >= minimumToolCount, let first = toolRun.first {
+                items.append(.toolGroup(ToolGroup(
+                    id: first.id,
+                    topGap: first.topGap,
+                    rows: toolRun
+                )))
+            } else {
+                items.append(contentsOf: toolRun.map(TranscriptItem.row))
+            }
+            toolRun.removeAll(keepingCapacity: true)
+        }
+
+        for row in rows {
+            if case .tool = row.entry {
+                toolRun.append(row)
+            } else {
+                flushTools()
+                items.append(.row(row))
+            }
+        }
+        flushTools()
+        return items
     }
 
     /// Keep SwiftUI's mounted transcript bounded while retaining the longer

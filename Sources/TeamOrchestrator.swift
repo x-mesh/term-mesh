@@ -5823,7 +5823,7 @@ final class TeamOrchestrator: ObservableObject {
                     }
                 )
                 syncTeamStateToDaemon()
-                activatePeerOwnedAgentRestart(
+                await activatePeerOwnedAgentRestart(
                     replacement,
                     teamName: teamName,
                     agentInstanceID: old.agentInstanceId

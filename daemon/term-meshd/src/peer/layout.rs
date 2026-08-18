@@ -1192,11 +1192,46 @@ impl PeerHost {
             .collect()
     }
 
+    /// Every surface id a stored manifest names, leader first.
+    ///
+    /// Malformed entries are skipped rather than failing the caller: a record
+    /// that reached the map already passed validation, and a reap list is not
+    /// the place to discover otherwise.
+    fn presentation_surface_ids(
+        record: &super::persist::PersistedProjectPresentation,
+    ) -> Vec<Vec<u8>> {
+        std::iter::once(&record.leader_surface_id)
+            .chain(record.members.iter().map(|member| &member.surface_id))
+            .filter_map(|encoded| hex::decode(encoded).ok())
+            .collect()
+    }
+
     pub fn delete_project_presentation(
         &self,
         owner_peer_ids: &[Vec<u8>],
         project_id: &str,
     ) -> Result<bool, &'static str> {
+        self.delete_project_presentation_with_released(owner_peer_ids, project_id)
+            .map(|released| released.is_some())
+    }
+
+    /// Remove one manifest and hand back the surfaces it had claimed.
+    ///
+    /// The ids are taken from the record this call actually removed, while
+    /// the persistence and records locks are still held. A caller that reads
+    /// the manifest first and deletes second would be reaping a snapshot: a
+    /// replace landing in between makes it release surfaces the live manifest
+    /// still names while stranding the ones that really lost their last
+    /// reference. `Ok(None)` means there was no such project — nothing was
+    /// removed and nothing is released. Losing THIS manifest's reference is
+    /// not the same as being unreferenced, so the returned ids stay subject
+    /// to `presentation_references_surface` in `reap_if_abandoned`; another
+    /// project naming the same surface still protects it.
+    pub(crate) fn delete_project_presentation_with_released(
+        &self,
+        owner_peer_ids: &[Vec<u8>],
+        project_id: &str,
+    ) -> Result<Option<Vec<Vec<u8>>>, &'static str> {
         if owner_peer_ids.is_empty()
             || owner_peer_ids.iter().any(|id| id.len() != 16)
             || project_id.is_empty()
@@ -1207,7 +1242,7 @@ impl PeerHost {
         let _persist_guard = self.project_presentations_persistence.lock().unwrap();
         let mut records = self.project_presentations.lock().unwrap();
         let Some(existing) = records.get(project_id) else {
-            return Ok(false);
+            return Ok(None);
         };
         if !owner_peer_ids
             .iter()
@@ -1216,17 +1251,25 @@ impl PeerHost {
             return Err("not_owner");
         }
         let previous = records.remove(project_id).expect("checked above");
+        let released = Self::presentation_surface_ids(&previous);
         if let Some(path) = self.project_presentations_path.lock().unwrap().clone() {
             let snapshot: Vec<_> = records.values().cloned().collect();
             if super::persist::save_project_presentations(&path, &snapshot).is_err() {
+                // The record is back, so its surfaces never lost their
+                // reference: a rolled-back delete releases nothing.
                 records.insert(project_id.to_string(), previous);
                 return Err("persistence_failed");
             }
         }
-        Ok(true)
+        Ok(Some(released))
     }
 
-    fn presentation_references_surface(&self, surface_id: &[u8]) -> bool {
+    /// Whether any durable project manifest still names this surface.
+    ///
+    /// Read by the roster watcher below and by `reap_if_abandoned`: a
+    /// published manifest is itself a live reference, so a surface it names
+    /// is never abandoned merely because the viewer that published it left.
+    pub(crate) fn presentation_references_surface(&self, surface_id: &[u8]) -> bool {
         let encoded = hex::encode(surface_id);
         self.project_presentations
             .lock()
@@ -1279,6 +1322,15 @@ impl PeerHost {
         owner_peer_ids: &[Vec<u8>],
         project: &peer_proto::v1::Team,
     ) -> Result<(u64, bool), &'static str> {
+        self.upsert_project_presentation_with_released(owner_peer_ids, project)
+            .map(|(revision, changed, _)| (revision, changed))
+    }
+
+    pub(crate) fn upsert_project_presentation_with_released(
+        self: &Arc<Self>,
+        owner_peer_ids: &[Vec<u8>],
+        project: &peer_proto::v1::Team,
+    ) -> Result<(u64, bool, Vec<Vec<u8>>), &'static str> {
         if owner_peer_ids.is_empty()
             || owner_peer_ids.iter().any(|id| id.len() != 16)
             || project.project_id.is_empty()
@@ -1350,6 +1402,10 @@ impl PeerHost {
         let _persist_guard = self.project_presentations_persistence.lock().unwrap();
         let owner = hex::encode(&owner_peer_ids[0]);
         let mut records = self.project_presentations.lock().unwrap();
+        let previous_surface_ids: Vec<Vec<u8>> = records
+            .get(&project.project_id)
+            .map(Self::presentation_surface_ids)
+            .unwrap_or_default();
         if let Some(existing) = records.get(&project.project_id) {
             // Surface liveness is not an ownership-transfer protocol. A dead
             // leader may be replaced by its owner, but it must not turn a
@@ -1398,7 +1454,7 @@ impl PeerHost {
                 for surface in watched {
                     watchers_changed |= self.watch_presentation_surface(surface);
                 }
-                return Ok((existing_revision, watchers_changed));
+                return Ok((existing_revision, watchers_changed, Vec::new()));
             }
             record.revision = revision;
         }
@@ -1427,7 +1483,11 @@ impl PeerHost {
         for surface in watched {
             self.watch_presentation_surface(surface);
         }
-        Ok((revision, true))
+        let released = previous_surface_ids
+            .into_iter()
+            .filter(|surface_id| !seen_surfaces.contains(surface_id))
+            .collect();
+        Ok((revision, true, released))
     }
 
     /// Wire the daemon's system monitor so connections can push `HostStats`.
@@ -3989,6 +4049,190 @@ mod tests {
         host.terminate_surface(&replacement_leader.surface_id)
             .unwrap();
         host.terminate_surface(&member.surface_id).unwrap();
+    }
+
+    /// The F2 shape, deterministically: a caller that read the manifest
+    /// before deleting it reaps the wrong surfaces once a replace lands in
+    /// between. Here the read is taken first, the replace commits, and the
+    /// delete must still report only what it removed — so a caller has no
+    /// reason to keep a snapshot of its own, and `connection.rs` keeps none.
+    #[tokio::test]
+    async fn delete_releases_the_removed_record_not_an_earlier_read() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let leader = host.ensure_surface("stale-leader", &spec).unwrap();
+        let first_member = host.ensure_surface("stale-member-first", &spec).unwrap();
+        let next_member = host.ensure_surface("stale-member-next", &spec).unwrap();
+        let owner = vec![vec![6; 16]];
+        let project = |member_surface_id: &[u8]| peer_proto::v1::Team {
+            name: "stale".into(),
+            team_uuid: "uuid-stale".into(),
+            working_directory: "/tmp".into(),
+            leader_surface_id: leader.surface_id.clone(),
+            project_id: "team:uuid-stale".into(),
+            members: vec![peer_proto::v1::TeamMember {
+                name: "worker".into(),
+                agent_instance_id: "worker-instance".into(),
+                working_directory: "/tmp".into(),
+                surface_id: member_surface_id.to_vec(),
+                surface_type: "terminal".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            host.upsert_project_presentation(&owner, &project(&first_member.surface_id)),
+            Ok((1, true))
+        );
+        // What the old caller would have carried into the delete.
+        let stale_read: Vec<Vec<u8>> = host
+            .project_presentations()
+            .iter()
+            .find(|record| record.project_id == "team:uuid-stale")
+            .map(PeerHost::presentation_surface_ids)
+            .expect("published manifest");
+        assert_eq!(
+            host.upsert_project_presentation(&owner, &project(&next_member.surface_id)),
+            Ok((2, true))
+        );
+
+        let released = host
+            .delete_project_presentation_with_released(&owner, "team:uuid-stale")
+            .expect("delete accepted");
+        assert_eq!(
+            released,
+            Some(vec![
+                leader.surface_id.clone(),
+                next_member.surface_id.clone()
+            ]),
+            "the delete must release the record it removed"
+        );
+        assert_ne!(
+            released,
+            Some(stale_read),
+            "a pre-delete read is exactly what must not decide the reap"
+        );
+        assert_eq!(
+            host.delete_project_presentation_with_released(&owner, "team:uuid-stale"),
+            Ok(None),
+            "a second delete removes nothing and so releases nothing"
+        );
+
+        host.terminate_surface(&leader.surface_id).unwrap();
+        host.terminate_surface(&first_member.surface_id).unwrap();
+        host.terminate_surface(&next_member.surface_id).unwrap();
+    }
+
+    /// A delete releases the surfaces of the record it removed — never the
+    /// ones an earlier read happened to see.
+    ///
+    /// Reading the manifest and then deleting it is two steps, and a replace
+    /// fits between them: the delete takes the NEW record while the caller
+    /// reaps the OLD one's surfaces, which both strands the pane that truly
+    /// lost its last reference and aims the reap at a pane the owner just
+    /// published. Both operations serialize on the persistence lock, so only
+    /// two end states exist and each one pins its own release set exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_replace_and_delete_release_only_the_removed_record() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let leader = host.ensure_surface("race-leader", &spec).unwrap();
+        let first_member = host.ensure_surface("race-member-first", &spec).unwrap();
+        let next_member = host.ensure_surface("race-member-next", &spec).unwrap();
+        let owner = vec![vec![5; 16]];
+        let project = |member_surface_id: &[u8]| peer_proto::v1::Team {
+            name: "race".into(),
+            team_uuid: "uuid-race".into(),
+            working_directory: "/tmp".into(),
+            leader_surface_id: leader.surface_id.clone(),
+            project_id: "team:uuid-race".into(),
+            members: vec![peer_proto::v1::TeamMember {
+                name: "worker".into(),
+                agent_instance_id: "worker-instance".into(),
+                working_directory: "/tmp".into(),
+                surface_id: member_surface_id.to_vec(),
+                surface_type: "terminal".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let before = project(&first_member.surface_id);
+        let after = project(&next_member.surface_id);
+        assert_eq!(
+            host.upsert_project_presentation(&owner, &before),
+            Ok((1, true))
+        );
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let deleting = {
+            let host = Arc::clone(&host);
+            let owner = owner.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                host.delete_project_presentation_with_released(&owner, "team:uuid-race")
+            })
+        };
+        let replacing = {
+            let host = Arc::clone(&host);
+            let owner = owner.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                host.upsert_project_presentation(&owner, &after)
+            })
+        };
+        let released = deleting.await.unwrap().expect("delete accepted");
+        replacing.await.unwrap().expect("replace accepted");
+
+        let released_before = Some(vec![
+            leader.surface_id.clone(),
+            first_member.surface_id.clone(),
+        ]);
+        let released_after = Some(vec![
+            leader.surface_id.clone(),
+            next_member.surface_id.clone(),
+        ]);
+        let remaining = host.project_presentations();
+        if remaining.is_empty() {
+            // Nothing survived, so the replace landed first and the delete
+            // removed the replacement — the original member's surface is
+            // still claimed by nothing, but it is not this delete's to free.
+            assert_eq!(
+                released, released_after,
+                "the delete must release the record it actually removed"
+            );
+        } else {
+            // The delete went first, so the replace re-created the project.
+            // Only the record that was removed may be released; the live
+            // manifest's member surface must not appear.
+            assert_eq!(
+                released, released_before,
+                "the delete must not release a surface the live manifest names"
+            );
+            assert_eq!(
+                remaining[0].members[0].surface_id,
+                hex::encode(&next_member.surface_id)
+            );
+        }
+
+        host.terminate_surface(&leader.surface_id).unwrap();
+        host.terminate_surface(&first_member.surface_id).unwrap();
+        host.terminate_surface(&next_member.surface_id).unwrap();
     }
 
     #[test]
