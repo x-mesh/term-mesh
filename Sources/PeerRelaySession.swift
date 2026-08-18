@@ -210,13 +210,15 @@ struct RelayStallLogGate {
     }
 
     /// Records one finished stall episode; true means the caller should
-    /// emit its log line now. Only emitted lines advance the interval, so a
-    /// storm of sustained stalls logs once per interval, not once and never
-    /// again.
+    /// emit its log line now. Only sustained episodes enter the totals —
+    /// call sites time every operation (every key frame, every injection),
+    /// so counting sub-threshold ones would report ordinary traffic as
+    /// "N stalls". Only emitted lines advance the interval, so a storm of
+    /// sustained stalls logs once per interval, not once and never again.
     mutating func recordEpisode(durationNanos: UInt64, now: UInt64) -> Bool {
+        guard durationNanos >= thresholdNanos else { return false }
         episodeCount += 1
         stalledNanosTotal += durationNanos
-        guard durationNanos >= thresholdNanos else { return false }
         if let lastLoggedAt, now &- lastLoggedAt < minIntervalNanos { return false }
         lastLoggedAt = now
         return true

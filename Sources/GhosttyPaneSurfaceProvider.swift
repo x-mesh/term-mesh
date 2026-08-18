@@ -920,9 +920,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         let inputStallGate = RelayStallLogGateBox()
         let input: @Sendable (Data) async -> Void = { [weakTS] bytes in
             let arrivedAt = DispatchTime.now().uptimeNanoseconds
-            await MainActor.run {
+            let wrote = await MainActor.run { () -> Bool in
                 guard let terminalSurface = weakTS.value,
-                      let ptr = terminalSurface.surface else { return }
+                      let ptr = terminalSurface.surface else { return false }
                 // Somebody is typing in the viewer, so the viewer's size wins
                 // the arbitration from here — see `resolvePixelSize`. Without
                 // this the viewer can never grow past the host pane's width.
@@ -931,12 +931,16 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                 // flushed later without capturing the raw (non-Sendable) pointer.
                 peerSurfaceRefForKey[UInt(bitPattern: ptr)] = weakTS
                 sendPeerInputBytes(ptr, bytes: bytes)
+                return true
             }
             // Arrival → PTY-write latency on the HOST side. A viewer whose
             // keys "hang" cannot tell whether they never got here or got here
             // and waited on a busy main thread; this episode record — the
             // only production trace of host-side injection — is what tells
             // those apart when read against the viewer's own stall lines.
+            // A drop for an already-freed surface is not an injection and
+            // must not be timed as one.
+            guard wrote else { return }
             let injectedAt = DispatchTime.now().uptimeNanoseconds
             let record = inputStallGate.recordEpisode(
                 durationNanos: injectedAt &- arrivedAt, now: injectedAt

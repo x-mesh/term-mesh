@@ -2343,14 +2343,16 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
 /// between "pane froze" and "every log is silent" — and the only thing
 /// standing between a stall storm and a log flood.
 final class RelayStallLogGateTests: XCTestCase {
-    func testCountsEveryEpisodeButLogsOnlySustainedOnes() {
+    func testIgnoresJitterAndLogsTheFirstSustainedEpisode() {
         var gate = RelayStallLogGate(thresholdNanos: 100, minIntervalNanos: 1_000)
         XCTAssertFalse(gate.recordEpisode(durationNanos: 99, now: 0),
-                       "below the threshold: counted, never logged")
-        XCTAssertEqual(gate.episodeCount, 1)
-        XCTAssertEqual(gate.stalledNanosTotal, 99)
+                       "below the threshold: neither counted nor logged")
+        XCTAssertEqual(gate.episodeCount, 0,
+                       "call sites time every operation — jitter in the totals would report ordinary traffic as stalls")
+        XCTAssertEqual(gate.stalledNanosTotal, 0)
         XCTAssertTrue(gate.recordEpisode(durationNanos: 100, now: 10),
                       "the first sustained episode logs")
+        XCTAssertEqual(gate.episodeCount, 1)
     }
 
     func testMinIntervalSuppressesAStormButNotForever() {
