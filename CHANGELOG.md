@@ -4,6 +4,27 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.195.0] - 2026-08-18
+
+**Project 삭제가 host의 leader까지 정리하고, 죽은 daemon은 15초 안에 스스로 돌아온다.**
+
+### Fixed
+
+- **다른 client에서 이어받은 Project를 삭제해도 host에 leader 프로세스가 남던 문제** ([#305](https://github.com/x-mesh/term-mesh/pull/305)) — 이어받은(adopt) Project는 전용 workspace 정보가 없어 삭제가 host의 workspace를 건너뛰었고, leader 프로세스가 daemon 아래 계속 살아 있었다. 이제 삭제 시 host의 workspace 목록에서 이 Project의 것을 다시 찾아 leader까지 확실히 정리한다.
+
+- **함께 실행되는 daemon이 죽으면 앱이 알아채지 못하던 문제** ([#305](https://github.com/x-mesh/term-mesh/pull/305)) — 업데이트 직후처럼 daemon이 조용히 사라지면 원격 Project 생성이 계속 거부되고 앱을 재시작해야만 복구됐다. 이제 daemon이 응답을 멈추면 15초 안에 자동으로 다시 시작하거나 다시 붙는다. Settings에서 직접 정지한 daemon은 되살리지 않는다.
+
+- **연결 화면이 앱이 서비스하는 host를 "debug-server"로 표시하던 문제** ([#304](https://github.com/x-mesh/term-mesh/pull/304)) — 버전 자리에 placeholder가 박혀 있어 어떤 버전이 서비스 중인지 알 수 없었다. 이제 실제 앱 버전(예: v0.195.0)이 표시되고, 너무 오래된 host 안내 문구도 daemon과 앱을 구분해 정확히 알려준다.
+
+### Changed
+
+- **daemon 로그가 앱을 다시 열 때마다 지워지지 않는다** ([#305](https://github.com/x-mesh/term-mesh/pull/305)) — `/tmp/term-meshd.log`가 실행마다 초기화돼 문제 조사 근거가 사라졌다. 이제 이어서 기록하고, 50MB를 넘으면 한 번에 비운다.
+
+### Thanks to 2 contributors!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+- [@lkasa5546](https://github.com/lkasa5546)
+
 ## [0.194.0] - 2026-08-18
 
 **Disconnect Host 후 재연결이 보존된 pane을 실제로 되살리고, relay가 잠깐 멈추면 그 이유가 로그에 남는다.**
