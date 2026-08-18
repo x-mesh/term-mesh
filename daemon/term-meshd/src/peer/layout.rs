@@ -717,6 +717,22 @@ struct PendingLeaderResponse {
 }
 
 impl Broadcaster {
+    fn remove_pending_leader_if_matches(
+        &self,
+        request_id: &[u8],
+        connection_id: u64,
+        correlation_id: u64,
+    ) -> bool {
+        let mut pending = self.leader_pending.lock().unwrap();
+        let matches = pending.get(request_id).is_some_and(|entry| {
+            entry.connection_id == connection_id && entry.correlation_id == correlation_id
+        });
+        if matches {
+            pending.remove(request_id);
+        }
+        matches
+    }
+
     pub fn new() -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
@@ -844,26 +860,33 @@ impl Broadcaster {
                 },
             );
         }
+        // The target can disconnect after it was selected but before the
+        // pending entry above was installed. Its BroadcastGuard then had no
+        // entry to remove. Re-check registration after insertion: if it is
+        // already gone, remove the orphan now. If it drops after this check,
+        // BroadcastGuard::drop performs the same cleanup.
+        if !self.clients.lock().unwrap().contains_key(&target.0) {
+            self.remove_pending_leader_if_matches(&request.request_id, target.0, correlation_id);
+            return Err("authorized peer viewer is unavailable".into());
+        }
         let envelope = Envelope {
             seq: correlation_id,
             correlation_id: 0,
             payload: Some(Payload::TeamLeaderCommandRequest(request.clone())),
         };
         if target.1.tx.try_send(envelope).is_err() {
-            self.leader_pending
-                .lock()
-                .unwrap()
-                .remove(&request.request_id);
+            self.remove_pending_leader_if_matches(&request.request_id, target.0, correlation_id);
             return Err("authorized peer viewer is unavailable".into());
         }
         match tokio::time::timeout(Duration::from_secs(15), rx).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err("peer viewer dropped the command response".into()),
             Err(_) => {
-                self.leader_pending
-                    .lock()
-                    .unwrap()
-                    .remove(&request.request_id);
+                self.remove_pending_leader_if_matches(
+                    &request.request_id,
+                    target.0,
+                    correlation_id,
+                );
                 Err("peer leader command timed out".into())
             }
         }
@@ -908,6 +931,16 @@ impl BroadcastGuard {
 impl Drop for BroadcastGuard {
     fn drop(&mut self) {
         self.broadcaster.clients.lock().unwrap().remove(&self.id);
+        // A reverse leader request is scoped to this exact connection. Once
+        // the connection is gone no response can legitimately satisfy it, so
+        // remove it now and drop its oneshot sender. Besides waking the caller
+        // immediately, this lets an idempotent retry reuse the request_id
+        // instead of failing with `request_id already in flight` until timeout.
+        self.broadcaster
+            .leader_pending
+            .lock()
+            .unwrap()
+            .retain(|_, pending| pending.connection_id != self.id);
     }
 }
 
@@ -2392,6 +2425,111 @@ mod tests {
         );
         assert!(router.resolve_team_leader(authorized.connection_id(), correlation_id, response));
         assert!(call.await.unwrap().unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn dropping_leader_connection_releases_request_id_for_retry() {
+        let router = Arc::new(Broadcaster::new());
+        let peer_id = vec![0xA1; 16];
+        let request = TeamLeaderCommandRequest {
+            request_id: vec![0x42; peer_proto::team_leader::REQUEST_ID_BYTES],
+            method: "team.read".into(),
+            params_json: "{}".into(),
+            ..Default::default()
+        };
+
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        let first_guard = router.register(first_tx, Arc::new(AtomicU64::new(10)), peer_id.clone());
+        let first_router = Arc::clone(&router);
+        let first_request = request.clone();
+        let first_call =
+            tokio::spawn(
+                async move { first_router.call_team_leader(first_request, &peer_id).await },
+            );
+        first_rx.recv().await.expect("first targeted request");
+        drop(first_guard);
+        assert_eq!(
+            first_call.await.unwrap().unwrap_err(),
+            "peer viewer dropped the command response"
+        );
+
+        let retry_peer_id = vec![0xA1; 16];
+        let (retry_tx, mut retry_rx) = mpsc::channel(4);
+        let retry_guard = router.register(
+            retry_tx,
+            Arc::new(AtomicU64::new(20)),
+            retry_peer_id.clone(),
+        );
+        let retry_router = Arc::clone(&router);
+        let retry_request = request.clone();
+        let retry = tokio::spawn(async move {
+            retry_router
+                .call_team_leader(retry_request, &retry_peer_id)
+                .await
+        });
+        let envelope = retry_rx.recv().await.expect("retried request");
+        let response = TeamLeaderCommandResponse {
+            request_id: request.request_id,
+            ok: true,
+            result_json: "{}".into(),
+            ..Default::default()
+        };
+        assert!(router.resolve_team_leader(retry_guard.connection_id(), envelope.seq, response,));
+        assert!(retry.await.unwrap().unwrap().ok);
+    }
+
+    #[test]
+    fn stale_cleanup_cannot_remove_new_retry_with_same_request_id() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let router = Arc::new(Broadcaster::new());
+        let request_id = vec![0x43; peer_proto::team_leader::REQUEST_ID_BYTES];
+        let (old_tx, _old_rx) = oneshot::channel();
+        router.leader_pending.lock().unwrap().insert(
+            request_id.clone(),
+            PendingLeaderResponse {
+                connection_id: 10,
+                correlation_id: 11,
+                sender: old_tx,
+            },
+        );
+        router.leader_pending.lock().unwrap().remove(&request_id);
+
+        // Model the exact failing order: the disconnected call has already
+        // lost its route, but its later error/timeout cleanup is paused while
+        // a retry registers the same request_id on a replacement connection.
+        let retry_registered = Arc::new(Barrier::new(2));
+        let allow_stale_cleanup = Arc::new(Barrier::new(2));
+        let cleanup_router = Arc::clone(&router);
+        let cleanup_request_id = request_id.clone();
+        let cleanup_retry_registered = Arc::clone(&retry_registered);
+        let cleanup_allowed = Arc::clone(&allow_stale_cleanup);
+        let stale_cleanup = thread::spawn(move || {
+            cleanup_retry_registered.wait();
+            cleanup_allowed.wait();
+            cleanup_router.remove_pending_leader_if_matches(&cleanup_request_id, 10, 11)
+        });
+
+        let (retry_tx, _retry_rx) = oneshot::channel();
+        router.leader_pending.lock().unwrap().insert(
+            request_id.clone(),
+            PendingLeaderResponse {
+                connection_id: 20,
+                correlation_id: 21,
+                sender: retry_tx,
+            },
+        );
+
+        retry_registered.wait();
+        allow_stale_cleanup.wait();
+        assert!(!stale_cleanup.join().unwrap());
+        let pending = router.leader_pending.lock().unwrap();
+        let retry = pending
+            .get(&request_id)
+            .expect("retry must survive stale cleanup");
+        assert_eq!(retry.connection_id, 20);
+        assert_eq!(retry.correlation_id, 21);
     }
 
     #[test]

@@ -9,7 +9,99 @@ import PeerProto
 @testable import term_mesh
 #endif
 
+private actor AsyncFlag {
+    private var value = false
+
+    func set() { value = true }
+    func read() -> Bool { value }
+}
+
 final class PeerPaneSessionTests: XCTestCase {
+    private func waitForLeaderGateWaiters(
+        _ gate: RelayLeaderSessionGate,
+        commands: Int,
+        heals: Int
+    ) async {
+        for _ in 0..<1_000 {
+            let counts = await gate.waitingCountsForTesting()
+            if counts.commands == commands, counts.heals == heals { return }
+            await Task.yield()
+        }
+        let counts = await gate.waitingCountsForTesting()
+        XCTFail("gate waiters never reached commands=\(commands), heals=\(heals); got \(counts)")
+    }
+
+    func testLeaderSessionGateKeepsHealOutOfInflightCommand() async {
+        let gate = RelayLeaderSessionGate()
+        let commandAcquired = await gate.acquireCommand()
+        XCTAssertTrue(commandAcquired)
+
+        let healAcquired = AsyncFlag()
+        let healTask = Task {
+            guard await gate.acquireHeal() else { return }
+            await healAcquired.set()
+            await gate.releaseHeal()
+        }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let healedPrematurely = await healAcquired.read()
+        XCTAssertFalse(healedPrematurely)
+
+        await gate.releaseCommand()
+        await healTask.value
+        let healed = await healAcquired.read()
+        XCTAssertTrue(healed)
+    }
+
+    func testLeaderSessionGateKeepsNewCommandOutOfHealSwap() async {
+        let gate = RelayLeaderSessionGate()
+        let healAcquired = await gate.acquireHeal()
+        XCTAssertTrue(healAcquired)
+
+        let commandAcquired = AsyncFlag()
+        let commandTask = Task {
+            guard await gate.acquireCommand() else { return }
+            await commandAcquired.set()
+            await gate.releaseCommand()
+        }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let commandRanPrematurely = await commandAcquired.read()
+        XCTAssertFalse(commandRanPrematurely)
+
+        await gate.releaseHeal()
+        await commandTask.value
+        let commandRan = await commandAcquired.read()
+        XCTAssertTrue(commandRan)
+    }
+
+    func testLeaderSessionGateCancelledCommandWaiterDoesNotRunOrBlockHeal() async {
+        let gate = RelayLeaderSessionGate()
+        let initialHeal = await gate.acquireHeal()
+        XCTAssertTrue(initialHeal)
+        let commandResult = Task { await gate.acquireCommand() }
+        await waitForLeaderGateWaiters(gate, commands: 1, heals: 0)
+        commandResult.cancel()
+        let cancelledCommand = await commandResult.value
+        XCTAssertFalse(cancelledCommand)
+        await gate.releaseHeal()
+        let nextHeal = await gate.acquireHeal()
+        XCTAssertTrue(nextHeal)
+        await gate.releaseHeal()
+    }
+
+    func testLeaderSessionGateCancelledHealWaiterDoesNotBlockCommands() async {
+        let gate = RelayLeaderSessionGate()
+        let initialCommand = await gate.acquireCommand()
+        XCTAssertTrue(initialCommand)
+        let healResult = Task { await gate.acquireHeal() }
+        await waitForLeaderGateWaiters(gate, commands: 0, heals: 1)
+        healResult.cancel()
+        let cancelledHeal = await healResult.value
+        XCTAssertFalse(cancelledHeal)
+        await gate.releaseCommand()
+        let nextCommand = await gate.acquireCommand()
+        XCTAssertTrue(nextCommand)
+        await gate.releaseCommand()
+    }
 
     @MainActor
     func testAdoptedProjectCleanupOwnershipSeparatesOwnerFromViewer() {
