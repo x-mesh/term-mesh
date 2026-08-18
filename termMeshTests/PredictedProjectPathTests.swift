@@ -147,15 +147,32 @@ final class PredictedProjectPathTests: XCTestCase {
         XCTAssertEqual(result.branches, ["main", "develop", "release/v2"])
     }
 
-    func testBranchSearchSupportsPartialNamesAndExcludesSelection() {
+    func testBranchSearchSupportsPartialNamesAndPinsExactMatchFirst() {
         XCTAssertEqual(
             RepositoryBranchLookup.matches(
                 ["main", "feature/auth", "feature/search", "release/v2"],
                 query: "feature",
-                excluding: "feature/auth",
                 limit: 8
             ),
-            ["feature/search"]
+            ["feature/auth", "feature/search"]
+        )
+        XCTAssertEqual(
+            RepositoryBranchLookup.matches(
+                ["fix/develop-p1-cli", "develop", "pr/develop-review-wave1"],
+                query: "develop",
+                limit: 8
+            ),
+            ["develop", "fix/develop-p1-cli", "pr/develop-review-wave1"],
+            "the fully typed branch is a match, not a thing to hide"
+        )
+        XCTAssertEqual(
+            RepositoryBranchLookup.matches(
+                ["fix/develop-p1-cli", "fix/develop-p1-pipe", "develop"],
+                query: "DEVELOP",
+                limit: 2
+            ),
+            ["develop", "fix/develop-p1-cli"],
+            "exact match ignores case and survives the limit"
         )
         XCTAssertEqual(
             RepositoryBranchLookup.singleLine("release/v2\nmain"),
