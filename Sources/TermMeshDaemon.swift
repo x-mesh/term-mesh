@@ -9,6 +9,25 @@ final class TermMeshDaemon: ObservableObject {
     static let shared = TermMeshDaemon()
 
     private var daemonProcess: Process?
+    /// Whether a daemon is currently WANTED on this machine. `startDaemon`
+    /// intends one; an explicit `stopDaemon` that actually proceeds does
+    /// not. Read by the subscribe loop's watchdog, which must never respawn
+    /// a daemon the user just stopped from Settings. Locked because start,
+    /// stop, and the watchdog run on three different threads.
+    private let intentLock = NSLock()
+    private var daemonRunIntendedStorage = false
+    var daemonRunIntended: Bool {
+        get {
+            intentLock.lock()
+            defer { intentLock.unlock() }
+            return daemonRunIntendedStorage
+        }
+        set {
+            intentLock.lock()
+            defer { intentLock.unlock() }
+            daemonRunIntendedStorage = newValue
+        }
+    }
     private let queue = DispatchQueue(label: "term-mesh.daemon", qos: .utility)
     /// Telemetry reads that nothing waits on, kept off `queue`.
     ///
@@ -316,6 +335,32 @@ final class TermMeshDaemon: ObservableObject {
             + "the daemon."
     }
 
+    /// Whether the subscribe loop's consecutive connect failures warrant
+    /// re-running `startDaemon`. This loop is the one place that reliably
+    /// observes "the daemon is gone": an adopted daemon has no Process
+    /// handle and a spawned one has no termination handler, so without this
+    /// the app watches its daemon die and does nothing (observed: 39
+    /// daemon-less minutes after a brew upgrade adopted a daemon that was
+    /// mid-shutdown). Three failures ≈ eight seconds of the 1s/2s/5s
+    /// backoff — long enough not to mistake a daemon mid-restart for a dead
+    /// one. The interval keeps a daemon that cannot come back (missing
+    /// binary, crash loop) from being respawned every backoff tick.
+    /// `startDaemon` itself is ping-gated, so a daemon that returned on its
+    /// own is adopted, never doubled.
+    static let watchdogFailureThreshold = 3
+    static let watchdogRespawnIntervalNanos: UInt64 = 30 * 1_000_000_000
+
+    static func watchdogShouldRespawn(
+        consecutiveFailures: Int,
+        runIntended: Bool,
+        nowNanos: UInt64,
+        lastRespawnNanos: UInt64?
+    ) -> Bool {
+        guard runIntended, consecutiveFailures >= watchdogFailureThreshold else { return false }
+        guard let lastRespawnNanos else { return true }
+        return nowNanos &- lastRespawnNanos >= watchdogRespawnIntervalNanos
+    }
+
     /// This build's marketing version, or nil when the bundle has none.
     static var appMarketingVersion: String? {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
@@ -338,6 +383,7 @@ final class TermMeshDaemon: ObservableObject {
     func startDaemon() {
         queue.async { [weak self] in
             guard let self else { return }
+            self.daemonRunIntended = true
 
             // Already running (tracked process)?
             if let proc = self.daemonProcess, proc.isRunning { return }
@@ -364,12 +410,25 @@ final class TermMeshDaemon: ObservableObject {
                     // whatever answers the socket. Say so when that is not this
                     // build, in the log the user actually reads, because every
                     // downstream symptom looks like an app bug instead.
+                    let runningVersion = self.runningDaemonVersion()
                     if let warning = Self.adoptedDaemonVersionWarning(
-                        runningVersion: self.runningDaemonVersion(),
+                        runningVersion: runningVersion,
                         appVersion: Self.appMarketingVersion
                     ) {
                         Logger.daemon.error("\(warning, privacy: .public)")
                         RemoteWorkLog.infoOffMain(warning)
+                    } else if runningVersion == nil {
+                        // An unknown version is not evidence of a mismatch,
+                        // but it is evidence worth keeping: a daemon that
+                        // cannot answer a version probe may already be
+                        // mid-shutdown, and adopting one leaves this app
+                        // daemon-less minutes later with nothing in any log.
+                        Logger.daemon.error(
+                            "adopted a daemon that did not answer the version probe — it may be shutting down"
+                        )
+                        RemoteWorkLog.infoOffMain(
+                            "Adopted this machine's daemon without a version answer; if its sessions vanish shortly, it was already shutting down"
+                        )
                     }
                     if let pid = self.getDaemonPeerPid() {
                         DispatchQueue.main.async {
@@ -382,6 +441,9 @@ final class TermMeshDaemon: ObservableObject {
                 // are applied.
                 Logger.daemon.info("daemon already running on socket — restarting with current settings")
                 self.stopDaemon()
+                // stopDaemon records "no daemon wanted"; this path stops only
+                // to start again, so the intent stays on.
+                self.daemonRunIntended = true
                 // Brief pause so the socket file is fully released
                 Thread.sleep(forTimeInterval: 0.3)
             }
@@ -469,7 +531,14 @@ final class TermMeshDaemon: ObservableObject {
             // Log daemon stdout/stderr — isolated per tag
             let tag = termMeshEnv("TAG") ?? ""
             let logPath = tag.isEmpty ? "/tmp/term-meshd.log" : "/tmp/term-meshd-\(tag).log"
-            FileManager.default.createFile(atPath: logPath, contents: nil)
+            // Create only when missing: `createFile` REPLACES an existing
+            // file, which defeated the append below — every app launch
+            // (and any second untagged instance) truncated the previous
+            // daemon's log, destroying exactly the evidence a "why was the
+            // daemon down" investigation needs.
+            if !FileManager.default.fileExists(atPath: logPath) {
+                FileManager.default.createFile(atPath: logPath, contents: nil)
+            }
             let logHandle = FileHandle(forWritingAtPath: logPath)
             logHandle?.seekToEndOfFile()
             process.standardOutput = logHandle ?? FileHandle.nullDevice
@@ -502,6 +571,10 @@ final class TermMeshDaemon: ObservableObject {
             Logger.daemon.info("leaving the daemon running; it holds sessions for other machines")
             return
         }
+        // Only a stop that actually proceeds withdraws the intent — the
+        // subscribe watchdog must not resurrect a daemon the user stopped,
+        // and must keep resurrecting one the outlive policy declined to stop.
+        daemonRunIntended = false
 
         // Case 1: We spawned the daemon — terminate directly
         if let proc = daemonProcess, proc.isRunning {
@@ -1267,6 +1340,7 @@ final class TermMeshDaemon: ObservableObject {
         eventSubscriptionTask = Task.detached(priority: .utility) { [weak self] in
             let backoffSequence = [1.0, 2.0, 5.0]
             var attempt = 0
+            var lastWatchdogRespawn: UInt64?
             while !Task.isCancelled {
                 guard let self else { return }
                 let path = self.socketPath
@@ -1310,8 +1384,28 @@ final class TermMeshDaemon: ObservableObject {
                 guard connectOK else {
                     close(fd)
                     let delay = backoffSequence[min(attempt, backoffSequence.count - 1)]
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     attempt += 1
+                    // This reconnect loop is the one place that reliably
+                    // observes a dead daemon (adopted daemons have no Process
+                    // handle; spawned ones have no termination handler), so
+                    // it is also where recovery must start — see
+                    // `watchdogShouldRespawn` for the thresholds.
+                    if Self.watchdogShouldRespawn(
+                        consecutiveFailures: attempt,
+                        runIntended: self.daemonRunIntended,
+                        nowNanos: DispatchTime.now().uptimeNanoseconds,
+                        lastRespawnNanos: lastWatchdogRespawn
+                    ) {
+                        lastWatchdogRespawn = DispatchTime.now().uptimeNanoseconds
+                        Logger.daemon.error(
+                            "daemon socket unanswered after \(attempt, privacy: .public) subscribe attempts — re-running startDaemon"
+                        )
+                        RemoteWorkLog.warningOffMain(
+                            "This machine's daemon stopped answering — restarting it"
+                        )
+                        self.startDaemon()
+                    }
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     continue
                 }
 
