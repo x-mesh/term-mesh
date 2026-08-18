@@ -21,6 +21,11 @@ import PeerProto
 private let kTypePtyData: UInt8  = 0x01
 private let kTypeKeyInput: UInt8 = 0x02
 private let kTypeResize: UInt8   = 0x03
+/// Relay → app telemetry: the helper's stdout write to the local Ghostty
+/// PTY stalled — the one segment of the output chain the app cannot time
+/// itself. Payload: stall ms (u64 LE) + helper's cumulative output bytes
+/// (u64 LE). Helpers that predate the type simply never send it.
+private let kTypeStall: UInt8    = 0x04
 private let kTypeGoodbye: UInt8  = 0xFF
 private let kTypeAuth: UInt8     = 0xFE
 private let kRelayMaxFrameBytes = 1024 * 1024
@@ -175,11 +180,80 @@ enum RelayError: Error, Sendable {
     case surfaceIDMismatch
 }
 
+/// Decides when a stall episode earns a production log line.
+///
+/// The DEBUG `dlog` edges in this file record every episode, but release
+/// builds carry none of them — a "pane froze, yet every log is silent"
+/// incident is invisible precisely because this path only spoke in DEBUG.
+/// One rate-limited `RemoteWorkLog` line per sustained episode closes that
+/// gap without letting an output flood turn the log into its own flood.
+struct RelayStallLogGate {
+    /// Below this an episode is scheduling jitter, not a freeze a person
+    /// could notice; it is counted but never logged.
+    static let defaultThresholdNanos: UInt64 = 200 * 1_000_000
+    /// Minimum spacing between lines, so a stall storm is one line per
+    /// interval rather than one per episode.
+    static let defaultMinIntervalNanos: UInt64 = 5 * 1_000_000_000
+
+    let thresholdNanos: UInt64
+    let minIntervalNanos: UInt64
+    private(set) var episodeCount: UInt64 = 0
+    private(set) var stalledNanosTotal: UInt64 = 0
+    private var lastLoggedAt: UInt64?
+
+    init(
+        thresholdNanos: UInt64 = Self.defaultThresholdNanos,
+        minIntervalNanos: UInt64 = Self.defaultMinIntervalNanos
+    ) {
+        self.thresholdNanos = thresholdNanos
+        self.minIntervalNanos = minIntervalNanos
+    }
+
+    /// Records one finished stall episode; true means the caller should
+    /// emit its log line now. Only sustained episodes enter the totals —
+    /// call sites time every operation (every key frame, every injection),
+    /// so counting sub-threshold ones would report ordinary traffic as
+    /// "N stalls". Only emitted lines advance the interval, so a storm of
+    /// sustained stalls logs once per interval, not once and never again.
+    mutating func recordEpisode(durationNanos: UInt64, now: UInt64) -> Bool {
+        guard durationNanos >= thresholdNanos else { return false }
+        episodeCount += 1
+        stalledNanosTotal += durationNanos
+        if let lastLoggedAt, now &- lastLoggedAt < minIntervalNanos { return false }
+        lastLoggedAt = now
+        return true
+    }
+}
+
+/// `RelayStallLogGate` behind a lock, for the `@Sendable` closures (the
+/// host-side peer input path) that cannot hold the gate as local mutable
+/// state the way the relay pump tasks do.
+final class RelayStallLogGateBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var gate: RelayStallLogGate
+
+    init(gate: RelayStallLogGate = RelayStallLogGate()) {
+        self.gate = gate
+    }
+
+    func recordEpisode(
+        durationNanos: UInt64, now: UInt64
+    ) -> (shouldLog: Bool, episodeCount: UInt64, stalledNanosTotal: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        let shouldLog = gate.recordEpisode(durationNanos: durationNanos, now: now)
+        return (shouldLog, gate.episodeCount, gate.stalledNanosTotal)
+    }
+}
+
 private actor RelayFrameSlots {
     private let limit: Int
     private var available: Int
     private var waiters: [CheckedContinuation<Void, Error>] = []
     private var stoppedError: Error?
+    /// Uptime at the 0→1 waiter edge; nil while writes flow freely.
+    private var stallStartedAt: UInt64?
+    private var stallLogGate = RelayStallLogGate()
 
     init(limit: Int) {
         self.limit = limit
@@ -194,16 +268,17 @@ private actor RelayFrameSlots {
             available -= 1
             return
         }
-        #if DEBUG
         // Slots exhausted: the relay socket write side is backed up (relay
-        // not draining → its stdout to Ghostty is blocked). Log only the
-        // onset edge (0→1 waiter) so a sustained stall is one line, not one
-        // per frame. This is the app→relay choke point in the "heavy output
-        // → truncate → pane closes" chain.
+        // not draining → its stdout to Ghostty is blocked). Track only the
+        // onset edge (0→1 waiter) so a sustained stall is one episode, not
+        // one per frame. This is the app→relay choke point in the "heavy
+        // output → truncate → pane closes" chain.
         if waiters.isEmpty {
+            stallStartedAt = DispatchTime.now().uptimeNanoseconds
+            #if DEBUG
             dlog("peer.relay.backpressure.stall limit=\(limit) — relay socket write side backed up")
+            #endif
         }
-        #endif
         try await withCheckedThrowingContinuation { continuation in
             waiters.append(continuation)
         }
@@ -217,12 +292,22 @@ private actor RelayFrameSlots {
         if waiters.isEmpty {
             available = min(limit, available + 1)
         } else {
-            #if DEBUG
-            // Drain edge: last waiter about to be resumed → backpressure cleared.
-            if waiters.count == 1 {
+            // Drain edge: last waiter about to be resumed → backpressure
+            // cleared. Unlike the DEBUG lines this episode record survives
+            // into release builds — it is the only trace a production
+            // output-freeze leaves.
+            if waiters.count == 1, let startedAt = stallStartedAt {
+                stallStartedAt = nil
+                let now = DispatchTime.now().uptimeNanoseconds
+                if stallLogGate.recordEpisode(durationNanos: now &- startedAt, now: now) {
+                    RemoteWorkLog.infoOffMain(
+                        "Relay output stalled — write queue full for \((now &- startedAt) / 1_000_000)ms (\(stallLogGate.episodeCount) stalls, \(stallLogGate.stalledNanosTotal / 1_000_000)ms total); output froze briefly"
+                    )
+                }
+                #if DEBUG
                 dlog("peer.relay.backpressure.drained")
+                #endif
             }
-            #endif
             waiters.removeFirst().resume()
         }
     }
@@ -230,6 +315,9 @@ private actor RelayFrameSlots {
     func stop(error: Error) {
         guard stoppedError == nil else { return }
         stoppedError = error
+        // Teardown ends any open episode without a log line — the disconnect
+        // path already reports why the session went away.
+        stallStartedAt = nil
         let pending = waiters
         waiters.removeAll()
         available = 0
@@ -310,9 +398,21 @@ private final class RelayFrameReader: @unchecked Sendable {
     private let queue = DispatchQueue(label: "term-mesh.peer.relay.reader", qos: .userInitiated)
     private let lock = NSLock()
     private var stopped = false
+    private var yielded: UInt64 = 0
 
     init(relay: RelaySocket) {
         self.relay = relay
+    }
+
+    /// Frames read off the relay socket so far. The stream below buffers
+    /// unboundedly (`AsyncThrowingStream`'s default policy), so against the
+    /// consumer's own count the difference is the backlog queued while frame
+    /// handling awaits a slow host — the number that says whether typed keys
+    /// piled up on this side.
+    var framesYielded: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return yielded
     }
 
     func frames() -> AsyncThrowingStream<RelayFrame, Error> {
@@ -320,7 +420,11 @@ private final class RelayFrameReader: @unchecked Sendable {
             queue.async {
                 while !self.isStopped {
                     do {
-                        continuation.yield(try self.relay.readFrame())
+                        let frame = try self.relay.readFrame()
+                        self.lock.lock()
+                        self.yielded &+= 1
+                        self.lock.unlock()
+                        continuation.yield(frame)
                     } catch {
                         if self.isStopped {
                             continuation.finish()
@@ -1469,12 +1573,18 @@ final class PeerRelaySession {
     /// coalesce one half-alive tunnel reset instead of restarting each other.
     private var ownedTransportGeneration: UInt64 = 0
     private var ownedTransportRecovery: ((UInt64) async -> UInt64)?
+    /// False once Disconnect Host retires the lease behind this pane. The old
+    /// local socket path remains on the session for diagnostics, but nothing
+    /// will ever listen there again.
+    private var ownedTransportMayReconnect: (() -> Bool)?
 
     func configureOwnedTransportRecovery(
         generation: UInt64,
+        mayReconnect: @escaping () -> Bool,
         handler: @escaping (UInt64) async -> UInt64
     ) {
         ownedTransportGeneration = generation
+        ownedTransportMayReconnect = mayReconnect
         ownedTransportRecovery = handler
     }
 
@@ -2824,8 +2934,12 @@ final class PeerRelaySession {
             let relayToHost: Task<Void, Never>?
             if let reader, let resizeCoalescer {
             relayToHost = Task.detached(priority: .userInitiated) {
+                var inputStallGate = RelayStallLogGate()
+                var inputSendFailures: UInt64 = 0
+                var framesConsumed: UInt64 = 0
                 do {
                     for try await frame in reader.frames() {
+                        framesConsumed &+= 1
                         if Task.isCancelled { break }
                         switch frame.type {
                         case kTypeKeyInput:
@@ -2844,6 +2958,7 @@ final class PeerRelaySession {
                                     offsetRows: exit
                                 )
                             }
+                            let sendStartedAt = DispatchTime.now().uptimeNanoseconds
                             do {
                                 try await current.sendInput(surfaceID: surfaceID, keys: frame.payload)
                             } catch {
@@ -2852,6 +2967,27 @@ final class PeerRelaySession {
                                 #if DEBUG
                                 dlog("peer.relay.sendInput.failed error=\(error)")
                                 #endif
+                                inputSendFailures &+= 1
+                                if inputSendFailures == 1 || inputSendFailures % 100 == 0 {
+                                    RemoteWorkLog.warningOffMain(
+                                        "Peer key input dropped — send failed (\(inputSendFailures) total): \(error)"
+                                    )
+                                }
+                            }
+                            // A slow send is the input-path counterpart of the
+                            // writer stall above: the wire, the remote session,
+                            // or its MainActor is briefly wedged while typed
+                            // keys pile up in the reader's unbounded stream.
+                            // This episode record is the only production trace
+                            // that path leaves.
+                            let sendEndedAt = DispatchTime.now().uptimeNanoseconds
+                            if inputStallGate.recordEpisode(
+                                durationNanos: sendEndedAt &- sendStartedAt, now: sendEndedAt
+                            ) {
+                                let backlog = reader.framesYielded &- framesConsumed
+                                RemoteWorkLog.infoOffMain(
+                                    "Peer input stalled — a key frame took \((sendEndedAt &- sendStartedAt) / 1_000_000)ms to send (\(backlog) frames queued behind it); typing lagged briefly"
+                                )
                             }
                         case kTypeResize where frame.payload.count >= 4:
                             let cols = UInt32(UInt16(littleEndian: frame.payload.withUnsafeBytes {
@@ -2861,6 +2997,20 @@ final class PeerRelaySession {
                                 $0.loadUnaligned(fromByteOffset: 2, as: UInt16.self)
                             }))
                             await resizeCoalescer.submit(cols: cols, rows: rows)
+                        case kTypeStall where frame.payload.count >= 16:
+                            // Already rate-limited helper-side (one per 5s);
+                            // log as-is so the helper's view of the freeze
+                            // lands in the same timeline as the app's own
+                            // writer/input stall lines.
+                            let stallMs = UInt64(littleEndian: frame.payload.withUnsafeBytes {
+                                $0.loadUnaligned(fromByteOffset: 0, as: UInt64.self)
+                            })
+                            let helperTotalOut = UInt64(littleEndian: frame.payload.withUnsafeBytes {
+                                $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self)
+                            })
+                            RemoteWorkLog.infoOffMain(
+                                "Relay terminal write stalled — the relay helper spent \(stallMs)ms writing to the local pane (\(helperTotalOut) bytes relayed so far); the local renderer was not draining"
+                            )
                         case kTypeGoodbye:
                             await resizeCoalescer.flushNow()
                             // Owned session only: a Goodbye on the shared
@@ -3101,22 +3251,42 @@ final class PeerRelaySession {
     /// the same pane resumes once the same remote surface is reachable.
     /// Workspace-mirror panes use their controller's shared reconnect loop.
     private func reconnectOwnedSession(afterLosing failedSession: PeerSession) async -> Bool {
-        guard ownsSession, !isTorndown, session === failedSession else {
+        guard Self.shouldReconnectOwnedSession(
+            ownsSession: ownsSession,
+            isTorndown: isTorndown,
+            isCurrentSession: session === failedSession,
+            hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
+        ) else {
             return session !== failedSession
         }
         await failedSession.stopHeartbeat()
         await refreshOwnedTransportForReconnect(reason: "owned peer session lost")
-        guard !isTorndown, session === failedSession else {
+        guard Self.shouldReconnectOwnedSession(
+            ownsSession: ownsSession,
+            isTorndown: isTorndown,
+            isCurrentSession: session === failedSession,
+            hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
+        ) else {
             return session !== failedSession
         }
         var attempt = 0
-        while !isTorndown, session === failedSession {
+        while Self.shouldReconnectOwnedSession(
+            ownsSession: ownsSession,
+            isTorndown: isTorndown,
+            isCurrentSession: session === failedSession,
+            hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
+        ) {
             attempt += 1
             let delay = Self.reconnectDelaySeconds(attempt: attempt)
             if delay > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
-            guard !isTorndown, session === failedSession else { break }
+            guard Self.shouldReconnectOwnedSession(
+                ownsSession: ownsSession,
+                isTorndown: isTorndown,
+                isCurrentSession: session === failedSession,
+                hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
+            ) else { break }
             #if DEBUG
             dlog("peer.relay.reconnect.attempt n=\(attempt) delay=\(delay)")
             #endif
@@ -3131,6 +3301,15 @@ final class PeerRelaySession {
             }
         }
         return session !== failedSession
+    }
+
+    nonisolated static func shouldReconnectOwnedSession(
+        ownsSession: Bool,
+        isTorndown: Bool,
+        isCurrentSession: Bool,
+        hostLeaseIsActive: Bool
+    ) -> Bool {
+        ownsSession && !isTorndown && isCurrentSession && hostLeaseIsActive
     }
 
     /// One reconnect attempt after the old receive loop has already failed.

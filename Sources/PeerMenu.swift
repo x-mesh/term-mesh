@@ -222,10 +222,19 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
 
     /// The other half of `preparePanesForHostDisconnect`. Panes kept across a
     /// Disconnect Host are live views of a transport that no longer exists;
-    /// this is the moment one can be made real again. Only native agent panes
-    /// act on it — a terminal pane offers Reconnect in its own banner.
+    /// this is the moment one can be made real again. Terminal and agent panes
+    /// rebuild against the replacement lease; mirrors replace their shared
+    /// subscription and reconcile all panes from the host layout.
     @discardableResult
     func resumePanesAfterHostReconnect(_ hostKey: PeerPaneHostKey) -> Int {
+        guard let replacement = PeerPaneHostRegistry.shared.activeLease(forKey: hostKey) else {
+            return 0
+        }
+        var reattached = 0
+        for mirror in openWorkspaceMirrors
+        where mirror.spec.hostKey == hostKey && mirror.resumeAfterHostReconnect(using: replacement) {
+            reattached += 1
+        }
         let sessions = openPaneSessions.filter {
             Self.shouldReattachAfterHostReconnect(
                 leaseKey: $0.lease.key,
@@ -234,7 +243,6 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 isTorndown: $0.isTorndown
             )
         }
-        var reattached = 0
         for session in sessions where session.requestHostReconnectReattach != nil {
             session.requestHostReconnectReattach?()
             reattached += 1

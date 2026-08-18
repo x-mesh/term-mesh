@@ -29,7 +29,7 @@ import PeerProto
 @MainActor
 final class PeerWorkspaceMirrorController {
     weak var workspace: Workspace?
-    let lease: PeerPaneHostLease
+    private(set) var lease: PeerPaneHostLease
     let spec: PeerPaneHostSpec
     /// Current host-owned identity. A single-workspace host may mint a new ID
     /// after daemon restart; reconnect adoption updates this value so inbound
@@ -250,7 +250,7 @@ final class PeerWorkspaceMirrorController {
                 }
                 if hostGone || lostReason != nil { break }
             }
-            guard let self, !self.isTornDown else { return }
+            guard let self, !self.isTornDown, self.subscriptionSession === session else { return }
             if hostGone {
                 self.markHostWorkspaceGone()
             } else if let reason = lostReason {
@@ -435,6 +435,15 @@ final class PeerWorkspaceMirrorController {
         #if DEBUG
         dlog("peer.mirror.lost reason=\(reason)")
         #endif
+        if !lease.canReconnectTransport {
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            markWorkspaceTitle(suffix: "disconnected")
+            RemoteWorkLog.infoOffMain(
+                "Workspace mirror disconnected with its host transport; waiting for the host to reconnect"
+            )
+            return
+        }
         RemoteWorkLog.infoOffMain("Workspace mirror lost its host: \(reason) — reconnecting")
         markWorkspaceTitle(suffix: "reconnecting…")
         let failedGeneration = subscriptionTransportGeneration
@@ -462,9 +471,11 @@ final class PeerWorkspaceMirrorController {
     nonisolated static func reconnectStep(
         isTornDown: Bool,
         hasWorkspace: Bool,
-        isCancelled: Bool
+        isCancelled: Bool,
+        hostLeaseIsActive: Bool = true
     ) -> ReconnectStep {
-        (!isTornDown && hasWorkspace && !isCancelled) ? .proceed : .abandon
+        (!isTornDown && hasWorkspace && !isCancelled && hostLeaseIsActive)
+            ? .proceed : .abandon
     }
 
     private func reconnectLoop(after failedGeneration: UInt64) async {
@@ -488,7 +499,10 @@ final class PeerWorkspaceMirrorController {
                 )
             }
         }
-        guard Self.reconnectStep(isTornDown: isTornDown, hasWorkspace: workspace != nil, isCancelled: Task.isCancelled) == .proceed else { return }
+        guard Self.reconnectStep(
+            isTornDown: isTornDown, hasWorkspace: workspace != nil,
+            isCancelled: Task.isCancelled, hostLeaseIsActive: lease.canReconnectTransport
+        ) == .proceed else { return }
         // Refresh once per failed generation. Pane, mirror and sidebar
         // consumers share this gate, so simultaneous heartbeat failures join
         // one SSH restart instead of repeatedly killing each other's fresh
@@ -497,8 +511,14 @@ final class PeerWorkspaceMirrorController {
             after: failedGeneration,
             reason: "workspace mirror subscription stopped responding"
         )
-        guard Self.reconnectStep(isTornDown: isTornDown, hasWorkspace: workspace != nil, isCancelled: Task.isCancelled) == .proceed else { return }
-        while Self.reconnectStep(isTornDown: isTornDown, hasWorkspace: workspace != nil, isCancelled: Task.isCancelled) == .proceed {
+        guard Self.reconnectStep(
+            isTornDown: isTornDown, hasWorkspace: workspace != nil,
+            isCancelled: Task.isCancelled, hostLeaseIsActive: lease.canReconnectTransport
+        ) == .proceed else { return }
+        while Self.reconnectStep(
+            isTornDown: isTornDown, hasWorkspace: workspace != nil,
+            isCancelled: Task.isCancelled, hostLeaseIsActive: lease.canReconnectTransport
+        ) == .proceed {
             attempt += 1
             let delaySeconds = min(30.0, pow(2.0, Double(min(attempt, 5))))
             do {
@@ -541,7 +561,10 @@ final class PeerWorkspaceMirrorController {
                 // and never runs twice, so a subscription installed here would
                 // keep its socket and 10s heartbeat alive for the rest of the
                 // process — on a host the user explicitly disconnected.
-                guard Self.reconnectStep(isTornDown: isTornDown, hasWorkspace: workspace != nil, isCancelled: Task.isCancelled) == .proceed else {
+                guard Self.reconnectStep(
+                    isTornDown: isTornDown, hasWorkspace: workspace != nil,
+                    isCancelled: Task.isCancelled, hostLeaseIsActive: lease.canReconnectTransport
+                ) == .proceed else {
                     await transport.close()
                     return
                 }
@@ -607,6 +630,52 @@ final class PeerWorkspaceMirrorController {
                 }
             }
         }
+    }
+
+    /// Move a mirror preserved by Disconnect Host onto the replacement lease
+    /// created by Connect. Starting a fresh subscription also rebuilds every
+    /// mirrored pane from the host's current layout.
+    @discardableResult
+    func resumeAfterHostReconnect(using replacement: PeerPaneHostLease) -> Bool {
+        guard !isTornDown, lease.key == replacement.key, lease !== replacement else {
+            return false
+        }
+
+        let previousLease = lease
+        let previousSession = subscriptionSession
+        let previousTransport = subscriptionTransport
+        receiveTask?.cancel()
+        receiveTask = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        subscriptionSession = nil
+        subscriptionTransport = nil
+        subscriptionAlive = false
+
+        PeerPaneHostRegistry.shared.retain(replacement)
+        lease = replacement
+        PeerPaneHostRegistry.shared.release(previousLease)
+        markAllPanesStale()
+        markWorkspaceTitle(suffix: "reconnecting…")
+
+        reconnectTask = Task { [weak self] in
+            if let previousSession {
+                await previousSession.stopHeartbeat()
+                try? await previousSession.sendGoodbye(reason: "host reconnected")
+            }
+            await previousTransport?.close()
+            guard let self, !self.isTornDown, !Task.isCancelled else { return }
+            do {
+                try await self.start()
+                self.markWorkspaceTitle(suffix: nil)
+                RemoteWorkLog.infoOffMain(
+                    "Workspace mirror reconnected through the replacement host transport"
+                )
+            } catch {
+                self.handleConnectionLost(reason: String(describing: error))
+            }
+        }
+        return true
     }
 
     /// The mirrored workspace was deleted on the host. Auto-close the
