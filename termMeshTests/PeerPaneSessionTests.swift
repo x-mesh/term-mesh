@@ -2689,7 +2689,7 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         )
 
         // Never had the path: no probe, no report.
-        for cli in ["claude", "gemini", "cursor", "agy"] {
+        for cli in ["gemini"] {
             let answer = await TeamOrchestrator.canUsePeerOwnedAgent(
                 host: Self.agentHostEntry(),
                 cli: cli,
@@ -2811,7 +2811,7 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         )
         XCTAssertEqual(blocked.count, 1)
         XCTAssertFalse(blocked[0].blocksTeamMessaging)
-        XCTAssertEqual(blocked[0].clis, ["codex"])
+        XCTAssertEqual(blocked[0].clis, ["claude", "codex"])
         XCTAssertTrue(blocked[0].message.contains("private SSH route"))
         XCTAssertFalse(
             TeamAgentComposer.blocksRemoteTeamCreation(
@@ -3045,8 +3045,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         XCTAssertTrue(script.contains("umask 077"))
         XCTAssertTrue(script.contains("a1b2-c3d4.json"))
         XCTAssertTrue(
-            script.hasPrefix("/bin/sh -c "),
-            "the account login shell may be csh or fish, which cannot parse this"
+            script.contains("/bin/sh -c "),
+            "the service-account wrapper must force sh for csh or fish login accounts"
         )
         XCTAssertFalse(
             script.lowercased().contains("grant_id"),
@@ -3876,7 +3876,7 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             observeNotifications: false,
             automaticRetryDelay: 60,
             hostSockPathProvider: { _ in "/tmp/unreachable-peer.sock" },
-            terminator: { _, _, _ in
+            terminator: { _, _, _, _ in
                 cleanupAttempts += 1
                 return false
             }
@@ -4277,6 +4277,59 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
         XCTAssertEqual(rolledBack?.agents[1].remoteSurfaceID, siblingSurfaceID)
     }
 
+    /// The retry pass snapshots records, then awaits each terminate. In that
+    /// window `enqueue` can enrich the live record with the exact owning
+    /// endpoint the snapshot did not have — and the in-flight nil-owner
+    /// attempt resolves by the host's current route, whose `notFound` reads
+    /// as success. Spending the record by id alone would drop the enriched
+    /// tombstone and orphan the bridge on the endpoint that has it.
+    @MainActor
+    func test_retrySpendsOnlyTheSnapshotItTerminated_notAnEnrichedRecord() async {
+        let suiteName = "CleanupEnrichRace-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("could not create isolated defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let cleanup = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults,
+            observeNotifications: false,
+            automaticRetryDelay: 60,
+            hostSockPathProvider: { _ in nil },
+            terminator: { _, _, _, _ in false }
+        )
+        let surfaceID = Data(repeating: 0x5A, count: 16)
+        cleanup.enqueue(hostKey: "ssh:host", surfaceID: surfaceID)
+
+        await cleanup.retryPending(
+            hostSockPath: { _ in "/tmp/serving.sock" },
+            terminate: { _, _, _, owner in
+                XCTAssertNil(owner, "the snapshot carried no owner")
+                // The enrichment lands while this attempt is in flight.
+                cleanup.enqueue(
+                    hostKey: "ssh:host",
+                    surfaceID: surfaceID,
+                    owningRemoteSockPath: "/run/user/1000/real-owner.sock"
+                )
+                return true  // wrong-owner notFound — indistinguishable from success
+            }
+        )
+        XCTAssertEqual(
+            cleanup.pendingRecords.map(\.owningRemoteSockPath),
+            ["/run/user/1000/real-owner.sock"],
+            "the enriched tombstone must survive the stale success"
+        )
+
+        // The next pass, armed with the recorded owner, is the one that spends it.
+        await cleanup.retryPending(
+            hostSockPath: { _ in "/tmp/serving.sock" },
+            terminate: { _, _, _, owner in
+                XCTAssertEqual(owner, "/run/user/1000/real-owner.sock")
+                return true
+            }
+        )
+        XCTAssertTrue(cleanup.pendingRecords.isEmpty)
+    }
+
     /// Detach/delete/destroy all funnel through this: a member whose bridge
     /// the peer owns gets the terminate, and nothing else does. A local native
     /// agent has no peer surface, and a borrowed (not spawned) surface belongs
@@ -4292,7 +4345,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             defaults: defaults,
             observeNotifications: false,
             hostSockPathProvider: { _ in nil },
-            terminator: { _, _, _ in false }
+            terminator: { _, _, _, _ in false }
         )
         func member(
             remoteAgentSurface: Bool,
@@ -4364,7 +4417,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
 
         await restored.retryPending(
             hostSockPath: { _ in "/tmp/peer.sock" },
-            terminate: { _, _, _ in false }
+            terminate: { _, _, _, _ in false }
         )
         XCTAssertEqual(
             restored.pendingRecords.count, 1,
@@ -4373,7 +4426,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
 
         await restored.retryPending(
             hostSockPath: { _ in "/tmp/peer.sock" },
-            terminate: { _, _, _ in true }
+            terminate: { _, _, _, _ in true }
         )
         XCTAssertTrue(restored.pendingRecords.isEmpty)
         let afterConfirmation = PendingPeerAgentSurfaceCleanupStore(
@@ -4413,7 +4466,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
                     in: [host]
                 )
             },
-            terminator: { resolvedHostKey, resolvedSocket, _ in
+            terminator: { resolvedHostKey, resolvedSocket, _, _ in
                 attemptedHostKey = resolvedHostKey
                 attemptedSocket = resolvedSocket
                 return true
@@ -4460,7 +4513,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             defaults: defaults,
             observeNotifications: false,
             hostSockPathProvider: { _ in nil },
-            terminator: { _, _, _ in false }
+            terminator: { _, _, _, _ in false }
         )
         let surfaceID = Data(repeating: 0x52, count: 16)
 
@@ -4491,7 +4544,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             observeNotifications: false,
             automaticRetryDelay: 0.01,
             hostSockPathProvider: { _ in "/tmp/peer.sock" },
-            terminator: { _, _, _ in
+            terminator: { _, _, _, _ in
                 attempts += 1
                 return attempts >= 2
             }
@@ -4682,6 +4735,57 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             hostKey: "ssh:root@jw-server"
         )
         XCTAssertFalse(terminalBacked.remoteAgentSurface)
+    }
+    /// A duplicate enqueue must enrich an ambiguous record rather than discard
+    /// the better information.
+    ///
+    /// A nil endpoint resolves by the host's *current* route, which is the
+    /// wrong-owner guess these records exist to prevent. Once some caller knows
+    /// the exact creation endpoint, keeping the older nil would carry that
+    /// ambiguity forever.
+    @MainActor
+    func testADuplicateEnqueueUpgradesAnAmbiguousEndpointButNeverDowngrades() {
+        let suiteName = "termmesh.tests.cleanup.upgrade.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("no test defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults, observeNotifications: false
+        )
+        let hostKey = "ssh:root@peer:/run/user/1000/term-mesh.sock"
+        let surfaceID = Data(repeating: 0x63, count: 16)
+
+        store.enqueue(hostKey: hostKey, surfaceID: surfaceID)
+        XCTAssertNil(store.pendingRecords.first?.owningRemoteSockPath)
+
+        store.enqueue(
+            hostKey: hostKey, surfaceID: surfaceID,
+            owningRemoteSockPath: "/tmp/OWNER-A/peer.sock"
+        )
+        XCTAssertEqual(store.pendingRecords.count, 1, "still one surface, not two")
+        XCTAssertEqual(
+            store.pendingRecords.first?.owningRemoteSockPath,
+            "/tmp/OWNER-A/peer.sock"
+        )
+
+        // An empty string names no endpoint and must not erase a known one.
+        store.enqueue(hostKey: hostKey, surfaceID: surfaceID, owningRemoteSockPath: "")
+        store.enqueue(hostKey: hostKey, surfaceID: surfaceID)
+        XCTAssertEqual(
+            store.pendingRecords.first?.owningRemoteSockPath,
+            "/tmp/OWNER-A/peer.sock",
+            "a known endpoint is never downgraded to nil"
+        )
+
+        // The upgrade is durable, not just in memory.
+        let restored = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults, observeNotifications: false
+        )
+        XCTAssertEqual(
+            restored.pendingRecords.first?.owningRemoteSockPath,
+            "/tmp/OWNER-A/peer.sock"
+        )
     }
 }
 

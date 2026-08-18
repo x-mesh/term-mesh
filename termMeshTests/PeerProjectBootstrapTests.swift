@@ -969,7 +969,10 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertFalse(prepare.contains("abab"), "the visible preparation must contain no grant")
         XCTAssertEqual(prepare, "unset HISTFILE; stty -echo")
         XCTAssertTrue(launch.hasPrefix("export TERMMESH_SAVED_"))
-        XCTAssertTrue(launch.contains(#"getent passwd "$(id -u)""#))
+        XCTAssertTrue(launch.contains(#"getent passwd "$term_mesh_login_user""#))
+        // `getent` is glibc-only, so a macOS peer needs the directory service
+        // or it silently falls back to the launching process's shell.
+        XCTAssertTrue(launch.contains(#"dscl . -read /Users/"#))
         XCTAssertTrue(launch.contains(#"exec "$term_mesh_login_shell" -l -c"#))
         XCTAssertTrue(launch.contains(#"export SHELL="$term_mesh_login_shell""#))
         XCTAssertTrue(launch.contains("$HOME/.profile"))
@@ -1520,8 +1523,10 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(launch.hasPrefix("export PATH="), "PATH has to be set before anything runs")
         XCTAssertEqual(
             RemoteShellPath.binDirs.first,
-            "$HOME/.local/bin"
+            "/Applications/term-mesh.app/Contents/Resources/bin",
+            "the app-matched CLI must win over a stale user install"
         )
+        XCTAssertTrue(RemoteShellPath.binDirs.contains("$HOME/.local/bin"))
         XCTAssertTrue(launch.contains("$HOME/.local/bin"))
         XCTAssertTrue(launch.contains(":\"$PATH\""), "the host's own PATH must survive, last")
         // Ordering matters as much as membership: a cd into the project before

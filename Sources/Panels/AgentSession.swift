@@ -103,13 +103,34 @@ enum RemoteAgentEnvironmentShell {
         return script
     }
 
+    /// Resolve the account's login shell the way the directory service on the
+    /// host defines it, then `exec` it as a non-interactive login shell.
+    ///
+    /// `getent` is a glibc tool and does not exist on macOS, so asking only it
+    /// made every Darwin host fall through to `${SHELL:-/bin/sh}` — the shell
+    /// of whatever launched the daemon, not the account's. That reads correct
+    /// on a Mac whose account shell happens to match the launching one and
+    /// silently loads the wrong profile set everywhere else, which is exactly
+    /// the divergence `/etc/passwd is authoritative` was written to prevent.
+    /// `dscl` is Darwin's answer to the same question; asking both keeps one
+    /// helper for both platforms.
     static func accountLoginShellExec(_ command: String) -> String {
-        let resolve = #"term_mesh_login_shell=$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f7); "#
-            + #"case "$term_mesh_login_shell" in /*/nologin|*/false|"") term_mesh_login_shell=${SHELL:-/bin/sh};; esac; "#
-            + #"case "$term_mesh_login_shell" in /*) ;; *) term_mesh_login_shell=/bin/sh;; esac; "#
-            + #"export SHELL="$term_mesh_login_shell"; "#
+        let resolve = accountLoginShellResolve + #"export SHELL="$term_mesh_login_shell"; "#
         return resolve + "exec \"$term_mesh_login_shell\" -l -c \(shellQuoted(command))"
     }
+
+    /// Leaves the resolved path in `term_mesh_login_shell`, never empty and
+    /// always absolute. Shared with the host doctor so the probe cannot report
+    /// a shell the launcher would not use.
+    ///
+    /// Single quotes are deliberately absent: this text ships inside
+    /// `sh -c '…'` on some paths and would terminate the outer quoting.
+    static let accountLoginShellResolve: String =
+        #"term_mesh_login_user=$(id -un 2>/dev/null); "#
+        + #"term_mesh_login_shell=$(getent passwd "$term_mesh_login_user" 2>/dev/null | cut -d: -f7); "#
+        + #"[ -n "$term_mesh_login_shell" ] || term_mesh_login_shell=$(dscl . -read /Users/"$term_mesh_login_user" UserShell 2>/dev/null | tr -s " " | cut -d" " -f2); "#
+        + #"case "$term_mesh_login_shell" in /*/nologin|*/false|"") term_mesh_login_shell=${SHELL:-/bin/sh};; esac; "#
+        + #"case "$term_mesh_login_shell" in /*) ;; *) term_mesh_login_shell=/bin/sh;; esac; "#
 
     private static func shellQuoted(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -1760,7 +1781,9 @@ final class AgentSession {
         return args
     }
 
-    private static func remoteCommand(
+    /// Internal rather than private so a test can pin the one thing that was
+    /// wrong here: the order of the diagnostic relative to the launch.
+    static func remoteCommand(
         executable: String,
         arguments: [String],
         workingDirectory: String,
@@ -1774,14 +1797,31 @@ final class AgentSession {
         let commandEnvironment = environmentFile == nil
             ? environment
             : environment.filter { $0.key == "PATH" }
-        let assignments = commandEnvironment
+        let assignmentPairs = commandEnvironment
             .filter { $0.key != "PATH" }
             .filter { isSafeEnvironmentKey($0.key) }
             .sorted { $0.key < $1.key }
-            .map { "\($0.key)=\($0.value)" }
+        let assignments = assignmentPairs.map { "\($0.key)=\($0.value)" }
         let launch = (["env", "IS_SANDBOX=1"] + assignments + [executable] + arguments)
             .map(shellQuoted)
             .joined(separator: " ")
+        // The same variables, exported into the shell that runs the diagnostic.
+        //
+        // `env K=V … exec`-style assignments are arguments to `env`, so they do
+        // not exist in this shell — and `diagnosticEvent` reads this shell.
+        // Reporting from it alone showed every inline-env gateway key as absent
+        // on a pane that was in fact receiving them, which is worse than no
+        // indicator: it accuses the environment loader of losing a value that
+        // the child has. The `env` prefix below stays as the authority on what
+        // the child gets; this only lets the report see the same set.
+        //
+        // After `loginPrelude`, so an explicit value keeps winning over the
+        // profile and `agent-env` — the priority the loader documents.
+        let exportedForDiagnostic = assignmentPairs.isEmpty
+            ? ""
+            : "export " + assignmentPairs
+                .map { "\($0.key)=\(shellQuoted($0.value))" }
+                .joined(separator: " ") + "; "
         let remotePath = "$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:"
             + "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         let stagedEnvironment: String
@@ -1798,6 +1838,7 @@ final class AgentSession {
             profileFailureAction: failure,
             agentEnvFailureAction: failure
         ) + stagedEnvironment
+            + exportedForDiagnostic
             + RemoteAgentEnvironmentShell.diagnosticEvent
             + "export PATH=\"\(remotePath)\"; exec \(launch)"
         return "mkdir -p \(directory) && cd \(directory) && "
