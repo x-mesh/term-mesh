@@ -17,6 +17,19 @@ private actor AsyncFlag {
 }
 
 final class PeerPaneSessionTests: XCTestCase {
+    private func waitForLeaderGateWaiters(
+        _ gate: RelayLeaderSessionGate,
+        commands: Int,
+        heals: Int
+    ) async {
+        for _ in 0..<1_000 {
+            let counts = await gate.waitingCountsForTesting()
+            if counts.commands == commands, counts.heals == heals { return }
+            await Task.yield()
+        }
+        let counts = await gate.waitingCountsForTesting()
+        XCTFail("gate waiters never reached commands=\(commands), heals=\(heals); got \(counts)")
+    }
 
     func testLeaderSessionGateKeepsHealOutOfInflightCommand() async {
         let gate = RelayLeaderSessionGate()
@@ -65,7 +78,7 @@ final class PeerPaneSessionTests: XCTestCase {
         let initialHeal = await gate.acquireHeal()
         XCTAssertTrue(initialHeal)
         let commandResult = Task { await gate.acquireCommand() }
-        await Task.yield()
+        await waitForLeaderGateWaiters(gate, commands: 1, heals: 0)
         commandResult.cancel()
         let cancelledCommand = await commandResult.value
         XCTAssertFalse(cancelledCommand)
@@ -80,7 +93,7 @@ final class PeerPaneSessionTests: XCTestCase {
         let initialCommand = await gate.acquireCommand()
         XCTAssertTrue(initialCommand)
         let healResult = Task { await gate.acquireHeal() }
-        await Task.yield()
+        await waitForLeaderGateWaiters(gate, commands: 0, heals: 1)
         healResult.cancel()
         let cancelledHeal = await healResult.value
         XCTAssertFalse(cancelledHeal)

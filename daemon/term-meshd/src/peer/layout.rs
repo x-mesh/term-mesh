@@ -866,11 +866,7 @@ impl Broadcaster {
         // already gone, remove the orphan now. If it drops after this check,
         // BroadcastGuard::drop performs the same cleanup.
         if !self.clients.lock().unwrap().contains_key(&target.0) {
-            self.remove_pending_leader_if_matches(
-                &request.request_id,
-                target.0,
-                correlation_id,
-            );
+            self.remove_pending_leader_if_matches(&request.request_id, target.0, correlation_id);
             return Err("authorized peer viewer is unavailable".into());
         }
         let envelope = Envelope {
@@ -879,11 +875,7 @@ impl Broadcaster {
             payload: Some(Payload::TeamLeaderCommandRequest(request.clone())),
         };
         if target.1.tx.try_send(envelope).is_err() {
-            self.remove_pending_leader_if_matches(
-                &request.request_id,
-                target.0,
-                correlation_id,
-            );
+            self.remove_pending_leader_if_matches(&request.request_id, target.0, correlation_id);
             return Err("authorized peer viewer is unavailable".into());
         }
         match tokio::time::timeout(Duration::from_secs(15), rx).await {
@@ -2428,7 +2420,10 @@ mod tests {
 
     #[test]
     fn stale_cleanup_cannot_remove_new_retry_with_same_request_id() {
-        let router = Broadcaster::new();
+        use std::sync::Barrier;
+        use std::thread;
+
+        let router = Arc::new(Broadcaster::new());
         let request_id = vec![0x43; peer_proto::team_leader::REQUEST_ID_BYTES];
         let (old_tx, _old_rx) = oneshot::channel();
         router.leader_pending.lock().unwrap().insert(
@@ -2441,6 +2436,21 @@ mod tests {
         );
         router.leader_pending.lock().unwrap().remove(&request_id);
 
+        // Model the exact failing order: the disconnected call has already
+        // lost its route, but its later error/timeout cleanup is paused while
+        // a retry registers the same request_id on a replacement connection.
+        let retry_registered = Arc::new(Barrier::new(2));
+        let allow_stale_cleanup = Arc::new(Barrier::new(2));
+        let cleanup_router = Arc::clone(&router);
+        let cleanup_request_id = request_id.clone();
+        let cleanup_retry_registered = Arc::clone(&retry_registered);
+        let cleanup_allowed = Arc::clone(&allow_stale_cleanup);
+        let stale_cleanup = thread::spawn(move || {
+            cleanup_retry_registered.wait();
+            cleanup_allowed.wait();
+            cleanup_router.remove_pending_leader_if_matches(&cleanup_request_id, 10, 11)
+        });
+
         let (retry_tx, _retry_rx) = oneshot::channel();
         router.leader_pending.lock().unwrap().insert(
             request_id.clone(),
@@ -2451,9 +2461,13 @@ mod tests {
             },
         );
 
-        assert!(!router.remove_pending_leader_if_matches(&request_id, 10, 11));
+        retry_registered.wait();
+        allow_stale_cleanup.wait();
+        assert!(!stale_cleanup.join().unwrap());
         let pending = router.leader_pending.lock().unwrap();
-        let retry = pending.get(&request_id).expect("retry must survive stale cleanup");
+        let retry = pending
+            .get(&request_id)
+            .expect("retry must survive stale cleanup");
         assert_eq!(retry.connection_id, 20);
         assert_eq!(retry.correlation_id, 21);
     }

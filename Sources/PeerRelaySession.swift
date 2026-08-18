@@ -1238,6 +1238,12 @@ actor RelayLeaderSessionGate {
         waitingHeals.remove(at: index).continuation.resume(returning: false)
         grantNextIfPossible()
     }
+
+    #if DEBUG
+    func waitingCountsForTesting() -> (commands: Int, heals: Int) {
+        (waitingCommands.count, waitingHeals.count)
+    }
+    #endif
 }
 
 /// Manages the full relay lifetime for one remote-pane window.
