@@ -308,31 +308,18 @@ final class TermMeshDaemon: ObservableObject {
         peerServingEnabled
     }
 
-    /// The one line to log when adopting a daemon that is not this build's.
-    ///
-    /// Adoption exists so peer sessions survive a quit, and that is worth
-    /// keeping even against a mismatch — restarting to fix the version is
-    /// exactly the session loss adoption prevents. What is not acceptable is
-    /// doing it silently: a released app has run for hours against a leftover
-    /// Debug daemon from a test harness, and the only visible symptom was
-    /// peer features behaving like an older build.
-    ///
-    /// Pure so the wording and the comparison are pinned by a test rather
-    /// than by whoever reads the adopt branch next. `nil` means "no warning":
-    /// the versions match, or the running daemon could not be asked (an
-    /// unknown version is not evidence of a mismatch).
-    static func adoptedDaemonVersionWarning(
+    /// A daemon from another app version must be replaced, even when it is
+    /// holding peer sessions. Keeping it preserves processes at the cost of
+    /// running the new app against an old protocol implementation forever.
+    /// Unknown versions are not enough evidence to destroy live sessions.
+    static func daemonRequiresUpgrade(
         runningVersion: String?,
         appVersion: String?
-    ) -> String? {
+    ) -> Bool {
         guard let runningVersion, !runningVersion.isEmpty,
-              let appVersion, !appVersion.isEmpty,
-              runningVersion != appVersion
-        else { return nil }
-        return "adopted daemon is version \(runningVersion) but this app is "
-            + "\(appVersion) — peer features follow the daemon, not the app. "
-            + "Quit every term-mesh on this machine and reopen it to replace "
-            + "the daemon."
+              let appVersion, !appVersion.isEmpty
+        else { return false }
+        return runningVersion != appVersion
     }
 
     /// Whether the subscribe loop's consecutive connect failures warrant
@@ -415,47 +402,44 @@ final class TermMeshDaemon: ObservableObject {
             // Daemon from a previous app launch?
             if self.ping() {
                 if outlivesApp {
-                    // Adopt rather than restart. Restarting is what makes a
-                    // session end at a quit: the sessions this daemon holds are
-                    // the thing another machine reattaches to, and they do not
-                    // survive being restarted to pick up a dashboard port.
-                    //
-                    // The cost is that settings changed while it was running are
-                    // not applied until it is restarted deliberately — said out
-                    // loud here rather than left to be discovered.
-                    Logger.daemon.info(
-                        "adopting the running daemon; settings changed since it started are not applied"
-                    )
-                    // Adoption is version-blind by construction: it trusts
-                    // whatever answers the socket. Say so when that is not this
-                    // build, in the log the user actually reads, because every
-                    // downstream symptom looks like an app bug instead.
                     let runningVersion = self.runningDaemonVersion()
-                    if let warning = Self.adoptedDaemonVersionWarning(
+                    if Self.daemonRequiresUpgrade(
                         runningVersion: runningVersion,
                         appVersion: Self.appMarketingVersion
                     ) {
-                        Logger.daemon.error("\(warning, privacy: .public)")
-                        RemoteWorkLog.infoOffMain(warning)
-                    } else if runningVersion == nil {
-                        // An unknown version is not evidence of a mismatch,
-                        // but it is evidence worth keeping: a daemon that
-                        // cannot answer a version probe may already be
-                        // mid-shutdown, and adopting one leaves this app
-                        // daemon-less minutes later with nothing in any log.
-                        Logger.daemon.error(
-                            "adopted a daemon that did not answer the version probe — it may be shutting down"
+                        Logger.daemon.warning(
+                            "replacing daemon version \(runningVersion ?? "unknown", privacy: .public) with bundled version \(Self.appMarketingVersion ?? "unknown", privacy: .public); live peer sessions will end"
                         )
-                        RemoteWorkLog.infoOffMain(
-                            "Adopted this machine's daemon without a version answer; if its sessions vanish shortly, it was already shutting down"
+                        RemoteWorkLog.warningOffMain(
+                            "Updating this machine's daemon from \(runningVersion ?? "unknown") to \(Self.appMarketingVersion ?? "unknown"); live project sessions will end"
                         )
-                    }
-                    if let pid = self.getDaemonPeerPid() {
-                        DispatchQueue.main.async {
-                            TerminalController.shared.trustedDaemonPid = pid
+                        self.stopDaemon(force: true)
+                        // stopDaemon withdraws run intent. This is a replacement,
+                        // not a user stop, so keep the watchdog and spawn path live.
+                        self.daemonRunIntended = true
+                        Thread.sleep(forTimeInterval: 0.3)
+                    } else {
+                        // Adopt rather than restart when versions match. An
+                        // unknown version is also preserved: uncertainty alone
+                        // is not enough reason to destroy live peer sessions.
+                        Logger.daemon.info(
+                            "adopting the running daemon; settings changed since it started are not applied"
+                        )
+                        if runningVersion == nil {
+                            Logger.daemon.error(
+                                "adopted a daemon that did not answer the version probe — it may be shutting down"
+                            )
+                            RemoteWorkLog.infoOffMain(
+                                "Adopted this machine's daemon without a version answer; if its sessions vanish shortly, it was already shutting down"
+                            )
                         }
+                        if let pid = self.getDaemonPeerPid() {
+                            DispatchQueue.main.async {
+                                TerminalController.shared.trustedDaemonPid = pid
+                            }
+                        }
+                        return
                     }
-                    return
                 }
                 // Restart it so current settings (dashboard enabled/port/bind)
                 // are applied.
@@ -598,10 +582,17 @@ final class TermMeshDaemon: ObservableObject {
     /// Stop the daemon process.
     /// Called from applicationWillTerminate — must complete quickly.
     func stopDaemon() {
+        stopDaemon(force: false)
+    }
+
+    /// Stop the daemon bound to this app variant's exact socket. `force` is
+    /// reserved for explicit restart/upgrade paths where continuing to run an
+    /// old daemon is worse than ending the sessions it owns.
+    private func stopDaemon(force: Bool) {
         // A daemon serving peers holds sessions another machine reattaches to.
         // Killing it here is precisely what made "quit term-mesh on the peer"
         // end the project, so this path declines to.
-        if Self.daemonShouldOutliveApp(peerServingEnabled: PeerFederationSettings.autoStart) {
+        if !force, Self.daemonShouldOutliveApp(peerServingEnabled: PeerFederationSettings.autoStart) {
             daemonProcess = nil
             Logger.daemon.info("leaving the daemon running; it holds sessions for other machines")
             return
@@ -679,7 +670,7 @@ final class TermMeshDaemon: ObservableObject {
             let stopGroup = DispatchGroup()
             stopGroup.enter()
             DispatchQueue.main.async { [weak self] in
-                self?.stopDaemon()
+                self?.stopDaemon(force: true)
                 stopGroup.leave()
             }
             stopGroup.wait()

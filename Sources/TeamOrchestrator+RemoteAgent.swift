@@ -2871,6 +2871,9 @@ extension TeamOrchestrator {
             let surfaces = try await PeerPaneSession.listSurfaces(on: lease)
             guard let surface = surfaces.first(where: { $0.surfaceID == surfaceID }) else {
                 PeerPaneHostRegistry.shared.release(lease)
+                RemoteWorkLog.error(
+                    "Cannot restore \(title) on \(hostKey): the saved surface is no longer available"
+                )
                 return nil
             }
             isAgentSurface = SessionHostPanes.isAgentSurfaceType(surface.surfaceType)
@@ -2901,6 +2904,9 @@ extension TeamOrchestrator {
                 focus: false
             ) else {
                 session.teardown()
+                RemoteWorkLog.error(
+                    "Cannot restore \(title) on \(hostKey): the agent panel could not be opened"
+                )
                 return nil
             }
             onAgentPanel(panel, host)
@@ -2913,6 +2919,9 @@ extension TeamOrchestrator {
             lifetime: .keepAlive
         ) else {
             session.teardown()
+            RemoteWorkLog.error(
+                "Cannot restore \(title) on \(hostKey): the terminal relay pane could not be opened"
+            )
             return nil
         }
         workspace.setPanelCustomTitle(

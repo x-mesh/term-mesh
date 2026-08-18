@@ -1262,17 +1262,15 @@ final class PeerPaneSessionTests: XCTestCase {
 
     @MainActor
     func test_savedRunnerRepeatedLaunchReusesExactEnsuredSurfaceID() async throws {
-        // Attaching spawns term-mesh-peer-relay out of the app bundle, and the
-        // Rust binaries are copied in by reload.sh / reloadp.sh / reloads.sh —
-        // not by an Xcode build phase. A plain `xcodebuild test` therefore
-        // produces a bundle without it and this test could never pass there; it
-        // failed as an opaque ENOTCONN, because the mock host closed its
-        // listener while the client was failing on the missing binary.
-        let relay = Bundle.main.resourceURL?
-            .appendingPathComponent("bin/term-mesh-peer-relay").path
+        // This is intentionally a bare-xcodebuild regression test. Debug apps
+        // do not run reload.sh's binary-copy step, but they must still attach
+        // terminal surfaces through a checkout or installed release helper.
+        // The old bundle-only check skipped this test and hid project restore
+        // failures behind an opaque noRelayBinary error.
+        let relay = PeerRelaySession.findRelayBinary()
         try XCTSkipUnless(
-            relay.map { FileManager.default.isExecutableFile(atPath: $0) } ?? false,
-            "needs term-mesh-peer-relay in the app bundle — run through reload.sh, not a bare xcodebuild"
+            FileManager.default.isExecutableFile(atPath: relay),
+            "needs a checkout, bundled, or installed term-mesh-peer-relay"
         )
 
         let socketPath = "/tmp/peer-runner-test-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
@@ -1346,6 +1344,31 @@ final class PeerPaneSessionTests: XCTestCase {
         }
 
         try await awaitHostCompletion(hostTask, host: host)
+    }
+
+    func test_bareDebugBuildCanFindCheckoutOrInstalledRelayHelper() {
+        let candidates = PeerRelaySession.relayBinaryCandidates(
+            bundlePath: "/DerivedData/Build/Products/Debug/term-mesh DEV.app",
+            sourceFilePath: "/work/term-mesh/Sources/PeerRelaySession.swift",
+            currentDirectoryPath: "/tmp/unrelated",
+            installedAppPath: "/Applications/term-mesh.app"
+        )
+
+        XCTAssertEqual(
+            candidates.prefix(2),
+            [
+                "/DerivedData/Build/Products/Debug/term-mesh DEV.app/Contents/Resources/bin/term-mesh-peer-relay",
+                "/DerivedData/Build/Products/Debug/term-mesh DEV.app/Contents/MacOS/term-mesh-peer-relay",
+            ]
+        )
+#if DEBUG
+        XCTAssertTrue(candidates.contains(
+            "/work/term-mesh/daemon/target/release/term-mesh-peer-relay"
+        ))
+        XCTAssertTrue(candidates.contains(
+            "/Applications/term-mesh.app/Contents/Resources/bin/term-mesh-peer-relay"
+        ))
+#endif
     }
 
     func test_savedRunnerProfileKeepsExecutionIdentitySeparateFromProjectBinding() throws {
