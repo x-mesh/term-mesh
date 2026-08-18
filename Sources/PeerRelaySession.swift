@@ -1145,17 +1145,36 @@ private final class RelayPtyDataSink: @unchecked Sendable {
 actor RelayLeaderSessionGate {
     private var activeCommands = 0
     private var healActive = false
-    private var waitingCommands: [CheckedContinuation<Void, Never>] = []
-    private var waitingHeals: [CheckedContinuation<Void, Never>] = []
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Bool, Never>
+    }
+    private var waitingCommands: [Waiter] = []
+    private var waitingHeals: [Waiter] = []
 
-    func acquireCommand() async {
+    func acquireCommand() async -> Bool {
+        guard !Task.isCancelled else { return false }
         if !healActive, waitingHeals.isEmpty {
             activeCommands += 1
-            return
+            return true
         }
-        await withCheckedContinuation { continuation in
-            waitingCommands.append(continuation)
+        let id = UUID()
+        let acquired = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                waitingCommands.append(Waiter(id: id, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.cancelCommandWaiter(id: id) }
         }
+        if acquired, Task.isCancelled {
+            releaseCommand()
+            return false
+        }
+        return acquired
     }
 
     func releaseCommand() {
@@ -1164,14 +1183,29 @@ actor RelayLeaderSessionGate {
         grantNextIfPossible()
     }
 
-    func acquireHeal() async {
+    func acquireHeal() async -> Bool {
+        guard !Task.isCancelled else { return false }
         if !healActive, activeCommands == 0 {
             healActive = true
-            return
+            return true
         }
-        await withCheckedContinuation { continuation in
-            waitingHeals.append(continuation)
+        let id = UUID()
+        let acquired = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                waitingHeals.append(Waiter(id: id, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.cancelHealWaiter(id: id) }
         }
+        if acquired, Task.isCancelled {
+            releaseHeal()
+            return false
+        }
+        return acquired
     }
 
     func releaseHeal() {
@@ -1184,14 +1218,25 @@ actor RelayLeaderSessionGate {
         guard activeCommands == 0, !healActive else { return }
         if !waitingHeals.isEmpty {
             healActive = true
-            waitingHeals.removeFirst().resume()
+            waitingHeals.removeFirst().continuation.resume(returning: true)
             return
         }
         guard !waitingCommands.isEmpty else { return }
         let commands = waitingCommands
         waitingCommands.removeAll(keepingCapacity: true)
         activeCommands = commands.count
-        for command in commands { command.resume() }
+        for command in commands { command.continuation.resume(returning: true) }
+    }
+
+    private func cancelCommandWaiter(id: UUID) {
+        guard let index = waitingCommands.firstIndex(where: { $0.id == id }) else { return }
+        waitingCommands.remove(at: index).continuation.resume(returning: false)
+    }
+
+    private func cancelHealWaiter(id: UUID) {
+        guard let index = waitingHeals.firstIndex(where: { $0.id == id }) else { return }
+        waitingHeals.remove(at: index).continuation.resume(returning: false)
+        grantNextIfPossible()
     }
 }
 
@@ -2480,14 +2525,18 @@ final class PeerRelaySession {
                         // request back over the already-authenticated peer
                         // session; answer it here without app activation or a
                         // local TERMMESH_SOCKET ever crossing machines.
-                        await self.leaderSessionGate.acquireCommand()
+                        guard await self.leaderSessionGate.acquireCommand() else { return }
+                        guard !Task.isCancelled, let liveSession = await self.session else {
+                            await self.leaderSessionGate.releaseCommand()
+                            return
+                        }
                         // A heal that was already exclusive when this frame
                         // arrived may have retired its connection before the
                         // command acquired the gate. Do not execute a command
                         // whose response can no longer return on that exact
                         // connection: the daemon drops the pending route and
                         // the CLI can retry the same request_id safely.
-                        if let liveSession = await self.session, liveSession !== currentSession {
+                        if liveSession !== currentSession {
                             await self.leaderSessionGate.releaseCommand()
                             currentSession = liveSession
                             expectedByteSeq = nil
@@ -2498,6 +2547,19 @@ final class PeerRelaySession {
                         }
                         let response = await GhosttyPaneSurfaceProvider
                             .handleRemoteLeaderCommand(request)
+                        guard !Task.isCancelled, let responseSession = await self.session else {
+                            await self.leaderSessionGate.releaseCommand()
+                            return
+                        }
+                        if responseSession !== currentSession {
+                            await self.leaderSessionGate.releaseCommand()
+                            currentSession = responseSession
+                            expectedByteSeq = nil
+                            gapBytesTotal = 0
+                            gapCount = 0
+                            resumeTransitionGate.adoptCommittedSession()
+                            continue pumpLoop
+                        }
                         var responseError: Error?
                         do {
                             try await currentSession.sendTeamLeaderCommandResponse(
@@ -2865,7 +2927,11 @@ final class PeerRelaySession {
         // connection that delivered it. Wait before capturing `oldSession`,
         // and keep exclusive ownership until the replacement is committed and
         // the old transport is retired. This closes #292's lag/heal/RPC race.
-        await leaderSessionGate.acquireHeal()
+        guard await leaderSessionGate.acquireHeal() else { return }
+        guard !Task.isCancelled, !isTorndown else {
+            await leaderSessionGate.releaseHeal()
+            return
+        }
         await performResumeHealExclusively(reason: reason)
         await leaderSessionGate.releaseHeal()
     }

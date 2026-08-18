@@ -717,6 +717,22 @@ struct PendingLeaderResponse {
 }
 
 impl Broadcaster {
+    fn remove_pending_leader_if_matches(
+        &self,
+        request_id: &[u8],
+        connection_id: u64,
+        correlation_id: u64,
+    ) -> bool {
+        let mut pending = self.leader_pending.lock().unwrap();
+        let matches = pending.get(request_id).is_some_and(|entry| {
+            entry.connection_id == connection_id && entry.correlation_id == correlation_id
+        });
+        if matches {
+            pending.remove(request_id);
+        }
+        matches
+    }
+
     pub fn new() -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
@@ -850,10 +866,11 @@ impl Broadcaster {
         // already gone, remove the orphan now. If it drops after this check,
         // BroadcastGuard::drop performs the same cleanup.
         if !self.clients.lock().unwrap().contains_key(&target.0) {
-            self.leader_pending
-                .lock()
-                .unwrap()
-                .remove(&request.request_id);
+            self.remove_pending_leader_if_matches(
+                &request.request_id,
+                target.0,
+                correlation_id,
+            );
             return Err("authorized peer viewer is unavailable".into());
         }
         let envelope = Envelope {
@@ -862,20 +879,22 @@ impl Broadcaster {
             payload: Some(Payload::TeamLeaderCommandRequest(request.clone())),
         };
         if target.1.tx.try_send(envelope).is_err() {
-            self.leader_pending
-                .lock()
-                .unwrap()
-                .remove(&request.request_id);
+            self.remove_pending_leader_if_matches(
+                &request.request_id,
+                target.0,
+                correlation_id,
+            );
             return Err("authorized peer viewer is unavailable".into());
         }
         match tokio::time::timeout(Duration::from_secs(15), rx).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err("peer viewer dropped the command response".into()),
             Err(_) => {
-                self.leader_pending
-                    .lock()
-                    .unwrap()
-                    .remove(&request.request_id);
+                self.remove_pending_leader_if_matches(
+                    &request.request_id,
+                    target.0,
+                    correlation_id,
+                );
                 Err("peer leader command timed out".into())
             }
         }
@@ -2405,6 +2424,38 @@ mod tests {
         };
         assert!(router.resolve_team_leader(retry_guard.connection_id(), envelope.seq, response,));
         assert!(retry.await.unwrap().unwrap().ok);
+    }
+
+    #[test]
+    fn stale_cleanup_cannot_remove_new_retry_with_same_request_id() {
+        let router = Broadcaster::new();
+        let request_id = vec![0x43; peer_proto::team_leader::REQUEST_ID_BYTES];
+        let (old_tx, _old_rx) = oneshot::channel();
+        router.leader_pending.lock().unwrap().insert(
+            request_id.clone(),
+            PendingLeaderResponse {
+                connection_id: 10,
+                correlation_id: 11,
+                sender: old_tx,
+            },
+        );
+        router.leader_pending.lock().unwrap().remove(&request_id);
+
+        let (retry_tx, _retry_rx) = oneshot::channel();
+        router.leader_pending.lock().unwrap().insert(
+            request_id.clone(),
+            PendingLeaderResponse {
+                connection_id: 20,
+                correlation_id: 21,
+                sender: retry_tx,
+            },
+        );
+
+        assert!(!router.remove_pending_leader_if_matches(&request_id, 10, 11));
+        let pending = router.leader_pending.lock().unwrap();
+        let retry = pending.get(&request_id).expect("retry must survive stale cleanup");
+        assert_eq!(retry.connection_id, 20);
+        assert_eq!(retry.correlation_id, 21);
     }
 
     #[test]

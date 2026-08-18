@@ -20,11 +20,12 @@ final class PeerPaneSessionTests: XCTestCase {
 
     func testLeaderSessionGateKeepsHealOutOfInflightCommand() async {
         let gate = RelayLeaderSessionGate()
-        await gate.acquireCommand()
+        let commandAcquired = await gate.acquireCommand()
+        XCTAssertTrue(commandAcquired)
 
         let healAcquired = AsyncFlag()
         let healTask = Task {
-            await gate.acquireHeal()
+            guard await gate.acquireHeal() else { return }
             await healAcquired.set()
             await gate.releaseHeal()
         }
@@ -40,11 +41,12 @@ final class PeerPaneSessionTests: XCTestCase {
 
     func testLeaderSessionGateKeepsNewCommandOutOfHealSwap() async {
         let gate = RelayLeaderSessionGate()
-        await gate.acquireHeal()
+        let healAcquired = await gate.acquireHeal()
+        XCTAssertTrue(healAcquired)
 
         let commandAcquired = AsyncFlag()
         let commandTask = Task {
-            await gate.acquireCommand()
+            guard await gate.acquireCommand() else { return }
             await commandAcquired.set()
             await gate.releaseCommand()
         }
@@ -56,6 +58,36 @@ final class PeerPaneSessionTests: XCTestCase {
         await commandTask.value
         let commandRan = await commandAcquired.read()
         XCTAssertTrue(commandRan)
+    }
+
+    func testLeaderSessionGateCancelledCommandWaiterDoesNotRunOrBlockHeal() async {
+        let gate = RelayLeaderSessionGate()
+        let initialHeal = await gate.acquireHeal()
+        XCTAssertTrue(initialHeal)
+        let commandResult = Task { await gate.acquireCommand() }
+        await Task.yield()
+        commandResult.cancel()
+        let cancelledCommand = await commandResult.value
+        XCTAssertFalse(cancelledCommand)
+        await gate.releaseHeal()
+        let nextHeal = await gate.acquireHeal()
+        XCTAssertTrue(nextHeal)
+        await gate.releaseHeal()
+    }
+
+    func testLeaderSessionGateCancelledHealWaiterDoesNotBlockCommands() async {
+        let gate = RelayLeaderSessionGate()
+        let initialCommand = await gate.acquireCommand()
+        XCTAssertTrue(initialCommand)
+        let healResult = Task { await gate.acquireHeal() }
+        await Task.yield()
+        healResult.cancel()
+        let cancelledHeal = await healResult.value
+        XCTAssertFalse(cancelledHeal)
+        await gate.releaseCommand()
+        let nextCommand = await gate.acquireCommand()
+        XCTAssertTrue(nextCommand)
+        await gate.releaseCommand()
     }
 
     @MainActor
