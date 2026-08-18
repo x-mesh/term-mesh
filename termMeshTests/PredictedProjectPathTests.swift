@@ -132,6 +132,37 @@ final class PredictedProjectPathTests: XCTestCase {
         )
     }
 
+    /// The "no repositories match" caption counts differently from the list:
+    /// the list hides the fully typed URL because suggesting it again is a
+    /// no-op, but the count must still see it, or finishing a known URL
+    /// would flip the caption to "no matches".
+    func testRepositoryURLMatchCountStillSeesTheFullyTypedValue() {
+        let suggestions = [
+            "git@github.com:org/term-mesh.git",
+            "https://github.com/org/other.git"
+        ]
+        XCTAssertEqual(
+            RepositoryURLAutocomplete.matchingCount(
+                suggestions,
+                query: "git@github.com:org/term-mesh.git"
+            ),
+            1
+        )
+        XCTAssertEqual(
+            RepositoryURLAutocomplete.matches(
+                suggestions,
+                query: "git@github.com:org/term-mesh.git",
+                limit: 6
+            ),
+            [],
+            "the list still hides it — only the count keeps it"
+        )
+        XCTAssertEqual(
+            RepositoryURLAutocomplete.matchingCount(suggestions, query: ""),
+            suggestions.count
+        )
+    }
+
     func testRemoteBranchesParseDefaultAndSortItFirst() {
         let result = RepositoryBranchLookup.parse(
             """
@@ -145,6 +176,44 @@ final class PredictedProjectPathTests: XCTestCase {
 
         XCTAssertEqual(result.defaultBranch, "main")
         XCTAssertEqual(result.branches, ["main", "develop", "release/v2"])
+    }
+
+    /// ls-remote output is a set, not a list: duplicates collapse, lines
+    /// without a refs/heads path are ignored, and names sort the way Finder
+    /// sorts them, so release/v10 follows release/v2.
+    func testRemoteBranchesParseDedupesIgnoresNoiseAndSortsNaturally() {
+        let result = RepositoryBranchLookup.parse(
+            """
+            aaaaaaaa\trefs/heads/release/v2
+            aaaaaaaa\trefs/heads/release/v2
+            bbbbbbbb\trefs/heads/release/v10
+            cccccccc\trefs/tags/v1.0
+            not a ref line
+            dddddddd\trefs/heads/
+            """
+        )
+        XCTAssertNil(result.defaultBranch)
+        XCTAssertEqual(
+            result.branches,
+            ["release/v2", "release/v10"],
+            "numeric-aware sort keeps v10 after v2"
+        )
+        XCTAssertEqual(RepositoryBranchLookup.parse("").branches, [])
+    }
+
+    /// A HEAD symref can name a branch the listing does not carry (unborn,
+    /// or hidden by the ref filter); the default is still reported, but a
+    /// branch entry is never invented for it.
+    func testRemoteBranchesKeepADefaultTheListingDoesNotCarry() {
+        let result = RepositoryBranchLookup.parse(
+            """
+            ref: refs/heads/trunk\tHEAD
+            aaaaaaaa\tHEAD
+            bbbbbbbb\trefs/heads/main
+            """
+        )
+        XCTAssertEqual(result.defaultBranch, "trunk")
+        XCTAssertEqual(result.branches, ["main"])
     }
 
     func testBranchSearchSupportsPartialNamesAndPinsExactMatchFirst() {
@@ -177,6 +246,52 @@ final class PredictedProjectPathTests: XCTestCase {
         XCTAssertEqual(
             RepositoryBranchLookup.singleLine("release/v2\nmain"),
             "release/v2"
+        )
+    }
+
+    /// Focusing the empty field is a browse, not a search: every branch is a
+    /// match, in the repository's own order, bounded by the limit.
+    func testBranchSearchShowsEverythingForAnEmptyQueryAndHonorsTheLimit() {
+        let branches = ["main", "develop", "release/v2"]
+        XCTAssertEqual(
+            RepositoryBranchLookup.matches(branches, query: "", limit: 8),
+            branches
+        )
+        XCTAssertEqual(
+            RepositoryBranchLookup.matches(branches, query: "   ", limit: 8),
+            branches,
+            "whitespace is not a search term"
+        )
+        XCTAssertEqual(
+            RepositoryBranchLookup.matches(branches, query: "", limit: 2),
+            ["main", "develop"]
+        )
+        XCTAssertEqual(
+            RepositoryBranchLookup.matches(branches, query: "", limit: 0),
+            []
+        )
+    }
+
+    /// The query is matched as typed except for surrounding whitespace, and a
+    /// branch that already leads the list stays where it is.
+    func testBranchSearchTrimsTheQueryAndLeavesALeadingExactMatchInPlace() {
+        XCTAssertEqual(
+            RepositoryBranchLookup.matches(
+                ["main", "develop"], query: " develop ", limit: 8
+            ),
+            ["develop"],
+            "a stray space is not a different branch name"
+        )
+        XCTAssertEqual(
+            RepositoryBranchLookup.matches(
+                ["develop", "fix/develop-p1-cli"], query: "develop", limit: 8
+            ),
+            ["develop", "fix/develop-p1-cli"],
+            "no reordering needed when the exact match already leads"
+        )
+        XCTAssertEqual(
+            RepositoryBranchLookup.matches(["main", "develop"], query: "nope", limit: 8),
+            []
         )
     }
 
