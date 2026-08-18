@@ -80,6 +80,63 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(rolledBack, ["team/demo/executor/one"])
     }
 
+    func testUnownedIsolatedWorktreesRollBackNewestFirstAndSpareOwnedPanes() {
+        let provisioned: [WorktreeInfo?] = [
+            WorktreeInfo(name: "wt-one", path: "/tmp/one", branch: "team/demo/executor/one"),
+            WorktreeInfo(name: "wt-two", path: "/tmp/two", branch: "team/demo/reviewer/two"),
+            nil,
+            WorktreeInfo(name: "wt-three", path: "/tmp/three", branch: "team/demo/planner/three"),
+        ]
+        var rolledBack: [String] = []
+        var logged: [(String, TeamOrchestrator.IsolatedWorktreeRollbackOutcome)] = []
+
+        let retained = TeamOrchestrator.rollbackUnownedIsolatedWorktrees(
+            provisioned: provisioned,
+            ownedNames: ["wt-one"],
+            rollback: { info in
+                rolledBack.append(info.name)
+                return true
+            },
+            log: { info, outcome in logged.append((info.name, outcome)) }
+        )
+
+        // Reverse provisioning order, and the pane-owned checkout is untouched.
+        XCTAssertEqual(rolledBack, ["wt-three", "wt-two"])
+        XCTAssertTrue(retained.isEmpty)
+        XCTAssertEqual(logged.map(\.0), ["wt-three", "wt-two", "wt-one"])
+        XCTAssertEqual(logged.map(\.1), [.removed, .removed, .owned])
+    }
+
+    func testRetainedIsolatedWorktreeIsReportedInsteadOfForcedAway() {
+        let dirty = WorktreeInfo(
+            name: "wt-dirty", path: "/tmp/dirty", branch: "team/demo/executor/one"
+        )
+        let clean = WorktreeInfo(
+            name: "wt-clean", path: "/tmp/clean", branch: "team/demo/reviewer/two"
+        )
+        var attempts: [String] = []
+        var logged: [(String, TeamOrchestrator.IsolatedWorktreeRollbackOutcome)] = []
+
+        let retained = TeamOrchestrator.rollbackUnownedIsolatedWorktrees(
+            provisioned: [dirty, clean],
+            ownedNames: [],
+            // The daemon removes with `force: false`, so a checkout carrying
+            // uncommitted work answers false rather than being deleted.
+            rollback: { info in
+                attempts.append(info.name)
+                return info.name != "wt-dirty"
+            },
+            log: { info, outcome in logged.append((info.name, outcome)) }
+        )
+
+        XCTAssertEqual(attempts, ["wt-clean", "wt-dirty"])
+        XCTAssertEqual(retained.map(\.name), ["wt-dirty"])
+        XCTAssertEqual(logged.map(\.1), [.removed, .retained])
+        // A refusal stops the sweep from lying about what is still on disk,
+        // and never turns into a forced delete of the user's work.
+        XCTAssertEqual(retained.first?.path, "/tmp/dirty")
+    }
+
     func testNativeAgentPaneExposesContextClearingRestart() throws {
         let presentation = try XCTUnwrap(Workspace.agentRestartPresentation(
             panelType: .agent,

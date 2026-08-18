@@ -1636,6 +1636,55 @@ final class TeamOrchestrator: ObservableObject {
         return .success(created)
     }
 
+    /// What one rollback attempt did to a pre-provisioned checkout.
+    ///
+    /// `retained` is the case that must never be silent: the daemon removes a
+    /// created worktree with `force: false`, so it refuses anything carrying
+    /// uncommitted work. That refusal is the correct outcome — the checkout
+    /// stays on disk — but only if somebody can see it in the log afterwards.
+    enum IsolatedWorktreeRollbackOutcome: Equatable {
+        /// The checkout and its created branch are gone; the slot is reusable.
+        case removed
+        /// A pane already owns it. Ownership transferred, so it is not ours.
+        case owned
+        /// The daemon declined (dirty work, RPC failure). Left alone on disk.
+        case retained
+    }
+
+    /// Give back every checkout that was provisioned but never claimed by a
+    /// pane, newest first.
+    ///
+    /// Provisioning happens before any process starts, so between it and the
+    /// committed team roster the worktrees belong to the transaction, not to
+    /// the team. Any early return in that window has to hand them back or the
+    /// next attempt collides with its own leftovers. Reverse order mirrors
+    /// creation, and `ownedNames` is what keeps a live pane's checkout — and
+    /// the shell sitting inside it — out of the sweep.
+    ///
+    /// Returns the checkouts that are still on disk, i.e. the ones a caller
+    /// must not assume it can recreate.
+    nonisolated static func rollbackUnownedIsolatedWorktrees(
+        provisioned: [WorktreeInfo?],
+        ownedNames: Set<String>,
+        rollback: (WorktreeInfo) -> Bool,
+        log: (WorktreeInfo, IsolatedWorktreeRollbackOutcome) -> Void
+    ) -> [WorktreeInfo] {
+        var retained: [WorktreeInfo] = []
+        for info in provisioned.compactMap({ $0 }).reversed() {
+            if ownedNames.contains(info.name) {
+                log(info, .owned)
+                continue
+            }
+            if rollback(info) {
+                log(info, .removed)
+            } else {
+                retained.append(info)
+                log(info, .retained)
+            }
+        }
+        return retained
+    }
+
     /// Create a team of Claude agents in split panes within a single workspace.
     /// Layout: leader console on left, agents stacked vertically on right.
     /// Returns the team info on success.
@@ -1917,6 +1966,32 @@ final class TeamOrchestrator: ObservableObject {
             }
         }
 
+        // Checkouts provisioned above exist before any pane does, so until the
+        // roster is committed they belong to this call. A pane claims one by
+        // name the moment it is created; everything still unclaimed goes back
+        // on any early return below.
+        var ownedWorktreeNames = Set<String>()
+        func rollbackUnownedWorktrees(reason: String) {
+            guard worktreeMode == "isolated", let repoRoot = gitRepoRoot else { return }
+            let retained = Self.rollbackUnownedIsolatedWorktrees(
+                provisioned: isolatedWorktrees,
+                ownedNames: ownedWorktreeNames,
+                rollback: { daemon.rollbackCreatedWorktree(repoPath: repoRoot, name: $0.name) },
+                log: { info, outcome in
+                    WorktreeLog.log(
+                        "team.isolated.rollback team=\(name) reason=\(reason) outcome=\(outcome) path=\(info.path) branch=\(info.branch)"
+                    )
+                }
+            )
+            for info in retained {
+                // Not a failure to recover from — `force: false` is what keeps
+                // uncommitted work alive — but the leftover has to be findable.
+                Logger.team.error(
+                    "isolated worktree retained after \(reason, privacy: .public): path=\(info.path, privacy: .public) branch=\(info.branch, privacy: .public)"
+                )
+            }
+        }
+
         // Leader working directory: use shared worktree when active
         let leaderWorkDir = sharedWorkDir ?? workingDirectory
 
@@ -1924,6 +1999,7 @@ final class TeamOrchestrator: ObservableObject {
         // Close the default panel and create a new one with the leader script as command
         guard let defaultPanelId = workspace.focusedPanelId else {
             Logger.team.error("no initial panel in workspace")
+            rollbackUnownedWorktrees(reason: "no-initial-panel")
             return nil
         }
 
@@ -1951,6 +2027,7 @@ final class TeamOrchestrator: ObservableObject {
         } else if leaderMode == "adopted" {
             guard let adoptedSurfaceId = adoptedLeaderSurfaceId else {
                 Logger.team.error("[team] adopted mode requires adoptedLeaderSurfaceId")
+                rollbackUnownedWorktrees(reason: "adopted-leader-missing")
                 return nil
             }
             // Look up the adopted leader's workspace so cross-workspace sends work correctly.
@@ -2106,6 +2183,7 @@ final class TeamOrchestrator: ObservableObject {
                 environment: leaderEnv
             ) else {
                 Logger.team.error("failed to create leader panel")
+                rollbackUnownedWorktrees(reason: "leader-pane-failed")
                 return nil
             }
             leaderPanelId = leaderPanel.id
@@ -2397,12 +2475,27 @@ final class TeamOrchestrator: ObservableObject {
             ) else {
                 if index == 0 {
                     Logger.team.error("failed to create first agent split pane")
+                    rollbackUnownedWorktrees(reason: "first-agent-pane-failed")
                     return nil
                 }
                 Logger.team.error("failed to create split pane for agent '\(agent.name, privacy: .public)'")
+                if worktreeMode == "isolated" {
+                    // An isolated team is all-or-nothing. Continuing here would
+                    // hand back a roster that quietly lost a member while that
+                    // member's checkout sat on disk with nothing pointing at it.
+                    WorktreeLog.log(
+                        "team.isolated.ABORT team=\(name) agent=\(agent.name) instance=\(reservedAgentInstanceIds[index]) reason=pane-failed"
+                    )
+                    rollbackUnownedWorktrees(reason: "agent-pane-failed")
+                    return nil
+                }
                 continue
             }
             members.append(member)
+            if worktreeMode == "isolated", let info = isolatedWorktrees[index] {
+                // The pane owns it now: from here a rollback must leave it be.
+                ownedWorktreeNames.insert(info.name)
+            }
         }
 
         // In adopted mode, the default panel served as anchor but is no longer needed.
