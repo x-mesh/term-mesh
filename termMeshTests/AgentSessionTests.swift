@@ -15,6 +15,70 @@ import Observation
 /// parsing: turning the stream into things a view can draw as what they are.
 @MainActor
 final class AgentSessionTests: XCTestCase {
+    func testIsolatedWorktreeBranchUsesDurableInstanceIdentity() {
+        let first = TeamOrchestrator.isolatedWorktreeBranch(
+            teamName: "term-mesh", agentName: "executor",
+            agentInstanceId: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        )
+        let second = TeamOrchestrator.isolatedWorktreeBranch(
+            teamName: "term-mesh", agentName: "executor",
+            agentInstanceId: "11111111-2222-3333-4444-555555555555"
+        )
+
+        XCTAssertEqual(
+            first, "team/term-mesh/executor/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        )
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(
+            first,
+            TeamOrchestrator.isolatedWorktreeBranch(
+                teamName: "term-mesh", agentName: "executor",
+                agentInstanceId: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+            )
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.isolatedWorktreeBranch(
+                teamName: "Team / Demo", agentName: "executor/one",
+                agentInstanceId: "INSTANCE / ONE"
+            ),
+            "team/team-demo/executor-one/instance-one"
+        )
+    }
+
+    func testIsolatedProvisioningRollsBackPartialSuccessAndStops() {
+        var attempted: [String] = []
+        var rolledBack: [String] = []
+        let agents = [
+            (name: "executor", instanceId: "one"),
+            (name: "reviewer", instanceId: "two"),
+            (name: "planner", instanceId: "three"),
+        ]
+
+        let result = TeamOrchestrator.provisionIsolatedWorktrees(
+            teamName: "demo", agents: agents,
+            create: { branch in
+                attempted.append(branch)
+                if branch.hasSuffix("/two") {
+                    return .failure(.rpcError("conflict at /existing/path"))
+                }
+                return .success(WorktreeInfo(
+                    name: "wt-\(branch)", path: "/tmp/\(branch)", branch: branch
+                ))
+            },
+            rollback: { rolledBack.append($0.branch) }
+        )
+
+        guard case .failure(let failure) = result else {
+            return XCTFail("partial provisioning unexpectedly succeeded")
+        }
+        XCTAssertEqual(failure.agentName, "reviewer")
+        XCTAssertEqual(failure.agentInstanceId, "two")
+        XCTAssertEqual(attempted, [
+            "team/demo/executor/one",
+            "team/demo/reviewer/two",
+        ])
+        XCTAssertEqual(rolledBack, ["team/demo/executor/one"])
+    }
 
     func testNativeAgentPaneExposesContextClearingRestart() throws {
         let presentation = try XCTUnwrap(Workspace.agentRestartPresentation(

@@ -1585,6 +1585,57 @@ final class TeamOrchestrator: ObservableObject {
 
     // MARK: - Team Lifecycle
 
+    nonisolated static func isolatedWorktreeBranch(
+        teamName: String,
+        agentName: String,
+        agentInstanceId: String
+    ) -> String {
+        func component(_ value: String, fallback: String) -> String {
+            let mapped = value.lowercased().unicodeScalars.map { scalar -> Character in
+                CharacterSet.alphanumerics.contains(scalar) || scalar == "-" || scalar == "_"
+                    ? Character(String(scalar)) : "-"
+            }
+            let normalized = String(mapped)
+                .split(separator: "-", omittingEmptySubsequences: true)
+                .joined(separator: "-")
+            return normalized.isEmpty ? fallback : normalized
+        }
+        return "team/\(component(teamName, fallback: "team"))/\(component(agentName, fallback: "agent"))/\(component(agentInstanceId, fallback: "instance"))"
+    }
+
+    struct IsolatedWorktreeProvisioningFailure: Error {
+        let agentName: String
+        let agentInstanceId: String
+        let branch: String
+        let underlying: WorktreeCreateError
+    }
+
+    nonisolated static func provisionIsolatedWorktrees(
+        teamName: String,
+        agents: [(name: String, instanceId: String)],
+        create: (String) -> Result<WorktreeInfo, WorktreeCreateError>,
+        rollback: (WorktreeInfo) -> Void
+    ) -> Result<[WorktreeInfo], IsolatedWorktreeProvisioningFailure> {
+        var created: [WorktreeInfo] = []
+        for agent in agents {
+            let branch = isolatedWorktreeBranch(
+                teamName: teamName, agentName: agent.name,
+                agentInstanceId: agent.instanceId
+            )
+            switch create(branch) {
+            case .success(let info):
+                created.append(info)
+            case .failure(let error):
+                for worktree in created.reversed() { rollback(worktree) }
+                return .failure(IsolatedWorktreeProvisioningFailure(
+                    agentName: agent.name, agentInstanceId: agent.instanceId,
+                    branch: branch, underlying: error
+                ))
+            }
+        }
+        return .success(created)
+    }
+
     /// Create a team of Claude agents in split panes within a single workspace.
     /// Layout: leader console on left, agents stacked vertically on right.
     /// Returns the team info on success.
@@ -1786,6 +1837,7 @@ final class TeamOrchestrator: ObservableObject {
         var sharedWtName: String?
         var sharedWtPath: String?
         var sharedWtBranch: String?
+        var isolatedWorktrees = [WorktreeInfo?](repeating: nil, count: agents.count)
 
         if useWorktrees {
             WorktreeLog.log("team.create mode=\(worktreeMode) team=\(name) gitRoot=\(gitRepoRoot ?? "nil")")
@@ -1813,6 +1865,55 @@ final class TeamOrchestrator: ObservableObject {
                     alert.addButton(withTitle: "OK")
                     alert.presentAsSheet()
                 }
+            }
+        }
+
+        // Provision every isolated checkout before any leader or agent process
+        // starts. Partial success is rolled back, and isolated mode never falls
+        // through to the source checkout: a failed sandbox is a failed team
+        // creation, not permission to run two agents in the user's working tree.
+        if worktreeMode == "isolated", executionMode != "headless", !agents.isEmpty {
+            guard let repoRoot = gitRepoRoot else {
+                Logger.team.error("isolated worktrees require a Git repository")
+                tabManager.closeWorkspace(workspace)
+                return nil
+            }
+            let identities = agents.enumerated().map { index, agent in
+                (name: agent.name, instanceId: reservedAgentInstanceIds[index])
+            }
+            switch Self.provisionIsolatedWorktrees(
+                teamName: name, agents: identities,
+                create: { branch in
+                    daemon.createWorktreeWithError(repoPath: repoRoot, branch: branch)
+                },
+                rollback: { info in
+                    _ = daemon.rollbackCreatedWorktree(repoPath: repoRoot, name: info.name)
+                }
+            ) {
+            case .success(let worktrees):
+                for (index, info) in worktrees.enumerated() {
+                    let agent = agents[index]
+                    let instanceId = reservedAgentInstanceIds[index]
+                    isolatedWorktrees[index] = info
+                    Logger.team.info(
+                        "worktree prepared agent=\(agent.name, privacy: .public) instance=\(instanceId, privacy: .public) path=\(info.path, privacy: .public) branch=\(info.branch, privacy: .public)"
+                    )
+                    WorktreeLog.log(
+                        "team.isolated.ok team=\(name) agent=\(agent.name) instance=\(instanceId) path=\(info.path) branch=\(info.branch)"
+                    )
+                }
+            case .failure(let failure):
+                WorktreeLog.log(
+                    "team.isolated.REFUSED team=\(name) agent=\(failure.agentName) instance=\(failure.agentInstanceId) branch=\(failure.branch) error=\(failure.underlying)"
+                )
+                tabManager.closeWorkspace(workspace)
+                let alert = NSAlert()
+                alert.messageText = "Isolated Worktree Creation Failed"
+                alert.informativeText = "Agent '\(failure.agentName)' (\(failure.agentInstanceId)) could not start.\nBranch: \(failure.branch)\n\(failure.underlying)"
+                alert.alertStyle = .critical
+                alert.addButton(withTitle: "OK")
+                alert.presentAsSheet()
+                return nil
             }
         }
 
@@ -2221,29 +2322,11 @@ final class TeamOrchestrator: ObservableObject {
             var wtPath = sharedWtPath
             var wtBranch = sharedWtBranch
 
-            if worktreeMode == "isolated", let repoRoot = gitRepoRoot {
-                let branchName = "team/\(name)/\(agent.name)"
-                let result = daemon.createWorktreeWithError(repoPath: repoRoot, branch: branchName)
-                switch result {
-                case .success(let info):
-                    agentWorkDir = info.path
-                    wtName = info.name
-                    wtPath = info.path
-                    wtBranch = info.branch
-                    Logger.team.info("worktree for \(agent.name, privacy: .public): \(info.path, privacy: .public) [\(info.branch, privacy: .public)]")
-                    WorktreeLog.log("team.isolated.ok team=\(name) agent=\(agent.name) path=\(info.path) branch=\(info.branch)")
-                case .failure(let error):
-                    Logger.team.error("worktree failed for \(agent.name, privacy: .public): \(error, privacy: .public), using original directory")
-                    WorktreeLog.log("team.isolated.FAIL team=\(name) agent=\(agent.name) error=\(error)")
-                    DispatchQueue.main.async {
-                        let alert = NSAlert()
-                        alert.messageText = "Worktree Creation Failed"
-                        alert.informativeText = "Worktree for agent '\(agent.name)' could not be created: \(error). Agent will use the original directory."
-                        alert.alertStyle = .warning
-                        alert.addButton(withTitle: "OK")
-                        alert.presentAsSheet()
-                    }
-                }
+            if worktreeMode == "isolated", let info = isolatedWorktrees[index] {
+                agentWorkDir = info.path
+                wtName = info.name
+                wtPath = info.path
+                wtBranch = info.branch
             }
 
             let agentCli = agent.cli.isEmpty ? "claude" : agent.cli

@@ -29,6 +29,14 @@ fn wt_log(msg: &str) {
     }
 }
 
+fn worktree_metadata_branch(repo: &Repository, name: &str) -> Option<String> {
+    let head = std::fs::read_to_string(repo.path().join("worktrees").join(name).join("HEAD"))
+        .ok()?;
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(str::to_owned)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateParams {
     /// Path to the source git repository
@@ -127,50 +135,60 @@ fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
             .map_err(|e| format!("HEAD is not a commit: {e}"))?
     };
 
-    // Create branch (delete stale branch+worktree first if it already exists)
+    // A valid linked worktree is live ownership, not stale metadata. Another
+    // create request must never delete it merely because the checkout is clean.
+    // Only a missing/invalid worktree may be pruned and recreated.
     if repo
         .find_branch(&branch_name, git2::BranchType::Local)
         .is_ok()
     {
-        // Check if there's an existing worktree using this branch and prune it
+        let mut pruned_invalid = false;
         if let Ok(wt_names) = repo.worktrees() {
             for existing_wt in wt_names.iter().flatten() {
                 if let Ok(wt) = repo.find_worktree(existing_wt) {
                     let wt_path = wt.path().to_path_buf();
-                    if let Ok(wt_repo) = Repository::open(&wt_path) {
-                        if let Ok(head) = wt_repo.head() {
-                            if head.shorthand() == Some(&branch_name) {
-                                // Safety: skip if worktree has uncommitted changes
-                                let is_dirty = wt_repo
-                                    .statuses(Some(
-                                        git2::StatusOptions::new()
-                                            .include_untracked(true)
-                                            .recurse_untracked_dirs(true),
-                                    ))
-                                    .map(|s| !s.is_empty())
-                                    .unwrap_or(false);
-                                if is_dirty {
-                                    return Err(format!(
-                                        "existing worktree '{existing_wt}' on branch '{branch_name}' has uncommitted changes — remove it manually first"
-                                    ));
-                                }
-                                let _ = wt.prune(Some(
-                                    git2::WorktreePruneOptions::new()
-                                        .working_tree(true)
-                                        .valid(true),
-                                ));
-                                if wt_path.exists() {
-                                    let _ = std::fs::remove_dir_all(&wt_path);
-                                }
-                                tracing::info!("pruned stale worktree '{existing_wt}' for branch '{branch_name}'");
-                                break;
-                            }
-                        }
+                    let checked_out_branch = Repository::open(&wt_path)
+                        .ok()
+                        .and_then(|wt_repo| {
+                            wt_repo
+                                .head()
+                                .ok()
+                                .and_then(|head| head.shorthand().map(str::to_owned))
+                        })
+                        .or_else(|| worktree_metadata_branch(&repo, existing_wt));
+                    if checked_out_branch.as_deref() != Some(&branch_name) {
+                        continue;
                     }
+                    if wt.validate().is_ok() {
+                        let message = format!(
+                            "worktree conflict: branch '{branch_name}' is already checked out by '{existing_wt}' at '{}'",
+                            wt_path.display()
+                        );
+                        tracing::warn!("{message}");
+                        return Err(message);
+                    }
+                    wt.prune(Some(git2::WorktreePruneOptions::new().valid(true)))
+                        .map_err(|e| {
+                            format!(
+                                "cannot prune invalid worktree '{existing_wt}' for branch '{branch_name}' at '{}': {e}",
+                                wt_path.display()
+                            )
+                        })?;
+                    tracing::info!(
+                        "pruned invalid worktree metadata name='{existing_wt}' branch='{branch_name}' path='{}'",
+                        wt_path.display()
+                    );
+                    pruned_invalid = true;
+                    break;
                 }
             }
         }
-        // Delete the stale branch so we can recreate it from current HEAD
+        if !pruned_invalid {
+            return Err(format!(
+                "branch conflict: '{branch_name}' already exists and is not an invalid linked worktree"
+            ));
+        }
+        // Delete only the branch whose invalid metadata was just pruned.
         let mut branch = repo
             .find_branch(&branch_name, git2::BranchType::Local)
             .map_err(|e| format!("cannot find branch '{branch_name}': {e}"))?;
@@ -280,6 +298,10 @@ pub fn remove(params: serde_json::Value) -> Result<(), String> {
         name: String,
         #[serde(default)]
         force: bool,
+        /// Rollback-only: delete the branch after removing a clean worktree
+        /// created by the same provisioning attempt. Existing callers omit it.
+        #[serde(default)]
+        delete_branch: bool,
     }
 
     let params: RemoveParams =
@@ -297,6 +319,7 @@ pub fn remove(params: serde_json::Value) -> Result<(), String> {
         .find_worktree(&params.name)
         .map_err(|e| format!("worktree '{}' not found: {e}", params.name))?;
     let wt_path = wt.path().to_path_buf();
+    let wt_branch = worktree_branch(&repo, &params.name);
 
     // Safety check: refuse to remove dirty/unpushed worktrees unless forced
     if !params.force {
@@ -326,6 +349,19 @@ pub fn remove(params: serde_json::Value) -> Result<(), String> {
     // Remove the directory using the path from git metadata
     if wt_path.exists() {
         std::fs::remove_dir_all(&wt_path).map_err(|e| format!("cannot remove directory: {e}"))?;
+    }
+    if params.delete_branch && !wt_branch.is_empty() {
+        let mut branch = repo
+            .find_branch(&wt_branch, git2::BranchType::Local)
+            .map_err(|e| format!("cannot find rollback branch '{wt_branch}': {e}"))?;
+        branch
+            .delete()
+            .map_err(|e| format!("cannot delete rollback branch '{wt_branch}': {e}"))?;
+        tracing::info!(
+            "deleted rollback branch '{}' after removing worktree '{}'",
+            wt_branch,
+            params.name
+        );
     }
 
     tracing::info!("removed worktree {} (force={})", params.name, params.force);
@@ -803,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn create_reuses_stale_branch() {
+    fn create_same_branch_preserves_live_worktree_and_returns_conflict() {
         let (_dir, repo_path, base_dir) = init_temp_repo();
 
         // First creation with a named branch
@@ -816,18 +852,75 @@ mod tests {
         assert_eq!(info1.branch, "team/test-team");
         assert!(std::path::Path::new(&info1.path).exists());
 
-        // Second creation with the same branch name should succeed
-        // (stale branch+worktree get cleaned up automatically)
+        let live_readme = std::path::Path::new(&info1.path).join("README.md");
+        let wt_repo = Repository::open(&info1.path).unwrap();
+        assert!(wt_repo.statuses(None).unwrap().is_empty());
+
+        // A second create must not delete a valid linked worktree.
         let params2 = serde_json::json!({
             "repo_path": repo_path,
             "base_dir": base_dir,
             "branch": "team/test-team",
         });
-        let info2 = create(params2).unwrap();
-        assert_eq!(info2.branch, "team/test-team");
-        assert!(std::path::Path::new(&info2.path).exists());
-        // Should be a different worktree
-        assert_ne!(info1.name, info2.name);
+        let error = create(params2).unwrap_err();
+        assert!(error.contains("worktree conflict"), "{error}");
+        assert!(error.contains(&info1.name), "{error}");
+        assert!(error.contains(&info1.path), "{error}");
+        assert_eq!(std::fs::read_to_string(live_readme).unwrap(), "# test");
+        assert!(std::path::Path::new(&info1.path).exists());
+    }
+
+    #[test]
+    fn create_same_branch_prunes_only_missing_worktree_metadata() {
+        let (_dir, repo_path, base_dir) = init_temp_repo();
+        let params = serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": "team/stale-team",
+        });
+        let first = create(params).unwrap();
+        std::fs::remove_dir_all(&first.path).unwrap();
+
+        let replacement = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": "team/stale-team",
+        }))
+        .unwrap();
+
+        assert_eq!(replacement.branch, "team/stale-team");
+        assert_ne!(replacement.name, first.name);
+        assert!(std::path::Path::new(&replacement.path).exists());
+    }
+
+    #[test]
+    fn rollback_remove_deletes_clean_created_branch_for_retry() {
+        let (_dir, repo_path, base_dir) = init_temp_repo();
+        let branch = "team/retry/executor/instance-1";
+        let first = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": branch,
+        }))
+        .unwrap();
+
+        remove(serde_json::json!({
+            "repo_path": repo_path,
+            "name": first.name,
+            "delete_branch": true,
+        }))
+        .unwrap();
+
+        let repo = Repository::open(&repo_path).unwrap();
+        assert!(repo.find_branch(branch, git2::BranchType::Local).is_err());
+        assert!(!std::path::Path::new(&first.path).exists());
+        let retry = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": branch,
+        }))
+        .unwrap();
+        assert_eq!(retry.branch, branch);
     }
 
     #[test]
