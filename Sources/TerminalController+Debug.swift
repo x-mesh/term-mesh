@@ -737,6 +737,7 @@ extension TerminalController {
                             )
                         }
                         result = .ok([
+                            "team": URL(fileURLWithPath: directory).lastPathComponent,
                             "primary": plan.primaryPath,
                             "checkouts": plan.agentCheckouts.map { ["agent": $0.agent, "path": $0.path, "branch": $0.branch] },
                         ])

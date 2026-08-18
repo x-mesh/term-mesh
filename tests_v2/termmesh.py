@@ -1292,6 +1292,8 @@ class termmesh:
                              leader_model: str = "sonnet",
                              leader_host: Optional[str] = None,
                              leader_directory: Optional[str] = None,
+                             remote_host: Optional[str] = None,
+                             remote_path: Optional[str] = None,
                              preset_id: Optional[str] = None) -> dict:
         params: Dict[str, Any] = {
             "directory": directory,
@@ -1303,6 +1305,10 @@ class termmesh:
             params["leader_host"] = leader_host
         if leader_directory:
             params["leader_directory"] = leader_directory
+        if remote_host:
+            params["host"] = remote_host
+        if remote_path:
+            params["remote_path"] = remote_path
         if preset_id:
             params["preset_id"] = preset_id
         return dict(self._call("debug.project.create", params) or {})

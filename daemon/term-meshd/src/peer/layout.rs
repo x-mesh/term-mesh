@@ -717,6 +717,22 @@ struct PendingLeaderResponse {
 }
 
 impl Broadcaster {
+    fn remove_pending_leader_if_matches(
+        &self,
+        request_id: &[u8],
+        connection_id: u64,
+        correlation_id: u64,
+    ) -> bool {
+        let mut pending = self.leader_pending.lock().unwrap();
+        let matches = pending.get(request_id).is_some_and(|entry| {
+            entry.connection_id == connection_id && entry.correlation_id == correlation_id
+        });
+        if matches {
+            pending.remove(request_id);
+        }
+        matches
+    }
+
     pub fn new() -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
@@ -844,26 +860,33 @@ impl Broadcaster {
                 },
             );
         }
+        // The target can disconnect after it was selected but before the
+        // pending entry above was installed. Its BroadcastGuard then had no
+        // entry to remove. Re-check registration after insertion: if it is
+        // already gone, remove the orphan now. If it drops after this check,
+        // BroadcastGuard::drop performs the same cleanup.
+        if !self.clients.lock().unwrap().contains_key(&target.0) {
+            self.remove_pending_leader_if_matches(&request.request_id, target.0, correlation_id);
+            return Err("authorized peer viewer is unavailable".into());
+        }
         let envelope = Envelope {
             seq: correlation_id,
             correlation_id: 0,
             payload: Some(Payload::TeamLeaderCommandRequest(request.clone())),
         };
         if target.1.tx.try_send(envelope).is_err() {
-            self.leader_pending
-                .lock()
-                .unwrap()
-                .remove(&request.request_id);
+            self.remove_pending_leader_if_matches(&request.request_id, target.0, correlation_id);
             return Err("authorized peer viewer is unavailable".into());
         }
         match tokio::time::timeout(Duration::from_secs(15), rx).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err("peer viewer dropped the command response".into()),
             Err(_) => {
-                self.leader_pending
-                    .lock()
-                    .unwrap()
-                    .remove(&request.request_id);
+                self.remove_pending_leader_if_matches(
+                    &request.request_id,
+                    target.0,
+                    correlation_id,
+                );
                 Err("peer leader command timed out".into())
             }
         }
@@ -908,6 +931,16 @@ impl BroadcastGuard {
 impl Drop for BroadcastGuard {
     fn drop(&mut self) {
         self.broadcaster.clients.lock().unwrap().remove(&self.id);
+        // A reverse leader request is scoped to this exact connection. Once
+        // the connection is gone no response can legitimately satisfy it, so
+        // remove it now and drop its oneshot sender. Besides waking the caller
+        // immediately, this lets an idempotent retry reuse the request_id
+        // instead of failing with `request_id already in flight` until timeout.
+        self.broadcaster
+            .leader_pending
+            .lock()
+            .unwrap()
+            .retain(|_, pending| pending.connection_id != self.id);
     }
 }
 
@@ -1192,11 +1225,46 @@ impl PeerHost {
             .collect()
     }
 
+    /// Every surface id a stored manifest names, leader first.
+    ///
+    /// Malformed entries are skipped rather than failing the caller: a record
+    /// that reached the map already passed validation, and a reap list is not
+    /// the place to discover otherwise.
+    fn presentation_surface_ids(
+        record: &super::persist::PersistedProjectPresentation,
+    ) -> Vec<Vec<u8>> {
+        std::iter::once(&record.leader_surface_id)
+            .chain(record.members.iter().map(|member| &member.surface_id))
+            .filter_map(|encoded| hex::decode(encoded).ok())
+            .collect()
+    }
+
     pub fn delete_project_presentation(
         &self,
         owner_peer_ids: &[Vec<u8>],
         project_id: &str,
     ) -> Result<bool, &'static str> {
+        self.delete_project_presentation_with_released(owner_peer_ids, project_id)
+            .map(|released| released.is_some())
+    }
+
+    /// Remove one manifest and hand back the surfaces it had claimed.
+    ///
+    /// The ids are taken from the record this call actually removed, while
+    /// the persistence and records locks are still held. A caller that reads
+    /// the manifest first and deletes second would be reaping a snapshot: a
+    /// replace landing in between makes it release surfaces the live manifest
+    /// still names while stranding the ones that really lost their last
+    /// reference. `Ok(None)` means there was no such project — nothing was
+    /// removed and nothing is released. Losing THIS manifest's reference is
+    /// not the same as being unreferenced, so the returned ids stay subject
+    /// to `presentation_references_surface` in `reap_if_abandoned`; another
+    /// project naming the same surface still protects it.
+    pub(crate) fn delete_project_presentation_with_released(
+        &self,
+        owner_peer_ids: &[Vec<u8>],
+        project_id: &str,
+    ) -> Result<Option<Vec<Vec<u8>>>, &'static str> {
         if owner_peer_ids.is_empty()
             || owner_peer_ids.iter().any(|id| id.len() != 16)
             || project_id.is_empty()
@@ -1207,7 +1275,7 @@ impl PeerHost {
         let _persist_guard = self.project_presentations_persistence.lock().unwrap();
         let mut records = self.project_presentations.lock().unwrap();
         let Some(existing) = records.get(project_id) else {
-            return Ok(false);
+            return Ok(None);
         };
         if !owner_peer_ids
             .iter()
@@ -1216,17 +1284,25 @@ impl PeerHost {
             return Err("not_owner");
         }
         let previous = records.remove(project_id).expect("checked above");
+        let released = Self::presentation_surface_ids(&previous);
         if let Some(path) = self.project_presentations_path.lock().unwrap().clone() {
             let snapshot: Vec<_> = records.values().cloned().collect();
             if super::persist::save_project_presentations(&path, &snapshot).is_err() {
+                // The record is back, so its surfaces never lost their
+                // reference: a rolled-back delete releases nothing.
                 records.insert(project_id.to_string(), previous);
                 return Err("persistence_failed");
             }
         }
-        Ok(true)
+        Ok(Some(released))
     }
 
-    fn presentation_references_surface(&self, surface_id: &[u8]) -> bool {
+    /// Whether any durable project manifest still names this surface.
+    ///
+    /// Read by the roster watcher below and by `reap_if_abandoned`: a
+    /// published manifest is itself a live reference, so a surface it names
+    /// is never abandoned merely because the viewer that published it left.
+    pub(crate) fn presentation_references_surface(&self, surface_id: &[u8]) -> bool {
         let encoded = hex::encode(surface_id);
         self.project_presentations
             .lock()
@@ -1279,6 +1355,15 @@ impl PeerHost {
         owner_peer_ids: &[Vec<u8>],
         project: &peer_proto::v1::Team,
     ) -> Result<(u64, bool), &'static str> {
+        self.upsert_project_presentation_with_released(owner_peer_ids, project)
+            .map(|(revision, changed, _)| (revision, changed))
+    }
+
+    pub(crate) fn upsert_project_presentation_with_released(
+        self: &Arc<Self>,
+        owner_peer_ids: &[Vec<u8>],
+        project: &peer_proto::v1::Team,
+    ) -> Result<(u64, bool, Vec<Vec<u8>>), &'static str> {
         if owner_peer_ids.is_empty()
             || owner_peer_ids.iter().any(|id| id.len() != 16)
             || project.project_id.is_empty()
@@ -1350,6 +1435,10 @@ impl PeerHost {
         let _persist_guard = self.project_presentations_persistence.lock().unwrap();
         let owner = hex::encode(&owner_peer_ids[0]);
         let mut records = self.project_presentations.lock().unwrap();
+        let previous_surface_ids: Vec<Vec<u8>> = records
+            .get(&project.project_id)
+            .map(Self::presentation_surface_ids)
+            .unwrap_or_default();
         if let Some(existing) = records.get(&project.project_id) {
             // Surface liveness is not an ownership-transfer protocol. A dead
             // leader may be replaced by its owner, but it must not turn a
@@ -1398,7 +1487,7 @@ impl PeerHost {
                 for surface in watched {
                     watchers_changed |= self.watch_presentation_surface(surface);
                 }
-                return Ok((existing_revision, watchers_changed));
+                return Ok((existing_revision, watchers_changed, Vec::new()));
             }
             record.revision = revision;
         }
@@ -1427,7 +1516,11 @@ impl PeerHost {
         for surface in watched {
             self.watch_presentation_surface(surface);
         }
-        Ok((revision, true))
+        let released = previous_surface_ids
+            .into_iter()
+            .filter(|surface_id| !seen_surfaces.contains(surface_id))
+            .collect();
+        Ok((revision, true, released))
     }
 
     /// Wire the daemon's system monitor so connections can push `HostStats`.
@@ -2332,6 +2425,111 @@ mod tests {
         );
         assert!(router.resolve_team_leader(authorized.connection_id(), correlation_id, response));
         assert!(call.await.unwrap().unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn dropping_leader_connection_releases_request_id_for_retry() {
+        let router = Arc::new(Broadcaster::new());
+        let peer_id = vec![0xA1; 16];
+        let request = TeamLeaderCommandRequest {
+            request_id: vec![0x42; peer_proto::team_leader::REQUEST_ID_BYTES],
+            method: "team.read".into(),
+            params_json: "{}".into(),
+            ..Default::default()
+        };
+
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        let first_guard = router.register(first_tx, Arc::new(AtomicU64::new(10)), peer_id.clone());
+        let first_router = Arc::clone(&router);
+        let first_request = request.clone();
+        let first_call =
+            tokio::spawn(
+                async move { first_router.call_team_leader(first_request, &peer_id).await },
+            );
+        first_rx.recv().await.expect("first targeted request");
+        drop(first_guard);
+        assert_eq!(
+            first_call.await.unwrap().unwrap_err(),
+            "peer viewer dropped the command response"
+        );
+
+        let retry_peer_id = vec![0xA1; 16];
+        let (retry_tx, mut retry_rx) = mpsc::channel(4);
+        let retry_guard = router.register(
+            retry_tx,
+            Arc::new(AtomicU64::new(20)),
+            retry_peer_id.clone(),
+        );
+        let retry_router = Arc::clone(&router);
+        let retry_request = request.clone();
+        let retry = tokio::spawn(async move {
+            retry_router
+                .call_team_leader(retry_request, &retry_peer_id)
+                .await
+        });
+        let envelope = retry_rx.recv().await.expect("retried request");
+        let response = TeamLeaderCommandResponse {
+            request_id: request.request_id,
+            ok: true,
+            result_json: "{}".into(),
+            ..Default::default()
+        };
+        assert!(router.resolve_team_leader(retry_guard.connection_id(), envelope.seq, response,));
+        assert!(retry.await.unwrap().unwrap().ok);
+    }
+
+    #[test]
+    fn stale_cleanup_cannot_remove_new_retry_with_same_request_id() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let router = Arc::new(Broadcaster::new());
+        let request_id = vec![0x43; peer_proto::team_leader::REQUEST_ID_BYTES];
+        let (old_tx, _old_rx) = oneshot::channel();
+        router.leader_pending.lock().unwrap().insert(
+            request_id.clone(),
+            PendingLeaderResponse {
+                connection_id: 10,
+                correlation_id: 11,
+                sender: old_tx,
+            },
+        );
+        router.leader_pending.lock().unwrap().remove(&request_id);
+
+        // Model the exact failing order: the disconnected call has already
+        // lost its route, but its later error/timeout cleanup is paused while
+        // a retry registers the same request_id on a replacement connection.
+        let retry_registered = Arc::new(Barrier::new(2));
+        let allow_stale_cleanup = Arc::new(Barrier::new(2));
+        let cleanup_router = Arc::clone(&router);
+        let cleanup_request_id = request_id.clone();
+        let cleanup_retry_registered = Arc::clone(&retry_registered);
+        let cleanup_allowed = Arc::clone(&allow_stale_cleanup);
+        let stale_cleanup = thread::spawn(move || {
+            cleanup_retry_registered.wait();
+            cleanup_allowed.wait();
+            cleanup_router.remove_pending_leader_if_matches(&cleanup_request_id, 10, 11)
+        });
+
+        let (retry_tx, _retry_rx) = oneshot::channel();
+        router.leader_pending.lock().unwrap().insert(
+            request_id.clone(),
+            PendingLeaderResponse {
+                connection_id: 20,
+                correlation_id: 21,
+                sender: retry_tx,
+            },
+        );
+
+        retry_registered.wait();
+        allow_stale_cleanup.wait();
+        assert!(!stale_cleanup.join().unwrap());
+        let pending = router.leader_pending.lock().unwrap();
+        let retry = pending
+            .get(&request_id)
+            .expect("retry must survive stale cleanup");
+        assert_eq!(retry.connection_id, 20);
+        assert_eq!(retry.correlation_id, 21);
     }
 
     #[test]
@@ -3989,6 +4187,190 @@ mod tests {
         host.terminate_surface(&replacement_leader.surface_id)
             .unwrap();
         host.terminate_surface(&member.surface_id).unwrap();
+    }
+
+    /// The F2 shape, deterministically: a caller that read the manifest
+    /// before deleting it reaps the wrong surfaces once a replace lands in
+    /// between. Here the read is taken first, the replace commits, and the
+    /// delete must still report only what it removed — so a caller has no
+    /// reason to keep a snapshot of its own, and `connection.rs` keeps none.
+    #[tokio::test]
+    async fn delete_releases_the_removed_record_not_an_earlier_read() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let leader = host.ensure_surface("stale-leader", &spec).unwrap();
+        let first_member = host.ensure_surface("stale-member-first", &spec).unwrap();
+        let next_member = host.ensure_surface("stale-member-next", &spec).unwrap();
+        let owner = vec![vec![6; 16]];
+        let project = |member_surface_id: &[u8]| peer_proto::v1::Team {
+            name: "stale".into(),
+            team_uuid: "uuid-stale".into(),
+            working_directory: "/tmp".into(),
+            leader_surface_id: leader.surface_id.clone(),
+            project_id: "team:uuid-stale".into(),
+            members: vec![peer_proto::v1::TeamMember {
+                name: "worker".into(),
+                agent_instance_id: "worker-instance".into(),
+                working_directory: "/tmp".into(),
+                surface_id: member_surface_id.to_vec(),
+                surface_type: "terminal".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            host.upsert_project_presentation(&owner, &project(&first_member.surface_id)),
+            Ok((1, true))
+        );
+        // What the old caller would have carried into the delete.
+        let stale_read: Vec<Vec<u8>> = host
+            .project_presentations()
+            .iter()
+            .find(|record| record.project_id == "team:uuid-stale")
+            .map(PeerHost::presentation_surface_ids)
+            .expect("published manifest");
+        assert_eq!(
+            host.upsert_project_presentation(&owner, &project(&next_member.surface_id)),
+            Ok((2, true))
+        );
+
+        let released = host
+            .delete_project_presentation_with_released(&owner, "team:uuid-stale")
+            .expect("delete accepted");
+        assert_eq!(
+            released,
+            Some(vec![
+                leader.surface_id.clone(),
+                next_member.surface_id.clone()
+            ]),
+            "the delete must release the record it removed"
+        );
+        assert_ne!(
+            released,
+            Some(stale_read),
+            "a pre-delete read is exactly what must not decide the reap"
+        );
+        assert_eq!(
+            host.delete_project_presentation_with_released(&owner, "team:uuid-stale"),
+            Ok(None),
+            "a second delete removes nothing and so releases nothing"
+        );
+
+        host.terminate_surface(&leader.surface_id).unwrap();
+        host.terminate_surface(&first_member.surface_id).unwrap();
+        host.terminate_surface(&next_member.surface_id).unwrap();
+    }
+
+    /// A delete releases the surfaces of the record it removed — never the
+    /// ones an earlier read happened to see.
+    ///
+    /// Reading the manifest and then deleting it is two steps, and a replace
+    /// fits between them: the delete takes the NEW record while the caller
+    /// reaps the OLD one's surfaces, which both strands the pane that truly
+    /// lost its last reference and aims the reap at a pane the owner just
+    /// published. Both operations serialize on the persistence lock, so only
+    /// two end states exist and each one pins its own release set exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_replace_and_delete_release_only_the_removed_record() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let leader = host.ensure_surface("race-leader", &spec).unwrap();
+        let first_member = host.ensure_surface("race-member-first", &spec).unwrap();
+        let next_member = host.ensure_surface("race-member-next", &spec).unwrap();
+        let owner = vec![vec![5; 16]];
+        let project = |member_surface_id: &[u8]| peer_proto::v1::Team {
+            name: "race".into(),
+            team_uuid: "uuid-race".into(),
+            working_directory: "/tmp".into(),
+            leader_surface_id: leader.surface_id.clone(),
+            project_id: "team:uuid-race".into(),
+            members: vec![peer_proto::v1::TeamMember {
+                name: "worker".into(),
+                agent_instance_id: "worker-instance".into(),
+                working_directory: "/tmp".into(),
+                surface_id: member_surface_id.to_vec(),
+                surface_type: "terminal".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let before = project(&first_member.surface_id);
+        let after = project(&next_member.surface_id);
+        assert_eq!(
+            host.upsert_project_presentation(&owner, &before),
+            Ok((1, true))
+        );
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let deleting = {
+            let host = Arc::clone(&host);
+            let owner = owner.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                host.delete_project_presentation_with_released(&owner, "team:uuid-race")
+            })
+        };
+        let replacing = {
+            let host = Arc::clone(&host);
+            let owner = owner.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                host.upsert_project_presentation(&owner, &after)
+            })
+        };
+        let released = deleting.await.unwrap().expect("delete accepted");
+        replacing.await.unwrap().expect("replace accepted");
+
+        let released_before = Some(vec![
+            leader.surface_id.clone(),
+            first_member.surface_id.clone(),
+        ]);
+        let released_after = Some(vec![
+            leader.surface_id.clone(),
+            next_member.surface_id.clone(),
+        ]);
+        let remaining = host.project_presentations();
+        if remaining.is_empty() {
+            // Nothing survived, so the replace landed first and the delete
+            // removed the replacement — the original member's surface is
+            // still claimed by nothing, but it is not this delete's to free.
+            assert_eq!(
+                released, released_after,
+                "the delete must release the record it actually removed"
+            );
+        } else {
+            // The delete went first, so the replace re-created the project.
+            // Only the record that was removed may be released; the live
+            // manifest's member surface must not appear.
+            assert_eq!(
+                released, released_before,
+                "the delete must not release a surface the live manifest names"
+            );
+            assert_eq!(
+                remaining[0].members[0].surface_id,
+                hex::encode(&next_member.surface_id)
+            );
+        }
+
+        host.terminate_surface(&leader.surface_id).unwrap();
+        host.terminate_surface(&first_member.surface_id).unwrap();
+        host.terminate_surface(&next_member.surface_id).unwrap();
     }
 
     #[test]
