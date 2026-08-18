@@ -4,6 +4,27 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.194.0] - 2026-08-18
+
+**Disconnect Host 후 재연결이 보존된 pane을 실제로 되살리고, relay가 잠깐 멈추면 그 이유가 로그에 남는다.**
+
+### Added
+
+- **원격 pane이 잠깐 멈추면 그 이유가 릴리스 빌드 로그에 남는다** ([#301](https://github.com/x-mesh/term-mesh/pull/301)) — 지금까지 relay 정체 계측은 개발 빌드에만 있어서, 릴리스 앱에서 pane이 잠깐 얼었다 풀리면 아무 기록도 남지 않았다. 이제 출력이 막힌 구간(앱→relay 쓰기 정체, relay helper가 로컬 터미널에 쓰는 지연)과 입력이 밀린 구간(키 전송 지연, host 쪽 주입 지연)이 각각 지속시간과 함께 Remote Work 로그에 남아, 네 구간 중 어디가 병목이었는지 로그만으로 가릴 수 있다. 200ms 미만은 기록하지 않고 5초당 한 줄로 제한해 로그가 넘치지 않는다.
+
+### Fixed
+
+- **Disconnect Host 후 다시 연결하면 보존된 pane과 workspace mirror가 되살아난다** ([#300](https://github.com/x-mesh/term-mesh/pull/300)) — 이전에는 host 연결을 끊으면 남겨둔 terminal pane과 mirror가 이미 은퇴한 socket에 재시도를 반복하거나 죽은 채로 남았다. 이제 재연결하면 terminal·agent pane은 교체된 lease로 다시 붙고, mirror는 구독을 교체해 host의 현재 layout대로 pane을 재구성한다.
+
+- **peer host의 번들 CLI 도구를 찾지 못하던 문제** ([#297](https://github.com/x-mesh/term-mesh/pull/297)) — macOS host에서 앱 번들의 `Resources/bin`을 우선 탐색해 peer 도구를 찾고, macOS에는 해당 없는 Linux 전용 bridge 설치 안내가 더 이상 뜨지 않는다.
+
+- **New Project에서 브랜치 이름을 끝까지 입력하면 제안 목록에서 사라지던 문제** ([#298](https://github.com/x-mesh/term-mesh/pull/298)) — "develop"을 다 치면 develop만 목록에서 빠져 그런 브랜치가 없는 것처럼 보였다. 이제 정확히 일치하는 브랜치가 체크 표시와 함께 목록 맨 위에 남는다.
+
+### Thanks to 2 contributors!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+- [@lkasa5546](https://github.com/lkasa5546)
+
 ## [0.193.0] - 2026-08-18
 
 **원격 Project와 agent가 이제 viewer의 수명에 묶이지 않는다.** 앱을 종료하거나 다른 Mac에서 다시 열어도 leader와 worker를 그대로 이어가고, relay 복구 중인 명령 응답과 duplicate agent의 격리 checkout도 잃지 않는다.
