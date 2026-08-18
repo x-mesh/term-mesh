@@ -709,11 +709,15 @@ final class TermMeshDaemon: ObservableObject {
         var params: [String: Any] = ["repo_path": gitRoot, "base_dir": worktreeBaseDir]
         if let branch { params["branch"] = branch }
         if let baseBranch { params["base_ref"] = baseBranch }
-        guard let response = rpcCall(method: "worktree.create", params: params),
-              let info = parseWorktreeInfo(response) else {
-            return .failure(.rpcError("Worktree creation failed"))
+        switch rpcCallResult(method: "worktree.create", params: params) {
+        case .success(let response):
+            guard let info = parseWorktreeInfo(response) else {
+                return .failure(.rpcError("Worktree creation returned an invalid response"))
+            }
+            return .success(info)
+        case .failure(let error):
+            return .failure(error)
         }
-        return .success(info)
     }
 
     /// List local branches for a repo.
@@ -744,6 +748,19 @@ final class TermMeshDaemon: ObservableObject {
     /// Remove a worktree by name. Refuses if dirty unless `force` is true.
     func removeWorktree(repoPath: String, name: String, force: Bool = false) -> Bool {
         let params: [String: Any] = ["repo_path": repoPath, "name": name, "force": force]
+        return rpcCall(method: "worktree.remove", params: params) != nil
+    }
+
+    /// Remove one untouched worktree created during a failed provisioning
+    /// transaction and delete its just-created branch so the durable instance
+    /// identity can be retried. The daemon still refuses dirty worktrees.
+    func rollbackCreatedWorktree(repoPath: String, name: String) -> Bool {
+        let params: [String: Any] = [
+            "repo_path": repoPath,
+            "name": name,
+            "force": false,
+            "delete_branch": true,
+        ]
         return rpcCall(method: "worktree.remove", params: params) != nil
     }
 
@@ -1363,6 +1380,20 @@ final class TermMeshDaemon: ObservableObject {
     // MARK: - Private
 
     private func rpcCall(method: String, params: [String: Any], timeout timeoutSec: Int = 5) -> Any? {
+        switch rpcCallResult(method: method, params: params, timeout: timeoutSec) {
+        case .success(let result):
+            return result
+        case .failure(let error):
+            Logger.daemon.error("RPC error: \(error.description, privacy: .public)")
+            return nil
+        }
+    }
+
+    private func rpcCallResult(
+        method: String,
+        params: [String: Any],
+        timeout timeoutSec: Int = 5
+    ) -> Result<Any, WorktreeCreateError> {
         // Serialised by `idLock`, not by `queue`: this method is called from
         // `queue` and from arbitrary threads (telemetry, WebView, callers of
         // `monitorSnapshot()`), so the bare read-modify-write it used to do
@@ -1371,18 +1402,22 @@ final class TermMeshDaemon: ObservableObject {
 
         let request: [String: Any] = ["id": id, "method": method, "params": params]
         guard let data = try? JSONSerialization.data(withJSONObject: request),
-              var jsonString = String(data: data, encoding: .utf8) else { return nil }
+              var jsonString = String(data: data, encoding: .utf8) else {
+            return .failure(.rpcError("could not encode RPC request"))
+        }
         jsonString += "\n"
 
         // Connect to Unix socket
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
+        guard fd >= 0 else { return .failure(.daemonNotConnected) }
         defer { close(fd) }
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = socketPath.utf8CString
-        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else { return nil }
+        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
+            return .failure(.rpcError("daemon socket path is too long"))
+        }
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { dest in
                 for (i, byte) in pathBytes.enumerated() {
@@ -1396,7 +1431,9 @@ final class TermMeshDaemon: ObservableObject {
                 connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        guard connectResult == 0 else { return nil }
+        guard connectResult == 0 else {
+            return .failure(.daemonNotConnected)
+        }
 
         // Set timeout
         var timeout = timeval(tv_sec: timeoutSec, tv_usec: 0)
@@ -1407,7 +1444,7 @@ final class TermMeshDaemon: ObservableObject {
         let sent = jsonString.withCString { ptr in
             write(fd, ptr, strlen(ptr))
         }
-        guard sent > 0 else { return nil }
+        guard sent > 0 else { return .failure(.rpcError("could not send daemon request")) }
 
         // Read response (line-delimited)
         var responseData = Data()
@@ -1421,18 +1458,18 @@ final class TermMeshDaemon: ObservableObject {
 
         guard !responseData.isEmpty,
               let json = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
-            return nil
+            return .failure(.rpcError("daemon returned no valid JSON response"))
         }
 
         if let error = json["error"] as? [String: Any] {
             let msg = (error["message"] as? String) ?? "unknown"
-            Logger.daemon.error("RPC error: \(msg, privacy: .public)")
-            return nil
+            return .failure(.rpcError(msg))
         }
 
-        let result = json["result"]
-        if result is NSNull { return nil }
-        return result
+        guard let result = json["result"], !(result is NSNull) else {
+            return .failure(.rpcError("daemon returned an empty result"))
+        }
+        return .success(result)
     }
 
     private func daemonBinaryPath() -> String? {
@@ -1585,10 +1622,18 @@ struct WorktreeInfo {
     let branch: String
 }
 
-enum WorktreeCreateError: Error {
+enum WorktreeCreateError: Error, CustomStringConvertible {
     case daemonNotConnected
     case notGitRepo
     case rpcError(String)
+
+    var description: String {
+        switch self {
+        case .daemonNotConnected: return "daemon is not connected"
+        case .notGitRepo: return "working directory is not a Git repository"
+        case .rpcError(let message): return message
+        }
+    }
 }
 
 struct AgentSessionInfo {

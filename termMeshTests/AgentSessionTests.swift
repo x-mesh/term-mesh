@@ -15,6 +15,126 @@ import Observation
 /// parsing: turning the stream into things a view can draw as what they are.
 @MainActor
 final class AgentSessionTests: XCTestCase {
+    func testIsolatedWorktreeBranchUsesDurableInstanceIdentity() {
+        let first = TeamOrchestrator.isolatedWorktreeBranch(
+            teamName: "term-mesh", agentName: "executor",
+            agentInstanceId: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        )
+        let second = TeamOrchestrator.isolatedWorktreeBranch(
+            teamName: "term-mesh", agentName: "executor",
+            agentInstanceId: "11111111-2222-3333-4444-555555555555"
+        )
+
+        XCTAssertEqual(
+            first, "team/term-mesh/executor/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        )
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(
+            first,
+            TeamOrchestrator.isolatedWorktreeBranch(
+                teamName: "term-mesh", agentName: "executor",
+                agentInstanceId: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+            )
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.isolatedWorktreeBranch(
+                teamName: "Team / Demo", agentName: "executor/one",
+                agentInstanceId: "INSTANCE / ONE"
+            ),
+            "team/team-demo/executor-one/instance-one"
+        )
+    }
+
+    func testIsolatedProvisioningRollsBackPartialSuccessAndStops() {
+        var attempted: [String] = []
+        var rolledBack: [String] = []
+        let agents = [
+            (name: "executor", instanceId: "one"),
+            (name: "reviewer", instanceId: "two"),
+            (name: "planner", instanceId: "three"),
+        ]
+
+        let result = TeamOrchestrator.provisionIsolatedWorktrees(
+            teamName: "demo", agents: agents,
+            create: { branch in
+                attempted.append(branch)
+                if branch.hasSuffix("/two") {
+                    return .failure(.rpcError("conflict at /existing/path"))
+                }
+                return .success(WorktreeInfo(
+                    name: "wt-\(branch)", path: "/tmp/\(branch)", branch: branch
+                ))
+            },
+            rollback: { rolledBack.append($0.branch) }
+        )
+
+        guard case .failure(let failure) = result else {
+            return XCTFail("partial provisioning unexpectedly succeeded")
+        }
+        XCTAssertEqual(failure.agentName, "reviewer")
+        XCTAssertEqual(failure.agentInstanceId, "two")
+        XCTAssertEqual(attempted, [
+            "team/demo/executor/one",
+            "team/demo/reviewer/two",
+        ])
+        XCTAssertEqual(rolledBack, ["team/demo/executor/one"])
+    }
+
+    func testUncommittedIsolatedWorktreesRollBackNewestFirst() {
+        let provisioned: [WorktreeInfo?] = [
+            WorktreeInfo(name: "wt-one", path: "/tmp/one", branch: "team/demo/executor/one"),
+            WorktreeInfo(name: "wt-two", path: "/tmp/two", branch: "team/demo/reviewer/two"),
+            nil,
+            WorktreeInfo(name: "wt-three", path: "/tmp/three", branch: "team/demo/planner/three"),
+        ]
+        var rolledBack: [String] = []
+        var logged: [(String, TeamOrchestrator.IsolatedWorktreeRollbackOutcome)] = []
+
+        let retained = TeamOrchestrator.rollbackUnownedIsolatedWorktrees(
+            provisioned: provisioned,
+            rollback: { info in
+                rolledBack.append(info.name)
+                return true
+            },
+            log: { info, outcome in logged.append((info.name, outcome)) }
+        )
+
+        // A pane is not ownership until the complete roster commits, so every
+        // provisioned checkout participates in rollback.
+        XCTAssertEqual(rolledBack, ["wt-three", "wt-two", "wt-one"])
+        XCTAssertTrue(retained.isEmpty)
+        XCTAssertEqual(logged.map(\.0), ["wt-three", "wt-two", "wt-one"])
+        XCTAssertEqual(logged.map(\.1), [.removed, .removed, .removed])
+    }
+
+    func testRetainedIsolatedWorktreeIsReportedInsteadOfForcedAway() {
+        let dirty = WorktreeInfo(
+            name: "wt-dirty", path: "/tmp/dirty", branch: "team/demo/executor/one"
+        )
+        let clean = WorktreeInfo(
+            name: "wt-clean", path: "/tmp/clean", branch: "team/demo/reviewer/two"
+        )
+        var attempts: [String] = []
+        var logged: [(String, TeamOrchestrator.IsolatedWorktreeRollbackOutcome)] = []
+
+        let retained = TeamOrchestrator.rollbackUnownedIsolatedWorktrees(
+            provisioned: [dirty, clean],
+            // The daemon removes with `force: false`, so a checkout carrying
+            // uncommitted work answers false rather than being deleted.
+            rollback: { info in
+                attempts.append(info.name)
+                return info.name != "wt-dirty"
+            },
+            log: { info, outcome in logged.append((info.name, outcome)) }
+        )
+
+        XCTAssertEqual(attempts, ["wt-clean", "wt-dirty"])
+        XCTAssertEqual(retained.map(\.name), ["wt-dirty"])
+        XCTAssertEqual(logged.map(\.1), [.removed, .retained])
+        // A refusal stops the sweep from lying about what is still on disk,
+        // and never turns into a forced delete of the user's work.
+        XCTAssertEqual(retained.first?.path, "/tmp/dirty")
+    }
 
     func testNativeAgentPaneExposesContextClearingRestart() throws {
         let presentation = try XCTUnwrap(Workspace.agentRestartPresentation(
