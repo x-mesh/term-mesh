@@ -659,6 +659,34 @@ final class PeerDaemonVersionTests: XCTestCase {
         XCTAssertTrue(exited)
     }
 
+    /// The picker labels a host with whatever the serving process answers in
+    /// the Hello handshake. The app-hosted server used to answer a hardcoded
+    /// "debug-server" — on every build, updated or not.
+    func test_appHostedServerAdvertisesTheBundleVersionNotAPlaceholder() {
+        let version = PeerHostCoordinator.advertisedAppVersion(
+            bundle: Bundle(for: PeerHostCoordinator.self)
+        )
+        XCTAssertNotNil(
+            PeerDaemonVersion.parseComponents(version),
+            "must be a real X.Y.Z version, got: \(version)"
+        )
+        XCTAssertNotEqual(version, "0.0.0", "the fallback must not be what ships")
+        XCTAssertNotEqual(version, "debug-server")
+    }
+
+    /// The raw plist value is untrusted: whitespace-only must fall back like
+    /// a missing key (advertising " \n" verbatim is how a picker shows an
+    /// empty version chip), and surrounding whitespace must not survive into
+    /// the wire string a client parses.
+    func test_advertisedAppVersionTrimsAndFallsBackHonestly() {
+        XCTAssertEqual(PeerHostCoordinator.advertisedAppVersion(rawBundleVersion: nil), "0.0.0")
+        XCTAssertEqual(PeerHostCoordinator.advertisedAppVersion(rawBundleVersion: " \n"), "0.0.0")
+        XCTAssertEqual(
+            PeerHostCoordinator.advertisedAppVersion(rawBundleVersion: " 0.194.0 "),
+            "0.194.0"
+        )
+    }
+
     // MARK: - Helpers (mirrors PeerSocketProberTests' local script runner)
 
     private func makeScratchDir() throws -> String {
