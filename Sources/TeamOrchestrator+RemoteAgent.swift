@@ -236,7 +236,18 @@ final class PendingPeerAgentSurfaceCleanupStore {
                       record.owningRemoteSockPath
                   )
             else { continue }
-            records.removeAll { $0.id == record.id }
+            // Spend only the record this pass actually terminated. While the
+            // await above was in flight, `enqueue` may have enriched the live
+            // record with the exact owning endpoint this snapshot did not
+            // have — and a nil-owner attempt resolves by the host's current
+            // route, whose `notFound` is indistinguishable from success.
+            // Dropping the enriched record on that answer would orphan the
+            // bridge on the endpoint that has it; leaving it costs one
+            // idempotent extra attempt on the next pass.
+            records.removeAll {
+                $0.id == record.id
+                    && $0.owningRemoteSockPath == record.owningRemoteSockPath
+            }
             persist()
         }
     }

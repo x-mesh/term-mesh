@@ -3603,6 +3603,59 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
         XCTAssertEqual(rolledBack?.agents[1].remoteSurfaceID, siblingSurfaceID)
     }
 
+    /// The retry pass snapshots records, then awaits each terminate. In that
+    /// window `enqueue` can enrich the live record with the exact owning
+    /// endpoint the snapshot did not have — and the in-flight nil-owner
+    /// attempt resolves by the host's current route, whose `notFound` reads
+    /// as success. Spending the record by id alone would drop the enriched
+    /// tombstone and orphan the bridge on the endpoint that has it.
+    @MainActor
+    func test_retrySpendsOnlyTheSnapshotItTerminated_notAnEnrichedRecord() async {
+        let suiteName = "CleanupEnrichRace-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("could not create isolated defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let cleanup = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults,
+            observeNotifications: false,
+            automaticRetryDelay: 60,
+            hostSockPathProvider: { _ in nil },
+            terminator: { _, _, _, _ in false }
+        )
+        let surfaceID = Data(repeating: 0x5A, count: 16)
+        cleanup.enqueue(hostKey: "ssh:host", surfaceID: surfaceID)
+
+        await cleanup.retryPending(
+            hostSockPath: { _ in "/tmp/serving.sock" },
+            terminate: { _, _, _, owner in
+                XCTAssertNil(owner, "the snapshot carried no owner")
+                // The enrichment lands while this attempt is in flight.
+                cleanup.enqueue(
+                    hostKey: "ssh:host",
+                    surfaceID: surfaceID,
+                    owningRemoteSockPath: "/run/user/1000/real-owner.sock"
+                )
+                return true  // wrong-owner notFound — indistinguishable from success
+            }
+        )
+        XCTAssertEqual(
+            cleanup.pendingRecords.map(\.owningRemoteSockPath),
+            ["/run/user/1000/real-owner.sock"],
+            "the enriched tombstone must survive the stale success"
+        )
+
+        // The next pass, armed with the recorded owner, is the one that spends it.
+        await cleanup.retryPending(
+            hostSockPath: { _ in "/tmp/serving.sock" },
+            terminate: { _, _, _, owner in
+                XCTAssertEqual(owner, "/run/user/1000/real-owner.sock")
+                return true
+            }
+        )
+        XCTAssertTrue(cleanup.pendingRecords.isEmpty)
+    }
+
     /// Detach/delete/destroy all funnel through this: a member whose bridge
     /// the peer owns gets the terminate, and nothing else does. A local native
     /// agent has no peer surface, and a borrowed (not spawned) surface belongs
