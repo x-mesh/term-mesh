@@ -6232,14 +6232,18 @@ extension TeamOrchestrator {
     ) -> String? {
         guard transaction.hasPrefix(".tx."),
               transaction.dropFirst(4).allSatisfy(\.isNumber) else { return nil }
-        let quoted = shellQuoted(transaction)
+        // The validation above reduces this to `.tx.` plus ASCII digits, so it
+        // is already safe to embed. Quoting it again inside the surrounding
+        // double-quoted path would make the single quotes literal and target
+        // `$dir/'.tx.1234'` instead of the staged transaction directory.
+        let safeTransaction = transaction
         let rollback = "while IFS= read -r n; do [ -n \"$n\" ] || continue; if [ -f \"$tx/$n.old\" ]; then mv -f \"$tx/$n.old\" \"$dir/$n\"; else rm -f \"$dir/$n\"; fi; done < \"$tx/committed\"; rm -rf \"$tx\""
         let action = commit
             ? "[ -f \"$tx.done\" ] && exit 0; [ -d \"$tx\" ] || exit 67; rollback() { " + rollback + "; }; trap rollback EXIT HUP INT TERM; for p in \"$tx\"/*.new; do [ -f \"$p\" ] || continue; n=${p##*/}; n=${n%.new}; [ ! -e \"$dir/$n\" ] || cp -p \"$dir/$n\" \"$tx/$n.old\"; mv -f \"$p\" \"$dir/$n\"; printf '%s\\n' \"$n\" >> \"$tx/committed\"; done; : > \"$tx.done\"; trap - EXIT HUP INT TERM; rm -rf \"$tx\""
             : rollback
         let guardTransaction = commit ? "" : "[ -d \"$tx\" ] || exit 0; "
         return "set -e; dir=\"$HOME/.term-mesh/agent-routes\"; tx=\"$dir/"
-            + quoted + "\"; " + guardTransaction + action
+            + safeTransaction + "\"; " + guardTransaction + action
     }
 
     static func finishAdoptedRemoteAgentRoutes(

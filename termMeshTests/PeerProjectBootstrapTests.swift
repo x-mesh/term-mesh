@@ -1523,8 +1523,10 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertTrue(launch.hasPrefix("export PATH="), "PATH has to be set before anything runs")
         XCTAssertEqual(
             RemoteShellPath.binDirs.first,
-            "$HOME/.local/bin"
+            "/Applications/term-mesh.app/Contents/Resources/bin",
+            "the app-matched CLI must win over a stale user install"
         )
+        XCTAssertTrue(RemoteShellPath.binDirs.contains("$HOME/.local/bin"))
         XCTAssertTrue(launch.contains("$HOME/.local/bin"))
         XCTAssertTrue(launch.contains(":\"$PATH\""), "the host's own PATH must survive, last")
         // Ordering matters as much as membership: a cd into the project before

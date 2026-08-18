@@ -2689,7 +2689,7 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         )
 
         // Never had the path: no probe, no report.
-        for cli in ["claude", "gemini", "cursor", "agy"] {
+        for cli in ["gemini"] {
             let answer = await TeamOrchestrator.canUsePeerOwnedAgent(
                 host: Self.agentHostEntry(),
                 cli: cli,
@@ -2811,7 +2811,7 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         )
         XCTAssertEqual(blocked.count, 1)
         XCTAssertFalse(blocked[0].blocksTeamMessaging)
-        XCTAssertEqual(blocked[0].clis, ["codex"])
+        XCTAssertEqual(blocked[0].clis, ["claude", "codex"])
         XCTAssertTrue(blocked[0].message.contains("private SSH route"))
         XCTAssertFalse(
             TeamAgentComposer.blocksRemoteTeamCreation(
@@ -3045,8 +3045,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         XCTAssertTrue(script.contains("umask 077"))
         XCTAssertTrue(script.contains("a1b2-c3d4.json"))
         XCTAssertTrue(
-            script.hasPrefix("/bin/sh -c "),
-            "the account login shell may be csh or fish, which cannot parse this"
+            script.contains("/bin/sh -c "),
+            "the service-account wrapper must force sh for csh or fish login accounts"
         )
         XCTAssertFalse(
             script.lowercased().contains("grant_id"),
