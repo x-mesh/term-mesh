@@ -557,16 +557,23 @@ async fn reader_loop(
                         }
                     }
                 } else if let Some(project) = request.project.as_ref() {
-                    match host.upsert_project_presentation(&project_owner_peer_ids, project) {
-                        Ok((revision, changed)) => (
-                            UpsertProjectPresentationResponse {
-                                request_id: request.request_id,
-                                ok: true,
-                                revision,
-                                ..Default::default()
-                            },
-                            changed,
-                        ),
+                    match host
+                        .upsert_project_presentation_with_released(&project_owner_peer_ids, project)
+                    {
+                        Ok((revision, changed, released)) => {
+                            for surface_id in &released {
+                                reap_if_abandoned(&host, surface_id);
+                            }
+                            (
+                                UpsertProjectPresentationResponse {
+                                    request_id: request.request_id,
+                                    ok: true,
+                                    revision,
+                                    ..Default::default()
+                                },
+                                changed,
+                            )
+                        }
                         Err(code) => (
                             UpsertProjectPresentationResponse {
                                 request_id: request.request_id,

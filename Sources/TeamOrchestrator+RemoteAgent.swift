@@ -412,7 +412,11 @@ extension TeamOrchestrator {
                 "Could not persist project \(team.id) on \(host.displayName): "
                     + "project.presentation.v1 requires every agent on the leader host"
             )
-            return true
+            // Same-host members acquire their daemon-local surface ids only
+            // after EnsureSurface returns. Keep the bounded publisher alive
+            // across that creation window; a genuinely mixed-host topology is
+            // terminal until a later roster mutation schedules a new signature.
+            return team.agents.contains { $0.hostKey != hostKey }
         }
 
         var project = Termmesh_Peer_V1_Team()
@@ -795,6 +799,7 @@ extension TeamOrchestrator {
         case promptStagingFailed(String)
         case environmentStagingFailed(String)
         case hostUpdateRequired(host: String, version: String?)
+        case durableAgentUnavailable(cli: String, host: String, reason: String)
         /// The peer never showed a pane in the workspace the leader was going to
         /// take. Everything after `host` is what the placement loop already knew
         /// and used to throw away: without it the failure reads as "it did not
@@ -839,6 +844,10 @@ extension TeamOrchestrator {
                 let serving = version.map { "term-mesh \($0)" } ?? "an unknown term-mesh version"
                 return "\(host) is serving \(serving), which cannot route remote team messages; "
                     + "update and restart term-mesh on that host before adding agents"
+            case .durableAgentUnavailable(let cli, let host, let reason):
+                return "cannot create durable \(cli) agent on \(host): \(reason). "
+                    + "A Project that must survive every viewer cannot use an SSH-owned fallback; "
+                    + "update/restart the host and retry."
             case .projectWorkspaceUnavailable(let host, let workspaceID, let attempts, let seedRequested):
                 var detail = "could not prepare the project workspace on \(host)"
                 if let workspaceID {
@@ -3440,6 +3449,21 @@ extension TeamOrchestrator {
         agentInstanceId reservedAgentInstanceId: String? = nil
     ) async throws -> AgentMember {
         guard let team = teams[teamName] else { throw RemoteAgentError.teamNotFound(teamName) }
+        let requiresDurableRemoteMember: Bool
+        if team.ownsRemotePresentation, case .peer = team.leaderEndpoint {
+            requiresDurableRemoteMember = true
+        } else {
+            requiresDurableRemoteMember = false
+        }
+        if requiresDurableRemoteMember,
+           case let .peer(leaderHostKey) = team.leaderEndpoint,
+           leaderHostKey != hostKey {
+            throw RemoteAgentError.durableAgentUnavailable(
+                cli: cli,
+                host: hostKey,
+                reason: "project.presentation.v1 requires every member on the leader host"
+            )
+        }
         guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) else {
             throw RemoteAgentError.hostNotFound(hostKey)
         }
@@ -3616,6 +3640,17 @@ extension TeamOrchestrator {
             peerBridgePath: binaries.bridgePath,
             sshTarget: host.sshTarget
         )
+        if requiresDurableRemoteMember, factory == .localNativeBridge {
+            let reason: String
+            if case .blocked(let block) = availability {
+                reason = block.rawValue
+            } else {
+                reason = "no daemon-owned surface recipe"
+            }
+            throw RemoteAgentError.durableAgentUnavailable(
+                cli: cli, host: host.displayName, reason: reason
+            )
+        }
         // Terminal and peer-owned routes need the serving host to proxy the
         // grant. Only SSH-owned Native has its own authenticated control hop.
         guard host.supportsRemoteTeamRoute != false || factory == .localNativeBridge else {
@@ -3670,6 +3705,9 @@ extension TeamOrchestrator {
                         error, cli: cli, hostName: host.displayName
                     )
                 )
+                if requiresDurableRemoteMember {
+                    throw RemoteAgentError.environmentStagingFailed(host.displayName)
+                }
                 return try await attachSSHOwnedNativeAgent()
             } catch {
                 // The host's answer, not ours. `canUsePeerOwnedAgent` read the
@@ -3684,6 +3722,11 @@ extension TeamOrchestrator {
                         .ensureRefused, cli: cli, hostName: host.displayName
                     )
                 )
+                if requiresDurableRemoteMember {
+                    throw RemoteAgentError.durableAgentUnavailable(
+                        cli: cli, host: host.displayName, reason: "ensure refused"
+                    )
+                }
                 return try await attachSSHOwnedNativeAgent()
             }
         case .localNativeBridge:
@@ -4106,18 +4149,15 @@ extension TeamOrchestrator {
         let reachableOverSSH = !(sshTarget ?? "").isEmpty
         // Native panes off, or a CLI no panel can hold (gemini): unchanged.
         guard AgentPipeTransport.canHoldNatively(cli: cli) else { return .terminal }
-        if AgentPipeTransport.isPipeOnly(cli: cli) {
-            return reachableOverSSH ? .localNativeBridge : .terminal
-        }
         guard reachableOverSSH else { return .terminal }
-        // Prefer the durable peer-owned renderer for codex/kiro when the
-        // serving daemon can hold it. Native is nevertheless a rendering
+        // Prefer the durable peer-owned renderer whenever the serving daemon
+        // can hold it. Claude speaks stream-json directly; the other
+        // session-shaped CLIs use tm-agent-bridge. Native is nevertheless a rendering
         // contract, not a durability hint: an older daemon must fall back to
         // the already-supported SSH-owned native process, never to a terminal.
-        if AgentPipeTransport.needsBridge(cli: cli),
-           !AgentPipeTransport.isPipeOnly(cli: cli),
-           hostAdvertisesAgentSurfaces,
-           !peerBridgePath.isEmpty {
+        let hasPeerRecipe = cli == "claude"
+            || (AgentPipeTransport.needsBridge(cli: cli) && !peerBridgePath.isEmpty)
+        if hostAdvertisesAgentSurfaces, hasPeerRecipe {
             return .peerOwnedAgent
         }
         return .localNativeBridge
@@ -4235,8 +4275,8 @@ extension TeamOrchestrator {
     /// Whether the peer-owned path is open for this member.
     ///
     /// `notApplicable` is not a failure and must not be reported as one: a
-    /// claude member never had this path, so nothing was given up by not
-    /// taking it. Only `blocked` describes something the user lost.
+    /// terminal-only or turn-per-process member has no daemon-owned native
+    /// recipe. Only `blocked` describes something the user lost.
     enum PeerOwnedAgentAvailability: Equatable, Sendable {
         case available
         case notApplicable
@@ -4309,11 +4349,11 @@ extension TeamOrchestrator {
         binaries: RemoteAgentBinaries
     ) async -> PeerOwnedAgentAvailability {
         guard AgentPipeTransport.canHoldNatively(cli: cli),
-              AgentPipeTransport.needsBridge(cli: cli),
-              !AgentPipeTransport.isPipeOnly(cli: cli),
               let sshTarget = host.sshTarget, !sshTarget.isEmpty
         else { return .notApplicable }
-        guard !binaries.bridgePath.isEmpty else { return .blocked(.bridgeMissing) }
+        if AgentPipeTransport.needsBridge(cli: cli), binaries.bridgePath.isEmpty {
+            return .blocked(.bridgeMissing)
+        }
         // Probe the endpoint the ensure will actually use, not the one the
         // sidebar is mirroring from. On a host that named a session owner
         // those differ, and asking the wrong one is how a capable machine
@@ -4424,7 +4464,34 @@ extension TeamOrchestrator {
         model: String,
         binaries: RemoteAgentBinaries
     ) -> PeerRunnerSurfaceSpec {
-        PeerRunnerSurfaceSpec(
+        if cli == "claude" {
+            let launch = AgentSession.claudeLaunch(
+                claudePath: binaries.cliPath.isEmpty ? "claude" : binaries.cliPath,
+                model: model,
+                instructions: "",
+                extraArgs: [],
+                workingDirectory: workingDirectory
+            )
+            // The daemon extracts `--cli claude` from the ensure argv to label
+            // later attaches. Keep that metadata in the shell's positional
+            // arguments; the exec command itself forwards only Claude's real
+            // stream-json flags.
+            let command = ([launch.executable] + launch.arguments)
+                .map(Self.shellQuoted)
+                .joined(separator: " ")
+            return PeerRunnerSurfaceSpec(
+                key: peerAgentEnsureKey(
+                    teamName: teamName,
+                    agentInstanceId: surfaceInstanceId ?? agentInstanceId
+                ),
+                cwd: workingDirectory,
+                executable: "/bin/sh",
+                args: ["-c", "exec \(command)", "--cli", "claude"],
+                restartPolicy: .never,
+                kind: SessionHostPanes.agentSurfaceType
+            )
+        }
+        return PeerRunnerSurfaceSpec(
             key: peerAgentEnsureKey(
                 teamName: teamName,
                 agentInstanceId: surfaceInstanceId ?? agentInstanceId

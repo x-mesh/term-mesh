@@ -2291,10 +2291,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
 
     /// The whole routing table in one place.
     ///
-    /// The two exclusions are the ones most likely to be "simplified" away
-    /// later, so they are asserted rather than described: claude never takes
-    /// the peer-owned path (`tm-agent-bridge --cli` has no claude value), and
-    /// cursor/agy stay on the local bridge until their own change lands.
+    /// Claude speaks stream-json directly from a daemon-owned agent surface;
+    /// every other native CLI uses the bridge on that daemon.
     @MainActor
     func test_factoryMatrix_capabilityTimesBridgeTimesCLI() {
         func route(
@@ -2329,12 +2327,12 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             )
         }
 
-        // Turn-per-process CLIs keep today's local bridge (R8).
+        // Turn-per-process CLIs can be owned by the peer bridge too.
         for cli in ["cursor", "agy"] {
-            XCTAssertEqual(route(cli, capability: true), .localNativeBridge, cli)
+            XCTAssertEqual(route(cli, capability: true), .peerOwnedAgent, cli)
             XCTAssertEqual(
                 route(cli, capability: false), .localNativeBridge,
-                "\(cli): unaffected by the host capability — nothing runs there"
+                "\(cli): an old daemon keeps the existing SSH-owned fallback"
             )
             XCTAssertEqual(
                 route(cli, capability: true, sshTarget: nil), .terminal,
@@ -2342,8 +2340,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             )
         }
 
-        // Claude speaks NDJSON directly and already has an SSH-native path.
-        XCTAssertEqual(route("claude", capability: true), .localNativeBridge)
+        // Claude needs no bridge, only an agent-capable daemon.
+        XCTAssertEqual(route("claude", capability: true), .peerOwnedAgent)
         XCTAssertEqual(route("claude", capability: false), .localNativeBridge)
         // gemini: the bridge speaks it, but no native panel holds it today.
         XCTAssertEqual(route("gemini", capability: true), .terminal)
@@ -2399,16 +2397,14 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         //                     ---------------  ---------------
         //   (cap, bridge) →   00  01  10  11   00  01  10  11
         let table: [(String, [Factory])] = [
-            // Claude has no peer-owned recipe, but its direct SSH stream is native.
-            ("claude", [T, T, T, T, L, L, L, L]),
+            // Claude's direct stream-json recipe does not depend on the bridge.
+            ("claude", [T, T, T, T, L, L, P, P]),
             ("gemini", [T, T, T, T, T, T, T, T]),
             // Peer ownership only in the last cell; every other SSH cell remains native.
             ("codex", [T, T, T, T, L, L, L, P]),
             ("kiro", [T, T, T, T, L, L, L, P]),
-            // Unmoved (R8). The bridge these run is this Mac's, so the peer's
-            // capability and the peer's bridge are both irrelevant to them.
-            ("cursor", [T, T, T, T, L, L, L, L]),
-            ("agy", [T, T, T, T, L, L, L, L]),
+            ("cursor", [T, T, T, T, L, L, L, P]),
+            ("agy", [T, T, T, T, L, L, L, P]),
         ]
 
         for (cli, expected) in table {
@@ -2581,7 +2577,7 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         )
         XCTAssertEqual(notices.count, 1, "one host gets one preflight warning")
         XCTAssertEqual(notices[0].servingVersion, "v0.179.0")
-        XCTAssertEqual(notices[0].clis, ["codex", "kiro"])
+        XCTAssertEqual(notices[0].clis, ["claude", "codex", "kiro"])
         XCTAssertTrue(notices[0].message.contains("mac-sub"))
         XCTAssertTrue(notices[0].message.contains("term-mesh v0.179.0"))
         XCTAssertTrue(notices[0].message.contains("through this Mac over SSH"))
@@ -2620,15 +2616,21 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             ).isEmpty,
             "a compatible serving daemon needs no warning"
         )
-        XCTAssertTrue(
+        var staleHost = oldHost
+        staleHost.supportsPeerOwnedAgentHosting = false
+        XCTAssertEqual(
             TeamAgentComposer.peerOwnedFallbackNotices(
-                agents: [row("claude")], hosts: [{
-                    var host = oldHost
-                    host.supportsPeerOwnedAgentHosting = false
-                    return host
-                }()]
-            ).isEmpty,
-            "Claude is SSH-owned by design, not because this host is stale"
+                agents: [row("claude")], hosts: [staleHost]
+            ).first?.clis,
+            ["claude"],
+            "Claude now has a durable peer-owned recipe too"
+        )
+        XCTAssertTrue(
+            TeamAgentComposer.blocksRemoteTeamCreation(
+                agents: [row("claude")], hosts: [staleHost],
+                requiresDurableProject: true
+            ),
+            "New Project must not silently create a viewer-owned Claude worker"
         )
     }
 
@@ -3441,6 +3443,36 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
         XCTAssertFalse(
             spec.args.contains("--exe"),
             "the role's own path is not a substitute for the executable's"
+        )
+    }
+
+    @MainActor
+    func test_claudeEnsureSpecRunsDirectStreamJsonAndKeepsRendererMetadataOutOfArgv() {
+        let spec = TeamOrchestrator.peerAgentSurfaceSpec(
+            teamName: "team",
+            agentInstanceId: "claude-instance",
+            cli: "claude",
+            workingDirectory: "/root/work",
+            model: "opus",
+            binaries: TeamOrchestrator.RemoteAgentBinaries(
+                cliPath: "/root/.local/bin/claude",
+                bridgePath: "",
+                cliAvailable: true
+            )
+        )
+
+        XCTAssertEqual(spec.executable, "/bin/sh")
+        XCTAssertEqual(spec.kind, SessionHostPanes.agentSurfaceType)
+        XCTAssertEqual(spec.args.prefix(2), ["-c", spec.args[1]])
+        XCTAssertTrue(spec.args[1].contains("/root/.local/bin/claude"))
+        XCTAssertTrue(spec.args[1].contains("--input-format"))
+        XCTAssertTrue(spec.args[1].contains("stream-json"))
+        XCTAssertTrue(spec.args[1].contains("--model"))
+        XCTAssertTrue(spec.args[1].contains("opus"))
+        XCTAssertEqual(Array(spec.args.suffix(2)), ["--cli", "claude"])
+        XCTAssertFalse(
+            spec.args[1].contains("--cli"),
+            "renderer metadata must stay in shell positional args, not Claude's argv"
         )
     }
 

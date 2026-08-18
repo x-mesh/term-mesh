@@ -1284,6 +1284,15 @@ impl PeerHost {
         owner_peer_ids: &[Vec<u8>],
         project: &peer_proto::v1::Team,
     ) -> Result<(u64, bool), &'static str> {
+        self.upsert_project_presentation_with_released(owner_peer_ids, project)
+            .map(|(revision, changed, _)| (revision, changed))
+    }
+
+    pub(crate) fn upsert_project_presentation_with_released(
+        self: &Arc<Self>,
+        owner_peer_ids: &[Vec<u8>],
+        project: &peer_proto::v1::Team,
+    ) -> Result<(u64, bool, Vec<Vec<u8>>), &'static str> {
         if owner_peer_ids.is_empty()
             || owner_peer_ids.iter().any(|id| id.len() != 16)
             || project.project_id.is_empty()
@@ -1355,6 +1364,15 @@ impl PeerHost {
         let _persist_guard = self.project_presentations_persistence.lock().unwrap();
         let owner = hex::encode(&owner_peer_ids[0]);
         let mut records = self.project_presentations.lock().unwrap();
+        let previous_surface_ids: Vec<Vec<u8>> = records
+            .get(&project.project_id)
+            .into_iter()
+            .flat_map(|record| {
+                std::iter::once(&record.leader_surface_id)
+                    .chain(record.members.iter().map(|member| &member.surface_id))
+            })
+            .filter_map(|encoded| hex::decode(encoded).ok())
+            .collect();
         if let Some(existing) = records.get(&project.project_id) {
             // Surface liveness is not an ownership-transfer protocol. A dead
             // leader may be replaced by its owner, but it must not turn a
@@ -1403,7 +1421,7 @@ impl PeerHost {
                 for surface in watched {
                     watchers_changed |= self.watch_presentation_surface(surface);
                 }
-                return Ok((existing_revision, watchers_changed));
+                return Ok((existing_revision, watchers_changed, Vec::new()));
             }
             record.revision = revision;
         }
@@ -1432,7 +1450,11 @@ impl PeerHost {
         for surface in watched {
             self.watch_presentation_surface(surface);
         }
-        Ok((revision, true))
+        let released = previous_surface_ids
+            .into_iter()
+            .filter(|surface_id| !seen_surfaces.contains(surface_id))
+            .collect();
+        Ok((revision, true, released))
     }
 
     /// Wire the daemon's system monitor so connections can push `HostStats`.
