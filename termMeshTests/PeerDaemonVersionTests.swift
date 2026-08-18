@@ -659,6 +659,21 @@ final class PeerDaemonVersionTests: XCTestCase {
         XCTAssertTrue(exited)
     }
 
+    /// The picker labels a host with whatever the serving process answers in
+    /// the Hello handshake. The app-hosted server used to answer a hardcoded
+    /// "debug-server" — on every build, updated or not.
+    func test_appHostedServerAdvertisesTheBundleVersionNotAPlaceholder() {
+        let version = PeerHostCoordinator.advertisedAppVersion(
+            bundle: Bundle(for: PeerHostCoordinator.self)
+        )
+        XCTAssertNotNil(
+            PeerDaemonVersion.parseComponents(version),
+            "must be a real X.Y.Z version, got: \(version)"
+        )
+        XCTAssertNotEqual(version, "0.0.0", "the fallback must not be what ships")
+        XCTAssertNotEqual(version, "debug-server")
+    }
+
     // MARK: - Helpers (mirrors PeerSocketProberTests' local script runner)
 
     private func makeScratchDir() throws -> String {
