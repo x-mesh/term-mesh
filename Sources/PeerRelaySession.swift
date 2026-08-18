@@ -1469,12 +1469,18 @@ final class PeerRelaySession {
     /// coalesce one half-alive tunnel reset instead of restarting each other.
     private var ownedTransportGeneration: UInt64 = 0
     private var ownedTransportRecovery: ((UInt64) async -> UInt64)?
+    /// False once Disconnect Host retires the lease behind this pane. The old
+    /// local socket path remains on the session for diagnostics, but nothing
+    /// will ever listen there again.
+    private var ownedTransportMayReconnect: (() -> Bool)?
 
     func configureOwnedTransportRecovery(
         generation: UInt64,
+        mayReconnect: @escaping () -> Bool,
         handler: @escaping (UInt64) async -> UInt64
     ) {
         ownedTransportGeneration = generation
+        ownedTransportMayReconnect = mayReconnect
         ownedTransportRecovery = handler
     }
 
@@ -3101,22 +3107,42 @@ final class PeerRelaySession {
     /// the same pane resumes once the same remote surface is reachable.
     /// Workspace-mirror panes use their controller's shared reconnect loop.
     private func reconnectOwnedSession(afterLosing failedSession: PeerSession) async -> Bool {
-        guard ownsSession, !isTorndown, session === failedSession else {
+        guard Self.shouldReconnectOwnedSession(
+            ownsSession: ownsSession,
+            isTorndown: isTorndown,
+            isCurrentSession: session === failedSession,
+            hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
+        ) else {
             return session !== failedSession
         }
         await failedSession.stopHeartbeat()
         await refreshOwnedTransportForReconnect(reason: "owned peer session lost")
-        guard !isTorndown, session === failedSession else {
+        guard Self.shouldReconnectOwnedSession(
+            ownsSession: ownsSession,
+            isTorndown: isTorndown,
+            isCurrentSession: session === failedSession,
+            hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
+        ) else {
             return session !== failedSession
         }
         var attempt = 0
-        while !isTorndown, session === failedSession {
+        while Self.shouldReconnectOwnedSession(
+            ownsSession: ownsSession,
+            isTorndown: isTorndown,
+            isCurrentSession: session === failedSession,
+            hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
+        ) {
             attempt += 1
             let delay = Self.reconnectDelaySeconds(attempt: attempt)
             if delay > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
-            guard !isTorndown, session === failedSession else { break }
+            guard Self.shouldReconnectOwnedSession(
+                ownsSession: ownsSession,
+                isTorndown: isTorndown,
+                isCurrentSession: session === failedSession,
+                hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
+            ) else { break }
             #if DEBUG
             dlog("peer.relay.reconnect.attempt n=\(attempt) delay=\(delay)")
             #endif
@@ -3131,6 +3157,15 @@ final class PeerRelaySession {
             }
         }
         return session !== failedSession
+    }
+
+    nonisolated static func shouldReconnectOwnedSession(
+        ownsSession: Bool,
+        isTorndown: Bool,
+        isCurrentSession: Bool,
+        hostLeaseIsActive: Bool
+    ) -> Bool {
+        ownsSession && !isTorndown && isCurrentSession && hostLeaseIsActive
     }
 
     /// One reconnect attempt after the old receive loop has already failed.

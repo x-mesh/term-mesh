@@ -1060,4 +1060,14 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             .abandon
         )
     }
+
+    func test_reconnectStep_abandonsWhenHostLeaseWasRetired() {
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.reconnectStep(
+                isTornDown: false, hasWorkspace: true, isCancelled: false,
+                hostLeaseIsActive: false
+            ),
+            .abandon
+        )
+    }
 }

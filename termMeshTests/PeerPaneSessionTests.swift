@@ -1162,6 +1162,17 @@ final class PeerPaneSessionTests: XCTestCase {
         )
     }
 
+    func test_ownedSessionReconnectStopsWhenHostLeaseWasRetired() {
+        XCTAssertTrue(PeerRelaySession.shouldReconnectOwnedSession(
+            ownsSession: true, isTorndown: false,
+            isCurrentSession: true, hostLeaseIsActive: true
+        ))
+        XCTAssertFalse(PeerRelaySession.shouldReconnectOwnedSession(
+            ownsSession: true, isTorndown: false,
+            isCurrentSession: true, hostLeaseIsActive: false
+        ))
+    }
+
     @MainActor
     func test_registry_concurrentFirstAcquireYieldsOneLease() async throws {
         let registry = PeerPaneHostRegistry.shared
