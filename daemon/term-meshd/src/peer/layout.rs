@@ -844,6 +844,18 @@ impl Broadcaster {
                 },
             );
         }
+        // The target can disconnect after it was selected but before the
+        // pending entry above was installed. Its BroadcastGuard then had no
+        // entry to remove. Re-check registration after insertion: if it is
+        // already gone, remove the orphan now. If it drops after this check,
+        // BroadcastGuard::drop performs the same cleanup.
+        if !self.clients.lock().unwrap().contains_key(&target.0) {
+            self.leader_pending
+                .lock()
+                .unwrap()
+                .remove(&request.request_id);
+            return Err("authorized peer viewer is unavailable".into());
+        }
         let envelope = Envelope {
             seq: correlation_id,
             correlation_id: 0,
@@ -908,6 +920,16 @@ impl BroadcastGuard {
 impl Drop for BroadcastGuard {
     fn drop(&mut self) {
         self.broadcaster.clients.lock().unwrap().remove(&self.id);
+        // A reverse leader request is scoped to this exact connection. Once
+        // the connection is gone no response can legitimately satisfy it, so
+        // remove it now and drop its oneshot sender. Besides waking the caller
+        // immediately, this lets an idempotent retry reuse the request_id
+        // instead of failing with `request_id already in flight` until timeout.
+        self.broadcaster
+            .leader_pending
+            .lock()
+            .unwrap()
+            .retain(|_, pending| pending.connection_id != self.id);
     }
 }
 
@@ -2332,6 +2354,57 @@ mod tests {
         );
         assert!(router.resolve_team_leader(authorized.connection_id(), correlation_id, response));
         assert!(call.await.unwrap().unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn dropping_leader_connection_releases_request_id_for_retry() {
+        let router = Arc::new(Broadcaster::new());
+        let peer_id = vec![0xA1; 16];
+        let request = TeamLeaderCommandRequest {
+            request_id: vec![0x42; peer_proto::team_leader::REQUEST_ID_BYTES],
+            method: "team.read".into(),
+            params_json: "{}".into(),
+            ..Default::default()
+        };
+
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        let first_guard = router.register(first_tx, Arc::new(AtomicU64::new(10)), peer_id.clone());
+        let first_router = Arc::clone(&router);
+        let first_request = request.clone();
+        let first_call =
+            tokio::spawn(
+                async move { first_router.call_team_leader(first_request, &peer_id).await },
+            );
+        first_rx.recv().await.expect("first targeted request");
+        drop(first_guard);
+        assert_eq!(
+            first_call.await.unwrap().unwrap_err(),
+            "peer viewer dropped the command response"
+        );
+
+        let retry_peer_id = vec![0xA1; 16];
+        let (retry_tx, mut retry_rx) = mpsc::channel(4);
+        let retry_guard = router.register(
+            retry_tx,
+            Arc::new(AtomicU64::new(20)),
+            retry_peer_id.clone(),
+        );
+        let retry_router = Arc::clone(&router);
+        let retry_request = request.clone();
+        let retry = tokio::spawn(async move {
+            retry_router
+                .call_team_leader(retry_request, &retry_peer_id)
+                .await
+        });
+        let envelope = retry_rx.recv().await.expect("retried request");
+        let response = TeamLeaderCommandResponse {
+            request_id: request.request_id,
+            ok: true,
+            result_json: "{}".into(),
+            ..Default::default()
+        };
+        assert!(router.resolve_team_leader(retry_guard.connection_id(), envelope.seq, response,));
+        assert!(retry.await.unwrap().unwrap().ok);
     }
 
     #[test]

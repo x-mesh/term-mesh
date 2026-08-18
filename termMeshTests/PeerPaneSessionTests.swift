@@ -9,7 +9,54 @@ import PeerProto
 @testable import term_mesh
 #endif
 
+private actor AsyncFlag {
+    private var value = false
+
+    func set() { value = true }
+    func read() -> Bool { value }
+}
+
 final class PeerPaneSessionTests: XCTestCase {
+
+    func testLeaderSessionGateKeepsHealOutOfInflightCommand() async {
+        let gate = RelayLeaderSessionGate()
+        await gate.acquireCommand()
+
+        let healAcquired = AsyncFlag()
+        let healTask = Task {
+            await gate.acquireHeal()
+            await healAcquired.set()
+            await gate.releaseHeal()
+        }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let healedPrematurely = await healAcquired.read()
+        XCTAssertFalse(healedPrematurely)
+
+        await gate.releaseCommand()
+        await healTask.value
+        let healed = await healAcquired.read()
+        XCTAssertTrue(healed)
+    }
+
+    func testLeaderSessionGateKeepsNewCommandOutOfHealSwap() async {
+        let gate = RelayLeaderSessionGate()
+        await gate.acquireHeal()
+
+        let commandAcquired = AsyncFlag()
+        let commandTask = Task {
+            await gate.acquireCommand()
+            await commandAcquired.set()
+            await gate.releaseCommand()
+        }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let commandRanPrematurely = await commandAcquired.read()
+        XCTAssertFalse(commandRanPrematurely)
+
+        await gate.releaseHeal()
+        await commandTask.value
+        let commandRan = await commandAcquired.read()
+        XCTAssertTrue(commandRan)
+    }
 
     @MainActor
     func testAdoptedProjectCleanupOwnershipSeparatesOwnerFromViewer() {

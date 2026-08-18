@@ -1132,6 +1132,69 @@ private final class RelayPtyDataSink: @unchecked Sendable {
     }
 }
 
+/// Serializes correctness-critical reverse leader RPCs with a resume-heal
+/// session swap. A leader request is received on one authenticated peer
+/// connection and its response must go back on that exact connection. Closing
+/// that connection while the app is still computing the response loses the
+/// result and used to make the response send tear down the replacement session.
+///
+/// Commands may run back-to-back, but once a heal is waiting it gets exclusive
+/// ownership before another command starts. The pump has only one receive loop,
+/// so there is normally at most one command holder; the count keeps the contract
+/// explicit and makes the gate safe if dispatch becomes concurrent later.
+actor RelayLeaderSessionGate {
+    private var activeCommands = 0
+    private var healActive = false
+    private var waitingCommands: [CheckedContinuation<Void, Never>] = []
+    private var waitingHeals: [CheckedContinuation<Void, Never>] = []
+
+    func acquireCommand() async {
+        if !healActive, waitingHeals.isEmpty {
+            activeCommands += 1
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waitingCommands.append(continuation)
+        }
+    }
+
+    func releaseCommand() {
+        precondition(activeCommands > 0)
+        activeCommands -= 1
+        grantNextIfPossible()
+    }
+
+    func acquireHeal() async {
+        if !healActive, activeCommands == 0 {
+            healActive = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waitingHeals.append(continuation)
+        }
+    }
+
+    func releaseHeal() {
+        precondition(healActive)
+        healActive = false
+        grantNextIfPossible()
+    }
+
+    private func grantNextIfPossible() {
+        guard activeCommands == 0, !healActive else { return }
+        if !waitingHeals.isEmpty {
+            healActive = true
+            waitingHeals.removeFirst().resume()
+            return
+        }
+        guard !waitingCommands.isEmpty else { return }
+        let commands = waitingCommands
+        waitingCommands.removeAll(keepingCapacity: true)
+        activeCommands = commands.count
+        for command in commands { command.resume() }
+    }
+}
+
 /// Manages the full relay lifetime for one remote-pane window.
 /// 1. Creates a listener socket that the relay binary will connect to.
 /// 2. Holds a PeerSession to the remote host.
@@ -1244,6 +1307,9 @@ final class PeerRelaySession {
     /// `RelayGapHealScheduler`). At most one of the two exists per session.
     private var gapHealScheduler: RelayGapHealScheduler?
     private var resizeAuthorityEligible = false
+    /// A resume reconnect may not retire the connection carrying an in-flight
+    /// reverse leader request. See `RelayLeaderSessionGate`.
+    private let leaderSessionGate = RelayLeaderSessionGate()
 
     // ── Callback (agent) delivery ────────────────────────────────────
     //
@@ -2414,15 +2480,49 @@ final class PeerRelaySession {
                         // request back over the already-authenticated peer
                         // session; answer it here without app activation or a
                         // local TERMMESH_SOCKET ever crossing machines.
+                        await self.leaderSessionGate.acquireCommand()
+                        // A heal that was already exclusive when this frame
+                        // arrived may have retired its connection before the
+                        // command acquired the gate. Do not execute a command
+                        // whose response can no longer return on that exact
+                        // connection: the daemon drops the pending route and
+                        // the CLI can retry the same request_id safely.
+                        if let liveSession = await self.session, liveSession !== currentSession {
+                            await self.leaderSessionGate.releaseCommand()
+                            currentSession = liveSession
+                            expectedByteSeq = nil
+                            gapBytesTotal = 0
+                            gapCount = 0
+                            resumeTransitionGate.adoptCommittedSession()
+                            continue pumpLoop
+                        }
                         let response = await GhosttyPaneSurfaceProvider
                             .handleRemoteLeaderCommand(request)
+                        var responseError: Error?
                         do {
                             try await currentSession.sendTeamLeaderCommandResponse(
                                 response,
                                 correlationID: correlationID
                             )
                         } catch {
-                            endReason = "hostToRelay-leader-response-error"
+                            responseError = error
+                        }
+                        await self.leaderSessionGate.releaseCommand()
+                        if let responseError {
+                            // A session replacement outside this command gate
+                            // (for example a future reconnect path) makes this
+                            // send failure stale. Adopt the live replacement;
+                            // never let failure on a retired connection destroy
+                            // the connection that superseded it.
+                            if let swapped = await self.session, swapped !== currentSession {
+                                currentSession = swapped
+                                expectedByteSeq = nil
+                                gapBytesTotal = 0
+                                gapCount = 0
+                                resumeTransitionGate.adoptCommittedSession()
+                                continue pumpLoop
+                            }
+                            endReason = "hostToRelay-leader-response-error error=\(responseError)"
                             break pumpLoop
                         }
                         continue pumpLoop
@@ -2758,7 +2858,20 @@ final class PeerRelaySession {
     // subscriber + replay snapshot.
     private func performResumeHeal(reason: String) async {
         guard !isTorndown, !resumeInFlight else { return }
-        guard let oldSession = session else { return }
+        resumeInFlight = true
+        defer { resumeInFlight = false }
+
+        // A reverse leader request must answer on the same authenticated
+        // connection that delivered it. Wait before capturing `oldSession`,
+        // and keep exclusive ownership until the replacement is committed and
+        // the old transport is retired. This closes #292's lag/heal/RPC race.
+        await leaderSessionGate.acquireHeal()
+        await performResumeHealExclusively(reason: reason)
+        await leaderSessionGate.releaseHeal()
+    }
+
+    private func performResumeHealExclusively(reason: String) async {
+        guard !isTorndown, let oldSession = session else { return }
 
         guard ownsSession else {
             // Shared (workspace-mirror) session: this pane doesn't own the
@@ -2778,9 +2891,6 @@ final class PeerRelaySession {
             return
         }
         guard let oldTransport = transport else { return }
-
-        resumeInFlight = true
-        defer { resumeInFlight = false }
 
         let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
 
