@@ -541,6 +541,68 @@ mod integration_tests {
         std::env::remove_var("TERMMESH_PEER_ABANDONED_GRACE_MS");
     }
 
+    /// A published project outlives the viewer that published it.
+    ///
+    /// The manifest is the durable reference: `project.presentation.v1` exists
+    /// so a second machine finds the SAME live leader and member panes, and a
+    /// spawned surface named by one is therefore not abandoned when its
+    /// publisher disconnects. Deleting the manifest gives that surface back to
+    /// the ordinary reap, so protection cannot outlive the project.
+    #[tokio::test]
+    async fn a_surface_named_by_a_project_manifest_outlives_its_publisher() {
+        std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");
+        let manager = Arc::new(crate::peer::surface::PtyManager::new());
+        let leader = vec![0xA1; 16];
+        manager.register_and_spawn_ephemeral(
+            leader.clone(),
+            crate::peer::surface::SpawnSpec {
+                title: "project-leader".into(),
+                command: "/bin/cat".into(),
+                args: vec![],
+                cols: 80,
+                rows: 24,
+                cwd: None,
+                kind: crate::peer::surface::SurfaceKind::Pty,
+                agent_cli: String::new(),
+            },
+        );
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        let project = peer_proto::v1::Team {
+            name: "durable".into(),
+            team_uuid: "uuid-durable".into(),
+            working_directory: "/tmp".into(),
+            leader_surface_id: leader.clone(),
+            project_id: "team:uuid-durable".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            host.upsert_project_presentation(&[vec![7; 16]], &project),
+            Ok((1, true))
+        );
+
+        let alive = |id: &[u8]| manager.list().iter().any(|s| s.surface_id == id);
+        manager.note_attached(&leader);
+        assert_eq!(manager.note_detached(&leader), 0);
+        crate::peer::connection::reap_if_abandoned(&host, &leader);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            alive(&leader),
+            "a published project's pane must survive the viewer that named it"
+        );
+
+        assert_eq!(
+            host.delete_project_presentation(&[vec![7; 16]], "team:uuid-durable"),
+            Ok(true)
+        );
+        crate::peer::connection::reap_if_abandoned(&host, &leader);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(
+            !alive(&leader),
+            "a retired project must not keep its pane alive forever"
+        );
+        std::env::remove_var("TERMMESH_PEER_ABANDONED_GRACE_MS");
+    }
+
     /// Detaching is not leaving for good. A client that comes back inside the
     /// grace — a dropped link, a restart — finds its pane still there.
     #[tokio::test]
