@@ -360,8 +360,20 @@ final class PeerHostCoordinator: NSObject {
     /// used to sit here showed every app-served host as "debug-server",
     /// on every build, updated or not.
     nonisolated static func advertisedAppVersion(bundle: Bundle = .main) -> String {
-        (bundle.infoDictionary?["CFBundleShortVersionString"] as? String)
-            .flatMap { $0.isEmpty ? nil : $0 } ?? "0.0.0"
+        advertisedAppVersion(
+            rawBundleVersion: bundle.infoDictionary?["CFBundleShortVersionString"] as? String
+        )
+    }
+
+    /// Trimmed before the emptiness check: a whitespace-only Info.plist value
+    /// must fall back like a missing one, not be advertised verbatim. The
+    /// "0.0.0" fallback mirrors `PeerServerConfig`'s wire default, so an
+    /// unreadable bundle answers the same as a server that never set the
+    /// field — and the test suite pins that a real build never ships it.
+    nonisolated static func advertisedAppVersion(rawBundleVersion: String?) -> String {
+        let trimmed = rawBundleVersion?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "0.0.0" : trimmed
     }
 
     private func bringUp(at path: String, silent: Bool = false, persistPath: Bool = false) async {

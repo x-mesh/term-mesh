@@ -1182,15 +1182,18 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             // up front, before any workspace is materialized, with an
             // actionable "update the host" message.
             if live, !conn.hostCapabilities.has(PeerCapability.workspaceLifecycleV1) {
-                let ver = conn.hostAppVersion.map { "term-meshd \($0)" }
-                    ?? "an older term-meshd build"
+                // The serving process can be term-meshd OR an app-hosted
+                // server — both answer `hostAppVersion` now — so the label
+                // must not attribute the version to the daemon by name.
+                let ver = conn.hostAppVersion.map { "term-mesh host \($0)" }
+                    ?? "an older term-mesh build"
                 await conn.cancel()
                 registry.release(lease)
                 reportFailure(
                     "Host Too Old for Live Mirror",
                     "This host is running \(ver), which doesn't support "
                         + "live workspace mirroring (needs workspace.lifecycle.v1). "
-                        + "Update the host's term-meshd and reconnect."
+                        + "Update term-mesh on the host and reconnect."
                 )
                 return
             }
