@@ -96,6 +96,21 @@ final class TeamOrchestrator: ObservableObject {
         /// detached-project restore picks a renderer, and a hard restart has
         /// to refuse outright because it can only build a local pane.
         var remoteAgentSurface: Bool = false
+        /// The remote socket of the endpoint this member's agent surface was
+        /// ensured on, when that was not the serving one.
+        ///
+        /// The host's *current* team route is the wrong thing to ask when the
+        /// surface is finally taken down: a later handshake can move the route,
+        /// and the surface does not move with it. The new owner then answers
+        /// `notFound` for a surface it never created — indistinguishable from a
+        /// real confirmation — so the tombstone is spent while the
+        /// `tm-agent-bridge` keeps running on the endpoint that has it. Captured
+        /// at ensure time, which is the only moment this is known for certain.
+        ///
+        /// nil for a member on a host that owns its own sessions, and for
+        /// members restored from a build that did not record it: both fall back
+        /// to resolving by host, which is what they have.
+        var remoteSurfaceOwnerRemoteSockPath: String?
         /// The peer this agent's pane runs on (`ssh:root@jw-server`), or nil
         /// when it runs here.
         ///

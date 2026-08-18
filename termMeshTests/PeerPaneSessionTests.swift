@@ -3232,7 +3232,7 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             observeNotifications: false,
             automaticRetryDelay: 60,
             hostSockPathProvider: { _ in "/tmp/unreachable-peer.sock" },
-            terminator: { _, _, _ in
+            terminator: { _, _, _, _ in
                 cleanupAttempts += 1
                 return false
             }
@@ -3618,7 +3618,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             defaults: defaults,
             observeNotifications: false,
             hostSockPathProvider: { _ in nil },
-            terminator: { _, _, _ in false }
+            terminator: { _, _, _, _ in false }
         )
         func member(
             remoteAgentSurface: Bool,
@@ -3690,7 +3690,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
 
         await restored.retryPending(
             hostSockPath: { _ in "/tmp/peer.sock" },
-            terminate: { _, _, _ in false }
+            terminate: { _, _, _, _ in false }
         )
         XCTAssertEqual(
             restored.pendingRecords.count, 1,
@@ -3699,7 +3699,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
 
         await restored.retryPending(
             hostSockPath: { _ in "/tmp/peer.sock" },
-            terminate: { _, _, _ in true }
+            terminate: { _, _, _, _ in true }
         )
         XCTAssertTrue(restored.pendingRecords.isEmpty)
         let afterConfirmation = PendingPeerAgentSurfaceCleanupStore(
@@ -3739,7 +3739,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
                     in: [host]
                 )
             },
-            terminator: { resolvedHostKey, resolvedSocket, _ in
+            terminator: { resolvedHostKey, resolvedSocket, _, _ in
                 attemptedHostKey = resolvedHostKey
                 attemptedSocket = resolvedSocket
                 return true
@@ -3786,7 +3786,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             defaults: defaults,
             observeNotifications: false,
             hostSockPathProvider: { _ in nil },
-            terminator: { _, _, _ in false }
+            terminator: { _, _, _, _ in false }
         )
         let surfaceID = Data(repeating: 0x52, count: 16)
 
@@ -3817,7 +3817,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             observeNotifications: false,
             automaticRetryDelay: 0.01,
             hostSockPathProvider: { _ in "/tmp/peer.sock" },
-            terminator: { _, _, _ in
+            terminator: { _, _, _, _ in
                 attempts += 1
                 return attempts >= 2
             }
@@ -4008,6 +4008,57 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             hostKey: "ssh:root@jw-server"
         )
         XCTAssertFalse(terminalBacked.remoteAgentSurface)
+    }
+    /// A duplicate enqueue must enrich an ambiguous record rather than discard
+    /// the better information.
+    ///
+    /// A nil endpoint resolves by the host's *current* route, which is the
+    /// wrong-owner guess these records exist to prevent. Once some caller knows
+    /// the exact creation endpoint, keeping the older nil would carry that
+    /// ambiguity forever.
+    @MainActor
+    func testADuplicateEnqueueUpgradesAnAmbiguousEndpointButNeverDowngrades() {
+        let suiteName = "termmesh.tests.cleanup.upgrade.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("no test defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults, observeNotifications: false
+        )
+        let hostKey = "ssh:root@peer:/run/user/1000/term-mesh.sock"
+        let surfaceID = Data(repeating: 0x63, count: 16)
+
+        store.enqueue(hostKey: hostKey, surfaceID: surfaceID)
+        XCTAssertNil(store.pendingRecords.first?.owningRemoteSockPath)
+
+        store.enqueue(
+            hostKey: hostKey, surfaceID: surfaceID,
+            owningRemoteSockPath: "/tmp/OWNER-A/peer.sock"
+        )
+        XCTAssertEqual(store.pendingRecords.count, 1, "still one surface, not two")
+        XCTAssertEqual(
+            store.pendingRecords.first?.owningRemoteSockPath,
+            "/tmp/OWNER-A/peer.sock"
+        )
+
+        // An empty string names no endpoint and must not erase a known one.
+        store.enqueue(hostKey: hostKey, surfaceID: surfaceID, owningRemoteSockPath: "")
+        store.enqueue(hostKey: hostKey, surfaceID: surfaceID)
+        XCTAssertEqual(
+            store.pendingRecords.first?.owningRemoteSockPath,
+            "/tmp/OWNER-A/peer.sock",
+            "a known endpoint is never downgraded to nil"
+        )
+
+        // The upgrade is durable, not just in memory.
+        let restored = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults, observeNotifications: false
+        )
+        XCTAssertEqual(
+            restored.pendingRecords.first?.owningRemoteSockPath,
+            "/tmp/OWNER-A/peer.sock"
+        )
     }
 }
 

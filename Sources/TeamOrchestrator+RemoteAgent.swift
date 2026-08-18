@@ -58,11 +58,27 @@ final class PendingPeerAgentSurfaceCleanupStore {
     /// names a surface that endpoint never created — the tombstone would then
     /// retry forever against a host that keeps answering "not mine" while the
     /// `tm-agent-bridge` it was meant to kill stays up.
-    typealias Terminator = @MainActor (String, String, Data) async -> Bool
+    typealias Terminator = @MainActor (String, String, Data, String?) async -> Bool
     struct Record: Codable, Equatable, Identifiable {
         let hostKey: String
         let surfaceIDBase64: String
         let createdAt: Date
+        /// The remote socket of the endpoint that actually created this
+        /// surface, when it was not the serving one.
+        ///
+        /// The host's *current* `teamHostSpec` is the wrong thing to ask at
+        /// termination time: a later handshake can move the route, and the
+        /// surface does not move with it. Asking the new owner produces a
+        /// `notFound` that is indistinguishable from a real confirmation, so
+        /// the tombstone is dropped while the `tm-agent-bridge` keeps running
+        /// on the endpoint that has it. Recording the creation endpoint is what
+        /// makes the two answers tellable apart.
+        ///
+        /// Optional and decoded leniently: tombstones persisted by an earlier
+        /// build have no such field, and must keep resolving by host key rather
+        /// than being discarded — a dropped tombstone is a bridge that runs
+        /// forever.
+        var owningRemoteSockPath: String?
 
         var id: String { "\(hostKey)\u{0000}\(surfaceIDBase64)" }
         var surfaceID: Data? { Data(base64Encoded: surfaceIDBase64) }
@@ -105,11 +121,12 @@ final class PendingPeerAgentSurfaceCleanupStore {
                 in: RemoteHostStore.shared.sortedHosts
             )
         },
-        terminator: @escaping Terminator = { hostKey, sockPath, surfaceID in
+        terminator: @escaping Terminator = { hostKey, sockPath, surfaceID, owningRemoteSockPath in
             await TeamOrchestrator.terminatePeerAgentSurfaceOnOwningEndpoint(
                 hostKey: hostKey,
                 servingSockPath: sockPath,
-                surfaceID: surfaceID
+                surfaceID: surfaceID,
+                owningRemoteSockPath: owningRemoteSockPath
             )
         }
     ) {
@@ -145,16 +162,30 @@ final class PendingPeerAgentSurfaceCleanupStore {
 
     var pendingRecords: [Record] { records }
 
-    func enqueue(hostKey: String, surfaceID: Data) {
+    func enqueue(hostKey: String, surfaceID: Data, owningRemoteSockPath: String? = nil) {
         guard !hostKey.isEmpty, !surfaceID.isEmpty else { return }
         let encoded = surfaceID.base64EncodedString()
-        guard !records.contains(where: {
+        let owner = (owningRemoteSockPath?.isEmpty ?? true) ? nil : owningRemoteSockPath
+        if let existing = records.firstIndex(where: {
             $0.hostKey == hostKey && $0.surfaceIDBase64 == encoded
-        }) else { return }
+        }) {
+            // Already recorded, but a later caller may know the endpoint the
+            // first one did not. Ambiguity carried forever is the thing to
+            // avoid: a nil endpoint resolves by the host's current route, which
+            // is exactly the wrong-owner guess these records exist to prevent.
+            // Never the reverse — a known endpoint is not downgraded to nil.
+            guard let owner,
+                  records[existing].owningRemoteSockPath == nil
+            else { return }
+            records[existing].owningRemoteSockPath = owner
+            persist()
+            return
+        }
         records.append(Record(
             hostKey: hostKey,
             surfaceIDBase64: encoded,
-            createdAt: Date()
+            createdAt: Date(),
+            owningRemoteSockPath: owner
         ))
         persist()
     }
@@ -191,14 +222,19 @@ final class PendingPeerAgentSurfaceCleanupStore {
     /// relay transition starts another pass.
     func retryPending(
         hostSockPath: (String) -> String?,
-        terminate: (String, String, Data) async -> Bool
+        terminate: (String, String, Data, String?) async -> Bool
     ) async {
         let snapshot = records
         for record in snapshot {
             guard let surfaceID = record.surfaceID,
                   let sockPath = hostSockPath(record.hostKey),
                   !sockPath.isEmpty,
-                  await terminate(record.hostKey, sockPath, surfaceID)
+                  await terminate(
+                      record.hostKey,
+                      sockPath,
+                      surfaceID,
+                      record.owningRemoteSockPath
+                  )
             else { continue }
             records.removeAll { $0.id == record.id }
             persist()
@@ -634,12 +670,14 @@ extension TeamOrchestrator {
 
         var members: [AgentMember] = []
         for descriptor in remote.members {
+            let owningEndpoint = RestoredSurfaceEndpoint()
             guard let panelID = await attachRestoredRemoteSurface(
                 hostKey: host.id,
                 surfaceID: descriptor.surfaceID,
                 title: descriptor.name,
                 panelTitle: "\(Self.colorEmoji(descriptor.color)) \(descriptor.name)",
                 workspace: workspace,
+                owningRemoteSockPath: owningEndpoint,
                 onAgentPanel: { panel, host in
                     Self.bindPeerOwnedAgentPanel(
                         panel: panel,
@@ -681,6 +719,11 @@ extension TeamOrchestrator {
                     surfaceType: descriptor.surfaceType
                 ),
                 remoteAgentSurface: descriptor.surfaceType == "agent",
+                // The endpoint whose lease proved this surface exists, reported
+                // by the attach itself. Re-reading the store here would read it
+                // after an await, and a reconnect landing in that window would
+                // name an endpoint that never had the surface.
+                remoteSurfaceOwnerRemoteSockPath: owningEndpoint.remoteSockPath,
                 hostKey: host.id,
                 originalAgentWorkDir: descriptor.workingDirectory
             ))
@@ -2789,12 +2832,36 @@ extension TeamOrchestrator {
     /// closures). A caller that passes none is declaring it cannot host one —
     /// the leader is never an agent surface — and gets nil rather than a pane
     /// wired to nobody.
+    /// Carries the proven endpoint back out of `attachRestoredRemoteSurface`.
+    ///
+    /// A plain return value would mean changing four call sites for one that
+    /// needs it; a class lets the restore path collect the value without the
+    /// others learning about it.
+    @MainActor
+    final class RestoredSurfaceEndpoint {
+        /// nil until `ListSurfaces` finds the surface, and nil afterwards when
+        /// the host owns its own sessions — the same "no redirect" the field
+        /// means elsewhere. A later attach or panel failure can leave this set
+        /// on a call that returns nil; callers read it only after a non-nil
+        /// panel id, and each gets its own box.
+        var remoteSockPath: String?
+    }
+
+    /// `owningRemoteSockPath` receives the remote socket of the endpoint whose
+    /// lease proved this surface exists — the `ListSurfaces` above ran on it.
+    ///
+    /// Reported back rather than re-read from the store by the caller: this
+    /// function awaits, and a reconnect handshake landing in that window can
+    /// move or clear the host's route. A post-await store snapshot would then
+    /// name an endpoint that never had the surface, which is the whole defect
+    /// the recorded endpoint exists to prevent.
     private func attachRestoredRemoteSurface(
         hostKey: String,
         surfaceID: Data,
         title: String,
         panelTitle: String,
         workspace: Workspace,
+        owningRemoteSockPath: RestoredSurfaceEndpoint? = nil,
         onAgentPanel: ((AgentPanel, HostEntry) -> Void)? = nil
     ) async -> UUID? {
         guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
@@ -2815,6 +2882,10 @@ extension TeamOrchestrator {
                 return nil
             }
             isAgentSurface = SessionHostPanes.isAgentSurfaceType(surface.surfaceType)
+            // Recorded here, where the lease that answered ListSurfaces is still
+            // in hand. `.direct` endpoints have no remote socket and mean "the
+            // serving socket", which is exactly the nil case.
+            owningRemoteSockPath?.remoteSockPath = lease.key.remoteSockPath
             session = try await PeerPaneSession.attach(
                 lease: lease,
                 surface: surface,
@@ -4514,10 +4585,44 @@ extension TeamOrchestrator {
         }
     }
 
+    /// Where a recorded surface's `TerminateSurface` has to be sent.
+    ///
+    /// `owningRemoteSockPath` is the endpoint that created the surface, and it
+    /// wins over the host's current route whenever the two disagree. The
+    /// host's route answers "where does team work go now", which is a different
+    /// question and the wrong one here: a handshake that moves the route does
+    /// not move existing surfaces, and the new owner replies `notFound` for a
+    /// surface it never created — a reply this code cannot tell from a real
+    /// confirmation, so the tombstone would be dropped with the bridge still
+    /// running on the endpoint that has it.
+    ///
+    /// A record without a recorded endpoint (persisted by an earlier build, or
+    /// created on a host that never redirected) falls back to resolving by
+    /// host, which is what it has.
     static func peerAgentCleanupEndpoint(
         host: HostEntry?,
-        servingSockPath: String
+        servingSockPath: String,
+        owningRemoteSockPath: String? = nil
     ) -> PeerAgentCleanupEndpoint {
+        if let owningRemoteSockPath, !owningRemoteSockPath.isEmpty {
+            // Rebuilt from the host so the tunnel keeps the profile's auth
+            // parameters; only the remote socket is pinned to the recorded one.
+            // Without a live host row there is no target to dial, and unlike
+            // the unknown-host case below there is a specific endpoint that is
+            // known to be the right one — so this waits for the row rather
+            // than sending the request somewhere it does not belong.
+            guard let host else { return .unresolved }
+            guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
+                // A direct host reaches its own socket path directly.
+                return .sessionOwner(.direct(sockPath: owningRemoteSockPath))
+            }
+            return .sessionOwner(.ssh(
+                target: sshTarget,
+                remoteSockPath: owningRemoteSockPath,
+                port: host.sshPort,
+                identityFile: host.identityFile
+            ))
+        }
         // An unknown host is not an unresolved one: nothing is coming that
         // would answer, so the socket that served this tombstone is the only
         // address there will ever be. Attempt it.
@@ -4533,11 +4638,13 @@ extension TeamOrchestrator {
     static func terminatePeerAgentSurfaceOnOwningEndpoint(
         hostKey: String,
         servingSockPath: String,
-        surfaceID: Data
+        surfaceID: Data,
+        owningRemoteSockPath: String? = nil
     ) async -> Bool {
         switch peerAgentCleanupEndpoint(
             host: RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-            servingSockPath: servingSockPath
+            servingSockPath: servingSockPath,
+            owningRemoteSockPath: owningRemoteSockPath
         ) {
         case .serving(let sockPath):
             return await terminatePeerAgentSurfaceConfirmed(
@@ -4600,8 +4707,32 @@ extension TeamOrchestrator {
               let surfaceID = agent.remoteSurfaceID, !surfaceID.isEmpty,
               let hostKey = agent.hostKey, !hostKey.isEmpty
         else { return }
-        cleanup.enqueue(hostKey: hostKey, surfaceID: surfaceID)
+        cleanup.enqueue(
+            hostKey: hostKey,
+            surfaceID: surfaceID,
+            // What the member recorded at ensure time, and only then the host's
+            // current route: a member that never recorded one predates this
+            // field or ran on a host that owns its own sessions.
+            owningRemoteSockPath: agent.remoteSurfaceOwnerRemoteSockPath
+                ?? currentTeamOwnerRemoteSockPath(forHostKey: hostKey)
+        )
         cleanup.scheduleRetry()
+    }
+
+    /// The remote socket team surfaces are being created on for this host right
+    /// now, or nil when that is the serving socket (or is not yet known).
+    ///
+    /// Read at the moment a tombstone is written, so the record keeps the
+    /// endpoint that has the surface rather than whichever one a later
+    /// handshake points at.
+    static func currentTeamOwnerRemoteSockPath(forHostKey hostKey: String) -> String? {
+        guard let host = RemoteHostStore.shared.sortedHosts
+            .first(where: { $0.id == hostKey }),
+              host.redirectsTeamWorkToSessionHost,
+              let remote = host.teamHostSpec?.hostKey.remoteSockPath,
+              !remote.isEmpty
+        else { return nil }
+        return remote
     }
 
     /// Record cleanup before dropping the only local handle to a peer-owned
@@ -4609,11 +4740,13 @@ extension TeamOrchestrator {
     /// `AgentMember` exists yet for the normal detach cleanup path to inspect.
     static func enqueuePendingPeerAgentSurfaceCleanup(
         hostKey: String,
-        surfaceID: Data
+        surfaceID: Data,
+        owningRemoteSockPath: String? = nil
     ) {
         enqueuePendingPeerAgentSurfaceCleanup(
             hostKey: hostKey,
             surfaceID: surfaceID,
+            owningRemoteSockPath: owningRemoteSockPath,
             cleanup: .shared
         )
     }
@@ -4621,9 +4754,15 @@ extension TeamOrchestrator {
     static func enqueuePendingPeerAgentSurfaceCleanup(
         hostKey: String,
         surfaceID: Data,
+        owningRemoteSockPath: String? = nil,
         cleanup: PendingPeerAgentSurfaceCleanupStore
     ) {
-        cleanup.enqueue(hostKey: hostKey, surfaceID: surfaceID)
+        cleanup.enqueue(
+            hostKey: hostKey,
+            surfaceID: surfaceID,
+            owningRemoteSockPath: owningRemoteSockPath
+                ?? currentTeamOwnerRemoteSockPath(forHostKey: hostKey)
+        )
         cleanup.scheduleRetry()
     }
 
@@ -5084,7 +5223,8 @@ extension TeamOrchestrator {
                 onAgentPostEnsureFailure: { surfaceID in
                     Self.enqueuePendingPeerAgentSurfaceCleanup(
                         hostKey: host.id,
-                        surfaceID: surfaceID
+                        surfaceID: surfaceID,
+                        owningRemoteSockPath: lease.key.remoteSockPath
                     )
                 }
             )
@@ -5103,7 +5243,10 @@ extension TeamOrchestrator {
             session.teardown()
             Self.enqueuePendingPeerAgentSurfaceCleanup(
                 hostKey: host.id,
-                surfaceID: surfaceID
+                surfaceID: surfaceID,
+                // The endpoint this surface was just ensured on, not whichever
+                // one the host points at when the tombstone is finally spent.
+                owningRemoteSockPath: lease.key.remoteSockPath
             )
         }
 
@@ -5161,6 +5304,10 @@ extension TeamOrchestrator {
             remoteSurfaceID: surfaceID,
             remoteSurfaceSpawned: true,
             remoteAgentSurface: true,
+            // The endpoint this surface was just ensured on. Read from the lease
+            // rather than the store so it cannot drift from where the ensure
+            // actually went.
+            remoteSurfaceOwnerRemoteSockPath: lease.key.remoteSockPath,
             hostKey: host.id,
             originalAgentWorkDir: workingDirectory
         )
@@ -5340,7 +5487,8 @@ extension TeamOrchestrator {
                 environment: environment,
                 onAgentPostEnsureFailure: { surfaceID in
                     Self.enqueuePendingPeerAgentSurfaceCleanup(
-                        hostKey: host.id, surfaceID: surfaceID
+                        hostKey: host.id, surfaceID: surfaceID,
+                        owningRemoteSockPath: lease.key.remoteSockPath
                     )
                 }
             )
@@ -5355,7 +5503,8 @@ extension TeamOrchestrator {
         func abandonReplacement() {
             session.teardown()
             Self.enqueuePendingPeerAgentSurfaceCleanup(
-                hostKey: host.id, surfaceID: surfaceID
+                hostKey: host.id, surfaceID: surfaceID,
+                owningRemoteSockPath: lease.key.remoteSockPath
             )
         }
         guard ownsPeerAgentSurface(
@@ -5400,6 +5549,9 @@ extension TeamOrchestrator {
         replacement.remoteSurfaceID = surfaceID
         replacement.remoteSurfaceSpawned = true
         replacement.remoteAgentSurface = true
+        // A restart re-ensures the surface, so the endpoint that owns it is the
+        // one this attempt leased — not whatever the previous surface used.
+        replacement.remoteSurfaceOwnerRemoteSockPath = lease.key.remoteSockPath
         // Ownership moves to the caller. It starts this grant only after the
         // roster swap and old-pane close both commit; until then the old
         // surface's keepalive must remain valid for rollback.

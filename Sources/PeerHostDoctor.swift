@@ -298,9 +298,12 @@ enum PeerHostDoctor {
             // them: `$SHELL` is unset here on purpose, because a daemon
             // started by systemd has none either and falls through to the
             // passwd entry. Reading the profile's PATH needs a login shell,
-            // and `-c` keeps it non-interactive.
-            + #"pane_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); "#
-            + #"case "$pane_shell" in */nologin|*/false|"") pane_shell=/bin/sh;; esac; "#
+            // and `-c` keeps it non-interactive. Shares
+            // `accountLoginShellResolve` with the launcher — asking the
+            // question a second way is how the probe came to report a shell
+            // the launcher would not use (`getent` is absent on macOS).
+            + RemoteAgentEnvironmentShell.accountLoginShellResolve
+            + #"pane_shell=$term_mesh_login_shell; "#
             + #"echo "login-shell=$pane_shell"; "#
             + #"agent_shell=$pane_shell; case "${agent_shell##*/}" in sh|bash|zsh|dash|ksh|mksh) ;; *) agent_shell=/bin/sh;; esac; echo "agent-shell=$agent_shell"; "#
             // `\$PATH` so the *login* shell expands it, not this one. Single

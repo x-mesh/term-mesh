@@ -969,7 +969,10 @@ final class PeerProjectBootstrapTests: XCTestCase {
         XCTAssertFalse(prepare.contains("abab"), "the visible preparation must contain no grant")
         XCTAssertEqual(prepare, "unset HISTFILE; stty -echo")
         XCTAssertTrue(launch.hasPrefix("export TERMMESH_SAVED_"))
-        XCTAssertTrue(launch.contains(#"getent passwd "$(id -u)""#))
+        XCTAssertTrue(launch.contains(#"getent passwd "$term_mesh_login_user""#))
+        // `getent` is glibc-only, so a macOS peer needs the directory service
+        // or it silently falls back to the launching process's shell.
+        XCTAssertTrue(launch.contains(#"dscl . -read /Users/"#))
         XCTAssertTrue(launch.contains(#"exec "$term_mesh_login_shell" -l -c"#))
         XCTAssertTrue(launch.contains(#"export SHELL="$term_mesh_login_shell""#))
         XCTAssertTrue(launch.contains("$HOME/.profile"))

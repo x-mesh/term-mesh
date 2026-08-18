@@ -947,6 +947,16 @@ final class RemoteHostStore: ObservableObject {
                 // WorkspaceSummary.hostSockPath never points to the dead tunnel.
                 if hosts[key]?.activeSockPath != conn.hostSockPath {
                     hosts[key]?.clearAuthenticatedHostCLIBinDirs()
+                    // The team route belongs to the connection that advertised
+                    // it, so a new tunnel invalidates it exactly as it
+                    // invalidates the CLI bin dirs. Keeping it left
+                    // `teamRouteResolved` true across the reconnect, which is
+                    // the one state that must not be claimed on credit: team
+                    // work would be addressed to the previous connection's
+                    // session owner until the new handshake answered, instead
+                    // of reading as unresolved and retrying. `fetchWorkspaces`
+                    // below re-answers it.
+                    hosts[key]?.clearServingMetadata()
                     hosts[key]?.activeSockPath = conn.hostSockPath
                     hosts[key]?.workspaces = []
                     fetchWorkspaces(for: conn.hostSockPath, key: key, provenance: nil)
