@@ -350,6 +350,11 @@ final class TermMeshDaemon: ObservableObject {
     static let watchdogFailureThreshold = 3
     static let watchdogRespawnIntervalNanos: UInt64 = 30 * 1_000_000_000
 
+    /// Cap on the appended daemon log before it is truncated on the next
+    /// spawn. Sized for weeks of ordinary output (a busy session writes a
+    /// few MB) while bounding what an append-only file in /tmp can grow to.
+    static let daemonLogMaxBytes: Int64 = 50 * 1024 * 1024
+
     static func watchdogShouldRespawn(
         consecutiveFailures: Int,
         runIntended: Bool,
@@ -381,9 +386,24 @@ final class TermMeshDaemon: ObservableObject {
 
     /// Spawn the term-meshd daemon process if not already running.
     func startDaemon() {
+        startDaemon(assertIntent: true)
+    }
+
+    /// `assertIntent: false` is the watchdog's entry. Its decision to start
+    /// was made earlier, off the control queue — by the time this block runs,
+    /// the user may have pressed Stop in Settings. Re-check the intent HERE,
+    /// on the control queue, and never rewrite it: an unconditional
+    /// `daemonRunIntended = true` in this position is exactly how a queued
+    /// watchdog start would resurrect a daemon the user just stopped.
+    private func startDaemon(assertIntent: Bool) {
         queue.async { [weak self] in
             guard let self else { return }
-            self.daemonRunIntended = true
+            if assertIntent {
+                self.daemonRunIntended = true
+            } else if !self.daemonRunIntended {
+                Logger.daemon.info("watchdog start dropped — the daemon was deliberately stopped")
+                return
+            }
 
             // Already running (tracked process)?
             if let proc = self.daemonProcess, proc.isRunning { return }
@@ -531,16 +551,28 @@ final class TermMeshDaemon: ObservableObject {
             // Log daemon stdout/stderr — isolated per tag
             let tag = termMeshEnv("TAG") ?? ""
             let logPath = tag.isEmpty ? "/tmp/term-meshd.log" : "/tmp/term-meshd-\(tag).log"
-            // Create only when missing: `createFile` REPLACES an existing
-            // file, which defeated the append below — every app launch
-            // (and any second untagged instance) truncated the previous
-            // daemon's log, destroying exactly the evidence a "why was the
-            // daemon down" investigation needs.
-            if !FileManager.default.fileExists(atPath: logPath) {
-                FileManager.default.createFile(atPath: logPath, contents: nil)
+            // Append, never truncate: every launch used to REPLACE this file
+            // (`createFile`), destroying exactly the evidence a "why was the
+            // daemon down" investigation needs. O_NOFOLLOW because the name
+            // is predictable in sticky /tmp — a pre-planted symlink must not
+            // redirect daemon output into an arbitrary file (open fails and
+            // the daemon logs to null instead). The size cap is what makes
+            // append-forever safe: one bounded truncation at the cap beats
+            // losing the log on every spawn, and beats filling /tmp.
+            let fd = open(logPath, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0o644)
+            let logHandle: FileHandle?
+            if fd >= 0 {
+                var info = stat()
+                if fstat(fd, &info) == 0, info.st_size > Self.daemonLogMaxBytes {
+                    ftruncate(fd, 0)
+                }
+                logHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+            } else {
+                Logger.daemon.error(
+                    "could not open daemon log at \(logPath, privacy: .public) (errno \(errno, privacy: .public)) — daemon output goes to /dev/null"
+                )
+                logHandle = nil
             }
-            let logHandle = FileHandle(forWritingAtPath: logPath)
-            logHandle?.seekToEndOfFile()
             process.standardOutput = logHandle ?? FileHandle.nullDevice
             process.standardError = logHandle ?? FileHandle.nullDevice
 
@@ -555,6 +587,9 @@ final class TermMeshDaemon: ObservableObject {
                     TerminalController.shared.trustedDaemonPid = daemonPid
                 }
             } catch {
+                // The fd was never handed to a child; close it here or a
+                // failing spawn (repeated by the watchdog) leaks one per try.
+                try? logHandle?.close()
                 Logger.daemon.error("failed to start daemon: \(error, privacy: .public)")
             }
         }
@@ -1403,7 +1438,7 @@ final class TermMeshDaemon: ObservableObject {
                         RemoteWorkLog.warningOffMain(
                             "This machine's daemon stopped answering — restarting it"
                         )
-                        self.startDaemon()
+                        self.startDaemon(assertIntent: false)
                     }
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     continue
