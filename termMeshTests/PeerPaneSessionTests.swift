@@ -1712,6 +1712,69 @@ final class ProjectRemoteSurfaceDeletionTests: XCTestCase {
             )
         )
     }
+
+    private func rosterWorkspace(
+        id: UInt8, title: String, surface: Data?
+    ) -> Termmesh_Peer_V1_Workspace {
+        var workspace = Termmesh_Peer_V1_Workspace()
+        workspace.workspaceID = Data(repeating: id, count: 16)
+        workspace.title = title
+        if let surface {
+            var pane = Termmesh_Peer_V1_WorkspacePane()
+            pane.surfaceID = surface
+            var layout = Termmesh_Peer_V1_WorkspaceLayout()
+            layout.pane = pane
+            workspace.layout = layout
+        }
+        return workspace
+    }
+
+    /// The adopted-viewer delete path: the manifest carries no workspace id,
+    /// so deletion re-derives the dedicated workspace from the roster. A
+    /// workspace qualifies only with BOTH the project title and one of the
+    /// project's known surfaces — either alone deleted the wrong workspace
+    /// (a recreated team's stale twin) or none at all (the observed leak:
+    /// the daemon-owned leader survived every delete from an adopting viewer).
+    func test_dedicated_workspace_resolves_by_title_and_known_surface() {
+        let leader = Data(repeating: 0x0A, count: 16)
+        let title = TeamOrchestrator.remoteProjectWorkspaceTitle(teamName: "demo")
+        let stale = rosterWorkspace(
+            id: 1, title: title, surface: Data(repeating: 0x0B, count: 16)
+        )
+        let dedicated = rosterWorkspace(id: 2, title: title, surface: leader)
+        let unrelated = rosterWorkspace(id: 3, title: "notes", surface: leader)
+
+        XCTAssertEqual(
+            TeamOrchestrator.resolveDedicatedProjectWorkspaceID(
+                workspaces: [unrelated, stale, dedicated],
+                teamName: "demo",
+                knownSurfaceIDs: [leader]
+            ),
+            dedicated.workspaceID,
+            "the same-title stale twin and the same-surface unrelated workspace both lose"
+        )
+    }
+
+    func test_dedicated_workspace_resolution_refuses_guesses() {
+        let leader = Data(repeating: 0x0A, count: 16)
+        let titled = rosterWorkspace(
+            id: 1,
+            title: TeamOrchestrator.remoteProjectWorkspaceTitle(teamName: "demo"),
+            surface: nil
+        )
+        XCTAssertNil(
+            TeamOrchestrator.resolveDedicatedProjectWorkspaceID(
+                workspaces: [titled], teamName: "demo", knownSurfaceIDs: [leader]
+            ),
+            "a layout-less title match is not ownership"
+        )
+        XCTAssertNil(
+            TeamOrchestrator.resolveDedicatedProjectWorkspaceID(
+                workspaces: [titled], teamName: "demo", knownSurfaceIDs: []
+            ),
+            "with no known surfaces nothing can prove ownership"
+        )
+    }
 }
 
 /// One PTY, two windows onto it — the size arbitration between a local pane
