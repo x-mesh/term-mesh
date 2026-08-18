@@ -969,7 +969,7 @@ extension TeamOrchestrator {
         let useSourceDirectly: Bool
     }
 
-    static func remoteProjectWorkspaceTitle(teamName: String) -> String {
+    nonisolated static func remoteProjectWorkspaceTitle(teamName: String) -> String {
         let singleLine = teamName
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
@@ -6803,6 +6803,56 @@ extension TeamOrchestrator {
             teamLeases[hostKey]?.hostSockPath ?? ""
         }
 
+        // An ADOPTING viewer holds no recorded workspace id — the manifest
+        // carries none, and `recordRemoteWorkspaceID` fires only when leader
+        // placement creates the workspace. Deleting from such a viewer
+        // skipped DeleteWorkspace entirely, and the leader pane then fell
+        // through to ClosePane's last-pane refusal: the daemon-owned leader
+        // process survived every "successful" delete. Re-derive the missing
+        // ids from the authoritative roster before deciding what exists.
+        var remoteWorkspaceIDs = team.remoteWorkspaceIDs
+        for hostKey in teamLeaseHostKeys.sorted() where remoteWorkspaceIDs[hostKey] == nil {
+            let sock = teamSock(hostKey)
+            guard !sock.isEmpty else { continue }
+            var knownSurfaceIDs = Set(
+                ManagedPeerSurfaceStore.shared.records(hostKey: hostKey)
+                    .filter { $0.teamName == teamName }
+                    .compactMap(\.surfaceID)
+            )
+            if case let .peer(leaderHostKey) = team.leaderEndpoint,
+               leaderHostKey == hostKey,
+               let leaderSurfaceID = team.remoteLeaderSurfaceID {
+                knownSurfaceIDs.insert(leaderSurfaceID)
+            }
+            for agent in team.agents where agent.hostKey == hostKey {
+                if let surfaceID = agent.remoteSurfaceID {
+                    knownSurfaceIDs.insert(surfaceID)
+                }
+            }
+            guard !knownSurfaceIDs.isEmpty else { continue }
+            do {
+                let connection = try await PeerRelaySession.connect(hostSockPath: sock)
+                let workspaces: [Termmesh_Peer_V1_Workspace]
+                do {
+                    workspaces = try await connection.session.listWorkspaces(timeoutSeconds: 10)
+                } catch {
+                    await connection.cancel()
+                    throw error
+                }
+                await connection.cancel()
+                if let resolved = Self.resolveDedicatedProjectWorkspaceID(
+                    workspaces: workspaces,
+                    teamName: teamName,
+                    knownSurfaceIDs: knownSurfaceIDs
+                ) {
+                    remoteWorkspaceIDs[hostKey] = resolved
+                }
+            } catch {
+                // Best-effort: an unreachable roster falls back to the
+                // per-surface path below, which reports its own failures.
+            }
+        }
+
         // Read through the durable record: after a restart the team's
         // in-memory list is empty while its checkouts are still on the peers.
         let grouped = Dictionary(
@@ -6889,7 +6939,7 @@ extension TeamOrchestrator {
         // that every terminal surface on that host belongs to the workspace.
         var ownedWorkspaceSurfaceIDs: [String: Set<Data>] = [:]
         var workspaceInspectionFailedHosts = Set<String>()
-        for (hostKey, workspaceID) in team.remoteWorkspaceIDs {
+        for (hostKey, workspaceID) in remoteWorkspaceIDs {
             let label = "workspace \(hostKey):\(workspaceID.base64EncodedString())"
             guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
                   !teamSock(hostKey).isEmpty
@@ -7002,7 +7052,7 @@ extension TeamOrchestrator {
         // The project owns these peer workspaces. Removing the project should
         // remove their now-detached shell containers too; relay/default and
         // user-created workspaces are never included in this map.
-        for (hostKey, workspaceID) in team.remoteWorkspaceIDs {
+        for (hostKey, workspaceID) in remoteWorkspaceIDs {
             let label = "workspace \(hostKey):\(workspaceID.base64EncodedString())"
             guard !workspaceInspectionFailedHosts.contains(hostKey) else {
                 continue
@@ -7143,6 +7193,27 @@ extension TeamOrchestrator {
         belongsToOwnedWorkspace: Bool
     ) -> Bool {
         isAgent || !belongsToOwnedWorkspace
+    }
+
+    /// The dedicated project workspace for `teamName` on one host, re-derived
+    /// from the authoritative workspace roster. The manifest carries no
+    /// workspace id, so a viewer that ADOPTED the project holds none —
+    /// `recordRemoteWorkspaceID` fires only when leader placement creates the
+    /// workspace. Title alone is not ownership (a recreated team can leave an
+    /// older same-title workspace behind), so the workspace must also hold
+    /// one of the project's known surfaces.
+    nonisolated static func resolveDedicatedProjectWorkspaceID(
+        workspaces: [Termmesh_Peer_V1_Workspace],
+        teamName: String,
+        knownSurfaceIDs: Set<Data>
+    ) -> Data? {
+        guard !knownSurfaceIDs.isEmpty else { return nil }
+        let title = remoteProjectWorkspaceTitle(teamName: teamName)
+        return workspaces.first(where: { workspace in
+            workspace.title == title
+                && workspace.hasLayout
+                && !peerSurfaceIDs(workspace.layout).isDisjoint(with: knownSurfaceIDs)
+        })?.workspaceID
     }
 
     /// Preserve the user's requested endpoint while the pane is connecting.

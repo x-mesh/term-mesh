@@ -354,13 +354,35 @@ final class PeerHostCoordinator: NSObject {
         postStateChange()
     }
 
+    /// What this app-hosted server answers in the Hello handshake. The
+    /// daemon reports its real Cargo version, and pickers label a host with
+    /// whichever process serves the connection — so the placeholder that
+    /// used to sit here showed every app-served host as "debug-server",
+    /// on every build, updated or not.
+    nonisolated static func advertisedAppVersion(bundle: Bundle = .main) -> String {
+        advertisedAppVersion(
+            rawBundleVersion: bundle.infoDictionary?["CFBundleShortVersionString"] as? String
+        )
+    }
+
+    /// Trimmed before the emptiness check: a whitespace-only Info.plist value
+    /// must fall back like a missing one, not be advertised verbatim. The
+    /// "0.0.0" fallback mirrors `PeerServerConfig`'s wire default, so an
+    /// unreadable bundle answers the same as a server that never set the
+    /// field — and the test suite pins that a real build never ships it.
+    nonisolated static func advertisedAppVersion(rawBundleVersion: String?) -> String {
+        let trimmed = rawBundleVersion?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "0.0.0" : trimmed
+    }
+
     private func bringUp(at path: String, silent: Bool = false, persistPath: Bool = false) async {
         guard canStartServer(at: path, silent: silent) else { return }
         let provider = GhosttyPaneSurfaceProvider()
 
         var config = PeerServerConfig()
         config.hostDisplayName = PeerFederationSettings.displayName
-        config.hostAppVersion = "debug-server"
+        config.hostAppVersion = Self.advertisedAppVersion()
         if let resourceURL = Bundle.main.resourceURL {
             config.hostCLIBinDirs = [
                 resourceURL.appendingPathComponent("bin").standardizedFileURL.path
