@@ -505,34 +505,21 @@ async fn reader_loop(
                     } else {
                         // Retiring a manifest also drops the durable reference
                         // that kept its surfaces out of the abandoned-surface
-                        // reap. Collected before the delete so each one can be
-                        // re-evaluated afterwards; otherwise a deleted project
-                        // would strand every spawned pane it had named.
-                        let released: Vec<Vec<u8>> = host
-                            .project_presentations()
-                            .into_iter()
-                            .find(|record| record.project_id == request.delete_project_id)
-                            .map(|record| {
-                                std::iter::once(record.leader_surface_id.clone())
-                                    .chain(
-                                        record
-                                            .members
-                                            .iter()
-                                            .map(|member| member.surface_id.clone()),
-                                    )
-                                    .filter_map(|encoded| hex::decode(encoded).ok())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        match host.delete_project_presentation(
+                        // reap, so each one is re-evaluated here; otherwise a
+                        // deleted project would strand every spawned pane it
+                        // had named. The ids come back FROM the delete rather
+                        // than from a read before it: the record removed under
+                        // the lock is the only one whose surfaces this call may
+                        // release, and a concurrent replace must not be able to
+                        // redirect the reap at another manifest's panes.
+                        match host.delete_project_presentation_with_released(
                             &project_owner_peer_ids,
                             &request.delete_project_id,
                         ) {
-                            Ok(changed) => {
-                                if changed {
-                                    for surface_id in &released {
-                                        reap_if_abandoned(&host, surface_id);
-                                    }
+                            Ok(released) => {
+                                let changed = released.is_some();
+                                for surface_id in released.into_iter().flatten() {
+                                    reap_if_abandoned(&host, &surface_id);
                                 }
                                 (
                                     UpsertProjectPresentationResponse {

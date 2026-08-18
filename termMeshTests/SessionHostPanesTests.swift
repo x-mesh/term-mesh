@@ -455,6 +455,7 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
             PeerCapability.surfaceAgentV1,
             PeerCapability.surfaceExitV1,
             PeerCapability.surfaceEnsureEnvV1,
+            PeerCapability.teamRouteFileV1,
         ]
         for missing in required {
             XCTAssertFalse(RemoteHostStore.hostSupportsPeerOwnedAgentFactory(

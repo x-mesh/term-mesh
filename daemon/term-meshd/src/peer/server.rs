@@ -498,6 +498,12 @@ mod integration_tests {
         assert!(!peer_uid_allowed(501, 0));
     }
 
+    /// `TERMMESH_PEER_ABANDONED_GRACE_MS` is process-global while these tests
+    /// run in parallel, so one test's `remove_var` restores the 60 s default
+    /// under another's feet — which reads exactly like "the reap never fired".
+    /// Every test that tunes the grace holds this for its duration.
+    static ABANDONED_GRACE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A surface the host made on request goes away once nobody holds it, and
     /// one the operator declared does not.
     ///
@@ -507,6 +513,7 @@ mod integration_tests {
     /// declared surface is published for anyone, and an empty one is idle.
     #[tokio::test]
     async fn reaps_a_spawned_surface_once_nobody_is_attached() {
+        let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");
         let manager = Arc::new(crate::peer::surface::PtyManager::new());
         let declared = b"declared-surface".to_vec();
@@ -553,6 +560,7 @@ mod integration_tests {
     /// the ordinary reap, so protection cannot outlive the project.
     #[tokio::test]
     async fn a_surface_named_by_a_project_manifest_outlives_its_publisher() {
+        let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");
         let manager = Arc::new(crate::peer::surface::PtyManager::new());
         let leader = vec![0xA1; 16];
@@ -608,6 +616,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn manifest_replacement_reaps_only_surfaces_with_no_remaining_project_reference() {
+        let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");
         let manager = Arc::new(crate::peer::surface::PtyManager::new());
         let first = vec![0xB1; 16];
@@ -684,6 +693,7 @@ mod integration_tests {
     /// grace — a dropped link, a restart — finds its pane still there.
     #[tokio::test]
     async fn a_reconnect_inside_the_grace_saves_the_surface() {
+        let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "300");
         let manager = Arc::new(crate::peer::surface::PtyManager::new());
         let sid = b"rejoined-surface".to_vec();

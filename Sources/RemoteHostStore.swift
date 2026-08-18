@@ -712,6 +712,7 @@ final class RemoteHostStore: ObservableObject {
         hostCapabilities.has(PeerCapability.surfaceAgentV1)
             && hostCapabilities.has(PeerCapability.surfaceExitV1)
             && hostCapabilities.has(PeerCapability.surfaceEnsureEnvV1)
+            && hostCapabilities.has(PeerCapability.teamRouteFileV1)
     }
 
     /// Fired after a successful sidebar connect so the mounted host

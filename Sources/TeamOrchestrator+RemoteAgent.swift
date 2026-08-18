@@ -690,6 +690,27 @@ extension TeamOrchestrator {
             ))
         }
 
+        // Before anything is installed: every adopted worker must be holding a
+        // grant this app owns, or the adoption does not happen at all. The
+        // panes attach either way — it is `tm-agent send`/`inbox`/`reply` that
+        // would silently address the previous viewer's revoked bearer.
+        guard let routeTransfer = await mintAdoptedRemoteAgentRoutes(
+            teamName: remote.name,
+            teamUUID: remote.teamUUID,
+            host: host,
+            members: members
+        ) else {
+            if remote.presentationOwnedByRequester {
+                ManagedPeerSurfaceStore.shared.forget(
+                    hostKey: host.id,
+                    surfaceID: remote.leaderSurfaceID
+                )
+            }
+            tabManager.closeWorkspace(workspace)
+            return false
+        }
+        let mintedRoutes = routeTransfer.grants
+
         let team = Team(
             id: remote.name,
             leaderSessionId: UUID().uuidString,
@@ -727,6 +748,10 @@ extension TeamOrchestrator {
                         surfaceID: remote.leaderSurfaceID
                     )
                 }
+                _ = await Self.finishAdoptedRemoteAgentRoutes(
+                    host: host, transaction: routeTransfer.transaction, commit: false
+                )
+                await Self.revokeGrants(Array(mintedRoutes.values))
                 tabManager.closeWorkspace(workspace)
                 return false
             }
@@ -747,9 +772,28 @@ extension TeamOrchestrator {
                         surfaceID: remote.leaderSurfaceID
                     )
                 }
+                _ = await Self.finishAdoptedRemoteAgentRoutes(
+                    host: host, transaction: routeTransfer.transaction, commit: false
+                )
+                await Self.revokeGrants(Array(mintedRoutes.values))
                 tabManager.closeWorkspace(workspace)
                 return false
             }
+        }
+        await Self.commitRemoteAgentRoutesPreservingGrants(
+            host: host,
+            transaction: routeTransfer.transaction,
+            grantIDs: Array(mintedRoutes.values)
+        )
+        // Only now that the roster is real: the keepalive loop retires itself
+        // when the team or the member is missing, so starting it any earlier
+        // would have cancelled every lease on its first tick.
+        for (agentInstanceID, grantID) in mintedRoutes {
+            startRemoteAgentRouteKeepalive(
+                teamName: remote.name,
+                agentInstanceID: agentInstanceID,
+                grantID: grantID
+            )
         }
         WorkspaceProjectNames.shared.declare(
             workspaceId: workspace.id,
@@ -2167,10 +2211,16 @@ extension TeamOrchestrator {
     /// machines. Workers intentionally do not share the leader's grant: a
     /// leader reconnect can replace its bearer without cutting every agent's
     /// `tm-agent` channel at once.
+    ///
+    /// `teamUUID` is passed explicitly by adoption, which mints routes before
+    /// the team exists in `teams` — installing a project whose workers had
+    /// already been proven unreachable is the failure this ordering avoids.
     private func bootstrapRemoteAgentRoute(
-        teamName: String
+        teamName: String,
+        teamUUID explicitTeamUUID: String? = nil
     ) async throws -> Termmesh_Peer_V1_TeamLeaderGrant {
-        guard let teamUUID = teams[teamName]?.teamUuid, !teamUUID.isEmpty else {
+        let resolved = explicitTeamUUID ?? teams[teamName]?.teamUuid
+        guard let teamUUID = resolved, !teamUUID.isEmpty else {
             throw RemoteAgentError.teamNotFound(teamName)
         }
         var bootstrap = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
@@ -3554,6 +3604,21 @@ extension TeamOrchestrator {
         let routeGrant = try await bootstrapRemoteAgentRoute(teamName: teamName)
         unownedRouteGrant = routeGrant
 
+        // Stage the route beside the worker before anything launches, so its
+        // environment can name a file a later viewer is able to replace. A
+        // host with no SSH provisioning route keeps the frozen variables and
+        // the old ceiling: it works until the app that minted the grant quits.
+        // A durable member may not accept that ceiling — surviving every
+        // viewer is the entire promise it was created under.
+        let routeFilePath = await Self.stageRemoteAgentRouteFile(
+            host: host,
+            agentInstanceID: agentInstanceId,
+            grant: routeGrant
+        )
+        if routeFilePath == nil, requiresDurableRemoteMember {
+            throw RemoteAgentError.environmentStagingFailed(host.displayName)
+        }
+
         // Use the same incremental grid growth as local `add`/`attach`.
         let placement = nextAgentSplitPlacement(team: team, workspace: workspace)
 
@@ -3622,7 +3687,8 @@ extension TeamOrchestrator {
                 agentType: agentType,
                 model: model,
                 cli: cli,
-                routeGrant: routeGrant
+                routeGrant: routeGrant,
+                routeFilePath: routeFilePath
             )
             startRemoteAgentRouteKeepalive(
                 teamName: teamName,
@@ -3680,6 +3746,7 @@ extension TeamOrchestrator {
                     model: model,
                     cli: cli,
                     routeGrant: routeGrant,
+                    routeFilePath: routeFilePath,
                     stillWanted: attachStillWanted
                 )
                 startRemoteAgentRouteKeepalive(
@@ -3960,7 +4027,8 @@ extension TeamOrchestrator {
                         // JSON-RPC protocol. The remote pane already inherits
                         // its owning app/daemon control socket; preserve it.
                         socketPath: nil,
-                        routeGrant: routeGrant
+                        routeGrant: routeGrant,
+                        routeFilePath: routeFilePath
                     )) {
                         _, internalValue in internalValue
                     },
@@ -5096,6 +5164,7 @@ extension TeamOrchestrator {
         model: String,
         cli: String,
         routeGrant: Termmesh_Peer_V1_TeamLeaderGrant,
+        routeFilePath: String?,
         stillWanted: () -> Bool
     ) async throws -> AgentMember {
         let color = Self.agentColor(
@@ -5133,7 +5202,8 @@ extension TeamOrchestrator {
                 // Peer-owned surfaces receive the authoritative daemon
                 // control socket as protected identity environment.
                 socketPath: nil,
-                routeGrant: routeGrant
+                routeGrant: routeGrant,
+                routeFilePath: routeFilePath
             )
         )
 
@@ -5257,6 +5327,10 @@ extension TeamOrchestrator {
         let panelID: UUID
         let member: AgentMember
         let routeGrantID: Data
+        let routeHost: HostEntry
+        let routeTransaction: String
+        let teamName: String
+        let agentInstanceID: String
     }
 
     /// Replace exactly the peer-owned member that a hard restart observed.
@@ -5286,6 +5360,11 @@ extension TeamOrchestrator {
         workspace.discardPanelForRollback(replacement.panelID)
         Self.releasePeerOwnedAgentSurface(replacement.member)
         Task {
+            _ = await Self.finishAdoptedRemoteAgentRoutes(
+                host: replacement.routeHost,
+                transaction: replacement.routeTransaction,
+                commit: false
+            )
             await PeerTeamLeaderControlPlane.shared.revokeGrant(
                 id: replacement.routeGrantID
             )
@@ -5297,7 +5376,14 @@ extension TeamOrchestrator {
         _ replacement: PeerOwnedAgentRestart,
         teamName: String,
         agentInstanceID: String
-    ) {
+    ) async {
+        // The live worker route still names the old grant until this finishes.
+        // Only then may `startRemoteAgentRouteKeepalive` revoke that old grant.
+        await Self.commitRemoteAgentRoutesPreservingGrants(
+            host: replacement.routeHost,
+            transaction: replacement.routeTransaction,
+            grantIDs: [replacement.routeGrantID]
+        )
         startRemoteAgentRouteKeepalive(
             teamName: teamName,
             agentInstanceID: agentInstanceID,
@@ -5344,15 +5430,34 @@ extension TeamOrchestrator {
             return .failure(.spawnFailed)
         }
         var grantOwned = true
+        var stagedRouteTransaction: String?
         defer {
             if grantOwned {
                 Task {
+                    if let transaction = stagedRouteTransaction {
+                        _ = await Self.finishAdoptedRemoteAgentRoutes(
+                            host: host, transaction: transaction, commit: false
+                        )
+                    }
                     await PeerTeamLeaderControlPlane.shared.revokeGrant(
                         id: routeGrant.grantID
                     )
                 }
             }
         }
+
+        // Restart mints a new grant, so the staged route has to move with it.
+        // Skipping this would leave the file naming a bearer that was revoked
+        // the moment the old surface went away.
+        guard let stagedRoute = await Self.stageRemoteAgentRouteTransaction(
+            host: host,
+            agentInstanceID: agent.agentInstanceId,
+            grant: routeGrant
+        ) else {
+            return .failure(.spawnFailed)
+        }
+        stagedRouteTransaction = stagedRoute.transaction
+        let routeFilePath = stagedRoute.routeFilePath
 
         let workingDirectory = agent.originalAgentWorkDir
             ?? agent.worktreePath
@@ -5380,7 +5485,8 @@ extension TeamOrchestrator {
                     agentCli: agent.cli,
                     workspaceId: workspace.id,
                     socketPath: nil,
-                    routeGrant: routeGrant
+                    routeGrant: routeGrant,
+                    routeFilePath: routeFilePath
                 )
             )
         } catch {
@@ -5474,7 +5580,11 @@ extension TeamOrchestrator {
         return .success(PeerOwnedAgentRestart(
             panelID: panel.id,
             member: replacement,
-            routeGrantID: routeGrant.grantID
+            routeGrantID: routeGrant.grantID,
+            routeHost: host,
+            routeTransaction: stagedRoute.transaction,
+            teamName: team.id,
+            agentInstanceID: agent.agentInstanceId
         ))
     }
 
@@ -5493,7 +5603,8 @@ extension TeamOrchestrator {
         agentType: String,
         model: String,
         cli: String,
-        routeGrant: Termmesh_Peer_V1_TeamLeaderGrant
+        routeGrant: Termmesh_Peer_V1_TeamLeaderGrant,
+        routeFilePath: String?
     ) async throws -> AgentMember {
         let bridge = AgentPipeTransport.needsBridge(cli: cli)
             ? AgentPipeTransport.bridgePath(workingDirectory: workingDirectory)
@@ -5527,7 +5638,8 @@ extension TeamOrchestrator {
                 agentCli: cli,
                 workspaceId: workspace.id,
                 socketPath: reverseUnixForward.remote,
-                routeGrant: routeGrant
+                routeGrant: routeGrant,
+                routeFilePath: routeFilePath
             )) { _, internalValue in internalValue }
         guard let remoteEnvironmentFile = await Self.writeRemoteAgentEnvironmentOverSSH(
             host: host,
@@ -5660,7 +5772,8 @@ extension TeamOrchestrator {
         agentCli: String,
         workspaceId: UUID,
         socketPath: String?,
-        routeGrant: Termmesh_Peer_V1_TeamLeaderGrant? = nil
+        routeGrant: Termmesh_Peer_V1_TeamLeaderGrant? = nil,
+        routeFilePath: String? = nil
     ) -> [String: String] {
         var env: [String: String] = [
             "TERMMESH_TEAM_AGENT": "1",
@@ -5682,6 +5795,11 @@ extension TeamOrchestrator {
             env.merge(remoteTeamRouteEnvironment(routeGrant)) {
                 _, routeValue in routeValue
             }
+        }
+        // A path, not a bearer. It is what lets a later viewer replace this
+        // worker's grant without touching the process that is already running.
+        if let routeFilePath, routeFilePath.hasPrefix("/") {
+            env[remoteTeamRouteFileEnvName] = routeFilePath
         }
         if agentCli == "claude" {
             env["CLAUDECODE"] = "1"
@@ -5727,6 +5845,334 @@ extension TeamOrchestrator {
                 PeerIdentity.defaultPeerID()
             ),
         ]
+    }
+
+    /// Names the file `tm-agent` reads its scoped route out of, on every
+    /// invocation, in preference to the five frozen variables beside it.
+    static let remoteTeamRouteFileEnvName = "TERMMESH_LEADER_ROUTE_FILE"
+
+    private static let remoteRouteFilePathMarker = "__TERMMESH_ROUTE_FILE__="
+
+    /// Where one worker's route lives on its own machine.
+    ///
+    /// Derived from the agent instance id and nothing else, because the app
+    /// that adopts this project later has the roster and not the launch. The
+    /// same sanitising rule as the SSH-owned control socket keeps a hostile
+    /// instance id from naming a path of its choosing.
+    static func remoteAgentRouteFileName(agentInstanceID: String) -> String {
+        let safeID = agentInstanceID.lowercased().filter {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-")
+        }
+        return String(safeID.prefix(48)) + ".json"
+    }
+
+    /// The exact bytes `tm-agent`'s `remote_leader_route_from_file` parses.
+    static func remoteAgentRouteFilePayload(
+        _ grant: Termmesh_Peer_V1_TeamLeaderGrant
+    ) -> Data {
+        let object: [String: Any] = [
+            "version": 1,
+            "grant_id_hex": grant.grantID.map { String(format: "%02x", $0) }.joined(),
+            "project_id": grant.projectID,
+            "team_uuid": grant.teamUuid,
+            "expires_at_unix_secs": grant.expiresAtUnixSecs,
+            "target_peer_id_hex": PeerIdentity.hexString(PeerIdentity.defaultPeerID()),
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object))
+            ?? Data("{}".utf8)
+    }
+
+    /// Write the route beside the running worker, then move it into place.
+    ///
+    /// Two properties matter and both are in the script rather than in Swift.
+    /// The rename is atomic, so a `tm-agent` invocation that lands mid-swap
+    /// reads either the whole old route or the whole new one and never a torn
+    /// file. And the grant arrives on **stdin**: a bearer in the remote
+    /// command line would sit in `ps` output and in shell history on a machine
+    /// this app does not own.
+    ///
+    /// `$HOME` is resolved on the far side and echoed back, because the app
+    /// knows the account but not its home directory, and the path has to be
+    /// the same one the next adopting app will compute.
+    static func remoteAgentRouteStagingScript(agentInstanceID: String) -> String {
+        let fileName = remoteAgentRouteFileName(agentInstanceID: agentInstanceID)
+        let body = "set -e; umask 077; "
+            + "dir=\"$HOME/.term-mesh/agent-routes\"; "
+            + "mkdir -p \"$dir\"; chmod 700 \"$dir\"; "
+            + "path=\"$dir/\(fileName)\"; tmp=\"$path.$$.tmp\"; "
+            + "trap 'rm -f \"$tmp\"' EXIT; "
+            + "cat > \"$tmp\"; chmod 600 \"$tmp\"; mv -f \"$tmp\" \"$path\"; "
+            + "printf '%s%s\\n' \(shellQuoted(remoteRouteFilePathMarker)) \"$path\""
+        // The worker belongs to term-meshd's service account, which may differ
+        // from the SSH login. Stage under that same account/home so the child
+        // can read the path now and a later viewer can replace it. The helper
+        // also forces /bin/sh for fish/csh login accounts.
+        return RemotePasteTransfer.serviceAccountCommand(body)
+    }
+
+    /// Only an absolute path counts. A shell that printed a warning around the
+    /// marker, or a marker with nothing after it, means the write did not land
+    /// where the environment will point.
+    static func parseRemoteAgentRouteFilePath(_ output: String) -> String? {
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            guard let range = text.range(of: remoteRouteFilePathMarker) else { continue }
+            let candidate = String(text[range.upperBound...])
+            if candidate.hasPrefix("/") { return candidate }
+        }
+        return nil
+    }
+
+    /// Stage one worker's route on its host, returning the path the worker's
+    /// environment should name. `nil` means the route stayed in the
+    /// environment — the pre-existing behaviour, and all a host without an SSH
+    /// provisioning route can offer.
+    static func stageRemoteAgentRouteFile(
+        host: HostEntry,
+        agentInstanceID: String,
+        grant: Termmesh_Peer_V1_TeamLeaderGrant
+    ) async -> String? {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return nil }
+        do {
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: remoteAgentRouteStagingScript(agentInstanceID: agentInstanceID),
+                standardInput: remoteAgentRouteFilePayload(grant),
+                timeoutSeconds: 20
+            )
+            return parseRemoteAgentRouteFilePath(output)
+        } catch {
+            // Deliberately value-free: the failure is reported by the caller
+            // that knows whether this member was allowed to degrade.
+            return nil
+        }
+    }
+
+    static func revokeGrants(_ grantIDs: [Data]) async {
+        for grantID in grantIDs {
+            await PeerTeamLeaderControlPlane.shared.revokeGrant(id: grantID)
+        }
+    }
+
+    /// Replace every adopted worker route as one remote transaction. All new
+    /// files are decoded before the first live path changes; the trap restores
+    /// backups (or removes newly-created paths) if any later rename fails.
+    struct AdoptedRemoteAgentRouteTransfer {
+        let grants: [String: Data]
+        let transaction: String
+    }
+
+    static func stageAdoptedRemoteAgentRoutes(
+        host: HostEntry,
+        routes: [(agentInstanceID: String, grant: Termmesh_Peer_V1_TeamLeaderGrant)]
+    ) async -> String? {
+        guard !routes.isEmpty else { return "" }
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return nil }
+        let records = routes.map { route in
+            remoteAgentRouteFileName(agentInstanceID: route.agentInstanceID)
+                + "\t" + remoteAgentRouteFilePayload(route.grant).base64EncodedString()
+        }.joined(separator: "\n") + "\n"
+        let body = adoptedRemoteAgentRouteTransactionScript()
+        do {
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: RemotePasteTransfer.serviceAccountCommand(body),
+                standardInput: Data(records.utf8),
+                timeoutSeconds: 30
+            )
+            return parseAdoptedRouteTransaction(output)
+        } catch {
+            return nil
+        }
+    }
+
+    private static let adoptedRouteTransactionMarker = "__TERMMESH_ROUTE_TX__="
+    private static let adoptedRouteDirectoryMarker = "__TERMMESH_ROUTE_DIR__="
+
+    struct StagedRemoteAgentRoute {
+        let routeFilePath: String
+        let transaction: String
+    }
+
+    static func parseAdoptedRouteTransaction(_ output: String) -> String? {
+        for line in output.split(separator: "\n") {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            guard text.hasPrefix(adoptedRouteTransactionMarker) else { continue }
+            let name = String(text.dropFirst(adoptedRouteTransactionMarker.count))
+            if name.hasPrefix(".tx."), name.dropFirst(4).allSatisfy(\.isNumber) { return name }
+        }
+        return nil
+    }
+
+    static func parseAdoptedRouteDirectory(_ output: String) -> String? {
+        for line in output.split(separator: "\n") {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            guard text.hasPrefix(adoptedRouteDirectoryMarker) else { continue }
+            let path = String(text.dropFirst(adoptedRouteDirectoryMarker.count))
+            if path.hasPrefix("/") { return path }
+        }
+        return nil
+    }
+
+    static func adoptedRemoteAgentRouteTransactionScript() -> String {
+        "set -e; umask 077; "
+            + "dir=\"$HOME/.term-mesh/agent-routes\"; mkdir -p \"$dir\"; chmod 700 \"$dir\"; "
+            + "tx=\"$dir/.tx.$$\"; mkdir \"$tx\"; : > \"$tx/committed\"; "
+            + "rollback() { while IFS= read -r n; do [ -n \"$n\" ] || continue; if [ -f \"$tx/$n.old\" ]; then mv -f \"$tx/$n.old\" \"$dir/$n\"; else rm -f \"$dir/$n\"; fi; done < \"$tx/committed\"; rm -rf \"$tx\"; }; "
+            + "trap rollback EXIT HUP INT TERM; tab=$(printf '\\t'); "
+            + "while IFS=\"$tab\" read -r n b; do [ -n \"$n\" ] || continue; "
+            + "case \"$n\" in *[!a-z0-9.-]*|'') exit 64;; esac; "
+            + "if printf '' | base64 -d >/dev/null 2>&1; then flag=-d; elif printf '' | base64 -D >/dev/null 2>&1; then flag=-D; else exit 65; fi; "
+            + "printf %s \"$b\" | base64 $flag > \"$tx/$n.new\"; chmod 600 \"$tx/$n.new\"; done; "
+            + "for p in \"$tx\"/*.new; do [ -f \"$p\" ] || exit 66; done; "
+            + "trap - EXIT HUP INT TERM; printf '%s%s\\n' \(shellQuoted(adoptedRouteDirectoryMarker)) \"$dir\""
+            + "; printf '%s%s\\n' \(shellQuoted(adoptedRouteTransactionMarker)) \"${tx##*/}\""
+    }
+
+    static func stageRemoteAgentRouteTransaction(
+        host: HostEntry,
+        agentInstanceID: String,
+        grant: Termmesh_Peer_V1_TeamLeaderGrant
+    ) async -> StagedRemoteAgentRoute? {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return nil }
+        let fileName = remoteAgentRouteFileName(agentInstanceID: agentInstanceID)
+        let record = fileName + "\t"
+            + remoteAgentRouteFilePayload(grant).base64EncodedString() + "\n"
+        do {
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: RemotePasteTransfer.serviceAccountCommand(
+                    adoptedRemoteAgentRouteTransactionScript()
+                ),
+                standardInput: Data(record.utf8),
+                timeoutSeconds: 30
+            )
+            guard let transaction = parseAdoptedRouteTransaction(output),
+                  let directory = parseAdoptedRouteDirectory(output) else { return nil }
+            return StagedRemoteAgentRoute(
+                routeFilePath: directory + "/" + fileName,
+                transaction: transaction
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    static func adoptedRemoteAgentRouteFinishScript(
+        transaction: String, commit: Bool
+    ) -> String? {
+        guard transaction.hasPrefix(".tx."),
+              transaction.dropFirst(4).allSatisfy(\.isNumber) else { return nil }
+        let quoted = shellQuoted(transaction)
+        let rollback = "while IFS= read -r n; do [ -n \"$n\" ] || continue; if [ -f \"$tx/$n.old\" ]; then mv -f \"$tx/$n.old\" \"$dir/$n\"; else rm -f \"$dir/$n\"; fi; done < \"$tx/committed\"; rm -rf \"$tx\""
+        let action = commit
+            ? "[ -f \"$tx.done\" ] && exit 0; [ -d \"$tx\" ] || exit 67; rollback() { " + rollback + "; }; trap rollback EXIT HUP INT TERM; for p in \"$tx\"/*.new; do [ -f \"$p\" ] || continue; n=${p##*/}; n=${n%.new}; [ ! -e \"$dir/$n\" ] || cp -p \"$dir/$n\" \"$tx/$n.old\"; mv -f \"$p\" \"$dir/$n\"; printf '%s\\n' \"$n\" >> \"$tx/committed\"; done; : > \"$tx.done\"; trap - EXIT HUP INT TERM; rm -rf \"$tx\""
+            : rollback
+        let guardTransaction = commit ? "" : "[ -d \"$tx\" ] || exit 0; "
+        return "set -e; dir=\"$HOME/.term-mesh/agent-routes\"; tx=\"$dir/"
+            + quoted + "\"; " + guardTransaction + action
+    }
+
+    static func finishAdoptedRemoteAgentRoutes(
+        host: HostEntry, transaction: String, commit: Bool
+    ) async -> Bool {
+        guard let body = adoptedRemoteAgentRouteFinishScript(
+            transaction: transaction, commit: commit
+        ), let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return false }
+        do {
+            _ = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget, port: host.sshPort, identityFile: host.identityFile,
+                script: RemotePasteTransfer.serviceAccountCommand(body), timeoutSeconds: 20
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Retry the commit after the local roster owns the worker. Staging never
+    /// touches the live route, so a failed local operation can simply discard
+    /// its prepared transaction and revoke the unused grants.
+    static func commitRemoteAgentRoutesPreservingGrants(
+        host: HostEntry, transaction: String, grantIDs: [Data]
+    ) async {
+        while true {
+            if await finishAdoptedRemoteAgentRoutes(
+                host: host, transaction: transaction, commit: true
+            ) {
+                return
+            }
+            for grantID in grantIDs {
+                _ = await PeerTeamLeaderControlPlane.shared.keepAliveGrant(id: grantID)
+            }
+            try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+        }
+    }
+
+    /// Hand every adopted worker a grant this app owns.
+    ///
+    /// Adoption used to attach the surfaces and stop there, which left each
+    /// worker addressing the bearer of whichever viewer created it. While that
+    /// viewer ran, everything worked; once it quit, `tm-agent send`, `inbox`
+    /// and `reply` answered "invalid remote leader route" on processes that
+    /// were otherwise perfectly alive, and the only cure was restarting them
+    /// and losing their context.
+    ///
+    /// So mint per-worker grants here and replace each route file. Returning
+    /// the leases rather than installing them keeps the caller free to abandon
+    /// the whole adoption: a half-refreshed team is worse than none, because
+    /// the panes look adopted and half the roster cannot be reached.
+    func mintAdoptedRemoteAgentRoutes(
+        teamName: String,
+        teamUUID: String,
+        host: HostEntry,
+        members: [AgentMember]
+    ) async -> AdoptedRemoteAgentRouteTransfer? {
+        guard !members.isEmpty else {
+            return AdoptedRemoteAgentRouteTransfer(grants: [:], transaction: "")
+        }
+        guard host.sshTarget?.isEmpty == false else { return nil }
+        var minted: [String: Data] = [:]
+        var routes: [(agentInstanceID: String, grant: Termmesh_Peer_V1_TeamLeaderGrant)] = []
+
+        func abandon() async {
+            await Self.revokeGrants(Array(minted.values))
+        }
+
+        for member in members {
+            guard let grant = try? await bootstrapRemoteAgentRoute(
+                teamName: teamName,
+                teamUUID: teamUUID
+            ) else {
+                RemoteWorkLog.info(
+                    "Could not mint a team route for \(member.name) on \(host.displayName); "
+                        + "leaving the existing project untouched"
+                )
+                await abandon()
+                return nil
+            }
+            minted[member.agentInstanceId] = grant.grantID
+            routes.append((member.agentInstanceId, grant))
+        }
+        guard let transaction = await Self.stageAdoptedRemoteAgentRoutes(
+            host: host, routes: routes
+        ) else {
+            RemoteWorkLog.info(
+                "Could not atomically hand workers new team routes on \(host.displayName); "
+                    + "the existing project was left untouched"
+            )
+            await abandon()
+            return nil
+        }
+        return AdoptedRemoteAgentRouteTransfer(
+            grants: minted, transaction: transaction
+        )
     }
 
     /// Stop what this agent left running on the other machine, then close its
