@@ -4,6 +4,27 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.193.0] - 2026-08-18
+
+**원격 Project와 agent가 이제 viewer의 수명에 묶이지 않는다.** 앱을 종료하거나 다른 Mac에서 다시 열어도 leader와 worker를 그대로 이어가고, relay 복구 중인 명령 응답과 duplicate agent의 격리 checkout도 잃지 않는다.
+
+### Added
+
+- **native agent pane에서 텍스트를 드래그해 복사할 수 있다** ([#291](https://github.com/x-mesh/term-mesh/pull/291)) — 일반 답변, 지시문, 도구 출력과 코드까지 macOS 표준 텍스트 선택으로 긁을 수 있다. 연속된 도구 호출은 한 활동 묶음으로 접혀 긴 작업 기록도 훨씬 짧게 훑는다.
+
+### Fixed
+
+- **원격 Project를 다른 client에서 열어도 같은 leader와 worker가 그대로 이어진다** ([#291](https://github.com/x-mesh/term-mesh/pull/291)) — Project manifest가 모든 surface와 agent instance를 보존하고, 원래 viewer가 종료돼도 host daemon이 작업을 계속 소유한다. 다른 인증된 client가 Project를 열면 worker의 team route도 새 viewer의 grant로 넘겨져 `send`, `inbox`, `reply`가 계속 동작한다. 정확히 복원할 수 없는 multi-host 배치나 구버전 daemon은 Project 생성 전에 막는다.
+
+- **relay가 화면을 복구하는 동안 원격 leader 응답이 사라지던 문제** ([#293](https://github.com/x-mesh/term-mesh/pull/293)) — 출력 누락을 복구하려고 peer session을 교체할 때 진행 중인 leader command의 응답 연결까지 닫혀 timeout이 날 수 있었다. 이제 응답이 원래 연결로 돌아갈 때까지 session 교체를 직렬화하고, 끊긴 요청 ID는 즉시 풀어 새 연결에서 안전하게 재시도한다.
+
+- **같은 역할의 agent를 여러 명 만들면 서로의 isolated worktree를 덮거나 고아 checkout을 남기던 문제** ([#294](https://github.com/x-mesh/term-mesh/pull/294)) — branch identity에 durable agent instance를 포함하고 모든 checkout을 process 시작 전에 준비한다. live worktree는 절대 stale로 오인해 지우지 않으며, pane 생성이 중간에 실패하면 아직 roster가 소유하지 않은 checkout과 branch를 역순으로 되돌린다.
+
+### Thanks to 2 contributors!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+- [@lkasa5546](https://github.com/lkasa5546)
+
 ## [0.192.0] - 2026-08-18
 
 ### Fixed
