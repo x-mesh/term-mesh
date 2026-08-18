@@ -167,13 +167,47 @@ fn create_inner(params: serde_json::Value) -> Result<WorktreeInfo, String> {
                         tracing::warn!("{message}");
                         return Err(message);
                     }
-                    wt.prune(Some(git2::WorktreePruneOptions::new().valid(true)))
+                    // Do not force-prune a worktree that became valid again
+                    // between `validate` and this mutation. Libgit2's default
+                    // prune options re-check validity and refuse the prune.
+                    let mut prune_options = git2::WorktreePruneOptions::new();
+                    wt.prune(Some(&mut prune_options))
                         .map_err(|e| {
                             format!(
                                 "cannot prune invalid worktree '{existing_wt}' for branch '{branch_name}' at '{}': {e}",
                                 wt_path.display()
-                            )
-                        })?;
+                        )
+                    })?;
+                    // The prune and branch deletion are separate libgit2
+                    // operations. Confirm that no linked checkout still owns
+                    // this branch before deleting it.
+                    if repo.find_worktree(existing_wt).is_ok() {
+                        return Err(format!(
+                            "worktree conflict: branch '{branch_name}' is still owned by '{existing_wt}' at '{}'",
+                            wt_path.display()
+                        ));
+                    }
+                    if let Ok(wt_names) = repo.worktrees() {
+                        for remaining in wt_names.iter().flatten() {
+                            let checked_out_branch =
+                                repo.find_worktree(remaining).ok().and_then(|other| {
+                                    let other_path = other.path().to_path_buf();
+                                    Repository::open(&other_path)
+                                        .ok()
+                                        .and_then(|wt_repo| {
+                                            wt_repo.head().ok().and_then(|head| {
+                                                head.shorthand().map(str::to_owned)
+                                            })
+                                        })
+                                        .or_else(|| worktree_metadata_branch(&repo, remaining))
+                                });
+                            if checked_out_branch.as_deref() == Some(&branch_name) {
+                                return Err(format!(
+                                    "worktree conflict: branch '{branch_name}' is still checked out by '{remaining}'"
+                                ));
+                            }
+                        }
+                    }
                     tracing::info!(
                         "pruned invalid worktree metadata name='{existing_wt}' branch='{branch_name}' path='{}'",
                         wt_path.display()
@@ -891,6 +925,35 @@ mod tests {
         assert_eq!(replacement.branch, "team/stale-team");
         assert_ne!(replacement.name, first.name);
         assert!(std::path::Path::new(&replacement.path).exists());
+    }
+
+    #[test]
+    fn default_prune_preserves_worktree_restored_after_validation() {
+        let (_dir, repo_path, base_dir) = init_temp_repo();
+        let created = create(serde_json::json!({
+            "repo_path": repo_path,
+            "base_dir": base_dir,
+            "branch": "team/restored",
+        }))
+        .unwrap();
+        let live_path = std::path::PathBuf::from(&created.path);
+        let hidden_path = live_path.with_extension("hidden");
+        std::fs::rename(&live_path, &hidden_path).unwrap();
+
+        let repo = Repository::open(&repo_path).unwrap();
+        let worktree = repo.find_worktree(&created.name).unwrap();
+        assert!(worktree.validate().is_err());
+
+        // This is the validate/prune race: another process restores the
+        // checkout after the caller observed invalid metadata.
+        std::fs::rename(&hidden_path, &live_path).unwrap();
+        let mut prune_options = git2::WorktreePruneOptions::new();
+        assert!(worktree.prune(Some(&mut prune_options)).is_err());
+        assert!(repo.find_worktree(&created.name).is_ok());
+        assert!(live_path.exists());
+        assert!(repo
+            .find_branch("team/restored", git2::BranchType::Local)
+            .is_ok());
     }
 
     #[test]
