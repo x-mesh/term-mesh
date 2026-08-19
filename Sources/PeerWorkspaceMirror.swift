@@ -665,17 +665,44 @@ final class PeerWorkspaceMirrorController {
             }
             await previousTransport?.close()
             guard let self, !self.isTornDown, !Task.isCancelled else { return }
+            var startError: Error?
             do {
                 try await self.start()
+            } catch {
+                startError = error
+            }
+            // A superseded resume owns nothing. A newer resume cancels this
+            // task and moves the lease before starting its own subscription,
+            // so whatever THIS task observed — success or failure — would
+            // speak for controller state the newer resume now owns. The
+            // failure side was the observed hazard: a cancelled `start()`
+            // throwing into an unconditional `handleConnectionLost` cleared
+            // the replacement's fresh session and cancelled its reconnect
+            // task. Only the resume still holding the current lease reports.
+            guard Self.resumeOutcomeMayReport(
+                isCancelled: Task.isCancelled,
+                leaseIsCurrent: self.lease === replacement
+            ) else { return }
+            if let startError {
+                self.handleConnectionLost(reason: String(describing: startError))
+            } else {
                 self.markWorkspaceTitle(suffix: nil)
                 RemoteWorkLog.infoOffMain(
                     "Workspace mirror reconnected through the replacement host transport"
                 )
-            } catch {
-                self.handleConnectionLost(reason: String(describing: error))
             }
         }
         return true
+    }
+
+    /// Whether a finished resume attempt may report its outcome to the
+    /// controller. Pure so the superseded-resume contract is pinned by a
+    /// test rather than by whoever edits the task body next.
+    nonisolated static func resumeOutcomeMayReport(
+        isCancelled: Bool,
+        leaseIsCurrent: Bool
+    ) -> Bool {
+        !isCancelled && leaseIsCurrent
     }
 
     /// The mirrored workspace was deleted on the host. Auto-close the

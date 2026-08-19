@@ -1070,4 +1070,20 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             .abandon
         )
     }
+
+    /// A resume that was superseded — cancelled by a newer resume, or whose
+    /// lease has moved on — must stay silent: reporting its failure used to
+    /// clear the replacement's fresh subscription and cancel its reconnect
+    /// task (the clobber both panel review runs flagged).
+    func test_supersededResumeNeverReportsItsOutcome() {
+        XCTAssertTrue(PeerWorkspaceMirrorController.resumeOutcomeMayReport(
+            isCancelled: false, leaseIsCurrent: true
+        ))
+        XCTAssertFalse(PeerWorkspaceMirrorController.resumeOutcomeMayReport(
+            isCancelled: true, leaseIsCurrent: true
+        ), "cancellation means a newer resume owns the controller now")
+        XCTAssertFalse(PeerWorkspaceMirrorController.resumeOutcomeMayReport(
+            isCancelled: false, leaseIsCurrent: false
+        ), "a moved lease means this resume's observation is about dead state")
+    }
 }
