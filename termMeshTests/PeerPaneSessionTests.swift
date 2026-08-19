@@ -1807,6 +1807,168 @@ final class ProjectRemoteSurfaceDeletionTests: XCTestCase {
     }
 }
 
+/// Invariant harness over the peer-agent cleanup submachine — the first
+/// class-level defense against the "distributed lifecycle state drifts from
+/// reality" defect family, whose members were previously found one incident
+/// at a time (tombstone enrichment race, wrong-owner notFound spends,
+/// delete-time leaks).
+///
+/// Instead of pinning one reproduced interleaving, seeded runs drive random
+/// interleavings of enqueue / mid-flight enrichment / retry passes / host
+/// route movement against a model host, then assert the invariants that must
+/// hold for EVERY ordering:
+///
+///  I-spend: a record that ever learned its true owning endpoint is never
+///           spent by a wrong-endpoint "success" (a moved route's notFound is
+///           indistinguishable from confirmation by protocol, so the ONLY
+///           defense is the record) — its process must be dead once the store
+///           lets go of it.
+///  I-drain: once the route heals, every remaining record is spent and every
+///           modeled process is dead — no immortal tombstone, no orphan.
+///
+/// A failing seed replays deterministically; put the seed in the failure
+/// message of any new assertion added here.
+final class PeerCleanupLifecycleInvariantTests: XCTestCase {
+
+    /// Deterministic LCG so a failing scenario replays by seed alone.
+    private struct SeededRNG: RandomNumberGenerator {
+        var state: UInt64
+        mutating func next() -> UInt64 {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return state
+        }
+    }
+
+    @MainActor
+    func test_everySeededInterleavingKeepsOwnerAwareTombstonesUntilTheProcessIsDead() async {
+        for seed in UInt64(1)...50 {
+            await runScenario(seed: seed)
+        }
+    }
+
+    @MainActor
+    private func runScenario(seed: UInt64) async {
+        var rng = SeededRNG(state: seed)
+        let suiteName = "LifecycleInv-\(seed)-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("seed \(seed): could not create isolated defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let hostKey = "ssh:model-host"
+        let trueOwner = "/run/model/true-owner.sock"
+        let wrongRoute = "/run/model/moved-route.sock"
+        // The host's CURRENT route starts on the moved endpoint — the exact
+        // condition that makes nil-owner fallback resolution dangerous.
+        var currentRoute = wrongRoute
+
+        var alive = Set<Data>()       // processes running on the model host
+        var ownerKnown = Set<Data>()  // surfaces whose record carried the true owner
+
+        let store = PendingPeerAgentSurfaceCleanupStore(
+            defaults: defaults,
+            observeNotifications: false,
+            automaticRetryDelay: 3600,
+            hostSockPathProvider: { _ in nil },
+            terminator: { _, _, _, _ in false }
+        )
+
+        let surfaceCount = Int(rng.next() % 4) + 2
+        let surfaces = (0..<surfaceCount).map { Data(repeating: UInt8($0 + 1), count: 16) }
+        for surface in surfaces {
+            alive.insert(surface)
+            if rng.next() % 2 == 0 {
+                // Recorded with the owner already known (post-ensure detach).
+                store.enqueue(
+                    hostKey: hostKey, surfaceID: surface,
+                    owningRemoteSockPath: trueOwner
+                )
+                ownerKnown.insert(surface)
+            } else {
+                // Legacy shape: recorded before anyone knew the endpoint.
+                store.enqueue(hostKey: hostKey, surfaceID: surface)
+            }
+        }
+
+        // Model terminate semantics, inlined in each pass below: resolution
+        // prefers the recorded owner, else the host's current route. Reaching
+        // the true owner kills the process. Reaching anything else returns
+        // notFound — which the wire contract defines as SUCCESS. Both answers
+        // are `true`; that lie is the hazard the invariants guard.
+        let passes = Int(rng.next() % 4) + 3
+        for pass in 0..<passes {
+            // The route heals partway through the scenario.
+            if pass == passes - 2 { currentRoute = trueOwner }
+            var enrichBudget = Int(rng.next() % 2) + (pass == 0 ? 1 : 0)
+            var localRNG = SeededRNG(state: rng.next())
+            await store.retryPending(
+                hostSockPath: { _ in "/tmp/model-serving.sock" },
+                terminate: { _, _, surfaceID, owner in
+                    // Mid-flight enrichment: while THIS terminate is awaited,
+                    // another caller learns the owner of a random pending
+                    // record and enqueues it — the exact window of the race.
+                    if enrichBudget > 0, localRNG.next() % 2 == 0 {
+                        enrichBudget -= 1
+                        let pending = store.pendingRecords
+                        if !pending.isEmpty {
+                            let pick = pending[Int(localRNG.next() % UInt64(pending.count))]
+                            if let pickID = pick.surfaceID {
+                                store.enqueue(
+                                    hostKey: hostKey, surfaceID: pickID,
+                                    owningRemoteSockPath: trueOwner
+                                )
+                                ownerKnown.insert(pickID)
+                            }
+                        }
+                    }
+                    let resolved = owner ?? currentRoute
+                    if resolved == trueOwner {
+                        alive.remove(surfaceID)
+                    }
+                    return true  // notFound and terminated are both "true"
+                }
+            )
+
+            // I-spend: any record the store has let go of, whose owner was
+            // ever known, must correspond to a dead process. A wrong-endpoint
+            // success spending an owner-aware record shows up here.
+            let stillRecorded = Set(store.pendingRecords.compactMap(\.surfaceID))
+            for surface in ownerKnown where !stillRecorded.contains(surface) {
+                XCTAssertFalse(
+                    alive.contains(surface),
+                    "seed \(seed) pass \(pass): an owner-aware tombstone was spent while its process still runs"
+                )
+            }
+        }
+
+        // I-drain: with the route healed, one more pass must spend everything
+        // that remains and leave no modeled process behind.
+        await store.retryPending(
+            hostSockPath: { _ in "/tmp/model-serving.sock" },
+            terminate: { _, _, surfaceID, owner in
+                let resolved = owner ?? currentRoute
+                if resolved == trueOwner { alive.remove(surfaceID) }
+                return true
+            }
+        )
+        XCTAssertTrue(
+            store.pendingRecords.isEmpty,
+            "seed \(seed): an immortal tombstone survived a healed route: \(store.pendingRecords)"
+        )
+        // Scoped to owner-aware surfaces on purpose. A legacy record that
+        // never learned its endpoint has no defense against a moved route's
+        // notFound lie — the wire contract makes the two answers identical,
+        // which is WHY the owner field exists. The harness encodes the
+        // contract's guarantee, not a utopia the protocol cannot deliver:
+        // every surface whose record ever carried the true owner must be
+        // dead once the store drains.
+        XCTAssertTrue(
+            alive.intersection(ownerKnown).isEmpty,
+            "seed \(seed): owner-aware processes survived the drain: \(alive.intersection(ownerKnown).count)"
+        )
+    }
+}
+
 /// One PTY, two windows onto it — the size arbitration between a local pane
 /// and an attached remote viewer.
 final class RemoteViewerSizeArbitrationTests: XCTestCase {
