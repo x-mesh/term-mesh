@@ -184,6 +184,17 @@ fi
             passed, reason = module.homebrew_acceptance(checkout)
             self.assertTrue(passed, reason)
 
+    def test_release_cask_generator_stops_only_the_installed_daemon(self):
+        script = (ROOT / "scripts/update-homebrew-cask.sh").read_text()
+        exact = '"^#{appdir}/term-mesh[.]app/Contents/Resources/bin/term-meshd$"'
+        self.assertGreaterEqual(script.count(exact), 2)
+        self.assertRegex(script, r"uninstall quit:[\s\S]+script: \{[\s\S]+term-meshd\$")
+        self.assertRegex(
+            script,
+            r"uninstall quit:[\s\S]+script: \{[\s\S]+must_succeed: false",
+        )
+        self.assertNotIn('args: ["-f", "term-meshd"]', script)
+
     def test_homebrew_check_rejects_install_outside_full_branch(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary)

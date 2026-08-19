@@ -1070,4 +1070,41 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             .abandon
         )
     }
+
+    /// A resume that was superseded — cancelled by a newer resume, or whose
+    /// lease has moved on — must stay silent: reporting its failure used to
+    /// clear the replacement's fresh subscription and cancel its reconnect
+    /// task (the clobber both panel review runs flagged).
+    func test_supersededResumeNeverReportsItsOutcome() {
+        XCTAssertTrue(PeerWorkspaceMirrorController.resumeOutcomeMayReport(
+            isCancelled: false, leaseIsCurrent: true
+        ))
+        XCTAssertFalse(PeerWorkspaceMirrorController.resumeOutcomeMayReport(
+            isCancelled: true, leaseIsCurrent: true
+        ), "cancellation means a newer resume owns the controller now")
+        XCTAssertFalse(PeerWorkspaceMirrorController.resumeOutcomeMayReport(
+            isCancelled: false, leaseIsCurrent: false
+        ), "a moved lease means this resume's observation is about dead state")
+    }
+
+    /// The deeper half of the superseded-resume defense: the outcome gate
+    /// stops the REPORT, but the mutations happen inside `start()` itself —
+    /// installing the session and cancelling the current receive task. These
+    /// pin the commit-point contract: a start attempt that was torn down,
+    /// whose dialed lease moved, or whose task was cancelled must not commit
+    /// what it acquired (it closes its own transport instead).
+    func test_supersededStartAttemptMayNotCommit() {
+        XCTAssertTrue(PeerWorkspaceMirrorController.startAttemptMayCommit(
+            isTornDown: false, dialedLeaseIsCurrent: true, isCancelled: false
+        ))
+        XCTAssertFalse(PeerWorkspaceMirrorController.startAttemptMayCommit(
+            isTornDown: true, dialedLeaseIsCurrent: true, isCancelled: false
+        ), "a torn-down controller must not be given a live session back")
+        XCTAssertFalse(PeerWorkspaceMirrorController.startAttemptMayCommit(
+            isTornDown: false, dialedLeaseIsCurrent: false, isCancelled: false
+        ), "the replacement's fresh state is not this attempt's to overwrite")
+        XCTAssertFalse(PeerWorkspaceMirrorController.startAttemptMayCommit(
+            isTornDown: false, dialedLeaseIsCurrent: true, isCancelled: true
+        ))
+    }
 }

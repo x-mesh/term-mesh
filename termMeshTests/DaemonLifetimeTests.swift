@@ -39,41 +39,26 @@ final class DaemonLifetimeTests: XCTestCase {
         }
     }
 
-    // MARK: - Adopting a daemon that is not this build
+    // MARK: - Replacing a daemon that is not this build
 
-    /// Adoption trusts whatever answers the socket, which is what lets a
-    /// session survive a quit — and what let a released app run for hours
-    /// against a leftover Debug daemon from a test harness. Keep the
-    /// adoption; refuse the silence.
-    func test_adoptingADifferentVersionWarnsAndNamesBothSides() {
-        let warning = TermMeshDaemon.adoptedDaemonVersionWarning(
-            runningVersion: "0.185.2", appVersion: "0.188.0"
-        )
-        XCTAssertNotNil(warning)
-        XCTAssertTrue(warning!.contains("0.185.2"))
-        XCTAssertTrue(warning!.contains("0.188.0"))
-        XCTAssertTrue(
-            warning!.contains("Quit every term-mesh"),
-            "a single app quit does not replace a daemon built to outlive it"
-        )
+    func test_aKnownVersionMismatchRequiresDaemonReplacement() {
+        XCTAssertTrue(TermMeshDaemon.daemonRequiresUpgrade(
+            runningVersion: "0.194.0", appVersion: "0.195.0"
+        ))
+        XCTAssertFalse(TermMeshDaemon.daemonRequiresUpgrade(
+            runningVersion: "0.195.0", appVersion: "0.195.0"
+        ))
     }
 
-    /// Silence is only correct when there is nothing to say. An unknown
-    /// version is not evidence of a mismatch — a daemon too old to answer
-    /// `daemon.status`, or one that dropped the call, must not be reported as
-    /// the wrong build.
-    func test_matchingOrUnknownVersionsProduceNoWarning() {
-        XCTAssertNil(TermMeshDaemon.adoptedDaemonVersionWarning(
-            runningVersion: "0.188.0", appVersion: "0.188.0"
+    func test_anUnknownVersionNeverDestroysLiveSessions() {
+        XCTAssertFalse(TermMeshDaemon.daemonRequiresUpgrade(
+            runningVersion: nil, appVersion: "0.195.0"
         ))
-        XCTAssertNil(TermMeshDaemon.adoptedDaemonVersionWarning(
-            runningVersion: nil, appVersion: "0.188.0"
+        XCTAssertFalse(TermMeshDaemon.daemonRequiresUpgrade(
+            runningVersion: "0.194.0", appVersion: nil
         ))
-        XCTAssertNil(TermMeshDaemon.adoptedDaemonVersionWarning(
-            runningVersion: "", appVersion: "0.188.0"
-        ))
-        XCTAssertNil(TermMeshDaemon.adoptedDaemonVersionWarning(
-            runningVersion: "0.185.2", appVersion: nil
+        XCTAssertFalse(TermMeshDaemon.daemonRequiresUpgrade(
+            runningVersion: "", appVersion: "0.195.0"
         ))
     }
 

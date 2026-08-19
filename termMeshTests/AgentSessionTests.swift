@@ -3630,4 +3630,95 @@ private final class RemoteSinkRecorder: @unchecked Sendable {
         defer { lock.unlock() }
         return payloads
     }
+
+    // MARK: - Environment diagnostic ordering
+
+    /// The panel header's key list must describe the environment the child
+    /// actually gets.
+    ///
+    /// `env K=V … claude` assignments are arguments to `env`, so they never
+    /// exist in the shell that runs `diagnosticEvent`. Reporting from that shell
+    /// alone showed every inline gateway key as absent on a pane that was
+    /// receiving them — an indicator that accuses the environment loader of
+    /// losing a value the child has, which is worse than no indicator at all.
+    @MainActor
+    func testInlineEnvironmentIsVisibleToTheDiagnosticThatReportsIt() throws {
+        let command = AgentSession.remoteCommand(
+            executable: "claude",
+            arguments: ["--print"],
+            workingDirectory: "/work",
+            environment: [
+                "ANTHROPIC_BASE_URL": "https://gw.example",
+                "ANTHROPIC_AUTH_TOKEN": "tok",
+                "PATH": "/usr/bin",
+            ]
+        )
+        let exportIndex = try XCTUnwrap(command.range(of: "export ANTHROPIC_AUTH_TOKEN="))
+        let diagnosticIndex = try XCTUnwrap(command.range(of: "present_keys"))
+        XCTAssertTrue(
+            exportIndex.lowerBound < diagnosticIndex.lowerBound,
+            "the diagnostic must run after the values it reports are in this shell"
+        )
+        // The `env` prefix stays the authority on what the child receives.
+        XCTAssertTrue(command.contains("'ANTHROPIC_AUTH_TOKEN=tok'"))
+        // PATH keeps its own dedicated export and must not be duplicated here.
+        XCTAssertFalse(command.contains("export PATH=/usr/bin"))
+    }
+
+    /// The export runs after `loginPrelude`, so an explicit value keeps winning
+    /// over the profile and `agent-env` — the priority the loader documents.
+    @MainActor
+    func testExplicitValuesAreExportedAfterTheProfileLoad() throws {
+        let command = AgentSession.remoteCommand(
+            executable: "claude",
+            arguments: [],
+            workingDirectory: "/work",
+            environment: ["ANTHROPIC_AUTH_TOKEN": "explicit"]
+        )
+        let agentEnv = try XCTUnwrap(command.range(of: ".config/term-mesh/agent-env"))
+        let export = try XCTUnwrap(command.range(of: "export ANTHROPIC_AUTH_TOKEN="))
+        XCTAssertTrue(agentEnv.lowerBound < export.lowerBound)
+    }
+
+    /// The staged-file variant sources its values before the diagnostic already,
+    /// and passes only PATH inline — so it must gain no second export.
+    @MainActor
+    func testTheStagedFileVariantIsUnchanged() {
+        let command = AgentSession.remoteCommand(
+            executable: "claude",
+            arguments: [],
+            workingDirectory: "/work",
+            environment: ["ANTHROPIC_AUTH_TOKEN": "tok", "PATH": "/usr/bin"],
+            environmentFile: "/tmp/staged.env"
+        )
+        XCTAssertFalse(
+            command.contains("export ANTHROPIC_AUTH_TOKEN="),
+            "the staged file is sourced before the diagnostic and needs no overlay"
+        )
+        XCTAssertTrue(command.contains("set -a; . '/tmp/staged.env'"))
+    }
+
+    /// `getent` is glibc-only. Asking only it made every macOS host fall through
+    /// to `${SHELL:-/bin/sh}` — the launching process's shell, not the account's
+    /// — silently loading the wrong profile set and voiding the documented
+    /// "/etc/passwd is authoritative" contract.
+    func testAccountShellResolutionAsksDarwinAsWellAsGlibc() {
+        let resolve = RemoteAgentEnvironmentShell.accountLoginShellResolve
+        XCTAssertTrue(resolve.contains("getent passwd"))
+        XCTAssertTrue(
+            resolve.contains("dscl . -read /Users/"),
+            "macOS needs the directory service, which has no getent"
+        )
+        let getentIndex = resolve.range(of: "getent passwd")!
+        let dsclIndex = resolve.range(of: "dscl")!
+        XCTAssertTrue(
+            getentIndex.lowerBound < dsclIndex.lowerBound,
+            "dscl is the fallback, so a Linux peer keeps its existing answer"
+        )
+        XCTAssertFalse(
+            resolve.contains("'"),
+            "this text ships inside sh -c '…' and a single quote would end it"
+        )
+        XCTAssertTrue(resolve.contains("/bin/sh"), "an unusable shell still needs a floor")
+    }
 }

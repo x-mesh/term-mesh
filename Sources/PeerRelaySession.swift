@@ -2105,32 +2105,53 @@ final class PeerRelaySession {
         let fm = FileManager.default
         let bundlePath = Bundle.main.bundlePath
 
-        // Production: bundled under Contents/Resources/bin/, where every
-        // other Rust binary lives (term-meshd, term-mesh-run, tm-agent).
-        // Makefile deploy/deploy-prod/dmg targets copy them here.
         let bundledResource = bundlePath + "/Contents/Resources/bin/term-mesh-peer-relay"
-        if fm.fileExists(atPath: bundledResource) { return bundledResource }
-
-        // Legacy fallback: older builds may have placed it in MacOS/.
-        let bundledMacOS = bundlePath + "/Contents/MacOS/term-mesh-peer-relay"
-        if fm.fileExists(atPath: bundledMacOS) { return bundledMacOS }
-
-        // Development: derive daemon/target/release from the DerivedData
-        // path. Works for any developer when the app runs straight from
-        // Xcode (./scripts/reload.sh, xcodebuild …) without committing a
-        // hardcoded user-specific source root.
-        if let derivedRoot = bundlePath.components(separatedBy: "/Build/").first {
-            let derivedRelative = (derivedRoot + "/../daemon/target/release/term-mesh-peer-relay") as NSString
-            let devPath = derivedRelative.standardizingPath
-            if fm.fileExists(atPath: devPath) { return devPath }
+        let candidates = relayBinaryCandidates(
+            bundlePath: bundlePath,
+            sourceFilePath: #filePath,
+            currentDirectoryPath: fm.currentDirectoryPath
+        )
+        if let executable = candidates.first(where: fm.isExecutableFile(atPath:)) {
+            return executable
         }
 
-        // Last resort: cwd-relative for `swift run` / unit tests launched
-        // from the repo root.
-        let cwdPath = fm.currentDirectoryPath + "/daemon/target/release/term-mesh-peer-relay"
-        if fm.fileExists(atPath: cwdPath) { return cwdPath }
-
         return bundledResource  // will fail at runtime; caller handles error
+    }
+
+    /// Ordered locations for the local relay helper. A normal release always
+    /// wins with its own bundle. Bare Xcode builds do not run `reload.sh` and
+    /// therefore have no `Resources/bin`; for those builds only, the checkout
+    /// binary or installed release helper keeps local daemon sessions usable.
+    nonisolated static func relayBinaryCandidates(
+        bundlePath: String,
+        sourceFilePath: String,
+        currentDirectoryPath: String,
+        installedAppPath: String = "/Applications/term-mesh.app"
+    ) -> [String] {
+        var candidates = [
+            bundlePath + "/Contents/Resources/bin/term-mesh-peer-relay",
+            bundlePath + "/Contents/MacOS/term-mesh-peer-relay",
+        ]
+#if DEBUG
+        let sourceRoot = URL(fileURLWithPath: sourceFilePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .path
+        candidates.append(
+            sourceRoot + "/daemon/target/release/term-mesh-peer-relay"
+        )
+        candidates.append(
+            installedAppPath + "/Contents/Resources/bin/term-mesh-peer-relay"
+        )
+        // cwd-relative is for `swift run` / unit tests launched from the repo
+        // root — a development shape. A RELEASE app must never execute a
+        // binary out of whatever directory it happens to have been launched
+        // from; its helper comes from a bundle or not at all.
+        candidates.append(
+            currentDirectoryPath + "/daemon/target/release/term-mesh-peer-relay"
+        )
+#endif
+        return candidates
     }
 
     // ── Start ────────────────────────────────────────────────────────
@@ -2935,6 +2956,19 @@ final class PeerRelaySession {
             if let reader, let resizeCoalescer {
             relayToHost = Task.detached(priority: .userInitiated) {
                 var inputStallGate = RelayStallLogGate()
+                // Threshold 0: every helper report is already a sustained
+                // stall by the helper's own 200ms bar. What this gate adds is
+                // the part the app must not delegate: a remote process's
+                // throttle is not a trust boundary, and a hostile or looping
+                // helper could otherwise write a log line per frame.
+                // Known trade: the gate samples at RECEIPT time, so two
+                // legitimate reports arriving back-to-back after a backlog
+                // (slow sendInput ahead of them) log once — the suppressed
+                // episode still lands in the totals the next line carries.
+                var helperStallGate = RelayStallLogGate(
+                    thresholdNanos: 0,
+                    minIntervalNanos: RelayStallLogGate.defaultMinIntervalNanos
+                )
                 var inputSendFailures: UInt64 = 0
                 var framesConsumed: UInt64 = 0
                 do {
@@ -2998,19 +3032,25 @@ final class PeerRelaySession {
                             }))
                             await resizeCoalescer.submit(cols: cols, rows: rows)
                         case kTypeStall where frame.payload.count >= 16:
-                            // Already rate-limited helper-side (one per 5s);
-                            // log as-is so the helper's view of the freeze
-                            // lands in the same timeline as the app's own
-                            // writer/input stall lines.
+                            // The helper rate-limits its reports to one per
+                            // 5s, but that throttle runs in a process this
+                            // app did not verify — gate again here so a
+                            // hostile or looping helper cannot flood the
+                            // production log one line per frame.
                             let stallMs = UInt64(littleEndian: frame.payload.withUnsafeBytes {
                                 $0.loadUnaligned(fromByteOffset: 0, as: UInt64.self)
                             })
                             let helperTotalOut = UInt64(littleEndian: frame.payload.withUnsafeBytes {
                                 $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self)
                             })
-                            RemoteWorkLog.infoOffMain(
-                                "Relay terminal write stalled — the relay helper spent \(stallMs)ms writing to the local pane (\(helperTotalOut) bytes relayed so far); the local renderer was not draining"
-                            )
+                            if helperStallGate.recordEpisode(
+                                durationNanos: stallMs &* 1_000_000,
+                                now: DispatchTime.now().uptimeNanoseconds
+                            ) {
+                                RemoteWorkLog.infoOffMain(
+                                    "Relay terminal write stalled — the relay helper spent \(stallMs)ms writing to the local pane (\(helperTotalOut) bytes relayed so far); the local renderer was not draining"
+                                )
+                            }
                         case kTypeGoodbye:
                             await resizeCoalescer.flushNow()
                             // Owned session only: a Goodbye on the shared
@@ -3315,7 +3355,22 @@ final class PeerRelaySession {
     /// One reconnect attempt after the old receive loop has already failed.
     /// Unlike gap healing, no old-session bytes can race this attach boundary.
     private func attemptOwnedSessionReconnect(from failedSession: PeerSession) async -> Bool {
-        guard !isTorndown, session === failedSession else { return false }
+        // The outer loop's predicate, re-checked at every await boundary
+        // INSIDE the attempt. `connect` and `attachSurface` are exactly
+        // where a Disconnect Host lands mid-flight; the original guards
+        // rechecked only teardown and session identity, so an attempt that
+        // straddled the disconnect could still commit a session against a
+        // retired lease — "reconnecting" against the user's explicit
+        // disconnect. (Both panel review runs flagged this independently.)
+        func stillEligible() -> Bool {
+            Self.shouldReconnectOwnedSession(
+                ownsSession: ownsSession,
+                isTorndown: isTorndown,
+                isCurrentSession: session === failedSession,
+                hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
+            )
+        }
+        guard stillEligible() else { return false }
         let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
         let connection: PeerRelayConnection
         do {
@@ -3326,7 +3381,7 @@ final class PeerRelaySession {
             #endif
             return false
         }
-        guard !isTorndown, session === failedSession else {
+        guard stillEligible() else {
             await connection.cancel()
             return false
         }
@@ -3353,7 +3408,7 @@ final class PeerRelaySession {
             await connection.cancel()
             return false
         }
-        guard outcome.surfaceID == surfaceID, !isTorndown, session === failedSession else {
+        guard outcome.surfaceID == surfaceID, stillEligible() else {
             await connection.cancel()
             return false
         }

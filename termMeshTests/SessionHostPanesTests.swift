@@ -763,4 +763,155 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
         XCTAssertEqual(direct.teamHostSpec?.hostKey, direct.paneHostSpec.hostKey)
         XCTAssertFalse(direct.redirectsTeamWorkToSessionHost)
     }
+
+    // MARK: - Review round 3: the endpoint that created the surface
+
+    /// A surface does not move when the host's route does.
+    ///
+    /// Cleanup used to re-ask the host where team work goes *now*, which is a
+    /// different question: after a later handshake moved the route, the new
+    /// owner answers `notFound` for a surface it never created, and that reply
+    /// is indistinguishable from a real confirmation — so the tombstone was
+    /// dropped while the bridge kept running on the endpoint that had it.
+    @MainActor
+    func test_cleanupPrefersTheRecordedCreationEndpointOverTheHostsCurrentRoute() {
+        let movedOn = hostEntry(sessionHostRemoteSockPath: "/tmp/OWNER-B/peer.sock")
+        let endpoint = TeamOrchestrator.peerAgentCleanupEndpoint(
+            host: movedOn,
+            servingSockPath: movedOn.activeSockPath,
+            owningRemoteSockPath: "/tmp/OWNER-A/peer.sock"
+        )
+        XCTAssertEqual(
+            endpoint.describedTarget, "/tmp/OWNER-A/peer.sock",
+            "the surface lives where it was ensured, not where team work goes now"
+        )
+        XCTAssertTrue(endpoint.leasesSessionOwner)
+    }
+
+    /// The recorded endpoint keeps the host row's auth parameters: only the
+    /// remote socket is pinned. Rebuilding it from the path alone would drop
+    /// the port/identity the tunnel needs.
+    @MainActor
+    func test_theRecordedEndpointKeepsTheHostsAuthParameters() {
+        var host = hostEntry(sessionHostRemoteSockPath: "/tmp/OWNER-B/peer.sock")
+        host.sshPort = 2222
+        host.identityFile = "/keys/id_ed25519"
+        let endpoint = TeamOrchestrator.peerAgentCleanupEndpoint(
+            host: host,
+            servingSockPath: host.activeSockPath,
+            owningRemoteSockPath: "/tmp/OWNER-A/peer.sock"
+        )
+        guard case .sessionOwner(let spec) = endpoint,
+              case .ssh(let target, let remote, let port, let identity) = spec
+        else { return XCTFail("a recorded endpoint on an SSH host must be an SSH spec") }
+        XCTAssertEqual(target, "mac-peer")
+        XCTAssertEqual(remote, "/tmp/OWNER-A/peer.sock")
+        XCTAssertEqual(port, 2222)
+        XCTAssertEqual(identity, "/keys/id_ed25519")
+    }
+
+    /// A tombstone written by an earlier build carries no endpoint. It must keep
+    /// resolving by host rather than being discarded — a dropped tombstone is a
+    /// bridge that runs forever.
+    @MainActor
+    func test_aRecordWithoutARecordedEndpointStillResolvesByHost() {
+        let host = hostEntry(sessionHostRemoteSockPath: "/tmp/OWNER/peer.sock")
+        let endpoint = TeamOrchestrator.peerAgentCleanupEndpoint(
+            host: host, servingSockPath: host.activeSockPath, owningRemoteSockPath: nil
+        )
+        XCTAssertEqual(endpoint.describedTarget, "/tmp/OWNER/peer.sock")
+        // Empty is the same as absent: neither names an endpoint.
+        XCTAssertEqual(
+            TeamOrchestrator.peerAgentCleanupEndpoint(
+                host: host, servingSockPath: host.activeSockPath, owningRemoteSockPath: ""
+            ).describedTarget,
+            "/tmp/OWNER/peer.sock"
+        )
+    }
+
+    /// With a known creation endpoint but no host row, there is a specific
+    /// address that is known to be right and no way to dial it yet. That waits
+    /// — unlike the unknown-host case, where the serving socket is the only
+    /// address there will ever be.
+    @MainActor
+    func test_aRecordedEndpointWithoutAHostRowWaitsRatherThanUsingTheServingSocket() {
+        XCTAssertTrue(
+            TeamOrchestrator.peerAgentCleanupEndpoint(
+                host: nil,
+                servingSockPath: "/tmp/serving.sock",
+                owningRemoteSockPath: "/tmp/OWNER-A/peer.sock"
+            ).isUnresolved
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.peerAgentCleanupEndpoint(
+                host: nil, servingSockPath: "/tmp/serving.sock"
+            ).describedTarget,
+            "/tmp/serving.sock",
+            "an unknown host with no recorded endpoint still attempts the serving socket"
+        )
+    }
+
+    /// A new tunnel invalidates the team route exactly as it invalidates the CLI
+    /// bin dirs.
+    ///
+    /// `clearAuthenticatedHostCLIBinDirs` clears only the three CLI fields;
+    /// `clearServingMetadata` is what forgets the route. Calling the first alone
+    /// on the reconnect path left `teamRouteResolved` true across the reconnect,
+    /// so team work was addressed to the previous connection's session owner
+    /// until the new handshake answered — the one state that must not be claimed
+    /// on credit.
+    @MainActor
+    func test_reconnectForgetsTheTeamRouteRatherThanCarryingItOver() {
+        var host = hostEntry(sessionHostRemoteSockPath: "/tmp/OWNER-A/peer.sock")
+        XCTAssertTrue(host.teamRouteResolved)
+        XCTAssertTrue(host.redirectsTeamWorkToSessionHost)
+
+        // What the reconnect path does when the ephemeral socket changed.
+        host.clearAuthenticatedHostCLIBinDirs()
+        host.clearServingMetadata()
+        host.activeSockPath = "/tmp/local-tunnel-2.sock"
+
+        XCTAssertFalse(
+            host.teamRouteResolved,
+            "the route belonged to the connection that advertised it"
+        )
+        XCTAssertNil(host.teamHostSpec)
+        XCTAssertTrue(TeamOrchestrator.liveTeamSockPath(for: host).isEmpty)
+        XCTAssertTrue(
+            TeamOrchestrator.peerAgentCleanupEndpoint(
+                host: host, servingSockPath: host.activeSockPath
+            ).isUnresolved,
+            "the new handshake is coming; a tombstone waits for it"
+        )
+    }
+
+    /// The CLI-bin-dirs clear on its own is not enough — this is the assertion
+    /// that fails if the two clears are ever collapsed back into one call.
+    @MainActor
+    func test_clearingCLIBinDirsAloneDoesNotForgetTheTeamRoute() {
+        var host = hostEntry(sessionHostRemoteSockPath: "/tmp/OWNER-A/peer.sock")
+        host.clearAuthenticatedHostCLIBinDirs()
+        XCTAssertTrue(
+            host.teamRouteResolved,
+            "these are two different facts; the reconnect path must clear both"
+        )
+    }
+
+    /// The principal mid-session case: a member ensured on owner A, detached
+    /// after the host's route moved to owner B.
+    ///
+    /// `releasePeerOwnedAgentSurface` reads what the member recorded at ensure
+    /// time. Reading the host's current route here instead is what left the
+    /// bridge alive on A while B's `notFound` retired the tombstone.
+    @MainActor
+    func test_aDetachedMemberIsTerminatedWhereItWasEnsured() {
+        let movedOn = hostEntry(sessionHostRemoteSockPath: "/tmp/OWNER-B/peer.sock")
+        let endpoint = TeamOrchestrator.peerAgentCleanupEndpoint(
+            host: movedOn,
+            servingSockPath: movedOn.activeSockPath,
+            // What the member carries from its ensure.
+            owningRemoteSockPath: "/tmp/OWNER-A/peer.sock"
+        )
+        XCTAssertEqual(endpoint.describedTarget, "/tmp/OWNER-A/peer.sock")
+    }
 }
