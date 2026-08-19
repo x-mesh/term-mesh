@@ -67,6 +67,51 @@ struct SavedWorkspaceState: Codable {
     let splitTree: Data?
     /// v2: Focused pane UUID string.
     let focusedPaneId: String?
+
+    /// Decoded by hand for `id` alone, so a malformed one costs an identity
+    /// rather than the session.
+    ///
+    /// `loadSavedSession` decodes before it version-gates and turns any thrown
+    /// error into "no session", so a synthesized `decodeIfPresent(UUID.self)`
+    /// would let one bad string — a hand edit, a truncated write — drop every
+    /// saved workspace and open an empty terminal. That whole-session loss is
+    /// the outcome this field was made additive and optional to avoid.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try? container.decodeIfPresent(UUID.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        customTitle = try container.decodeIfPresent(String.self, forKey: .customTitle)
+        directory = try container.decode(String.self, forKey: .directory)
+        isPinned = try container.decode(Bool.self, forKey: .isPinned)
+        customColor = try container.decodeIfPresent(String.self, forKey: .customColor)
+        paneDirectories = try container.decodeIfPresent(
+            [String: String].self, forKey: .paneDirectories
+        )
+        splitTree = try container.decodeIfPresent(Data.self, forKey: .splitTree)
+        focusedPaneId = try container.decodeIfPresent(String.self, forKey: .focusedPaneId)
+    }
+
+    init(
+        id: UUID?,
+        title: String,
+        customTitle: String?,
+        directory: String,
+        isPinned: Bool,
+        customColor: String?,
+        paneDirectories: [String: String]?,
+        splitTree: Data?,
+        focusedPaneId: String?
+    ) {
+        self.id = id
+        self.title = title
+        self.customTitle = customTitle
+        self.directory = directory
+        self.isPinned = isPinned
+        self.customColor = customColor
+        self.paneDirectories = paneDirectories
+        self.splitTree = splitTree
+        self.focusedPaneId = focusedPaneId
+    }
 }
 
 struct SavedSessionState: Codable {
@@ -75,6 +120,41 @@ struct SavedSessionState: Codable {
     let selectedIndex: Int?
     /// v2: Window frame for restoring size/position.
     let windowFrame: SavedWindowFrame?
+    /// Which build wrote this, so restored identities are only adopted by the
+    /// build that minted them.
+    ///
+    /// `sessionFilePath` is shared across Debug and Release on purpose, and
+    /// this repo's workflow runs a tagged Debug app beside the release one. Two
+    /// live processes restoring the same file would otherwise hold workspaces
+    /// under identical UUIDs — and that UUID addresses a workspace everywhere
+    /// else: `tab=<uuid>` socket arguments, `workspace_id` in replies, and
+    /// `TERMMESH_WORKSPACE_ID` in every shell. A command that reached the wrong
+    /// socket would find a match and act on it instead of failing.
+    ///
+    /// `nil` for sessions written before this field existed.
+    let writerBundleID: String?
+
+    init(
+        version: Int,
+        workspaces: [SavedWorkspaceState],
+        selectedIndex: Int?,
+        windowFrame: SavedWindowFrame?,
+        writerBundleID: String? = Bundle.main.bundleIdentifier
+    ) {
+        self.version = version
+        self.workspaces = workspaces
+        self.selectedIndex = selectedIndex
+        self.windowFrame = windowFrame
+        self.writerBundleID = writerBundleID
+    }
+
+    /// Whether this session's saved workspace identities belong to the running
+    /// build. A session from another bundle restores its layout as before; only
+    /// the identities are re-minted.
+    var identitiesBelongToThisBuild: Bool {
+        guard let writerBundleID else { return false }
+        return writerBundleID == Bundle.main.bundleIdentifier
+    }
 }
 
 struct SavedWindowFrame: Codable {

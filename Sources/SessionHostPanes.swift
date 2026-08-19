@@ -133,6 +133,16 @@ enum SessionHostPanes {
             ?? projectName(fromWorkspaceTitle: workspace.customTitle)
     }
 
+    /// Every window's workspaces, deduplicated.
+    ///
+    /// `AppDelegate.tabManager` is not always one of `mainWindowContexts`, so
+    /// the fallback is appended rather than assumed present.
+    static func allTabManagers(app: AppDelegate, fallback: TabManager) -> [TabManager] {
+        var seen = Set<ObjectIdentifier>()
+        return (app.mainWindowContexts.values.map(\.tabManager) + [fallback])
+            .filter { seen.insert(ObjectIdentifier($0)).inserted }
+    }
+
     /// The project claims `workspaceDestination` chooses among.
     ///
     /// Named rather than inlined at the call site so a test can assert the
@@ -506,9 +516,8 @@ extension SessionHostPanes {
         let projectDirectories = projectWorkingDirectories(teams: snapshot.teams)
         guard let app = AppDelegate.shared, let tabManager = app.tabManager else { return 0 }
 
-        var repairedManagers = Set<ObjectIdentifier>()
-        for manager in app.mainWindowContexts.values.map(\.tabManager) + [tabManager]
-        where repairedManagers.insert(ObjectIdentifier(manager)).inserted {
+        let managers = allTabManagers(app: app, fallback: tabManager)
+        for manager in managers {
             migrateShownProjectSurfaces(
                 projectNames: projectNames,
                 projectDirectories: projectDirectories,
@@ -533,17 +542,27 @@ extension SessionHostPanes {
         for surfaceID in wanted {
             guard let info = surfaces.first(where: { $0.surfaceID == surfaceID }) else { continue }
             let projectName = projectNames[surfaceID]
+            // Every window, not just the active one. `shownSurfaceIDs()` is
+            // already window-global, and the repair pass above runs per manager
+            // for the same reason: a `[project]` workspace living in a second
+            // window was invisible here, so its project took the `.newProject`
+            // branch and got a duplicate in the active window — and the repair
+            // then found the pane's source already declared and left it. That
+            // is this change's own proliferation, reached through a second
+            // window rather than a relaunch.
             let destination = workspaceDestination(
                 projectName: projectName,
-                declaredProjects: declaredProjects(in: tabManager.tabs),
-                hostSessionsWorkspaceID: tabManager.tabs.first(where: {
-                    $0.customTitle == "Host Sessions"
-                })?.id
+                declaredProjects: managers.flatMap { declaredProjects(in: $0.tabs) },
+                hostSessionsWorkspaceID: managers.lazy.compactMap { manager in
+                    manager.tabs.first(where: { $0.customTitle == "Host Sessions" })?.id
+                }.first
             )
             let workspace: Workspace
             switch destination {
             case .existingProject(let id), .existingHostSessions(let id):
-                guard let existing = tabManager.tabs.first(where: { $0.id == id }) else {
+                guard let existing = managers.lazy.compactMap({ manager in
+                    manager.tabs.first(where: { $0.id == id })
+                }).first else {
                     continue
                 }
                 workspace = existing

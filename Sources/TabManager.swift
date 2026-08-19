@@ -604,6 +604,7 @@ class TabManager {
         tabs.removeAll()
         selectedTabId = nil
 
+        let adoptsSavedIdentities = session.identitiesBelongToThisBuild
         let fm = FileManager.default
         for saved in session.workspaces {
             let fallbackDir = fm.fileExists(atPath: saved.directory)
@@ -629,12 +630,16 @@ class TabManager {
 
             // Two workspaces sharing an ID would share every UUID-keyed
             // sidecar, so a repeated or already-live ID falls back to a fresh
-            // one. `id` stays an additive optional rather than a version bump:
-            // `loadSavedSession` rejects any version it does not know, so a bump
-            // would make a downgrade drop the whole session.
-            let restoredID: UUID? = saved.id.flatMap { candidate in
-                tabs.contains(where: { $0.id == candidate }) ? nil : candidate
-            }
+            // one — as does an ID another build minted, which a sibling
+            // process may still be holding. `id` stays an additive optional
+            // rather than a version bump: `loadSavedSession` rejects any
+            // version it does not know, so a bump would make a downgrade drop
+            // the whole session.
+            let restoredID: UUID? = adoptsSavedIdentities
+                ? saved.id.flatMap { candidate in
+                    tabs.contains(where: { $0.id == candidate }) ? nil : candidate
+                }
+                : nil
             let workspace = addWorkspace(
                 workingDirectory: rootDir, select: false, id: restoredID
             )
@@ -661,6 +666,10 @@ class TabManager {
         } else if let first = tabs.first {
             selectedTabId = first.id
         }
+        // Launch is the one moment the live workspaces are exactly the restored
+        // ones, so it is the only place a declaration for a workspace that no
+        // longer exists can be told apart from one still in use.
+        WorkspaceProjectNames.shared.retain(ids: Set(tabs.map(\.id)))
         let version = session.version
         Logger.app.info("session-restore: restored \(self.tabs.count, privacy: .public) workspace(s) (v\(version, privacy: .public))")
     }

@@ -10,6 +10,14 @@ All notable changes to term-mesh are documented here.
 
 - **headless agent를 붙인 팀의 workspace가 중복으로 열리던 문제** — 팀 workspace 제목은 `[project] 3 headless`인데 Project 이름을 알아보는 규칙이 제목이 `]`로 끝나야만 인정해서, headless 팀을 다시 열면 매번 workspace가 하나 더 생겼다. 이제 앞의 `[project]` 부분만 보고 판단한다.
 
+- **창이 두 개일 때 Project workspace가 중복으로 생기던 문제** — 원격 세션을 어디에 붙일지 고를 때 활성 창만 살펴서, 같은 Project의 workspace가 다른 창에 열려 있으면 그걸 못 보고 활성 창에 하나 더 만들었다. 이제 모든 창을 함께 본다.
+
+- **세션 파일이 손상되면 workspace가 전부 사라지던 문제** — 저장된 workspace 식별자 하나만 깨져도 세션 전체를 못 읽고 빈 터미널로 시작했다. 이제 깨진 식별자 하나만 버리고 나머지는 그대로 복원한다.
+
+- **개발용 빌드와 정식 빌드를 함께 띄우면 서로의 workspace를 같은 것으로 취급하던 문제** — 두 빌드가 같은 세션 파일을 공유하는데 workspace 식별자까지 그대로 가져가, CLI 명령이 엉뚱한 쪽 workspace에 적용될 수 있었다. 이제 자기 빌드가 저장한 식별자만 이어받는다.
+
+- 더 이상 존재할 수 없는 workspace의 Project 기록이 계속 쌓이던 것을 앱 시작 때 정리한다.
+
 ## [0.198.0] - 2026-08-19
 
 **원격 Project pane이 엉뚱한 workspace에 섞이지 않고, 큰 세션과 긴 활동 로그도 앱을 멈추지 않는다.**

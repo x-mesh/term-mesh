@@ -139,6 +139,78 @@ final class SessionRestoreIdentityTests: XCTestCase {
         XCTAssertEqual(tabs.tabs.count, 1, "an ID-less session restores as it always did")
     }
 
+    /// `loadSavedSession` decodes before it version-gates and turns any thrown
+    /// error into "no session", so a malformed `id` must not be allowed to
+    /// throw — one bad string would drop every saved workspace.
+    func test_aMalformedIdentityCostsOnlyTheIdentity() throws {
+        let corrupt = Data("""
+        {
+          "version": 2,
+          "selectedIndex": 0,
+          "workspaces": [
+            {"id": "", "title": "Terminal 1", "directory": "/tmp", "isPinned": false},
+            {"id": "not-a-uuid", "title": "Terminal 2", "directory": "/tmp", "isPinned": false}
+          ]
+        }
+        """.utf8)
+
+        let decoded = try JSONDecoder().decode(SavedSessionState.self, from: corrupt)
+        XCTAssertEqual(decoded.workspaces.count, 2, "the session survives a bad ID")
+        XCTAssertNil(decoded.workspaces[0].id)
+        XCTAssertNil(decoded.workspaces[1].id)
+        XCTAssertEqual(decoded.workspaces[1].title, "Terminal 2", "the rest still decodes")
+    }
+
+    // MARK: - Whose identities these are
+
+    /// `sessionFilePath` is shared across Debug and Release on purpose, so a
+    /// tagged Debug app running beside the release one restores the same file.
+    /// Adopting the other build's IDs would give two live processes workspaces
+    /// under identical UUIDs, and that UUID is how a socket command addresses a
+    /// workspace.
+    func test_anotherBuildsIdentitiesAreNotAdopted() {
+        let foreign = UUID()
+        let written = SavedSessionState(
+            version: 2,
+            workspaces: [savedWorkspace(id: foreign, customTitle: "[term-mesh]")],
+            selectedIndex: 0,
+            windowFrame: nil,
+            writerBundleID: "com.termmesh.app.some-other-build"
+        )
+        XCTAssertFalse(written.identitiesBelongToThisBuild)
+
+        let tabs = manager()
+        tabs.restoreSessionForTests(written)
+
+        XCTAssertEqual(tabs.tabs.count, 1, "the layout still restores")
+        XCTAssertNotEqual(tabs.tabs[0].id, foreign)
+        XCTAssertEqual(
+            tabs.tabs[0].customTitle, "[term-mesh]",
+            "the title carries the project, so routing still recognizes it"
+        )
+    }
+
+    func test_aSessionWithNoWriterKeepsItsIdentitiesToItself() {
+        let orphan = SavedSessionState(
+            version: 2,
+            workspaces: [savedWorkspace(id: UUID())],
+            selectedIndex: 0,
+            windowFrame: nil,
+            writerBundleID: nil
+        )
+        XCTAssertFalse(
+            orphan.identitiesBelongToThisBuild,
+            "a session written before the field existed names no owner"
+        )
+    }
+
+    func test_thisBuildAdoptsWhatItWrote() {
+        let tabs = manager()
+        let saved = tabs.savedSessionState()
+        XCTAssertEqual(saved.writerBundleID, Bundle.main.bundleIdentifier)
+        XCTAssertTrue(saved.identitiesBelongToThisBuild)
+    }
+
     // MARK: - Forgetting
 
     func test_closingAWorkspaceForgetsItsProjectDeclaration() {
@@ -154,6 +226,28 @@ final class SessionRestoreIdentityTests: XCTestCase {
         XCTAssertNil(
             WorkspaceProjectNames.shared.projectName(for: workspace.id),
             "a declaration the workspace can no longer own is never revoked otherwise"
+        )
+    }
+
+    /// Team and peer-mirror workspaces are excluded from the saved session and
+    /// end with the process rather than through a close, so `forget` never sees
+    /// them. Their declarations named an ID no launch can produce again.
+    func test_theRestoreDropsDeclarationsNoWorkspaceCanClaim() {
+        let dead = UUID()
+        WorkspaceProjectNames.shared.declare(workspaceId: dead, projectName: "gone")
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: dead) }
+
+        let survivor = UUID()
+        WorkspaceProjectNames.shared.declare(workspaceId: survivor, projectName: "term-mesh")
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: survivor) }
+
+        let tabs = manager()
+        tabs.restoreSessionForTests(session([savedWorkspace(id: survivor)]))
+
+        XCTAssertNil(WorkspaceProjectNames.shared.projectName(for: dead))
+        XCTAssertEqual(
+            WorkspaceProjectNames.shared.projectName(for: survivor), "term-mesh",
+            "a restored workspace keeps the declaration it is about to need"
         )
     }
 }

@@ -46,6 +46,25 @@ final class WorkspaceProjectNames {
         UserDefaults.standard.set(names, forKey: Self.storageKey)
     }
 
+    /// Drop every declaration outside `ids`.
+    ///
+    /// `forget` covers a workspace someone closes, which leaves out the ones
+    /// that simply stop existing: team and peer-mirror workspaces are excluded
+    /// from the saved session, and quitting the app ends them without a close.
+    /// Their declarations named an ID no launch can produce again, so nothing
+    /// ever removed them and the map kept every one this install had declared.
+    ///
+    /// Called once with the workspaces a restore produced. A team workspace
+    /// created later this run declares itself as it is built, so pruning to the
+    /// restored set cannot strand one that is still coming.
+    func retain(ids: Set<UUID>) {
+        let live = Set(ids.map(\.uuidString))
+        let pruned = names.filter { live.contains($0.key) }
+        guard pruned.count != names.count else { return }
+        names = pruned
+        UserDefaults.standard.set(names, forKey: Self.storageKey)
+    }
+
     func projectName(for workspaceId: UUID) -> String? {
         names[workspaceId.uuidString]
     }
