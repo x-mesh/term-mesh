@@ -340,6 +340,7 @@ final class Workspace: Identifiable {
     }
 
     init(
+        id: UUID = UUID(),
         title: String = "Terminal",
         workingDirectory: String? = nil,
         portOrdinal: Int = 0,
@@ -350,7 +351,9 @@ final class Workspace: Identifiable {
         // Installs the reconnect observer and retries durable peer-agent
         // tombstones restored from a previous app run.
         _ = PendingPeerAgentSurfaceCleanupStore.shared
-        self.id = UUID()
+        // Session restore passes the saved identity so UUID-keyed sidecar
+        // state survives a relaunch.
+        self.id = id
         self.portOrdinal = portOrdinal
         self.processTitle = title
         self.title = title

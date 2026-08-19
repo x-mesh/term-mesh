@@ -88,8 +88,28 @@ cleanup() {
   fi
 }
 
+# State a test is allowed to destroy. `SessionRestoreSettings.sessionFilePath` is
+# deliberately shared by every build on the machine, so without this a test that
+# saved for real would overwrite the developer's own session; the same variable
+# moves the project declarations to their own defaults suite.
+#
+# Reset per test, never between the relaunches inside one — a test that restarts
+# the app is asserting on exactly this state surviving.
+reset_e2e_state() {
+  rm -rf "$E2E_STATE_DIR"
+  mkdir -p "$E2E_STATE_DIR"
+  defaults delete com.termmesh.e2e >/dev/null 2>&1 || true
+}
+
+E2E_STATE_DIR="${TMPDIR:-/tmp}/termmesh-e2e-state.$$"
+export TERMMESH_E2E_STATE_DIR="$E2E_STATE_DIR"
+# A test that relaunches the app respawns this exact binary with this exact env.
+export TERMMESH_APP_BIN="$APP/Contents/MacOS/term-mesh DEV"
+trap 'rm -rf "$E2E_STATE_DIR"; defaults delete com.termmesh.e2e >/dev/null 2>&1 || true' EXIT
+
 launch_and_wait() {
   cleanup
+  reset_e2e_state
   # Wait briefly for the previous instance to fully terminate; LaunchServices can flake if we
   # relaunch too quickly.
   for _ in {1..50}; do

@@ -4,6 +4,22 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **앱을 다시 켤 때마다 같은 Project workspace가 하나씩 더 생기던 문제** — `session.json`이 workspace를 복원하면서 그 정체성(ID)까지는 저장하지 않아, 복원된 workspace는 매번 새 ID를 받았다. Project 선언은 그 ID로 보관돼 있어서 재시작 후에는 조회가 항상 실패했고, 그때마다 term-mesh는 "이 Project를 담은 workspace가 아직 없다"고 판단해 `[project]` workspace를 새로 만들었다. team 3개를 쓰는 호스트에서 재시작 한 번에 3개씩 늘어났다. 이제 workspace ID를 세션에 함께 저장하고, ID가 없는 기존 세션은 workspace 제목으로 Project를 알아본다. workspace를 닫으면 그 선언도 함께 지운다.
+
+- **headless agent를 붙인 팀의 workspace가 중복으로 열리던 문제** — 팀 workspace 제목은 `[project] 3 headless`인데 Project 이름을 알아보는 규칙이 제목이 `]`로 끝나야만 인정해서, headless 팀을 다시 열면 매번 workspace가 하나 더 생겼다. 이제 앞의 `[project]` 부분만 보고 판단한다.
+
+- **창이 두 개일 때 Project workspace가 중복으로 생기던 문제** — 원격 세션을 어디에 붙일지 고를 때 활성 창만 살펴서, 같은 Project의 workspace가 다른 창에 열려 있으면 그걸 못 보고 활성 창에 하나 더 만들었다. 이제 모든 창을 함께 본다.
+
+- **세션 파일이 손상되면 workspace가 전부 사라지던 문제** — 저장된 workspace 식별자 하나만 깨져도 세션 전체를 못 읽고 빈 터미널로 시작했다. 이제 깨진 식별자 하나만 버리고 나머지는 그대로 복원한다.
+
+- **개발용 빌드와 정식 빌드를 함께 띄우면 서로의 workspace를 같은 것으로 취급하던 문제** — 두 빌드가 같은 세션 파일을 공유하는데 workspace 식별자까지 그대로 가져가, CLI 명령이 엉뚱한 쪽 workspace에 적용될 수 있었다. 이제 자기 빌드가 저장한 식별자만 이어받는다.
+
+- 더 이상 존재할 수 없는 workspace의 Project 기록이 계속 쌓이던 것을 앱 시작 때 정리한다.
+
+- **workspace 목록이 재시작할 때마다 거꾸로 뒤집히던 문제** — 새 workspace를 어디에 놓을지 정하는 설정(`Top`)이 복원에도 적용돼, 저장된 순서와 반대로 쌓이고 선택된 workspace도 어긋났다. 이제 복원은 저장된 순서를 그대로 따르고, 선택은 위치가 아니라 workspace 자체를 따라간다.
+
 ## [0.198.0] - 2026-08-19
 
 **원격 Project pane이 엉뚱한 workspace에 섞이지 않고, 큰 세션과 긴 활동 로그도 앱을 멈추지 않는다.**
