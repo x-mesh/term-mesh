@@ -2143,10 +2143,14 @@ final class PeerRelaySession {
         candidates.append(
             installedAppPath + "/Contents/Resources/bin/term-mesh-peer-relay"
         )
-#endif
+        // cwd-relative is for `swift run` / unit tests launched from the repo
+        // root — a development shape. A RELEASE app must never execute a
+        // binary out of whatever directory it happens to have been launched
+        // from; its helper comes from a bundle or not at all.
         candidates.append(
             currentDirectoryPath + "/daemon/target/release/term-mesh-peer-relay"
         )
+#endif
         return candidates
     }
 

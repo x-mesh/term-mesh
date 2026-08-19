@@ -1368,6 +1368,13 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertTrue(candidates.contains(
             "/Applications/term-mesh.app/Contents/Resources/bin/term-mesh-peer-relay"
         ))
+        XCTAssertTrue(candidates.contains(
+            "/tmp/unrelated/daemon/target/release/term-mesh-peer-relay"
+        ))
+#else
+        // A release app must never execute a binary out of its launch
+        // directory: every non-bundle candidate is a development shape.
+        XCTAssertEqual(candidates.count, 2)
 #endif
     }
 

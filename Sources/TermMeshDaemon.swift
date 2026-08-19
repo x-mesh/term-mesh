@@ -403,10 +403,28 @@ final class TermMeshDaemon: ObservableObject {
             if self.ping() {
                 if outlivesApp {
                     let runningVersion = self.runningDaemonVersion()
-                    if Self.daemonRequiresUpgrade(
+                    let requiresUpgrade = Self.daemonRequiresUpgrade(
                         runningVersion: runningVersion,
                         appVersion: Self.appMarketingVersion
-                    ) {
+                    )
+                    // The replacement must be proven launchable BEFORE the
+                    // working daemon is destroyed. A bare Xcode build or an
+                    // incomplete bundle carries no term-meshd; destroy-then-
+                    // verify traded a live daemon — and every peer session it
+                    // owned — for a "binary not found, skipping launch".
+                    let replacementReady = requiresUpgrade
+                        && self.daemonBinaryPath().map {
+                            FileManager.default.isExecutableFile(atPath: $0)
+                        } == true
+                    if requiresUpgrade && !replacementReady {
+                        Logger.daemon.error(
+                            "daemon \(runningVersion ?? "unknown", privacy: .public) is older than this app, but no replacement binary is launchable — keeping the running daemon"
+                        )
+                        RemoteWorkLog.warningOffMain(
+                            "This machine's daemon (\(runningVersion ?? "unknown")) is older than the app, but this build bundles no replacement — keeping the running daemon"
+                        )
+                    }
+                    if replacementReady {
                         Logger.daemon.warning(
                             "replacing daemon version \(runningVersion ?? "unknown", privacy: .public) with bundled version \(Self.appMarketingVersion ?? "unknown", privacy: .public); live peer sessions will end"
                         )
@@ -419,9 +437,11 @@ final class TermMeshDaemon: ObservableObject {
                         self.daemonRunIntended = true
                         Thread.sleep(forTimeInterval: 0.3)
                     } else {
-                        // Adopt rather than restart when versions match. An
-                        // unknown version is also preserved: uncertainty alone
-                        // is not enough reason to destroy live peer sessions.
+                        // Adopt rather than restart when versions match, when
+                        // the version is unknown, or when a stale daemon has
+                        // no launchable replacement — neither uncertainty nor
+                        // an impossible upgrade is a reason to destroy live
+                        // peer sessions.
                         Logger.daemon.info(
                             "adopting the running daemon; settings changed since it started are not applied"
                         )
