@@ -140,13 +140,33 @@ final class PeerWorkspaceMirrorController {
     }
 
     func start() async throws {
-        subscriptionTransportGeneration = lease.transportGeneration
-        let transport = try await UnixSocketTransport.connect(socketPath: lease.hostSockPath)
+        // Capture the lease this attempt dials. Every await below is a
+        // window for a newer resume to cancel this task and move the
+        // controller onto a replacement lease, or for teardown to retire
+        // it — and the outcome gate at the call sites runs only AFTER the
+        // assignments here. The commit-point guards below are therefore
+        // the only thing standing between a late-resuming attempt and
+        // overwriting the replacement's fresh session (or re-installing
+        // one on a torn-down controller).
+        let dialedLease = lease
+        subscriptionTransportGeneration = dialedLease.transportGeneration
+        let transport = try await UnixSocketTransport.connect(socketPath: dialedLease.hostSockPath)
         let session = PeerSession(
             read: { try await transport.read() },
             write: { try await transport.write($0) }
         )
         _ = try await session.handshake(options: Self.mirrorHandshakeOptions)
+        guard Self.startAttemptMayCommit(
+            isTornDown: isTornDown,
+            dialedLeaseIsCurrent: lease === dialedLease,
+            isCancelled: Task.isCancelled
+        ) else {
+            // Resources this attempt acquired are its own to release: a
+            // superseded or torn-down controller must not inherit an
+            // orphan connection.
+            await transport.close()
+            throw CancellationError()
+        }
         subscriptionTransport = transport
         subscriptionSession = session
         subscriptionAlive = true
@@ -175,11 +195,53 @@ final class PeerWorkspaceMirrorController {
         }
 
         let workspaces = try await session.listWorkspaces()
+        // Guarded BEFORE matchAndAdoptWorkspace and reconcile, not only
+        // after: matchAndAdoptWorkspace stamps the mirrored identity
+        // (hostWorkspaceID + aliases, plus an identity-change notification)
+        // and reconcile mutates panes and the split tree — stale writes the
+        // final guard cannot roll back. A supersede landing DURING
+        // reconcile's own awaits still slips through; that residue is
+        // corrected by the replacement's reconcile converging the same
+        // workspace, and the initial call site treats this refusal as
+        // supersession rather than failure.
+        guard Self.startAttemptMayCommit(
+            isTornDown: isTornDown,
+            dialedLeaseIsCurrent: lease === dialedLease,
+            isCancelled: Task.isCancelled
+        ) else {
+            await session.stopHeartbeat()
+            await transport.close()
+            throw CancellationError()
+        }
         guard let target = matchAndAdoptWorkspace(workspaces) else {
             throw RelayError.ioError("host workspace not found")
         }
         try await reconcile(target: target.layout)
+        // Re-checked after the last awaits: `startReceiveLoop` CANCELS the
+        // current receive task, so a superseded attempt reaching it would
+        // kill the replacement's loop even though its own session is no
+        // longer installed. Stop only what this attempt owns.
+        guard Self.startAttemptMayCommit(
+            isTornDown: isTornDown,
+            dialedLeaseIsCurrent: lease === dialedLease,
+            isCancelled: Task.isCancelled
+        ) else {
+            await session.stopHeartbeat()
+            await transport.close()
+            throw CancellationError()
+        }
         startReceiveLoop(session: session)
+    }
+
+    /// Whether an in-flight `start()` may still commit state it acquired.
+    /// Pure so the commit-point contract is pinned by a test rather than by
+    /// whoever edits the suspension points next.
+    nonisolated static func startAttemptMayCommit(
+        isTornDown: Bool,
+        dialedLeaseIsCurrent: Bool,
+        isCancelled: Bool
+    ) -> Bool {
+        !isTornDown && dialedLeaseIsCurrent && !isCancelled
     }
 
     /// Pure routing decision for one incoming message, keyed against the

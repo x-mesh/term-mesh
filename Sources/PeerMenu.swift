@@ -1335,6 +1335,15 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             registerWorkspaceMirror(mirror)
             do {
                 try await mirror.start()
+            } catch is CancellationError {
+                // Superseded, not failed: start()'s commit-point guard threw
+                // because a host-reconnect resume moved this mirror onto a
+                // replacement lease while the initial handshake was in
+                // flight. The replacement owns the controller now — tearing
+                // down here would destroy ITS live subscription and close
+                // the workspace it just rebuilt, turning the guard's refusal
+                // into the very clobber it exists to prevent.
+                return
             } catch {
                 // Mirror couldn't initialize (listWorkspaces / subscribe /
                 // reconcile failed): `startReceiveLoop` never ran, so there is

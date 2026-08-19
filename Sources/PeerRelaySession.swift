@@ -2956,6 +2956,19 @@ final class PeerRelaySession {
             if let reader, let resizeCoalescer {
             relayToHost = Task.detached(priority: .userInitiated) {
                 var inputStallGate = RelayStallLogGate()
+                // Threshold 0: every helper report is already a sustained
+                // stall by the helper's own 200ms bar. What this gate adds is
+                // the part the app must not delegate: a remote process's
+                // throttle is not a trust boundary, and a hostile or looping
+                // helper could otherwise write a log line per frame.
+                // Known trade: the gate samples at RECEIPT time, so two
+                // legitimate reports arriving back-to-back after a backlog
+                // (slow sendInput ahead of them) log once — the suppressed
+                // episode still lands in the totals the next line carries.
+                var helperStallGate = RelayStallLogGate(
+                    thresholdNanos: 0,
+                    minIntervalNanos: RelayStallLogGate.defaultMinIntervalNanos
+                )
                 var inputSendFailures: UInt64 = 0
                 var framesConsumed: UInt64 = 0
                 do {
@@ -3019,19 +3032,25 @@ final class PeerRelaySession {
                             }))
                             await resizeCoalescer.submit(cols: cols, rows: rows)
                         case kTypeStall where frame.payload.count >= 16:
-                            // Already rate-limited helper-side (one per 5s);
-                            // log as-is so the helper's view of the freeze
-                            // lands in the same timeline as the app's own
-                            // writer/input stall lines.
+                            // The helper rate-limits its reports to one per
+                            // 5s, but that throttle runs in a process this
+                            // app did not verify — gate again here so a
+                            // hostile or looping helper cannot flood the
+                            // production log one line per frame.
                             let stallMs = UInt64(littleEndian: frame.payload.withUnsafeBytes {
                                 $0.loadUnaligned(fromByteOffset: 0, as: UInt64.self)
                             })
                             let helperTotalOut = UInt64(littleEndian: frame.payload.withUnsafeBytes {
                                 $0.loadUnaligned(fromByteOffset: 8, as: UInt64.self)
                             })
-                            RemoteWorkLog.infoOffMain(
-                                "Relay terminal write stalled — the relay helper spent \(stallMs)ms writing to the local pane (\(helperTotalOut) bytes relayed so far); the local renderer was not draining"
-                            )
+                            if helperStallGate.recordEpisode(
+                                durationNanos: stallMs &* 1_000_000,
+                                now: DispatchTime.now().uptimeNanoseconds
+                            ) {
+                                RemoteWorkLog.infoOffMain(
+                                    "Relay terminal write stalled — the relay helper spent \(stallMs)ms writing to the local pane (\(helperTotalOut) bytes relayed so far); the local renderer was not draining"
+                                )
+                            }
                         case kTypeGoodbye:
                             await resizeCoalescer.flushNow()
                             // Owned session only: a Goodbye on the shared
