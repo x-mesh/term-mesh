@@ -151,9 +151,21 @@ enum SessionHostPanes {
     /// Inlined, reverting the recovery reinstated the proliferation bug without
     /// failing a single test.
     static func declaredProjects(in workspaces: [Workspace]) -> [(id: UUID, name: String)] {
-        workspaces.compactMap { workspace in
-            declaredProjectName(for: workspace).map { (id: workspace.id, name: $0) }
+        let declared = workspaces.compactMap { workspace in
+            WorkspaceProjectNames.shared.projectName(for: workspace.id).map {
+                (id: workspace.id, name: $0)
+            }
         }
+        let recovered = workspaces.compactMap { workspace -> (id: UUID, name: String)? in
+            guard WorkspaceProjectNames.shared.projectName(for: workspace.id) == nil,
+                  let name = projectName(fromWorkspaceTitle: workspace.customTitle)
+            else { return nil }
+            return (id: workspace.id, name: name)
+        }
+        // A title is only a recovery hint. If an unrelated worktree happens to
+        // be named `[project]`, the durable declaration must win regardless of
+        // tab or window order.
+        return declared + recovered
     }
 
     /// Choose by declared project identity, never by the selected tab. The
@@ -191,19 +203,18 @@ enum SessionHostPanes {
             guard let source = tabManager.tabs.first(where: {
                 $0.panelID(forPeerSurfaceID: surfaceID) != nil
             }),
-            declaredProjectName(for: source)?.caseInsensitiveCompare(
-                projectName
-            ) != .orderedSame,
             let panelID = source.panelID(forPeerSurfaceID: surfaceID),
             let sourcePane = source.paneId(forPanelId: panelID),
             let sourceIndex = source.indexInPane(forPanelId: panelID)
             else { continue }
 
-            let existingTarget = tabManager.tabs.first(where: {
-                declaredProjectName(for: $0)?.caseInsensitiveCompare(
-                    projectName
-                ) == .orderedSame
-            })
+            let existingTargetID = declaredProjects(in: tabManager.tabs).first(where: {
+                $0.name.caseInsensitiveCompare(projectName) == .orderedSame
+            })?.id
+            let existingTarget = existingTargetID.flatMap { id in
+                tabManager.tabs.first(where: { $0.id == id })
+            }
+            guard existingTarget?.id != source.id else { continue }
             var targetAnchor: UUID?
             let target = existingTarget ?? {
                 let created = tabManager.addWorkspace(
@@ -552,7 +563,9 @@ extension SessionHostPanes {
             // window rather than a relaunch.
             let destination = workspaceDestination(
                 projectName: projectName,
-                declaredProjects: managers.flatMap { declaredProjects(in: $0.tabs) },
+                declaredProjects: declaredProjects(
+                    in: managers.flatMap(\.tabs)
+                ),
                 hostSessionsWorkspaceID: managers.lazy.compactMap { manager in
                     manager.tabs.first(where: { $0.customTitle == "Host Sessions" })?.id
                 }.first

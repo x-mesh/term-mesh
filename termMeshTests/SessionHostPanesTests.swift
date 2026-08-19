@@ -220,6 +220,34 @@ final class SessionHostPanesTests: XCTestCase {
         )
     }
 
+    /// A bracketed title is only a recovery hint. A worktree named like a
+    /// project must not steal routing from that project's durable declaration,
+    /// even when the worktree appears first in tab/window order.
+    func test_anExplicitProjectOutranksAMatchingTitleAcrossWorkspaces() {
+        let worktree = Workspace(title: "Terminal", workingDirectory: "/tmp/worktree")
+        worktree.customTitle = "[term-mesh]"
+        let project = Workspace(title: "Terminal", workingDirectory: "/tmp/project")
+        project.customTitle = "[term-mesh]"
+        defer {
+            WorkspaceProjectNames.shared.forget(workspaceId: worktree.id)
+            WorkspaceProjectNames.shared.forget(workspaceId: project.id)
+        }
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: project.id, projectName: "term-mesh"
+        )
+
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: "term-mesh",
+                declaredProjects: SessionHostPanes.declaredProjects(
+                    in: [worktree, project]
+                ),
+                hostSessionsWorkspaceID: nil
+            ),
+            .existingProject(project.id)
+        )
+    }
+
     // MARK: - Which sessions get a pane
 
     /// Everything the daemon holds deserves a window here: it owns it, so it
