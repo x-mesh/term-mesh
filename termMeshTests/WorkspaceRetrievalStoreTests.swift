@@ -8,6 +8,27 @@ import XCTest
 
 @MainActor
 final class WorkspaceRetrievalStoreTests: XCTestCase {
+    func test_liveActivityRowSelectionSupportsRangeAndToggleWithoutTextKit() {
+        let ids = (0..<5).map { _ in UUID() }
+        let first = RetrievalActivitySelection.updating(
+            current: [], clicked: ids[1], ordered: ids, anchor: nil,
+            extendsRange: false, toggles: false
+        )
+        XCTAssertEqual(first.selected, [ids[1]])
+
+        let range = RetrievalActivitySelection.updating(
+            current: first.selected, clicked: ids[3], ordered: ids, anchor: first.anchor,
+            extendsRange: true, toggles: false
+        )
+        XCTAssertEqual(range.selected, Set(ids[1...3]))
+
+        let toggled = RetrievalActivitySelection.updating(
+            current: range.selected, clicked: ids[2], ordered: ids, anchor: range.anchor,
+            extendsRange: false, toggles: true
+        )
+        XCTAssertEqual(toggled.selected, [ids[1], ids[3]])
+    }
+
     func test_liveActivityPreservesErrorSeverity() {
         let suite = "WorkspaceRetrievalStoreTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
