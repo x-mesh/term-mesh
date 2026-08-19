@@ -295,6 +295,7 @@
 				DR00000009000000090000009 /* GitHubIssueDraftTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR0000000A0000000A000000A /* GitHubIssueDraftTests.swift */; };
 				DR0000000D0000000D000000D /* DiagnosticsTriageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR0000000E0000000E000000E /* DiagnosticsTriageTests.swift */; };
 				DR00000011000000110000011 /* DiagnosticsCaptureStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR00000012000000120000012 /* DiagnosticsCaptureStoreTests.swift */; };
+				DR00000013000000130000013 /* BugReportAgentAnalysisTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR00000014000000140000014 /* BugReportAgentAnalysisTests.swift */; };
 			FE000004A1B2C3D4E5F60718 /* PasteQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */; };
 			FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */; };
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
@@ -648,6 +649,7 @@
 			DR0000000A0000000A000000A /* GitHubIssueDraftTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubIssueDraftTests.swift; sourceTree = "<group>"; };
 			DR0000000E0000000E000000E /* DiagnosticsTriageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsTriageTests.swift; sourceTree = "<group>"; };
 			DR00000012000000120000012 /* DiagnosticsCaptureStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsCaptureStoreTests.swift; sourceTree = "<group>"; };
+			DR00000014000000140000014 /* BugReportAgentAnalysisTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BugReportAgentAnalysisTests.swift; sourceTree = "<group>"; };
 			FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PasteQueueTests.swift; sourceTree = "<group>"; };
 			FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceManualUnreadTests.swift; sourceTree = "<group>"; };
 			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
@@ -1072,6 +1074,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				DR0000000A0000000A000000A /* GitHubIssueDraftTests.swift */,
 				DR0000000E0000000E000000E /* DiagnosticsTriageTests.swift */,
 				DR00000012000000120000012 /* DiagnosticsCaptureStoreTests.swift */,
+				DR00000014000000140000014 /* BugReportAgentAnalysisTests.swift */,
 				FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */,
 				FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */,
 				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
@@ -1511,6 +1514,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				DR00000009000000090000009 /* GitHubIssueDraftTests.swift in Sources */,
 				DR0000000D0000000D000000D /* DiagnosticsTriageTests.swift in Sources */,
 				DR00000011000000110000011 /* DiagnosticsCaptureStoreTests.swift in Sources */,
+				DR00000013000000130000013 /* BugReportAgentAnalysisTests.swift in Sources */,
 				FE000004A1B2C3D4E5F60718 /* PasteQueueTests.swift in Sources */,
 				FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */,
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,
