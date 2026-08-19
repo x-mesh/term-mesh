@@ -248,6 +248,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         false
     }
 
+    // Modern macOS asks the secure-state variants when the application
+    // supports secure coding. Keep them aligned with the legacy callbacks so
+    // an OS path change cannot silently re-enable the second restoration
+    // owner this policy exists to exclude.
+    func applicationShouldSaveSecureApplicationState(_ app: NSApplication) -> Bool {
+        false
+    }
+
+    func applicationShouldRestoreSecureApplicationState(_ app: NSApplication) -> Bool {
+        false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Raise the per-process FD soft limit before any subsystem opens
         // sockets. macOS launchd hands GUI apps a 256-fd default which

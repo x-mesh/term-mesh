@@ -109,6 +109,8 @@ final class NativeWindowRestorationPolicyTests: XCTestCase {
 
         XCTAssertFalse(delegate.applicationShouldSaveApplicationState(app))
         XCTAssertFalse(delegate.applicationShouldRestoreApplicationState(app))
+        XCTAssertFalse(delegate.applicationShouldSaveSecureApplicationState(app))
+        XCTAssertFalse(delegate.applicationShouldRestoreSecureApplicationState(app))
     }
 }
 
