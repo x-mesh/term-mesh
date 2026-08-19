@@ -199,6 +199,46 @@ final class DiagnosticsLogTailTests: XCTestCase {
         XCTAssertLessThan(tail[0].count, long.count)
     }
 
+    /// The daemon logs through `tracing`, which colours its output, so the
+    /// file holds real escape bytes. Carried into a bundle they reach a GitHub
+    /// comment and an agent's prompt as `[0m` litter — and an escape sequence
+    /// pasted into a terminal is not inert.
+    func test_ansiColourCodesAreStrippedFromLogLines() throws {
+        let coloured = "\u{1B}[2m2026-08-19T05:09:49Z\u{1B}[0m \u{1B}[32mDEBUG\u{1B}[0m team.sync: ok"
+        let path = try writeTemp(coloured)
+        XCTAssertEqual(
+            DiagnosticsLogTail.tail(path: path, lines: 1),
+            ["2026-08-19T05:09:49Z DEBUG team.sync: ok"]
+        )
+    }
+
+    /// The exact shape observed in a real bundle: the reset sequence at the
+    /// head of a wrapped line, which reached the agent as `[0m`.
+    func test_leadingResetSequenceLeavesNoLitter() {
+        XCTAssertEqual(
+            DiagnosticsLogTail.stripped("\u{1B}[0m team.sync: Object {\"teams\": Number(1)}"),
+            " team.sync: Object {\"teams\": Number(1)}"
+        )
+    }
+
+    /// Tabs align log columns and stay; a bare BEL is noise and goes.
+    func test_barControlBytesAreRemovedButTabsSurvive() {
+        XCTAssertEqual(DiagnosticsLogTail.stripped("a\u{07}b\tc"), "ab\tc")
+    }
+
+    /// `ESC` followed by one character is a two-byte escape in its own right
+    /// (`ESC c` is a full reset), so both bytes go. Costing one character of a
+    /// log line is the right trade against leaving a live escape byte in text
+    /// that gets pasted into a terminal.
+    func test_twoByteEscapeIsConsumedWhole() {
+        XCTAssertEqual(DiagnosticsLogTail.stripped("a\u{1B}cb"), "ab")
+    }
+
+    func test_ordinaryTextIsUntouched() {
+        let line = "2026-08-19 INFO peer authenticated (ssh-passthrough)"
+        XCTAssertEqual(DiagnosticsLogTail.stripped(line), line)
+    }
+
     /// Seeking past the start lands mid-line; that fragment is dropped rather
     /// than reported as though the log contained a truncated entry.
     func test_partialFirstLineIsDroppedWhenSeeking() throws {

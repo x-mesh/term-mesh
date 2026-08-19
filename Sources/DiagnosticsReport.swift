@@ -703,8 +703,45 @@ enum DiagnosticsLogTail {
         // fragment rather than reporting a truncated line as if the log
         // contained it.
         if start > 0, !split.isEmpty { split.removeFirst() }
-        return split.suffix(lines).map(bounded)
+        return split.suffix(lines).map { bounded(stripped($0)) }
     }
+
+    /// Remove terminal control sequences.
+    ///
+    /// The daemon writes its log through `tracing`, which colours its output,
+    /// so the file holds real `ESC[0m` bytes. Carried into a bundle they end
+    /// up in a GitHub comment and in an agent's prompt as `[0m` litter that
+    /// looks like corrupted data and buries the line it decorates. Worse, an
+    /// escape sequence pasted into a terminal is not inert — a bug report
+    /// should never be something you have to be careful about reading.
+    ///
+    /// Stripped here rather than in the redactor: this is encoding noise from
+    /// reading a log file, and this is the type that reads log files. The
+    /// redactor's job is secrets.
+    static func stripped(_ line: String) -> String {
+        var result = line
+        if let regex = ansiPattern {
+            result = regex.stringByReplacingMatches(
+                in: result,
+                range: NSRange(result.startIndex..<result.endIndex, in: result),
+                withTemplate: ""
+            )
+        }
+        // Whatever control bytes survived — a lone ESC, a stray BEL. Tab is
+        // kept because log lines use it for alignment.
+        return String(String.UnicodeScalarView(
+            result.unicodeScalars.filter { $0.value >= 0x20 || $0 == "\t" }
+        ))
+    }
+
+    /// CSI (`ESC[…`), OSC (`ESC]…` terminated by BEL or ST), and any other
+    /// two-character escape. Ordered so the longer forms match before the
+    /// catch-all consumes their introducer.
+    private static let ansiPattern = try? NSRegularExpression(
+        pattern: "\u{1B}\\[[0-9;?]*[ -/]*[@-~]"
+            + "|\u{1B}\\][^\u{07}\u{1B}]*(?:\u{07}|\u{1B}\\\\)"
+            + "|\u{1B}."
+    )
 
     private static func bounded(_ line: String) -> String {
         guard line.count > maxLineLength else { return line }
