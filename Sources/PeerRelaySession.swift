@@ -1242,10 +1242,11 @@ private final class RelayPtyDataSink: @unchecked Sendable {
 /// that connection while the app is still computing the response loses the
 /// result and used to make the response send tear down the replacement session.
 ///
-/// Commands may run back-to-back, but once a heal is waiting it gets exclusive
-/// ownership before another command starts. The pump has only one receive loop,
-/// so there is normally at most one command holder; the count keeps the contract
-/// explicit and makes the gate safe if dispatch becomes concurrent later.
+/// Commands may overlap. Once they drain to zero, a waiting heal gets exclusive
+/// ownership before a new command batch starts. While a command is still active,
+/// new commands join that batch: a hung command already prevents the exact
+/// connection from healing, and parking unrelated commands behind that heal
+/// would recreate the total control-plane stall this gate exists to avoid.
 actor RelayLeaderSessionGate {
     private var activeCommands = 0
     private var healActive = false
@@ -1258,7 +1259,7 @@ actor RelayLeaderSessionGate {
 
     func acquireCommand() async -> Bool {
         guard !Task.isCancelled else { return false }
-        if !healActive, waitingHeals.isEmpty {
+        if !healActive, waitingHeals.isEmpty || activeCommands > 0 {
             activeCommands += 1
             return true
         }
@@ -2660,69 +2661,42 @@ final class PeerRelaySession {
                         // A tm-agent running inside the remote pane can reach
                         // only the remote daemon. The daemon sends this scoped
                         // request back over the already-authenticated peer
-                        // session; answer it here without app activation or a
-                        // local TERMMESH_SOCKET ever crossing machines.
-                        guard await self.leaderSessionGate.acquireCommand() else { return }
-                        guard !Task.isCancelled, let liveSession = await self.session else {
-                            await self.leaderSessionGate.releaseCommand()
-                            return
-                        }
-                        // A heal that was already exclusive when this frame
-                        // arrived may have retired its connection before the
-                        // command acquired the gate. Do not execute a command
-                        // whose response can no longer return on that exact
-                        // connection: the daemon drops the pending route and
-                        // the CLI can retry the same request_id safely.
-                        if liveSession !== currentSession {
-                            await self.leaderSessionGate.releaseCommand()
-                            currentSession = liveSession
-                            expectedByteSeq = nil
-                            gapBytesTotal = 0
-                            gapCount = 0
-                            resumeTransitionGate.adoptCommittedSession()
-                            continue pumpLoop
-                        }
-                        let response = await GhosttyPaneSurfaceProvider
-                            .handleRemoteLeaderCommand(request)
-                        guard !Task.isCancelled, let responseSession = await self.session else {
-                            await self.leaderSessionGate.releaseCommand()
-                            return
-                        }
-                        if responseSession !== currentSession {
-                            await self.leaderSessionGate.releaseCommand()
-                            currentSession = responseSession
-                            expectedByteSeq = nil
-                            gapBytesTotal = 0
-                            gapCount = 0
-                            resumeTransitionGate.adoptCommittedSession()
-                            continue pumpLoop
-                        }
-                        var responseError: Error?
-                        do {
-                            try await currentSession.sendTeamLeaderCommandResponse(
-                                response,
-                                correlationID: correlationID
-                            )
-                        } catch {
-                            responseError = error
-                        }
-                        await self.leaderSessionGate.releaseCommand()
-                        if let responseError {
-                            // A session replacement outside this command gate
-                            // (for example a future reconnect path) makes this
-                            // send failure stale. Adopt the live replacement;
-                            // never let failure on a retired connection destroy
-                            // the connection that superseded it.
-                            if let swapped = await self.session, swapped !== currentSession {
-                                currentSession = swapped
-                                expectedByteSeq = nil
-                                gapBytesTotal = 0
-                                gapCount = 0
-                                resumeTransitionGate.adoptCommittedSession()
-                                continue pumpLoop
+                        // session. Run the control call beside the receive loop:
+                        // a slow team command must not stop PtyData or unrelated
+                        // leader requests from being received. The gate still
+                        // pins execution and response to this exact connection.
+                        let commandSession = currentSession
+                        Task.detached(priority: .userInitiated) { [weak self] in
+                            guard let self,
+                                  await self.leaderSessionGate.acquireCommand() else { return }
+                            guard !Task.isCancelled,
+                                  let liveSession = await self.session,
+                                  liveSession === commandSession else {
+                                await self.leaderSessionGate.releaseCommand()
+                                return
                             }
-                            endReason = "hostToRelay-leader-response-error error=\(responseError)"
-                            break pumpLoop
+                            let response = await GhosttyPaneSurfaceProvider
+                                .handleRemoteLeaderCommand(request)
+                            guard !Task.isCancelled,
+                                  let responseSession = await self.session,
+                                  responseSession === commandSession else {
+                                await self.leaderSessionGate.releaseCommand()
+                                return
+                            }
+                            do {
+                                try await commandSession.sendTeamLeaderCommandResponse(
+                                    response,
+                                    correlationID: correlationID
+                                )
+                            } catch {
+                                #if DEBUG
+                                dlog("peer.relay.leaderResponse.failed error=\(error)")
+                                #endif
+                                RemoteWorkLog.warningOffMain(
+                                    "Remote leader response failed: \(error)"
+                                )
+                            }
+                            await self.leaderSessionGate.releaseCommand()
                         }
                         continue pumpLoop
                     // Forward only this surface's output. Other-surface PtyData

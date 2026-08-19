@@ -4424,7 +4424,12 @@ fn rpc_call_with_timeout_secs(
 ) -> Result<Value, String> {
     match remote_leader_rpc_policy(remote_leader_route().is_some(), method) {
         RemoteLeaderRpcPolicy::Proxy => {
-            return remote_leader_rpc_call(sock, method, params, timeout_secs);
+            return remote_leader_rpc_call(
+                sock,
+                method,
+                params,
+                remote_leader_timeout(Duration::from_secs(timeout_secs)).as_secs(),
+            );
         }
         // A remote leader's TERMMESH_SOCKET points at the peer host's local
         // app. Falling through for a disallowed team method therefore acts on
@@ -4457,6 +4462,32 @@ fn rpc_call_with_timeout_duration(
             "{method} is not allowed from a scoped remote leader; use the owning project window to change team lifecycle"
         )),
         RemoteLeaderRpcPolicy::Local => rpc_call_timeout_duration(sock, method, params, timeout),
+    }
+}
+
+const REMOTE_LEADER_TIMEOUT_MARGIN: Duration = Duration::from_secs(1);
+
+fn remote_leader_timeout(requested: Duration) -> Duration {
+    requested.max(
+        Duration::from_secs(peer_proto::team_leader::COMMAND_PENDING_TIMEOUT_SECS)
+            + REMOTE_LEADER_TIMEOUT_MARGIN,
+    )
+}
+
+#[cfg(test)]
+mod remote_leader_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn remote_leader_timeout_outlives_daemon_pending_window() {
+        assert_eq!(
+            remote_leader_timeout(Duration::from_secs(6)),
+            Duration::from_secs(16)
+        );
+        assert_eq!(
+            remote_leader_timeout(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
     }
 }
 

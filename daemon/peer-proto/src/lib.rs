@@ -163,6 +163,7 @@ pub mod team_leader {
     pub const MAX_TEAM_UUID_BYTES: usize = 128;
     pub const REQUEST_ID_BYTES: usize = 16;
     pub const GRANT_ID_BYTES: usize = 32;
+    pub const COMMAND_PENDING_TIMEOUT_SECS: u64 = 15;
     pub const MAX_BOOTSTRAP_PAYLOAD_BYTES: usize = 512;
     /// Extra methods available only through a project-bound leader grant.
     /// Generic `team.call.v1` must continue to reject these scoped operations.

@@ -693,7 +693,7 @@ struct PeerHostEditorView: View {
                 .font(.caption).foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
             case .unhealthy:
-                let control = health.controlPathPresent && health.controlRPC
+                let control = health.controlPathPresent && health.controlRPC == .available
                     ? "control OK" : "control unavailable at \(health.controlPath)"
                 Label(
                     "Host unhealthy — \(control); protocol mismatches \(health.protocolMismatchCount) in 5 min",
@@ -702,7 +702,12 @@ struct PeerHostEditorView: View {
                 .font(.caption).foregroundStyle(.red)
                 .fixedSize(horizontal: false, vertical: true)
             case .unknown:
-                Label("Host health baseline unavailable", systemImage: "questionmark.circle")
+                Label(
+                    health.controlRPC == .probeUnavailable
+                        ? "Host control probe unavailable — tm-agent was not found"
+                        : "Host health baseline unavailable",
+                    systemImage: "questionmark.circle"
+                )
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

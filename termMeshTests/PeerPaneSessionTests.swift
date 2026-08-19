@@ -52,6 +52,37 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertTrue(healed)
     }
 
+    func testLeaderSessionGateDoesNotParkNewCommandsBehindHealWaitingOnHungCommand() async {
+        let gate = RelayLeaderSessionGate()
+        let firstAcquired = await gate.acquireCommand()
+        XCTAssertTrue(firstAcquired)
+
+        let healTask = Task {
+            guard await gate.acquireHeal() else { return }
+            await gate.releaseHeal()
+        }
+        await waitForLeaderGateWaiters(gate, commands: 0, heals: 1)
+
+        let secondAcquired = await gate.acquireCommand()
+        XCTAssertTrue(secondAcquired)
+        await gate.releaseCommand()
+        await gate.releaseCommand()
+        await healTask.value
+    }
+
+    func testLeaderSessionGateAllowsConcurrentCommands() async {
+        let gate = RelayLeaderSessionGate()
+        let firstAcquired = await gate.acquireCommand()
+        XCTAssertTrue(firstAcquired)
+
+        let secondCommand = Task { await gate.acquireCommand() }
+        let acquired = await secondCommand.value
+        XCTAssertTrue(acquired, "one slow leader command must not serialize the next")
+
+        await gate.releaseCommand()
+        await gate.releaseCommand()
+    }
+
     func testLeaderSessionGateKeepsNewCommandOutOfHealSwap() async {
         let gate = RelayLeaderSessionGate()
         let healAcquired = await gate.acquireHeal()

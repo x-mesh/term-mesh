@@ -16,6 +16,7 @@ final class PeerDaemonVersionTests: XCTestCase {
         let body = String(command.dropFirst("sh -c '".count).dropLast())
         XCTAssertFalse(body.contains("'"))
         XCTAssertTrue(body.contains("health-control-rpc"))
+        XCTAssertTrue(body.contains("crpc=unknown"))
         XCTAssertTrue(body.contains("health-peer-present"))
         XCTAssertTrue(body.contains("attach relay lagged"))
         XCTAssertTrue(body.contains("frame length .* exceeds"))
@@ -35,6 +36,7 @@ final class PeerDaemonVersionTests: XCTestCase {
         health-protocol-mismatch-5m=0
         """)
         XCTAssertEqual(healthy?.verdict, .healthy)
+        XCTAssertEqual(healthy?.controlRPC, .available)
 
         var missingControl = healthy!
         missingControl.controlPathPresent = false
@@ -47,6 +49,24 @@ final class PeerDaemonVersionTests: XCTestCase {
         var lagging = healthy!
         lagging.relayLagCount = 2
         XCTAssertEqual(lagging.verdict, .degraded)
+
+        let missingCLI = PeerHostDoctor.parseHealthBaseline("""
+        health-service-active=1
+        health-control-path=/tmp/term-meshd.sock
+        health-control-present=1
+        health-control-rpc=unknown
+        health-peer-path=/run/term-mesh/tm-peer.sock
+        health-peer-present=1
+        health-relay-lag-5m=0
+        health-resume-heal-5m=0
+        health-protocol-mismatch-5m=0
+        """)
+        XCTAssertEqual(missingCLI?.controlRPC, .probeUnavailable)
+        XCTAssertEqual(missingCLI?.verdict, .unknown)
+
+        var missingCLIWithMismatch = missingCLI!
+        missingCLIWithMismatch.protocolMismatchCount = 1
+        XCTAssertEqual(missingCLIWithMismatch.verdict, .unhealthy)
     }
 
     func test_healthBaseline_duplicateBannerKeysUseFinalProbeBlock() {

@@ -42,6 +42,12 @@ enum PeerHostHealthVerdict: String, Equatable {
     case unknown
 }
 
+enum PeerHostControlRPCStatus: Equatable {
+    case available
+    case unavailable
+    case probeUnavailable
+}
+
 /// A measured Linux-peer baseline. A peer handshake alone is insufficient:
 /// the daemon control plane must also have a reachable pathname, and recent
 /// protocol mismatches must be absent.
@@ -49,7 +55,7 @@ struct PeerHostHealthBaseline: Equatable {
     var serviceActive = false
     var controlPath = "/tmp/term-meshd.sock"
     var controlPathPresent = false
-    var controlRPC = false
+    var controlRPC: PeerHostControlRPCStatus = .unavailable
     var peerPath = ""
     var peerPathPresent = false
     var relayLagCount = 0
@@ -57,10 +63,12 @@ struct PeerHostHealthBaseline: Equatable {
     var protocolMismatchCount = 0
 
     var verdict: PeerHostHealthVerdict {
-        guard serviceActive, controlPathPresent, controlRPC, peerPathPresent else {
+        guard serviceActive, controlPathPresent, peerPathPresent else {
             return .unhealthy
         }
         guard protocolMismatchCount == 0 else { return .unhealthy }
+        guard controlRPC != .probeUnavailable else { return .unknown }
+        guard controlRPC == .available else { return .unhealthy }
         return relayLagCount > 0 || resumeHealCount > 0 ? .degraded : .healthy
     }
 }
@@ -133,7 +141,7 @@ enum PeerHostDoctor {
     }
 
     private static let healthBaselineCommandTemplate =
-        #"sh -c 'if [ "$(uname -s)" != Linux ]; then exit 44; fi; u=$(systemctl --user is-active term-meshd 2>/dev/null); s=$(systemctl is-active term-meshd 2>/dev/null); if [ "$s" = active ] || [ "$u" = active ]; then active=1; else active=0; fi; control=${TERMMESH_DAEMON_UNIX_PATH:-}; if [ -z "$control" ]; then control=$(sed -n "s/^TERMMESH_DAEMON_UNIX_PATH=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$control" ] || control=/tmp/term-meshd.sock; peer=${TERMMESH_PEER_SOCKET:-}; if [ -z "$peer" ]; then peer=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$peer" ] || peer=/run/term-mesh/tm-peer.sock; [ -S "$control" ] && cpresent=1 || cpresent=0; [ -S "$peer" ] && ppresent=1 || ppresent=0; cli=$(command -v tm-agent 2>/dev/null); [ -x "$cli" ] || cli=$HOME/.local/bin/tm-agent; if [ -x "$cli" ] && TERMMESH_DAEMON_UNIX_PATH="$control" "$cli" daemon replay-capacity >/dev/null 2>&1; then crpc=1; else crpc=0; fi; if [ "$s" = active ]; then logs=$(journalctl -u term-meshd --since=-5min --no-pager 2>/dev/null); else logs=$(journalctl --user -u term-meshd --since=-5min --no-pager 2>/dev/null); fi; lag=$(printf "%s\n" "$logs" | grep -c "attach relay lagged"); heal=$(printf "%s\n" "$logs" | grep -c "resume-heal reconnect"); proto=$(printf "%s\n" "$logs" | grep -c "frame length .* exceeds"); echo "health-service-active=$active"; echo "health-control-path=$control"; echo "health-control-present=$cpresent"; echo "health-control-rpc=$crpc"; echo "health-peer-path=$peer"; echo "health-peer-present=$ppresent"; echo "health-relay-lag-5m=$lag"; echo "health-resume-heal-5m=$heal"; echo "health-protocol-mismatch-5m=$proto"'"#
+        #"sh -c 'if [ "$(uname -s)" != Linux ]; then exit 44; fi; u=$(systemctl --user is-active term-meshd 2>/dev/null); s=$(systemctl is-active term-meshd 2>/dev/null); if [ "$s" = active ] || [ "$u" = active ]; then active=1; else active=0; fi; control=${TERMMESH_DAEMON_UNIX_PATH:-}; if [ -z "$control" ]; then control=$(sed -n "s/^TERMMESH_DAEMON_UNIX_PATH=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$control" ] || control=/tmp/term-meshd.sock; peer=${TERMMESH_PEER_SOCKET:-}; if [ -z "$peer" ]; then peer=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$peer" ] || peer=/run/term-mesh/tm-peer.sock; [ -S "$control" ] && cpresent=1 || cpresent=0; [ -S "$peer" ] && ppresent=1 || ppresent=0; cli=$(command -v tm-agent 2>/dev/null); [ -x "$cli" ] || cli=$HOME/.local/bin/tm-agent; if [ ! -x "$cli" ]; then crpc=unknown; elif TERMMESH_DAEMON_UNIX_PATH="$control" "$cli" daemon replay-capacity >/dev/null 2>&1; then crpc=1; else crpc=0; fi; if [ "$s" = active ]; then logs=$(journalctl -u term-meshd --since=-5min --no-pager 2>/dev/null); else logs=$(journalctl --user -u term-meshd --since=-5min --no-pager 2>/dev/null); fi; lag=$(printf "%s\n" "$logs" | grep -c "attach relay lagged"); heal=$(printf "%s\n" "$logs" | grep -c "resume-heal reconnect"); proto=$(printf "%s\n" "$logs" | grep -c "frame length .* exceeds"); echo "health-service-active=$active"; echo "health-control-path=$control"; echo "health-control-present=$cpresent"; echo "health-control-rpc=$crpc"; echo "health-peer-path=$peer"; echo "health-peer-present=$ppresent"; echo "health-relay-lag-5m=$lag"; echo "health-resume-heal-5m=$heal"; echo "health-protocol-mismatch-5m=$proto"'"#
 
     /// Sentinel exit code for "no term-meshd binary found" — distinct
     /// from PeerSocketProber.noSocketExitCode (43) so the two probes'
@@ -906,11 +914,17 @@ enum PeerHostDoctor {
             fields[key] = String(text[text.index(after: split)...])
         }
         guard expectedKeys.allSatisfy({ fields[$0] != nil }) else { return nil }
+        let controlRPC: PeerHostControlRPCStatus
+        switch fields["health-control-rpc"] {
+        case "1": controlRPC = .available
+        case "unknown": controlRPC = .probeUnavailable
+        default: controlRPC = .unavailable
+        }
         return PeerHostHealthBaseline(
             serviceActive: fields["health-service-active"] == "1",
             controlPath: fields["health-control-path"] ?? "/tmp/term-meshd.sock",
             controlPathPresent: fields["health-control-present"] == "1",
-            controlRPC: fields["health-control-rpc"] == "1",
+            controlRPC: controlRPC,
             peerPath: fields["health-peer-path"] ?? "",
             peerPathPresent: fields["health-peer-present"] == "1",
             relayLagCount: Int(fields["health-relay-lag-5m"] ?? "") ?? 0,
