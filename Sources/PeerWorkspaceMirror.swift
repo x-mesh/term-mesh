@@ -195,6 +195,24 @@ final class PeerWorkspaceMirrorController {
         }
 
         let workspaces = try await session.listWorkspaces()
+        // Guarded BEFORE matchAndAdoptWorkspace and reconcile, not only
+        // after: matchAndAdoptWorkspace stamps the mirrored identity
+        // (hostWorkspaceID + aliases, plus an identity-change notification)
+        // and reconcile mutates panes and the split tree — stale writes the
+        // final guard cannot roll back. A supersede landing DURING
+        // reconcile's own awaits still slips through; that residue is
+        // corrected by the replacement's reconcile converging the same
+        // workspace, and the initial call site treats this refusal as
+        // supersession rather than failure.
+        guard Self.startAttemptMayCommit(
+            isTornDown: isTornDown,
+            dialedLeaseIsCurrent: lease === dialedLease,
+            isCancelled: Task.isCancelled
+        ) else {
+            await session.stopHeartbeat()
+            await transport.close()
+            throw CancellationError()
+        }
         guard let target = matchAndAdoptWorkspace(workspaces) else {
             throw RelayError.ioError("host workspace not found")
         }

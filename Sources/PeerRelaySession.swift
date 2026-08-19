@@ -2961,6 +2961,10 @@ final class PeerRelaySession {
                 // the part the app must not delegate: a remote process's
                 // throttle is not a trust boundary, and a hostile or looping
                 // helper could otherwise write a log line per frame.
+                // Known trade: the gate samples at RECEIPT time, so two
+                // legitimate reports arriving back-to-back after a backlog
+                // (slow sendInput ahead of them) log once — the suppressed
+                // episode still lands in the totals the next line carries.
                 var helperStallGate = RelayStallLogGate(
                     thresholdNanos: 0,
                     minIntervalNanos: RelayStallLogGate.defaultMinIntervalNanos
