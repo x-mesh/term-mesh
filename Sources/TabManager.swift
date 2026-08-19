@@ -96,6 +96,9 @@ class TabManager {
     // every stored property would otherwise become an invalidation source, and
     // `pendingPanelTitleUpdates` alone is written at the coalescer's 30Hz.
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
+    /// Set while `restoreSession` rebuilds a saved order, so `addWorkspace`
+    /// appends rather than consulting the new-workspace placement preference.
+    @ObservationIgnored private var appendsInOrder = false
     @ObservationIgnored private var suppressFocusFlash = false
     @ObservationIgnored private var lastFocusedPanelByTab: [UUID: UUID] = [:]
     private struct PanelTitleUpdateKey: Hashable {
@@ -145,9 +148,14 @@ class TabManager {
         // opts into restoring the saved session. Secondary windows opened via
         // AppDelegate.createMainWindow intentionally start with a fresh workspace so
         // they don't duplicate the primary window's workspaces.
+        // An isolated e2e run restores regardless of the machine's preference:
+        // the runner host may have session restore turned off, and a test that
+        // silently skipped the restore would pass without asserting anything.
+        let restoresSession = SessionRestoreSettings.mode() == .always
+            || SessionRestoreSettings.stateDirectoryOverride() != nil
         if initialWorkingDirectory == nil,
            restoreSavedSession,
-           SessionRestoreSettings.mode() == .always,
+           restoresSession,
            let saved = Self.loadSavedSession() {
             restoreSession(saved)
         } else {
@@ -433,7 +441,12 @@ class TabManager {
         }
 
         wireClosedBrowserTracking(for: newWorkspace)
-        let insertIndex = newTabInsertIndex()
+        // A restore rebuilds an order the user already arranged, so the
+        // placement preference — which describes where a *new* workspace goes —
+        // does not apply. Under `.top` it returned `pinnedCount`, which is 0 for
+        // an unpinned session, so every restored workspace landed at index 0 and
+        // the sidebar came back reversed on each launch.
+        let insertIndex = appendsInOrder ? tabs.count : newTabInsertIndex()
         if insertIndex >= 0 && insertIndex <= tabs.count {
             tabs.insert(newWorkspace, at: insertIndex)
         } else {
@@ -512,7 +525,8 @@ class TabManager {
             version: 2,
             workspaces: workspaceStates,
             selectedIndex: selectedIndex,
-            windowFrame: nil
+            windowFrame: nil,
+            selectedWorkspaceID: selectedIndex.map { nonTeamTabs[$0].id }
         )
     }
 
@@ -605,6 +619,8 @@ class TabManager {
         selectedTabId = nil
 
         let adoptsSavedIdentities = session.identitiesBelongToThisBuild
+        appendsInOrder = true
+        defer { appendsInOrder = false }
         let fm = FileManager.default
         for saved in session.workspaces {
             let fallbackDir = fm.fileExists(atPath: saved.directory)
@@ -660,8 +676,15 @@ class TabManager {
             }
         }
 
-        // Restore selected tab
-        if let idx = session.selectedIndex, idx >= 0, idx < tabs.count {
+        // Restore selected tab. By ID first: the index is a position in the
+        // saved array, so anything that reorders during restore selects the
+        // wrong workspace. The index remains the fallback for sessions written
+        // before the ID was saved.
+        if adoptsSavedIdentities,
+           let savedID = session.selectedWorkspaceID,
+           tabs.contains(where: { $0.id == savedID }) {
+            selectedTabId = savedID
+        } else if let idx = session.selectedIndex, idx >= 0, idx < tabs.count {
             selectedTabId = tabs[idx].id
         } else if let first = tabs.first {
             selectedTabId = first.id

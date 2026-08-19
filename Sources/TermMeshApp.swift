@@ -128,9 +128,16 @@ struct TermMeshApp: App {
         let isRunningUnderXCTest = AppLaunchEnvironment.isRunningUnderXCTest(
             ProcessInfo.processInfo.environment
         )
+        // An e2e run with its own state directory opts back in: the session
+        // round trip is what it is testing, and any `TERMMESH_UI_TEST_*`
+        // variable — which is how the socket runner launches the app — reads as
+        // XCTest here and would otherwise turn both halves off. Safe because the
+        // override redirects the save away from the user's real session file.
+        let ownsSessionState = !isRunningUnderXCTest
+            || SessionRestoreSettings.stateDirectoryOverride() != nil
         _tabManager = State(wrappedValue: TabManager(
-            restoreSavedSession: !isRunningUnderXCTest,
-            persistsSessionState: !isRunningUnderXCTest,
+            restoreSavedSession: ownsSessionState,
+            persistsSessionState: ownsSessionState,
             daemon: TermMeshDaemon.shared,
             notifications: TerminalNotificationStore.shared
         ))

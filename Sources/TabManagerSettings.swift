@@ -35,9 +35,32 @@ enum SessionRestoreSettings {
         return SessionRestoreMode(rawValue: raw) ?? defaultMode
     }
 
+    /// Where an e2e run keeps the state it is allowed to destroy.
+    ///
+    /// The defect this exists for is only visible across a relaunch, and the
+    /// session path below is deliberately shared by every build on the machine —
+    /// so a test that saved for real would overwrite the developer's own
+    /// session. One opt-in directory redirects both this file and the project
+    /// declarations; unset, nothing about either changes.
+    static let stateDirectoryOverrideKey = "TERMMESH_E2E_STATE_DIR"
+
+    static func stateDirectoryOverride(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        guard let dir = environment[stateDirectoryOverrideKey],
+              !dir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return dir
+    }
+
     /// Fixed path shared across Debug and Release builds so session state persists
     /// regardless of bundle identifier (com.termmesh.app vs com.termmesh.app.debug).
     static var sessionFilePath: String {
+        if let override = stateDirectoryOverride() {
+            let dir = URL(fileURLWithPath: override)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir.appendingPathComponent("session.json").path
+        }
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let dir = appSupport.appendingPathComponent("com.termmesh.app")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -133,19 +156,27 @@ struct SavedSessionState: Codable {
     ///
     /// `nil` for sessions written before this field existed.
     let writerBundleID: String?
+    /// Which workspace was selected, by identity rather than position.
+    ///
+    /// `selectedIndex` is an offset into the saved array, so it names the wrong
+    /// workspace the moment a restore produces a different order. It stays as
+    /// the fallback for sessions written before this field existed.
+    let selectedWorkspaceID: UUID?
 
     init(
         version: Int,
         workspaces: [SavedWorkspaceState],
         selectedIndex: Int?,
         windowFrame: SavedWindowFrame?,
-        writerBundleID: String? = Bundle.main.bundleIdentifier
+        writerBundleID: String? = Bundle.main.bundleIdentifier,
+        selectedWorkspaceID: UUID? = nil
     ) {
         self.version = version
         self.workspaces = workspaces
         self.selectedIndex = selectedIndex
         self.windowFrame = windowFrame
         self.writerBundleID = writerBundleID
+        self.selectedWorkspaceID = selectedWorkspaceID
     }
 
     /// Whether this session's saved workspace identities belong to the running

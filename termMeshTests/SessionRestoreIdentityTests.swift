@@ -161,6 +161,68 @@ final class SessionRestoreIdentityTests: XCTestCase {
         XCTAssertEqual(decoded.workspaces[1].title, "Terminal 2", "the rest still decodes")
     }
 
+    // MARK: - Order and selection
+
+    /// `addWorkspace` honors the new-workspace placement preference, which
+    /// describes where a *new* workspace goes and has no business rebuilding an
+    /// order the user already arranged. Under `.top` it returns `pinnedCount` —
+    /// 0 for an unpinned session — so every restored workspace landed at index 0
+    /// and the sidebar came back reversed on every launch.
+    func test_theRestoreKeepsTheSavedOrderUnderEveryPlacement() {
+        let defaults = UserDefaults.standard
+        let previous = defaults.string(forKey: WorkspacePlacementSettings.placementKey)
+        defer {
+            if let previous {
+                defaults.set(previous, forKey: WorkspacePlacementSettings.placementKey)
+            } else {
+                defaults.removeObject(forKey: WorkspacePlacementSettings.placementKey)
+            }
+        }
+
+        for placement in NewWorkspacePlacement.allCases {
+            defaults.set(placement.rawValue, forKey: WorkspacePlacementSettings.placementKey)
+            let ids = [UUID(), UUID(), UUID()]
+            let tabs = manager()
+            tabs.restoreSessionForTests(session(ids.enumerated().map { index, id in
+                savedWorkspace(id: id, title: "Terminal \(index + 1)")
+            }))
+
+            XCTAssertEqual(
+                tabs.tabs.map(\.id), ids,
+                "placement \(placement.rawValue) reordered a restored session"
+            )
+        }
+    }
+
+    /// The selection is saved as an offset into the saved array, so it names the
+    /// wrong workspace as soon as a restore produces a different order.
+    func test_theSelectionFollowsTheWorkspaceNotItsPosition() {
+        let first = UUID()
+        let second = UUID()
+        let tabs = manager()
+
+        tabs.restoreSessionForTests(SavedSessionState(
+            version: 2,
+            workspaces: [
+                savedWorkspace(id: first),
+                savedWorkspace(id: second, title: "Terminal 2"),
+            ],
+            // A stale index pointing at the wrong workspace: the ID has to win.
+            selectedIndex: 0,
+            windowFrame: nil,
+            selectedWorkspaceID: second
+        ))
+
+        XCTAssertEqual(tabs.selectedTabId, second)
+    }
+
+    func test_theSavedStateNamesTheSelectedWorkspace() {
+        let tabs = manager()
+        let selected = tabs.tabs.first { $0.id == tabs.selectedTabId }
+        let saved = tabs.savedSessionState()
+        XCTAssertEqual(saved.selectedWorkspaceID, selected?.id)
+    }
+
     // MARK: - Whose identities these are
 
     /// `sessionFilePath` is shared across Debug and Release on purpose, so a

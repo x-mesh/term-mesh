@@ -156,6 +156,92 @@ class termmesh:
             finally:
                 self._socket = None
 
+    def relaunch(self, *, settle_s: float = 1.5, timeout_s: float = 60.0) -> None:
+        """Quit the app and start it again, keeping the state it saved.
+
+        Some defects are only visible across a restart — a workspace losing the
+        identity every UUID-keyed sidecar is filed under, for one — and the
+        runner relaunches only *between* test files. This gives one test its own
+        restart boundary.
+
+        Quits through AppleScript rather than a signal: `applicationWillTerminate`
+        is where the session is written, and `pkill`'s SIGTERM does not run it,
+        so a signal-killed app restores whatever the debounced periodic save
+        happened to catch. Requires `TERMMESH_APP_BIN` and
+        `TERMMESH_E2E_STATE_DIR` from the runner — without the state dir the app
+        would be saving over the developer's real session.
+        """
+        import subprocess
+
+        app_bin = os.environ.get("TERMMESH_APP_BIN")
+        if not app_bin:
+            raise termmeshError(
+                "relaunch needs TERMMESH_APP_BIN; run through scripts/run-tests-v2.sh"
+            )
+        if not os.environ.get("TERMMESH_E2E_STATE_DIR"):
+            raise termmeshError(
+                "relaunch needs TERMMESH_E2E_STATE_DIR so the app does not save "
+                "over the real session; run through scripts/run-tests-v2.sh"
+            )
+
+        # Wait for the session to actually be on disk before quitting. The save
+        # is debounced and its write runs on a background queue, so quitting on a
+        # timer races it — and a relaunch that restores a pre-mutation session
+        # asserts nothing while looking like it did.
+        session_file = os.path.join(os.environ["TERMMESH_E2E_STATE_DIR"], "session.json")
+        written_at: Optional[float] = None
+        quiet_since: Optional[float] = None
+        deadline = time.time() + settle_s + 15.0
+        while time.time() < deadline:
+            try:
+                stamp = os.path.getmtime(session_file)
+            except OSError:
+                stamp = None
+            if stamp is not None and stamp == written_at:
+                quiet_since = quiet_since or time.time()
+                if time.time() - quiet_since >= 0.75:
+                    break
+            else:
+                written_at, quiet_since = stamp, None
+            time.sleep(0.1)
+        else:
+            raise termmeshError(
+                f"no session save settled in {session_file} before the relaunch"
+            )
+        self.close()
+
+        app_name = os.path.basename(app_bin)
+        subprocess.run(
+            ["osascript", "-e", f'quit app "{app_name}"'],
+            capture_output=True, timeout=60,
+        )
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            if subprocess.run(["pgrep", "-x", app_name], capture_output=True).returncode != 0:
+                break
+            time.sleep(0.25)
+        else:
+            raise termmeshError(f"{app_name} did not quit")
+
+        subprocess.Popen(
+            [app_bin], env=dict(os.environ),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        deadline = time.time() + timeout_s
+        last: Optional[Exception] = None
+        while time.time() < deadline:
+            try:
+                self.connect()
+                self.current_workspace()
+                return
+            except Exception as e:  # socket not up yet, or no workspace yet
+                last = e
+                self.close()
+                time.sleep(0.25)
+        raise termmeshError(f"{app_name} did not come back: {last}")
+
     def __enter__(self):
         self.connect()
         return self

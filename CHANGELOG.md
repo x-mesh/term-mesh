@@ -18,6 +18,8 @@ All notable changes to term-mesh are documented here.
 
 - 더 이상 존재할 수 없는 workspace의 Project 기록이 계속 쌓이던 것을 앱 시작 때 정리한다.
 
+- **workspace 목록이 재시작할 때마다 거꾸로 뒤집히던 문제** — 새 workspace를 어디에 놓을지 정하는 설정(`Top`)이 복원에도 적용돼, 저장된 순서와 반대로 쌓이고 선택된 workspace도 어긋났다. 이제 복원은 저장된 순서를 그대로 따르고, 선택은 위치가 아니라 workspace 자체를 따라간다.
+
 ## [0.198.0] - 2026-08-19
 
 **원격 Project pane이 엉뚱한 workspace에 섞이지 않고, 큰 세션과 긴 활동 로그도 앱을 멈추지 않는다.**
