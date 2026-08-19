@@ -4,6 +4,22 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.198.0] - 2026-08-19
+
+**원격 Project pane이 엉뚱한 workspace에 섞이지 않고, 큰 세션과 긴 활동 로그도 앱을 멈추지 않는다.**
+
+### Fixed
+
+- **Mac peer의 daemon session이 현재 보고 있던 다른 Project에 열리던 문제** ([#324](https://github.com/x-mesh/term-mesh/pull/324)) — session owner가 보유한 worker pane을 복원할 때 project identity 대신 선택된 workspace를 사용해 `term-mesh` worker가 `xm`에 섞일 수 있었다. 이제 manifest의 surface ID로 Project를 찾아 배치하고, 이전 버전에서 잘못 열린 live pane도 session을 끊지 않고 올바른 workspace로 옮긴다. Project에 속하지 않은 daemon shell은 `Host Sessions`에 분리하며, 이미 죽은 surface만 가리키는 Project 항목은 자동으로 사라진다.
+
+- **Live Activity에서 로그를 drag-select하면 CPU가 100%로 고정되고 앱이 멈추던 문제** ([#321](https://github.com/x-mesh/term-mesh/issues/321), [#324](https://github.com/x-mesh/term-mesh/pull/324)) — 긴 로그를 TextKit 2 selection으로 추적하는 경로를 제거했다. 대신 행을 click·Command-click·Shift-click으로 선택해 `Copy Selected`하거나 한 행만 `Copy Event`할 수 있고, 전체 복사는 계속 `Copy All`로 제공한다.
+
+- **큰 복원 세션에서 macOS native window restoration과 term-mesh 복원이 동시에 실행돼 메모리가 폭증하던 문제** ([#323](https://github.com/x-mesh/term-mesh/pull/323)) — term-mesh가 `session.json`에서 pane graph를 복원한 뒤 AppKit/SwiftUI가 같은 창을 다시 복원하며 focus graph 순환을 만들 수 있었다. 이제 launch 전부터 native restoration을 차단하고, 모든 main window를 non-restorable로 등록한다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.197.0] - 2026-08-19
 
 **원격 Project가 실제 session owner의 능력을 확인한 뒤 시작하고, 실패하면 기다리게 두지 않고 바로 이유를 보여준다.**
