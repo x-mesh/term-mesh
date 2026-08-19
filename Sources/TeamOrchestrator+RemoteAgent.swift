@@ -4352,7 +4352,11 @@ extension TeamOrchestrator {
     }
 
     static func teamHostCanLaunch(_ host: HostEntry) -> Bool {
-        host.isLaunchable && host.teamRouteResolved
+        guard host.isLaunchable,
+              let endpoint = host.teamHostSpec?.hostKey,
+              host.teamHostReadiness.snapshot?.endpoint == endpoint
+        else { return false }
+        return true
     }
 
     /// A sidebar row becomes connected before authenticated launch metadata

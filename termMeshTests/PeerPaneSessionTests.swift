@@ -3171,6 +3171,16 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         XCTAssertFalse(TeamOrchestrator.teamHostCanLaunch(host))
 
         host.sessionHostRemoteSockPath = ""
+        XCTAssertFalse(
+            TeamOrchestrator.teamHostCanLaunch(host),
+            "the route answer alone is not an endpoint capability proof"
+        )
+        let endpoint = host.teamHostSpec!.hostKey
+        host.teamHostReadiness = .ready(TeamHostCapabilitySnapshot(
+            endpoint: endpoint, appVersion: "0.200.0",
+            supportsPeerOwnedAgentHosting: true, supportsRemoteTeamRoute: true,
+            looksLikeGUIPeerHost: false, redirectedFromServingEndpoint: false
+        ))
         XCTAssertTrue(TeamOrchestrator.teamHostCanLaunch(host))
     }
 
