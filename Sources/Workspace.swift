@@ -1866,6 +1866,22 @@ final class Workspace: Identifiable {
         return bonsplitController.tabs(inPane: paneId).firstIndex(where: { $0.id == tabId })
     }
 
+    /// Local panel currently consuming one exact peer surface. Used by the
+    /// session-host reconciler to repair panes opened in an unrelated Project
+    /// workspace by older builds without tearing down the live session.
+    func panelID(forPeerSurfaceID surfaceID: Data) -> UUID? {
+        for (panelID, panel) in panels {
+            if let terminal = panel as? TerminalPanel,
+               terminal.peerPaneSession?.originSurface.surfaceID == surfaceID {
+                return panelID
+            }
+            if remoteAgentPaneSessions[panelID]?.originSurface.surfaceID == surfaceID {
+                return panelID
+            }
+        }
+        return nil
+    }
+
     /// Returns the nearest right-side sibling pane for browser placement.
     /// The search is local to the source pane's ancestry in the split tree:
     /// use the closest horizontal ancestor where the source is in the first (left) branch.

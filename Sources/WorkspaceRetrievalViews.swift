@@ -7,6 +7,33 @@ private enum RetrievalDrawerTab: String, CaseIterable {
     case checkpoints = "Checkpoints"
 }
 
+/// Selection math for Live Activity rows. Kept separate from AppKit modifier
+/// lookup so range/toggle behavior stays deterministic and unit-testable.
+enum RetrievalActivitySelection {
+    static func updating(
+        current: Set<UUID>,
+        clicked: UUID,
+        ordered: [UUID],
+        anchor: UUID?,
+        extendsRange: Bool,
+        toggles: Bool
+    ) -> (selected: Set<UUID>, anchor: UUID?) {
+        if extendsRange,
+           let anchor,
+           let start = ordered.firstIndex(of: anchor),
+           let end = ordered.firstIndex(of: clicked) {
+            let range = Set(ordered[min(start, end)...max(start, end)])
+            return (toggles ? current.union(range) : range, anchor)
+        }
+        if toggles {
+            var next = current
+            if !next.insert(clicked).inserted { next.remove(clicked) }
+            return (next, clicked)
+        }
+        return ([clicked], clicked)
+    }
+}
+
 /// Remote Work is mounted directly beside terminal surfaces. Use explicit
 /// AppKit semantic colors rather than materials, which sample the terminal
 /// underneath and can retain a dark tint after a light-mode appearance change.
@@ -252,6 +279,8 @@ private struct RetrievalActivityDrawer: View {
     @State private var selectedTab: RetrievalDrawerTab = .activity
     @State private var isEditingProject = false
     @State private var editingBinding: ProjectBinding?
+    @State private var selectedActivityIDs = Set<UUID>()
+    @State private var activitySelectionAnchor: UUID?
 
     init(workspace: Workspace) {
         self.workspace = workspace
@@ -443,13 +472,17 @@ private struct RetrievalActivityDrawer: View {
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                 Spacer()
+                Button("Copy Selected") {
+                    copyActivity(store.activity.reversed().filter {
+                        selectedActivityIDs.contains($0.id)
+                    })
+                }
+                .controlSize(.small)
+                .disabled(selectedActivityIDs.isEmpty)
+                .help("Click rows to select them; use Command-click or Shift-click for multiple rows.")
+                .accessibilityIdentifier("retrieval.copySelectedActivity")
                 Button("Copy All") {
-                    let text = store.activity.reversed().map { event in
-                        let stamp = event.occurredAt.formatted(date: .omitted, time: .standard)
-                        return "\(stamp)  [\(event.severity.rawValue.uppercased())] \(event.message)"
-                    }.joined(separator: "\n")
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(text, forType: .string)
+                    copyActivity(store.activity.reversed())
                 }
                 .controlSize(.small)
                 .disabled(store.activity.isEmpty)
@@ -458,6 +491,8 @@ private struct RetrievalActivityDrawer: View {
                 // a run worth re-reading is still there afterwards.
                 Button("Clear Log") {
                     store.clearActivity()
+                    selectedActivityIDs.removeAll()
+                    activitySelectionAnchor = nil
                 }
                 .controlSize(.small)
                 .disabled(store.activity.isEmpty)
@@ -476,32 +511,92 @@ private struct RetrievalActivityDrawer: View {
         }
     }
 
+    private func activityText<S: Sequence>(_ events: S) -> String
+    where S.Element == RemotePaneActivity {
+        events.map { event in
+            let stamp = event.occurredAt.formatted(date: .omitted, time: .standard)
+            return "\(stamp)  [\(event.severity.rawValue.uppercased())] \(event.message)"
+        }.joined(separator: "\n")
+    }
+
+    private func copyActivity<S: Sequence>(_ events: S)
+    where S.Element == RemotePaneActivity {
+        let text = activityText(events)
+        guard !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    private func selectActivity(
+        _ event: RemotePaneActivity,
+        visibleEvents: [RemotePaneActivity]
+    ) {
+        let modifiers = NSEvent.modifierFlags
+        let update = RetrievalActivitySelection.updating(
+            current: selectedActivityIDs,
+            clicked: event.id,
+            ordered: visibleEvents.map(\.id),
+            anchor: activitySelectionAnchor,
+            extendsRange: modifiers.contains(.shift),
+            toggles: modifiers.contains(.command)
+        )
+        selectedActivityIDs = update.selected
+        activitySelectionAnchor = update.anchor
+    }
+
     private var activityEvents: some View {
         ScrollView {
             // Tight rows: these are log lines, and the drawer is short. The
             // point is to see the sequence that led somewhere, which costs
             // more when three events fill the view than any leading gains.
             LazyVStack(alignment: .leading, spacing: 2) {
-                ForEach(store.activity.prefix(200)) { event in
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Image(systemName: activityIcon(for: event.severity))
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(activityColor(for: event.severity))
-                            .accessibilityLabel(event.severity.rawValue.capitalized)
-                        Text(event.occurredAt.formatted(date: .omitted, time: .standard))
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundStyle(.secondary)
-                        Text(event.message)
-                            .font(.system(size: 11))
-                            .foregroundStyle(activityColor(for: event.severity))
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
+                let visibleEvents = Array(store.activity.prefix(200))
+                ForEach(visibleEvents) { event in
+                    Button {
+                        selectActivity(event, visibleEvents: visibleEvents)
+                    } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Image(systemName: activityIcon(for: event.severity))
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(activityColor(for: event.severity))
+                                .accessibilityLabel(event.severity.rawValue.capitalized)
+                            Text(event.occurredAt.formatted(date: .omitted, time: .standard))
+                                .font(.system(size: 10).monospacedDigit())
+                                .foregroundStyle(.secondary)
+                            Text(event.message)
+                                .font(.system(size: 11))
+                                .foregroundStyle(activityColor(for: event.severity))
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(
+                            selectedActivityIDs.contains(event.id)
+                                ? Color.accentColor.opacity(0.18) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        )
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        Button("Copy Event") { copyActivity([event]) }
+                    }
+                    .accessibilityAddTraits(
+                        selectedActivityIDs.contains(event.id) ? .isSelected : []
+                    )
                 }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .onChange(of: store.activity.map(\.id)) { ids in
+            let visibleIDs = Array(ids.prefix(200))
+            selectedActivityIDs.formIntersection(visibleIDs)
+            if let activitySelectionAnchor, !visibleIDs.contains(activitySelectionAnchor) {
+                self.activitySelectionAnchor = nil
+            }
         }
     }
 

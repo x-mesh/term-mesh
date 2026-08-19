@@ -585,6 +585,36 @@ final class PeerPaneSession {
         return surfaces
     }
 
+    /// Read the daemon's live surface roster and its project manifests on one
+    /// authenticated connection. SessionHostPanes needs both answers from the
+    /// same endpoint: a surface id without its project identity is how a
+    /// term-mesh worker was opened in whichever unrelated workspace happened
+    /// to be selected (for example `xm`).
+    static func listSessionHostSnapshot(
+        on lease: PeerPaneHostLease
+    ) async throws -> (surfaces: [Termmesh_Peer_V1_SurfaceInfo], teams: [Termmesh_Peer_V1_Team]) {
+        let connection = try await PeerRelaySession.connectAndList(
+            hostSockPath: lease.hostSockPath
+        )
+        if lease.hostDisplayName.isEmpty {
+            lease.hostDisplayName = connection.hostDisplayName
+        }
+        let teams: [Termmesh_Peer_V1_Team]
+        if connection.hostCapabilities.has(PeerCapability.teamRosterV1) {
+            do {
+                teams = try await connection.session.listTeams()
+            } catch {
+                await connection.cancel()
+                throw error
+            }
+        } else {
+            teams = []
+        }
+        let surfaces = connection.surfaces
+        await connection.cancel()
+        return (surfaces, teams)
+    }
+
     /// Ask the host for one more shell, and return it once it exists.
     ///
     /// A host publishes a fixed roster of surfaces (`TERMMESH_PEER_SURFACES`),

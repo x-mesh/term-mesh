@@ -842,6 +842,12 @@ final class RemoteHostStore: ObservableObject {
     /// Debounced one-shot ListTeams refreshes triggered by roster pushes.
     /// Layout updates can be frequent, so never query once per frame.
     private var teamRosterRefreshTasks: [String: Task<Void, Never>] = [:]
+    /// The serving GUI cannot forward the session daemon's roster-change
+    /// broadcast. Re-read ListTeams periodically so a manifest whose leader or
+    /// worker exited disappears from the sidebar instead of remaining a button
+    /// that can only fail.
+    private var teamRosterPollTasks: [String: Task<Void, Never>] = [:]
+    static let teamRosterPollInterval: Duration = .seconds(15)
     /// Identifies the task currently installed for each host. A cancelled
     /// task can finish after a reconnect has already installed its successor;
     /// its `defer` must not clear the successor's state.
@@ -1647,6 +1653,7 @@ final class RemoteHostStore: ObservableObject {
                 }
                 self.hosts[key]?.workspaces = summaries
                 self.hosts[key]?.teams = teams
+                self.startTeamRosterPolling(for: path, key: key)
                 // A connection may have recovered after the owner's initial
                 // publication attempt. Re-run publication from this concrete
                 // success event even when the team itself did not mutate.
@@ -1763,6 +1770,23 @@ final class RemoteHostStore: ObservableObject {
         teamRosterRefreshTasks[key] = nil
         teamRosterRefreshGenerations[key] = nil
         teamRosterRefreshDirtyKeys.remove(key)
+        teamRosterPollTasks[key]?.cancel()
+        teamRosterPollTasks[key] = nil
+    }
+
+    private func startTeamRosterPolling(for path: String, key: String) {
+        teamRosterPollTasks[key]?.cancel()
+        teamRosterPollTasks[key] = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.teamRosterPollInterval)
+                guard !Task.isCancelled,
+                      let self,
+                      self.hosts[key]?.activeSockPath == path,
+                      self.hosts[key]?.isConnected == true
+                else { return }
+                self.scheduleTeamRosterRefresh(for: path, key: key)
+            }
+        }
     }
 
     private func applyWorkspaceRoster(

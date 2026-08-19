@@ -87,6 +87,33 @@ final class AppLaunchEnvironmentTests: XCTestCase {
     }
 }
 
+@MainActor
+final class NativeWindowRestorationPolicyTests: XCTestCase {
+    func testDisablePersistsBothNativeRestorationGuards() throws {
+        let suiteName = "NativeWindowRestorationPolicyTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.set(false, forKey: NativeWindowRestorationPolicy.ignoreStateKey)
+        defaults.set(true, forKey: NativeWindowRestorationPolicy.keepWindowsKey)
+
+        NativeWindowRestorationPolicy.disable(defaults: defaults)
+
+        XCTAssertTrue(defaults.bool(forKey: NativeWindowRestorationPolicy.ignoreStateKey))
+        XCTAssertFalse(defaults.bool(forKey: NativeWindowRestorationPolicy.keepWindowsKey))
+    }
+
+    func testAppDelegateRejectsSavingAndRestoringNativeWindowState() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+
+        XCTAssertFalse(delegate.applicationShouldSaveApplicationState(app))
+        XCTAssertFalse(delegate.applicationShouldRestoreApplicationState(app))
+        XCTAssertFalse(delegate.applicationShouldSaveSecureApplicationState(app))
+        XCTAssertFalse(delegate.applicationShouldRestoreSecureApplicationState(app))
+    }
+}
+
 final class LanguageSettingsTests: XCTestCase {
     func testInvalidStoredLanguageFallsBackToSystemAndRepairsDefaults() {
         let suiteName = "LanguageSettingsTests.Invalid.\(UUID().uuidString)"
@@ -823,6 +850,24 @@ final class AppDelegateWindowContextRoutingTests: XCTestCase {
         )
         window.identifier = NSUserInterfaceItemIdentifier("term-mesh.main.\(id.uuidString)")
         return window
+    }
+
+    func testRegisterMainWindowDisablesNativeRestorationForSwiftUIWindow() {
+        let app = AppDelegate()
+        let windowId = UUID()
+        let window = makeMainWindow(id: windowId)
+        window.isRestorable = true
+        defer { window.orderOut(nil) }
+
+        app.registerMainWindow(
+            window,
+            windowId: windowId,
+            tabManager: TabManager(),
+            sidebarState: SidebarState(),
+            sidebarSelectionState: SidebarSelectionState()
+        )
+
+        XCTAssertFalse(window.isRestorable)
     }
 
     func testLocateBonsplitTabResolvesPanelAndRejectsWrongSourcePane() throws {
