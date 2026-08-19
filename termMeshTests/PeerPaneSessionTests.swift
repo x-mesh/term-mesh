@@ -3156,6 +3156,24 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         ))
     }
 
+    @MainActor
+    func test_teamHostLaunchWaitRequiresBothLaunchMetadataAndResolvedRoute() {
+        var host = Self.agentHostEntry()
+        XCTAssertFalse(TeamOrchestrator.teamHostCanLaunch(host))
+
+        let provenance = PeerHostEndpointProvenance(
+            sshTarget: "root@jw-server", port: nil, identityFile: nil,
+            remoteSocket: "/run/user/0/tm-peer.sock"
+        )
+        host.configuredEndpoint = provenance
+        _ = host.acceptAuthenticatedHostCLIBinDirs(["/usr/local/bin"], provenance: provenance)
+        XCTAssertTrue(host.isLaunchable)
+        XCTAssertFalse(TeamOrchestrator.teamHostCanLaunch(host))
+
+        host.sessionHostRemoteSockPath = ""
+        XCTAssertTrue(TeamOrchestrator.teamHostCanLaunch(host))
+    }
+
     /// A remote worker reaches the owning team through the same scoped
     /// reverse route as a peer leader. Pointing TERMMESH_SOCKET at the remote
     /// daemon without these fields deterministically returns `no_app`.

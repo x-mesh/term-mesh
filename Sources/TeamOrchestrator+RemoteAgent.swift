@@ -1944,10 +1944,7 @@ extension TeamOrchestrator {
     ) async throws {
         guard let team = teams[teamName] else { throw RemoteAgentError.teamNotFound(teamName) }
         guard let teamUUID = team.teamUuid else { throw RemoteAgentError.teamNotFound(teamName) }
-        guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) else {
-            throw RemoteAgentError.hostNotFound(hostKey)
-        }
-        guard host.isLaunchable else { throw RemoteAgentError.hostNotConnected(host.displayName) }
+        let host = try await Self.waitForTeamHostLaunchReadiness(hostKey: hostKey)
         var promptFile = systemPrompt.map { _ in
             "/tmp/term-mesh-leader-prompt-\(teamUUID).txt"
         }
@@ -3605,12 +3602,7 @@ extension TeamOrchestrator {
                 reason: "project.presentation.v1 requires every member on the leader host"
             )
         }
-        guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) else {
-            throw RemoteAgentError.hostNotFound(hostKey)
-        }
-        guard host.isLaunchable else {
-            throw RemoteAgentError.hostNotConnected(host.displayName)
-        }
+        let host = try await Self.waitForTeamHostLaunchReadiness(hostKey: hostKey)
         // An agent attach is not the leader, so it carries no attempt — but it
         // commits the same two things a project deletion tears down: a surface
         // record and a team member. Snapshot the generation now and refuse to
@@ -4357,6 +4349,38 @@ extension TeamOrchestrator {
             throw RemoteAgentError.hostNotConnected(host.displayName)
         }
         return spec
+    }
+
+    static func teamHostCanLaunch(_ host: HostEntry) -> Bool {
+        host.isLaunchable && host.teamRouteResolved
+    }
+
+    /// A sidebar row becomes connected before authenticated launch metadata
+    /// and the session-owner route land. Wait for the same complete answer the
+    /// creation UI requires instead of freezing that partial snapshot into a
+    /// permanent attach failure.
+    @MainActor
+    static func waitForTeamHostLaunchReadiness(
+        hostKey: String,
+        timeoutNanoseconds: UInt64 = 15_000_000_000
+    ) async throws -> HostEntry {
+        let started = DispatchTime.now().uptimeNanoseconds
+        while true {
+            try Task.checkCancellation()
+            guard let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                $0.id == hostKey
+            }) else {
+                throw RemoteAgentError.hostNotFound(hostKey)
+            }
+            if teamHostCanLaunch(host) { return host }
+            if case .failed = host.connectionState {
+                throw RemoteAgentError.hostNotConnected(host.displayName)
+            }
+            if DispatchTime.now().uptimeNanoseconds &- started >= timeoutNanoseconds {
+                throw RemoteAgentError.hostNotConnected(host.displayName)
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
     }
 
     /// Local socket to dial for a team RPC on `host`, without starting a
