@@ -4,6 +4,22 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.197.0] - 2026-08-19
+
+**원격 Project가 실제 session owner의 능력을 확인한 뒤 시작하고, 실패하면 기다리게 두지 않고 바로 이유를 보여준다.**
+
+### Fixed
+
+- **Mac peer의 New Project 화면이 쓸 수 있는 daemon을 두고도 업데이트가 필요하다고 막던 문제** ([#316](https://github.com/x-mesh/term-mesh/pull/316)) — workspace를 보여주는 GUI socket의 능력만 보고 Project 생성 여부를 판단해, 실제 team 작업을 맡는 daemon이 준비돼 있어도 생성 버튼이 막혔다. 이제 GUI가 알려 준 session-owner endpoint를 직접 확인하고, 그 endpoint의 인증된 결과가 준비된 뒤에만 Project를 시작한다.
+
+- **원격 Project 리더와 worker가 연결 중인 짧은 틈에 실패하던 문제** ([#316](https://github.com/x-mesh/term-mesh/pull/316)) — host가 연결됨으로 표시된 직후 team route 인증이 아직 끝나지 않으면 생성이 영구 실패할 수 있었다. 이제 제한 시간 안에서 route 준비를 기다리고, worker attach 실패도 Project 상태에 즉시 노출한다.
+
+- **Linux system daemon의 control socket을 앱이 찾지 못하던 문제** ([#316](https://github.com/x-mesh/term-mesh/pull/316)) — system service로 실행한 daemon이 control socket 경로를 publish하지 않아 관리 명령이 연결되지 않았다. 이제 system daemon도 자신의 socket을 정확히 알린다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.196.0] - 2026-08-19
 
 **앱을 업데이트하면 daemon도 같이 새 버전으로 바뀌고, 빠르게 끊었다 다시 붙어도 방금 살아난 pane이 옛 시도에 지워지지 않는다.**
