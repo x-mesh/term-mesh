@@ -19,6 +19,68 @@ import PeerProto
 /// mirror showed one. These tests cover the per-surface decision instead.
 @MainActor
 final class SessionHostPanesTests: XCTestCase {
+    func test_projectManifestRoutesEverySurfaceToItsDeclaredProject() {
+        var team = Termmesh_Peer_V1_Team()
+        team.name = "term-mesh"
+        team.workingDirectory = "/Users/jinwoo/work/tm-projects/term-mesh"
+        team.leaderSurfaceID = sid(1)
+        var member = Termmesh_Peer_V1_TeamMember()
+        member.name = "executor"
+        member.surfaceID = sid(2)
+        team.members = [member]
+
+        XCTAssertEqual(
+            SessionHostPanes.projectNamesBySurfaceID(teams: [team]),
+            [sid(1): "term-mesh", sid(2): "term-mesh"]
+        )
+        XCTAssertEqual(
+            SessionHostPanes.projectWorkingDirectories(teams: [team]),
+            ["term-mesh": "/Users/jinwoo/work/tm-projects/term-mesh"]
+        )
+    }
+
+    func test_incompleteTeamRosterCannotClaimAnUnrelatedSurface() {
+        var stale = Termmesh_Peer_V1_Team()
+        stale.name = "term-mesh"
+        stale.agentNames = ["executor"]
+
+        XCTAssertTrue(SessionHostPanes.projectNamesBySurfaceID(teams: [stale]).isEmpty)
+    }
+
+    func test_sessionPlacementNeverFallsBackToTheSelectedUnrelatedWorkspace() {
+        let xm = UUID()
+        let termMesh = UUID()
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: "term-mesh",
+                declaredProjects: [(xm, "xm"), (termMesh, "term-mesh")],
+                hostSessionsWorkspaceID: nil
+            ),
+            .existingProject(termMesh)
+        )
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: "term-mesh",
+                declaredProjects: [(xm, "xm")],
+                hostSessionsWorkspaceID: nil
+            ),
+            .newProject("term-mesh")
+        )
+    }
+
+    func test_unclaimedDaemonSessionUsesDedicatedHostSessionsWorkspace() {
+        let xm = UUID()
+        let hostSessions = UUID()
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: nil,
+                declaredProjects: [(xm, "xm")],
+                hostSessionsWorkspaceID: hostSessions
+            ),
+            .existingHostSessions(hostSessions)
+        )
+    }
+
     func test_teamHostSnapshotAcceptsOnlyTheCurrentRouteAndServingGeneration() {
         let ownerA = PeerPaneHostKey.ssh(
             target: "host", remoteSockPath: "/owner-a.sock", port: nil

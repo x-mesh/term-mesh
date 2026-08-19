@@ -62,6 +62,123 @@ enum SessionHostPanes {
         )
     }
 
+    /// Project manifests are the only authoritative link between a daemon
+    /// surface and the Project workspace that should display it. Names, cwd,
+    /// and ensure keys are presentation details and can disagree.
+    static func projectNamesBySurfaceID(
+        teams: [Termmesh_Peer_V1_Team]
+    ) -> [Data: String] {
+        var names: [Data: String] = [:]
+        for team in teams where !team.name.isEmpty && !team.leaderSurfaceID.isEmpty {
+            names[team.leaderSurfaceID] = team.name
+            for member in team.members where !member.surfaceID.isEmpty {
+                names[member.surfaceID] = team.name
+            }
+        }
+        return names
+    }
+
+    static func projectWorkingDirectories(
+        teams: [Termmesh_Peer_V1_Team]
+    ) -> [String: String] {
+        Dictionary(
+            teams.filter { !$0.name.isEmpty }.map { ($0.name, $0.workingDirectory) },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+
+    enum WorkspaceDestination: Equatable {
+        case existingProject(UUID)
+        case newProject(String)
+        case existingHostSessions(UUID)
+        case newHostSessions
+    }
+
+    /// Choose by declared project identity, never by the selected tab. The
+    /// selected tab is merely what the user is looking at; treating it as the
+    /// owner injected a term-mesh worker into an `xm` workspace.
+    static func workspaceDestination(
+        projectName: String?,
+        declaredProjects: [(id: UUID, name: String)],
+        hostSessionsWorkspaceID: UUID?
+    ) -> WorkspaceDestination {
+        if let projectName {
+            if let existing = declaredProjects.first(where: {
+                $0.name.caseInsensitiveCompare(projectName) == .orderedSame
+            }) {
+                return .existingProject(existing.id)
+            }
+            return .newProject(projectName)
+        }
+        if let hostSessionsWorkspaceID {
+            return .existingHostSessions(hostSessionsWorkspaceID)
+        }
+        return .newHostSessions
+    }
+
+    /// Repair panes opened by older builds in whichever workspace happened to
+    /// be selected. Run once per window because `shownSurfaceIDs()` is also
+    /// window-global; limiting repair to the active window would leave a pane
+    /// in another window permanently misplaced and suppress its correct reopen.
+    private static func migrateShownProjectSurfaces(
+        projectNames: [Data: String],
+        projectDirectories: [String: String],
+        tabManager: TabManager
+    ) {
+        for (surfaceID, projectName) in projectNames {
+            guard let source = tabManager.tabs.first(where: {
+                $0.panelID(forPeerSurfaceID: surfaceID) != nil
+            }),
+            WorkspaceProjectNames.shared.projectName(for: source.id)?.caseInsensitiveCompare(
+                projectName
+            ) != .orderedSame,
+            let panelID = source.panelID(forPeerSurfaceID: surfaceID),
+            let sourcePane = source.paneId(forPanelId: panelID),
+            let sourceIndex = source.indexInPane(forPanelId: panelID)
+            else { continue }
+
+            let existingTarget = tabManager.tabs.first(where: {
+                WorkspaceProjectNames.shared.projectName(for: $0.id)?.caseInsensitiveCompare(
+                    projectName
+                ) == .orderedSame
+            })
+            var targetAnchor: UUID?
+            let target = existingTarget ?? {
+                let created = tabManager.addWorkspace(
+                    workingDirectory: projectDirectories[projectName], select: false
+                )
+                targetAnchor = created.focusedPanelId
+                WorkspaceProjectNames.shared.declare(
+                    workspaceId: created.id, projectName: projectName
+                )
+                created.customTitle = "[\(projectName)]"
+                created.title = "[\(projectName)]"
+                return created
+            }()
+            guard source.id != target.id,
+                  let targetPane = target.bonsplitController.focusedPaneId
+                    ?? target.bonsplitController.allPaneIds.first
+            else {
+                if existingTarget == nil { tabManager.closeWorkspace(target) }
+                continue
+            }
+            guard let transfer = source.detachSurface(panelId: panelID) else {
+                if existingTarget == nil { tabManager.closeWorkspace(target) }
+                continue
+            }
+            if target.attachDetachedSurface(transfer, inPane: targetPane, focus: false) == nil {
+                _ = source.attachDetachedSurface(
+                    transfer, inPane: sourcePane, atIndex: sourceIndex, focus: false
+                )
+                if existingTarget == nil {
+                    tabManager.closeWorkspace(target)
+                }
+            } else if let targetAnchor, target.panels.count > 1 {
+                _ = target.closePanel(targetAnchor, force: true)
+            }
+        }
+    }
+
     /// Whether this machine has a session owner worth looking at.
     ///
     /// The empty path is a host saying it has none — see
@@ -322,12 +439,29 @@ extension SessionHostPanes {
         }
         defer { registry.release(lease) }
 
-        let surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+        let snapshot: (
+            surfaces: [Termmesh_Peer_V1_SurfaceInfo],
+            teams: [Termmesh_Peer_V1_Team]
+        )
         do {
-            surfaces = try await PeerPaneSession.listSurfaces(on: lease)
+            snapshot = try await PeerPaneSession.listSessionHostSnapshot(on: lease)
         } catch {
             RemoteWorkLog.debug("session host did not list its sessions: \(error)")
             return 0
+        }
+        let surfaces = snapshot.surfaces
+        let projectNames = projectNamesBySurfaceID(teams: snapshot.teams)
+        let projectDirectories = projectWorkingDirectories(teams: snapshot.teams)
+        guard let app = AppDelegate.shared, let tabManager = app.tabManager else { return 0 }
+
+        var repairedManagers = Set<ObjectIdentifier>()
+        for manager in app.mainWindowContexts.values.map(\.tabManager) + [tabManager]
+        where repairedManagers.insert(ObjectIdentifier(manager)).inserted {
+            migrateShownProjectSurfaces(
+                projectNames: projectNames,
+                projectDirectories: projectDirectories,
+                tabManager: manager
+            )
         }
 
         pruneDismissals(stillHeld: Set(surfaces.map(\.surfaceID)))
@@ -342,18 +476,60 @@ extension SessionHostPanes {
         guard !wanted.isEmpty else { return 0 }
 
         var opened = 0
+        var autoCreatedAnchors: [UUID: UUID] = [:]
+        var autoCreatedWorkspaceIDs = Set<UUID>()
         for surfaceID in wanted {
             guard let info = surfaces.first(where: { $0.surfaceID == surfaceID }) else { continue }
-            guard let workspace = AppDelegate.shared?.tabManager?.selectedWorkspace else {
-                // No window yet. The poller comes back, so this is a wait
-                // rather than the permanent give-up it used to be — but a
-                // silent return here is how this looked like it had worked
-                // while showing nothing, so name which half is missing.
-                RemoteWorkLog.info(
-                    "\(wanted.count) session(s) are waiting on this machine's daemon, "
-                        + "but there is no workspace to show them in yet"
-                )
-                break
+            let projectName = projectNames[surfaceID]
+            let destination = workspaceDestination(
+                projectName: projectName,
+                declaredProjects: tabManager.tabs.compactMap { workspace in
+                    WorkspaceProjectNames.shared.projectName(for: workspace.id).map {
+                        (id: workspace.id, name: $0)
+                    }
+                },
+                hostSessionsWorkspaceID: tabManager.tabs.first(where: {
+                    $0.customTitle == "Host Sessions"
+                })?.id
+            )
+            let workspace: Workspace
+            switch destination {
+            case .existingProject(let id), .existingHostSessions(let id):
+                guard let existing = tabManager.tabs.first(where: { $0.id == id }) else {
+                    continue
+                }
+                workspace = existing
+            case .newProject(let name):
+                workspace = {
+                    let created = tabManager.addWorkspace(
+                        workingDirectory: projectDirectories[name],
+                        select: false
+                    )
+                    WorkspaceProjectNames.shared.declare(
+                        workspaceId: created.id, projectName: name
+                    )
+                    created.customTitle = "[\(name)]"
+                    created.title = "[\(name)]"
+                    if let anchor = created.focusedPanelId {
+                        autoCreatedAnchors[created.id] = anchor
+                    }
+                    autoCreatedWorkspaceIDs.insert(created.id)
+                    return created
+                }()
+            case .newHostSessions:
+                // Unclaimed daemon sessions are host activity, not members of
+                // the Project the user happens to be viewing. Keep them in one
+                // stable workspace instead of contaminating `selectedWorkspace`.
+                workspace = {
+                    let created = tabManager.addWorkspace(select: false)
+                    created.customTitle = "Host Sessions"
+                    created.title = "Host Sessions"
+                    if let anchor = created.focusedPanelId {
+                        autoCreatedAnchors[created.id] = anchor
+                    }
+                    autoCreatedWorkspaceIDs.insert(created.id)
+                    return created
+                }()
             }
             do {
                 let session = try await PeerPaneSession.attach(
@@ -376,10 +552,23 @@ extension SessionHostPanes {
                     : workspace.openRemotePane(session: session, focus: false) != nil
                 guard openedPane else {
                     session.teardown()
+                    if autoCreatedWorkspaceIDs.remove(workspace.id) != nil {
+                        autoCreatedAnchors[workspace.id] = nil
+                        tabManager.closeWorkspace(workspace)
+                    }
                     continue
                 }
+                if let anchor = autoCreatedAnchors.removeValue(forKey: workspace.id),
+                   workspace.panels.count > 1 {
+                    _ = workspace.closePanel(anchor, force: true)
+                }
+                autoCreatedWorkspaceIDs.remove(workspace.id)
                 opened += 1
             } catch {
+                if autoCreatedWorkspaceIDs.remove(workspace.id) != nil {
+                    autoCreatedAnchors[workspace.id] = nil
+                    tabManager.closeWorkspace(workspace)
+                }
                 RemoteWorkLog.error(
                     "could not show session \(info.title.isEmpty ? "?" : info.title): \(error)"
                 )
