@@ -133,6 +133,7 @@
 		SHPS00000000000000003 /* SessionHostPanes.swift in Sources */ = {isa = PBXBuildFile; fileRef = SHPS00000000000000006 /* SessionHostPanes.swift */; };
 		F46F7DFF875543329CD15B08 /* AgentRolePreset.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE801F330BAD4EB88D9D875E /* AgentRolePreset.swift */; };
 		WL00000001000000010000001 /* WorktreeLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = WL00000002000000020000002 /* WorktreeLog.swift */; };
+		DR00000001000000010000001 /* DiagnosticsReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR00000002000000020000002 /* DiagnosticsReport.swift */; };
 		562D55FA859F4E8B94EB49CB /* TeamCreationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B848F672710C48B1944F70BF /* TeamCreationView.swift */; };
 		TCD00001 /* TeamCreationRecentDirs.swift in Sources */ = {isa = PBXBuildFile; fileRef = TCD00002 /* TeamCreationRecentDirs.swift */; };
 		SRL00001 /* SurfaceReadLease.swift in Sources */ = {isa = PBXBuildFile; fileRef = SRL00002 /* SurfaceReadLease.swift */; };
@@ -286,6 +287,7 @@
 				D5000101A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5000102A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift */; };
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */; };
 				FA000000A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift */; };
+				DR00000003000000030000003 /* DiagnosticsRedactorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR00000004000000040000004 /* DiagnosticsRedactorTests.swift */; };
 			FE000004A1B2C3D4E5F60718 /* PasteQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */; };
 			FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */; };
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
@@ -476,6 +478,7 @@
 		SHPS00000000000000006 /* SessionHostPanes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionHostPanes.swift; sourceTree = "<group>"; };
 		DE801F330BAD4EB88D9D875E /* AgentRolePreset.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRolePreset.swift; sourceTree = "<group>"; };
 		WL00000002000000020000002 /* WorktreeLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorktreeLog.swift; sourceTree = "<group>"; };
+		DR00000002000000020000002 /* DiagnosticsReport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsReport.swift; sourceTree = "<group>"; };
 		B848F672710C48B1944F70BF /* TeamCreationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamCreationView.swift; sourceTree = "<group>"; };
 		TCD00002 /* TeamCreationRecentDirs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamCreationRecentDirs.swift; sourceTree = "<group>"; };
 		SRL00002 /* SurfaceReadLease.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceReadLease.swift; sourceTree = "<group>"; };
@@ -630,6 +633,7 @@
 			D5000102A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessTreeSnapshotTests.swift; sourceTree = "<group>"; };
 			FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProberTests.swift; sourceTree = "<group>"; };
 			FA000001A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostBinaryInventoryTests.swift; sourceTree = "<group>"; };
+			DR00000004000000040000004 /* DiagnosticsRedactorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsRedactorTests.swift; sourceTree = "<group>"; };
 			FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PasteQueueTests.swift; sourceTree = "<group>"; };
 			FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceManualUnreadTests.swift; sourceTree = "<group>"; };
 			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
@@ -910,6 +914,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				SRL00002 /* SurfaceReadLease.swift */,
 				DE801F330BAD4EB88D9D875E /* AgentRolePreset.swift */,
 				WL00000002000000020000002 /* WorktreeLog.swift */,
+				DR00000002000000020000002 /* DiagnosticsReport.swift */,
 				A5001703 /* DashboardController.swift */,
 				A5001225 /* SocketControlSettings.swift */,
 				A5001600 /* SentryHelper.swift */,
@@ -1045,6 +1050,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				D5000102A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift */,
 				FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */,
 				FA000001A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift */,
+				DR00000004000000040000004 /* DiagnosticsRedactorTests.swift */,
 				FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */,
 				FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */,
 				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
@@ -1369,6 +1375,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				SRL00001 /* SurfaceReadLease.swift in Sources */,
 				F46F7DFF875543329CD15B08 /* AgentRolePreset.swift in Sources */,
 				WL00000001000000010000001 /* WorktreeLog.swift in Sources */,
+				DR00000001000000010000001 /* DiagnosticsReport.swift in Sources */,
 				A5001702 /* DashboardController.swift in Sources */,
 				A5001226 /* SocketControlSettings.swift in Sources */,
 				A5001601 /* SentryHelper.swift in Sources */,
@@ -1475,6 +1482,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				D5000101A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift in Sources */,
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */,
 				FA000000A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift in Sources */,
+				DR00000003000000030000003 /* DiagnosticsRedactorTests.swift in Sources */,
 				FE000004A1B2C3D4E5F60718 /* PasteQueueTests.swift in Sources */,
 				FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */,
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,
