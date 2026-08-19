@@ -31,7 +31,7 @@ final class DiagnosticsReportTests: XCTestCase {
             workspaceCount: 2,
             teamCount: 1,
             isLaunchable: true,
-            supportsRemoteTeamRoute: true,
+            teamHostReadiness: "ready",
             failureReason: failure,
             healthBaseline: health
         )

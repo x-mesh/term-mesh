@@ -29,7 +29,7 @@ final class DiagnosticsTriageTests: XCTestCase {
             workspaceCount: 0,
             teamCount: 0,
             isLaunchable: true,
-            supportsRemoteTeamRoute: true,
+            teamHostReadiness: "ready",
             failureReason: failure,
             healthBaseline: health
         )
@@ -167,7 +167,7 @@ final class DiagnosticsSignatureRenderingTests: XCTestCase {
                 id: "h", displayName: "builder", state: "connected", sshTarget: nil,
                 remoteSockPath: nil, activeSockPath: "", servingAppVersion: nil,
                 workspaceCount: 0, teamCount: 0, isLaunchable: true,
-                supportsRemoteTeamRoute: nil, failureReason: nil, healthBaseline: baseline
+                teamHostReadiness: "unresolved", failureReason: nil, healthBaseline: baseline
             )
         ])
         let output = DiagnosticsReport.build(snapshot)

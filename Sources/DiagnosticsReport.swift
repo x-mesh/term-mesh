@@ -214,7 +214,12 @@ struct PeerHostSnapshot {
     var workspaceCount: Int
     var teamCount: Int
     var isLaunchable: Bool
-    var supportsRemoteTeamRoute: Bool?
+    /// Rendered readiness rather than a yes/no. The host store distinguishes
+    /// never-probed, probing, unreachable, and ready-but-without-the-route,
+    /// and flattening those into a Bool would throw away exactly the kind of
+    /// difference a report is read for — "we never asked" is not "the host
+    /// said no".
+    var teamHostReadiness: String
     var failureReason: String?
     var healthBaseline: PeerHostHealthBaseline?
 }
@@ -351,7 +356,7 @@ enum DiagnosticsReport {
                 workspaceCount: host.workspaces.count,
                 teamCount: host.teams.count,
                 isLaunchable: host.isLaunchable,
-                supportsRemoteTeamRoute: host.supportsRemoteTeamRoute,
+                teamHostReadiness: describe(host.teamHostReadiness),
                 failureReason: failureReason,
                 healthBaseline: nil
             )
@@ -476,7 +481,7 @@ enum DiagnosticsReport {
                 lines.append("    active sock: \(host.activeSockPath)")
             }
             lines.append("    workspaces: \(host.workspaceCount), teams: \(host.teamCount)")
-            lines.append("    launchable: \(host.isLaunchable), team route: \(describe(host.supportsRemoteTeamRoute))")
+            lines.append("    launchable: \(host.isLaunchable), team host: \(host.teamHostReadiness)")
             appendHealthBaseline(host.healthBaseline, to: &lines)
         }
     }
@@ -508,9 +513,18 @@ enum DiagnosticsReport {
         }
     }
 
-    private static func describe(_ flag: Bool?) -> String {
-        guard let flag else { return "unknown" }
-        return flag ? "yes" : "no"
+    /// Keeps the four states apart. `ready (no team route)` in particular is a
+    /// working host that simply cannot carry team work — reporting it the same
+    /// as an unreachable one would send a reader after the connection instead
+    /// of the capability.
+    private static func describe(_ readiness: TeamHostReadiness) -> String {
+        switch readiness {
+        case .unresolved: return "unresolved"
+        case .probing: return "probing"
+        case .unreachable: return "unreachable"
+        case .ready(let snapshot):
+            return snapshot.lacksRemoteTeamRoute ? "ready (no team route)" : "ready"
+        }
     }
 
     /// Round-trips back to the token the probe emitted, so the bundle shows

@@ -123,7 +123,7 @@ final class DiagnosticsSnapshotAttachTests: XCTestCase {
             id: id, displayName: id, state: "connected", sshTarget: ssh,
             remoteSockPath: nil, activeSockPath: "", servingAppVersion: nil,
             workspaceCount: 0, teamCount: 0, isLaunchable: true,
-            supportsRemoteTeamRoute: nil, failureReason: nil, healthBaseline: nil
+            teamHostReadiness: "unresolved", failureReason: nil, healthBaseline: nil
         )
     }
 
