@@ -3336,7 +3336,22 @@ final class PeerRelaySession {
     /// One reconnect attempt after the old receive loop has already failed.
     /// Unlike gap healing, no old-session bytes can race this attach boundary.
     private func attemptOwnedSessionReconnect(from failedSession: PeerSession) async -> Bool {
-        guard !isTorndown, session === failedSession else { return false }
+        // The outer loop's predicate, re-checked at every await boundary
+        // INSIDE the attempt. `connect` and `attachSurface` are exactly
+        // where a Disconnect Host lands mid-flight; the original guards
+        // rechecked only teardown and session identity, so an attempt that
+        // straddled the disconnect could still commit a session against a
+        // retired lease — "reconnecting" against the user's explicit
+        // disconnect. (Both panel review runs flagged this independently.)
+        func stillEligible() -> Bool {
+            Self.shouldReconnectOwnedSession(
+                ownsSession: ownsSession,
+                isTorndown: isTorndown,
+                isCurrentSession: session === failedSession,
+                hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
+            )
+        }
+        guard stillEligible() else { return false }
         let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
         let connection: PeerRelayConnection
         do {
@@ -3347,7 +3362,7 @@ final class PeerRelaySession {
             #endif
             return false
         }
-        guard !isTorndown, session === failedSession else {
+        guard stillEligible() else {
             await connection.cancel()
             return false
         }
@@ -3374,7 +3389,7 @@ final class PeerRelaySession {
             await connection.cancel()
             return false
         }
-        guard outcome.surfaceID == surfaceID, !isTorndown, session === failedSession else {
+        guard outcome.surfaceID == surfaceID, stillEligible() else {
             await connection.cancel()
             return false
         }
