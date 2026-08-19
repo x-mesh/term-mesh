@@ -2105,32 +2105,53 @@ final class PeerRelaySession {
         let fm = FileManager.default
         let bundlePath = Bundle.main.bundlePath
 
-        // Production: bundled under Contents/Resources/bin/, where every
-        // other Rust binary lives (term-meshd, term-mesh-run, tm-agent).
-        // Makefile deploy/deploy-prod/dmg targets copy them here.
         let bundledResource = bundlePath + "/Contents/Resources/bin/term-mesh-peer-relay"
-        if fm.fileExists(atPath: bundledResource) { return bundledResource }
-
-        // Legacy fallback: older builds may have placed it in MacOS/.
-        let bundledMacOS = bundlePath + "/Contents/MacOS/term-mesh-peer-relay"
-        if fm.fileExists(atPath: bundledMacOS) { return bundledMacOS }
-
-        // Development: derive daemon/target/release from the DerivedData
-        // path. Works for any developer when the app runs straight from
-        // Xcode (./scripts/reload.sh, xcodebuild …) without committing a
-        // hardcoded user-specific source root.
-        if let derivedRoot = bundlePath.components(separatedBy: "/Build/").first {
-            let derivedRelative = (derivedRoot + "/../daemon/target/release/term-mesh-peer-relay") as NSString
-            let devPath = derivedRelative.standardizingPath
-            if fm.fileExists(atPath: devPath) { return devPath }
+        let candidates = relayBinaryCandidates(
+            bundlePath: bundlePath,
+            sourceFilePath: #filePath,
+            currentDirectoryPath: fm.currentDirectoryPath
+        )
+        if let executable = candidates.first(where: fm.isExecutableFile(atPath:)) {
+            return executable
         }
 
-        // Last resort: cwd-relative for `swift run` / unit tests launched
-        // from the repo root.
-        let cwdPath = fm.currentDirectoryPath + "/daemon/target/release/term-mesh-peer-relay"
-        if fm.fileExists(atPath: cwdPath) { return cwdPath }
-
         return bundledResource  // will fail at runtime; caller handles error
+    }
+
+    /// Ordered locations for the local relay helper. A normal release always
+    /// wins with its own bundle. Bare Xcode builds do not run `reload.sh` and
+    /// therefore have no `Resources/bin`; for those builds only, the checkout
+    /// binary or installed release helper keeps local daemon sessions usable.
+    nonisolated static func relayBinaryCandidates(
+        bundlePath: String,
+        sourceFilePath: String,
+        currentDirectoryPath: String,
+        installedAppPath: String = "/Applications/term-mesh.app"
+    ) -> [String] {
+        var candidates = [
+            bundlePath + "/Contents/Resources/bin/term-mesh-peer-relay",
+            bundlePath + "/Contents/MacOS/term-mesh-peer-relay",
+        ]
+#if DEBUG
+        let sourceRoot = URL(fileURLWithPath: sourceFilePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .path
+        candidates.append(
+            sourceRoot + "/daemon/target/release/term-mesh-peer-relay"
+        )
+        candidates.append(
+            installedAppPath + "/Contents/Resources/bin/term-mesh-peer-relay"
+        )
+        // cwd-relative is for `swift run` / unit tests launched from the repo
+        // root — a development shape. A RELEASE app must never execute a
+        // binary out of whatever directory it happens to have been launched
+        // from; its helper comes from a bundle or not at all.
+        candidates.append(
+            currentDirectoryPath + "/daemon/target/release/term-mesh-peer-relay"
+        )
+#endif
+        return candidates
     }
 
     // ── Start ────────────────────────────────────────────────────────

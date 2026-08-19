@@ -380,7 +380,7 @@ extension SessionHostPanes {
                 }
                 opened += 1
             } catch {
-                RemoteWorkLog.debug(
+                RemoteWorkLog.error(
                     "could not show session \(info.title.isEmpty ? "?" : info.title): \(error)"
                 )
             }
