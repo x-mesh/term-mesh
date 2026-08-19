@@ -4,6 +4,33 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.196.0] - 2026-08-19
+
+**앱을 업데이트하면 daemon도 같이 새 버전으로 바뀌고, 빠르게 끊었다 다시 붙어도 방금 살아난 pane이 옛 시도에 지워지지 않는다.**
+
+### Fixed
+
+- **Homebrew로 업데이트해도 이전 버전 daemon이 계속 돌던 문제** ([#309](https://github.com/x-mesh/term-mesh/pull/309)) — 새 앱이 버전이 다른 옛 daemon을 그대로 이어받아, 업데이트에 담긴 daemon 쪽 수정이 앱을 껐다 켜도 적용되지 않았다. 이제 버전이 다르면 daemon을 교체한다. 다만 교체할 daemon이 실제로 실행 가능한지 먼저 확인한 뒤에만 옛 것을 정리하므로, 실행 파일이 없는 상황에서 멀쩡히 돌던 daemon과 그 아래 원격 session을 잃는 일은 없다 ([#310](https://github.com/x-mesh/term-mesh/pull/310)).
+
+- **원격 Project를 여는 중 terminal pane 하나가 막히면 Project 전체가 열리지 않던 문제** ([#309](https://github.com/x-mesh/term-mesh/pull/309)) — relay helper를 찾지 못한 pane 하나 때문에 이미 붙은 agent pane까지 전부 되돌아갔다. 이제 helper를 설치본과 checkout에서도 찾고, 복원이 실패하면 어떤 session이 왜 실패했는지 정확한 사유를 화면에 보여준다.
+
+- **끊었다 다시 연결하는 중에 방금 복구된 pane이 다시 죽던 문제** ([#310](https://github.com/x-mesh/term-mesh/pull/310), [#311](https://github.com/x-mesh/term-mesh/pull/311)) — 빠르게 재연결하면 뒤늦게 끝난 이전 시도가 새 연결이 막 세운 session·workspace mirror·수신 loop를 자기 것으로 착각해 정리해 버렸다. 이제 늦게 끝난 시도는 자신이 이미 교체됐음을 알아채고 조용히 물러난다. Disconnect Host를 누른 직후 진행 중이던 재연결이 끝까지 밀고 들어와 다시 붙던 것도 함께 막는다.
+
+- **team 작업이 SSH 재연결 후 이전 연결로 잘못 전달되던 문제** ([#308](https://github.com/x-mesh/term-mesh/pull/308)) — 새 tunnel이 열려도 이전 연결의 session owner를 계속 가리켜, 새 handshake가 끝나기 전까지 `send`·`inbox`·`reply`가 엉뚱한 곳으로 갔다.
+
+- **원격 pane을 정리해도 host에 tm-agent-bridge 프로세스가 남던 문제** ([#308](https://github.com/x-mesh/term-mesh/pull/308), [#310](https://github.com/x-mesh/term-mesh/pull/310)) — 정리 요청이 "지금 team 작업이 가는 곳"에 물었는데, 그 사이 연결이 바뀌면 새 host는 모르는 surface에 대해 "없다"고 답했고 앱은 이를 정리 완료로 받아들였다. 이제 각 기록이 실제로 만들어진 host를 함께 들고 다니며 그쪽에 확인하므로, bridge가 영원히 남는 일이 없다.
+
+- **host 진단이 agent pane의 환경변수를 실제와 다르게 보고하던 문제** ([#308](https://github.com/x-mesh/term-mesh/pull/308)) — 같은 host의 pane인데 하나는 gateway 키가 있다고, 다른 하나는 없다고 나왔다. 또 macOS에서는 계정에 설정된 shell 대신 앱을 띄운 shell을 기준으로 profile을 읽어, 계정 shell이 다른 Mac에서 환경이 조용히 어긋났다.
+
+### Changed
+
+- **relay 정체 로그가 host 쪽에서 폭주하지 않는다** ([#311](https://github.com/x-mesh/term-mesh/pull/311)) — 지금까지 정체 보고의 빈도 제한이 host helper 쪽에만 있어, helper가 비정상 동작하면 릴리스 로그가 프레임마다 한 줄씩 쌓일 수 있었다. 이제 앱에서도 같은 제한을 한 번 더 적용한다.
+
+### Thanks to 2 contributors!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+- [@lkasa5546](https://github.com/lkasa5546)
+
 ## [0.195.0] - 2026-08-18
 
 **Project 삭제가 host의 leader까지 정리하고, 죽은 daemon은 15초 안에 스스로 돌아온다.**
