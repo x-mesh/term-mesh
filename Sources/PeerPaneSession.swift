@@ -59,7 +59,7 @@ enum PeerPaneHostSpec {
     }
 }
 
-enum PeerPaneHostKey: Hashable, CustomStringConvertible {
+enum PeerPaneHostKey: Hashable, CustomStringConvertible, Sendable {
     case direct(sockPath: String)
     /// Keyed by target AND remote socket: one machine can host several
     /// daemons on different sockets, and pooling them onto one tunnel

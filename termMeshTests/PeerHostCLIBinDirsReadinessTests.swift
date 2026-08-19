@@ -137,7 +137,6 @@ final class PeerHostCLIBinDirsReadinessTests: XCTestCase {
             hostCLIBinDirsResolved: true
         )
         entry.servingAppVersion = "0.179.0"
-        entry.supportsPeerOwnedAgentHosting = false
 
         entry.applyConfiguredEndpoint(PeerHostEndpointProvenance(
             sshTarget: "root@old-server",
@@ -152,7 +151,7 @@ final class PeerHostCLIBinDirsReadinessTests: XCTestCase {
         XCTAssertEqual(entry.hostCLIBinDirs, [])
         XCTAssertNil(entry.hostCLIBinDirsProvenance)
         XCTAssertNil(entry.servingAppVersion)
-        XCTAssertNil(entry.supportsPeerOwnedAgentHosting)
+        XCTAssertEqual(entry.teamHostReadiness, .unresolved)
     }
 
     /// Changing sshTarget moves a profile to a different stable dictionary
@@ -168,7 +167,6 @@ final class PeerHostCLIBinDirsReadinessTests: XCTestCase {
             hostCLIBinDirsResolved: true
         )
         oldRow.servingAppVersion = "0.179.0"
-        oldRow.supportsPeerOwnedAgentHosting = false
 
         oldRow.detachProfileConfiguration()
 
@@ -179,7 +177,7 @@ final class PeerHostCLIBinDirsReadinessTests: XCTestCase {
         XCTAssertEqual(oldRow.hostCLIBinDirs, [])
         XCTAssertNil(oldRow.hostCLIBinDirsProvenance)
         XCTAssertNil(oldRow.servingAppVersion)
-        XCTAssertNil(oldRow.supportsPeerOwnedAgentHosting)
+        XCTAssertEqual(oldRow.teamHostReadiness, .unresolved)
     }
 
     /// Models the editor's failed-doctor fallback after an in-place route

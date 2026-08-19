@@ -3741,17 +3741,12 @@ extension TeamOrchestrator {
         // **Terminal** now means Native was disabled, the CLI is unsupported,
         // or no SSH route exists. Peer capability may choose ownership, never
         // override the renderer the user selected.
-        let availability: PeerOwnedAgentAvailability
-        if host.supportsRemoteTeamRoute == false {
-            // The peer itself cannot carry team.leader.v1, but a Native
-            // SSH-owned process can use its private reverse control-socket
-            // forward and keep the exact same scoped grant contract.
-            availability = .blocked(.daemonTooOld)
-        } else {
-            availability = await Self.canUsePeerOwnedAgent(
-                host: host, cli: cli, binaries: binaries
-            )
-        }
+        // Preflight uses the cached endpoint snapshot for synchronous UI, but
+        // process creation always re-checks the live team endpoint. A daemon
+        // may restart between opening the sheet and pressing Create.
+        let availability = await Self.canUsePeerOwnedAgent(
+            host: host, cli: cli, binaries: binaries
+        )
         if case .blocked(let block) = availability {
             RemoteWorkLog.info(
                 Self.peerOwnedAgentFallbackMessage(
@@ -3810,10 +3805,13 @@ extension TeamOrchestrator {
         }
         // Terminal and peer-owned routes need the serving host to proxy the
         // grant. Only SSH-owned Native has its own authenticated control hop.
-        guard host.supportsRemoteTeamRoute != false || factory == .localNativeBridge else {
+        guard Self.teamRouteAllowsFactory(
+            factory, liveAvailability: availability,
+            cachedSnapshot: host.teamHostReadiness.snapshot
+        ) else {
             throw RemoteAgentError.hostUpdateRequired(
                 host: host.displayName,
-                version: host.servingVersionDisplay
+                version: host.teamHostReadiness.snapshot?.appVersion
             )
         }
 
@@ -4425,10 +4423,27 @@ extension TeamOrchestrator {
     /// requiring those to be *present* is what separates "cannot, by design"
     /// from "cannot, for now".
     static func looksLikeGUIPeerHost(_ capabilities: PeerCapabilities) -> Bool {
-        !capabilities.has(PeerCapability.surfaceAgentV1)
-            && !capabilities.has(PeerCapability.projectPresentationV1)
-            && capabilities.has(PeerCapability.surfaceEnsureEnvV1)
-            && capabilities.has(PeerCapability.surfaceExitV1)
+        RemoteHostStore.looksLikeGUIPeerHost(capabilities)
+    }
+
+    static func peerOwnedAvailability(
+        from snapshot: TeamHostCapabilitySnapshot
+    ) -> PeerOwnedAgentAvailability {
+        guard snapshot.supportsDurableRemoteCreation else {
+            return .blocked(snapshot.peerOwnedAgentIssue == .guiHostNoSessionOwner
+                ? .guiHostNoSessionOwner : .daemonTooOld)
+        }
+        return .available
+    }
+
+    static func teamRouteAllowsFactory(
+        _ factory: RemoteAgentFactory,
+        liveAvailability: PeerOwnedAgentAvailability,
+        cachedSnapshot: TeamHostCapabilitySnapshot?
+    ) -> Bool {
+        factory == .localNativeBridge
+            || liveAvailability == .available
+            || cachedSnapshot?.lacksRemoteTeamRoute != true
     }
 
     /// Whether the peer-owned path is open for this member.
@@ -4493,11 +4508,10 @@ extension TeamOrchestrator {
 
     /// Ask the host connection itself whether the peer-owned path is open.
     ///
-    /// The capability is only knowable from a live handshake — nothing is
-    /// cached on `HostEntry` — so this opens a connection, reads
-    /// `hostCapabilities`, and closes it. Never fatal: every answer other than
-    /// `available` lets the caller preserve Native rendering with an
-    /// SSH-owned process when SSH is available.
+    /// Preflight caches an endpoint-bound snapshot on `HostEntry`, but process
+    /// creation re-checks the live endpoint so a daemon restart cannot make a
+    /// stale UI answer authorize work. Every answer other than `available`
+    /// preserves Native rendering with an SSH-owned process when SSH exists.
     ///
     /// Reporting is the caller's, deliberately. This is also the shape of the
     /// answer the factory wants, and a function that both decides and
@@ -4545,16 +4559,15 @@ extension TeamOrchestrator {
             return .blocked(.hostUnreachable)
         }
         let capabilities = connection.hostCapabilities
-        let supported = RemoteHostStore.hostSupportsPeerOwnedAgentFactory(capabilities)
+        let snapshot = RemoteHostStore.teamHostCapabilitySnapshot(
+            endpoint: host.teamHostSpec?.hostKey ?? host.paneHostSpec.hostKey,
+            capabilities: capabilities,
+            appVersion: connection.hostAppVersion,
+            redirectedFromServingEndpoint: host.redirectsTeamWorkToSessionHost
+        )
         await connection.cancel()
         releaseTeamLease()
-        if supported { return .available }
-        // Reached without a redirect: this host offered no daemon to fall
-        // forward to. Naming which of the two situations it is decides
-        // whether the user should update something or start something.
-        return .blocked(Self.looksLikeGUIPeerHost(capabilities)
-            ? .guiHostNoSessionOwner
-            : .daemonTooOld)
+        return peerOwnedAvailability(from: snapshot)
     }
 
     /// The logical key an agent surface is ensured under.

@@ -394,6 +394,80 @@ struct PeerHostEndpointProvenance: Equatable, Sendable {
     let remoteSocket: String
 }
 
+/// Capabilities proven by the exact authenticated endpoint that owns team
+/// processes. Never substitute the serving peer's Hello for this snapshot:
+/// a GUI peer can redirect team work to a separate daemon.
+struct TeamHostCapabilitySnapshot: Equatable, Sendable {
+    let endpoint: PeerPaneHostKey
+    let appVersion: String?
+    private let peerOwnedAgentHosting: Bool
+    private let remoteTeamRoute: Bool
+    let looksLikeGUIPeerHost: Bool
+    let redirectedFromServingEndpoint: Bool
+
+    var supportsDurableRemoteCreation: Bool {
+        peerOwnedAgentHosting && remoteTeamRoute
+    }
+    var lacksRemoteTeamRoute: Bool { !remoteTeamRoute }
+
+    init(
+        endpoint: PeerPaneHostKey,
+        appVersion: String?,
+        supportsPeerOwnedAgentHosting: Bool,
+        supportsRemoteTeamRoute: Bool,
+        looksLikeGUIPeerHost: Bool,
+        redirectedFromServingEndpoint: Bool
+    ) {
+        self.endpoint = endpoint
+        self.appVersion = appVersion
+        self.peerOwnedAgentHosting = supportsPeerOwnedAgentHosting
+        self.remoteTeamRoute = supportsRemoteTeamRoute
+        self.looksLikeGUIPeerHost = looksLikeGUIPeerHost
+        self.redirectedFromServingEndpoint = redirectedFromServingEndpoint
+    }
+
+    var peerOwnedAgentIssue: TeamHostCapabilityIssue? {
+        guard !supportsDurableRemoteCreation else { return nil }
+        return looksLikeGUIPeerHost && !redirectedFromServingEndpoint
+            ? .guiHostNoSessionOwner : .daemonTooOld
+    }
+}
+
+enum TeamHostCapabilityIssue: Equatable, Sendable {
+    case daemonTooOld
+    case guiHostNoSessionOwner
+}
+
+enum TeamHostReadiness: Equatable, Sendable {
+    case unresolved
+    case probing(PeerPaneHostKey)
+    case ready(TeamHostCapabilitySnapshot)
+    case unreachable(PeerPaneHostKey)
+
+    var snapshot: TeamHostCapabilitySnapshot? {
+        guard case .ready(let snapshot) = self else { return nil }
+        return snapshot
+    }
+
+    var endpoint: PeerPaneHostKey? {
+        switch self {
+        case .unresolved: return nil
+        case .probing(let endpoint), .unreachable(let endpoint): return endpoint
+        case .ready(let snapshot): return snapshot.endpoint
+        }
+    }
+}
+
+nonisolated func acceptingTeamHostSnapshot(
+    current: TeamHostReadiness,
+    expectedEndpoint: PeerPaneHostKey?,
+    servingPathMatches: Bool,
+    snapshot: TeamHostCapabilitySnapshot
+) -> TeamHostReadiness {
+    guard servingPathMatches, expectedEndpoint == snapshot.endpoint else { return current }
+    return .ready(snapshot)
+}
+
 struct HostEntry: Identifiable, Equatable {
     let id: String         // stable dedup key (stableKey)
     var displayName: String
@@ -429,15 +503,6 @@ struct HostEntry: Identifiable, Equatable {
     /// login shell happens to resolve, so creation UI can explain capability
     /// fallback before launching work on the host.
     var servingAppVersion: String? = nil
-    /// Whether the serving process can own a Native Codex/Kiro agent for its
-    /// full lifetime. Nil means no current authenticated handshake supplied
-    /// the answer; false is an explicit compatibility result, not offline.
-    var supportsPeerOwnedAgentHosting: Bool? = nil
-    /// Whether `tm-agent` inside a remote pane can reach the owning project
-    /// through the scoped `team.leader.v1` reverse route. A host may have a
-    /// newer tm-agent in its login PATH while the serving daemon is older;
-    /// only the authenticated handshake answers this correctly.
-    var supportsRemoteTeamRoute: Bool? = nil
     /// Remote path this host names as the owner of sessions that outlive it
     /// (`Hello.session_host_socket`).
     ///
@@ -459,6 +524,10 @@ struct HostEntry: Identifiable, Equatable {
     /// Live-session state, like the capability flags above — cleared with the
     /// socket, never persisted.
     var sessionHostRemoteSockPath: String?
+    /// Route and capabilities from one endpoint generation. UI preflight and
+    /// runtime factory selection both consume this instead of the serving
+    /// endpoint's raw capability flags.
+    var teamHostReadiness: TeamHostReadiness = .unresolved
     /// Authenticated host CLI directories. Live-session cache only: never
     /// written to PeerHostProfile/UserDefaults and cleared with the socket.
     var hostCLIBinDirs: [String] = []
@@ -544,9 +613,8 @@ struct HostEntry: Identifiable, Equatable {
     mutating func clearServingMetadata() {
         supportsWorkspaceLifecycle = nil
         servingAppVersion = nil
-        supportsPeerOwnedAgentHosting = nil
-        supportsRemoteTeamRoute = nil
         sessionHostRemoteSockPath = nil
+        teamHostReadiness = .unresolved
     }
 
     /// Detach profile-owned configuration without letting a still-live
@@ -713,6 +781,31 @@ final class RemoteHostStore: ObservableObject {
             && hostCapabilities.has(PeerCapability.surfaceExitV1)
             && hostCapabilities.has(PeerCapability.surfaceEnsureEnvV1)
             && hostCapabilities.has(PeerCapability.teamRouteFileV1)
+    }
+
+    nonisolated static func looksLikeGUIPeerHost(
+        _ capabilities: PeerCapabilities
+    ) -> Bool {
+        !capabilities.has(PeerCapability.surfaceAgentV1)
+            && !capabilities.has(PeerCapability.projectPresentationV1)
+            && capabilities.has(PeerCapability.surfaceEnsureEnvV1)
+            && capabilities.has(PeerCapability.surfaceExitV1)
+    }
+
+    nonisolated static func teamHostCapabilitySnapshot(
+        endpoint: PeerPaneHostKey,
+        capabilities: PeerCapabilities,
+        appVersion: String?,
+        redirectedFromServingEndpoint: Bool
+    ) -> TeamHostCapabilitySnapshot {
+        TeamHostCapabilitySnapshot(
+            endpoint: endpoint,
+            appVersion: appVersion,
+            supportsPeerOwnedAgentHosting: hostSupportsPeerOwnedAgentFactory(capabilities),
+            supportsRemoteTeamRoute: capabilities.has(PeerCapability.teamLeaderV1),
+            looksLikeGUIPeerHost: looksLikeGUIPeerHost(capabilities),
+            redirectedFromServingEndpoint: redirectedFromServingEndpoint
+        )
     }
 
     /// Fired after a successful sidebar connect so the mounted host
@@ -1474,10 +1567,6 @@ final class RemoteHostStore: ObservableObject {
                     self.hosts[key]?.supportsWorkspaceLifecycle =
                         conn.hostCapabilities.has(PeerCapability.workspaceLifecycleV1)
                     self.hosts[key]?.servingAppVersion = conn.hostAppVersion
-                    self.hosts[key]?.supportsPeerOwnedAgentHosting =
-                        Self.hostSupportsPeerOwnedAgentFactory(conn.hostCapabilities)
-                    self.hosts[key]?.supportsRemoteTeamRoute =
-                        conn.hostCapabilities.has(PeerCapability.teamLeaderV1)
                     // Always non-nil from here: this handshake is the answer,
                     // and "" means "this host owns its own sessions" rather
                     // than "nobody has asked yet".
@@ -1489,6 +1578,22 @@ final class RemoteHostStore: ObservableObject {
                     self.hosts[key]?.sessionHostRemoteSockPath =
                         Self.hostSupportsPeerOwnedAgentFactory(conn.hostCapabilities)
                             ? "" : conn.sessionHostSockPath
+                    if let host = self.hosts[key], let teamSpec = host.teamHostSpec {
+                        if host.redirectsTeamWorkToSessionHost {
+                            self.hosts[key]?.teamHostReadiness = .probing(teamSpec.hostKey)
+                        } else {
+                            self.hosts[key]?.teamHostReadiness = .ready(
+                                Self.teamHostCapabilitySnapshot(
+                                    endpoint: teamSpec.hostKey,
+                                    capabilities: conn.hostCapabilities,
+                                    appVersion: conn.hostAppVersion,
+                                    redirectedFromServingEndpoint: false
+                                )
+                            )
+                        }
+                    } else {
+                        self.hosts[key]?.teamHostReadiness = .unresolved
+                    }
                     if let provenance {
                         _ = self.hosts[key]?.acceptAuthenticatedHostCLIBinDirs(
                             conn.hostCLIBinDirs, provenance: provenance
@@ -1745,20 +1850,52 @@ final class RemoteHostStore: ObservableObject {
 
         var lease: PeerPaneHostLease?
         let rosterSockPath: String
+        let teamEndpoint: PeerPaneHostKey
+        let redirected = host.redirectsTeamWorkToSessionHost
         if host.redirectsTeamWorkToSessionHost {
             guard let spec = host.teamHostSpec,
                   let acquired = try? await PeerPaneHostRegistry.shared.acquire(spec)
-            else { return nil }
+            else {
+                if let endpoint = host.teamHostSpec?.hostKey,
+                   hosts[key]?.activeSockPath == servingSockPath,
+                   hosts[key]?.teamHostReadiness.endpoint == endpoint {
+                    hosts[key]?.teamHostReadiness = .unreachable(endpoint)
+                }
+                return nil
+            }
             lease = acquired
             rosterSockPath = acquired.hostSockPath
+            teamEndpoint = spec.hostKey
         } else {
             rosterSockPath = servingSockPath
+            teamEndpoint = host.paneHostSpec.hostKey
         }
         defer { lease.map { PeerPaneHostRegistry.shared.release($0) } }
 
         guard !Task.isCancelled,
               let connection = try? await PeerRelaySession.connect(hostSockPath: rosterSockPath)
-        else { return nil }
+        else {
+            if redirected,
+               hosts[key]?.activeSockPath == servingSockPath,
+               hosts[key]?.teamHostReadiness.endpoint == teamEndpoint {
+                hosts[key]?.teamHostReadiness = .unreachable(teamEndpoint)
+            }
+            return nil
+        }
+        if !Task.isCancelled, let current = hosts[key]?.teamHostReadiness {
+            let snapshot = Self.teamHostCapabilitySnapshot(
+                endpoint: teamEndpoint,
+                capabilities: connection.hostCapabilities,
+                appVersion: connection.hostAppVersion,
+                redirectedFromServingEndpoint: redirected
+            )
+            hosts[key]?.teamHostReadiness = acceptingTeamHostSnapshot(
+                current: current,
+                expectedEndpoint: hosts[key]?.teamHostSpec?.hostKey,
+                servingPathMatches: hosts[key]?.activeSockPath == servingSockPath,
+                snapshot: snapshot
+            )
+        }
         return await withTaskCancellationHandler {
             guard connection.hostCapabilities.has(PeerCapability.teamRosterV1) else {
                 await connection.cancel()

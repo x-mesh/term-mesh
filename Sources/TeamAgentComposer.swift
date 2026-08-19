@@ -3,27 +3,47 @@ import SwiftUI
 /// A creation-time explanation for a remote Native agent whose renderer can
 /// stay Native but whose process cannot be owned by the selected host.
 struct TeamAgentHostCompatibilityNotice: Identifiable, Equatable {
+    enum Reason: Equatable {
+        case teamRouteUnavailable
+        case daemonTooOld
+        case guiHostNoSessionOwner
+        case checkingTeamHost
+        case teamHostUnreachable
+    }
+
     let hostKey: String
     let hostName: String
-    let servingVersion: String?
+    let teamHostVersion: String?
     let clis: [String]
     let blocksTeamMessaging: Bool
+    let reason: Reason
 
     var id: String { hostKey }
 
     var message: String {
-        let version = servingVersion.map { "term-mesh \($0)" }
+        let version = teamHostVersion.map { "term-mesh \($0)" }
             ?? "an unknown term-mesh version"
         let cliList = clis.map(\.capitalized).joined(separator: "/")
-        if blocksTeamMessaging {
+        switch reason {
+        case .teamRouteUnavailable:
             return "\(hostName) is serving \(version), which cannot route remote team "
                 + "messages. Update and restart term-mesh on \(hostName) before creating "
                 + "this team; otherwise \(cliList) opens but tm-agent returns no_app."
+        case .guiHostNoSessionOwner:
+            return "\(hostName) is serving peers from the term-mesh app but named no "
+                + "session-owner daemon. Updating the app cannot add durable ownership; "
+                + "start term-meshd on that host before creating this team."
+        case .checkingTeamHost:
+            return "Checking the session-owner daemon on \(hostName) before enabling durable "
+                + "team creation."
+        case .teamHostUnreachable:
+            return "The session-owner daemon on \(hostName) could not be reached. Reconnect "
+                + "the host before creating this team."
+        case .daemonTooOld:
+            return "\(hostName)'s team-owning daemon is \(version) and lacks a required "
+                + "durable-agent or team-route capability. Update and restart that daemon "
+                + "before creating this team."
         }
-        return "\(hostName) is serving \(version). Native \(cliList) sessions will run "
-            + "through this Mac over SSH; team messaging stays available through a private "
-            + "SSH route, but the agents stop if this app quits. Restart or update "
-            + "term-mesh on \(hostName) to keep them on the host."
     }
 }
 
@@ -109,10 +129,8 @@ struct TeamAgentComposer: View {
         RemoteHostStore.selectableLaunchHosts(in: hostStore.sortedHosts)
     }
 
-    /// One warning per affected host, not one per member. The serving version
-    /// and capability came from the same authenticated handshake used to make
-    /// the host launchable, so this never compares against a merely installed
-    /// binary that may not be the process handling the team.
+    /// One warning per affected host, not one per member. Route and capability
+    /// come from the same authenticated team-owning endpoint snapshot.
     static func peerOwnedFallbackNotices(
         agents: [TeamAgentRow],
         hosts: [HostEntry]
@@ -132,9 +150,27 @@ struct TeamAgentComposer: View {
                 && rows.allSatisfy {
                     AgentPipeTransport.canHoldNatively(cli: $0.1)
                 }
-            let blocksTeamMessaging = host.supportsRemoteTeamRoute == false
+            let snapshot = host.teamHostReadiness.snapshot
+            let blocksTeamMessaging = snapshot?.lacksRemoteTeamRoute == true
                 && !hasSSHNativeRoute
-            guard blocksTeamMessaging || host.supportsPeerOwnedAgentHosting == false else {
+            let reason: TeamAgentHostCompatibilityNotice.Reason?
+            if snapshot?.peerOwnedAgentIssue == .guiHostNoSessionOwner {
+                reason = .guiHostNoSessionOwner
+            } else if blocksTeamMessaging {
+                reason = .teamRouteUnavailable
+            } else {
+                switch host.teamHostReadiness {
+                case .unresolved, .probing: reason = .checkingTeamHost
+                case .unreachable: reason = .teamHostUnreachable
+                case .ready(let snapshot):
+                    switch snapshot.peerOwnedAgentIssue {
+                    case .daemonTooOld: reason = .daemonTooOld
+                    case .guiHostNoSessionOwner: reason = .guiHostNoSessionOwner
+                    case nil: reason = nil
+                    }
+                }
+            }
+            guard let reason else {
                 return nil
             }
             let affectedCLIs = Set(rows.map { $0.1 }.filter { cli in
@@ -146,9 +182,10 @@ struct TeamAgentComposer: View {
             return TeamAgentHostCompatibilityNotice(
                 hostKey: hostKey,
                 hostName: host.displayName,
-                servingVersion: host.servingVersionDisplay,
+                teamHostVersion: snapshot?.appVersion.map { $0.hasPrefix("v") ? $0 : "v\($0)" },
                 clis: affectedCLIs,
-                blocksTeamMessaging: blocksTeamMessaging
+                blocksTeamMessaging: blocksTeamMessaging,
+                reason: reason
             )
         }.sorted { $0.hostName.localizedCaseInsensitiveCompare($1.hostName) == .orderedAscending }
     }
@@ -168,7 +205,7 @@ struct TeamAgentComposer: View {
                         cli: agent.preset.cli.isEmpty ? "claude" : agent.preset.cli
                       )
                 else { return false }
-                return host.supportsPeerOwnedAgentHosting == false
+                return host.teamHostReadiness.snapshot?.supportsDurableRemoteCreation != true
             }
         }
         return peerOwnedFallbackNotices(agents: agents, hosts: hosts)
@@ -181,11 +218,7 @@ struct TeamAgentComposer: View {
 
     private func compatibilityMessage(_ notice: TeamAgentHostCompatibilityNotice) -> String {
         guard requiresDurableRemoteMembers else { return notice.message }
-        let version = notice.servingVersion.map { "term-mesh \($0)" }
-            ?? "an unknown term-mesh version"
-        return "\(notice.hostName) is serving \(version), which cannot own every selected "
-            + "agent after this app quits. Update and restart term-mesh on that host "
-            + "before creating this Project."
+        return notice.message
     }
 
     var body: some View {
