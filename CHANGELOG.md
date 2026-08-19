@@ -4,9 +4,13 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.199.0] - 2026-08-19
+
+**앱을 다시 켜도 Project workspace의 정체성과 배치가 그대로 유지된다.**
+
 ### Fixed
 
-- **앱을 다시 켤 때마다 같은 Project workspace가 하나씩 더 생기던 문제** — `session.json`이 workspace를 복원하면서 그 정체성(ID)까지는 저장하지 않아, 복원된 workspace는 매번 새 ID를 받았다. Project 선언은 그 ID로 보관돼 있어서 재시작 후에는 조회가 항상 실패했고, 그때마다 term-mesh는 "이 Project를 담은 workspace가 아직 없다"고 판단해 `[project]` workspace를 새로 만들었다. team 3개를 쓰는 호스트에서 재시작 한 번에 3개씩 늘어났다. 이제 workspace ID를 세션에 함께 저장하고, ID가 없는 기존 세션은 workspace 제목으로 Project를 알아본다. workspace를 닫으면 그 선언도 함께 지운다.
+- **앱을 다시 켤 때마다 같은 Project workspace가 하나씩 더 생기던 문제** ([#326](https://github.com/x-mesh/term-mesh/pull/326)) — `session.json`이 workspace를 복원하면서 그 정체성(ID)까지는 저장하지 않아, 복원된 workspace는 매번 새 ID를 받았다. Project 선언은 그 ID로 보관돼 있어서 재시작 후에는 조회가 항상 실패했고, 그때마다 term-mesh는 "이 Project를 담은 workspace가 아직 없다"고 판단해 `[project]` workspace를 새로 만들었다. team 3개를 쓰는 호스트에서 재시작 한 번에 3개씩 늘어났다. 이제 workspace ID를 세션에 함께 저장하고, ID가 없는 기존 세션은 workspace 제목으로 Project를 알아본다. workspace를 닫으면 그 선언도 함께 지운다. — thanks @JINWOO-J!
 
 - **headless agent를 붙인 팀의 workspace가 중복으로 열리던 문제** — 팀 workspace 제목은 `[project] 3 headless`인데 Project 이름을 알아보는 규칙이 제목이 `]`로 끝나야만 인정해서, headless 팀을 다시 열면 매번 workspace가 하나 더 생겼다. 이제 앞의 `[project]` 부분만 보고 판단한다.
 
@@ -19,6 +23,10 @@ All notable changes to term-mesh are documented here.
 - 더 이상 존재할 수 없는 workspace의 Project 기록이 계속 쌓이던 것을 앱 시작 때 정리한다.
 
 - **workspace 목록이 재시작할 때마다 거꾸로 뒤집히던 문제** — 새 workspace를 어디에 놓을지 정하는 설정(`Top`)이 복원에도 적용돼, 저장된 순서와 반대로 쌓이고 선택된 workspace도 어긋났다. 이제 복원은 저장된 순서를 그대로 따르고, 선택은 위치가 아니라 workspace 자체를 따라간다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
 
 ## [0.198.0] - 2026-08-19
 
