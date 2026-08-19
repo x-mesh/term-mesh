@@ -37,10 +37,10 @@ curl -fsSL https://raw.githubusercontent.com/x-mesh/term-mesh/main/scripts/insta
 
 The exact paths and commands depend on the selected scope:
 
-| Scope | Binary | Config | Unit | Peer socket | Service commands |
-|---|---|---|---|---|---|
-| User (default) | `~/.local/bin/term-meshd` | `~/.config/term-mesh/peer.env` | `~/.config/systemd/user/term-meshd.service` | `/run/user/<uid>/tm-peer.sock` | `systemctl --user …`; `journalctl --user …` |
-| System (root installer) | `/usr/local/bin/term-meshd` | `/etc/term-mesh/peer.env` | `/etc/systemd/system/term-meshd.service` | `/run/term-mesh/tm-peer.sock` | `systemctl …`; `journalctl …` |
+| Scope | Binary | Config | Unit | Peer socket | Control socket | Service commands |
+|---|---|---|---|---|---|---|
+| User (default) | `~/.local/bin/term-meshd` | `~/.config/term-mesh/peer.env` | `~/.config/systemd/user/term-meshd.service` | `/run/user/<uid>/tm-peer.sock` | `/run/user/<uid>/term-meshd.sock` | `systemctl --user …`; `journalctl --user …` |
+| System (root installer) | `/usr/local/bin/term-meshd` | `/etc/term-mesh/peer.env` | `/etc/systemd/system/term-meshd.service` | `/run/term-mesh/tm-peer.sock` | `/run/term-mesh/term-meshd.sock` | `systemctl …`; `journalctl …` |
 
 The daemon runs as the connecting account by default. This keeps SSH project
 setup, file ownership, HOME/PATH, and pane processes under the same identity:
@@ -73,8 +73,9 @@ sudo systemctl restart term-meshd
 ```
 
 Re-running the install command is safe — it updates the binary, replaces the
-unit file, and restarts the service, but never touches an existing
-`peer.env`. Supports both `x86_64` and `aarch64`; the script detects the
+unit file, and restarts the service. Existing `peer.env` choices are preserved;
+an older config missing `TERMMESH_DAEMON_UNIX_PATH` gains the scope's reachable
+default during upgrade. Supports both `x86_64` and `aarch64`; the script detects the
 architecture and fetches the matching release asset. Requires systemd (most
 mainstream distros) — see [Build from source](#build-from-source) for hosts
 without it.
@@ -139,6 +140,7 @@ The peer server is **opt-in**: without `TERMMESH_PEER_SOCKET` it never starts.
 
 ```bash
 export TERMMESH_PEER_SOCKET=/run/user/$(id -u)/tm-peer.sock
+export TERMMESH_DAEMON_UNIX_PATH=/run/user/$(id -u)/term-meshd.sock
 
 # One surface per line. Each command runs under `/bin/sh -c`, so `;` and loops
 # work as written. Omit this and you get a single `$SHELL -l` surface named "shell".
@@ -212,18 +214,18 @@ short-lived ssh command against the target that checks, in order:
 
 1. `TERMMESH_PEER_SOCKET` in `~/.config/term-mesh/peer.env` (the user-scope
    installer config; last assignment wins)
-2. `$XDG_RUNTIME_DIR/tm-peer.sock`
-3. `/run/user/<uid>/tm-peer.sock` (the installer default)
-4. `/tmp/term-mesh-peer-<uid>/peer.sock` (the macOS host default)
+2. `TERMMESH_PEER_SOCKET` in `/etc/term-mesh/peer.env`
+3. `$XDG_RUNTIME_DIR/tm-peer.sock`
+4. `/run/term-mesh/tm-peer.sock` (the system-scope installer default)
+5. `/run/user/<uid>/tm-peer.sock` (the user-scope installer default)
+6. `/tmp/term-mesh-peer-<uid>/peer.sock` (the macOS host default)
 
 The first live socket wins and is what gets stored in the recent-hosts
 list. Hosts with a custom socket path outside `peer.env` still need the
 path typed once — after that, recents carry it.
 
-The system-scope socket `/run/term-mesh/tm-peer.sock` and config
-`/etc/term-mesh/peer.env` are intentionally outside this per-login probe. Enter
-that socket path explicitly on the first connection; the recent-host entry
-then remembers it.
+The system-scope socket and config are probed directly, so a root-installed
+host can also leave the socket field empty.
 
 The app spawns and owns the `ssh -N -T -L …` process, and reconnects with
 exponential backoff (capped at 30 s) across sleep/wake, network blips, and

@@ -97,10 +97,26 @@ grep -qx 'ProtectSystem=full' /etc/systemd/system/term-meshd.service
 grep -qx 'ProtectHome=false' /etc/systemd/system/term-meshd.service
 grep -qx 'RuntimeDirectory=term-mesh' /etc/systemd/system/term-meshd.service
 grep -qx 'TERMMESH_PEER_SOCKET=/run/term-mesh/tm-peer.sock' /etc/term-mesh/peer.env
+grep -qx 'TERMMESH_DAEMON_UNIX_PATH=/run/term-mesh/term-meshd.sock' /etc/term-mesh/peer.env
 if grep -q '^sudo ' "$CALLS"; then
   echo 'direct root install must not invoke sudo' >&2
   exit 1
 fi
+
+echo '==> an old system config gains the reachable control socket on upgrade'
+sed -i '/^TERMMESH_DAEMON_UNIX_PATH=/d' /etc/term-mesh/peer.env
+printf '%s\n' 'TERMMESH_DAEMON_UNIX_PATH=/tmp/overridden.sock' >> /etc/term-mesh/peer.env
+printf '%s\n' 'TERMMESH_DAEMON_UNIX_PATH=' >> /etc/term-mesh/peer.env
+TERMMESH_INSTALL_PREFIX=/opt/term-mesh-upgrade bash "$INSTALLER"
+grep -qx 'TERMMESH_DAEMON_UNIX_PATH=/run/term-mesh/term-meshd.sock' /etc/term-mesh/peer.env
+[[ "$(grep -c '^TERMMESH_DAEMON_UNIX_PATH=' /etc/term-mesh/peer.env)" == 1 ]]
+
+echo '==> an explicit control socket choice survives reinstall'
+sed -i 's#^TERMMESH_DAEMON_UNIX_PATH=.*#TERMMESH_DAEMON_UNIX_PATH=/srv/term-mesh/control.sock#' \
+  /etc/term-mesh/peer.env
+TERMMESH_INSTALL_PREFIX=/opt/term-mesh-explicit bash "$INSTALLER"
+grep -qx 'TERMMESH_DAEMON_UNIX_PATH=/srv/term-mesh/control.sock' /etc/term-mesh/peer.env
+[[ "$(grep -c '^TERMMESH_DAEMON_UNIX_PATH=' /etc/term-mesh/peer.env)" == 1 ]]
 
 echo '==> sudo system install follows the invoking SSH account'
 useradd --create-home tester
@@ -142,6 +158,8 @@ grep -qx 'ExecStart=/home/tester/.local/bin/term-meshd' \
   /home/tester/.config/systemd/user/term-meshd.service
 tester_uid=$(id -u tester)
 grep -qx "TERMMESH_PEER_SOCKET=/run/user/${tester_uid}/tm-peer.sock" \
+  /home/tester/.config/term-mesh/peer.env
+grep -qx "TERMMESH_DAEMON_UNIX_PATH=/run/user/${tester_uid}/term-meshd.sock" \
   /home/tester/.config/term-mesh/peer.env
 grep -q 'systemctl disable --now term-meshd.service' "$CALLS"
 

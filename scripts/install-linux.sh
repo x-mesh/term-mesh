@@ -16,7 +16,8 @@
 # non-root run there stops with instructions instead of half-installing.
 #
 # Re-running this script is safe: it replaces the binary and unit file,
-# restarts the service, and leaves any existing peer.env config alone.
+# restarts the service, and preserves existing peer.env choices. Missing
+# installer-owned socket defaults are added during upgrade.
 #
 # Env overrides:
 #   TERMMESH_INSTALL_TAG   Release tag to install (default: latest)
@@ -26,9 +27,8 @@
 #   TERMMESH_SERVICE_USER   Account for a system service (default: the
 #                           connecting account; SUDO_USER under sudo)
 #
-# What this does NOT do: bind the peer socket to a fixed path chosen for
-# you, or pick surfaces to expose. Those are yours to set in
-# ~/.config/term-mesh/peer.env after install — see docs/peer-linux-host.md.
+# What this does NOT do: pick surfaces to expose. Socket defaults are scoped
+# to systemd's runtime directories and can be overridden in peer.env.
 set -euo pipefail
 
 REPO="${TERMMESH_INSTALL_REPO:-x-mesh/term-mesh}"
@@ -95,6 +95,7 @@ if [[ "$INSTALL_UID" != 0 ]] && systemctl --user show-environment >/dev/null 2>&
   ENV_FILE="${CONFIG_DIR}/peer.env"
   WANTED_BY=default.target
   PEER_SOCKET_DEFAULT="/run/user/$(id -u)/tm-peer.sock"
+  CONTROL_SOCKET_DEFAULT="/run/user/$(id -u)/term-meshd.sock"
   systemctl_scoped() { systemctl --user "$@"; }
 elif [[ "$INSTALL_UID" == 0 ]]; then
   SERVICE_SCOPE=system
@@ -105,6 +106,7 @@ elif [[ "$INSTALL_UID" == 0 ]]; then
   ENV_FILE="${CONFIG_DIR}/peer.env"
   WANTED_BY=multi-user.target
   PEER_SOCKET_DEFAULT=/run/term-mesh/tm-peer.sock
+  CONTROL_SOCKET_DEFAULT=/run/term-mesh/term-meshd.sock
   systemctl_scoped() { systemctl "$@"; }
   log "installing a system service as ${SERVICE_USER}"
 else
@@ -346,6 +348,10 @@ if [[ ! -f "$ENV_FILE" ]]; then
 # Required for the peer server to start at all (opt-in — see main.rs).
 TERMMESH_PEER_SOCKET=${PEER_SOCKET_DEFAULT}
 
+# JSON-RPC control plane used by tm-agent and host health checks. This must
+# stay outside PrivateTmp for a system-scope service.
+TERMMESH_DAEMON_UNIX_PATH=${CONTROL_SOCKET_DEFAULT}
+
 # One "name=command" pair per line. Omit this entirely for a single
 # default "\$SHELL -l" surface named "shell". Example:
 # TERMMESH_PEER_SURFACES=shell=/bin/bash -l
@@ -353,6 +359,18 @@ TERMMESH_PEER_SOCKET=${PEER_SOCKET_DEFAULT}
 EOF
 else
   log "keeping existing config at ${ENV_FILE}"
+  # Upgrade configs written before the control socket was pinned. Preserve an
+  # explicit operator choice; only fill the previously absent managed key.
+  existing_control=$(sed -n 's/^TERMMESH_DAEMON_UNIX_PATH=//p' "$ENV_FILE" | tail -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
+  if [[ -z "$existing_control" ]]; then
+    log "adding control socket path to existing config: ${CONTROL_SOCKET_DEFAULT}"
+    sed -i '/^[[:space:]]*TERMMESH_DAEMON_UNIX_PATH=/d' "$ENV_FILE"
+    cat >> "$ENV_FILE" <<EOF
+
+# Added by install-linux.sh: reachable outside the service's PrivateTmp.
+TERMMESH_DAEMON_UNIX_PATH=${CONTROL_SOCKET_DEFAULT}
+EOF
+  fi
   # A config left over from a different scope can point the socket somewhere
   # this service can't bind — most often a /run/user/<uid> path inherited by
   # a now-system service, where that dir does not exist. Warn loudly rather
@@ -363,6 +381,12 @@ else
       log "warning: ${ENV_FILE} sets TERMMESH_PEER_SOCKET=${existing_sock}, which a"
       log "         system service cannot create. Edit it to ${PEER_SOCKET_DEFAULT}"
       log "         (and keep RuntimeDirectory=term-mesh in the unit), then restart."
+    fi
+    existing_control=$(sed -n 's/^TERMMESH_DAEMON_UNIX_PATH=//p' "$ENV_FILE" | tail -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
+    if [[ "$existing_control" == /tmp/* ]]; then
+      log "warning: ${ENV_FILE} sets TERMMESH_DAEMON_UNIX_PATH=${existing_control}, but"
+      log "         PrivateTmp hides that socket from tm-agent and health probes."
+      log "         Set it to ${CONTROL_SOCKET_DEFAULT}, then restart."
     fi
   fi
 fi

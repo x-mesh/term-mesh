@@ -71,6 +71,21 @@ struct PeerHostHealthBaseline: Equatable {
         guard controlRPC == .available else { return .unhealthy }
         return relayLagCount > 0 || resumeHealCount > 0 ? .degraded : .healthy
     }
+
+    var unhealthyReasons: [String] {
+        var reasons: [String] = []
+        if !serviceActive { reasons.append("service inactive") }
+        if !controlPathPresent {
+            reasons.append("control socket missing at \(controlPath)")
+        } else if controlRPC == .unavailable {
+            reasons.append("control RPC unavailable at \(controlPath)")
+        }
+        if !peerPathPresent { reasons.append("peer socket missing at \(peerPath)") }
+        if protocolMismatchCount > 0 {
+            reasons.append("protocol mismatches \(protocolMismatchCount) in 5 min")
+        }
+        return reasons
+    }
 }
 
 /// What the agent-notification stack looks like on a remote host: the
@@ -136,7 +151,7 @@ enum PeerHostDoctor {
     static var healthBaselineCommand: String {
         healthBaselineCommandTemplate.replacingOccurrences(
             of: #"[ -n "$control" ] || control=/tmp/term-meshd.sock"#,
-            with: #"if [ -z "$control" ] && [ "$u" = active ]; then control=/run/user/$(id -u)/term-meshd.sock; fi; [ -n "$control" ] || control=/tmp/term-meshd.sock"#
+            with: #"configured=$control; t=${TMPDIR:-}; [ -n "$t" ] || t=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null); control=; for c in "$configured" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/term-meshd.sock}" "/run/user/$(id -u)/term-meshd.sock" "/run/term-mesh/term-meshd.sock" "${t:+${t%/}/term-meshd.sock}" "/tmp/term-meshd.sock"; do [ -n "$c" ] && [ -S "$c" ] || continue; control=$c; break; done; if [ -z "$control" ]; then if [ -n "$configured" ]; then control=$configured; elif [ "$s" = active ]; then control=/run/term-mesh/term-meshd.sock; elif [ "$u" = active ]; then control=/run/user/$(id -u)/term-meshd.sock; else control=/tmp/term-meshd.sock; fi; fi"#
         )
     }
 

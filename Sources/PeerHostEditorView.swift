@@ -693,10 +693,8 @@ struct PeerHostEditorView: View {
                 .font(.caption).foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
             case .unhealthy:
-                let control = health.controlPathPresent && health.controlRPC == .available
-                    ? "control OK" : "control unavailable at \(health.controlPath)"
                 Label(
-                    "Host unhealthy — \(control); protocol mismatches \(health.protocolMismatchCount) in 5 min",
+                    "Host unhealthy — \(health.unhealthyReasons.joined(separator: "; "))",
                     systemImage: "xmark.shield"
                 )
                 .font(.caption).foregroundStyle(.red)

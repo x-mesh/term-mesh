@@ -21,6 +21,9 @@ final class PeerDaemonVersionTests: XCTestCase {
         XCTAssertTrue(body.contains("attach relay lagged"))
         XCTAssertTrue(body.contains("frame length .* exceeds"))
         XCTAssertTrue(body.contains("/run/user/$(id -u)/term-meshd.sock"))
+        XCTAssertTrue(body.contains("/run/term-mesh/term-meshd.sock"))
+        XCTAssertTrue(body.contains("${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/term-meshd.sock}"))
+        XCTAssertTrue(body.contains("${t:+${t%/}/term-meshd.sock}"))
     }
 
     func test_healthBaseline_requiresControlAndProtocolIntegrity() {
@@ -41,10 +44,15 @@ final class PeerDaemonVersionTests: XCTestCase {
         var missingControl = healthy!
         missingControl.controlPathPresent = false
         XCTAssertEqual(missingControl.verdict, .unhealthy)
+        XCTAssertEqual(
+            missingControl.unhealthyReasons,
+            ["control socket missing at /tmp/term-meshd.sock"]
+        )
 
         var protocolMismatch = healthy!
         protocolMismatch.protocolMismatchCount = 1
         XCTAssertEqual(protocolMismatch.verdict, .unhealthy)
+        XCTAssertEqual(protocolMismatch.unhealthyReasons, ["protocol mismatches 1 in 5 min"])
 
         var lagging = healthy!
         lagging.relayLagCount = 2
@@ -67,6 +75,14 @@ final class PeerDaemonVersionTests: XCTestCase {
         var missingCLIWithMismatch = missingCLI!
         missingCLIWithMismatch.protocolMismatchCount = 1
         XCTAssertEqual(missingCLIWithMismatch.verdict, .unhealthy)
+
+        var missingServiceAndPeer = healthy!
+        missingServiceAndPeer.serviceActive = false
+        missingServiceAndPeer.peerPathPresent = false
+        XCTAssertEqual(
+            missingServiceAndPeer.unhealthyReasons,
+            ["service inactive", "peer socket missing at /run/term-mesh/tm-peer.sock"]
+        )
     }
 
     func test_healthBaseline_duplicateBannerKeysUseFinalProbeBlock() {
