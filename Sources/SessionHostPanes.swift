@@ -94,6 +94,80 @@ enum SessionHostPanes {
         case newHostSessions
     }
 
+    /// The bracketed prefix this file writes is the project identity that
+    /// survives a restart even when the declaration does not.
+    ///
+    /// The prefix, not the whole title: `TeamOrchestrator` writes
+    /// `[project] 3 headless`, so requiring the title to end in `]` left a
+    /// resumed headless team unrecognized — the same proliferation this
+    /// recovery exists to stop, reachable without a restart.
+    static func projectName(fromWorkspaceTitle title: String?) -> String? {
+        guard let title,
+              title.hasPrefix("["),
+              let close = title.firstIndex(of: "]")
+        else { return nil }
+        let name = String(title[title.index(after: title.startIndex)..<close])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    /// The project a workspace belongs to, falling back to its title when a
+    /// restore left no declaration behind.
+    ///
+    /// `WorkspaceProjectNames` is keyed by workspace UUID, and a session
+    /// written before workspace IDs were persisted restores workspaces no
+    /// declaration can name. Reading the declaration alone therefore reported
+    /// "no workspace owns this project" on every launch, and each launch
+    /// created one more `[project]` workspace for the same project.
+    ///
+    /// The fallback deliberately does not write the declaration back. A
+    /// bracketed title is not proof of a project: `workspace.create` titles a
+    /// worktree workspace `[<branch>]`, and a rename over the control socket
+    /// produces any bracketed title at all. Persisting those would give a
+    /// presentation string permanent authority over routing — `SidebarViews`
+    /// honors a declaration over its own path inference, and nothing short of
+    /// closing the workspace revokes one. Recomputed per pass instead, a title
+    /// that stops matching stops counting.
+    static func declaredProjectName(for workspace: Workspace) -> String? {
+        WorkspaceProjectNames.shared.projectName(for: workspace.id)
+            ?? projectName(fromWorkspaceTitle: workspace.customTitle)
+    }
+
+    /// Every window's workspaces, deduplicated.
+    ///
+    /// `AppDelegate.tabManager` is not always one of `mainWindowContexts`, so
+    /// the fallback is appended rather than assumed present.
+    static func allTabManagers(app: AppDelegate, fallback: TabManager) -> [TabManager] {
+        var seen = Set<ObjectIdentifier>()
+        return (app.mainWindowContexts.values.map(\.tabManager) + [fallback])
+            .filter { seen.insert(ObjectIdentifier($0)).inserted }
+    }
+
+    /// The project claims `workspaceDestination` chooses among.
+    ///
+    /// Named rather than inlined at the call site so a test can assert the
+    /// decision this change exists to make — that restored `[project]`
+    /// workspaces, which carry no declaration, still resolve to themselves.
+    /// Inlined, reverting the recovery reinstated the proliferation bug without
+    /// failing a single test.
+    static func declaredProjects(in workspaces: [Workspace]) -> [(id: UUID, name: String)] {
+        let declared = workspaces.compactMap { workspace in
+            WorkspaceProjectNames.shared.projectName(for: workspace.id).map {
+                (id: workspace.id, name: $0)
+            }
+        }
+        let recovered = workspaces.compactMap { workspace -> (id: UUID, name: String)? in
+            guard WorkspaceProjectNames.shared.projectName(for: workspace.id) == nil,
+                  let name = projectName(fromWorkspaceTitle: workspace.customTitle)
+            else { return nil }
+            return (id: workspace.id, name: name)
+        }
+        // A title is only a recovery hint. If an unrelated worktree happens to
+        // be named `[project]`, the durable declaration must win regardless of
+        // tab or window order.
+        return declared + recovered
+    }
+
     /// Choose by declared project identity, never by the selected tab. The
     /// selected tab is merely what the user is looking at; treating it as the
     /// owner injected a term-mesh worker into an `xm` workspace.
@@ -129,19 +203,18 @@ enum SessionHostPanes {
             guard let source = tabManager.tabs.first(where: {
                 $0.panelID(forPeerSurfaceID: surfaceID) != nil
             }),
-            WorkspaceProjectNames.shared.projectName(for: source.id)?.caseInsensitiveCompare(
-                projectName
-            ) != .orderedSame,
             let panelID = source.panelID(forPeerSurfaceID: surfaceID),
             let sourcePane = source.paneId(forPanelId: panelID),
             let sourceIndex = source.indexInPane(forPanelId: panelID)
             else { continue }
 
-            let existingTarget = tabManager.tabs.first(where: {
-                WorkspaceProjectNames.shared.projectName(for: $0.id)?.caseInsensitiveCompare(
-                    projectName
-                ) == .orderedSame
-            })
+            let existingTargetID = declaredProjects(in: tabManager.tabs).first(where: {
+                $0.name.caseInsensitiveCompare(projectName) == .orderedSame
+            })?.id
+            let existingTarget = existingTargetID.flatMap { id in
+                tabManager.tabs.first(where: { $0.id == id })
+            }
+            guard existingTarget?.id != source.id else { continue }
             var targetAnchor: UUID?
             let target = existingTarget ?? {
                 let created = tabManager.addWorkspace(
@@ -454,9 +527,8 @@ extension SessionHostPanes {
         let projectDirectories = projectWorkingDirectories(teams: snapshot.teams)
         guard let app = AppDelegate.shared, let tabManager = app.tabManager else { return 0 }
 
-        var repairedManagers = Set<ObjectIdentifier>()
-        for manager in app.mainWindowContexts.values.map(\.tabManager) + [tabManager]
-        where repairedManagers.insert(ObjectIdentifier(manager)).inserted {
+        let managers = allTabManagers(app: app, fallback: tabManager)
+        for manager in managers {
             migrateShownProjectSurfaces(
                 projectNames: projectNames,
                 projectDirectories: projectDirectories,
@@ -481,21 +553,29 @@ extension SessionHostPanes {
         for surfaceID in wanted {
             guard let info = surfaces.first(where: { $0.surfaceID == surfaceID }) else { continue }
             let projectName = projectNames[surfaceID]
+            // Every window, not just the active one. `shownSurfaceIDs()` is
+            // already window-global, and the repair pass above runs per manager
+            // for the same reason: a `[project]` workspace living in a second
+            // window was invisible here, so its project took the `.newProject`
+            // branch and got a duplicate in the active window — and the repair
+            // then found the pane's source already declared and left it. That
+            // is this change's own proliferation, reached through a second
+            // window rather than a relaunch.
             let destination = workspaceDestination(
                 projectName: projectName,
-                declaredProjects: tabManager.tabs.compactMap { workspace in
-                    WorkspaceProjectNames.shared.projectName(for: workspace.id).map {
-                        (id: workspace.id, name: $0)
-                    }
-                },
-                hostSessionsWorkspaceID: tabManager.tabs.first(where: {
-                    $0.customTitle == "Host Sessions"
-                })?.id
+                declaredProjects: declaredProjects(
+                    in: managers.flatMap(\.tabs)
+                ),
+                hostSessionsWorkspaceID: managers.lazy.compactMap { manager in
+                    manager.tabs.first(where: { $0.customTitle == "Host Sessions" })?.id
+                }.first
             )
             let workspace: Workspace
             switch destination {
             case .existingProject(let id), .existingHostSessions(let id):
-                guard let existing = tabManager.tabs.first(where: { $0.id == id }) else {
+                guard let existing = managers.lazy.compactMap({ manager in
+                    manager.tabs.first(where: { $0.id == id })
+                }).first else {
                     continue
                 }
                 workspace = existing

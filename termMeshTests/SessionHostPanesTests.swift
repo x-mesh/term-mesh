@@ -116,6 +116,138 @@ final class SessionHostPanesTests: XCTestCase {
 
     private func sid(_ byte: UInt8) -> Data { Data(repeating: byte, count: 16) }
 
+    // MARK: - Project identity across a relaunch
+
+    /// Sessions written before workspace IDs were persisted mint a fresh UUID
+    /// for every restored workspace, so the UUID-keyed declaration cannot
+    /// match. Reading the declaration alone therefore answered "no workspace
+    /// owns this project" on every launch, and every launch created one more
+    /// `[project]` workspace for the same project — 3 more per restart on a
+    /// host with 3 teams.
+    func test_aRestoredProjectWorkspaceIsRecognizedFromItsTitle() {
+        let workspace = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        workspace.customTitle = "[term-mesh]"
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: workspace.id) }
+
+        XCTAssertNil(
+            WorkspaceProjectNames.shared.projectName(for: workspace.id),
+            "a restored workspace starts with no declaration"
+        )
+        XCTAssertEqual(SessionHostPanes.declaredProjectName(for: workspace), "term-mesh")
+    }
+
+    /// The title is a fallback, not the source of truth: a workspace the user
+    /// happened to name `[something]` must not outrank its own declaration.
+    func test_anExplicitDeclarationOutranksTheTitle() {
+        let workspace = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        workspace.customTitle = "[term-mesh]"
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: workspace.id) }
+        WorkspaceProjectNames.shared.declare(workspaceId: workspace.id, projectName: "xm")
+
+        XCTAssertEqual(SessionHostPanes.declaredProjectName(for: workspace), "xm")
+    }
+
+    func test_anOrdinaryTitleClaimsNoProject() {
+        let titles: [String?] = [nil, "", "Terminal 1", "[]", "[ ]", "[unclosed", "unopened]"]
+        for title in titles {
+            XCTAssertNil(
+                SessionHostPanes.projectName(fromWorkspaceTitle: title),
+                "\(title ?? "<nil>") is not a project title"
+            )
+        }
+        XCTAssertEqual(
+            SessionHostPanes.projectName(fromWorkspaceTitle: "[h2-verify-fda00162]"),
+            "h2-verify-fda00162"
+        )
+    }
+
+    /// `TeamOrchestrator` titles a team workspace `[project] 3 headless`.
+    /// Requiring the title to end in `]` left a resumed headless team
+    /// unrecognized, so it kept getting a second workspace.
+    func test_aTrailingCountStillNamesTheProject() {
+        XCTAssertEqual(
+            SessionHostPanes.projectName(fromWorkspaceTitle: "[term-mesh] 3 headless"),
+            "term-mesh"
+        )
+        XCTAssertEqual(
+            SessionHostPanes.projectName(fromWorkspaceTitle: "[term-mesh]"),
+            "term-mesh"
+        )
+    }
+
+    /// The title is a fallback for reading, never a claim worth keeping. The app
+    /// itself titles a worktree workspace `[<branch>]` and a socket rename can
+    /// produce any bracketed title, so persisting the recovery would let a
+    /// presentation string permanently outrank `SidebarViews`' path inference
+    /// with no way to revoke it short of closing the workspace.
+    func test_theTitleFallbackNeverWritesADeclaration() {
+        let workspace = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        workspace.customTitle = "[feat/some-branch]"
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: workspace.id) }
+
+        XCTAssertEqual(
+            SessionHostPanes.declaredProjectName(for: workspace), "feat/some-branch"
+        )
+        XCTAssertNil(
+            WorkspaceProjectNames.shared.projectName(for: workspace.id),
+            "reading a title must not declare the workspace"
+        )
+    }
+
+    /// The invariant the whole change exists for, asserted end to end through
+    /// the expression the routing actually evaluates: restored project
+    /// workspaces carry no declaration, and must still resolve to themselves
+    /// rather than to one more new workspace.
+    func test_restoredProjectWorkspacesRouteToThemselvesNotToNewOnes() {
+        let restored = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        restored.customTitle = "[term-mesh]"
+        let unrelated = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        defer {
+            WorkspaceProjectNames.shared.forget(workspaceId: restored.id)
+            WorkspaceProjectNames.shared.forget(workspaceId: unrelated.id)
+        }
+
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: "term-mesh",
+                declaredProjects: SessionHostPanes.declaredProjects(
+                    in: [restored, unrelated]
+                ),
+                hostSessionsWorkspaceID: nil
+            ),
+            .existingProject(restored.id),
+            "a second [term-mesh] workspace per launch is exactly the bug"
+        )
+    }
+
+    /// A bracketed title is only a recovery hint. A worktree named like a
+    /// project must not steal routing from that project's durable declaration,
+    /// even when the worktree appears first in tab/window order.
+    func test_anExplicitProjectOutranksAMatchingTitleAcrossWorkspaces() {
+        let worktree = Workspace(title: "Terminal", workingDirectory: "/tmp/worktree")
+        worktree.customTitle = "[term-mesh]"
+        let project = Workspace(title: "Terminal", workingDirectory: "/tmp/project")
+        project.customTitle = "[term-mesh]"
+        defer {
+            WorkspaceProjectNames.shared.forget(workspaceId: worktree.id)
+            WorkspaceProjectNames.shared.forget(workspaceId: project.id)
+        }
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: project.id, projectName: "term-mesh"
+        )
+
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: "term-mesh",
+                declaredProjects: SessionHostPanes.declaredProjects(
+                    in: [worktree, project]
+                ),
+                hostSessionsWorkspaceID: nil
+            ),
+            .existingProject(project.id)
+        )
+    }
+
     // MARK: - Which sessions get a pane
 
     /// Everything the daemon holds deserves a window here: it owns it, so it

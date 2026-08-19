@@ -96,6 +96,9 @@ class TabManager {
     // every stored property would otherwise become an invalidation source, and
     // `pendingPanelTitleUpdates` alone is written at the coalescer's 30Hz.
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
+    /// Set while `restoreSession` rebuilds a saved order, so `addWorkspace`
+    /// appends rather than consulting the new-workspace placement preference.
+    @ObservationIgnored private var appendsInOrder = false
     @ObservationIgnored private var suppressFocusFlash = false
     @ObservationIgnored private var lastFocusedPanelByTab: [UUID: UUID] = [:]
     private struct PanelTitleUpdateKey: Hashable {
@@ -145,9 +148,14 @@ class TabManager {
         // opts into restoring the saved session. Secondary windows opened via
         // AppDelegate.createMainWindow intentionally start with a fresh workspace so
         // they don't duplicate the primary window's workspaces.
+        // An isolated e2e run restores regardless of the machine's preference:
+        // the runner host may have session restore turned off, and a test that
+        // silently skipped the restore would pass without asserting anything.
+        let restoresSession = SessionRestoreSettings.mode() == .always
+            || SessionRestoreSettings.stateDirectoryOverride() != nil
         if initialWorkingDirectory == nil,
            restoreSavedSession,
-           SessionRestoreSettings.mode() == .always,
+           restoresSession,
            let saved = Self.loadSavedSession() {
             restoreSession(saved)
         } else {
@@ -377,7 +385,7 @@ class TabManager {
     }
 
     @discardableResult
-    func addWorkspace(workingDirectory overrideWorkingDirectory: String? = nil, select: Bool = true, command: String? = nil, environment: [String: String] = [:]) -> Workspace {
+    func addWorkspace(workingDirectory overrideWorkingDirectory: String? = nil, select: Bool = true, command: String? = nil, environment: [String: String] = [:], id: UUID? = nil) -> Workspace {
         sentryBreadcrumb("workspace.create", data: ["tabCount": tabs.count + 1])
         let workingDirectory = normalizedWorkingDirectory(overrideWorkingDirectory) ?? preferredWorkingDirectoryForNewTab()
 
@@ -392,6 +400,7 @@ class TabManager {
         Self.nextPortOrdinal += 1
         let tabNumber = tabs.count + 1
         let newWorkspace = Workspace(
+            id: id ?? UUID(),
             title: "Terminal \(tabNumber)",
             workingDirectory: workingDirectory,
             portOrdinal: ordinal,
@@ -432,7 +441,12 @@ class TabManager {
         }
 
         wireClosedBrowserTracking(for: newWorkspace)
-        let insertIndex = newTabInsertIndex()
+        // A restore rebuilds an order the user already arranged, so the
+        // placement preference — which describes where a *new* workspace goes —
+        // does not apply. Under `.top` it returned `pinnedCount`, which is 0 for
+        // an unpinned session, so every restored workspace landed at index 0 and
+        // the sidebar came back reversed on each launch.
+        let insertIndex = appendsInOrder ? tabs.count : newTabInsertIndex()
         if insertIndex >= 0 && insertIndex <= tabs.count {
             tabs.insert(newWorkspace, at: insertIndex)
         } else {
@@ -470,8 +484,12 @@ class TabManager {
         qos: .utility
     )
 
-    func saveSessionState() {
-        guard persistsSessionState else { return }
+    /// The saved form of the current workspaces, split out from
+    /// `saveSessionState` so a test can assert what gets written without
+    /// touching the real session file — `sessionFilePath` is a fixed shared
+    /// path, so a test that saved for real would clobber the developer's own
+    /// session.
+    func savedSessionState() -> SavedSessionState {
         // Main-thread snapshot (Workspace is @MainActor-isolated).
         let teamWorkspaceIds = Set(
             TeamOrchestrator.shared.teams.values.map { $0.workspaceId }
@@ -489,6 +507,7 @@ class TabManager {
             }()
             let paneDirs = Self.collectPaneDirectories(in: workspace)
             return SavedWorkspaceState(
+                id: workspace.id,
                 title: workspace.title,
                 customTitle: workspace.customTitle,
                 directory: workspace.currentDirectory,
@@ -502,12 +521,18 @@ class TabManager {
         let selectedIndex = selectedTabId.flatMap { id in
             nonTeamTabs.firstIndex(where: { $0.id == id })
         }
-        let session = SavedSessionState(
+        return SavedSessionState(
             version: 2,
             workspaces: workspaceStates,
             selectedIndex: selectedIndex,
-            windowFrame: nil
+            windowFrame: nil,
+            selectedWorkspaceID: selectedIndex.map { nonTeamTabs[$0].id }
         )
+    }
+
+    func saveSessionState() {
+        guard persistsSessionState else { return }
+        let session = savedSessionState()
         let sessionFilePath = SessionRestoreSettings.sessionFilePath
 
         // Off-main JSON encode + atomicWrite. atomicWrite does a rename that
@@ -520,7 +545,7 @@ class TabManager {
                     to: URL(fileURLWithPath: sessionFilePath),
                     options: .atomicWrite
                 )
-                Logger.app.info("session-restore: saved \(workspaceStates.count, privacy: .public) workspace(s) (v2, split trees included)")
+                Logger.app.info("session-restore: saved \(session.workspaces.count, privacy: .public) workspace(s) (v2, split trees included)")
             } catch {
                 Logger.app.error("session-restore: save failed: \(error, privacy: .public)")
             }
@@ -581,11 +606,21 @@ class TabManager {
         }
     }
 
+    /// Restore is otherwise reachable only through `init`, which also reads the
+    /// real session file. Tests need the restore itself, on a session they
+    /// wrote.
+    func restoreSessionForTests(_ session: SavedSessionState) {
+        restoreSession(session)
+    }
+
     private func restoreSession(_ session: SavedSessionState) {
         // Remove the default workspace created by init
         tabs.removeAll()
         selectedTabId = nil
 
+        let adoptsSavedIdentities = session.identitiesBelongToThisBuild
+        appendsInOrder = true
+        defer { appendsInOrder = false }
         let fm = FileManager.default
         for saved in session.workspaces {
             let fallbackDir = fm.fileExists(atPath: saved.directory)
@@ -609,7 +644,21 @@ class TabManager {
                 return dir
             }()
 
-            let workspace = addWorkspace(workingDirectory: rootDir, select: false)
+            // Two workspaces sharing an ID would share every UUID-keyed
+            // sidecar, so a repeated or already-live ID falls back to a fresh
+            // one — as does an ID another build minted, which a sibling
+            // process may still be holding. `id` stays an additive optional
+            // rather than a version bump: `loadSavedSession` rejects any
+            // version it does not know, so a bump would make a downgrade drop
+            // the whole session.
+            let restoredID: UUID? = adoptsSavedIdentities
+                ? saved.id.flatMap { candidate in
+                    tabs.contains(where: { $0.id == candidate }) ? nil : candidate
+                }
+                : nil
+            let workspace = addWorkspace(
+                workingDirectory: rootDir, select: false, id: restoredID
+            )
             if let customTitle = saved.customTitle {
                 workspace.customTitle = customTitle
                 workspace.title = customTitle
@@ -627,12 +676,23 @@ class TabManager {
             }
         }
 
-        // Restore selected tab
-        if let idx = session.selectedIndex, idx >= 0, idx < tabs.count {
+        // Restore selected tab. By ID first: the index is a position in the
+        // saved array, so anything that reorders during restore selects the
+        // wrong workspace. The index remains the fallback for sessions written
+        // before the ID was saved.
+        if adoptsSavedIdentities,
+           let savedID = session.selectedWorkspaceID,
+           tabs.contains(where: { $0.id == savedID }) {
+            selectedTabId = savedID
+        } else if let idx = session.selectedIndex, idx >= 0, idx < tabs.count {
             selectedTabId = tabs[idx].id
         } else if let first = tabs.first {
             selectedTabId = first.id
         }
+        // Launch is the one moment the live workspaces are exactly the restored
+        // ones, so it is the only place a declaration for a workspace that no
+        // longer exists can be told apart from one still in use.
+        WorkspaceProjectNames.shared.retain(ids: Set(tabs.map(\.id)))
         let version = session.version
         Logger.app.info("session-restore: restored \(self.tabs.count, privacy: .public) workspace(s) (v\(version, privacy: .public))")
     }
@@ -1017,6 +1077,11 @@ class TabManager {
         }
 
         sentryBreadcrumb("workspace.close", data: ["tabCount": max(0, tabs.count - 1)])
+
+        // The declaration outlives the workspace otherwise: nothing ever
+        // called `forget`, so the stored map kept every ID this install had
+        // ever declared.
+        WorkspaceProjectNames.shared.forget(workspaceId: workspace.id)
 
         // Live mirror: drop the layout-sync plane first (subscription,
         // heartbeat, lease ref). Pane sessions tear down below via each

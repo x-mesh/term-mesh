@@ -27,23 +27,54 @@ final class WorkspaceProjectNames {
 
     private static let storageKey = "termmesh.workspaceProjectNames"
 
+    /// The suite an e2e run declares into instead of the standard domain.
+    ///
+    /// The runner launches `term-mesh DEV`, which shares a bundle — and so a
+    /// `UserDefaults.standard` domain — with the DEV app a developer keeps
+    /// open. Swapping the suite keeps the key, the plist encoding, and the
+    /// cross-process persistence this relies on, while leaving the real domain
+    /// untouched.
+    private static let testSuiteName = "com.termmesh.e2e"
+
     /// Workspace UUID string → project name.
     private var names: [String: String]
+    private let store: UserDefaults
 
     private init() {
-        names = UserDefaults.standard.dictionary(forKey: Self.storageKey) as? [String: String] ?? [:]
+        let isolated = SessionRestoreSettings.stateDirectoryOverride() != nil
+        store = (isolated ? UserDefaults(suiteName: Self.testSuiteName) : nil) ?? .standard
+        names = store.dictionary(forKey: Self.storageKey) as? [String: String] ?? [:]
     }
 
     func declare(workspaceId: UUID, projectName: String) {
         let trimmed = projectName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         names[workspaceId.uuidString] = trimmed
-        UserDefaults.standard.set(names, forKey: Self.storageKey)
+        store.set(names, forKey: Self.storageKey)
     }
 
     func forget(workspaceId: UUID) {
         guard names.removeValue(forKey: workspaceId.uuidString) != nil else { return }
-        UserDefaults.standard.set(names, forKey: Self.storageKey)
+        store.set(names, forKey: Self.storageKey)
+    }
+
+    /// Drop every declaration outside `ids`.
+    ///
+    /// `forget` covers a workspace someone closes, which leaves out the ones
+    /// that simply stop existing: team and peer-mirror workspaces are excluded
+    /// from the saved session, and quitting the app ends them without a close.
+    /// Their declarations named an ID no launch can produce again, so nothing
+    /// ever removed them and the map kept every one this install had declared.
+    ///
+    /// Called once with the workspaces a restore produced. A team workspace
+    /// created later this run declares itself as it is built, so pruning to the
+    /// restored set cannot strand one that is still coming.
+    func retain(ids: Set<UUID>) {
+        let live = Set(ids.map(\.uuidString))
+        let pruned = names.filter { live.contains($0.key) }
+        guard pruned.count != names.count else { return }
+        names = pruned
+        store.set(names, forKey: Self.storageKey)
     }
 
     func projectName(for workspaceId: UUID) -> String? {
