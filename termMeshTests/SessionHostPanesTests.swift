@@ -134,10 +134,6 @@ final class SessionHostPanesTests: XCTestCase {
             "a restored workspace starts with no declaration"
         )
         XCTAssertEqual(SessionHostPanes.declaredProjectName(for: workspace), "term-mesh")
-        XCTAssertEqual(
-            WorkspaceProjectNames.shared.projectName(for: workspace.id), "term-mesh",
-            "recovery re-declares, so the next lookup no longer needs the title"
-        )
     }
 
     /// The title is a fallback, not the source of truth: a workspace the user
@@ -145,8 +141,8 @@ final class SessionHostPanesTests: XCTestCase {
     func test_anExplicitDeclarationOutranksTheTitle() {
         let workspace = Workspace(title: "Terminal", workingDirectory: "/tmp")
         workspace.customTitle = "[term-mesh]"
-        WorkspaceProjectNames.shared.declare(workspaceId: workspace.id, projectName: "xm")
         defer { WorkspaceProjectNames.shared.forget(workspaceId: workspace.id) }
+        WorkspaceProjectNames.shared.declare(workspaceId: workspace.id, projectName: "xm")
 
         XCTAssertEqual(SessionHostPanes.declaredProjectName(for: workspace), "xm")
     }
@@ -162,6 +158,65 @@ final class SessionHostPanesTests: XCTestCase {
         XCTAssertEqual(
             SessionHostPanes.projectName(fromWorkspaceTitle: "[h2-verify-fda00162]"),
             "h2-verify-fda00162"
+        )
+    }
+
+    /// `TeamOrchestrator` titles a team workspace `[project] 3 headless`.
+    /// Requiring the title to end in `]` left a resumed headless team
+    /// unrecognized, so it kept getting a second workspace.
+    func test_aTrailingCountStillNamesTheProject() {
+        XCTAssertEqual(
+            SessionHostPanes.projectName(fromWorkspaceTitle: "[term-mesh] 3 headless"),
+            "term-mesh"
+        )
+        XCTAssertEqual(
+            SessionHostPanes.projectName(fromWorkspaceTitle: "[term-mesh]"),
+            "term-mesh"
+        )
+    }
+
+    /// The title is a fallback for reading, never a claim worth keeping. The app
+    /// itself titles a worktree workspace `[<branch>]` and a socket rename can
+    /// produce any bracketed title, so persisting the recovery would let a
+    /// presentation string permanently outrank `SidebarViews`' path inference
+    /// with no way to revoke it short of closing the workspace.
+    func test_theTitleFallbackNeverWritesADeclaration() {
+        let workspace = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        workspace.customTitle = "[feat/some-branch]"
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: workspace.id) }
+
+        XCTAssertEqual(
+            SessionHostPanes.declaredProjectName(for: workspace), "feat/some-branch"
+        )
+        XCTAssertNil(
+            WorkspaceProjectNames.shared.projectName(for: workspace.id),
+            "reading a title must not declare the workspace"
+        )
+    }
+
+    /// The invariant the whole change exists for, asserted end to end through
+    /// the expression the routing actually evaluates: restored project
+    /// workspaces carry no declaration, and must still resolve to themselves
+    /// rather than to one more new workspace.
+    func test_restoredProjectWorkspacesRouteToThemselvesNotToNewOnes() {
+        let restored = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        restored.customTitle = "[term-mesh]"
+        let unrelated = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        defer {
+            WorkspaceProjectNames.shared.forget(workspaceId: restored.id)
+            WorkspaceProjectNames.shared.forget(workspaceId: unrelated.id)
+        }
+
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: "term-mesh",
+                declaredProjects: SessionHostPanes.declaredProjects(
+                    in: [restored, unrelated]
+                ),
+                hostSessionsWorkspaceID: nil
+            ),
+            .existingProject(restored.id),
+            "a second [term-mesh] workspace per launch is exactly the bug"
         )
     }
 

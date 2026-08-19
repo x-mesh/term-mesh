@@ -471,8 +471,12 @@ class TabManager {
         qos: .utility
     )
 
-    func saveSessionState() {
-        guard persistsSessionState else { return }
+    /// The saved form of the current workspaces, split out from
+    /// `saveSessionState` so a test can assert what gets written without
+    /// touching the real session file — `sessionFilePath` is a fixed shared
+    /// path, so a test that saved for real would clobber the developer's own
+    /// session.
+    func savedSessionState() -> SavedSessionState {
         // Main-thread snapshot (Workspace is @MainActor-isolated).
         let teamWorkspaceIds = Set(
             TeamOrchestrator.shared.teams.values.map { $0.workspaceId }
@@ -504,12 +508,17 @@ class TabManager {
         let selectedIndex = selectedTabId.flatMap { id in
             nonTeamTabs.firstIndex(where: { $0.id == id })
         }
-        let session = SavedSessionState(
+        return SavedSessionState(
             version: 2,
             workspaces: workspaceStates,
             selectedIndex: selectedIndex,
             windowFrame: nil
         )
+    }
+
+    func saveSessionState() {
+        guard persistsSessionState else { return }
+        let session = savedSessionState()
         let sessionFilePath = SessionRestoreSettings.sessionFilePath
 
         // Off-main JSON encode + atomicWrite. atomicWrite does a rename that
@@ -522,7 +531,7 @@ class TabManager {
                     to: URL(fileURLWithPath: sessionFilePath),
                     options: .atomicWrite
                 )
-                Logger.app.info("session-restore: saved \(workspaceStates.count, privacy: .public) workspace(s) (v2, split trees included)")
+                Logger.app.info("session-restore: saved \(session.workspaces.count, privacy: .public) workspace(s) (v2, split trees included)")
             } catch {
                 Logger.app.error("session-restore: save failed: \(error, privacy: .public)")
             }
@@ -583,6 +592,13 @@ class TabManager {
         }
     }
 
+    /// Restore is otherwise reachable only through `init`, which also reads the
+    /// real session file. Tests need the restore itself, on a session they
+    /// wrote.
+    func restoreSessionForTests(_ session: SavedSessionState) {
+        restoreSession(session)
+    }
+
     private func restoreSession(_ session: SavedSessionState) {
         // Remove the default workspace created by init
         tabs.removeAll()
@@ -614,7 +630,7 @@ class TabManager {
             // Two workspaces sharing an ID would share every UUID-keyed
             // sidecar, so a repeated or already-live ID falls back to a fresh
             // one. `id` stays an additive optional rather than a version bump:
-            // `loadSession` rejects any version it does not know, so a bump
+            // `loadSavedSession` rejects any version it does not know, so a bump
             // would make a downgrade drop the whole session.
             let restoredID: UUID? = saved.id.flatMap { candidate in
                 tabs.contains(where: { $0.id == candidate }) ? nil : candidate

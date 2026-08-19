@@ -94,38 +94,56 @@ enum SessionHostPanes {
         case newHostSessions
     }
 
-    /// The bracketed title this file writes is the project identity that
+    /// The bracketed prefix this file writes is the project identity that
     /// survives a restart even when the declaration does not.
+    ///
+    /// The prefix, not the whole title: `TeamOrchestrator` writes
+    /// `[project] 3 headless`, so requiring the title to end in `]` left a
+    /// resumed headless team unrecognized — the same proliferation this
+    /// recovery exists to stop, reachable without a restart.
     static func projectName(fromWorkspaceTitle title: String?) -> String? {
         guard let title,
               title.hasPrefix("["),
-              title.hasSuffix("]"),
-              title.count > 2
+              let close = title.firstIndex(of: "]")
         else { return nil }
-        let name = String(title.dropFirst().dropLast())
+        let name = String(title[title.index(after: title.startIndex)..<close])
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty ? nil : name
     }
 
-    /// The declared project for a workspace, re-declaring it when a restore
-    /// dropped the declaration.
+    /// The project a workspace belongs to, falling back to its title when a
+    /// restore left no declaration behind.
     ///
     /// `WorkspaceProjectNames` is keyed by workspace UUID, and a session
-    /// restore that predates persisted workspace IDs mints a new UUID for
-    /// every workspace. Reading the declaration alone therefore reported "no
-    /// workspace owns this project" on every launch, and each launch created
-    /// one more `[project]` workspace for the same project.
+    /// written before workspace IDs were persisted restores workspaces no
+    /// declaration can name. Reading the declaration alone therefore reported
+    /// "no workspace owns this project" on every launch, and each launch
+    /// created one more `[project]` workspace for the same project.
+    ///
+    /// The fallback deliberately does not write the declaration back. A
+    /// bracketed title is not proof of a project: `workspace.create` titles a
+    /// worktree workspace `[<branch>]`, and a rename over the control socket
+    /// produces any bracketed title at all. Persisting those would give a
+    /// presentation string permanent authority over routing — `SidebarViews`
+    /// honors a declaration over its own path inference, and nothing short of
+    /// closing the workspace revokes one. Recomputed per pass instead, a title
+    /// that stops matching stops counting.
     static func declaredProjectName(for workspace: Workspace) -> String? {
-        if let declared = WorkspaceProjectNames.shared.projectName(for: workspace.id) {
-            return declared
+        WorkspaceProjectNames.shared.projectName(for: workspace.id)
+            ?? projectName(fromWorkspaceTitle: workspace.customTitle)
+    }
+
+    /// The project claims `workspaceDestination` chooses among.
+    ///
+    /// Named rather than inlined at the call site so a test can assert the
+    /// decision this change exists to make — that restored `[project]`
+    /// workspaces, which carry no declaration, still resolve to themselves.
+    /// Inlined, reverting the recovery reinstated the proliferation bug without
+    /// failing a single test.
+    static func declaredProjects(in workspaces: [Workspace]) -> [(id: UUID, name: String)] {
+        workspaces.compactMap { workspace in
+            declaredProjectName(for: workspace).map { (id: workspace.id, name: $0) }
         }
-        guard let recovered = projectName(fromWorkspaceTitle: workspace.customTitle) else {
-            return nil
-        }
-        WorkspaceProjectNames.shared.declare(
-            workspaceId: workspace.id, projectName: recovered
-        )
-        return recovered
     }
 
     /// Choose by declared project identity, never by the selected tab. The
@@ -517,11 +535,7 @@ extension SessionHostPanes {
             let projectName = projectNames[surfaceID]
             let destination = workspaceDestination(
                 projectName: projectName,
-                declaredProjects: tabManager.tabs.compactMap { workspace in
-                    declaredProjectName(for: workspace).map {
-                        (id: workspace.id, name: $0)
-                    }
-                },
+                declaredProjects: declaredProjects(in: tabManager.tabs),
                 hostSessionsWorkspaceID: tabManager.tabs.first(where: {
                     $0.customTitle == "Host Sessions"
                 })?.id

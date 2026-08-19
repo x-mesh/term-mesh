@@ -51,7 +51,7 @@ struct SavedWorkspaceState: Codable {
     /// declaration that decides where a hosted session's pane belongs, first
     /// among them — permanently out of reach.
     ///
-    /// Additive and optional rather than a version bump, because `loadSession`
+    /// Additive and optional rather than a version bump, because `loadSavedSession`
     /// accepts only the versions it knows: bumping would make a downgrade drop
     /// the whole session instead of just the IDs. `nil` for sessions written
     /// before this field existed.
