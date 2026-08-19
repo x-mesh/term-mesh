@@ -182,17 +182,26 @@ extension GitHubIssueDraft {
 final class BugReportModel: ObservableObject {
     @Published private(set) var bundle: String = ""
     @Published private(set) var isAwaitingDaemon = false
+    /// Set when this build recognises the failure shape and already has an
+    /// answer for it. Drives the panel that offers the answer instead of the
+    /// issue form.
+    @Published private(set) var knownSignature: DiagnosticsSignature?
 
     func refresh(daemon: (any DaemonService)? = TermMeshDaemon.shared) {
-        bundle = DiagnosticsReport.build(daemonStatus: nil)
+        apply(DiagnosticsReport.current(daemonStatus: nil))
         isAwaitingDaemon = true
         DispatchQueue.global(qos: .userInitiated).async {
             let status = daemon?.daemonStatus()
             DispatchQueue.main.async {
-                self.bundle = DiagnosticsReport.build(daemonStatus: status)
+                self.apply(DiagnosticsReport.current(daemonStatus: status))
                 self.isAwaitingDaemon = false
             }
         }
+    }
+
+    private func apply(_ snapshot: DiagnosticsSnapshot) {
+        bundle = DiagnosticsReport.build(snapshot)
+        knownSignature = DiagnosticsTriage.firstKnownIssue(for: snapshot)?.0
     }
 }
 
@@ -215,6 +224,10 @@ struct BugReportView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if let signature = model.knownSignature, let known = signature.knownIssue {
+                knownIssuePanel(signature: signature, known: known)
+            }
 
             ScrollView {
                 Text(bundle)
@@ -251,6 +264,42 @@ struct BugReportView: View {
         }
         .padding(20)
         .frame(minWidth: 640, minHeight: 520)
+    }
+
+    /// Offered before the issue form, not after it. Someone who already has a
+    /// working answer should get it here rather than after writing a report
+    /// that a maintainer will close as a duplicate. Filing stays available —
+    /// a match is a strong hint, not a verdict on someone else's situation.
+    @ViewBuilder
+    private func knownIssuePanel(signature: DiagnosticsSignature, known: KnownIssue) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("This looks like a known issue", systemImage: "lightbulb")
+                .font(.callout).bold()
+            Text("#\(known.number) — \(known.title)")
+                .font(.callout)
+            Text(known.workaround)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                if let url = known.url {
+                    Link("Open issue #\(known.number)", destination: url)
+                        .font(.callout)
+                }
+                Spacer()
+                Text(signature.id)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.yellow.opacity(0.12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.yellow.opacity(0.5))
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 }
 

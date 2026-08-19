@@ -53,6 +53,23 @@ enum PeerHostControlRPCStatus: Equatable {
 /// protocol mismatches must be absent.
 struct PeerHostHealthBaseline: Equatable {
     var serviceActive = false
+    /// The `root` field of the daemon's own `/tmp` mount, read from
+    /// `/proc/<pid>/mountinfo`.
+    ///
+    /// Empty on a host where it could not be read, and `/` on an ordinary
+    /// one. Under `PrivateTmp=true` it reads
+    /// `/tmp/systemd-private-<id>-term-meshd.service-<rand>/tmp`, which names
+    /// the unit outright — that is the whole reason it is collected. Without
+    /// it the probe can say the control socket is missing but not that it is
+    /// missing *because the daemon's /tmp is a private mount the prober
+    /// cannot see*, and those two lead to opposite conclusions about whether
+    /// the host is broken.
+    ///
+    /// Deliberately outside the verdict and outside the parser's required
+    /// keys: it explains a failure, it does not define one, and an additive
+    /// diagnostic must never be able to turn a readable baseline into no
+    /// baseline at all.
+    var daemonTmpRoot = ""
     var controlPath = "/tmp/term-meshd.sock"
     var controlPathPresent = false
     var controlRPC: PeerHostControlRPCStatus = .unavailable
@@ -156,7 +173,7 @@ enum PeerHostDoctor {
     }
 
     private static let healthBaselineCommandTemplate =
-        #"sh -c 'if [ "$(uname -s)" != Linux ]; then exit 44; fi; u=$(systemctl --user is-active term-meshd 2>/dev/null); s=$(systemctl is-active term-meshd 2>/dev/null); if [ "$s" = active ] || [ "$u" = active ]; then active=1; else active=0; fi; control=${TERMMESH_DAEMON_UNIX_PATH:-}; if [ -z "$control" ]; then control=$(sed -n "s/^TERMMESH_DAEMON_UNIX_PATH=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$control" ] || control=/tmp/term-meshd.sock; peer=${TERMMESH_PEER_SOCKET:-}; if [ -z "$peer" ]; then peer=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$peer" ] || peer=/run/term-mesh/tm-peer.sock; [ -S "$control" ] && cpresent=1 || cpresent=0; [ -S "$peer" ] && ppresent=1 || ppresent=0; cli=$(command -v tm-agent 2>/dev/null); [ -x "$cli" ] || cli=$HOME/.local/bin/tm-agent; if [ ! -x "$cli" ]; then crpc=unknown; elif TERMMESH_DAEMON_UNIX_PATH="$control" "$cli" daemon replay-capacity >/dev/null 2>&1; then crpc=1; else crpc=0; fi; if [ "$s" = active ]; then logs=$(journalctl -u term-meshd --since=-5min --no-pager 2>/dev/null); else logs=$(journalctl --user -u term-meshd --since=-5min --no-pager 2>/dev/null); fi; lag=$(printf "%s\n" "$logs" | grep -c "attach relay lagged"); heal=$(printf "%s\n" "$logs" | grep -c "resume-heal reconnect"); proto=$(printf "%s\n" "$logs" | grep -c "frame length .* exceeds"); echo "health-service-active=$active"; echo "health-control-path=$control"; echo "health-control-present=$cpresent"; echo "health-control-rpc=$crpc"; echo "health-peer-path=$peer"; echo "health-peer-present=$ppresent"; echo "health-relay-lag-5m=$lag"; echo "health-resume-heal-5m=$heal"; echo "health-protocol-mismatch-5m=$proto"'"#
+        #"sh -c 'if [ "$(uname -s)" != Linux ]; then exit 44; fi; u=$(systemctl --user is-active term-meshd 2>/dev/null); s=$(systemctl is-active term-meshd 2>/dev/null); if [ "$s" = active ] || [ "$u" = active ]; then active=1; else active=0; fi; control=${TERMMESH_DAEMON_UNIX_PATH:-}; if [ -z "$control" ]; then control=$(sed -n "s/^TERMMESH_DAEMON_UNIX_PATH=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$control" ] || control=/tmp/term-meshd.sock; peer=${TERMMESH_PEER_SOCKET:-}; if [ -z "$peer" ]; then peer=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$peer" ] || peer=/run/term-mesh/tm-peer.sock; [ -S "$control" ] && cpresent=1 || cpresent=0; [ -S "$peer" ] && ppresent=1 || ppresent=0; cli=$(command -v tm-agent 2>/dev/null); [ -x "$cli" ] || cli=$HOME/.local/bin/tm-agent; if [ ! -x "$cli" ]; then crpc=unknown; elif TERMMESH_DAEMON_UNIX_PATH="$control" "$cli" daemon replay-capacity >/dev/null 2>&1; then crpc=1; else crpc=0; fi; if [ "$s" = active ]; then logs=$(journalctl -u term-meshd --since=-5min --no-pager 2>/dev/null); else logs=$(journalctl --user -u term-meshd --since=-5min --no-pager 2>/dev/null); fi; lag=$(printf "%s\n" "$logs" | grep -c "attach relay lagged"); heal=$(printf "%s\n" "$logs" | grep -c "resume-heal reconnect"); proto=$(printf "%s\n" "$logs" | grep -c "frame length .* exceeds"); dpid=$(systemctl show -p MainPID --value term-meshd 2>/dev/null); if [ -z "$dpid" ] || [ "$dpid" = 0 ]; then dpid=$(systemctl --user show -p MainPID --value term-meshd 2>/dev/null); fi; tmproot=$(grep " /tmp " /proc/$dpid/mountinfo 2>/dev/null | head -1 | cut -d" " -f4); echo "health-service-active=$active"; echo "health-daemon-tmp-root=$tmproot"; echo "health-control-path=$control"; echo "health-control-present=$cpresent"; echo "health-control-rpc=$crpc"; echo "health-peer-path=$peer"; echo "health-peer-present=$ppresent"; echo "health-relay-lag-5m=$lag"; echo "health-resume-heal-5m=$heal"; echo "health-protocol-mismatch-5m=$proto"'"#
 
     /// Sentinel exit code for "no term-meshd binary found" — distinct
     /// from PeerSocketProber.noSocketExitCode (43) so the two probes'
@@ -937,6 +954,11 @@ enum PeerHostDoctor {
         }
         return PeerHostHealthBaseline(
             serviceActive: fields["health-service-active"] == "1",
+            // Not in `expectedKeys`: a host that could not read the daemon's
+            // mountinfo still has a perfectly good baseline, and losing the
+            // whole verdict over a missing explanatory field would be a worse
+            // failure than the one this field was added to explain.
+            daemonTmpRoot: fields["health-daemon-tmp-root"] ?? "",
             controlPath: fields["health-control-path"] ?? "/tmp/term-meshd.sock",
             controlPathPresent: fields["health-control-present"] == "1",
             controlRPC: controlRPC,

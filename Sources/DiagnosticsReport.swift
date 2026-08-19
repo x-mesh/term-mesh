@@ -405,6 +405,11 @@ enum DiagnosticsReport {
         let buildNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
         lines.append("App: \(appVersion) (\(buildNumber))")
 
+        // Early on purpose. The issue URL carries the bundle head-first under a
+        // byte budget, so anything that must survive truncation has to be near
+        // the top — and a recognised failure shape is the single most useful
+        // line a triager can read.
+        appendSignatures(DiagnosticsTriage.signatures(for: snapshot), to: &lines)
         appendDaemon(snapshot.daemonStatus, to: &lines)
         appendPeerHosts(snapshot.peerHosts, to: &lines)
         appendContext(snapshot.context, to: &lines)
@@ -414,6 +419,30 @@ enum DiagnosticsReport {
         appendLogTail("Daemon log", snapshot.daemonLogTail, to: &lines)
 
         return lines.joined(separator: "\n")
+    }
+
+    /// Names the shapes this build recognised, and says plainly when it
+    /// recognised none. "No known signature" is information: it tells a
+    /// triager the bundle was checked and did not match, rather than leaving
+    /// them to wonder whether checking happened at all.
+    private static func appendSignatures(
+        _ signatures: [DiagnosticsSignature],
+        to lines: inout [String]
+    ) {
+        lines.append("")
+        lines.append("Signatures:")
+        guard !signatures.isEmpty else {
+            lines.append("  (none matched — this build did not recognise the failure shape)")
+            return
+        }
+        for signature in signatures {
+            lines.append("  \(signature.id)")
+            lines.append("    \(signature.summary)")
+            if let known = signature.knownIssue {
+                lines.append("    known issue: #\(known.number) — \(known.title)")
+                lines.append("    workaround: \(known.workaround)")
+            }
+        }
     }
 
     private static func appendPeerHosts(_ hosts: [PeerHostSnapshot], to lines: inout [String]) {
