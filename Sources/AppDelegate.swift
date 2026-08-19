@@ -43,6 +43,19 @@ enum AppLaunchEnvironment {
     }
 }
 
+/// term-mesh owns workspace/window restoration through `session.json`. AppKit's
+/// separate persistent-window restoration must stay disabled or it can rebuild a
+/// second SwiftUI window around the same restored pane graph during launch.
+enum NativeWindowRestorationPolicy {
+    static let ignoreStateKey = "ApplePersistenceIgnoreState"
+    static let keepWindowsKey = "NSQuitAlwaysKeepsWindows"
+
+    static func disable(defaults: UserDefaults = .standard) {
+        defaults.set(true, forKey: ignoreStateKey)
+        defaults.set(false, forKey: keepWindowsKey)
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate, NSMenuItemValidation {
     static var shared: AppDelegate?
@@ -224,6 +237,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
+    // These delegate gates are consulted by AppKit before it decodes saved
+    // NSWindow/SwiftUI scene state. They are the authoritative guard; the
+    // defaults policy also prevents restoration before the delegate is ready.
+    func applicationShouldSaveApplicationState(_ app: NSApplication) -> Bool {
+        false
+    }
+
+    func applicationShouldRestoreApplicationState(_ app: NSApplication) -> Bool {
+        false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Raise the per-process FD soft limit before any subsystem opens
         // sockets. macOS launchd hands GUI apps a 256-fd default which
@@ -352,11 +376,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
         }
         NSWindow.allowsAutomaticWindowTabbing = false
-        // Disable macOS window state restoration. We manage our own session
-        // restore via TabManager/SessionRestoreSettings. Without this, macOS
-        // can recreate previously-open NSWindows on launch, producing ghost
-        // duplicates that share the SwiftUI WindowGroup's tabManager.
-        UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
+        // Repair the persisted policy in case a previous build or external
+        // defaults write changed it. The same policy is installed in launch
+        // preflight, before SwiftUI/AppKit can begin restoring window state.
+        NativeWindowRestorationPolicy.disable()
         disableNativeTabbingShortcut()
         ensureApplicationIcon()
         if !isRunningUnderXCTest {
@@ -782,6 +805,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         sidebarState: SidebarState,
         sidebarSelectionState: SidebarSelectionState
     ) {
+        // The delegate gates protect the current launch; this also prevents
+        // both SwiftUI-created and AppKit-created main windows from being
+        // archived for a later launch.
+        window.isRestorable = false
         let key = ObjectIdentifier(window)
         #if DEBUG
         let priorManagerToken = debugManagerToken(self.tabManager)

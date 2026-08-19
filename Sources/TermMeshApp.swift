@@ -10,6 +10,11 @@ import Bonsplit
 /// that first singleton access, not merely before the `init()` body finishes.
 private enum TermMeshLaunchPreflight {
     static func prepare() -> AppearanceMode {
+        // Must precede NSApp creation and every singleton access. term-mesh
+        // restores its pane graph from session.json; allowing AppKit to restore
+        // the SwiftUI window too can make both systems rebuild the same large
+        // focus graph during launch.
+        NativeWindowRestorationPolicy.disable()
         GhosttyEnvironment.configureOnce()
         let appearance = AppearanceSettings.resolvedMode()
         // `TerminalThemeOverride` consults the effective AppKit appearance for
