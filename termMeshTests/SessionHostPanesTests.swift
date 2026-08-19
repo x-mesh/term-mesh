@@ -19,6 +19,38 @@ import PeerProto
 /// mirror showed one. These tests cover the per-surface decision instead.
 @MainActor
 final class SessionHostPanesTests: XCTestCase {
+    func test_teamHostSnapshotAcceptsOnlyTheCurrentRouteAndServingGeneration() {
+        let ownerA = PeerPaneHostKey.ssh(
+            target: "host", remoteSockPath: "/owner-a.sock", port: nil
+        )
+        let ownerB = PeerPaneHostKey.ssh(
+            target: "host", remoteSockPath: "/owner-b.sock", port: nil
+        )
+        let pending = TeamHostReadiness.probing(ownerB)
+        let stale = TeamHostCapabilitySnapshot(
+            endpoint: ownerA, appVersion: "0.193.0",
+            supportsPeerOwnedAgentHosting: true, supportsRemoteTeamRoute: true,
+            looksLikeGUIPeerHost: false, redirectedFromServingEndpoint: true
+        )
+        XCTAssertEqual(acceptingTeamHostSnapshot(
+            current: pending, expectedEndpoint: ownerB,
+            servingPathMatches: true, snapshot: stale
+        ), pending)
+
+        let current = TeamHostCapabilitySnapshot(
+            endpoint: ownerB, appVersion: "0.200.0",
+            supportsPeerOwnedAgentHosting: true, supportsRemoteTeamRoute: true,
+            looksLikeGUIPeerHost: false, redirectedFromServingEndpoint: true
+        )
+        XCTAssertEqual(acceptingTeamHostSnapshot(
+            current: pending, expectedEndpoint: ownerB,
+            servingPathMatches: false, snapshot: current
+        ), pending, "a retired serving tunnel cannot publish metadata")
+        XCTAssertEqual(acceptingTeamHostSnapshot(
+            current: pending, expectedEndpoint: ownerB,
+            servingPathMatches: true, snapshot: current
+        ), .ready(current))
+    }
 
     private func sid(_ byte: UInt8) -> Data { Data(repeating: byte, count: 16) }
 

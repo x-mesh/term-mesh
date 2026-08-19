@@ -683,6 +683,17 @@ extension TerminalController {
                         )
                         let gitURL = params["git_url"] as? String
                         let presets = AgentRolePresetManager.shared.presets
+                        let missingRoles = plan.agentCheckouts.map(\.agent).filter {
+                            Self.debugProjectPreset(named: $0, presets: presets) == nil
+                        }
+                        guard missingRoles.isEmpty else {
+                            result = .err(
+                                code: "invalid_params",
+                                message: "unknown agent role(s): \(missingRoles.joined(separator: ", "))",
+                                data: nil
+                            )
+                            return
+                        }
                         guard let tabManager = self.tabManager else {
                             result = .err(code: "unavailable", message: "no TabManager", data: nil)
                             return
@@ -701,13 +712,15 @@ extension TerminalController {
                                 )
                             )
                             let rows: [TeamAgentRow] = plan.agentCheckouts.compactMap { checkout in
-                                guard let preset = presets.first(where: { $0.name == checkout.agent })
-                                else { return nil }
+                                guard let preset = Self.debugProjectPreset(
+                                    named: checkout.agent, presets: presets
+                                ) else { return nil }
                                 var row = TeamAgentRow(preset: preset, customInstructions: "")
                                 row.hostKey = hostKey
                                 row.hostDirectory = checkout.path
                                 return row
                             }
+                            precondition(rows.count == plan.agentCheckouts.count)
                             TeamOrchestrator.shared.createTeam(
                                 named: URL(fileURLWithPath: directory).lastPathComponent,
                                 rows: rows,
@@ -854,6 +867,14 @@ extension TerminalController {
             }
         }
         return result
+    }
+
+    static func debugProjectPreset(
+        named name: String,
+        presets: [AgentRolePreset]
+    ) -> AgentRolePreset? {
+        presets.first(where: { $0.name == name })
+            ?? AgentRolePresetManager.builtInPresets.first(where: { $0.name == name })
     }
 
     func v2DebugProjectDelete(params: [String: Any]) -> V2CallResult {

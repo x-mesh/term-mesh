@@ -2990,19 +2990,18 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         )
     }
 
-    /// Project and team creation must disclose the same ownership downgrade
-    /// the attach path will take. The warning is capability-driven and uses
-    /// the serving version from the handshake, not a binary found on PATH.
+    /// Project and team creation consume the team endpoint snapshot, never the
+    /// serving endpoint's raw capability. This is the #279 regression matrix:
+    /// a GUI serving socket may be incapable while its advertised daemon is
+    /// fully capable.
     @MainActor
     func test_creationPreflight_namesServingVersionBeforeNativeOwnershipFallback() {
         let restore = Self.forceNativePanes(true)
         defer { restore() }
 
-        var oldHost = Self.agentHostEntry()
-        oldHost.displayName = "mac-sub"
-        oldHost.servingAppVersion = "0.179.0"
-        oldHost.supportsPeerOwnedAgentHosting = false
-        oldHost.supportsRemoteTeamRoute = true
+        var host = Self.agentHostEntry()
+        host.displayName = "mac-sub"
+        host.sessionHostRemoteSockPath = ""
 
         func row(_ cli: String) -> TeamAgentRow {
             TeamAgentRow(
@@ -3012,71 +3011,177 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
                     instructions: "", isBuiltIn: false
                 ),
                 customInstructions: "",
-                hostKey: oldHost.id
+                hostKey: host.id
             )
         }
 
-        let notices = TeamAgentComposer.peerOwnedFallbackNotices(
+        func snapshot(
+            supportsOwned: Bool,
+            supportsRoute: Bool = true,
+            gui: Bool = false,
+            redirected: Bool = false,
+            version: String = "0.179.0"
+        ) -> TeamHostCapabilitySnapshot {
+            TeamHostCapabilitySnapshot(
+                endpoint: host.teamHostSpec!.hostKey,
+                appVersion: version,
+                supportsPeerOwnedAgentHosting: supportsOwned,
+                supportsRemoteTeamRoute: supportsRoute,
+                looksLikeGUIPeerHost: gui,
+                redirectedFromServingEndpoint: redirected
+            )
+        }
+
+        host.teamHostReadiness = .ready(snapshot(supportsOwned: false))
+        var notices = TeamAgentComposer.peerOwnedFallbackNotices(
             agents: [row("codex"), row("kiro"), row("claude")],
-            hosts: [oldHost]
+            hosts: [host]
         )
         XCTAssertEqual(notices.count, 1, "one host gets one preflight warning")
-        XCTAssertEqual(notices[0].servingVersion, "v0.179.0")
+        XCTAssertEqual(notices[0].teamHostVersion, "v0.179.0")
         XCTAssertEqual(notices[0].clis, ["claude", "codex", "kiro"])
-        XCTAssertTrue(notices[0].message.contains("mac-sub"))
-        XCTAssertTrue(notices[0].message.contains("term-mesh v0.179.0"))
-        XCTAssertTrue(notices[0].message.contains("through this Mac over SSH"))
-        XCTAssertTrue(notices[0].message.contains("stop if this app quits"))
+        XCTAssertEqual(notices[0].reason, .daemonTooOld)
+        XCTAssertTrue(notices[0].message.contains("Update and restart"))
 
-        oldHost.supportsRemoteTeamRoute = false
+        host.teamHostReadiness = .ready(snapshot(supportsOwned: false, supportsRoute: false))
         let blocked = TeamAgentComposer.peerOwnedFallbackNotices(
-            agents: [row("codex"), row("claude")], hosts: [oldHost]
+            agents: [row("codex"), row("claude")], hosts: [host]
         )
         XCTAssertEqual(blocked.count, 1)
         XCTAssertFalse(blocked[0].blocksTeamMessaging)
-        XCTAssertEqual(blocked[0].clis, ["claude", "codex"])
-        XCTAssertTrue(blocked[0].message.contains("private SSH route"))
         XCTAssertFalse(
             TeamAgentComposer.blocksRemoteTeamCreation(
-                agents: [row("codex")], hosts: [oldHost]
+                agents: [row("codex")], hosts: [host]
             ),
             "SSH-owned Native has its own scoped reverse control route"
         )
 
-        oldHost.sshTarget = nil
+        host.sshTarget = nil
         let noSSHRoute = TeamAgentComposer.peerOwnedFallbackNotices(
-            agents: [row("codex"), row("claude")], hosts: [oldHost]
+            agents: [row("codex"), row("claude")], hosts: [host]
         )
         XCTAssertEqual(noSSHRoute.count, 1)
         XCTAssertTrue(noSSHRoute[0].blocksTeamMessaging)
-        XCTAssertEqual(noSSHRoute[0].clis, ["claude", "codex"])
         XCTAssertTrue(noSSHRoute[0].message.contains("tm-agent returns no_app"))
-        XCTAssertTrue(noSSHRoute[0].message.contains("Update and restart"))
 
-        oldHost.supportsPeerOwnedAgentHosting = true
-        oldHost.supportsRemoteTeamRoute = true
+        host.sshTarget = "root@jw-server"
+        host.teamHostReadiness = .ready(snapshot(supportsOwned: true))
         XCTAssertTrue(
             TeamAgentComposer.peerOwnedFallbackNotices(
-                agents: [row("codex")], hosts: [oldHost]
+                agents: [row("codex")], hosts: [host]
             ).isEmpty,
-            "a compatible serving daemon needs no warning"
+            "a compatible team endpoint needs no warning"
         )
-        var staleHost = oldHost
-        staleHost.supportsPeerOwnedAgentHosting = false
-        XCTAssertEqual(
-            TeamAgentComposer.peerOwnedFallbackNotices(
-                agents: [row("claude")], hosts: [staleHost]
-            ).first?.clis,
-            ["claude"],
-            "Claude now has a durable peer-owned recipe too"
+
+        host.teamHostReadiness = .ready(snapshot(
+            supportsOwned: false, supportsRoute: false, gui: true, redirected: false
+        ))
+        notices = TeamAgentComposer.peerOwnedFallbackNotices(
+            agents: [row("claude")], hosts: [host]
         )
-        XCTAssertTrue(
-            TeamAgentComposer.blocksRemoteTeamCreation(
-                agents: [row("claude")], hosts: [staleHost],
-                requiresDurableProject: true
-            ),
-            "New Project must not silently create a viewer-owned Claude worker"
+        XCTAssertEqual(notices.first?.reason, .guiHostNoSessionOwner)
+        XCTAssertFalse(notices.first?.message.contains("Update and restart") == true)
+
+        // The exact regression: the serving GUI says false, but team work is
+        // redirected to a capable daemon. Only the daemon snapshot may decide.
+        host.sessionHostRemoteSockPath = "/run/user/501/term-meshd.sock"
+        host.teamHostReadiness = .ready(TeamHostCapabilitySnapshot(
+            endpoint: host.teamHostSpec!.hostKey, appVersion: "0.193.0",
+            supportsPeerOwnedAgentHosting: true, supportsRemoteTeamRoute: true,
+            looksLikeGUIPeerHost: false, redirectedFromServingEndpoint: true
+        ))
+        XCTAssertTrue(TeamAgentComposer.peerOwnedFallbackNotices(
+            agents: [row("claude")], hosts: [host]
+        ).isEmpty)
+        XCTAssertFalse(TeamAgentComposer.blocksRemoteTeamCreation(
+            agents: [row("claude")], hosts: [host], requiresDurableProject: true
+        ))
+
+        host.teamHostReadiness = .probing(host.teamHostSpec!.hostKey)
+        XCTAssertEqual(TeamAgentComposer.peerOwnedFallbackNotices(
+            agents: [row("claude")], hosts: [host]
+        ).first?.reason, .checkingTeamHost)
+        XCTAssertTrue(TeamAgentComposer.blocksRemoteTeamCreation(
+            agents: [row("claude")], hosts: [host], requiresDurableProject: true
+        ))
+
+        host.teamHostReadiness = .unreachable(host.teamHostSpec!.hostKey)
+        XCTAssertEqual(TeamAgentComposer.peerOwnedFallbackNotices(
+            agents: [row("claude")], hosts: [host]
+        ).first?.reason, .teamHostUnreachable)
+    }
+
+    @MainActor
+    func test_peerOwnedAvailabilityUsesTheSameTeamEndpointSnapshotAsPreflight() {
+        let endpoint = PeerPaneHostKey.ssh(
+            target: "root@host", remoteSockPath: "/run/term-mesh/peer.sock", port: nil
         )
+        XCTAssertEqual(TeamOrchestrator.peerOwnedAvailability(from: .init(
+            endpoint: endpoint, appVersion: "0.200.0",
+            supportsPeerOwnedAgentHosting: true, supportsRemoteTeamRoute: true,
+            looksLikeGUIPeerHost: false, redirectedFromServingEndpoint: true
+        )), .available)
+        XCTAssertEqual(TeamOrchestrator.peerOwnedAvailability(from: .init(
+            endpoint: endpoint, appVersion: "0.190.0",
+            supportsPeerOwnedAgentHosting: false, supportsRemoteTeamRoute: true,
+            looksLikeGUIPeerHost: false, redirectedFromServingEndpoint: true
+        )), .blocked(.daemonTooOld))
+        XCTAssertEqual(TeamOrchestrator.peerOwnedAvailability(from: .init(
+            endpoint: endpoint, appVersion: "0.190.0",
+            supportsPeerOwnedAgentHosting: true, supportsRemoteTeamRoute: false,
+            looksLikeGUIPeerHost: false, redirectedFromServingEndpoint: true
+        )), .blocked(.daemonTooOld))
+        XCTAssertEqual(TeamOrchestrator.peerOwnedAvailability(from: .init(
+            endpoint: endpoint, appVersion: "0.200.0",
+            supportsPeerOwnedAgentHosting: false, supportsRemoteTeamRoute: true,
+            looksLikeGUIPeerHost: true, redirectedFromServingEndpoint: false
+        )), .blocked(.guiHostNoSessionOwner))
+
+        let staleRouteSnapshot = TeamHostCapabilitySnapshot(
+            endpoint: endpoint, appVersion: "0.190.0",
+            supportsPeerOwnedAgentHosting: true, supportsRemoteTeamRoute: false,
+            looksLikeGUIPeerHost: false, redirectedFromServingEndpoint: true
+        )
+        XCTAssertTrue(TeamOrchestrator.teamRouteAllowsFactory(
+            .peerOwnedAgent, liveAvailability: .available,
+            cachedSnapshot: staleRouteSnapshot
+        ), "the live team-endpoint handshake wins over stale preflight cache")
+        XCTAssertTrue(TeamOrchestrator.teamRouteAllowsFactory(
+            .localNativeBridge, liveAvailability: .blocked(.daemonTooOld),
+            cachedSnapshot: staleRouteSnapshot
+        ), "SSH-owned Native has its own private reverse route")
+        XCTAssertFalse(TeamOrchestrator.teamRouteAllowsFactory(
+            .terminal, liveAvailability: .notApplicable,
+            cachedSnapshot: staleRouteSnapshot
+        ))
+    }
+
+    @MainActor
+    func test_teamHostLaunchWaitRequiresBothLaunchMetadataAndResolvedRoute() {
+        var host = Self.agentHostEntry()
+        XCTAssertFalse(TeamOrchestrator.teamHostCanLaunch(host))
+
+        let provenance = PeerHostEndpointProvenance(
+            sshTarget: "root@jw-server", port: nil, identityFile: nil,
+            remoteSocket: "/run/user/0/tm-peer.sock"
+        )
+        host.configuredEndpoint = provenance
+        _ = host.acceptAuthenticatedHostCLIBinDirs(["/usr/local/bin"], provenance: provenance)
+        XCTAssertTrue(host.isLaunchable)
+        XCTAssertFalse(TeamOrchestrator.teamHostCanLaunch(host))
+
+        host.sessionHostRemoteSockPath = ""
+        XCTAssertFalse(
+            TeamOrchestrator.teamHostCanLaunch(host),
+            "the route answer alone is not an endpoint capability proof"
+        )
+        let endpoint = host.teamHostSpec!.hostKey
+        host.teamHostReadiness = .ready(TeamHostCapabilitySnapshot(
+            endpoint: endpoint, appVersion: "0.200.0",
+            supportsPeerOwnedAgentHosting: true, supportsRemoteTeamRoute: true,
+            looksLikeGUIPeerHost: false, redirectedFromServingEndpoint: false
+        ))
+        XCTAssertTrue(TeamOrchestrator.teamHostCanLaunch(host))
     }
 
     /// A remote worker reaches the owning team through the same scoped

@@ -213,11 +213,21 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
     )
     if created.get("team") != team_name:
         raise termmeshError(f"remote project was not created: {created!r}")
+    checkouts = created.get("checkouts")
+    if not isinstance(checkouts, list) or len(checkouts) != len(roles):
+        raise termmeshError(
+            "remote project bootstrap did not preserve the requested workers: "
+            f"roles={roles!r} created={created!r}"
+        )
 
     def ready_team():
         team = next((item for item in c.team_list() if item.get("team_name") == team_name), None)
         if team and team.get("leader_failure"):
             raise termmeshError(f"remote leader failed: {team['leader_failure']}")
+        if team and team.get("remote_attach_failures"):
+            raise termmeshError(
+                f"remote worker failed: {team['remote_attach_failures']}"
+            )
         agents = team.get("agents") if team else None
         agents_ready = (
             isinstance(agents, list)
@@ -232,7 +242,14 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
 
     team = _wait(ready_team)
     if team is None:
-        raise termmeshError("remote leader never became ready")
+        observed = next(
+            (item for item in c.team_list() if item.get("team_name") == team_name),
+            None,
+        )
+        raise termmeshError(
+            "remote Project never became fully ready; "
+            f"last team snapshot={observed!r}"
+        )
     expected_instances = {
         agent["name"]: agent["agent_instance_id"]
         for agent in team["agents"]
