@@ -213,6 +213,12 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
     )
     if created.get("team") != team_name:
         raise termmeshError(f"remote project was not created: {created!r}")
+    checkouts = created.get("checkouts")
+    if not isinstance(checkouts, list) or len(checkouts) != len(roles):
+        raise termmeshError(
+            "remote project bootstrap did not preserve the requested workers: "
+            f"roles={roles!r} created={created!r}"
+        )
 
     def ready_team():
         team = next((item for item in c.team_list() if item.get("team_name") == team_name), None)
