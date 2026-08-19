@@ -187,19 +187,43 @@ final class BugReportModel: ObservableObject {
     /// issue form.
     @Published private(set) var knownSignature: DiagnosticsSignature?
 
+    /// Snapshots frozen when a host looked unhealthy. Offered because the
+    /// state that explains a failure is usually gone by the time someone gets
+    /// around to reporting it.
+    @Published private(set) var captures: [DiagnosticsCapture] = []
+
+    /// nil selects the live snapshot.
+    @Published var selectedCaptureID: UUID? {
+        didSet { render() }
+    }
+
+    private var liveSnapshot = DiagnosticsSnapshot()
+
     func refresh(daemon: (any DaemonService)? = TermMeshDaemon.shared) {
-        apply(DiagnosticsReport.current(daemonStatus: nil))
+        captures = DiagnosticsCaptureStore.shared.captures
+        liveSnapshot = DiagnosticsReport.current(daemonStatus: nil)
+        render()
         isAwaitingDaemon = true
         DispatchQueue.global(qos: .userInitiated).async {
             let status = daemon?.daemonStatus()
             DispatchQueue.main.async {
-                self.apply(DiagnosticsReport.current(daemonStatus: status))
+                self.liveSnapshot = DiagnosticsReport.current(daemonStatus: status)
                 self.isAwaitingDaemon = false
+                self.render()
             }
         }
     }
 
-    private func apply(_ snapshot: DiagnosticsSnapshot) {
+    var selectedSnapshot: DiagnosticsSnapshot {
+        guard let id = selectedCaptureID,
+              let capture = captures.first(where: { $0.id == id }) else {
+            return liveSnapshot
+        }
+        return capture.snapshot
+    }
+
+    private func render() {
+        let snapshot = selectedSnapshot
         bundle = DiagnosticsReport.build(snapshot)
         knownSignature = DiagnosticsTriage.firstKnownIssue(for: snapshot)?.0
     }
@@ -224,6 +248,10 @@ struct BugReportView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if !model.captures.isEmpty {
+                capturePicker
+            }
 
             if let signature = model.knownSignature, let known = signature.knownIssue {
                 knownIssuePanel(signature: signature, known: known)
@@ -265,6 +293,29 @@ struct BugReportView: View {
         .padding(20)
         .frame(minWidth: 640, minHeight: 520)
     }
+
+    /// Lets the report describe the failure instead of the recovery. The live
+    /// state is the default because it is what most reports are about; the
+    /// frozen ones matter when a host has already come back and taken the
+    /// explanation with it.
+    @ViewBuilder
+    private var capturePicker: some View {
+        Picker("Report on", selection: $model.selectedCaptureID) {
+            Text("Current state").tag(UUID?.none)
+            ForEach(model.captures) { capture in
+                Text("\(capture.reason) — \(Self.relative.localizedString(for: capture.capturedAt, relativeTo: Date()))")
+                    .tag(UUID?.some(capture.id))
+            }
+        }
+        .pickerStyle(.menu)
+        .fixedSize()
+    }
+
+    private static let relative: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter
+    }()
 
     /// Offered before the issue form, not after it. Someone who already has a
     /// working answer should get it here rather than after writing a report

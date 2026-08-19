@@ -136,6 +136,7 @@
 		DR00000001000000010000001 /* DiagnosticsReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR00000002000000020000002 /* DiagnosticsReport.swift */; };
 		DR00000007000000070000007 /* BugReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR00000008000000080000008 /* BugReport.swift */; };
 		DR0000000B0000000B000000B /* DiagnosticsSignature.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR0000000C0000000C000000C /* DiagnosticsSignature.swift */; };
+		DR0000000F0000000F000000F /* DiagnosticsCaptureStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR00000010000000100000010 /* DiagnosticsCaptureStore.swift */; };
 		562D55FA859F4E8B94EB49CB /* TeamCreationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B848F672710C48B1944F70BF /* TeamCreationView.swift */; };
 		TCD00001 /* TeamCreationRecentDirs.swift in Sources */ = {isa = PBXBuildFile; fileRef = TCD00002 /* TeamCreationRecentDirs.swift */; };
 		SRL00001 /* SurfaceReadLease.swift in Sources */ = {isa = PBXBuildFile; fileRef = SRL00002 /* SurfaceReadLease.swift */; };
@@ -293,6 +294,7 @@
 				DR00000005000000050000005 /* DiagnosticsReportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR00000006000000060000006 /* DiagnosticsReportTests.swift */; };
 				DR00000009000000090000009 /* GitHubIssueDraftTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR0000000A0000000A000000A /* GitHubIssueDraftTests.swift */; };
 				DR0000000D0000000D000000D /* DiagnosticsTriageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR0000000E0000000E000000E /* DiagnosticsTriageTests.swift */; };
+				DR00000011000000110000011 /* DiagnosticsCaptureStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DR00000012000000120000012 /* DiagnosticsCaptureStoreTests.swift */; };
 			FE000004A1B2C3D4E5F60718 /* PasteQueueTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */; };
 			FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */; };
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
@@ -486,6 +488,7 @@
 		DR00000002000000020000002 /* DiagnosticsReport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsReport.swift; sourceTree = "<group>"; };
 		DR00000008000000080000008 /* BugReport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BugReport.swift; sourceTree = "<group>"; };
 		DR0000000C0000000C000000C /* DiagnosticsSignature.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsSignature.swift; sourceTree = "<group>"; };
+		DR00000010000000100000010 /* DiagnosticsCaptureStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsCaptureStore.swift; sourceTree = "<group>"; };
 		B848F672710C48B1944F70BF /* TeamCreationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamCreationView.swift; sourceTree = "<group>"; };
 		TCD00002 /* TeamCreationRecentDirs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamCreationRecentDirs.swift; sourceTree = "<group>"; };
 		SRL00002 /* SurfaceReadLease.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceReadLease.swift; sourceTree = "<group>"; };
@@ -644,6 +647,7 @@
 			DR00000006000000060000006 /* DiagnosticsReportTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsReportTests.swift; sourceTree = "<group>"; };
 			DR0000000A0000000A000000A /* GitHubIssueDraftTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubIssueDraftTests.swift; sourceTree = "<group>"; };
 			DR0000000E0000000E000000E /* DiagnosticsTriageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsTriageTests.swift; sourceTree = "<group>"; };
+			DR00000012000000120000012 /* DiagnosticsCaptureStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticsCaptureStoreTests.swift; sourceTree = "<group>"; };
 			FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PasteQueueTests.swift; sourceTree = "<group>"; };
 			FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceManualUnreadTests.swift; sourceTree = "<group>"; };
 			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
@@ -927,6 +931,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				DR00000002000000020000002 /* DiagnosticsReport.swift */,
 				DR00000008000000080000008 /* BugReport.swift */,
 				DR0000000C0000000C000000C /* DiagnosticsSignature.swift */,
+				DR00000010000000100000010 /* DiagnosticsCaptureStore.swift */,
 				A5001703 /* DashboardController.swift */,
 				A5001225 /* SocketControlSettings.swift */,
 				A5001600 /* SentryHelper.swift */,
@@ -1066,6 +1071,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				DR00000006000000060000006 /* DiagnosticsReportTests.swift */,
 				DR0000000A0000000A000000A /* GitHubIssueDraftTests.swift */,
 				DR0000000E0000000E000000E /* DiagnosticsTriageTests.swift */,
+				DR00000012000000120000012 /* DiagnosticsCaptureStoreTests.swift */,
 				FE000005A1B2C3D4E5F60718 /* PasteQueueTests.swift */,
 				FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */,
 				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
@@ -1393,6 +1399,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				DR00000001000000010000001 /* DiagnosticsReport.swift in Sources */,
 				DR00000007000000070000007 /* BugReport.swift in Sources */,
 				DR0000000B0000000B000000B /* DiagnosticsSignature.swift in Sources */,
+				DR0000000F0000000F000000F /* DiagnosticsCaptureStore.swift in Sources */,
 				A5001702 /* DashboardController.swift in Sources */,
 				A5001226 /* SocketControlSettings.swift in Sources */,
 				A5001601 /* SentryHelper.swift in Sources */,
@@ -1503,6 +1510,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				DR00000005000000050000005 /* DiagnosticsReportTests.swift in Sources */,
 				DR00000009000000090000009 /* GitHubIssueDraftTests.swift in Sources */,
 				DR0000000D0000000D000000D /* DiagnosticsTriageTests.swift in Sources */,
+				DR00000011000000110000011 /* DiagnosticsCaptureStoreTests.swift in Sources */,
 				FE000004A1B2C3D4E5F60718 /* PasteQueueTests.swift in Sources */,
 				FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */,
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,

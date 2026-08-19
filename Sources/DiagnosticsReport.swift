@@ -244,6 +244,12 @@ struct DiagnosticsContextSnapshot {
 /// live machine — and it guarantees the Help menu never blocks on SSH.
 struct DiagnosticsSnapshot {
     var capturedAt: Date
+    /// Set when this snapshot was frozen by the capture store rather than
+    /// taken live. A reader has to know which one they are holding: a frozen
+    /// bundle describes a machine that has probably moved on since, and
+    /// mistaking one for the other is how a stale reading sends an
+    /// investigation after the wrong thing.
+    var captureReason: String?
     var daemonStatus: TermMeshDaemon.DaemonStatus?
     var peerHosts: [PeerHostSnapshot]
     var context: DiagnosticsContextSnapshot?
@@ -252,6 +258,7 @@ struct DiagnosticsSnapshot {
 
     init(
         capturedAt: Date = Date(),
+        captureReason: String? = nil,
         daemonStatus: TermMeshDaemon.DaemonStatus? = nil,
         peerHosts: [PeerHostSnapshot] = [],
         context: DiagnosticsContextSnapshot? = nil,
@@ -259,6 +266,7 @@ struct DiagnosticsSnapshot {
         daemonLogTail: [String] = []
     ) {
         self.capturedAt = capturedAt
+        self.captureReason = captureReason
         self.daemonStatus = daemonStatus
         self.peerHosts = peerHosts
         self.context = context
@@ -400,6 +408,10 @@ enum DiagnosticsReport {
         lines.append("term-mesh diagnostics")
         lines.append("=====================")
         lines.append("Date: \(ISO8601DateFormatter().string(from: snapshot.capturedAt))")
+        if let reason = snapshot.captureReason {
+            lines.append("Captured automatically at the time of: \(reason)")
+            lines.append("(frozen snapshot — the host may have changed since)")
+        }
         lines.append("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
         let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
         let buildNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"

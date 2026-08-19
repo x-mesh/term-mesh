@@ -1211,6 +1211,14 @@ struct PeerHostEditorView: View {
         healthBaseline = measured
         if let measured, measured.verdict != .healthy {
             RemoteWorkLog.info("\(draft.sshTarget): peer health \(measured.verdict.rawValue)")
+            // Freeze it here or lose it. This baseline exists only while this
+            // sheet is open; by the time someone files a report the host has
+            // often recovered, and the measurement that explained the failure
+            // is gone. Reuses the probe that just ran — no extra round trip.
+            DiagnosticsCaptureStore.shared.recordUnhealthyHost(
+                sshTarget: draft.sshTarget,
+                health: measured
+            )
         }
     }
 
