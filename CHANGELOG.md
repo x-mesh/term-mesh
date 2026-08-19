@@ -4,6 +4,10 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **앱을 다시 켤 때마다 같은 Project workspace가 하나씩 더 생기던 문제** — `session.json`이 workspace를 복원하면서 그 정체성(ID)까지는 저장하지 않아, 복원된 workspace는 매번 새 ID를 받았다. Project 선언은 그 ID로 보관돼 있어서 재시작 후에는 조회가 항상 실패했고, 그때마다 term-mesh는 "이 Project를 담은 workspace가 아직 없다"고 판단해 `[project]` workspace를 새로 만들었다. team 3개를 쓰는 호스트에서 재시작 한 번에 3개씩 늘어났다. 이제 workspace ID를 세션에 함께 저장하고, ID가 없는 기존 세션은 workspace 제목으로 Project를 되찾는다. workspace를 닫으면 그 선언도 함께 지운다.
+
 ## [0.198.0] - 2026-08-19
 
 **원격 Project pane이 엉뚱한 workspace에 섞이지 않고, 큰 세션과 긴 활동 로그도 앱을 멈추지 않는다.**

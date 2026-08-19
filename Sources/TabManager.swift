@@ -377,7 +377,7 @@ class TabManager {
     }
 
     @discardableResult
-    func addWorkspace(workingDirectory overrideWorkingDirectory: String? = nil, select: Bool = true, command: String? = nil, environment: [String: String] = [:]) -> Workspace {
+    func addWorkspace(workingDirectory overrideWorkingDirectory: String? = nil, select: Bool = true, command: String? = nil, environment: [String: String] = [:], id: UUID? = nil) -> Workspace {
         sentryBreadcrumb("workspace.create", data: ["tabCount": tabs.count + 1])
         let workingDirectory = normalizedWorkingDirectory(overrideWorkingDirectory) ?? preferredWorkingDirectoryForNewTab()
 
@@ -392,6 +392,7 @@ class TabManager {
         Self.nextPortOrdinal += 1
         let tabNumber = tabs.count + 1
         let newWorkspace = Workspace(
+            id: id ?? UUID(),
             title: "Terminal \(tabNumber)",
             workingDirectory: workingDirectory,
             portOrdinal: ordinal,
@@ -489,6 +490,7 @@ class TabManager {
             }()
             let paneDirs = Self.collectPaneDirectories(in: workspace)
             return SavedWorkspaceState(
+                id: workspace.id,
                 title: workspace.title,
                 customTitle: workspace.customTitle,
                 directory: workspace.currentDirectory,
@@ -609,7 +611,17 @@ class TabManager {
                 return dir
             }()
 
-            let workspace = addWorkspace(workingDirectory: rootDir, select: false)
+            // Two workspaces sharing an ID would share every UUID-keyed
+            // sidecar, so a repeated or already-live ID falls back to a fresh
+            // one. `id` stays an additive optional rather than a version bump:
+            // `loadSession` rejects any version it does not know, so a bump
+            // would make a downgrade drop the whole session.
+            let restoredID: UUID? = saved.id.flatMap { candidate in
+                tabs.contains(where: { $0.id == candidate }) ? nil : candidate
+            }
+            let workspace = addWorkspace(
+                workingDirectory: rootDir, select: false, id: restoredID
+            )
             if let customTitle = saved.customTitle {
                 workspace.customTitle = customTitle
                 workspace.title = customTitle
@@ -1017,6 +1029,11 @@ class TabManager {
         }
 
         sentryBreadcrumb("workspace.close", data: ["tabCount": max(0, tabs.count - 1)])
+
+        // The declaration outlives the workspace otherwise: nothing ever
+        // called `forget`, so the stored map kept every ID this install had
+        // ever declared.
+        WorkspaceProjectNames.shared.forget(workspaceId: workspace.id)
 
         // Live mirror: drop the layout-sync plane first (subscription,
         // heartbeat, lease ref). Pane sessions tear down below via each

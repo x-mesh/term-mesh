@@ -94,6 +94,40 @@ enum SessionHostPanes {
         case newHostSessions
     }
 
+    /// The bracketed title this file writes is the project identity that
+    /// survives a restart even when the declaration does not.
+    static func projectName(fromWorkspaceTitle title: String?) -> String? {
+        guard let title,
+              title.hasPrefix("["),
+              title.hasSuffix("]"),
+              title.count > 2
+        else { return nil }
+        let name = String(title.dropFirst().dropLast())
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    /// The declared project for a workspace, re-declaring it when a restore
+    /// dropped the declaration.
+    ///
+    /// `WorkspaceProjectNames` is keyed by workspace UUID, and a session
+    /// restore that predates persisted workspace IDs mints a new UUID for
+    /// every workspace. Reading the declaration alone therefore reported "no
+    /// workspace owns this project" on every launch, and each launch created
+    /// one more `[project]` workspace for the same project.
+    static func declaredProjectName(for workspace: Workspace) -> String? {
+        if let declared = WorkspaceProjectNames.shared.projectName(for: workspace.id) {
+            return declared
+        }
+        guard let recovered = projectName(fromWorkspaceTitle: workspace.customTitle) else {
+            return nil
+        }
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: workspace.id, projectName: recovered
+        )
+        return recovered
+    }
+
     /// Choose by declared project identity, never by the selected tab. The
     /// selected tab is merely what the user is looking at; treating it as the
     /// owner injected a term-mesh worker into an `xm` workspace.
@@ -129,7 +163,7 @@ enum SessionHostPanes {
             guard let source = tabManager.tabs.first(where: {
                 $0.panelID(forPeerSurfaceID: surfaceID) != nil
             }),
-            WorkspaceProjectNames.shared.projectName(for: source.id)?.caseInsensitiveCompare(
+            declaredProjectName(for: source)?.caseInsensitiveCompare(
                 projectName
             ) != .orderedSame,
             let panelID = source.panelID(forPeerSurfaceID: surfaceID),
@@ -138,7 +172,7 @@ enum SessionHostPanes {
             else { continue }
 
             let existingTarget = tabManager.tabs.first(where: {
-                WorkspaceProjectNames.shared.projectName(for: $0.id)?.caseInsensitiveCompare(
+                declaredProjectName(for: $0)?.caseInsensitiveCompare(
                     projectName
                 ) == .orderedSame
             })
@@ -484,7 +518,7 @@ extension SessionHostPanes {
             let destination = workspaceDestination(
                 projectName: projectName,
                 declaredProjects: tabManager.tabs.compactMap { workspace in
-                    WorkspaceProjectNames.shared.projectName(for: workspace.id).map {
+                    declaredProjectName(for: workspace).map {
                         (id: workspace.id, name: $0)
                     }
                 },

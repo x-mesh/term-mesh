@@ -46,6 +46,16 @@ enum SessionRestoreSettings {
 }
 
 struct SavedWorkspaceState: Codable {
+    /// Stable workspace identity. Without it a restore mints a fresh UUID for
+    /// every workspace, which puts every UUID-keyed sidecar — the project
+    /// declaration that decides where a hosted session's pane belongs, first
+    /// among them — permanently out of reach.
+    ///
+    /// Additive and optional rather than a version bump, because `loadSession`
+    /// accepts only the versions it knows: bumping would make a downgrade drop
+    /// the whole session instead of just the IDs. `nil` for sessions written
+    /// before this field existed.
+    let id: UUID?
     let title: String
     let customTitle: String?
     let directory: String

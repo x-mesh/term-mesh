@@ -116,6 +116,55 @@ final class SessionHostPanesTests: XCTestCase {
 
     private func sid(_ byte: UInt8) -> Data { Data(repeating: byte, count: 16) }
 
+    // MARK: - Project identity across a relaunch
+
+    /// Sessions written before workspace IDs were persisted mint a fresh UUID
+    /// for every restored workspace, so the UUID-keyed declaration cannot
+    /// match. Reading the declaration alone therefore answered "no workspace
+    /// owns this project" on every launch, and every launch created one more
+    /// `[project]` workspace for the same project — 3 more per restart on a
+    /// host with 3 teams.
+    func test_aRestoredProjectWorkspaceIsRecognizedFromItsTitle() {
+        let workspace = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        workspace.customTitle = "[term-mesh]"
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: workspace.id) }
+
+        XCTAssertNil(
+            WorkspaceProjectNames.shared.projectName(for: workspace.id),
+            "a restored workspace starts with no declaration"
+        )
+        XCTAssertEqual(SessionHostPanes.declaredProjectName(for: workspace), "term-mesh")
+        XCTAssertEqual(
+            WorkspaceProjectNames.shared.projectName(for: workspace.id), "term-mesh",
+            "recovery re-declares, so the next lookup no longer needs the title"
+        )
+    }
+
+    /// The title is a fallback, not the source of truth: a workspace the user
+    /// happened to name `[something]` must not outrank its own declaration.
+    func test_anExplicitDeclarationOutranksTheTitle() {
+        let workspace = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        workspace.customTitle = "[term-mesh]"
+        WorkspaceProjectNames.shared.declare(workspaceId: workspace.id, projectName: "xm")
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: workspace.id) }
+
+        XCTAssertEqual(SessionHostPanes.declaredProjectName(for: workspace), "xm")
+    }
+
+    func test_anOrdinaryTitleClaimsNoProject() {
+        let titles: [String?] = [nil, "", "Terminal 1", "[]", "[ ]", "[unclosed", "unopened]"]
+        for title in titles {
+            XCTAssertNil(
+                SessionHostPanes.projectName(fromWorkspaceTitle: title),
+                "\(title ?? "<nil>") is not a project title"
+            )
+        }
+        XCTAssertEqual(
+            SessionHostPanes.projectName(fromWorkspaceTitle: "[h2-verify-fda00162]"),
+            "h2-verify-fda00162"
+        )
+    }
+
     // MARK: - Which sessions get a pane
 
     /// Everything the daemon holds deserves a window here: it owns it, so it
