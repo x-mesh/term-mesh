@@ -2121,6 +2121,78 @@ final class RemoteViewerSizeArbitrationTests: XCTestCase {
         XCTAssertEqual(size.w, 1200)
         XCTAssertEqual(size.h, 800)
     }
+
+    /// A remote input preference was established while the host pane was not
+    /// participating in size arbitration. Opening that workspace locally must
+    /// return to the neutral shared-grid rule instead of stretching the host
+    /// pane to the relay's stale dimensions. The stateful surface method is
+    /// covered through the resolver inputs it establishes here.
+    func test_showing_host_pane_after_remote_input_returns_to_shared_grid() {
+        let preference = TerminalSurface.remoteTypistPreference(
+            true,
+            afterLocalVisibilityChangeTo: true
+        )
+        XCTAssertNil(preference, "showing the host invalidates a preference established while it was hidden")
+
+        let staleRemotePreference = TerminalSurface.resolvePixelSize(
+            local: (w: 1200, h: 800),
+            remote: (w: 700, h: 1100),
+            localOnScreen: false,
+            remoteTypedLast: true,
+            fallback: (w: 0, h: 0)
+        )
+        XCTAssertEqual(staleRemotePreference.w, 700)
+        XCTAssertEqual(staleRemotePreference.h, 1100)
+
+        let visibleSharedGrid = TerminalSurface.resolvePixelSize(
+            local: (w: 1200, h: 800),
+            remote: (w: 700, h: 1100),
+            localOnScreen: true,
+            remoteTypedLast: preference,
+            fallback: (w: 0, h: 0)
+        )
+        XCTAssertEqual(visibleSharedGrid.w, 700)
+        XCTAssertEqual(visibleSharedGrid.h, 800)
+    }
+
+    func test_hiding_host_pane_keeps_remote_input_preference() {
+        XCTAssertEqual(
+            TerminalSurface.remoteTypistPreference(
+                true,
+                afterLocalVisibilityChangeTo: false
+            ),
+            true
+        )
+    }
+}
+
+final class WorkspaceGeometryReconcilePolicyTests: XCTestCase {
+    func test_geometry_only_reconcile_does_not_request_portal_reattach() {
+        XCTAssertFalse(
+            Workspace.coalescedViewReattachRequirement(
+                pending: false,
+                requested: false
+            )
+        )
+    }
+
+    func test_structural_reconcile_requests_portal_reattach() {
+        XCTAssertTrue(
+            Workspace.coalescedViewReattachRequirement(
+                pending: false,
+                requested: true
+            )
+        )
+    }
+
+    func test_structural_request_is_preserved_when_geometry_requests_coalesce() {
+        XCTAssertTrue(
+            Workspace.coalescedViewReattachRequirement(
+                pending: true,
+                requested: false
+            )
+        )
+    }
 }
 
 // ── t14: callback (agent) delivery ───────────────────────────────────

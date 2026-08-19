@@ -835,7 +835,11 @@ extension Workspace: BonsplitDelegate {
 
     func splitTabBar(_ controller: BonsplitController, didChangeGeometry snapshot: LayoutSnapshot) {
         _ = snapshot
-        scheduleTerminalGeometryReconcile()
+        // Geometry changes are already reflected in the existing portal
+        // hierarchy. Bumping every panel's reattach token here invalidates the
+        // SwiftUI graph, which can produce another geometry callback and turn
+        // host+relay size arbitration into a CPU-heavy feedback loop.
+        scheduleTerminalGeometryReconcile(reattachViews: false)
         scheduleFocusReconcile()
         postPeerLayoutChange()
         // Live mirror: a user divider drag surfaces here — diff the
