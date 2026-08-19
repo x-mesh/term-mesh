@@ -224,6 +224,10 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
         team = next((item for item in c.team_list() if item.get("team_name") == team_name), None)
         if team and team.get("leader_failure"):
             raise termmeshError(f"remote leader failed: {team['leader_failure']}")
+        if team and team.get("remote_attach_failures"):
+            raise termmeshError(
+                f"remote worker failed: {team['remote_attach_failures']}"
+            )
         agents = team.get("agents") if team else None
         agents_ready = (
             isinstance(agents, list)

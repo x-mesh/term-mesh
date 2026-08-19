@@ -166,6 +166,9 @@ final class TeamOrchestrator: ObservableObject {
         /// receive leader instructions as if it were a running CLI.
         var leaderReady: Bool = true
         var leaderFailureDescription: String? = nil
+        /// Remote worker attach failures survive after the async callback so
+        /// socket/UI observers do not mistake an empty roster for "still starting".
+        var remoteAttachFailures: [String] = []
         /// Observable policy injection state. `failed`/`degraded` are never
         /// silently treated as a normal ready leader.
         var leaderPolicyState: String = "pending"
@@ -613,6 +616,13 @@ final class TeamOrchestrator: ObservableObject {
                 title: "⚠ Remote leader failed"
             )
         }
+        syncTeamStateToDaemon()
+    }
+
+    func recordRemoteAttachFailure(teamName: String, description: String) {
+        guard var team = teams[teamName] else { return }
+        team.remoteAttachFailures.append(description)
+        teams[teamName] = team
         syncTeamStateToDaemon()
     }
 
@@ -6508,6 +6518,7 @@ final class TeamOrchestrator: ObservableObject {
                 "leader_ready": team.leaderReady,
                 "leader_pane_attached": isLeaderPaneAttached(teamName: team.id),
                 "leader_failure": team.leaderFailureDescription as Any? ?? NSNull(),
+                "remote_attach_failures": team.remoteAttachFailures,
                 "leader_policy_version": LeaderParallelPolicy.version,
                 "leader_policy_digest": LeaderParallelPolicy.digest,
                 "leader_policy_source": "LeaderParallelPolicy",

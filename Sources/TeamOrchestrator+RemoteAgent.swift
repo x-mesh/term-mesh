@@ -6932,6 +6932,9 @@ extension TeamOrchestrator {
                     let description =
                         "Could not start \(row.preset.name) on \(hostKey): \(error)"
                     RemoteWorkLog.info(description)
+                    self.recordRemoteAttachFailure(
+                        teamName: team.id, description: description
+                    )
                     onRemoteAttach?(.agentFailed(
                         name: row.preset.name,
                         host: hostKey,
