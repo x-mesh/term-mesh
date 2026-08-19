@@ -197,6 +197,76 @@ final class DiagnosticsRedactor {
     }
 }
 
+/// One peer host as the app knows it, without asking the host anything.
+///
+/// Everything here is already in `RemoteHostStore`, so a bundle can name the
+/// hosts involved without an SSH round trip. `healthBaseline` is the
+/// exception: it comes from a probe, so it is nil unless a caller that had
+/// one — the host editor, or the failure-detection capture — supplies it.
+struct PeerHostSnapshot {
+    var id: String
+    var displayName: String
+    var state: String
+    var sshTarget: String?
+    var remoteSockPath: String?
+    var activeSockPath: String
+    var servingAppVersion: String?
+    var workspaceCount: Int
+    var teamCount: Int
+    var isLaunchable: Bool
+    var supportsRemoteTeamRoute: Bool?
+    var failureReason: String?
+    var healthBaseline: PeerHostHealthBaseline?
+}
+
+/// Which windows, workspaces, and panes existed when the snapshot was taken.
+struct DiagnosticsContextSnapshot {
+    struct WorkspaceEntry {
+        var title: String
+        var isSelected: Bool
+        var terminalPanels: Int
+        var browserPanels: Int
+        var agentPanels: Int
+        var remoteAgentPanes: Int
+    }
+
+    var windowCount: Int
+    var workspaces: [WorkspaceEntry]
+}
+
+/// Everything a bundle renders from, captured at one instant.
+///
+/// Collection and rendering are separate on purpose. The failure-detection
+/// capture has to freeze state at the moment a host goes unhealthy and render
+/// it minutes later, when the app has moved on; fusing the two would make that
+/// impossible. It also keeps the report a pure function of its input, so the
+/// section formatting can be tested against a synthesized host instead of a
+/// live machine — and it guarantees the Help menu never blocks on SSH.
+struct DiagnosticsSnapshot {
+    var capturedAt: Date
+    var daemonStatus: TermMeshDaemon.DaemonStatus?
+    var peerHosts: [PeerHostSnapshot]
+    var context: DiagnosticsContextSnapshot?
+    var activityTail: [String]
+    var daemonLogTail: [String]
+
+    init(
+        capturedAt: Date = Date(),
+        daemonStatus: TermMeshDaemon.DaemonStatus? = nil,
+        peerHosts: [PeerHostSnapshot] = [],
+        context: DiagnosticsContextSnapshot? = nil,
+        activityTail: [String] = [],
+        daemonLogTail: [String] = []
+    ) {
+        self.capturedAt = capturedAt
+        self.daemonStatus = daemonStatus
+        self.peerHosts = peerHosts
+        self.context = context
+        self.activityTail = activityTail
+        self.daemonLogTail = daemonLogTail
+    }
+}
+
 /// A human-readable snapshot of what the app knows about itself, built for
 /// pasting into a bug report.
 ///
@@ -207,37 +277,246 @@ final class DiagnosticsRedactor {
 /// forgot to run it would leak silently.
 @MainActor
 enum DiagnosticsReport {
+    /// Lines of log tail carried in a bundle. Enough to show what led up to a
+    /// failure; short enough that the bundle stays readable and fits beside a
+    /// URL-length budget.
+    static let activityTailLines = 80
+    static let daemonLogTailLines = 40
+
     /// Build the redacted bundle. This is the only way text leaves this type.
     ///
     /// The redactor is passed as an optional rather than defaulted to a fresh
     /// instance: a default argument is evaluated in a nonisolated context, and
-    /// `DiagnosticsRedactor` is main-actor bound. Constructing it inside the
-    /// body keeps the call site a plain `build(daemonStatus:)`.
+    /// `DiagnosticsRedactor` is main-actor bound. Constructing it here also
+    /// lets the snapshot seed the host aliases, so `<host-1>` follows the
+    /// peer host list rather than whichever section mentioned a host first.
+    static func build(
+        _ snapshot: DiagnosticsSnapshot,
+        redactor: DiagnosticsRedactor? = nil
+    ) -> String {
+        let redactor = redactor ?? DiagnosticsRedactor(
+            seedHosts: snapshot.peerHosts.compactMap(\.sshTarget)
+        )
+        return redactor.redact(rawText(snapshot))
+    }
+
+    /// Convenience for callers that only have the daemon status to hand; the
+    /// rest of the snapshot is gathered from live app state.
     static func build(
         daemonStatus: TermMeshDaemon.DaemonStatus?,
         redactor: DiagnosticsRedactor? = nil
     ) -> String {
-        let redactor = redactor ?? DiagnosticsRedactor()
-        return redactor.redact(rawText(daemonStatus: daemonStatus))
+        build(current(daemonStatus: daemonStatus), redactor: redactor)
+    }
+
+    /// Capture what the app knows right now. Reads only in-memory state and
+    /// two local log files — no SSH, no RPC — so it is safe to call from a
+    /// menu action without leaving the user staring at a spinner.
+    static func current(daemonStatus: TermMeshDaemon.DaemonStatus?) -> DiagnosticsSnapshot {
+        DiagnosticsSnapshot(
+            daemonStatus: daemonStatus,
+            peerHosts: currentPeerHosts(),
+            context: currentContext(),
+            activityTail: DiagnosticsLogTail.tail(
+                path: RemoteWorkLog.path,
+                lines: activityTailLines
+            ),
+            daemonLogTail: DiagnosticsLogTail.tail(
+                path: daemonStatus?.logPath ?? "",
+                lines: daemonLogTailLines
+            )
+        )
+    }
+
+    private static func currentPeerHosts() -> [PeerHostSnapshot] {
+        RemoteHostStore.shared.sortedHosts.map { host in
+            var failureReason: String?
+            if case .failed(let reason) = host.connectionState { failureReason = reason }
+            return PeerHostSnapshot(
+                id: host.id,
+                displayName: host.displayName,
+                state: describe(host.connectionState),
+                sshTarget: host.sshTarget,
+                remoteSockPath: host.remoteSockPath,
+                activeSockPath: host.activeSockPath,
+                servingAppVersion: host.servingAppVersion,
+                workspaceCount: host.workspaces.count,
+                teamCount: host.teams.count,
+                isLaunchable: host.isLaunchable,
+                supportsRemoteTeamRoute: host.supportsRemoteTeamRoute,
+                failureReason: failureReason,
+                healthBaseline: nil
+            )
+        }
+    }
+
+    private static func describe(_ state: HostConnectionState) -> String {
+        switch state {
+        case .saved: return "saved"
+        case .connecting: return "connecting"
+        case .connected: return "connected"
+        case .failed: return "failed"
+        }
+    }
+
+    private static func currentContext() -> DiagnosticsContextSnapshot? {
+        guard let appDelegate = AppDelegate.shared else { return nil }
+        var workspaces: [DiagnosticsContextSnapshot.WorkspaceEntry] = []
+        for context in appDelegate.mainWindowContexts.values {
+            let selectedId = context.tabManager.selectedTabId
+            for workspace in context.tabManager.tabs {
+                var terminals = 0
+                var browsers = 0
+                var agents = 0
+                for panel in workspace.panels.values {
+                    switch panel.panelType {
+                    case .terminal: terminals += 1
+                    case .browser: browsers += 1
+                    case .agent: agents += 1
+                    }
+                }
+                workspaces.append(
+                    .init(
+                        title: workspace.customTitle ?? workspace.title,
+                        isSelected: workspace.id == selectedId,
+                        terminalPanels: terminals,
+                        browserPanels: browsers,
+                        agentPanels: agents,
+                        remoteAgentPanes: workspace.remoteAgentPaneSessions.count
+                    )
+                )
+            }
+        }
+        return DiagnosticsContextSnapshot(
+            windowCount: appDelegate.mainWindowContexts.count,
+            workspaces: workspaces
+        )
     }
 
     /// Unredacted assembly. Private on purpose: the only caller is `build`,
     /// so there is no way to obtain the raw text from outside this file.
-    private static func rawText(daemonStatus: TermMeshDaemon.DaemonStatus?) -> String {
+    private static func rawText(_ snapshot: DiagnosticsSnapshot) -> String {
         var lines: [String] = []
         lines.append("term-mesh diagnostics")
         lines.append("=====================")
-        lines.append("Date: \(ISO8601DateFormatter().string(from: Date()))")
+        lines.append("Date: \(ISO8601DateFormatter().string(from: snapshot.capturedAt))")
         lines.append("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
         let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
         let buildNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
         lines.append("App: \(appVersion) (\(buildNumber))")
 
-        appendDaemon(daemonStatus, to: &lines)
+        appendDaemon(snapshot.daemonStatus, to: &lines)
+        appendPeerHosts(snapshot.peerHosts, to: &lines)
+        appendContext(snapshot.context, to: &lines)
         appendShellIntegration(to: &lines)
         appendIMERendering(to: &lines)
+        appendLogTail("Remote Work log", snapshot.activityTail, to: &lines)
+        appendLogTail("Daemon log", snapshot.daemonLogTail, to: &lines)
 
         return lines.joined(separator: "\n")
+    }
+
+    private static func appendPeerHosts(_ hosts: [PeerHostSnapshot], to lines: inout [String]) {
+        lines.append("")
+        lines.append("Peer Hosts:")
+        guard !hosts.isEmpty else {
+            lines.append("  (none configured)")
+            return
+        }
+        for host in hosts {
+            lines.append("  \(host.displayName) [\(host.state)]")
+            if let reason = host.failureReason { lines.append("    failure: \(reason)") }
+            if let ssh = host.sshTarget, !ssh.isEmpty { lines.append("    ssh: \(ssh)") }
+            lines.append("    serving version: \(host.servingAppVersion ?? "unknown")")
+            if let remote = host.remoteSockPath, !remote.isEmpty {
+                lines.append("    remote sock: \(remote)")
+            }
+            if !host.activeSockPath.isEmpty {
+                lines.append("    active sock: \(host.activeSockPath)")
+            }
+            lines.append("    workspaces: \(host.workspaceCount), teams: \(host.teamCount)")
+            lines.append("    launchable: \(host.isLaunchable), team route: \(describe(host.supportsRemoteTeamRoute))")
+            appendHealthBaseline(host.healthBaseline, to: &lines)
+        }
+    }
+
+    /// Emit the probe's own `health-*` keys rather than the verdict they add
+    /// up to. A rendered verdict — "control unavailable" — states a conclusion
+    /// about the host; the raw fields state what was measured, and the two
+    /// come apart exactly when the probe is wrong about the host. That gap is
+    /// what a bug report needs to show.
+    private static func appendHealthBaseline(
+        _ health: PeerHostHealthBaseline?,
+        to lines: inout [String]
+    ) {
+        guard let health else { return }
+        lines.append("    health baseline (verdict: \(health.verdict.rawValue)):")
+        let fields: [(String, String)] = [
+            ("health-service-active", health.serviceActive ? "1" : "0"),
+            ("health-control-path", health.controlPath),
+            ("health-control-present", health.controlPathPresent ? "1" : "0"),
+            ("health-control-rpc", rawValue(health.controlRPC)),
+            ("health-peer-path", health.peerPath),
+            ("health-peer-present", health.peerPathPresent ? "1" : "0"),
+            ("health-relay-lag-5m", String(health.relayLagCount)),
+            ("health-resume-heal-5m", String(health.resumeHealCount)),
+            ("health-protocol-mismatch-5m", String(health.protocolMismatchCount)),
+        ]
+        for (key, value) in fields {
+            lines.append("      \(key)=\(value)")
+        }
+    }
+
+    private static func describe(_ flag: Bool?) -> String {
+        guard let flag else { return "unknown" }
+        return flag ? "yes" : "no"
+    }
+
+    /// Round-trips back to the token the probe emitted, so the bundle shows
+    /// the measurement rather than this app's reading of it. `unknown` is the
+    /// one that matters: it means the probe could not run, which is a
+    /// different claim from "the daemon did not answer" and must not be
+    /// flattened into it.
+    private static func rawValue(_ status: PeerHostControlRPCStatus) -> String {
+        switch status {
+        case .available: return "1"
+        case .unavailable: return "0"
+        case .probeUnavailable: return "unknown"
+        }
+    }
+
+    private static func appendContext(
+        _ context: DiagnosticsContextSnapshot?,
+        to lines: inout [String]
+    ) {
+        lines.append("")
+        lines.append("Context:")
+        guard let context else {
+            lines.append("  (no app delegate)")
+            return
+        }
+        lines.append("  windows: \(context.windowCount), workspaces: \(context.workspaces.count)")
+        for workspace in context.workspaces {
+            let marker = workspace.isSelected ? "*" : " "
+            var line = "  \(marker) \(workspace.title): term=\(workspace.terminalPanels)"
+            line += " browser=\(workspace.browserPanels) agent=\(workspace.agentPanels)"
+            if workspace.remoteAgentPanes > 0 {
+                line += " remoteAgent=\(workspace.remoteAgentPanes)"
+            }
+            lines.append(line)
+        }
+    }
+
+    private static func appendLogTail(_ title: String, _ tail: [String], to lines: inout [String]) {
+        lines.append("")
+        lines.append("\(title) (last \(tail.count)):")
+        guard !tail.isEmpty else {
+            lines.append("  (empty or unreadable)")
+            return
+        }
+        for line in tail {
+            lines.append("  \(line)")
+        }
     }
 
     private static func appendDaemon(
@@ -348,5 +627,46 @@ enum DiagnosticsReport {
         if hours > 0 { return "\(hours)h \(minutes)m" }
         if minutes > 0 { return "\(minutes)m \(secs)s" }
         return "\(secs)s"
+    }
+}
+
+/// Reads the end of a log file without pulling the whole thing into memory.
+///
+/// `RemoteWorkLog` truncates at 8 MB and the daemon log at 50 MB, so reading a
+/// log whole to keep its last 40 lines would allocate megabytes for kilobytes
+/// of answer — on the main thread, in a menu action. Seeking to the tail keeps
+/// the cost proportional to what is actually reported.
+enum DiagnosticsLogTail {
+    /// How far back to read. Comfortably more than `lines` worth of log at any
+    /// plausible line length, so the cap is the line count rather than this.
+    static let readBudgetBytes = 128 * 1024
+
+    /// A single log line long enough to dominate the bundle is almost always a
+    /// dumped payload rather than a message worth reading in full.
+    static let maxLineLength = 500
+
+    static func tail(path: String, lines: Int) -> [String] {
+        guard !path.isEmpty,
+              let handle = FileHandle(forReadingAtPath: path) else { return [] }
+        defer { try? handle.close() }
+
+        guard let end = try? handle.seekToEnd() else { return [] }
+        let budget = UInt64(readBudgetBytes)
+        let start = end > budget ? end - budget : 0
+        guard (try? handle.seek(toOffset: start)) != nil,
+              let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+
+        var split = text.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        // A seek lands mid-line unless we started at byte zero. Drop that
+        // fragment rather than reporting a truncated line as if the log
+        // contained it.
+        if start > 0, !split.isEmpty { split.removeFirst() }
+        return split.suffix(lines).map(bounded)
+    }
+
+    private static func bounded(_ line: String) -> String {
+        guard line.count > maxLineLength else { return line }
+        return String(line.prefix(maxLineLength)) + "… (truncated)"
     }
 }

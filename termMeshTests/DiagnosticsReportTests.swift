@@ -1,0 +1,210 @@
+import XCTest
+
+#if canImport(term_mesh_DEV)
+@testable import term_mesh_DEV
+#elseif canImport(term_mesh)
+@testable import term_mesh
+#endif
+
+/// Rendering is a pure function of the snapshot, which is the whole reason the
+/// two are separate types — these assertions run against a synthesized host
+/// instead of a live machine.
+@MainActor
+final class DiagnosticsReportTests: XCTestCase {
+    private func host(
+        id: String = "h1",
+        name: String = "builder",
+        state: String = "connected",
+        ssh: String? = "root@203.0.113.10",
+        version: String? = "0.196.0",
+        failure: String? = nil,
+        health: PeerHostHealthBaseline? = nil
+    ) -> PeerHostSnapshot {
+        PeerHostSnapshot(
+            id: id,
+            displayName: name,
+            state: state,
+            sshTarget: ssh,
+            remoteSockPath: "/run/term-mesh/tm-peer.sock",
+            activeSockPath: "/tmp/tm-peer-live.sock",
+            servingAppVersion: version,
+            workspaceCount: 2,
+            teamCount: 1,
+            isLaunchable: true,
+            supportsRemoteTeamRoute: true,
+            failureReason: failure,
+            healthBaseline: health
+        )
+    }
+
+    private func render(_ hosts: [PeerHostSnapshot]) -> String {
+        DiagnosticsReport.build(DiagnosticsSnapshot(peerHosts: hosts))
+    }
+
+    // MARK: - Health baseline is reported as measured, not as concluded
+
+    /// The bundle carries the probe's own keys. A verdict states a conclusion
+    /// about the host; the raw fields state what was measured, and the two come
+    /// apart exactly when the probe is wrong — which is the case a bug report
+    /// exists to show.
+    func test_healthBaselineIsEmittedAsRawProbeKeys() {
+        let baseline = PeerHostHealthBaseline(
+            serviceActive: true,
+            controlPath: "/tmp/term-meshd.sock",
+            controlPathPresent: false,
+            controlRPC: .unavailable,
+            peerPath: "/run/term-mesh/tm-peer.sock",
+            peerPathPresent: true,
+            relayLagCount: 0,
+            resumeHealCount: 0,
+            protocolMismatchCount: 0
+        )
+        let output = render([host(health: baseline)])
+        XCTAssertTrue(output.contains("health-service-active=1"))
+        XCTAssertTrue(output.contains("health-control-path=/tmp/term-meshd.sock"))
+        XCTAssertTrue(output.contains("health-control-present=0"))
+        XCTAssertTrue(output.contains("health-control-rpc=0"))
+        XCTAssertTrue(output.contains("health-peer-present=1"))
+        XCTAssertTrue(output.contains("health-protocol-mismatch-5m=0"))
+    }
+
+    /// "The probe could not run" is a different claim from "the daemon did not
+    /// answer". Flattening the first into the second is what made a healthy
+    /// host read as broken, so the distinction has to survive into the bundle.
+    func test_probeUnavailableIsReportedAsUnknownNotAsFailure() {
+        let baseline = PeerHostHealthBaseline(controlRPC: .probeUnavailable)
+        let output = render([host(health: baseline)])
+        XCTAssertTrue(output.contains("health-control-rpc=unknown"))
+        XCTAssertFalse(output.contains("health-control-rpc=0"))
+    }
+
+    func test_hostWithoutBaselineOmitsTheSection() {
+        let output = render([host(health: nil)])
+        XCTAssertFalse(output.contains("health baseline"))
+        XCTAssertTrue(output.contains("Peer Hosts:"))
+    }
+
+    // MARK: - Peer host section
+
+    func test_failedHostCarriesItsReason() {
+        let output = render([host(state: "failed", failure: "ssh handshake refused")])
+        XCTAssertTrue(output.contains("[failed]"))
+        XCTAssertTrue(output.contains("ssh handshake refused"))
+    }
+
+    func test_unknownServingVersionIsStatedNotOmitted() {
+        let output = render([host(version: nil)])
+        XCTAssertTrue(output.contains("serving version: unknown"))
+    }
+
+    func test_noPeerHostsSaysSoExplicitly() {
+        let output = render([])
+        XCTAssertTrue(output.contains("(none configured)"))
+    }
+
+    // MARK: - Redactor seeding
+
+    /// Seeding from the snapshot is what makes `<host-1>` mean "the first host
+    /// in the peer list" rather than "whichever host a section happened to
+    /// mention first".
+    func test_hostAliasNumberingFollowsThePeerHostList() {
+        let output = render([
+            host(id: "a", name: "alpha", ssh: "root@203.0.113.10"),
+            host(id: "b", name: "beta", ssh: "root@198.51.100.7"),
+        ])
+        guard let alphaRange = output.range(of: "alpha"),
+              let betaRange = output.range(of: "beta") else {
+            return XCTFail("both hosts should appear in the bundle")
+        }
+        let alphaSection = output[alphaRange.lowerBound..<betaRange.lowerBound]
+        XCTAssertTrue(alphaSection.contains("<host-1>"))
+        XCTAssertTrue(output[betaRange.lowerBound...].contains("<host-2>"))
+        XCTAssertFalse(output.contains("203.0.113.10"))
+        XCTAssertFalse(output.contains("198.51.100.7"))
+    }
+
+    /// The bundle is redacted on the way out no matter which section produced
+    /// the value — a peer host's ssh target is not special-cased.
+    func test_bundleIsRedactedEndToEnd() {
+        let output = render([host(ssh: "alice@203.0.113.10")])
+        XCTAssertFalse(output.contains("alice"))
+        XCTAssertFalse(output.contains("203.0.113.10"))
+    }
+
+    // MARK: - Context
+
+    func test_contextReportsWindowAndWorkspaceShape() {
+        let context = DiagnosticsContextSnapshot(
+            windowCount: 2,
+            workspaces: [
+                .init(
+                    title: "api",
+                    isSelected: true,
+                    terminalPanels: 3,
+                    browserPanels: 1,
+                    agentPanels: 2,
+                    remoteAgentPanes: 1
+                )
+            ]
+        )
+        let output = DiagnosticsReport.build(DiagnosticsSnapshot(context: context))
+        XCTAssertTrue(output.contains("windows: 2, workspaces: 1"))
+        XCTAssertTrue(output.contains("* api: term=3 browser=1 agent=2 remoteAgent=1"))
+    }
+}
+
+/// The tail reader exists because reading an 8 MB log to keep 40 lines of it
+/// allocates megabytes for kilobytes of answer, on the main thread.
+final class DiagnosticsLogTailTests: XCTestCase {
+    private func writeTemp(_ contents: String) throws -> String {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tailtest-\(UUID().uuidString).log")
+        try contents.write(to: url, atomically: true, encoding: .utf8)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url.path
+    }
+
+    func test_returnsTheLastLinesInOrder() throws {
+        let path = try writeTemp((1...10).map { "line \($0)" }.joined(separator: "\n"))
+        XCTAssertEqual(
+            DiagnosticsLogTail.tail(path: path, lines: 3),
+            ["line 8", "line 9", "line 10"]
+        )
+    }
+
+    func test_shortFileReturnsEverythingWithNoLostFirstLine() throws {
+        let path = try writeTemp("only line")
+        XCTAssertEqual(DiagnosticsLogTail.tail(path: path, lines: 10), ["only line"])
+    }
+
+    func test_missingFileIsEmptyNotACrash() {
+        XCTAssertEqual(
+            DiagnosticsLogTail.tail(path: "/nonexistent/term-mesh/nope.log", lines: 5),
+            []
+        )
+    }
+
+    func test_emptyPathIsEmpty() {
+        XCTAssertEqual(DiagnosticsLogTail.tail(path: "", lines: 5), [])
+    }
+
+    /// A single line long enough to dominate the bundle is a dumped payload,
+    /// not a message worth carrying whole.
+    func test_overlongLineIsTruncatedWithAMarker() throws {
+        let long = String(repeating: "x", count: DiagnosticsLogTail.maxLineLength + 50)
+        let path = try writeTemp(long)
+        let tail = DiagnosticsLogTail.tail(path: path, lines: 1)
+        XCTAssertEqual(tail.count, 1)
+        XCTAssertTrue(tail[0].hasSuffix("… (truncated)"))
+        XCTAssertLessThan(tail[0].count, long.count)
+    }
+
+    /// Seeking past the start lands mid-line; that fragment is dropped rather
+    /// than reported as though the log contained a truncated entry.
+    func test_partialFirstLineIsDroppedWhenSeeking() throws {
+        let filler = String(repeating: "a", count: DiagnosticsLogTail.readBudgetBytes)
+        let path = try writeTemp("\(filler)\nsecond\nthird")
+        let tail = DiagnosticsLogTail.tail(path: path, lines: 10)
+        XCTAssertEqual(tail, ["second", "third"])
+    }
+}
