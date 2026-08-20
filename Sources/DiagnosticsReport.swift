@@ -65,7 +65,6 @@ final class DiagnosticsRedactor {
     func redact(_ text: String) -> String {
         var result = AgentSession.redactingCredentials(text)
             .precomposedStringWithCanonicalMapping
-        result = redactingDisplayNameLines(result)
         result = redactingHosts(result)
         result = redactingIdentity(result)
         return result
@@ -152,14 +151,16 @@ final class DiagnosticsRedactor {
         return value.precomposedStringWithCanonicalMapping.lowercased()
     }
 
-    private func redactingDisplayNameLines(_ text: String) -> String {
-        text.components(separatedBy: "\n").map { line in
-            let range = NSRange(line.startIndex..<line.endIndex, in: line)
-            guard let match = displayNameRules.first(where: {
-                $0.0.firstMatch(in: line, range: range) != nil
-            }) else { return line }
-            return "  [redacted line containing \(match.1)]"
-        }.joined(separator: "\n")
+    /// Display-name matching is limited to fields that can actually contain
+    /// user or host text. Running it over the assembled report would let a
+    /// peer named `api` erase unrelated version and health lines.
+    func redactingPeerText(_ text: String) -> String {
+        let normalized = text.precomposedStringWithCanonicalMapping
+        let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+        guard let match = displayNameRules.first(where: {
+            $0.0.firstMatch(in: normalized, range: range) != nil
+        }) else { return normalized }
+        return "[redacted text containing \(match.1)]"
     }
 
     private func redactingHosts(_ text: String) -> String {
@@ -381,6 +382,23 @@ enum DiagnosticsReport {
             safeHost.displayName = alias
             return safeHost
         }
+        safeSnapshot.peerHosts = safeSnapshot.peerHosts.map { host in
+            var safeHost = host
+            if let failureReason = host.failureReason {
+                safeHost.failureReason = redactor.redactingPeerText(failureReason)
+            }
+            return safeHost
+        }
+        if var context = safeSnapshot.context {
+            context.workspaces = context.workspaces.map { workspace in
+                var safeWorkspace = workspace
+                safeWorkspace.title = redactor.redactingPeerText(workspace.title)
+                return safeWorkspace
+            }
+            safeSnapshot.context = context
+        }
+        safeSnapshot.activityTail = snapshot.activityTail.map(redactor.redactingPeerText)
+        safeSnapshot.daemonLogTail = snapshot.daemonLogTail.map(redactor.redactingPeerText)
         return redactor.redact(rawText(safeSnapshot))
     }
 

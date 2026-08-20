@@ -142,7 +142,7 @@ final class DiagnosticsReportTests: XCTestCase {
         )
         let output = DiagnosticsReport.build(snapshot)
         XCTAssertTrue(output.contains("  <host-1> [connected]"))
-        XCTAssertTrue(output.contains("[redacted line containing <host-1>]"))
+        XCTAssertTrue(output.contains("[redacted text containing <host-1>]"))
         XCTAssertFalse(output.contains("Alice"))
         XCTAssertFalse(output.contains("MacBook"))
         XCTAssertFalse(output.contains("builder.example.com"))
@@ -179,7 +179,7 @@ final class DiagnosticsReportTests: XCTestCase {
             activityTail: ["Connected builder.example.com Mac"]
         )
         let output = DiagnosticsReport.build(snapshot)
-        XCTAssertTrue(output.contains("[redacted line containing <host-1>]"))
+        XCTAssertTrue(output.contains("[redacted text containing <host-1>]"))
         XCTAssertFalse(output.contains("builder.example.com"))
         XCTAssertFalse(output.contains(" Mac"))
     }
@@ -203,7 +203,7 @@ final class DiagnosticsReportTests: XCTestCase {
             activityTail: ["Connected \(decomposed)"]
         )
         let output = DiagnosticsReport.build(snapshot)
-        XCTAssertTrue(output.contains("[redacted line containing <host-1>]"))
+        XCTAssertTrue(output.contains("[redacted text containing <host-1>]"))
         XCTAssertFalse(output.contains("Café"))
     }
 
@@ -223,8 +223,23 @@ final class DiagnosticsReportTests: XCTestCase {
             activityTail: ["Connected builder.corp.internal"]
         )
         let output = DiagnosticsReport.build(snapshot)
-        XCTAssertTrue(output.contains("[redacted line containing <host-1>]"))
+        XCTAssertTrue(output.contains("[redacted text containing <host-1>]"))
         XCTAssertFalse(output.contains("corp.internal"))
+    }
+
+    func test_commonPeerLabelDoesNotRewriteUnrelatedReportText() {
+        let redactor = DiagnosticsRedactor(
+            homeDirectory: "/Users/testuser",
+            userName: "testuser",
+            localHostName: "local.example"
+        )
+        let alias = redactor.reserveAlias()
+        redactor.register(displayName: "api", as: alias)
+        XCTAssertEqual(redactor.redact("API version: 2"), "API version: 2")
+        XCTAssertEqual(
+            redactor.redactingPeerText("API host failed"),
+            "[redacted text containing <host-1>]"
+        )
     }
 
     func test_unicodeEquivalentSSHHostIsRedacted() {
