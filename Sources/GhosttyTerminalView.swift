@@ -1186,6 +1186,37 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// Record that an attached remote viewer produced input, and re-arbitrate.
     func noteRemoteInput() { noteTypist(remote: true) }
 
+    /// Re-arbitrate the shared PTY size when the host pane enters or leaves
+    /// the visible workspace. Visibility is one of `resolvedPixelSize`'s
+    /// inputs, but changing it previously only toggled the renderer: the PTY
+    /// kept the size chosen while the pane was hidden until another resize or
+    /// keystroke happened to arrive. In particular, opening a locally-hosted
+    /// workspace that was already visible through a relay left the host pane
+    /// drawing a relay-sized grid into local bounds.
+    ///
+    /// A remote-input preference established while the local pane was hidden
+    /// is stale once that pane becomes visible. Return to the neutral
+    /// smaller-grid rule so both windows render a valid grid until either side
+    /// produces fresh input.
+    func localPaneVisibilityDidChange(becameVisible: Bool) {
+        guard remoteViewerPixelSize != nil else { return }
+        remoteViewerTypedLast = Self.remoteTypistPreference(
+            remoteViewerTypedLast,
+            afterLocalVisibilityChangeTo: becameVisible
+        )
+        guard let surface else { return }
+        let resolved = resolvedPixelSize()
+        guard resolved.w != lastPixelWidth || resolved.h != lastPixelHeight else { return }
+        applyResolvedSize(resolved, to: surface)
+    }
+
+    static func remoteTypistPreference(
+        _ current: Bool?,
+        afterLocalVisibilityChangeTo visible: Bool
+    ) -> Bool? {
+        visible ? nil : current
+    }
+
     private func noteTypist(remote: Bool) {
         // Called per keystroke, so it costs a comparison on all but the first
         // press after the other side was typing.
@@ -2576,8 +2607,10 @@ static func focusLog(_ message: String) {
         // Visibility is used for focus gating, not for libghostty occlusion.
     var isVisibleInUI: Bool { visibleInUI }
     func setVisibleInUI(_ visible: Bool) {
-            visibleInUI = visible
-        }
+        guard visibleInUI != visible else { return }
+        visibleInUI = visible
+        terminalSurface?.localPaneVisibilityDidChange(becameVisible: visible)
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)

@@ -699,7 +699,7 @@ extension TerminalController {
                             return
                         }
                         Task { @MainActor in
-                            try? await PeerProjectBootstrap.run(
+                            let primaryOwned = (try? await PeerProjectBootstrap.run(
                                 sshTarget: sshTarget, port: host.sshPort,
                                 identityFile: host.identityFile,
                                 plan: plan, gitURL: (gitURL?.isEmpty ?? true) ? nil : gitURL,
@@ -710,7 +710,19 @@ extension TerminalController {
                                 memMeshProjectID: PeerProjectBootstrap.memMeshProjectID(
                                     for: URL(fileURLWithPath: directory).lastPathComponent
                                 )
-                            )
+                            )) ?? false
+                            // Same rule as production: only what this run made.
+                            var createdPaths: Set<PeerProjectBootstrap.CreatedPath> = []
+                            if primaryOwned {
+                                createdPaths.insert(
+                                    .init(hostKey: hostKey, path: plan.primaryPath)
+                                )
+                            }
+                            for checkout in plan.agentCheckouts {
+                                createdPaths.insert(
+                                    .init(hostKey: hostKey, path: checkout.path)
+                                )
+                            }
                             let rows: [TeamAgentRow] = plan.agentCheckouts.compactMap { checkout in
                                 guard let preset = Self.debugProjectPreset(
                                     named: checkout.agent, presets: presets
@@ -744,8 +756,10 @@ extension TerminalController {
                                     hostKey: hostKey,
                                     projectPath: remotePath,
                                     gitURL: gitURL ?? "",
-                                    isolateAgents: (params["isolate"] as? Bool) ?? true
+                                    isolateAgents: (params["isolate"] as? Bool) ?? true,
+                                    kind: (gitURL?.isEmpty ?? true) ? .existingFolder : .clone
                                 ),
+                                createdPaths: createdPaths,
                                 tabManager: tabManager
                             )
                         }

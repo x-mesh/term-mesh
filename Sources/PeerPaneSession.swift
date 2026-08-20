@@ -751,7 +751,11 @@ final class PeerPaneSession {
         #if DEBUG
         dlog("peer.pane.attach key=\(lease.key) surface=\(title)")
         #endif
-        RemoteWorkLog.infoOffMain("Remote pane attached: \(title) on \(lease.key)")
+        RemoteWorkLog.infoOffMain(
+            "Remote pane attached: \(title) "
+                + "surface=\(surface.surfaceID.map { String(format: "%02x", $0) }.joined()) "
+                + "on \(lease.key)"
+        )
         return paneSession
     }
 

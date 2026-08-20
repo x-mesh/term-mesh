@@ -143,4 +143,18 @@ final class RemoteLeaderReattachTriStateTests: XCTestCase {
             "the recovery interlock is held for this whole window; it cannot be long"
         )
     }
+
+    func testInitialAttachAndRecoveryShareOneSingleFlightGate() {
+        let teamName = "single-flight-\(UUID().uuidString)"
+        let orchestrator = TeamOrchestrator.shared
+
+        XCTAssertTrue(orchestrator.beginRemoteLeaderAttach(teamName: teamName))
+        XCTAssertFalse(
+            orchestrator.beginRemoteLeaderAttach(teamName: teamName),
+            "a workspace click during initial attach must not start recovery"
+        )
+        orchestrator.endRemoteLeaderAttach(teamName: teamName)
+        XCTAssertTrue(orchestrator.beginRemoteLeaderAttach(teamName: teamName))
+        orchestrator.endRemoteLeaderAttach(teamName: teamName)
+    }
 }

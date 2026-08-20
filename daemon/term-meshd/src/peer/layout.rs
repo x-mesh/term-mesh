@@ -1524,6 +1524,7 @@ impl PeerHost {
             team_uuid: project.team_uuid.clone(),
             working_directory: project.working_directory.clone(),
             project_root: project.project_root.clone(),
+            created_at_unix_secs: project.created_at_unix_secs,
             leader_surface_id: hex::encode(&project.leader_surface_id),
             members,
             revision,

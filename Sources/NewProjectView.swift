@@ -3416,6 +3416,11 @@ enum ProjectCreationFlow {
     /// Every machine selected in the form, prepared before launching anyone.
     struct PreparedCheckouts {
         var rows: [TeamAgentRow]
+        /// Every (host, path) this run actually created, reported by the setup
+        /// script itself. Delete Project may remove these and nothing else: a
+        /// checkout the user already had at the same location is theirs even
+        /// when its path differs from the source project's path.
+        var createdPaths: Set<PeerProjectBootstrap.CreatedPath> = []
         /// Primary checkout on this Mac, when either the source, leader or a
         /// member runs here. The local team engine builds its own worktrees
         /// from this root.
@@ -3704,6 +3709,7 @@ enum ProjectCreationFlow {
                 ? "isolated"
                 : "off",
             projectSource: source,
+            createdPaths: prepared.createdPaths,
             onRemoteAttach: onAttach,
             tabManager: tabManager
         ) != nil else {
@@ -3872,6 +3878,9 @@ enum ProjectCreationFlow {
         }
 
         var prepared = rows
+        // Filled from each setup script's own report, never inferred from the
+        // paths: only what this run created may be deleted later.
+        var createdPaths: Set<PeerProjectBootstrap.CreatedPath> = []
         var localProjectPath: String?
         var leaderProjectPath: String?
         let gitURL = source.gitURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3949,8 +3958,9 @@ enum ProjectCreationFlow {
                     else {
                         throw CreationError.remoteHostUnavailable
                     }
+                    let primaryOwned: Bool
                     do {
-                        try await PeerProjectBootstrap.run(
+                        primaryOwned = try await PeerProjectBootstrap.run(
                             sshTarget: sshTarget,
                             port: host.sshPort,
                             identityFile: host.identityFile,
@@ -3973,6 +3983,18 @@ enum ProjectCreationFlow {
                         throw CreationError.remoteSetupFailed(
                             host: host.displayName,
                             detail: detail
+                        )
+                    }
+                    if primaryOwned {
+                        createdPaths.insert(
+                            .init(hostKey: hostKey, path: plan.primaryPath)
+                        )
+                    }
+                    // Agent worktrees carry this transaction's instance tag, so
+                    // no earlier run and no user can have written them.
+                    for checkout in plan.agentCheckouts {
+                        createdPaths.insert(
+                            .init(hostKey: hostKey, path: checkout.path)
                         )
                     }
                     completed.append(CompletedPlacement(
@@ -4000,8 +4022,9 @@ enum ProjectCreationFlow {
                         primaryPath: plan.primaryPath,
                         agentCheckouts: []
                     )
+                    let primaryOwned: Bool
                     do {
-                        try await PeerProjectBootstrap.runLocal(
+                        primaryOwned = try await PeerProjectBootstrap.runLocal(
                             plan: primaryOnly,
                             gitURL: gitURL.isEmpty ? nil : gitURL,
                             gitBranch: source.gitBranch,
@@ -4011,6 +4034,9 @@ enum ProjectCreationFlow {
                     } catch {
                         progress(.failed(id: stepID, message: error.localizedDescription))
                         throw error
+                    }
+                    if primaryOwned {
+                        createdPaths.insert(.init(hostKey: nil, path: plan.primaryPath))
                     }
                     completed.append(CompletedPlacement(
                         hostKey: nil,
@@ -4052,6 +4078,7 @@ enum ProjectCreationFlow {
         PeerProjectBootstrap.finishTransaction(transactionKey)
         return PreparedCheckouts(
             rows: prepared,
+            createdPaths: createdPaths,
             localProjectPath: localProjectPath,
             leaderProjectPath: leaderProjectPath
         )

@@ -340,6 +340,7 @@ final class Workspace: Identifiable {
     }
 
     init(
+        id: UUID = UUID(),
         title: String = "Terminal",
         workingDirectory: String? = nil,
         portOrdinal: Int = 0,
@@ -350,7 +351,9 @@ final class Workspace: Identifiable {
         // Installs the reconnect observer and retries durable peer-agent
         // tombstones restored from a previous app run.
         _ = PendingPeerAgentSurfaceCleanupStore.shared
-        self.id = UUID()
+        // Session restore passes the saved identity so UUID-keyed sidecar
+        // state survives a relaunch.
+        self.id = id
         self.portOrdinal = portOrdinal
         self.processTitle = title
         self.title = title
@@ -568,6 +571,7 @@ final class Workspace: Identifiable {
     @ObservationIgnored var isReconcilingFocusState = false
     @ObservationIgnored var focusReconcileScheduled = false
     @ObservationIgnored var geometryReconcileScheduled = false
+    @ObservationIgnored var geometryReconcileNeedsViewReattach = false
     @ObservationIgnored var isNormalizingPinnedTabOrder = false
     @ObservationIgnored var pendingNonFocusSplitFocusReassert: PendingNonFocusSplitFocusReassert?
     @ObservationIgnored var nonFocusSplitFocusReassertGeneration: UInt64 = 0
@@ -3878,20 +3882,38 @@ final class Workspace: Identifiable {
 
     /// Reconcile remaining terminal view geometries after split topology changes.
     /// This keeps AppKit bounds and Ghostty surface sizes in sync in the next runloop turn.
-    func scheduleTerminalGeometryReconcile() {
+    func scheduleTerminalGeometryReconcile(reattachViews: Bool = true) {
+        // A structural request must win if it is coalesced with a geometry-only
+        // callback in the same runloop turn. Split/close recovery still needs
+        // SwiftUI to revisit the portal binding; ordinary size changes do not.
+        geometryReconcileNeedsViewReattach = Self.coalescedViewReattachRequirement(
+            pending: geometryReconcileNeedsViewReattach,
+            requested: reattachViews
+        )
         guard !geometryReconcileScheduled else { return }
         geometryReconcileScheduled = true
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.geometryReconcileScheduled = false
+            let reattachViews = self.geometryReconcileNeedsViewReattach
+            self.geometryReconcileNeedsViewReattach = false
 
             for panel in self.panels.values {
                 guard let terminalPanel = panel as? TerminalPanel else { continue }
-                terminalPanel.requestViewReattach()
+                if reattachViews {
+                    terminalPanel.requestViewReattach()
+                }
                 terminalPanel.hostedView.reconcileGeometryNow()
                 terminalPanel.surface.forceRefresh()
             }
         }
+    }
+
+    nonisolated static func coalescedViewReattachRequirement(
+        pending: Bool,
+        requested: Bool
+    ) -> Bool {
+        pending || requested
     }
 
     func closeTabs(_ tabIds: [TabID], skipPinned: Bool = true) {

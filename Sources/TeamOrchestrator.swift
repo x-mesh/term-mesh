@@ -149,7 +149,41 @@ final class TeamOrchestrator: ObservableObject {
         struct RemoteProjectLocation: Hashable {
             let hostKey: String
             let path: String
+            /// True only when term-mesh created this directory for the team.
+            /// User-selected source checkouts are routing inputs, not assets
+            /// Delete Project is allowed to remove.
+            let owned: Bool
+
+            /// `owned` defaults to false because a forgotten value must fall
+            /// on the side that keeps a directory, not the side that deletes
+            /// one. Every production caller states it from what the bootstrap
+            /// reported; a probe or a fixture that only names a location gets
+            /// the harmless answer.
+            init(hostKey: String, path: String, owned: Bool = false) {
+                self.hostKey = hostKey
+                self.path = path
+                self.owned = owned
+            }
+
+            /// A location is which directory on which host, and nothing else.
+            ///
+            /// Ownership is an attribute of that directory, not part of its
+            /// name, and folding it into equality made every
+            /// `contains(where-the-agent-wants-to-work)` probe answer "no" for
+            /// any location recorded as unowned — silently disabling late-agent
+            /// checkout isolation and worktree reaping. Two records for one
+            /// directory that disagree about ownership are one record with a
+            /// merge to do, never two directories.
+            static func == (lhs: Self, rhs: Self) -> Bool {
+                lhs.hostKey == rhs.hostKey && lhs.path == rhs.path
+            }
+
+            func hash(into hasher: inout Hasher) {
+                hasher.combine(hostKey)
+                hasher.combine(path)
+            }
         }
+
 
         let id: String            // team name
         let leaderSessionId: String
@@ -261,9 +295,19 @@ final class TeamOrchestrator: ObservableObject {
     /// Prevent repeated project clicks from attaching multiple local viewers
     /// to the same persistent remote leader surface.
     var remoteLeaderReattachInFlight: Set<String> = []
-    /// Runtime EOF can arrive more than once while Ghostty and the peer relay
-    /// unwind. Only one recovery may reattach or re-bootstrap a leader.
+    /// Initial attach and runtime recovery share this gate. A workspace click
+    /// while its initial remote leader is still connecting must not start a
+    /// second reattach/bootstrap against the same team. Runtime EOF can also
+    /// arrive more than once while Ghostty and the peer relay unwind.
     var remoteLeaderRecoveryInFlight: Set<String> = []
+
+    func beginRemoteLeaderAttach(teamName: String) -> Bool {
+        remoteLeaderRecoveryInFlight.insert(teamName).inserted
+    }
+
+    func endRemoteLeaderAttach(teamName: String) {
+        remoteLeaderRecoveryInFlight.remove(teamName)
+    }
     /// Owner-side keepalives for scoped remote-leader grants. The bearer in
     /// the remote process cannot renew itself after going idle; only this app,
     /// which minted the grant and owns the project, may extend its server lease.
@@ -362,7 +406,9 @@ final class TeamOrchestrator: ObservableObject {
         teams[teamName]?.remoteProjectLocations = locations
         RemoteProjectLocationStore.shared.replace(
             teamName: teamName,
-            locations: locations.map { (hostKey: $0.hostKey, path: $0.path) }
+            locations: locations.map {
+                (hostKey: $0.hostKey, path: $0.path, owned: $0.owned)
+            }
         )
     }
 
@@ -373,11 +419,21 @@ final class TeamOrchestrator: ObservableObject {
     /// directly — after a restart the in-memory list is empty even though the
     /// directories are still sitting on the peer.
     func knownRemoteProjectLocations(teamName: String) -> [Team.RemoteProjectLocation] {
-        var merged = Set(teams[teamName]?.remoteProjectLocations ?? [])
-        for stored in RemoteProjectLocationStore.shared.locations(teamName: teamName) {
-            merged.insert(Team.RemoteProjectLocation(hostKey: stored.hostKey, path: stored.path))
+        var merged: [String: Team.RemoteProjectLocation] = [:]
+        func merge(_ location: Team.RemoteProjectLocation) {
+            let key = "\(location.hostKey)\u{0000}\(location.path)"
+            let owned = (merged[key]?.owned ?? false) || location.owned
+            merged[key] = Team.RemoteProjectLocation(
+                hostKey: location.hostKey, path: location.path, owned: owned
+            )
         }
-        return merged.sorted { ($0.hostKey, $0.path) < ($1.hostKey, $1.path) }
+        for location in teams[teamName]?.remoteProjectLocations ?? [] { merge(location) }
+        for stored in RemoteProjectLocationStore.shared.locations(teamName: teamName) {
+            merge(Team.RemoteProjectLocation(
+                hostKey: stored.hostKey, path: stored.path, owned: stored.owned
+            ))
+        }
+        return merged.values.sorted { ($0.hostKey, $0.path) < ($1.hostKey, $1.path) }
     }
 
     func configureDedicatedRemoteWorkspaces(teamName: String, enabled: Bool) {
@@ -2290,6 +2346,11 @@ final class TeamOrchestrator: ObservableObject {
                             if var existing = self.teams[name] {
                                 existing.teamUuid = teamUuid
                                 self.teams[name] = existing
+                                WorkspaceProjectNames.shared.declare(
+                                    workspaceId: existing.workspaceId,
+                                    projectName: name,
+                                    projectID: "team:\(teamUuid)"
+                                )
                             }
                         }
                     }
@@ -9304,5 +9365,17 @@ final class ClaudeSessionWatcher {
         #if DEBUG
         dlog("[claude.sid.watch] teardown dir=\(dir)")
         #endif
+    }
+}
+
+extension Sequence where Element == TeamOrchestrator.Team.RemoteProjectLocation {
+    /// Is this directory on this host one of ours to route work into?
+    ///
+    /// Spelled out rather than left to `contains(_:)` with a synthesized
+    /// probe: building the probe means choosing an `owned` value for a
+    /// question that is not about ownership, and choosing wrong silently
+    /// answers "no" for every unowned location.
+    func containsLocation(hostKey: String, path: String) -> Bool {
+        contains { $0.hostKey == hostKey && $0.path == path }
     }
 }

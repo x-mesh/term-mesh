@@ -120,6 +120,38 @@ final class RemoteLaunchCompensationRegression169Tests: XCTestCase {
         XCTAssertEqual(remaining, locations)
     }
 
+    func testDeleteProjectNeverOwnsAUserSelectedSourceCheckout() {
+        let source = Location(hostKey: host, path: "/srv/existing-project", owned: false)
+        let leaderWorktree = Location(
+            hostKey: host, path: "/srv/existing-project-leader-260820-abcd", owned: true
+        )
+        let workerWorktree = Location(
+            hostKey: host, path: "/srv/existing-project-executor-260820-ef01", owned: true
+        )
+
+        XCTAssertEqual(
+            TeamOrchestrator.ownedRemoteProjectLocations([
+                source, leaderWorktree, workerWorktree,
+            ]),
+            [leaderWorktree, workerWorktree],
+            "Delete Project may remove only paths this Project created"
+        )
+    }
+
+    func testLegacyRemoteLocationRecordDecodesAsUnowned() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "teamName": "legacy", "hostKey": host, "path": "/srv/user-checkout",
+        ])
+        let record = try JSONDecoder().decode(
+            RemoteProjectLocationStore.Record.self, from: data
+        )
+
+        XCTAssertFalse(
+            record.owned,
+            "old records predate ownership evidence and must fail safe"
+        )
+    }
+
     func testRuntimeCloseRecoversOnlyThePeerLeaderInItsOwningWorkspace() {
         let leader = UUID()
         let workspace = UUID()
@@ -158,4 +190,84 @@ final class RemoteLaunchCompensationRegression169Tests: XCTestCase {
         )
     }
 
+}
+
+/// Findings from the cross-model review of the remote project lifecycle work.
+/// Each one is a defect the change itself introduced, verified in the code
+/// before being fixed.
+final class RemoteProjectLifecycleReviewFixTests: XCTestCase {
+    private typealias Location = TeamOrchestrator.Team.RemoteProjectLocation
+
+    /// A location is a directory on a host. Folding `owned` into equality made
+    /// every membership probe build its key with the default value and miss
+    /// any record that disagreed, which silently switched off late-agent
+    /// checkout isolation and detached-worktree reaping.
+    func testLocationIdentityIgnoresOwnership() {
+        let ours = Location(hostKey: "ssh:h", path: "/srv/p", owned: true)
+        let theirs = Location(hostKey: "ssh:h", path: "/srv/p", owned: false)
+
+        XCTAssertEqual(ours, theirs, "one directory is one location")
+        XCTAssertEqual(Set([ours, theirs]).count, 1)
+        XCTAssertNotEqual(ours, Location(hostKey: "ssh:h", path: "/srv/q", owned: true))
+        XCTAssertNotEqual(ours, Location(hostKey: "ssh:i", path: "/srv/p", owned: true))
+    }
+
+    /// The probe both call sites needed: "is work already routed here?" has to
+    /// answer yes for a directory the user owns, because that is exactly the
+    /// case that needs an isolated checkout instead of a second writer.
+    func testContainsLocationFindsAnUnownedDirectory() {
+        let recorded = [
+            Location(hostKey: "ssh:h", path: "/srv/theirs", owned: false),
+            Location(hostKey: "ssh:h", path: "/srv/ours", owned: true),
+        ]
+
+        XCTAssertTrue(recorded.containsLocation(hostKey: "ssh:h", path: "/srv/theirs"))
+        XCTAssertTrue(recorded.containsLocation(hostKey: "ssh:h", path: "/srv/ours"))
+        XCTAssertFalse(recorded.containsLocation(hostKey: "ssh:h", path: "/srv/other"))
+        XCTAssertFalse(recorded.containsLocation(hostKey: "ssh:other", path: "/srv/ours"))
+    }
+
+    /// Forgetting the parameter must not hand Delete Project a directory.
+    func testOwnershipDefaultsToTheSideThatKeepsTheDirectory() {
+        XCTAssertFalse(Location(hostKey: "ssh:h", path: "/srv/p").owned)
+        XCTAssertTrue(
+            TeamOrchestrator.ownedRemoteProjectLocations([
+                Location(hostKey: "ssh:h", path: "/srv/ours", owned: true),
+                Location(hostKey: "ssh:h", path: "/srv/theirs", owned: false),
+            ]).map(\.path) == ["/srv/ours"]
+        )
+    }
+
+    /// An unanswered session-owner question must stay unanswered.
+    ///
+    /// `teamRouteResolved` reads any non-nil value as resolved, and
+    /// `teamHostSpec` then falls back to the serving GUI socket. Storing the
+    /// empty string after the retries ran out therefore pinned team work to
+    /// the endpoint that cannot do it, which is the failure the retry loop was
+    /// added to prevent.
+    func testEmptySessionOwnerRouteIsNotAResolvedRoute() {
+        var host = HostEntry(
+            id: "ssh:root@mac-sub",
+            displayName: "mac-sub",
+            connectionState: .connected,
+            workspaces: [],
+            activeSockPath: "/tmp/term-mesh-peer-501/mac-sub.sock",
+            sshTarget: "root@mac-sub",
+            remoteSockPath: "/run/user/0/tm-peer.sock"
+        )
+
+        host.sessionHostRemoteSockPath = nil
+        XCTAssertFalse(host.teamRouteResolved, "no answer yet is not an answer")
+        XCTAssertNil(host.teamHostSpec)
+
+        // "" remains the real answer for a host that owns its own sessions.
+        host.sessionHostRemoteSockPath = ""
+        XCTAssertTrue(host.teamRouteResolved)
+        XCTAssertEqual(host.teamHostSpec?.hostKey, host.paneHostSpec.hostKey)
+        XCTAssertFalse(host.redirectsTeamWorkToSessionHost)
+
+        host.sessionHostRemoteSockPath = "/run/user/501/term-meshd.sock"
+        XCTAssertTrue(host.teamRouteResolved)
+        XCTAssertTrue(host.redirectsTeamWorkToSessionHost)
+    }
 }

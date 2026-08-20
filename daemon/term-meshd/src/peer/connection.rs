@@ -390,10 +390,10 @@ async fn reader_loop(
                     else {
                         continue;
                     };
-                    let Some(members) = manifest
+                    let members = manifest
                         .members
                         .iter()
-                        .map(|member| {
+                        .filter_map(|member| {
                             let surface_id = hex::decode(&member.surface_id).ok()?;
                             live_surface_ids
                                 .contains(&surface_id)
@@ -409,10 +409,7 @@ async fn reader_loop(
                                     surface_type: member.surface_type.clone(),
                                 })
                         })
-                        .collect::<Option<Vec<TeamMember>>>()
-                    else {
-                        continue;
-                    };
+                        .collect::<Vec<TeamMember>>();
                     if let Some(team) = teams
                         .iter_mut()
                         .find(|team| team.team_uuid == manifest.team_uuid)
@@ -423,6 +420,7 @@ async fn reader_loop(
                             members.iter().map(|member| member.name.clone()).collect();
                         team.members = members;
                         team.presentation_revision = manifest.revision;
+                        team.created_at_unix_secs = manifest.created_at_unix_secs;
                         team.presentation_owned_by_requester =
                             project_owner_hex.contains(&manifest.owner_peer_id);
                         if team.project_root.is_empty() {
@@ -435,7 +433,7 @@ async fn reader_loop(
                             working_directory: manifest.working_directory,
                             project_root: manifest.project_root,
                             agent_names: members.iter().map(|member| member.name.clone()).collect(),
-                            created_at_unix_secs: 0,
+                            created_at_unix_secs: manifest.created_at_unix_secs,
                             leader_surface_id,
                             members,
                             project_id: manifest.project_id,
@@ -4508,9 +4506,11 @@ mod agent_surface_tests {
                 other => panic!("expected team list, got {other:?}"),
             }
         };
+        assert_eq!(list.teams.len(), 1, "a live leader keeps the project discoverable");
+        assert_eq!(list.teams[0].leader_surface_id, leader_id);
         assert!(
-            list.teams.is_empty(),
-            "a partial project manifest must not be discoverable"
+            list.teams[0].members.is_empty(),
+            "dead members must be omitted instead of respawned by discovery"
         );
 
         let (mut owner_reader, mut owner_writer) = handshake_as_with_owner_aliases(

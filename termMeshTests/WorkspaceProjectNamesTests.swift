@@ -70,4 +70,36 @@ final class WorkspaceProjectNamesTests: XCTestCase {
         XCTAssertNotEqual(declared?.key, executor.key)
         XCTAssertNotEqual(declared?.key, architect.key)
     }
+
+    func testDurableProjectIDRoundTripsAndIsForgottenWithWorkspace() {
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: workspace,
+            projectName: "term-mesh",
+            projectID: "team:ABC"
+        )
+        XCTAssertEqual(
+            WorkspaceProjectNames.shared.projectID(for: workspace),
+            "team:ABC"
+        )
+        WorkspaceProjectNames.shared.forget(workspaceId: workspace)
+        XCTAssertNil(WorkspaceProjectNames.shared.projectID(for: workspace))
+    }
+
+    func testNameOnlyRedeclarationClearsAStaleDurableProjectID() {
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: workspace,
+            projectName: "term-mesh",
+            projectID: "team:old"
+        )
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: workspace,
+            projectName: "another-project"
+        )
+
+        XCTAssertNil(WorkspaceProjectNames.shared.projectID(for: workspace))
+        XCTAssertEqual(
+            WorkspaceProjectNames.shared.projectName(for: workspace),
+            "another-project"
+        )
+    }
 }

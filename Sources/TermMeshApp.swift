@@ -10,6 +10,11 @@ import Bonsplit
 /// that first singleton access, not merely before the `init()` body finishes.
 private enum TermMeshLaunchPreflight {
     static func prepare() -> AppearanceMode {
+        // Must precede NSApp creation and every singleton access. term-mesh
+        // restores its pane graph from session.json; allowing AppKit to restore
+        // the SwiftUI window too can make both systems rebuild the same large
+        // focus graph during launch.
+        NativeWindowRestorationPolicy.disable()
         GhosttyEnvironment.configureOnce()
         let appearance = AppearanceSettings.resolvedMode()
         // `TerminalThemeOverride` consults the effective AppKit appearance for
@@ -123,9 +128,16 @@ struct TermMeshApp: App {
         let isRunningUnderXCTest = AppLaunchEnvironment.isRunningUnderXCTest(
             ProcessInfo.processInfo.environment
         )
+        // An e2e run with its own state directory opts back in: the session
+        // round trip is what it is testing, and any `TERMMESH_UI_TEST_*`
+        // variable — which is how the socket runner launches the app — reads as
+        // XCTest here and would otherwise turn both halves off. Safe because the
+        // override redirects the save away from the user's real session file.
+        let ownsSessionState = !isRunningUnderXCTest
+            || SessionRestoreSettings.stateDirectoryOverride() != nil
         _tabManager = State(wrappedValue: TabManager(
-            restoreSavedSession: !isRunningUnderXCTest,
-            persistsSessionState: !isRunningUnderXCTest,
+            restoreSavedSession: ownsSessionState,
+            persistsSessionState: ownsSessionState,
             daemon: TermMeshDaemon.shared,
             notifications: TerminalNotificationStore.shared
         ))

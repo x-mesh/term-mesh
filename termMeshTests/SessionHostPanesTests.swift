@@ -19,9 +19,42 @@ import PeerProto
 /// mirror showed one. These tests cover the per-surface decision instead.
 @MainActor
 final class SessionHostPanesTests: XCTestCase {
+    func test_sessionHostStartupRetryOutlivesSlowSiblingDaemonStartup() {
+        let total = RemoteHostStore.sessionHostStartupRetryDelays.reduce(0.0) { sum, delay in
+            sum + Double(delay.components.seconds)
+                + Double(delay.components.attoseconds) / 1_000_000_000_000_000_000
+        }
+        XCTAssertGreaterThanOrEqual(total, 30)
+        XCTAssertLessThanOrEqual(total, 46)
+    }
+
+    func test_unansweredSessionOwnerRetriesInBackgroundWithoutReclassifyingTheGUI() {
+        XCTAssertEqual(
+            initialSessionOwnerRoute(
+                ownsItsOwnSessions: false, advertisedSocket: ""
+            ),
+            .discoverInBackground,
+            "workspace listing must continue while only the owner route retries"
+        )
+        XCTAssertEqual(
+            initialSessionOwnerRoute(
+                ownsItsOwnSessions: false, advertisedSocket: "/tmp/daemon-peer.sock"
+            ),
+            .resolved("/tmp/daemon-peer.sock")
+        )
+        XCTAssertEqual(
+            initialSessionOwnerRoute(
+                ownsItsOwnSessions: true, advertisedSocket: "/ignored.sock"
+            ),
+            .resolved(""),
+            "a daemon serving directly owns its sessions on the current socket"
+        )
+    }
+
     func test_projectManifestRoutesEverySurfaceToItsDeclaredProject() {
         var team = Termmesh_Peer_V1_Team()
         team.name = "term-mesh"
+        team.projectID = "team:term-mesh"
         team.workingDirectory = "/Users/jinwoo/work/tm-projects/term-mesh"
         team.leaderSurfaceID = sid(1)
         var member = Termmesh_Peer_V1_TeamMember()
@@ -34,8 +67,66 @@ final class SessionHostPanesTests: XCTestCase {
             [sid(1): "term-mesh", sid(2): "term-mesh"]
         )
         XCTAssertEqual(
-            SessionHostPanes.projectWorkingDirectories(teams: [team]),
-            ["term-mesh": "/Users/jinwoo/work/tm-projects/term-mesh"]
+            SessionHostPanes.projectClaimsBySurfaceID(teams: [team])[sid(1)]?.workingDirectory,
+            "/Users/jinwoo/work/tm-projects/term-mesh"
+        )
+    }
+
+    func test_workingDirectoryIsKeyedByDurableProjectIDNotDisplayName() {
+        var stale = Termmesh_Peer_V1_Team()
+        stale.name = "term-mesh"
+        stale.projectID = "team:stale"
+        stale.workingDirectory = "/tmp/stale"
+        var current = stale
+        current.projectID = "team:current"
+        current.workingDirectory = "/tmp/current"
+
+        current.leaderSurfaceID = sid(9)
+        XCTAssertEqual(
+            SessionHostPanes.projectClaimsBySurfaceID(
+                teams: [stale, current], preferredProjectIDs: ["team:current"]
+            )[sid(9)]?.workingDirectory,
+            "/tmp/current"
+        )
+    }
+
+    func test_newestRevisionOwnsTheDirectoryRegardlessOfRosterOrder() {
+        var current = Termmesh_Peer_V1_Team()
+        current.name = "term-mesh"
+        current.projectID = "team:one"
+        current.presentationRevision = 9
+        current.workingDirectory = "/tmp/current"
+        var stale = current
+        stale.presentationRevision = 3
+        stale.workingDirectory = "/tmp/stale"
+
+        current.leaderSurfaceID = sid(10)
+        stale.leaderSurfaceID = sid(10)
+        XCTAssertEqual(
+            SessionHostPanes.projectClaimsBySurfaceID(teams: [current, stale])[sid(10)]?
+                .workingDirectory,
+            "/tmp/current"
+        )
+    }
+
+    func test_supersededViewerClosesWhenSameNamedProjectWinnerChanges() {
+        XCTAssertEqual(
+            SessionHostPanes.supersededShownSurfaceIDs(
+                shown: [sid(1), sid(2), sid(3)],
+                suppressed: [sid(1), sid(4)],
+                currentlyClaimed: [sid(2), sid(3)]
+            ),
+            [sid(1)]
+        )
+    }
+
+    func test_overlappingWinnerSurfaceIsNeverClosedAsSuperseded() {
+        XCTAssertTrue(
+            SessionHostPanes.supersededShownSurfaceIDs(
+                shown: [sid(7)],
+                suppressed: [sid(7)],
+                currentlyClaimed: [sid(7)]
+            ).isEmpty
         )
     }
 
@@ -45,6 +136,280 @@ final class SessionHostPanesTests: XCTestCase {
         stale.agentNames = ["executor"]
 
         XCTAssertTrue(SessionHostPanes.projectNamesBySurfaceID(teams: [stale]).isEmpty)
+    }
+
+    func test_newerPresentationWinsWhenStaleManifestReferencesSameSurface() {
+        let surface = sid(7)
+        var stale = Termmesh_Peer_V1_Team()
+        stale.name = "term-mesh"
+        stale.projectID = "team:old"
+        stale.presentationRevision = 2
+        stale.leaderSurfaceID = surface
+        var current = stale
+        current.projectID = "team:current"
+        current.presentationRevision = 6
+
+        XCTAssertEqual(
+            SessionHostPanes.projectClaimsBySurfaceID(teams: [stale, current])[surface],
+            .init(
+                projectID: "team:current", name: "term-mesh",
+                revision: 6, ownedByRequester: false
+            )
+        )
+    }
+
+    func test_activeLocalProjectWinsOverNewerStalePresentation() {
+        let surface = sid(8)
+        var active = Termmesh_Peer_V1_Team()
+        active.name = "term-mesh"
+        active.projectID = "team:active"
+        active.presentationRevision = 5
+        active.leaderSurfaceID = surface
+        var stale = active
+        stale.projectID = "team:stale"
+        stale.presentationRevision = 6
+
+        XCTAssertEqual(
+            SessionHostPanes.projectClaimsBySurfaceID(
+                teams: [active, stale],
+                preferredProjectIDs: ["team:active"]
+            )[surface],
+            .init(
+                projectID: "team:active", name: "term-mesh",
+                revision: 5, ownedByRequester: false
+            )
+        )
+        XCTAssertFalse(
+            SessionHostPanes.projectRoutingSnapshot(
+                teams: [active, stale],
+                preferredProjectIDs: ["team:active"]
+            ).suppressedSurfaceIDs.contains(surface)
+        )
+    }
+
+    func test_staleSameNamedProjectSurfacesAreSuppressedFromAutoOpen() {
+        var active = Termmesh_Peer_V1_Team()
+        active.name = "term-mesh"
+        active.projectID = "team:active"
+        active.presentationRevision = 5
+        active.leaderSurfaceID = sid(1)
+        var stale = active
+        stale.projectID = "team:stale"
+        stale.presentationRevision = 9
+        stale.leaderSurfaceID = sid(2)
+        var staleMember = Termmesh_Peer_V1_TeamMember()
+        staleMember.surfaceID = sid(3)
+        stale.members = [staleMember]
+
+        let routing = SessionHostPanes.projectRoutingSnapshot(
+            teams: [active, stale],
+            preferredProjectIDs: ["team:active"]
+        )
+        XCTAssertEqual(routing.claims[sid(1)]?.projectID, "team:active")
+        XCTAssertNil(routing.claims[sid(2)])
+        XCTAssertEqual(routing.suppressedSurfaceIDs, [sid(2), sid(3)])
+    }
+
+    func test_twoExplicitSameNamedProjectIDsBothRemainRoutable() {
+        var first = Termmesh_Peer_V1_Team()
+        first.name = "term-mesh"
+        first.projectID = "team:first"
+        first.presentationRevision = 3
+        first.leaderSurfaceID = sid(31)
+        var second = first
+        second.projectID = "team:second"
+        second.presentationRevision = 8
+        second.leaderSurfaceID = sid(32)
+
+        let routing = SessionHostPanes.projectRoutingSnapshot(
+            teams: [first, second],
+            preferredProjectIDs: ["team:first", "team:second"]
+        )
+
+        XCTAssertEqual(routing.claims[sid(31)]?.projectID, "team:first")
+        XCTAssertEqual(routing.claims[sid(32)]?.projectID, "team:second")
+        XCTAssertTrue(routing.suppressedSurfaceIDs.isEmpty)
+    }
+
+    func test_requesterOwnedPresentationWinsOverNewerForeignRecord() {
+        let surface = sid(9)
+        var owned = Termmesh_Peer_V1_Team()
+        owned.name = "term-mesh"
+        owned.projectID = "team:owned"
+        owned.presentationRevision = 3
+        owned.presentationOwnedByRequester = true
+        owned.leaderSurfaceID = surface
+        var foreign = owned
+        foreign.projectID = "team:foreign"
+        foreign.presentationRevision = 99
+        foreign.presentationOwnedByRequester = false
+
+        XCTAssertEqual(
+            SessionHostPanes.projectRoutingSnapshot(teams: [owned, foreign]).claims[surface],
+            .init(
+                projectID: "team:owned", name: "term-mesh",
+                revision: 3, ownedByRequester: true
+            )
+        )
+    }
+
+    func test_differentNamedProjectsRemainAutoOpenCandidates() {
+        var active = Termmesh_Peer_V1_Team()
+        active.name = "term-mesh"
+        active.projectID = "team:active"
+        active.leaderSurfaceID = sid(1)
+        var other = active
+        other.name = "xm"
+        other.projectID = "team:xm"
+        other.leaderSurfaceID = sid(2)
+
+        let routing = SessionHostPanes.projectRoutingSnapshot(
+            teams: [active, other],
+            preferredProjectIDs: ["team:active"]
+        )
+        XCTAssertEqual(routing.claims[sid(2)]?.projectID, "team:xm")
+        XCTAssertTrue(routing.suppressedSurfaceIDs.isEmpty)
+    }
+
+    func test_ambiguousForeignSameNamedProjectsAreAllSuppressed() {
+        var first = Termmesh_Peer_V1_Team()
+        first.name = "term-mesh"
+        first.projectID = "team:first"
+        first.leaderSurfaceID = sid(1)
+        var second = first
+        second.projectID = "team:second"
+        second.leaderSurfaceID = sid(2)
+
+        let routing = SessionHostPanes.projectRoutingSnapshot(teams: [first, second])
+        XCTAssertTrue(routing.claims.isEmpty)
+        XCTAssertEqual(routing.suppressedSurfaceIDs, [sid(1), sid(2)])
+    }
+
+    func test_legacySameNamedProjectsAreSuppressedWithoutIdentityEvidence() {
+        var stale = Termmesh_Peer_V1_Team()
+        stale.name = "term-mesh"
+        stale.projectID = "team:stale"
+        stale.leaderSurfaceID = sid(1)
+        var current = stale
+        current.projectID = "team:current"
+        current.leaderSurfaceID = sid(2)
+        var member = Termmesh_Peer_V1_TeamMember()
+        member.surfaceID = sid(3)
+        current.members = [member]
+
+        let routing = SessionHostPanes.projectRoutingSnapshot(teams: [stale, current])
+        XCTAssertTrue(routing.claims.isEmpty)
+        XCTAssertEqual(routing.suppressedSurfaceIDs, [sid(1), sid(2), sid(3)])
+    }
+
+    func test_newForeignProjectBeatsOlderFullerSameNamedProject() {
+        var old = Termmesh_Peer_V1_Team()
+        old.name = "term-mesh"
+        old.projectID = "team:old"
+        old.createdAtUnixSecs = 100
+        old.leaderSurfaceID = sid(1)
+        old.members = (2...6).map { value in
+            var member = Termmesh_Peer_V1_TeamMember()
+            member.surfaceID = sid(UInt8(value))
+            return member
+        }
+        var current = Termmesh_Peer_V1_Team()
+        current.name = "term-mesh"
+        current.projectID = "team:current"
+        current.createdAtUnixSecs = 200
+        current.leaderSurfaceID = sid(9)
+        var executor = Termmesh_Peer_V1_TeamMember()
+        executor.surfaceID = sid(10)
+        current.members = [executor]
+
+        let routing = SessionHostPanes.projectRoutingSnapshot(teams: [old, current])
+        XCTAssertEqual(routing.claims[sid(9)]?.projectID, "team:current")
+        XCTAssertEqual(routing.claims[sid(10)]?.projectID, "team:current")
+        XCTAssertTrue(routing.claims[sid(1)] == nil)
+        XCTAssertEqual(routing.suppressedSurfaceIDs, Set((1...6).map { sid(UInt8($0)) }))
+    }
+
+    func test_unclaimedDaemonShellsAreNotProjectAutoOpenCandidates() {
+        var claimed = Termmesh_Peer_V1_SurfaceInfo()
+        claimed.surfaceID = sid(1)
+        var unclaimed = Termmesh_Peer_V1_SurfaceInfo()
+        unclaimed.surfaceID = sid(2)
+        let claims: [Data: SessionHostPanes.ProjectClaim] = [
+            claimed.surfaceID: .init(
+                projectID: "team:active", name: "term-mesh",
+                revision: 1, ownedByRequester: true
+            )
+        ]
+        XCTAssertEqual(
+            SessionHostPanes.projectSurfacesForAutoOpen(
+                surfaces: [claimed, unclaimed],
+                claims: claims,
+                suppressedSurfaceIDs: []
+            ).map(\.surfaceID),
+            [claimed.surfaceID]
+        )
+    }
+
+    func test_sameNamedDurableProjectsRouteToDifferentWorkspaces() {
+        let first = UUID()
+        let second = UUID()
+        let declared = [
+            SessionHostPanes.DeclaredProjectClaim(
+                id: first, name: "term-mesh", projectID: "team:first"
+            ),
+            SessionHostPanes.DeclaredProjectClaim(
+                id: second, name: "term-mesh", projectID: "team:second"
+            ),
+        ]
+
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: "term-mesh",
+                projectID: "team:first",
+                declaredProjects: declared,
+                hostSessionsWorkspaceID: nil
+            ),
+            .existingProject(first)
+        )
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: "term-mesh",
+                projectID: "team:third",
+                declaredProjects: declared,
+                hostSessionsWorkspaceID: nil
+            ),
+            .newProject("term-mesh")
+        )
+    }
+
+    func test_uniqueLegacyWorkspaceIsUpgradedToDurableProject() {
+        let legacy = UUID()
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: "term-mesh",
+                projectID: "team:active",
+                declaredProjects: [
+                    .init(id: legacy, name: "term-mesh", projectID: nil)
+                ],
+                hostSessionsWorkspaceID: nil
+            ),
+            .existingProject(legacy)
+        )
+    }
+
+    func test_ambiguousLegacyWorkspacesAreNeverGuessed() {
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: "term-mesh",
+                projectID: "team:active",
+                declaredProjects: [
+                    .init(id: UUID(), name: "term-mesh", projectID: nil),
+                    .init(id: UUID(), name: "term-mesh", projectID: nil),
+                ],
+                hostSessionsWorkspaceID: nil
+            ),
+            .newProject("term-mesh")
+        )
     }
 
     func test_sessionPlacementNeverFallsBackToTheSelectedUnrelatedWorkspace() {
@@ -115,6 +480,138 @@ final class SessionHostPanesTests: XCTestCase {
     }
 
     private func sid(_ byte: UInt8) -> Data { Data(repeating: byte, count: 16) }
+
+    // MARK: - Project identity across a relaunch
+
+    /// Sessions written before workspace IDs were persisted mint a fresh UUID
+    /// for every restored workspace, so the UUID-keyed declaration cannot
+    /// match. Reading the declaration alone therefore answered "no workspace
+    /// owns this project" on every launch, and every launch created one more
+    /// `[project]` workspace for the same project — 3 more per restart on a
+    /// host with 3 teams.
+    func test_aRestoredProjectWorkspaceIsRecognizedFromItsTitle() {
+        let workspace = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        workspace.customTitle = "[term-mesh]"
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: workspace.id) }
+
+        XCTAssertNil(
+            WorkspaceProjectNames.shared.projectName(for: workspace.id),
+            "a restored workspace starts with no declaration"
+        )
+        XCTAssertEqual(SessionHostPanes.declaredProjectName(for: workspace), "term-mesh")
+    }
+
+    /// The title is a fallback, not the source of truth: a workspace the user
+    /// happened to name `[something]` must not outrank its own declaration.
+    func test_anExplicitDeclarationOutranksTheTitle() {
+        let workspace = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        workspace.customTitle = "[term-mesh]"
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: workspace.id) }
+        WorkspaceProjectNames.shared.declare(workspaceId: workspace.id, projectName: "xm")
+
+        XCTAssertEqual(SessionHostPanes.declaredProjectName(for: workspace), "xm")
+    }
+
+    func test_anOrdinaryTitleClaimsNoProject() {
+        let titles: [String?] = [nil, "", "Terminal 1", "[]", "[ ]", "[unclosed", "unopened]"]
+        for title in titles {
+            XCTAssertNil(
+                SessionHostPanes.projectName(fromWorkspaceTitle: title),
+                "\(title ?? "<nil>") is not a project title"
+            )
+        }
+        XCTAssertEqual(
+            SessionHostPanes.projectName(fromWorkspaceTitle: "[h2-verify-fda00162]"),
+            "h2-verify-fda00162"
+        )
+    }
+
+    /// `TeamOrchestrator` titles a team workspace `[project] 3 headless`.
+    /// Requiring the title to end in `]` left a resumed headless team
+    /// unrecognized, so it kept getting a second workspace.
+    func test_aTrailingCountStillNamesTheProject() {
+        XCTAssertEqual(
+            SessionHostPanes.projectName(fromWorkspaceTitle: "[term-mesh] 3 headless"),
+            "term-mesh"
+        )
+        XCTAssertEqual(
+            SessionHostPanes.projectName(fromWorkspaceTitle: "[term-mesh]"),
+            "term-mesh"
+        )
+    }
+
+    /// The title is a fallback for reading, never a claim worth keeping. The app
+    /// itself titles a worktree workspace `[<branch>]` and a socket rename can
+    /// produce any bracketed title, so persisting the recovery would let a
+    /// presentation string permanently outrank `SidebarViews`' path inference
+    /// with no way to revoke it short of closing the workspace.
+    func test_theTitleFallbackNeverWritesADeclaration() {
+        let workspace = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        workspace.customTitle = "[feat/some-branch]"
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: workspace.id) }
+
+        XCTAssertEqual(
+            SessionHostPanes.declaredProjectName(for: workspace), "feat/some-branch"
+        )
+        XCTAssertNil(
+            WorkspaceProjectNames.shared.projectName(for: workspace.id),
+            "reading a title must not declare the workspace"
+        )
+    }
+
+    /// The invariant the whole change exists for, asserted end to end through
+    /// the expression the routing actually evaluates: restored project
+    /// workspaces carry no declaration, and must still resolve to themselves
+    /// rather than to one more new workspace.
+    func test_restoredProjectWorkspacesRouteToThemselvesNotToNewOnes() {
+        let restored = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        restored.customTitle = "[term-mesh]"
+        let unrelated = Workspace(title: "Terminal", workingDirectory: "/tmp")
+        defer {
+            WorkspaceProjectNames.shared.forget(workspaceId: restored.id)
+            WorkspaceProjectNames.shared.forget(workspaceId: unrelated.id)
+        }
+
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: "term-mesh",
+                declaredProjects: SessionHostPanes.declaredProjects(
+                    in: [restored, unrelated]
+                ),
+                hostSessionsWorkspaceID: nil
+            ),
+            .existingProject(restored.id),
+            "a second [term-mesh] workspace per launch is exactly the bug"
+        )
+    }
+
+    /// A bracketed title is only a recovery hint. A worktree named like a
+    /// project must not steal routing from that project's durable declaration,
+    /// even when the worktree appears first in tab/window order.
+    func test_anExplicitProjectOutranksAMatchingTitleAcrossWorkspaces() {
+        let worktree = Workspace(title: "Terminal", workingDirectory: "/tmp/worktree")
+        worktree.customTitle = "[term-mesh]"
+        let project = Workspace(title: "Terminal", workingDirectory: "/tmp/project")
+        project.customTitle = "[term-mesh]"
+        defer {
+            WorkspaceProjectNames.shared.forget(workspaceId: worktree.id)
+            WorkspaceProjectNames.shared.forget(workspaceId: project.id)
+        }
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: project.id, projectName: "term-mesh"
+        )
+
+        XCTAssertEqual(
+            SessionHostPanes.workspaceDestination(
+                projectName: "term-mesh",
+                declaredProjects: SessionHostPanes.declaredProjects(
+                    in: [worktree, project]
+                ),
+                hostSessionsWorkspaceID: nil
+            ),
+            .existingProject(project.id)
+        )
+    }
 
     // MARK: - Which sessions get a pane
 
@@ -418,6 +915,17 @@ extension SessionHostPanesTests {
         XCTAssertLessThanOrEqual(
             SessionHostPanes.pollInterval, .seconds(60),
             "longer than this and a session created now feels like it was dropped"
+        )
+    }
+
+    func test_autoOpenPinOutlivesTheRelayAcceptWindowButStaysBounded() {
+        XCTAssertGreaterThan(
+            SessionHostPanes.autoOpenRealizationPinDuration,
+            .seconds(10)
+        )
+        XCTAssertLessThanOrEqual(
+            SessionHostPanes.autoOpenRealizationPinDuration,
+            SessionHostPanes.pollInterval
         )
     }
 }
@@ -776,6 +1284,44 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
             redirected.teamHostSpec?.hostKey.remoteSockPath,
             "/tmp/T/term-meshd-peer.sock",
             "manifest discovery must read the endpoint that stores the manifest"
+        )
+    }
+
+    /// The production topology that regressed on mac-sub, kept as one
+    /// mutation-sensitive contract rather than three independent facts. The
+    /// serving GUI intentionally cannot own agents or manifests; its sibling
+    /// daemon can. Durable creation is allowed only when discovery, readiness,
+    /// and later team RPCs all name that sibling endpoint.
+    @MainActor
+    func test_macGUIProjectCreationUsesOneReadySessionOwnerForEveryDurableOperation() throws {
+        var redirected = hostEntry(
+            sessionHostRemoteSockPath: "/tmp/T/term-meshd-peer.sock"
+        )
+        let servingEndpoint = redirected.paneHostSpec.hostKey
+        let ownerEndpoint = try XCTUnwrap(redirected.teamHostSpec?.hostKey)
+        XCTAssertNotEqual(servingEndpoint, ownerEndpoint)
+        XCTAssertEqual(
+            ownerEndpoint.remoteSockPath, "/tmp/T/term-meshd-peer.sock"
+        )
+
+        redirected.teamHostReadiness = .ready(TeamHostCapabilitySnapshot(
+            endpoint: ownerEndpoint,
+            appVersion: "0.199.0",
+            supportsPeerOwnedAgentHosting: true,
+            supportsRemoteTeamRoute: true,
+            looksLikeGUIPeerHost: false,
+            redirectedFromServingEndpoint: true
+        ))
+
+        let snapshot = try XCTUnwrap(redirected.teamHostReadiness.snapshot)
+        XCTAssertEqual(snapshot.endpoint, ownerEndpoint)
+        XCTAssertNotEqual(snapshot.endpoint, servingEndpoint)
+        XCTAssertTrue(snapshot.supportsDurableRemoteCreation)
+        XCTAssertTrue(redirected.redirectsTeamWorkToSessionHost)
+        XCTAssertEqual(
+            try TeamOrchestrator.requireTeamHostSpec(redirected).hostKey,
+            ownerEndpoint,
+            "create, presentation discovery, attach, and delete must share one owner"
         )
     }
 
