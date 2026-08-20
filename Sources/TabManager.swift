@@ -504,6 +504,13 @@ class TabManager {
             !teamWorkspaceIds.contains(workspace.id)
                 && !workspace.isPeerMirror
                 && WorkspaceProjectNames.shared.projectID(for: workspace.id) == nil
+                && workspace.customTitle != "Host Sessions"
+                && !(
+                    WorkspaceProjectNames.shared.projectName(for: workspace.id) != nil
+                        && SessionHostPanes.projectName(
+                            fromWorkspaceTitle: workspace.customTitle
+                        ) != nil
+                )
         }
 
         let encoder = JSONEncoder()

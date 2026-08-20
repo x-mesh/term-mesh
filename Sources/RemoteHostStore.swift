@@ -835,6 +835,12 @@ final class RemoteHostStore: ObservableObject {
 
     private var observer: NSObjectProtocol?
     private var fetchTasks: [String: Task<Void, Never>] = [:]
+    /// A Mac GUI may answer before its sibling daemon has bound the advertised
+    /// session-owner socket. Discover that route independently from the serving
+    /// GUI's workspace roster: the sidebar must show reachable workspaces now,
+    /// while durable Project actions stay gated until this task resolves.
+    private var sessionOwnerDiscoveryTasks: [String: Task<Void, Never>] = [:]
+    private var sessionOwnerDiscoveryGenerations: [String: UUID] = [:]
     /// One long-lived, receive-only roster stream per sidebar host. It never
     /// shares a session with a response-waiting RPC: `WorkspaceListChanged`
     /// frames are pushed asynchronously and PeerSession has one reader.
@@ -1594,43 +1600,18 @@ final class RemoteHostStore: ObservableObject {
                     // "" from a host that owns its own sessions is a real
                     // answer; "" from one that does not is an unanswered
                     // question, and the two must not be stored the same way.
-                    var sessionHostSocket = ownsItsOwnSessions
+                    let sessionHostSocket = ownsItsOwnSessions
                         ? "" : conn.sessionHostSockPath
-                    var sessionOwnerUnanswered = false
                     if !ownsItsOwnSessions, sessionHostSocket.isEmpty {
                         self.hosts[key]?.sessionHostRemoteSockPath = nil
                         self.hosts[key]?.teamHostReadiness = .unresolved
-                        for delay in Self.sessionHostStartupRetryDelays {
-                            try? await Task.sleep(for: delay)
-                            guard !Task.isCancelled,
-                                  self.hosts[key]?.activeSockPath == path,
-                                  self.hosts[key]?.isConnected == true
-                            else {
-                                // Every other way out of this function closes
-                                // `conn` first. Leaving through the middle of a
-                                // retry must too, or a reconnect that arrives
-                                // during the wait strands this connection and
-                                // the session the host is holding open for it.
-                                await conn.cancel()
-                                return
-                            }
-                            guard let probe = try? await PeerRelaySession.connect(
-                                hostSockPath: path
-                            ) else { continue }
-                            sessionHostSocket = probe.sessionHostSockPath
-                            await probe.cancel()
-                            if !sessionHostSocket.isEmpty { break }
-                        }
-                        sessionOwnerUnanswered = sessionHostSocket.isEmpty
+                        self.startSessionOwnerDiscovery(for: path, key: key)
+                    } else {
+                        self.sessionOwnerDiscoveryTasks[key]?.cancel()
+                        self.sessionOwnerDiscoveryTasks[key] = nil
+                        self.sessionOwnerDiscoveryGenerations[key] = nil
+                        self.hosts[key]?.sessionHostRemoteSockPath = sessionHostSocket
                     }
-                    // Exhausted retries leave the question open. Storing "" for
-                    // it would make `teamRouteResolved` true, and `teamHostSpec`
-                    // then falls back to the serving GUI socket — pinning team
-                    // work to the endpoint that cannot do it until the next
-                    // reconnect, which is the failure this retry exists to
-                    // prevent, moved 46 seconds later. Stay unresolved instead.
-                    self.hosts[key]?.sessionHostRemoteSockPath =
-                        sessionOwnerUnanswered ? nil : sessionHostSocket
                     RemoteWorkLog.info(
                         "Session owner advertised by \(self.hosts[key]?.displayName ?? key): "
                             + "\(self.hosts[key]?.sessionHostRemoteSockPath ?? "<unresolved>")"
@@ -1659,13 +1640,6 @@ final class RemoteHostStore: ObservableObject {
                         self.hosts[key]?.clearAuthenticatedHostCLIBinDirs()
                     }
                 }
-                // Durable project creation depends on the separate session
-                // owner, not on the GUI workspace roster. Probe that endpoint
-                // first so a slow/stuck ListWorkspaces cannot leave a healthy
-                // daemon reading "checking" forever.
-                let teams = await self.fetchTeamRoster(
-                    hostKey: key, servingSockPath: path
-                ) ?? []
                 let workspaces: [Termmesh_Peer_V1_Workspace]
                 do {
                     workspaces = try await conn.session.listWorkspaces(timeoutSeconds: 10)
@@ -1705,7 +1679,10 @@ final class RemoteHostStore: ObservableObject {
                     )
                 }
                 self.hosts[key]?.workspaces = summaries
-                self.hosts[key]?.teams = teams
+                // Project discovery follows independently. An unresolved or
+                // slow session owner must not hold the serving GUI's roster
+                // hostage for the whole startup retry budget.
+                self.scheduleTeamRosterRefresh(for: path, key: key)
                 self.startTeamRosterPolling(for: path, key: key)
                 // A connection may have recovered after the owner's initial
                 // publication attempt. Re-run publication from this concrete
@@ -1742,6 +1719,52 @@ final class RemoteHostStore: ObservableObject {
                     )
                 }
             }
+        }
+    }
+
+    private func startSessionOwnerDiscovery(for path: String, key: String) {
+        sessionOwnerDiscoveryTasks[key]?.cancel()
+        let generation = UUID()
+        sessionOwnerDiscoveryGenerations[key] = generation
+        sessionOwnerDiscoveryTasks[key] = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.sessionOwnerDiscoveryGenerations[key] == generation {
+                    self.sessionOwnerDiscoveryTasks[key] = nil
+                    self.sessionOwnerDiscoveryGenerations[key] = nil
+                }
+            }
+            for delay in Self.sessionHostStartupRetryDelays {
+                try? await Task.sleep(for: delay)
+                guard !Task.isCancelled,
+                      self.hosts[key]?.activeSockPath == path,
+                      self.hosts[key]?.isConnected == true
+                else { return }
+                guard let probe = try? await PeerRelaySession.connect(
+                    hostSockPath: path
+                ) else { continue }
+                let sessionHostSocket = probe.sessionHostSockPath
+                await probe.cancel()
+                guard !sessionHostSocket.isEmpty else { continue }
+                guard !Task.isCancelled,
+                      self.hosts[key]?.activeSockPath == path,
+                      self.hosts[key]?.isConnected == true
+                else { return }
+                self.hosts[key]?.sessionHostRemoteSockPath = sessionHostSocket
+                if let endpoint = self.hosts[key]?.teamHostSpec?.hostKey {
+                    self.hosts[key]?.teamHostReadiness = .probing(endpoint)
+                }
+                RemoteWorkLog.info(
+                    "Session owner advertised by \(self.hosts[key]?.displayName ?? key): "
+                        + sessionHostSocket
+                )
+                self.scheduleTeamRosterRefresh(for: path, key: key)
+                return
+            }
+            // Exhausted retries leave the route unresolved. Storing "" here
+            // would redirect Project work to the incapable serving GUI.
+            self.hosts[key]?.sessionHostRemoteSockPath = nil
+            self.hosts[key]?.teamHostReadiness = .unresolved
         }
     }
 
@@ -1817,6 +1840,9 @@ final class RemoteHostStore: ObservableObject {
     }
 
     private func stopWorkspaceSubscription(for key: String) {
+        sessionOwnerDiscoveryTasks[key]?.cancel()
+        sessionOwnerDiscoveryTasks[key] = nil
+        sessionOwnerDiscoveryGenerations[key] = nil
         rosterSubscriptionTasks[key]?.cancel()
         rosterSubscriptionTasks[key] = nil
         teamRosterRefreshTasks[key]?.cancel()
