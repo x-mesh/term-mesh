@@ -123,7 +123,11 @@ final class DiagnosticsReportTests: XCTestCase {
     func test_userDefinedPeerNameIsReplacedByItsHostAlias() {
         let snapshot = DiagnosticsSnapshot(
             peerHosts: [
-                host(name: "Alice’s MacBook", ssh: "alice@builder.example.com"),
+                host(
+                    name: "Alice’s MacBook",
+                    ssh: "alice@builder.example.com",
+                    failure: "Alice’s MacBook refused the connection"
+                ),
             ],
             context: .init(
                 windowCount: 1,
@@ -138,7 +142,8 @@ final class DiagnosticsReportTests: XCTestCase {
                     ),
                 ]
             ),
-            activityTail: ["Disconnected Alice’s MacBook"]
+            activityTail: ["Disconnected Alice’s MacBook"],
+            daemonLogTail: ["Retrying Alice’s MacBook"]
         )
         let output = DiagnosticsReport.build(snapshot)
         XCTAssertTrue(output.contains("  <host-1> [connected]"))
