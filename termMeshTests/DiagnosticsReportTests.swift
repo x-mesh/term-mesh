@@ -112,15 +112,22 @@ final class DiagnosticsReportTests: XCTestCase {
             host(id: "a", name: "alpha", ssh: "root@203.0.113.10"),
             host(id: "b", name: "beta", ssh: "root@198.51.100.7"),
         ])
-        guard let alphaRange = output.range(of: "alpha"),
-              let betaRange = output.range(of: "beta") else {
-            return XCTFail("both hosts should appear in the bundle")
-        }
-        let alphaSection = output[alphaRange.lowerBound..<betaRange.lowerBound]
-        XCTAssertTrue(alphaSection.contains("<host-1>"))
-        XCTAssertTrue(output[betaRange.lowerBound...].contains("<host-2>"))
+        XCTAssertTrue(output.contains("  <host-1> [connected]"))
+        XCTAssertTrue(output.contains("  <host-2> [connected]"))
+        XCTAssertFalse(output.contains("alpha"))
+        XCTAssertFalse(output.contains("beta"))
         XCTAssertFalse(output.contains("203.0.113.10"))
         XCTAssertFalse(output.contains("198.51.100.7"))
+    }
+
+    func test_userDefinedPeerNameIsReplacedByItsHostAlias() {
+        let output = render([
+            host(name: "Alice’s MacBook", ssh: "alice@builder.example.com"),
+        ])
+        XCTAssertTrue(output.contains("  <host-1> [connected]"))
+        XCTAssertFalse(output.contains("Alice"))
+        XCTAssertFalse(output.contains("MacBook"))
+        XCTAssertFalse(output.contains("builder.example.com"))
     }
 
     /// The bundle is redacted on the way out no matter which section produced

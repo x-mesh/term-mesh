@@ -310,7 +310,15 @@ enum DiagnosticsReport {
         let redactor = redactor ?? DiagnosticsRedactor(
             seedHosts: snapshot.peerHosts.compactMap(\.sshTarget)
         )
-        return redactor.redact(rawText(snapshot))
+        var safeSnapshot = snapshot
+        safeSnapshot.peerHosts = snapshot.peerHosts.map { host in
+            var safeHost = host
+            let identity = host.sshTarget.flatMap { $0.isEmpty ? nil : $0 }
+                ?? host.displayName
+            safeHost.displayName = redactor.alias(forHost: identity)
+            return safeHost
+        }
+        return redactor.redact(rawText(safeSnapshot))
     }
 
     /// Convenience for callers that only have the daemon status to hand; the
