@@ -2761,6 +2761,80 @@ final class RelayStallLogGateTests: XCTestCase {
 /// is `Workspace.openRemoteAgentPane`, tested with the rest of Phase 2.
 final class PeerOwnedAgentSurfaceTests: XCTestCase {
 
+    /// The regression this exists for: the SSH-owned launch site assembled
+    /// this merge by hand and left the profile layer out, so a remote pane
+    /// started with the host's stored keys but without the active CLI
+    /// profile's gateway settings. Authentication then failed against the
+    /// wrong endpoint, far from the code that dropped them.
+    @MainActor
+    func test_remoteNativeLaunchEnvironmentCarriesTheActiveProfileLayer() throws {
+        var askedForCLI: String?
+        let merged = try TeamOrchestrator.remoteNativeAgentLaunchEnvironment(
+            cli: "claude",
+            hostKey: "host-1",
+            internalIdentity: ["TERMMESH_TEAM": "real"],
+            profileLookup: { cli in
+                askedForCLI = cli
+                return [
+                    "ANTHROPIC_BASE_URL": "https://gateway.example",
+                    "ANTHROPIC_AUTH_TOKEN": "profile-token",
+                    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+                ]
+            },
+            hostLookup: { _ in ["AI_MESH_API_KEY": "host-key"] }
+        )
+
+        // The profile is consulted for the CLI actually being launched, not a
+        // hardcoded one — a codex pane must not inherit claude's gateway.
+        XCTAssertEqual(askedForCLI, "claude")
+        XCTAssertEqual(merged["ANTHROPIC_BASE_URL"], "https://gateway.example")
+        XCTAssertEqual(merged["ANTHROPIC_AUTH_TOKEN"], "profile-token")
+        XCTAssertEqual(merged["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], "1")
+        // The host layer that kept working while the profile layer was missing
+        // — its presence is what made the failure look partial rather than
+        // structural.
+        XCTAssertEqual(merged["AI_MESH_API_KEY"], "host-key")
+    }
+
+    /// Precedence has to survive the extraction: a host may override a
+    /// profile, but neither may override term-mesh's own identity.
+    @MainActor
+    func test_remoteNativeLaunchEnvironmentKeepsLayerPrecedence() throws {
+        let merged = try TeamOrchestrator.remoteNativeAgentLaunchEnvironment(
+            cli: "claude",
+            hostKey: "host-1",
+            internalIdentity: ["TERMMESH_TEAM": "real"],
+            profileLookup: { _ in ["SHARED": "profile", "TERMMESH_TEAM": "spoof"] },
+            hostLookup: { _ in ["SHARED": "host", "TERMMESH_TEAM": "also-spoof"] }
+        )
+        XCTAssertEqual(merged["SHARED"], "host")
+        XCTAssertEqual(merged["TERMMESH_TEAM"], "real")
+    }
+
+    /// Both ownership models must produce the same environment for the same
+    /// inputs. They diverged once by being written out separately; this is the
+    /// property that divergence broke.
+    @MainActor
+    func test_bothOwnershipModelsAgreeOnTheSameInputs() throws {
+        let profile = ["ANTHROPIC_BASE_URL": "https://gateway.example"]
+        let host = ["AI_MESH_API_KEY": "host-key"]
+        let identity = ["TERMMESH_TEAM": "real"]
+
+        let viaLaunchHelper = try TeamOrchestrator.remoteNativeAgentLaunchEnvironment(
+            cli: "claude",
+            hostKey: "host-1",
+            internalIdentity: identity,
+            profileLookup: { _ in profile },
+            hostLookup: { _ in host }
+        )
+        let viaPeerHelper = try TeamOrchestrator.peerOwnedAgentEnvironment(
+            profile: profile,
+            explicitHost: host,
+            internalIdentity: identity
+        )
+        XCTAssertEqual(viaLaunchHelper, viaPeerHelper)
+    }
+
     @MainActor
     func test_configuredRemoteAgentEnvironmentIncludesProfileAndLetsHostOverride() {
         let merged = TeamOrchestrator.configuredRemoteAgentEnvironment(
