@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""A daemon-owned remote Project survives app restart and reattaches exact surfaces."""
+"""A daemon-owned remote Project survives app restart and reattaches exact surfaces.
+
+Set ``TERMMESH_E2E_REQUIRE_SESSION_OWNER_REDIRECT=1`` for the Mac GUI ->
+sibling daemon regression topology. That mode waits for the advertised owner
+to become ready, then pins the two endpoints, exact panes/surfaces, and cleanup.
+"""
 from __future__ import annotations
 
 import json
@@ -18,6 +23,7 @@ DIR_ENV = "TERMMESH_E2E_REMOTE_LEADER_DIR"
 PHASE_ENV = "TERMMESH_E2E_REATTACH_PHASE"
 STATE_ENV = "TERMMESH_E2E_REATTACH_STATE"
 ROLES_ENV = "TERMMESH_E2E_REATTACH_ROLES"
+REQUIRE_SESSION_OWNER_REDIRECT_ENV = "TERMMESH_E2E_REQUIRE_SESSION_OWNER_REDIRECT"
 
 
 def _wait(predicate, timeout_s: float = 45.0, interval_s: float = 0.2):
@@ -174,7 +180,47 @@ class _DebugLogTail:
                    for path, baseline in self._baselines.items())
 
 
-def _connect(c, host: str) -> None:
+def _assert_session_owner_route(row: dict) -> dict:
+    """Pin the Mac GUI -> daemon split that durable Projects require.
+
+    Most remote hosts own panes and Projects on one socket. A Mac GUI host is
+    intentionally different: its serving socket owns workspace mirrors, while
+    the advertised session owner owns agent surfaces and project manifests.
+    The original regression passed a generic "connected" check while all
+    Project RPCs still went to the serving GUI socket.
+    """
+    serving = str(row.get("remote_sock_path") or "")
+    session_owner = str(row.get("session_host_socket") or "")
+    team_endpoint = str(row.get("team_host_endpoint") or "")
+    readiness = str(row.get("team_host_readiness") or "")
+    if not session_owner:
+        raise termmeshError(
+            "connected GUI host did not advertise session_host_socket; "
+            f"row={row!r}"
+        )
+    if session_owner == serving:
+        raise termmeshError(
+            "session owner collapsed onto the serving GUI socket; "
+            f"socket={serving!r}"
+        )
+    if session_owner not in team_endpoint:
+        raise termmeshError(
+            "team endpoint does not target the advertised session owner; "
+            f"owner={session_owner!r} endpoint={team_endpoint!r}"
+        )
+    if readiness not in {"probing", "ready"}:
+        raise termmeshError(
+            "session owner route resolved without a usable readiness state; "
+            f"row={row!r}"
+        )
+    return {
+        "serving_socket": serving,
+        "session_owner_socket": session_owner,
+        "team_host_endpoint": team_endpoint,
+    }
+
+
+def _connect(c, host: str) -> dict:
     row = next((item for item in c.peer_host_list() if item.get("id") == host), None)
     if row is None:
         raise termmeshError(f"saved peer host not found: {host!r}")
@@ -187,9 +233,32 @@ def _connect(c, host: str) -> None:
                     timeout_s=25)
         if row is None:
             raise termmeshError(f"peer host did not become launchable: {host!r}")
+    if os.environ.get(REQUIRE_SESSION_OWNER_REDIRECT_ENV, "").strip() == "1":
+        def ready_session_owner():
+            current = next(
+                (item for item in c.peer_host_list() if item.get("id") == host),
+                None,
+            )
+            if current is None:
+                raise termmeshError(f"saved peer host disappeared: {host!r}")
+            _assert_session_owner_route(current)
+            return current if current.get("team_host_readiness") == "ready" else None
+
+        row = _wait(ready_session_owner, timeout_s=45)
+        if row is None:
+            raise termmeshError(
+                f"advertised session owner did not become ready: {host!r}"
+            )
+    return row
 
 
 def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
+    host_row = next(item for item in c.peer_host_list() if item.get("id") == host)
+    route = (
+        _assert_session_owner_route(host_row)
+        if os.environ.get(REQUIRE_SESSION_OWNER_REDIRECT_ENV, "").strip() == "1"
+        else None
+    )
     team_name = f"remote-reattach-e2e-{uuid.uuid4().hex[:8]}"
     roles = [
         role.strip()
@@ -254,6 +323,22 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
         agent["name"]: agent["agent_instance_id"]
         for agent in team["agents"]
     }
+    panel_ids = [team["leader_panel_id"]] + [
+        agent["panel_id"] for agent in team["agents"]
+    ]
+    if len(set(panel_ids)) != len(panel_ids):
+        raise termmeshError(
+            "leader and workers did not receive distinct panes: "
+            f"panels={panel_ids!r}"
+        )
+    matching_teams = [
+        item for item in c.team_list() if item.get("team_name") == team_name
+    ]
+    if len(matching_teams) != 1:
+        raise termmeshError(
+            "project creation produced duplicate local teams: "
+            f"matches={matching_teams!r}"
+        )
 
     def complete_project():
         project = next((item for item in c.debug_project_remote_presentations(host)
@@ -281,12 +366,23 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
         "leader_surface_id": project["leader_surface_id"],
         "member_instances": expected_instances,
         "member_surfaces": member_surfaces,
+        "source_directory": remote_dir,
+        "checkouts": checkouts,
+        "route": route,
     }))
 
 
 def _phase_adopt(c, host: str, state_path: Path) -> None:
     state = json.loads(state_path.read_text())
     team_name = state["team_name"]
+    if state.get("route") is not None:
+        row = next(item for item in c.peer_host_list() if item.get("id") == host)
+        route = _assert_session_owner_route(row)
+        if route != state["route"]:
+            raise termmeshError(
+                "Project route changed across app restart: "
+                f"before={state['route']!r} after={route!r}"
+            )
     project = _wait(lambda: next((item for item in c.debug_project_remote_presentations(host)
                                   if item.get("project_id") == state["project_id"]), None))
     if project is None:
@@ -392,12 +488,44 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
         )
     if any(not agent.get("panel_id") for agent in team.get("agents", [])):
         raise termmeshError(f"an adopted remote worker has no pane: {team!r}")
+    matching_teams = [
+        item for item in c.team_list() if item.get("team_name") == team_name
+    ]
+    if len(matching_teams) != 1:
+        raise termmeshError(
+            "remote Project adoption produced duplicate local teams: "
+            f"matches={matching_teams!r}"
+        )
+    adopted_panels = [team["leader_panel_id"]] + [
+        agent["panel_id"] for agent in team.get("agents", [])
+    ]
+    if len(set(adopted_panels)) != len(adopted_panels):
+        raise termmeshError(
+            "adopted leader and workers share or duplicate a pane: "
+            f"panels={adopted_panels!r}"
+        )
     c.debug_project_delete(team_name)
-    if _wait(lambda: not any(item.get("project_id") == state["project_id"]
-                             for item in c.debug_project_remote_presentations(host))):
+
+    def fully_deleted():
+        project_exists = any(
+            item.get("project_id") == state["project_id"]
+            for item in c.debug_project_remote_presentations(host)
+        )
+        team_exists = any(
+            item.get("team_name") == team_name for item in c.team_list()
+        )
+        remaining_panes = {pane_id for _, pane_id, _, _ in c.list_panes()}
+        project_pane_exists = any(
+            panel_id in remaining_panes for panel_id in adopted_panels
+        )
+        return not project_exists and not team_exists and not project_pane_exists
+
+    if _wait(fully_deleted):
         state_path.unlink(missing_ok=True)
         return
-    raise termmeshError("remote Project manifest was not deleted after verification")
+    raise termmeshError(
+        "remote Project deletion left its manifest, local team, or relay pane behind"
+    )
 
 
 def main() -> int:

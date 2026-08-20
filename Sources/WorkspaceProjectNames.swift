@@ -26,6 +26,7 @@ final class WorkspaceProjectNames {
     static let shared = WorkspaceProjectNames()
 
     private static let storageKey = "termmesh.workspaceProjectNames"
+    private static let projectIDsStorageKey = "termmesh.workspaceProjectIDs"
 
     /// The suite an e2e run declares into instead of the standard domain.
     ///
@@ -38,24 +39,40 @@ final class WorkspaceProjectNames {
 
     /// Workspace UUID string → project name.
     private var names: [String: String]
+    private var projectIDs: [String: String]
     private let store: UserDefaults
 
     private init() {
         let isolated = SessionRestoreSettings.stateDirectoryOverride() != nil
         store = (isolated ? UserDefaults(suiteName: Self.testSuiteName) : nil) ?? .standard
         names = store.dictionary(forKey: Self.storageKey) as? [String: String] ?? [:]
+        projectIDs = store.dictionary(forKey: Self.projectIDsStorageKey) as? [String: String] ?? [:]
     }
 
-    func declare(workspaceId: UUID, projectName: String) {
+    func declare(
+        workspaceId: UUID,
+        projectName: String,
+        projectID: String? = nil
+    ) {
         let trimmed = projectName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         names[workspaceId.uuidString] = trimmed
         store.set(names, forKey: Self.storageKey)
+        if let projectID = projectID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !projectID.isEmpty {
+            projectIDs[workspaceId.uuidString] = projectID
+            store.set(projectIDs, forKey: Self.projectIDsStorageKey)
+        } else if projectIDs.removeValue(forKey: workspaceId.uuidString) != nil {
+            store.set(projectIDs, forKey: Self.projectIDsStorageKey)
+        }
     }
 
     func forget(workspaceId: UUID) {
-        guard names.removeValue(forKey: workspaceId.uuidString) != nil else { return }
-        store.set(names, forKey: Self.storageKey)
+        let key = workspaceId.uuidString
+        let removedName = names.removeValue(forKey: key) != nil
+        let removedProjectID = projectIDs.removeValue(forKey: key) != nil
+        if removedName { store.set(names, forKey: Self.storageKey) }
+        if removedProjectID { store.set(projectIDs, forKey: Self.projectIDsStorageKey) }
     }
 
     /// Drop every declaration outside `ids`.
@@ -72,13 +89,23 @@ final class WorkspaceProjectNames {
     func retain(ids: Set<UUID>) {
         let live = Set(ids.map(\.uuidString))
         let pruned = names.filter { live.contains($0.key) }
-        guard pruned.count != names.count else { return }
-        names = pruned
-        store.set(names, forKey: Self.storageKey)
+        if pruned.count != names.count {
+            names = pruned
+            store.set(names, forKey: Self.storageKey)
+        }
+        let prunedProjectIDs = projectIDs.filter { live.contains($0.key) }
+        if prunedProjectIDs.count != projectIDs.count {
+            projectIDs = prunedProjectIDs
+            store.set(projectIDs, forKey: Self.projectIDsStorageKey)
+        }
     }
 
     func projectName(for workspaceId: UUID) -> String? {
         names[workspaceId.uuidString]
+    }
+
+    func projectID(for workspaceId: UUID) -> String? {
+        projectIDs[workspaceId.uuidString]
     }
 
     /// The identity the sidebar groups by, built the same way the path rule

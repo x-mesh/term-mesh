@@ -744,7 +744,8 @@ extension TerminalController {
                                     hostKey: hostKey,
                                     projectPath: remotePath,
                                     gitURL: gitURL ?? "",
-                                    isolateAgents: (params["isolate"] as? Bool) ?? true
+                                    isolateAgents: (params["isolate"] as? Bool) ?? true,
+                                    kind: (gitURL?.isEmpty ?? true) ? .existingFolder : .clone
                                 ),
                                 tabManager: tabManager
                             )

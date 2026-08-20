@@ -291,6 +291,84 @@ final class SessionRestoreIdentityTests: XCTestCase {
         )
     }
 
+    func test_durablePeerProjectWorkspaceIsNotSerializedAsLocalShells() {
+        let tabs = manager()
+        let local = tabs.tabs[0]
+        let remote = tabs.addWorkspace(select: false)
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: remote.id,
+            projectName: "term-mesh",
+            projectID: "team:durable"
+        )
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: remote.id) }
+
+        let saved = tabs.savedSessionState()
+
+        XCTAssertEqual(saved.workspaces.map(\.id), [local.id])
+        XCTAssertFalse(saved.workspaces.contains { $0.id == remote.id })
+    }
+
+    func test_restoreSkipsPreviouslySavedPeerProjectsAndHostSessions() {
+        let project = UUID()
+        let hostSessions = UUID()
+        let local = UUID()
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: project,
+            projectName: "term-mesh",
+            projectID: "team:durable"
+        )
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: project) }
+
+        let tabs = manager()
+        tabs.restoreSessionForTests(session([
+            savedWorkspace(id: project, customTitle: "[term-mesh]"),
+            savedWorkspace(id: hostSessions, customTitle: "Host Sessions"),
+            savedWorkspace(id: local, title: "Terminal 3"),
+        ]))
+
+        XCTAssertEqual(tabs.tabs.map(\.id), [local])
+    }
+
+    func test_restoreSkipsLegacyBracketedPeerDeclarationWithoutDurableID() {
+        let legacyPeer = UUID()
+        let local = UUID()
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: legacyPeer, projectName: "legacy-peer"
+        )
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: legacyPeer) }
+
+        let tabs = manager()
+        tabs.restoreSessionForTests(session([
+            savedWorkspace(id: legacyPeer, customTitle: "[legacy-peer]"),
+            savedWorkspace(id: local, title: "Terminal 2"),
+        ]))
+
+        XCTAssertEqual(tabs.tabs.map(\.id), [local])
+    }
+
+    func test_restoreSelectionRemainsAttachedAfterSkippedPeerWorkspace() {
+        let project = UUID()
+        let local = UUID()
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: project, projectName: "term-mesh"
+        )
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: project) }
+
+        let tabs = manager()
+        tabs.restoreSessionForTests(SavedSessionState(
+            version: 2,
+            workspaces: [
+                savedWorkspace(id: project, customTitle: "[term-mesh]"),
+                savedWorkspace(id: local, title: "Terminal 2"),
+            ],
+            selectedIndex: 1,
+            windowFrame: nil,
+            selectedWorkspaceID: local
+        ))
+
+        XCTAssertEqual(tabs.selectedTabId, local)
+    }
+
     /// Team and peer-mirror workspaces are excluded from the saved session and
     /// end with the process rather than through a close, so `forget` never sees
     /// them. Their declarations named an ID no launch can produce again.

@@ -78,6 +78,23 @@ extension TerminalController {
         if let ssh = host.sshTarget, !ssh.isEmpty { dict["ssh_target"] = ssh }
         if let remote = host.remoteSockPath, !remote.isEmpty { dict["remote_sock_path"] = remote }
         if !host.activeSockPath.isEmpty { dict["active_sock_path"] = host.activeSockPath }
+        if let sessionHost = host.sessionHostRemoteSockPath {
+            dict["session_host_socket"] = sessionHost
+        }
+        switch host.teamHostReadiness {
+        case .unresolved:
+            dict["team_host_readiness"] = "unresolved"
+        case .probing(let endpoint):
+            dict["team_host_readiness"] = "probing"
+            dict["team_host_endpoint"] = endpoint.description
+        case .ready(let snapshot):
+            dict["team_host_readiness"] = "ready"
+            dict["team_host_endpoint"] = snapshot.endpoint.description
+            dict["durable_remote_creation"] = snapshot.supportsDurableRemoteCreation
+        case .unreachable(let endpoint):
+            dict["team_host_readiness"] = "unreachable"
+            dict["team_host_endpoint"] = endpoint.description
+        }
         return dict
     }
 

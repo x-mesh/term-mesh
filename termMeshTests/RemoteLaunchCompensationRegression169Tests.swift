@@ -120,6 +120,38 @@ final class RemoteLaunchCompensationRegression169Tests: XCTestCase {
         XCTAssertEqual(remaining, locations)
     }
 
+    func testDeleteProjectNeverOwnsAUserSelectedSourceCheckout() {
+        let source = Location(hostKey: host, path: "/srv/existing-project", owned: false)
+        let leaderWorktree = Location(
+            hostKey: host, path: "/srv/existing-project-leader-260820-abcd", owned: true
+        )
+        let workerWorktree = Location(
+            hostKey: host, path: "/srv/existing-project-executor-260820-ef01", owned: true
+        )
+
+        XCTAssertEqual(
+            TeamOrchestrator.ownedRemoteProjectLocations([
+                source, leaderWorktree, workerWorktree,
+            ]),
+            [leaderWorktree, workerWorktree],
+            "Delete Project may remove only paths this Project created"
+        )
+    }
+
+    func testLegacyRemoteLocationRecordDecodesAsUnowned() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "teamName": "legacy", "hostKey": host, "path": "/srv/user-checkout",
+        ])
+        let record = try JSONDecoder().decode(
+            RemoteProjectLocationStore.Record.self, from: data
+        )
+
+        XCTAssertFalse(
+            record.owned,
+            "old records predate ownership evidence and must fail safe"
+        )
+    }
+
     func testRuntimeCloseRecoversOnlyThePeerLeaderInItsOwningWorkspace() {
         let leader = UUID()
         let workspace = UUID()

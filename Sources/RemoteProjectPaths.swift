@@ -83,6 +83,29 @@ final class RemoteProjectLocationStore {
         let teamName: String
         let hostKey: String
         let path: String
+        /// Only paths created by term-mesh belong to Delete Project. Records
+        /// written before this field existed decode as false: preserving an
+        /// old checkout is safer than deleting a user's source repository.
+        let owned: Bool
+
+        init(teamName: String, hostKey: String, path: String, owned: Bool) {
+            self.teamName = teamName
+            self.hostKey = hostKey
+            self.path = path
+            self.owned = owned
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case teamName, hostKey, path, owned
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            teamName = try values.decode(String.self, forKey: .teamName)
+            hostKey = try values.decode(String.self, forKey: .hostKey)
+            path = try values.decode(String.self, forKey: .path)
+            owned = try values.decodeIfPresent(Bool.self, forKey: .owned) ?? false
+        }
     }
 
     static let shared = RemoteProjectLocationStore()
@@ -101,18 +124,23 @@ final class RemoteProjectLocationStore {
 
     /// Replace everything known for one team. Callers always hand over the
     /// complete list, so a removed entry must not linger.
-    func replace(teamName: String, locations: [(hostKey: String, path: String)]) {
+    func replace(
+        teamName: String,
+        locations: [(hostKey: String, path: String, owned: Bool)]
+    ) {
         records.removeAll { $0.teamName == teamName }
         records.append(contentsOf: locations.map {
-            Record(teamName: teamName, hostKey: $0.hostKey, path: $0.path)
+            Record(
+                teamName: teamName, hostKey: $0.hostKey, path: $0.path, owned: $0.owned
+            )
         })
         persist()
     }
 
-    func locations(teamName: String) -> [(hostKey: String, path: String)] {
+    func locations(teamName: String) -> [(hostKey: String, path: String, owned: Bool)] {
         records
             .filter { $0.teamName == teamName }
-            .map { (hostKey: $0.hostKey, path: $0.path) }
+            .map { (hostKey: $0.hostKey, path: $0.path, owned: $0.owned) }
     }
 
     func forget(teamName: String) {

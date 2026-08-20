@@ -1158,6 +1158,14 @@ final class RemoteHostStore: ObservableObject {
     /// spawn that never reports leaves the row in `.connecting` with no way
     /// back — so the row gives up here and offers Retry instead.
     private static let connectTimeoutSeconds: Double = 45
+    /// A Mac GUI can accept its first peer Hello before the sibling daemon has
+    /// bound the session-owner socket. Hello is immutable for that connection,
+    /// so an empty first answer must be re-read rather than cached forever. The
+    /// total stays within the sidebar's ordinary connect budget.
+    static let sessionHostStartupRetryDelays: [Duration] = [
+        .milliseconds(250), .milliseconds(500), .seconds(1), .seconds(2),
+        .seconds(4), .seconds(8), .seconds(15), .seconds(15),
+    ]
 
     var hasAnySidebarLease: Bool { !sidebarLeases.isEmpty }
 
@@ -1581,9 +1589,32 @@ final class RemoteHostStore: ObservableObject {
                     // A host that can is already the right place for team work,
                     // and recording a redirect there would tunnel a second time
                     // to reach the socket we are already talking to.
-                    self.hosts[key]?.sessionHostRemoteSockPath =
+                    var sessionHostSocket =
                         Self.hostSupportsPeerOwnedAgentFactory(conn.hostCapabilities)
                             ? "" : conn.sessionHostSockPath
+                    if !Self.hostSupportsPeerOwnedAgentFactory(conn.hostCapabilities),
+                       sessionHostSocket.isEmpty {
+                        self.hosts[key]?.sessionHostRemoteSockPath = nil
+                        self.hosts[key]?.teamHostReadiness = .unresolved
+                        for delay in Self.sessionHostStartupRetryDelays {
+                            try? await Task.sleep(for: delay)
+                            guard !Task.isCancelled,
+                                  self.hosts[key]?.activeSockPath == path,
+                                  self.hosts[key]?.isConnected == true
+                            else { return }
+                            guard let probe = try? await PeerRelaySession.connect(
+                                hostSockPath: path
+                            ) else { continue }
+                            sessionHostSocket = probe.sessionHostSockPath
+                            await probe.cancel()
+                            if !sessionHostSocket.isEmpty { break }
+                        }
+                    }
+                    self.hosts[key]?.sessionHostRemoteSockPath = sessionHostSocket
+                    RemoteWorkLog.info(
+                        "Session owner advertised by \(self.hosts[key]?.displayName ?? key): "
+                            + "\(self.hosts[key]?.sessionHostRemoteSockPath ?? "<unresolved>")"
+                    )
                     if let host = self.hosts[key], let teamSpec = host.teamHostSpec {
                         if host.redirectsTeamWorkToSessionHost {
                             self.hosts[key]?.teamHostReadiness = .probing(teamSpec.hostKey)
@@ -1608,10 +1639,20 @@ final class RemoteHostStore: ObservableObject {
                         self.hosts[key]?.clearAuthenticatedHostCLIBinDirs()
                     }
                 }
+                // Durable project creation depends on the separate session
+                // owner, not on the GUI workspace roster. Probe that endpoint
+                // first so a slow/stuck ListWorkspaces cannot leave a healthy
+                // daemon reading "checking" forever.
+                let teams = await self.fetchTeamRoster(
+                    hostKey: key, servingSockPath: path
+                ) ?? []
                 let workspaces: [Termmesh_Peer_V1_Workspace]
                 do {
-                    workspaces = try await conn.session.listWorkspaces()
+                    workspaces = try await conn.session.listWorkspaces(timeoutSeconds: 10)
                 } catch {
+                    RemoteWorkLog.info(
+                        "Workspace roster failed for \(self.hosts[key]?.displayName ?? key): \(error)"
+                    )
                     await conn.cancel()
                     if self.hosts[key]?.activeSockPath == path {
                         self.hosts[key]?.clearAuthenticatedHostCLIBinDirs()
@@ -1619,16 +1660,8 @@ final class RemoteHostStore: ObservableObject {
                     return
                 }
                 await conn.cancel()
-                // Workspaces belong to the serving GUI socket, but durable
-                // project manifests belong to the endpoint that owns team
-                // sessions. On a redirected Mac those are deliberately
-                // different daemons, so reading ListTeams beside
-                // ListWorkspaces made every successfully-published manifest
-                // invisible after restart. Resolve and lease the team endpoint
-                // only for this one-shot roster read.
-                let teams = await self.fetchTeamRoster(
-                    hostKey: key, servingSockPath: path
-                ) ?? []
+                // Workspaces belong to the serving GUI socket, while `teams`
+                // above came from the separate session owner on redirected Macs.
                 // Stale-path guard: a reconnect may have superseded this fetch with a
                 // newer ephemeral path. Drop the result if this task was cancelled or the
                 // host's active path no longer matches the path we fetched against.
@@ -1870,16 +1903,34 @@ final class RemoteHostStore: ObservableObject {
         hostKey key: String,
         servingSockPath: String
     ) async -> [RemoteTeamSummary]? {
-        guard let host = hosts[key], host.teamRouteResolved else { return nil }
+        guard let host = hosts[key], host.teamRouteResolved else {
+            RemoteWorkLog.info(
+                "Team host probe skipped for \(key): session-owner route is unresolved"
+            )
+            return nil
+        }
 
         var lease: PeerPaneHostLease?
         let rosterSockPath: String
         let teamEndpoint: PeerPaneHostKey
         let redirected = host.redirectsTeamWorkToSessionHost
         if host.redirectsTeamWorkToSessionHost {
-            guard let spec = host.teamHostSpec,
-                  let acquired = try? await PeerPaneHostRegistry.shared.acquire(spec)
-            else {
+            guard let spec = host.teamHostSpec else {
+                RemoteWorkLog.info(
+                    "Team host probe skipped for \(host.displayName): redirect has no endpoint"
+                )
+                return nil
+            }
+            RemoteWorkLog.info(
+                "Probing session-owner daemon for \(host.displayName): \(spec.hostKey)"
+            )
+            let acquired: PeerPaneHostLease
+            do {
+                acquired = try await PeerPaneHostRegistry.shared.acquire(spec)
+            } catch {
+                RemoteWorkLog.info(
+                    "Session-owner tunnel failed for \(host.displayName): \(error)"
+                )
                 if let endpoint = host.teamHostSpec?.hostKey,
                    hosts[key]?.activeSockPath == servingSockPath,
                    hosts[key]?.teamHostReadiness.endpoint == endpoint {
@@ -1896,9 +1947,14 @@ final class RemoteHostStore: ObservableObject {
         }
         defer { lease.map { PeerPaneHostRegistry.shared.release($0) } }
 
-        guard !Task.isCancelled,
-              let connection = try? await PeerRelaySession.connect(hostSockPath: rosterSockPath)
-        else {
+        guard !Task.isCancelled else { return nil }
+        let connection: PeerRelayConnection
+        do {
+            connection = try await PeerRelaySession.connect(hostSockPath: rosterSockPath)
+        } catch {
+            RemoteWorkLog.info(
+                "Session-owner handshake failed for \(host.displayName): \(error)"
+            )
             if redirected,
                hosts[key]?.activeSockPath == servingSockPath,
                hosts[key]?.teamHostReadiness.endpoint == teamEndpoint {
@@ -1918,6 +1974,9 @@ final class RemoteHostStore: ObservableObject {
                 expectedEndpoint: hosts[key]?.teamHostSpec?.hostKey,
                 servingPathMatches: hosts[key]?.activeSockPath == servingSockPath,
                 snapshot: snapshot
+            )
+            RemoteWorkLog.info(
+                "Session-owner daemon ready for \(host.displayName): \(teamEndpoint)"
             )
         }
         return await withTaskCancellationHandler {

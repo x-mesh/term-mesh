@@ -851,7 +851,8 @@ extension TeamOrchestrator {
         }
         WorkspaceProjectNames.shared.declare(
             workspaceId: workspace.id,
-            projectName: remote.name
+            projectName: remote.name,
+            projectID: remote.projectID
         )
         scheduleAgentGridEqualization(workspace: workspace)
         RemoteWorkLog.info(
@@ -2579,9 +2580,8 @@ extension TeamOrchestrator {
               original.leaderPanelId == closedPanelID,
               case let .peer(hostKey) = original.leaderEndpoint
         else { return false }
-        guard !remoteLeaderRecoveryInFlight.contains(teamName) else { return false }
-        remoteLeaderRecoveryInFlight.insert(teamName)
-        defer { remoteLeaderRecoveryInFlight.remove(teamName) }
+        guard beginRemoteLeaderAttach(teamName: teamName) else { return false }
+        defer { endRemoteLeaderAttach(teamName: teamName) }
 
         markRemoteLeaderFailed(
             teamName: teamName,
@@ -2731,7 +2731,8 @@ extension TeamOrchestrator {
             tabManager.attachWorkspace(preserved, select: true)
             WorkspaceProjectNames.shared.declare(
                 workspaceId: preserved.id,
-                projectName: teamName
+                projectName: teamName,
+                projectID: original.remotePresentationProjectID
             )
 #if DEBUG
             dlog(
@@ -2869,7 +2870,8 @@ extension TeamOrchestrator {
         DetachedRestoreRegistry.progressByTeam.removeValue(forKey: teamName)
         WorkspaceProjectNames.shared.declare(
             workspaceId: workspace.id,
-            projectName: teamName
+            projectName: teamName,
+            projectID: original.remotePresentationProjectID
         )
         if let anchorPanelID = progress.anchorPanelID, workspace.panels.count > 1 {
             _ = workspace.closePanel(anchorPanelID, force: true)
@@ -3663,7 +3665,9 @@ extension TeamOrchestrator {
         func recordIsolatedCheckout() {
             guard let path = isolatedCheckout else { return }
             var locations = teams[teamName]?.remoteProjectLocations ?? []
-            let location = Team.RemoteProjectLocation(hostKey: hostKey, path: path)
+            let location = Team.RemoteProjectLocation(
+                hostKey: hostKey, path: path, owned: true
+            )
             if !locations.contains(location) {
                 locations.append(location)
             }
@@ -4240,6 +4244,16 @@ extension TeamOrchestrator {
         onHost hostKey: String
     ) -> [Team.RemoteProjectLocation] {
         locations.filter { !($0.hostKey == hostKey && $0.path == path) }
+    }
+
+    /// Filesystem entries Delete Project may remove. A source checkout the
+    /// user selected is a routing input, not project-owned storage. Keeping
+    /// this decision pure lets a fast test fail if deletion ever broadens back
+    /// to every path associated with the team.
+    nonisolated static func ownedRemoteProjectLocations(
+        _ locations: [Team.RemoteProjectLocation]
+    ) -> [Team.RemoteProjectLocation] {
+        locations.filter(\.owned)
     }
 
     // MARK: - Peer-owned agent surface
@@ -6794,15 +6808,26 @@ extension TeamOrchestrator {
             configureDedicatedRemoteWorkspaces(teamName: team.id, enabled: true)
             var locations: Set<Team.RemoteProjectLocation> = []
             if let hostKey = projectSource.hostKey {
-                locations.insert(.init(hostKey: hostKey, path: projectSource.projectPath))
+                locations.insert(.init(
+                    hostKey: hostKey, path: projectSource.projectPath,
+                    owned: projectSource.kind != .existingFolder
+                ))
             }
             for resolved in resolvedRemoteRows {
                 guard let hostKey = resolved.row.hostKey else { continue }
-                locations.insert(.init(hostKey: hostKey, path: resolved.workingDirectory))
+                locations.insert(.init(
+                    hostKey: hostKey, path: resolved.workingDirectory,
+                    owned: resolved.workingDirectory != projectSource.projectPath
+                        || projectSource.kind != .existingFolder
+                ))
             }
             if case let .peer(hostKey) = leaderEndpoint {
                 guard let resolvedRemoteLeaderWorkingDirectory else { return nil }
-                locations.insert(.init(hostKey: hostKey, path: resolvedRemoteLeaderWorkingDirectory))
+                locations.insert(.init(
+                    hostKey: hostKey, path: resolvedRemoteLeaderWorkingDirectory,
+                    owned: resolvedRemoteLeaderWorkingDirectory != projectSource.projectPath
+                        || projectSource.kind != .existingFolder
+                ))
             }
             team.remoteProjectLocations = locations.sorted {
                 ($0.hostKey, $0.path) < ($1.hostKey, $1.path)
@@ -6822,6 +6847,15 @@ extension TeamOrchestrator {
         // the shell could not find.
         Task { @MainActor in
             if case let .peer(hostKey) = leaderEndpoint {
+                guard self.beginRemoteLeaderAttach(teamName: team.id) else {
+                    onRemoteAttach?(.leaderFailed(
+                        host: hostKey,
+                        message: "Remote leader attachment is already in progress"
+                    ))
+                    onRemoteAttach?(.settled)
+                    return
+                }
+                defer { self.endRemoteLeaderAttach(teamName: team.id) }
 #if DEBUG
                 dlog("leader.attach.enter host=\(hostKey) "
                     + "wd=\(resolvedRemoteLeaderWorkingDirectory ?? "nil")")
@@ -7076,7 +7110,9 @@ extension TeamOrchestrator {
         // Read through the durable record: after a restart the team's
         // in-memory list is empty while its checkouts are still on the peers.
         let grouped = Dictionary(
-            grouping: knownRemoteProjectLocations(teamName: teamName),
+            grouping: Self.ownedRemoteProjectLocations(
+                knownRemoteProjectLocations(teamName: teamName)
+            ),
             by: \.hostKey
         )
         var deletionJobs: [(host: HostEntry, script: String)] = []
