@@ -47,11 +47,17 @@ CLI="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh"
 DAEMON_BIN="$PWD/daemon/target/release/term-meshd"
 DAEMON_SOCK_PATH="${TMPDIR:-/tmp}/term-meshd.sock"
 DAEMON_LOG_PATH="/tmp/term-meshd-e2e.log"
+PYTHON_VENV="$DERIVED_DATA_PATH/python-venv"
+PYTHON="$PYTHON_VENV/bin/python3"
 
 echo "== build =="
 ./scripts/generate-build-info.sh
 command -v cargo >/dev/null 2>&1 || { echo "ERROR: cargo not found" >&2; exit 1; }
 (cd daemon && cargo build --release)
+if [ ! -x "$PYTHON" ]; then
+  python3 -m venv "$PYTHON_VENV"
+fi
+"$PYTHON" -m pip install --disable-pip-version-check -q -r tests_v2/requirements.txt
 # Work around stale explicit-module cache artifacts (notably Sentry headers) that can
 # intermittently break incremental VM builds with "file ... has been modified since the
 # module file ... was built".
@@ -177,7 +183,7 @@ launch_and_wait() {
   sleep 0.5
 
   echo "== wait ready =="
-  python3 - <<'PY'
+  "$PYTHON" - <<'PY'
 import time
 import os
 import sys
@@ -313,7 +319,7 @@ run_test_with_retry() {
 
   while [ "$n" -le "$attempts" ]; do
     echo "RUN  $f (attempt $n/$attempts)"
-    if python3 "$f"; then
+    if "$PYTHON" "$f"; then
       return 0
     fi
 
