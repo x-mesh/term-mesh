@@ -458,6 +458,24 @@ enum TeamHostReadiness: Equatable, Sendable {
     }
 }
 
+enum InitialSessionOwnerRoute: Equatable, Sendable {
+    case resolved(String)
+    case discoverInBackground
+}
+
+/// Interpret the serving handshake without waiting. Workspace listing uses
+/// the same connection immediately; only a GUI host whose sibling daemon has
+/// not advertised yet enters the independent retry task.
+nonisolated func initialSessionOwnerRoute(
+    ownsItsOwnSessions: Bool,
+    advertisedSocket: String
+) -> InitialSessionOwnerRoute {
+    if ownsItsOwnSessions { return .resolved("") }
+    return advertisedSocket.isEmpty
+        ? .discoverInBackground
+        : .resolved(advertisedSocket)
+}
+
 nonisolated func acceptingTeamHostSnapshot(
     current: TeamHostReadiness,
     expectedEndpoint: PeerPaneHostKey?,
@@ -1600,13 +1618,15 @@ final class RemoteHostStore: ObservableObject {
                     // "" from a host that owns its own sessions is a real
                     // answer; "" from one that does not is an unanswered
                     // question, and the two must not be stored the same way.
-                    let sessionHostSocket = ownsItsOwnSessions
-                        ? "" : conn.sessionHostSockPath
-                    if !ownsItsOwnSessions, sessionHostSocket.isEmpty {
+                    switch initialSessionOwnerRoute(
+                        ownsItsOwnSessions: ownsItsOwnSessions,
+                        advertisedSocket: conn.sessionHostSockPath
+                    ) {
+                    case .discoverInBackground:
                         self.hosts[key]?.sessionHostRemoteSockPath = nil
                         self.hosts[key]?.teamHostReadiness = .unresolved
                         self.startSessionOwnerDiscovery(for: path, key: key)
-                    } else {
+                    case .resolved(let sessionHostSocket):
                         self.sessionOwnerDiscoveryTasks[key]?.cancel()
                         self.sessionOwnerDiscoveryTasks[key] = nil
                         self.sessionOwnerDiscoveryGenerations[key] = nil
