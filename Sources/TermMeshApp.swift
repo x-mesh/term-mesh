@@ -737,6 +737,13 @@ struct TermMeshApp: App {
 
             CommandGroup(after: .help) {
                 Button {
+                    BugReportWindowController.shared.show()
+                    NSApp.activate(ignoringOtherApps: true)
+                } label: {
+                    commandLabel("Report an Issue…")
+                }
+                Divider()
+                Button {
                     appDelegate.copyUpdateLogs(nil)
                 } label: {
                     commandLabel("Copy Update Logs")
