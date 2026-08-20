@@ -1763,6 +1763,11 @@ final class RemoteHostStore: ObservableObject {
             }
             // Exhausted retries leave the route unresolved. Storing "" here
             // would redirect Project work to the incapable serving GUI.
+            guard !Task.isCancelled,
+                  self.sessionOwnerDiscoveryGenerations[key] == generation,
+                  self.hosts[key]?.activeSockPath == path,
+                  self.hosts[key]?.isConnected == true
+            else { return }
             self.hosts[key]?.sessionHostRemoteSockPath = nil
             self.hosts[key]?.teamHostReadiness = .unresolved
         }
