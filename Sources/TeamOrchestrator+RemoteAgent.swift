@@ -6676,6 +6676,10 @@ extension TeamOrchestrator {
         pairModel: String = "",
         pairSpec: String = "",
         projectSource: ProjectSource? = nil,
+        /// What the bootstrap actually created, as the setup script reported
+        /// it. Empty means nothing here is deletable, which is the safe answer
+        /// for a caller that did not run a bootstrap.
+        createdPaths: Set<PeerProjectBootstrap.CreatedPath> = [],
         onRemoteAttach: ((RemoteAttachOutcome) -> Void)? = nil,
         tabManager: TabManager
     ) -> Team? {
@@ -6807,26 +6811,36 @@ extension TeamOrchestrator {
             setProjectTargetBranch(teamName: team.id, branch: team.projectTargetBranch)
             configureDedicatedRemoteWorkspaces(teamName: team.id, enabled: true)
             var locations: Set<Team.RemoteProjectLocation> = []
+            // Ownership is what the bootstrap reported creating, not what the
+            // paths look like. A path comparison cannot tell a clone this run
+            // made from a checkout the user already kept at that location, and
+            // it gets the answer wrong in both directions: it marked a
+            // pre-existing sibling checkout deletable, and it marked a clone
+            // term-mesh made on the source host permanent.
+            func owned(hostKey: String?, path: String) -> Bool {
+                createdPaths.contains(.init(hostKey: hostKey, path: path))
+            }
             if let hostKey = projectSource.hostKey {
                 locations.insert(.init(
                     hostKey: hostKey, path: projectSource.projectPath,
-                    owned: projectSource.kind != .existingFolder
+                    owned: owned(hostKey: hostKey, path: projectSource.projectPath)
                 ))
             }
             for resolved in resolvedRemoteRows {
                 guard let hostKey = resolved.row.hostKey else { continue }
                 locations.insert(.init(
                     hostKey: hostKey, path: resolved.workingDirectory,
-                    owned: resolved.workingDirectory != projectSource.projectPath
-                        || projectSource.kind != .existingFolder
+                    owned: owned(hostKey: hostKey, path: resolved.workingDirectory)
                 ))
             }
             if case let .peer(hostKey) = leaderEndpoint {
                 guard let resolvedRemoteLeaderWorkingDirectory else { return nil }
                 locations.insert(.init(
-                    hostKey: hostKey, path: resolvedRemoteLeaderWorkingDirectory,
-                    owned: resolvedRemoteLeaderWorkingDirectory != projectSource.projectPath
-                        || projectSource.kind != .existingFolder
+                    hostKey: hostKey,
+                    path: resolvedRemoteLeaderWorkingDirectory,
+                    owned: owned(
+                        hostKey: hostKey, path: resolvedRemoteLeaderWorkingDirectory
+                    )
                 ))
             }
             team.remoteProjectLocations = locations.sorted {

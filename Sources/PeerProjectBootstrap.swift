@@ -434,6 +434,29 @@ enum PeerProjectBootstrap {
     /// running it twice is running it once. Artifacts created by this run are
     /// marked as they commit; the EXIT trap removes only those artifacts, in
     /// reverse order, when a later setup step fails.
+    /// One directory this run brought into existence, on the machine that
+    /// holds it. `nil` host is this Mac, matching `Placement.hostKey`.
+    struct CreatedPath: Hashable {
+        let hostKey: String?
+        let path: String
+    }
+
+    /// How the setup script reports what it actually created, and how the
+    /// Swift side reads that answer back out of the run's stdout.
+    static let primaryOwnedMarkerPrefix = "tm-primary-owned="
+
+    /// Did the run that produced this output create the primary checkout?
+    ///
+    /// Absent marker means no: a script that never ran, or one from a build
+    /// that predates the marker, must not license a delete.
+    static func primaryOwned(inScriptOutput output: String) -> Bool {
+        output
+            .split(whereSeparator: \.isNewline)
+            .last { $0.hasPrefix(primaryOwnedMarkerPrefix) }
+            .map { $0.dropFirst(primaryOwnedMarkerPrefix.count) == "1" }
+            ?? false
+    }
+
     static func script(
         for plan: Plan,
         gitURL: String?,
@@ -569,12 +592,33 @@ enum PeerProjectBootstrap {
         if let memMeshProjectID, !memMeshProjectID.isEmpty {
             steps.append(memMeshIdentityStep(primary: primary, projectID: memMeshProjectID))
         }
+        // Whether this run created the primary is a runtime answer, and the
+        // caller needs it: Delete Project may remove only what term-mesh made.
+        // Comparing paths cannot tell a directory this script cloned from one
+        // the user already had at the same location, and guessing in the
+        // deleting direction cost two source checkouts once already.
+        //
+        // The initialiser leads the chain, which is safe because it cannot
+        // fail. The report deliberately does NOT trail it: `set -e` is ignored
+        // for every command of an AND-OR list except the last, so appending
+        // anything after the final setup step silently disarms that step's
+        // internal guards. Doing exactly that let a worktree step run past its
+        // "directory is empty" check and marked a directory the user had
+        // filled as this run's own, which rollback then deleted. The trap
+        // reports instead, and only on success: a rolled-back run created
+        // nothing that survives for anyone to delete.
+        steps.insert("tm_primary_owned=0", at: 0)
+        let report =
+            "printf '%s%s\\n' \(quote(primaryOwnedMarkerPrefix)) \"$tm_primary_owned\""
         let setup = steps.joined(separator: " && ")
-        guard !rollbackSteps.isEmpty else { return setup }
+        // No trap means no `set -e` either, so ending the chain with the report
+        // keeps a failing step's status and skips the report, as it must.
+        guard !rollbackSteps.isEmpty else { return "\(setup) && \(report)" }
         let rollback = rollbackSteps.reversed().joined(separator: "; ")
         return "set -e; \(rollbackVariables.joined(separator: "; ")); "
             + "tm_rollback() { tm_status=$?; trap - EXIT; "
-            + "if [ \"$tm_status\" -ne 0 ]; then set +e; \(rollback); fi; "
+            + "if [ \"$tm_status\" -ne 0 ]; then set +e; \(rollback); "
+            + "else \(report); fi; "
             + "exit \"$tm_status\"; }; trap tm_rollback EXIT; "
             + setup
     }
@@ -704,6 +748,10 @@ enum PeerProjectBootstrap {
     /// Over ssh rather than through the pane: this has to finish before the
     /// agents start, and a shell that is also a terminal someone is watching
     /// is not a place to wait for a clone.
+    ///
+    /// Returns whether this run created the primary checkout, so the caller
+    /// can record ownership from what happened rather than from path shapes.
+    @discardableResult
     static func run(
         sshTarget: String,
         port: Int?,
@@ -720,27 +768,29 @@ enum PeerProjectBootstrap {
         // as much as the agent that follows does.
         environment: [String: String] = [:],
         timeoutSeconds: TimeInterval = 300
-    ) async throws {
+    ) async throws -> Bool {
         guard let script = script(
             for: plan,
             gitURL: gitURL,
             gitBranch: gitBranch,
             sourceKind: sourceKind,
             memMeshProjectID: memMeshProjectID
-        ) else { return }
+        ) else { return false }
         let assignments = PeerHostEnvironment.inlineAssignments(environment)
         let prefixed = assignments.isEmpty
             ? script
             : "export \(assignments) && \(script)"
-        try await PeerHostReadinessChecker.runScript(
+        let output = try await PeerHostReadinessChecker.runScript(
             sshTarget: sshTarget,
             port: port,
             identityFile: identityFile,
             script: prefixed,
             timeoutSeconds: timeoutSeconds
         )
+        return primaryOwned(inScriptOutput: output)
     }
 
+    @discardableResult
     static func runLocal(
         plan: Plan,
         gitURL: String?,
@@ -749,15 +799,19 @@ enum PeerProjectBootstrap {
         // See `run` — not defaulted, for the same reason.
         memMeshProjectID: String?,
         timeoutSeconds: TimeInterval = 300
-    ) async throws {
+    ) async throws -> Bool {
         guard let script = script(
             for: plan,
             gitURL: gitURL,
             gitBranch: gitBranch,
             sourceKind: sourceKind,
             memMeshProjectID: memMeshProjectID
-        ) else { return }
-        try await runLocalScript(script, timeoutSeconds: timeoutSeconds)
+        ) else { return false }
+        return primaryOwned(
+            inScriptOutput: try await runLocalScript(
+                script, timeoutSeconds: timeoutSeconds
+            )
+        )
     }
 
     /// One `/bin/sh -lc` on this Mac, bounded. Split out of `runLocal` so the
@@ -778,10 +832,11 @@ enum PeerProjectBootstrap {
     /// it with a script that actually floods stderr. Going through
     /// `runLocal` cannot reproduce it: git writes progress only to a TTY, so
     /// a piped clone stays far under the 64 KiB buffer that triggers the bug.
+    @discardableResult
     static func runLocalScript(
         _ script: String,
         timeoutSeconds: TimeInterval
-    ) async throws {
+    ) async throws -> String {
         let output: ProcessRun.Output
         do {
             output = try await ProcessRun.capture(
@@ -801,6 +856,7 @@ enum PeerProjectBootstrap {
                 message.isEmpty ? "git exited with \(output.status)" : message
             )
         }
+        return output.stdoutText
     }
 
     enum ProjectBootstrapError: LocalizedError {
