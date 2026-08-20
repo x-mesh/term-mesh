@@ -121,13 +121,101 @@ final class DiagnosticsReportTests: XCTestCase {
     }
 
     func test_userDefinedPeerNameIsReplacedByItsHostAlias() {
-        let output = render([
-            host(name: "Alice’s MacBook", ssh: "alice@builder.example.com"),
-        ])
+        let snapshot = DiagnosticsSnapshot(
+            peerHosts: [
+                host(name: "Alice’s MacBook", ssh: "alice@builder.example.com"),
+            ],
+            context: .init(
+                windowCount: 1,
+                workspaces: [
+                    .init(
+                        title: "Alice’s MacBook workspace",
+                        isSelected: true,
+                        terminalPanels: 1,
+                        browserPanels: 0,
+                        agentPanels: 0,
+                        remoteAgentPanes: 0
+                    ),
+                ]
+            ),
+            activityTail: ["Disconnected Alice’s MacBook"]
+        )
+        let output = DiagnosticsReport.build(snapshot)
         XCTAssertTrue(output.contains("  <host-1> [connected]"))
+        XCTAssertTrue(output.contains("Disconnected <host-1>"))
+        XCTAssertTrue(output.contains("<host-1> workspace"))
         XCTAssertFalse(output.contains("Alice"))
         XCTAssertFalse(output.contains("MacBook"))
         XCTAssertFalse(output.contains("builder.example.com"))
+    }
+
+    func test_shortPeerNameDoesNotCorruptWordsThatContainIt() {
+        let snapshot = DiagnosticsSnapshot(
+            peerHosts: [host(name: "ci", ssh: nil)],
+            activityTail: ["specific decision for ci"]
+        )
+        let output = DiagnosticsReport.build(snapshot)
+        XCTAssertTrue(output.contains("specific decision for <host-1>"))
+        XCTAssertFalse(output.contains("spe<host-1>fic"))
+        XCTAssertFalse(output.contains("de<host-1>sion"))
+    }
+
+    func test_hostWithoutSSHTargetKeepsAliasOrder() {
+        let output = render([
+            host(id: "a", name: "local peer", ssh: nil),
+            host(id: "b", name: "builder", ssh: "root@198.51.100.7"),
+        ])
+        XCTAssertTrue(output.contains("  <host-1> [connected]"))
+        XCTAssertTrue(output.contains("  <host-2> [connected]"))
+    }
+
+    func test_displayNameContainingHostIsFullyRedacted() {
+        let snapshot = DiagnosticsSnapshot(
+            peerHosts: [
+                host(
+                    name: "builder.example.com Mac",
+                    ssh: "alice@builder.example.com"
+                ),
+            ],
+            activityTail: ["Connected builder.example.com Mac"]
+        )
+        let output = DiagnosticsReport.build(snapshot)
+        XCTAssertTrue(output.contains("Connected <host-1>"))
+        XCTAssertFalse(output.contains("builder.example.com"))
+        XCTAssertFalse(output.contains(" Mac"))
+    }
+
+    func test_duplicateAndEmptyDisplayNamesStillReserveOneAliasPerPeer() {
+        let output = render([
+            host(id: "a", name: "builder", ssh: nil),
+            host(id: "b", name: "builder", ssh: "root@198.51.100.7"),
+            host(id: "c", name: "", ssh: nil),
+        ])
+        XCTAssertTrue(output.contains("  <host-1> [connected]"))
+        XCTAssertTrue(output.contains("  <host-2> [connected]"))
+        XCTAssertTrue(output.contains("  <host-3> [connected]"))
+    }
+
+    func test_unicodeEquivalentPeerNameIsRedacted() {
+        let decomposed = "Cafe\u{301} Mac"
+        let precomposed = "Café Mac"
+        let snapshot = DiagnosticsSnapshot(
+            peerHosts: [host(name: precomposed, ssh: nil)],
+            activityTail: ["Connected \(decomposed)"]
+        )
+        let output = DiagnosticsReport.build(snapshot)
+        XCTAssertTrue(output.contains("Connected <host-1>"))
+        XCTAssertFalse(output.contains("Café"))
+    }
+
+    func test_aliasShapedDisplayNameDoesNotRewriteGeneratedAliases() {
+        let output = render([
+            host(id: "a", name: "<host-1>", ssh: nil),
+            host(id: "b", name: "builder", ssh: nil),
+        ])
+        XCTAssertTrue(output.contains("  <host-1> [connected]"))
+        XCTAssertTrue(output.contains("  <host-2> [connected]"))
+        XCTAssertFalse(output.contains("<host-2> [connected]\n  <host-2>"))
     }
 
     /// The bundle is redacted on the way out no matter which section produced
