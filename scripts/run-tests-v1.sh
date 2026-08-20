@@ -39,12 +39,19 @@ if ! csv_contains "$ALLOWED_USERS" "$CURRENT_USER" \
 fi
 
 cd "$(dirname "$0")/.."
+export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rust/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 DERIVED_DATA_PATH="$HOME/Library/Developer/Xcode/DerivedData/term-mesh-tests-v1"
 APP="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh DEV.app"
 CLI="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh"
+DAEMON_BIN="$PWD/daemon/target/release/term-meshd"
+DAEMON_SOCK_PATH="${TMPDIR:-/tmp}/term-meshd.sock"
+DAEMON_LOG_PATH="/tmp/term-meshd-v1-e2e.log"
 
 echo "== build =="
+./scripts/generate-build-info.sh
+command -v cargo >/dev/null 2>&1 || { echo "ERROR: cargo not found" >&2; exit 1; }
+(cd daemon && cargo build --release)
 # Work around stale explicit-module cache artifacts (notably Sentry headers) that can
 # intermittently break incremental VM builds with "file ... has been modified since the
 # module file ... was built".
@@ -78,7 +85,8 @@ export TERMMESH_CLI_BIN="$CLI"
 cleanup() {
   pkill -x "term-mesh DEV" || true
   pkill -x "term-mesh" || true
-  rm -f /tmp/term-mesh*.sock /tmp/term-mesh*.sock || true
+  pkill -f "term-meshd" || true
+  rm -f /tmp/term-mesh*.sock /tmp/term-meshd*.sock || true
 }
 
 launch_and_wait() {
@@ -93,8 +101,15 @@ launch_and_wait() {
   # Force socket mode for deterministic automation runs, independent of prior user settings.
   defaults write com.termmesh.app.debug socketControlMode -string full >/dev/null 2>&1 || true
 
+  TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
+  TERM_MESH_HTTP_DISABLED=1 \
+  "$DAEMON_BIN" >>"$DAEMON_LOG_PATH" 2>&1 &
+
   # Launch directly with UI test mode enabled so startup follows deterministic test codepaths.
-  TERMMESH_UI_TEST_MODE=1 "$APP/Contents/MacOS/term-mesh DEV" >/dev/null 2>&1 &
+  DAEMON_BINARY_PATH="$DAEMON_BIN" \
+  TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
+  TERMMESH_UI_TEST_MODE=1 \
+  "$APP/Contents/MacOS/term-mesh DEV" >/dev/null 2>&1 &
 
   SOCK=""
   for _ in {1..120}; do
@@ -111,6 +126,19 @@ launch_and_wait() {
   fi
   export TERMMESH_SOCKET_PATH="$SOCK"
   export TERMMESH_SOCKET="$SOCK"
+  export TERMMESH_DAEMON_SOCKET="$DAEMON_SOCK_PATH"
+  export TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH"
+
+  for _ in {1..80}; do
+    if [ -S "$DAEMON_SOCK_PATH" ]; then
+      break
+    fi
+    sleep 0.1
+  done
+  if [ ! -S "$DAEMON_SOCK_PATH" ]; then
+    echo "ERROR: daemon socket not ready: $DAEMON_SOCK_PATH" >&2
+    exit 1
+  fi
 
   # Ensure LaunchServices has a visible/main window attached for rendering checks.
   open "$APP" >/dev/null 2>&1 || true
@@ -272,16 +300,28 @@ run_test_with_retry() {
 
 echo "== tests (v1) =="
 fail=0
-if [ "$#" -gt 0 ]; then
-  test_files=("$@")
+KEEP_GOING="${TERMMESH_E2E_KEEP_GOING:-0}"
+positional=()
+for arg in "$@"; do
+  case "$arg" in
+    --keep-going) KEEP_GOING=1 ;;
+    *) positional[${#positional[@]}]="$arg" ;;
+  esac
+done
+if [ "${#positional[@]}" -gt 0 ]; then
+  test_files=("${positional[@]}")
 else
   test_files=(tests/test_*.py)
 fi
+passed=0
+skipped=0
+failed_tests=()
 
 for f in "${test_files[@]}"; do
   base=$(basename "$f")
   if [ "$base" = "test_ctrl_interactive.py" ]; then
     echo "SKIP $f"
+    skipped=$((skipped + 1))
     continue
   fi
 
@@ -290,9 +330,24 @@ for f in "${test_files[@]}"; do
   if ! run_test_with_retry "$f"; then
     echo "FAIL $f" >&2
     fail=1
-    break
+    failed_tests[${#failed_tests[@]}]="$f"
+    if [ "$KEEP_GOING" != "1" ]; then
+      break
+    fi
+  else
+    passed=$((passed + 1))
   fi
 done
+
+echo "== summary =="
+echo "passed:  $passed"
+echo "failed:  ${#failed_tests[@]}"
+echo "skipped: $skipped"
+if [ "${#failed_tests[@]}" -gt 0 ]; then
+  for t in "${failed_tests[@]}"; do
+    echo "  FAIL $t"
+  done
+fi
 
 echo "== cleanup =="
 cleanup

@@ -39,6 +39,7 @@ if ! csv_contains "$ALLOWED_USERS" "$CURRENT_USER" \
 fi
 
 cd "$(dirname "$0")/.."
+export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rust/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 DERIVED_DATA_PATH="$HOME/Library/Developer/Xcode/DerivedData/term-mesh-tests-v2"
 APP="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh DEV.app"
@@ -48,6 +49,9 @@ DAEMON_SOCK_PATH="${TMPDIR:-/tmp}/term-meshd.sock"
 DAEMON_LOG_PATH="/tmp/term-meshd-e2e.log"
 
 echo "== build =="
+./scripts/generate-build-info.sh
+command -v cargo >/dev/null 2>&1 || { echo "ERROR: cargo not found" >&2; exit 1; }
+(cd daemon && cargo build --release)
 # Work around stale explicit-module cache artifacts (notably Sentry headers) that can
 # intermittently break incremental VM builds with "file ... has been modified since the
 # module file ... was built".
@@ -120,11 +124,9 @@ launch_and_wait() {
   # Force socket mode for deterministic automation runs, independent of prior user settings.
   defaults write com.termmesh.app.debug socketControlMode -string full >/dev/null 2>&1 || true
 
-  if [ -x "$DAEMON_BIN" ]; then
-    TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
-    TERM_MESH_HTTP_DISABLED=1 \
-    "$DAEMON_BIN" >>"$DAEMON_LOG_PATH" 2>&1 &
-  fi
+  TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
+  TERM_MESH_HTTP_DISABLED=1 \
+  "$DAEMON_BIN" >>"$DAEMON_LOG_PATH" 2>&1 &
 
   # Launch directly with UI test mode enabled so startup follows deterministic test codepaths.
   PROJECT_DIR="$PWD" \
@@ -166,7 +168,8 @@ launch_and_wait() {
     export TERMMESH_DAEMON_SOCKET="$DAEMON_SOCK"
     export TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK"
   else
-    unset TERMMESH_DAEMON_SOCKET TERMMESH_DAEMON_UNIX_PATH
+    echo "ERROR: daemon socket not ready: $DAEMON_SOCK_PATH" >&2
+    exit 1
   fi
 
   # Ensure LaunchServices has a visible/main window attached for rendering checks.
