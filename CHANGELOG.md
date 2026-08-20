@@ -4,6 +4,26 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.200.0] - 2026-08-21
+
+**앱 안에서 안전한 진단 자료를 검토해 이슈를 열 수 있고, 원격 Project가 연결 변화와 실패 뒤에도 자기 session·checkout을 잃지 않는다.**
+
+### Added
+
+- **Help → Report an Issue** — 앱 버전, macOS, peer 상태, workspace 구성, health baseline, 최근 로그를 한 화면에서 검토한 뒤 GitHub issue form을 열 수 있다. credential·홈 경로·계정·host 주소와 사용자가 붙인 peer 이름은 공개 이슈로 나가기 전에 한 번의 redaction gate를 통과한다. 긴 자료는 전체 내용을 clipboard에 보존하고 URL에는 안전한 길이만 넣는다. host가 비정상이었던 순간의 snapshot도 최대 5개까지 메모리에 보관해, 이미 회복한 뒤에도 실패 당시 상태를 고를 수 있다. 알려진 failure signature는 관련 이슈와 즉시 적용할 workaround를 먼저 보여준다. ([#318](https://github.com/x-mesh/term-mesh/pull/318)) — thanks @JINWOO-J!
+
+### Fixed
+
+- **원격 Project 생성·복원·삭제가 실제 소유권을 끝까지 따른다** — sidebar가 session owner를 시작하는 동안 막히던 문제, 늦게 끝난 owner discovery가 새 연결을 덮던 문제, 사용자가 만든 checkout과 앱이 만든 checkout을 경로 모양만 보고 잘못 구분하던 문제를 고쳤다. 연결 재시도와 rollback도 자신이 만든 transport·workspace·checkout만 정리해, 두 writer가 한 checkout을 공유하거나 실패 뒤 빈 team route가 고정되지 않는다. ([#329](https://github.com/x-mesh/term-mesh/pull/329)) — thanks @JINWOO-J!
+
+- **SSH로 띄운 native agent pane이 선택한 CLI profile 환경을 잃지 않는다** — Claude gateway 주소·token·model discovery 같은 profile 설정이 daemon-owned pane에는 들어가지만 SSH-owned pane에서는 빠지던 두 갈래 merge를 하나로 합쳤다. host override와 term-mesh identity의 우선순위는 그대로 유지된다. ([#322](https://github.com/x-mesh/term-mesh/pull/322)) — thanks @JINWOO-J!
+
+- **peer host와 relay pane이 reconnect·resize 뒤에도 안정적으로 유지된다** — 공유 host connection과 relay geometry 갱신이 오래된 연결·frame을 새 pane에 적용하지 않도록 수명과 배치 순서를 고정했다.
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.199.0] - 2026-08-19
 
 **앱을 다시 켜도 Project workspace의 정체성과 배치가 그대로 유지된다.**
