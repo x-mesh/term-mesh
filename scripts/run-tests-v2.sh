@@ -49,13 +49,16 @@ DAEMON_SOCK_PATH="${TMPDIR:-/tmp}/term-meshd.sock"
 DAEMON_LOG_PATH="/tmp/term-meshd-e2e.log"
 PYTHON_VENV="$DERIVED_DATA_PATH/python-venv"
 PYTHON="$PYTHON_VENV/bin/python3"
+SYSTEM_PYTHON="/usr/bin/python3"
 
 echo "== build =="
 ./scripts/generate-build-info.sh
 command -v cargo >/dev/null 2>&1 || { echo "ERROR: cargo not found" >&2; exit 1; }
 (cd daemon && cargo build --release)
-if [ ! -x "$PYTHON" ]; then
-  python3 -m venv "$PYTHON_VENV"
+if [ ! -x "$PYTHON" ] \
+  || ! grep -q '^home = /usr/bin$' "$PYTHON_VENV/pyvenv.cfg" 2>/dev/null; then
+  rm -rf "$PYTHON_VENV"
+  "$SYSTEM_PYTHON" -m venv "$PYTHON_VENV"
 fi
 "$PYTHON" -m pip install --disable-pip-version-check -q -r tests_v2/requirements.txt
 # Work around stale explicit-module cache artifacts (notably Sentry headers) that can
