@@ -115,6 +115,8 @@ pub struct PersistedProjectPresentation {
     pub team_uuid: String,
     pub working_directory: String,
     pub project_root: String,
+    #[serde(default)]
+    pub created_at_unix_secs: u64,
     pub leader_surface_id: String,
     pub members: Vec<PersistedProjectMember>,
     pub revision: u64,
@@ -508,6 +510,7 @@ mod tests {
             team_uuid: "team-uuid".into(),
             working_directory: "/srv/demo".into(),
             project_root: "/srv/demo".into(),
+            created_at_unix_secs: 1_700_000_000,
             leader_surface_id: hex::encode([8u8; 16]),
             members: vec![PersistedProjectMember {
                 name: "executor".into(),

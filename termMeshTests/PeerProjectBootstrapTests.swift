@@ -496,11 +496,16 @@ final class PeerProjectBootstrapTests: XCTestCase {
         let plan = PeerProjectBootstrap.plan(
             projectRoot: "/app/p", projectName: "x", agents: ["a"], isolateAgents: false
         )
+        // The ownership report brackets every script: the initialiser first,
+        // the `printf` last. It reads the state the steps between them left,
+        // and here that state is untouched — validating a folder is not
+        // creating one, so the marker must come back 0.
         XCTAssertEqual(
             PeerProjectBootstrap.script(
                 for: plan, gitURL: nil, sourceKind: .existingFolder
             ),
-            "test -d '/app/p/x'"
+            "tm_primary_owned=0 && test -d '/app/p/x' && "
+                + "printf '%s%s\\n' 'tm-primary-owned=' \"$tm_primary_owned\""
         )
         // The whole-script form is the only guard against a step being added
         // that nobody declared, so the named variant is spelled out too — the
@@ -510,13 +515,14 @@ final class PeerProjectBootstrapTests: XCTestCase {
             PeerProjectBootstrap.script(
                 for: plan, gitURL: nil, sourceKind: .existingFolder, memMeshProjectID: "demo"
             ),
-            "test -d '/app/p/x' && "
+            "tm_primary_owned=0 && test -d '/app/p/x' && "
                 + "( top=$(git -C '/app/p/x' rev-parse --show-toplevel 2>/dev/null) "
                 + "&& here=$(cd '/app/p/x' 2>/dev/null && pwd -P) "
                 + "&& [ -n \"$top\" ] && [ \"$top\" = \"$here\" ] "
                 + "&& { git -C '/app/p/x' config --local --get mem-mesh.project-id >/dev/null 2>&1 "
                 + "|| git -C '/app/p/x' config --local mem-mesh.project-id 'demo'; } "
-                + "|| true )"
+                + "|| true ) && "
+                + "printf '%s%s\\n' 'tm-primary-owned=' \"$tm_primary_owned\""
         )
     }
 
@@ -2348,5 +2354,164 @@ final class ProjectCreationRecoveryTests: XCTestCase {
         XCTAssertEqual(params["host"] as? String, "ssh:root@131.186.23.19")
         XCTAssertEqual(params["directory"] as? String, "/app/tm-prj/xm")
         XCTAssertEqual(params["cli"] as? String, "codex")
+    }
+}
+
+/// Delete Project may remove only what term-mesh created.
+///
+/// The path-shape heuristic this replaces was wrong in both directions: it
+/// marked a checkout the user already kept at a non-source path as deletable,
+/// and it marked a clone this app made at the source path as permanent. The
+/// setup script is the only party that knows which happened, so it reports it
+/// and these tests drive the real script to prove the report.
+final class PeerProjectBootstrapOwnershipTests: XCTestCase {
+    private func makeRoot(_ name: String) throws -> String {
+        let root = NSTemporaryDirectory() + "tm-owned-\(name)-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(
+            atPath: root, withIntermediateDirectories: true
+        )
+        return root
+    }
+
+    private func seedRepository(at path: String) async throws {
+        try FileManager.default.createDirectory(
+            atPath: path, withIntermediateDirectories: true
+        )
+        let seed = """
+        set -e
+        cd \(path)
+        git init -q .
+        git config user.email t@example.com
+        git config user.name t
+        printf 'seed\\n' > file.txt
+        git add -A
+        git commit -qm seed
+        """
+        let seeded = try await ProcessRun.capture(
+            executable: "/bin/sh", arguments: ["-lc", seed], timeout: 60
+        )
+        try XCTSkipUnless(seeded.status == 0, "git unavailable: \(seeded.stderrText)")
+    }
+
+    /// An absent marker must read as "not ours". A script that never ran, or
+    /// one produced by a build without the marker, cannot license a delete.
+    func test_missing_marker_reads_as_not_owned() {
+        XCTAssertFalse(PeerProjectBootstrap.primaryOwned(inScriptOutput: ""))
+        XCTAssertFalse(
+            PeerProjectBootstrap.primaryOwned(inScriptOutput: "Cloning into 'x'...\n")
+        )
+    }
+
+    func test_marker_is_read_from_the_last_line_it_appears_on() {
+        XCTAssertTrue(
+            PeerProjectBootstrap.primaryOwned(
+                inScriptOutput: "noise\ntm-primary-owned=1\n"
+            )
+        )
+        XCTAssertFalse(
+            PeerProjectBootstrap.primaryOwned(
+                inScriptOutput: "noise\ntm-primary-owned=0\n"
+            )
+        )
+    }
+
+    /// "Existing folder" is a promise the directory is already there. The
+    /// script only checks it, so nothing about it is term-mesh's to delete.
+    func test_existing_folder_source_is_never_reported_as_created() async throws {
+        let root = try makeRoot("existing")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let primary = root + "/mine"
+        try FileManager.default.createDirectory(
+            atPath: primary, withIntermediateDirectories: true
+        )
+
+        let owned = try await PeerProjectBootstrap.runLocal(
+            plan: PeerProjectBootstrap.Plan(primaryPath: primary, agentCheckouts: []),
+            gitURL: nil,
+            sourceKind: .existingFolder,
+            memMeshProjectID: nil,
+            timeoutSeconds: 60
+        )
+
+        XCTAssertFalse(owned, "a directory the user already had is not ours to delete")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: primary))
+    }
+
+    /// The clone this run performed is term-mesh's, and saying so is what
+    /// keeps Delete Project able to reclaim it.
+    func test_a_clone_this_run_performed_is_reported_as_created() async throws {
+        let root = try makeRoot("clone")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let source = root + "/source"
+        try await seedRepository(at: source)
+
+        let owned = try await PeerProjectBootstrap.runLocal(
+            plan: PeerProjectBootstrap.Plan(
+                primaryPath: root + "/copy", agentCheckouts: []
+            ),
+            gitURL: source,
+            sourceKind: .clone,
+            memMeshProjectID: nil,
+            timeoutSeconds: 120
+        )
+
+        XCTAssertTrue(owned, "this run created the checkout, so it may remove it")
+    }
+
+    /// The report must never become the last link of the setup chain.
+    ///
+    /// `set -e` is ignored for every command of an AND-OR list except the
+    /// last one, so a step appended after the final setup step disarms that
+    /// step's own guards. Appending the ownership report did exactly that: a
+    /// worktree step ran past its "the directory is empty" check, claimed a
+    /// directory the user had filled, and rollback deleted it. Asserting the
+    /// shape here is cheaper than rediscovering it through lost files.
+    func test_ownership_report_never_terminates_the_setup_chain() throws {
+        let plan = PeerProjectBootstrap.plan(
+            projectRoot: "/app/p", projectName: "x", agents: ["a", "b"], isolateAgents: true
+        )
+        let text = try XCTUnwrap(
+            PeerProjectBootstrap.script(for: plan, gitURL: nil, sourceKind: .existingFolder)
+        )
+        XCTAssertTrue(text.contains("trap tm_rollback EXIT"), text)
+        XCTAssertFalse(
+            text.hasSuffix("\"$tm_primary_owned\""),
+            "a trailing report would suppress set -e for the last setup step"
+        )
+        XCTAssertTrue(
+            text.contains("else printf '%s%s\\n' 'tm-primary-owned=' \"$tm_primary_owned\"; fi"),
+            "with a rollback trap the report belongs on the trap's success path"
+        )
+    }
+
+    /// The regression this whole change exists for: a checkout the user
+    /// already has where a placement points. The script reuses it instead of
+    /// cloning, so ownership must come back false even though the path is not
+    /// the source project's path.
+    func test_a_reused_existing_checkout_is_not_reported_as_created() async throws {
+        let root = try makeRoot("reuse")
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let source = root + "/source"
+        try await seedRepository(at: source)
+        // The user's own checkout, sitting exactly where the placement points.
+        let theirs = root + "/theirs"
+        try await seedRepository(at: theirs)
+
+        let owned = try await PeerProjectBootstrap.runLocal(
+            plan: PeerProjectBootstrap.Plan(primaryPath: theirs, agentCheckouts: []),
+            gitURL: source,
+            sourceKind: .existingFolder,
+            memMeshProjectID: nil,
+            timeoutSeconds: 120
+        )
+
+        XCTAssertFalse(
+            owned,
+            "a checkout that was already there must survive Delete Project"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: theirs + "/file.txt"),
+            "the user's checkout must be left exactly as it was"
+        )
     }
 }

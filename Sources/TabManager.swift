@@ -494,10 +494,24 @@ class TabManager {
         let teamWorkspaceIds = Set(
             TeamOrchestrator.shared.teams.values.map { $0.workspaceId }
         )
-        // Peer mirror workspaces are excluded too: restoring one would
-        // resurrect dead local shells for panes whose content lives on
-        // a remote host.
-        let nonTeamTabs = tabs.filter { !teamWorkspaceIds.contains($0.id) && !$0.isPeerMirror }
+        // Peer-backed workspaces are excluded too. Their daemon surfaces are
+        // the source of truth and SessionHostPanes recreates the view. Saving
+        // the local split tree turns those panes into ordinary login shells on
+        // restore; one corrupted session restored 64 Kiro runtimes and drove
+        // the compressor to its hard limit. A durable project declaration is
+        // the proof that this workspace is reconstructed from a peer roster.
+        let nonTeamTabs = tabs.filter { workspace in
+            !teamWorkspaceIds.contains(workspace.id)
+                && !workspace.isPeerMirror
+                && WorkspaceProjectNames.shared.projectID(for: workspace.id) == nil
+                && workspace.customTitle != "Host Sessions"
+                && !(
+                    WorkspaceProjectNames.shared.projectName(for: workspace.id) != nil
+                        && SessionHostPanes.projectName(
+                            fromWorkspaceTitle: workspace.customTitle
+                        ) != nil
+                )
+        }
 
         let encoder = JSONEncoder()
         let workspaceStates = nonTeamTabs.map { workspace -> SavedWorkspaceState in
@@ -622,7 +636,24 @@ class TabManager {
         appendsInOrder = true
         defer { appendsInOrder = false }
         let fm = FileManager.default
-        for saved in session.workspaces {
+        let durableProjectNames = Set(session.workspaces.compactMap { saved -> String? in
+            guard let id = saved.id,
+                  WorkspaceProjectNames.shared.projectID(for: id) != nil
+            else { return nil }
+            return WorkspaceProjectNames.shared.projectName(for: id)?.lowercased()
+                ?? SessionHostPanes.projectName(fromWorkspaceTitle: saved.customTitle)?.lowercased()
+        })
+        let restorable = session.workspaces.enumerated().filter { _, saved in
+            guard saved.customTitle != "Host Sessions" else { return false }
+            guard let id = saved.id else { return true }
+            if WorkspaceProjectNames.shared.projectID(for: id) != nil { return false }
+            guard let titleProject = SessionHostPanes.projectName(
+                fromWorkspaceTitle: saved.customTitle
+            ) else { return true }
+            if WorkspaceProjectNames.shared.projectName(for: id) != nil { return false }
+            return !durableProjectNames.contains(titleProject.lowercased())
+        }
+        for (_, saved) in restorable {
             let fallbackDir = fm.fileExists(atPath: saved.directory)
                 ? saved.directory
                 : fm.homeDirectoryForCurrentUser.path
@@ -684,8 +715,12 @@ class TabManager {
            let savedID = session.selectedWorkspaceID,
            tabs.contains(where: { $0.id == savedID }) {
             selectedTabId = savedID
-        } else if let idx = session.selectedIndex, idx >= 0, idx < tabs.count {
-            selectedTabId = tabs[idx].id
+        } else if let originalIndex = session.selectedIndex,
+                  let restoredIndex = restorable.firstIndex(where: {
+                      $0.offset == originalIndex
+                  }),
+                  restoredIndex < tabs.count {
+            selectedTabId = tabs[restoredIndex].id
         } else if let first = tabs.first {
             selectedTabId = first.id
         }

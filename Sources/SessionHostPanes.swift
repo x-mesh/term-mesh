@@ -62,28 +62,198 @@ enum SessionHostPanes {
         )
     }
 
+    static func projectSurfacesForAutoOpen(
+        surfaces: [Termmesh_Peer_V1_SurfaceInfo],
+        claims: [Data: ProjectClaim],
+        suppressedSurfaceIDs: Set<Data>
+    ) -> [Termmesh_Peer_V1_SurfaceInfo] {
+        surfaces.filter { surface in
+            claims[surface.surfaceID] != nil
+                && !suppressedSurfaceIDs.contains(surface.surfaceID)
+        }
+    }
+
     /// Project manifests are the only authoritative link between a daemon
     /// surface and the Project workspace that should display it. Names, cwd,
     /// and ensure keys are presentation details and can disagree.
     static func projectNamesBySurfaceID(
         teams: [Termmesh_Peer_V1_Team]
     ) -> [Data: String] {
-        var names: [Data: String] = [:]
-        for team in teams where !team.name.isEmpty && !team.leaderSurfaceID.isEmpty {
-            names[team.leaderSurfaceID] = team.name
-            for member in team.members where !member.surfaceID.isEmpty {
-                names[member.surfaceID] = team.name
-            }
-        }
-        return names
+        projectClaimsBySurfaceID(teams: teams).mapValues(\.name)
     }
 
-    static func projectWorkingDirectories(
-        teams: [Termmesh_Peer_V1_Team]
-    ) -> [String: String] {
-        Dictionary(
-            teams.filter { !$0.name.isEmpty }.map { ($0.name, $0.workingDirectory) },
-            uniquingKeysWith: { first, _ in first }
+    struct ProjectClaim: Equatable {
+        let projectID: String
+        let name: String
+        let revision: UInt64
+        let ownedByRequester: Bool
+        let workingDirectory: String
+
+        init(
+            projectID: String,
+            name: String,
+            revision: UInt64,
+            ownedByRequester: Bool,
+            workingDirectory: String = ""
+        ) {
+            self.projectID = projectID
+            self.name = name
+            self.revision = revision
+            self.ownedByRequester = ownedByRequester
+            self.workingDirectory = workingDirectory
+        }
+    }
+
+    struct ProjectRoutingSnapshot: Equatable {
+        let claims: [Data: ProjectClaim]
+        let suppressedSurfaceIDs: Set<Data>
+    }
+
+    /// A name is presentation copy, not identity. Stale manifests can retain
+    /// a surface that a newer same-named project now owns, so choose the
+    /// highest presentation revision per surface before routing it.
+    static func projectClaimsBySurfaceID(
+        teams: [Termmesh_Peer_V1_Team],
+        preferredProjectIDs: Set<String> = []
+    ) -> [Data: ProjectClaim] {
+        projectRoutingSnapshot(
+            teams: teams, preferredProjectIDs: preferredProjectIDs
+        ).claims
+    }
+
+    /// When this app already owns one durable project identity, older
+    /// same-named presentations are historical records, not additional
+    /// projects to auto-open. Keep their surfaces out of both the selected
+    /// project and Host Sessions; an explicit remote-project adoption can
+    /// still open them by identity.
+    static func projectRoutingSnapshot(
+        teams: [Termmesh_Peer_V1_Team],
+        preferredProjectIDs: Set<String> = []
+    ) -> ProjectRoutingSnapshot {
+        var claims: [Data: ProjectClaim] = [:]
+        var suppressed = Set<Data>()
+        let grouped = Dictionary(grouping: teams.filter { !$0.projectID.isEmpty }) {
+            $0.name.lowercased()
+        }
+        var allowedProjectIDs = Set<String>()
+        for candidates in grouped.values {
+            if candidates.count == 1, let only = candidates.first {
+                allowedProjectIDs.insert(only.projectID)
+                continue
+            }
+            let explicitlyPreferred = candidates.filter {
+                preferredProjectIDs.contains($0.projectID)
+            }
+            if !explicitlyPreferred.isEmpty {
+                allowedProjectIDs.formUnion(explicitlyPreferred.map(\.projectID))
+                continue
+            }
+            let requesterOwned = candidates.filter(\.presentationOwnedByRequester)
+            if !requesterOwned.isEmpty {
+                let winner = requesterOwned.max { lhs, rhs in
+                    (lhs.presentationRevision, lhs.projectID)
+                        < (rhs.presentationRevision, rhs.projectID)
+                }
+                if let winner { allowedProjectIDs.insert(winner.projectID) }
+                continue
+            }
+            // Revisions are scoped to one project id and member count is not
+            // recency: an old five-agent project must not beat the one-agent
+            // project the user created a minute ago. New daemons preserve the
+            // publisher's creation timestamp; legacy records read as zero and
+            // fall through to the compatibility heuristics below.
+            let newestCreatedAt = candidates.map(\.createdAtUnixSecs).max() ?? 0
+            let newest = candidates.filter {
+                newestCreatedAt > 0 && $0.createdAtUnixSecs == newestCreatedAt
+            }
+            if newest.count == 1, let winner = newest.first {
+                allowedProjectIDs.insert(winner.projectID)
+                continue
+            }
+            // Two persisted generations of one project can tie on live
+            // member count while naming the same durable surface. That shared
+            // surface is identity evidence: pick the newest presentation.
+            // Same-named projects with disjoint surfaces remain ambiguous and
+            // are suppressed below.
+            let sharedSurfaceIDs = candidates
+                .map { team in
+                    Set(
+                        [team.leaderSurfaceID]
+                            + team.members.compactMap {
+                                $0.surfaceID.isEmpty ? nil : $0.surfaceID
+                            }
+                    ).filter { !$0.isEmpty }
+                }
+                .dropFirst()
+                .reduce(
+                    candidates.first.map { team in
+                        Set(
+                            [team.leaderSurfaceID]
+                                + team.members.compactMap {
+                                    $0.surfaceID.isEmpty ? nil : $0.surfaceID
+                                }
+                        ).filter { !$0.isEmpty }
+                    } ?? []
+                ) { $0.intersection($1) }
+            if !sharedSurfaceIDs.isEmpty,
+               let winner = candidates.max(by: { lhs, rhs in
+                   (lhs.presentationRevision, lhs.projectID)
+                       < (rhs.presentationRevision, rhs.projectID)
+               }) {
+                allowedProjectIDs.insert(winner.projectID)
+            }
+        }
+        let preferredNames = Set(teams.compactMap { team -> String? in
+            guard team.presentationOwnedByRequester
+                    || preferredProjectIDs.contains(team.projectID)
+            else { return nil }
+            return team.name.lowercased()
+        })
+        for team in teams where !team.name.isEmpty && !team.leaderSurfaceID.isEmpty {
+            let candidate = ProjectClaim(
+                projectID: team.projectID,
+                name: team.name,
+                revision: team.presentationRevision,
+                ownedByRequester: team.presentationOwnedByRequester,
+                workingDirectory: team.workingDirectory
+            )
+            let surfaceIDs = [team.leaderSurfaceID]
+                + team.members.compactMap { $0.surfaceID.isEmpty ? nil : $0.surfaceID }
+            if !team.projectID.isEmpty, !allowedProjectIDs.contains(team.projectID) {
+                suppressed.formUnion(surfaceIDs)
+                continue
+            }
+            if preferredNames.contains(team.name.lowercased()),
+               !team.presentationOwnedByRequester,
+               !preferredProjectIDs.contains(team.projectID) {
+                suppressed.formUnion(surfaceIDs)
+                continue
+            }
+            for surfaceID in surfaceIDs {
+                if let current = claims[surfaceID] {
+                    if current.ownedByRequester != candidate.ownedByRequester {
+                        if current.ownedByRequester { continue }
+                    } else {
+                        let currentPreferred = preferredProjectIDs.contains(current.projectID)
+                        let candidatePreferred = preferredProjectIDs.contains(candidate.projectID)
+                        if currentPreferred != candidatePreferred {
+                            if currentPreferred { continue }
+                        } else if current.revision > candidate.revision
+                            || (current.revision == candidate.revision
+                                && current.projectID >= candidate.projectID) {
+                            continue
+                        }
+                    }
+                }
+                claims[surfaceID] = candidate
+            }
+        }
+        // A stale manifest may still mention the active project's leader. The
+        // preferred claim wins that shared surface; suppression applies only
+        // to surfaces no selected claim owns.
+        suppressed.subtract(claims.keys)
+        return ProjectRoutingSnapshot(
+            claims: claims, suppressedSurfaceIDs: suppressed
         )
     }
 
@@ -151,16 +321,30 @@ enum SessionHostPanes {
     /// Inlined, reverting the recovery reinstated the proliferation bug without
     /// failing a single test.
     static func declaredProjects(in workspaces: [Workspace]) -> [(id: UUID, name: String)] {
+        declaredProjectClaims(in: workspaces).map { ($0.id, $0.name) }
+    }
+
+    struct DeclaredProjectClaim: Equatable {
+        let id: UUID
+        let name: String
+        let projectID: String?
+    }
+
+    static func declaredProjectClaims(in workspaces: [Workspace]) -> [DeclaredProjectClaim] {
         let declared = workspaces.compactMap { workspace in
             WorkspaceProjectNames.shared.projectName(for: workspace.id).map {
-                (id: workspace.id, name: $0)
+                DeclaredProjectClaim(
+                    id: workspace.id,
+                    name: $0,
+                    projectID: WorkspaceProjectNames.shared.projectID(for: workspace.id)
+                )
             }
         }
-        let recovered = workspaces.compactMap { workspace -> (id: UUID, name: String)? in
+        let recovered = workspaces.compactMap { workspace -> DeclaredProjectClaim? in
             guard WorkspaceProjectNames.shared.projectName(for: workspace.id) == nil,
                   let name = projectName(fromWorkspaceTitle: workspace.customTitle)
             else { return nil }
-            return (id: workspace.id, name: name)
+            return DeclaredProjectClaim(id: workspace.id, name: name, projectID: nil)
         }
         // A title is only a recovery hint. If an unrelated worktree happens to
         // be named `[project]`, the durable declaration must win regardless of
@@ -176,6 +360,41 @@ enum SessionHostPanes {
         declaredProjects: [(id: UUID, name: String)],
         hostSessionsWorkspaceID: UUID?
     ) -> WorkspaceDestination {
+        workspaceDestination(
+            projectName: projectName,
+            projectID: nil,
+            declaredProjects: declaredProjects.map {
+                DeclaredProjectClaim(id: $0.id, name: $0.name, projectID: nil)
+            },
+            hostSessionsWorkspaceID: hostSessionsWorkspaceID
+        )
+    }
+
+    static func workspaceDestination(
+        projectName: String?,
+        projectID: String?,
+        declaredProjects: [DeclaredProjectClaim],
+        hostSessionsWorkspaceID: UUID?
+    ) -> WorkspaceDestination {
+        if let projectID, !projectID.isEmpty {
+            if let existing = declaredProjects.first(where: { $0.projectID == projectID }) {
+                return .existingProject(existing.id)
+            }
+            // Upgrade one legacy name-only declaration in place. This is the
+            // host workspace the project already occupied before durable peer
+            // project IDs existed. More than one is ambiguous and must not be
+            // guessed at — keep those presentations separate instead.
+            if let projectName {
+                let legacyMatches = declaredProjects.filter {
+                    $0.projectID == nil
+                        && $0.name.caseInsensitiveCompare(projectName) == .orderedSame
+                }
+                if legacyMatches.count == 1, let legacy = legacyMatches.first {
+                    return .existingProject(legacy.id)
+                }
+            }
+            return projectName.map(WorkspaceDestination.newProject) ?? .newHostSessions
+        }
         if let projectName {
             if let existing = declaredProjects.first(where: {
                 $0.name.caseInsensitiveCompare(projectName) == .orderedSame
@@ -195,11 +414,10 @@ enum SessionHostPanes {
     /// window-global; limiting repair to the active window would leave a pane
     /// in another window permanently misplaced and suppress its correct reopen.
     private static func migrateShownProjectSurfaces(
-        projectNames: [Data: String],
-        projectDirectories: [String: String],
+        projectClaims: [Data: ProjectClaim],
         tabManager: TabManager
     ) {
-        for (surfaceID, projectName) in projectNames {
+        for (surfaceID, claim) in projectClaims {
             guard let source = tabManager.tabs.first(where: {
                 $0.panelID(forPeerSurfaceID: surfaceID) != nil
             }),
@@ -208,26 +426,46 @@ enum SessionHostPanes {
             let sourceIndex = source.indexInPane(forPanelId: panelID)
             else { continue }
 
-            let existingTargetID = declaredProjects(in: tabManager.tabs).first(where: {
-                $0.name.caseInsensitiveCompare(projectName) == .orderedSame
-            })?.id
+            let destination = workspaceDestination(
+                projectName: claim.name,
+                projectID: claim.projectID.isEmpty ? nil : claim.projectID,
+                declaredProjects: declaredProjectClaims(in: tabManager.tabs),
+                hostSessionsWorkspaceID: nil
+            )
+            let existingTargetID: UUID? = if case .existingProject(let id) = destination {
+                id
+            } else {
+                nil
+            }
             let existingTarget = existingTargetID.flatMap { id in
                 tabManager.tabs.first(where: { $0.id == id })
             }
-            guard existingTarget?.id != source.id else { continue }
             var targetAnchor: UUID?
             let target = existingTarget ?? {
                 let created = tabManager.addWorkspace(
-                    workingDirectory: projectDirectories[projectName], select: false
+                    workingDirectory: claim.workingDirectory.isEmpty
+                        ? nil : claim.workingDirectory,
+                    select: false
                 )
                 targetAnchor = created.focusedPanelId
                 WorkspaceProjectNames.shared.declare(
-                    workspaceId: created.id, projectName: projectName
+                    workspaceId: created.id,
+                    projectName: claim.name,
+                    projectID: claim.projectID.isEmpty ? nil : claim.projectID
                 )
-                created.customTitle = "[\(projectName)]"
-                created.title = "[\(projectName)]"
+                created.customTitle = "[\(claim.name)]"
+                created.title = "[\(claim.name)]"
                 return created
             }()
+            if !claim.projectID.isEmpty,
+               WorkspaceProjectNames.shared.projectID(for: target.id) == nil {
+                WorkspaceProjectNames.shared.declare(
+                    workspaceId: target.id,
+                    projectName: claim.name,
+                    projectID: claim.projectID
+                )
+            }
+            guard target.id != source.id else { continue }
             guard source.id != target.id,
                   let targetPane = target.bonsplitController.focusedPaneId
                     ?? target.bonsplitController.allPaneIds.first
@@ -277,11 +515,12 @@ enum SessionHostPanes {
     /// Keyed by the *peer's* surface id, not the local panel id: the local one
     /// is minted per attach, so comparing those would open a duplicate pane
     /// every pass.
-    static func shownSurfaceIDs() -> Set<Data> {
+    static func shownSurfaceIDs(in tabManagers: [TabManager]? = nil) -> Set<Data> {
         guard let app = AppDelegate.shared else { return [] }
+        let managers = tabManagers ?? app.mainWindowContexts.values.map(\.tabManager)
         var shown: Set<Data> = []
-        for context in app.mainWindowContexts.values {
-            for workspace in context.tabManager.tabs {
+        for manager in managers {
+            for workspace in manager.tabs {
                 for panel in workspace.panels.values {
                     guard let terminal = panel as? TerminalPanel,
                           let session = terminal.peerPaneSession,
@@ -299,6 +538,111 @@ enum SessionHostPanes {
             }
         }
         return shown
+    }
+
+    /// Local viewers that belonged to an older same-named project generation.
+    ///
+    /// A daemon surface can stay live after its publishing app disappears, and
+    /// so can its durable project manifest. When a newer project with the same
+    /// display name becomes the routing winner, merely suppressing the old
+    /// manifest from the next open pass is not enough: panes opened while it
+    /// was the winner remain alive forever, each holding a relay helper pair.
+    ///
+    /// A surface claimed by the current winner is never superseded even when an
+    /// older overlapping manifest also names it.
+    static func supersededShownSurfaceIDs(
+        shown: Set<Data>,
+        suppressed: Set<Data>,
+        currentlyClaimed: Set<Data>
+    ) -> Set<Data> {
+        shown.intersection(suppressed).subtracting(currentlyClaimed)
+    }
+
+    /// Close only this app's viewers for superseded local-daemon surfaces. The
+    /// daemon-owned work and manifest remain intact and can still be adopted by
+    /// exact project id. This is routing cleanup, not a user dismissal, so clear
+    /// the dismissal marks installed by the ordinary close funnel afterwards.
+    @discardableResult
+    static func pruneSupersededLocalSessionHostPanes(
+        suppressedSurfaceIDs: Set<Data>,
+        currentlyClaimedSurfaceIDs: Set<Data>,
+        in tabManagers: [TabManager]
+    ) -> Int {
+        let targets = supersededShownSurfaceIDs(
+            shown: shownSurfaceIDs(in: tabManagers),
+            suppressed: suppressedSurfaceIDs,
+            currentlyClaimed: currentlyClaimedSurfaceIDs
+        )
+        guard !targets.isEmpty else { return 0 }
+
+        var closed = 0
+        for workspace in tabManagers.flatMap(\.tabs) {
+            let panelIDs = workspace.panels.compactMap { panelID, panel -> UUID? in
+                if let terminal = panel as? TerminalPanel,
+                   let session = terminal.peerPaneSession,
+                   Workspace.isLocalSessionHost(session.originSpec),
+                   targets.contains(session.originSurface.surfaceID) {
+                    return panelID
+                }
+                if let session = workspace.remoteAgentPaneSessions[panelID],
+                   Workspace.isLocalSessionHost(session.originSpec),
+                   targets.contains(session.originSurface.surfaceID) {
+                    return panelID
+                }
+                return nil
+            }
+            for panelID in panelIDs where workspace.closePanel(panelID, force: true) {
+                closed += 1
+            }
+        }
+        dismissedSurfaceIDs.subtract(targets)
+        return closed
+    }
+
+    /// Close only dead local-daemon mirrors after a successful roster read.
+    /// A background workspace can miss the relay helper's accept window; its
+    /// torn-down panel then stays visible while the next poll opens a fresh
+    /// mirror for the same surface. Keeping those shells produced 65 panes in
+    /// one saved workspace. Live and intentionally disconnected panes are not
+    /// torn down and therefore stay untouched.
+    @discardableResult
+    static func pruneTornDownLocalSessionHostPanes(
+        in tabManagers: [TabManager]
+    ) -> Int {
+        var closed = 0
+        // Closing goes through the ordinary funnel, and that funnel records a
+        // dismissal — it cannot tell this cleanup from someone closing the
+        // pane on purpose. Leaving the mark in place inverts the whole point
+        // of the pass: the surface is still alive on the daemon, so the next
+        // poll must open a fresh mirror, and a remembered dismissal is exactly
+        // what stops it for the rest of the process. Collect what we close and
+        // clear it, the same way the superseded pass does.
+        var reopenable = Set<Data>()
+        for workspace in tabManagers.flatMap(\.tabs) {
+            let dead = workspace.panels.compactMap { panelID, panel -> (UUID, Data)? in
+                guard let terminal = panel as? TerminalPanel,
+                      let session = terminal.peerPaneSession,
+                      session.isTorndown,
+                      Workspace.isLocalSessionHost(session.originSpec)
+                else { return nil }
+                return (panelID, session.originSurface.surfaceID)
+            }
+            for (panelID, surfaceID) in dead {
+                if workspace.closePanel(panelID, force: true) {
+                    closed += 1
+                    reopenable.insert(surfaceID)
+                }
+            }
+        }
+        dismissedSurfaceIDs.subtract(reopenable)
+        return closed
+    }
+
+    static func containsPeerBackedPane(_ workspace: Workspace) -> Bool {
+        if !workspace.remoteAgentPaneSessions.isEmpty { return true }
+        return workspace.panels.values.contains { panel in
+            (panel as? TerminalPanel)?.peerPaneSession != nil
+        }
     }
 
     /// Sessions whose pane someone closed, which must stay closed.
@@ -414,6 +758,10 @@ enum SessionHostPanes {
     /// to the daemon, and nothing about a session that has been running for a
     /// minute needs to be noticed in under one.
     static let pollInterval: Duration = .seconds(15)
+    /// A hosted terminal's relay helper only starts after its workspace mounts.
+    /// Fresh project workspaces are deliberately not selected, so keep their
+    /// view alive through the relay's 10-second accept window.
+    static let autoOpenRealizationPinDuration: Duration = .seconds(12)
 
     /// Only one pass at a time.
     ///
@@ -523,25 +871,61 @@ extension SessionHostPanes {
             return 0
         }
         let surfaces = snapshot.surfaces
-        let projectNames = projectNamesBySurfaceID(teams: snapshot.teams)
-        let projectDirectories = projectWorkingDirectories(teams: snapshot.teams)
         guard let app = AppDelegate.shared, let tabManager = app.tabManager else { return 0 }
 
         let managers = allTabManagers(app: app, fallback: tabManager)
+        let pruned = pruneTornDownLocalSessionHostPanes(in: managers)
+        if pruned > 0 {
+            RemoteWorkLog.info(
+                "Removed \(pruned) dead hosted pane\(pruned == 1 ? "" : "s") before reconciling the live roster"
+            )
+        }
+        let liveSurfaceIDs = Set(surfaces.map(\.surfaceID))
+        // Only a live orchestrator team is an explicit preference. A workspace
+        // that this reconciler auto-created is an observation of the previous
+        // routing winner, not authority to keep that winner forever. Feeding
+        // its declaration back here made the first stale same-named manifest
+        // self-pin even after a fuller/newer project appeared.
+        let activeTeamIDs = TeamOrchestrator.shared.teams.values.compactMap { team in
+            team.teamUuid.map { "team:\($0)" }
+        }
+        let routing = projectRoutingSnapshot(
+            teams: snapshot.teams,
+            preferredProjectIDs: Set(activeTeamIDs)
+        )
+        let projectClaims = routing.claims
+        let superseded = pruneSupersededLocalSessionHostPanes(
+            suppressedSurfaceIDs: routing.suppressedSurfaceIDs,
+            currentlyClaimedSurfaceIDs: Set(projectClaims.keys),
+            in: managers
+        )
+        if superseded > 0 {
+            RemoteWorkLog.info(
+                "Closed \(superseded) superseded hosted pane\(superseded == 1 ? "" : "s")"
+            )
+        }
         for manager in managers {
             migrateShownProjectSurfaces(
-                projectNames: projectNames,
-                projectDirectories: projectDirectories,
+                projectClaims: projectClaims,
                 tabManager: manager
             )
         }
 
-        pruneDismissals(stillHeld: Set(surfaces.map(\.surfaceID)))
+        pruneDismissals(stillHeld: liveSurfaceIDs)
+        // Automatic session-host presentation is project-driven. Bare daemon
+        // shells belong in the explicit Host Sessions browser; opening every
+        // unclaimed surface on each poll creates panes the user never asked
+        // for and repeatedly reopens them after their workspace closes.
+        let displayableSurfaces = projectSurfacesForAutoOpen(
+            surfaces: surfaces,
+            claims: projectClaims,
+            suppressedSurfaceIDs: routing.suppressedSurfaceIDs
+        )
         let routed = sessionsNeedingPanes(
-            daemonSurfaces: surfaces.map {
+            daemonSurfaces: displayableSurfaces.map {
                 (id: $0.surfaceID, attachable: $0.attachable, surfaceType: $0.surfaceType)
             },
-            alreadyShown: shownSurfaceIDs().union(dismissedSurfaceIDs)
+            alreadyShown: shownSurfaceIDs(in: managers).union(dismissedSurfaceIDs)
         )
         let agentIDs = Set(routed.agent)
         let wanted = routed.terminal + routed.agent
@@ -551,8 +935,8 @@ extension SessionHostPanes {
         var autoCreatedAnchors: [UUID: UUID] = [:]
         var autoCreatedWorkspaceIDs = Set<UUID>()
         for surfaceID in wanted {
-            guard let info = surfaces.first(where: { $0.surfaceID == surfaceID }) else { continue }
-            let projectName = projectNames[surfaceID]
+            guard let info = displayableSurfaces.first(where: { $0.surfaceID == surfaceID }) else { continue }
+            let projectClaim = projectClaims[surfaceID]
             // Every window, not just the active one. `shownSurfaceIDs()` is
             // already window-global, and the repair pass above runs per manager
             // for the same reason: a `[project]` workspace living in a second
@@ -562,8 +946,9 @@ extension SessionHostPanes {
             // is this change's own proliferation, reached through a second
             // window rather than a relaunch.
             let destination = workspaceDestination(
-                projectName: projectName,
-                declaredProjects: declaredProjects(
+                projectName: projectClaim?.name,
+                projectID: projectClaim?.projectID,
+                declaredProjects: declaredProjectClaims(
                     in: managers.flatMap(\.tabs)
                 ),
                 hostSessionsWorkspaceID: managers.lazy.compactMap { manager in
@@ -582,11 +967,15 @@ extension SessionHostPanes {
             case .newProject(let name):
                 workspace = {
                     let created = tabManager.addWorkspace(
-                        workingDirectory: projectDirectories[name],
+                        workingDirectory: projectClaim.flatMap { claim in
+                            claim.workingDirectory.isEmpty ? nil : claim.workingDirectory
+                        },
                         select: false
                     )
                     WorkspaceProjectNames.shared.declare(
-                        workspaceId: created.id, projectName: name
+                        workspaceId: created.id,
+                        projectName: name,
+                        projectID: projectClaim?.projectID
                     )
                     created.customTitle = "[\(name)]"
                     created.title = "[\(name)]"
@@ -594,6 +983,7 @@ extension SessionHostPanes {
                         autoCreatedAnchors[created.id] = anchor
                     }
                     autoCreatedWorkspaceIDs.insert(created.id)
+                    pinAutoOpenedWorkspace(created.id, on: tabManager)
                     return created
                 }()
             case .newHostSessions:
@@ -608,8 +998,17 @@ extension SessionHostPanes {
                         autoCreatedAnchors[created.id] = anchor
                     }
                     autoCreatedWorkspaceIDs.insert(created.id)
+                    pinAutoOpenedWorkspace(created.id, on: tabManager)
                     return created
                 }()
+            }
+            if let projectClaim,
+               WorkspaceProjectNames.shared.projectID(for: workspace.id) == nil {
+                WorkspaceProjectNames.shared.declare(
+                    workspaceId: workspace.id,
+                    projectName: projectClaim.name,
+                    projectID: projectClaim.projectID
+                )
             }
             do {
                 let session = try await PeerPaneSession.attach(
@@ -627,9 +1026,26 @@ extension SessionHostPanes {
                 // selected callback delivery from the same surfaceType
                 // (`PeerPaneSession.attach`), which is what
                 // `openRemoteAgentPane` requires.
-                let openedPane: Bool = agentIDs.contains(surfaceID)
-                    ? workspace.openRemoteAgentPane(session: session, focus: false) != nil
-                    : workspace.openRemotePane(session: session, focus: false) != nil
+                let anchor = autoCreatedAnchors[workspace.id]
+                let openedPane: Bool
+                if agentIDs.contains(surfaceID) {
+                    openedPane = workspace.openRemoteAgentPane(
+                        session: session, focus: false
+                    ) != nil
+                } else if let anchor {
+                    // A fresh workspace already has one local terminal. Replace
+                    // that placeholder in place for the first hosted terminal;
+                    // splitting and immediately closing the anchor made Bonsplit
+                    // tear down the new relay pane again a few seconds later.
+                    openedPane = workspace.replaceTerminalPaneWithRemote(
+                        panelId: anchor, session: session
+                    ) != nil
+                    if openedPane { autoCreatedAnchors[workspace.id] = nil }
+                } else {
+                    openedPane = workspace.openRemotePane(
+                        session: session, focus: false
+                    ) != nil
+                }
                 guard openedPane else {
                     session.teardown()
                     if autoCreatedWorkspaceIDs.remove(workspace.id) != nil {
@@ -660,5 +1076,13 @@ extension SessionHostPanes {
             )
         }
         return opened
+    }
+
+    private static func pinAutoOpenedWorkspace(_ id: UUID, on tabManager: TabManager) {
+        tabManager.pinWorkspaceForSurfaceRealization(id)
+        Task { @MainActor [weak tabManager] in
+            try? await Task.sleep(for: autoOpenRealizationPinDuration)
+            tabManager?.unpinWorkspaceForSurfaceRealization(id)
+        }
     }
 }
