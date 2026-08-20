@@ -3647,8 +3647,8 @@ extension TeamOrchestrator {
         )
         let workingDirectory: String
         var isolatedCheckout: String?
-        if team.remoteProjectLocations.contains(
-            .init(hostKey: hostKey, path: requestedDirectory)
+        if team.remoteProjectLocations.containsLocation(
+            hostKey: hostKey, path: requestedDirectory
         ) {
             let isolated = try await Self.prepareLateAgentCheckout(
                 host: host,
@@ -6629,9 +6629,8 @@ extension TeamOrchestrator {
                   .trimmingCharacters(in: .whitespacesAndNewlines),
               !workDir.isEmpty,
               teams[teamName] != nil,
-              knownRemoteProjectLocations(teamName: teamName).contains(
-                  Team.RemoteProjectLocation(hostKey: hostKey, path: workDir)
-              ),
+              knownRemoteProjectLocations(teamName: teamName)
+                  .containsLocation(hostKey: hostKey, path: workDir),
               let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
               let sshTarget = host.sshTarget, !sshTarget.isEmpty
         else { return }

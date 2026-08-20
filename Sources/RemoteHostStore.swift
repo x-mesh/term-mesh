@@ -1589,11 +1589,15 @@ final class RemoteHostStore: ObservableObject {
                     // A host that can is already the right place for team work,
                     // and recording a redirect there would tunnel a second time
                     // to reach the socket we are already talking to.
-                    var sessionHostSocket =
+                    let ownsItsOwnSessions =
                         Self.hostSupportsPeerOwnedAgentFactory(conn.hostCapabilities)
-                            ? "" : conn.sessionHostSockPath
-                    if !Self.hostSupportsPeerOwnedAgentFactory(conn.hostCapabilities),
-                       sessionHostSocket.isEmpty {
+                    // "" from a host that owns its own sessions is a real
+                    // answer; "" from one that does not is an unanswered
+                    // question, and the two must not be stored the same way.
+                    var sessionHostSocket = ownsItsOwnSessions
+                        ? "" : conn.sessionHostSockPath
+                    var sessionOwnerUnanswered = false
+                    if !ownsItsOwnSessions, sessionHostSocket.isEmpty {
                         self.hosts[key]?.sessionHostRemoteSockPath = nil
                         self.hosts[key]?.teamHostReadiness = .unresolved
                         for delay in Self.sessionHostStartupRetryDelays {
@@ -1601,7 +1605,15 @@ final class RemoteHostStore: ObservableObject {
                             guard !Task.isCancelled,
                                   self.hosts[key]?.activeSockPath == path,
                                   self.hosts[key]?.isConnected == true
-                            else { return }
+                            else {
+                                // Every other way out of this function closes
+                                // `conn` first. Leaving through the middle of a
+                                // retry must too, or a reconnect that arrives
+                                // during the wait strands this connection and
+                                // the session the host is holding open for it.
+                                await conn.cancel()
+                                return
+                            }
                             guard let probe = try? await PeerRelaySession.connect(
                                 hostSockPath: path
                             ) else { continue }
@@ -1609,8 +1621,16 @@ final class RemoteHostStore: ObservableObject {
                             await probe.cancel()
                             if !sessionHostSocket.isEmpty { break }
                         }
+                        sessionOwnerUnanswered = sessionHostSocket.isEmpty
                     }
-                    self.hosts[key]?.sessionHostRemoteSockPath = sessionHostSocket
+                    // Exhausted retries leave the question open. Storing "" for
+                    // it would make `teamRouteResolved` true, and `teamHostSpec`
+                    // then falls back to the serving GUI socket — pinning team
+                    // work to the endpoint that cannot do it until the next
+                    // reconnect, which is the failure this retry exists to
+                    // prevent, moved 46 seconds later. Stay unresolved instead.
+                    self.hosts[key]?.sessionHostRemoteSockPath =
+                        sessionOwnerUnanswered ? nil : sessionHostSocket
                     RemoteWorkLog.info(
                         "Session owner advertised by \(self.hosts[key]?.displayName ?? key): "
                             + "\(self.hosts[key]?.sessionHostRemoteSockPath ?? "<unresolved>")"

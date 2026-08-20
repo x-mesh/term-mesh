@@ -154,12 +154,36 @@ final class TeamOrchestrator: ObservableObject {
             /// Delete Project is allowed to remove.
             let owned: Bool
 
-            init(hostKey: String, path: String, owned: Bool = true) {
+            /// `owned` defaults to false because a forgotten value must fall
+            /// on the side that keeps a directory, not the side that deletes
+            /// one. Every production caller states it from what the bootstrap
+            /// reported; a probe or a fixture that only names a location gets
+            /// the harmless answer.
+            init(hostKey: String, path: String, owned: Bool = false) {
                 self.hostKey = hostKey
                 self.path = path
                 self.owned = owned
             }
+
+            /// A location is which directory on which host, and nothing else.
+            ///
+            /// Ownership is an attribute of that directory, not part of its
+            /// name, and folding it into equality made every
+            /// `contains(where-the-agent-wants-to-work)` probe answer "no" for
+            /// any location recorded as unowned — silently disabling late-agent
+            /// checkout isolation and worktree reaping. Two records for one
+            /// directory that disagree about ownership are one record with a
+            /// merge to do, never two directories.
+            static func == (lhs: Self, rhs: Self) -> Bool {
+                lhs.hostKey == rhs.hostKey && lhs.path == rhs.path
+            }
+
+            func hash(into hasher: inout Hasher) {
+                hasher.combine(hostKey)
+                hasher.combine(path)
+            }
         }
+
 
         let id: String            // team name
         let leaderSessionId: String
@@ -9341,5 +9365,17 @@ final class ClaudeSessionWatcher {
         #if DEBUG
         dlog("[claude.sid.watch] teardown dir=\(dir)")
         #endif
+    }
+}
+
+extension Sequence where Element == TeamOrchestrator.Team.RemoteProjectLocation {
+    /// Is this directory on this host one of ours to route work into?
+    ///
+    /// Spelled out rather than left to `contains(_:)` with a synthesized
+    /// probe: building the probe means choosing an `owned` value for a
+    /// question that is not about ownership, and choosing wrong silently
+    /// answers "no" for every unowned location.
+    func containsLocation(hostKey: String, path: String) -> Bool {
+        contains { $0.hostKey == hostKey && $0.path == path }
     }
 }

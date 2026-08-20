@@ -610,19 +610,31 @@ enum SessionHostPanes {
         in tabManagers: [TabManager]
     ) -> Int {
         var closed = 0
+        // Closing goes through the ordinary funnel, and that funnel records a
+        // dismissal — it cannot tell this cleanup from someone closing the
+        // pane on purpose. Leaving the mark in place inverts the whole point
+        // of the pass: the surface is still alive on the daemon, so the next
+        // poll must open a fresh mirror, and a remembered dismissal is exactly
+        // what stops it for the rest of the process. Collect what we close and
+        // clear it, the same way the superseded pass does.
+        var reopenable = Set<Data>()
         for workspace in tabManagers.flatMap(\.tabs) {
-            let deadPanelIDs = workspace.panels.compactMap { panelID, panel -> UUID? in
+            let dead = workspace.panels.compactMap { panelID, panel -> (UUID, Data)? in
                 guard let terminal = panel as? TerminalPanel,
                       let session = terminal.peerPaneSession,
                       session.isTorndown,
                       Workspace.isLocalSessionHost(session.originSpec)
                 else { return nil }
-                return panelID
+                return (panelID, session.originSurface.surfaceID)
             }
-            for panelID in deadPanelIDs {
-                if workspace.closePanel(panelID, force: true) { closed += 1 }
+            for (panelID, surfaceID) in dead {
+                if workspace.closePanel(panelID, force: true) {
+                    closed += 1
+                    reopenable.insert(surfaceID)
+                }
             }
         }
+        dismissedSurfaceIDs.subtract(reopenable)
         return closed
     }
 
