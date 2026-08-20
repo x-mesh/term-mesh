@@ -67,6 +67,7 @@ class TerminalController {
         "focus_surface_by_panel",
         "focus_webview",
         "focus_notification",
+        "simulate_shortcut",
         "activate_app"
     ]
 
@@ -82,6 +83,7 @@ class TerminalController {
         "browser.focus_webview",
         "browser.focus",
         "browser.tab.switch",
+        "debug.shortcut.simulate",
         "debug.command_palette.toggle",
         "debug.notification.focus",
         "debug.app.activate"
