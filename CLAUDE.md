@@ -131,7 +131,10 @@ Canonical details: [team lifecycle](.claude/commands/team.md),
 ## Lessons (x-humble)
 <!-- Section managed by x-humble. Manual editing allowed. -->
 
-- STOP: 같은 가설이 2회 실패해도 계속 밀어붙이는 것 — 가설 자체를 폐기하고 다른 방향(데이터/호스트/회귀)으로 전환. (L3, confirmed 3 times, 2026-07-20)
+- STOP: 같은 가설이 2회 실패해도 계속 밀어붙이는 것 — 가설 자체를 폐기하고 다른 방향(데이터/호스트/회귀)으로 전환. (L3, confirmed 4 times, 2026-08-20)
+- STOP: 원격 E2E host에서 Release·Debug·build·daemon 교체·복수 project를 겹쳐 실행하는 것 — 한 번에 한 topology만 실행하고 CPU/RSS/process baseline 이탈 시 즉시 중단. (L9, confirmed 1 times, 2026-08-20)
 - START: UI/렌더링 버그 디버깅 시 코드·아키텍처 추론 전에 런타임 ground-truth(계측·바이트 단위 로그)부터 확인. (L2, confirmed 3 times, 2026-07-20)
+- START: 검증 전에 실행 topology를 고정하고 PID·binary path·socket owner·state directory·project 생성 위치를 기록 — Release/Debug와 local/relay 결과를 섞지 않기. (L4, confirmed 2 times, 2026-08-20)
 - START: 실패한 기능에 "동작하는 선례"(플러그인·유사 구현)가 있으면 내 가설 실험 전에 그 구현 전체를 독해 — source된 파일 포함. 부분 독해는 답을 옆에 두고 우회하게 만든다. (L5, confirmed 1 times, 2026-07-20)
 - START: 같은 결함 클래스가 2회째 나타나면 지점 수정 전에 클래스 인벤토리부터 — 관련 상태 전이 목록과 불변식(고아 프로세스 0, 기록 소실 0 등)을 명시하고, 수정은 그 불변식을 검증하는 테스트와 함께. (L6, confirmed 1 times, 2026-08-19)
+- START: relay E2E는 production socket owner → 외부 project 생성 → exact project.presentation → exact workspace/pane → A/B/A2 순서의 hard gate로 실행 — 한 단계라도 실패하면 성공 판정과 다음 단계 금지. (L8, confirmed 1 times, 2026-08-20)
