@@ -8,6 +8,7 @@ public enum PeerIdentityError: Error, Equatable, CustomStringConvertible {
     case keychainDeleteFailed(OSStatus)
     case fileReadFailed(String)
     case fileWriteFailed(String)
+    case invalidStoredFile(String)
     case invalidStoredLength(Int)
 
     public var description: String {
@@ -24,6 +25,8 @@ public enum PeerIdentityError: Error, Equatable, CustomStringConvertible {
             return "peer identity file read failed: \(message)"
         case .fileWriteFailed(let message):
             return "peer identity file write failed: \(message)"
+        case .invalidStoredFile(let message):
+            return "peer identity file is invalid: \(message)"
         case .invalidStoredLength(let length):
             return "stored peer id has invalid length: \(length)"
         }
@@ -181,8 +184,16 @@ public enum PeerIdentity {
         // random ID forever. If it cannot be decoded, fall through to the same
         // migration/create path used when the file is absent; the atomic write
         // below replaces it only after a durable identity is ready.
-        if let stored = try? readStoredIdentity(at: fileURL) {
-            return (stored.id, stored.history)
+        do {
+            if let stored = try readStoredIdentity(at: fileURL) {
+                return (stored.id, stored.history)
+            }
+        } catch PeerIdentityError.invalidStoredFile {
+            // Malformed contents are recoverable. I/O failures are not: an
+            // unreadable but valid file must never be mistaken for absence and
+            // overwritten with a different identity.
+        } catch PeerIdentityError.invalidStoredLength {
+            // A malformed current ID is equivalent to other corrupt contents.
         }
 
         // The Keychain fallback is intentionally reachable only when the file
@@ -224,8 +235,15 @@ public enum PeerIdentity {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
         do {
             let data = try Data(contentsOf: fileURL)
-            let stored = try JSONDecoder().decode(StoredIdentity.self, from: data)
+            let stored: StoredIdentity
+            do {
+                stored = try JSONDecoder().decode(StoredIdentity.self, from: data)
+            } catch {
+                throw PeerIdentityError.invalidStoredFile(error.localizedDescription)
+            }
             guard stored.version == 1 else {
+                // A newer app may own this file. Do not downgrade it by
+                // treating an unknown schema as corrupt.
                 throw PeerIdentityError.fileReadFailed("unsupported version \(stored.version)")
             }
             guard stored.id.count == byteCount else {

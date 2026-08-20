@@ -156,6 +156,49 @@ final class PeerIdentityTests: XCTestCase {
         XCTAssertEqual(loaded.history, [])
     }
 
+    func testReadFailureDoesNotOverwriteExistingPath() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent(PeerIdentity.identityFileName)
+        try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
+
+        XCTAssertThrowsError(try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: {
+                XCTFail("I/O failure must not fall back to legacy storage")
+                return nil
+            },
+            legacyHistoryLoader: { [] }
+        )) { error in
+            guard case PeerIdentityError.fileReadFailed = error else {
+                return XCTFail("expected fileReadFailed, got \(error)")
+            }
+        }
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+    }
+
+    func testUnsupportedVersionIsNotDowngraded() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent(PeerIdentity.identityFileName)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let id = Data(repeating: 0x88, count: PeerIdentity.byteCount).base64EncodedString()
+        let original = Data("{\"version\":2,\"id\":\"\(id)\",\"history\":[]}".utf8)
+        try original.write(to: fileURL)
+
+        XCTAssertThrowsError(try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: {
+                XCTFail("unknown versions must not fall back to legacy storage")
+                return nil
+            },
+            legacyHistoryLoader: { [] }
+        ))
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+    }
+
     func testLoadOrCreateFirstCallCreates() throws {
         let service = testServiceName()
         defer { try? PeerIdentity.deleteStoredIdentity(service: service, account: PeerIdentity.account) }
