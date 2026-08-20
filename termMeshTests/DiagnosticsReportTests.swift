@@ -142,8 +142,7 @@ final class DiagnosticsReportTests: XCTestCase {
         )
         let output = DiagnosticsReport.build(snapshot)
         XCTAssertTrue(output.contains("  <host-1> [connected]"))
-        XCTAssertTrue(output.contains("Disconnected <host-1>"))
-        XCTAssertTrue(output.contains("<host-1> workspace"))
+        XCTAssertTrue(output.contains("[redacted line containing <host-1>]"))
         XCTAssertFalse(output.contains("Alice"))
         XCTAssertFalse(output.contains("MacBook"))
         XCTAssertFalse(output.contains("builder.example.com"))
@@ -155,7 +154,7 @@ final class DiagnosticsReportTests: XCTestCase {
             activityTail: ["specific decision for ci"]
         )
         let output = DiagnosticsReport.build(snapshot)
-        XCTAssertTrue(output.contains("specific decision for <host-1>"))
+        XCTAssertTrue(output.contains("specific decision for ci"))
         XCTAssertFalse(output.contains("spe<host-1>fic"))
         XCTAssertFalse(output.contains("de<host-1>sion"))
     }
@@ -180,7 +179,7 @@ final class DiagnosticsReportTests: XCTestCase {
             activityTail: ["Connected builder.example.com Mac"]
         )
         let output = DiagnosticsReport.build(snapshot)
-        XCTAssertTrue(output.contains("Connected <host-1>"))
+        XCTAssertTrue(output.contains("[redacted line containing <host-1>]"))
         XCTAssertFalse(output.contains("builder.example.com"))
         XCTAssertFalse(output.contains(" Mac"))
     }
@@ -204,18 +203,38 @@ final class DiagnosticsReportTests: XCTestCase {
             activityTail: ["Connected \(decomposed)"]
         )
         let output = DiagnosticsReport.build(snapshot)
-        XCTAssertTrue(output.contains("Connected <host-1>"))
+        XCTAssertTrue(output.contains("[redacted line containing <host-1>]"))
         XCTAssertFalse(output.contains("Café"))
     }
 
     func test_aliasShapedDisplayNameDoesNotRewriteGeneratedAliases() {
         let output = render([
             host(id: "a", name: "<host-1>", ssh: nil),
-            host(id: "b", name: "builder", ssh: nil),
+            host(id: "b", name: "host-2", ssh: nil),
         ])
         XCTAssertTrue(output.contains("  <host-1> [connected]"))
         XCTAssertTrue(output.contains("  <host-2> [connected]"))
         XCTAssertFalse(output.contains("<host-2> [connected]\n  <host-2>"))
+    }
+
+    func test_hostnameComponentLabelRedactsTheWholeLineWithoutLeakingSuffix() {
+        let snapshot = DiagnosticsSnapshot(
+            peerHosts: [host(name: "builder", ssh: "dev@builder.corp.internal")],
+            activityTail: ["Connected builder.corp.internal"]
+        )
+        let output = DiagnosticsReport.build(snapshot)
+        XCTAssertTrue(output.contains("[redacted line containing <host-1>]"))
+        XCTAssertFalse(output.contains("corp.internal"))
+    }
+
+    func test_unicodeEquivalentSSHHostIsRedacted() {
+        let decomposed = "cafe\u{301}.example.com"
+        let precomposed = "café.example.com"
+        let output = render([
+            host(name: "builder", ssh: "dev@\(decomposed)", failure: precomposed),
+        ])
+        XCTAssertFalse(output.contains("café.example.com"))
+        XCTAssertTrue(output.contains("<host-1>"))
     }
 
     /// The bundle is redacted on the way out no matter which section produced
