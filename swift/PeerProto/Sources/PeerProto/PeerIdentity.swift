@@ -6,6 +6,8 @@ public enum PeerIdentityError: Error, Equatable, CustomStringConvertible {
     case keychainReadFailed(OSStatus)
     case keychainAddFailed(OSStatus)
     case keychainDeleteFailed(OSStatus)
+    case fileReadFailed(String)
+    case fileWriteFailed(String)
     case invalidStoredLength(Int)
 
     public var description: String {
@@ -18,6 +20,10 @@ public enum PeerIdentityError: Error, Equatable, CustomStringConvertible {
             return "SecItemAdd failed: \(status)"
         case .keychainDeleteFailed(let status):
             return "SecItemDelete failed: \(status)"
+        case .fileReadFailed(let message):
+            return "peer identity file read failed: \(message)"
+        case .fileWriteFailed(let message):
+            return "peer identity file write failed: \(message)"
         case .invalidStoredLength(let length):
             return "stored peer id has invalid length: \(length)"
         }
@@ -33,19 +39,23 @@ public enum PeerIdentity {
     static let debugDefaultsKey = "installation-id-v1"
     static let debugHistoryDefaultsKey = "installation-id-history-v1"
     static let historyAccountSuffix = ".history-v1"
+    static let identityFileName = "peer-identity-v1.json"
 
-    /// In-memory cache for `defaultPeerID()`. `SecItemCopyMatching` is a
-    /// synchronous IPC to securityd — seconds-slow on unsigned dev
-    /// builds awaiting keychain authorization — and the peer ID gets
-    /// evaluated as a handshake default argument, sometimes on the main
-    /// actor. Cache after the first load so only one call ever pays;
-    /// `warmUp()` lets the app pay it off-main at startup.
+    private struct StoredIdentity: Codable {
+        let version: Int
+        var id: Data
+        var history: [Data]
+    }
+
+    /// In-memory cache for `defaultPeerID()`. Existing installs make one
+    /// legacy Keychain read while migrating; later loads use the identity
+    /// file and avoid synchronous securityd IPC entirely.
     private static let cacheLock = NSLock()
     nonisolated(unsafe) private static var cachedID: Data?
     nonisolated(unsafe) private static var cachedPreviousIDs: [Data]?
 
     public static func loadOrCreate() throws -> Data {
-        try loadOrCreate(service: service, account: account)
+        try loadOrCreateFileIdentity().id
     }
 
     public static func regenerate() throws -> Data {
@@ -60,8 +70,9 @@ public enum PeerIdentity {
             id = result.id
             cachedPreviousIDs = result.history
         } else {
-            id = try regenerate(service: service, account: account)
-            cachedPreviousIDs = try loadPreviousIDs(service: service, account: account)
+            let result = try regenerateFileIdentity()
+            id = result.id
+            cachedPreviousIDs = result.history
         }
         cachedID = id
         return id
@@ -102,7 +113,7 @@ public enum PeerIdentity {
         } else if usesDebugDefaultsIdentity() {
             ids = loadDebugHistory(defaults: debugDefaults())
         } else {
-            ids = (try? loadPreviousIDs(service: service, account: account)) ?? []
+            ids = (try? loadOrCreateFileIdentity().history) ?? []
         }
         cachedPreviousIDs = ids
         return ids
@@ -138,8 +149,8 @@ public enum PeerIdentity {
         return (bundleIdentifier ?? "").contains(".debug")
     }
 
-    /// Prime the keychain-backed cache off the critical path (call from
-    /// a background queue during app startup).
+    /// Prime the file-backed cache off the critical path. Existing installs
+    /// can perform a one-time legacy Keychain migration here.
     public static func warmUp() {
         _ = defaultPeerID()
         _ = previousPeerIDs()
@@ -147,6 +158,116 @@ public enum PeerIdentity {
 
     public static func hexString(_ data: Data) -> String {
         data.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func loadOrCreateFileIdentity() throws -> StoredIdentity {
+        let loaded = try loadOrCreateFileIdentity(
+            at: identityFileURL(),
+            // A denied or unreadable legacy item must not leave migration
+            // pending forever. Generate a new file identity instead, so the
+            // next launch never repeats the authorization prompt.
+            legacyIdentityLoader: { try load(service: service, account: account) },
+            legacyHistoryLoader: { try loadPreviousIDs(service: service, account: account) }
+        )
+        return StoredIdentity(version: 1, id: loaded.id, history: loaded.history)
+    }
+
+    static func loadOrCreateFileIdentity(
+        at fileURL: URL,
+        legacyIdentityLoader: () throws -> Data?,
+        legacyHistoryLoader: () throws -> [Data]
+    ) throws -> (id: Data, history: [Data]) {
+        // A malformed file must not trap the installation on a process-local
+        // random ID forever. If it cannot be decoded, fall through to the same
+        // migration/create path used when the file is absent; the atomic write
+        // below replaces it only after a durable identity is ready.
+        if let stored = try? readStoredIdentity(at: fileURL) {
+            return (stored.id, stored.history)
+        }
+
+        // The Keychain fallback is intentionally reachable only when the file
+        // is absent. Once this write succeeds, later app updates never ask
+        // securityd to authorize the ad-hoc-signed binary again.
+        let legacyID = try? legacyIdentityLoader()
+        let id = try legacyID ?? makeRandomID()
+        // If the current legacy item was unavailable, do not make a second
+        // Keychain request for history. That could show another authorization
+        // dialog even though the new file identity is already sufficient.
+        let legacyHistory = legacyID == nil ? [] : ((try? legacyHistoryLoader()) ?? [])
+        let history = try validatedHistory(legacyHistory)
+        let stored = StoredIdentity(version: 1, id: id, history: history)
+        try writeStoredIdentity(stored, to: fileURL)
+        return (id, history)
+    }
+
+    private static func regenerateFileIdentity() throws -> StoredIdentity {
+        var stored = try loadOrCreateFileIdentity()
+        stored.history = updatedHistory(previous: stored.id, existing: stored.history)
+        stored.id = try makeRandomID()
+        try writeStoredIdentity(stored, to: identityFileURL())
+        return stored
+    }
+
+    static func identityFileURL(fileManager: FileManager = .default) throws -> URL {
+        guard let appSupport = fileManager.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            throw PeerIdentityError.fileReadFailed("Application Support directory unavailable")
+        }
+        return appSupport
+            .appendingPathComponent("term-mesh", isDirectory: true)
+            .appendingPathComponent(identityFileName)
+    }
+
+    private static func readStoredIdentity(at fileURL: URL) throws -> StoredIdentity? {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        do {
+            let data = try Data(contentsOf: fileURL)
+            let stored = try JSONDecoder().decode(StoredIdentity.self, from: data)
+            guard stored.version == 1 else {
+                throw PeerIdentityError.fileReadFailed("unsupported version \(stored.version)")
+            }
+            guard stored.id.count == byteCount else {
+                throw PeerIdentityError.invalidStoredLength(stored.id.count)
+            }
+            return StoredIdentity(
+                version: stored.version,
+                id: stored.id,
+                // History is advisory ownership context. Preserve a valid
+                // current ID even if one old alias was damaged.
+                history: Array(stored.history.filter { $0.count == byteCount }.prefix(historyLimit))
+            )
+        } catch let error as PeerIdentityError {
+            throw error
+        } catch {
+            throw PeerIdentityError.fileReadFailed(error.localizedDescription)
+        }
+    }
+
+    private static func writeStoredIdentity(_ stored: StoredIdentity, to fileURL: URL) throws {
+        do {
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            let data = try JSONEncoder().encode(stored)
+            try data.write(to: fileURL, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: fileURL.path
+            )
+        } catch {
+            throw PeerIdentityError.fileWriteFailed(error.localizedDescription)
+        }
+    }
+
+    private static func validatedHistory(_ ids: [Data]) throws -> [Data] {
+        if let invalid = ids.first(where: { $0.count != byteCount }) {
+            throw PeerIdentityError.invalidStoredLength(invalid.count)
+        }
+        return Array(ids.prefix(historyLimit))
     }
 
     static func loadOrCreate(service: String, account: String) throws -> Data {

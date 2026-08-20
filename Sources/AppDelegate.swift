@@ -304,10 +304,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // /tmp/tm-peer-relay-*.sock files accumulate indefinitely.
         PeerRelaySession.sweepStaleRelaySockets()
 
-        // Prime the peer identity keychain cache off-main: the first
-        // SecItemCopyMatching can stall for seconds on dev builds
-        // (securityd authorization), and it otherwise fires lazily as a
-        // handshake default argument — sometimes on the main actor.
+        // Prime the peer identity cache off-main. Existing installs can need
+        // one legacy Keychain read before the identity moves to Application
+        // Support; it otherwise happens lazily during the first handshake.
         DispatchQueue.global(qos: .utility).async {
             PeerIdentity.warmUp()
         }
