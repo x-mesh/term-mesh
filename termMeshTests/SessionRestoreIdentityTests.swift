@@ -346,6 +346,22 @@ final class SessionRestoreIdentityTests: XCTestCase {
         XCTAssertEqual(tabs.tabs.map(\.id), [local])
     }
 
+    func test_saveOmitsLegacyBracketedPeerDeclarationBeforeRestore() {
+        let tabs = manager()
+        let local = tabs.tabs[0]
+        let legacyPeer = tabs.addWorkspace(select: false)
+        legacyPeer.customTitle = "[legacy-peer]"
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: legacyPeer.id, projectName: "legacy-peer"
+        )
+        defer { WorkspaceProjectNames.shared.forget(workspaceId: legacyPeer.id) }
+
+        let saved = tabs.savedSessionState()
+
+        XCTAssertEqual(saved.workspaces.map(\.id), [local.id])
+        XCTAssertFalse(saved.workspaces.contains { $0.id == legacyPeer.id })
+    }
+
     func test_restoreSelectionRemainsAttachedAfterSkippedPeerWorkspace() {
         let project = UUID()
         let local = UUID()

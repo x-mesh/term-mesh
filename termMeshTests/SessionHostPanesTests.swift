@@ -28,6 +28,29 @@ final class SessionHostPanesTests: XCTestCase {
         XCTAssertLessThanOrEqual(total, 46)
     }
 
+    func test_unansweredSessionOwnerRetriesInBackgroundWithoutReclassifyingTheGUI() {
+        XCTAssertEqual(
+            initialSessionOwnerRoute(
+                ownsItsOwnSessions: false, advertisedSocket: ""
+            ),
+            .discoverInBackground,
+            "workspace listing must continue while only the owner route retries"
+        )
+        XCTAssertEqual(
+            initialSessionOwnerRoute(
+                ownsItsOwnSessions: false, advertisedSocket: "/tmp/daemon-peer.sock"
+            ),
+            .resolved("/tmp/daemon-peer.sock")
+        )
+        XCTAssertEqual(
+            initialSessionOwnerRoute(
+                ownsItsOwnSessions: true, advertisedSocket: "/ignored.sock"
+            ),
+            .resolved(""),
+            "a daemon serving directly owns its sessions on the current socket"
+        )
+    }
+
     func test_projectManifestRoutesEverySurfaceToItsDeclaredProject() {
         var team = Termmesh_Peer_V1_Team()
         team.name = "term-mesh"

@@ -426,12 +426,7 @@ extension TerminalController {
 
         var result = "ERROR: No window"
         let completed = v2MainExec {
-            guard let window = NSApp.mainWindow
-                ?? NSApp.keyWindow
-                ?? NSApp.windows.first(where: { win in
-                    guard let raw = win.identifier?.rawValue else { return false }
-                    return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
-                }),
+            guard let window = self.debugMainTerminalWindow(),
                   let contentView = window.contentView,
                   let themeFrame = contentView.superview else { return }
 

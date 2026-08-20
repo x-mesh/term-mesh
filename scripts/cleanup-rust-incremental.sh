@@ -44,11 +44,14 @@ if [[ ! -d "$INCREMENTAL_DIR" ]]; then
   exit 0
 fi
 
-if [[ "$APPLY" -eq 1 ]] \
-  && [[ -f "$DEBUG_DIR/.cargo-lock" ]] \
-  && lsof "$DEBUG_DIR/.cargo-lock" >/dev/null 2>&1; then
-  echo "this Cargo target is in use; refusing to delete incremental data" >&2
-  exit 1
+if [[ "$APPLY" -eq 1 ]]; then
+  for lock in .cargo-lock .cargo-build-lock .cargo-artifact-lock; do
+    if [[ -f "$DEBUG_DIR/$lock" ]] \
+      && lsof "$DEBUG_DIR/$lock" >/dev/null 2>&1; then
+      echo "this Cargo target is in use ($lock); refusing to delete incremental data" >&2
+      exit 1
+    fi
+  done
 fi
 
 if [[ "$APPLY" -eq 1 ]]; then

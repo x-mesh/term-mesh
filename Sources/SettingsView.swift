@@ -2809,114 +2809,12 @@ struct SettingsView: View {
         shellHealthEntries = entries
     }
 
+    /// Collection, redaction, and formatting all live in `DiagnosticsReport`
+    /// so this button and the bug-report flow cannot drift into producing
+    /// two different bundles — and so nothing reaches the pasteboard that
+    /// has not passed the redactor.
     private func copyDiagnostics() {
-        var lines: [String] = []
-        lines.append("term-mesh diagnostics")
-        lines.append("=====================")
-        lines.append("Date: \(ISO8601DateFormatter().string(from: Date()))")
-        lines.append("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
-        let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
-        let buildNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
-        lines.append("App: \(appVersion) (\(buildNumber))")
-
-        if let status = daemonStatusInfo {
-            lines.append("Variant: \(status.appVariant)")
-            lines.append("Bundle ID: \(status.bundleIdentifier)")
-            lines.append("")
-            lines.append("Daemon: \(status.connected ? "connected" : "not connected")")
-            if let pid = status.pid { lines.append("PID: \(pid)") }
-            if let uptime = status.uptimeSecs { lines.append("Uptime: \(formatUptime(uptime))") }
-            lines.append("Binary: \(status.binaryPath ?? "(not found)") [\(status.binaryExists ? "exists" : "MISSING")]")
-            lines.append("Socket: \(status.socketPath) [\(status.socketExists ? "exists" : "MISSING")]")
-            lines.append("Log: \(status.logPath) [\(status.logExists ? "exists" : "MISSING")]")
-
-            if !status.subsystems.isEmpty {
-                lines.append("")
-                lines.append("Subsystems:")
-                for sub in status.subsystems {
-                    var line = "  \(sub.name): \(sub.status)"
-                    if let d = sub.detail { line += " (\(d))" }
-                    lines.append(line)
-                }
-            }
-        } else {
-            lines.append("Daemon: status not available")
-        }
-
-        // Shell Integration Health
-        lines.append("")
-        lines.append("Shell Integration:")
-        if let appDelegate = AppDelegate.shared {
-            var panelIndex = 0
-            for context in appDelegate.mainWindowContexts.values {
-                for workspace in context.tabManager.tabs {
-                    for panelId in workspace.panels.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
-                        guard workspace.panels[panelId] is TerminalPanel else { continue }
-                        let health = workspace.shellIntegrationHealth[panelId]
-                            ?? ShellIntegrationHealth(createdAt: workspace.createdAt)
-                        let now = Date()
-                        let pwdAge: String
-                        if let lastPwd = health.lastReportPwd {
-                            pwdAge = "last \(Int(now.timeIntervalSince(lastPwd)))s ago"
-                        } else {
-                            pwdAge = "never"
-                        }
-                        let age = Int(now.timeIntervalSince(health.createdAt))
-                        let title = workspace.customTitle ?? workspace.title
-                        let panelLabel = workspace.panelTitles[panelId] ?? String(panelId.uuidString.prefix(8))
-                        panelIndex += 1
-                        lines.append("  \(title)/\(panelLabel): \(health.status.rawValue) (pwd: \(health.reportPwdCount) msgs, \(pwdAge), tty: \(health.reportTtyCount > 0 ? "yes" : "no"), git: \(health.reportGitBranchCount > 0 ? "yes" : "no"), age: \(age)s)")
-                    }
-                }
-            }
-            if panelIndex == 0 {
-                lines.append("  (no terminal panels)")
-            }
-        }
-
-        // IME Text Rendering
-        lines.append("")
-        lines.append("IME Text Rendering:")
-        if let appDelegate = AppDelegate.shared,
-           let window = appDelegate.mainWindowContexts.values.first?.window {
-            // Walk the view hierarchy to find IMETextView
-            func findIMETextView(in view: NSView) -> NSTextView? {
-                if let tv = view as? IMETextView { return tv }
-                for sub in view.subviews {
-                    if let found = findIMETextView(in: sub) { return found }
-                }
-                return nil
-            }
-            if let tv = findIMETextView(in: window.contentView ?? NSView()) {
-                let hasLM = tv.layoutManager != nil
-                let hasTM = tv.textContentStorage != nil
-                lines.append("  TextKit: \(hasLM ? "1 (layoutManager)" : "2 (textContentStorage)")")
-                lines.append("  textColor: \(tv.textColor?.description ?? "nil")")
-                lines.append("  insertionPointColor: \(tv.insertionPointColor.description)")
-                lines.append("  drawsBackground: \(tv.drawsBackground)")
-                lines.append("  isRichText: \(tv.isRichText)")
-                lines.append("  font: \(tv.font?.displayName ?? "nil") \(tv.font?.pointSize ?? 0)pt")
-                lines.append("  frame: \(Int(tv.frame.width))x\(Int(tv.frame.height))")
-                if let storage = tv.textStorage {
-                    lines.append("  textStorage.length: \(storage.length)")
-                    if storage.length > 0 {
-                        let attrs = storage.attributes(at: 0, effectiveRange: nil)
-                        let fgDesc = (attrs[.foregroundColor] as? NSColor)?.description ?? "nil"
-                        lines.append("  textStorage[0].foregroundColor: \(fgDesc)")
-                    }
-                }
-                let typingFg = (tv.typingAttributes[.foregroundColor] as? NSColor)?.description ?? "nil"
-                lines.append("  typingAttributes.foregroundColor: \(typingFg)")
-                lines.append("  isHidden: \(tv.isHidden), alphaValue: \(tv.alphaValue)")
-                lines.append("  wantsLayer: \(tv.wantsLayer), layer: \(tv.layer != nil ? "yes" : "nil")")
-            } else {
-                lines.append("  (IME text view not found — input bar may not be open)")
-            }
-        } else {
-            lines.append("  (no main window)")
-        }
-
-        let text = lines.joined(separator: "\n")
+        let text = DiagnosticsReport.build(daemonStatus: daemonStatusInfo)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }

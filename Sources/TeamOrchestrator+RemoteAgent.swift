@@ -5364,6 +5364,45 @@ extension TeamOrchestrator {
         )
     }
 
+    /// The complete environment a remote native agent launches with, for
+    /// either ownership model.
+    ///
+    /// Both models want the same three layers in the same order, and both used
+    /// to assemble them at their own call site. They drifted: the SSH-owned
+    /// site omitted the profile layer entirely, so a pane launched with the
+    /// host's stored keys but without the active CLI profile's — the layer
+    /// carrying the gateway base URL, auth token, and model-discovery flag.
+    /// The result authenticated against the wrong endpoint and failed far from
+    /// the code that caused it.
+    ///
+    /// Deciding the layers once is what prevents that. The lookups are
+    /// parameters so the composition can be tested without reaching into
+    /// `UserDefaults` or the host profile store.
+    ///
+    /// They are optionals rather than defaulted closures because a default
+    /// argument is evaluated in a nonisolated context and both real lookups
+    /// are main-actor bound; resolving them in the body keeps the call sites
+    /// down to the three arguments that vary.
+    @MainActor
+    static func remoteNativeAgentLaunchEnvironment(
+        cli: String,
+        hostKey: String,
+        internalIdentity: [String: String],
+        profileLookup: ((String) -> [String: String])? = nil,
+        hostLookup: ((String) -> [String: String])? = nil
+    ) throws -> [String: String] {
+        let profile = profileLookup?(cli)
+            ?? CLIPathSettings.activeProfile(for: cli)?.env
+            ?? [:]
+        let explicitHost = hostLookup?(hostKey)
+            ?? PeerHostEnvironment.stored(forHostKey: hostKey)
+        return try peerOwnedAgentEnvironment(
+            profile: profile,
+            explicitHost: explicitHost,
+            internalIdentity: internalIdentity
+        )
+    }
+
     private func attachPeerOwnedAgent(
         team: Team,
         workspace: Workspace,
@@ -5404,9 +5443,9 @@ extension TeamOrchestrator {
         // profile at the bottom, explicit peer-host values above it, and
         // term-mesh's identity last so configuration cannot impersonate
         // another team/member.
-        let environment = try Self.peerOwnedAgentEnvironment(
-            profile: CLIPathSettings.activeProfile(for: cli)?.env ?? [:],
-            explicitHost: PeerHostEnvironment.stored(forHostKey: host.id),
+        let environment = try Self.remoteNativeAgentLaunchEnvironment(
+            cli: cli,
+            hostKey: host.id,
             internalIdentity: Self.remoteNativeAgentEnvironment(
                 teamName: team.id,
                 agentName: agentName,
@@ -5697,9 +5736,9 @@ extension TeamOrchestrator {
         )
         let environment: [String: String]
         do {
-            environment = try Self.peerOwnedAgentEnvironment(
-                profile: CLIPathSettings.activeProfile(for: agent.cli)?.env ?? [:],
-                explicitHost: PeerHostEnvironment.stored(forHostKey: host.id),
+            environment = try Self.remoteNativeAgentLaunchEnvironment(
+                cli: agent.cli,
+                hostKey: host.id,
                 internalIdentity: Self.remoteNativeAgentEnvironment(
                     teamName: team.id,
                     agentName: agent.name,
@@ -5855,10 +5894,24 @@ extension TeamOrchestrator {
             agentInstanceID: agentInstanceId,
             localControlSocket: SocketControlSettings.socketPath()
         )
-        // The host profile's variables underneath, term-mesh's own on top —
-        // a profile must be able to add a proxy, not to impersonate the team.
-        let remoteEnvironment = PeerHostEnvironment.stored(forHostKey: host.id)
-            .merging(Self.remoteNativeAgentEnvironment(
+        // Active CLI profile at the bottom, explicit peer-host values above
+        // it, term-mesh's identity last — a profile must be able to add a
+        // gateway, not to impersonate the team.
+        //
+        // Built by the same helper the daemon-owned path uses. This merge was
+        // once written out by hand here and omitted the profile layer, so an
+        // SSH-owned pane launched without the gateway variables that layer
+        // carries (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
+        // `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`) while host-stored keys
+        // still arrived. A partly-populated environment is the worst shape to
+        // debug: it reads as "some variables work" rather than as a whole
+        // layer missing, and the CLI fails at authentication far from here.
+        // Sharing the helper is what keeps the two ownership models from
+        // drifting apart again.
+        let remoteEnvironment = try Self.remoteNativeAgentLaunchEnvironment(
+            cli: cli,
+            hostKey: host.id,
+            internalIdentity: Self.remoteNativeAgentEnvironment(
                 teamName: team.id,
                 agentName: agentName,
                 agentType: agentType,
@@ -5867,7 +5920,8 @@ extension TeamOrchestrator {
                 socketPath: reverseUnixForward.remote,
                 routeGrant: routeGrant,
                 routeFilePath: routeFilePath
-            )) { _, internalValue in internalValue }
+            )
+        )
         guard let remoteEnvironmentFile = await Self.writeRemoteAgentEnvironmentOverSSH(
             host: host,
             environment: remoteEnvironment,

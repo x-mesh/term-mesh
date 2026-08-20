@@ -487,10 +487,10 @@ end
             self.assertIn('\"route\": \"direct|probe|parallel\"', prompt)
             self.assertIn('\"tasks\"', prompt)
         self.assertIn("coordinator, not a worker", legacy)
-        self.assertIn("default executor", adaptive)
-        self.assertIn("at least two dependency-ready", adaptive)
-        self.assertIn("one controller-managed wave", adaptive)
-        self.assertIn("POLICY V6", adaptive)
+        self.assertIn("coordinator and integration owner", adaptive)
+        self.assertIn("at least two units are dependency-ready", adaptive)
+        self.assertIn("controller-managed wave", adaptive)
+        self.assertIn("POLICY V10", adaptive)
 
     def test_structured_routing_contract_enforces_dynamic_worker_counts(self):
         direct = {"route": "direct", "reason": "same-file edit", "tasks": []}

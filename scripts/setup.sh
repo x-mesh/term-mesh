@@ -283,6 +283,9 @@ prune_ghosttykit_cache() {
 
 prune_ghosttykit_cache
 
+echo "==> Generating BuildInfo.swift..."
+"$PROJECT_DIR/scripts/generate-build-info.sh"
+
 echo "==> Setup complete!"
 echo ""
 echo "You can now build and run the app:"
