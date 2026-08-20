@@ -69,6 +69,20 @@ extension TerminalController {
     // MARK: - V2 Debug / Test-only Methods
 
 #if DEBUG
+    /// Resolve the main terminal window without depending on one AppKit/SwiftUI
+    /// identifier shape. SwiftUI's primary `WindowGroup` uses
+    /// `term-mesh-primary-AppWindow-*`, while AppDelegate-created windows use
+    /// `term-mesh.main.*`; AppDelegate registration is the shared truth.
+    func debugMainTerminalWindow() -> NSWindow? {
+        guard let appDelegate = AppDelegate.shared else { return nil }
+        let preferred = [NSApp.mainWindow, NSApp.keyWindow].compactMap { $0 }
+        return preferred.first(where: appDelegate.isMainTerminalWindow)
+            ?? NSApp.windows.first(where: appDelegate.isMainTerminalWindow)
+            ?? appDelegate.mainWindowContexts.values
+                .compactMap(\.window)
+                .first(where: \.isVisible)
+    }
+
     func v2DebugShortcutSet(params: [String: Any]) -> V2CallResult {
         guard let name = v2String(params, "name"),
               let combo = v2String(params, "combo") else {
@@ -2170,12 +2184,7 @@ extension TerminalController {
 
         var result = "ERROR: No window"
         _ = v2MainExec(timeout: 5) {
-            guard let window = NSApp.mainWindow
-                ?? NSApp.keyWindow
-                ?? NSApp.windows.first(where: { win in
-                    guard let raw = win.identifier?.rawValue else { return false }
-                    return raw == "term-mesh.main" || raw.hasPrefix("term-mesh.main.")
-                }),
+            guard let window = self.debugMainTerminalWindow(),
                   let contentView = window.contentView,
                   let themeFrame = contentView.superview else { return }
 
