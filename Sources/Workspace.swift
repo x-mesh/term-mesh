@@ -1977,7 +1977,10 @@ final class Workspace: Identifiable {
                 return .split(ExternalSplitNode(
                     id: UUID().uuidString,
                     orientation: savedOrientation.rawValue,
-                    dividerPosition: max(0.1, min(0.9, divider)),
+                    dividerPosition: max(
+                        ProjectPresentationLayoutSnapshot.minimumDividerPosition,
+                        min(ProjectPresentationLayoutSnapshot.maximumDividerPosition, divider)
+                    ),
                     first: firstTree,
                     second: secondTree
                 ))
