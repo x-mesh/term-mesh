@@ -74,10 +74,19 @@ def gk(*args: str, cwd: Path = ROOT, input_text: str | None = None) -> dict[str,
         capture_output=True, check=False, env=env,
     )
     raw = proc.stdout.strip()
+    diagnostic = proc.stderr.strip()
     try:
-        envelope = json.loads(raw)
+        envelope = json.loads(raw or diagnostic)
     except json.JSONDecodeError as exc:
-        raise ReleaseError(f"git-kit returned non-JSON output: {raw[-1000:]}") from exc
+        detail = raw or diagnostic
+        if proc.returncode == 0:
+            return {
+                "schema": 1,
+                "state": "ok",
+                "ok": True,
+                "result": {"output": detail},
+            }
+        raise ReleaseError(f"git-kit returned non-JSON output: {detail[-1000:]}") from exc
     if proc.returncode != 0 or envelope.get("state") != "ok":
         raise ReleaseError(f"git-kit {args[0]} failed: {json.dumps(envelope, ensure_ascii=False)}")
     return envelope
@@ -374,14 +383,14 @@ def release_worktree(state: dict[str, Any], ref: str, *, artifact: bool = False)
     return path
 
 
-def branch_worktree(branch: str) -> Path:
+def branch_worktree(branch: str, *, allow_dirty: bool = False) -> Path:
     rows = git("worktree", "list", "--porcelain").splitlines()
     current: Path | None = None
     for line in rows:
         if line.startswith("worktree "):
             current = Path(line.removeprefix("worktree "))
         elif line == f"branch refs/heads/{branch}" and current is not None:
-            if git("-C", str(current), "status", "--porcelain"):
+            if not allow_dirty and git("-C", str(current), "status", "--porcelain"):
                 raise ReleaseError(f"{branch} worktree is dirty: {current}")
             return current
     path = Path.home() / ".cache/term-mesh/release-worktrees" / branch
@@ -538,9 +547,12 @@ def publish(args: argparse.Namespace) -> dict[str, Any]:
         elif current_develop != state["candidate_develop_sha"]:
             raise ReleaseError("origin/develop changed during release; refusing automatic resync")
         else:
-            develop_wt = branch_worktree("develop")
+            develop_wt = branch_worktree("develop", allow_dirty=True)
             gk("pull", cwd=develop_wt)
-            gk("merge", "--no-ai", "origin/main", "--into", "develop", cwd=develop_wt)
+            gk(
+                "merge", "--no-ai", "--autostash",
+                "origin/main", "--into", "develop", cwd=develop_wt,
+            )
             gk("push", "--from", "develop", cwd=develop_wt)
             fetch()
             mark(state, "develop_resync", develop_sha=remote_sha("develop"), adopted=False)
