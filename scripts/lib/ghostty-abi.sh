@@ -26,6 +26,14 @@
 # full guard below therefore also requires the parent pin, submodule checkout,
 # framework stamp, and cache symlink SHA to agree.
 
+ghostty_kit_linked_sha() {
+    local xcframework="$1" resolved
+    [ -L "$xcframework" ] || return 1
+    resolved="$(cd "$(dirname "$xcframework")" && realpath "$(basename "$xcframework")" 2>/dev/null)" \
+        || return 1
+    basename "$(dirname "$resolved")"
+}
+
 # Usage: ghostty_abi_is_consistent <project_dir>
 # Returns 0 when the root header matches every header shipped in the
 # xcframework, non-zero on any mismatch or when either side is missing.
@@ -95,7 +103,7 @@ ghostty_kit_is_consistent() {
     [ -L "$xcframework" ] || return 1
     [ -f "$xcframework/.ghostty_sha" ] || return 1
     framework_sha="$(tr -d '[:space:]' < "$xcframework/.ghostty_sha")"
-    linked_sha="$(basename "$(dirname "$(readlink "$xcframework")")")"
+    linked_sha="$(ghostty_kit_linked_sha "$xcframework")" || return 1
 
     [ -n "$parent_sha" ] || return 1
     [ "$parent_sha" = "$worktree_sha" ] || return 1
@@ -121,7 +129,7 @@ ghostty_kit_report() {
     parent_sha="$(git -C "$project_dir" rev-parse HEAD:ghostty 2>/dev/null || true)"
     worktree_sha="$(git -C "$project_dir/ghostty" rev-parse HEAD 2>/dev/null || true)"
     framework_sha="$([ -f "$xcframework/.ghostty_sha" ] && tr -d '[:space:]' < "$xcframework/.ghostty_sha" || true)"
-    linked_sha="$([ -L "$xcframework" ] && basename "$(dirname "$(readlink "$xcframework")")" || true)"
+    linked_sha="$(ghostty_kit_linked_sha "$xcframework" 2>/dev/null || true)"
 
     echo "  parent ghostty pin : ${parent_sha:-missing}" >&2
     echo "  submodule HEAD     : ${worktree_sha:-missing}" >&2

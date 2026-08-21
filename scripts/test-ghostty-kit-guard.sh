@@ -44,6 +44,11 @@ export PATH="$MOCK_BIN:$PATH" MOCK_PARENT_SHA="$SHA" MOCK_WORKTREE_SHA="$SHA"
 
 expect "matching pin, checkout, stamp, symlink, archive, and header" pass
 
+ln -s "$CACHE/$SHA/GhosttyKit.xcframework" "$SANDBOX/shared-GhosttyKit.xcframework"
+ln -sfn "$SANDBOX/shared-GhosttyKit.xcframework" "$PROJECT/GhosttyKit.xcframework"
+expect "accepts a worktree link through the main checkout symlink" pass
+ln -sfn "$CACHE/$SHA/GhosttyKit.xcframework" "$PROJECT/GhosttyKit.xcframework"
+
 MOCK_WORKTREE_SHA="$OTHER"
 expect "rejects a drifted submodule checkout" fail
 MOCK_WORKTREE_SHA="$SHA"
