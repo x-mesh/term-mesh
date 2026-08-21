@@ -4,6 +4,24 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.203.0] - 2026-08-21
+
+**native agent 명령 전달을 즉시 시작하고, 원격 Project의 agent pane 수명을 실제 process와 일치시킨다.**
+
+### Performance
+
+- **native agent 전송이 terminal paste용 지연과 불필요한 Return 왕복을 거치지 않는다** — native send·delegate·broadcast는 terminal 입력 혼잡을 막기 위한 stagger를 건너뛰고, text write가 turn 제출을 끝냈음을 acknowledgement에 명시한다. mac-sub A/B에서 단일 send p50은 283ms에서 13ms, p95는 296ms에서 40ms, 4-agent broadcast RPC는 385ms에서 4ms로 줄었다. terminal agent는 기존 paste+Return 계약을 그대로 유지한다. ([#349](https://github.com/x-mesh/term-mesh/pull/349)) — thanks @JINWOO-J!
+
+### Fixed
+
+- **peer-owned native agent의 전달 결과가 실제 remote transport 상태를 반영한다** — peer write 성공·실패·queue 인수를 구분해 응답하고, 느린 write가 뒤늦게 끝났을 때 caller retry가 같은 turn을 중복 제출하지 않게 했다. delegate 실패도 생성된 task 정보를 돌려줘 같은 request를 복구할 수 있다. ([#349](https://github.com/x-mesh/term-mesh/pull/349)) — thanks @JINWOO-J!
+
+- **원격 agent surface와 실제 process가 서로 다른 생존 상태로 남던 문제** — surface 시작·종료에 PID/PGID와 exit·cleanup 영수증을 남기고, owner shell 뒤에 남은 agent process group을 정리한다. Linux의 `waitpid(ECHILD)`도 PID starttime이 같은 live process라면 죽었다고 오판하지 않는다. ([#348](https://github.com/x-mesh/term-mesh/pull/348), [#350](https://github.com/x-mesh/term-mesh/pull/350)) — thanks @JINWOO-J!
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.202.0] - 2026-08-21
 
 **원격 Project에서 끝난 agent pane과 보호 중인 pane을 정확히 정리할 수 있다.**
