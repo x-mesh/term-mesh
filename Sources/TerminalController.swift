@@ -3421,21 +3421,33 @@ class TerminalController {
         guard let text = params["text"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
-        // Stagger sends: 100ms between each agent to avoid main-thread congestion
-        // that causes text/Enter key drops. 10 agents × 100ms = 1s total (acceptable).
+        // Stagger sends: 100ms between terminal targets to avoid main-thread
+        // congestion that causes text/Enter key drops. A native target takes
+        // its turn on stdin — no paste, no key events — so it is dispatched
+        // without a gap and never pushes one onto the targets after it.
         // Use (workspaceId, panelId) pairs — not names — so duplicate-named agents each
         // receive the broadcast instead of collapsing to a single recipient.
-        let agentPanels: [(workspaceId: UUID, panelId: UUID)] = await MainActor.run {
+        let agentPanels: [(workspaceId: UUID, panelId: UUID, isNative: Bool)] = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teams[teamName] else { return [] }
-            return team.agents.compactMap { agent -> (workspaceId: UUID, panelId: UUID)? in
+            return team.agents.compactMap { agent -> (workspaceId: UUID, panelId: UUID, isNative: Bool)? in
                 guard let pid = agent.panelId else { return nil }
-                return (workspaceId: agent.workspaceId, panelId: pid)
+                return (
+                    workspaceId: agent.workspaceId,
+                    panelId: pid,
+                    isNative: TeamOrchestrator.shared.agentPanelIsNative(
+                        workspaceId: agent.workspaceId, panelId: pid
+                    )
+                )
             }
         }
         var count = 0
-        for (index, panel) in agentPanels.enumerated() {
-            if index > 0 {
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+        var terminalDispatched = false
+        for panel in agentPanels {
+            if !panel.isNative {
+                if terminalDispatched {
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                }
+                terminalDispatched = true
             }
             let success = await MainActor.run {
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager

@@ -5667,12 +5667,19 @@ final class TeamOrchestrator: ObservableObject {
     /// Broadcast text to all agents in a team.
     /// Iterates by panelId (not name) so every agent pane receives the message,
     /// including multiple agents that share the same name.
+    /// Routed through `sendToAgentByPanel` for its transport fork: the direct
+    /// `sendTextToPanel` call could only find terminal panels, so a natively-
+    /// held agent walked the surface-nil retry ladder and never received a
+    /// menu broadcast at all.
     func broadcast(teamName: String, text: String, tabManager: TabManager) -> Int {
         guard let team = teams[teamName] else { return 0 }
         var count = 0
         for agent in team.agents {
             guard let pid = agent.panelId else { continue }
-            if sendTextToPanel(workspaceId: agent.workspaceId, panelId: pid, text: text, tabManager: tabManager) {
+            if sendToAgentByPanel(
+                teamName: teamName, panelId: pid, workspaceId: agent.workspaceId,
+                text: text, tabManager: tabManager
+            ) {
                 count += 1
             }
         }
