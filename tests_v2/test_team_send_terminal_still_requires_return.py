@@ -23,18 +23,16 @@ from termmesh import termmesh, termmeshError
 
 
 TEAM_NAME = f"test-terminal-return-{uuid.uuid4().hex[:8]}"
-AGENT_NAME = f"codex-terminal-{uuid.uuid4().hex[:8]}"
+AGENT_NAME = f"gemini-terminal-{uuid.uuid4().hex[:8]}"
 DEFAULTS_DOMAIN = "com.termmesh.app.debug"
-CLI_PATH_KEY = "cliPath.codex"
-PIPE_ENABLED_KEY = "agentPipeTransport.enabled"
-NATIVE_PANEL_KEY = "agentPipeTransport.nativePanel"
+CLI_PATH_KEY = "cliPath.gemini"
 
 # Prints a banner immediately: the first paste into a fresh terminal pane is
 # gated on pty output, and a silent child would hold that gate shut forever.
-FAKE_CODEX = r'''#!/usr/bin/env python3
+FAKE_GEMINI = r'''#!/usr/bin/env python3
 import sys
 
-print("fake-codex terminal ready", flush=True)
+print("fake-gemini terminal ready", flush=True)
 for raw in sys.stdin:
     pass
 '''
@@ -55,14 +53,6 @@ def _write_default(key: str, value: str) -> None:
     )
 
 
-def _write_default_bool(key: str, value: bool) -> None:
-    subprocess.run(
-        ["defaults", "write", DEFAULTS_DOMAIN, key, "-bool",
-         "true" if value else "false"],
-        check=True,
-    )
-
-
 def _restore_default(key: str, existed: bool, value: str) -> None:
     if existed:
         _write_default(key, value)
@@ -79,17 +69,12 @@ def main() -> int:
     if not tm_agent.is_file():
         raise termmeshError(f"tm-agent binary not found: {tm_agent}")
 
-    saved = {
-        key: _read_default(key)
-        for key in (CLI_PATH_KEY, PIPE_ENABLED_KEY, NATIVE_PANEL_KEY)
-    }
-    with tempfile.TemporaryDirectory(prefix="term-mesh-fake-codex-") as tmp:
-        fake_codex = Path(tmp) / "codex"
-        fake_codex.write_text(FAKE_CODEX)
-        fake_codex.chmod(fake_codex.stat().st_mode | stat.S_IXUSR)
-        _write_default(CLI_PATH_KEY, str(fake_codex))
-        _write_default_bool(PIPE_ENABLED_KEY, False)
-        _write_default_bool(NATIVE_PANEL_KEY, False)
+    saved = _read_default(CLI_PATH_KEY)
+    with tempfile.TemporaryDirectory(prefix="term-mesh-fake-gemini-") as tmp:
+        fake_gemini = Path(tmp) / "gemini"
+        fake_gemini.write_text(FAKE_GEMINI)
+        fake_gemini.chmod(fake_gemini.stat().st_mode | stat.S_IXUSR)
+        _write_default(CLI_PATH_KEY, str(fake_gemini))
 
         try:
             with termmesh() as client:
@@ -100,7 +85,7 @@ def main() -> int:
                     env["TERMMESH_TEAM"] = TEAM_NAME
                     add = subprocess.run(
                         [str(tm_agent), "add", "reviewer", "--name", AGENT_NAME,
-                         "--cli", "codex"],
+                         "--cli", "gemini"],
                         cwd=repo, env=env, text=True, capture_output=True,
                         timeout=30, check=False,
                     )
@@ -158,8 +143,7 @@ def main() -> int:
                 finally:
                     client.team_destroy(TEAM_NAME)
         finally:
-            for key, (existed, value) in saved.items():
-                _restore_default(key, existed, value)
+            _restore_default(CLI_PATH_KEY, *saved)
 
     print("PASS: terminal agent keeps return_required=true and a typed Return")
     return 0
