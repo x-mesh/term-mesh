@@ -3242,7 +3242,17 @@ class TerminalController {
                 resumed = true
                 cont.resume(returning: ok)
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) { resume(false) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) {
+                // Terminal paste completion owns an 8s watchdog, so this is
+                // its dead-man switch. A remote native write is different:
+                // the peer transport callback is the acknowledgement. If we
+                // time it out locally and it lands later, a CLI retry submits
+                // the same turn twice. Once delivery resolves as native, wait
+                // for the transport result instead.
+                if self.sendDeadmanApplies(deliveredNatively: deliveredNatively) {
+                    resume(false)
+                }
+            }
             Task { @MainActor in
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager else { resume(false); return }
@@ -3293,12 +3303,7 @@ class TerminalController {
                 TerminalController.discardSendGate(sendGate, agentKey: agentKey)
             }
         }
-        let deliveryScope: String
-        switch nativeDisposition {
-        case .remoteWritten: deliveryScope = "peer_transport_write"
-        case .queuedBehindTurn: deliveryScope = "queued_local"
-        default: deliveryScope = "transport_write"
-        }
+        let deliveryScope = nativeDeliveryScope(nativeDisposition)
         return teamSendDeliveryResponse(
             id: id,
             dispatched: dispatched,
@@ -3310,6 +3315,19 @@ class TerminalController {
             returnRequired: !deliveredNatively,
             deliveryScope: deliveryScope
         )
+    }
+
+    func nativeDeliveryScope(_ disposition: AgentSession.SendDisposition?) -> String {
+        switch disposition {
+        case .remoteWritten: return "peer_transport_write"
+        case .remoteFailed: return "peer_transport_failed"
+        case .queuedBehindTurn: return "queued_local"
+        default: return "transport_write"
+        }
+    }
+
+    func sendDeadmanApplies(deliveredNatively: Bool) -> Bool {
+        !deliveredNatively
     }
 
     /// Formats the `team.send` delivery contract. `delivery_scope` names how
@@ -4509,7 +4527,13 @@ class TerminalController {
                 resumed = true
                 cont.resume(returning: ok)
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) { resume(false) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) {
+                let native = capturedOutcome.flatMap { outcome -> Bool? in
+                    guard case .delivered(let result) = outcome else { return nil }
+                    return !result.returnRequired
+                } ?? false
+                if self.sendDeadmanApplies(deliveredNatively: native) { resume(false) }
+            }
             Task { @MainActor in
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager else { resume(false); return }
@@ -4561,6 +4585,14 @@ class TerminalController {
         }
 
         var returnSubmitted = false
+        guard textDelivered else {
+            return teamDelegateDeliveryFailureResponse(
+                id: id,
+                returnRequired: delegateResult.returnRequired,
+                requestReplayed: delegateResult.requestReplayed,
+                agentInstanceId: delegateResult.task.assigneeInstanceId
+            )
+        }
         if delegateResult.requestReplayed {
             // The original idempotent operation already owned text delivery.
             // A remote-leader retry also committed Return in that operation;
@@ -4601,6 +4633,26 @@ class TerminalController {
             "request_replayed": delegateResult.requestReplayed,
             "agent_instance_id": delegateResult.task.assigneeInstanceId ?? NSNull(),
         ])
+    }
+
+    func teamDelegateDeliveryFailureResponse(
+        id: Any?,
+        returnRequired: Bool,
+        requestReplayed: Bool,
+        agentInstanceId: String?
+    ) -> String {
+        let instanceValue: Any = agentInstanceId.map { $0 as Any } ?? NSNull()
+        return v2Error(
+            id: id, code: "delivery_failed",
+            message: "Instruction text was not delivered",
+            data: [
+                "sent": false,
+                "text_delivered": false,
+                "return_required": returnRequired,
+                "request_replayed": requestReplayed,
+                "agent_instance_id": instanceValue,
+            ]
+        )
     }
 
     /// Send a named key (return, ctrl-c, etc.) to an agent's terminal surface.

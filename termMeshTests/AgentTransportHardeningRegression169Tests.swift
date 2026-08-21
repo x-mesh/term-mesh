@@ -147,6 +147,54 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
         XCTAssertEqual(data["transport_dispatched"] as? Bool, true)
     }
 
+    func testNativeDeliveryScopeDistinguishesPeerFailureFromLocalWrite() {
+        XCTAssertEqual(
+            TerminalController.shared.nativeDeliveryScope(.remoteWritten),
+            "peer_transport_write"
+        )
+        XCTAssertEqual(
+            TerminalController.shared.nativeDeliveryScope(.remoteFailed("closed")),
+            "peer_transport_failed"
+        )
+        XCTAssertEqual(
+            TerminalController.shared.nativeDeliveryScope(.queuedBehindTurn),
+            "queued_local"
+        )
+        XCTAssertEqual(
+            TerminalController.shared.nativeDeliveryScope(.writtenLocal),
+            "transport_write"
+        )
+    }
+
+    func testSendDeadmanAppliesOnlyToTerminalPaste() {
+        XCTAssertTrue(
+            TerminalController.shared.sendDeadmanApplies(deliveredNatively: false)
+        )
+        XCTAssertFalse(
+            TerminalController.shared.sendDeadmanApplies(deliveredNatively: true)
+        )
+    }
+
+    func testDelegateMissingWriteAckIsDeliveryFailure() throws {
+        let response = TerminalController.shared.teamDelegateDeliveryFailureResponse(
+            id: 20,
+            returnRequired: false,
+            requestReplayed: false,
+            agentInstanceId: "instance-1"
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["ok"] as? Bool, false)
+        let error = try XCTUnwrap(object["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "delivery_failed")
+        let data = try XCTUnwrap(error["data"] as? [String: Any])
+        XCTAssertEqual(data["sent"] as? Bool, false)
+        XCTAssertEqual(data["text_delivered"] as? Bool, false)
+        XCTAssertEqual(data["return_required"] as? Bool, false)
+        XCTAssertEqual(data["agent_instance_id"] as? String, "instance-1")
+    }
+
     func testTeamSendAcknowledgementAnnouncesWhetherReturnIsRequired() throws {
         func result(returnRequired: Bool?) throws -> [String: Any] {
             let response = TerminalController.shared.teamSendDeliveryResponse(

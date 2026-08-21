@@ -163,11 +163,13 @@ def main() -> int:
                     # C. Broadcast RPC wall clock (the handler owns the stagger,
                     # so its response time is the dispatch schedule).
                     start = time.monotonic()
-                    client._call("team.broadcast", {
+                    broadcast = client._call("team.broadcast", {
                         "team_name": TEAM_NAME,
                         "text": "bench broadcast\n",
                     })
                     broadcast_ms = (time.monotonic() - start) * 1000.0
+                    if broadcast.get("sent_count") != len(AGENTS):
+                        raise termmeshError(f"broadcast did not dispatch to all agents: {broadcast!r}")
 
                     print(
                         "BENCH single_send_ms "
