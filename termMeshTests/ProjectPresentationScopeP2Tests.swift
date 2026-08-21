@@ -62,4 +62,37 @@ final class ProjectPresentationScopeP2Tests: XCTestCase {
             shouldPreserve(declaredName: true, dedicatedRemote: true, peerLeader: true)
         )
     }
+
+    func testAppQuitKeepsDurablePeerProjectAgentsAlive() {
+        XCTAssertFalse(TeamOrchestrator.shouldReleaseRemoteAgentsOnQuit(
+            ownsRemotePresentation: true,
+            hasPeerLeader: true,
+            teamUUID: "durable-team",
+            agentSurfacePublished: true
+        ))
+        XCTAssertTrue(TeamOrchestrator.shouldReleaseRemoteAgentsOnQuit(
+            ownsRemotePresentation: true,
+            hasPeerLeader: true,
+            teamUUID: "not-persisted",
+            agentSurfacePublished: false
+        ))
+        XCTAssertTrue(TeamOrchestrator.shouldReleaseRemoteAgentsOnQuit(
+            ownsRemotePresentation: true,
+            hasPeerLeader: false,
+            teamUUID: "local-team",
+            agentSurfacePublished: true
+        ))
+        XCTAssertTrue(TeamOrchestrator.shouldReleaseRemoteAgentsOnQuit(
+            ownsRemotePresentation: false,
+            hasPeerLeader: true,
+            teamUUID: "borrowed-team",
+            agentSurfacePublished: true
+        ))
+        XCTAssertTrue(TeamOrchestrator.shouldReleaseRemoteAgentsOnQuit(
+            ownsRemotePresentation: true,
+            hasPeerLeader: true,
+            teamUUID: nil,
+            agentSurfacePublished: true
+        ))
+    }
 }

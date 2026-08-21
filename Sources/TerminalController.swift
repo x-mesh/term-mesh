@@ -1398,6 +1398,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugProjectRemotePresentations(params: params))
         case "debug.project.adopt_remote":
             return v2Result(id: id, self.v2DebugProjectAdoptRemote(params: params))
+        case "debug.project.layout":
+            return v2Result(id: id, self.v2DebugProjectLayout(params: params))
         case "debug.peer.shells.inspect":
             return v2Result(id: id, self.v2DebugPeerShellInspect(params: params))
         case "debug.peer.shells.close":

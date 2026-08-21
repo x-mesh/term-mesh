@@ -362,6 +362,9 @@ extension TerminalController {
                 )
                 return
             }
+            TeamOrchestrator.shared.scheduleProjectPresentationLayoutSaveIfNeeded(
+                workspace: ws
+            )
 
             let windowId = self.v2ResolveWindowId(tabManager: tabManager)
             result = .ok([

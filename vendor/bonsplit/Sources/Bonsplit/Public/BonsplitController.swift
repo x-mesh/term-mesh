@@ -767,6 +767,66 @@ public final class BonsplitController {
         return buildExternalTree(from: internalController.rootNode, containerFrame: containerFrame)
     }
 
+    /// Replace the complete pane tree in one commit while preserving the
+    /// existing TabItem instances. The external tree must contain every live
+    /// tab exactly once; validation/build happens before `rootNode` changes, so
+    /// a stale sidecar cannot leave a partially rebuilt layout.
+    @discardableResult
+    public func applyExternalTreeAtomically(
+        _ tree: ExternalTreeNode,
+        focusedTabId: TabID? = nil
+    ) -> Bool {
+        let currentTabs = Dictionary(
+            uniqueKeysWithValues: internalController.rootNode.allPanes
+                .flatMap(\.tabs)
+                .map { ($0.id.uuidString, $0) }
+        )
+        var consumed = Set<String>()
+
+        func build(_ node: ExternalTreeNode) -> SplitNode? {
+            switch node {
+            case .pane(let pane):
+                guard !pane.tabs.isEmpty else { return nil }
+                let tabs = pane.tabs.compactMap { external -> TabItem? in
+                    guard consumed.insert(external.id).inserted else { return nil }
+                    return currentTabs[external.id]
+                }
+                guard tabs.count == pane.tabs.count else { return nil }
+                let selected = pane.selectedTabId.flatMap(UUID.init(uuidString:))
+                guard selected == nil || tabs.contains(where: { $0.id == selected }) else {
+                    return nil
+                }
+                return .pane(PaneState(tabs: tabs, selectedTabId: selected))
+
+            case .split(let split):
+                guard let orientation = SplitOrientation(rawValue: split.orientation),
+                      split.dividerPosition.isFinite,
+                      (0...1).contains(split.dividerPosition),
+                      let first = build(split.first),
+                      let second = build(split.second) else { return nil }
+                return .split(SplitState(
+                    orientation: orientation,
+                    first: first,
+                    second: second,
+                    dividerPosition: CGFloat(split.dividerPosition)
+                ))
+            }
+        }
+
+        guard let nextRoot = build(tree), consumed == Set(currentTabs.keys) else {
+            return false
+        }
+        let focusedPane: PaneID? = focusedTabId.flatMap { wanted in
+            nextRoot.allPanes.first(where: { pane in
+                pane.tabs.contains(where: { $0.id == wanted.id })
+            })?.id
+        } ?? nextRoot.allPaneIds.first
+        internalController.rootNode = nextRoot
+        internalController.focusedPaneId = focusedPane
+        notifyGeometryChange()
+        return true
+    }
+
     private func buildExternalTree(from node: SplitNode, containerFrame: CGRect, bounds: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)) -> ExternalTreeNode {
         switch node {
         case .pane(let paneState):

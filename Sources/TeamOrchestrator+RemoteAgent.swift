@@ -506,6 +506,9 @@ extension TeamOrchestrator {
                         + response.errorCode
                 )
             } else {
+                publishedRemoteProjectAgentSurfaceIDs[teamName] = Set(
+                    project.members.map(\.surfaceID)
+                )
                 RemoteHostStore.shared.refreshTeamRoster(forHostKey: hostKey)
             }
             return response.ok
@@ -585,6 +588,169 @@ extension TeamOrchestrator {
             || (!localPresentationOwnedByRequester && remoteRevision > localRevision)
     }
 
+    /// Pick the one daemon manifest this installation may restore without a
+    /// click. Team names are presentation copy and can repeat; the newest
+    /// locally-owned leader record is the durable join key that prevents an
+    /// old same-named Project from being adopted after a restart.
+    nonisolated static func automaticRemoteProjectRestoreCandidate(
+        in remotes: [RemoteTeamSummary],
+        leaderRecord: ManagedPeerSurfaceStore.Record?
+    ) -> RemoteTeamSummary? {
+        guard let leaderSurfaceID = leaderRecord?.surfaceID else { return nil }
+        return remotes
+            .filter { remote in
+                remote.presentationOwnedByRequester
+                    && !remote.projectID.isEmpty
+                    && remote.leaderSurfaceID == leaderSurfaceID
+            }
+            .max { $0.presentationRevision < $1.presentationRevision }
+    }
+
+    nonisolated static func shouldReleaseRemoteAgentsOnQuit(
+        ownsRemotePresentation: Bool,
+        hasPeerLeader: Bool,
+        teamUUID: String?,
+        agentSurfacePublished: Bool
+    ) -> Bool {
+        !(ownsRemotePresentation
+            && hasPeerLeader
+            && teamUUID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            && agentSurfacePublished)
+    }
+
+    nonisolated static func automaticProjectRestoreFailureKey(
+        hostID: String,
+        activeSockPath: String,
+        projectID: String,
+        revision: UInt64
+    ) -> String {
+        [hostID, activeSockPath, projectID, String(revision)].joined(separator: "\u{1f}")
+    }
+
+    nonisolated static func automaticProjectRestoreRetryDelayNanoseconds(
+        afterFailureCount failureCount: Int
+    ) -> UInt64? {
+        switch failureCount {
+        case 1: return 1_000_000_000
+        case 2: return 2_000_000_000
+        case 3: return 4_000_000_000
+        default: return nil
+        }
+    }
+
+    /// Recreate owned Project viewers as soon as the session-owner roster is
+    /// available. Persistence is useful only when relaunch does not require a
+    /// hidden Projects-sidebar button to materialize it again.
+    func restoreOwnedRemoteProjectsIfNeeded(
+        hosts: [HostEntry],
+        tabManager: TabManager
+    ) async {
+        for host in hosts where host.isConnected && host.teamHostSpec != nil {
+            let teamNames = Set(host.teams.map(\.name))
+            for teamName in teamNames.sorted() where teams[teamName] == nil {
+                let leaderRecord = ManagedPeerSurfaceStore.shared.leaderRecord(
+                    hostKey: host.id,
+                    teamName: teamName
+                )
+                guard let remote = Self.automaticRemoteProjectRestoreCandidate(
+                    in: host.teams.filter { $0.name == teamName },
+                    leaderRecord: leaderRecord
+                ) else { continue }
+                let failureKey = Self.automaticProjectRestoreFailureKey(
+                    hostID: host.id,
+                    activeSockPath: host.activeSockPath,
+                    projectID: remote.projectID,
+                    revision: remote.presentationRevision
+                )
+                guard automaticProjectRestoreRetryTasks[failureKey] == nil,
+                      (automaticProjectRestoreFailureAttempts[failureKey] ?? 0) < 4,
+                      !projectRestoreInFlight.contains(remote.name) else {
+                    continue
+                }
+                let restored = await adoptRemoteProjectPresentation(
+                    remote, host: host, tabManager: tabManager, selectWorkspace: false
+                )
+                if restored {
+                    automaticProjectRestoreFailureAttempts.removeValue(forKey: failureKey)
+                    automaticProjectRestoreRetryTasks.removeValue(forKey: failureKey)?.cancel()
+                } else {
+                    let failureCount = (automaticProjectRestoreFailureAttempts[failureKey] ?? 0) + 1
+                    automaticProjectRestoreFailureAttempts[failureKey] = failureCount
+                    guard let delay = Self.automaticProjectRestoreRetryDelayNanoseconds(
+                        afterFailureCount: failureCount
+                    ) else { continue }
+                    automaticProjectRestoreRetryTasks[failureKey] = Task {
+                        try? await Task.sleep(nanoseconds: delay)
+                        guard !Task.isCancelled else { return }
+                        self.automaticProjectRestoreRetryTasks.removeValue(forKey: failureKey)
+                        await self.restoreOwnedRemoteProjectsIfNeeded(
+                            hosts: RemoteHostStore.shared.sortedHosts,
+                            tabManager: tabManager
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    func persistProjectPresentationLayoutIfNeeded(workspace: Workspace) {
+        guard !workspace.isApplyingProjectPresentationLayout,
+              let team = teams.values.first(where: { $0.workspaceId == workspace.id }),
+              team.ownsRemotePresentation,
+              let projectID = team.remotePresentationProjectID
+                ?? team.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:)) ,
+              let snapshot = workspace.projectPresentationLayoutSnapshot(projectID: projectID)
+        else { return }
+        ProjectPresentationLayoutStore.shared.save(snapshot)
+    }
+
+    func scheduleProjectPresentationLayoutSaveIfNeeded(workspace: Workspace) {
+        guard !workspace.isApplyingProjectPresentationLayout,
+              let team = teams.values.first(where: { $0.workspaceId == workspace.id }),
+              team.ownsRemotePresentation,
+              let projectID = team.remotePresentationProjectID
+                ?? team.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:))
+        else { return }
+        scheduleProjectPresentationLayoutSave(projectID: projectID, workspace: workspace)
+    }
+
+    private func finalizeRestoredProjectLayout(
+        projectID: String,
+        workspace: Workspace,
+        anchorPanelID: UUID?,
+        restoreFocus: Bool
+    ) {
+        let saved = ProjectPresentationLayoutStore.shared.snapshot(projectID: projectID)
+        let restored = workspace.withProjectPresentationLayoutPersistenceSuppressed {
+            if let anchorPanelID, workspace.panels.count > 1 {
+                _ = workspace.closePanel(anchorPanelID, force: true)
+            }
+            guard let saved else { return false }
+            return workspace.applyProjectPresentationLayout(saved, restoreFocus: restoreFocus)
+        }
+        if restored {
+            // The saved snapshot already is the source of truth. Capturing the
+            // background viewer's temporary focus here would overwrite its
+            // focusedSurfaceID with the first pane.
+        } else if saved == nil {
+            settleRestoredAgentGrid(workspace: workspace)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self, weak workspace] in
+                guard let self, let workspace else { return }
+                self.persistProjectPresentationLayoutIfNeeded(workspace: workspace)
+            }
+        } else {
+            // Adoption reaches here only after every manifest member attached.
+            // A surface-set mismatch therefore means the authoritative Project
+            // topology changed, not that one pane is transiently missing.
+            ProjectPresentationLayoutStore.shared.remove(projectID: projectID)
+            settleRestoredAgentGrid(workspace: workspace)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self, weak workspace] in
+                guard let self, let workspace else { return }
+                self.persistProjectPresentationLayoutIfNeeded(workspace: workspace)
+            }
+        }
+    }
+
     nonisolated static func remotePresentationIdentityMatches(
         localHostKey: String?,
         localProjectID: String?,
@@ -619,7 +785,8 @@ extension TeamOrchestrator {
     func adoptRemoteProjectPresentation(
         _ remote: RemoteTeamSummary,
         host: HostEntry,
-        tabManager: TabManager
+        tabManager: TabManager,
+        selectWorkspace: Bool = true
     ) async -> Bool {
         let namedTeam = teams[remote.name]
         let matchingTeam = namedTeam.flatMap {
@@ -658,8 +825,9 @@ extension TeamOrchestrator {
 
         let workspace = tabManager.addWorkspace(
             workingDirectory: remote.workingDirectory,
-            select: true
+            select: selectWorkspace
         )
+        let anchorPanelID = workspace.focusedPanelId
         workspace.customTitle = "[\(remote.name)]"
         workspace.title = "[\(remote.name)]"
 
@@ -705,12 +873,6 @@ extension TeamOrchestrator {
                     )
                 }
             ) else {
-                if remote.presentationOwnedByRequester {
-                    ManagedPeerSurfaceStore.shared.forget(
-                        hostKey: host.id,
-                        surfaceID: remote.leaderSurfaceID
-                    )
-                }
                 tabManager.closeWorkspace(workspace)
                 return false
             }
@@ -754,12 +916,6 @@ extension TeamOrchestrator {
             host: host,
             members: members
         ) else {
-            if remote.presentationOwnedByRequester {
-                ManagedPeerSurfaceStore.shared.forget(
-                    hostKey: host.id,
-                    surfaceID: remote.leaderSurfaceID
-                )
-            }
             tabManager.closeWorkspace(workspace)
             return false
         }
@@ -796,12 +952,6 @@ extension TeamOrchestrator {
                 expectedRevision: updateTarget.remotePresentationRevision
             )
             guard replacement.replaced else {
-                if remote.presentationOwnedByRequester {
-                    ManagedPeerSurfaceStore.shared.forget(
-                        hostKey: host.id,
-                        surfaceID: remote.leaderSurfaceID
-                    )
-                }
                 _ = await Self.finishAdoptedRemoteAgentRoutes(
                     host: host, transaction: routeTransfer.transaction, commit: false
                 )
@@ -820,12 +970,6 @@ extension TeamOrchestrator {
             }
         } else {
             guard installAdoptedRemoteProject(team) else {
-                if remote.presentationOwnedByRequester {
-                    ManagedPeerSurfaceStore.shared.forget(
-                        hostKey: host.id,
-                        surfaceID: remote.leaderSurfaceID
-                    )
-                }
                 _ = await Self.finishAdoptedRemoteAgentRoutes(
                     host: host, transaction: routeTransfer.transaction, commit: false
                 )
@@ -838,6 +982,13 @@ extension TeamOrchestrator {
             host: host,
             transaction: routeTransfer.transaction,
             grantIDs: Array(mintedRoutes.values)
+        )
+        let adoptedSignature = Self.remoteProjectManifestSignature(
+            team, hostKey: host.id
+        )
+        remoteProjectManifestSignatures[remote.name] = adoptedSignature
+        publishedRemoteProjectAgentSurfaceIDs[remote.name] = Set(
+            remote.members.map(\.surfaceID)
         )
         // Only now that the roster is real: the keepalive loop retires itself
         // when the team or the member is missing, so starting it any earlier
@@ -854,7 +1005,12 @@ extension TeamOrchestrator {
             projectName: remote.name,
             projectID: remote.projectID
         )
-        scheduleAgentGridEqualization(workspace: workspace)
+        finalizeRestoredProjectLayout(
+            projectID: remote.projectID,
+            workspace: workspace,
+            anchorPanelID: anchorPanelID,
+            restoreFocus: selectWorkspace
+        )
         RemoteWorkLog.info(
             "Adopted live project \(remote.name) from \(host.displayName): "
                 + "leader + \(members.count) existing agent surfaces"
@@ -2873,10 +3029,20 @@ extension TeamOrchestrator {
             projectName: teamName,
             projectID: original.remotePresentationProjectID
         )
-        if let anchorPanelID = progress.anchorPanelID, workspace.panels.count > 1 {
-            _ = workspace.closePanel(anchorPanelID, force: true)
+        if let projectID = original.remotePresentationProjectID
+            ?? original.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:)) {
+            finalizeRestoredProjectLayout(
+                projectID: projectID,
+                workspace: workspace,
+                anchorPanelID: progress.anchorPanelID,
+                restoreFocus: true
+            )
+        } else {
+            if let anchorPanelID = progress.anchorPanelID, workspace.panels.count > 1 {
+                _ = workspace.closePanel(anchorPanelID, force: true)
+            }
+            settleRestoredAgentGrid(workspace: workspace)
         }
-        scheduleAgentGridEqualization(workspace: workspace)
 
 #if DEBUG
         dlog(
@@ -7505,7 +7671,12 @@ extension TeamOrchestrator {
                 throw error
             }
         }
+        let projectID = team.remotePresentationProjectID
+            ?? team.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:))
         _ = destroyTeam(name: teamName, tabManager: tabManager, archive: false)
+        if let projectID {
+            removeProjectPresentationLayout(projectID: projectID)
+        }
     }
 
     /// Terminal panes inside a project-owned workspace are removed by the
@@ -7603,21 +7774,34 @@ extension TeamOrchestrator {
         "pending", "queued", "assigned", "in_progress", "reassigned",
     ]
 
-    /// Tell every agent running on a peer to quit, because this app is.
+    /// Tell only non-durable remote agents to quit because this app is.
     ///
     /// A local agent dies with the app: its process lives in a pane, and the
     /// pane goes when the process hosting it does. An agent on another machine
-    /// does not — it keeps running, holding its session, with nobody left who
-    /// knows it exists. Teams do not survive a restart, so nothing would ever
-    /// come back for it, and the next agent added to that host would find the
-    /// surface occupied by a ghost. Every restart would leave one more.
+    /// does not. Durable peer Projects now persist an exact daemon manifest
+    /// and are restored from it, so quitting those agents here destroys the
+    /// very state the restart contract promises to recover.
     ///
     /// Returns whether anything was asked to quit, so the caller knows whether
     /// it is worth delaying the quit at all.
     @MainActor
     @discardableResult
     func releaseAllRemoteAgentsForQuit() -> Bool {
-        let remote = teams.values.flatMap(\.agents).filter { $0.hostKey != nil }
+        let remote = teams.values.flatMap { team -> [AgentMember] in
+            let hasPeerLeader: Bool
+            if case .peer = team.leaderEndpoint { hasPeerLeader = true }
+            else { hasPeerLeader = false }
+            let published = publishedRemoteProjectAgentSurfaceIDs[team.id] ?? []
+            return team.agents.filter { agent in
+                guard agent.hostKey != nil else { return false }
+                return Self.shouldReleaseRemoteAgentsOnQuit(
+                    ownsRemotePresentation: team.ownsRemotePresentation,
+                    hasPeerLeader: hasPeerLeader,
+                    teamUUID: team.teamUuid,
+                    agentSurfacePublished: agent.remoteSurfaceID.map(published.contains) == true
+                )
+            }
+        }
         var askedTerminalAgentToQuit = false
         for agent in remote {
             guard let panelId = agent.panelId,
