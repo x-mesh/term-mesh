@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.201.0] - 2026-08-21
+
+**peer 연결 신뢰를 유지하고, 원격 Project의 pane 배치를 앱 재시작 뒤에도 그대로 복원한다.**
+
+### Fixed
+
+- **업데이트할 때마다 peer identity Keychain 승인을 다시 묻던 문제** — 장치 identity를 앱 전용 파일에 안전하게 보관하고, 일시적인 읽기 실패가 기존 identity를 덮어쓰지 않게 했다. 반복되는 Keychain prompt 없이 같은 peer로 계속 인식된다. ([#334](https://github.com/x-mesh/term-mesh/pull/334), [#320](https://github.com/x-mesh/term-mesh/issues/320)) — thanks @JINWOO-J!
+
+- **원격 Project가 앱 재시작 뒤 pane 순서·split 방향·divider 위치·focus를 잃던 문제** — daemon에 남아 있는 leader와 agent surface를 다시 붙인 뒤 저장한 Bonsplit tree를 복원한다. 일시적인 attach 실패는 제한된 backoff로 재시도하고, 지원 범위를 벗어난 divider 값은 적용 전에 거부한다. ([#335](https://github.com/x-mesh/term-mesh/pull/335), [#337](https://github.com/x-mesh/term-mesh/pull/337), [#336](https://github.com/x-mesh/term-mesh/issues/336)) — thanks @JINWOO-J!
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.200.0] - 2026-08-21
 
 **앱 안에서 안전한 진단 자료를 검토해 이슈를 열 수 있고, 원격 Project가 연결 변화와 실패 뒤에도 자기 session·checkout을 잃지 않는다.**
