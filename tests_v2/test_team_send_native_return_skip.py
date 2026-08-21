@@ -140,6 +140,11 @@ def main() -> int:
                         raise termmeshError(
                             f"expected return_required=false in the ack: {result!r}"
                         )
+                    if result.get("delivery_scope") != "transport_write":
+                        raise termmeshError(
+                            "a local native write must report "
+                            f"delivery_scope=transport_write: {result!r}"
+                        )
                     if result.get("sent") is not True \
                             or result.get("return_submitted") is not True \
                             or result.get("delivery_state") != "submitted":
