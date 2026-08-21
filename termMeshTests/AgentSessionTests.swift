@@ -3697,9 +3697,11 @@ private final class RemoteSinkRecorder: @unchecked Sendable {
         defer { lock.unlock() }
         return payloads
     }
+}
 
-    // MARK: - Environment diagnostic ordering
+// MARK: - Environment diagnostic ordering
 
+extension AgentSessionTests {
     /// The panel header's key list must describe the environment the child
     /// actually gets.
     ///
@@ -3708,6 +3710,9 @@ private final class RemoteSinkRecorder: @unchecked Sendable {
     /// alone showed every inline gateway key as absent on a pane that was
     /// receiving them — an indicator that accuses the environment loader of
     /// losing a value the child has, which is worse than no indicator at all.
+    ///
+    /// Moved out of `RemoteSinkRecorder`: a test function on a helper class is
+    /// never discovered by XCTest, so this suite silently ran zero of these.
     @MainActor
     func testInlineEnvironmentIsVisibleToTheDiagnosticThatReportsIt() throws {
         let command = AgentSession.remoteCommand(
@@ -3750,7 +3755,7 @@ private final class RemoteSinkRecorder: @unchecked Sendable {
     /// The staged-file variant sources its values before the diagnostic already,
     /// and passes only PATH inline — so it must gain no second export.
     @MainActor
-    func testTheStagedFileVariantIsUnchanged() {
+    func testTheStagedFileVariantIsUnchanged() throws {
         let command = AgentSession.remoteCommand(
             executable: "claude",
             arguments: [],
@@ -3762,7 +3767,16 @@ private final class RemoteSinkRecorder: @unchecked Sendable {
             command.contains("export ANTHROPIC_AUTH_TOKEN="),
             "the staged file is sourced before the diagnostic and needs no overlay"
         )
-        XCTAssertTrue(command.contains("set -a; . '/tmp/staged.env'"))
+        // Asserted on intent, not the literal: the returned command wraps the
+        // inner script in another quoting layer, so the file path's quotes
+        // arrive escaped and a pre-escape literal can never match.
+        let sourced = try XCTUnwrap(command.range(of: "set -a; . "))
+        let diagnostic = try XCTUnwrap(command.range(of: "present_keys"))
+        XCTAssertTrue(
+            sourced.lowerBound < diagnostic.lowerBound,
+            "the diagnostic must report values the staged file already loaded"
+        )
+        XCTAssertTrue(command.contains("/tmp/staged.env"))
     }
 
     /// `getent` is glibc-only. Asking only it made every macOS host fall through
