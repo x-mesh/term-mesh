@@ -75,6 +75,10 @@ const AGENT_CHUNK_MAX_BYTES: usize = READ_BUF_SIZE;
 /// Per-agent ordered input backlog. `try_send` makes socket control traffic
 /// independent of a child that stopped consuming stdin.
 const AGENT_INPUT_QUEUE_CAPACITY: usize = 16;
+/// Recent agent stderr retained for the one terminal lifecycle receipt. The
+/// live debug stream still receives every chunk; this tail makes the reason
+/// visible at info/warn level when stdout closes hours later.
+const AGENT_STDERR_TAIL_BYTES: usize = 8 * 1024;
 /// Fan-out channel capacity. If a slow subscriber falls behind by this many
 /// chunks, it starts getting `RecvError::Lagged` on `recv()`; the connection
 /// layer handles that as a gap (eventual reconnect will re-snapshot).
@@ -499,6 +503,7 @@ struct AgentIo {
     agent_cli: String,
     /// Bounded, ordered handoff to the one blocking stdin writer thread.
     input_tx: std_mpsc::SyncSender<Vec<u8>>,
+    stderr_tail: Arc<Mutex<VecDeque<u8>>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -556,6 +561,9 @@ enum ChildState {
 #[derive(Debug)]
 struct ChildLifecycle {
     pid: libc::pid_t,
+    /// Captured at spawn. The group can outlive its leader, so resolving it
+    /// from `pid` after waitpid is exactly too late for orphan cleanup.
+    process_group: libc::pid_t,
     state: ChildState,
     exit: Option<SurfaceExitInfo>,
 }
@@ -581,13 +589,78 @@ fn polite_exit_signal(io: &SurfaceIo) -> libc::c_int {
 /// Safety: every caller holds the surface's lifecycle mutex, which proves
 /// the child has not been reaped — so the pid cannot yet have been
 /// recycled to an unrelated process.
-fn deliver_signal(io: &SurfaceIo, pid: libc::pid_t, signal: libc::c_int) -> bool {
+fn deliver_signal(
+    io: &SurfaceIo,
+    pid: libc::pid_t,
+    process_group: libc::pid_t,
+    signal: libc::c_int,
+) -> bool {
     match io {
         SurfaceIo::Pty(_) => unsafe { libc::kill(pid, signal) == 0 },
-        SurfaceIo::Agent(_) => {
-            crate::headless::signal_agent_process_group(pid as u32, signal).is_ok()
-        }
+        SurfaceIo::Agent(_) => unsafe { libc::killpg(process_group, signal) == 0 },
     }
+}
+
+fn process_group_exists(process_group: libc::pid_t) -> bool {
+    process_group > 1
+        && (unsafe { libc::killpg(process_group, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+/// Reap descendants adopted by term-meshd after the tracked shell exits.
+/// `waitpid(-pgid, …)` cannot touch another surface because every agent
+/// surface starts in its own session/process group.
+fn reap_process_group_children(process_group: libc::pid_t) -> usize {
+    let mut reaped = 0;
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(-process_group, &mut status, libc::WNOHANG) };
+        if result > 0 {
+            reaped += 1;
+            continue;
+        }
+        if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return reaped;
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProcessGroupCleanup {
+    alive_before: bool,
+    term_delivered: bool,
+    kill_delivered: bool,
+    reaped: usize,
+    alive_after: bool,
+}
+
+fn cleanup_process_group(process_group: libc::pid_t) -> ProcessGroupCleanup {
+    let mut receipt = ProcessGroupCleanup {
+        alive_before: process_group_exists(process_group),
+        ..Default::default()
+    };
+    if !receipt.alive_before {
+        return receipt;
+    }
+    receipt.term_delivered = unsafe { libc::killpg(process_group, libc::SIGTERM) == 0 };
+    for _ in 0..FORCE_KILL_GRACE_POLLS {
+        receipt.reaped += reap_process_group_children(process_group);
+        if !process_group_exists(process_group) {
+            return receipt;
+        }
+        std::thread::sleep(FORCE_KILL_GRACE_INTERVAL);
+    }
+    receipt.kill_delivered = unsafe { libc::killpg(process_group, libc::SIGKILL) == 0 };
+    for _ in 0..REAP_AFTER_KILL_POLLS {
+        receipt.reaped += reap_process_group_children(process_group);
+        if !process_group_exists(process_group) {
+            return receipt;
+        }
+        std::thread::sleep(REAP_AFTER_KILL_INTERVAL);
+    }
+    receipt.alive_after = process_group_exists(process_group);
+    receipt
 }
 
 /// Winsize arbitration state for one PTY (behind `size_requests`).
@@ -872,6 +945,7 @@ impl PtySurface {
             }),
             child: Mutex::new(ChildLifecycle {
                 pid: child.pid,
+                process_group: child.pid,
                 state: ChildState::Running,
                 exit: None,
             }),
@@ -1028,7 +1102,7 @@ impl PtySurface {
             // zombie when waitpid(WNOHANG) loses the process-exit race.
             let reap_surface = reader_surface.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                reap_surface.finish_after_eof();
+                reap_surface.finish_after_eof("pty_eof");
                 reap_surface.mark_dead();
             })
             .await;
@@ -1138,6 +1212,15 @@ impl PtySurface {
                 .unwrap_or_default()
         });
 
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+        tracing::info!(
+            surface_id = %hex_id(&surface_id),
+            owner_pid = pid,
+            process_group = pid,
+            agent_cli = %agent_cli,
+            cwd = %resolved_cwd,
+            "agent surface process started"
+        );
         let surface = Arc::new(PtySurface {
             surface_id,
             title,
@@ -1155,9 +1238,11 @@ impl PtySurface {
             io: SurfaceIo::Agent(AgentIo {
                 agent_cli,
                 input_tx,
+                stderr_tail: Arc::clone(&stderr_tail),
             }),
             child: Mutex::new(ChildLifecycle {
                 pid,
+                process_group: pid,
                 state: ChildState::Running,
                 exit: None,
             }),
@@ -1189,10 +1274,12 @@ impl PtySurface {
                 Ok(receiver) => receiver,
                 Err(e) => {
                     tracing::error!(
-                        "agent stdout pipe registration failed on surface {:?}: {e}",
-                        hex_short(&reader_surface.surface_id)
+                        surface_id = %hex_id(&reader_surface.surface_id),
+                        owner_pid = reader_surface.pid(),
+                        error = %e,
+                        "agent stdout pipe registration failed"
                     );
-                    reader_surface.hangup();
+                    reader_surface.shutdown_forcibly();
                     reader_surface.mark_dead();
                     return;
                 }
@@ -1218,6 +1305,7 @@ impl PtySurface {
             // top of every iteration — both arms below emit the moment it
             // reaches the cap, so this is the whole memory bound.
             let mut pending: Vec<u8> = Vec::new();
+            let mut stream_end = "stdout_eof";
             loop {
                 let consumed = match reader.fill_buf().await {
                     Ok([]) => {
@@ -1265,6 +1353,7 @@ impl PtySurface {
                         // line interrupted by a read error is dropped, not
                         // emitted as a fragment.
                         pending.clear();
+                        stream_end = "stdout_read_error";
                         break;
                     }
                 };
@@ -1278,7 +1367,7 @@ impl PtySurface {
             }
             let reap_surface = reader_surface.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                reap_surface.finish_after_eof();
+                reap_surface.finish_after_eof(stream_end);
                 reap_surface.mark_dead();
             })
             .await;
@@ -1294,15 +1383,28 @@ impl PtySurface {
         let stderr_id = hex_short(&surface.surface_id);
         tokio::spawn(async move {
             let stderr_fd: OwnedFd = stderr.into();
-            let Ok(mut receiver) = tokio::net::unix::pipe::Receiver::from_owned_fd(stderr_fd)
-            else {
-                return;
+            let mut receiver = match tokio::net::unix::pipe::Receiver::from_owned_fd(stderr_fd) {
+                Ok(receiver) => receiver,
+                Err(error) => {
+                    tracing::warn!(
+                        surface_id = %stderr_id,
+                        error = %error,
+                        "agent stderr pipe registration failed; lifecycle receipt will have no stderr tail"
+                    );
+                    return;
+                }
             };
             let mut buf = vec![0u8; READ_BUF_SIZE];
             loop {
                 match receiver.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        if let Ok(mut tail) = stderr_tail.lock() {
+                            tail.extend(&buf[..n]);
+                            while tail.len() > AGENT_STDERR_TAIL_BYTES {
+                                tail.pop_front();
+                            }
+                        }
                         tracing::debug!(
                             "agent stderr [{stderr_id}]: {}",
                             String::from_utf8_lossy(&buf[..n]).trim_end_matches('\n')
@@ -1351,7 +1453,12 @@ impl PtySurface {
         }
         // Safety: the mutex proves this child has not been reaped, so its pid
         // cannot yet have been recycled to an unrelated process.
-        if deliver_signal(&self.io, child.pid, polite_exit_signal(&self.io)) {
+        if deliver_signal(
+            &self.io,
+            child.pid,
+            child.process_group,
+            polite_exit_signal(&self.io),
+        ) {
             self.signal_owners.fetch_add(1, Ordering::Relaxed);
         }
         child.state = ChildState::Signaled;
@@ -1384,18 +1491,37 @@ impl PtySurface {
             return;
         };
         if matches!(child.state, ChildState::Reaped | ChildState::Abandoned) {
+            // A process-group number can be reused after the original group
+            // is gone. Only the EOF/exit transition may clean descendants; a
+            // later idempotent terminate must not signal a stale numeric id.
             return;
         }
         if child.state == ChildState::Running {
             // Safety: the mutex proves this child has not been reaped, so its
             // pid cannot yet have been recycled to an unrelated process.
-            if deliver_signal(&self.io, child.pid, polite_exit_signal(&self.io)) {
+            if deliver_signal(
+                &self.io,
+                child.pid,
+                child.process_group,
+                polite_exit_signal(&self.io),
+            ) {
                 self.signal_owners.fetch_add(1, Ordering::Relaxed);
             }
             child.state = ChildState::Signaled;
         }
         for _ in 0..FORCE_KILL_GRACE_POLLS {
             if Self::observe_exit_locked(&mut child, &self.reap_owners) {
+                if matches!(self.io, SurfaceIo::Agent(_)) {
+                    let cleanup = cleanup_process_group(child.process_group);
+                    if cleanup.alive_before {
+                        tracing::warn!(
+                            surface_id = %hex_id(&self.surface_id),
+                            owner_pid = child.pid, process_group = child.process_group,
+                            ?cleanup,
+                            "agent surface terminate cleaned descendants after owner exit"
+                        );
+                    }
+                }
                 return;
             }
             std::thread::sleep(FORCE_KILL_GRACE_INTERVAL);
@@ -1404,8 +1530,19 @@ impl PtySurface {
         // for an agent child, so the bridge's own CLI child dies with it.
         // Safety: still holding the lifecycle lock, so the pid is not yet
         // reaped/recycled.
-        deliver_signal(&self.io, child.pid, libc::SIGKILL);
+        deliver_signal(&self.io, child.pid, child.process_group, libc::SIGKILL);
         Self::reap_after_kill_locked(&mut child, &self.reap_owners);
+        if matches!(self.io, SurfaceIo::Agent(_)) {
+            let cleanup = cleanup_process_group(child.process_group);
+            if cleanup.alive_before || cleanup.reaped > 0 {
+                tracing::warn!(
+                    surface_id = %hex_id(&self.surface_id),
+                    owner_pid = child.pid, process_group = child.process_group,
+                    ?cleanup,
+                    "agent surface terminate finalized its process group"
+                );
+            }
+        }
     }
 
     /// Finish ownership after the output pipe reaches EOF. A normal child
@@ -1414,18 +1551,49 @@ impl PtySurface {
     /// clean exit into SIGTERM, so first give it the same bounded grace used
     /// by polite shutdown without delivering any signal. Only a process that
     /// remains alive after that grace is forcefully torn down.
-    fn finish_after_eof(&self) {
+    fn finish_after_eof(&self, stream_end: &'static str) {
         let Ok(mut child) = self.child.lock() else {
             return;
         };
+        let owner_pid = child.pid;
+        let process_group = child.process_group;
         for _ in 0..FORCE_KILL_GRACE_POLLS {
             if Self::observe_exit_locked(&mut child, &self.reap_owners) {
-                return;
+                break;
             }
             std::thread::sleep(FORCE_KILL_GRACE_INTERVAL);
         }
-        drop(child);
-        self.shutdown_forcibly();
+        if matches!(self.io, SurfaceIo::Pty(_)) {
+            if child.state != ChildState::Reaped {
+                drop(child);
+                self.shutdown_forcibly();
+            }
+            return;
+        }
+        let exit = child.exit.clone().unwrap_or(SurfaceExitInfo {
+            reason: "unknown",
+            ..Default::default()
+        });
+        let cleanup = cleanup_process_group(process_group);
+        let SurfaceIo::Agent(agent) = &self.io else {
+            unreachable!("PTY returned above")
+        };
+        let (stderr_bytes, stderr_sha256) =
+            agent.stderr_tail.lock().map_or((0, String::new()), |tail| {
+                let bytes: Vec<u8> = tail.iter().copied().collect();
+                (bytes.len(), format!("{:x}", Sha256::digest(&bytes)))
+            });
+        tracing::warn!(
+            surface_id = %hex_id(&self.surface_id),
+            owner_pid, process_group, stream_end,
+            exit_code = exit.exit_code, exit_signal = exit.signal, exit_reason = exit.reason,
+            group_alive_after_grace = cleanup.alive_before,
+            term_delivered = cleanup.term_delivered, kill_delivered = cleanup.kill_delivered,
+            group_children_reaped = cleanup.reaped,
+            group_alive_after_cleanup = cleanup.alive_after,
+            stderr_bytes, stderr_sha256 = %stderr_sha256,
+            "agent surface lifecycle ended"
+        );
     }
 
     /// Reap the child after a SIGKILL, giving up after a bounded window.
@@ -2167,7 +2335,12 @@ impl Drop for PtySurface {
         // holding the same lifecycle lock, close the fd, and attempt WNOHANG.
         if let Ok(child) = self.child.get_mut() {
             if child.state == ChildState::Running {
-                if deliver_signal(&self.io, child.pid, polite_exit_signal(&self.io)) {
+                if deliver_signal(
+                    &self.io,
+                    child.pid,
+                    child.process_group,
+                    polite_exit_signal(&self.io),
+                ) {
                     self.signal_owners.fetch_add(1, Ordering::Relaxed);
                 }
                 child.state = ChildState::Signaled;
@@ -4552,13 +4725,74 @@ mod tests {
         assert!(died.is_ok(), "agent EOF must flip the dead flag");
         assert!(!surface.info().attachable);
         let replay = surface.replay_snapshot();
-        assert_eq!(replay.len(), 1);
-        assert_eq!(replay[0].bytes, b"bye\n".to_vec());
+        assert_eq!(
+            replay.last().map(|chunk| chunk.bytes.as_slice()),
+            Some(b"bye\n".as_slice()),
+            "the final child line must land after the environment diagnostic"
+        );
         assert_eq!(surface.exit_info().exit_code, 7);
         assert_eq!(surface.exit_info().signal, 0);
         assert_eq!(surface.exit_info().reason, "exited");
         assert_eq!(surface.reap_owners.load(Ordering::Relaxed), 1);
 
+        manager.remove(&outcome.surface_id);
+    }
+
+    /// Ground-truth regression from jw-server: the tracked shell exited, its
+    /// Claude descendant kept the same process group, and the daemon marked
+    /// the surface dead while leaving Claude alive under term-meshd.
+    #[tokio::test]
+    async fn agent_surface_does_not_leave_a_descendant_after_owner_exit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pid_file = dir.path().join("descendant.pid");
+        let script = format!(
+            "sleep 30 >/dev/null 2>&1 & echo $! > {}; \
+             printf 'orphan-evidence\\n' >&2; printf 'bye\\n'; exit 7",
+            tm_agent_bridge::location::shell_quote(&pid_file.display().to_string())
+        );
+        let manager = PtyManager::new();
+        let outcome = manager
+            .ensure("agent-orphan", &agent_ensure_spec(&script))
+            .expect("ensure agent surface");
+        let surface = outcome.surface.clone();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !surface.dead.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("surface becomes terminal");
+        let descendant: libc::pid_t = std::fs::read_to_string(pid_file)
+            .expect("descendant pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if unsafe { libc::kill(descendant, 0) } != 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if gone.is_err() {
+            unsafe { libc::kill(descendant, libc::SIGKILL) };
+        }
+        assert!(
+            gone.is_ok(),
+            "surface death must not leave its CLI descendant alive"
+        );
+        let SurfaceIo::Agent(agent) = &surface.io else {
+            panic!("agent test created a terminal surface")
+        };
+        let mut stderr = agent.stderr_tail.lock().expect("stderr tail");
+        assert!(
+            String::from_utf8_lossy(stderr.make_contiguous()).contains("orphan-evidence"),
+            "terminal receipt must retain a bounded diagnostic tail"
+        );
         manager.remove(&outcome.surface_id);
     }
 
