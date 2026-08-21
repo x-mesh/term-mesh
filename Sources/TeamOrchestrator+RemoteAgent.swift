@@ -2566,7 +2566,7 @@ extension TeamOrchestrator {
         Task { await PeerTeamLeaderControlPlane.shared.revokeGrant(id: grantID) }
     }
 
-    private func stopRemoteAgentRouteKeepalive(
+    func stopRemoteAgentRouteKeepalive(
         agentInstanceID: String,
         revoke: Bool
     ) {
@@ -5460,7 +5460,7 @@ extension TeamOrchestrator {
     /// the panel is minted per attach and is exactly the thing that just went
     /// away, while the surface id is the peer's own durable name for the
     /// bridge.
-    private func peerOwnedAgentMember(
+    func peerOwnedAgentMember(
         panelID: UUID,
         surfaceID: Data
     ) -> (teamName: String, agent: AgentMember)? {
@@ -5777,6 +5777,25 @@ extension TeamOrchestrator {
         var updated = current
         updated.agents[index] = replacement
         return updated
+    }
+
+    /// Remove exactly the peer-owned member whose authoritative surface ended.
+    /// A stale exit callback from an older pane must not remove a replacement
+    /// that kept the same durable instance id but already owns a new surface.
+    @MainActor
+    static func teamByRetiringEndedPeerOwnedAgent(
+        current: Team,
+        agentInstanceID: String,
+        surfaceID: Data
+    ) -> (team: Team, retired: AgentMember)? {
+        guard let index = current.agents.firstIndex(where: {
+            $0.agentInstanceId == agentInstanceID
+                && $0.remoteAgentSurface
+                && $0.remoteSurfaceID == surfaceID
+        }) else { return nil }
+        var updated = current
+        let retired = updated.agents.remove(at: index)
+        return (updated, retired)
     }
 
     @MainActor
