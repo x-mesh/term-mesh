@@ -3057,7 +3057,10 @@ struct RemoteHostGroupView: View, Equatable {
         shellCleanupLoading = true
         shellCleanupError = nil
         do {
-            let items = try await TeamOrchestrator.shared.inspectPeerShells(host: host)
+            let currentHost = RemoteHostStore.currentHostSnapshot(
+                for: host, in: store.hosts
+            )
+            let items = try await TeamOrchestrator.shared.inspectPeerShells(host: currentHost)
             shellCleanupItems = items
             shellCleanupSelection = Set(items.compactMap { item in
                 guard !item.isBusy else { return nil }
@@ -3079,13 +3082,18 @@ struct RemoteHostGroupView: View, Equatable {
         shellCleanupLoading = true
         shellCleanupError = nil
         do {
+            let currentHost = RemoteHostStore.currentHostSnapshot(
+                for: host, in: store.hosts
+            )
             _ = try await TeamOrchestrator.shared.closePeerShells(
-                host: host,
+                host: currentHost,
                 surfaceIDs: shellCleanupSelection,
                 force: force
             )
-            shellCleanupItems.removeAll { shellCleanupSelection.contains($0.id) }
-            shellCleanupSelection = []
+            // ClosePane is asynchronous on the host and protected selections
+            // may be skipped. Re-read the authoritative roster instead of
+            // making the sheet claim that every selected row disappeared.
+            await loadShellCleanup()
         } catch {
             // Part of the sweep may have landed before the failure, so the list
             // on screen no longer describes the host. Re-read it, then restore
@@ -3708,8 +3716,11 @@ struct RemoteWorkspaceRowView: View {
         shellCleanupLoading = true
         shellCleanupError = nil
         do {
+            let currentHost = RemoteHostStore.currentHostSnapshot(
+                for: host, in: store.hosts
+            )
             let items = try await TeamOrchestrator.shared.inspectPeerShells(
-                host: host,
+                host: currentHost,
                 workspaceID: workspace.id
             )
             shellCleanupItems = items
@@ -3733,13 +3744,15 @@ struct RemoteWorkspaceRowView: View {
         shellCleanupLoading = true
         shellCleanupError = nil
         do {
+            let currentHost = RemoteHostStore.currentHostSnapshot(
+                for: host, in: store.hosts
+            )
             _ = try await TeamOrchestrator.shared.closePeerShells(
-                host: host,
+                host: currentHost,
                 surfaceIDs: shellCleanupSelection,
                 force: force
             )
-            shellCleanupItems.removeAll { shellCleanupSelection.contains($0.id) }
-            shellCleanupSelection = []
+            await loadShellCleanup()
         } catch {
             let message = String(describing: error)
             await loadShellCleanup()

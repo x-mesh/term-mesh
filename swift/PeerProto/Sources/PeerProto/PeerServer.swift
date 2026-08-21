@@ -1595,7 +1595,10 @@ actor PeerServerSession {
             // doesn't" drift (#218/#219/#220). Same filter pattern as
             // `PeerWorkspaceMirror.mirrorHandshakeOptions`. Remove this
             // filter once the Mac host can actually host agent surfaces.
-            advertisedCapabilities.removeAll { $0 == PeerCapability.surfaceAgentV1 }
+            advertisedCapabilities.removeAll {
+                $0 == PeerCapability.surfaceAgentV1
+                    || $0 == PeerCapability.surfaceTerminateV1
+            }
             // Project manifests promise that the named surfaces outlive this
             // viewer. A GUI host owns no such lifecycle; only term-meshd may
             // advertise the durable publication endpoint.

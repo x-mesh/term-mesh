@@ -383,23 +383,25 @@ message EnsureSurfaceResponse {
   EnsureSurfaceError error = 8;
 }
 
-// TerminateSurface removes exactly one ensured surface from the live PTY
-// registry, durable ensured-state, and workspace layout. It never selects a
-// surface by name or by current attachment.
+// TerminateSurface removes exactly one surface from the live PTY registry,
+// durable ensured-state (when present), and workspace layout. It never selects
+// a surface by name or by current attachment.
 message TerminateSurfaceRequest {
   // Exactly 16 opaque bytes; one-shot across EnsureSurface and
   // TerminateSurface for the authenticated connection. If a response is
   // dropped, retry with a fresh request_id. Reusing this id is always
   // DUPLICATE_REQUEST_ID and is never a response-replay mechanism.
   bytes request_id = 1;
-  // Exact 16-byte SurfaceInfo.surface_id returned by EnsureSurfaceResponse.
+  // Exact 16-byte SurfaceInfo.surface_id. Explicit termination applies to
+  // ordinary PTY panes as well as ensured runners and, unlike ClosePane, may
+  // remove the final pane from a workspace.
   bytes surface_id = 2;
 }
 
 enum TerminateSurfaceResult {
   TERMINATE_SURFACE_RESULT_UNSPECIFIED = 0;
   TERMINATE_SURFACE_RESULT_TERMINATED = 1;
-  // Idempotent success: the exact surface does not exist or is not ensured.
+  // Idempotent success: the exact surface does not exist.
   // A fresh-id retry after a successful terminate whose response was dropped
   // therefore returns NOT_FOUND.
   TERMINATE_SURFACE_RESULT_NOT_FOUND = 2;

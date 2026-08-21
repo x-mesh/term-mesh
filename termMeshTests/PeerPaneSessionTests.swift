@@ -2024,6 +2024,78 @@ final class PeerShellSweepTests: XCTestCase {
     }
 
     @MainActor
+    func test_force_uses_authoritative_termination_for_the_last_pane() async throws {
+        var closeSent = false
+        var confirmationRead = false
+        try await TeamOrchestrator.closePeerShellConfirmed(
+            surfaceID: Data(repeating: 0x41, count: 16),
+            force: true,
+            terminate: { .terminated },
+            closePane: { closeSent = true },
+            confirmRemoved: { confirmationRead = true; return false }
+        )
+        XCTAssertFalse(closeSent)
+        XCTAssertFalse(confirmationRead)
+    }
+
+    @MainActor
+    func test_force_falls_back_for_an_older_host_and_confirms_removal() async throws {
+        var closeSent = false
+        try await TeamOrchestrator.closePeerShellConfirmed(
+            surfaceID: Data(repeating: 0x42, count: 16),
+            force: true,
+            terminate: { .notFound },
+            closePane: { closeSent = true },
+            confirmRemoved: { true }
+        )
+        XCTAssertTrue(closeSent)
+    }
+
+    @MainActor
+    func test_force_borrowed_termination_still_requires_roster_confirmation() async throws {
+        var closeSent = false
+        var confirmationRead = false
+        do {
+            try await TeamOrchestrator.closePeerShellConfirmed(
+                surfaceID: Data(repeating: 0x44, count: 16),
+                force: true,
+                terminate: { .notFound },
+                closePane: { closeSent = true },
+                confirmRemoved: { confirmationRead = true; return false }
+            )
+            XCTFail("borrowed termination must not count before roster confirmation")
+        } catch {
+            XCTAssertTrue(closeSent)
+            XCTAssertTrue(confirmationRead)
+        }
+    }
+
+    @MainActor
+    func test_silent_close_noop_is_not_counted_as_cleanup_success() async throws {
+        do {
+            _ = try await TeamOrchestrator.sweepClose(
+                targets: [Data(repeating: 0x43, count: 16)],
+                send: { surfaceID in
+                    try await TeamOrchestrator.closePeerShellConfirmed(
+                        surfaceID: surfaceID,
+                        force: false,
+                        terminate: { .notFound },
+                        closePane: {},
+                        confirmRemoved: { false }
+                    )
+                }
+            )
+            XCTFail("an unconfirmed close must not be reported as deleted")
+        } catch let error as TeamOrchestrator.RemoteAgentError {
+            guard case .partialShellClose(let closed, let failed, _) = error else {
+                return XCTFail("expected partialShellClose, got \(error)")
+            }
+            XCTAssertEqual(closed, 0)
+            XCTAssertEqual(failed, 1)
+        }
+    }
+
+    @MainActor
     func test_forceCloseRemovesLocalViewerBeforeRemoteTermination() throws {
         let workspace = Workspace(title: "force-close-viewer")
         let panelID = try XCTUnwrap(workspace.focusedPanelId)

@@ -1177,10 +1177,11 @@ public actor PeerSession {
         }
     }
 
-    /// Remove one ensured surface from the host's registry, durable ensured
-    /// state, and workspace layout.
+    /// Remove one surface from the host's registry, durable ensured state (if
+    /// any), and workspace layout. Unlike interactive `requestClosePane`, this
+    /// explicit destructive operation may remove a workspace's final pane.
     ///
-    /// This is the only way to stop an *agent* surface: it is deliberately
+    /// This is also the only way to stop an *agent* surface: it is deliberately
     /// never placed in the workspace tree, so `requestClosePane` finds
     /// nothing and silently succeeds. NOT_FOUND is a success — the proto
     /// defines it as the idempotent outcome, which is what a cleanup path
@@ -1221,6 +1222,30 @@ public actor PeerSession {
             throw PeerSessionError.malformedEnsureResponse("request_id does not echo the request")
         }
         return response.result
+    }
+
+    /// Submit explicit termination over an attached session whose inbound
+    /// pump already owns reads. The matching response is consumed as other;
+    /// callers must confirm removal from an authoritative roster before
+    /// reporting success.
+    public func requestTerminateSurface(
+        requestID suppliedRequestID: Data? = nil,
+        surfaceID: Data
+    ) async throws {
+        try requireHostCapability(PeerCapability.surfaceTerminateV1)
+        let requestID = suppliedRequestID ?? Self.makeEnsureRequestID()
+        guard requestID.count == 16 else {
+            throw PeerSessionError.invalidEnsureRequest("request_id must be 16 bytes")
+        }
+        guard surfaceID.count == 16 else {
+            throw PeerSessionError.invalidEnsureRequest("surface_id must be 16 bytes")
+        }
+        try await sendEnvelope { env in
+            var request = Termmesh_Peer_V1_TerminateSurfaceRequest()
+            request.requestID = requestID
+            request.surfaceID = surfaceID
+            env.terminateSurfaceRequest = request
+        }
     }
 
     public func attachSurface(
