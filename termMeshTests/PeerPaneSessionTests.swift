@@ -2005,6 +2005,50 @@ final class PeerShellSweepTests: XCTestCase {
         XCTAssertEqual(closed, 0)
         XCTAssertFalse(sendCalled)
     }
+
+    func test_forceBypassesProtectionOnlyWhenExplicitlyEnabled() {
+        let selected = ids(3)
+        let protected = Set([Data([0x01])])
+        XCTAssertEqual(
+            TeamOrchestrator.peerShellTargets(
+                selected: selected, protected: protected, force: false
+            ),
+            selected.subtracting(protected)
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.peerShellTargets(
+                selected: selected, protected: protected, force: true
+            ),
+            selected
+        )
+    }
+
+    @MainActor
+    func test_forceCloseRemovesLocalViewerBeforeRemoteTermination() throws {
+        let workspace = Workspace(title: "force-close-viewer")
+        let panelID = try XCTUnwrap(workspace.focusedPanelId)
+        let surfaceID = Data(repeating: 0x71, count: 16)
+        workspace.debugProjectLayoutSurfaceIDs[panelID] = surfaceID
+
+        XCTAssertEqual(TeamOrchestrator.closePeerSurfaceViewers(
+            surfaceIDs: [surfaceID], workspaces: [workspace]
+        ), 1)
+        XCTAssertNil(workspace.panels[panelID])
+    }
+
+    func test_forceConfirmationCountsOnlyProtectedSelection() {
+        let protected = TeamOrchestrator.PeerShellCleanupItem(
+            id: Data([0x01]), title: "busy", workingDirectory: "/tmp",
+            isBusy: true, state: .unclaimed
+        )
+        let safe = TeamOrchestrator.PeerShellCleanupItem(
+            id: Data([0x02]), title: "orphan", workingDirectory: "/tmp",
+            isBusy: false, state: .managedOrphan
+        )
+        XCTAssertEqual(TeamOrchestrator.protectedPeerShellCount(
+            items: [protected, safe], selection: [protected.id, safe.id]
+        ), 1)
+    }
 }
 
 /// Project deletion must respect the host's last-pane invariant: a dedicated
