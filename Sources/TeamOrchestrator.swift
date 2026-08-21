@@ -4151,7 +4151,7 @@ final class TeamOrchestrator: ObservableObject {
     /// When multiple agents share the same name, round-robins across them.
     /// Maintains an in-flight counter and a panelId snapshot so a concurrent
     /// hard restart can either drain (preferred) or detect mid-flight migration.
-    func sendToAgent(teamName: String, agentName: String, agentInstanceId: String? = nil, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil) -> Bool {
+    func sendToAgent(teamName: String, agentName: String, agentInstanceId: String? = nil, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil, disposition: ((AgentSession.SendDisposition) -> Void)? = nil) -> Bool {
         guard let team = teams[teamName] else {
             #if DEBUG
             dlog("[team.sendToAgent] DROP reason=team_not_found team=\(teamName) agent=\(agentName)")
@@ -4180,7 +4180,7 @@ final class TeamOrchestrator: ObservableObject {
         if let panelId = agent.panelId,
            let agentPanel = nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) {
             return deliverNatively(agentPanel, agentId: agent.transportId, text: text,
-                                   completion: completion)
+                                   completion: completion, disposition: disposition)
         }
         if AgentPipeTransport.isDriven(agentId: agent.transportId) {
             let expectation = AgentPipeCompletion.shared.expect(
@@ -4276,7 +4276,7 @@ final class TeamOrchestrator: ObservableObject {
     /// separate team.send_key Return lands on the SAME pane (used by panel-targeted
     /// team.send / team.delegate for deterministic duplicate-name addressing).
     @discardableResult
-    func sendToAgentByPanel(teamName: String, panelId: UUID, workspaceId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, recordPendingReturnFor agentName: String? = nil, completion: ((Bool) -> Void)? = nil) -> Bool {
+    func sendToAgentByPanel(teamName: String, panelId: UUID, workspaceId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, recordPendingReturnFor agentName: String? = nil, completion: ((Bool) -> Void)? = nil, disposition: ((AgentSession.SendDisposition) -> Void)? = nil) -> Bool {
         // An agent driven by a pipe takes its turn there, and none of what
         // follows applies to it: no paste queue, no pending-Return target, no
         // in-flight accounting to keep a restart from cutting a paste in half.
@@ -4284,7 +4284,7 @@ final class TeamOrchestrator: ObservableObject {
         // either lands whole or reports why it did not.
         if let native = nativeAgentPanel(workspaceId: workspaceId, panelId: panelId) {
             return deliverNatively(native, agentId: native.agentName, text: text,
-                                   completion: completion)
+                                   completion: completion, disposition: disposition)
         }
         if let agent = pipeDrivenAgent(teamName: teamName, panelId: panelId) {
             let expectation = AgentPipeCompletion.shared.expect(
@@ -5272,13 +5272,28 @@ final class TeamOrchestrator: ObservableObject {
     /// so the others fell through to the pipe fork, found no FIFO, waited out
     /// the readiness timeout and failed.
     private func deliverNatively(_ panel: AgentPanel, agentId: String, text: String,
-                                 completion: ((Bool) -> Void)?) -> Bool {
+                                 completion: ((Bool) -> Void)?,
+                                 disposition: ((AgentSession.SendDisposition) -> Void)? = nil) -> Bool {
         do {
-            _ = try panel.session.send(Self.withoutTerminalProtocol(text), from: .leader)
+            // Completion rides the session's receipt: a local write or a
+            // queued turn answers synchronously as before, while a peer-owned
+            // agent answers when the sink write actually lands — so the
+            // caller's `text_delivered` stops meaning "the local tail queue
+            // took it".
+            _ = try panel.session.send(
+                Self.withoutTerminalProtocol(text), from: .leader
+            ) { sendDisposition in
+                disposition?(sendDisposition)
+                switch sendDisposition {
+                case .writtenLocal, .queuedBehindTurn, .remoteWritten:
+                    completion?(true)
+                case .remoteFailed:
+                    completion?(false)
+                }
+            }
             #if DEBUG
             dlog("agent.native.deliver agent=\(agentId) chars=\(text.count)")
             #endif
-            completion?(true)
             return true
         } catch {
             #if DEBUG

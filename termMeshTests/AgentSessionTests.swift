@@ -3611,6 +3611,73 @@ final class AgentSessionTests: XCTestCase {
 
         XCTAssertFalse(panel.session.isRunning)
     }
+
+    // MARK: - Send receipts
+
+    func testRemoteReceiptFiresWhenTheSinkWriteLands() async throws {
+        let session = AgentSession()
+        session.startRemote { _ in }
+        let received = expectation(description: "receipt")
+        var disposition: AgentSession.SendDisposition?
+        _ = try session.send("ping", from: .leader) { d in
+            disposition = d
+            received.fulfill()
+        }
+        await fulfillment(of: [received], timeout: 2)
+        guard case .remoteWritten = disposition else {
+            return XCTFail("expected remoteWritten, got \(String(describing: disposition))")
+        }
+        session.stop()
+    }
+
+    func testRemoteReceiptReportsASinkFailure() async throws {
+        struct SinkError: Error {}
+        let session = AgentSession()
+        session.startRemote { _ in throw SinkError() }
+        let received = expectation(description: "receipt")
+        var disposition: AgentSession.SendDisposition?
+        _ = try session.send("ping", from: .leader) { d in
+            disposition = d
+            received.fulfill()
+        }
+        await fulfillment(of: [received], timeout: 2)
+        guard case .remoteFailed = disposition else {
+            return XCTFail("expected remoteFailed, got \(String(describing: disposition))")
+        }
+        session.stop()
+    }
+
+    func testTeardownBeforeTheWriteAnswersRemoteFailedInsteadOfSilence() async throws {
+        let session = AgentSession()
+        session.startRemote { _ in }
+        let received = expectation(description: "receipt")
+        var disposition: AgentSession.SendDisposition?
+        _ = try session.send("ping", from: .leader) { d in
+            disposition = d
+            received.fulfill()
+        }
+        // The tail task cannot have run yet — it needs this main-actor turn to
+        // yield first — so stopping now ends the session before the write, the
+        // exact path that used to return without answering.
+        session.stop()
+        await fulfillment(of: [received], timeout: 2)
+        guard case .remoteFailed = disposition else {
+            return XCTFail("expected remoteFailed, got \(String(describing: disposition))")
+        }
+    }
+
+    func testQueuedTurnAnswersImmediatelyRatherThanAfterTheRunningTurn() throws {
+        let session = AgentSession()
+        session.startRemote { _ in }
+        _ = try session.send("first", from: .leader)
+        var disposition: AgentSession.SendDisposition?
+        _ = try session.send("second", from: .leader) { d in disposition = d }
+        // The running turn could last minutes; the receipt must not wait on it.
+        guard case .queuedBehindTurn = disposition else {
+            return XCTFail("expected queuedBehindTurn, got \(String(describing: disposition))")
+        }
+        session.stop()
+    }
 }
 
 /// Collects what a remote session wrote, across whatever executor the

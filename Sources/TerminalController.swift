@@ -3234,6 +3234,7 @@ class TerminalController {
         // watchdog (8s) + max retry backoff (~2s) so it doesn't trip a still-live paste.
         var dispatched = false
         var deliveredNatively = false
+        var nativeDisposition: AgentSession.SendDisposition?
         let textDelivered: Bool = await withCheckedContinuation { cont in
             var resumed = false
             let resume: (Bool) -> Void = { ok in
@@ -3263,7 +3264,10 @@ class TerminalController {
                     text: text,
                     tabManager: tabManager,
                     withReturn: false, // Return is sent separately by Rust CLI via team.send_key
-                    completion: { ack in resume(ack) }
+                    completion: { ack in resume(ack) },
+                    // Fires before the completion above, so the scope is
+                    // always set by the time the continuation resumes.
+                    disposition: { nativeDisposition = $0 }
                 )
                 dispatched = ok
                 if !ok { resume(false) }
@@ -3289,6 +3293,12 @@ class TerminalController {
                 TerminalController.discardSendGate(sendGate, agentKey: agentKey)
             }
         }
+        let deliveryScope: String
+        switch nativeDisposition {
+        case .remoteWritten: deliveryScope = "peer_transport_write"
+        case .queuedBehindTurn: deliveryScope = "queued_local"
+        default: deliveryScope = "transport_write"
+        }
         return teamSendDeliveryResponse(
             id: id,
             dispatched: dispatched,
@@ -3297,13 +3307,18 @@ class TerminalController {
             agentName: agentName,
             agentInstanceId: agentInstanceId,
             sendSequenceID: sendSequenceAware ? sendGate.sequenceID : nil,
-            returnRequired: !deliveredNatively
+            returnRequired: !deliveredNatively,
+            deliveryScope: deliveryScope
         )
     }
 
-    /// Formats the `team.send` delivery contract. `transport_write` means only
-    /// that the complete text reached the target transport/input field; it does
-    /// not claim that the agent consumed the text or produced a reply.
+    /// Formats the `team.send` delivery contract. `delivery_scope` names how
+    /// far the write is known to have got: `transport_write` — the local
+    /// transport/input field took the complete text; `peer_transport_write` —
+    /// the peer relay session accepted the input frame; `queued_local` — the
+    /// turn is parked behind the agent's running turn and is written after
+    /// its result. None of them claim that the agent consumed the text or
+    /// produced a reply.
     func teamSendDeliveryResponse(
         id: Any?,
         dispatched: Bool,
@@ -3312,7 +3327,8 @@ class TerminalController {
         agentName: String,
         agentInstanceId: String,
         sendSequenceID: String? = nil,
-        returnRequired: Bool? = nil
+        returnRequired: Bool? = nil,
+        deliveryScope: String = "transport_write"
     ) -> String {
         guard dispatched else {
             return v2Error(id: id, code: "not_found", message: "Agent or team not found")
@@ -3320,7 +3336,7 @@ class TerminalController {
         var delivery: [String: Any] = [
             "sent": textDelivered,
             "text_delivered": textDelivered,
-            "delivery_scope": "transport_write",
+            "delivery_scope": deliveryScope,
             "transport_dispatched": true,
             "team_name": teamName,
             "agent_name": agentName,
