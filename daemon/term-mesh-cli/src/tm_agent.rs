@@ -721,6 +721,14 @@ mod project_sync_cli_tests {
     }
 
     #[test]
+    fn correlation_poll_cadence_starts_fast_and_settles_at_the_legacy_pace() {
+        let cadence: Vec<u64> = (0..7)
+            .map(|attempt| correlation_poll_delay(attempt).as_millis() as u64)
+            .collect();
+        assert_eq!(cadence, vec![10, 20, 40, 80, 100, 100, 100]);
+    }
+
+    #[test]
     fn best_effort_rpc_retries_ok_false_without_exiting() {
         let mut calls = 0;
         run_best_effort_rpc_with_retry("test.post", || {
@@ -9849,6 +9857,16 @@ fn correlated_reply_from_mailbox(
     })))
 }
 
+/// Poll cadence for a correlated reply. The early probes are quick because
+/// the native fast path can land a reply tens of milliseconds after the
+/// send; the cadence settles at the historical 100 ms so a long wait costs
+/// no more RPCs than it used to. The extra polls all fit in the first
+/// quarter second, against a local unix socket.
+fn correlation_poll_delay(attempt: usize) -> Duration {
+    const LADDER_MS: [u64; 5] = [10, 20, 40, 80, 100];
+    Duration::from_millis(LADDER_MS[attempt.min(LADDER_MS.len() - 1)])
+}
+
 fn wait_for_correlated_reply_with<P>(
     expected_agent: &str,
     expected_instance_id: &str,
@@ -9860,6 +9878,7 @@ where
     P: FnMut(Duration) -> Result<Value, String>,
 {
     let deadline = Instant::now() + timeout;
+    let mut attempt = 0usize;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -9882,7 +9901,8 @@ where
                 "timed out waiting for correlated reply from {expected_agent}"
             ));
         }
-        thread::sleep(remaining.min(Duration::from_millis(100)));
+        thread::sleep(remaining.min(correlation_poll_delay(attempt)));
+        attempt += 1;
     }
 }
 
