@@ -955,6 +955,61 @@ final class TabManagerInactiveTitlePublicationTests: XCTestCase {
     }
 }
 
+@MainActor
+final class TabManagerPanelTitleDeduplicationTests: XCTestCase {
+    override func tearDown() {
+        AppFocusState.overrideIsFocused = nil
+        super.tearDown()
+    }
+
+    func testDropsTitleMatchingLastReceivedValue() {
+        XCTAssertFalse(TabManager.shouldEnqueuePanelTitleUpdate(
+            lastReceivedTitle: "new",
+            newTitle: "new"
+        ))
+    }
+
+    func testKeepsLatestTitleWhenItDiffersFromLastReceivedValue() {
+        XCTAssertTrue(TabManager.shouldEnqueuePanelTitleUpdate(
+            lastReceivedTitle: "intermediate",
+            newTitle: "latest"
+        ))
+    }
+
+    func testAlwaysEnqueuesFirstReceivedTitle() {
+        XCTAssertTrue(TabManager.shouldEnqueuePanelTitleUpdate(
+            lastReceivedTitle: nil,
+            newTitle: "new"
+        ))
+    }
+
+    func testActiveTitleBurstPublishesLatestValueAtDisplayRate() async throws {
+        let manager = TabManager(initialWorkingDirectory: "/tmp", persistsSessionState: false)
+        let workspace = try XCTUnwrap(manager.selectedWorkspace)
+        let panelId = try XCTUnwrap(workspace.focusedPanelId)
+        let originalTitle = workspace.panelTitles[panelId]
+        AppFocusState.overrideIsFocused = true
+
+        for index in 0..<5 {
+            NotificationCenter.default.post(
+                name: .ghosttyDidSetTitle,
+                object: nil,
+                userInfo: [
+                    GhosttyNotificationKey.tabId: workspace.id,
+                    GhosttyNotificationKey.surfaceId: panelId,
+                    GhosttyNotificationKey.title: "rate-limited-\(index)",
+                ]
+            )
+        }
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(workspace.panelTitles[panelId], originalTitle)
+
+        try await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertEqual(workspace.panelTitles[panelId], "rate-limited-4")
+    }
+}
+
 final class SocketControlSettingsTests: XCTestCase {
     func testMigrateModeSupportsExpandedSocketModes() {
         XCTAssertEqual(SocketControlSettings.migrateMode("off"), .off)
@@ -1254,7 +1309,7 @@ final class TabManagerObservationTests: XCTestCase {
 
     // MARK: - Silence
 
-    /// Terminal titles arrive on every prompt and are coalesced at 30Hz. The
+    /// Terminal titles arrive on every prompt and are rate-limited before publication. The
     /// coalescer's buffer is `@ObservationIgnored` precisely so that stream
     /// never reaches a reader of the workspace list. Drop the annotation and
     /// this fails.

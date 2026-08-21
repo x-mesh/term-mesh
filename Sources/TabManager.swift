@@ -106,7 +106,11 @@ class TabManager {
         let panelId: UUID
     }
     @ObservationIgnored private var pendingPanelTitleUpdates: [PanelTitleUpdateKey: String] = [:]
-    @ObservationIgnored private let panelTitleUpdateCoalescer = NotificationBurstCoalescer(delay: 1.0 / 30.0)
+    @ObservationIgnored private var lastReceivedPanelTitles: [PanelTitleUpdateKey: String] = [:]
+    /// Terminal programs can rewrite their title on every rendered chunk. The
+    /// title is display metadata, so publishing the latest value at 4Hz keeps
+    /// it responsive without waking the SwiftUI workspace graph at frame rate.
+    @ObservationIgnored private let panelTitleUpdateCoalescer = NotificationBurstCoalescer(delay: 0.25)
     var recentlyClosedBrowsers = RecentlyClosedBrowserStack(capacity: 20)
 
     // Recent tab history for back/forward navigation (like browser history)
@@ -1760,6 +1764,12 @@ class TabManager {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let key = PanelTitleUpdateKey(tabId: tabId, panelId: panelId)
+        guard Self.shouldEnqueuePanelTitleUpdate(
+            lastReceivedTitle: lastReceivedPanelTitles[key],
+            newTitle: trimmed
+        ) else { return }
+        prunePanelTitleDeduplicationCacheIfNeeded(adding: key)
+        lastReceivedPanelTitles[key] = trimmed
         pendingPanelTitleUpdates[key] = trimmed
         // Terminal programs may update their title continuously while the app is
         // inactive. Publishing those strings through Workspace/@Published wakes
@@ -1770,6 +1780,22 @@ class TabManager {
         panelTitleUpdateCoalescer.signal { [weak self] in
             self?.flushPendingPanelTitleUpdates()
         }
+    }
+
+    static func shouldEnqueuePanelTitleUpdate(
+        lastReceivedTitle: String?,
+        newTitle: String
+    ) -> Bool {
+        lastReceivedTitle != newTitle
+    }
+
+    private func prunePanelTitleDeduplicationCacheIfNeeded(adding key: PanelTitleUpdateKey) {
+        guard lastReceivedPanelTitles[key] == nil,
+              lastReceivedPanelTitles.count >= 512 else { return }
+        let validKeys = Set(tabs.flatMap { tab in
+            tab.panels.keys.map { PanelTitleUpdateKey(tabId: tab.id, panelId: $0) }
+        })
+        lastReceivedPanelTitles = lastReceivedPanelTitles.filter { validKeys.contains($0.key) }
     }
 
     private func flushPendingPanelTitleUpdates() {
