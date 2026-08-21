@@ -3206,9 +3206,18 @@ class TerminalController {
         TerminalController.startSendGateWatchdog(sendGate, agentKey: agentKey)
 
         // Stagger: dynamic gap based on team size to prevent GCD main-queue saturation
-        // when the CLI sends to 10+ agents in rapid succession.
-        let staggerNs = await MainActor.run {
-            let count = TeamOrchestrator.shared.teams[teamName]?.agents.count ?? 1
+        // when the CLI sends to 10+ agents in rapid succession. A natively-held
+        // agent takes its turn as an stdin write with no paste to pace, so it
+        // skips the slot entirely — reserving one would also advance the shared
+        // clock and delay unrelated terminal sends.
+        let staggerNs = await MainActor.run { () -> UInt64 in
+            let orchestrator = TeamOrchestrator.shared
+            if !orchestrator.agentNeedsReturn(
+                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+            ) {
+                return 0
+            }
+            let count = orchestrator.teams[teamName]?.agents.count ?? 1
             return TerminalController.reserveTeamSendSlot(agentCount: count)
         }
         if staggerNs > 0 {
@@ -4403,8 +4412,24 @@ class TerminalController {
 
         // Stagger: dynamic gap based on team size to prevent main-queue saturation
         // when many team.delegate commands arrive in rapid succession (fan-out).
-        let delegateStaggerNs = await MainActor.run {
-            let count = TeamOrchestrator.shared.teams[teamName]?.agents.count ?? 1
+        // Native targets skip the slot (and leave the shared clock alone): their
+        // turn is an stdin write with no paste to pace. A pool target is only
+        // safely native when every same-named candidate is — the instance is
+        // chosen later, inside `delegate`'s main-actor turn.
+        let delegateStaggerNs = await MainActor.run { () -> UInt64 in
+            let orchestrator = TeamOrchestrator.shared
+            let bypassStagger: Bool
+            if let requestedInstanceId, !requestedInstanceId.isEmpty {
+                bypassStagger = !orchestrator.agentNeedsReturn(
+                    teamName: teamName, agentName: agentName, agentInstanceId: requestedInstanceId
+                )
+            } else {
+                bypassStagger = orchestrator.agentPoolIsAllNative(
+                    teamName: teamName, agentName: agentName
+                )
+            }
+            if bypassStagger { return 0 }
+            let count = orchestrator.teams[teamName]?.agents.count ?? 1
             return TerminalController.reserveTeamSendSlot(agentCount: count)
         }
         if delegateStaggerNs > 0 {

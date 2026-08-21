@@ -5445,6 +5445,27 @@ final class TeamOrchestrator: ObservableObject {
         return false
     }
 
+    /// Whether this specific pane holds a native agent.
+    func agentPanelIsNative(workspaceId: UUID, panelId: UUID) -> Bool {
+        nativeAgentPanel(workspaceId: workspaceId, panelId: panelId) != nil
+    }
+
+    /// Whether every pool candidate for this agent name is natively held.
+    ///
+    /// Pool delegation picks its instance inside `delegate`'s main-actor turn,
+    /// later than the dispatch slot is reserved — so the stagger bypass can
+    /// only be decided for the pool as a whole. Mixed or empty pools answer
+    /// false and keep the terminal pacing.
+    func agentPoolIsAllNative(teamName: String, agentName: String) -> Bool {
+        guard let team = teams[teamName] else { return false }
+        let candidates = team.agents.filter { $0.name == agentName }
+        guard !candidates.isEmpty else { return false }
+        return candidates.allSatisfy { agent in
+            guard let panelId = agent.panelId else { return false }
+            return nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) != nil
+        }
+    }
+
     /// The panel behind a natively-held agent, if that is what it is.
     ///
     /// Same two-step lookup `sendTextToPanel` uses: the agent's own workspace
