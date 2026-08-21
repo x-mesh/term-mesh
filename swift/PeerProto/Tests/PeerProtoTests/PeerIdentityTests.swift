@@ -2,6 +2,203 @@ import XCTest
 @testable import PeerProto
 
 final class PeerIdentityTests: XCTestCase {
+    func testFileMigrationPreservesIdentityAndHistory() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent(PeerIdentity.identityFileName)
+        let legacyID = Data(repeating: 0x11, count: PeerIdentity.byteCount)
+        let legacyHistory = [
+            Data(repeating: 0x22, count: PeerIdentity.byteCount),
+            Data(repeating: 0x33, count: PeerIdentity.byteCount),
+        ]
+
+        let migrated = try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: { legacyID },
+            legacyHistoryLoader: { legacyHistory }
+        )
+
+        XCTAssertEqual(migrated.id, legacyID)
+        XCTAssertEqual(migrated.history, legacyHistory)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+    }
+
+    func testExistingFileWinsWithoutConsultingKeychain() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent(PeerIdentity.identityFileName)
+        let expected = try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: { nil },
+            legacyHistoryLoader: { [] }
+        )
+
+        let loaded = try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: {
+                XCTFail("existing file must bypass the Keychain identity loader")
+                return nil
+            },
+            legacyHistoryLoader: {
+                XCTFail("existing file must bypass the Keychain history loader")
+                return []
+            }
+        )
+
+        XCTAssertEqual(loaded.id, expected.id)
+        XCTAssertEqual(loaded.history, expected.history)
+    }
+
+    func testNewFileIdentityIsStableAndOwnerOnly() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent(PeerIdentity.identityFileName)
+
+        let first = try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: { nil },
+            legacyHistoryLoader: { [] }
+        )
+        let second = try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: { nil },
+            legacyHistoryLoader: { [] }
+        )
+        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+
+        XCTAssertEqual(first.id, second.id)
+        XCTAssertEqual(first.id.count, PeerIdentity.byteCount)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+    }
+
+    func testDeniedLegacyMigrationStillCreatesStableFileIdentity() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent(PeerIdentity.identityFileName)
+        var legacyLoadCount = 0
+
+        func load() throws -> Data? {
+            legacyLoadCount += 1
+            throw PeerIdentityError.keychainReadFailed(errSecAuthFailed)
+        }
+
+        let first = try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: { try load() },
+            legacyHistoryLoader: {
+                XCTFail("history must not be read after the legacy identity is unavailable")
+                return []
+            }
+        )
+        let second = try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: { try load() },
+            legacyHistoryLoader: { [] }
+        )
+
+        XCTAssertEqual(first.id, second.id)
+        XCTAssertEqual(legacyLoadCount, 1)
+    }
+
+    func testCorruptFileRepairsFromLegacyIdentity() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent(PeerIdentity.identityFileName)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("not-json".utf8).write(to: fileURL)
+        let legacyID = Data(repeating: 0x44, count: PeerIdentity.byteCount)
+        let legacyHistory = [Data(repeating: 0x55, count: PeerIdentity.byteCount)]
+
+        let repaired = try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: { legacyID },
+            legacyHistoryLoader: { legacyHistory }
+        )
+        let reloaded = try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: {
+                XCTFail("repaired file must bypass the legacy identity loader")
+                return nil
+            },
+            legacyHistoryLoader: {
+                XCTFail("repaired file must bypass the legacy history loader")
+                return []
+            }
+        )
+
+        XCTAssertEqual(repaired.id, legacyID)
+        XCTAssertEqual(repaired.history, legacyHistory)
+        XCTAssertEqual(reloaded.id, legacyID)
+        XCTAssertEqual(reloaded.history, legacyHistory)
+    }
+
+    func testInvalidHistoryKeepsValidCurrentIdentity() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent(PeerIdentity.identityFileName)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let id = Data(repeating: 0x66, count: PeerIdentity.byteCount)
+        let invalidHistory = Data([0x77]).base64EncodedString()
+        let encodedID = id.base64EncodedString()
+        try Data("{\"version\":1,\"id\":\"\(encodedID)\",\"history\":[\"\(invalidHistory)\"]}".utf8)
+            .write(to: fileURL)
+
+        let loaded = try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: {
+                XCTFail("a valid current ID must not fall back to legacy storage")
+                return nil
+            },
+            legacyHistoryLoader: { [] }
+        )
+
+        XCTAssertEqual(loaded.id, id)
+        XCTAssertEqual(loaded.history, [])
+    }
+
+    func testReadFailureDoesNotOverwriteExistingPath() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent(PeerIdentity.identityFileName)
+        try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
+
+        XCTAssertThrowsError(try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: {
+                XCTFail("I/O failure must not fall back to legacy storage")
+                return nil
+            },
+            legacyHistoryLoader: { [] }
+        )) { error in
+            guard case PeerIdentityError.fileReadFailed = error else {
+                return XCTFail("expected fileReadFailed, got \(error)")
+            }
+        }
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+    }
+
+    func testUnsupportedVersionIsNotDowngraded() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent(PeerIdentity.identityFileName)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let id = Data(repeating: 0x88, count: PeerIdentity.byteCount).base64EncodedString()
+        let original = Data("{\"version\":2,\"id\":\"\(id)\",\"history\":[]}".utf8)
+        try original.write(to: fileURL)
+
+        XCTAssertThrowsError(try PeerIdentity.loadOrCreateFileIdentity(
+            at: fileURL,
+            legacyIdentityLoader: {
+                XCTFail("unknown versions must not fall back to legacy storage")
+                return nil
+            },
+            legacyHistoryLoader: { [] }
+        ))
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+    }
+
     func testLoadOrCreateFirstCallCreates() throws {
         let service = testServiceName()
         defer { try? PeerIdentity.deleteStoredIdentity(service: service, account: PeerIdentity.account) }
@@ -78,7 +275,7 @@ final class PeerIdentityTests: XCTestCase {
         )
     }
 
-    func testKeychainUsedForReleaseBundle() {
+    func testPersistentStorageUsedForReleaseBundle() {
         XCTAssertFalse(ephemeral(bundle: "com.termmesh.app"))
         XCTAssertFalse(debugDefaults(bundle: "com.termmesh.app"))
         XCTAssertFalse(ephemeral(bundle: nil))
@@ -160,5 +357,10 @@ final class PeerIdentityTests: XCTestCase {
 
     private func testServiceName() -> String {
         "com.termmesh.peer-identity.tests.\(UUID().uuidString)"
+    }
+
+    private func temporaryDirectory() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("peer-identity-tests-\(UUID().uuidString)", isDirectory: true)
     }
 }

@@ -2,6 +2,7 @@ import XCTest
 import Darwin
 import AppKit
 import PeerProto
+import Bonsplit
 
 #if canImport(term_mesh_DEV)
 @testable import term_mesh_DEV
@@ -187,6 +188,85 @@ final class PeerPaneSessionTests: XCTestCase {
         ))
     }
 
+    @MainActor
+    func testAutomaticRestoreChoosesExactLatestOwnedLeaderRecord() {
+        let oldID = Data(repeating: 0x11, count: 16)
+        let currentID = Data(repeating: 0x22, count: 16)
+        let record = ManagedPeerSurfaceStore.Record(
+            hostKey: "ssh:mac-sub",
+            surfaceIDBase64: currentID.base64EncodedString(),
+            teamName: "term-mesh",
+            role: "leader",
+            workingDirectory: "/work/term-mesh",
+            createdAt: Date()
+        )
+        let stale = RemoteTeamSummary(
+            name: "term-mesh", teamUUID: "old", workingDirectory: "/old",
+            projectRootPath: nil, agentNames: [], projectID: "team:old",
+            leaderSurfaceID: oldID, presentationRevision: 99,
+            presentationOwnedByRequester: true
+        )
+        let current = RemoteTeamSummary(
+            name: "term-mesh", teamUUID: "current", workingDirectory: "/current",
+            projectRootPath: nil, agentNames: [], projectID: "team:current",
+            leaderSurfaceID: currentID, presentationRevision: 7,
+            presentationOwnedByRequester: true
+        )
+        let foreign = RemoteTeamSummary(
+            name: "term-mesh", teamUUID: "foreign", workingDirectory: "/foreign",
+            projectRootPath: nil, agentNames: [], projectID: "team:foreign",
+            leaderSurfaceID: currentID, presentationRevision: 100,
+            presentationOwnedByRequester: false
+        )
+
+        XCTAssertEqual(
+            TeamOrchestrator.automaticRemoteProjectRestoreCandidate(
+                in: [stale, foreign, current], leaderRecord: record
+            )?.projectID,
+            "team:current"
+        )
+        XCTAssertNil(TeamOrchestrator.automaticRemoteProjectRestoreCandidate(
+            in: [stale], leaderRecord: record
+        ))
+    }
+
+    func testAutomaticRestoreFailureKeyChangesWithSocketOrRevision() {
+        let base = TeamOrchestrator.automaticProjectRestoreFailureKey(
+            hostID: "host", activeSockPath: "/tmp/one.sock",
+            projectID: "team:one", revision: 7
+        )
+        XCTAssertEqual(base, TeamOrchestrator.automaticProjectRestoreFailureKey(
+            hostID: "host", activeSockPath: "/tmp/one.sock",
+            projectID: "team:one", revision: 7
+        ))
+        XCTAssertNotEqual(base, TeamOrchestrator.automaticProjectRestoreFailureKey(
+            hostID: "host", activeSockPath: "/tmp/two.sock",
+            projectID: "team:one", revision: 7
+        ))
+        XCTAssertNotEqual(base, TeamOrchestrator.automaticProjectRestoreFailureKey(
+            hostID: "host", activeSockPath: "/tmp/one.sock",
+            projectID: "team:one", revision: 8
+        ))
+    }
+
+    func testAutomaticRestoreRetriesWithBoundedBackoff() {
+        XCTAssertEqual(
+            TeamOrchestrator.automaticProjectRestoreRetryDelayNanoseconds(afterFailureCount: 1),
+            1_000_000_000
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.automaticProjectRestoreRetryDelayNanoseconds(afterFailureCount: 2),
+            2_000_000_000
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.automaticProjectRestoreRetryDelayNanoseconds(afterFailureCount: 3),
+            4_000_000_000
+        )
+        XCTAssertNil(
+            TeamOrchestrator.automaticProjectRestoreRetryDelayNanoseconds(afterFailureCount: 4)
+        )
+    }
+
     func testRemoteProjectPresentationIDUsesStableUUIDInsteadOfDisplayName() {
         XCTAssertEqual(
             TeamOrchestrator.remoteProjectPresentationID(teamUUID: "uuid-a"),
@@ -195,6 +275,222 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertNotEqual(
             TeamOrchestrator.remoteProjectPresentationID(teamUUID: "uuid-a"),
             TeamOrchestrator.remoteProjectPresentationID(teamUUID: "uuid-b")
+        )
+    }
+
+    func testProjectLayoutCapturesSurfaceIDsAndDividerTree() throws {
+        let leader = Data(repeating: 0x11, count: 16)
+        let worker = Data(repeating: 0x22, count: 16)
+        let leaderTab = UUID().uuidString
+        let workerTab = UUID().uuidString
+        let frame = PixelRect(x: 0, y: 0, width: 100, height: 100)
+        let tree = ExternalTreeNode.split(ExternalSplitNode(
+            id: UUID().uuidString,
+            orientation: "horizontal",
+            dividerPosition: 0.37,
+            first: .pane(ExternalPaneNode(
+                id: UUID().uuidString, frame: frame,
+                tabs: [ExternalTab(id: leaderTab, title: "Leader")],
+                selectedTabId: leaderTab
+            )),
+            second: .pane(ExternalPaneNode(
+                id: UUID().uuidString, frame: frame,
+                tabs: [ExternalTab(id: workerTab, title: "Worker")],
+                selectedTabId: workerTab
+            ))
+        ))
+
+        let snapshot = try XCTUnwrap(ProjectPresentationLayoutSnapshot.capture(
+            projectID: "team:layout",
+            tree: tree,
+            surfaceIDByTabID: [leaderTab: leader, workerTab: worker],
+            focusedSurfaceID: worker
+        ))
+        let roundTrip = try JSONDecoder().decode(
+            ProjectPresentationLayoutSnapshot.self,
+            from: JSONEncoder().encode(snapshot)
+        )
+
+        XCTAssertEqual(roundTrip, snapshot)
+        XCTAssertEqual(roundTrip.surfaceIDs, [leader, worker])
+        XCTAssertTrue(roundTrip.canApply(to: [leader, worker]))
+        XCTAssertFalse(roundTrip.canApply(to: [leader]))
+        guard case .split(let orientation, let divider, _, _) = roundTrip.root else {
+            return XCTFail("expected split root")
+        }
+        XCTAssertEqual(orientation, .horizontal)
+        XCTAssertEqual(divider, 0.37, accuracy: 0.0001)
+    }
+
+    func testProjectLayoutRejectsPartialAndMultiTabLeaves() {
+        let first = Data([0x01])
+        let second = Data([0x02])
+        let duplicate = ProjectPresentationLayoutSnapshot(
+            projectID: "team:duplicate",
+            root: .split(
+                orientation: .vertical, dividerPosition: 0.5,
+                first: .pane(.init(surfaceID: first)),
+                second: .pane(.init(surfaceID: first))
+            ),
+            focusedSurfaceID: first
+        )
+        XCTAssertFalse(duplicate.isValid)
+
+        let badGeometry = ProjectPresentationLayoutSnapshot(
+            projectID: "team:bad-geometry",
+            root: .split(
+                orientation: .horizontal, dividerPosition: 1.5,
+                first: .pane(.init(surfaceID: first)),
+                second: .pane(.init(surfaceID: second))
+            ),
+            focusedSurfaceID: first
+        )
+        XCTAssertFalse(badGeometry.isValid)
+    }
+
+    func testProjectLayoutDividerValidationMatchesRestoreRange() {
+        let first = Data([0x01])
+        let second = Data([0x02])
+        let snapshot: (Double) -> ProjectPresentationLayoutSnapshot = { dividerPosition in
+            ProjectPresentationLayoutSnapshot(
+                projectID: "team:divider-boundary",
+                root: .split(
+                    orientation: .horizontal, dividerPosition: dividerPosition,
+                    first: .pane(.init(surfaceID: first)),
+                    second: .pane(.init(surfaceID: second))
+                ),
+                focusedSurfaceID: first
+            )
+        }
+
+        XCTAssertFalse(snapshot(0).isValid)
+        XCTAssertTrue(snapshot(0.1).isValid)
+        XCTAssertTrue(snapshot(0.9).isValid)
+        XCTAssertFalse(snapshot(1).isValid)
+    }
+
+    @MainActor
+    func testProjectLayoutReordersLivePanelsAndRestoresNestedDividers() throws {
+        let workspace = Workspace(title: "layout-test")
+        let firstPanel = try XCTUnwrap(workspace.focusedPanelId)
+        let secondPanel = try XCTUnwrap(workspace.newTerminalSplit(
+            from: firstPanel, orientation: .vertical, focus: false
+        )?.id)
+        let thirdPanel = try XCTUnwrap(workspace.newTerminalSplit(
+            from: secondPanel, orientation: .horizontal, focus: false
+        )?.id)
+        let a = Data(repeating: 0xa1, count: 16)
+        let b = Data(repeating: 0xb2, count: 16)
+        let c = Data(repeating: 0xc3, count: 16)
+        workspace.debugProjectLayoutSurfaceIDs = [
+            firstPanel: a, secondPanel: b, thirdPanel: c,
+        ]
+        let pane: (Data) -> ProjectPresentationLayoutSnapshot.Node = { surfaceID in
+            .pane(.init(surfaceID: surfaceID))
+        }
+        let desired = ProjectPresentationLayoutSnapshot(
+            projectID: "team:live-layout",
+            root: .split(
+                orientation: .horizontal, dividerPosition: 0.31,
+                first: pane(c),
+                second: .split(
+                    orientation: .vertical, dividerPosition: 0.64,
+                    first: pane(a), second: pane(b)
+                )
+            ),
+            focusedSurfaceID: b
+        )
+
+        XCTAssertTrue(workspace.applyProjectPresentationLayout(desired, restoreFocus: true))
+        let actual = try XCTUnwrap(workspace.projectPresentationLayoutSnapshot(
+            projectID: desired.projectID
+        ))
+        XCTAssertEqual(actual.root.surfaceIDs, [c, a, b])
+        XCTAssertEqual(actual.focusedSurfaceID, b)
+        guard case .split(let rootOrientation, let rootDivider, _, let second) = actual.root,
+              case .split(let nestedOrientation, let nestedDivider, _, _) = second else {
+            return XCTFail("expected nested split tree")
+        }
+        XCTAssertEqual(rootOrientation, .horizontal)
+        XCTAssertEqual(rootDivider, 0.31, accuracy: 0.01)
+        XCTAssertEqual(nestedOrientation, .vertical)
+        XCTAssertEqual(nestedDivider, 0.64, accuracy: 0.01)
+    }
+
+    @MainActor
+    func testProjectLayoutMismatchDoesNotMutateLiveTree() throws {
+        let workspace = Workspace(title: "layout-mismatch")
+        let firstPanel = try XCTUnwrap(workspace.focusedPanelId)
+        let secondPanel = try XCTUnwrap(workspace.newTerminalSplit(
+            from: firstPanel, orientation: .horizontal, focus: false
+        )?.id)
+        let a = Data([0x01])
+        let b = Data([0x02])
+        workspace.debugProjectLayoutSurfaceIDs = [firstPanel: a, secondPanel: b]
+        let before = workspace.bonsplitController.treeSnapshot()
+        let stale = ProjectPresentationLayoutSnapshot(
+            projectID: "team:stale",
+            root: .pane(.init(surfaceID: a)),
+            focusedSurfaceID: a
+        )
+
+        XCTAssertFalse(workspace.applyProjectPresentationLayout(stale, restoreFocus: false))
+        XCTAssertEqual(workspace.bonsplitController.treeSnapshot(), before)
+    }
+
+    @MainActor
+    func testAtomicExternalTreeRejectsDuplicateTabsWithoutMutation() throws {
+        let workspace = Workspace(title: "atomic-layout")
+        let firstPanel = try XCTUnwrap(workspace.focusedPanelId)
+        _ = try XCTUnwrap(workspace.newTerminalSplit(
+            from: firstPanel, orientation: .horizontal, focus: false
+        ))
+        let before = workspace.bonsplitController.treeSnapshot()
+        let tabID = try XCTUnwrap(workspace.bonsplitController.allTabIds.first)
+        let frame = PixelRect(x: 0, y: 0, width: 0, height: 0)
+        let duplicate = ExternalTreeNode.split(ExternalSplitNode(
+            id: UUID().uuidString, orientation: "horizontal", dividerPosition: 0.4,
+            first: .pane(ExternalPaneNode(
+                id: UUID().uuidString, frame: frame,
+                tabs: [ExternalTab(id: tabID.uuid.uuidString, title: "A")],
+                selectedTabId: tabID.uuid.uuidString
+            )),
+            second: .pane(ExternalPaneNode(
+                id: UUID().uuidString, frame: frame,
+                tabs: [ExternalTab(id: tabID.uuid.uuidString, title: "A")],
+                selectedTabId: tabID.uuid.uuidString
+            ))
+        ))
+
+        XCTAssertFalse(workspace.bonsplitController.applyExternalTreeAtomically(duplicate))
+        XCTAssertEqual(workspace.bonsplitController.treeSnapshot(), before)
+    }
+
+    @MainActor
+    func testProjectLayoutStoreRoundTripsAndIgnoresCorruption() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("project-layout-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("layouts.json")
+        let surface = Data(repeating: 0x33, count: 16)
+        let snapshot = ProjectPresentationLayoutSnapshot(
+            projectID: "team:store",
+            root: .pane(.init(surfaceID: surface)),
+            focusedSurfaceID: surface
+        )
+        let store = ProjectPresentationLayoutStore(fileURL: file)
+        store.save(snapshot)
+        store.waitForPendingWritesForTests()
+        XCTAssertEqual(
+            ProjectPresentationLayoutStore(fileURL: file).snapshot(projectID: "team:store"),
+            snapshot
+        )
+        let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
+        XCTAssertEqual((attrs[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+
+        try Data("not-json".utf8).write(to: file)
+        XCTAssertNil(
+            ProjectPresentationLayoutStore(fileURL: file).snapshot(projectID: "team:store")
         )
     }
 

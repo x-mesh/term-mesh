@@ -343,6 +343,10 @@ final class TeamOrchestrator: ObservableObject {
     /// separate from fleet/task telemetry: heartbeat and message updates run
     /// through the same daemon sync funnel but must not create revisions.
     var remoteProjectManifestSignatures: [String: String] = [:]
+    var publishedRemoteProjectAgentSurfaceIDs: [String: Set<Data>] = [:]
+    var automaticProjectRestoreFailureAttempts: [String: Int] = [:]
+    var automaticProjectRestoreRetryTasks: [String: Task<Void, Never>] = [:]
+    private var projectLayoutSaveTasks: [String: Task<Void, Never>] = [:]
     /// Same single-flight need as the two above, one level down: a rewound
     /// stream can drop the same peer-owned agent pane twice before the first
     /// reattach has opened its replacement, and two reattaches would leave two
@@ -1136,6 +1140,49 @@ final class TeamOrchestrator: ObservableObject {
                 self?.equalizeAgentGrid(workspace: workspace)
             }
         }
+    }
+
+    /// Restored panes need one settled layout pass, not the creation path's
+    /// three-pass enforcement. Later passes race the user's first divider drag
+    /// and make the recovered grid look impossible to resize.
+    func settleRestoredAgentGrid(workspace: Workspace) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak workspace] in
+            guard let workspace else { return }
+            self?.equalizeAgentGrid(workspace: workspace)
+        }
+    }
+
+    func scheduleProjectPresentationLayoutSave(
+        projectID: String,
+        workspace: Workspace
+    ) {
+        projectLayoutSaveTasks[projectID]?.cancel()
+        projectLayoutSaveTasks[projectID] = Task { @MainActor [weak self, weak workspace] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled, let self, let workspace else { return }
+            self.persistProjectPresentationLayoutIfNeeded(workspace: workspace)
+            self.projectLayoutSaveTasks.removeValue(forKey: projectID)
+        }
+    }
+
+    func removeProjectPresentationLayout(projectID: String) {
+        projectLayoutSaveTasks.removeValue(forKey: projectID)?.cancel()
+        ProjectPresentationLayoutStore.shared.remove(projectID: projectID)
+    }
+
+    func flushProjectPresentationLayoutsForQuit() {
+        for team in teams.values where team.ownsRemotePresentation {
+            guard let projectID = team.remotePresentationProjectID
+                    ?? team.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:)),
+                  let manager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
+                  let workspace = manager.tabs.first(where: { $0.id == team.workspaceId })
+            else { continue }
+            projectLayoutSaveTasks.removeValue(forKey: projectID)?.cancel()
+            if let snapshot = workspace.projectPresentationLayoutSnapshot(projectID: projectID) {
+                ProjectPresentationLayoutStore.shared.save(snapshot)
+            }
+        }
+        ProjectPresentationLayoutStore.shared.flushPendingWritesForQuit()
     }
 
     // MARK: - Agent CLI Binaries
@@ -6779,6 +6826,7 @@ final class TeamOrchestrator: ObservableObject {
         guard let team = teams[name] else { return false }
         remoteProjectManifestTasks.removeValue(forKey: name)?.cancel()
         remoteProjectManifestSignatures.removeValue(forKey: name)
+        publishedRemoteProjectAgentSurfaceIDs.removeValue(forKey: name)
         let mayTerminateRemotePresentation =
             Self.adoptedPresentationAllowsRemoteDestruction(
                 presentationOwnedByRequester: team.ownsRemotePresentation

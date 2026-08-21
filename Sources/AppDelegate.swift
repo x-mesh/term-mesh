@@ -123,6 +123,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var systemAppearanceObserver: NSObjectProtocol?
     private var wakeRecoveryObserver: NSObjectProtocol?
     private var screensWakeRecoveryObserver: NSObjectProtocol?
+    private var remoteProjectRestoreObserver: AnyCancellable?
+    private var remoteProjectRestoreTask: Task<Void, Never>?
+    private var remoteProjectRestorePending = false
+    private weak var remoteProjectRestoreTabManager: TabManager?
+    private var remoteProjectRestoreHosts: [HostEntry] = []
+    private var remoteProjectRestoreGeneration = UUID()
     private var lastWakeRecoveryAt: Date?
     var ghosttyGotoSplitLeftShortcut: StoredShortcut?
     var ghosttyGotoSplitRightShortcut: StoredShortcut?
@@ -304,10 +310,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // /tmp/tm-peer-relay-*.sock files accumulate indefinitely.
         PeerRelaySession.sweepStaleRelaySockets()
 
-        // Prime the peer identity keychain cache off-main: the first
-        // SecItemCopyMatching can stall for seconds on dev builds
-        // (securityd authorization), and it otherwise fires lazily as a
-        // handshake default argument — sometimes on the main actor.
+        // Prime the peer identity cache off-main. Existing installs can need
+        // one legacy Keychain read before the identity moves to Application
+        // Support; it otherwise happens lazily during the first handshake.
         DispatchQueue.global(qos: .utility).async {
             PeerIdentity.warmUp()
         }
@@ -763,6 +768,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
         tabManager?.saveSessionState()
+        TeamOrchestrator.shared.flushProjectPresentationLayoutsForQuit()
         // Phase 2 (pane-mode resume): archive live pane teams to disk before
         // the daemon goes away — without this, a plain Cmd+Q would lose the
         // team and leave the resume picker empty. Headless teams are persisted
@@ -782,6 +788,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         self.notificationStore = notificationStore
         self.sidebarState = sidebarState
         DashboardController.shared.tabManager = tabManager
+        installRemoteProjectRestoreObserver(tabManager: tabManager)
         observeSystemAppearanceChanges()
 #if DEBUG
         setupJumpUnreadUITestIfNeeded()
@@ -806,6 +813,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
         }
 #endif
+    }
+
+    /// Project manifests arrive after the primary TabManager restores its
+    /// local session. Observe the roster itself so relaunch recovery does not
+    /// depend on opening the Projects sidebar and pressing "Open on …".
+    private func installRemoteProjectRestoreObserver(tabManager: TabManager) {
+        guard remoteProjectRestoreObserver == nil
+                || remoteProjectRestoreTabManager !== tabManager else { return }
+        remoteProjectRestoreObserver?.cancel()
+        remoteProjectRestoreTask?.cancel()
+        remoteProjectRestoreTask = nil
+        remoteProjectRestorePending = false
+        remoteProjectRestoreTabManager = tabManager
+        let generation = UUID()
+        remoteProjectRestoreGeneration = generation
+        remoteProjectRestoreObserver = RemoteHostStore.shared.$hosts
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak tabManager] hosts in
+                guard let self, let tabManager else { return }
+                remoteProjectRestoreHosts = Array(hosts.values)
+                remoteProjectRestorePending = true
+                guard remoteProjectRestoreTask == nil else { return }
+                remoteProjectRestoreTask = Task { @MainActor in
+                    while self.remoteProjectRestorePending, !Task.isCancelled {
+                        self.remoteProjectRestorePending = false
+                        await TeamOrchestrator.shared.restoreOwnedRemoteProjectsIfNeeded(
+                            hosts: self.remoteProjectRestoreHosts,
+                            tabManager: tabManager
+                        )
+                    }
+                    if self.remoteProjectRestoreGeneration == generation {
+                        self.remoteProjectRestoreTask = nil
+                    }
+                }
+            }
     }
 
     /// Register a terminal window with the AppDelegate so menu commands and socket control

@@ -1004,6 +1004,34 @@ extension TerminalController {
         ])
     }
 
+    func v2DebugProjectLayout(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team"] as? String,
+              let team = TeamOrchestrator.shared.teams[teamName],
+              let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
+              let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }),
+              let projectID = team.remotePresentationProjectID
+                ?? team.teamUuid.map(TeamOrchestrator.remoteProjectPresentationID(teamUUID:)),
+              let snapshot = workspace.projectPresentationLayoutSnapshot(projectID: projectID),
+              let liveData = try? JSONEncoder().encode(snapshot),
+              let liveObject = try? JSONSerialization.jsonObject(with: liveData)
+        else {
+            return .err(
+                code: "not_found",
+                message: "team project layout is unavailable",
+                data: nil
+            )
+        }
+        let persistedObject: Any
+        if let persisted = ProjectPresentationLayoutStore.shared.snapshot(projectID: projectID),
+           let data = try? JSONEncoder().encode(persisted),
+           let object = try? JSONSerialization.jsonObject(with: data) {
+            persistedObject = object
+        } else {
+            persistedObject = NSNull()
+        }
+        return .ok(["live": liveObject, "persisted": persistedObject])
+    }
+
     private static func debugRemoteProjectDictionary(_ remote: RemoteTeamSummary) -> [String: Any] {
         [
             "name": remote.name,
