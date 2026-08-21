@@ -627,6 +627,17 @@ extension TeamOrchestrator {
         [hostID, activeSockPath, projectID, String(revision)].joined(separator: "\u{1f}")
     }
 
+    nonisolated static func automaticProjectRestoreRetryDelayNanoseconds(
+        afterFailureCount failureCount: Int
+    ) -> UInt64? {
+        switch failureCount {
+        case 1: return 1_000_000_000
+        case 2: return 2_000_000_000
+        case 3: return 4_000_000_000
+        default: return nil
+        }
+    }
+
     /// Recreate owned Project viewers as soon as the session-owner roster is
     /// available. Persistence is useful only when relaunch does not require a
     /// hidden Projects-sidebar button to materialize it again.
@@ -651,16 +662,32 @@ extension TeamOrchestrator {
                     projectID: remote.projectID,
                     revision: remote.presentationRevision
                 )
-                guard automaticProjectRestoreFailureByHost[host.id] != failureKey else {
+                guard automaticProjectRestoreRetryTasks[failureKey] == nil,
+                      (automaticProjectRestoreFailureAttempts[failureKey] ?? 0) < 4,
+                      !projectRestoreInFlight.contains(remote.name) else {
                     continue
                 }
                 let restored = await adoptRemoteProjectPresentation(
                     remote, host: host, tabManager: tabManager, selectWorkspace: false
                 )
                 if restored {
-                    automaticProjectRestoreFailureByHost.removeValue(forKey: host.id)
+                    automaticProjectRestoreFailureAttempts.removeValue(forKey: failureKey)
+                    automaticProjectRestoreRetryTasks.removeValue(forKey: failureKey)?.cancel()
                 } else {
-                    automaticProjectRestoreFailureByHost[host.id] = failureKey
+                    let failureCount = (automaticProjectRestoreFailureAttempts[failureKey] ?? 0) + 1
+                    automaticProjectRestoreFailureAttempts[failureKey] = failureCount
+                    guard let delay = Self.automaticProjectRestoreRetryDelayNanoseconds(
+                        afterFailureCount: failureCount
+                    ) else { continue }
+                    automaticProjectRestoreRetryTasks[failureKey] = Task {
+                        try? await Task.sleep(nanoseconds: delay)
+                        guard !Task.isCancelled else { return }
+                        self.automaticProjectRestoreRetryTasks.removeValue(forKey: failureKey)
+                        await self.restoreOwnedRemoteProjectsIfNeeded(
+                            hosts: RemoteHostStore.shared.sortedHosts,
+                            tabManager: tabManager
+                        )
+                    }
                 }
             }
         }

@@ -249,6 +249,24 @@ final class PeerPaneSessionTests: XCTestCase {
         ))
     }
 
+    func testAutomaticRestoreRetriesWithBoundedBackoff() {
+        XCTAssertEqual(
+            TeamOrchestrator.automaticProjectRestoreRetryDelayNanoseconds(afterFailureCount: 1),
+            1_000_000_000
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.automaticProjectRestoreRetryDelayNanoseconds(afterFailureCount: 2),
+            2_000_000_000
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.automaticProjectRestoreRetryDelayNanoseconds(afterFailureCount: 3),
+            4_000_000_000
+        )
+        XCTAssertNil(
+            TeamOrchestrator.automaticProjectRestoreRetryDelayNanoseconds(afterFailureCount: 4)
+        )
+    }
+
     func testRemoteProjectPresentationIDUsesStableUUIDInsteadOfDisplayName() {
         XCTAssertEqual(
             TeamOrchestrator.remoteProjectPresentationID(teamUUID: "uuid-a"),
