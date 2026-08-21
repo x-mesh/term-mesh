@@ -1904,7 +1904,7 @@ extension TeamOrchestrator {
         // Dial only once the borrowed session is gone. That death is also what
         // frees the slot this path was avoiding, so the sweep can finish on its
         // own connection rather than failing every remaining target.
-        func send(_ paneID: Data) async throws {
+        func sendClosePane(_ paneID: Data) async throws {
             if let session = borrowed {
                 if try await session.requestClosePane(paneID) { return }
                 borrowed = nil
@@ -1926,8 +1926,57 @@ extension TeamOrchestrator {
             }
             try await opened?.session.requestClosePane(paneID: paneID)
         }
-        return try await Self.sweepClose(targets: targets, send: send) { surfaceID in
+        func terminateSurface(_ paneID: Data) async throws
+            -> Termmesh_Peer_V1_TerminateSurfaceResult {
+            let connection = try await PeerRelaySession.connect(hostSockPath: host.activeSockPath)
+            do {
+                let result = try await connection.session.terminateSurface(surfaceID: paneID)
+                await connection.cancel()
+                return result
+            } catch {
+                await connection.cancel()
+                throw error
+            }
+        }
+        return try await Self.sweepClose(targets: targets, send: { surfaceID in
+            try await Self.closePeerShellConfirmed(
+                surfaceID: surfaceID,
+                force: force,
+                terminate: { try await terminateSurface(surfaceID) },
+                closePane: { try await sendClosePane(surfaceID) },
+                confirmRemoved: {
+                    try await self.waitForRemoteRemoval(
+                        hostSockPath: host.activeSockPath, surfaceID: surfaceID
+                    )
+                }
+            )
+        }) { surfaceID in
             ManagedPeerSurfaceStore.shared.forget(hostKey: host.id, surfaceID: surfaceID)
+        }
+    }
+
+    /// Close one cleanup target only after the host has authoritatively removed
+    /// it. `ClosePane` is fire-and-forget and deliberately ignores the final
+    /// pane in a workspace, so successful frame delivery is not successful
+    /// cleanup. Force mode first uses `TerminateSurface`, whose response is
+    /// authoritative and can remove the final pane; older hosts that return
+    /// `.notFound` fall back to ClosePane plus roster polling.
+    static func closePeerShellConfirmed(
+        surfaceID: Data,
+        force: Bool,
+        terminate: () async throws -> Termmesh_Peer_V1_TerminateSurfaceResult,
+        closePane: () async throws -> Void,
+        confirmRemoved: () async throws -> Bool
+    ) async throws {
+        if force, let result = try? await terminate(), result == .terminated {
+            return
+        }
+        try await closePane()
+        guard try await confirmRemoved() else {
+            throw RemoteAgentError.projectDeletionIncomplete(
+                "host did not confirm removal of shell "
+                    + surfaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
+            )
         }
     }
 
