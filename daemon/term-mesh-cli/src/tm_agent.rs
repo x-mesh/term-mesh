@@ -721,6 +721,14 @@ mod project_sync_cli_tests {
     }
 
     #[test]
+    fn correlation_poll_cadence_starts_fast_and_settles_at_the_legacy_pace() {
+        let cadence: Vec<u64> = (0..7)
+            .map(|attempt| correlation_poll_delay(attempt).as_millis() as u64)
+            .collect();
+        assert_eq!(cadence, vec![10, 20, 40, 80, 100, 100, 100]);
+    }
+
+    #[test]
     fn best_effort_rpc_retries_ok_false_without_exiting() {
         let mut calls = 0;
         run_best_effort_rpc_with_retry("test.post", || {
@@ -4248,6 +4256,58 @@ mod runbook_tests {
         let legacy = send_return_key_params("team-a", "reviewer", None, None, None);
         assert!(legacy["send_sequence_id"].is_null());
     }
+
+    #[test]
+    fn return_required_is_read_from_the_result_and_absent_means_none() {
+        assert_eq!(
+            send_response_return_required(&json!({ "result": { "return_required": false } })),
+            Some(false)
+        );
+        assert_eq!(
+            send_response_return_required(&json!({ "result": { "return_required": true } })),
+            Some(true)
+        );
+        // An older app that never learned the field keeps the legacy ladder.
+        assert_eq!(send_response_return_required(&json!({ "result": {} })), None);
+    }
+
+    #[test]
+    fn delegate_return_already_submitted_honours_return_required() {
+        assert!(delegate_return_already_submitted(
+            &json!({ "result": { "return_required": false } })
+        ));
+        assert!(!delegate_return_already_submitted(
+            &json!({ "result": { "return_required": true } })
+        ));
+        assert!(!delegate_return_already_submitted(&json!({ "result": {} })));
+        assert!(delegate_return_already_submitted(
+            &json!({ "remote_leader_proxy": true, "result": {} })
+        ));
+        assert!(delegate_return_already_submitted(
+            &json!({ "result": { "return_submitted": true } })
+        ));
+    }
+
+    #[test]
+    fn send_key_skip_precedes_the_first_delay_and_the_rpc() {
+        // The socket does not exist, so any RPC attempt could never answer ok,
+        // and the text-delivered ladder would begin with a 250 ms sleep:
+        // returning true this fast proves the skip runs before both.
+        let missing_sock = PathBuf::from("/nonexistent/tm-agent-unit-test.sock");
+        let started = std::time::Instant::now();
+        assert!(send_return_key_with_retry(
+            &missing_sock,
+            "team-a",
+            "reviewer",
+            true,
+            "unit-test",
+            None,
+            None,
+            None,
+            Some(false),
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
 }
 
 // ── Socket / RPC infrastructure ──────────────────────────────────────
@@ -4997,15 +5057,26 @@ fn remote_leader_proxy_result(proxied: Value) -> Result<Value, String> {
     }))
 }
 
+/// A `team.send`/`team.delegate` acknowledgement may declare that no Return is
+/// needed: a natively-held agent's turn is submitted the moment the text write
+/// lands. `None` — the field is absent, an older app — keeps the legacy
+/// send_key follow-up, which the app still answers authoritatively
+/// (`no_keyboard`) for callers that never learn about this field.
+fn send_response_return_required(response: &Value) -> Option<bool> {
+    response["result"]["return_required"].as_bool()
+}
+
 /// A scoped remote-leader delegate commits paste + Return in the authoritative
-/// control plane, rather than through this daemon.  Never issue the legacy
-/// follow-up `team.send_key` after either form of that acknowledgement: doing
-/// so would submit the same prompt a second time.
+/// control plane, rather than through this daemon; a native assignee needs no
+/// Return at all.  Never issue the legacy follow-up `team.send_key` after any
+/// of these acknowledgements: for the first two it would submit the same
+/// prompt a second time, for the third there is nothing to submit.
 fn delegate_return_already_submitted(response: &Value) -> bool {
     response["remote_leader_proxy"].as_bool().unwrap_or(false)
         || response["result"]["return_submitted"]
             .as_bool()
             .unwrap_or(false)
+        || send_response_return_required(response) == Some(false)
 }
 
 fn remote_leader_proxy_params(
@@ -6560,7 +6631,15 @@ fn send_return_key_with_retry(
     panel_id: Option<&str>,
     agent_instance_id: Option<&str>,
     send_sequence_id: Option<&str>,
+    return_required: Option<bool>,
 ) -> bool {
+    if return_required == Some(false) {
+        // The acknowledgement declared the turn submitted on the text write
+        // (native transport): there is no Return to press, so skip the first
+        // delay and the send_key round trip entirely.
+        eprintln!("send_key.skip context={context} reason=return_not_required");
+        return true;
+    }
     let delays = return_retry_delays_ms(text_delivered, context);
     eprintln!(
         "send_key.skip_or_retry context={context} text_delivered={text_delivered} attempts={} delays_ms={}",
@@ -8524,6 +8603,7 @@ fn main() {
                         panel.as_deref(),
                         selected_instance_id.as_deref(),
                         r["result"]["send_sequence_id"].as_str(),
+                        send_response_return_required(r),
                     );
                 send_result.map(|response| send_delivery_response(response, return_submitted))
             } else {
@@ -9777,6 +9857,16 @@ fn correlated_reply_from_mailbox(
     })))
 }
 
+/// Poll cadence for a correlated reply. The early probes are quick because
+/// the native fast path can land a reply tens of milliseconds after the
+/// send; the cadence settles at the historical 100 ms so a long wait costs
+/// no more RPCs than it used to. The extra polls all fit in the first
+/// quarter second, against a local unix socket.
+fn correlation_poll_delay(attempt: usize) -> Duration {
+    const LADDER_MS: [u64; 5] = [10, 20, 40, 80, 100];
+    Duration::from_millis(LADDER_MS[attempt.min(LADDER_MS.len() - 1)])
+}
+
 fn wait_for_correlated_reply_with<P>(
     expected_agent: &str,
     expected_instance_id: &str,
@@ -9788,6 +9878,7 @@ where
     P: FnMut(Duration) -> Result<Value, String>,
 {
     let deadline = Instant::now() + timeout;
+    let mut attempt = 0usize;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -9810,7 +9901,8 @@ where
                 "timed out waiting for correlated reply from {expected_agent}"
             ));
         }
-        thread::sleep(remaining.min(Duration::from_millis(100)));
+        thread::sleep(remaining.min(correlation_poll_delay(attempt)));
+        attempt += 1;
     }
 }
 
@@ -11130,6 +11222,7 @@ fn run_create(
                     created_agent_selector(&created_agents, *agent_index);
                 let init_text =
                     agent_init_prompt(name, role, team, &workdir, &sock.to_string_lossy());
+                let mut pace_for_terminal = true;
                 match rpc_call_timeout(
                     sock,
                     "team.send",
@@ -11150,6 +11243,7 @@ fn run_create(
                         // unsubmitted in the freshly spawned agent pane (enter-swallow).
                         let text_delivered =
                             r["result"]["text_delivered"].as_bool().unwrap_or(false);
+                        let return_required = send_response_return_required(r);
                         let _ = send_return_key_with_retry(
                             sock,
                             team,
@@ -11159,7 +11253,9 @@ fn run_create(
                             panel_id,
                             agent_instance_id,
                             r["result"]["send_sequence_id"].as_str(),
+                            return_required,
                         );
+                        pace_for_terminal = return_required != Some(false);
                         eprintln!("  \u{2713} {name}: init prompt sent");
                     }
                     Err(e) => eprintln!("  \u{2717} {name}: init prompt FAILED: {e}"),
@@ -11169,7 +11265,11 @@ fn run_create(
                 // on DispatchQueue.main — sending too fast causes Enter key events to be
                 // dropped because the TUI (Claude Code) hasn't processed the previous
                 // text input before the next arrives. DO NOT remove this delay.
-                thread::sleep(Duration::from_secs(1));
+                // A native acknowledgement (return_required=false) is exempt: its
+                // turn went to stdin, with no main-thread paste or TUI to congest.
+                if pace_for_terminal {
+                    thread::sleep(Duration::from_secs(1));
+                }
             }
         }
         let kiro_count = agents.len() - non_kiro.len();
@@ -12685,6 +12785,7 @@ fn run_delegate_result(
                             panel_id,
                             selected_instance_id.as_deref(),
                             rv["result"]["send_sequence_id"].as_str(),
+                            send_response_return_required(rv),
                         );
                     }
                     return Ok(patched);
@@ -12742,6 +12843,7 @@ fn run_delegate_result(
             panel_id,
             selected_instance_id.as_deref(),
             v["result"]["send_sequence_id"].as_str(),
+            send_response_return_required(&v),
         );
 
         return Ok(v);
@@ -13617,6 +13719,7 @@ fn run_delegate_result_with_worktree(
         panel_id,
         agent_instance_id,
         sent["result"]["send_sequence_id"].as_str(),
+        send_response_return_required(&sent),
     );
     Ok(json!({ "task": task, "send": sent, "worktree": worktree_path }))
 }
@@ -16483,7 +16586,14 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                             }),
                         ) {
                             Ok(hr) if !hr["result"].is_null() => {
-                                Ok(json!({ "ok": true, "result": hr["result"].clone() }))
+                                let mut result = hr["result"].clone();
+                                if result.is_object() {
+                                    // headless.send is the whole submission — no pane
+                                    // exists for a Return — so declare it and spare the
+                                    // follow-up its ~11 s headless_no_pane ladder.
+                                    result["return_required"] = json!(false);
+                                }
+                                Ok(json!({ "ok": true, "result": result }))
                             }
                             Ok(hr) => Err(format!("headless.send returned null: {}", pretty(&hr))),
                             Err(e) => Err(format!("headless.send: {e}")),
@@ -16524,6 +16634,7 @@ fn run_claim(sock: &PathBuf, team: &str, agent: &str) {
                             None,
                             None,
                             sent["result"]["send_sequence_id"].as_str(),
+                            send_response_return_required(&sent),
                         );
                         println!(
                             "{}",
