@@ -147,6 +147,108 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
         XCTAssertEqual(data["transport_dispatched"] as? Bool, true)
     }
 
+    func testNativeDeliveryScopeDistinguishesPeerFailureFromLocalWrite() {
+        XCTAssertEqual(
+            TerminalController.shared.nativeDeliveryScope(.remoteWritten),
+            "peer_transport_write"
+        )
+        XCTAssertEqual(
+            TerminalController.shared.nativeDeliveryScope(.remoteFailed("closed")),
+            "peer_transport_failed"
+        )
+        XCTAssertEqual(
+            TerminalController.shared.nativeDeliveryScope(.remoteQueued),
+            "peer_transport_queued"
+        )
+        XCTAssertEqual(
+            TerminalController.shared.nativeDeliveryScope(.queuedBehindTurn),
+            "queued_local"
+        )
+        XCTAssertEqual(
+            TerminalController.shared.nativeDeliveryScope(.writtenLocal),
+            "transport_write"
+        )
+    }
+
+    func testDelegateMissingWriteAckIsDeliveryFailure() throws {
+        let response = TerminalController.shared.teamDelegateDeliveryFailureResponse(
+            id: 20,
+            returnRequired: false,
+            requestReplayed: false,
+            agentInstanceId: "instance-1",
+            task: ["id": "task-1", "status": "pending"]
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["ok"] as? Bool, false)
+        let error = try XCTUnwrap(object["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "delivery_failed")
+        let data = try XCTUnwrap(error["data"] as? [String: Any])
+        XCTAssertEqual(data["sent"] as? Bool, false)
+        XCTAssertEqual(data["text_delivered"] as? Bool, false)
+        XCTAssertEqual(data["return_required"] as? Bool, false)
+        XCTAssertEqual(data["agent_instance_id"] as? String, "instance-1")
+        let task = try XCTUnwrap(data["task"] as? [String: Any])
+        XCTAssertEqual(task["id"] as? String, "task-1")
+    }
+
+    func testTeamSendAcknowledgementAnnouncesWhetherReturnIsRequired() throws {
+        func result(returnRequired: Bool?) throws -> [String: Any] {
+            let response = TerminalController.shared.teamSendDeliveryResponse(
+                id: 19,
+                dispatched: true,
+                textDelivered: true,
+                teamName: "review",
+                agentName: "security",
+                agentInstanceId: "instance-1",
+                sendSequenceID: "sequence-2",
+                returnRequired: returnRequired
+            )
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any]
+            )
+            return try XCTUnwrap(object["result"] as? [String: Any])
+        }
+        XCTAssertEqual(try result(returnRequired: false)["return_required"] as? Bool, false)
+        XCTAssertEqual(try result(returnRequired: true)["return_required"] as? Bool, true)
+        XCTAssertNil(
+            try result(returnRequired: nil)["return_required"],
+            "a caller that does not state the transport keeps the legacy shape"
+        )
+    }
+
+    func testNativeSendReleasesItsGateAtSendTimeWithoutAwaitingReturn() async {
+        let key = "gate-native-release/\(UUID().uuidString)"
+        let (_, gate) = await MainActor.run {
+            TerminalController.enqueueSendGate(agentKey: key, sequenceAware: true)
+        }
+        // asyncTeamSend on a native target discards instead of markAwaitingReturn:
+        // no team.send_key follows to claim this gate.
+        await MainActor.run {
+            TerminalController.discardSendGate(gate, agentKey: key)
+        }
+        let legacyFollowUpReturn = await MainActor.run {
+            TerminalController.takeAcknowledgedSendGate(
+                agentKey: key, sequenceID: gate.sequenceID
+            )
+        }
+        XCTAssertNil(
+            legacyFollowUpReturn,
+            "a released native gate must not be claimable by a legacy follow-up Return"
+        )
+        let (predecessor, next) = await MainActor.run {
+            TerminalController.enqueueSendGate(agentKey: key, sequenceAware: true)
+        }
+        XCTAssertNil(
+            predecessor,
+            "the next send must not queue behind a gate the native ack already released"
+        )
+        await MainActor.run {
+            TerminalController.discardSendGate(next, agentKey: key)
+        }
+    }
+
     func testSlowAndFastSendKeysCompleteOnlyTheirOwnedGate() async {
         let key = "gate-test/\(UUID().uuidString)"
         let (_, slow) = await MainActor.run {

@@ -3206,9 +3206,18 @@ class TerminalController {
         TerminalController.startSendGateWatchdog(sendGate, agentKey: agentKey)
 
         // Stagger: dynamic gap based on team size to prevent GCD main-queue saturation
-        // when the CLI sends to 10+ agents in rapid succession.
-        let staggerNs = await MainActor.run {
-            let count = TeamOrchestrator.shared.teams[teamName]?.agents.count ?? 1
+        // when the CLI sends to 10+ agents in rapid succession. A natively-held
+        // agent takes its turn as an stdin write with no paste to pace, so it
+        // skips the slot entirely — reserving one would also advance the shared
+        // clock and delay unrelated terminal sends.
+        let staggerNs = await MainActor.run { () -> UInt64 in
+            let orchestrator = TeamOrchestrator.shared
+            if !orchestrator.agentNeedsReturn(
+                teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+            ) {
+                return 0
+            }
+            let count = orchestrator.teams[teamName]?.agents.count ?? 1
             return TerminalController.reserveTeamSendSlot(agentCount: count)
         }
         if staggerNs > 0 {
@@ -3224,6 +3233,8 @@ class TerminalController {
         // 12s last-resort timeout mirrors asyncTeamDelegate: it must exceed the paste
         // watchdog (8s) + max retry backoff (~2s) so it doesn't trip a still-live paste.
         var dispatched = false
+        var deliveredNatively = false
+        var nativeDisposition: AgentSession.SendDisposition?
         let textDelivered: Bool = await withCheckedContinuation { cont in
             var resumed = false
             let resume: (Bool) -> Void = { ok in
@@ -3231,10 +3242,33 @@ class TerminalController {
                 resumed = true
                 cont.resume(returning: ok)
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) { resume(false) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) {
+                // Terminal paste completion owns an 8s watchdog, so this is
+                // its dead-man switch. A remote native write is different:
+                // the peer transport callback is the acknowledgement. If we
+                // time it out locally and it lands later, a CLI retry submits
+                // the same turn twice. Once delivery resolves as native, wait
+                // for the transport result. If that result itself stalls,
+                // acknowledge ownership by the ordered remote queue instead
+                // of failing (a retry would enqueue the same turn twice).
+                if deliveredNatively {
+                    nativeDisposition = .remoteQueued
+                    resume(true)
+                } else {
+                    resume(false)
+                }
+            }
             Task { @MainActor in
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager else { resume(false); return }
+                // Decide the transport in the same main-actor turn as the
+                // delivery, atomically with sendToAgent's native fork. The
+                // stagger-time verdict must not be reused: an agent restarting
+                // across that gap could get a terminal paste answered with
+                // return_required=false, losing the turn.
+                deliveredNatively = !TeamOrchestrator.shared.agentNeedsReturn(
+                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+                )
                 // Keep only the durable instance across the stagger/queue wait.
                 // sendToAgent resolves its current panel, transport and host here,
                 // immediately before delivery, so a restarted sibling is never used.
@@ -3245,14 +3279,28 @@ class TerminalController {
                     text: text,
                     tabManager: tabManager,
                     withReturn: false, // Return is sent separately by Rust CLI via team.send_key
-                    completion: { ack in resume(ack) }
+                    completion: { ack in resume(ack) },
+                    // Fires before the completion above, so the scope is
+                    // always set by the time the continuation resumes.
+                    disposition: { nativeDisposition = $0 }
                 )
                 dispatched = ok
                 if !ok { resume(false) }
             }
         }
         if dispatched && textDelivered {
-            sendGate.markAwaitingReturn()
+            if deliveredNatively {
+                // The stdin write was the whole turn: no team.send_key follows
+                // to release this gate (the acknowledgement below says so), so
+                // release it here instead of leaving it to the 30s watchdog. A
+                // legacy caller that presses Return anyway is answered by the
+                // no_keyboard branch before the stale-sequence check.
+                await MainActor.run {
+                    TerminalController.discardSendGate(sendGate, agentKey: agentKey)
+                }
+            } else {
+                sendGate.markAwaitingReturn()
+            }
         } else {
             // No team.send_key follows a failed paste acknowledgement, so remove
             // this send's gate instead of leaving the FIFO queue one entry behind.
@@ -3260,6 +3308,7 @@ class TerminalController {
                 TerminalController.discardSendGate(sendGate, agentKey: agentKey)
             }
         }
+        let deliveryScope = nativeDeliveryScope(nativeDisposition)
         return teamSendDeliveryResponse(
             id: id,
             dispatched: dispatched,
@@ -3267,13 +3316,29 @@ class TerminalController {
             teamName: teamName,
             agentName: agentName,
             agentInstanceId: agentInstanceId,
-            sendSequenceID: sendSequenceAware ? sendGate.sequenceID : nil
+            sendSequenceID: sendSequenceAware ? sendGate.sequenceID : nil,
+            returnRequired: !deliveredNatively,
+            deliveryScope: deliveryScope
         )
     }
 
-    /// Formats the `team.send` delivery contract. `transport_write` means only
-    /// that the complete text reached the target transport/input field; it does
-    /// not claim that the agent consumed the text or produced a reply.
+    func nativeDeliveryScope(_ disposition: AgentSession.SendDisposition?) -> String {
+        switch disposition {
+        case .remoteWritten: return "peer_transport_write"
+        case .remoteQueued: return "peer_transport_queued"
+        case .remoteFailed: return "peer_transport_failed"
+        case .queuedBehindTurn: return "queued_local"
+        default: return "transport_write"
+        }
+    }
+
+    /// Formats the `team.send` delivery contract. `delivery_scope` names how
+    /// far the write is known to have got: `transport_write` — the local
+    /// transport/input field took the complete text; `peer_transport_write` —
+    /// the peer relay session accepted the input frame; `queued_local` — the
+    /// turn is parked behind the agent's running turn and is written after
+    /// its result. None of them claim that the agent consumed the text or
+    /// produced a reply.
     func teamSendDeliveryResponse(
         id: Any?,
         dispatched: Bool,
@@ -3281,7 +3346,9 @@ class TerminalController {
         teamName: String,
         agentName: String,
         agentInstanceId: String,
-        sendSequenceID: String? = nil
+        sendSequenceID: String? = nil,
+        returnRequired: Bool? = nil,
+        deliveryScope: String = "transport_write"
     ) -> String {
         guard dispatched else {
             return v2Error(id: id, code: "not_found", message: "Agent or team not found")
@@ -3289,7 +3356,7 @@ class TerminalController {
         var delivery: [String: Any] = [
             "sent": textDelivered,
             "text_delivered": textDelivered,
-            "delivery_scope": "transport_write",
+            "delivery_scope": deliveryScope,
             "transport_dispatched": true,
             "team_name": teamName,
             "agent_name": agentName,
@@ -3297,6 +3364,13 @@ class TerminalController {
         ]
         if textDelivered, let sendSequenceID {
             delivery["send_sequence_id"] = sendSequenceID
+        }
+        // false announces a natively-held target whose turn was submitted on
+        // the text write: the CLI may skip its Return follow-up. The send_key
+        // no_keyboard answer remains authoritative for callers that never
+        // learn this field.
+        if let returnRequired {
+            delivery["return_required"] = returnRequired
         }
         guard textDelivered else {
             return v2Error(
@@ -3383,21 +3457,33 @@ class TerminalController {
         guard let text = params["text"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
-        // Stagger sends: 100ms between each agent to avoid main-thread congestion
-        // that causes text/Enter key drops. 10 agents × 100ms = 1s total (acceptable).
+        // Stagger sends: 100ms between terminal targets to avoid main-thread
+        // congestion that causes text/Enter key drops. A native target takes
+        // its turn on stdin — no paste, no key events — so it is dispatched
+        // without a gap and never pushes one onto the targets after it.
         // Use (workspaceId, panelId) pairs — not names — so duplicate-named agents each
         // receive the broadcast instead of collapsing to a single recipient.
-        let agentPanels: [(workspaceId: UUID, panelId: UUID)] = await MainActor.run {
+        let agentPanels: [(workspaceId: UUID, panelId: UUID, isNative: Bool)] = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teams[teamName] else { return [] }
-            return team.agents.compactMap { agent -> (workspaceId: UUID, panelId: UUID)? in
+            return team.agents.compactMap { agent -> (workspaceId: UUID, panelId: UUID, isNative: Bool)? in
                 guard let pid = agent.panelId else { return nil }
-                return (workspaceId: agent.workspaceId, panelId: pid)
+                return (
+                    workspaceId: agent.workspaceId,
+                    panelId: pid,
+                    isNative: TeamOrchestrator.shared.agentPanelIsNative(
+                        workspaceId: agent.workspaceId, panelId: pid
+                    )
+                )
             }
         }
         var count = 0
-        for (index, panel) in agentPanels.enumerated() {
-            if index > 0 {
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+        var terminalDispatched = false
+        for panel in agentPanels {
+            if !panel.isNative {
+                if terminalDispatched {
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                }
+                terminalDispatched = true
             }
             let success = await MainActor.run {
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
@@ -4403,8 +4489,24 @@ class TerminalController {
 
         // Stagger: dynamic gap based on team size to prevent main-queue saturation
         // when many team.delegate commands arrive in rapid succession (fan-out).
-        let delegateStaggerNs = await MainActor.run {
-            let count = TeamOrchestrator.shared.teams[teamName]?.agents.count ?? 1
+        // Native targets skip the slot (and leave the shared clock alone): their
+        // turn is an stdin write with no paste to pace. A pool target is only
+        // safely native when every same-named candidate is — the instance is
+        // chosen later, inside `delegate`'s main-actor turn.
+        let delegateStaggerNs = await MainActor.run { () -> UInt64 in
+            let orchestrator = TeamOrchestrator.shared
+            let bypassStagger: Bool
+            if let requestedInstanceId, !requestedInstanceId.isEmpty {
+                bypassStagger = !orchestrator.agentNeedsReturn(
+                    teamName: teamName, agentName: agentName, agentInstanceId: requestedInstanceId
+                )
+            } else {
+                bypassStagger = orchestrator.agentPoolIsAllNative(
+                    teamName: teamName, agentName: agentName
+                )
+            }
+            if bypassStagger { return 0 }
+            let count = orchestrator.teams[teamName]?.agents.count ?? 1
             return TerminalController.reserveTeamSendSlot(agentCount: count)
         }
         if delegateStaggerNs > 0 {
@@ -4427,7 +4529,23 @@ class TerminalController {
                 resumed = true
                 cont.resume(returning: ok)
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) { resume(false) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 12.0) {
+                let native = capturedOutcome.flatMap { outcome -> Bool? in
+                    guard case .delivered(let result) = outcome else { return nil }
+                    return !result.returnRequired
+                } ?? false
+                if native, case .delivered(let result) = capturedOutcome {
+                    // Same bounded queue-acceptance contract as team.send.
+                    // Mark the idempotent request so a lost RPC reply cannot
+                    // enqueue the instruction a second time.
+                    TeamDataStore.shared.markTextDelivered(
+                        teamName: teamName, taskId: result.task.id
+                    )
+                    resume(true)
+                } else {
+                    resume(false)
+                }
+            }
             Task { @MainActor in
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager else { resume(false); return }
@@ -4479,6 +4597,15 @@ class TerminalController {
         }
 
         var returnSubmitted = false
+        guard textDelivered else {
+            return teamDelegateDeliveryFailureResponse(
+                id: id,
+                returnRequired: delegateResult.returnRequired,
+                requestReplayed: delegateResult.requestReplayed,
+                agentInstanceId: delegateResult.task.assigneeInstanceId,
+                task: store.taskDictionary(delegateResult.task)
+            )
+        }
         if delegateResult.requestReplayed {
             // The original idempotent operation already owned text delivery.
             // A remote-leader retry also committed Return in that operation;
@@ -4507,15 +4634,41 @@ class TerminalController {
         }
 
         // delegateToAgent sends text WITHOUT Return (withReturn: false).
-        // The Rust CLI sends Return separately via team.send_key RPC after this ack.
+        // The Rust CLI sends Return separately via team.send_key RPC after this
+        // ack — unless return_required says the assignee is native and the
+        // stdin write already was the whole turn.
         return v2Ok(id: id, result: [
             "task": store.taskDictionary(delegateResult.task),
             "sent": true,
             "text_delivered": textDelivered,
             "return_submitted": returnSubmitted,
+            "return_required": delegateResult.returnRequired,
             "request_replayed": delegateResult.requestReplayed,
             "agent_instance_id": delegateResult.task.assigneeInstanceId ?? NSNull(),
         ])
+    }
+
+    func teamDelegateDeliveryFailureResponse(
+        id: Any?,
+        returnRequired: Bool,
+        requestReplayed: Bool,
+        agentInstanceId: String?,
+        task: [String: Any]? = nil
+    ) -> String {
+        let instanceValue: Any = agentInstanceId.map { $0 as Any } ?? NSNull()
+        var data: [String: Any] = [
+            "sent": false,
+            "text_delivered": false,
+            "return_required": returnRequired,
+            "request_replayed": requestReplayed,
+            "agent_instance_id": instanceValue,
+        ]
+        if let task { data["task"] = task }
+        return v2Error(
+            id: id, code: "delivery_failed",
+            message: "Instruction text was not delivered",
+            data: data
+        )
     }
 
     /// Send a named key (return, ctrl-c, etc.) to an agent's terminal surface.
@@ -4551,20 +4704,18 @@ class TerminalController {
                 )
             }
             : nil
-        if key.lowercased() == "return", let sendSequenceID, claimedGate == nil {
-            return v2Error(
-                id: id,
-                code: "stale_send_sequence",
-                message: "Return delivery does not own an active send sequence",
-                data: ["sent": false, "send_sequence_id": sendSequenceID]
-            )
-        }
         // An agent held natively has no keyboard to press Return on, and needs
         // none: the write to its stdin was already a whole turn, submitted the
         // moment it landed. The caller is asking "is this turn in?", and the
         // answer is yes — so it is answered here rather than left to a ladder
         // that can only fail, eight times, over eleven seconds, ending in a
         // warning about a Return nothing was waiting for.
+        //
+        // Answered before the stale-sequence check on purpose: a native send
+        // releases its gate at send time (there is no Return to wait for), so
+        // a legacy caller's follow-up Return arrives with no claimable
+        // sequence. That is the expected shape of an already-submitted native
+        // turn, not a stale terminal paste.
         if key.lowercased() == "return",
            await MainActor.run(body: {
                !TeamOrchestrator.shared.agentNeedsReturn(
@@ -4578,6 +4729,14 @@ class TerminalController {
             }
             return v2Ok(id: id, result: ["sent": true, "no_keyboard": true,
                                          "team_name": teamName, "agent_name": agentName])
+        }
+        if key.lowercased() == "return", let sendSequenceID, claimedGate == nil {
+            return v2Error(
+                id: id,
+                code: "stale_send_sequence",
+                message: "Return delivery does not own an active send sequence",
+                data: ["sent": false, "send_sequence_id": sendSequenceID]
+            )
         }
 
         let result: (sent: Bool, targetMissing: Bool, reason: String) = await withCheckedContinuation { continuation in

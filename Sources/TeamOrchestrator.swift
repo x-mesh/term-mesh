@@ -4151,7 +4151,7 @@ final class TeamOrchestrator: ObservableObject {
     /// When multiple agents share the same name, round-robins across them.
     /// Maintains an in-flight counter and a panelId snapshot so a concurrent
     /// hard restart can either drain (preferred) or detect mid-flight migration.
-    func sendToAgent(teamName: String, agentName: String, agentInstanceId: String? = nil, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil) -> Bool {
+    func sendToAgent(teamName: String, agentName: String, agentInstanceId: String? = nil, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil, disposition: ((AgentSession.SendDisposition) -> Void)? = nil) -> Bool {
         guard let team = teams[teamName] else {
             #if DEBUG
             dlog("[team.sendToAgent] DROP reason=team_not_found team=\(teamName) agent=\(agentName)")
@@ -4180,7 +4180,7 @@ final class TeamOrchestrator: ObservableObject {
         if let panelId = agent.panelId,
            let agentPanel = nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) {
             return deliverNatively(agentPanel, agentId: agent.transportId, text: text,
-                                   completion: completion)
+                                   completion: completion, disposition: disposition)
         }
         if AgentPipeTransport.isDriven(agentId: agent.transportId) {
             let expectation = AgentPipeCompletion.shared.expect(
@@ -4276,7 +4276,7 @@ final class TeamOrchestrator: ObservableObject {
     /// separate team.send_key Return lands on the SAME pane (used by panel-targeted
     /// team.send / team.delegate for deterministic duplicate-name addressing).
     @discardableResult
-    func sendToAgentByPanel(teamName: String, panelId: UUID, workspaceId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, recordPendingReturnFor agentName: String? = nil, completion: ((Bool) -> Void)? = nil) -> Bool {
+    func sendToAgentByPanel(teamName: String, panelId: UUID, workspaceId: UUID, text: String, tabManager: TabManager, withReturn: Bool = true, recordPendingReturnFor agentName: String? = nil, completion: ((Bool) -> Void)? = nil, disposition: ((AgentSession.SendDisposition) -> Void)? = nil) -> Bool {
         // An agent driven by a pipe takes its turn there, and none of what
         // follows applies to it: no paste queue, no pending-Return target, no
         // in-flight accounting to keep a restart from cutting a paste in half.
@@ -4284,7 +4284,7 @@ final class TeamOrchestrator: ObservableObject {
         // either lands whole or reports why it did not.
         if let native = nativeAgentPanel(workspaceId: workspaceId, panelId: panelId) {
             return deliverNatively(native, agentId: native.agentName, text: text,
-                                   completion: completion)
+                                   completion: completion, disposition: disposition)
         }
         if let agent = pipeDrivenAgent(teamName: teamName, panelId: panelId) {
             let expectation = AgentPipeCompletion.shared.expect(
@@ -4680,6 +4680,10 @@ final class TeamOrchestrator: ObservableObject {
         let requestReplayed: Bool
         /// Pre-formatted instruction text for retry (avoids re-calling private formatter).
         let instruction: String
+        /// False when the assignee is natively held: its stdin write already
+        /// was the whole turn, so the CLI may skip the Return follow-up.
+        /// Decided per creation site on the member the delegate chose.
+        let returnRequired: Bool
     }
 
     /// A task that is keeping an agent out of the delegate pool.
@@ -4846,7 +4850,8 @@ final class TeamOrchestrator: ObservableObject {
                         task: existing,
                         textDelivered: true,
                         requestReplayed: true,
-                        instruction: instruction
+                        instruction: instruction,
+                        returnRequired: memberNeedsReturn(replayTarget)
                     )
                 )
             }
@@ -4937,7 +4942,8 @@ final class TeamOrchestrator: ObservableObject {
                     task: task,
                     textDelivered: true,
                     requestReplayed: true,
-                    instruction: instruction
+                    instruction: instruction,
+                    returnRequired: memberNeedsReturn(target)
                 )
             )
         }
@@ -4980,7 +4986,8 @@ final class TeamOrchestrator: ObservableObject {
                     task: task,
                     textDelivered: delivered,
                     requestReplayed: false,
-                    instruction: instruction
+                    instruction: instruction,
+                    returnRequired: memberNeedsReturn(target)
                 )
             )
         }
@@ -5002,7 +5009,8 @@ final class TeamOrchestrator: ObservableObject {
                 task: task,
                 textDelivered: delivered,
                 requestReplayed: false,
-                instruction: instruction
+                instruction: instruction,
+                returnRequired: memberNeedsReturn(target)
             )
         )
     }
@@ -5264,13 +5272,28 @@ final class TeamOrchestrator: ObservableObject {
     /// so the others fell through to the pipe fork, found no FIFO, waited out
     /// the readiness timeout and failed.
     private func deliverNatively(_ panel: AgentPanel, agentId: String, text: String,
-                                 completion: ((Bool) -> Void)?) -> Bool {
+                                 completion: ((Bool) -> Void)?,
+                                 disposition: ((AgentSession.SendDisposition) -> Void)? = nil) -> Bool {
         do {
-            _ = try panel.session.send(Self.withoutTerminalProtocol(text), from: .leader)
+            // Completion rides the session's receipt: a local write or a
+            // queued turn answers synchronously as before, while a peer-owned
+            // agent answers when the sink write actually lands — so the
+            // caller's `text_delivered` stops meaning "the local tail queue
+            // took it".
+            _ = try panel.session.send(
+                Self.withoutTerminalProtocol(text), from: .leader
+            ) { sendDisposition in
+                disposition?(sendDisposition)
+                switch sendDisposition {
+                case .writtenLocal, .queuedBehindTurn, .remoteWritten, .remoteQueued:
+                    completion?(true)
+                case .remoteFailed:
+                    completion?(false)
+                }
+            }
             #if DEBUG
             dlog("agent.native.deliver agent=\(agentId) chars=\(text.count)")
             #endif
-            completion?(true)
             return true
         } catch {
             #if DEBUG
@@ -5430,10 +5453,12 @@ final class TeamOrchestrator: ObservableObject {
     /// natively has no composer: the write to its stdin *is* the turn, complete
     /// the moment it lands.
     ///
-    /// Asked when the Return arrives rather than announced with the text: the
-    /// CLI's first attempt is already a round trip, so answering it there is
-    /// one mechanism instead of two, and it covers every caller — including the
-    /// ones that never learn about a new response field.
+    /// Answered in two places on purpose. The send/delegate acknowledgement
+    /// announces it as `return_required`, so a current CLI can skip the Return
+    /// round trip and its pre-delay entirely; the send_key handler keeps
+    /// answering it authoritatively (`no_keyboard`) for every caller that
+    /// never learned the field. The hint is an optimization — the Return-time
+    /// answer remains the contract of record.
     func agentNeedsReturn(teamName: String, agentName: String, agentInstanceId: String? = nil) -> Bool {
         guard let team = teams[teamName],
               let agent = agentInstanceId.flatMap({
@@ -5443,6 +5468,34 @@ final class TeamOrchestrator: ObservableObject {
               nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) != nil
         else { return true }
         return false
+    }
+
+    /// Whether this specific pane holds a native agent.
+    func agentPanelIsNative(workspaceId: UUID, panelId: UUID) -> Bool {
+        nativeAgentPanel(workspaceId: workspaceId, panelId: panelId) != nil
+    }
+
+    /// `agentNeedsReturn`, for a member the caller has already resolved —
+    /// delegate answers it per creation site, on the member it chose.
+    func memberNeedsReturn(_ member: AgentMember) -> Bool {
+        guard let panelId = member.panelId else { return true }
+        return !agentPanelIsNative(workspaceId: member.workspaceId, panelId: panelId)
+    }
+
+    /// Whether every pool candidate for this agent name is natively held.
+    ///
+    /// Pool delegation picks its instance inside `delegate`'s main-actor turn,
+    /// later than the dispatch slot is reserved — so the stagger bypass can
+    /// only be decided for the pool as a whole. Mixed or empty pools answer
+    /// false and keep the terminal pacing.
+    func agentPoolIsAllNative(teamName: String, agentName: String) -> Bool {
+        guard let team = teams[teamName] else { return false }
+        let candidates = team.agents.filter { $0.name == agentName }
+        guard !candidates.isEmpty else { return false }
+        return candidates.allSatisfy { agent in
+            guard let panelId = agent.panelId else { return false }
+            return nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) != nil
+        }
     }
 
     /// The panel behind a natively-held agent, if that is what it is.
@@ -5629,12 +5682,19 @@ final class TeamOrchestrator: ObservableObject {
     /// Broadcast text to all agents in a team.
     /// Iterates by panelId (not name) so every agent pane receives the message,
     /// including multiple agents that share the same name.
+    /// Routed through `sendToAgentByPanel` for its transport fork: the direct
+    /// `sendTextToPanel` call could only find terminal panels, so a natively-
+    /// held agent walked the surface-nil retry ladder and never received a
+    /// menu broadcast at all.
     func broadcast(teamName: String, text: String, tabManager: TabManager) -> Int {
         guard let team = teams[teamName] else { return 0 }
         var count = 0
         for agent in team.agents {
             guard let pid = agent.panelId else { continue }
-            if sendTextToPanel(workspaceId: agent.workspaceId, panelId: pid, text: text, tabManager: tabManager) {
+            if sendToAgentByPanel(
+                teamName: teamName, panelId: pid, workspaceId: agent.workspaceId,
+                text: text, tabManager: tabManager
+            ) {
                 count += 1
             }
         }

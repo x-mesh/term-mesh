@@ -2345,6 +2345,32 @@ final class AgentSession {
         var description: String { "the agent is not running" }
     }
 
+    /// Where a sent turn actually got to when its receipt fired.
+    ///
+    /// For a peer-owned agent, acknowledging at enqueue time claimed more than
+    /// was known: `remoteSendTail` is a local queue, not the peer. The receipt
+    /// names the scope honestly so callers can report `delivery_scope` as what
+    /// actually happened.
+    enum SendDisposition: Sendable {
+        /// Written synchronously onto the local process's stdin.
+        case writtenLocal
+        /// Parked behind the running turn. The write happens after that
+        /// turn's result event — unbounded — so this is reported immediately,
+        /// keeping the acknowledgement bounded and today's success meaning.
+        case queuedBehindTurn
+        /// The peer sink accepted the write: the input frame reached the
+        /// relay session, not merely the local tail queue.
+        case remoteWritten
+        /// The peer write did not settle inside the RPC acknowledgement
+        /// window, but the ordered remote tail owns the payload and will make
+        /// exactly one attempt. Reporting queue acceptance prevents both an
+        /// unbounded RPC and a caller retry that would enqueue a duplicate.
+        case remoteQueued
+        /// The write never reached the peer — the sink threw, or the session
+        /// ended before its turn in the tail queue came up.
+        case remoteFailed(String)
+    }
+
     /// One user turn onto the agent's stdin.
     ///
     /// The text goes as-is. Nothing is flattened — an instruction carrying
@@ -2352,7 +2378,11 @@ final class AgentSession {
     /// to submit early on one. That flattening is the clearest thing the
     /// terminal path costs: an instruction reshaped to survive its own delivery.
     @discardableResult
-    func send(_ text: String, from speaker: Speaker) throws -> Int {
+    func send(
+        _ text: String,
+        from speaker: Speaker,
+        receipt: (@MainActor (SendDisposition) -> Void)? = nil
+    ) throws -> Int {
         guard isRunning else { throw SendError.notRunning }
         // Native turns report completion from their result event. Peer-proxied
         // worktree delegates can bypass deliverNatively(), so strip terminal
@@ -2362,12 +2392,14 @@ final class AgentSession {
             : text
         if speaker == .leader, turnInFlight {
             queued.append((deliveredText, Self.taskId(in: deliveredText)))
+            receipt?(.queuedBehindTurn)
             return 0
         }
         return try write(
             deliveredText,
             from: speaker,
-            taskId: Self.taskId(in: deliveredText)
+            taskId: Self.taskId(in: deliveredText),
+            receipt: receipt
         )
     }
 
@@ -2384,10 +2416,15 @@ final class AgentSession {
     @ObservationIgnored private var turnStartedAt: Date?
 
     @discardableResult
-    private func write(_ text: String, from speaker: Speaker, taskId: String?) throws -> Int {
+    private func write(
+        _ text: String,
+        from speaker: Speaker,
+        taskId: String?,
+        receipt: (@MainActor (SendDisposition) -> Void)? = nil
+    ) throws -> Int {
         guard isRunning else { throw SendError.notRunning }
         let payload = try Self.encode(text: text)
-        try writeToTransport(payload)
+        try writeToTransport(payload, receipt: receipt)
         // Shown from the receipt (`isReplay`) rather than from here, so what is
         // drawn is what the agent confirmed receiving — not what was hoped for.
         pendingSpeaker = speaker
@@ -2404,13 +2441,17 @@ final class AgentSession {
     /// process's stdin, or the sink `startRemote` installed. Every writer
     /// (turns, queued turns, interrupts) passes through here, so a transport
     /// cannot be missed by one of them.
-    private func writeToTransport(_ payload: Data) throws {
+    private func writeToTransport(
+        _ payload: Data,
+        receipt: (@MainActor (SendDisposition) -> Void)? = nil
+    ) throws {
         if let stdin {
             try stdin.write(contentsOf: payload)
+            receipt?(.writtenLocal)
             return
         }
         guard let remoteSink else { throw SendError.notRunning }
-        deliverRemote(payload, via: remoteSink)
+        deliverRemote(payload, via: remoteSink, receipt: receipt)
     }
 
     private var hasInputTransport: Bool { stdin != nil || remoteSink != nil }
@@ -2420,15 +2461,23 @@ final class AgentSession {
     /// bug the leader queue exists to prevent.
     private func deliverRemote(
         _ payload: Data,
-        via sink: @escaping @Sendable (Data) async throws -> Void
+        via sink: @escaping @Sendable (Data) async throws -> Void,
+        receipt: (@MainActor (SendDisposition) -> Void)? = nil
     ) {
         let generation = remoteGeneration
         let previous = remoteSendTail
+        // The receipt must fire on every exit of this task — a path that
+        // returns without answering leaves the caller waiting on its
+        // dead-man timeout instead of hearing the write's real fate.
         remoteSendTail = Task { [weak self] in
             await previous?.value
-            guard let self, self.remoteGeneration == generation else { return }
+            guard let self, self.remoteGeneration == generation else {
+                receipt?(.remoteFailed("the session ended before the write"))
+                return
+            }
             do {
                 try await sink(payload)
+                receipt?(.remoteWritten)
             } catch {
                 // The turn already opened optimistically; the transport's
                 // owner sees the same failure and decides the session's
@@ -2437,6 +2486,7 @@ final class AgentSession {
                     .error,
                     "could not deliver to the remote agent: \(error.localizedDescription)"
                 )
+                receipt?(.remoteFailed(error.localizedDescription))
             }
         }
     }
