@@ -96,6 +96,10 @@ final class Workspace: Identifiable {
     /// the screen is the record, the same reasoning `SessionHostPanes`
     /// runs on. Read by `SessionHostPanes.shownSurfaceIDs()`.
     @ObservationIgnored private(set) var remoteAgentPaneSessions: [UUID: PeerPaneSession] = [:]
+    @ObservationIgnored private(set) var isApplyingProjectPresentationLayout = false
+    #if DEBUG
+    @ObservationIgnored var debugProjectLayoutSurfaceIDs: [UUID: Data] = [:]
+    #endif
 
     /// Panel-count changes for the UI-test harnesses, which wait on a pane
     /// closing from outside SwiftUI.
@@ -1874,6 +1878,11 @@ final class Workspace: Identifiable {
     /// session-host reconciler to repair panes opened in an unrelated Project
     /// workspace by older builds without tearing down the live session.
     func panelID(forPeerSurfaceID surfaceID: Data) -> UUID? {
+        #if DEBUG
+        if let panelID = debugProjectLayoutSurfaceIDs.first(where: { $0.value == surfaceID })?.key {
+            return panelID
+        }
+        #endif
         for (panelID, panel) in panels {
             if let terminal = panel as? TerminalPanel,
                terminal.peerPaneSession?.originSurface.surfaceID == surfaceID {
@@ -1884,6 +1893,110 @@ final class Workspace: Identifiable {
             }
         }
         return nil
+    }
+
+    func peerSurfaceID(forPanelID panelID: UUID) -> Data? {
+        #if DEBUG
+        if let surfaceID = debugProjectLayoutSurfaceIDs[panelID] { return surfaceID }
+        #endif
+        if let terminal = panels[panelID] as? TerminalPanel,
+           let surfaceID = terminal.peerPaneSession?.originSurface.surfaceID {
+            return surfaceID
+        }
+        return remoteAgentPaneSessions[panelID]?.originSurface.surfaceID
+    }
+
+    func projectPresentationLayoutSnapshot(
+        projectID: String
+    ) -> ProjectPresentationLayoutSnapshot? {
+        let surfaceIDByTabID = Dictionary(uniqueKeysWithValues: surfaceIdToPanelId.compactMap {
+            tabID, panelID -> (String, Data)? in
+            guard let surfaceID = peerSurfaceID(forPanelID: panelID) else { return nil }
+            return (tabID.uuid.uuidString, surfaceID)
+        })
+        let focusedSurfaceID = focusedPanelId.flatMap(peerSurfaceID(forPanelID:))
+        return ProjectPresentationLayoutSnapshot.capture(
+            projectID: projectID,
+            tree: bonsplitController.treeSnapshot(),
+            surfaceIDByTabID: surfaceIDByTabID,
+            focusedSurfaceID: focusedSurfaceID
+        )
+    }
+
+    func withProjectPresentationLayoutPersistenceSuppressed<T>(
+        _ body: () throws -> T
+    ) rethrows -> T {
+        let wasApplying = isApplyingProjectPresentationLayout
+        isApplyingProjectPresentationLayout = true
+        defer { isApplyingProjectPresentationLayout = wasApplying }
+        return try body()
+    }
+
+    /// Rebuild the Bonsplit tree around already-attached remote panels. The
+    /// sidecar is accepted only when it describes exactly the live surface set
+    /// and one surface per leaf; otherwise the caller keeps the safe balanced
+    /// fallback rather than partially applying stale geometry.
+    func applyProjectPresentationLayout(
+        _ snapshot: ProjectPresentationLayoutSnapshot,
+        restoreFocus: Bool
+    ) -> Bool {
+        let liveSurfaceIDs = Set(panels.keys.compactMap(peerSurfaceID(forPanelID:)))
+        guard snapshot.canApply(to: liveSurfaceIDs) else { return false }
+        let placementBySurfaceID: [Data: (panelID: UUID, tabID: TabID)] = Dictionary(
+            uniqueKeysWithValues: snapshot.root.surfaceIDs.compactMap { surfaceID in
+                guard let panelID = panelID(forPeerSurfaceID: surfaceID),
+                      let tabID = surfaceIdFromPanelId(panelID),
+                      paneId(forPanelId: panelID) != nil else { return nil }
+                return (surfaceID, (panelID, tabID))
+            }
+        )
+        guard placementBySurfaceID.count == liveSurfaceIDs.count else { return false }
+
+        let wasApplying = isApplyingProjectPresentationLayout
+        isApplyingProjectPresentationLayout = true
+        defer { isApplyingProjectPresentationLayout = wasApplying }
+
+        func externalTree(
+            _ node: ProjectPresentationLayoutSnapshot.Node
+        ) -> ExternalTreeNode? {
+            switch node {
+            case .pane(let pane):
+                guard let placement = placementBySurfaceID[pane.surfaceID] else { return nil }
+                let tabID = placement.tabID
+                let title = panels[placement.panelID]?.displayTitle ?? "Pane"
+                return .pane(ExternalPaneNode(
+                    id: UUID().uuidString,
+                    frame: PixelRect(x: 0, y: 0, width: 0, height: 0),
+                    tabs: [ExternalTab(id: tabID.uuid.uuidString, title: title)],
+                    selectedTabId: tabID.uuid.uuidString
+                ))
+
+            case .split(let savedOrientation, let divider, let first, let second):
+                guard let firstTree = externalTree(first),
+                      let secondTree = externalTree(second) else { return nil }
+                return .split(ExternalSplitNode(
+                    id: UUID().uuidString,
+                    orientation: savedOrientation.rawValue,
+                    dividerPosition: max(0.1, min(0.9, divider)),
+                    first: firstTree,
+                    second: secondTree
+                ))
+            }
+        }
+
+        guard let tree = externalTree(snapshot.root) else { return false }
+        let focusedTabID = restoreFocus
+            ? snapshot.focusedSurfaceID.flatMap { placementBySurfaceID[$0]?.tabID }
+            : nil
+        guard bonsplitController.applyExternalTreeAtomically(
+            tree, focusedTabId: focusedTabID
+        ) else { return false }
+        if restoreFocus,
+           let pane = bonsplitController.focusedPaneId,
+           let tab = bonsplitController.selectedTab(inPane: pane) {
+            applyTabSelection(tabId: tab.id, inPane: pane)
+        }
+        return true
     }
 
     /// Returns the nearest right-side sibling pane for browser placement.

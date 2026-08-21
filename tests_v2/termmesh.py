@@ -25,7 +25,14 @@ import select
 import socket
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
+
+
+class ProjectLayout(TypedDict):
+    version: int
+    projectID: str
+    root: Dict[str, Any]
+    focusedSurfaceID: Optional[str]
 
 
 class termmeshError(Exception):
@@ -800,6 +807,21 @@ class termmesh:
             raise termmeshError(f"Invalid pane: {pane!r}")
         self._call("pane.focus", {"pane_id": pid})
 
+    def resize_pane(
+        self,
+        pane: Union[str, int],
+        direction: Literal["left", "right", "up", "down"],
+        amount: int,
+    ) -> None:
+        pid = self._resolve_pane_id(pane)
+        if not pid:
+            raise termmeshError(f"Invalid pane: {pane!r}")
+        self._call("pane.resize", {
+            "pane_id": pid,
+            "direction": direction,
+            "amount": int(amount),
+        })
+
     def list_pane_surfaces(self, pane: Union[str, int, None] = None) -> List[Tuple[int, str, str, bool]]:
         params: Dict[str, Any] = {}
         if pane is not None:
@@ -1411,6 +1433,17 @@ class termmesh:
             "host": host,
             "project_id": project_id,
         }) or {})
+
+    def debug_project_layout(self, team_name: str) -> Dict[str, Optional[ProjectLayout]]:
+        result = dict(self._call("debug.project.layout", {"team": team_name}) or {})
+        live = result.get("live")
+        persisted = result.get("persisted")
+        return {
+            "live": ProjectLayout(**dict(live)) if isinstance(live, dict) else None,
+            "persisted": (
+                ProjectLayout(**dict(persisted)) if isinstance(persisted, dict) else None
+            ),
+        }
 
     def team_destroy(self, team_name: str) -> dict:
         return dict(self._call("team.destroy", {"team_name": team_name}) or {})

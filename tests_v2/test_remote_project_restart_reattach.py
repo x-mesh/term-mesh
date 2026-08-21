@@ -340,6 +340,23 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
             f"matches={matching_teams!r}"
         )
 
+    # Persist a non-default divider position so the restart check cannot pass
+    # merely because both runs happened to build the same balanced fallback.
+    panes = c.list_panes()
+    if len(panes) < 2:
+        raise termmeshError(f"Project layout has fewer than two panes: {panes!r}")
+    layout_before_resize = c.debug_project_layout(team_name)["live"]
+    c.resize_pane(panes[0][1], "right", 80)
+    def changed_layout():
+        layouts = c.debug_project_layout(team_name)
+        live = layouts["live"]
+        persisted = layouts["persisted"]
+        return live if live != layout_before_resize and persisted == live else None
+
+    saved_layout = _wait(changed_layout, timeout_s=10)
+    if saved_layout is None:
+        raise termmeshError("Project divider change was not persisted to its layout sidecar")
+
     def complete_project():
         project = next((item for item in c.debug_project_remote_presentations(host)
                         if item.get("name") == team_name
@@ -369,6 +386,7 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
         "source_directory": remote_dir,
         "checkouts": checkouts,
         "route": route,
+        "layout": saved_layout,
     }))
 
 
@@ -401,6 +419,55 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
         raise termmeshError(
             "worker descriptors changed or disappeared across app/client restart: "
             f"expected={expected_members!r} actual={remote_members!r}"
+        )
+
+    # Relaunch recovery is automatic. The old test called
+    # debug_project_adopt_remote here, which proved only that a hidden manual
+    # repair path worked and missed the user-visible regression entirely.
+    team = _wait(lambda: next((item for item in c.team_list()
+                               if item.get("team_name") == team_name
+                               and item.get("leader_pane_attached")
+                               and item.get("leader_panel_id")), None))
+    if team is None:
+        raise termmeshError("remote Project was not restored automatically after app restart")
+    restored_instances = {
+        agent.get("name"): agent.get("agent_instance_id")
+        for agent in team.get("agents", [])
+    }
+    if restored_instances != state["member_instances"]:
+        raise termmeshError(
+            "automatic restore did not recover the exact remote workers: "
+            f"expected={state['member_instances']!r} actual={restored_instances!r}"
+        )
+    restored_layout = c.debug_project_layout(team_name)["live"]
+
+    def same_layout(expected, actual, tolerance=0.015):
+        if not isinstance(expected, dict) or not isinstance(actual, dict):
+            return expected == actual
+        if expected.get("projectID") != actual.get("projectID"):
+            return False
+        if expected.get("focusedSurfaceID") != actual.get("focusedSurfaceID"):
+            return False
+
+        def same_node(left, right):
+            if left.get("type") != right.get("type"):
+                return False
+            if left.get("type") == "pane":
+                return left.get("pane") == right.get("pane")
+            return (
+                left.get("orientation") == right.get("orientation")
+                and abs(float(left.get("dividerPosition", 0))
+                        - float(right.get("dividerPosition", 0))) <= tolerance
+                and same_node(left.get("first") or {}, right.get("first") or {})
+                and same_node(left.get("second") or {}, right.get("second") or {})
+            )
+
+        return same_node(expected.get("root") or {}, actual.get("root") or {})
+
+    if not same_layout(state.get("layout"), restored_layout):
+        raise termmeshError(
+            "automatic restore changed project pane order or divider layout: "
+            f"before={state.get('layout')!r} after={restored_layout!r}"
         )
 
     # A stale id must be rejected before any asynchronous presentation work
@@ -468,9 +535,6 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
                         timeout_s=25)
     if republished is None:
         raise termmeshError("remote project manifest did not return after reconnect")
-    adopted = c.debug_project_adopt_remote(host, state["project_id"])
-    if adopted.get("leader_surface_id") != state["leader_surface_id"]:
-        raise termmeshError(f"adopt selected a different leader surface: {adopted!r}")
     team = _wait(lambda: next((item for item in c.team_list()
                                if item.get("team_name") == team_name
                                and item.get("leader_pane_attached")

@@ -465,7 +465,9 @@ extension Workspace: BonsplitDelegate {
             "sourceTabs=\(controller.tabs(inPane: source).count) destTabs=\(controller.tabs(inPane: destination).count)"
         )
 #endif
-        applyTabSelection(tabId: tab.id, inPane: destination)
+        if !isApplyingProjectPresentationLayout {
+            applyTabSelection(tabId: tab.id, inPane: destination)
+        }
         normalizePinnedTabs(in: source)
         normalizePinnedTabs(in: destination)
         scheduleTerminalGeometryReconcile()
@@ -494,6 +496,7 @@ extension Workspace: BonsplitDelegate {
         // Titlebar accent follows the focused pane's host (remote pane
         // → host gradient, local pane → none).
         PeerTitlebarAccentController.refresh()
+        TeamOrchestrator.shared.scheduleProjectPresentationLayoutSaveIfNeeded(workspace: self)
     }
 
     func splitTabBar(_ controller: BonsplitController, didClosePane paneId: PaneID) {
@@ -850,6 +853,7 @@ extension Workspace: BonsplitDelegate {
         if mirrorForwardsLocalActions {
             peerMirror?.handleLocalGeometryChange()
         }
+        TeamOrchestrator.shared.scheduleProjectPresentationLayoutSaveIfNeeded(workspace: self)
     }
 
     /// Notify any peer-federation observers (PeerServer broadcast) so
