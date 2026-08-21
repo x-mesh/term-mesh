@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.204.0] - 2026-08-22
+
+**터미널 출력이 계속 이어지는 동안의 CPU 부하를 낮추고, 원격 pane 정리가 실제 host 상태와 일치하도록 고쳤다.**
+
+### Fixed
+
+- **foreground terminal 출력 중 term-mesh와 WindowServer CPU가 계속 높아지던 문제** — terminal title이 같은 값으로 반복되면 SwiftUI 갱신 전에 제거하고, 값이 계속 바뀌더라도 최신 title만 초당 4회 publish한다. title 최신성은 유지하면서 workspace graph의 반복 layout과 AttributeGraph traversal을 줄였다.
+
+- **원격 pane 강제 정리가 성공으로 표시됐지만 host에는 pane이 남을 수 있던 문제** ([#353](https://github.com/x-mesh/term-mesh/pull/353)) — ordinary PTY와 마지막 pane도 host의 authoritative termination 경로로 제거하고, connection이 가득 찬 host에서는 이미 연결된 relay를 사용한다. cleanup 결과와 목록은 host의 최신 roster에서 실제 제거를 확인한 뒤에만 갱신한다.
+
+### Thanks
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.203.0] - 2026-08-21
 
 **native agent 명령 전달을 즉시 시작하고, 원격 Project의 agent pane 수명을 실제 process와 일치시킨다.**
