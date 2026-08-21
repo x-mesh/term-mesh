@@ -2361,6 +2361,11 @@ final class AgentSession {
         /// The peer sink accepted the write: the input frame reached the
         /// relay session, not merely the local tail queue.
         case remoteWritten
+        /// The peer write did not settle inside the RPC acknowledgement
+        /// window, but the ordered remote tail owns the payload and will make
+        /// exactly one attempt. Reporting queue acceptance prevents both an
+        /// unbounded RPC and a caller retry that would enqueue a duplicate.
+        case remoteQueued
         /// The write never reached the peer — the sink threw, or the session
         /// ended before its turn in the tail queue came up.
         case remoteFailed(String)

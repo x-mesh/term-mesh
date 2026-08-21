@@ -3248,8 +3248,13 @@ class TerminalController {
                 // the peer transport callback is the acknowledgement. If we
                 // time it out locally and it lands later, a CLI retry submits
                 // the same turn twice. Once delivery resolves as native, wait
-                // for the transport result instead.
-                if self.sendDeadmanApplies(deliveredNatively: deliveredNatively) {
+                // for the transport result. If that result itself stalls,
+                // acknowledge ownership by the ordered remote queue instead
+                // of failing (a retry would enqueue the same turn twice).
+                if deliveredNatively {
+                    nativeDisposition = .remoteQueued
+                    resume(true)
+                } else {
                     resume(false)
                 }
             }
@@ -3320,14 +3325,11 @@ class TerminalController {
     func nativeDeliveryScope(_ disposition: AgentSession.SendDisposition?) -> String {
         switch disposition {
         case .remoteWritten: return "peer_transport_write"
+        case .remoteQueued: return "peer_transport_queued"
         case .remoteFailed: return "peer_transport_failed"
         case .queuedBehindTurn: return "queued_local"
         default: return "transport_write"
         }
-    }
-
-    func sendDeadmanApplies(deliveredNatively: Bool) -> Bool {
-        !deliveredNatively
     }
 
     /// Formats the `team.send` delivery contract. `delivery_scope` names how
@@ -4532,7 +4534,17 @@ class TerminalController {
                     guard case .delivered(let result) = outcome else { return nil }
                     return !result.returnRequired
                 } ?? false
-                if self.sendDeadmanApplies(deliveredNatively: native) { resume(false) }
+                if native, case .delivered(let result) = capturedOutcome {
+                    // Same bounded queue-acceptance contract as team.send.
+                    // Mark the idempotent request so a lost RPC reply cannot
+                    // enqueue the instruction a second time.
+                    TeamDataStore.shared.markTextDelivered(
+                        teamName: teamName, taskId: result.task.id
+                    )
+                    resume(true)
+                } else {
+                    resume(false)
+                }
             }
             Task { @MainActor in
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
@@ -4590,7 +4602,8 @@ class TerminalController {
                 id: id,
                 returnRequired: delegateResult.returnRequired,
                 requestReplayed: delegateResult.requestReplayed,
-                agentInstanceId: delegateResult.task.assigneeInstanceId
+                agentInstanceId: delegateResult.task.assigneeInstanceId,
+                task: store.taskDictionary(delegateResult.task)
             )
         }
         if delegateResult.requestReplayed {
@@ -4639,19 +4652,22 @@ class TerminalController {
         id: Any?,
         returnRequired: Bool,
         requestReplayed: Bool,
-        agentInstanceId: String?
+        agentInstanceId: String?,
+        task: [String: Any]? = nil
     ) -> String {
         let instanceValue: Any = agentInstanceId.map { $0 as Any } ?? NSNull()
+        var data: [String: Any] = [
+            "sent": false,
+            "text_delivered": false,
+            "return_required": returnRequired,
+            "request_replayed": requestReplayed,
+            "agent_instance_id": instanceValue,
+        ]
+        if let task { data["task"] = task }
         return v2Error(
             id: id, code: "delivery_failed",
             message: "Instruction text was not delivered",
-            data: [
-                "sent": false,
-                "text_delivered": false,
-                "return_required": returnRequired,
-                "request_replayed": requestReplayed,
-                "agent_instance_id": instanceValue,
-            ]
+            data: data
         )
     }
 

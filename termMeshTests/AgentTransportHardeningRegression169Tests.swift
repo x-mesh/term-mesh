@@ -157,6 +157,10 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
             "peer_transport_failed"
         )
         XCTAssertEqual(
+            TerminalController.shared.nativeDeliveryScope(.remoteQueued),
+            "peer_transport_queued"
+        )
+        XCTAssertEqual(
             TerminalController.shared.nativeDeliveryScope(.queuedBehindTurn),
             "queued_local"
         )
@@ -166,21 +170,13 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
         )
     }
 
-    func testSendDeadmanAppliesOnlyToTerminalPaste() {
-        XCTAssertTrue(
-            TerminalController.shared.sendDeadmanApplies(deliveredNatively: false)
-        )
-        XCTAssertFalse(
-            TerminalController.shared.sendDeadmanApplies(deliveredNatively: true)
-        )
-    }
-
     func testDelegateMissingWriteAckIsDeliveryFailure() throws {
         let response = TerminalController.shared.teamDelegateDeliveryFailureResponse(
             id: 20,
             returnRequired: false,
             requestReplayed: false,
-            agentInstanceId: "instance-1"
+            agentInstanceId: "instance-1",
+            task: ["id": "task-1", "status": "pending"]
         )
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: Any]
@@ -193,6 +189,8 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
         XCTAssertEqual(data["text_delivered"] as? Bool, false)
         XCTAssertEqual(data["return_required"] as? Bool, false)
         XCTAssertEqual(data["agent_instance_id"] as? String, "instance-1")
+        let task = try XCTUnwrap(data["task"] as? [String: Any])
+        XCTAssertEqual(task["id"] as? String, "task-1")
     }
 
     func testTeamSendAcknowledgementAnnouncesWhetherReturnIsRequired() throws {

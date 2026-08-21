@@ -5285,7 +5285,7 @@ final class TeamOrchestrator: ObservableObject {
             ) { sendDisposition in
                 disposition?(sendDisposition)
                 switch sendDisposition {
-                case .writtenLocal, .queuedBehindTurn, .remoteWritten:
+                case .writtenLocal, .queuedBehindTurn, .remoteWritten, .remoteQueued:
                     completion?(true)
                 case .remoteFailed:
                     completion?(false)
