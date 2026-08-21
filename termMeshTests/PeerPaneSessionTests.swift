@@ -5047,6 +5047,80 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
         XCTAssertEqual(rolledBack?.agents[1].remoteSurfaceID, siblingSurfaceID)
     }
 
+    @MainActor
+    func testEndedPeerOwnedAgentRetirementRequiresExactSurfaceAndPreservesSiblings() {
+        let teamName = "ended-peer-agent"
+        let endedSurface = Data(repeating: 0x61, count: 16)
+        let siblingSurface = Data(repeating: 0x62, count: 16)
+        let workspaceID = UUID()
+        let ended = TeamOrchestrator.AgentMember(
+            id: "executor@\(teamName)", agentInstanceId: "executor-instance",
+            name: "executor", teamName: teamName, cli: "claude",
+            launchCommand: "claude", model: "sonnet", agentType: "executor",
+            color: "green", instructions: "", workspaceId: workspaceID,
+            panelId: UUID(), createdAt: Date(), remoteSurfaceID: endedSurface,
+            remoteSurfaceSpawned: true, remoteAgentSurface: true, hostKey: "ssh:peer"
+        )
+        let sibling = TeamOrchestrator.AgentMember(
+            id: "tester@\(teamName)", agentInstanceId: "tester-instance",
+            name: "tester", teamName: teamName, cli: "codex",
+            launchCommand: "codex", model: "gpt", agentType: "tester",
+            color: "blue", instructions: "", workspaceId: workspaceID,
+            panelId: UUID(), createdAt: Date(), remoteSurfaceID: siblingSurface,
+            remoteSurfaceSpawned: true, remoteAgentSurface: true, hostKey: "ssh:peer"
+        )
+        let current = TeamOrchestrator.Team(
+            id: teamName, leaderSessionId: UUID().uuidString, leaderMode: "adopted",
+            leaderModel: "opus", leaderCli: "claude", leaderPanelId: UUID(),
+            workingDirectory: "/tmp", workspaceId: workspaceID,
+            agents: [ended, sibling], createdAt: Date(), gitRepoRoot: nil,
+            worktreeMode: "off", ownsRemotePresentation: true
+        )
+
+        let result = TeamOrchestrator.teamByRetiringEndedPeerOwnedAgent(
+            current: current, agentInstanceID: ended.agentInstanceId, surfaceID: endedSurface
+        )
+        XCTAssertEqual(result?.retired.agentInstanceId, ended.agentInstanceId)
+        XCTAssertEqual(result?.team.agents.map(\.agentInstanceId), [sibling.agentInstanceId])
+        XCTAssertNil(TeamOrchestrator.teamByRetiringEndedPeerOwnedAgent(
+            current: current,
+            agentInstanceID: ended.agentInstanceId,
+            surfaceID: Data(repeating: 0x63, count: 16)
+        ), "a stale surface-exit callback must not retire a replacement")
+    }
+
+    @MainActor
+    func testEndedPeerOwnedAgentRetirementRunsOnlyInTheOwnerViewer() {
+        let orchestrator = TeamOrchestrator.shared
+        let teamName = "ended-owner-guard-\(UUID().uuidString.prefix(8))"
+        defer { orchestrator.forgetTeamForTests(teamName) }
+        let surfaceID = Data(repeating: 0x71, count: 16)
+        let workspace = Workspace(title: "owner-guard")
+        let member = TeamOrchestrator.AgentMember(
+            id: "executor@\(teamName)", agentInstanceId: "executor-instance",
+            name: "executor", teamName: teamName, cli: "claude",
+            launchCommand: "claude", model: "sonnet", agentType: "executor",
+            color: "green", instructions: "", workspaceId: workspace.id,
+            panelId: UUID(), createdAt: Date(), remoteSurfaceID: surfaceID,
+            remoteSurfaceSpawned: true, remoteAgentSurface: true, hostKey: "ssh:peer"
+        )
+
+        orchestrator.installTeamForTests(name: teamName, agents: [member])
+        orchestrator.retireEndedPeerOwnedAgent(
+            panelID: member.panelId!, surfaceID: surfaceID, workspace: workspace
+        )
+        XCTAssertEqual(orchestrator.teams[teamName]?.agents.count, 1)
+
+        orchestrator.forgetTeamForTests(teamName)
+        orchestrator.installTeamForTests(
+            name: teamName, agents: [member], ownsRemotePresentation: true
+        )
+        orchestrator.retireEndedPeerOwnedAgent(
+            panelID: member.panelId!, surfaceID: surfaceID, workspace: workspace
+        )
+        XCTAssertEqual(orchestrator.teams[teamName]?.agents.count, 0)
+    }
+
     /// The retry pass snapshots records, then awaits each terminate. In that
     /// window `enqueue` can enrich the live record with the exact owning
     /// endpoint the snapshot did not have — and the in-flight nil-owner

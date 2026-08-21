@@ -3458,13 +3458,19 @@ final class Workspace: Identifiable {
         relay.onPtyDeliveryRestart = { [weak self] in
             self?.dropRemoteAgentPane(panelId: panelId, reason: "stream rewound")
         }
+        let boundSurfaceID = session.originSurface.surfaceID
         relay.onSurfaceExited = { [weak self] exitCode, signal, reason in
-            await (self?.panels[panelId] as? AgentPanel)?.session
-                .finishRemoteSurfaceExited(
+            guard let self else { return }
+            await (self.panels[panelId] as? AgentPanel)?.session.finishRemoteSurfaceExited(
                     exitCode: exitCode,
                     signal: signal,
                     reason: reason
                 )
+            TeamOrchestrator.shared.retireEndedPeerOwnedAgent(
+                panelID: panelId,
+                surfaceID: boundSurfaceID,
+                workspace: self
+            )
         }
         // Terminal death of the relay session (heartbeat kill, writer
         // failure, host teardown). Same recovery as a rewind: the daemon
@@ -3557,6 +3563,19 @@ final class Workspace: Identifiable {
                 surfaceID: surfaceID
             )
         }
+    }
+
+    /// Close a pane whose host has confirmed the process is gone. Remove the
+    /// binding before mutating `panels` so the generic user-close reconciler
+    /// does not record a dismissal for a surface that no longer exists.
+    func closeEndedRemoteAgentPane(panelId: UUID) {
+        guard let session = remoteAgentPaneSessions.removeValue(forKey: panelId) else {
+            _ = closePanel(panelId, force: true)
+            return
+        }
+        session.relaySession.onPtyData = nil
+        session.teardown()
+        _ = closePanel(panelId, force: true)
     }
 
     /// Whether a pane session is held by THIS machine's daemon — the only
