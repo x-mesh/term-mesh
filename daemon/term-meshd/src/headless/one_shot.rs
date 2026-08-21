@@ -632,15 +632,28 @@ impl HeadlessOneShotRunner {
                 // parse/RPC failure (pane mid-transition, app momentarily busy)
                 // must not kill the whole tick. Keep the last error for the
                 // timeout message.
-                if let Err(e) = app_send_pane(app_socket, &input.team_name, WATCHER, &message).await
-                {
-                    last_send_err = Some(format!("send: {e}"));
-                } else if let Err(e) =
-                    app_send_key_pane(app_socket, &input.team_name, WATCHER, "return").await
-                {
-                    last_send_err = Some(format!("send_key: {e}"));
-                } else {
-                    last_send_err = None;
+                match app_send_pane(app_socket, &input.team_name, WATCHER, &message).await {
+                    Err(e) => last_send_err = Some(format!("send: {e}")),
+                    // An acknowledgement carrying return_required=false came
+                    // from a native watcher pane: the turn is already
+                    // submitted. Older apps omit the field and keep the Return.
+                    Ok(sent)
+                        if !sent
+                            .get("return_required")
+                            .and_then(|r| r.as_bool())
+                            .unwrap_or(true) =>
+                    {
+                        last_send_err = None;
+                    }
+                    Ok(_) => {
+                        if let Err(e) =
+                            app_send_key_pane(app_socket, &input.team_name, WATCHER, "return").await
+                        {
+                            last_send_err = Some(format!("send_key: {e}"));
+                        } else {
+                            last_send_err = None;
+                        }
+                    }
                 }
                 last_send = Some(Instant::now());
             }
@@ -841,14 +854,17 @@ async fn app_recycle_pane(app_socket: &str, team: &str, agent: &str) -> Result<(
     app_rpc_result(&v).map(|_| ())
 }
 
-/// §4 GUI path: send the review prompt text to the watcher pane.
+/// §4 GUI path: send the review prompt text to the watcher pane. Returns the
+/// `team.send` result object so the caller can honour `return_required` — a
+/// native watcher's turn is submitted on the text write and pressing Return
+/// on it would be a stray keystroke into a pane that has no composer.
 #[allow(dead_code)]
 async fn app_send_pane(
     app_socket: &str,
     team: &str,
     agent: &str,
     text: &str,
-) -> Result<(), String> {
+) -> Result<serde_json::Value, String> {
     let v = call_app_rpc(
         app_socket,
         "team.send",
@@ -856,7 +872,7 @@ async fn app_send_pane(
         10,
     )
     .await?;
-    app_rpc_result(&v).map(|_| ())
+    app_rpc_result(&v).map(|result| result.clone())
 }
 
 /// §4 GUI path: read the watcher pane's terminal text. Swift already base64-
