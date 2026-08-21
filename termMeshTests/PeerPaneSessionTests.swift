@@ -2052,6 +2052,25 @@ final class PeerShellSweepTests: XCTestCase {
     }
 
     @MainActor
+    func test_force_borrowed_termination_still_requires_roster_confirmation() async throws {
+        var closeSent = false
+        var confirmationRead = false
+        do {
+            try await TeamOrchestrator.closePeerShellConfirmed(
+                surfaceID: Data(repeating: 0x44, count: 16),
+                force: true,
+                terminate: { .notFound },
+                closePane: { closeSent = true },
+                confirmRemoved: { confirmationRead = true; return false }
+            )
+            XCTFail("borrowed termination must not count before roster confirmation")
+        } catch {
+            XCTAssertTrue(closeSent)
+            XCTAssertTrue(confirmationRead)
+        }
+    }
+
+    @MainActor
     func test_silent_close_noop_is_not_counted_as_cleanup_success() async throws {
         do {
             _ = try await TeamOrchestrator.sweepClose(

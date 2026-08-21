@@ -1224,6 +1224,30 @@ public actor PeerSession {
         return response.result
     }
 
+    /// Submit explicit termination over an attached session whose inbound
+    /// pump already owns reads. The matching response is consumed as other;
+    /// callers must confirm removal from an authoritative roster before
+    /// reporting success.
+    public func requestTerminateSurface(
+        requestID suppliedRequestID: Data? = nil,
+        surfaceID: Data
+    ) async throws {
+        try requireHostCapability(PeerCapability.surfaceTerminateV1)
+        let requestID = suppliedRequestID ?? Self.makeEnsureRequestID()
+        guard requestID.count == 16 else {
+            throw PeerSessionError.invalidEnsureRequest("request_id must be 16 bytes")
+        }
+        guard surfaceID.count == 16 else {
+            throw PeerSessionError.invalidEnsureRequest("surface_id must be 16 bytes")
+        }
+        try await sendEnvelope { env in
+            var request = Termmesh_Peer_V1_TerminateSurfaceRequest()
+            request.requestID = requestID
+            request.surfaceID = surfaceID
+            env.terminateSurfaceRequest = request
+        }
+    }
+
     public func attachSurface(
         id: Data,
         mode: Termmesh_Peer_V1_AttachMode = .coWrite,

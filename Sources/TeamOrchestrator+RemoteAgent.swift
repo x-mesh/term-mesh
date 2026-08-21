@@ -1928,15 +1928,34 @@ extension TeamOrchestrator {
         }
         func terminateSurface(_ paneID: Data) async throws
             -> Termmesh_Peer_V1_TerminateSurfaceResult {
-            let connection = try await PeerRelaySession.connect(hostSockPath: host.activeSockPath)
-            do {
-                let result = try await connection.session.terminateSurface(surfaceID: paneID)
-                await connection.cancel()
-                return result
-            } catch {
-                await connection.cancel()
-                throw error
+            // Direct-response RPCs cannot share a relay session whose inbound
+            // pump is active. Keep one dedicated connection for the whole
+            // sweep instead of consuming a new host permit for every target.
+            if opened == nil {
+                guard !dialFailed else {
+                    throw RemoteAgentError.hostNotConnected(host.displayName)
+                }
+                do {
+                    opened = try await PeerRelaySession.connect(
+                        hostSockPath: host.activeSockPath
+                    )
+                } catch {
+                    dialFailed = true
+                    // A saturated host rejects new peer connections. Submit
+                    // termination over an already-admitted relay instead; the
+                    // fallback path below confirms removal from the live
+                    // roster before it can count as success.
+                    if let borrowed,
+                       try await borrowed.requestTerminateSurface(paneID) {
+                        return .notFound
+                    }
+                    throw error
+                }
             }
+            guard let session = opened?.session else {
+                throw RemoteAgentError.hostNotConnected(host.displayName)
+            }
+            return try await session.terminateSurface(surfaceID: paneID)
         }
         return try await Self.sweepClose(targets: targets, send: { surfaceID in
             try await Self.closePeerShellConfirmed(
@@ -1945,14 +1964,40 @@ extension TeamOrchestrator {
                 terminate: { try await terminateSurface(surfaceID) },
                 closePane: { try await sendClosePane(surfaceID) },
                 confirmRemoved: {
-                    try await self.waitForRemoteRemoval(
-                        hostSockPath: host.activeSockPath, surfaceID: surfaceID
+                    if RemoteHostStore.shared.hosts[host.id] != nil {
+                        return try await self.waitForStoredPeerShellRemoval(
+                            hostID: host.id, surfaceID: surfaceID
+                        )
+                    }
+                    return try await self.waitForRemoteRemoval(
+                        hostSockPath: host.activeSockPath,
+                        surfaceID: surfaceID
                     )
                 }
             )
         }) { surfaceID in
             ManagedPeerSurfaceStore.shared.forget(hostKey: host.id, surfaceID: surfaceID)
         }
+    }
+
+    @MainActor
+    private func waitForStoredPeerShellRemoval(
+        hostID: String,
+        surfaceID: Data
+    ) async throws -> Bool {
+        for attempt in 0..<15 {
+            guard let current = RemoteHostStore.shared.hosts[hostID] else {
+                return false
+            }
+            let stillExists = current.workspaces
+                .flatMap(\.panes)
+                .contains { $0.id == surfaceID }
+            if !stillExists { return true }
+            if attempt < 14 {
+                try await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+        return false
     }
 
     /// Close one cleanup target only after the host has authoritatively removed

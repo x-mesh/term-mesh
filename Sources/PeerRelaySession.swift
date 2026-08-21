@@ -1640,6 +1640,16 @@ final class PeerRelaySession {
         return true
     }
 
+    /// Submit authoritative termination over this already-admitted relay
+    /// connection. The relay pump consumes the response; cleanup confirms the
+    /// result through the host roster before counting success.
+    @discardableResult
+    func requestTerminateSurface(_ surfaceID: Data) async throws -> Bool {
+        guard let session else { return false }
+        try await session.requestTerminateSurface(surfaceID: surfaceID)
+        return true
+    }
+
     /// Send bytes straight to this attached remote PTY.
     ///
     /// Bootstrap commands must not depend on Ghostty synthesizing Return:

@@ -27,6 +27,39 @@ import XCTest
 ///    stable across edits to its sshTarget/port/identityFile/socket.
 @MainActor
 final class PeerHostCLIBinDirsReadinessTests: XCTestCase {
+    func testCurrentHostSnapshotPrefersLatestStoreValue() {
+        var captured = host(hostCLIBinDirs: ["/old"])
+        captured.workspaces = []
+        var current = captured
+        current.workspaces = [WorkspaceSummary(
+            id: Data([0x01]),
+            title: "current",
+            hostSockPath: "/tmp/current.sock",
+            windowID: Data(),
+            windowTitle: "",
+            isDefault: true,
+            paneCount: 0,
+            surfaceCount: 0,
+            busyCount: 0,
+            panes: []
+        )]
+
+        let resolved = RemoteHostStore.currentHostSnapshot(
+            for: captured,
+            in: [captured.id: current]
+        )
+
+        XCTAssertEqual(resolved.workspaces.map(\.title), ["current"])
+    }
+
+    func testCurrentHostSnapshotFallsBackWhenEntryWasRemoved() {
+        let captured = host(hostCLIBinDirs: ["/old"])
+        XCTAssertEqual(
+            RemoteHostStore.currentHostSnapshot(for: captured, in: [:]),
+            captured
+        )
+    }
+
 
     // MARK: - Helpers
 

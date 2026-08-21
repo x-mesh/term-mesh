@@ -3057,7 +3057,10 @@ struct RemoteHostGroupView: View, Equatable {
         shellCleanupLoading = true
         shellCleanupError = nil
         do {
-            let items = try await TeamOrchestrator.shared.inspectPeerShells(host: host)
+            let currentHost = RemoteHostStore.currentHostSnapshot(
+                for: host, in: store.hosts
+            )
+            let items = try await TeamOrchestrator.shared.inspectPeerShells(host: currentHost)
             shellCleanupItems = items
             shellCleanupSelection = Set(items.compactMap { item in
                 guard !item.isBusy else { return nil }
@@ -3079,8 +3082,11 @@ struct RemoteHostGroupView: View, Equatable {
         shellCleanupLoading = true
         shellCleanupError = nil
         do {
+            let currentHost = RemoteHostStore.currentHostSnapshot(
+                for: host, in: store.hosts
+            )
             _ = try await TeamOrchestrator.shared.closePeerShells(
-                host: host,
+                host: currentHost,
                 surfaceIDs: shellCleanupSelection,
                 force: force
             )
@@ -3710,8 +3716,11 @@ struct RemoteWorkspaceRowView: View {
         shellCleanupLoading = true
         shellCleanupError = nil
         do {
+            let currentHost = RemoteHostStore.currentHostSnapshot(
+                for: host, in: store.hosts
+            )
             let items = try await TeamOrchestrator.shared.inspectPeerShells(
-                host: host,
+                host: currentHost,
                 workspaceID: workspace.id
             )
             shellCleanupItems = items
@@ -3735,8 +3744,11 @@ struct RemoteWorkspaceRowView: View {
         shellCleanupLoading = true
         shellCleanupError = nil
         do {
+            let currentHost = RemoteHostStore.currentHostSnapshot(
+                for: host, in: store.hosts
+            )
             _ = try await TeamOrchestrator.shared.closePeerShells(
-                host: host,
+                host: currentHost,
                 surfaceIDs: shellCleanupSelection,
                 force: force
             )

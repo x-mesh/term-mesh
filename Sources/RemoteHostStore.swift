@@ -851,6 +851,16 @@ final class RemoteHostStore: ObservableObject {
         }
     }
 
+    /// Resolve a view-captured host value against the store's latest roster.
+    /// HostEntry is a value snapshot; async cleanup must not keep reading the
+    /// workspace list that was current when its sheet first opened.
+    nonisolated static func currentHostSnapshot(
+        for captured: HostEntry,
+        in hosts: [String: HostEntry]
+    ) -> HostEntry {
+        hosts[captured.id] ?? captured
+    }
+
     private var observer: NSObjectProtocol?
     private var fetchTasks: [String: Task<Void, Never>] = [:]
     /// A Mac GUI may answer before its sibling daemon has bound the advertised
