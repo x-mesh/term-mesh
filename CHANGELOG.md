@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.202.0] - 2026-08-21
+
+**원격 Project에서 끝난 agent pane과 보호 중인 pane을 정확히 정리할 수 있다.**
+
+### Fixed
+
+- **끝난 remote agent가 기존 viewer에만 계속 보이던 문제** — daemon이 agent surface 종료를 확인하면 정확한 instance와 surface가 일치할 때만 owner roster에서 제거하고, 남은 Project 구성을 다시 배포한다. 새로 연결한 Mac에는 leader만 보이는데 기존 Mac에는 종료된 agent pane이 남던 불일치가 사라진다. 복구가 필요할 수 있는 checkout은 삭제하지 않는다. ([#343](https://github.com/x-mesh/term-mesh/pull/343)) — thanks @JINWOO-J!
+
+- **Clean Up Panes에서 사용 중이거나 명령을 실행 중인 pane을 정리할 수 없던 문제** — 기본 보호는 유지하면서 명시적인 Force 옵션을 추가했다. Force로 원격 surface를 종료할 때 연결된 local pane도 함께 닫아 더 이상 출력이 오지 않는 pane이 남지 않는다. ([#344](https://github.com/x-mesh/term-mesh/pull/344), [#317](https://github.com/x-mesh/term-mesh/issues/317)) — thanks @JINWOO-J!
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.201.0] - 2026-08-21
 
 **peer 연결 신뢰를 유지하고, 원격 Project의 pane 배치를 앱 재시작 뒤에도 그대로 복원한다.**
