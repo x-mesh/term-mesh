@@ -1,0 +1,6 @@
+worktree:
+  init:
+    link:
+      - GhosttyKit.xcframework
+    run:
+      - git submodule update --init --recursive
