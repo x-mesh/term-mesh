@@ -564,6 +564,9 @@ struct ChildLifecycle {
     /// Captured at spawn. The group can outlive its leader, so resolving it
     /// from `pid` after waitpid is exactly too late for orphan cleanup.
     process_group: libc::pid_t,
+    /// Linux `/proc/<pid>/stat` starttime captured at spawn. PID plus this
+    /// marker distinguishes the same live process from a recycled number.
+    process_start_time: Option<u64>,
     state: ChildState,
     exit: Option<SurfaceExitInfo>,
 }
@@ -605,6 +608,25 @@ fn process_group_exists(process_group: libc::pid_t) -> bool {
     process_group > 1
         && (unsafe { libc::killpg(process_group, 0) } == 0
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: libc::pid_t) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = stat.rsplit_once(')')?.1.trim();
+    // Fields after `comm` begin with field 3 (`state`); starttime is field 22.
+    after_name.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_time(_pid: libc::pid_t) -> Option<u64> {
+    None
+}
+
+fn same_process_is_live(child: &ChildLifecycle) -> bool {
+    child.process_start_time.is_some()
+        && process_start_time(child.pid) == child.process_start_time
+        && unsafe { libc::kill(child.pid, 0) } == 0
 }
 
 /// Reap descendants adopted by term-meshd after the tracked shell exits.
@@ -946,6 +968,7 @@ impl PtySurface {
             child: Mutex::new(ChildLifecycle {
                 pid: child.pid,
                 process_group: child.pid,
+                process_start_time: process_start_time(child.pid),
                 state: ChildState::Running,
                 exit: None,
             }),
@@ -973,7 +996,7 @@ impl PtySurface {
                     Err(e) => {
                         tracing::error!("AsyncFd registration failed: {e}");
                         reader_surface.hangup();
-                        reader_surface.mark_dead();
+                        reader_surface.mark_dead("pty_async_fd_registration_failed");
                         return;
                     }
                 };
@@ -1103,7 +1126,7 @@ impl PtySurface {
             let reap_surface = reader_surface.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 reap_surface.finish_after_eof("pty_eof");
-                reap_surface.mark_dead();
+                reap_surface.mark_dead("pty_eof");
             })
             .await;
         });
@@ -1243,6 +1266,7 @@ impl PtySurface {
             child: Mutex::new(ChildLifecycle {
                 pid,
                 process_group: pid,
+                process_start_time: process_start_time(pid),
                 state: ChildState::Running,
                 exit: None,
             }),
@@ -1280,7 +1304,7 @@ impl PtySurface {
                         "agent stdout pipe registration failed"
                     );
                     reader_surface.shutdown_forcibly();
-                    reader_surface.mark_dead();
+                    reader_surface.mark_dead("stdout_pipe_registration_failed");
                     return;
                 }
             };
@@ -1368,7 +1392,7 @@ impl PtySurface {
             let reap_surface = reader_surface.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 reap_surface.finish_after_eof(stream_end);
-                reap_surface.mark_dead();
+                reap_surface.mark_dead(stream_end);
             })
             .await;
         });
@@ -1636,12 +1660,12 @@ impl PtySurface {
 
     fn child_has_exited(&self) -> bool {
         let Ok(mut child) = self.child.lock() else {
-            self.mark_dead();
+            self.mark_dead("child_mutex_poisoned");
             return true;
         };
         let exited = Self::observe_exit_locked(&mut child, &self.reap_owners);
         if exited {
-            self.mark_dead();
+            self.mark_dead("child_exit_observed");
         }
         drop(child);
         exited
@@ -1682,6 +1706,15 @@ impl PtySurface {
                 return true;
             }
             if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                if same_process_is_live(child) {
+                    tracing::warn!(
+                        owner_pid = child.pid,
+                        process_group = child.process_group,
+                        process_start_time = ?child.process_start_time,
+                        "waitpid returned ECHILD for the same live surface process; preserving liveness"
+                    );
+                    return false;
+                }
                 child.exit = Some(SurfaceExitInfo {
                     reason: "unknown",
                     ..Default::default()
@@ -1707,8 +1740,19 @@ impl PtySurface {
         !self.dead.load(Ordering::Acquire) && !self.child_has_exited()
     }
 
-    fn mark_dead(&self) {
+    fn mark_dead(&self, reason: &'static str) {
         if !self.dead.swap(true, Ordering::AcqRel) {
+            let child = self.child.lock().ok();
+            tracing::warn!(
+                surface_id = %hex_id(&self.surface_id),
+                surface_type = self.kind().as_wire_str(),
+                reason,
+                owner_pid = child.as_ref().map(|value| value.pid).unwrap_or(-1),
+                process_group = child.as_ref().map(|value| value.process_group).unwrap_or(-1),
+                child_state = ?child.as_ref().map(|value| value.state),
+                exit = ?child.as_ref().and_then(|value| value.exit.clone()),
+                "surface marked dead"
+            );
             self.dead_notify.notify_waiters();
         }
     }
@@ -4794,6 +4838,35 @@ mod tests {
             "terminal receipt must retain a bounded diagnostic tail"
         );
         manager.remove(&outcome.surface_id);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn echild_preserves_the_same_live_process_identity() {
+        let pid = std::process::id() as libc::pid_t;
+        let child = ChildLifecycle {
+            pid,
+            process_group: unsafe { libc::getpgid(pid) },
+            process_start_time: process_start_time(pid),
+            state: ChildState::Running,
+            exit: None,
+        };
+        assert!(child.process_start_time.is_some());
+        assert!(same_process_is_live(&child));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn echild_rejects_a_recycled_process_identity() {
+        let pid = std::process::id() as libc::pid_t;
+        let child = ChildLifecycle {
+            pid,
+            process_group: unsafe { libc::getpgid(pid) },
+            process_start_time: process_start_time(pid).map(|value| value + 1),
+            state: ChildState::Running,
+            exit: None,
+        };
+        assert!(!same_process_is_live(&child));
     }
 
     #[tokio::test]
