@@ -18,7 +18,8 @@
 TAG           ?= term-mesh
 DERIVED_DATA  := /tmp/term-mesh-$(TAG)
 BUILD_DIR     := $(DERIVED_DATA)/Build/Products/Debug
-PROD_DIR      := /tmp/term-mesh-prod/Build/Products/Release
+PROD_DERIVED_DATA ?= /tmp/term-mesh-prod
+PROD_DIR      := $(PROD_DERIVED_DATA)/Build/Products/Release
 SRC_APP       := $(BUILD_DIR)/term-mesh DEV $(TAG).app
 BASE_APP      := $(BUILD_DIR)/term-mesh DEV.app
 PROD_APP      := $(PROD_DIR)/term-mesh.app
@@ -37,7 +38,7 @@ XCFW          := GhosttyKit.xcframework
 # that each one was actually built before any packaging step runs.
 DAEMON_BINS   := term-meshd term-mesh-run tm-agent term-mesh-peer-relay tm-agent-bridge
 
-.PHONY: init doctor sync setup build prod deploy deploy-prod dmg run stop clean daemon test install-commands sentry-upload-dsym verify-daemon-binaries
+.PHONY: init doctor sync setup build prod deploy deploy-prod dmg dmg-package run stop clean daemon test install-commands sentry-upload-dsym verify-daemon-binaries
 
 # One-shot onboarding: sync the ghostty submodule and build/cache GhosttyKit
 # only when out of date. Safe to run repeatedly — no-op when everything matches.
@@ -213,7 +214,7 @@ prod:
 		-scheme term-mesh \
 		-configuration Release \
 		-destination 'platform=macOS' \
-		-derivedDataPath /tmp/term-mesh-prod \
+		-derivedDataPath "$(PROD_DERIVED_DATA)" \
 		ONLY_ACTIVE_ARCH=YES \
 		build 2>&1 | tee /tmp/term-mesh-xcodebuild-prod.log | grep -E '(warning:|error:|BUILD|Compiling)'; \
 		RESULT=$${PIPESTATUS[0]}; \
@@ -230,7 +231,11 @@ prod:
 			tail -20 /tmp/term-mesh-cargo.log; \
 			exit 1; \
 		fi
-	@$(MAKE) sentry-upload-dsym DSYM_DIR="$(PROD_DIR)"
+	@if [ "$(SENTRY_UPLOAD_DSYM)" = "0" ]; then \
+		echo "==> dSYM upload deferred to strict release verification"; \
+	else \
+		$(MAKE) sentry-upload-dsym DSYM_DIR="$(PROD_DIR)"; \
+	fi
 	@echo ""
 	@echo "================================================"
 	@echo "  Release build complete!"
@@ -280,6 +285,7 @@ deploy-prod: daemon prod
 # sentry-cli is missing, auth is absent, or DSYM_DIR contains no .dSYM bundles.
 # DSYM_DIR defaults to the Release build dir; override when uploading elsewhere.
 DSYM_DIR ?= $(PROD_DIR)
+SENTRY_UPLOAD_DSYM ?= 1
 sentry-upload-dsym:
 	@if ! command -v sentry-cli >/dev/null 2>&1; then \
 		echo "==> sentry-cli not installed; skipping dSYM upload"; \
@@ -312,6 +318,10 @@ verify-daemon-binaries:
 	done
 
 dmg: prod
+	@$(MAKE) dmg-package
+	@$(MAKE) install-commands
+
+dmg-package:
 	@$(MAKE) verify-daemon-binaries
 	@echo "==> Creating DMG (version $(APP_VERSION))..."
 	@# Ensure no stale mount from a previous run blocks create-dmg's detach step
@@ -369,18 +379,16 @@ dmg: prod
 	@echo "  Install: open $(DMG_NAME), drag term-mesh to Applications"
 	@echo "  Unsigned: run 'xattr -cr /Applications/term-mesh.app' after install"
 	@echo "================================================"
-	@$(MAKE) install-commands
-
 install-commands:
 	@echo "==> Installing Claude commands to ~/.claude/commands/..."
 	@mkdir -p "$(HOME)/.claude/commands"
-	@for cmd in tm-op team team-up tm-bench; do \
+	@for cmd in tm-op team team-up tm-bench release; do \
 		SRC="$(PROJECT_DIR)/.claude/commands/$$cmd.md"; \
 		if [ -f "$$SRC" ]; then \
 			cp "$$SRC" "$(HOME)/.claude/commands/$$cmd.md"; \
 		fi; \
 	done
-	@echo "==> Claude commands installed (tm-op, team, team-up, tm-bench)"
+	@echo "==> Claude commands installed (tm-op, team, team-up, tm-bench, release)"
 
 clean:
 	@echo "==> Cleaning build artifacts..."
