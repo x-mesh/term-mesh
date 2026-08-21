@@ -3084,8 +3084,10 @@ struct RemoteHostGroupView: View, Equatable {
                 surfaceIDs: shellCleanupSelection,
                 force: force
             )
-            shellCleanupItems.removeAll { shellCleanupSelection.contains($0.id) }
-            shellCleanupSelection = []
+            // ClosePane is asynchronous on the host and protected selections
+            // may be skipped. Re-read the authoritative roster instead of
+            // making the sheet claim that every selected row disappeared.
+            await loadShellCleanup()
         } catch {
             // Part of the sweep may have landed before the failure, so the list
             // on screen no longer describes the host. Re-read it, then restore
@@ -3738,8 +3740,7 @@ struct RemoteWorkspaceRowView: View {
                 surfaceIDs: shellCleanupSelection,
                 force: force
             )
-            shellCleanupItems.removeAll { shellCleanupSelection.contains($0.id) }
-            shellCleanupSelection = []
+            await loadShellCleanup()
         } catch {
             let message = String(describing: error)
             await loadShellCleanup()

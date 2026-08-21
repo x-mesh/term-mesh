@@ -1674,7 +1674,11 @@ impl PeerHost {
         let workspace_id = self.workspace_id_for_surface(surface_id);
         // Durable PTY/logical-state deletion commits first. On failure the
         // manager restores the live process, so layout/index remain untouched.
-        let runtime_removed = self.pty.terminate_ensured(surface_id)?;
+        // TerminateSurface is the explicit destructive verb, not the
+        // interactive ClosePane verb. It therefore applies to ordinary PTY
+        // surfaces as well as ensured runners and may leave a named workspace
+        // empty (the layout helper below deliberately allows that).
+        let runtime_removed = self.pty.terminate(surface_id)?;
         let layout_removed = workspace_id.as_ref().is_some_and(|workspace_id| {
             self.with_store(workspace_id, |store| {
                 store.remove_surface_allow_empty(surface_id)
@@ -3937,6 +3941,24 @@ mod tests {
             &crate::peer::persist::ensured_surfaces_path(&workspace_path)
         )
         .is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_termination_removes_an_unensured_last_pane() {
+        let manager = Arc::new(PtyManager::new());
+        let surface = PtySurface::spawn(sid("plain"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(surface);
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        let workspace_id = host.default_id();
+
+        assert!(host.terminate_surface(&sid("plain")).unwrap());
+        assert!(manager.list().is_empty());
+        assert!(host
+            .with_store(&workspace_id, |store| store.surface_ids())
+            .unwrap()
+            .is_empty());
+        assert!(!host.terminate_surface(&sid("plain")).unwrap());
     }
 
     /// An ensured agent spec: `/bin/cat` stands in for the bridge — pipes

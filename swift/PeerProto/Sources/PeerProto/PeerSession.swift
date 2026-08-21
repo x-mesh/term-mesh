@@ -1177,10 +1177,11 @@ public actor PeerSession {
         }
     }
 
-    /// Remove one ensured surface from the host's registry, durable ensured
-    /// state, and workspace layout.
+    /// Remove one surface from the host's registry, durable ensured state (if
+    /// any), and workspace layout. Unlike interactive `requestClosePane`, this
+    /// explicit destructive operation may remove a workspace's final pane.
     ///
-    /// This is the only way to stop an *agent* surface: it is deliberately
+    /// This is also the only way to stop an *agent* surface: it is deliberately
     /// never placed in the workspace tree, so `requestClosePane` finds
     /// nothing and silently succeeds. NOT_FOUND is a success — the proto
     /// defines it as the idempotent outcome, which is what a cleanup path

@@ -298,6 +298,10 @@ final class PeerServerTests: XCTestCase {
         // publishes terminal panes only and cannot host an agent surface,
         // so PeerServer filters the string out of its own Hello.
         XCTAssertFalse(info.hasHostCapability(PeerCapability.surfaceAgentV1))
+        // The GUI host also has no TerminateSurface handler. Advertising the
+        // daemon-only direct-response RPC would make cleanup wait for a reply
+        // that can never arrive instead of using ClosePane + roster checking.
+        XCTAssertFalse(info.hasHostCapability(PeerCapability.surfaceTerminateV1))
         XCTAssertFalse(info.hasHostCapability("totally.unknown.v1"))
 
         let activeSessions = await server.activeSessions

@@ -3267,6 +3267,14 @@ impl PtyManager {
         self.remove_inner(surface_id, true)
     }
 
+    /// Explicit destructive termination for any registered surface. Cleanup
+    /// uses this for ordinary PTY panes too: unlike interactive ClosePane, an
+    /// explicit terminate is allowed to remove the final pane in a workspace.
+    /// Ensured state is still removed transactionally when it exists.
+    pub fn terminate(&self, surface_id: &[u8]) -> Result<bool, EnsureError> {
+        self.remove_inner(surface_id, false)
+    }
+
     fn remove_inner(&self, surface_id: &[u8], require_ensured: bool) -> Result<bool, EnsureError> {
         if !self.begin_close(surface_id) {
             return Err(EnsureError::Internal("closing registry poisoned"));

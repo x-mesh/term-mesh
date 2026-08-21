@@ -283,7 +283,7 @@ public nonisolated enum Termmesh_Peer_V1_TerminateSurfaceResult: SwiftProtobuf.E
   case unspecified // = 0
   case terminated // = 1
 
-  /// Idempotent success: the exact surface does not exist or is not ensured.
+  /// Idempotent success: the exact surface does not exist.
   /// A fresh-id retry after a successful terminate whose response was dropped
   /// therefore returns NOT_FOUND.
   case notFound // = 2
@@ -1304,9 +1304,9 @@ public nonisolated struct Termmesh_Peer_V1_EnsureSurfaceResponse: Sendable {
   fileprivate var _error: Termmesh_Peer_V1_EnsureSurfaceError? = nil
 }
 
-/// TerminateSurface removes exactly one ensured surface from the live PTY
-/// registry, durable ensured-state, and workspace layout. It never selects a
-/// surface by name or by current attachment.
+/// TerminateSurface removes exactly one surface from the live PTY registry,
+/// durable ensured-state (when present), and workspace layout. It never selects
+/// a surface by name or by current attachment.
 public nonisolated struct Termmesh_Peer_V1_TerminateSurfaceRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -1318,7 +1318,9 @@ public nonisolated struct Termmesh_Peer_V1_TerminateSurfaceRequest: Sendable {
   /// DUPLICATE_REQUEST_ID and is never a response-replay mechanism.
   public var requestID: Data = Data()
 
-  /// Exact 16-byte SurfaceInfo.surface_id returned by EnsureSurfaceResponse.
+  /// Exact 16-byte SurfaceInfo.surface_id. Explicit termination applies to
+  /// ordinary PTY panes as well as ensured runners and, unlike ClosePane, may
+  /// remove the final pane from a workspace.
   public var surfaceID: Data = Data()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
