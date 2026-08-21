@@ -4680,6 +4680,10 @@ final class TeamOrchestrator: ObservableObject {
         let requestReplayed: Bool
         /// Pre-formatted instruction text for retry (avoids re-calling private formatter).
         let instruction: String
+        /// False when the assignee is natively held: its stdin write already
+        /// was the whole turn, so the CLI may skip the Return follow-up.
+        /// Decided per creation site on the member the delegate chose.
+        let returnRequired: Bool
     }
 
     /// A task that is keeping an agent out of the delegate pool.
@@ -4846,7 +4850,8 @@ final class TeamOrchestrator: ObservableObject {
                         task: existing,
                         textDelivered: true,
                         requestReplayed: true,
-                        instruction: instruction
+                        instruction: instruction,
+                        returnRequired: memberNeedsReturn(replayTarget)
                     )
                 )
             }
@@ -4937,7 +4942,8 @@ final class TeamOrchestrator: ObservableObject {
                     task: task,
                     textDelivered: true,
                     requestReplayed: true,
-                    instruction: instruction
+                    instruction: instruction,
+                    returnRequired: memberNeedsReturn(target)
                 )
             )
         }
@@ -4980,7 +4986,8 @@ final class TeamOrchestrator: ObservableObject {
                     task: task,
                     textDelivered: delivered,
                     requestReplayed: false,
-                    instruction: instruction
+                    instruction: instruction,
+                    returnRequired: memberNeedsReturn(target)
                 )
             )
         }
@@ -5002,7 +5009,8 @@ final class TeamOrchestrator: ObservableObject {
                 task: task,
                 textDelivered: delivered,
                 requestReplayed: false,
-                instruction: instruction
+                instruction: instruction,
+                returnRequired: memberNeedsReturn(target)
             )
         )
     }
@@ -5430,10 +5438,12 @@ final class TeamOrchestrator: ObservableObject {
     /// natively has no composer: the write to its stdin *is* the turn, complete
     /// the moment it lands.
     ///
-    /// Asked when the Return arrives rather than announced with the text: the
-    /// CLI's first attempt is already a round trip, so answering it there is
-    /// one mechanism instead of two, and it covers every caller — including the
-    /// ones that never learn about a new response field.
+    /// Answered in two places on purpose. The send/delegate acknowledgement
+    /// announces it as `return_required`, so a current CLI can skip the Return
+    /// round trip and its pre-delay entirely; the send_key handler keeps
+    /// answering it authoritatively (`no_keyboard`) for every caller that
+    /// never learned the field. The hint is an optimization — the Return-time
+    /// answer remains the contract of record.
     func agentNeedsReturn(teamName: String, agentName: String, agentInstanceId: String? = nil) -> Bool {
         guard let team = teams[teamName],
               let agent = agentInstanceId.flatMap({
@@ -5448,6 +5458,13 @@ final class TeamOrchestrator: ObservableObject {
     /// Whether this specific pane holds a native agent.
     func agentPanelIsNative(workspaceId: UUID, panelId: UUID) -> Bool {
         nativeAgentPanel(workspaceId: workspaceId, panelId: panelId) != nil
+    }
+
+    /// `agentNeedsReturn`, for a member the caller has already resolved —
+    /// delegate answers it per creation site, on the member it chose.
+    func memberNeedsReturn(_ member: AgentMember) -> Bool {
+        guard let panelId = member.panelId else { return true }
+        return !agentPanelIsNative(workspaceId: member.workspaceId, panelId: panelId)
     }
 
     /// Whether every pool candidate for this agent name is natively held.

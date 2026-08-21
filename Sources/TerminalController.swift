@@ -3233,6 +3233,7 @@ class TerminalController {
         // 12s last-resort timeout mirrors asyncTeamDelegate: it must exceed the paste
         // watchdog (8s) + max retry backoff (~2s) so it doesn't trip a still-live paste.
         var dispatched = false
+        var deliveredNatively = false
         let textDelivered: Bool = await withCheckedContinuation { cont in
             var resumed = false
             let resume: (Bool) -> Void = { ok in
@@ -3244,6 +3245,14 @@ class TerminalController {
             Task { @MainActor in
                 let tabManager = TeamOrchestrator.shared.resolveTabManager(teamName: teamName) ?? self.tabManager
                 guard let tabManager else { resume(false); return }
+                // Decide the transport in the same main-actor turn as the
+                // delivery, atomically with sendToAgent's native fork. The
+                // stagger-time verdict must not be reused: an agent restarting
+                // across that gap could get a terminal paste answered with
+                // return_required=false, losing the turn.
+                deliveredNatively = !TeamOrchestrator.shared.agentNeedsReturn(
+                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+                )
                 // Keep only the durable instance across the stagger/queue wait.
                 // sendToAgent resolves its current panel, transport and host here,
                 // immediately before delivery, so a restarted sibling is never used.
@@ -3261,7 +3270,18 @@ class TerminalController {
             }
         }
         if dispatched && textDelivered {
-            sendGate.markAwaitingReturn()
+            if deliveredNatively {
+                // The stdin write was the whole turn: no team.send_key follows
+                // to release this gate (the acknowledgement below says so), so
+                // release it here instead of leaving it to the 30s watchdog. A
+                // legacy caller that presses Return anyway is answered by the
+                // no_keyboard branch before the stale-sequence check.
+                await MainActor.run {
+                    TerminalController.discardSendGate(sendGate, agentKey: agentKey)
+                }
+            } else {
+                sendGate.markAwaitingReturn()
+            }
         } else {
             // No team.send_key follows a failed paste acknowledgement, so remove
             // this send's gate instead of leaving the FIFO queue one entry behind.
@@ -3276,7 +3296,8 @@ class TerminalController {
             teamName: teamName,
             agentName: agentName,
             agentInstanceId: agentInstanceId,
-            sendSequenceID: sendSequenceAware ? sendGate.sequenceID : nil
+            sendSequenceID: sendSequenceAware ? sendGate.sequenceID : nil,
+            returnRequired: !deliveredNatively
         )
     }
 
@@ -3290,7 +3311,8 @@ class TerminalController {
         teamName: String,
         agentName: String,
         agentInstanceId: String,
-        sendSequenceID: String? = nil
+        sendSequenceID: String? = nil,
+        returnRequired: Bool? = nil
     ) -> String {
         guard dispatched else {
             return v2Error(id: id, code: "not_found", message: "Agent or team not found")
@@ -3306,6 +3328,13 @@ class TerminalController {
         ]
         if textDelivered, let sendSequenceID {
             delivery["send_sequence_id"] = sendSequenceID
+        }
+        // false announces a natively-held target whose turn was submitted on
+        // the text write: the CLI may skip its Return follow-up. The send_key
+        // no_keyboard answer remains authoritative for callers that never
+        // learn this field.
+        if let returnRequired {
+            delivery["return_required"] = returnRequired
         }
         guard textDelivered else {
             return v2Error(
@@ -4532,12 +4561,15 @@ class TerminalController {
         }
 
         // delegateToAgent sends text WITHOUT Return (withReturn: false).
-        // The Rust CLI sends Return separately via team.send_key RPC after this ack.
+        // The Rust CLI sends Return separately via team.send_key RPC after this
+        // ack — unless return_required says the assignee is native and the
+        // stdin write already was the whole turn.
         return v2Ok(id: id, result: [
             "task": store.taskDictionary(delegateResult.task),
             "sent": true,
             "text_delivered": textDelivered,
             "return_submitted": returnSubmitted,
+            "return_required": delegateResult.returnRequired,
             "request_replayed": delegateResult.requestReplayed,
             "agent_instance_id": delegateResult.task.assigneeInstanceId ?? NSNull(),
         ])
@@ -4576,20 +4608,18 @@ class TerminalController {
                 )
             }
             : nil
-        if key.lowercased() == "return", let sendSequenceID, claimedGate == nil {
-            return v2Error(
-                id: id,
-                code: "stale_send_sequence",
-                message: "Return delivery does not own an active send sequence",
-                data: ["sent": false, "send_sequence_id": sendSequenceID]
-            )
-        }
         // An agent held natively has no keyboard to press Return on, and needs
         // none: the write to its stdin was already a whole turn, submitted the
         // moment it landed. The caller is asking "is this turn in?", and the
         // answer is yes — so it is answered here rather than left to a ladder
         // that can only fail, eight times, over eleven seconds, ending in a
         // warning about a Return nothing was waiting for.
+        //
+        // Answered before the stale-sequence check on purpose: a native send
+        // releases its gate at send time (there is no Return to wait for), so
+        // a legacy caller's follow-up Return arrives with no claimable
+        // sequence. That is the expected shape of an already-submitted native
+        // turn, not a stale terminal paste.
         if key.lowercased() == "return",
            await MainActor.run(body: {
                !TeamOrchestrator.shared.agentNeedsReturn(
@@ -4603,6 +4633,14 @@ class TerminalController {
             }
             return v2Ok(id: id, result: ["sent": true, "no_keyboard": true,
                                          "team_name": teamName, "agent_name": agentName])
+        }
+        if key.lowercased() == "return", let sendSequenceID, claimedGate == nil {
+            return v2Error(
+                id: id,
+                code: "stale_send_sequence",
+                message: "Return delivery does not own an active send sequence",
+                data: ["sent": false, "send_sequence_id": sendSequenceID]
+            )
         }
 
         let result: (sent: Bool, targetMissing: Bool, reason: String) = await withCheckedContinuation { continuation in
