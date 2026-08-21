@@ -110,6 +110,21 @@ def main() -> int:
                             f"add+warmup exited {add.returncode}:\n{add.stdout}{add.stderr}"
                         )
 
+                    # Warmup leaves its report task in review_ready, and an
+                    # active task holds the delegate pool gate shut. The gate
+                    # is not what this test pins — close the board first.
+                    tasks = client._call("team.task.list", {"team_name": TEAM_NAME})
+                    entries = tasks.get("tasks") if isinstance(tasks, dict) else tasks
+                    for task in entries or []:
+                        task_id = task.get("id")
+                        status = task.get("status", "")
+                        if task_id and status not in ("completed", "cancelled"):
+                            client._call("team.task.update", {
+                                "team_name": TEAM_NAME,
+                                "task_id": task_id,
+                                "status": "completed",
+                            })
+
                     request_id = f"contract-{uuid.uuid4().hex[:16]}"
                     params = {
                         "team_name": TEAM_NAME,
