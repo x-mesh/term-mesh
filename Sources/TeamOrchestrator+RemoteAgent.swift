@@ -1031,6 +1031,7 @@ extension TeamOrchestrator {
         let workingDirectory: String
         let isBusy: Bool
         let state: State
+        var isProtected: Bool { state == .inUse || isBusy }
 
         var idLabel: String { id.prefix(4).map { String(format: "%02x", $0) }.joined() }
     }
@@ -1867,13 +1868,20 @@ extension TeamOrchestrator {
     /// guard is worse than the send: `liveTeamSockPath` is empty until some
     /// pane has leased the team tunnel, so a perfectly connected GUI host would
     /// report itself disconnected before a single shell was tried.
-    func closePeerShells(host: HostEntry, surfaceIDs: Set<Data>) async throws -> Int {
+    func closePeerShells(
+        host: HostEntry,
+        surfaceIDs: Set<Data>,
+        force: Bool = false
+    ) async throws -> Int {
         guard !host.activeSockPath.isEmpty else {
             throw RemoteAgentError.hostNotConnected(host.displayName)
         }
         let protected = claimedRemoteSurfaceIDs(host: host)
-        let targets = surfaceIDs.subtracting(protected)
+        let targets = Self.peerShellTargets(
+            selected: surfaceIDs, protected: protected, force: force
+        )
         guard !targets.isEmpty else { return 0 }
+        if force { closeLocalPeerPanes(surfaceIDs: targets) }
 
         // Prefer a connection the host has already granted. Opening one here
         // is what made this sweep unusable: the host allows a fixed number of
@@ -1921,6 +1929,47 @@ extension TeamOrchestrator {
         return try await Self.sweepClose(targets: targets, send: send) { surfaceID in
             ManagedPeerSurfaceStore.shared.forget(hostKey: host.id, surfaceID: surfaceID)
         }
+    }
+
+    /// Close local viewers before force-ending their remote surfaces. Leaving
+    /// one attached creates a zombie pane whose stream can never produce
+    /// another byte, which is less honest than the current refusal.
+    @MainActor
+    private func closeLocalPeerPanes(surfaceIDs: Set<Data>) {
+        guard let app = AppDelegate.shared else { return }
+        let workspaces = app.mainWindowContexts.values.flatMap { $0.tabManager.tabs }
+        _ = Self.closePeerSurfaceViewers(surfaceIDs: surfaceIDs, workspaces: workspaces)
+    }
+
+    nonisolated static func peerShellTargets(
+        selected: Set<Data>,
+        protected: Set<Data>,
+        force: Bool
+    ) -> Set<Data> {
+        force ? selected : selected.subtracting(protected)
+    }
+
+    @MainActor
+    @discardableResult
+    static func closePeerSurfaceViewers(
+        surfaceIDs: Set<Data>,
+        workspaces: [Workspace]
+    ) -> Int {
+        var closed = 0
+        for workspace in workspaces {
+            let panels = surfaceIDs.compactMap(workspace.panelID(forPeerSurfaceID:))
+            for panelID in panels where workspace.closePanel(panelID, force: true) {
+                closed += 1
+            }
+        }
+        return closed
+    }
+
+    nonisolated static func protectedPeerShellCount(
+        items: [PeerShellCleanupItem],
+        selection: Set<Data>
+    ) -> Int {
+        items.count { selection.contains($0.id) && $0.isProtected }
     }
 
     /// Attempt every target, count what actually closed, and report the
@@ -2566,7 +2615,7 @@ extension TeamOrchestrator {
         Task { await PeerTeamLeaderControlPlane.shared.revokeGrant(id: grantID) }
     }
 
-    private func stopRemoteAgentRouteKeepalive(
+    func stopRemoteAgentRouteKeepalive(
         agentInstanceID: String,
         revoke: Bool
     ) {
@@ -5460,7 +5509,7 @@ extension TeamOrchestrator {
     /// the panel is minted per attach and is exactly the thing that just went
     /// away, while the surface id is the peer's own durable name for the
     /// bridge.
-    private func peerOwnedAgentMember(
+    func peerOwnedAgentMember(
         panelID: UUID,
         surfaceID: Data
     ) -> (teamName: String, agent: AgentMember)? {
@@ -5777,6 +5826,25 @@ extension TeamOrchestrator {
         var updated = current
         updated.agents[index] = replacement
         return updated
+    }
+
+    /// Remove exactly the peer-owned member whose authoritative surface ended.
+    /// A stale exit callback from an older pane must not remove a replacement
+    /// that kept the same durable instance id but already owns a new surface.
+    @MainActor
+    static func teamByRetiringEndedPeerOwnedAgent(
+        current: Team,
+        agentInstanceID: String,
+        surfaceID: Data
+    ) -> (team: Team, retired: AgentMember)? {
+        guard let index = current.agents.firstIndex(where: {
+            $0.agentInstanceId == agentInstanceID
+                && $0.remoteAgentSurface
+                && $0.remoteSurfaceID == surfaceID
+        }) else { return nil }
+        var updated = current
+        let retired = updated.agents.remove(at: index)
+        return (updated, retired)
     }
 
     @MainActor

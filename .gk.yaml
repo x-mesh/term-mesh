@@ -4,3 +4,4 @@ worktree:
       - GhosttyKit.xcframework
     run:
       - git submodule update --init --recursive
+      - ./scripts/generate-build-info.sh

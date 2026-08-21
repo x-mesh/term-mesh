@@ -2351,9 +2351,10 @@ private struct PeerShellCleanupSheet: View {
     let error: String?
     @Binding var selection: Set<Data>
     let onRefresh: () -> Void
-    let onClose: () -> Void
+    let onClose: (Bool) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var showCloseConfirm = false
+    @State private var force = false
 
     private var closeableCount: Int {
         items.filter { $0.state != .inUse && !$0.isBusy }.count
@@ -2362,7 +2363,13 @@ private struct PeerShellCleanupSheet: View {
     /// Running and claimed panes are never bulk-close candidates. A person can
     /// stop the process first and refresh; the cleanup flow itself stays safe.
     private var closeableIDs: Set<Data> {
-        Set(items.filter { $0.state != .inUse && !$0.isBusy }.map(\.id))
+        force
+            ? Set(items.map(\.id))
+            : Set(items.filter { $0.state != .inUse && !$0.isBusy }.map(\.id))
+    }
+
+    private var protectedSelectedCount: Int {
+        TeamOrchestrator.protectedPeerShellCount(items: items, selection: selection)
     }
 
     private var allCloseableSelected: Bool {
@@ -2396,9 +2403,18 @@ private struct PeerShellCleanupSheet: View {
             }
             .font(.caption)
 
-            Text("Orphans and panes whose folder was deleted are selected automatically. Panes in use or running a command are always protected.")
+            Text(force
+                 ? "Force is on. In-use and busy panes may be selected; their local viewers close too."
+                 : "Orphans and panes whose folder was deleted are selected automatically. Panes in use or running a command are protected.")
                 .font(.caption)
                 .foregroundColor(.secondary)
+
+            Toggle("Force close panes that are in use or busy", isOn: $force)
+                .toggleStyle(.switch)
+                .disabled(isLoading)
+                .onChange(of: force) { enabled in
+                    if !enabled { selection.formIntersection(closeableIDs) }
+                }
 
             if let error {
                 Text(error)
@@ -2438,7 +2454,7 @@ private struct PeerShellCleanupSheet: View {
                         }
                     ))
                     .labelsHidden()
-                    .disabled(item.state == .inUse || item.isBusy)
+                    .disabled(!force && (item.state == .inUse || item.isBusy))
 
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
@@ -2490,10 +2506,14 @@ private struct PeerShellCleanupSheet: View {
             "Close \(selection.count) panes on \"\(hostName)\"?",
             isPresented: $showCloseConfirm
         ) {
-            Button("Close \(selection.count) Panes", role: .destructive, action: onClose)
+            Button("Close \(selection.count) Panes", role: .destructive) {
+                onClose(force)
+            }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("The processes inside end immediately. This cannot be undone.")
+            Text(protectedSelectedCount > 0
+                 ? "Force overrides protection for \(protectedSelectedCount) in-use or busy panes. Their local panes close too. This cannot be undone."
+                 : "The processes inside end immediately. This cannot be undone.")
         }
     }
 
@@ -3018,8 +3038,8 @@ struct RemoteHostGroupView: View, Equatable {
                 onRefresh: {
                     Task { await loadShellCleanup() }
                 },
-                onClose: {
-                    Task { await closeSelectedShells() }
+                onClose: { force in
+                    Task { await closeSelectedShells(force: force) }
                 }
             )
         }
@@ -3055,13 +3075,14 @@ struct RemoteHostGroupView: View, Equatable {
     }
 
     @MainActor
-    private func closeSelectedShells() async {
+    private func closeSelectedShells(force: Bool) async {
         shellCleanupLoading = true
         shellCleanupError = nil
         do {
             _ = try await TeamOrchestrator.shared.closePeerShells(
                 host: host,
-                surfaceIDs: shellCleanupSelection
+                surfaceIDs: shellCleanupSelection,
+                force: force
             )
             shellCleanupItems.removeAll { shellCleanupSelection.contains($0.id) }
             shellCleanupSelection = []
@@ -3675,8 +3696,8 @@ struct RemoteWorkspaceRowView: View {
                 onRefresh: {
                     Task { await loadShellCleanup() }
                 },
-                onClose: {
-                    Task { await closeSelectedShells() }
+                onClose: { force in
+                    Task { await closeSelectedShells(force: force) }
                 }
             )
         }
@@ -3708,13 +3729,14 @@ struct RemoteWorkspaceRowView: View {
     }
 
     @MainActor
-    private func closeSelectedShells() async {
+    private func closeSelectedShells(force: Bool) async {
         shellCleanupLoading = true
         shellCleanupError = nil
         do {
             _ = try await TeamOrchestrator.shared.closePeerShells(
                 host: host,
-                surfaceIDs: shellCleanupSelection
+                surfaceIDs: shellCleanupSelection,
+                force: force
             )
             shellCleanupItems.removeAll { shellCleanupSelection.contains($0.id) }
             shellCleanupSelection = []

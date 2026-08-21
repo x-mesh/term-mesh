@@ -5935,7 +5935,11 @@ final class TeamOrchestrator: ObservableObject {
     /// the paths that maintain it, but a test asserting a guard still needs a
     /// member on the roster to guard. Everything not named here is a filler
     /// value the guard under test never reads.
-    func installTeamForTests(name: String, agents: [AgentMember]) {
+    func installTeamForTests(
+        name: String,
+        agents: [AgentMember],
+        ownsRemotePresentation: Bool = false
+    ) {
         teams[name] = Team(
             id: name,
             leaderSessionId: UUID().uuidString,
@@ -5948,7 +5952,8 @@ final class TeamOrchestrator: ObservableObject {
             agents: agents,
             createdAt: Date(),
             gitRepoRoot: nil,
-            worktreeMode: "off"
+            worktreeMode: "off",
+            ownsRemotePresentation: ownsRemotePresentation
         )
     }
 
@@ -6232,6 +6237,49 @@ final class TeamOrchestrator: ObservableObject {
             "[team.restart] mode=hard ok team=\(teamName, privacy: .public) agent=\(agentName, privacy: .public) oldPanel=\(oldPid.uuidString.prefix(8), privacy: .public) newPanel=\(newPid.uuidString.prefix(8), privacy: .public) splitFrom=\(splitFrom.uuidString.prefix(8), privacy: .public) insertFirst=\(insertFirst, privacy: .public) close_ok=\(closed, privacy: .public)"
         )
         return .success((old: oldPid, new: newPid))
+    }
+
+    /// Converge the owner viewer with the daemon after a peer-owned agent
+    /// process exits. These surfaces deliberately do not respawn because a
+    /// fresh bridge would have no prior conversation. Keep the Project, retire
+    /// only the ended member, and publish the reduced manifest.
+    @MainActor
+    func retireEndedPeerOwnedAgent(
+        panelID: UUID,
+        surfaceID: Data,
+        workspace: Workspace
+    ) {
+        guard let owner = peerOwnedAgentMember(panelID: panelID, surfaceID: surfaceID)
+        else { return }
+        let teamName = owner.teamName
+        guard let current = teams[teamName], current.ownsRemotePresentation,
+              let result = Self.teamByRetiringEndedPeerOwnedAgent(
+                  current: current,
+                  agentInstanceID: owner.agent.agentInstanceId,
+                  surfaceID: surfaceID
+              )
+        else { return }
+
+        stopRemoteAgentRouteKeepalive(
+            agentInstanceID: result.retired.agentInstanceId, revoke: true
+        )
+        Self.releaseTransport(agentId: result.retired.transportId)
+        teams[teamName] = result.team
+        TeamDataStore.shared.registerTeam(
+            teamName,
+            agents: result.team.agents.map {
+                .init(name: $0.name, instanceId: $0.agentInstanceId)
+            }
+        )
+        syncTeamStateToDaemon()
+        if let panelID = result.retired.panelId {
+            workspace.closeEndedRemoteAgentPane(panelId: panelID)
+        }
+        scheduleAgentGridEqualization(workspace: workspace)
+        RemoteWorkLog.info(
+            "Retired ended peer agent \(result.retired.name) from \(teamName); "
+                + "its checkout was preserved for recovery"
+        )
     }
 
     /// Recycle an agent pane: guard on active task status, then hard-restart.

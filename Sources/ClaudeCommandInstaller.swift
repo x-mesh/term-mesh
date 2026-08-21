@@ -38,7 +38,8 @@ enum ClaudeCommandInstaller {
         "team-up.md",
         "tm-op.md",
         "tm-bench.md",
-        "watch.md"
+        "watch.md",
+        "release.md"
     ]
 
     /// term-mesh가 소유권을 주장하는 Codex prompt 파일 이름 (~/.codex/prompts/).
@@ -49,7 +50,8 @@ enum ClaudeCommandInstaller {
         "tm.md",
         "tm-op.md",
         "tm-bench.md",
-        "watch.md"
+        "watch.md",
+        "release.md"
     ]
 
     /// 번들 내 커맨드 디렉토리 (claude-commands/)
