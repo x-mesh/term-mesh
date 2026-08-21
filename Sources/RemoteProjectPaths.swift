@@ -264,6 +264,9 @@ final class ManagedPeerSurfaceStore {
 /// survive viewer restarts; Bonsplit pane/tab UUIDs do not, so only surface
 /// IDs may cross this persistence boundary.
 struct ProjectPresentationLayoutSnapshot: Codable, Equatable, Sendable {
+    static let minimumDividerPosition = 0.1
+    static let maximumDividerPosition = 0.9
+
     enum Orientation: String, Codable, Equatable, Sendable {
         case horizontal
         case vertical
@@ -329,7 +332,10 @@ struct ProjectPresentationLayoutSnapshot: Codable, Equatable, Sendable {
                 return true
             case .split(_, let dividerPosition, let first, let second):
                 return dividerPosition.isFinite
-                    && (0...1).contains(dividerPosition)
+                    && (
+                        ProjectPresentationLayoutSnapshot.minimumDividerPosition
+                            ... ProjectPresentationLayoutSnapshot.maximumDividerPosition
+                    ).contains(dividerPosition)
                     && first.hasValidGeometry
                     && second.hasValidGeometry
             }

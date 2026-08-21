@@ -348,6 +348,27 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertFalse(badGeometry.isValid)
     }
 
+    func testProjectLayoutDividerValidationMatchesRestoreRange() {
+        let first = Data([0x01])
+        let second = Data([0x02])
+        let snapshot: (Double) -> ProjectPresentationLayoutSnapshot = { dividerPosition in
+            ProjectPresentationLayoutSnapshot(
+                projectID: "team:divider-boundary",
+                root: .split(
+                    orientation: .horizontal, dividerPosition: dividerPosition,
+                    first: .pane(.init(surfaceID: first)),
+                    second: .pane(.init(surfaceID: second))
+                ),
+                focusedSurfaceID: first
+            )
+        }
+
+        XCTAssertFalse(snapshot(0).isValid)
+        XCTAssertTrue(snapshot(0.1).isValid)
+        XCTAssertTrue(snapshot(0.9).isValid)
+        XCTAssertFalse(snapshot(1).isValid)
+    }
+
     @MainActor
     func testProjectLayoutReordersLivePanelsAndRestoresNestedDividers() throws {
         let workspace = Workspace(title: "layout-test")
