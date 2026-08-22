@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.205.0] - 2026-08-22
+
+**원격 Project의 leader와 agent pane을 의도한 grid로 복원하고, 저장된 focus와 사용자 layout을 안전하게 보존한다.**
+
+### Fixed
+
+- **relay Project에 다시 접속하면 agent pane이 가로 한 줄로 이어지고 divider 비율이 달라지던 문제** — 저장 layout이 없거나 Project 구성원이 바뀐 경우 leader와 agent pane을 canonical grid로 원자적으로 재구성하고, 선택된 pane과 새 layout snapshot을 함께 보존한다. 기존에 잘못 저장된 layout은 Project 메뉴의 `Reset Layout`으로 명시적으로 복구할 수 있으며, 정상 사용자 layout은 자동 판별로 덮어쓰지 않는다.
+
+### Thanks
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.204.0] - 2026-08-22
 
 **터미널 출력이 계속 이어지는 동안의 CPU 부하를 낮추고, 원격 pane 정리가 실제 host 상태와 일치하도록 고쳤다.**
