@@ -714,13 +714,94 @@ extension TeamOrchestrator {
         scheduleProjectPresentationLayoutSave(projectID: projectID, workspace: workspace)
     }
 
-    private func finalizeRestoredProjectLayout(
+    enum ProjectPresentationLayoutRestoreOutcome: Equatable {
+        case restoredSaved
+        case rebuiltCanonical
+        case failed
+    }
+
+    @discardableResult
+    func resetProjectPresentationLayout(teamName: String) -> Bool {
+        guard let team = teams[teamName],
+              let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
+              let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }),
+              let projectID = team.remotePresentationProjectID
+                ?? team.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:)),
+              workspace.peerSurfaceID(forPanelID: team.leaderPanelId) != nil
+        else { return false }
+        let agentPanelIDs = team.agents.compactMap { $0.panelId }
+        guard agentPanelIDs.count == team.agents.count,
+              agentPanelIDs.allSatisfy({ workspace.peerSurfaceID(forPanelID: $0) != nil })
+        else { return false }
+        return rebuildCanonicalProjectPresentationLayout(
+            projectID: projectID,
+            workspace: workspace,
+            leaderPanelID: team.leaderPanelId,
+            agentPanelIDs: agentPanelIDs,
+            focusedSurfaceID: workspace.focusedPanelId.flatMap(
+                workspace.peerSurfaceID(forPanelID:)
+            ),
+            restoreFocus: true,
+            layoutStore: .shared
+        )
+    }
+
+    @discardableResult
+    func rebuildCanonicalProjectPresentationLayout(
+        projectID: String,
+        workspace: Workspace,
+        leaderPanelID: UUID,
+        agentPanelIDs: [UUID],
+        focusedSurfaceID: Data?,
+        restoreFocus: Bool,
+        layoutStore: ProjectPresentationLayoutStore
+    ) -> Bool {
+        let panelIDs = [leaderPanelID] + agentPanelIDs
+        guard Set(panelIDs).count == panelIDs.count,
+              panelIDs.allSatisfy({ workspace.peerSurfaceID(forPanelID: $0) != nil })
+        else { return false }
+        let layout = workspace.bonsplitController.layoutSnapshot()
+        let size = CGSize(
+            width: CGFloat(layout.containerFrame.width),
+            height: CGFloat(layout.containerFrame.height)
+        )
+        let columns = optimalGridDimensions(
+            count: agentPanelIDs.count, containerSize: size, hasLeader: true
+        ).cols
+        let rebuilt = workspace.withProjectPresentationLayoutPersistenceSuppressed {
+            workspace.applyCanonicalProjectPresentationGrid(
+                leaderPanelID: leaderPanelID,
+                agentPanelIDs: agentPanelIDs,
+                columnCount: columns,
+                focusedSurfaceID: focusedSurfaceID,
+                restoreFocus: restoreFocus
+            )
+        }
+        guard rebuilt,
+              let snapshot = workspace.projectPresentationLayoutSnapshot(projectID: projectID)
+        else { return false }
+        layoutStore.save(snapshot)
+        return true
+    }
+
+    @discardableResult
+    func finalizeRestoredProjectLayout(
         projectID: String,
         workspace: Workspace,
         anchorPanelID: UUID?,
-        restoreFocus: Bool
-    ) {
-        let saved = ProjectPresentationLayoutStore.shared.snapshot(projectID: projectID)
+        leaderPanelID: UUID,
+        agentPanelIDs: [UUID],
+        restoreFocus: Bool,
+        layoutStore providedLayoutStore: ProjectPresentationLayoutStore? = nil
+    ) -> ProjectPresentationLayoutRestoreOutcome {
+        let layoutStore = providedLayoutStore ?? ProjectPresentationLayoutStore.shared
+        let saved = layoutStore.snapshot(projectID: projectID)
+        let currentFocusedSurfaceID = workspace.focusedPanelId.flatMap(
+            workspace.peerSurfaceID(forPanelID:)
+        )
+        let fallbackFocusedSurfaceID = saved?.focusedSurfaceID.flatMap { surfaceID in
+            workspace.panelID(forPeerSurfaceID: surfaceID) == nil ? nil : surfaceID
+        } ?? currentFocusedSurfaceID
         let restored = workspace.withProjectPresentationLayoutPersistenceSuppressed {
             if let anchorPanelID, workspace.panels.count > 1 {
                 _ = workspace.closePanel(anchorPanelID, force: true)
@@ -732,22 +813,22 @@ extension TeamOrchestrator {
             // The saved snapshot already is the source of truth. Capturing the
             // background viewer's temporary focus here would overwrite its
             // focusedSurfaceID with the first pane.
-        } else if saved == nil {
-            settleRestoredAgentGrid(workspace: workspace)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self, weak workspace] in
-                guard let self, let workspace else { return }
-                self.persistProjectPresentationLayoutIfNeeded(workspace: workspace)
-            }
+            return .restoredSaved
         } else {
-            // Adoption reaches here only after every manifest member attached.
-            // A surface-set mismatch therefore means the authoritative Project
-            // topology changed, not that one pane is transiently missing.
-            ProjectPresentationLayoutStore.shared.remove(projectID: projectID)
-            settleRestoredAgentGrid(workspace: workspace)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self, weak workspace] in
-                guard let self, let workspace else { return }
-                self.persistProjectPresentationLayoutIfNeeded(workspace: workspace)
+            let rebuilt = rebuildCanonicalProjectPresentationLayout(
+                projectID: projectID,
+                workspace: workspace,
+                leaderPanelID: leaderPanelID,
+                agentPanelIDs: agentPanelIDs,
+                focusedSurfaceID: fallbackFocusedSurfaceID,
+                restoreFocus: restoreFocus,
+                layoutStore: layoutStore
+            )
+            if !rebuilt {
+                settleRestoredAgentGrid(workspace: workspace)
+                return .failed
             }
+            return .rebuiltCanonical
         }
     }
 
@@ -1009,6 +1090,8 @@ extension TeamOrchestrator {
             projectID: remote.projectID,
             workspace: workspace,
             anchorPanelID: anchorPanelID,
+            leaderPanelID: leaderPanelID,
+            agentPanelIDs: members.compactMap(\.panelId),
             restoreFocus: selectWorkspace
         )
         RemoteWorkLog.info(
@@ -3178,6 +3261,10 @@ extension TeamOrchestrator {
                 projectID: projectID,
                 workspace: workspace,
                 anchorPanelID: progress.anchorPanelID,
+                leaderPanelID: leaderPanelID,
+                agentPanelIDs: original.agents.compactMap {
+                    progress.agentPanelIDs[$0.agentInstanceId]
+                },
                 restoreFocus: true
             )
         } else {
