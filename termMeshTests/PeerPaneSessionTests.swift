@@ -370,6 +370,255 @@ final class PeerPaneSessionTests: XCTestCase {
     }
 
     @MainActor
+    func testCanonicalProjectFallbackBuildsLeaderAndAgentGrid() throws {
+        let workspace = Workspace(title: "canonical-project-grid")
+        let leader = try XCTUnwrap(workspace.focusedPanelId)
+        var agents: [UUID] = []
+        var splitFrom = leader
+        for _ in 0..<4 {
+            let panel = try XCTUnwrap(workspace.newTerminalSplit(
+                from: splitFrom, orientation: .horizontal, focus: false
+            )?.id)
+            agents.append(panel)
+            splitFrom = panel
+        }
+
+        XCTAssertTrue(workspace.applyCanonicalProjectPresentationGrid(
+            leaderPanelID: leader, agentPanelIDs: agents,
+            columnCount: 2, focusedSurfaceID: nil, restoreFocus: false
+        ))
+        guard case .split(let root) = workspace.bonsplitController.treeSnapshot(),
+              case .pane = root.first,
+              case .split(let agentColumns) = root.second,
+              case .split(let firstColumn) = agentColumns.first,
+              case .split(let secondColumn) = agentColumns.second
+        else {
+            return XCTFail("expected leader | 2x2 agent grid")
+        }
+        XCTAssertEqual(root.orientation, "horizontal")
+        XCTAssertEqual(root.dividerPosition, 0.5, accuracy: 0.001)
+        XCTAssertEqual(agentColumns.orientation, "horizontal")
+        XCTAssertEqual(firstColumn.orientation, "vertical")
+        XCTAssertEqual(secondColumn.orientation, "vertical")
+    }
+
+    @MainActor
+    func testCanonicalProjectFallbackRestoresRequestedFocus() throws {
+        let workspace = Workspace(title: "canonical-project-focus")
+        let leader = try XCTUnwrap(workspace.focusedPanelId)
+        let firstAgent = try XCTUnwrap(workspace.newTerminalSplit(
+            from: leader, orientation: .horizontal, focus: false
+        )?.id)
+        let secondAgent = try XCTUnwrap(workspace.newTerminalSplit(
+            from: firstAgent, orientation: .horizontal, focus: false
+        )?.id)
+        let leaderSurface = Data(repeating: 0x10, count: 16)
+        let firstSurface = Data(repeating: 0x11, count: 16)
+        let secondSurface = Data(repeating: 0x12, count: 16)
+        workspace.debugProjectLayoutSurfaceIDs = [
+            leader: leaderSurface, firstAgent: firstSurface, secondAgent: secondSurface,
+        ]
+
+        XCTAssertTrue(workspace.applyCanonicalProjectPresentationGrid(
+            leaderPanelID: leader,
+            agentPanelIDs: [firstAgent, secondAgent],
+            columnCount: 1,
+            focusedSurfaceID: secondSurface,
+            restoreFocus: true
+        ))
+        XCTAssertEqual(workspace.focusedPanelId, secondAgent)
+    }
+
+    @MainActor
+    func testCanonicalProjectFallbackSupportsLeaderOnlyProject() throws {
+        let workspace = Workspace(title: "canonical-project-leader-only")
+        let leader = try XCTUnwrap(workspace.focusedPanelId)
+        let leaderSurface = Data(repeating: 0x13, count: 16)
+        workspace.debugProjectLayoutSurfaceIDs = [leader: leaderSurface]
+
+        XCTAssertTrue(workspace.applyCanonicalProjectPresentationGrid(
+            leaderPanelID: leader,
+            agentPanelIDs: [],
+            columnCount: 1,
+            focusedSurfaceID: leaderSurface,
+            restoreFocus: true
+        ))
+        XCTAssertEqual(workspace.bonsplitController.allPaneIds.count, 1)
+        XCTAssertEqual(workspace.focusedPanelId, leader)
+    }
+
+    @MainActor
+    func testProjectRestoreRebuildsStaleRosterAfterCommitAndRestoresFocus() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("project-restore-test-(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProjectPresentationLayoutStore(
+            fileURL: directory.appendingPathComponent("layouts.json")
+        )
+        let workspace = Workspace(title: "project-restore-stale-roster")
+        let anchor = try XCTUnwrap(workspace.focusedPanelId)
+        let leader = try XCTUnwrap(workspace.newTerminalSplit(
+            from: anchor, orientation: .horizontal, focus: false
+        )?.id)
+        let firstAgent = try XCTUnwrap(workspace.newTerminalSplit(
+            from: leader, orientation: .horizontal, focus: false
+        )?.id)
+        let secondAgent = try XCTUnwrap(workspace.newTerminalSplit(
+            from: firstAgent, orientation: .horizontal, focus: false
+        )?.id)
+        let leaderSurface = Data(repeating: 0x20, count: 16)
+        let firstSurface = Data(repeating: 0x21, count: 16)
+        let secondSurface = Data(repeating: 0x22, count: 16)
+        let retiredSurface = Data(repeating: 0x23, count: 16)
+        workspace.debugProjectLayoutSurfaceIDs = [
+            leader: leaderSurface, firstAgent: firstSurface, secondAgent: secondSurface,
+        ]
+        let projectID = "team:stale-roster"
+        let stale = ProjectPresentationLayoutSnapshot(
+            projectID: projectID,
+            root: .split(
+                orientation: .horizontal, dividerPosition: 0.4,
+                first: .pane(.init(surfaceID: leaderSurface)),
+                second: .split(
+                    orientation: .vertical, dividerPosition: 0.6,
+                    first: .pane(.init(surfaceID: firstSurface)),
+                    second: .pane(.init(surfaceID: retiredSurface))
+                )
+            ),
+            focusedSurfaceID: firstSurface
+        )
+        store.save(stale)
+
+        let outcome = TeamOrchestrator.shared.finalizeRestoredProjectLayout(
+            projectID: projectID,
+            workspace: workspace,
+            anchorPanelID: anchor,
+            leaderPanelID: leader,
+            agentPanelIDs: [firstAgent, secondAgent],
+            restoreFocus: true,
+            layoutStore: store
+        )
+
+        XCTAssertEqual(outcome, .rebuiltCanonical)
+        let rebuilt = try XCTUnwrap(store.snapshot(projectID: projectID))
+        XCTAssertEqual(rebuilt.surfaceIDs, [leaderSurface, firstSurface, secondSurface])
+        XCTAssertEqual(rebuilt.focusedSurfaceID, firstSurface)
+        XCTAssertNil(workspace.panels[anchor])
+        XCTAssertEqual(workspace.focusedPanelId, firstAgent)
+        XCTAssertEqual(workspace.bonsplitController.allPaneIds.count, 3)
+    }
+
+    @MainActor
+    func testExplicitProjectLayoutResetReplacesBrokenSnapshot() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("project-layout-reset-(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProjectPresentationLayoutStore(
+            fileURL: directory.appendingPathComponent("layouts.json")
+        )
+        let workspace = Workspace(title: "explicit-layout-reset")
+        let leader = try XCTUnwrap(workspace.focusedPanelId)
+        var agents: [UUID] = []
+        var splitFrom = leader
+        for _ in 0..<4 {
+            let panel = try XCTUnwrap(workspace.newTerminalSplit(
+                from: splitFrom, orientation: .horizontal, focus: false
+            )?.id)
+            agents.append(panel)
+            splitFrom = panel
+        }
+        let surfaces = (0..<5).map { Data(repeating: UInt8(0x40 + $0), count: 16) }
+        workspace.debugProjectLayoutSurfaceIDs = Dictionary(
+            uniqueKeysWithValues: zip([leader] + agents, surfaces)
+        )
+        let projectID = "team:explicit-reset"
+        store.save(try XCTUnwrap(workspace.projectPresentationLayoutSnapshot(projectID: projectID)))
+
+        XCTAssertTrue(TeamOrchestrator.shared.rebuildCanonicalProjectPresentationLayout(
+            projectID: projectID,
+            workspace: workspace,
+            leaderPanelID: leader,
+            agentPanelIDs: agents,
+            focusedSurfaceID: surfaces[3],
+            restoreFocus: true,
+            layoutStore: store
+        ))
+        let reset = try XCTUnwrap(store.snapshot(projectID: projectID))
+        XCTAssertEqual(reset.surfaceIDs, Set(surfaces))
+        XCTAssertEqual(reset.focusedSurfaceID, surfaces[3])
+        guard case .split(let root) = reset.root,
+              case .pane = root.first,
+              case .split(let agentColumns) = root.second
+        else { return XCTFail("expected canonical leader | agent-grid topology") }
+        XCTAssertEqual(root.orientation, .horizontal)
+        XCTAssertEqual(agentColumns.orientation, .horizontal)
+    }
+
+    @MainActor
+    func testCanonicalRebuildRefusesUnknownPanelWithoutMutatingTree() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("project-layout-reset-refusal-(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProjectPresentationLayoutStore(
+            fileURL: directory.appendingPathComponent("layouts.json")
+        )
+        let workspace = Workspace(title: "explicit-layout-reset-refusal")
+        let leader = try XCTUnwrap(workspace.focusedPanelId)
+        let before = workspace.bonsplitController.treeSnapshot()
+
+        XCTAssertFalse(TeamOrchestrator.shared.rebuildCanonicalProjectPresentationLayout(
+            projectID: "team:refused-reset",
+            workspace: workspace,
+            leaderPanelID: leader,
+            agentPanelIDs: [UUID()],
+            focusedSurfaceID: nil,
+            restoreFocus: true,
+            layoutStore: store
+        ))
+        XCTAssertEqual(workspace.bonsplitController.treeSnapshot(), before)
+        XCTAssertNil(store.snapshot(projectID: "team:refused-reset"))
+    }
+
+    @MainActor
+    func testProjectRestoreKeepsStaleSnapshotWhenCanonicalCommitFails() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("project-restore-failure-(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProjectPresentationLayoutStore(
+            fileURL: directory.appendingPathComponent("layouts.json")
+        )
+        let workspace = Workspace(title: "project-restore-failure")
+        let leader = try XCTUnwrap(workspace.focusedPanelId)
+        let leaderSurface = Data(repeating: 0x30, count: 16)
+        let retiredSurface = Data(repeating: 0x31, count: 16)
+        workspace.debugProjectLayoutSurfaceIDs = [leader: leaderSurface]
+        let projectID = "team:failed-rebuild"
+        let stale = ProjectPresentationLayoutSnapshot(
+            projectID: projectID,
+            root: .split(
+                orientation: .horizontal, dividerPosition: 0.5,
+                first: .pane(.init(surfaceID: leaderSurface)),
+                second: .pane(.init(surfaceID: retiredSurface))
+            ),
+            focusedSurfaceID: leaderSurface
+        )
+        store.save(stale)
+
+        let outcome = TeamOrchestrator.shared.finalizeRestoredProjectLayout(
+            projectID: projectID,
+            workspace: workspace,
+            anchorPanelID: nil,
+            leaderPanelID: leader,
+            agentPanelIDs: [UUID()],
+            restoreFocus: true,
+            layoutStore: store
+        )
+
+        XCTAssertEqual(outcome, .failed)
+        XCTAssertEqual(store.snapshot(projectID: projectID), stale)
+    }
+
+    @MainActor
     func testProjectLayoutReordersLivePanelsAndRestoresNestedDividers() throws {
         let workspace = Workspace(title: "layout-test")
         let firstPanel = try XCTUnwrap(workspace.focusedPanelId)

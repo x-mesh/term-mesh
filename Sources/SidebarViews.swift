@@ -1596,6 +1596,7 @@ private struct SidebarPeerProjectsView: View {
     @State private var pairReviewTarget: PairReviewTarget?
     @State private var deletionTarget: SidebarProjectDeletionTarget?
     @State private var deletionFailure: String?
+    @State private var layoutResetFailure: String?
     @State private var presentationRestoreFailure: String?
     @State private var restoringTeamNames: Set<String> = []
 
@@ -1944,6 +1945,14 @@ private struct SidebarPeerProjectsView: View {
             )
         }
         .disabled(teamName(for: group) == nil)
+        Button("Reset Layout") {
+            guard let teamName = teamName(for: group) else { return }
+            if !TeamOrchestrator.shared.resetProjectPresentationLayout(teamName: teamName) {
+                layoutResetFailure = "This project does not have a complete remote pane presentation to reset."
+            }
+        }
+        .disabled(!canResetLayout(for: group))
+        .accessibilityIdentifier("project.resetLayout")
         Divider()
         if let teamName = teamName(for: group),
            let team = TeamOrchestrator.shared.teams[teamName],
@@ -1983,6 +1992,18 @@ private struct SidebarPeerProjectsView: View {
         return TeamOrchestrator.shared.teams.values
             .first { workspaceIDs.contains($0.workspaceId) }?
             .id
+    }
+
+    private func canResetLayout(for group: SidebarPeerProjectGroup) -> Bool {
+        guard let teamName = teamName(for: group),
+              let team = TeamOrchestrator.shared.teams[teamName],
+              let manager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
+              let workspace = manager.tabs.first(where: { $0.id == team.workspaceId }),
+              workspace.peerSurfaceID(forPanelID: team.leaderPanelId) != nil
+        else { return false }
+        return team.agents.allSatisfy { agent in
+            agent.panelId.flatMap(workspace.peerSurfaceID(forPanelID:)) != nil
+        }
     }
 
     private func delegateRootPath(for group: SidebarPeerProjectGroup) -> String? {
@@ -2137,6 +2158,17 @@ private struct SidebarPeerProjectsView: View {
             Button("OK") { deletionFailure = nil }
         } message: {
             Text(deletionFailure ?? "")
+        }
+        .alert(
+            "Couldn’t Reset Layout",
+            isPresented: Binding(
+                get: { layoutResetFailure != nil },
+                set: { if !$0 { layoutResetFailure = nil } }
+            )
+        ) {
+            Button("OK") { layoutResetFailure = nil }
+        } message: {
+            Text(layoutResetFailure ?? "")
         }
         .alert(
             "Couldn’t Open Project",

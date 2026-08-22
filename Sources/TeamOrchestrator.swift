@@ -1031,7 +1031,7 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Compute optimal (cols, rows) so each pane's aspect ratio is closest to 1:1 (square).
     /// Falls back to fixed column logic when container size is unavailable.
-    private func optimalGridDimensions(
+    func optimalGridDimensions(
         count: Int,
         containerSize: CGSize,
         hasLeader: Bool

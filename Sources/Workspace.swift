@@ -2002,6 +2002,80 @@ final class Workspace: Identifiable {
         return true
     }
 
+    /// Rebuild the safe default Project topology around already-attached panes:
+    /// leader on the left, and agents in equal-width columns with equal-height
+    /// rows. This is the fallback when no durable layout can be applied.
+    func applyCanonicalProjectPresentationGrid(
+        leaderPanelID: UUID,
+        agentPanelIDs: [UUID],
+        columnCount requestedColumnCount: Int,
+        focusedSurfaceID: Data?,
+        restoreFocus: Bool
+    ) -> Bool {
+        func paneNode(panelID: UUID) -> ExternalTreeNode? {
+            guard let tabID = surfaceIdFromPanelId(panelID),
+                  paneId(forPanelId: panelID) != nil
+            else { return nil }
+            let title = panels[panelID]?.displayTitle ?? "Pane"
+            return .pane(ExternalPaneNode(
+                id: UUID().uuidString,
+                frame: PixelRect(x: 0, y: 0, width: 0, height: 0),
+                tabs: [ExternalTab(id: tabID.uuid.uuidString, title: title)],
+                selectedTabId: tabID.uuid.uuidString
+            ))
+        }
+
+        func joined(_ nodes: ArraySlice<ExternalTreeNode>, orientation: String) -> ExternalTreeNode? {
+            guard let first = nodes.first else { return nil }
+            guard nodes.count > 1, let rest = joined(nodes.dropFirst(), orientation: orientation) else {
+                return first
+            }
+            return .split(ExternalSplitNode(
+                id: UUID().uuidString,
+                orientation: orientation,
+                dividerPosition: 1.0 / Double(nodes.count),
+                first: first,
+                second: rest
+            ))
+        }
+
+        guard let leader = paneNode(panelID: leaderPanelID) else { return false }
+        let tree: ExternalTreeNode
+        if agentPanelIDs.isEmpty {
+            tree = leader
+        } else {
+            let columnCount = max(1, min(requestedColumnCount, agentPanelIDs.count))
+            var columns: [[ExternalTreeNode]] = Array(repeating: [], count: columnCount)
+            for (index, panelID) in agentPanelIDs.enumerated() {
+                guard let node = paneNode(panelID: panelID) else { return false }
+                columns[index % columnCount].append(node)
+            }
+            let columnNodes = columns.compactMap { joined($0[...], orientation: "vertical") }
+            guard columnNodes.count == columnCount,
+                  let agentGrid = joined(columnNodes[...], orientation: "horizontal")
+            else { return false }
+            tree = .split(ExternalSplitNode(
+                id: UUID().uuidString,
+                orientation: "horizontal",
+                dividerPosition: 0.5,
+                first: leader,
+                second: agentGrid
+            ))
+        }
+        let focusedTabID = restoreFocus
+            ? focusedSurfaceID.flatMap(panelID(forPeerSurfaceID:)).flatMap(surfaceIdFromPanelId)
+            : nil
+        guard bonsplitController.applyExternalTreeAtomically(
+            tree, focusedTabId: focusedTabID
+        ) else { return false }
+        if restoreFocus,
+           let pane = bonsplitController.focusedPaneId,
+           let tab = bonsplitController.selectedTab(inPane: pane) {
+            applyTabSelection(tabId: tab.id, inPane: pane)
+        }
+        return true
+    }
+
     /// Returns the nearest right-side sibling pane for browser placement.
     /// The search is local to the source pane's ancestry in the split tree:
     /// use the closest horizontal ancestor where the source is in the first (left) branch.
