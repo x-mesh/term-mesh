@@ -4,6 +4,17 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.207.0] - 2026-08-23
+
+### Fixed
+
+- Prevented restored remote Projects from timing out their leader relay while still in the background; the exact leader surface now starts only after its terminal view mounts and recovers through one bounded path if the relay fails.
+- Added process-level leader liveness so a durable surface that only contains an idle login shell is never mistaken for a live Claude or Codex leader.
+- Made remote Project deletion transactional: the durable manifest is retired before workspace teardown, stale roster adoption is tombstoned, and cleanup completion is explicitly acknowledged.
+- Hardened the mac-sub relay release gate to reproduce the 10-second background timeout, hold relay bytes for 15 seconds across restart and reconnect, and require exact-surface, live-process, and cleanup receipts.
+
+Thanks to Jinwoo for the report and repeated production-topology verification.
+
 ## [0.206.0] - 2026-08-23
 
 ### Fixed
