@@ -282,6 +282,7 @@
 		DG210000000000000003 /* DelegateDiagnosisP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DG210000000000000006 /* DelegateDiagnosisP1Tests.swift */; };
 		DD210000000000000003 /* DelegateDedupP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD210000000000000006 /* DelegateDedupP1Tests.swift */; };
 		DD210000000000000010 /* DelegateDiagnosisP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD210000000000000011 /* DelegateDiagnosisP1Tests.swift */; };
+		DD210000000000000020 /* RoutingInstrumentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD210000000000000021 /* RoutingInstrumentationTests.swift */; };
 		CS210000000000000003 /* ControlSocketFramingP1Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CS210000000000000006 /* ControlSocketFramingP1Tests.swift */; };
 		RL170000000000000003 /* RemoteLeaderReattachTriStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RL170000000000000006 /* RemoteLeaderReattachTriStateTests.swift */; };
 		A5009020 /* AgentSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009021 /* AgentSessionTests.swift */; };
@@ -637,6 +638,7 @@
 		DG210000000000000006 /* DelegateDiagnosisP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDiagnosisP1Tests.swift; sourceTree = "<group>"; };
 		DD210000000000000006 /* DelegateDedupP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDedupP1Tests.swift; sourceTree = "<group>"; };
 		DD210000000000000011 /* DelegateDiagnosisP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DelegateDiagnosisP1Tests.swift; sourceTree = "<group>"; };
+		DD210000000000000021 /* RoutingInstrumentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RoutingInstrumentationTests.swift; sourceTree = "<group>"; };
 		CS210000000000000006 /* ControlSocketFramingP1Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlSocketFramingP1Tests.swift; sourceTree = "<group>"; };
 		RL170000000000000006 /* RemoteLeaderReattachTriStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteLeaderReattachTriStateTests.swift; sourceTree = "<group>"; };
 		A5009021 /* AgentSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentSessionTests.swift; sourceTree = "<group>"; };
@@ -1062,6 +1064,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				DG210000000000000006 /* DelegateDiagnosisP1Tests.swift */,
 				DD210000000000000006 /* DelegateDedupP1Tests.swift */,
 				DD210000000000000011 /* DelegateDiagnosisP1Tests.swift */,
+				DD210000000000000021 /* RoutingInstrumentationTests.swift */,
 				CS210000000000000006 /* ControlSocketFramingP1Tests.swift */,
 				RL170000000000000006 /* RemoteLeaderReattachTriStateTests.swift */,
 				A5009021 /* AgentSessionTests.swift */,
@@ -1503,6 +1506,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				DG210000000000000003 /* DelegateDiagnosisP1Tests.swift in Sources */,
 				DD210000000000000003 /* DelegateDedupP1Tests.swift in Sources */,
 				DD210000000000000010 /* DelegateDiagnosisP1Tests.swift in Sources */,
+				DD210000000000000020 /* RoutingInstrumentationTests.swift in Sources */,
 				CS210000000000000003 /* ControlSocketFramingP1Tests.swift in Sources */,
 				RL170000000000000003 /* RemoteLeaderReattachTriStateTests.swift in Sources */,
 				A5009020 /* AgentSessionTests.swift in Sources */,

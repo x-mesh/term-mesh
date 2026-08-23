@@ -1079,7 +1079,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         parentTaskId: String? = nil,
         createdBy: String = "leader",
         worktreePolicy: String? = nil,
-        requestId: String? = nil
+        requestId: String? = nil,
+        route: String? = nil,
+        waveId: String? = nil
     ) -> TaskCreation? {
         lock.lock()
         defer { lock.unlock() }
@@ -1147,6 +1149,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             reviewSummary: nil,
             createdBy: normalizedCreatedBy,
             request_id: normalizedRequestId,
+            route: route?.teamDataNilIfBlank,
+            waveId: waveId?.teamDataNilIfBlank,
             result: nil,
             resultPath: nil,
             worktreePolicy: worktreePolicy?.teamDataNilIfBlank,
@@ -1185,7 +1189,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         parentTaskId: String? = nil,
         createdBy: String = "leader",
         worktreePolicy: String? = nil,
-        requestId: String? = nil
+        requestId: String? = nil,
+        route: String? = nil,
+        waveId: String? = nil
     ) -> TeamOrchestrator.TeamTask? {
         createTaskWithDisposition(
             teamName: teamName,
@@ -1201,7 +1207,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             parentTaskId: parentTaskId,
             createdBy: createdBy,
             worktreePolicy: worktreePolicy,
-            requestId: requestId
+            requestId: requestId,
+            route: route,
+            waveId: waveId
         )?.task
     }
 
@@ -2192,6 +2200,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "review_summary": task.reviewSummary as Any? ?? NSNull(),
             "created_by": task.createdBy,
             "request_id": task.request_id as Any? ?? NSNull(),
+            "route": task.route as Any? ?? NSNull(),
+            "wave_id": task.waveId as Any? ?? NSNull(),
             "result": task.result as Any? ?? NSNull(),
             "result_path": task.resultPath as Any? ?? NSNull(),
             "worktree_policy": task.worktreePolicy as Any? ?? NSNull(),
@@ -2233,7 +2243,12 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// prompts, reports, and result bodies never enter this object.
     private static func parallelTelemetry(for task: TeamOrchestrator.TeamTask) -> [String: Any] {
         [
-            "wave_id": task.parentTaskId ?? task.id,
+            // A stated wave is the real grouping. The parent/self fallback is
+            // kept only so tasks written before `waveId` existed still answer
+            // this field, but it is a task identity, not a wave — never treat
+            // the two as interchangeable when analyzing wave size.
+            "wave_id": task.waveId ?? task.parentTaskId ?? task.id,
+            "wave_id_stated": task.waveId != nil,
             "task_id": task.id,
             "agent_instance_id": task.assigneeInstanceId as Any? ?? NSNull(),
             "host": NSNull(),

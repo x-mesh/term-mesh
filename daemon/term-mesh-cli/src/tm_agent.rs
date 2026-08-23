@@ -365,10 +365,80 @@ mod project_sync_cli_tests {
             panel.as_deref(),
             Some("instance-2"),
             "delegate-test-request",
+            None,
+            None,
         );
         assert_eq!(params["depends_on"], json!(["337a5e71"]));
         assert_eq!(params["panel_id"], "panel-2");
         assert_eq!(params["agent_instance_id"], "instance-2");
+        // Unstated route/wave are omitted, not sent as null: absence is what
+        // "the leader did not classify this" looks like on the board.
+        assert!(params.get("route").is_none());
+        assert!(params.get("wave_id").is_none());
+    }
+
+    /// Measurement-only fields. They must reach the board verbatim when stated
+    /// and stay absent when not — a blank flag value must not create an empty
+    /// route that later reads as a real classification.
+    #[test]
+    fn delegate_params_carry_stated_route_and_wave_and_omit_blank_ones() {
+        let stated = delegate_rpc_params(
+            "team-a",
+            "executor",
+            "own the parser lane",
+            "Parser lane",
+            2,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            "request-route",
+            Some("parallel"),
+            Some("wave-7"),
+        );
+        assert_eq!(stated["route"], "parallel");
+        assert_eq!(stated["wave_id"], "wave-7");
+
+        let blank = delegate_rpc_params(
+            "team-a",
+            "executor",
+            "own the parser lane",
+            "Parser lane",
+            2,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            "request-route",
+            Some("   "),
+            Some(""),
+        );
+        assert!(blank.get("route").is_none());
+        assert!(blank.get("wave_id").is_none());
+
+        let worktree = worktree_task_create_params(
+            "team-a",
+            "executor",
+            "Parser lane",
+            2,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            WorktreePolicyArg::Auto,
+            "request-route",
+            Some("parallel"),
+            Some("wave-7"),
+        );
+        assert_eq!(worktree["route"], "parallel");
+        assert_eq!(worktree["wave_id"], "wave-7");
     }
 
     #[test]
@@ -843,6 +913,8 @@ mod project_sync_cli_tests {
             target.agent_instance_id.as_deref(),
             WorktreePolicyArg::Auto,
             "request-1",
+            None,
+            None,
         );
         assert_eq!(params["agent_instance_id"], "instance-2");
         assert_eq!(target.working_directory.as_deref(), Some("/repo/two"));
@@ -1444,6 +1516,16 @@ enum Commands {
         /// Base ref for `git-kit wt acquire --from <ref>` when a worktree is acquired.
         #[arg(long = "from")]
         from_ref: Option<String>,
+        /// Measurement only: the leader's own route classification for the
+        /// request that produced this task (`direct`, `probe`, `parallel`).
+        /// Recorded verbatim on the board; nothing validates or acts on it.
+        #[arg(long)]
+        route: Option<String>,
+        /// Measurement only: groups the tasks of one dispatch so wave size is a
+        /// GROUP BY rather than a guess about clock gaps. Pass the same value
+        /// to every delegate in the same wave.
+        #[arg(long = "wave-id")]
+        wave_id: Option<String>,
     },
     /// Stop (interrupt) agents by sending Ctrl+C to their terminals
     Stop {
@@ -8685,6 +8767,8 @@ fn main() {
             agent_instance_id,
             worktree,
             from_ref,
+            route,
+            wave_id,
         } => {
             if agent_instance_id.is_some() && (target.contains(',') || autonomous) {
                 eprintln!(
@@ -8742,6 +8826,8 @@ fn main() {
                         worktree_policy: worktree,
                         from_ref: from_ref.as_deref(),
                         request_id: request_id.as_deref(),
+                        route: route.as_deref(),
+                        wave_id: wave_id.as_deref(),
                     },
                 );
             }
@@ -12619,6 +12705,10 @@ struct DelegateOptions<'a> {
     worktree_policy: WorktreePolicyArg,
     from_ref: Option<&'a str>,
     request_id: Option<&'a str>,
+    /// Measurement only, forwarded verbatim to the board. See `TeamTask.route`.
+    route: Option<&'a str>,
+    /// Measurement only, forwarded verbatim to the board. See `TeamTask.waveId`.
+    wave_id: Option<&'a str>,
 }
 
 fn run_delegate_result(
@@ -12642,6 +12732,8 @@ fn run_delegate_result(
         worktree_policy,
         from_ref,
         request_id,
+        route,
+        wave_id,
     } = options;
     let resolved_title = title.unwrap_or_else(|| task_title_from_text(text));
     let resolved_priority = priority.unwrap_or(2);
@@ -12681,6 +12773,8 @@ fn run_delegate_result(
             worktree_policy,
             from_ref,
             &request_id,
+            route,
+            wave_id,
         );
     }
 
@@ -12699,6 +12793,8 @@ fn run_delegate_result(
         panel_id,
         selected_instance_id,
         &request_id,
+        route,
+        wave_id,
     );
     let unified = resolve_unified_delegate(&delegate_params, &request_id, |params| {
         rpc_call(sock, "team.delegate", params.clone())
@@ -13016,6 +13112,8 @@ fn delegate_rpc_params(
     panel_id: Option<&str>,
     agent_instance_id: Option<&str>,
     request_id: &str,
+    route: Option<&str>,
+    wave_id: Option<&str>,
 ) -> Value {
     let mut params = json!({
         "team": team,
@@ -13043,6 +13141,14 @@ fn delegate_rpc_params(
     }
     if let Some(pid) = panel_id {
         params["panel_id"] = json!(pid);
+    }
+    // Omitted rather than sent as null when unstated: absent reads as "the
+    // leader did not classify this", which is what nil means on the board.
+    if let Some(r) = route.filter(|v| !v.trim().is_empty()) {
+        params["route"] = json!(r);
+    }
+    if let Some(w) = wave_id.filter(|v| !v.trim().is_empty()) {
+        params["wave_id"] = json!(w);
     }
     params
 }
@@ -13560,6 +13666,8 @@ fn worktree_task_create_params(
     agent_instance_id: Option<&str>,
     worktree_policy: WorktreePolicyArg,
     request_id: &str,
+    route: Option<&str>,
+    wave_id: Option<&str>,
 ) -> Value {
     let mut params = json!({
         "team_name": team,
@@ -13581,6 +13689,12 @@ fn worktree_task_create_params(
     }
     if let Some(fb) = fix_budget {
         params["fix_budget"] = json!(fb);
+    }
+    if let Some(r) = route.filter(|v| !v.trim().is_empty()) {
+        params["route"] = json!(r);
+    }
+    if let Some(w) = wave_id.filter(|v| !v.trim().is_empty()) {
+        params["wave_id"] = json!(w);
     }
     params
 }
@@ -13604,6 +13718,8 @@ fn run_delegate_result_with_worktree(
     worktree_policy: WorktreePolicyArg,
     from_ref: Option<&str>,
     request_id: &str,
+    route: Option<&str>,
+    wave_id: Option<&str>,
 ) -> Result<Value, String> {
     let params = worktree_task_create_params(
         team,
@@ -13617,6 +13733,8 @@ fn run_delegate_result_with_worktree(
         agent_instance_id,
         worktree_policy,
         request_id,
+        route,
+        wave_id,
     );
 
     let created = rpc_call(sock, "team.task.create", params)
@@ -14064,6 +14182,8 @@ fn run_fan_out(
                             worktree_policy,
                             from_ref,
                             request_id: None,
+                            route: None,
+                            wave_id: None,
                         },
                     );
                     (*target, result)
@@ -16402,6 +16522,8 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
                 worktree_policy: WorktreePolicyArg::Off,
                 from_ref: None,
                 request_id: None,
+                route: None,
+                wave_id: None,
             },
         );
         match result {
@@ -17097,6 +17219,8 @@ fn dispatch_and_wait(
                     worktree_policy: WorktreePolicyArg::Off,
                     from_ref: None,
                     request_id: None,
+                    route: None,
+                    wave_id: None,
                 },
             );
             (name, result)
@@ -17463,6 +17587,8 @@ fn run_autonomous(
                     worktree_policy: WorktreePolicyArg::Off,
                     from_ref: None,
                     request_id: None,
+                    route: None,
+                    wave_id: None,
                 },
             );
             (name_owned, result)
