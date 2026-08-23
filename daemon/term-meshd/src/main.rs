@@ -62,6 +62,14 @@ pub(crate) fn configured_owner_pid() -> Option<u32> {
     })
 }
 
+fn preserve_shared_processes_after_required_server_exit(
+    control_server_started: bool,
+    peer_server_configured: bool,
+    peer_server_started: bool,
+) -> bool {
+    !control_server_started || (peer_server_configured && !peer_server_started)
+}
+
 fn process_exists(pid: u32) -> bool {
     // Signal 0 performs existence/permission checking without delivering a
     // signal. EPERM still means the process exists.
@@ -422,7 +430,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 5a. Peer federation server (opt-in via TERMMESH_PEER_SOCKET).
-    let peer_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
+    let (peer_started_tx, peer_started_rx) = tokio::sync::watch::channel(false);
+    let mut peer_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
         std::env::var("TERMMESH_PEER_SOCKET")
             .ok()
             .filter(|s| !s.is_empty())
@@ -434,14 +443,17 @@ async fn main() -> anyhow::Result<()> {
                     monitor_rx.clone(),
                     headless_manager.clone(),
                     agent_manager.clone(),
+                    peer_started_tx.clone(),
                 ))
             });
     if peer_task.is_some() {
         tracing::info!("peer-federation server enabled");
     }
+    let peer_server_configured = peer_task.is_some();
 
     // 5. Unix socket server
     let socket_path = socket::default_socket_path();
+    let (control_started_tx, control_started_rx) = tokio::sync::watch::channel(false);
     let socket_task = tokio::spawn(socket::serve(
         socket_path.clone(),
         monitor_rx,
@@ -456,9 +468,10 @@ async fn main() -> anyhow::Result<()> {
         watch_runner_for_serve,
         watch_sink_for_serve,
         shutdown_rx,
+        control_started_tx,
     ));
 
-    // 6. Wait for a shutdown signal — OR for the control socket to die.
+    // 6. Wait for a shutdown signal — OR for either required socket to die.
     // `socket::serve` loops forever on success, so if it ever RETURNS, it
     // failed. Dropping its JoinHandle (the previous behavior) meant the
     // daemon kept running with a dead control plane, answering nothing while
@@ -467,12 +480,20 @@ async fn main() -> anyhow::Result<()> {
     // silent zombie.
     let owner_exit = wait_for_owner_exit(owner_pid);
     tokio::pin!(owner_exit);
-    let shutdown_reason = tokio::select! {
-        _ = tokio::signal::ctrl_c() => "SIGINT (Ctrl-C)",
-        _ = sigterm() => "SIGTERM",
-        _ = &mut owner_exit => "GUI owner process exited",
+    let (shutdown_reason, peer_task_finished) = {
+        let peer_wait = async {
+            match peer_task.as_mut() {
+                Some(task) => Some(task.await),
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(peer_wait);
+        tokio::select! {
+        _ = tokio::signal::ctrl_c() => ("SIGINT (Ctrl-C)", false),
+        _ = sigterm() => ("SIGTERM", false),
+        _ = &mut owner_exit => ("GUI owner process exited", false),
         result = socket_task => {
-            match result {
+            let reason = match result {
                 Ok(Ok(())) => "control socket closed",
                 Ok(Err(error)) => {
                     tracing::error!("control socket server failed: {error:?}");
@@ -482,7 +503,23 @@ async fn main() -> anyhow::Result<()> {
                     tracing::error!("control socket task panicked: {join_error}");
                     "control socket task panic"
                 }
-            }
+            };
+            (reason, false)
+        }
+        result = &mut peer_wait => {
+            let reason = match result.expect("peer wait only resolves when configured") {
+                Ok(Ok(())) => "peer socket closed",
+                Ok(Err(error)) => {
+                    tracing::error!("peer socket server failed: {error:?}");
+                    "peer socket server error"
+                }
+                Err(join_error) => {
+                    tracing::error!("peer socket task panicked: {join_error}");
+                    "peer socket task panic"
+                }
+            };
+            (reason, true)
+        }
         }
     };
     tracing::info!("received {shutdown_reason}, initiating graceful shutdown...");
@@ -491,24 +528,39 @@ async fn main() -> anyhow::Result<()> {
     // a. Signal servers to stop
     let _ = shutdown_tx.send(true);
 
-    // b. Terminate all headless agents
-    headless_manager.lock().await.terminate_all().await;
-    tracing::info!("headless agents terminated");
+    if preserve_shared_processes_after_required_server_exit(
+        *control_started_rx.borrow(),
+        peer_server_configured,
+        *peer_started_rx.borrow(),
+    ) {
+        // Either required server can fail before this generation owns the
+        // complete control+peer topology. AgentSessionManager has already
+        // opened the shared DB, so running terminate_all in that state could
+        // kill the real owner's agents by stale PID. Judge ownership from both
+        // startup receipts, never from whichever task won tokio::select!.
+        tracing::warn!(
+            "required server failed during startup; preserving shared agent and headless processes"
+        );
+    } else {
+        // b. Terminate all headless agents
+        headless_manager.lock().await.terminate_all().await;
+        tracing::info!("headless agents terminated");
 
-    // c. Terminate all agent sessions (cleanup worktrees + PIDs)
-    // terminate_all() contains a blocking sleep (SIGTERM → wait → SIGKILL), so
-    // offload it to a blocking thread to avoid starving the tokio executor.
-    {
-        let mgr = agent_manager.clone();
-        let wh = watcher_handle.clone();
-        let _ = tokio::task::spawn_blocking(move || mgr.terminate_all(&wh)).await;
-    }
-    tracing::info!("agent sessions terminated");
+        // c. Terminate all agent sessions (cleanup worktrees + PIDs)
+        // terminate_all() contains a blocking sleep (SIGTERM → wait → SIGKILL), so
+        // offload it to a blocking thread to avoid starving the tokio executor.
+        {
+            let mgr = agent_manager.clone();
+            let wh = watcher_handle.clone();
+            let _ = tokio::task::spawn_blocking(move || mgr.terminate_all(&wh)).await;
+        }
+        tracing::info!("agent sessions terminated");
 
-    // c. Resume all stopped processes
-    let resumed = monitor_handle.resume_all_stopped();
-    if resumed > 0 {
-        tracing::info!("resumed {resumed} stopped process(es)");
+        // c. Resume all stopped processes
+        let resumed = monitor_handle.resume_all_stopped();
+        if resumed > 0 {
+            tracing::info!("resumed {resumed} stopped process(es)");
+        }
     }
 
     // d. Wait for servers to finish (with timeout). `socket_task` was already
@@ -517,8 +569,10 @@ async fn main() -> anyhow::Result<()> {
     let timeout = tokio::time::Duration::from_secs(5);
     match tokio::time::timeout(timeout, async {
         let _ = http_task.await;
-        if let Some(t) = peer_task {
-            let _ = t.await;
+        if !peer_task_finished {
+            if let Some(t) = peer_task {
+                let _ = t.await;
+            }
         }
     })
     .await
@@ -560,5 +614,26 @@ mod owner_tests {
     #[test]
     fn current_process_is_detected_as_alive() {
         assert!(process_exists(std::process::id()));
+    }
+
+    #[test]
+    fn teardown_requires_complete_required_server_ownership() {
+        // Exact collision regression: the control task may win select while
+        // the peer lock task has also failed before publishing its receipt.
+        assert!(preserve_shared_processes_after_required_server_exit(
+            false, true, false
+        ));
+        assert!(preserve_shared_processes_after_required_server_exit(
+            true, true, false
+        ));
+        assert!(preserve_shared_processes_after_required_server_exit(
+            false, true, true
+        ));
+        assert!(!preserve_shared_processes_after_required_server_exit(
+            true, true, true
+        ));
+        assert!(!preserve_shared_processes_after_required_server_exit(
+            true, false, false
+        ));
     }
 }

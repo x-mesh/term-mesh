@@ -23,6 +23,29 @@ import XCTest
 /// roster to nil and hands it here — so pinning it pins the real path.
 @MainActor
 final class RemoteLeaderReattachTriStateTests: XCTestCase {
+    func testHostReconnectRepairsOnlyItsMissingPeerLeader() {
+        XCTAssertTrue(TeamOrchestrator.shouldRecoverRemoteLeaderOnHostReconnect(
+            teamHostKey: "ssh:mac-sub", connectedHostKey: "ssh:mac-sub", isAttached: false
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldRecoverRemoteLeaderOnHostReconnect(
+            teamHostKey: "ssh:other", connectedHostKey: "ssh:mac-sub", isAttached: false
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldRecoverRemoteLeaderOnHostReconnect(
+            teamHostKey: "ssh:mac-sub", connectedHostKey: "ssh:mac-sub", isAttached: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldRecoverRemoteLeaderOnHostReconnect(
+            teamHostKey: nil, connectedHostKey: "ssh:mac-sub", isAttached: false
+        ))
+    }
+
+    func testReconnectRecoveryUsesIndependentTaskStorage() {
+        let orchestrator = TeamOrchestrator.shared
+        XCTAssertNil(orchestrator.remoteLeaderReconnectTasks["independent"])
+        orchestrator.remoteLeaderReconnectTasks["independent"] = Task {}
+        XCTAssertNotNil(orchestrator.remoteLeaderReconnectTasks["independent"])
+        orchestrator.remoteLeaderReconnectTasks.removeValue(forKey: "independent")
+    }
+
 
     private let stored = Data([0xCA, 0xFE, 0xBA, 0xBE])
     private let other = Data([0x01, 0x02, 0x03, 0x04])

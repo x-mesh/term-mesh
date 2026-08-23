@@ -138,3 +138,4 @@ Canonical details: [team lifecycle](.claude/commands/team.md),
 - START: 실패한 기능에 "동작하는 선례"(플러그인·유사 구현)가 있으면 내 가설 실험 전에 그 구현 전체를 독해 — source된 파일 포함. 부분 독해는 답을 옆에 두고 우회하게 만든다. (L5, confirmed 1 times, 2026-07-20)
 - START: 같은 결함 클래스가 2회째 나타나면 지점 수정 전에 클래스 인벤토리부터 — 관련 상태 전이 목록과 불변식(고아 프로세스 0, 기록 소실 0 등)을 명시하고, 수정은 그 불변식을 검증하는 테스트와 함께. (L6, confirmed 1 times, 2026-08-19)
 - START: relay E2E는 production socket owner → 외부 project 생성 → exact project.presentation → exact workspace/pane → A/B/A2 순서의 hard gate로 실행 — 한 단계라도 실패하면 성공 판정과 다음 단계 금지. (L8, confirmed 1 times, 2026-08-20)
+- START: daemon/Project health는 control socket ping만 보지 말고 peer socket pathname의 실제 connect, 단일 owner, exact Project manifest, leader pane attachment까지 함께 검증 — 기존 relay fd가 살아 있어도 새 연결은 이미 죽었을 수 있다. (L10, confirmed 1 times, 2026-08-22)

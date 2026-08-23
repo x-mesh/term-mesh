@@ -638,6 +638,12 @@ extension TeamOrchestrator {
         }
     }
 
+    nonisolated static func shouldRecoverRemoteLeaderOnHostReconnect(
+        teamHostKey: String?, connectedHostKey: String, isAttached: Bool
+    ) -> Bool {
+        teamHostKey == connectedHostKey && !isAttached
+    }
+
     /// Recreate owned Project viewers as soon as the session-owner roster is
     /// available. Persistence is useful only when relaunch does not require a
     /// hidden Projects-sidebar button to materialize it again.
@@ -646,6 +652,26 @@ extension TeamOrchestrator {
         tabManager: TabManager
     ) async {
         for host in hosts where host.isConnected && host.teamHostSpec != nil {
+            let leaderRecoveryNames = teams.values.compactMap { team -> String? in
+                let teamHostKey: String? = {
+                    guard case let .peer(key) = team.leaderEndpoint else { return nil }
+                    return key
+                }()
+                return Self.shouldRecoverRemoteLeaderOnHostReconnect(
+                    teamHostKey: teamHostKey,
+                    connectedHostKey: host.id,
+                    isAttached: isLeaderPaneAttached(teamName: team.id)
+                ) ? team.id : nil
+            }
+            for teamName in leaderRecoveryNames.sorted() {
+                guard remoteLeaderReconnectTasks[teamName] == nil else { continue }
+                remoteLeaderReconnectTasks[teamName] = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    _ = await self.recoverRemoteLeaderIfNeeded(teamName: teamName)
+                    self.remoteLeaderReconnectTasks.removeValue(forKey: teamName)
+                }
+            }
+
             let teamNames = Set(host.teams.map(\.name))
             for teamName in teamNames.sorted() where teams[teamName] == nil {
                 let leaderRecord = ManagedPeerSurfaceStore.shared.leaderRecord(
