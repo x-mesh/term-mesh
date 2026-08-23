@@ -120,16 +120,19 @@ struct AgentPanelView: View {
             // side by side were five identical grey lines, and a 7pt dot is
             // not something you pick a pane out by.
             Capsule().fill(accent).frame(width: 3, height: 15)
-            // A pane can be narrow, and a wrapped name reads as two agents:
-            // measured at a real width, this row broke into `explore / r` and
-            // `CLAUD / E`. Identity never wraps and never yields; the model
-            // summary is the part worth losing first, so it is the only thing
-            // allowed to shrink.
+            // A pane can be narrow, and a wrapped name reads as two agents.
+            // Keep it on one line, but let a remote name such as
+            // `reviewer @host` truncate: making it horizontally fixed gives
+            // the whole VStack that minimum width, so the transcript wraps at
+            // the title's width and Bonsplit clips both sides of the pane.
+            // The model summary still yields first; the name yields before the
+            // compact provider and ownership badges.
             Text(panel.agentName)
                 .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(accent)
                 .lineLimit(1)
-                .fixedSize()
+                .truncationMode(.tail)
+                .layoutPriority(1)
             CliBadge(cli: panel.cli, accent: providerAccent)
                 .fixedSize()
             if let ownership = panel.runtimeOwnership.badgeTitle {
