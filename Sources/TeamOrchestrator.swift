@@ -346,6 +346,7 @@ final class TeamOrchestrator: ObservableObject {
     var publishedRemoteProjectAgentSurfaceIDs: [String: Set<Data>] = [:]
     var automaticProjectRestoreFailureAttempts: [String: Int] = [:]
     var automaticProjectRestoreRetryTasks: [String: Task<Void, Never>] = [:]
+    var remoteLeaderReconnectTasks: [String: Task<Void, Never>] = [:]
     private var projectLayoutSaveTasks: [String: Task<Void, Never>] = [:]
     /// Same single-flight need as the two above, one level down: a rewound
     /// stream can drop the same peer-owned agent pane twice before the first

@@ -1354,6 +1354,7 @@ pub async fn serve(
         tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>,
     >,
     mut shutdown_rx: watch::Receiver<bool>,
+    started: watch::Sender<bool>,
 ) -> anyhow::Result<()> {
     clear_stale_socket_entry(&path)?;
 
@@ -1418,6 +1419,10 @@ pub async fn serve(
     // Phase 2.5: 30s disk flush for dirty usage counters.
     let usage_flush_task = tokio::spawn(run_usage_disk_flusher(ctx.clone(), shutdown_rx.clone()));
     let mut connection_tasks = JoinSet::new();
+    // Publish only after every fallible startup step has completed. main.rs
+    // combines this receipt with the peer-server receipt before deciding that
+    // this daemon generation may terminate processes loaded from the shared DB.
+    let _ = started.send(true);
 
     loop {
         tokio::select! {

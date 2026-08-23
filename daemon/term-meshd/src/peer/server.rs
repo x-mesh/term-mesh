@@ -4,8 +4,10 @@
 //! spawns a default PTY surface, and passes the manager into each
 //! per-connection task.
 
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::UnixListener;
 use tokio::sync::{watch, Semaphore};
@@ -81,7 +83,9 @@ pub async fn serve(
     monitor_rx: watch::Receiver<Option<crate::monitor::SystemSnapshot>>,
     teams: Arc<tokio::sync::Mutex<crate::headless::HeadlessManager>>,
     agents: Arc<crate::agent::AgentSessionManager>,
+    started: watch::Sender<bool>,
 ) -> anyhow::Result<()> {
+    let socket_owner = prepare_socket_owner(&path)?;
     let manager = Arc::new(PtyManager::new());
     manager.spawn_from_config();
     let workspaces_path = persist::default_workspaces_path();
@@ -108,7 +112,7 @@ pub async fn serve(
     // out of. Wired here for the same reason as the manager above: only the
     // daemon has one, and a host without it says so rather than guessing.
     host.set_agents(agents);
-    serve_with_host(path, shutdown_rx, host).await
+    serve_with_prepared_host(path, shutdown_rx, host, socket_owner, Some(started)).await
 }
 
 /// Test/embedding entry point: builds a host with `PeerHost::new` (a
@@ -124,43 +128,58 @@ pub async fn serve_with_manager(
     shutdown_rx: watch::Receiver<bool>,
     manager: Arc<PtyManager>,
 ) -> anyhow::Result<()> {
+    let socket_owner = prepare_socket_owner(&path)?;
     // The host owns the layout tree the manager's surfaces are arranged
     // in; connections share it so WorkspaceControl mutations made over
     // one connection are visible (and pushable) to all of them.
     let host = Arc::new(PeerHost::new(manager));
-    serve_with_host(path, shutdown_rx, host).await
+    serve_with_prepared_host(path, shutdown_rx, host, socket_owner, None).await
 }
 
 /// Shared accept loop, parameterized on an already-constructed host so
 /// `serve` (persistence-backed) and `serve_with_manager` (persistence-
 /// free) can share every bit of socket/connection plumbing below.
+#[allow(dead_code)]
 async fn serve_with_host(
+    path: PathBuf,
+    shutdown_rx: watch::Receiver<bool>,
+    host: Arc<PeerHost>,
+) -> anyhow::Result<()> {
+    let socket_owner = prepare_socket_owner(&path)?;
+    serve_with_prepared_host(path, shutdown_rx, host, socket_owner, None).await
+}
+
+struct PreparedPeerSocket {
+    _lock: File,
+    listener: UnixListener,
+    path_identity: Option<(u64, u64)>,
+}
+
+async fn serve_with_prepared_host(
     path: PathBuf,
     mut shutdown_rx: watch::Receiver<bool>,
     host: Arc<PeerHost>,
+    socket_owner: PreparedPeerSocket,
+    started: Option<watch::Sender<bool>>,
 ) -> anyhow::Result<()> {
     super::install_remote_leader_router(&host.clients);
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            harden_parent_directory(parent)?;
-        }
-    }
-
-    // Bind under a tight umask so the socket file is created at 0600
-    // from the start; the post-bind chmod is kept as belt-and-braces
-    // for the (already narrow) window between bind() and the umask
-    // restore. Closes the bind-time TOCTOU on multi-user systems.
-    let listener = bind_with_tight_umask(&path)?;
-    harden_socket_permissions(&path);
+    let PreparedPeerSocket {
+        _lock: socket_lock,
+        mut listener,
+        path_identity: mut bound_path_identity,
+    } = socket_owner;
+    let _socket_lock = socket_lock;
     tracing::info!("peer-federation listening on {}", path.display());
+    if let Some(started) = started {
+        let _ = started.send(true);
+    }
     let max_connections = max_peer_connections();
     tracing::info!("peer-federation connection ceiling: {max_connections}");
     let connection_permits = Arc::new(Semaphore::new(max_connections));
     let owner_uid = current_uid();
     let mut connection_tasks = JoinSet::new();
+    let mut pathname_watch = tokio::time::interval(Duration::from_secs(1));
+    pathname_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -204,6 +223,24 @@ async fn serve_with_host(
                     }
                     Err(e) => {
                         tracing::error!("peer accept error: {e}");
+                    }
+                }
+            }
+            _ = pathname_watch.tick() => {
+                if !path_identity_matches(&path, bound_path_identity) {
+                    match rebind_missing_listener(&path) {
+                        Ok(Some((rebound, identity))) => {
+                            listener = rebound;
+                            bound_path_identity = identity;
+                            tracing::warn!(
+                                "peer socket pathname disappeared; rebound {} without dropping live surfaces or connections",
+                                path.display()
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::error!(
+                            "peer socket pathname unhealthy and could not be rebound; preserving live surfaces and retrying: {error}"
+                        ),
                     }
                 }
             }
@@ -259,10 +296,185 @@ async fn serve_with_host(
         }
     }
 
-    if Path::new(&path).exists() {
+    if path_identity_matches(&path, bound_path_identity) {
         let _ = std::fs::remove_file(&path);
     }
     Ok(())
+}
+
+fn prepare_socket_owner(path: &Path) -> anyhow::Result<PreparedPeerSocket> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            harden_parent_directory(parent)?;
+        }
+    }
+    let socket_lock = acquire_socket_owner_lock(path)?;
+    remove_stale_socket_only(path)?;
+    let listener = bind_with_tight_umask(path)?;
+    harden_socket_permissions(path);
+    let path_identity = socket_path_identity(path);
+    Ok(PreparedPeerSocket {
+        _lock: socket_lock,
+        listener,
+        path_identity,
+    })
+}
+
+/// Hold an advisory lock for the complete lifetime of this listener.
+#[cfg(unix)]
+fn acquire_socket_owner_lock(path: &Path) -> anyhow::Result<File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let lock_path = path.with_extension("sock.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&lock_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != current_uid() || metadata.nlink() != 1 {
+        anyhow::bail!(
+            "peer socket lock {} is not a single-link regular file owned by uid {}",
+            lock_path.display(),
+            current_uid()
+        );
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        anyhow::bail!(
+            "peer socket {} is already owned by another daemon ({})",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn acquire_socket_owner_lock(path: &Path) -> anyhow::Result<File> {
+    Ok(OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("sock.lock"))?)
+}
+
+/// Never unlink a socket that accepts connections. Only an unreachable stale
+/// inode from an unclean exit may be removed before bind.
+fn remove_stale_socket_only(path: &Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => anyhow::bail!("peer socket {} already has a live listener", path.display()),
+        Err(error) if socket_error_allows_replacement(&error) => {
+            ensure_socket_inode(path)?;
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(error) => anyhow::bail!(
+            "peer socket {} could still be live; refusing to unlink after connect error: {error}",
+            path.display()
+        ),
+    }
+}
+
+fn socket_error_allows_replacement(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+    )
+}
+
+#[cfg(unix)]
+fn ensure_socket_inode(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_socket() {
+        anyhow::bail!("refusing to remove non-socket path {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_socket_inode(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn socket_path_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn socket_path_identity(path: &Path) -> Option<(u64, u64)> {
+    path.exists().then_some((0, 0))
+}
+
+fn path_identity_matches(path: &Path, expected: Option<(u64, u64)>) -> bool {
+    expected.is_some() && socket_path_identity(path) == expected
+}
+
+/// Recreate only a missing/stale pathname. A different live listener wins and
+/// is never unlinked; the owner lock means this normally indicates an external
+/// server rather than another term-meshd generation.
+fn rebind_missing_listener(
+    path: &Path,
+) -> anyhow::Result<Option<(UnixListener, Option<(u64, u64)>)>> {
+    if path.exists() {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => return bind_and_replace_socket_path(path).map(Some),
+            Err(error) if socket_error_allows_replacement(&error) => {
+                ensure_socket_inode(path)?;
+                std::fs::remove_file(path)?;
+            }
+            Err(error) => anyhow::bail!(
+                "peer socket {} could still be live; refusing to unlink after connect error: {error}",
+                path.display()
+            ),
+        }
+    }
+    let listener = bind_with_tight_umask(path)?;
+    harden_socket_permissions(path);
+    let identity = socket_path_identity(path);
+    Ok(Some((listener, identity)))
+}
+
+/// Bind a fresh socket next to the target, then atomically replace only the
+/// pathname. The foreign listener keeps its already-open fd/connections, but
+/// every new client reaches the daemon that owns the lifetime lock.
+fn bind_and_replace_socket_path(
+    path: &Path,
+) -> anyhow::Result<(UnixListener, Option<(u64, u64)>)> {
+    let mut nonce = [0u8; 8];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| anyhow::anyhow!("rebind nonce: {error}"))?;
+    // Keep the sibling name independent of the requested basename. A valid
+    // Unix socket path can already sit near SUN_LEN; appending the original
+    // name plus a suffix would make only the repair path fail to bind.
+    let replacement = path.with_file_name(format!(
+        ".tmr-{}-{:016x}",
+        std::process::id(),
+        u64::from_ne_bytes(nonce)
+    ));
+    let listener = bind_with_tight_umask(&replacement)?;
+    harden_socket_permissions(&replacement);
+    if let Err(error) = std::fs::rename(&replacement, path) {
+        let _ = std::fs::remove_file(&replacement);
+        return Err(error.into());
+    }
+    harden_socket_permissions(path);
+    Ok((listener, socket_path_identity(path)))
 }
 
 #[cfg(unix)]
@@ -455,6 +667,160 @@ fn peer_uid(_stream: &tokio::net::UnixStream) -> Option<u32> {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+
+    #[test]
+    fn only_definitively_stale_connect_errors_allow_socket_replacement() {
+        assert!(socket_error_allows_replacement(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(socket_error_allows_replacement(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            assert!(!socket_error_allows_replacement(&std::io::Error::from(kind)));
+        }
+    }
+
+    #[test]
+    fn stale_cleanup_refuses_a_non_socket_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("peer.sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+        let error = remove_stale_socket_only(&path).expect_err("regular file must survive");
+        assert!(error.to_string().contains("non-socket"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
+    }
+
+    #[tokio::test]
+    async fn lock_owner_atomically_reclaims_a_foreign_live_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("peer.sock");
+        let foreign = UnixListener::bind(&path).unwrap();
+
+        let (owner, _) = bind_and_replace_socket_path(&path).unwrap();
+        let client = UnixStream::connect(&path).await.unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(1), owner.accept())
+            .await
+            .expect("owner accepts new connection")
+            .expect("accept succeeds");
+        drop(client);
+        drop(accepted);
+
+        assert!(tokio::time::timeout(Duration::from_millis(100), foreign.accept())
+            .await
+            .is_err(), "foreign listener must receive no new connections");
+    }
+
+    #[tokio::test]
+    async fn atomic_reclaim_does_not_extend_a_near_limit_socket_basename() {
+        let tmp = TempDir::new().unwrap();
+        let parent_len = tmp.path().as_os_str().as_encoded_bytes().len() + 1;
+        // Darwin sockaddr_un has the smaller path budget (104 bytes). Leave
+        // room for the NUL while making the original basename longer than the
+        // replacement's fixed-width name. Linux accepts this path as well.
+        let basename_len = 102usize.saturating_sub(parent_len).max(32);
+        let path = tmp.path().join("p".repeat(basename_len));
+        let foreign = UnixListener::bind(&path).expect("original near-limit path binds");
+
+        let (owner, _) = bind_and_replace_socket_path(&path).unwrap();
+        let client = UnixStream::connect(&path).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), owner.accept())
+            .await
+            .expect("replacement accepts")
+            .expect("replacement accept succeeds");
+        drop(client);
+        drop(foreign);
+    }
+
+    #[tokio::test]
+    async fn second_server_cannot_steal_a_live_peer_socket() {
+        let tmp = TempDir::new().unwrap();
+        let socket = tmp.path().join("peer.sock");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let first_socket = socket.clone();
+        let first = tokio::spawn(async move {
+            serve_with_manager(first_socket, shutdown_rx, cat_manager()).await
+        });
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let identity = socket_path_identity(&socket);
+        assert!(UnixStream::connect(&socket).await.is_ok());
+
+        let (_second_tx, second_rx) = watch::channel(false);
+        let second = serve_with_manager(socket.clone(), second_rx, cat_manager()).await;
+        let error = second.expect_err("second server must fail without unlinking the owner");
+        assert!(error.to_string().contains("already owned"));
+        assert_eq!(socket_path_identity(&socket), identity);
+        assert!(UnixStream::connect(&socket).await.is_ok());
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), first)
+            .await
+            .expect("first server exits")
+            .expect("join first server")
+            .expect("first server clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn missing_peer_socket_path_is_rebound_without_losing_surfaces() {
+        let tmp = TempDir::new().unwrap();
+        let socket = tmp.path().join("peer.sock");
+        let manager = cat_manager();
+        let surface_ids: Vec<_> = manager
+            .list()
+            .iter()
+            .map(|s| s.surface_id.clone())
+            .collect();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task_socket = socket.clone();
+        let task_manager = Arc::clone(&manager);
+        let server = tokio::spawn(async move {
+            serve_with_manager(task_socket, shutdown_rx, task_manager).await
+        });
+        for _ in 0..50 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let original = socket_path_identity(&socket);
+        assert!(UnixStream::connect(&socket).await.is_ok());
+        std::fs::remove_file(&socket).unwrap();
+
+        let mut rebound = false;
+        for _ in 0..100 {
+            if socket_path_identity(&socket).is_some()
+                && socket_path_identity(&socket) != original
+                && UnixStream::connect(&socket).await.is_ok()
+            {
+                rebound = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(rebound, "listener pathname was not recreated");
+        let remaining: Vec<_> = manager
+            .list()
+            .iter()
+            .map(|s| s.surface_id.clone())
+            .collect();
+        assert_eq!(remaining, surface_ids, "rebind must keep the live registry");
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("server exits")
+            .expect("join server")
+            .expect("clean shutdown");
+    }
 
     /// A ceiling read from the environment, and the reasons to ignore one.
     ///
