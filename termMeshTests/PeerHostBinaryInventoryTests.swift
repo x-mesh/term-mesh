@@ -362,13 +362,47 @@ final class PeerHostDaemonSnapshotTests: XCTestCase {
         )
     }
 
-    /// The observed host: two daemons from yesterday, an app that holds only
-    /// its own peer/control sockets, and no connection between them.
-    func test_daemonsTheAppIsNotUsingAreStale() {
+    /// Peer listeners may be serving another Mac. Local lsof cannot prove
+    /// external client count is zero, so they are not cleanup candidates.
+    func test_peerServingDaemonsAreNeverInferredStaleFromLocalAppSockets() {
         let stale = PeerHostDoctor.staleDaemons(
             in: PeerHostDoctor.parseDaemonSnapshot(observedOutput)
         )
-        XCTAssertEqual(stale.map(\.pid), [42767, 44865])
+        XCTAssertTrue(stale.isEmpty)
+    }
+
+    func test_controlOnlyDaemonOutsideTheAppCanBeStale() {
+        let output = """
+        app=87534
+        appsocks=/tmp/term-mesh.sock
+        daemon=42767 ppid=1 etime=01-05:10:54 socks=/private/tmp/term-meshd.sock
+        """
+        XCTAssertEqual(
+            PeerHostDoctor.staleDaemons(
+                in: PeerHostDoctor.parseDaemonSnapshot(output)
+            ).map(\.pid),
+            [42767]
+        )
+    }
+
+    /// Production regression, 2026-08-23: the Mac app owns its bundled
+    /// session daemon as a child process, but the listener belongs to the
+    /// child and therefore never appears in the app process's lsof list.
+    /// Cleanup called that daemon unused, SIGTERM'd it, and disconnected
+    /// every Project another Mac had attached through it. Parent ownership is
+    /// authoritative even when no socket pathname intersects.
+    func test_appChildSessionOwnerIsNeverStaleWithoutSocketIntersection() {
+        let output = """
+        app=65188
+        appsocks=/tmp/term-mesh-peer-501/peer.sock /tmp/term-mesh.sock
+        daemon=65197 ppid=65188 etime=02:23:13 socks=/var/folders/rd/xx/T/term-meshd-peer.sock /var/folders/rd/xx/T/term-meshd.sock
+        """
+        XCTAssertTrue(
+            PeerHostDoctor.staleDaemons(
+                in: PeerHostDoctor.parseDaemonSnapshot(output)
+            ).isEmpty,
+            "the app's own child daemon may be the session owner for another Mac"
+        )
     }
 
     /// An adopted daemon shows up as a client connection in the app's own
@@ -415,6 +449,11 @@ final class PeerHostDaemonSnapshotTests: XCTestCase {
         let cmd = PeerHostDoctor.daemonCleanupCommand
         XCTAssertTrue(cmd.contains("*[!0-9]*"), "non-numeric stdin must be skipped remotely")
         XCTAssertFalse(cmd.contains("kill -9"), "SIGTERM only — SIGKILL leaves sockets behind")
+        XCTAssertTrue(
+            cmd.contains(".app/Contents/MacOS/term-mesh"),
+            "kill-time guard must protect the app's current child daemon"
+        )
+        XCTAssertTrue(cmd.contains("grep peer"), "kill-time guard must protect peer listeners")
     }
 
     /// The readiness script decides whether a leader may start, and its

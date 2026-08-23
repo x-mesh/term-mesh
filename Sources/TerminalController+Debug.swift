@@ -1720,6 +1720,83 @@ extension TerminalController {
         return .ok(result)
     }
 
+    /// Drive the exact Test Relay transport path against two explicit remote
+    /// sockets. This is DEBUG-only and exists for the destructive split-route
+    /// E2E: configured can be a listener that drops the handshake while
+    /// discovered is an isolated live daemon. The operation is async so socket
+    /// dispatch and MainActor remain unblocked; poll the returned id.
+    func v2DebugPeerRouteProbe(params: [String: Any]) -> V2CallResult {
+        guard let sshTarget = params["ssh_target"] as? String, !sshTarget.isEmpty,
+              let configured = params["configured_socket"] as? String, !configured.isEmpty,
+              let discovered = params["discovered_socket"] as? String, !discovered.isEmpty
+        else {
+            return .err(
+                code: "invalid_params",
+                message: "ssh_target, configured_socket, and discovered_socket are required",
+                data: nil
+            )
+        }
+        let operationID = UUID().uuidString
+        debugPeerRouteProbeStatus[operationID] = ["state": "running"]
+        Task { @MainActor in
+            let result = await PeerHostDoctor.testResolvedRoute(
+                sshTarget: sshTarget, port: nil, identityFile: nil,
+                configuredSocket: configured, discoveredSocket: discovered,
+                selectedSocket: configured
+            )
+            self.debugPeerRouteProbeStatus[operationID] =
+                Self.debugPeerRouteProbePayload(result)
+        }
+        return .ok(["operation_id": operationID])
+    }
+
+    func v2DebugPeerRouteProbeStatus(params: [String: Any]) -> V2CallResult {
+        guard let operationID = params["operation_id"] as? String,
+              let status = debugPeerRouteProbeStatus[operationID] else {
+            return .err(code: "not_found", message: "route probe not found", data: nil)
+        }
+        return .ok(status)
+    }
+
+    nonisolated private static func debugPeerRouteProbePayload(
+        _ result: PeerHostTestResult
+    ) -> [String: Any] {
+        switch result {
+        case .ok(let details, _):
+            return debugPeerRouteDetailsPayload(
+                details, state: "succeeded", message: ""
+            )
+        case .relayFailed(let details, let message):
+            return debugPeerRouteDetailsPayload(
+                details, state: "failed", message: message
+            )
+        case .daemonMissing:
+            return ["state": "failed", "message": "daemon missing"]
+        case .sshFailed(let message):
+            return ["state": "failed", "message": message]
+        }
+    }
+
+    nonisolated private static func debugPeerRouteDetailsPayload(
+        _ details: PeerRelayTestDetails, state: String, message: String
+    ) -> [String: Any] {
+        [
+            "state": state,
+            "message": message,
+            "configured_socket": details.configuredSocket ?? NSNull(),
+            "discovered_socket": details.discoveredSocket ?? NSNull(),
+            "discovered_verified": details.discoveredVerified ?? NSNull(),
+            "connected_socket": details.connectedSocket,
+            "connected_verified": details.connectedVerified,
+            "session_owner_socket": details.sessionOwnerSocket ?? NSNull(),
+            "session_owner_verified": details.sessionOwnerVerified,
+            "route_verified": details.routeVerified,
+            "ui_summary": PeerHostEditorView.relayRouteSummary(details),
+            "ui_discovered": PeerHostEditorView.relayDiscoveredValue(details),
+            "ui_warnings": PeerHostEditorView.relayRouteWarnings(details),
+        ]
+    }
+
     func v2DebugFlashCount(params: [String: Any]) -> V2CallResult {
         guard let surfaceId = v2String(params, "surface_id") else {
             return .err(code: "invalid_params", message: "Missing surface_id", data: nil)
