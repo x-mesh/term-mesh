@@ -338,9 +338,8 @@ struct SidebarFleetRestoreBanner: View {
                 }
                 Spacer(minLength: 4)
                 Button("Restore") {
-                    NotificationCenter.default.post(
+                    MainWindowPresentationRouter.post(
                         name: .restoreFleetRequested,
-                        object: nil,
                         userInfo: ["team_uuid": fleet.teamUuid]
                     )
                 }
@@ -390,9 +389,8 @@ struct SidebarResumableFooter: View {
             if resumableCount > 0 {
                 HStack(spacing: 6) {
                     Button {
-                        NotificationCenter.default.post(
-                            name: .openCreateTeamSheetInResumeMode,
-                            object: nil
+                        MainWindowPresentationRouter.post(
+                            name: .openCreateTeamSheetInResumeMode
                         )
                     } label: {
                         Text("\(resumableCount) resumable team\(resumableCount == 1 ? "" : "s")")
@@ -1060,9 +1058,8 @@ struct SidebarProjectsSection: View {
                     // The sheet itself belongs to the app, not to this header:
                     // the titlebar's + opens the same one, and it is visible
                     // exactly when the sidebar — and so this button — is not.
-                    NotificationCenter.default.post(
-                        name: .projectCreationRequested,
-                        object: nil
+                    MainWindowPresentationRouter.post(
+                        name: .projectCreationRequested
                     )
                 } label: {
                     Image(systemName: "plus")
