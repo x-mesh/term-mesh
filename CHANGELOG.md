@@ -4,6 +4,16 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.206.0] - 2026-08-23
+
+### Fixed
+
+- Restored peer socket ownership after pathname loss or replacement without dropping live Project surfaces and connections.
+- Prevented duplicate daemon startup from terminating agents owned by the active daemon generation.
+- Reattached missing remote Project leaders automatically after a host reconnect without blocking other Project restoration.
+
+Thanks to Jinwoo for the report and verification.
+
 ## [0.205.0] - 2026-08-22
 
 **원격 Project의 leader와 agent pane을 의도한 grid로 복원하고, 저장된 focus와 사용자 layout을 안전하게 보존한다.**
