@@ -4,6 +4,17 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.209.0] - 2026-08-23
+
+### Fixed
+
+- Prevented the Projects sidebar from listing an owner Project twice as a local group and a misleading remote Update row.
+- Persisted the exact `team:<uuid>` identity after manifest publication so local and daemon-owned views compare the same Project ID and host.
+- Changed remote Project action labels to use exact host/project identity instead of treating any same-named team as an update.
+- Added unit and full relay E2E assertions that the owner Project ID and host equal the published manifest across create, restart, reconnect, and cleanup.
+
+Thanks to Jinwoo for the production reproduction and verification.
+
 ## [0.208.0] - 2026-08-23
 
 ### Fixed
