@@ -20,6 +20,7 @@ struct PeerHostEditorView: View {
     @State private var profile: PeerHostProfile
     private let isNew: Bool
     private let onSave: (PeerHostProfile) -> Void
+    private let onRepair: ((PeerHostProfile) -> RemoteHostStore.RepairConnectionResult)?
     private let onCancel: () -> Void
 
     /// Text mirror of the optional Int port (empty = nil).
@@ -27,6 +28,7 @@ struct PeerHostEditorView: View {
     /// KEY=VALUE per line — parsed into `profile.environment` on save.
     @State private var environmentText: String
     @State private var validationError: String?
+    @State private var repairError: String?
     @State private var discovered: [DiscoveredPeer] = []
     /// Held for the sheet's lifetime; started/stopped with appearance.
     @State private var bonjourBrowser = PeerBonjourBrowser()
@@ -93,6 +95,12 @@ struct PeerHostEditorView: View {
     @State private var daemonSnapshot: PeerHostDoctor.DaemonSnapshot?
     @State private var showDaemonCleanupConfirm = false
     @State private var daemonCleanupBusy = false
+    @State private var daemonCleanupFeedback: String?
+    @State private var daemonCleanupFeedbackIsError = false
+    @State private var showBinaryCleanupConfirm = false
+    @State private var binaryCleanupBusy = false
+    @State private var binaryCleanupFeedback: String?
+    @State private var binaryCleanupFeedbackIsError = false
     /// Version reported by a binary found on the host while term-meshd
     /// itself isn't running (`.daemonMissing`). Kept out of that case's
     /// associated value since its signature must not change.
@@ -186,10 +194,12 @@ struct PeerHostEditorView: View {
 
     init(context: PeerHostEditorContext,
          onSave: @escaping (PeerHostProfile) -> Void,
+         onRepair: ((PeerHostProfile) -> RemoteHostStore.RepairConnectionResult)? = nil,
          onCancel: @escaping () -> Void) {
         _profile = State(initialValue: context.profile)
         self.isNew = context.isNew
         self.onSave = onSave
+        self.onRepair = onRepair
         self.onCancel = onCancel
         _portText = State(initialValue: context.profile.sshPort.map(String.init) ?? "")
         _environmentText = State(initialValue: (context.profile.environment ?? [:])
@@ -299,6 +309,12 @@ struct PeerHostEditorView: View {
                     .foregroundColor(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let repairError {
+                Label(repairError, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             doctorStatusLine
             relayRouteStatusLine
@@ -308,6 +324,7 @@ struct PeerHostEditorView: View {
             agentStackStatusLine
             binaryWarningLines
             staleDaemonLine
+            cleanupFeedbackLines
 
             HStack {
                 Button("Test Relay", action: runTest)
@@ -334,8 +351,13 @@ struct PeerHostEditorView: View {
                 }
                 if !staleDaemons.isEmpty {
                     Button("Clean Up Daemons…") { showDaemonCleanupConfirm = true }
-                        .disabled(doctorBusy || daemonCleanupBusy)
-                        .help("Stop term-meshd processes this host is no longer using")
+                        .disabled(doctorBusy)
+                        .help("Stop detached term-meshd processes and their unreachable agent children")
+                }
+                if !isNew, onRepair != nil {
+                    Button("Repair Connection") { validateAndRepair() }
+                        .disabled(doctorBusy)
+                        .help("Save this host, clear the failed auto-detected socket, and reconnect")
                 }
                 Spacer()
                 Button("Cancel", action: onCancel)
@@ -413,7 +435,22 @@ struct PeerHostEditorView: View {
             // Name the exact processes: this ends something on another
             // machine, and "some daemons" is not a thing anyone can agree to.
             Text(
-                "Stops \(staleDaemonPidSummary). The app serving this host keeps running, and open panes, mirrors and sessions are untouched — these processes are not serving any of them."
+                "Stops \(staleDaemonPidSummary) and their unreachable agent children. "
+                    + "The daemon that owns the verified Project route is protected."
+            )
+        }
+        .confirmationDialog(
+            shadowedBinaryCandidates.count == 1
+                ? "Archive 1 old binary on \"\(profile.sshTarget)\"?"
+                : "Archive \(shadowedBinaryCandidates.count) old binaries on \"\(profile.sshTarget)\"?",
+            isPresented: $showBinaryCleanupConfirm
+        ) {
+            Button("Archive Old Binaries") { runBinaryCleanup() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "Moves only HOME-owned shadowed copies into ~/.term-mesh/cleanup-backups. "
+                    + "The binaries currently selected by PATH are unchanged."
             )
         }
     }
@@ -427,6 +464,33 @@ struct PeerHostEditorView: View {
         }
     }
 
+    /// Operation results outlive the warning that offered the action. A
+    /// successful cleanup normally removes that warning; hiding its result at
+    /// the same moment made partial failures look like success.
+    @ViewBuilder
+    private var cleanupFeedbackLines: some View {
+        if let daemonCleanupFeedback {
+            Label(
+                daemonCleanupFeedback,
+                systemImage: daemonCleanupFeedbackIsError
+                    ? "exclamationmark.triangle" : "checkmark.circle"
+            )
+            .font(.caption2)
+            .foregroundStyle(daemonCleanupFeedbackIsError ? Color.orange : Color.green)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        if let binaryCleanupFeedback {
+            Label(
+                binaryCleanupFeedback,
+                systemImage: binaryCleanupFeedbackIsError
+                    ? "exclamationmark.triangle" : "checkmark.circle"
+            )
+            .font(.caption)
+            .foregroundStyle(binaryCleanupFeedbackIsError ? Color.orange : Color.green)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private var staleDaemonPidSummary: String {
         staleDaemons.map { daemon in
             daemon.elapsed.isEmpty ? "pid \(daemon.pid)" : "pid \(daemon.pid) (up \(daemon.elapsed))"
@@ -435,38 +499,122 @@ struct PeerHostEditorView: View {
 
     private var staleDaemonMessage: String {
         let lead = staleDaemons.count == 1
-            ? "1 term-meshd process here is serving nothing"
-            : "\(staleDaemons.count) term-meshd processes here are serving nothing"
+            ? "1 term-meshd process is detached from every live socket"
+            : "\(staleDaemons.count) term-meshd processes are detached from every live socket"
         return "\(lead) — \(staleDaemonPidSummary). "
-            + "They outlived the app that started them and this host's app is not using them."
+            + "They outlived the app route that started them."
     }
 
     /// Ends exactly the pids the dialog named, then re-probes so the row
     /// reflects what actually happened rather than what was requested.
     private func runDaemonCleanup() {
         guard let draft = testedDraft, !staleDaemons.isEmpty else { return }
-        let pids = staleDaemons.map(\.pid)
+        let daemons = staleDaemons
+        let pids = daemons.map(\.pid)
         let gen = doctorGeneration
         daemonCleanupBusy = true
+        daemonCleanupFeedback = nil
         Task {
-            let killed = (try? await PeerHostDoctor.terminateDaemons(
-                sshTarget: draft.sshTarget, port: draft.sshPort,
-                identityFile: draft.identityFile, pids: pids
-            )) ?? []
-            guard gen == doctorGeneration else { return }
-            daemonCleanupBusy = false
-            RemoteWorkLog.info(
-                "Stopped \(killed.count) of \(pids.count) unused term-meshd process(es) on \(draft.sshTarget)"
-            )
-            await refreshDaemonSnapshot(draft: draft, gen: gen)
+            defer { daemonCleanupBusy = false }
+            do {
+                let killed = try await PeerHostDoctor.terminateDaemons(
+                    sshTarget: draft.sshTarget, port: draft.sshPort,
+                    identityFile: draft.identityFile, daemons: daemons
+                )
+                guard gen == doctorGeneration else { return }
+                daemonCleanupFeedbackIsError = killed.count != pids.count
+                daemonCleanupFeedback = killed.count == pids.count
+                    ? "Stopped \(killed.count) unused daemon process(es)."
+                    : "Stopped \(killed.count) of \(pids.count). A daemon still has a client or did not finish graceful shutdown."
+                RemoteWorkLog.info(
+                    "Stopped \(killed.count) of \(pids.count) detached term-meshd process(es) on \(draft.sshTarget)"
+                )
+                let refreshed = await refreshDaemonSnapshot(draft: draft, gen: gen)
+                if gen == doctorGeneration, !refreshed {
+                    daemonCleanupFeedbackIsError = true
+                    daemonCleanupFeedback? += " Could not refresh daemon status; run Test Relay again."
+                }
+            } catch {
+                guard gen == doctorGeneration else { return }
+                daemonCleanupFeedbackIsError = true
+                daemonCleanupFeedback = "Cleanup failed: \(error.localizedDescription)"
+                RemoteWorkLog.error(
+                    "Daemon cleanup failed on \(draft.sshTarget): \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    private var shadowedBinaryCandidates: [PeerHostDoctor.BinaryEntry] {
+        binaryInventory.map(PeerHostDoctor.shadowedBinaryCleanupCandidates) ?? []
+    }
+
+    private func runBinaryCleanup() {
+        guard let draft = testedDraft else { return }
+        let candidates = shadowedBinaryCandidates
+        guard !candidates.isEmpty else { return }
+        let gen = doctorGeneration
+        binaryCleanupBusy = true
+        binaryCleanupFeedback = nil
+        Task {
+            defer { binaryCleanupBusy = false }
+            do {
+                let result = try await PeerHostDoctor.archiveShadowedBinaries(
+                    sshTarget: draft.sshTarget,
+                    port: draft.sshPort,
+                    identityFile: draft.identityFile,
+                    candidates: candidates
+                )
+                guard gen == doctorGeneration else { return }
+                let unresolved = result.protected.count + result.changed.count
+                    + result.missing.count + result.failed.count
+                binaryCleanupFeedbackIsError = unresolved > 0
+                binaryCleanupFeedback = unresolved == 0
+                    ? "Archived \(result.archived.count) old binary copy/copies."
+                    : "Archived \(result.archived.count); kept \(unresolved) because the file changed, moved, or failed validation."
+                RemoteWorkLog.info(
+                    "Archived \(result.archived.count) of \(candidates.count) old binary copy/copies on \(draft.sshTarget)"
+                )
+                if !result.archived.isEmpty {
+                    let refreshed = await refreshBinaryInventory(draft: draft, gen: gen)
+                    if gen == doctorGeneration, !refreshed {
+                        binaryCleanupFeedbackIsError = true
+                        binaryCleanupFeedback? += " Could not refresh binary status; run Test Relay again."
+                    }
+                }
+            } catch {
+                guard gen == doctorGeneration else { return }
+                binaryCleanupFeedbackIsError = true
+                binaryCleanupFeedback = "Could not archive old binaries: \(error.localizedDescription)"
+                RemoteWorkLog.error(
+                    "Could not archive old binaries on \(draft.sshTarget): \(error.localizedDescription)"
+                )
+            }
         }
     }
 
     private var doctorBusy: Bool {
-        // installInFlight can outlive `.installing` in doctorState (e.g.
-        // right after invalidateDoctorState() resets state mid-install)
-        // so it's checked independently, not folded into the switch.
-        if installInFlight || agentInstallInFlight { return true }
+        Self.doctorActionsBusy(
+            doctorState: doctorState,
+            installInFlight: installInFlight,
+            agentInstallInFlight: agentInstallInFlight,
+            daemonCleanupBusy: daemonCleanupBusy,
+            binaryCleanupBusy: binaryCleanupBusy
+        )
+    }
+
+    /// One mutual-exclusion gate for every doctor action. Cleanup latches are
+    /// independent of `doctorGeneration`: editing a field may invalidate a
+    /// result, but it cannot make a remote side effect stop being in flight.
+    static func doctorActionsBusy(
+        doctorState: DoctorState,
+        installInFlight: Bool,
+        agentInstallInFlight: Bool,
+        daemonCleanupBusy: Bool,
+        binaryCleanupBusy: Bool
+    ) -> Bool {
+        if installInFlight || agentInstallInFlight
+            || daemonCleanupBusy || binaryCleanupBusy { return true }
         switch doctorState {
         case .testing, .installing, .diagnosing: return true
         default: return false
@@ -704,6 +852,27 @@ struct PeerHostEditorView: View {
                 if let ownerPID = relayOwnerPID(details: details) {
                     relayRouteRow("Owner PID", String(ownerPID))
                 }
+                if relayOwnerIsAmbiguous(details: details) {
+                    Label(
+                        "Cleanup paused for this route — the current listener PID could not be proven. Re-run Test Relay or restart the host app.",
+                        systemImage: "exclamationmark.shield"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if details.sessionOwnerVerified,
+                   let owner = details.sessionOwnerSocket,
+                   owner != details.connectedSocket {
+                    Label(
+                        "Projects use the verified session-owner route automatically",
+                        systemImage: "checkmark.circle"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.green)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
 
                 ForEach(Self.relayRouteWarnings(details), id: \.self) { warning in
                     Label(warning, systemImage: "exclamationmark.arrow.triangle.2.circlepath")
@@ -752,7 +921,34 @@ struct PeerHostEditorView: View {
 
     private func relayOwnerPID(details: PeerRelayTestDetails) -> Int? {
         let wanted = details.sessionOwnerSocket ?? details.connectedSocket
-        return daemonSnapshot?.daemons.first(where: { $0.sockets.contains(wanted) })?.pid
+        let matches = daemonSnapshot?.daemons.filter { $0.sockets.contains(wanted) } ?? []
+        return verifiedRelayOwnerPIDs(details: details).first
+            ?? matches.first(where: {
+                $0.existingSockets.contains(wanted)
+            })?.pid
+            ?? matches.first?.pid
+    }
+
+    /// Cleanup protection uses only strong ownership evidence. A pathname can
+    /// appear in old and new daemon generations during rebind; protecting
+    /// every match would make the exact same-path garbage impossible to find.
+    private func verifiedRelayOwnerPIDs(details: PeerRelayTestDetails) -> Set<Int> {
+        guard details.sessionOwnerVerified else { return [] }
+        let wanted = details.sessionOwnerSocket ?? details.connectedSocket
+        let matches = daemonSnapshot?.daemons.filter { $0.sockets.contains(wanted) } ?? []
+        let exact = matches.filter { $0.currentListenerSockets.contains(wanted) }
+        if exact.count == 1 { return [exact[0].pid] }
+        // No exact kernel owner, or contradictory owners: fail closed for the
+        // whole same-path group. The UI explains why cleanup is paused.
+        return Set(matches.map(\.pid))
+    }
+
+    private func relayOwnerIsAmbiguous(details: PeerRelayTestDetails) -> Bool {
+        guard details.sessionOwnerVerified else { return false }
+        let wanted = details.sessionOwnerSocket ?? details.connectedSocket
+        let matches = daemonSnapshot?.daemons.filter { $0.sockets.contains(wanted) } ?? []
+        guard matches.count > 1 else { return false }
+        return matches.filter { $0.currentListenerSockets.contains(wanted) }.count != 1
     }
 
     static func relayRouteWarnings(_ details: PeerRelayTestDetails) -> [String] {
@@ -768,9 +964,6 @@ struct PeerHostEditorView: View {
                 warnings.append("The alternate socket also failed its peer handshake")
             }
         }
-        if let owner = details.sessionOwnerSocket, owner != details.connectedSocket {
-            warnings.append("Sessions are owned by a different socket; both endpoints were tested")
-        }
         return warnings
     }
 
@@ -782,10 +975,22 @@ struct PeerHostEditorView: View {
     /// one you installed — is invisible everywhere else.
     @ViewBuilder
     private var binaryWarningLines: some View {
-        ForEach(binaryWarnings, id: \.self) { warning in
-            Label(warning, systemImage: "exclamationmark.arrow.triangle.2.circlepath")
-                .font(.caption).foregroundColor(.orange)
-                .fixedSize(horizontal: false, vertical: true)
+        if !binaryWarnings.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(binaryWarnings, id: \.self) { warning in
+                    Label(warning, systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                        .font(.caption).foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !shadowedBinaryCandidates.isEmpty {
+                    Button(binaryCleanupBusy ? "Archiving…" : "Archive Old Binaries…") {
+                        showBinaryCleanupConfirm = true
+                    }
+                    .controlSize(.small)
+                    .disabled(binaryCleanupBusy || doctorBusy)
+                    .help("Move HOME-owned shadowed binaries into a recoverable backup")
+                }
+            }
         }
     }
 
@@ -1107,7 +1312,11 @@ struct PeerHostEditorView: View {
         daemonSnapshot = nil
         relayTestDetails = nil
         showDaemonCleanupConfirm = false
-        daemonCleanupBusy = false
+        daemonCleanupFeedback = nil
+        daemonCleanupFeedbackIsError = false
+        showBinaryCleanupConfirm = false
+        binaryCleanupFeedback = nil
+        binaryCleanupFeedbackIsError = false
         agentStackState = .idle
         showAgentInstallConfirm = false
     }
@@ -1309,19 +1518,21 @@ struct PeerHostEditorView: View {
     /// `$HOME/.local/bin`, which is searched first — and nothing said so
     /// until a leader failed with an error naming a symbol that no longer
     /// exists.
-    private func refreshBinaryInventory(draft: PeerHostProfile, gen: Int) async {
-        guard gen == doctorGeneration else { return }
+    @discardableResult
+    private func refreshBinaryInventory(draft: PeerHostProfile, gen: Int) async -> Bool {
+        guard gen == doctorGeneration else { return false }
         let inventory = await PeerHostDoctor.binaryInventory(
             sshTarget: draft.sshTarget, port: draft.sshPort,
             identityFile: draft.identityFile
         )
-        guard gen == doctorGeneration else { return }
+        guard gen == doctorGeneration else { return false }
         binaryInventory = inventory
         let warnings = inventory.map(PeerHostDoctor.inventoryWarnings) ?? []
         binaryWarnings = warnings
         for warning in warnings {
             RemoteWorkLog.info("\(draft.sshTarget): \(warning)")
         }
+        return inventory != nil
     }
 
     private func refreshHealthBaseline(draft: PeerHostProfile, gen: Int) async {
@@ -1348,15 +1559,24 @@ struct PeerHostEditorView: View {
     /// Mac hosts only — the probe answers `exit 44` elsewhere, which arrives
     /// here as nil and leaves the row silent. A Linux host's daemon is
     /// supposed to outlive every app, so there is nothing to report there.
-    private func refreshDaemonSnapshot(draft: PeerHostProfile, gen: Int) async {
-        guard gen == doctorGeneration else { return }
+    @discardableResult
+    private func refreshDaemonSnapshot(draft: PeerHostProfile, gen: Int) async -> Bool {
+        guard gen == doctorGeneration else { return false }
         let snapshot = await PeerHostDoctor.daemonSnapshot(
             sshTarget: draft.sshTarget, port: draft.sshPort,
             identityFile: draft.identityFile
         )
-        guard gen == doctorGeneration else { return }
+        guard gen == doctorGeneration else { return false }
         daemonSnapshot = snapshot
-        let stale = snapshot.map(PeerHostDoctor.staleDaemons) ?? []
+        let protectedOwners = relayTestDetails.map {
+            verifiedRelayOwnerPIDs(details: $0)
+        } ?? []
+        let stale = snapshot.map {
+            PeerHostDoctor.staleDaemons(
+                in: $0,
+                protecting: protectedOwners
+            )
+        } ?? []
         staleDaemons = stale
         if !stale.isEmpty {
             RemoteWorkLog.info(
@@ -1364,6 +1584,7 @@ struct PeerHostEditorView: View {
                     + "pid \(stale.map { String($0.pid) }.joined(separator: ", "))"
             )
         }
+        return snapshot != nil
     }
 
     private func refreshAgentStack(draft: PeerHostProfile, gen: Int) async {
@@ -1663,6 +1884,17 @@ struct PeerHostEditorView: View {
     private func validateAndSave() {
         guard let draft = validatedDraft() else { return }
         onSave(draft)
+    }
+
+    private func validateAndRepair() {
+        guard let draft = validatedDraft(), let onRepair else { return }
+        repairError = nil
+        switch onRepair(draft) {
+        case .started:
+            onCancel()
+        case .blocked(let message):
+            repairError = message
+        }
     }
 
     /// Binding for optional String fields ("" ↔ nil).

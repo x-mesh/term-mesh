@@ -158,6 +158,7 @@ struct NewProjectView: View {
     @State private var isDiscarding = false
     @State private var agentPlacementMode: AgentPlacementMode = .sameAsLeader
     @State private var allAgentsHostKey: String?
+    @State private var peerHostEditorContext: PeerHostEditorContext?
 
     enum AgentPlacementMode: String, CaseIterable {
         case sameAsLeader
@@ -310,6 +311,19 @@ struct NewProjectView: View {
                 onDeleteSelected: {
                     appliedTeamSignature = nil
                 }
+            )
+        }
+        .sheet(item: $peerHostEditorContext) { context in
+            PeerHostEditorView(
+                context: context,
+                onSave: { profile in
+                    PeerHostProfileStore.shared.upsert(profile)
+                    peerHostEditorContext = nil
+                },
+                onRepair: { profile in
+                    hostStore.repairConnection(using: profile)
+                },
+                onCancel: { peerHostEditorContext = nil }
             )
         }
         .alert("Preset could not be saved", isPresented: Binding(
@@ -2025,6 +2039,10 @@ struct NewProjectView: View {
                             showsFailureDetail = false
                         }
                         .keyboardShortcut(.cancelAction)
+                        if peerHostRecoveryContext != nil {
+                            Button("Check Host…") { openPeerHostRecovery() }
+                                .accessibilityIdentifier("newProject.failure.checkHost")
+                        }
                         // Closing onto a project whose leader never arrived is
                         // what left checkouts on peers that nothing would use,
                         // so it is a deliberate choice rather than the way out.
@@ -2055,6 +2073,11 @@ struct NewProjectView: View {
                     if let retryTitle = placementRetryTitle {
                         Button(retryTitle) { runPlacementRetry() }
                             .accessibilityIdentifier("newProject.placementRetry")
+                    }
+                    if placementBlockerMessage != nil,
+                       peerHostRecoveryContext != nil {
+                        Button("Check Host…") { openPeerHostRecovery() }
+                            .accessibilityIdentifier("newProject.placementCheckHost")
                     }
                     Button("Cancel", action: onClose)
                         .keyboardShortcut(.cancelAction)
@@ -2409,6 +2432,28 @@ struct NewProjectView: View {
             // sidebar lease; reset the lease and start a real retry instead.
             _ = store.retryConnectingHost(host)
         }
+    }
+
+    /// The same host editor the sidebar uses, opened without throwing away the
+    /// Project form. Retry handles a stale route automatically; this action is
+    /// the deeper lane for daemon cleanup, binary drift, install/update and
+    /// project-root repair when reconnect alone is not enough.
+    private var peerHostRecoveryContext: PeerHostEditorContext? {
+        let selectedKeys = Set(
+            [runsOnHostKey].compactMap { $0 } + agents.compactMap(\.hostKey)
+        )
+        let candidates = selectedKeys.compactMap { key in
+            placeableHosts.first(where: { $0.id == key })
+        }
+        let host = placementRetryHosts.first ?? candidates.first
+        guard let profileID = host?.profileID,
+              let profile = PeerHostProfileStore.shared.profile(id: profileID)
+        else { return nil }
+        return PeerHostEditorContext(profile: profile, isNew: false)
+    }
+
+    private func openPeerHostRecovery() {
+        peerHostEditorContext = peerHostRecoveryContext
     }
 
     /// Peer-bound agents whose project folder is still blank.
