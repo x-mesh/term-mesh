@@ -1424,6 +1424,11 @@ class termmesh:
     def debug_project_delete(self, team_name: str) -> dict:
         return dict(self._call("debug.project.delete", {"team": team_name}) or {})
 
+    def debug_project_delete_status(self, operation_id: str) -> dict:
+        return dict(self._call("debug.project.delete_status", {
+            "operation_id": operation_id,
+        }) or {})
+
     def debug_project_remote_presentations(self, host: str) -> List[Dict[str, Any]]:
         result = dict(self._call("debug.project.remote_presentations", {"host": host}) or {})
         return list(result.get("projects") or [])

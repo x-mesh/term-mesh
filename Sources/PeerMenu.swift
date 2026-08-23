@@ -1766,6 +1766,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 var row: [String: Any] = [
                     "host_key": String(describing: session.lease.key),
                     "title": session.surfaceTitle,
+                    "surface_id": session.originSurface.surfaceID.base64EncodedString(),
                     "torn_down": session.isTorndown,
                 ]
                 // Byte counters, so a blank pane can be adjudicated live

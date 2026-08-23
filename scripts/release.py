@@ -37,6 +37,20 @@ STEP_ORDER = [
     "develop_resync",
     "verify",
 ]
+RELAY_E2E_PATH_PREFIXES = (
+    "Sources/Peer",
+    "Sources/RemoteHostStore.swift",
+    "Sources/SessionHostPanes.swift",
+    "Sources/TeamOrchestrator",
+    "Sources/Workspace.swift",
+    "Sources/TabManager.swift",
+    "proto/peer/",
+    "daemon/peer-proto/",
+    "daemon/term-meshd/src/peer/",
+    "swift/PeerProto/",
+    "tests_v2/test_remote_project",
+    "scripts/run-tests-v2.sh",
+)
 
 
 class ReleaseError(RuntimeError):
@@ -268,6 +282,72 @@ def ensure_approved(args: argparse.Namespace) -> None:
         raise ReleaseError("remote release mutations require --yes after user approval")
 
 
+def validate_relay_e2e_receipt(receipt: dict[str, Any], candidate_sha: str) -> None:
+    """Reject release evidence that does not prove the production failure boundary."""
+    required_phases = {"create", "adopt", "reconnect", "cleanup"}
+    phases = receipt.get("phases")
+    if receipt.get("schema") != 1:
+        raise ReleaseError("relay E2E receipt has an unsupported schema")
+    if receipt.get("candidate_sha") != candidate_sha:
+        raise ReleaseError("relay E2E receipt does not match the planned develop SHA")
+    if receipt.get("result") != "pass" or receipt.get("skipped") is not False:
+        raise ReleaseError("relay E2E receipt is not an unskipped pass")
+    if receipt.get("required_topology") is not True:
+        raise ReleaseError("relay E2E receipt did not use the required topology")
+    if not isinstance(phases, dict) or any(phases.get(name) != "pass" for name in required_phases):
+        raise ReleaseError("relay E2E receipt did not pass create/adopt/reconnect/cleanup")
+    if receipt.get("exact_surface_preserved") is not True:
+        raise ReleaseError("relay E2E receipt did not preserve the exact leader surface")
+    if float(receipt.get("leader_relay_stability_seconds") or 0) < 15:
+        raise ReleaseError("relay E2E receipt did not hold attachment for 15 seconds")
+    if float(receipt.get("background_restore_hold_seconds") or 0) < 12:
+        raise ReleaseError("relay E2E receipt did not hold the restored Project in background past timeout")
+    if receipt.get("saw_first_byte") is not True:
+        raise ReleaseError("relay E2E receipt saw no leader relay bytes")
+    if int(receipt.get("bytes_received") or 0) <= 0:
+        raise ReleaseError("relay E2E receipt has zero leader relay bytes")
+    if not receipt.get("leader_surface_id"):
+        raise ReleaseError("relay E2E receipt is missing leader surface identity")
+    if receipt.get("leader_process_active_known") is not True:
+        raise ReleaseError("relay E2E receipt lacks authoritative leader process liveness")
+    if receipt.get("leader_process_active") is not True:
+        raise ReleaseError("relay E2E receipt points at an inactive leader process")
+    tested_at = int(receipt.get("tested_at_unix") or 0)
+    if tested_at <= 0 or abs(time.time() - tested_at) > 6 * 60 * 60:
+        raise ReleaseError("relay E2E receipt is missing or older than six hours")
+
+
+def require_relay_e2e_receipt(
+    state: dict[str, Any], receipt_path: str | None
+) -> dict[str, Any]:
+    receipt = state.get("relay_e2e_receipt")
+    if receipt_path:
+        try:
+            receipt = json.loads(Path(receipt_path).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ReleaseError(f"could not read relay E2E receipt: {exc}") from exc
+    if not isinstance(receipt, dict):
+        raise ReleaseError(
+            "prepare requires --relay-e2e-receipt from the required mac-sub relay E2E"
+        )
+    validate_relay_e2e_receipt(receipt, state["candidate_develop_sha"])
+    state["relay_e2e_receipt"] = receipt
+    save_state(state)
+    return receipt
+
+
+def relay_e2e_required_for_paths(paths: list[str]) -> bool:
+    return any(path.startswith(RELAY_E2E_PATH_PREFIXES) for path in paths)
+
+
+def candidate_changed_paths(state: dict[str, Any]) -> list[str]:
+    base = state.get("latest_tag") or state["candidate_main_sha"]
+    output = git(
+        "diff", "--name-only", f"{base}..{state['candidate_develop_sha']}", "--"
+    )
+    return [line for line in output.splitlines() if line]
+
+
 def plan(args: argparse.Namespace) -> dict[str, Any]:
     fetch()
     rate = gh_json("api", "rate_limit")
@@ -417,6 +497,8 @@ def install_notes(changelog: Path, version: str, notes: str) -> None:
 def prepare(args: argparse.Namespace) -> dict[str, Any]:
     ensure_approved(args)
     state = load_state(normalize_version(args.version))
+    if relay_e2e_required_for_paths(candidate_changed_paths(state)):
+        require_relay_e2e_receipt(state, args.relay_e2e_receipt)
     if args.notes_file:
         state["notes"] = Path(args.notes_file).read_text()
         save_state(state)
@@ -615,6 +697,7 @@ def parser() -> argparse.ArgumentParser:
         sub.add_argument("--json", action="store_true")
         if name in ("prepare", "resume"):
             sub.add_argument("--notes-file")
+            sub.add_argument("--relay-e2e-receipt")
     s = subs.add_parser("status")
     s.add_argument("version")
     s.add_argument("--json", action="store_true")

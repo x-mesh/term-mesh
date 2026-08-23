@@ -39,6 +39,49 @@ class ReleaseStateMachineTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "require --yes"):
             release.ensure_approved(args)
 
+    def test_relay_receipt_requires_exact_candidate_and_durable_bytes(self):
+        receipt = {
+            "schema": 1,
+            "candidate_sha": "abc123",
+            "result": "pass",
+            "required_topology": True,
+            "skipped": False,
+            "phases": {
+                "create": "pass", "adopt": "pass",
+                "reconnect": "pass", "cleanup": "pass",
+            },
+            "exact_surface_preserved": True,
+            "leader_relay_stability_seconds": 15,
+            "background_restore_hold_seconds": 12,
+            "saw_first_byte": True,
+            "bytes_received": 42,
+            "leader_surface_id": "surface",
+            "leader_process_active": True,
+            "leader_process_active_known": True,
+            "tested_at_unix": int(release.time.time()),
+        }
+        release.validate_relay_e2e_receipt(receipt, "abc123")
+        for key, value in (
+            ("candidate_sha", "wrong"),
+            ("skipped", True),
+            ("leader_relay_stability_seconds", 10),
+            ("bytes_received", 0),
+            ("leader_process_active", False),
+        ):
+            invalid = dict(receipt)
+            invalid[key] = value
+            with self.assertRaises(release.ReleaseError, msg=key):
+                release.validate_relay_e2e_receipt(invalid, "abc123")
+
+    def test_relay_e2e_scope_is_fail_closed_for_peer_lifecycle_only(self):
+        self.assertTrue(release.relay_e2e_required_for_paths([
+            "Sources/TeamOrchestrator+RemoteAgent.swift"
+        ]))
+        self.assertTrue(release.relay_e2e_required_for_paths([
+            "daemon/term-meshd/src/peer/connection.rs"
+        ]))
+        self.assertFalse(release.relay_e2e_required_for_paths(["README.md"]))
+
     def test_steps_preserve_release_order(self):
         self.assertLess(
             release.STEP_ORDER.index("develop_to_main"),

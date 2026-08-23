@@ -222,6 +222,14 @@ message SurfaceInfo {
   // Optional semantics — empty for terminal/browser surfaces and on hosts
   // that predate agent surfaces (missing-on-wire decodes to "").
   string agent_cli = 10;
+  // True when the PTY's foreground process group differs from its login
+  // shell. For a Project leader this is the process-level evidence that the
+  // leader CLI still exists; a durable surface id alone can name an idle shell
+  // after that CLI exits. `foreground_busy_known` is false on older hosts or
+  // when the capability was not negotiated, so clients fail safe instead of
+  // interpreting protobuf's default false as authoritative idleness.
+  bool foreground_busy = 11;
+  bool foreground_busy_known = 12;
 }
 
 enum AttachMode {
@@ -954,6 +962,11 @@ message Team {
   // Computed per connection; true only when the authenticated requesting
   // peer_id owns this manifest. The owner id itself is never disclosed.
   bool presentation_owned_by_requester = 11;
+  // Process-level liveness for leader_surface_id. Known only when the host
+  // negotiated surface.foreground.v1; older hosts leave `known` false. A
+  // durable manifest with active=false names an idle shell, not a live leader.
+  bool leader_process_active = 12;
+  bool leader_process_active_known = 13;
 }
 
 message TeamMember {

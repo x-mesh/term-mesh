@@ -23,19 +23,58 @@ import XCTest
 /// roster to nil and hands it here — so pinning it pins the real path.
 @MainActor
 final class RemoteLeaderReattachTriStateTests: XCTestCase {
+    func testOnlyOwnerDeletionCreatesAReadoptionTombstone() {
+        XCTAssertTrue(TeamOrchestrator.shouldTombstoneDeletedProject(
+            ownsRemotePresentation: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldTombstoneDeletedProject(
+            ownsRemotePresentation: false
+        ))
+    }
+
+    func testUnexpectedPeerLeaderRelayFailureTriggersRecovery() {
+        XCTAssertTrue(TeamOrchestrator.shouldRecoverRemoteLeaderRelayFailure(
+            isPeerLeader: true,
+            paneWasExplicitlyTornDown: false,
+            hostTransportWasDisconnected: false
+        ))
+    }
+
+    func testIntentionalLeaderTeardownNeverTriggersRecovery() {
+        XCTAssertFalse(TeamOrchestrator.shouldRecoverRemoteLeaderRelayFailure(
+            isPeerLeader: true,
+            paneWasExplicitlyTornDown: true,
+            hostTransportWasDisconnected: false
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldRecoverRemoteLeaderRelayFailure(
+            isPeerLeader: true,
+            paneWasExplicitlyTornDown: false,
+            hostTransportWasDisconnected: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.shouldRecoverRemoteLeaderRelayFailure(
+            isPeerLeader: false,
+            paneWasExplicitlyTornDown: false,
+            hostTransportWasDisconnected: false
+        ))
+    }
+
     func testHostReconnectRepairsOnlyItsMissingPeerLeader() {
         XCTAssertTrue(TeamOrchestrator.shouldRecoverRemoteLeaderOnHostReconnect(
-            teamHostKey: "ssh:mac-sub", connectedHostKey: "ssh:mac-sub", isAttached: false
+            teamHostKey: "ssh:mac-sub", connectedHostKey: "ssh:mac-sub", recoveryEligible: true
         ))
         XCTAssertFalse(TeamOrchestrator.shouldRecoverRemoteLeaderOnHostReconnect(
-            teamHostKey: "ssh:other", connectedHostKey: "ssh:mac-sub", isAttached: false
+            teamHostKey: "ssh:other", connectedHostKey: "ssh:mac-sub", recoveryEligible: true
         ))
         XCTAssertFalse(TeamOrchestrator.shouldRecoverRemoteLeaderOnHostReconnect(
-            teamHostKey: "ssh:mac-sub", connectedHostKey: "ssh:mac-sub", isAttached: true
+            teamHostKey: "ssh:mac-sub", connectedHostKey: "ssh:mac-sub", recoveryEligible: false
         ))
         XCTAssertFalse(TeamOrchestrator.shouldRecoverRemoteLeaderOnHostReconnect(
-            teamHostKey: nil, connectedHostKey: "ssh:mac-sub", isAttached: false
+            teamHostKey: nil, connectedHostKey: "ssh:mac-sub", recoveryEligible: true
         ))
+    }
+
+    func testForegroundInactiveSurfaceNeverPermitsAutomaticBootstrap() {
+        XCTAssertFalse(RemoteLeaderReattachOutcome.confirmedInactive.permitsReplacementBootstrap)
     }
 
     func testReconnectRecoveryUsesIndependentTaskStorage() {
@@ -144,6 +183,7 @@ final class RemoteLeaderReattachTriStateTests: XCTestCase {
         XCTAssertFalse(
             RemoteLeaderReattachOutcome.temporarilyUnavailable.permitsReplacementBootstrap
         )
+        XCTAssertFalse(RemoteLeaderReattachOutcome.confirmedInactive.permitsReplacementBootstrap)
     }
 
     // MARK: - The retry is bounded

@@ -206,6 +206,10 @@ final class TerminalPanel: Panel, ObservableObject {
         viewReattachToken &+= 1
     }
 
+    func startPeerRelayIfNeeded() {
+        peerPaneSession?.startRelayIfNeeded()
+    }
+
     // MARK: - Terminal-specific methods
 
     func sendText(_ text: String) {

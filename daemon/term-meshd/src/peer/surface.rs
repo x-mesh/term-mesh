@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -2067,6 +2067,33 @@ impl PtySurface {
         fg > 0 && fg != shell_pgid
     }
 
+    /// Process-level evidence for a durable Project leader. Unlike `is_busy`,
+    /// this also handles an `exec` that replaces the login shell without
+    /// changing its process group. Unknown is kept distinct from false so an
+    /// older/unsupported host never authorizes destructive recovery.
+    pub fn foreground_workload_active(&self) -> Option<bool> {
+        let pty = self.pty_io()?;
+        let owner_pid = match self.child.lock() {
+            Ok(child) if child.state == ChildState::Running => child.pid,
+            _ => return Some(false),
+        };
+        let fg = unsafe { libc::tcgetpgrp(pty.master_fd) };
+        if fg <= 0 {
+            return None;
+        }
+        if fg != owner_pid {
+            return Some(true);
+        }
+        let executable = process_executable(owner_pid)?;
+        let name = Path::new(&executable)
+            .file_name()
+            .and_then(|value| value.to_str())?;
+        Some(!matches!(
+            name,
+            "sh" | "bash" | "dash" | "zsh" | "fish" | "ksh" | "csh" | "tcsh"
+        ))
+    }
+
     /// Where the shell sits *now*, not where it was spawned.
     ///
     /// A terminal normally learns this from the shell's own OSC 7 report, but
@@ -2113,6 +2140,7 @@ impl PtySurface {
             SurfaceIo::Pty(_) => ("terminal".to_string(), String::new()),
             SurfaceIo::Agent(agent) => ("agent".to_string(), agent.agent_cli.clone()),
         };
+        let foreground_workload = self.foreground_workload_active();
         SurfaceInfo {
             surface_id: self.surface_id.clone(),
             workspace_name: self.workspace_name.clone(),
@@ -2125,9 +2153,36 @@ impl PtySurface {
             cwd,
             branch,
             agent_cli,
+            foreground_busy: foreground_workload.unwrap_or(false),
+            foreground_busy_known: foreground_workload.is_some(),
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn process_executable(pid: libc::pid_t) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn process_executable(pid: libc::pid_t) -> Option<String> {
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid,
+            buffer.as_mut_ptr().cast::<libc::c_void>(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 { return None; }
+    buffer.truncate(length as usize);
+    String::from_utf8(buffer).ok()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_executable(_pid: libc::pid_t) -> Option<String> { None }
 
 /// The working directory of `pid`, or `None` when it cannot be determined.
 #[cfg(target_os = "linux")]

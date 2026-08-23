@@ -504,6 +504,13 @@ final class PeerPaneHostRegistry {
 /// relay session plus the host lease it holds a ref on.
 @MainActor
 final class PeerPaneSession {
+    enum RelayStartupState: Equatable {
+        case pending
+        case starting
+        case started
+        case failed
+    }
+
     let lease: PeerPaneHostLease
     let relaySession: PeerRelaySession
     let surfaceTitle: String
@@ -513,6 +520,9 @@ final class PeerPaneSession {
     /// relay failure. Agent panes normally recreate themselves on failure;
     /// an intentional disconnect must keep the visible pane in place instead.
     private(set) var hostTransportWasDisconnected = false
+    private(set) var relayStartupState: RelayStartupState = .pending
+    var relayStartupFailure: (@MainActor (Error) -> Void)?
+    var relayStartupSucceeded: (@MainActor () -> Void)?
 
     /// Reattach recipe for the disconnect banner's Reconnect action:
     /// how this pane's host was reached and which surface it mirrored.
@@ -552,6 +562,29 @@ final class PeerPaneSession {
     // Pane-command plumbing for TerminalPanel creation (t2).
     var relayLaunchCommand: String { relaySession.relayLaunchCommand }
     var relayEnvironment: [String: String] { relaySession.relayEnvironment }
+    var isRelayStarted: Bool { relayStartupState == .started && !isTorndown }
+
+    /// Start only after SwiftUI has mounted this panel. Background Project
+    /// restoration creates pane models before their Ghostty views exist;
+    /// starting here at model creation used to arm a 10s accept timeout that
+    /// could never succeed. Multiple onAppear/update passes remain idempotent.
+    func startRelayIfNeeded() {
+        guard !isTorndown, relayStartupState == .pending else { return }
+        relayStartupState = .starting
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.start()
+                guard !self.isTorndown else { return }
+                self.relayStartupState = .started
+                self.relayStartupSucceeded?()
+            } catch {
+                guard !self.isTorndown else { return }
+                self.relayStartupState = .failed
+                self.relayStartupFailure?(error)
+            }
+        }
+    }
 
     private init(
         lease: PeerPaneHostLease,

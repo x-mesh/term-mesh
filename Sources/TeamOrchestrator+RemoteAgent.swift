@@ -33,6 +33,11 @@ enum RemoteLeaderReattachOutcome: Equatable {
     /// in it — or none was ever recorded. Authoritative: there is no live
     /// remote leader left for a replacement to duplicate.
     case confirmedMissing
+    /// The surface is durable but its login shell is idle. This proves the
+    /// recorded leader CLI is not in the foreground, but does not prove it is
+    /// safe to mint a duplicate (it may be stopped/backgrounded). Keep the
+    /// surface and require an explicit restart decision.
+    case confirmedInactive
     /// Nothing was established and nothing was disproved. The surface may well
     /// still be there; whatever is stored for it must be kept.
     case temporarilyUnavailable
@@ -627,6 +632,18 @@ extension TeamOrchestrator {
         [hostID, activeSockPath, projectID, String(revision)].joined(separator: "\u{1f}")
     }
 
+    nonisolated static func projectDeletionSuppressionKey(
+        hostID: String, projectID: String
+    ) -> String {
+        hostID + "\u{1f}" + projectID
+    }
+
+    nonisolated static func shouldTombstoneDeletedProject(
+        ownsRemotePresentation: Bool
+    ) -> Bool {
+        ownsRemotePresentation
+    }
+
     nonisolated static func automaticProjectRestoreRetryDelayNanoseconds(
         afterFailureCount failureCount: Int
     ) -> UInt64? {
@@ -639,9 +656,9 @@ extension TeamOrchestrator {
     }
 
     nonisolated static func shouldRecoverRemoteLeaderOnHostReconnect(
-        teamHostKey: String?, connectedHostKey: String, isAttached: Bool
+        teamHostKey: String?, connectedHostKey: String, recoveryEligible: Bool
     ) -> Bool {
-        teamHostKey == connectedHostKey && !isAttached
+        teamHostKey == connectedHostKey && recoveryEligible
     }
 
     /// Recreate owned Project viewers as soon as the session-owner roster is
@@ -660,7 +677,7 @@ extension TeamOrchestrator {
                 return Self.shouldRecoverRemoteLeaderOnHostReconnect(
                     teamHostKey: teamHostKey,
                     connectedHostKey: host.id,
-                    isAttached: isLeaderPaneAttached(teamName: team.id)
+                    recoveryEligible: isRemoteLeaderRecoveryEligible(teamName: team.id)
                 ) ? team.id : nil
             }
             for teamName in leaderRecoveryNames.sorted() {
@@ -690,7 +707,12 @@ extension TeamOrchestrator {
                 )
                 guard automaticProjectRestoreRetryTasks[failureKey] == nil,
                       (automaticProjectRestoreFailureAttempts[failureKey] ?? 0) < 4,
-                      !projectRestoreInFlight.contains(remote.name) else {
+                      !projectRestoreInFlight.contains(remote.name),
+                      !projectDeletionSuppressions.contains(
+                        Self.projectDeletionSuppressionKey(
+                            hostID: host.id, projectID: remote.projectID
+                        )
+                      ) else {
                     continue
                 }
                 let restored = await adoptRemoteProjectPresentation(
@@ -895,6 +917,9 @@ extension TeamOrchestrator {
         tabManager: TabManager,
         selectWorkspace: Bool = true
     ) async -> Bool {
+        guard !projectDeletionSuppressions.contains(
+            Self.projectDeletionSuppressionKey(hostID: host.id, projectID: remote.projectID)
+        ) else { return false }
         let namedTeam = teams[remote.name]
         let matchingTeam = namedTeam.flatMap {
             Self.remotePresentationIdentityMatches(
@@ -1028,7 +1053,7 @@ extension TeamOrchestrator {
         }
         let mintedRoutes = routeTransfer.grants
 
-        let team = Team(
+        var team = Team(
             id: remote.name,
             leaderSessionId: UUID().uuidString,
             leaderMode: "adopted",
@@ -1049,6 +1074,31 @@ extension TeamOrchestrator {
             remotePresentationHostKey: host.id,
             remoteLeaderSurfaceID: remote.leaderSurfaceID
         )
+        // A background pane is pending, while a selected workspace can finish
+        // its relay before this team record is installed. Read the session's
+        // actual state so neither ordering loses the readiness transition.
+        team.leaderReady = workspace.terminalPanel(for: leaderPanelID)?
+            .peerPaneSession?.isRelayStarted == true
+        if !team.leaderReady {
+            team.leaderFailureDescription = "Remote leader relay is pending"
+        }
+        if remote.leaderProcessActiveKnown, !remote.leaderProcessActive {
+            team.leaderFailureDescription =
+                "Remote leader surface exists, but no foreground leader process is running"
+        }
+        // Delete can land while the surface and route awaits above are in
+        // flight. Re-check at the commit boundary; a start-only guard lets the
+        // stale adoption resurrect the team after manifest deletion.
+        guard !projectDeletionSuppressions.contains(
+            Self.projectDeletionSuppressionKey(hostID: host.id, projectID: remote.projectID)
+        ) else {
+            _ = await Self.finishAdoptedRemoteAgentRoutes(
+                host: host, transaction: routeTransfer.transaction, commit: false
+            )
+            await Self.revokeGrants(Array(mintedRoutes.values))
+            tabManager.closeWorkspace(workspace)
+            return false
+        }
         if let updateTarget {
             let oldTabManager = AppDelegate.shared?.tabManagerFor(
                 tabId: updateTarget.workspaceId
@@ -2929,6 +2979,14 @@ extension TeamOrchestrator {
         guard let surface = roster?.first(where: { $0.surfaceID == surfaceID }) else {
             PeerPaneHostRegistry.shared.release(lease)
             return .temporarilyUnavailable
+        }
+        if surface.foregroundBusyKnown, !surface.foregroundBusy {
+            PeerPaneHostRegistry.shared.release(lease)
+            markRemoteLeaderFailed(
+                teamName: teamName,
+                description: "Remote leader surface exists, but no foreground leader process is running"
+            )
+            return .confirmedInactive
         }
 
         let session: PeerPaneSession
@@ -7513,12 +7571,24 @@ extension TeamOrchestrator {
         guard let team = teams[teamName] else {
             throw RemoteAgentError.teamNotFound(teamName)
         }
+        let deletionSuppression: String? = {
+            guard case let .peer(hostKey) = team.leaderEndpoint,
+                  let projectID = team.remotePresentationProjectID
+                    ?? team.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:))
+            else { return nil }
+            return Self.projectDeletionSuppressionKey(hostID: hostKey, projectID: projectID)
+        }()
         // A discovered presentation is a local viewer, not an ownership
         // grant. Its destructive action is therefore a detach: close only
         // this app's sessions and leave the daemon-owned surfaces and files.
         guard team.ownsRemotePresentation else {
             _ = destroyTeam(name: teamName, tabManager: tabManager, archive: false)
             return
+        }
+        if Self.shouldTombstoneDeletedProject(
+            ownsRemotePresentation: team.ownsRemotePresentation
+        ), let deletionSuppression {
+            projectDeletionSuppressions.insert(deletionSuppression)
         }
         // Before anything is read, let alone removed. A leader attach that is
         // still in flight commits by writing a surface record and a checkout;
@@ -7563,6 +7633,68 @@ extension TeamOrchestrator {
         /// connected" and leave the object in `remaining`.
         func teamSock(_ hostKey: String) -> String {
             teamLeases[hostKey]?.hostSockPath ?? ""
+        }
+
+        // Open the manifest control session before deleting any pane or
+        // workspace. The project workspace owns the last live relay in the
+        // common adopted-viewer topology; opening a fresh control connection
+        // after DeleteWorkspace has torn that relay down repeatedly timed out
+        // and left the durable manifest behind. The tunnel lease above keeps
+        // the pathname alive, while this connection keeps the authenticated
+        // protocol session itself alive across every destructive step.
+        var manifestDeletionConnection: PeerRelayConnection?
+        if case let .peer(hostKey) = team.leaderEndpoint,
+           let teamUUID = team.teamUuid,
+           !teamUUID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let sock = teamSock(hostKey)
+            guard !sock.isEmpty else {
+                throw RemoteAgentError.projectDeletionIncomplete(
+                    "manifest preflight \(hostKey): host not connected"
+                )
+            }
+            do {
+                let connection = try await PeerRelaySession.connect(hostSockPath: sock)
+                if connection.hostCapabilities.has(PeerCapability.projectPresentationV1) {
+                    manifestDeletionConnection = connection
+                } else {
+                    await connection.cancel()
+                }
+            } catch {
+                throw RemoteAgentError.projectDeletionIncomplete(
+                    "manifest preflight \(hostKey): \(error)"
+                )
+            }
+        }
+        defer {
+            if let manifestDeletionConnection {
+                Task { await manifestDeletionConnection.cancel() }
+            }
+        }
+        // Commit the durable tombstone while the Project workspace and its
+        // relay are still unquestionably alive. Doing this last made the
+        // delete ambiguous: DeleteWorkspace succeeded, then the manifest RPC
+        // timed out and discovery hid the now-dead surfaces even though the
+        // record was still on disk. A successful response here proves the
+        // durable record is gone before local/remote runtime cleanup begins.
+        if case let .peer(hostKey) = team.leaderEndpoint,
+           let teamUUID = team.teamUuid,
+           !teamUUID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let connection = manifestDeletionConnection {
+            do {
+                let response = try await connection.session.deleteProjectPresentation(
+                    projectID: Self.remoteProjectPresentationID(teamUUID: teamUUID)
+                )
+                guard response.ok else {
+                    throw RemoteAgentError.projectDeletionIncomplete(
+                        "manifest \(hostKey): \(response.errorCode)"
+                    )
+                }
+                RemoteHostStore.shared.refreshTeamRoster(forHostKey: hostKey)
+            } catch {
+                throw RemoteAgentError.projectDeletionIncomplete(
+                    "manifest delete \(hostKey): \(error)"
+                )
+            }
         }
 
         // An ADOPTING viewer holds no recorded workspace id — the manifest
@@ -7911,40 +8043,6 @@ extension TeamOrchestrator {
             // next attempt.
             RemoteWorkLog.info("Could not delete \(teamName): \(report)")
             throw RemoteAgentError.projectDeletionIncomplete(report)
-        }
-        if case let .peer(hostKey) = team.leaderEndpoint,
-           let teamUUID = team.teamUuid,
-           !teamUUID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            guard let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
-                  !teamSock(hostKey).isEmpty
-            else {
-                throw RemoteAgentError.projectDeletionIncomplete(
-                    "manifest \(hostKey): host not connected"
-                )
-            }
-            let connection = try await PeerRelaySession.connect(hostSockPath: teamSock(hostKey))
-            do {
-                let response: Termmesh_Peer_V1_UpsertProjectPresentationResponse?
-                if connection.hostCapabilities.has(PeerCapability.projectPresentationV1) {
-                    response = try await connection.session.deleteProjectPresentation(
-                        projectID: Self.remoteProjectPresentationID(teamUUID: teamUUID)
-                    )
-                } else {
-                    response = nil
-                }
-                await connection.cancel()
-                guard response?.ok != false else {
-                    throw RemoteAgentError.projectDeletionIncomplete(
-                        "manifest \(hostKey): \(response?.errorCode ?? "unknown")"
-                    )
-                }
-                if response?.ok == true {
-                    RemoteHostStore.shared.refreshTeamRoster(forHostKey: hostKey)
-                }
-            } catch {
-                await connection.cancel()
-                throw error
-            }
         }
         let projectID = team.remotePresentationProjectID
             ?? team.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:))

@@ -80,6 +80,10 @@ pub mod capability {
     /// The host reports a surface process exit after its final data frame.
     /// Advertised by the CLIENT because it opts into the new pushed payload.
     pub const SURFACE_EXIT_V1: &str = "surface.exit.v1";
+    /// SurfaceInfo reports whether a terminal's foreground process group is
+    /// distinct from its login shell. Used to distinguish a live Project
+    /// leader CLI from a durable-but-idle shell surface.
+    pub const SURFACE_FOREGROUND_V1: &str = "surface.foreground.v1";
     /// The host pushes `HostStats` (load, memory, disk and network rates)
     /// for the machine it runs on. Advertised by the client, since the
     /// client is what decides whether it wants the traffic — a host sends
@@ -136,6 +140,7 @@ pub mod capability {
         SURFACE_ENSURE_ENV_V1,
         SURFACE_AGENT_V1,
         SURFACE_EXIT_V1,
+        SURFACE_FOREGROUND_V1,
         HOST_STATS_V1,
         GRID_SNAPSHOT_V1,
         HOST_CLI_BIN_DIRS_V1,

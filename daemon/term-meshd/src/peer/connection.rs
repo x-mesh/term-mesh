@@ -370,15 +370,16 @@ async fn reader_loop(
                     // that asked anyway; an empty roster is the honest answer.
                     None => Vec::new(),
                 };
-                let live_surface_ids: HashSet<Vec<u8>> = host
+                let live_surfaces: HashMap<Vec<u8>, peer_proto::v1::SurfaceInfo> = host
                     .pty
                     .list()
                     .into_iter()
                     .filter_map(|surface| {
-                        surface
-                            .info()
-                            .attachable
-                            .then_some(surface.surface_id.clone())
+                        let info = surface.info();
+                        let mut info = info;
+                        info.foreground_busy_known = peer_capabilities
+                            .has(capability::SURFACE_FOREGROUND_V1);
+                        info.attachable.then_some((surface.surface_id.clone(), info))
                     })
                     .collect();
                 let project_owner_hex: HashSet<String> =
@@ -386,7 +387,7 @@ async fn reader_loop(
                 for manifest in host.project_presentations() {
                     let Some(leader_surface_id) = hex::decode(&manifest.leader_surface_id)
                         .ok()
-                        .filter(|id| live_surface_ids.contains(id))
+                        .filter(|id| live_surfaces.contains_key(id))
                     else {
                         continue;
                     };
@@ -395,8 +396,8 @@ async fn reader_loop(
                         .iter()
                         .filter_map(|member| {
                             let surface_id = hex::decode(&member.surface_id).ok()?;
-                            live_surface_ids
-                                .contains(&surface_id)
+                            live_surfaces
+                                .contains_key(&surface_id)
                                 .then_some(TeamMember {
                                     name: member.name.clone(),
                                     agent_instance_id: member.agent_instance_id.clone(),
@@ -423,10 +424,15 @@ async fn reader_loop(
                         team.created_at_unix_secs = manifest.created_at_unix_secs;
                         team.presentation_owned_by_requester =
                             project_owner_hex.contains(&manifest.owner_peer_id);
+                        if let Some(info) = live_surfaces.get(&team.leader_surface_id) {
+                            team.leader_process_active = info.foreground_busy;
+                            team.leader_process_active_known = info.foreground_busy_known;
+                        }
                         if team.project_root.is_empty() {
                             team.project_root = manifest.project_root;
                         }
                     } else {
+                        let leader_info = live_surfaces.get(&leader_surface_id);
                         teams.push(Team {
                             name: manifest.team_name,
                             team_uuid: manifest.team_uuid,
@@ -440,6 +446,10 @@ async fn reader_loop(
                             presentation_revision: manifest.revision,
                             presentation_owned_by_requester: project_owner_hex
                                 .contains(&manifest.owner_peer_id),
+                            leader_process_active: leader_info
+                                .is_some_and(|info| info.foreground_busy),
+                            leader_process_active_known: leader_info
+                                .is_some_and(|info| info.foreground_busy_known),
                         });
                     }
                 }
@@ -4441,6 +4451,11 @@ mod agent_surface_tests {
         assert_eq!(project.members.len(), 1);
         assert_eq!(project.members[0].surface_id, member_id);
         assert!(!project.presentation_owned_by_requester);
+        assert!(project.leader_process_active_known);
+        assert!(
+            project.leader_process_active,
+            "the fixture's foreground /bin/cat workload must be advertised as active"
+        );
 
         write_envelope(
             &mut viewer_writer,

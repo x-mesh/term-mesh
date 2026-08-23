@@ -910,6 +910,8 @@ extension TerminalController {
               let tabManager else {
             return .err(code: "invalid_params", message: "team is required", data: nil)
         }
+        let operationID = UUID().uuidString
+        debugProjectDeletionStatus[operationID] = ["state": "running", "team": team]
         Task { @MainActor in
             do {
                 try await TeamOrchestrator.shared.deleteProject(
@@ -919,13 +921,31 @@ extension TerminalController {
                 #if DEBUG
                 dlog("debug.project.delete complete team=\(team)")
                 #endif
+                self.debugProjectDeletionStatus[operationID] = [
+                    "state": "succeeded", "team": team,
+                ]
             } catch {
                 #if DEBUG
                 dlog("debug.project.delete failed team=\(team) error=\(error)")
                 #endif
+                self.debugProjectDeletionStatus[operationID] = [
+                    "state": "failed", "team": team,
+                    "error": String(describing: error),
+                ]
             }
         }
-        return .ok(["started": true])
+        return .ok(["started": true, "operation_id": operationID])
+    }
+
+    func v2DebugProjectDeleteStatus(params: [String: Any]) -> V2CallResult {
+        guard let operationID = params["operation_id"] as? String,
+              !operationID.isEmpty else {
+            return .err(code: "invalid_params", message: "operation_id is required", data: nil)
+        }
+        guard let status = debugProjectDeletionStatus[operationID] else {
+            return .err(code: "not_found", message: "deletion operation not found", data: nil)
+        }
+        return .ok(status)
     }
 
     func v2DebugProjectReattachLeader(params: [String: Any]) -> V2CallResult {
@@ -1040,6 +1060,8 @@ extension TerminalController {
             "working_directory": remote.workingDirectory,
             "leader_surface_id": remote.leaderSurfaceID.base64EncodedString(),
             "revision": remote.presentationRevision,
+            "leader_process_active": remote.leaderProcessActive,
+            "leader_process_active_known": remote.leaderProcessActiveKnown,
             "members": remote.members.map { member in
                 [
                     "name": member.name,

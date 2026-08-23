@@ -69,6 +69,8 @@ public enum PeerCapability {
     /// to finish the matching session without guessing from socket lifetime.
     /// Client-advertised: sending it opts this connection into the new push.
     public static let surfaceExitV1 = "surface.exit.v1"
+    /// SurfaceInfo carries foreground-process liveness for terminal surfaces.
+    public static let surfaceForegroundV1 = "surface.foreground.v1"
     /// `HostStats` pushes — load, memory, disk and network rates for the
     /// machine hosting the panes. Advertised by the side that WANTS them,
     /// so a host sends them only to a client that asked. Mirrors
@@ -102,7 +104,7 @@ public enum PeerCapability {
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, hostStatsV1, gridSnapshotV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, teamRouteFileV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, gridSnapshotV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, teamRouteFileV1]
 }
 
 /// Strict validation for host-controlled Hello.cli_bin_dirs. Invalid input
