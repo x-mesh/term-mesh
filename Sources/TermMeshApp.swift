@@ -78,44 +78,6 @@ struct TermMeshApp: App {
     @AppStorage(KeyboardShortcutSettings.Action.closeWorkspace.defaultsKey) private var closeWorkspaceShortcutData = Data()
     @AppStorage(TermMeshDaemon.worktreeAutoCleanupKey) private var worktreeAutoCleanup = false
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    /// A dialog the primary window can present, carrying everything it needs.
-    ///
-    /// The TabManager rides in the payload because it has to be captured when
-    /// the request arrives: once the sheet takes key window, the window that
-    /// asked is no longer identifiable.
-    private enum PrimarySheet: Identifiable {
-        /// New Project. Owned here rather than by the sidebar's Projects
-        /// header, because the titlebar's + opens the same sheet and is on
-        /// screen precisely when the sidebar is not.
-        case projectCreation(tabManager: TabManager?)
-        /// `mode` is "new" or "resume" (Phase 2.5).
-        case teamCreation(tabManager: TabManager?, mode: String)
-        /// P0-5: Configure Watch, from the palette or a sidebar notification.
-        case watchConfig(teamName: String, workingDirectory: String)
-
-        /// Identity is the KIND of sheet, not its payload: re-requesting the
-        /// dialog already on screen must not tear it down and rebuild it,
-        /// which would discard whatever the user had typed into it.
-        var id: String {
-            switch self {
-            case .projectCreation: "project-creation"
-            case .teamCreation: "team-creation"
-            case .watchConfig: "watch-config"
-            }
-        }
-    }
-
-    /// The one sheet this window can be showing.
-    ///
-    /// One presenter, not three. A `.sheet(isPresented:)` per dialog put three
-    /// bindings in front of a single presentation slot: SwiftUI dropped any
-    /// request that landed while another sheet was up — or while one was still
-    /// tearing down — and left that dialog's binding stuck `true`, which no
-    /// later request could clear, so the dialog stayed dead until the app was
-    /// relaunched. With a single `item` there is nothing to strand: what is
-    /// showing IS the state, and a request either becomes it or replaces it.
-    @State private var activeSheet: PrimarySheet?
-    @State private var ghosttyTheme = GhosttyTheme.current
 
     init() {
         Self.applyAppearance(startupAppearance)
@@ -217,88 +179,16 @@ struct TermMeshApp: App {
         defaults.set(targetVersion, forKey: migrationKey)
     }
 
-    private func resolveDefaultWorkingDirectory(activeTabManager: TabManager?) -> (path: String, source: WorkingDirectorySource) {
-        // 1. Caller-provided active tab manager (already from the key/main window context at menu click time)
-        if let dir = activeTabManager?.selectedTab?.currentDirectory, !dir.isEmpty {
-            return (dir, .currentPane)
-        }
-        // 2. Workspace: key window first, then main window (deterministic; avoids
-        //    wrong-window bug class from non-deterministic window ordering).
-        if let kw = NSApp.keyWindow,
-           let ctx = AppDelegate.shared?.contextForMainWindow(kw),
-           let dir = ctx.tabManager.selectedTab?.currentDirectory, !dir.isEmpty {
-            return (dir, .workspace)
-        }
-        if let mw = NSApp.mainWindow,
-           let ctx = AppDelegate.shared?.contextForMainWindow(mw),
-           let dir = ctx.tabManager.selectedTab?.currentDirectory, !dir.isEmpty {
-            return (dir, .workspace)
-        }
-        // 3. Last successfully used directory from MRU list
-        if let dir = TeamCreationRecentDirs.shared.current().first {
-            return (dir, .lastUsed)
-        }
-        // 4. App process CWD — warn via .appLaunch source label
-        return (FileManager.default.currentDirectoryPath, .appLaunch)
-    }
-
-    private func makeTeamCreationView(
-        requestedBy requestingTabManager: TabManager?,
-        mode: String
-    ) -> TeamCreationView {
-        let activeTabManager = requestingTabManager ?? tabManager
-        let (defaultDir, defaultSource) = resolveDefaultWorkingDirectory(activeTabManager: activeTabManager)
-        return TeamCreationView(
-            onCreate: { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId, pairMode, pairModel, pairSpec, workingDirectory in
-                TeamOrchestrator.shared.createTeam(
-                    named: teamName,
-                    rows: agents,
-                    workingDirectory: workingDirectory,
-                    leaderMode: leaderMode,
-                    leaderModel: leaderModel,
-                    worktreeMode: worktreeMode,
-                    executionMode: executionMode,
-                    resumeSessionId: resumeSessionId,
-                    pairMode: pairMode,
-                    pairModel: pairModel,
-                    pairSpec: pairSpec,
-                    tabManager: activeTabManager
-                ) != nil
-            },
-            onResume: { (result: [String: Any]) in
-                // The picker tags pane-mode resumes so we route to a separate
-                // app-side rehydration path. Headless resumes go through the
-                // existing daemon-respawn-driven adoption.
-                if (result["mode"] as? String) == "pane" {
-                    TeamOrchestrator.shared.adoptResumedPaneTeam(
-                        result: result,
-                        tabManager: activeTabManager
-                    )
-                } else {
-                    TeamOrchestrator.shared.adoptResumedHeadlessTeam(
-                        result: result,
-                        tabManager: activeTabManager
-                    )
-                }
-            },
-            initialMode: mode,
-            defaultWorkingDirectory: defaultDir,
-            defaultWorkingDirectorySource: defaultSource
-        )
-    }
-
     @ViewBuilder
     private var primaryWindowBaseContent: some View {
-    ContentView(updateViewModel: appDelegate.updateViewModel, windowId: primaryWindowId)
-        .environment(tabManager)
-        .environmentObject(notificationStore)
-        .environmentObject(sidebarState)
-        .environmentObject(sidebarSelectionState)
-        .environment(\.ghosttyTheme, ghosttyTheme)
-        .withServices()
-        .onReceive(NotificationCenter.default.publisher(for: .ghosttyDefaultBackgroundDidChange)) { _ in
-            ghosttyTheme = .current
-        }
+    TermMeshWindowRoot(windowID: primaryWindowId, tabManager: tabManager) {
+        ContentView(updateViewModel: appDelegate.updateViewModel, windowId: primaryWindowId)
+            .environment(tabManager)
+            .environmentObject(notificationStore)
+            .environmentObject(sidebarState)
+            .environmentObject(sidebarSelectionState)
+            .withServices()
+    }
         .onAppear {
 #if DEBUG
             if termMeshEnv("UI_TEST_MODE") == "1" {
@@ -385,139 +275,6 @@ struct TermMeshApp: App {
     @ViewBuilder
     private var primaryWindowContent: some View {
         primaryWindowBaseContent
-            .onReceive(
-                NotificationCenter.default.publisher(for: .teamCreationRequested)
-                    .merge(with: NotificationCenter.default.publisher(for: .openCreateTeamSheetInResumeMode))
-                    .eraseToAnyPublisher()
-            ) { note in
-                present(.teamCreation(
-                    tabManager: requestingTabManager(),
-                    mode: note.name == .openCreateTeamSheetInResumeMode ? "resume" : "new"
-                ))
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .projectCreationRequested)) { _ in
-                present(.projectCreation(tabManager: requestingTabManager()))
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .spawnCLIRequested)) { _ in
-                Task { @MainActor in
-                    await showSpawnCLIDialog()
-                }
-            }
-            // Restore Fleet Layer 3: perform the restore where an active
-            // TabManager is in scope (sidebar banner button, or auto-posted
-            // by detectRestorableFleets in `always` mode).
-            .onReceive(NotificationCenter.default.publisher(for: .restoreFleetRequested)) { note in
-                guard let uuid = note.userInfo?["team_uuid"] as? String else { return }
-                let targetTabManager: TabManager = {
-                    if let kw = NSApp.keyWindow,
-                       let ctx = AppDelegate.shared?.contextForMainWindow(kw) {
-                        return ctx.tabManager
-                    }
-                    if let mw = NSApp.mainWindow,
-                       let ctx = AppDelegate.shared?.contextForMainWindow(mw) {
-                        return ctx.tabManager
-                    }
-                    return tabManager
-                }()
-                TeamOrchestrator.shared.restoreFleet(teamUuid: uuid, tabManager: targetTabManager)
-            }
-            // P0-5: Configure Watch sheet handler
-            .onReceive(NotificationCenter.default.publisher(for: .watchConfigRequested)) { note in
-                let info = note.userInfo
-                present(.watchConfig(
-                    teamName: info?["teamName"] as? String ?? "",
-                    workingDirectory: info?["workingDirectory"] as? String ?? ""
-                ))
-            }
-            .sheet(item: $activeSheet) { sheet in
-                switch sheet {
-                case .projectCreation(let requestingTabManager):
-                    makeProjectCreationView(requestedBy: requestingTabManager)
-                case .teamCreation(let requestingTabManager, let mode):
-                    makeTeamCreationView(requestedBy: requestingTabManager, mode: mode)
-                case .watchConfig(let teamName, let workingDirectory):
-                    WatchConfigSheet(
-                        teamName: teamName,
-                        workingDirectory: workingDirectory
-                    )
-                    .frame(width: 480)
-                }
-            }
-    }
-
-    private func makeProjectCreationView(
-        requestedBy requestingTabManager: TabManager?
-    ) -> NewProjectView {
-        let activeTabManager = requestingTabManager ?? tabManager
-        return NewProjectView(
-            onCreate: { name, directory, rows, source, leader, progress in
-                try await ProjectCreationFlow.create(
-                    name: name,
-                    directory: directory,
-                    rows: rows,
-                    source: source,
-                    leader: leader,
-                    progress: progress,
-                    tabManager: activeTabManager
-                )
-            },
-            onClose: { activeSheet = nil },
-            onDiscard: { name in
-                // Best effort by design: this runs because something already
-                // went wrong, and a peer that is now unreachable must not trap
-                // the sheet. What could not be removed is reported by
-                // `deleteProject` into the team's own record.
-                do {
-                    try await TeamOrchestrator.shared.deleteProject(
-                        teamName: name,
-                        tabManager: activeTabManager
-                    )
-                } catch {
-                    RemoteWorkLog.info("Could not discard \(name): \(error)")
-                }
-            },
-            repositoryDirectories: (
-                activeTabManager.tabs.map(\.currentDirectory)
-                + TeamCreationRecentDirs.shared.current()
-            ),
-            repositorySearchRoots: ProjectLocationSettings.repositorySearchRoots
-        )
-    }
-
-    /// The TabManager of the window that asked, captured before the sheet
-    /// takes key window and makes it unidentifiable.
-    @MainActor
-    private func requestingTabManager() -> TabManager? {
-        if let kw = NSApp.keyWindow, let ctx = AppDelegate.shared?.contextForMainWindow(kw) {
-            return ctx.tabManager
-        }
-        if let mw = NSApp.mainWindow, let ctx = AppDelegate.shared?.contextForMainWindow(mw) {
-            return ctx.tabManager
-        }
-        return nil
-    }
-
-    /// Show `sheet`, replacing whatever is on screen.
-    ///
-    /// Requesting the dialog already up is a no-op rather than a rebuild, so
-    /// a stray second trigger cannot discard what the user has typed.
-    ///
-    /// Swapping one dialog for another goes through `nil` first: asking
-    /// SwiftUI to dismiss and present inside one write gives it a single
-    /// frame to do both, and it drops that often enough to matter. Two clean
-    /// transitions always land. This is also what makes a lost presentation
-    /// self-healing — under `.sheet(isPresented:)` a dropped request left the
-    /// binding stuck `true` and killed that dialog until relaunch (the "New
-    /// Project stopped opening" report on 0.170.0).
-    @MainActor
-    private func present(_ sheet: PrimarySheet) {
-        guard let current = activeSheet else {
-            activeSheet = sheet
-            return
-        }
-        guard current.id != sheet.id else { return }
-        activeSheet = nil
-        DispatchQueue.main.async { activeSheet = sheet }
     }
 
     var body: some Scene {
@@ -528,7 +285,6 @@ struct TermMeshApp: App {
         // with their own TabManager, avoiding the shared-@StateObject problem.
         WindowGroup(id: "term-mesh-primary") {
             primaryWindowContent
-                .termMeshLanguage()
         }
         .environment(\.locale, LanguageSettings.locale(for: languageMode))
         // Prevent macOS from creating duplicate WindowGroup scenes via
@@ -543,16 +299,14 @@ struct TermMeshApp: App {
             CommandMenu(LanguageSettings.localized("Agents")) {
                 // -- Create --
                 Button {
-                    present(.teamCreation(tabManager: requestingTabManager(), mode: "new"))
+                    MainWindowPresentationRouter.post(name: .teamCreationRequested)
                 } label: {
                     commandLabel("New Agent Team…")
                 }
                 .keyboardShortcut("t", modifiers: [.command, .option])
 
                 Button {
-                    Task { @MainActor in
-                        await showSpawnCLIDialog()
-                    }
+                    MainWindowPresentationRouter.post(name: .spawnCLIRequested)
                 } label: {
                     commandLabel("Spawn CLI…")
                 }
@@ -1004,10 +758,7 @@ struct TermMeshApp: App {
                 // AppDelegate handles this by physical key code as well as characters,
                 // so the shortcut keeps working under CJK keyboard layouts.
                 splitCommandButton(title: "New Project…", shortcut: newProjectMenuShortcut, registerShortcut: false) {
-                    NotificationCenter.default.post(
-                        name: .projectCreationRequested,
-                        object: nil
-                    )
+                    MainWindowPresentationRouter.post(name: .projectCreationRequested)
                 }
             }
 
@@ -1573,7 +1324,18 @@ struct TermMeshApp: App {
 
     @MainActor
     private func runAlertAsSheetIfPossible(_ alert: NSAlert) async -> NSApplication.ModalResponse {
-        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+        await Self.runAlertAsSheetIfPossible(
+            alert,
+            targetWindow: NSApp.keyWindow ?? NSApp.mainWindow
+        )
+    }
+
+    @MainActor
+    private static func runAlertAsSheetIfPossible(
+        _ alert: NSAlert,
+        targetWindow: NSWindow?
+    ) async -> NSApplication.ModalResponse {
+        if let window = targetWindow {
             var resumed = false
             return await withCheckedContinuation { continuation in
                 alert.beginSheetModal(for: window) { response in
@@ -1729,7 +1491,10 @@ struct TermMeshApp: App {
     private static let spawnCLILastNewWorkspaceKey = "spawnCLILastNewWorkspace"
 
     @MainActor
-    private func showSpawnCLIDialog() async {
+    static func showSpawnCLIDialog(
+        tabManager: TabManager,
+        targetWindow: NSWindow?
+    ) async {
         let alert = NSAlert()
         alert.messageText = "Spawn CLI"
         alert.informativeText = "Create multiple terminal panes in a grid layout:"
@@ -1831,7 +1596,10 @@ struct TermMeshApp: App {
         container.addSubview(loginShellCheck)
         alert.accessoryView = container
 
-        guard await runAlertAsSheetIfPossible(alert) == .alertFirstButtonReturn else { return }
+        guard await runAlertAsSheetIfPossible(
+            alert,
+            targetWindow: targetWindow
+        ) == .alertFirstButtonReturn else { return }
         let count = stepper.integerValue
         let useWorktree = worktreeCheck.state == .on
         let useNewWorkspace = newWorkspaceCheck.state == .on
@@ -1860,9 +1628,9 @@ struct TermMeshApp: App {
         }()
 
         if useWorktree {
-            activeTabManager.spawnAgentSessions(count: count, command: command)
+            tabManager.spawnAgentSessions(count: count, command: command)
         } else {
-            activeTabManager.spawnCLISessions(count: count, command: command, newWorkspace: useNewWorkspace)
+            tabManager.spawnCLISessions(count: count, command: command, newWorkspace: useNewWorkspace)
         }
     }
 

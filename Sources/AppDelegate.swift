@@ -9,21 +9,288 @@ import WebKit
 import Combine
 import ObjectiveC.runtime
 
-/// Mirrors TermMeshApp's primary window setup: owns ghosttyTheme as @State and
-/// refreshes it on the ghostty background-color change notification so secondary
-/// windows' chrome follows light/dark transitions instead of freezing at the
-/// default (black) environment value.
-private struct TermMeshWindowRoot<Content: View>: View {
+/// A window-local presentation. Every main window owns one coordinator and can
+/// therefore present the same workflows regardless of whether SwiftUI's initial
+/// WindowGroup or AppDelegate created it.
+enum MainWindowSheet: Identifiable, Equatable {
+    case projectCreation
+    case teamCreation(mode: String)
+    case watchConfig(teamName: String, workingDirectory: String)
+
+    var id: String {
+        switch self {
+        case .projectCreation: "project-creation"
+        case .teamCreation: "team-creation"
+        case .watchConfig: "watch-config"
+        }
+    }
+}
+
+/// One presentation slot per main window. Replacing a different sheet goes
+/// through nil on a later run-loop turn so SwiftUI receives a clean dismissal
+/// followed by a clean presentation. Re-requesting the current kind is a no-op
+/// and preserves any in-progress form state.
+@MainActor
+final class MainWindowSheetCoordinator: ObservableObject {
+    @Published var activeSheet: MainWindowSheet?
+    private var transitionGeneration: UInt64 = 0
+
+    var activeSheetID: String? { activeSheet?.id }
+
+    func present(_ sheet: MainWindowSheet) {
+        guard let current = activeSheet else {
+            transitionGeneration &+= 1
+            activeSheet = sheet
+            return
+        }
+        guard current.id != sheet.id else { return }
+        transitionGeneration &+= 1
+        let generation = transitionGeneration
+        activeSheet = nil
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.transitionGeneration == generation else { return }
+            self.activeSheet = sheet
+        }
+    }
+
+    func dismiss() {
+        transitionGeneration &+= 1
+        activeSheet = nil
+    }
+}
+
+/// Addresses an app-wide presentation request to exactly one main window.
+/// Older callers that do not include a window id remain compatible: synchronous
+/// NotificationCenter delivery resolves the key/main window before a sheet can
+/// steal focus. New callers should pass `windowID` explicitly when they have it.
+enum MainWindowPresentationRouter {
+    static let windowIDUserInfoKey = "term-mesh.presentation.window-id"
+
+    @MainActor
+    static func post(
+        name: Notification.Name,
+        windowID: UUID? = nil,
+        userInfo: [AnyHashable: Any] = [:]
+    ) {
+        var routedInfo = userInfo
+        if let target = windowID ?? activeWindowID() {
+            routedInfo[windowIDUserInfoKey] = target.uuidString
+        }
+        NotificationCenter.default.post(
+            name: name,
+            object: nil,
+            userInfo: routedInfo
+        )
+    }
+
+    @MainActor
+    static func targets(_ notification: Notification, windowID: UUID) -> Bool {
+        targetWindowID(from: notification) == windowID
+    }
+
+    @MainActor
+    static func targetWindowID(from notification: Notification) -> UUID? {
+        if let id = notification.userInfo?[windowIDUserInfoKey] as? UUID {
+            return id
+        }
+        if let raw = notification.userInfo?[windowIDUserInfoKey] as? String,
+           let id = UUID(uuidString: raw) {
+            return id
+        }
+        if let id = notification.object as? UUID {
+            return id
+        }
+        if let window = notification.object as? NSWindow,
+           let context = AppDelegate.shared?.contextForMainWindow(window) {
+            return context.windowId
+        }
+        return activeWindowID()
+    }
+
+    @MainActor
+    static func activeWindowID() -> UUID? {
+        guard let appDelegate = AppDelegate.shared else { return nil }
+        if let keyWindow = NSApp.keyWindow,
+           let context = appDelegate.contextForMainWindow(keyWindow) {
+            return context.windowId
+        }
+        if let mainWindow = NSApp.mainWindow,
+           let context = appDelegate.contextForMainWindow(mainWindow) {
+            return context.windowId
+        }
+        if let activeManager = appDelegate.tabManager,
+           let windowID = appDelegate.windowId(for: activeManager) {
+            return windowID
+        }
+        return appDelegate.listMainWindowSummaries().first?.windowId
+    }
+}
+
+/// The single composition root for every main terminal window. Window-local
+/// environment, presentation routing, and contextual workflows belong here so
+/// adding a feature cannot silently make the initial WindowGroup more capable
+/// than AppDelegate-created windows.
+struct TermMeshWindowRoot<Content: View>: View {
+    let windowID: UUID
+    let tabManager: TabManager
     @ViewBuilder let content: () -> Content
     @State private var ghosttyTheme = GhosttyTheme.current
+    @StateObject private var sheetCoordinator: MainWindowSheetCoordinator
+
+    init(
+        windowID: UUID,
+        tabManager: TabManager,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.windowID = windowID
+        self.tabManager = tabManager
+        self.content = content
+        _sheetCoordinator = StateObject(wrappedValue: MainWindowSheetCoordinator())
+    }
 
     var body: some View {
         content()
             .environment(\.ghosttyTheme, ghosttyTheme)
             .termMeshLanguage()
+            .onAppear {
+                AppDelegate.shared?.registerMainWindowSheetCoordinator(
+                    sheetCoordinator,
+                    for: windowID
+                )
+            }
             .onReceive(NotificationCenter.default.publisher(for: .ghosttyDefaultBackgroundDidChange)) { _ in
                 ghosttyTheme = .current
             }
+            .onReceive(
+                NotificationCenter.default.publisher(for: .teamCreationRequested)
+                    .merge(with: NotificationCenter.default.publisher(for: .openCreateTeamSheetInResumeMode))
+                    .eraseToAnyPublisher()
+            ) { note in
+                guard MainWindowPresentationRouter.targets(note, windowID: windowID) else { return }
+                sheetCoordinator.present(.teamCreation(
+                    mode: note.name == .openCreateTeamSheetInResumeMode ? "resume" : "new"
+                ))
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .projectCreationRequested)) { note in
+                guard MainWindowPresentationRouter.targets(note, windowID: windowID) else { return }
+                sheetCoordinator.present(.projectCreation)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .watchConfigRequested)) { note in
+                guard MainWindowPresentationRouter.targets(note, windowID: windowID) else { return }
+                sheetCoordinator.present(.watchConfig(
+                    teamName: note.userInfo?["teamName"] as? String ?? "",
+                    workingDirectory: note.userInfo?["workingDirectory"] as? String ?? ""
+                ))
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .restoreFleetRequested)) { note in
+                guard MainWindowPresentationRouter.targets(note, windowID: windowID),
+                      let uuid = note.userInfo?["team_uuid"] as? String else { return }
+                TeamOrchestrator.shared.restoreFleet(teamUuid: uuid, tabManager: tabManager)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .spawnCLIRequested)) { note in
+                guard MainWindowPresentationRouter.targets(note, windowID: windowID) else { return }
+                let targetWindow = AppDelegate.shared?.windowForMainWindowId(windowID)
+                Task { @MainActor in
+                    await TermMeshApp.showSpawnCLIDialog(
+                        tabManager: tabManager,
+                        targetWindow: targetWindow
+                    )
+                }
+            }
+            .sheet(item: $sheetCoordinator.activeSheet) { sheet in
+                switch sheet {
+                case .projectCreation:
+                    makeProjectCreationView()
+                case .teamCreation(let mode):
+                    makeTeamCreationView(mode: mode)
+                case .watchConfig(let teamName, let workingDirectory):
+                    WatchConfigSheet(
+                        teamName: teamName,
+                        workingDirectory: workingDirectory
+                    )
+                    .frame(width: 480)
+                }
+            }
+    }
+
+    private func resolveDefaultWorkingDirectory() -> (path: String, source: WorkingDirectorySource) {
+        if let dir = tabManager.selectedTab?.currentDirectory, !dir.isEmpty {
+            return (dir, .currentPane)
+        }
+        if let dir = TeamCreationRecentDirs.shared.current().first {
+            return (dir, .lastUsed)
+        }
+        return (FileManager.default.currentDirectoryPath, .appLaunch)
+    }
+
+    private func makeTeamCreationView(mode: String) -> TeamCreationView {
+        let (defaultDir, defaultSource) = resolveDefaultWorkingDirectory()
+        return TeamCreationView(
+            onCreate: { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId, pairMode, pairModel, pairSpec, workingDirectory in
+                TeamOrchestrator.shared.createTeam(
+                    named: teamName,
+                    rows: agents,
+                    workingDirectory: workingDirectory,
+                    leaderMode: leaderMode,
+                    leaderModel: leaderModel,
+                    worktreeMode: worktreeMode,
+                    executionMode: executionMode,
+                    resumeSessionId: resumeSessionId,
+                    pairMode: pairMode,
+                    pairModel: pairModel,
+                    pairSpec: pairSpec,
+                    tabManager: tabManager
+                ) != nil
+            },
+            onResume: { result in
+                if (result["mode"] as? String) == "pane" {
+                    TeamOrchestrator.shared.adoptResumedPaneTeam(
+                        result: result,
+                        tabManager: tabManager
+                    )
+                } else {
+                    TeamOrchestrator.shared.adoptResumedHeadlessTeam(
+                        result: result,
+                        tabManager: tabManager
+                    )
+                }
+            },
+            initialMode: mode,
+            defaultWorkingDirectory: defaultDir,
+            defaultWorkingDirectorySource: defaultSource
+        )
+    }
+
+    private func makeProjectCreationView() -> NewProjectView {
+        NewProjectView(
+            onCreate: { name, directory, rows, source, leader, progress in
+                try await ProjectCreationFlow.create(
+                    name: name,
+                    directory: directory,
+                    rows: rows,
+                    source: source,
+                    leader: leader,
+                    progress: progress,
+                    tabManager: tabManager
+                )
+            },
+            onClose: { sheetCoordinator.dismiss() },
+            onDiscard: { name in
+                do {
+                    try await TeamOrchestrator.shared.deleteProject(
+                        teamName: name,
+                        tabManager: tabManager
+                    )
+                } catch {
+                    RemoteWorkLog.info("Could not discard \(name): \(error)")
+                }
+            },
+            repositoryDirectories: (
+                tabManager.tabs.map(\.currentDirectory)
+                + TeamCreationRecentDirs.shared.current()
+            ),
+            repositorySearchRoots: ProjectLocationSettings.repositorySearchRoots
+        )
     }
 }
 
@@ -70,6 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let sidebarState: SidebarState
         let sidebarSelectionState: SidebarSelectionState
         weak var window: NSWindow?
+        weak var sheetCoordinator: MainWindowSheetCoordinator?
         /// Observer token for NSWindow.willCloseNotification — must be removed on unregister.
         var closeObserver: NSObjectProtocol?
 
@@ -901,6 +1169,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
+    /// Associates the window-local presenter with the same context used for
+    /// TabManager and focus routing. SwiftUI may call the root's onAppear just
+    /// before WindowAccessor registration, so retry once on the next turn.
+    func registerMainWindowSheetCoordinator(
+        _ coordinator: MainWindowSheetCoordinator,
+        for windowID: UUID
+    ) {
+        if let context = mainWindowContexts.values.first(where: { $0.windowId == windowID }) {
+            context.sheetCoordinator = coordinator
+            return
+        }
+        DispatchQueue.main.async { [weak self, weak coordinator] in
+            guard let self, let coordinator,
+                  let context = self.mainWindowContexts.values.first(where: { $0.windowId == windowID })
+            else { return }
+            context.sheetCoordinator = coordinator
+        }
+    }
+
+    func mainWindowSheetCoordinator(for windowID: UUID) -> MainWindowSheetCoordinator? {
+        mainWindowContexts.values.first(where: { $0.windowId == windowID })?.sheetCoordinator
+    }
+
     struct MainWindowSummary {
         let windowId: UUID
         let isKeyWindow: Bool
@@ -1457,7 +1748,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let sidebarSelectionState = SidebarSelectionState()
         let notificationStore = self.notificationStore ?? TerminalNotificationStore.shared
 
-        let root = TermMeshWindowRoot {
+        let root = TermMeshWindowRoot(windowID: windowId, tabManager: tabManager) {
             ContentView(updateViewModel: self.updateViewModel, windowId: windowId)
                 .environment(tabManager)
                 .environmentObject(notificationStore)
@@ -2773,7 +3064,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // equivalent so the physical N key also works under CJK input sources
         // where charactersIgnoringModifiers is not "n".
         if matchShortcut(event: event, shortcut: KeyboardShortcutSettings.shortcut(for: .newProject)) {
-            NotificationCenter.default.post(name: .projectCreationRequested, object: nil)
+            MainWindowPresentationRouter.post(name: .projectCreationRequested)
             return true
         }
 

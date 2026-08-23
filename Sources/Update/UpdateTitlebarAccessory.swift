@@ -905,13 +905,13 @@ final class TitlebarControlsAccessoryViewController: NSTitlebarAccessoryViewCont
         let toggleNotifications: () -> Void = { _ = AppDelegate.shared?.toggleNotificationsPopover(animated: true) }
         let newTab = { _ = AppDelegate.shared?.tabManager?.addTab() }
         let newAgentTeam = {
-            NotificationCenter.default.post(name: .teamCreationRequested, object: nil)
+            MainWindowPresentationRouter.post(name: .teamCreationRequested)
         }
         let spawnCLI = {
-            NotificationCenter.default.post(name: .spawnCLIRequested, object: nil)
+            MainWindowPresentationRouter.post(name: .spawnCLIRequested)
         }
         let newProject = {
-            NotificationCenter.default.post(name: .projectCreationRequested, object: nil)
+            MainWindowPresentationRouter.post(name: .projectCreationRequested)
         }
 
         hostingView = NonDraggableHostingView(

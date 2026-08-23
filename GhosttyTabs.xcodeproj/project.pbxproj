@@ -256,6 +256,7 @@
 					E1000000A1B2C3D4E5F60718 /* MenuKeyEquivalentRoutingUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1000001A1B2C3D4E5F60718 /* MenuKeyEquivalentRoutingUITests.swift */; };
 				F1000000A1B2C3D4E5F60718 /* TermMeshWebViewKeyEquivalentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1000001A1B2C3D4E5F60718 /* TermMeshWebViewKeyEquivalentTests.swift */; };
 				F2000000A1B2C3D4E5F60718 /* UpdatePillReleaseVisibilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000001A1B2C3D4E5F60718 /* UpdatePillReleaseVisibilityTests.swift */; };
+				D2A100000000000000000001 /* MainWindowSheetCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2A100000000000000000002 /* MainWindowSheetCoordinatorTests.swift */; };
 				F3000000A1B2C3D4E5F60718 /* CJKIMEInputTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */; };
 				F3010000A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */; };
 				F4000000A1B2C3D4E5F60718 /* GhosttyConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */; };
@@ -610,6 +611,7 @@
 					E1000001A1B2C3D4E5F60718 /* MenuKeyEquivalentRoutingUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuKeyEquivalentRoutingUITests.swift; sourceTree = "<group>"; };
 			F1000001A1B2C3D4E5F60718 /* TermMeshWebViewKeyEquivalentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TermMeshWebViewKeyEquivalentTests.swift; sourceTree = "<group>"; };
 			F2000001A1B2C3D4E5F60718 /* UpdatePillReleaseVisibilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdatePillReleaseVisibilityTests.swift; sourceTree = "<group>"; };
+			D2A100000000000000000002 /* MainWindowSheetCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowSheetCoordinatorTests.swift; sourceTree = "<group>"; };
 			F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CJKIMEInputTests.swift; sourceTree = "<group>"; };
 			F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyTerminalViewComposingTests.swift; sourceTree = "<group>"; };
 			F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GhosttyConfigTests.swift; sourceTree = "<group>"; };
@@ -1034,6 +1036,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 			children = (
 				F1000001A1B2C3D4E5F60718 /* TermMeshWebViewKeyEquivalentTests.swift */,
 				F2000001A1B2C3D4E5F60718 /* UpdatePillReleaseVisibilityTests.swift */,
+				D2A100000000000000000002 /* MainWindowSheetCoordinatorTests.swift */,
 				F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */,
 				F3010001A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift */,
 				F4000001A1B2C3D4E5F60718 /* GhosttyConfigTests.swift */,
@@ -1474,6 +1477,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 			files = (
 				F1000000A1B2C3D4E5F60718 /* TermMeshWebViewKeyEquivalentTests.swift in Sources */,
 				F2000000A1B2C3D4E5F60718 /* UpdatePillReleaseVisibilityTests.swift in Sources */,
+				D2A100000000000000000001 /* MainWindowSheetCoordinatorTests.swift in Sources */,
 				F3000000A1B2C3D4E5F60718 /* CJKIMEInputTests.swift in Sources */,
 				F3010000A1B2C3D4E5F60718 /* GhosttyTerminalViewComposingTests.swift in Sources */,
 				F4000000A1B2C3D4E5F60718 /* GhosttyConfigTests.swift in Sources */,
