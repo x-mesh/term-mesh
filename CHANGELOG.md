@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.211.0] - 2026-08-24
+
+### Fixed
+
+- **Peer host failures can be repaired in place** — New Project now opens the same host recovery screen as Edit Peer Host without discarding the form. Retry clears stale auto-detected socket data before reconnecting.
+- **Stale remote processes can be cleaned up safely** — Edit Peer Host can stop detached `term-meshd` processes while protecting active clients, the verified Project route, and ambiguous socket owners.
+- **Old shadowed binaries can be archived** — HOME-owned outdated copies can be moved into a recoverable backup without changing the binary currently selected by PATH.
+- **Recovery results stay visible** — cleanup and archive outcomes remain on screen after diagnostics refresh, including partial failures and follow-up guidance.
+
 ## [0.210.0] - 2026-08-24
 
 ### Fixed
