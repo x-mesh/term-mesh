@@ -83,6 +83,80 @@ extension TerminalController {
                 .first(where: \.isVisible)
     }
 
+    /// Exercise the same addressed presentation route used by buttons and
+    /// shortcuts without asking an E2E test to drive AppKit menus. The target
+    /// must already have registered its window-local coordinator.
+    func v2DebugSheetRequest(params: [String: Any]) -> V2CallResult {
+        guard let windowID = v2UUID(params, "window_id"),
+              let kind = v2String(params, "kind") else {
+            return .err(code: "invalid_params", message: "Missing window_id/kind", data: nil)
+        }
+
+        var result: V2CallResult = .err(code: "not_found", message: "Window not found", data: nil)
+        _ = v2MainExec(timeout: 5) {
+            guard let appDelegate = AppDelegate.shared,
+                  appDelegate.windowForMainWindowId(windowID) != nil else {
+                return
+            }
+            guard appDelegate.mainWindowSheetCoordinator(for: windowID) != nil else {
+                result = .err(
+                    code: "unavailable",
+                    message: "Window sheet coordinator is not registered",
+                    data: nil
+                )
+                return
+            }
+
+            let name: Notification.Name
+            switch kind {
+            case "project": name = .projectCreationRequested
+            case "team": name = .teamCreationRequested
+            default:
+                result = .err(code: "invalid_params", message: "Unsupported sheet kind", data: nil)
+                return
+            }
+            MainWindowPresentationRouter.post(name: name, windowID: windowID)
+            result = .ok(["window_id": windowID.uuidString, "requested": kind])
+        }
+        return result
+    }
+
+    func v2DebugSheetState(params: [String: Any]) -> V2CallResult {
+        guard let windowID = v2UUID(params, "window_id") else {
+            return .err(code: "invalid_params", message: "Missing window_id", data: nil)
+        }
+
+        var result: V2CallResult = .err(code: "not_found", message: "Window not found", data: nil)
+        _ = v2MainExec(timeout: 5) {
+            guard let appDelegate = AppDelegate.shared,
+                  let window = appDelegate.windowForMainWindowId(windowID) else { return }
+            let coordinator = appDelegate.mainWindowSheetCoordinator(for: windowID)
+            result = .ok([
+                "window_id": windowID.uuidString,
+                "coordinator_registered": coordinator != nil,
+                "active_sheet": coordinator?.activeSheetID ?? NSNull(),
+                "attached_sheet": window.attachedSheet != nil,
+            ])
+        }
+        return result
+    }
+
+    func v2DebugSheetDismiss(params: [String: Any]) -> V2CallResult {
+        guard let windowID = v2UUID(params, "window_id") else {
+            return .err(code: "invalid_params", message: "Missing window_id", data: nil)
+        }
+
+        var result: V2CallResult = .err(code: "not_found", message: "Window not found", data: nil)
+        _ = v2MainExec(timeout: 5) {
+            guard let coordinator = AppDelegate.shared?.mainWindowSheetCoordinator(for: windowID) else {
+                return
+            }
+            coordinator.dismiss()
+            result = .ok(["window_id": windowID.uuidString])
+        }
+        return result
+    }
+
     func v2DebugShortcutSet(params: [String: Any]) -> V2CallResult {
         guard let name = v2String(params, "name"),
               let combo = v2String(params, "combo") else {

@@ -1331,6 +1331,12 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugActivateApp())
         case "debug.app.build":
             return v2Result(id: id, self.v2DebugAppBuild())
+        case "debug.sheet.request":
+            return v2Result(id: id, self.v2DebugSheetRequest(params: params))
+        case "debug.sheet.state":
+            return v2Result(id: id, self.v2DebugSheetState(params: params))
+        case "debug.sheet.dismiss":
+            return v2Result(id: id, self.v2DebugSheetDismiss(params: params))
         case "debug.command_palette.toggle":
             return v2Result(id: id, self.v2DebugToggleCommandPalette(params: params))
         case "debug.agent.transcript":
@@ -1652,6 +1658,9 @@ class TerminalController {
             "debug.type",
             "debug.app.activate",
             "debug.app.build",
+            "debug.sheet.request",
+            "debug.sheet.state",
+            "debug.sheet.dismiss",
             "debug.command_palette.toggle",
             "debug.agent.transcript",
             "debug.agent.render_stats",

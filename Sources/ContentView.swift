@@ -758,13 +758,22 @@ struct ContentView: View {
             },
             onNewTab: { tabManager.addTab() },
             onNewAgentTeam: {
-                NotificationCenter.default.post(name: .teamCreationRequested, object: nil)
+                MainWindowPresentationRouter.post(
+                    name: .teamCreationRequested,
+                    windowID: windowId
+                )
             },
             onSpawnCLI: {
-                NotificationCenter.default.post(name: .spawnCLIRequested, object: nil)
+                MainWindowPresentationRouter.post(
+                    name: .spawnCLIRequested,
+                    windowID: windowId
+                )
             },
             onNewProject: {
-                NotificationCenter.default.post(name: .projectCreationRequested, object: nil)
+                MainWindowPresentationRouter.post(
+                    name: .projectCreationRequested,
+                    windowID: windowId
+                )
             }
         )
     }
@@ -4424,7 +4433,10 @@ struct ContentView: View {
 
         // --- Agent Team Commands ---
         registry.register(commandId: "palette.newAgentTeam") {
-            NotificationCenter.default.post(name: .teamCreationRequested, object: nil)
+            MainWindowPresentationRouter.post(
+                name: .teamCreationRequested,
+                windowID: windowId
+            )
         }
         registry.register(commandId: "palette.destroyTeam") {
             let teams = TeamOrchestrator.shared.teams
@@ -4460,9 +4472,9 @@ struct ContentView: View {
             let teams = TeamOrchestrator.shared.teams
             guard let teamName = teams.keys.sorted().first,
                   let team = teams[teamName] else { return }
-            NotificationCenter.default.post(
+            MainWindowPresentationRouter.post(
                 name: .watchConfigRequested,
-                object: nil,
+                windowID: windowId,
                 userInfo: [
                     "teamName": teamName,
                     "workingDirectory": team.workingDirectory,

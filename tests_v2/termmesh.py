@@ -459,6 +459,20 @@ class termmesh:
     def close_window(self, window_id: str) -> None:
         self._call("window.close", {"window_id": str(window_id)})
 
+    def request_sheet(self, window_id: str, kind: str) -> dict:
+        return dict(self._call("debug.sheet.request", {
+            "window_id": str(window_id),
+            "kind": str(kind),
+        }) or {})
+
+    def sheet_state(self, window_id: str) -> dict:
+        return dict(self._call("debug.sheet.state", {
+            "window_id": str(window_id),
+        }) or {})
+
+    def dismiss_sheet(self, window_id: str) -> None:
+        self._call("debug.sheet.dismiss", {"window_id": str(window_id)})
+
     # ---------------------------------------------------------------------
     # Workspaces
     # ---------------------------------------------------------------------
