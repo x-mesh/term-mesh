@@ -50,6 +50,7 @@ class TerminalController {
     #if DEBUG
     var debugPeerShellInspection: [String: Any]?
     var debugProjectDeletionStatus: [String: [String: Any]] = [:]
+    var debugPeerRouteProbeStatus: [String: [String: Any]] = [:]
     #endif
 
     /// Dedicated queue for team data commands that don't need MainActor.
@@ -1431,6 +1432,10 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPeerCoalesceProbe(params: params))
         case "debug.peer.capabilities_probe":
             return v2Result(id: id, self.v2DebugPeerCapabilitiesProbe(params: params))
+        case "debug.peer.route_probe":
+            return v2Result(id: id, self.v2DebugPeerRouteProbe(params: params))
+        case "debug.peer.route_probe_status":
+            return v2Result(id: id, self.v2DebugPeerRouteProbeStatus(params: params))
         case "debug.peer.open_remote_pane":
             return v2Result(id: id, self.v2DebugPeerOpenRemotePane(params: params))
         case "debug.session_host.reconcile":

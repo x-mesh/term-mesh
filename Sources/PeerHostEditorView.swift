@@ -61,6 +61,10 @@ struct PeerHostEditorView: View {
         case okVersionUnknown(socket: String)
     }
     @State private var doctorState: DoctorState = .idle
+    /// Exact endpoint chain proven by the last successful Test Relay. Kept
+    /// outside DoctorState because version comparison changes that state after
+    /// the handshake, while the route evidence must remain visible.
+    @State private var relayTestDetails: PeerRelayTestDetails?
     @State private var showInstallConfirm = false
     @State private var showUpdateConfirm = false
     @State private var showForceReinstallConfirm = false
@@ -86,6 +90,7 @@ struct PeerHostEditorView: View {
     /// term-meshd processes this host keeps running while nothing points at
     /// them. Empty on Linux hosts by design (see `refreshDaemonSnapshot`).
     @State private var staleDaemons: [PeerHostDoctor.DaemonInstance] = []
+    @State private var daemonSnapshot: PeerHostDoctor.DaemonSnapshot?
     @State private var showDaemonCleanupConfirm = false
     @State private var daemonCleanupBusy = false
     /// Version reported by a binary found on the host while term-meshd
@@ -296,6 +301,7 @@ struct PeerHostEditorView: View {
             }
 
             doctorStatusLine
+            relayRouteStatusLine
             healthBaselineLine
 
             agentEnvironmentStatusLine
@@ -660,6 +666,114 @@ struct PeerHostEditorView: View {
         }
     }
 
+    @ViewBuilder
+    private var relayRouteStatusLine: some View {
+        if let details = relayTestDetails {
+            VStack(alignment: .leading, spacing: 3) {
+                Label(
+                    Self.relayRouteSummary(details),
+                    systemImage: details.routeVerified
+                        ? "point.3.connected.trianglepath.dotted"
+                        : "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(
+                    details.routeVerified
+                        ? Color.green : Color.red
+                )
+
+                relayRouteRow("Configured", details.configuredSocket ?? "Auto-detect")
+                relayRouteRow(
+                    "Discovered",
+                    Self.relayDiscoveredValue(details)
+                )
+                relayRouteRow(
+                    details.connectedVerified ? "Connected" : "Attempted",
+                    details.connectedSocket
+                )
+                if details.connectedVerified {
+                    relayRouteRow(
+                        "Session owner",
+                        details.sessionOwnerSocket ?? "No redirect (connected endpoint)"
+                    )
+                    relayRouteRow(
+                        "Server",
+                        "\(details.hostDisplayName) · v\(displayVersion(details.hostAppVersion))"
+                    )
+                }
+                if let ownerPID = relayOwnerPID(details: details) {
+                    relayRouteRow("Owner PID", String(ownerPID))
+                }
+
+                ForEach(Self.relayRouteWarnings(details), id: \.self) { warning in
+                    Label(warning, systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Test Relay route details")
+        }
+    }
+
+    static func relayDiscoveredValue(_ details: PeerRelayTestDetails) -> String {
+        guard let socket = details.discoveredSocket else {
+            return "No default socket found"
+        }
+        switch details.discoveredVerified {
+        case true: return socket + " (reachable)"
+        case false: return socket + " (handshake failed)"
+        case nil: return socket + " (not tested)"
+        }
+    }
+
+    static func relayRouteSummary(_ details: PeerRelayTestDetails) -> String {
+        guard details.connectedVerified else {
+            return "Peer handshake failed at the attempted socket"
+        }
+        return details.sessionOwnerVerified
+            ? "Relay route verified end to end"
+            : "Connected endpoint answered, but session owner did not"
+    }
+
+    @ViewBuilder
+    private func relayRouteRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(label + ":")
+                .foregroundStyle(.secondary)
+                .frame(width: 82, alignment: .trailing)
+            Text(value)
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+        }
+        .font(.system(.caption2, design: .monospaced))
+    }
+
+    private func relayOwnerPID(details: PeerRelayTestDetails) -> Int? {
+        let wanted = details.sessionOwnerSocket ?? details.connectedSocket
+        return daemonSnapshot?.daemons.first(where: { $0.sockets.contains(wanted) })?.pid
+    }
+
+    static func relayRouteWarnings(_ details: PeerRelayTestDetails) -> [String] {
+        var warnings: [String] = []
+        if let configured = details.configuredSocket, configured != details.connectedSocket {
+            warnings.append("Configured socket was not the endpoint that answered")
+        }
+        if let discovered = details.discoveredSocket, discovered != details.connectedSocket {
+            warnings.append("Auto-detection found a different socket than the configured route")
+            if details.discoveredVerified == true {
+                warnings.append("The alternate socket is reachable but was not substituted")
+            } else if details.discoveredVerified == false {
+                warnings.append("The alternate socket also failed its peer handshake")
+            }
+        }
+        if let owner = details.sessionOwnerSocket, owner != details.connectedSocket {
+            warnings.append("Sessions are owned by a different socket; both endpoints were tested")
+        }
+        return warnings
+    }
+
     /// Version drift, one line each. Silent on a consistent host.
     ///
     /// Worth surfacing here rather than only in the log: this is the screen
@@ -990,6 +1104,8 @@ struct PeerHostEditorView: View {
         showUpdateConfirm = false
         showForceReinstallConfirm = false
         staleDaemons = []
+        daemonSnapshot = nil
+        relayTestDetails = nil
         showDaemonCleanupConfirm = false
         daemonCleanupBusy = false
         agentStackState = .idle
@@ -1011,6 +1127,7 @@ struct PeerHostEditorView: View {
         binaryWarnings = []
         binaryInventory = nil
         healthBaseline = nil
+        relayTestDetails = nil
         daemonMissingHostKind = nil
         testedHostKind = nil
         // Snapshot NOW — this is the exact target Install/Update must use
@@ -1028,9 +1145,10 @@ struct PeerHostEditorView: View {
             // flight — discard rather than write a stale doctorState.
             guard gen == doctorGeneration else { return }
             switch result {
-            case .ok(let path, _):
+            case .ok(let details, _):
+                relayTestDetails = details
                 guard let resolved = await resolveConnectedState(
-                    socketPath: path, draft: draft, gen: gen
+                    socketPath: details.connectedSocket, draft: draft, gen: gen
                 ) else { return }
                 guard gen == doctorGeneration else { return }
                 doctorState = resolved
@@ -1072,13 +1190,15 @@ struct PeerHostEditorView: View {
                 // before its daemon is ever installed.
                 await refreshAgentStack(draft: draft, gen: gen)
                 await refreshBinaryInventory(draft: draft, gen: gen)
-            case .relayFailed(let socket, let message):
+            case .relayFailed(let details, let message):
+                relayTestDetails = details
                 testedHostKind = await PeerHostDoctor.checkHostKind(
                     sshTarget: draft.sshTarget, port: draft.sshPort,
                     identityFile: draft.identityFile
                 )
                 guard gen == doctorGeneration else { return }
-                doctorState = .relayFailed(socket: socket, message: message)
+                doctorState = .relayFailed(socket: details.connectedSocket, message: message)
+                await refreshDaemonSnapshot(draft: draft, gen: gen)
             case .sshFailed(let msg): doctorState = .sshFailed(msg)
             }
         }
@@ -1149,9 +1269,10 @@ struct PeerHostEditorView: View {
             )
             guard gen == doctorGeneration else { return }
             switch result {
-            case .ok(let path, _):
+            case .ok(let details, _):
+                relayTestDetails = details
                 guard let resolved = await resolveConnectedState(
-                    socketPath: path, draft: draft, gen: gen
+                    socketPath: details.connectedSocket, draft: draft, gen: gen
                 ) else { return }
                 guard gen == doctorGeneration else { return }
                 doctorState = resolved
@@ -1164,8 +1285,10 @@ struct PeerHostEditorView: View {
                 )
                 guard gen == doctorGeneration else { return }
                 doctorState = .diagnosed(PeerHostDoctor.summarizeDiagnosis(raw))
-            case .relayFailed(let socket, let message):
-                doctorState = .relayFailed(socket: socket, message: message)
+            case .relayFailed(let details, let message):
+                relayTestDetails = details
+                doctorState = .relayFailed(socket: details.connectedSocket, message: message)
+                await refreshDaemonSnapshot(draft: draft, gen: gen)
             case .sshFailed(let msg):
                 doctorState = .sshFailed(msg)
             }
@@ -1232,6 +1355,7 @@ struct PeerHostEditorView: View {
             identityFile: draft.identityFile
         )
         guard gen == doctorGeneration else { return }
+        daemonSnapshot = snapshot
         let stale = snapshot.map(PeerHostDoctor.staleDaemons) ?? []
         staleDaemons = stale
         if !stale.isEmpty {

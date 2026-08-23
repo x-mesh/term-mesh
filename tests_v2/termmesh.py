@@ -1375,6 +1375,19 @@ class termmesh:
         `TerminalController+Debug.swift`'s `v2DebugPeerCapabilitiesProbe`."""
         return dict(self._call("debug.peer.capabilities_probe", {}) or {})
 
+    def peer_route_probe(self, ssh_target: str, configured_socket: str,
+                         discovered_socket: str) -> dict:
+        return dict(self._call("debug.peer.route_probe", {
+            "ssh_target": ssh_target,
+            "configured_socket": configured_socket,
+            "discovered_socket": discovered_socket,
+        }) or {})
+
+    def peer_route_probe_status(self, operation_id: str) -> dict:
+        return dict(self._call("debug.peer.route_probe_status", {
+            "operation_id": operation_id,
+        }) or {})
+
     def screenshot(self, label: str = "") -> dict:
         params: Dict[str, Any] = {}
         if label:

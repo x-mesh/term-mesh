@@ -8,6 +8,78 @@ import XCTest
 #endif
 
 final class PeerDaemonVersionTests: XCTestCase {
+    func testRelayRouteWarningsExposeEveryEndpointMismatch() {
+        let details = PeerRelayTestDetails(
+            configuredSocket: "/configured.sock",
+            discoveredSocket: "/discovered.sock",
+            discoveredVerified: true,
+            connectedSocket: "/connected.sock",
+            connectedVerified: true,
+            sessionOwnerSocket: "/owner.sock",
+            sessionOwnerVerified: true,
+            hostDisplayName: "mac-sub",
+            hostAppVersion: "0.207.0"
+        )
+        let warnings = PeerHostEditorView.relayRouteWarnings(details)
+        XCTAssertEqual(warnings.count, 4)
+        XCTAssertTrue(warnings.contains(where: { $0.contains("Configured") }))
+        XCTAssertTrue(warnings.contains(where: { $0.contains("Auto-detection") }))
+        XCTAssertTrue(warnings.contains(where: { $0.contains("Sessions are owned") }))
+    }
+
+    func testRelayRouteWarningsStayEmptyForOneCanonicalSocket() {
+        let details = PeerRelayTestDetails(
+            configuredSocket: "/peer.sock",
+            discoveredSocket: "/peer.sock",
+            discoveredVerified: true,
+            connectedSocket: "/peer.sock",
+            connectedVerified: true,
+            sessionOwnerSocket: nil,
+            sessionOwnerVerified: true,
+            hostDisplayName: "mac-sub",
+            hostAppVersion: "0.207.0"
+        )
+        XCTAssertTrue(PeerHostEditorView.relayRouteWarnings(details).isEmpty)
+    }
+
+    func testReachableAlternateCannotGreenADeadConfiguredRoute() {
+        let details = PeerRelayTestDetails(
+            configuredSocket: "/configured.sock",
+            discoveredSocket: "/alternate.sock",
+            discoveredVerified: true,
+            connectedSocket: "/configured.sock",
+            connectedVerified: false,
+            sessionOwnerSocket: nil,
+            sessionOwnerVerified: false,
+            hostDisplayName: "Handshake failed",
+            hostAppVersion: "unknown"
+        )
+        XCTAssertFalse(
+            details.routeVerified,
+            "an alternate endpoint is diagnosis, never a silent route replacement"
+        )
+        XCTAssertTrue(
+            PeerHostEditorView.relayRouteWarnings(details).contains(where: {
+                $0.contains("not substituted")
+            })
+        )
+    }
+
+    func testUnreachableSessionOwnerFailsAnOtherwiseLiveRoute() {
+        let details = PeerRelayTestDetails(
+            configuredSocket: "/configured.sock",
+            discoveredSocket: "/configured.sock",
+            discoveredVerified: true,
+            connectedSocket: "/configured.sock",
+            connectedVerified: true,
+            sessionOwnerSocket: "/owner.sock",
+            sessionOwnerVerified: false,
+            hostDisplayName: "mac-sub",
+            hostAppVersion: "0.207.0"
+        )
+        XCTAssertFalse(details.routeVerified)
+    }
+
 
     func test_healthBaselineCommand_isFixedQuotedAndMeasuresBothPlanes() {
         let command = PeerHostDoctor.healthBaselineCommand

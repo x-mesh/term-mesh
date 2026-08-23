@@ -11,16 +11,41 @@ import Foundation
 
 enum PeerHostTestResult: Equatable {
     /// SSH tunnel + peer protocol handshake both succeeded.
-    case ok(socketPath: String, hostCLIBinDirs: [String])
+    case ok(details: PeerRelayTestDetails, hostCLIBinDirs: [String])
     /// SSH reached the host but no live peer socket was found —
     /// term-meshd is likely not installed/running. Install is offered.
     case daemonMissing
     /// A socket file exists, but the SSH forward or peer protocol handshake
     /// could not reach a live compatible server. Kept separate from
     /// `sshFailed` so a stale socket never produces a false-green result.
-    case relayFailed(socketPath: String, message: String)
+    case relayFailed(details: PeerRelayTestDetails, message: String)
     /// SSH itself failed (auth, DNS, timeout…).
     case sshFailed(String)
+}
+
+/// Exact route proven by Test Relay. Kept separate from the connection state
+/// so the editor can show which socket was configured, which one discovery
+/// found, which endpoint answered, and which durable session owner the host
+/// advertised. A green result without these identities is not actionable.
+struct PeerRelayTestDetails: Equatable, Sendable {
+    var configuredSocket: String?
+    var discoveredSocket: String?
+    var discoveredVerified: Bool?
+    var connectedSocket: String
+    var connectedVerified: Bool
+    var sessionOwnerSocket: String?
+    var sessionOwnerVerified: Bool
+    var hostDisplayName: String
+    var hostAppVersion: String
+
+    /// The profile-selected route and its advertised session owner are the
+    /// release gate. A reachable alternate discovered socket is diagnostic
+    /// evidence only and can never turn a failed configured route green.
+    var routeVerified: Bool { connectedVerified && sessionOwnerVerified }
+}
+
+private extension String {
+    var nonEmpty: String? { isEmpty ? nil : self }
 }
 
 /// Which process is actually serving this peer. The version-probe
@@ -305,10 +330,21 @@ enum PeerHostDoctor {
     /// holding sessions for the next launch to adopt, and killing those would
     /// destroy the very thing outliving the app exists to protect.
     static func staleDaemons(in snapshot: DaemonSnapshot) -> [DaemonInstance] {
-        guard snapshot.appPid != nil else { return [] }
+        guard let appPid = snapshot.appPid else { return [] }
         let appSockets = Set(snapshot.appSockets)
         return snapshot.daemons.filter { daemon in
-            daemon.sockets.allSatisfy { !appSockets.contains($0) }
+            // The bundled daemon owns its listener itself, so that pathname
+            // does not appear in the parent app's lsof list. Production cleanup
+            // used the missing intersection as proof of staleness and SIGTERM'd
+            // the live session owner. Parent ownership wins over socket heuristics.
+            daemon.parentPid != appPid
+                // A peer listener can be serving another Mac even when this
+                // app has no FD pointing at it. Local lsof cannot prove that
+                // external client count is zero, so cleanup must fail closed.
+                && !daemon.sockets.contains(where: {
+                    ($0 as NSString).lastPathComponent.contains("peer")
+                })
+                && daemon.sockets.allSatisfy { !appSockets.contains($0) }
         }
     }
 
@@ -554,7 +590,7 @@ enum PeerHostDoctor {
     /// SIGTERM only. A daemon that ignores it is a different problem, and
     /// SIGKILL would take its unix sockets with it uncleaned.
     static let daemonCleanupCommand =
-        #"sh -c 'while read -r pid; do case "$pid" in ""|*[!0-9]*) continue ;; esac; if kill "$pid" 2>/dev/null; then echo "killed=$pid"; else echo "failed=$pid"; fi; done'"#
+        #"sh -c 'while read -r pid; do case "$pid" in ""|*[!0-9]*) continue ;; esac; ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d " " ); parent=$(ps -o command= -p "$ppid" 2>/dev/null); case "$parent" in *.app/Contents/MacOS/term-mesh*) echo "protected=$pid"; continue ;; esac; peers=$(lsof -a -p "$pid" -U -F n 2>/dev/null | sed -n "s/^n//p" | grep peer); if [ -n "$peers" ]; then echo "protected=$pid"; continue; fi; if kill "$pid" 2>/dev/null; then echo "killed=$pid"; else echo "failed=$pid"; fi; done'"#
 
     /// Stop the daemons this host is no longer using.
     ///
@@ -692,10 +728,12 @@ enum PeerHostDoctor {
         remoteSocket: String? = nil
     ) async -> PeerHostTestResult {
         let socketPath: String
+        var discoveredSocket: String?
+        let configuredSocket = remoteSocket?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nonEmpty
         do {
-            if let explicit = remoteSocket?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-               !explicit.isEmpty {
+            if let explicit = configuredSocket {
                 try PeerSSHTunnel.validateRemoteSockPath(explicit)
                 // A custom socket may sit outside every auto-detect
                 // candidate. Run discovery only as an SSH reachability
@@ -703,7 +741,7 @@ enum PeerHostDoctor {
                 // auth/DNS/timeout failures remain correctly classified
                 // as SSH failures instead of relay failures.
                 do {
-                    _ = try await PeerSocketProber.probe(
+                    discoveredSocket = try await PeerSocketProber.probe(
                         sshTarget: sshTarget, port: port,
                         identityFile: identityFile
                     )
@@ -715,6 +753,7 @@ enum PeerHostDoctor {
                 socketPath = try await PeerSocketProber.probe(
                     sshTarget: sshTarget, port: port, identityFile: identityFile
                 )
+                discoveredSocket = socketPath
             }
         } catch PeerSocketProbeError.noSocketFound {
             return .daemonMissing
@@ -722,6 +761,25 @@ enum PeerHostDoctor {
             return .sshFailed(String(describing: error))
         }
 
+        return await testResolvedRoute(
+            sshTarget: sshTarget, port: port, identityFile: identityFile,
+            configuredSocket: configuredSocket, discoveredSocket: discoveredSocket,
+            selectedSocket: socketPath
+        )
+    }
+
+    /// Transport half of Test Relay after endpoint resolution. Production and
+    /// the split-route E2E share this exact path; the E2E supplies isolated
+    /// resolved endpoints so it can prove a dead configured route is not
+    /// replaced by a reachable alternate without editing host config files.
+    static func testResolvedRoute(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?,
+        configuredSocket: String?,
+        discoveredSocket: String?,
+        selectedSocket socketPath: String
+    ) async -> PeerHostTestResult {
         let tunnel = PeerSSHTunnel(
             sshTarget: sshTarget,
             remoteSockPath: socketPath,
@@ -733,22 +791,130 @@ enum PeerHostDoctor {
             let connection = try await PeerRelaySession.connect(
                 hostSockPath: tunnel.localSockPath
             )
+            let discoveredVerified: Bool?
+            if let discoveredSocket, discoveredSocket != socketPath {
+                discoveredVerified = await verifyPeerEndpoint(
+                    sshTarget: sshTarget, port: port, identityFile: identityFile,
+                    remoteSocket: discoveredSocket
+                )
+            } else {
+                discoveredVerified = discoveredSocket == nil ? nil : true
+            }
+            let ownerPath = connection.sessionHostSockPath.nonEmpty
+            var ownerVerified = ownerPath == nil || ownerPath == socketPath
+            if let ownerPath, ownerPath != socketPath {
+                let ownerTunnel = PeerSSHTunnel(
+                    sshTarget: sshTarget, remoteSockPath: ownerPath,
+                    port: port, identityFile: identityFile
+                )
+                do {
+                    try await ownerTunnel.start()
+                    let owner = try await PeerRelaySession.connect(
+                        hostSockPath: ownerTunnel.localSockPath
+                    )
+                    await owner.cancel()
+                    ownerTunnel.stop()
+                    ownerVerified = true
+                } catch {
+                    ownerTunnel.stop()
+                    await connection.cancel()
+                    tunnel.stop()
+                    let message = "connected via \(socketPath), but advertised session owner \(ownerPath) failed: \(error)"
+                    RemoteWorkLog.infoOffMain(
+                        "Relay health check failed for \(sshTarget): \(message)"
+                    )
+                    return .relayFailed(
+                        details: PeerRelayTestDetails(
+                            configuredSocket: configuredSocket,
+                            discoveredSocket: discoveredSocket,
+                            discoveredVerified: discoveredVerified,
+                            connectedSocket: socketPath,
+                            connectedVerified: true,
+                            sessionOwnerSocket: ownerPath,
+                            sessionOwnerVerified: false,
+                            hostDisplayName: connection.hostDisplayName,
+                            hostAppVersion: connection.hostAppVersion ?? "unknown"
+                        ),
+                        message: message
+                    )
+                }
+            }
+            let details = PeerRelayTestDetails(
+                configuredSocket: configuredSocket,
+                discoveredSocket: discoveredSocket,
+                discoveredVerified: discoveredVerified,
+                connectedSocket: socketPath,
+                connectedVerified: true,
+                sessionOwnerSocket: ownerPath,
+                sessionOwnerVerified: ownerVerified,
+                hostDisplayName: connection.hostDisplayName,
+                hostAppVersion: connection.hostAppVersion ?? "unknown"
+            )
             await connection.cancel()
             tunnel.stop()
             RemoteWorkLog.debugOffMain(
                 "Relay health check passed for \(sshTarget) via \(socketPath)"
             )
             return .ok(
-                socketPath: socketPath,
+                details: details,
                 hostCLIBinDirs: connection.hostCLIBinDirs
             )
         } catch {
             tunnel.stop()
             let message = String(describing: error)
+            let discoveredVerified: Bool?
+            if let discoveredSocket, discoveredSocket != socketPath {
+                discoveredVerified = await verifyPeerEndpoint(
+                    sshTarget: sshTarget, port: port, identityFile: identityFile,
+                    remoteSocket: discoveredSocket
+                )
+            } else {
+                discoveredVerified = discoveredSocket == nil ? nil : false
+            }
             RemoteWorkLog.infoOffMain(
                 "Relay health check failed for \(sshTarget) via \(socketPath): \(message)"
             )
-            return .relayFailed(socketPath: socketPath, message: message)
+            return .relayFailed(
+                details: PeerRelayTestDetails(
+                    configuredSocket: configuredSocket,
+                    discoveredSocket: discoveredSocket,
+                    discoveredVerified: discoveredVerified,
+                    connectedSocket: socketPath,
+                    connectedVerified: false,
+                    sessionOwnerSocket: nil,
+                    sessionOwnerVerified: false,
+                    hostDisplayName: "Handshake failed",
+                    hostAppVersion: "unknown"
+                ),
+                message: message
+            )
+        }
+    }
+
+    /// Probe a secondary endpoint without changing the route selected by the
+    /// profile. Test Relay uses this for diagnosis only: a reachable discovered
+    /// socket never silently replaces a failed configured socket.
+    private static func verifyPeerEndpoint(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?,
+        remoteSocket: String
+    ) async -> Bool {
+        let tunnel = PeerSSHTunnel(
+            sshTarget: sshTarget, remoteSockPath: remoteSocket,
+            port: port, identityFile: identityFile
+        )
+        do {
+            try await tunnel.start()
+            let connection = try await PeerRelaySession.connect(
+                hostSockPath: tunnel.localSockPath
+            )
+            await connection.cancel()
+            tunnel.stop()
+            return true
+        } catch {
+            tunnel.stop()
+            return false
         }
     }
 
