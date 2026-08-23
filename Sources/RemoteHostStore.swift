@@ -60,6 +60,8 @@ struct RemoteTeamSummary: Identifiable, Equatable {
     let members: [Member]
     let presentationRevision: UInt64
     let presentationOwnedByRequester: Bool
+    let leaderProcessActive: Bool
+    let leaderProcessActiveKnown: Bool
 
     var id: String { teamUUID.isEmpty ? name : teamUUID }
 
@@ -73,7 +75,9 @@ struct RemoteTeamSummary: Identifiable, Equatable {
         leaderSurfaceID: Data = Data(),
         members: [Member] = [],
         presentationRevision: UInt64 = 0,
-        presentationOwnedByRequester: Bool = false
+        presentationOwnedByRequester: Bool = false,
+        leaderProcessActive: Bool = false,
+        leaderProcessActiveKnown: Bool = false
     ) {
         self.name = name
         self.teamUUID = teamUUID
@@ -85,6 +89,8 @@ struct RemoteTeamSummary: Identifiable, Equatable {
         self.members = members
         self.presentationRevision = presentationRevision
         self.presentationOwnedByRequester = presentationOwnedByRequester
+        self.leaderProcessActive = leaderProcessActive
+        self.leaderProcessActiveKnown = leaderProcessActiveKnown
     }
 }
 
@@ -2104,7 +2110,9 @@ final class RemoteHostStore: ObservableObject {
                 )
             },
             presentationRevision: team.presentationRevision,
-            presentationOwnedByRequester: team.presentationOwnedByRequester
+            presentationOwnedByRequester: team.presentationOwnedByRequester,
+            leaderProcessActive: team.leaderProcessActive,
+            leaderProcessActiveKnown: team.leaderProcessActiveKnown
         )
     }
 

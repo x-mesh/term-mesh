@@ -335,6 +335,12 @@ final class TeamOrchestrator: ObservableObject {
     /// per surface, with the first set of panes orphaned because
     /// `progress.agentPanelIDs` keeps only the last writer.
     var projectRestoreInFlight: Set<String> = []
+    /// Prevent a stale host-roster snapshot or an already in-flight adoption
+    /// from resurrecting a Project after delete has removed its manifest. A
+    /// project id is UUID-backed and never reused, so this is a process-lifetime
+    /// tombstone: clearing it merely because a fresh roster omits the project
+    /// creates the exact window in which an older roster can commit afterward.
+    var projectDeletionSuppressions: Set<String> = []
     /// Debounced full-manifest publication to the daemon that owns a remote
     /// project's surfaces. This is separate from local live snapshots: a new
     /// Mac has no access to those snapshots and discovers through the host.
@@ -378,6 +384,20 @@ final class TeamOrchestrator: ObservableObject {
             && workspaceID == teamWorkspaceID
     }
 
+    /// A relay ending unexpectedly is the same lifecycle event as Ghostty
+    /// reporting that its helper child exited. Explicit pane teardown and an
+    /// intentional host disconnect are not: recovering either would recreate
+    /// a leader the user deliberately closed or disconnected.
+    nonisolated static func shouldRecoverRemoteLeaderRelayFailure(
+        isPeerLeader: Bool,
+        paneWasExplicitlyTornDown: Bool,
+        hostTransportWasDisconnected: Bool
+    ) -> Bool {
+        isPeerLeader
+            && !paneWasExplicitlyTornDown
+            && !hostTransportWasDisconnected
+    }
+
     func remoteLeaderTeamName(
         runtimeClosedPanelID panelID: UUID,
         workspaceID: UUID
@@ -397,6 +417,39 @@ final class TeamOrchestrator: ObservableObject {
                 isPeerLeader: isPeerLeader
             )
         }?.id
+    }
+
+    /// Route a terminal relay failure through the one remote-leader recovery
+    /// funnel. Closing via `closeRuntimeSurface` is intentional: it removes
+    /// the dead local helper pane first, then reattaches the exact peer surface
+    /// and only bootstraps a replacement after an authoritative roster says
+    /// that surface is gone.
+    @discardableResult
+    func recoverRemoteLeaderAfterRelayFailure(
+        panelID: UUID,
+        workspaceID: UUID,
+        description: String
+    ) -> Bool {
+        guard let teamName = remoteLeaderTeamName(
+            runtimeClosedPanelID: panelID,
+            workspaceID: workspaceID
+        ) else { return false }
+        markRemoteLeaderFailed(teamName: teamName, description: description)
+        guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: workspaceID) else {
+            return false
+        }
+        tabManager.closeRuntimeSurface(tabId: workspaceID, surfaceId: panelID)
+        return true
+    }
+
+    func markRemoteLeaderRelayStarted(panelID: UUID, workspaceID: UUID) {
+        guard let teamName = remoteLeaderTeamName(
+            runtimeClosedPanelID: panelID, workspaceID: workspaceID
+        ), var team = teams[teamName] else { return }
+        team.leaderReady = true
+        team.leaderFailureDescription = nil
+        teams[teamName] = team
+        syncTeamStateToDaemon()
     }
 
     /// The single funnel for "this team owns these remote checkouts".
@@ -464,8 +517,16 @@ final class TeamOrchestrator: ObservableObject {
         team.leaderPanelId = panelID
         team.leaderWorkspaceId = nil
         team.leaderEndpoint = endpoint
-        team.leaderReady = true
-        team.leaderFailureDescription = nil
+        let relayStarted: Bool = {
+            guard case .peer = endpoint,
+                  let located = AppDelegate.shared?.locateSurface(surfaceId: panelID),
+                  let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+                  let session = workspace.terminalPanel(for: panelID)?.peerPaneSession
+            else { return true }
+            return session.isRelayStarted
+        }()
+        team.leaderReady = relayStarted
+        team.leaderFailureDescription = relayStarted ? nil : "Remote leader relay is pending"
         teams[teamName] = team
         syncTeamStateToDaemon()
     }
@@ -660,9 +721,26 @@ final class TeamOrchestrator: ObservableObject {
                   let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
                   let session = workspace.terminalPanel(for: team.leaderPanelId)?.peerPaneSession
             else { return false }
-            return !session.isTorndown
+            return session.isRelayStarted
         }
         return AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId) != nil
+    }
+
+    /// Pending background panes are not failed: their Ghostty view has not
+    /// mounted yet, so no relay helper can exist. Recover only an absent,
+    /// failed, or torn-down session; otherwise reconnect notifications would
+    /// loop while the Project stays in the background.
+    func isRemoteLeaderRecoveryEligible(teamName: String) -> Bool {
+        guard let team = teams[teamName], case .peer = team.leaderEndpoint else { return false }
+        guard let located = AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId),
+              let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
+              let session = workspace.terminalPanel(for: team.leaderPanelId)?.peerPaneSession
+        else { return true }
+        switch session.relayStartupState {
+        case .pending, .starting: return false
+        case .started: return session.isTorndown
+        case .failed: return true
+        }
     }
 
     func markRemoteLeaderFailed(teamName: String, description: String) {

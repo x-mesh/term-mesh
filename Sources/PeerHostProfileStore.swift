@@ -17,6 +17,11 @@ final class PeerHostProfileStore: ObservableObject {
     @Published private(set) var profiles: [PeerHostProfile] = []
 
     private static var storeURL: URL {
+        if let override = SessionRestoreSettings.stateDirectoryOverride() {
+            let dir = URL(fileURLWithPath: override, isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir.appendingPathComponent("peer-host-profiles.json")
+        }
         let appSupport = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         ).first!

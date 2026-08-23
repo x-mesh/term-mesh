@@ -3317,7 +3317,28 @@ final class Workspace: Identifiable {
                 }
             )
         }
-        session.relaySession.onDisconnect = { showBanner(hostLabel) }
+        let recoverRemoteLeader: @MainActor (String) -> Bool = { [weak self, weak session] reason in
+            guard let self, let session else { return false }
+            let isPeerLeader = TeamOrchestrator.shared.remoteLeaderTeamName(
+                runtimeClosedPanelID: panelId,
+                workspaceID: self.id
+            ) != nil
+            guard TeamOrchestrator.shouldRecoverRemoteLeaderRelayFailure(
+                isPeerLeader: isPeerLeader,
+                paneWasExplicitlyTornDown: session.isTorndown,
+                hostTransportWasDisconnected: session.hostTransportWasDisconnected
+            ) else { return false }
+            return TeamOrchestrator.shared.recoverRemoteLeaderAfterRelayFailure(
+                panelID: panelId,
+                workspaceID: self.id,
+                description: reason
+            )
+        }
+        session.relaySession.onDisconnect = {
+            if !recoverRemoteLeader("Remote leader relay disconnected") {
+                showBanner(hostLabel)
+            }
+        }
         session.relaySession.onError = { error in
             showBanner("\(hostLabel): \(String(describing: error))")
         }
@@ -3333,26 +3354,26 @@ final class Workspace: Identifiable {
         session.relaySession.onReconnected = { [weak panel] in
             panel?.hostedView.hidePeerDisconnectBanner()
         }
+        session.relayStartupFailure = { error in
+            let reason = "Remote leader relay failed to start: \(String(describing: error))"
+            if recoverRemoteLeader(reason) { return }
+            showBanner("relay start failed: \(String(describing: error))")
+            session.teardown()
+        }
+        session.relayStartupSucceeded = { [weak self] in
+            guard let self else { return }
+            TeamOrchestrator.shared.markRemoteLeaderRelayStarted(
+                panelID: panelId, workspaceID: self.id
+            )
+        }
         PeerTitlebarAccentController.refresh()
         #if DEBUG
         dlog("peer.pane.open workspace=\(id.uuidString.prefix(8)) host=\(session.lease.key) title=\(session.surfaceTitle)")
         #endif
-        // Accept the relay binary's connection once Ghostty spawns it as
-        // the pane's shell. Weak panel: if the pane closes mid-start,
-        // close() already ran teardown and start() unblocks with an error.
-        Task { [weak panel] in
-            do {
-                try await session.start()
-            } catch {
-                NSLog("[peer-pane] relay start failed: %@", String(describing: error))
-                // Banner BEFORE teardown — showBanner refuses to draw on a
-                // torn-down session, and a start failure with no visible
-                // error (just a dead shell) is undebuggable for the user.
-                showBanner("relay start failed: \(String(describing: error))")
-                session.teardown()
-                _ = panel
-            }
-        }
+        // TerminalPanelView.onAppear starts the helper. A background Project
+        // has no mounted Ghostty view yet, so arming accept here would always
+        // time out and leave a torn-down pane before the user opens it.
+        if panel.surface.isViewInWindow { panel.startPeerRelayIfNeeded() }
     }
 
     // MARK: - Remote agent panes (peer-owned bridge surfaces)

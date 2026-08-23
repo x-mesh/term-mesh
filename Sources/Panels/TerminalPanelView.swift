@@ -37,6 +37,7 @@ struct TerminalPanelView: View {
         .background(Color.clear)
         .onAppear {
             panel.peerPaneSession?.relaySession.setResizeAuthorityEligible(isFocused)
+            panel.startPeerRelayIfNeeded()
         }
         .onChange(of: isFocused) { focused in
             panel.peerPaneSession?.relaySession.setResizeAuthorityEligible(focused)

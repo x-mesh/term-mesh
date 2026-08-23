@@ -45,8 +45,12 @@ DERIVED_DATA_PATH="$HOME/Library/Developer/Xcode/DerivedData/term-mesh-tests-v2"
 APP="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh DEV.app"
 CLI="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh"
 DAEMON_BIN="$PWD/daemon/target/release/term-meshd"
-DAEMON_SOCK_PATH="${TMPDIR:-/tmp}/term-meshd.sock"
-DAEMON_LOG_PATH="/tmp/term-meshd-e2e.log"
+E2E_RUN_ID="$$"
+APP_SOCK_PATH="${TMPDIR:-/tmp}/term-mesh-e2e-app-${E2E_RUN_ID}.sock"
+DAEMON_SOCK_PATH="${TMPDIR:-/tmp}/term-meshd-e2e-${E2E_RUN_ID}.sock"
+DAEMON_LOG_PATH="/tmp/term-meshd-e2e-${E2E_RUN_ID}.log"
+E2E_APP_PID=""
+E2E_DAEMON_PID=""
 PYTHON_VENV="$DERIVED_DATA_PATH/python-venv"
 PYTHON="$PYTHON_VENV/bin/python3"
 SYSTEM_PYTHON="/usr/bin/python3"
@@ -92,13 +96,17 @@ export TERMMESH_CLI="$CLI"
 export TERMMESH_CLI_BIN="$CLI"
 
 cleanup() {
-  pkill -x "term-mesh DEV" || true
-  pkill -x "term-mesh" || true
-  pkill -f "term-meshd" || true
-  rm -f /tmp/term-mesh*.sock /tmp/term-meshd*.sock || true
-  if [ -n "${TMPDIR:-}" ]; then
-    rm -f "$TMPDIR"/term-mesh*.sock "$TMPDIR"/term-meshd*.sock || true
-  fi
+  if [ -n "$E2E_APP_PID" ]; then kill "$E2E_APP_PID" 2>/dev/null || true; fi
+  if [ -n "$E2E_DAEMON_PID" ]; then kill "$E2E_DAEMON_PID" 2>/dev/null || true; fi
+  for _ in {1..30}; do
+    { [ -z "$E2E_APP_PID" ] || ! kill -0 "$E2E_APP_PID" 2>/dev/null; } \
+      && { [ -z "$E2E_DAEMON_PID" ] || ! kill -0 "$E2E_DAEMON_PID" 2>/dev/null; } \
+      && break
+    sleep 0.1
+  done
+  E2E_APP_PID=""
+  E2E_DAEMON_PID=""
+  rm -f "$APP_SOCK_PATH" "$DAEMON_SOCK_PATH" || true
 }
 
 # State a test is allowed to destroy. `SessionRestoreSettings.sessionFilePath` is
@@ -112,17 +120,24 @@ reset_e2e_state() {
   rm -rf "$E2E_STATE_DIR"
   mkdir -p "$E2E_STATE_DIR"
   defaults delete com.termmesh.e2e >/dev/null 2>&1 || true
+  if [ -n "${TERMMESH_E2E_REMOTE_LEADER_HOST_PROFILE_JSON:-}" ]; then
+    printf '%s\n' "$TERMMESH_E2E_REMOTE_LEADER_HOST_PROFILE_JSON" \
+      > "$E2E_STATE_DIR/peer-host-profiles.json"
+  fi
 }
 
 E2E_STATE_DIR="${TMPDIR:-/tmp}/termmesh-e2e-state.$$"
 export TERMMESH_E2E_STATE_DIR="$E2E_STATE_DIR"
 # A test that relaunches the app respawns this exact binary with this exact env.
 export TERMMESH_APP_BIN="$APP/Contents/MacOS/term-mesh DEV"
-trap 'rm -rf "$E2E_STATE_DIR"; defaults delete com.termmesh.e2e >/dev/null 2>&1 || true' EXIT
+trap 'cleanup; rm -rf "$E2E_STATE_DIR"; defaults delete com.termmesh.e2e >/dev/null 2>&1 || true' EXIT
 
 launch_and_wait() {
+  local preserve_state="${1:-0}"
   cleanup
-  reset_e2e_state
+  if [ "$preserve_state" != "1" ]; then
+    reset_e2e_state
+  fi
   # Wait briefly for the previous instance to fully terminate; LaunchServices can flake if we
   # relaunch too quickly.
   for _ in {1..50}; do
@@ -136,17 +151,20 @@ launch_and_wait() {
   TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
   TERM_MESH_HTTP_DISABLED=1 \
   "$DAEMON_BIN" >>"$DAEMON_LOG_PATH" 2>&1 &
+  E2E_DAEMON_PID=$!
 
   # Launch directly with UI test mode enabled so startup follows deterministic test codepaths.
   PROJECT_DIR="$PWD" \
   DAEMON_BINARY_PATH="$PWD/daemon/target/release/term-meshd" \
   TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
+  TERMMESH_SOCKET_PATH="$APP_SOCK_PATH" \
+  TERMMESH_ALLOW_SOCKET_OVERRIDE=1 \
   TERMMESH_UI_TEST_MODE=1 \
   "$APP/Contents/MacOS/term-mesh DEV" >/dev/null 2>&1 &
+  E2E_APP_PID=$!
 
-  SOCK=""
+  SOCK="$APP_SOCK_PATH"
   for _ in {1..120}; do
-    SOCK=$(ls -t /tmp/term-mesh-debug*.sock /tmp/term-mesh*.sock /tmp/term-mesh-debug*.sock /tmp/term-mesh*.sock 2>/dev/null | head -1 || true)
     if [ -n "$SOCK" ] && [ -S "$SOCK" ]; then
       break
     fi
@@ -186,7 +204,7 @@ launch_and_wait() {
   sleep 0.5
 
   echo "== wait ready =="
-  "$PYTHON" - <<'PY'
+  TERMMESH_E2E_PRESERVE_RELAUNCH_STATE="$preserve_state" "$PYTHON" - <<'PY'
 import time
 import os
 import sys
@@ -254,8 +272,9 @@ else:
 # Force a single fresh workspace so startup-state restoration doesn't leave tests
 # focused on non-terminal panels (which breaks read_screen/read_terminal_text assumptions)
 # or with extra pre-existing workspaces that make ordering-dependent tests flaky.
+preserve_relaunch_state = os.environ.get("TERMMESH_E2E_PRESERVE_RELAUNCH_STATE") == "1"
 bootstrap_last = None
-for _ in range(3):
+for _ in range(0 if preserve_relaunch_state else 3):
     try:
         if client is not None:
             try:
@@ -291,6 +310,11 @@ for _ in range(3):
         bootstrap_last = e
         time.sleep(0.2)
 else:
+    if preserve_relaunch_state:
+        bootstrap_last = None
+    else:
+        raise SystemExit(f"ERROR: Failed to bootstrap fresh terminal workspace: {bootstrap_last}")
+if bootstrap_last is not None:
     raise SystemExit(f"ERROR: Failed to bootstrap fresh terminal workspace: {bootstrap_last}")
 
 window_last = None
@@ -376,6 +400,31 @@ for f in "${test_files[@]}"; do
   if [ "$base" = "test_ctrl_interactive.py" ]; then
     echo "SKIP $f"
     skipped=$((skipped + 1))
+    continue
+  fi
+  if [ "$base" = "test_remote_project_restart_reattach.py" ] \
+    && [ "${TERMMESH_E2E_REATTACH_PHASE:-}" = "full" ]; then
+    echo "== launch ($base create) =="
+    launch_and_wait
+    echo "RUN  $f (phase create)"
+    if ! TERMMESH_E2E_REATTACH_PHASE=create "$PYTHON" "$f"; then
+      echo "FAIL $f (phase create)" >&2
+      fail=1
+      failed_tests[${#failed_tests[@]}]="$f:create"
+      [ "$KEEP_GOING" = "1" ] || break
+      continue
+    fi
+    echo "== relaunch ($base adopt; preserving app and test state) =="
+    launch_and_wait 1
+    echo "RUN  $f (phase adopt/reconnect)"
+    if ! TERMMESH_E2E_REATTACH_PHASE=adopt "$PYTHON" "$f"; then
+      echo "FAIL $f (phase adopt/reconnect)" >&2
+      fail=1
+      failed_tests[${#failed_tests[@]}]="$f:adopt"
+      [ "$KEEP_GOING" = "1" ] || break
+      continue
+    fi
+    passed=$((passed + 1))
     continue
   fi
 

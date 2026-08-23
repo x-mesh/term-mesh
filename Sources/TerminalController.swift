@@ -49,6 +49,7 @@ class TerminalController {
     let myPid = getpid()
     #if DEBUG
     var debugPeerShellInspection: [String: Any]?
+    var debugProjectDeletionStatus: [String: [String: Any]] = [:]
     #endif
 
     /// Dedicated queue for team data commands that don't need MainActor.
@@ -1390,6 +1391,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugProjectCreate(params: params))
         case "debug.project.delete":
             return v2Result(id: id, self.v2DebugProjectDelete(params: params))
+        case "debug.project.delete_status":
+            return v2Result(id: id, self.v2DebugProjectDeleteStatus(params: params))
         case "debug.project.reattach_leader":
             return v2Result(id: id, self.v2DebugProjectReattachLeader(params: params))
         case "debug.project.restore_presentation":

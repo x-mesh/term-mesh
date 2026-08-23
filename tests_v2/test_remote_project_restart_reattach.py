@@ -24,6 +24,11 @@ PHASE_ENV = "TERMMESH_E2E_REATTACH_PHASE"
 STATE_ENV = "TERMMESH_E2E_REATTACH_STATE"
 ROLES_ENV = "TERMMESH_E2E_REATTACH_ROLES"
 REQUIRE_SESSION_OWNER_REDIRECT_ENV = "TERMMESH_E2E_REQUIRE_SESSION_OWNER_REDIRECT"
+REQUIRE_REMOTE_PROJECT_ENV = "TERMMESH_E2E_REQUIRE_REMOTE_PROJECT"
+RECEIPT_ENV = "TERMMESH_E2E_RELAY_RECEIPT"
+CANDIDATE_SHA_ENV = "TERMMESH_E2E_CANDIDATE_SHA"
+LEADER_RELAY_STABILITY_SECONDS = 15.0
+BACKGROUND_RESTORE_HOLD_SECONDS = 12.0
 
 
 def _wait(predicate, timeout_s: float = 45.0, interval_s: float = 0.2):
@@ -59,6 +64,128 @@ def _hold(check, until, timeout_s: float = 20.0, interval_s: float = 0.2) -> boo
         time.sleep(interval_s)
     check()
     return bool(until())
+
+
+def _project_deletion_succeeded(c: termmesh, operation_id: str):
+    status = c.debug_project_delete_status(operation_id)
+    if status.get("state") == "failed":
+        raise termmeshError(
+            f"remote Project deletion operation failed: {status.get('error')!r}"
+        )
+    return status if status.get("state") == "succeeded" else None
+
+
+def _wait_for_project_deletion(c: termmesh, operation_id: str, timeout_s: float = 45.0):
+    """Wait for the deletion receipt without swallowing a terminal failure."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        result = _project_deletion_succeeded(c, operation_id)
+        if result:
+            return result
+        time.sleep(0.2)
+    raise termmeshError(
+        f"remote Project deletion operation timed out: operation_id={operation_id!r}"
+    )
+
+
+def _assert_leader_relay_stable(
+    c: termmesh, host: str, project_id: str, team_name: str, leader_surface_id: str,
+    duration_s: float = LEADER_RELAY_STABILITY_SECONDS,
+) -> dict:
+    """Hold exact attachment and actual relay bytes past the 10s accept timeout."""
+    deadline = time.time() + duration_s
+    last_relay = None
+    while time.time() < deadline:
+        team = next(
+            (item for item in c.team_list() if item.get("team_name") == team_name),
+            None,
+        )
+        if not team or not team.get("leader_pane_attached"):
+            raise termmeshError(
+                f"leader pane detached during relay stability window: team={team!r}"
+            )
+        if team.get("leader_failure"):
+            raise termmeshError(
+                f"leader failed during relay stability window: team={team!r}"
+            )
+        project = next(
+            (item for item in c.debug_project_remote_presentations(host)
+             if item.get("project_id") == project_id),
+            None,
+        )
+        if not project or not project.get("leader_process_active_known"):
+            raise termmeshError(
+                f"host did not provide authoritative leader process liveness: {project!r}"
+            )
+        if not project.get("leader_process_active"):
+            raise termmeshError(
+                f"manifest points at an idle shell, not a live leader process: {project!r}"
+            )
+        pane_sessions = c.peer_pane_status().get("pane_sessions") or []
+        last_relay = next(
+            (row for row in pane_sessions
+             if row.get("surface_id") == leader_surface_id),
+            None,
+        )
+        if not last_relay or last_relay.get("torn_down"):
+            raise termmeshError(
+                "exact leader relay disappeared during stability window: "
+                f"surface={leader_surface_id!r} relay={last_relay!r}"
+            )
+        io = last_relay.get("io") or {}
+        if not io.get("saw_first_byte") or int(io.get("bytes_received") or 0) <= 0:
+            raise termmeshError(
+                "leader relay is attached without receiving bytes: "
+                f"surface={leader_surface_id!r} io={io!r}"
+            )
+        time.sleep(0.25)
+    return last_relay or {}
+
+
+def _assert_background_project_waits_for_mount(
+    c: termmesh, team_name: str, duration_s: float = BACKGROUND_RESTORE_HOLD_SECONDS
+) -> dict:
+    """Reproduce the production boundary: restored Project stays background >10s.
+
+    Old code started the relay accept timer as soon as the pane model existed,
+    even though no Ghostty view/helper could exist. It then tore the session down
+    at 10 seconds. Correct code keeps the session pending until selection mounts it.
+    """
+    deadline = time.time() + duration_s
+    last_team = None
+    while time.time() < deadline:
+        last_team = next(
+            (item for item in c.team_list() if item.get("team_name") == team_name),
+            None,
+        )
+        if last_team is None or not last_team.get("leader_panel_id"):
+            raise termmeshError(f"background Project disappeared: {last_team!r}")
+        if last_team.get("leader_pane_attached"):
+            raise termmeshError(
+                "background Project claimed an attached relay before its view mounted: "
+                f"{last_team!r}"
+            )
+        failure = str(last_team.get("leader_failure") or "")
+        if failure and "pending" not in failure.lower():
+            raise termmeshError(
+                f"background Project relay failed before mount: {last_team!r}"
+            )
+        time.sleep(0.25)
+    return last_team or {}
+
+
+def _layout_dividers(layout: dict | None) -> tuple[float, ...]:
+    values: list[float] = []
+
+    def walk(node):
+        if not isinstance(node, dict) or node.get("type") != "split":
+            return
+        values.append(round(float(node.get("dividerPosition", 0)), 6))
+        walk(node.get("first"))
+        walk(node.get("second"))
+
+    walk((layout or {}).get("root"))
+    return tuple(values)
 
 
 _SHARED_DEBUG_LOGS = (
@@ -292,7 +419,9 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
     def ready_team():
         team = next((item for item in c.team_list() if item.get("team_name") == team_name), None)
         if team and team.get("leader_failure"):
-            raise termmeshError(f"remote leader failed: {team['leader_failure']}")
+            failure = str(team["leader_failure"])
+            if "pending" not in failure.lower():
+                raise termmeshError(f"remote leader failed: {failure}")
         if team and team.get("remote_attach_failures"):
             raise termmeshError(
                 f"remote worker failed: {team['remote_attach_failures']}"
@@ -305,7 +434,8 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
         )
         return (
             team
-            if team and team.get("leader_ready") and team.get("leader_panel_id") and agents_ready
+            if team and team.get("leader_ready") and team.get("leader_pane_attached")
+            and team.get("leader_panel_id") and agents_ready
             else None
         )
 
@@ -342,20 +472,48 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
 
     # Persist a non-default divider position so the restart check cannot pass
     # merely because both runs happened to build the same balanced fallback.
+    c.select_workspace(team["workspace_id"])
+    selected = _wait(
+        lambda: c.current_workspace() == team["workspace_id"]
+        and team["workspace_id"]
+    )
+    if selected is None:
+        raise termmeshError("Project workspace did not become selected before resize")
     panes = c.list_panes()
     if len(panes) < 2:
         raise termmeshError(f"Project layout has fewer than two panes: {panes!r}")
     layout_before_resize = c.debug_project_layout(team_name)["live"]
-    c.resize_pane(panes[0][1], "right", 80)
+    dividers_before_resize = _layout_dividers(layout_before_resize)
+    # Depending on which side of the root split this pane occupies, only one
+    # horizontal direction grows it. Try both and require an observed mutation.
+    for direction in ("right", "left"):
+        c.resize_pane(panes[0][1], direction, 40)
+        changed = _wait(
+            lambda: (live if (live := c.debug_project_layout(team_name)["live"])
+                     != layout_before_resize else None),
+            timeout_s=2,
+        )
+        if changed is not None:
+            break
     def changed_layout():
         layouts = c.debug_project_layout(team_name)
-        live = layouts["live"]
         persisted = layouts["persisted"]
-        return live if live != layout_before_resize and persisted == live else None
+        # Canonical equalization may redraw the live split after a resize. The
+        # durable sidecar is the restart source of truth; record its non-default
+        # value here, then the adopt phase proves it becomes the live layout.
+        return (
+            persisted
+            if persisted and _layout_dividers(persisted) != dividers_before_resize
+            else None
+        )
 
     saved_layout = _wait(changed_layout, timeout_s=10)
     if saved_layout is None:
-        raise termmeshError("Project divider change was not persisted to its layout sidecar")
+        raise termmeshError(
+            "Project divider change was not persisted to its layout sidecar: "
+            f"workspace={c.current_workspace()!r} before={layout_before_resize!r} "
+            f"after={c.debug_project_layout(team_name)!r}"
+        )
 
     def complete_project():
         project = next((item for item in c.debug_project_remote_presentations(host)
@@ -373,6 +531,18 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
     project = _wait(complete_project)
     if project is None:
         raise termmeshError("complete remote project manifest was not published")
+    relay = _assert_leader_relay_stable(
+        c, host, project["project_id"], team_name, project["leader_surface_id"]
+    )
+    # Agent panes and canonical equalization can settle after the divider write.
+    # Persist the final topology, not the transient leader-only snapshot that
+    # happened to exist when resize first returned.
+    final_layouts = c.debug_project_layout(team_name)
+    saved_layout = final_layouts["persisted"] or final_layouts["live"]
+    if saved_layout is None or saved_layout.get("root", {}).get("type") != "split":
+        raise termmeshError(
+            f"final Project layout did not contain leader + worker panes: {final_layouts!r}"
+        )
     member_surfaces = {
         member["name"]: member["surface_id"]
         for member in project["members"]
@@ -387,6 +557,7 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
         "checkouts": checkouts,
         "route": route,
         "layout": saved_layout,
+        "create_relay_io": relay.get("io") or {},
     }))
 
 
@@ -407,6 +578,17 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
         raise termmeshError("remote project manifest did not survive app restart")
     if project.get("leader_surface_id") != state["leader_surface_id"]:
         raise termmeshError(f"leader surface changed across restart: {project!r}")
+
+    # Automatic restore creates the Project model without stealing focus. A
+    # terminal relay cannot start until its Ghostty view is mounted, so open the
+    # Project exactly as a user does before requiring transport readiness.
+    pending_team = _wait(lambda: next(
+        (item for item in c.team_list() if item.get("team_name") == team_name), None
+    ))
+    if pending_team is None or not pending_team.get("workspace_id"):
+        raise termmeshError("remote Project model was not restored after app restart")
+    _assert_background_project_waits_for_mount(c, team_name)
+    c.select_workspace(pending_team["workspace_id"])
     remote_members = {
         member.get("name"): (member.get("agent_instance_id"), member.get("surface_id"))
         for member in project.get("members", [])
@@ -430,6 +612,9 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
                                and item.get("leader_panel_id")), None))
     if team is None:
         raise termmeshError("remote Project was not restored automatically after app restart")
+    restart_relay = _assert_leader_relay_stable(
+        c, host, state["project_id"], team_name, state["leader_surface_id"]
+    )
     restored_instances = {
         agent.get("name"): agent.get("agent_instance_id")
         for agent in team.get("agents", [])
@@ -541,6 +726,9 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
                                and item.get("leader_panel_id")), None))
     if team is None:
         raise termmeshError("remote Project did not reattach after app restart")
+    reconnect_relay = _assert_leader_relay_stable(
+        c, host, state["project_id"], team_name, state["leader_surface_id"]
+    )
     restored_instances = {
         agent.get("name"): agent.get("agent_instance_id")
         for agent in team.get("agents", [])
@@ -568,7 +756,10 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
             "adopted leader and workers share or duplicate a pane: "
             f"panels={adopted_panels!r}"
         )
-    c.debug_project_delete(team_name)
+    deletion = c.debug_project_delete(team_name)
+    deletion_operation_id = deletion.get("operation_id")
+    if not deletion_operation_id:
+        raise termmeshError(f"Project deletion returned no operation id: {deletion!r}")
 
     def fully_deleted():
         project_exists = any(
@@ -584,11 +775,77 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
         )
         return not project_exists and not team_exists and not project_pane_exists
 
+    receipt_path = os.environ.get(RECEIPT_ENV, "").strip()
+    if receipt_path:
+        # The release receipt proves the non-destructive lifecycle boundary.
+        # Write it before cleanup so a cleanup regression cannot erase evidence
+        # that create/restart/background/mount/reconnect itself passed. Cleanup
+        # remains a separate failing assertion below.
+        try:
+            candidate_sha = os.environ.get(CANDIDATE_SHA_ENV, "").strip()
+            if not candidate_sha:
+                raise termmeshError(
+                    f"{CANDIDATE_SHA_ENV} is required when writing a relay receipt"
+                )
+            reconnect_io = reconnect_relay.get("io") or {}
+            receipt = {
+                "schema": 1,
+                "candidate_sha": candidate_sha,
+                "result": "lifecycle_pass_cleanup_pending",
+                "required_topology": True,
+                "skipped": False,
+                "host": host,
+                "phases": {
+                    "create": "pass",
+                    "adopt": "pass",
+                    "reconnect": "pass",
+                    "cleanup": "pending",
+                },
+                "leader_surface_id": state["leader_surface_id"],
+                "exact_surface_preserved": True,
+                "leader_relay_stability_seconds": LEADER_RELAY_STABILITY_SECONDS,
+                "background_restore_hold_seconds": BACKGROUND_RESTORE_HOLD_SECONDS,
+                "saw_first_byte": bool(reconnect_io.get("saw_first_byte")),
+                "bytes_received": int(reconnect_io.get("bytes_received") or 0),
+                "leader_process_active": True,
+                "leader_process_active_known": True,
+                "create_relay_io": state.get("create_relay_io") or {},
+                "restart_relay_io": restart_relay.get("io") or {},
+                "reconnect_relay_io": reconnect_io,
+                "tested_at_unix": int(time.time()),
+            }
+            payload = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
+            temp_receipt = Path(receipt_path + ".tmp")
+            temp_receipt.write_text(payload)
+            temp_receipt.replace(receipt_path)
+        except OSError as exc:
+            raise termmeshError(f"could not write relay E2E receipt: {exc}") from exc
+
+    _wait_for_project_deletion(c, deletion_operation_id)
     if _wait(fully_deleted):
+        if receipt_path:
+            receipt["result"] = "pass"
+            receipt["phases"]["cleanup"] = "pass"
+            receipt["tested_at_unix"] = int(time.time())
+            temp_receipt = Path(receipt_path + ".tmp")
+            temp_receipt.write_text(json.dumps(
+                receipt, indent=2, sort_keys=True
+            ) + "\n")
+            temp_receipt.replace(receipt_path)
         state_path.unlink(missing_ok=True)
         return
+    project_exists = any(
+        item.get("project_id") == state["project_id"]
+        for item in c.debug_project_remote_presentations(host)
+    )
+    remaining_teams = [
+        item for item in c.team_list() if item.get("team_name") == team_name
+    ]
+    remaining_panes = {pane_id for _, pane_id, _, _ in c.list_panes()}
     raise termmeshError(
-        "remote Project deletion left its manifest, local team, or relay pane behind"
+        "remote Project deletion left state behind: "
+        f"manifest={project_exists} teams={remaining_teams!r} "
+        f"project_panes={sorted(set(adopted_panels) & remaining_panes)!r}"
     )
 
 
@@ -598,7 +855,15 @@ def main() -> int:
     phase = os.environ.get(PHASE_ENV, "").strip()
     state_path = Path(os.environ.get(STATE_ENV, "/tmp/term-mesh-remote-project-e2e-state.json"))
     if not host or not remote_dir or phase not in {"create", "adopt"}:
-        print(f"SKIP: set {HOST_ENV}, {DIR_ENV}, and {PHASE_ENV}=create|adopt")
+        if os.environ.get(REQUIRE_REMOTE_PROJECT_ENV) == "1":
+            raise termmeshError(
+                f"required remote Project topology missing: set {HOST_ENV}, "
+                f"{DIR_ENV}, and {PHASE_ENV}=full (runner) or create|adopt"
+            )
+        print(
+            f"SKIP: set {HOST_ENV}, {DIR_ENV}, and "
+            f"{PHASE_ENV}=full (runner) or create|adopt"
+        )
         return 0
 
     with termmesh() as c:
