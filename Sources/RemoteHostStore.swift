@@ -1390,6 +1390,24 @@ final class RemoteHostStore: ObservableObject {
         hosts[key]?.clearServingMetadata()
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
         hosts[key]?.connectionState = .saved
+
+        // Retry means the cached auto-detection result already failed. Clear
+        // it before connectSavedHost reads the row, otherwise Retry opens the
+        // same dead tunnel forever and the only working repair lives outside
+        // the screen reporting the failure. An explicit Remote Socket is a
+        // user instruction and remains pinned.
+        if PeerHostProfileStore.shared.invalidateAutoDetectedSocket(
+            profileID: host.profileID
+        ), let profile = PeerHostProfileStore.shared.profile(id: host.profileID) {
+            let endpoint = PeerHostEndpointProvenance(
+                sshTarget: profile.sshTarget,
+                port: profile.sshPort,
+                identityFile: profile.identityFile,
+                remoteSocket: profile.remoteSocket
+            )
+            hosts[key]?.applyConfiguredEndpoint(endpoint)
+            hosts[key]?.remoteSockPath = nil
+        }
         #if DEBUG
         dlog("peer.sidebar.connect retry key=\(key) cancelledPending=\(cancelledPending)")
         #endif
@@ -1404,8 +1422,33 @@ final class RemoteHostStore: ObservableObject {
             return false
         }
         RemoteWorkLog.info("Retrying connection to \(host.displayName)")
-        connectSavedHost(host)
+        connectSavedHost(hosts[key] ?? host)
         return true
+    }
+
+    /// Shared recovery entry point for Edit Peer Host and New Project.
+    /// Saving and reconnecting must be one action: saving a corrected profile
+    /// while leaving the failed HostEntry alive made both screens look fixed
+    /// while Project creation continued addressing the stale route.
+    enum RepairConnectionResult: Equatable {
+        case started
+        case blocked(String)
+    }
+
+    @discardableResult
+    func repairConnection(using profile: PeerHostProfile) -> RepairConnectionResult {
+        PeerHostProfileStore.shared.upsert(profile)
+        let key = profile.stableKey
+        rebuild()
+        guard let host = hosts[key] else {
+            return .blocked("The saved host is not available in the connection roster yet.")
+        }
+        guard retryConnectingHost(host) else {
+            return .blocked(
+                "Another pane is still waiting on the previous connection. Close that pane, then retry."
+            )
+        }
+        return .started
     }
 
     /// Close every pane, mirror and relay window opened from this host, then

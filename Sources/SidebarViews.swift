@@ -1237,6 +1237,9 @@ struct SidebarRemoteHostsSection: View, Equatable {
                     PeerHostProfileStore.shared.upsert(profile)
                     editorContext = nil
                 },
+                onRepair: { profile in
+                    RemoteHostStore.shared.repairConnection(using: profile)
+                },
                 onCancel: { editorContext = nil }
             )
         }

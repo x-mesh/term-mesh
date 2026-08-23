@@ -147,6 +147,36 @@ final class PeerHostProfileStore: ObservableObject {
         persist()
     }
 
+    /// Forget an implementation cache before an explicit Retry/Repair.
+    ///
+    /// `lastResolvedSocket` is useful on an ordinary reconnect, but once that
+    /// pathname has failed it must not become the only route Retry attempts.
+    /// A Mac app can restart under a different TMPDIR and advertise a new peer
+    /// socket while the saved profile still points at the previous launch.
+    /// Explicit sockets remain user instructions and are never cleared here.
+    @discardableResult
+    func invalidateAutoDetectedSocket(profileID: UUID?) -> Bool {
+        guard let updated = Self.invalidatingAutoDetectedSocket(
+            profiles, profileID: profileID
+        ) else { return false }
+        profiles = updated
+        persist()
+        return true
+    }
+
+    nonisolated static func invalidatingAutoDetectedSocket(
+        _ profiles: [PeerHostProfile], profileID: UUID?
+    ) -> [PeerHostProfile]? {
+        guard let profileID,
+              let index = profiles.firstIndex(where: { $0.id == profileID }),
+              profiles[index].remoteSocket.isEmpty,
+              profiles[index].lastResolvedSocket?.isEmpty == false
+        else { return nil }
+        var result = profiles
+        result[index].lastResolvedSocket = nil
+        return result
+    }
+
     // MARK: - Persistence
 
     private func load() {

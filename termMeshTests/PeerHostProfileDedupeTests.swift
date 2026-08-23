@@ -262,6 +262,30 @@ final class PeerHostProfileDedupeTests: XCTestCase {
 
     // MARK: - upserted(_:with:)
 
+    func test_repairInvalidatesOnlyAutoDetectedSocketCache() {
+        let auto = PeerHostProfile(
+            sshTarget: "auto-host",
+            lastResolvedSocket: "/tmp/old.sock"
+        )
+        let explicit = PeerHostProfile(
+            sshTarget: "explicit-host",
+            remoteSocket: "/run/pinned.sock",
+            lastResolvedSocket: "/tmp/old-explicit.sock"
+        )
+
+        let repaired = PeerHostProfileStore.invalidatingAutoDetectedSocket(
+            [auto, explicit], profileID: auto.id
+        )
+        XCTAssertNil(repaired?.first?.lastResolvedSocket)
+        XCTAssertEqual(repaired?[1].lastResolvedSocket, "/tmp/old-explicit.sock")
+        XCTAssertNil(
+            PeerHostProfileStore.invalidatingAutoDetectedSocket(
+                [auto, explicit], profileID: explicit.id
+            ),
+            "Repair must not discard an explicit Remote Socket instruction"
+        )
+    }
+
     /// Editing a profile's sshTarget onto one another saved profile
     /// already claims must drop that older duplicate, not leave both
     /// alive under the same target.

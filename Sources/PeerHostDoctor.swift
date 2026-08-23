@@ -250,7 +250,7 @@ enum PeerHostDoctor {
     /// `TeamOrchestrator.leaderDaemonDiagnostic`. Keeping one body means the
     /// two callers cannot drift into disagreeing about what a daemon is.
     static let daemonInstancesProbeBody =
-        #"if [ "$(uname -s)" != Darwin ]; then exit 44; fi; app=$(pgrep -f "term-mesh.app/Contents/MacOS/term-mesh" | head -1); echo "app=${app:-none}"; if [ -n "$app" ]; then echo "appsocks=$(lsof -a -p "$app" -U -F n 2>/dev/null | sed -n "s/^n//p" | grep term-mesh | sort -u | tr "\n" " ")"; fi; for p in $(pgrep -f "Resources/bin/term-meshd" 2>/dev/null); do ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " "); etime=$(ps -o etime= -p "$p" 2>/dev/null | tr -d " "); socks=$(lsof -a -p "$p" -U -F n 2>/dev/null | sed -n "s/^n//p" | grep term-mesh | sort -u | tr "\n" " "); echo "daemon=$p ppid=${ppid:-0} etime=$etime socks=$socks"; done; exit 0"#
+        #"if [ "$(uname -s)" != Darwin ]; then exit 44; fi; app=$(pgrep -f "term-mesh.app/Contents/MacOS/term-mesh" | head -1); net=$(netstat -anv -f unix 2>/dev/null); echo "app=${app:-none}"; if [ -n "$app" ]; then appraw=$(lsof -a -p "$app" -U -F fn 2>/dev/null); printf "%s\n" "$appraw" | sed -n "s/^n\(\/.*\)/\1/p" | sort -u | while IFS= read -r s; do [ -n "$s" ] || continue; encoded=$(printf %s "$s" | base64 | tr -d "\n"); echo "app-socket=$encoded"; done; fi; for p in $(pgrep -f "Resources/bin/term-meshd" 2>/dev/null); do ppid=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " "); etime=$(ps -o etime= -p "$p" 2>/dev/null | tr -d " "); started=$(ps -o lstart= -p "$p" 2>/dev/null | tr -s " " "_" | sed "s/^_//;s/_$//"); pgid=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d " "); sid=$(ps -o sess= -p "$p" 2>/dev/null | tr -d " "); identity=${started}_${pgid}_${sid}; exe=$(lsof -a -p "$p" -d txt -F n 2>/dev/null | sed -n "s/^n//p" | head -1); raw=$(lsof -a -p "$p" -U -F fn 2>/dev/null); probe=$?; named=$(printf "%s\n" "$raw" | sed -n "s/^n\(\/.*\)/\1/p"); unixfds=$(printf "%s\n" "$raw" | grep -c "^f"); socketfds=$(printf "%s\n" "$named" | grep -c .); anonfds=$((unixfds - socketfds)); peerfds=$(printf "%s\n" "$named" | grep -c peer); if [ "$probe" = 0 ]; then complete=1; else complete=0; fi; echo "daemon=$p ppid=${ppid:-0} etime=$etime probe=$complete unixfds=$unixfds socketfds=$socketfds anonfds=$anonfds peerfds=$peerfds started=$identity exe=$exe socks="; printf "%s\n" "$named" | sort -u | while IFS= read -r s; do [ -n "$s" ] || continue; encoded=$(printf %s "$s" | base64 | tr -d "\n"); echo "daemon-socket=$p encoded=$encoded"; [ -S "$s" ] && echo "daemon-existing=$p encoded=$encoded"; current=$(printf "%s\n" "$net" | awk -v proc="term-meshd:$p" -v path="$s" "index(\$0, proc) && index(\$0, \" 00000002 \") && substr(\$0, length(\$0) - length(path) + 1) == path { print 1; exit }"); [ "$current" = 1 ] && echo "daemon-current=$p encoded=$encoded"; done; done; exit 0"#
 
     static let daemonInstancesProbeCommand = "sh -c '" + daemonInstancesProbeBody + "'"
 
@@ -262,6 +262,32 @@ enum PeerHostDoctor {
         /// "since yesterday", not arithmetic.
         var elapsed: String
         var sockets: [String]
+        /// Socket names that currently exist in the filesystem. This is kept
+        /// separate from `sockets`: after unlink/rebind two daemon generations
+        /// can report the same name, so the classifier also needs duplicate
+        /// ownership and peer-FD counts before calling either one stale.
+        var existingSockets: [String]
+        /// Pathnames whose kernel `SO_ACCEPTCONN` listener row is attributed
+        /// to this exact PID by Darwin netstat. Unlike an lsof pathname, this
+        /// distinguishes the current bind owner from an unlinked generation.
+        var currentListenerSockets: [String]
+        /// Listener plus accepted peer connections. More than one FD for one
+        /// peer pathname proves an existing client still depends on this
+        /// daemon even when the pathname itself was unlinked.
+        var peerFDCount: Int
+        var socketFDCount: Int
+        /// Every UNIX FD record from `lsof -Ffn`, including anonymous
+        /// `n->0x…` records that have no pathname.
+        var unixSocketFDCount: Int
+        var anonymousSocketFDCount: Int
+        /// `lsof` completed successfully. An incomplete probe is never
+        /// cleanup evidence: failure to observe a client must fail closed.
+        var socketProbeComplete: Bool
+        /// Stable process identity captured with the PID. Cleanup rechecks both
+        /// values immediately before signaling so PID reuse cannot target an
+        /// unrelated process.
+        var startIdentity: String
+        var executablePath: String
     }
 
     /// A Mac peer's daemon situation: the app that serves the peer socket, and
@@ -280,13 +306,76 @@ enum PeerHostDoctor {
                 snapshot.appPid = Int(value)
             } else if let value = text.dropPrefixIfPresent("appsocks=") {
                 snapshot.appSockets = splitSocketList(value)
+            } else if let value = text.dropPrefixIfPresent("app-socket="),
+                      let path = decodeSocketPath(value) {
+                snapshot.appSockets.append(path)
             } else if text.hasPrefix("daemon=") {
                 if let instance = parseDaemonInstance(text) {
                     snapshot.daemons.append(instance)
                 }
+            } else if text.hasPrefix("daemon-socket=") {
+                appendEncodedDaemonSocket(
+                    text, key: "daemon-socket", destination: .reported, to: &snapshot
+                )
+            } else if text.hasPrefix("daemon-current=") {
+                appendEncodedDaemonSocket(
+                    text, key: "daemon-current", destination: .current, to: &snapshot
+                )
+            } else if text.hasPrefix("daemon-existing=") {
+                if text.contains(" encoded=") {
+                    appendEncodedDaemonSocket(
+                        text, key: "daemon-existing", destination: .existing, to: &snapshot
+                    )
+                } else {
+                    guard let pathRange = text.range(of: " path=") else { continue }
+                    let head = text[..<pathRange.lowerBound]
+                    let path = String(text[pathRange.upperBound...])
+                    guard let pid = Int(head.dropFirst("daemon-existing=".count)),
+                          path.hasPrefix("/"),
+                          let index = snapshot.daemons.firstIndex(where: { $0.pid == pid })
+                    else { continue }
+                    snapshot.daemons[index].existingSockets.append(path)
+                }
             }
         }
         return snapshot
+    }
+
+    private static func decodeSocketPath(_ encoded: String) -> String? {
+        guard let data = Data(base64Encoded: encoded),
+              let path = String(data: data, encoding: .utf8),
+              path.hasPrefix("/")
+        else { return nil }
+        return path
+    }
+
+    private enum DaemonSocketDestination {
+        case reported
+        case existing
+        case current
+    }
+
+    private static func appendEncodedDaemonSocket(
+        _ text: String,
+        key: String,
+        destination: DaemonSocketDestination,
+        to snapshot: inout DaemonSnapshot
+    ) {
+        guard let encodedRange = text.range(of: " encoded=") else { return }
+        let head = text[..<encodedRange.lowerBound]
+        let encoded = String(text[encodedRange.upperBound...])
+        guard let pid = Int(head.dropFirst(key.count + 1)),
+              let path = decodeSocketPath(encoded),
+              let index = snapshot.daemons.firstIndex(where: { $0.pid == pid })
+        else { return }
+        switch destination {
+        case .existing:
+            snapshot.daemons[index].existingSockets.append(path)
+        case .reported:
+            snapshot.daemons[index].sockets.append(path)
+        case .current:
+            snapshot.daemons[index].currentListenerSockets.append(path)
+        }
     }
 
     private static func splitSocketList(_ value: String) -> [String] {
@@ -305,46 +394,96 @@ enum PeerHostDoctor {
         var pid: Int?
         var parentPid = 0
         var elapsed = ""
+        var peerFDCount = 0
+        var socketFDCount = 0
+        var parsedUnixSocketFDCount: Int?
+        var anonymousSocketFDCount = 0
+        var socketProbeComplete = false
+        var startIdentity = ""
+        var executablePath = ""
         for field in head.split(separator: " ", omittingEmptySubsequences: true) {
             let text = String(field)
             if let value = text.dropPrefixIfPresent("daemon=") { pid = Int(value) }
             else if let value = text.dropPrefixIfPresent("ppid=") { parentPid = Int(value) ?? 0 }
             else if let value = text.dropPrefixIfPresent("etime=") { elapsed = value }
+            else if let value = text.dropPrefixIfPresent("peerfds=") { peerFDCount = Int(value) ?? 0 }
+            else if let value = text.dropPrefixIfPresent("socketfds=") { socketFDCount = Int(value) ?? 0 }
+            else if let value = text.dropPrefixIfPresent("unixfds=") { parsedUnixSocketFDCount = Int(value) }
+            else if let value = text.dropPrefixIfPresent("anonfds=") { anonymousSocketFDCount = Int(value) ?? 0 }
+            else if let value = text.dropPrefixIfPresent("probe=") { socketProbeComplete = value == "1" }
+            else if let value = text.dropPrefixIfPresent("started=") { startIdentity = value }
+            else if let value = text.dropPrefixIfPresent("exe=") { executablePath = value }
         }
         guard let pid else { return nil }
+        let unixSocketFDCount = parsedUnixSocketFDCount
+            ?? socketFDCount + anonymousSocketFDCount
         return DaemonInstance(
-            pid: pid, parentPid: parentPid, elapsed: elapsed, sockets: sockets
+            pid: pid, parentPid: parentPid, elapsed: elapsed,
+            sockets: sockets, existingSockets: [], currentListenerSockets: [],
+            peerFDCount: peerFDCount,
+            socketFDCount: socketFDCount,
+            unixSocketFDCount: unixSocketFDCount,
+            anonymousSocketFDCount: anonymousSocketFDCount,
+            socketProbeComplete: socketProbeComplete,
+            startIdentity: startIdentity, executablePath: executablePath
         )
     }
 
     /// Daemons nothing on this host points at any more.
     ///
-    /// The test is the app's own socket list: a daemon the app adopted appears
-    /// there as a client connection, so an empty intersection means this
-    /// process is serving nobody. Being parented to 1 is NOT the test —
-    /// outliving the app is deliberate (`daemonShouldOutliveApp`), which is
-    /// exactly why the leftovers accumulate and why a lifetime alone cannot
-    /// separate them.
+    /// Parentage, accepted peer connections, and pathname ownership are
+    /// separate evidence. No one signal decides this: daemons intentionally
+    /// outlive an app, and an unlinked listener can still carry existing
+    /// clients. Cleanup is offered only when those protections are absent or
+    /// another independently protected generation owns the duplicate path.
     ///
     /// With no app running, the answer is "none": a daemon may legitimately be
     /// holding sessions for the next launch to adopt, and killing those would
     /// destroy the very thing outliving the app exists to protect.
-    static func staleDaemons(in snapshot: DaemonSnapshot) -> [DaemonInstance] {
+    static func staleDaemons(
+        in snapshot: DaemonSnapshot,
+        protecting protectedPIDs: Set<Int> = []
+    ) -> [DaemonInstance] {
         guard let appPid = snapshot.appPid else { return [] }
-        let appSockets = Set(snapshot.appSockets)
+        let ownersByPath = Dictionary(grouping: snapshot.daemons.flatMap { daemon in
+            daemon.sockets.map { (path: $0, daemon: daemon) }
+        }, by: { $0.path })
+        let intrinsicallyProtected = Set(snapshot.daemons.compactMap { daemon -> Int? in
+            let hasAcceptedClient = daemon.socketFDCount > Set(daemon.sockets).count
+            // The Tokio runtime in every bundled Mac daemon owns a stable
+            // three-FD anonymous wakeup/socketpair set. Zero is accepted for
+            // older builds that do not expose it through lsof. Any other
+            // anonymous shape may be a client and therefore fails closed.
+            let anonymousShapeKnown = daemon.anonymousSocketFDCount == 0
+                || daemon.anonymousSocketFDCount == 3
+            let fdCountsConsistent = daemon.unixSocketFDCount
+                == daemon.socketFDCount + daemon.anonymousSocketFDCount
+            return daemon.parentPid == appPid
+                || hasAcceptedClient
+                || !daemon.currentListenerSockets.isEmpty
+                || !anonymousShapeKnown
+                || !fdCountsConsistent
+                || !daemon.socketProbeComplete
+                || protectedPIDs.contains(daemon.pid)
+                ? daemon.pid : nil
+        }).union(protectedPIDs)
+
         return snapshot.daemons.filter { daemon in
-            // The bundled daemon owns its listener itself, so that pathname
-            // does not appear in the parent app's lsof list. Production cleanup
-            // used the missing intersection as proof of staleness and SIGTERM'd
-            // the live session owner. Parent ownership wins over socket heuristics.
-            daemon.parentPid != appPid
-                // A peer listener can be serving another Mac even when this
-                // app has no FD pointing at it. Local lsof cannot prove that
-                // external client count is zero, so cleanup must fail closed.
-                && !daemon.sockets.contains(where: {
-                    ($0 as NSString).lastPathComponent.contains("peer")
-                })
-                && daemon.sockets.allSatisfy { !appSockets.contains($0) }
+            guard !intrinsicallyProtected.contains(daemon.pid) else { return false }
+            if daemon.existingSockets.isEmpty { return true }
+            for path in daemon.existingSockets {
+                let owners = ownersByPath[path]?.map(\.daemon) ?? []
+                // A unique reachable pathname is an idle but valid daemon.
+                guard owners.count > 1 else { return false }
+                // Duplicate names are conclusive only when Darwin's kernel
+                // socket table attributes the current SO_ACCEPTCONN listener
+                // for this exact pathname to another generation. Parentage
+                // and accepted clients may belong to an unlinked old owner.
+                guard owners.contains(where: {
+                    $0.pid != daemon.pid && $0.currentListenerSockets.contains(path)
+                }) else { return false }
+            }
+            return true
         }
     }
 
@@ -352,6 +491,7 @@ enum PeerHostDoctor {
     struct BinaryEntry: Equatable {
         var path: String
         var version: String
+        var identity: String = ""
     }
 
     /// What a host would actually execute, and what else is lying around.
@@ -401,7 +541,7 @@ enum PeerHostDoctor {
     /// surfaced as a leader whose every command died with an error naming a
     /// symbol the current tree no longer contains.
     ///
-    /// Emits `key=path|version` lines and always exits 0 — absence is data,
+    /// Emits `key=path|version|identity` lines and always exits 0 — absence is data,
     /// not an error. No single quotes in the body (sh -c '…' wrapper
     /// constraint, same as remoteCommand/diagnoseCommand).
     static var binaryInventoryCommand: String {
@@ -440,7 +580,7 @@ enum PeerHostDoctor {
             // whole question — without it this host cannot run a codex / kiro
             // / cursor / agy agent as a native panel, and nothing on either
             // side says so.
-            + #"for b in tm-agent term-meshd tm-agent-bridge; do first=1; seen=""; for d in $(echo "$PATH" | tr : " "); do p="$d/$b"; case " $seen " in *" $p "*) continue ;; esac; if [ -x "$p" ]; then seen="$seen $p"; if [ "$b" = tm-agent-bridge ]; then v=""; else v=$("$p" --version 2>/dev/null | head -1); fi; if [ "$first" = 1 ]; then echo "$b=$p|$v"; first=0; else echo "$b.shadowed=$p|$v"; fi; fi; done; done; exit 0"#
+            + #"for b in tm-agent term-meshd tm-agent-bridge; do first=1; seen=""; for d in $(echo "$PATH" | tr : " "); do p="$d/$b"; case " $seen " in *" $p "*) continue ;; esac; if [ -x "$p" ]; then seen="$seen $p"; if [ "$b" = tm-agent-bridge ]; then v=""; else v=$("$p" --version 2>/dev/null | head -1); fi; fid=$(stat -f "%d:%i:%m:%z" "$p" 2>/dev/null || stat -c "%d:%i:%Y:%s" "$p" 2>/dev/null); if [ "$first" = 1 ]; then echo "$b=$p|$v|$fid"; first=0; else echo "$b.shadowed=$p|$v|$fid"; fi; fi; done; done; exit 0"#
         return "sh -c '\(body)'"
     }
 
@@ -587,10 +727,13 @@ enum PeerHostDoctor {
     /// the remote half of that promise — a line that is not a plain number is
     /// skipped rather than run.
     ///
-    /// SIGTERM only. A daemon that ignores it is a different problem, and
-    /// SIGKILL would take its unix sockets with it uncleaned.
+    /// Detached daemons receive SIGTERM together, then share one bounded grace
+    /// period longer than the daemon's own five-second server shutdown budget.
+    /// A process that does not finish is reported, never SIGKILLed here:
+    /// cutting its shutdown short is how agent descendants became a second
+    /// generation of garbage.
     static let daemonCleanupCommand =
-        #"sh -c 'while read -r pid; do case "$pid" in ""|*[!0-9]*) continue ;; esac; ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d " " ); parent=$(ps -o command= -p "$ppid" 2>/dev/null); case "$parent" in *.app/Contents/MacOS/term-mesh*) echo "protected=$pid"; continue ;; esac; peers=$(lsof -a -p "$pid" -U -F n 2>/dev/null | sed -n "s/^n//p" | grep peer); if [ -n "$peers" ]; then echo "protected=$pid"; continue; fi; if kill "$pid" 2>/dev/null; then echo "killed=$pid"; else echo "failed=$pid"; fi; done'"#
+        #"sh -c 'tab=$(printf "\t"); identity() { p=$1; started=$(ps -o lstart= -p "$p" 2>/dev/null | tr -s " " "_" | sed "s/^_//;s/_$//"); pgid=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d " "); sid=$(ps -o sess= -p "$p" 2>/dev/null | tr -d " "); echo ${started}_${pgid}_${sid}; }; executable() { lsof -a -p "$1" -d txt -F n 2>/dev/null | sed -n "s/^n//p" | head -1; }; active=$(mktemp /tmp/term-mesh-cleanup-active.XXXXXX) || exit 65; trap "rm -f $active" EXIT HUP INT TERM; while IFS="$tab" read -r pid expected_start expected_exe; do case "$pid" in ""|*[!0-9]*) continue ;; esac; [ "$(identity "$pid")" = "$expected_start" ] && [ "$(executable "$pid")" = "$expected_exe" ] || { echo "replaced=$pid"; continue; }; ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d " "); parent=$(ps -o command= -p "$ppid" 2>/dev/null); case "$parent" in *.app/Contents/MacOS/term-mesh*) echo "protected=$pid"; continue ;; esac; if ! raw=$(lsof -a -p "$pid" -U -F fn 2>/dev/null); then echo "protected=$pid"; continue; fi; named=$(printf "%s\n" "$raw" | sed -n "s/^n\(\/.*\)/\1/p"); unixfds=$(printf "%s\n" "$raw" | grep -c "^f"); socketfds=$(printf "%s\n" "$named" | grep -c .); socketnames=$(printf "%s\n" "$named" | sort -u | grep -c .); anonfds=$((unixfds - socketfds)); [ "$socketfds" -le "$socketnames" ] || { echo "protected=$pid"; continue; }; [ "$unixfds" -eq $((socketfds + anonfds)) ] || { echo "protected=$pid"; continue; }; case "$anonfds" in 0|3) ;; *) echo "protected=$pid"; continue ;; esac; [ "$(identity "$pid")" = "$expected_start" ] && [ "$(executable "$pid")" = "$expected_exe" ] || { echo "replaced=$pid"; continue; }; if kill "$pid" 2>/dev/null; then printf "%s\t%s\t%s\n" "$pid" "$expected_start" "$expected_exe" >> "$active"; else echo "failed=$pid"; fi; done; n=0; while [ "$n" -lt 120 ]; do alive=0; while IFS="$tab" read -r pid expected_start expected_exe; do if kill -0 "$pid" 2>/dev/null && [ "$(identity "$pid")" = "$expected_start" ] && [ "$(executable "$pid")" = "$expected_exe" ]; then alive=1; fi; done < "$active"; [ "$alive" = 0 ] && break; sleep 0.1; n=$((n + 1)); done; while IFS="$tab" read -r pid expected_start expected_exe; do if ! kill -0 "$pid" 2>/dev/null; then echo "killed=$pid"; elif [ "$(identity "$pid")" != "$expected_start" ] || [ "$(executable "$pid")" != "$expected_exe" ]; then echo "replaced=$pid"; else echo "failed=$pid"; fi; done < "$active"'"#
 
     /// Stop the daemons this host is no longer using.
     ///
@@ -603,34 +746,44 @@ enum PeerHostDoctor {
         sshTarget: String,
         port: Int?,
         identityFile: String?,
-        pids: [Int]
+        daemons: [DaemonInstance]
     ) async throws -> [Int] {
-        guard !pids.isEmpty else { return [] }
+        let safe = daemons.filter {
+            $0.pid > 1
+                && !$0.startIdentity.isEmpty
+                && !$0.startIdentity.contains("\t")
+                && !$0.executablePath.contains("\t")
+                && !$0.executablePath.contains("\n")
+                && ($0.executablePath as NSString).lastPathComponent == "term-meshd"
+        }
+        guard safe.count == daemons.count, !safe.isEmpty else { return [] }
         RemoteWorkLog.infoOffMain(
-            "Stopping \(pids.count) unused term-meshd process(es) on \(sshTarget)"
+            "Stopping \(daemons.count) unused term-meshd process(es) on \(sshTarget)"
         )
-        let payload = pids.map(String.init).joined(separator: "\n") + "\n"
+        let payload = safe.map {
+            "\($0.pid)\t\($0.startIdentity)\t\($0.executablePath)"
+        }.joined(separator: "\n") + "\n"
         let output = try await runRemote(
             sshTarget: sshTarget,
             port: port,
             identityFile: identityFile,
             command: daemonCleanupCommand,
-            timeoutSeconds: 20,
+            timeoutSeconds: 30,
             input: Data(payload.utf8)
         )
         let killed = parseTerminatedPids(output)
         RemoteWorkLog.infoOffMain(
-            killed.count == pids.count
+            killed.count == daemons.count
                 ? "Stopped \(killed.count) unused term-meshd process(es) on \(sshTarget)"
-                : "Stopped \(killed.count) of \(pids.count) on \(sshTarget) — the rest were already gone or refused"
+                : "Stopped \(killed.count) of \(daemons.count) on \(sshTarget) — the rest were already gone or refused"
         )
         return killed
     }
 
     static func parseTerminatedPids(_ output: String) -> [Int] {
         output.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
-            guard let value = line.trimmingCharacters(in: .whitespaces)
-                .dropPrefixIfPresent("killed=") else { return nil }
+            let text = line.trimmingCharacters(in: .whitespaces)
+            guard let value = text.dropPrefixIfPresent("killed=") else { return nil }
             return Int(value)
         }
     }
@@ -954,14 +1107,15 @@ enum PeerHostDoctor {
                 inventory.agentEnvironmentFileExists = value == "1"
                 continue
             }
-            // `path|version`. A binary that ran but printed nothing still
+            // `path|version|identity`. A binary that ran but printed nothing still
             // gets an entry — where it is matters even when it won't say
             // what it is.
-            let parts = value.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+            let parts = value.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
             guard let path = parts.first, !path.isEmpty else { continue }
             let entry = BinaryEntry(
                 path: String(path),
-                version: parts.count > 1 ? String(parts[1]) : ""
+                version: parts.count > 1 ? String(parts[1]) : "",
+                identity: parts.count > 2 ? String(parts[2]) : ""
             )
             switch key {
             case "os": inventory.hostOS = value.isEmpty ? nil : value
@@ -1077,6 +1231,102 @@ enum PeerHostDoctor {
             )
         }
         return warnings
+    }
+
+    /// Old PATH copies the doctor can safely archive without sudo. System and
+    /// package-manager paths remain diagnostic-only; only files below the SSH
+    /// account's HOME are eligible, and only when their version differs from
+    /// the binary that actually wins PATH resolution.
+    static func shadowedBinaryCleanupCandidates(
+        _ inventory: BinaryInventory
+    ) -> [BinaryEntry] {
+        guard let rawHome = inventory.homeDirectory?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawHome.isEmpty, rawHome.hasPrefix("/")
+        else { return [] }
+        let homePrefix = rawHome.hasSuffix("/") ? rawHome : rawHome + "/"
+        var seen = Set<String>()
+        var result: [BinaryEntry] = []
+        for (winner, shadowed) in [
+            (inventory.cli, inventory.cliShadowed),
+            (inventory.daemon, inventory.daemonShadowed),
+        ] {
+            guard let winner else { continue }
+            for candidate in shadowed where candidate.version != winner.version {
+                let path = (candidate.path as NSString).standardizingPath
+                guard path.hasPrefix(homePrefix),
+                      !path.contains("\n"),
+                      !candidate.identity.isEmpty,
+                      seen.insert(path).inserted
+                else { continue }
+                result.append(BinaryEntry(
+                    path: path, version: candidate.version, identity: candidate.identity
+                ))
+            }
+        }
+        return result.sorted { $0.path < $1.path }
+    }
+
+    /// Moves exact HOME-owned paths supplied on stdin into a unique,
+    /// path-preserving backup. Nothing computed by the client enters shell
+    /// syntax, and physical HOME/backup guards refuse symlink escapes.
+    static let shadowedBinaryArchiveCommand =
+        #"sh -c 'tab=$(printf "\t"); home_real=$(realpath "$HOME") || exit 65; root="$HOME/.term-mesh"; parent="$root/cleanup-backups"; [ ! -L "$root" ] && [ ! -L "$parent" ] || exit 66; mkdir -p "$parent" || exit 65; [ ! -L "$root" ] && [ ! -L "$parent" ] || exit 66; root_real=$(realpath "$root") || exit 65; parent_real=$(realpath "$parent") || exit 65; [ "$root_real" = "$home_real/.term-mesh" ] && [ "$parent_real" = "$root_real/cleanup-backups" ] || exit 66; backup=$(mktemp -d "$parent/archive-XXXXXXXX") || exit 65; while IFS="$tab" read -r p expected_version expected_identity; do case "$p" in "$HOME"/*) ;; *) echo "protected=$p"; continue ;; esac; if [ ! -f "$p" ]; then echo "missing=$p"; continue; fi; rel_lex=${p#"$HOME"/}; physical=$(realpath "$p" 2>/dev/null) || { echo "failed=$p"; continue; }; [ "$physical" = "$home_real/$rel_lex" ] || { echo "protected=$p"; continue; }; actual_identity=$(stat -f "%d:%i:%m:%z" "$p" 2>/dev/null || stat -c "%d:%i:%Y:%s" "$p" 2>/dev/null); actual_version=$("$p" --version 2>/dev/null | head -1); if [ "$actual_identity" != "$expected_identity" ] || [ "$actual_version" != "$expected_version" ]; then echo "changed=$p"; continue; fi; dest="$backup/$rel_lex"; mkdir -p "$(dirname "$dest")" || { echo "failed=$p"; continue; }; [ ! -e "$dest" ] && [ ! -L "$dest" ] || { echo "failed=$p"; continue; }; final_identity=$(stat -f "%d:%i:%m:%z" "$p" 2>/dev/null || stat -c "%d:%i:%Y:%s" "$p" 2>/dev/null); [ "$final_identity" = "$expected_identity" ] || { echo "changed=$p"; continue; }; if mv "$p" "$dest"; then echo "archived=$p"; else echo "failed=$p"; fi; done'"#
+
+    struct BinaryArchiveResult: Equatable {
+        var archived: [String] = []
+        var protected: [String] = []
+        var changed: [String] = []
+        var missing: [String] = []
+        var failed: [String] = []
+    }
+
+    static func archiveShadowedBinaries(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?,
+        candidates: [BinaryEntry]
+    ) async throws -> BinaryArchiveResult {
+        let safe = candidates.filter {
+            $0.path.hasPrefix("/")
+                && !$0.path.contains("\n") && !$0.path.contains("\r")
+                && !$0.version.contains("\n") && !$0.version.contains("\t")
+                && !$0.identity.isEmpty && !$0.identity.contains("\t")
+        }
+        guard safe.count == candidates.count, !safe.isEmpty else {
+            return BinaryArchiveResult(failed: candidates.map(\.path))
+        }
+        let payload = safe.map {
+            "\($0.path)\t\($0.version)\t\($0.identity)"
+        }.joined(separator: "\n") + "\n"
+        let output = try await runRemote(
+            sshTarget: sshTarget,
+            port: port,
+            identityFile: identityFile,
+            command: shadowedBinaryArchiveCommand,
+            timeoutSeconds: 20,
+            input: Data(payload.utf8)
+        )
+        return parseBinaryArchiveResult(output)
+    }
+
+    static func parseBinaryArchiveResult(_ output: String) -> BinaryArchiveResult {
+        var result = BinaryArchiveResult()
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            if let value = text.dropPrefixIfPresent("archived=") {
+                result.archived.append(value)
+            } else if let value = text.dropPrefixIfPresent("protected=") {
+                result.protected.append(value)
+            } else if let value = text.dropPrefixIfPresent("changed=") {
+                result.changed.append(value)
+            } else if let value = text.dropPrefixIfPresent("missing=") {
+                result.missing.append(value)
+            } else if let value = text.dropPrefixIfPresent("failed=") {
+                result.failed.append(value)
+            }
+        }
+        return result
     }
 
     /// Ask a host what it would actually run. Never throws; an unreachable
