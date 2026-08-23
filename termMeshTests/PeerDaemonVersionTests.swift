@@ -8,6 +8,25 @@ import XCTest
 #endif
 
 final class PeerDaemonVersionTests: XCTestCase {
+    func testCleanupAndDoctorActionsShareOneBusyGate() {
+        for (daemonCleanup, binaryCleanup) in [(true, false), (false, true), (true, true)] {
+            XCTAssertTrue(PeerHostEditorView.doctorActionsBusy(
+                doctorState: .idle,
+                installInFlight: false,
+                agentInstallInFlight: false,
+                daemonCleanupBusy: daemonCleanup,
+                binaryCleanupBusy: binaryCleanup
+            ))
+        }
+        XCTAssertFalse(PeerHostEditorView.doctorActionsBusy(
+            doctorState: .idle,
+            installInFlight: false,
+            agentInstallInFlight: false,
+            daemonCleanupBusy: false,
+            binaryCleanupBusy: false
+        ))
+    }
+
     func testRelayRouteWarningsExposeEveryEndpointMismatch() {
         let details = PeerRelayTestDetails(
             configuredSocket: "/configured.sock",
@@ -21,10 +40,10 @@ final class PeerDaemonVersionTests: XCTestCase {
             hostAppVersion: "0.207.0"
         )
         let warnings = PeerHostEditorView.relayRouteWarnings(details)
-        XCTAssertEqual(warnings.count, 4)
+        XCTAssertEqual(warnings.count, 3)
         XCTAssertTrue(warnings.contains(where: { $0.contains("Configured") }))
         XCTAssertTrue(warnings.contains(where: { $0.contains("Auto-detection") }))
-        XCTAssertTrue(warnings.contains(where: { $0.contains("Sessions are owned") }))
+        XCTAssertFalse(warnings.contains(where: { $0.contains("Sessions are owned") }))
     }
 
     func testRelayRouteWarningsStayEmptyForOneCanonicalSocket() {
