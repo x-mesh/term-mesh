@@ -514,6 +514,10 @@ extension TeamOrchestrator {
                 publishedRemoteProjectAgentSurfaceIDs[teamName] = Set(
                     project.members.map(\.surfaceID)
                 )
+                recordPublishedRemoteProjectIdentity(
+                    teamName: teamName, projectID: project.projectID,
+                    hostKey: hostKey, revision: response.revision
+                )
                 RemoteHostStore.shared.refreshTeamRoster(forHostKey: hostKey)
             }
             return response.ok
@@ -591,6 +595,26 @@ extension TeamOrchestrator {
     ) -> Bool {
         !hasLocalTeam
             || (!localPresentationOwnedByRequester && remoteRevision > localRevision)
+    }
+
+    nonisolated static func sidebarRemoteManifestState(
+        localTeam: Team?,
+        remote: RemoteTeamSummary,
+        hostKey: String
+    ) -> (shouldOffer: Bool, isUpdate: Bool) {
+        let matching = localTeam.map {
+            remotePresentationIdentityMatches(
+                team: $0, remote: remote, hostKey: hostKey
+            )
+        } ?? false
+        let shouldOffer = shouldOfferRemoteManifest(
+            hasLocalTeam: matching,
+            localPresentationOwnedByRequester:
+                matching ? (localTeam?.ownsRemotePresentation ?? false) : false,
+            localRevision: matching ? (localTeam?.remotePresentationRevision ?? 0) : 0,
+            remoteRevision: remote.presentationRevision
+        )
+        return (shouldOffer, matching)
     }
 
     /// Pick the one daemon manifest this installation may restore without a
@@ -889,7 +913,23 @@ extension TeamOrchestrator {
         localHostKey == remoteHostKey && localProjectID == remoteProjectID
     }
 
-    private static func remotePresentationIdentityMatches(
+    /// One Project id on both sides of publication. Owners used to publish
+    /// `team:<uuid>` while keeping nil locally, so the sidebar compared the
+    /// same Project as `name:<team>` versus `team:<uuid>`, rendered it twice,
+    /// and then refused its misleading "Update" action as a name collision.
+    nonisolated static func effectiveRemotePresentationProjectID(
+        storedProjectID: String?,
+        teamUUID: String?,
+        teamName: String
+    ) -> String {
+        if let storedProjectID, !storedProjectID.isEmpty { return storedProjectID }
+        if let teamUUID, !teamUUID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return remoteProjectPresentationID(teamUUID: teamUUID)
+        }
+        return "name:\(teamName)"
+    }
+
+    nonisolated static func remotePresentationIdentityMatches(
         team: Team,
         remote: RemoteTeamSummary,
         hostKey: String
@@ -898,7 +938,11 @@ extension TeamOrchestrator {
             if case let .peer(key) = team.leaderEndpoint { return key }
             return nil
         }()
-        let localProjectID = team.remotePresentationProjectID ?? "name:\(team.id)"
+        let localProjectID = effectiveRemotePresentationProjectID(
+            storedProjectID: team.remotePresentationProjectID,
+            teamUUID: team.teamUuid,
+            teamName: team.id
+        )
         return remotePresentationIdentityMatches(
             localHostKey: localHostKey,
             localProjectID: localProjectID,

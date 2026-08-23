@@ -188,6 +188,67 @@ final class PeerPaneSessionTests: XCTestCase {
         ))
     }
 
+    func testOwnerTeamUsesTheSameProjectIDItPublishes() {
+        XCTAssertEqual(
+            TeamOrchestrator.effectiveRemotePresentationProjectID(
+                storedProjectID: nil,
+                teamUUID: "F62ADEC6-8149-4BA8-AA0F-86EB3C770A3E",
+                teamName: "xm"
+            ),
+            "team:F62ADEC6-8149-4BA8-AA0F-86EB3C770A3E"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.effectiveRemotePresentationProjectID(
+                storedProjectID: "team:adopted",
+                teamUUID: "ignored",
+                teamName: "xm"
+            ),
+            "team:adopted"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.effectiveRemotePresentationProjectID(
+                storedProjectID: nil, teamUUID: nil, teamName: "legacy"
+            ),
+            "name:legacy"
+        )
+    }
+
+    @MainActor
+    func testSidebarDoesNotOfferOwnersOwnManifestAsDuplicate() {
+        let teamUUID = "F62ADEC6-8149-4BA8-AA0F-86EB3C770A3E"
+        let team = TeamOrchestrator.Team(
+            id: "xm", leaderSessionId: "leader", leaderMode: "claude",
+            leaderModel: "opus", leaderCli: "claude",
+            leaderPanelId: UUID(), leaderEndpoint: .peer(hostKey: "ssh:mac-sub"),
+            workingDirectory: "/work/xm", workspaceId: UUID(),
+            agents: [], createdAt: Date(), worktreeMode: "off", teamUuid: teamUUID,
+            ownsRemotePresentation: true
+        )
+        let same = RemoteTeamSummary(
+            name: "xm", teamUUID: teamUUID, workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: [],
+            projectID: "team:\(teamUUID)", leaderSurfaceID: Data(repeating: 1, count: 16),
+            presentationRevision: 5, presentationOwnedByRequester: true
+        )
+        let sameState = TeamOrchestrator.sidebarRemoteManifestState(
+            localTeam: team, remote: same, hostKey: "ssh:mac-sub"
+        )
+        XCTAssertFalse(sameState.shouldOffer)
+        XCTAssertTrue(sameState.isUpdate)
+
+        let stale = RemoteTeamSummary(
+            name: "xm", teamUUID: "old", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: [], projectID: "team:old",
+            leaderSurfaceID: Data(repeating: 2, count: 16),
+            presentationRevision: 5, presentationOwnedByRequester: true
+        )
+        let staleState = TeamOrchestrator.sidebarRemoteManifestState(
+            localTeam: team, remote: stale, hostKey: "ssh:mac-sub"
+        )
+        XCTAssertTrue(staleState.shouldOffer)
+        XCTAssertFalse(staleState.isUpdate, "same display name is not an update identity")
+    }
+
     @MainActor
     func testAutomaticRestoreChoosesExactLatestOwnedLeaderRecord() {
         let oldID = Data(repeating: 0x11, count: 16)

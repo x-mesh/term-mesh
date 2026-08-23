@@ -673,6 +673,27 @@ final class TeamOrchestrator: ObservableObject {
         return true
     }
 
+    /// Record the exact identity this owner successfully published. Without
+    /// this, the owner compared itself as `name:<team>` against its daemon
+    /// manifest's `team:<uuid>` and the Projects sidebar rendered both.
+    func recordPublishedRemoteProjectIdentity(
+        teamName: String,
+        projectID: String,
+        hostKey: String,
+        revision: UInt64
+    ) {
+        guard var team = teams[teamName], team.ownsRemotePresentation else { return }
+        guard team.remotePresentationProjectID != projectID
+            || team.remotePresentationHostKey != hostKey
+            || team.remotePresentationRevision != revision
+        else { return }
+        team.remotePresentationProjectID = projectID
+        team.remotePresentationHostKey = hostKey
+        team.remotePresentationRevision = revision
+        teams[teamName] = team
+        syncTeamStateToDaemon()
+    }
+
     /// Atomically exchange a non-owner viewer after its replacement workspace
     /// has attached every surface. Returns any window-detached old workspace
     /// so the caller can close its local sessions after the commit.
@@ -6767,6 +6788,15 @@ final class TeamOrchestrator: ObservableObject {
                 "leader_session_id": team.leaderSessionId,
                 "working_directory": team.workingDirectory,
                 "workspace_id": team.workspaceId.uuidString,
+                "team_uuid": team.teamUuid as Any? ?? NSNull(),
+                "remote_project_id": Self.effectiveRemotePresentationProjectID(
+                    storedProjectID: team.remotePresentationProjectID,
+                    teamUUID: team.teamUuid, teamName: team.id
+                ),
+                "remote_project_host": team.remotePresentationHostKey as Any? ?? {
+                    if case let .peer(key) = team.leaderEndpoint { return key }
+                    return NSNull()
+                }(),
                 "agent_count": team.agents.count,
                 "agents": team.agents.map { agent in
                     let activeTask = activeTask(for: team.id, agentName: agent.name)
@@ -6941,6 +6971,15 @@ final class TeamOrchestrator: ObservableObject {
             "leader_policy_state": team.leaderPolicyState,
             "leader_policy_failure": team.leaderPolicyFailureDescription as Any? ?? NSNull(),
             "workspace_id": team.workspaceId.uuidString,
+            "team_uuid": team.teamUuid as Any? ?? NSNull(),
+            "remote_project_id": Self.effectiveRemotePresentationProjectID(
+                storedProjectID: team.remotePresentationProjectID,
+                teamUUID: team.teamUuid, teamName: team.id
+            ),
+            "remote_project_host": team.remotePresentationHostKey as Any? ?? {
+                if case let .peer(key) = team.leaderEndpoint { return key }
+                return NSNull()
+            }(),
             "agent_count": team.agents.count,
             "agents": team.agents.map { agent in
                 let enrichment = TeamDataStore.shared.agentDataEnrichment(
