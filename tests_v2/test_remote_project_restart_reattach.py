@@ -531,6 +531,19 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
     project = _wait(complete_project)
     if project is None:
         raise termmeshError("complete remote project manifest was not published")
+    local_team = next(
+        (item for item in c.team_list() if item.get("team_name") == team_name), None
+    )
+    if local_team is None or local_team.get("remote_project_id") != project["project_id"]:
+        raise termmeshError(
+            "owner Project identity differs from its published manifest: "
+            f"local={local_team!r} remote={project!r}"
+        )
+    if local_team.get("remote_project_host") != host:
+        raise termmeshError(
+            "owner Project host identity differs from its published manifest: "
+            f"local={local_team!r} expected_host={host!r}"
+        )
     relay = _assert_leader_relay_stable(
         c, host, project["project_id"], team_name, project["leader_surface_id"]
     )

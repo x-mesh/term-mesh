@@ -1610,27 +1610,11 @@ private struct SidebarPeerProjectsView: View {
             .flatMap { host in
                 host.teams.compactMap { team in
                     guard !team.leaderSurfaceID.isEmpty else { return nil }
-                    let local = orchestrator.teams[team.name].flatMap { candidate in
-                        let localHostKey = candidate.remotePresentationHostKey ?? {
-                            if case let .peer(key) = candidate.leaderEndpoint { return key }
-                            return nil
-                        }()
-                        let localProjectID = candidate.remotePresentationProjectID
-                            ?? "name:\(candidate.id)"
-                        return TeamOrchestrator.remotePresentationIdentityMatches(
-                            localHostKey: localHostKey,
-                            localProjectID: localProjectID,
-                            remoteHostKey: host.id,
-                            remoteProjectID: team.projectID
-                        ) ? candidate : nil
-                    }
-                    guard TeamOrchestrator.shouldOfferRemoteManifest(
-                        hasLocalTeam: local != nil,
-                        localPresentationOwnedByRequester:
-                            local?.ownsRemotePresentation ?? false,
-                        localRevision: local?.remotePresentationRevision ?? 0,
-                        remoteRevision: team.presentationRevision
-                    ) else { return nil }
+                    let state = TeamOrchestrator.sidebarRemoteManifestState(
+                        localTeam: orchestrator.teams[team.name],
+                        remote: team, hostKey: host.id
+                    )
+                    guard state.shouldOffer else { return nil }
                     return RemoteManifestItem(host: host, team: team)
                 }
             }
@@ -1805,7 +1789,10 @@ private struct SidebarPeerProjectsView: View {
 
     private func remoteManifestRow(_ item: RemoteManifestItem) -> some View {
         let restoreKey = item.id
-        let isUpdate = orchestrator.teams[item.team.name] != nil
+        let isUpdate = TeamOrchestrator.sidebarRemoteManifestState(
+            localTeam: orchestrator.teams[item.team.name],
+            remote: item.team, hostKey: item.host.id
+        ).isUpdate
         return Button {
             guard !restoringTeamNames.contains(restoreKey) else { return }
             restoringTeamNames.insert(restoreKey)
