@@ -4,6 +4,17 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.210.0] - 2026-08-24
+
+### Fixed
+
+- Made New Project, New Agent Team, Watch configuration, Fleet restore, and Spawn CLI open from every main terminal window, including a replacement window after the original launch window has closed.
+- Routed each presentation to the window that requested it, preventing dialogs from appearing in or leaking into another open window.
+- Kept rapid sheet replacement and dismissal deterministic so an older queued dialog cannot reappear over a newer request.
+- Added unit and mac-sub socket E2E coverage for secondary-window presentation and the initial-window-close topology.
+
+Thanks to Jinwoo for the production reproduction and verification.
+
 ## [0.209.0] - 2026-08-23
 
 ### Fixed
