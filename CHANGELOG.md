@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.208.0] - 2026-08-23
+
+### Fixed
+
+- Prevented Clean Up Daemons from terminating a Mac app child daemon or any daemon that exposes a peer listener, including session owners used by another Mac.
+- Added kill-time parent and peer-listener checks so a stale cleanup dialog cannot terminate a daemon that became active after diagnosis.
+- Expanded Test Relay into an end-to-end route diagnostic that shows configured, discovered, connected, and session-owner sockets, server identity and version, and owner PID when available.
+- Made Test Relay fail closed: a reachable alternate socket never silently replaces a failed configured route, and an unreachable advertised session owner fails the test.
+- Added an isolated split-route transport E2E that drives a real failed configured socket and a real healthy discovered daemon, verifies the failure UI contract, and confirms all fixture processes and sockets are removed.
+
+Thanks to Jinwoo for the production reproduction and verification.
+
 ## [0.207.0] - 2026-08-23
 
 ### Fixed
