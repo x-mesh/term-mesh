@@ -720,14 +720,22 @@ extension TeamOrchestrator {
         in remotes: [RemoteTeamSummary],
         leaderRecord: ManagedPeerSurfaceStore.Record?
     ) -> RemoteTeamSummary? {
-        guard let leaderSurfaceID = leaderRecord?.surfaceID else { return nil }
-        return remotes
-            .filter { remote in
-                remote.presentationOwnedByRequester
-                    && !remote.projectID.isEmpty
-                    && remote.leaderSurfaceID == leaderSurfaceID
-            }
-            .max { $0.presentationRevision < $1.presentationRevision }
+        let owned = remotes.filter {
+            $0.presentationOwnedByRequester && !$0.projectID.isEmpty
+        }
+        if let leaderSurfaceID = leaderRecord?.surfaceID {
+            return owned
+                .filter { $0.leaderSurfaceID == leaderSurfaceID }
+                .max { $0.presentationRevision < $1.presentationRevision }
+        }
+        // A hard app relaunch can occur before cfprefsd flushes the local
+        // surface record. The daemon manifest is still durable and carries an
+        // authenticated ownership bit. Restore only when this team name has
+        // exactly one owned identity; ambiguity remains fail-closed so an old
+        // same-named Project can never be adopted by guessing.
+        let identities = Dictionary(grouping: owned, by: \.projectID)
+        guard identities.count == 1, let candidates = identities.values.first else { return nil }
+        return candidates.max { $0.presentationRevision < $1.presentationRevision }
     }
 
     nonisolated static func shouldReleaseRemoteAgentsOnQuit(

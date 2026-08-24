@@ -408,6 +408,11 @@ struct TeamHostCapabilitySnapshot: Equatable, Sendable {
     let appVersion: String?
     private let peerOwnedAgentHosting: Bool
     private let remoteTeamRoute: Bool
+    /// True only when this exact authenticated endpoint advertised
+    /// `surface.foreground.v1`. Project lifecycle E2E uses this instead of
+    /// discovering much later that a stale daemon cannot distinguish a live
+    /// leader process from an idle shell.
+    let supportsAuthoritativeLeaderLiveness: Bool
     let looksLikeGUIPeerHost: Bool
     let redirectedFromServingEndpoint: Bool
 
@@ -421,6 +426,7 @@ struct TeamHostCapabilitySnapshot: Equatable, Sendable {
         appVersion: String?,
         supportsPeerOwnedAgentHosting: Bool,
         supportsRemoteTeamRoute: Bool,
+        supportsAuthoritativeLeaderLiveness: Bool = false,
         looksLikeGUIPeerHost: Bool,
         redirectedFromServingEndpoint: Bool
     ) {
@@ -428,6 +434,7 @@ struct TeamHostCapabilitySnapshot: Equatable, Sendable {
         self.appVersion = appVersion
         self.peerOwnedAgentHosting = supportsPeerOwnedAgentHosting
         self.remoteTeamRoute = supportsRemoteTeamRoute
+        self.supportsAuthoritativeLeaderLiveness = supportsAuthoritativeLeaderLiveness
         self.looksLikeGUIPeerHost = looksLikeGUIPeerHost
         self.redirectedFromServingEndpoint = redirectedFromServingEndpoint
     }
@@ -827,6 +834,9 @@ final class RemoteHostStore: ObservableObject {
             appVersion: appVersion,
             supportsPeerOwnedAgentHosting: hostSupportsPeerOwnedAgentFactory(capabilities),
             supportsRemoteTeamRoute: capabilities.has(PeerCapability.teamLeaderV1),
+            supportsAuthoritativeLeaderLiveness: capabilities.has(
+                PeerCapability.surfaceForegroundV1
+            ),
             looksLikeGUIPeerHost: looksLikeGUIPeerHost(capabilities),
             redirectedFromServingEndpoint: redirectedFromServingEndpoint
         )

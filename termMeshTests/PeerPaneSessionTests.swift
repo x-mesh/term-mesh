@@ -573,6 +573,37 @@ final class PeerPaneSessionTests: XCTestCase {
         ))
     }
 
+    func testAutomaticRestoreWithoutLocalRecordRequiresOneOwnedIdentity() {
+        let current = RemoteTeamSummary(
+            name: "term-mesh", teamUUID: "current", workingDirectory: "/current",
+            projectRootPath: nil, agentNames: [], projectID: "team:current",
+            leaderSurfaceID: Data(repeating: 1, count: 16), presentationRevision: 7,
+            presentationOwnedByRequester: true
+        )
+        let newerRevision = RemoteTeamSummary(
+            name: "term-mesh", teamUUID: "current", workingDirectory: "/current",
+            projectRootPath: nil, agentNames: [], projectID: "team:current",
+            leaderSurfaceID: Data(repeating: 1, count: 16), presentationRevision: 8,
+            presentationOwnedByRequester: true
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.automaticRemoteProjectRestoreCandidate(
+                in: [current, newerRevision], leaderRecord: nil
+            )?.presentationRevision,
+            8
+        )
+
+        let ambiguous = RemoteTeamSummary(
+            name: "term-mesh", teamUUID: "other", workingDirectory: "/other",
+            projectRootPath: nil, agentNames: [], projectID: "team:other",
+            leaderSurfaceID: Data(repeating: 2, count: 16), presentationRevision: 9,
+            presentationOwnedByRequester: true
+        )
+        XCTAssertNil(TeamOrchestrator.automaticRemoteProjectRestoreCandidate(
+            in: [current, ambiguous], leaderRecord: nil
+        ))
+    }
+
     func testAutomaticRestoreFailureKeyChangesWithSocketOrRevision() {
         let base = TeamOrchestrator.automaticProjectRestoreFailureKey(
             hostID: "host", activeSockPath: "/tmp/one.sock",

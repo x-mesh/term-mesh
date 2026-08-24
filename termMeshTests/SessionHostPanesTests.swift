@@ -1069,6 +1069,27 @@ final class RemoteHostAgentSurfaceGateTests: XCTestCase {
         ))
     }
 
+    func test_teamHostSnapshotSeparatelyPinsAuthoritativeLeaderLiveness() {
+        let endpoint = PeerPaneHostKey.direct(sockPath: "/tmp/peer.sock")
+        let without = RemoteHostStore.teamHostCapabilitySnapshot(
+            endpoint: endpoint,
+            capabilities: PeerCapabilities([PeerCapability.teamLeaderV1]),
+            appVersion: "0.209.0",
+            redirectedFromServingEndpoint: false
+        )
+        XCTAssertFalse(without.supportsAuthoritativeLeaderLiveness)
+
+        let candidate = RemoteHostStore.teamHostCapabilitySnapshot(
+            endpoint: endpoint,
+            capabilities: PeerCapabilities([
+                PeerCapability.teamLeaderV1, PeerCapability.surfaceForegroundV1,
+            ]),
+            appVersion: "0.213.0",
+            redirectedFromServingEndpoint: false
+        )
+        XCTAssertTrue(candidate.supportsAuthoritativeLeaderLiveness)
+    }
+
     // MARK: - Session-host redirect
 
     /// The exact set a Swift GUI peer host advertises: everything this build
