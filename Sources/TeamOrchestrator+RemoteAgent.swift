@@ -2744,7 +2744,8 @@ extension TeamOrchestrator {
         }
 
         let turnHookFile: String?
-        if cli.lowercased() == "claude", let hookData = Self.localLeaderTurnHookData() {
+        if Self.supportsLeaderTurnMeasurement(cli: cli),
+           let hookData = Self.localLeaderTurnHookData() {
             turnHookFile = await Self.writeRemoteLeaderTurnHookOverSSH(
                 host: host, hookData: hookData, teamUUID: teamUUID
             )
@@ -2753,7 +2754,7 @@ extension TeamOrchestrator {
             turnHookFile = nil
         }
         let participationControlFile: String?
-        if cli.lowercased() == "claude", turnHookFile != nil,
+        if Self.supportsLeaderTurnMeasurement(cli: cli), turnHookFile != nil,
            let controlData = Self.leaderParticipationControlData(
                teamName: teamName, sessionID: team.leaderSessionId, supportedLeader: true
            ) {
@@ -2852,7 +2853,7 @@ extension TeamOrchestrator {
         markLeaderPolicyState(teamName: teamName, state: "injected")
         setLeaderMeasurementCapability(
             teamName: teamName,
-            capability: cli.lowercased() == "claude"
+            capability: Self.supportsLeaderTurnMeasurement(cli: cli)
                 ? (turnHookFile == nil ? .degraded : .supported)
                 : .unsupported
         )
@@ -8595,9 +8596,17 @@ extension TeamOrchestrator {
                 + hookCleanup
         case "codex", "kiro", "gemini":
             let autonomy = needsSocketAccess ? Self.leaderAutonomyFlags(cli: cli) : []
-            let flags = autonomy.isEmpty ? "" : " " + autonomy.joined(separator: " ")
+            let codexHooks = cli == "codex" ? turnHookFile.map {
+                Self.codexLeaderTurnHookArguments(path: $0).map(shellQuoted).joined(separator: " ")
+            } ?? "" : ""
+            let allFlags = autonomy + (codexHooks.isEmpty ? [] : [codexHooks])
+            let flags = allFlags.isEmpty ? "" : " " + allFlags.joined(separator: " ")
+            let cleanupFiles = cli == "codex" ? [turnHookFile, participationControlFile]
+                .compactMap { $0 }.map(shellQuoted).joined(separator: " ") : ""
+            let cleanup = cleanupFiles.isEmpty ? ""
+                : "; status=$?; rm -f -- \(cleanupFiles); exit \"$status\""
             guard let systemPromptFile else {
-                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)\(flags)"
+                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)\(flags)" + cleanup
             }
             let directive = LeaderParallelPolicy.launchDirective(promptFile: systemPromptFile)
             switch cli {
@@ -8606,7 +8615,7 @@ extension TeamOrchestrator {
                     + " \(shellQuoted(directive))"
             default:
                 return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)\(flags)"
-                    + " \(shellQuoted(directive))"
+                    + " \(shellQuoted(directive))" + cleanup
             }
         default:
             return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)"

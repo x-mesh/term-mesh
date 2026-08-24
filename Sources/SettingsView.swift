@@ -1468,7 +1468,8 @@ struct SettingsView: View {
                             .pickerStyle(.menu)
                         }
 
-                        if settingsMatch("leader", "participation", "shadow", "canary", "kill switch") {
+                        if settingsMatch("leader", "participation", "shadow", "canary", "kill switch",
+                                         "리더", "참여", "관찰", "시험 적용", "긴급 중지") {
                         SettingsCardDivider()
 
                         SettingsCardRow(
@@ -1510,7 +1511,7 @@ struct SettingsView: View {
                             "Canary Projects",
                             subtitle: "Explicit Project names, comma-separated. No Project is opted in by default."
                         ) {
-                            TextField("project-a, project-b", text: $leaderParticipationOptInProjects)
+                            TextField(LocalizedStringKey("project-a, project-b"), text: $leaderParticipationOptInProjects)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 240)
                         }

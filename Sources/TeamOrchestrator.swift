@@ -2437,10 +2437,11 @@ final class TeamOrchestrator: ObservableObject {
         // path as the wrapper so the measurement contract is not accidentally
         // limited to ad-hoc shell invocations. The hook independently checks
         // the request token above, so workers cannot write leader turns.
-        if leaderMode == "claude", let hookPath = Self.leaderTurnHookPath(workingDirectory: workingDirectory) {
+        if Self.supportsLeaderTurnMeasurement(cli: leaderMode),
+           let hookPath = Self.leaderTurnHookPath(workingDirectory: workingDirectory) {
             leaderEnv["TERMMESH_LEADER_TURN_HOOK"] = hookPath
         }
-        if leaderMode == "claude" {
+        if Self.supportsLeaderTurnMeasurement(cli: leaderMode) {
             let participationControlFile = Self.leaderParticipationControlFile(teamName: name)
             leaderEnv["TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE"] = participationControlFile
             Self.writeLeaderParticipationControl(
@@ -2706,7 +2707,12 @@ final class TeamOrchestrator: ObservableObject {
                 } else { leaderCommand = nil }
             case "codex":
                 if let path = agentBinaryPath(cli: "codex") {
-                    leaderCommand = buildCodexCommand(codexPath: path, agentName: "leader", teamName: name, model: leaderModel)
+                    let hookArgs = leaderEnv["TERMMESH_LEADER_TURN_HOOK"]
+                        .map(Self.codexLeaderTurnHookArguments) ?? []
+                    leaderCommand = buildCodexCommand(
+                        codexPath: path, agentName: "leader", teamName: name,
+                        model: leaderModel, extraArgs: hookArgs
+                    )
                 } else { leaderCommand = nil }
             case "gemini":
                 if let path = agentBinaryPath(cli: "gemini") {
@@ -2941,8 +2947,8 @@ final class TeamOrchestrator: ObservableObject {
             team.leaderReady = launchLeaderLocally && !Self.localLeaderNeedsReadinessProbe(
                 launchLeaderLocally: launchLeaderLocally, leaderMode: leaderMode
             )
-            team.leaderPolicyState = leaderMode == "claude" ? "injected" : "pending"
-            team.leaderMeasurementCapability = leaderMode == "claude"
+            team.leaderPolicyState = Self.supportsLeaderTurnMeasurement(cli: leaderMode) ? "injected" : "pending"
+            team.leaderMeasurementCapability = Self.supportsLeaderTurnMeasurement(cli: leaderMode)
                 && leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil ? .supported : .unsupported
             teams[name] = team
             TeamDataStore.shared.registerTeam(name, agents: headlessMembers.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
@@ -3129,8 +3135,8 @@ final class TeamOrchestrator: ObservableObject {
         team.leaderReady = launchLeaderLocally && !Self.localLeaderNeedsReadinessProbe(
             launchLeaderLocally: launchLeaderLocally, leaderMode: leaderMode
         )
-        team.leaderPolicyState = leaderMode == "claude" ? "injected" : "pending"
-        team.leaderMeasurementCapability = leaderMode == "claude"
+        team.leaderPolicyState = Self.supportsLeaderTurnMeasurement(cli: leaderMode) ? "injected" : "pending"
+        team.leaderMeasurementCapability = Self.supportsLeaderTurnMeasurement(cli: leaderMode)
             && leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil ? .supported : .unsupported
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
@@ -3808,7 +3814,8 @@ final class TeamOrchestrator: ObservableObject {
                     supportedLeader: supported
                 )
             case .peer(let hostKey):
-                guard team.leaderMode == "claude", let teamUUID = team.teamUuid else { continue }
+                guard Self.supportsLeaderTurnMeasurement(cli: team.leaderMode),
+                      let teamUUID = team.teamUuid else { continue }
                 Task {
                     await Self.refreshRemoteLeaderParticipationControl(
                         hostKey: hostKey, teamUUID: teamUUID, teamName: team.id,
@@ -3817,6 +3824,29 @@ final class TeamOrchestrator: ObservableObject {
                 }
             }
         }
+    }
+
+    static func supportsLeaderTurnMeasurement(cli: String) -> Bool {
+        ["claude", "codex"].contains(cli.lowercased())
+    }
+
+    static func codexLeaderTurnHookArguments(path: String) -> [String] {
+        func tomlString(_ value: String) -> String {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.withoutEscapingSlashes]
+            let data = try? encoder.encode(value)
+            return data.flatMap { String(data: $0, encoding: .utf8) } ?? "\"\""
+        }
+        let startCommand = tomlString("\(shellQuoted(path)) --start")
+        let stopCommand = tomlString("\(shellQuoted(path)) --end")
+        let start = "[{matcher=\"\",hooks=[{type=\"command\",command=\(startCommand),timeout=10}]}]"
+        let stop = "[{matcher=\"\",hooks=[{type=\"command\",command=\(stopCommand),timeout=10}]}]"
+        return [
+            "--dangerously-bypass-hook-trust",
+            "--enable", "hooks",
+            "-c", "hooks.UserPromptSubmit=\(start)",
+            "-c", "hooks.Stop=\(stop)",
+        ]
     }
 
     /// Settings injected only into supported Claude leader launches. The

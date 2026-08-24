@@ -1299,7 +1299,7 @@ impl PeerHost {
     }
 
     pub fn delete_project_presentation(
-        &self,
+        self: &Arc<Self>,
         owner_peer_ids: &[Vec<u8>],
         project_id: &str,
     ) -> Result<bool, &'static str> {
@@ -1307,7 +1307,7 @@ impl PeerHost {
             .map(|released| released.is_some())
     }
 
-    /// Remove one manifest and hand back the surfaces it had claimed.
+    /// Remove one manifest and retire surfaces that lost their final Project reference.
     ///
     /// The ids are taken from the record this call actually removed, while
     /// the persistence and records locks are still held. A caller that reads
@@ -1316,11 +1316,12 @@ impl PeerHost {
     /// still names while stranding the ones that really lost their last
     /// reference. `Ok(None)` means there was no such project — nothing was
     /// removed and nothing is released. Losing THIS manifest's reference is
-    /// not the same as being unreferenced, so the returned ids stay subject
-    /// to `presentation_references_surface` in `reap_if_abandoned`; another
-    /// project naming the same surface still protects it.
+    /// not the same as being unreferenced, so another project naming the same
+    /// surface still protects it. The persistence guard stays held through the
+    /// final-reference decision; surface lifecycle locks serialize retirement
+    /// against a concurrent upsert's under-lock liveness recheck.
     pub(crate) fn delete_project_presentation_with_released(
-        &self,
+        self: &Arc<Self>,
         owner_peer_ids: &[Vec<u8>],
         project_id: &str,
     ) -> Result<Option<Vec<Vec<u8>>>, &'static str> {
@@ -1351,6 +1352,22 @@ impl PeerHost {
                 // reference: a rolled-back delete releases nothing.
                 records.insert(project_id.to_string(), previous);
                 return Err("persistence_failed");
+            }
+        }
+        let unreferenced = released.iter().filter(|surface_id| {
+            let encoded = hex::encode(surface_id);
+            !records.values().any(|record| {
+                record.leader_surface_id == encoded
+                    || record.members.iter().any(|member| member.surface_id == encoded)
+            })
+        }).cloned().collect::<Vec<_>>();
+        drop(records);
+        drop(_persist_guard);
+        for surface_id in unreferenced {
+            let lifecycle = self.surface_lifecycle_lock(&surface_id);
+            let _lifecycle_guard = lifecycle.lock().map_err(|_| "surface_lifecycle_poisoned")?;
+            if !self.presentation_references_surface(&surface_id) {
+                let _ = self.terminate_surface_locked(&surface_id);
             }
         }
         Ok(Some(released))
@@ -1438,22 +1455,8 @@ impl PeerHost {
         {
             return Err("invalid_manifest");
         }
-        let surfaces: HashMap<Vec<u8>, _> = self
-            .pty
-            .list()
-            .into_iter()
-            .map(|surface| (surface.surface_id.clone(), surface))
-            .collect();
-        let Some(leader) = surfaces.get(&project.leader_surface_id) else {
-            return Err("leader_surface_missing");
-        };
-        if !leader.info().attachable {
-            return Err("leader_surface_missing");
-        }
-
         let mut seen_instances = HashSet::new();
         let mut seen_surfaces = HashSet::from([project.leader_surface_id.clone()]);
-        let mut members = Vec::with_capacity(project.members.len());
         for member in &project.members {
             if member.name.is_empty()
                 || member.agent_instance_id.is_empty()
@@ -1471,6 +1474,25 @@ impl PeerHost {
             {
                 return Err("invalid_member");
             }
+        }
+
+        let _persist_guard = self.project_presentations_persistence.lock().unwrap();
+        let mut ordered_surface_ids = seen_surfaces.iter().cloned().collect::<Vec<_>>();
+        ordered_surface_ids.sort();
+        let lifecycle_locks = ordered_surface_ids.iter()
+            .map(|surface_id| self.surface_lifecycle_lock(surface_id))
+            .collect::<Vec<_>>();
+        let _lifecycle_guards = lifecycle_locks.iter()
+            .map(|lock| lock.lock().map_err(|_| "surface_lifecycle_poisoned"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let surfaces: HashMap<Vec<u8>, _> = self.pty.list().into_iter()
+            .map(|surface| (surface.surface_id.clone(), surface)).collect();
+        let Some(leader) = surfaces.get(&project.leader_surface_id) else {
+            return Err("leader_surface_missing");
+        };
+        if !leader.info().attachable { return Err("leader_surface_missing"); }
+        let mut members = Vec::with_capacity(project.members.len());
+        for member in &project.members {
             let Some(surface) = surfaces.get(&member.surface_id) else {
                 return Err("member_surface_missing");
             };
@@ -1490,8 +1512,6 @@ impl PeerHost {
                 surface_type: member.surface_type.clone(),
             });
         }
-
-        let _persist_guard = self.project_presentations_persistence.lock().unwrap();
         let owner = hex::encode(&owner_peer_ids[0]);
         let mut records = self.project_presentations.lock().unwrap();
         let previous_surface_ids: Vec<Vec<u8>> = records
@@ -1671,6 +1691,10 @@ impl PeerHost {
         let _lifecycle_guard = lifecycle
             .lock()
             .map_err(|_| EnsureError::Internal("host surface lifecycle lock poisoned"))?;
+        self.terminate_surface_locked(surface_id)
+    }
+
+    fn terminate_surface_locked(self: &Arc<Self>, surface_id: &[u8]) -> Result<bool, EnsureError> {
         let workspace_id = self.workspace_id_for_surface(surface_id);
         // Durable PTY/logical-state deletion commits first. On failure the
         // manager restores the live process, so layout/index remain untouched.
@@ -4522,7 +4546,7 @@ mod tests {
             })
         };
         let released = deleting.await.unwrap().expect("delete accepted");
-        replacing.await.unwrap().expect("replace accepted");
+        let replace_result = replacing.await.unwrap();
 
         let released_before = Some(vec![
             leader.surface_id.clone(),
@@ -4533,31 +4557,65 @@ mod tests {
             next_member.surface_id.clone(),
         ]);
         let remaining = host.project_presentations();
-        if remaining.is_empty() {
-            // Nothing survived, so the replace landed first and the delete
-            // removed the replacement — the original member's surface is
-            // still claimed by nothing, but it is not this delete's to free.
+        assert!(remaining.is_empty());
+        if replace_result.is_ok() {
+            // The replace landed first and the delete removed that exact
+            // replacement. Its surfaces were retired atomically.
             assert_eq!(
                 released, released_after,
                 "the delete must release the record it actually removed"
             );
         } else {
-            // The delete went first, so the replace re-created the project.
-            // Only the record that was removed may be released; the live
-            // manifest's member surface must not appear.
+            // The delete landed first and retired the shared leader. The
+            // waiting replace must refuse to publish a dead surface.
+            assert_eq!(replace_result, Err("leader_surface_missing"));
             assert_eq!(
                 released, released_before,
-                "the delete must not release a surface the live manifest names"
-            );
-            assert_eq!(
-                remaining[0].members[0].surface_id,
-                hex::encode(&next_member.surface_id)
+                "the delete must release only the record it removed"
             );
         }
 
         host.terminate_surface(&leader.surface_id).unwrap();
         host.terminate_surface(&first_member.surface_id).unwrap();
         host.terminate_surface(&next_member.surface_id).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_delete_and_new_presentation_never_publish_a_dead_surface() {
+        let manager = Arc::new(PtyManager::new());
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        let leader = host.ensure_surface("delete-upsert-shared-leader", &SurfaceSpec {
+            cwd: "/tmp".into(), executable: "/bin/cat".into(), args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty, agent_cli: String::new(),
+        }).unwrap();
+        let owner = vec![vec![0x5A; 16]];
+        let project = |project_id: &str| peer_proto::v1::Team {
+            name: project_id.into(), team_uuid: format!("uuid-{project_id}"),
+            working_directory: "/tmp".into(), leader_surface_id: leader.surface_id.clone(),
+            project_id: format!("team:{project_id}"), ..Default::default()
+        };
+        assert_eq!(host.upsert_project_presentation(&owner, &project("before")), Ok((1, true)));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let deleting = {
+            let host = Arc::clone(&host); let owner = owner.clone(); let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || { barrier.wait(); host.delete_project_presentation_with_released(&owner, "team:before") })
+        };
+        let publishing = {
+            let host = Arc::clone(&host); let owner = owner.clone(); let after = project("after"); let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || { barrier.wait(); host.upsert_project_presentation(&owner, &after) })
+        };
+        deleting.await.unwrap().unwrap();
+        let publish_result = publishing.await.unwrap();
+        let after_exists = host.project_presentations().iter().any(|record| record.project_id == "team:after");
+        let leader_live = manager.list().iter().any(|surface| surface.surface_id == leader.surface_id);
+        assert_eq!(after_exists, leader_live, "a published Project must never retain a deleted surface");
+        if after_exists {
+            assert!(publish_result.is_ok());
+            host.delete_project_presentation_with_released(&owner, "team:after").unwrap();
+        } else {
+            assert_eq!(publish_result, Err("leader_surface_missing"));
+        }
     }
 
     #[test]
