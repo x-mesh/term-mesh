@@ -4,6 +4,21 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.213.0] - 2026-08-24
+
+### Added
+
+- Added privacy-safe production leader-turn measurement for local and remote Claude leaders, including linked start/route/end health, explicit unsupported/degraded cohorts, and shadow-versus-applied reporting.
+- Added versioned dynamic leader participation with shadow defaults, deterministic canary and holdout cohorts, health promotion gates, per-Project opt-in, observable dispatch bounds, and an immediate global kill switch.
+- Added Agent Teams settings for participation mode, canary percentage, Project opt-in, and rollback.
+
+### Fixed
+
+- Restored a unique authenticated owner Project after a hard app relaunch even when the local leader-surface preference record had not flushed, while keeping ambiguous same-name restores fail-closed.
+- Hardened the remote release gate to stage the exact candidate daemon in an isolated socket, pin serving version and liveness capability, reject invalid Git fixtures immediately, clean failed fixtures, and bundle the Rust CLIs used by installed-app E2E.
+
+Thanks to Jinwoo Jeong for the production reproduction and verification.
+
 ## [0.212.0] - 2026-08-24
 
 ### Fixed
