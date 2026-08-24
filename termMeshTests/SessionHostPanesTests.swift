@@ -88,6 +88,25 @@ final class SessionHostPanesTests: XCTestCase {
         XCTAssertNotEqual(SessionHostPanes.hostedProjectLayoutSignature(project), original)
     }
 
+    func test_hostLayoutFinalizationIdentityChangesWhenWorkspaceIsRecreated() {
+        var project = Termmesh_Peer_V1_Team()
+        project.projectID = "team:hosted"
+        project.presentationRevision = 3
+        project.leaderSurfaceID = sid(1)
+        let firstWorkspace = UUID()
+        let replacementWorkspace = UUID()
+
+        XCTAssertNotEqual(
+            SessionHostPanes.hostedProjectLayoutFinalizationID(
+                project: project, workspaceID: firstWorkspace
+            ),
+            SessionHostPanes.hostedProjectLayoutFinalizationID(
+                project: project, workspaceID: replacementWorkspace
+            ),
+            "a replacement workspace must not inherit the old workspace's finalized state"
+        )
+    }
+
     func test_sessionHostStartupRetryOutlivesSlowSiblingDaemonStartup() {
         let total = RemoteHostStore.sessionHostStartupRetryDelays.reduce(0.0) { sum, delay in
             sum + Double(delay.components.seconds)

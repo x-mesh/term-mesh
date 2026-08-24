@@ -117,6 +117,12 @@ enum SessionHostPanes {
         return "\(project.projectID)|\(project.presentationRevision)|\(surfaces)"
     }
 
+    static func hostedProjectLayoutFinalizationID(
+        project: Termmesh_Peer_V1_Team, workspaceID: UUID
+    ) -> String {
+        "\(workspaceID.uuidString)|\(hostedProjectLayoutSignature(project))"
+    }
+
     struct ProjectClaim: Equatable {
         let projectID: String
         let name: String
@@ -1109,11 +1115,13 @@ extension SessionHostPanes {
             selectedProjectIDs.contains($0.key)
         }
         for project in snapshot.teams where selectedProjectIDs.contains(project.projectID) {
-            let signature = hostedProjectLayoutSignature(project)
-            guard finalizedProjectLayoutSignatures[project.projectID] != signature,
-                  let workspace = managers.lazy.flatMap(\.tabs).first(where: {
+            guard let workspace = managers.lazy.flatMap(\.tabs).first(where: {
                     WorkspaceProjectNames.shared.projectID(for: $0.id) == project.projectID
                   }),
+                  finalizedProjectLayoutSignatures[project.projectID]
+                    != hostedProjectLayoutFinalizationID(
+                        project: project, workspaceID: workspace.id
+                    ),
                   finalizeHostedProjectLayout(
                     project: project,
                     workspace: workspace,
@@ -1121,7 +1129,8 @@ extension SessionHostPanes {
                     layoutStore: nil
                   ) != nil
             else { continue }
-            finalizedProjectLayoutSignatures[project.projectID] = signature
+            finalizedProjectLayoutSignatures[project.projectID] =
+                hostedProjectLayoutFinalizationID(project: project, workspaceID: workspace.id)
         }
         if opened > 0 {
             RemoteWorkLog.info(
