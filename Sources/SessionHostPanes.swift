@@ -82,6 +82,41 @@ enum SessionHostPanes {
         projectClaimsBySurfaceID(teams: teams).mapValues(\.name)
     }
 
+    @discardableResult
+    static func finalizeHostedProjectLayout(
+        project: Termmesh_Peer_V1_Team,
+        workspace: Workspace,
+        anchorPanelID: UUID?,
+        layoutStore: ProjectPresentationLayoutStore? = nil
+    ) -> TeamOrchestrator.ProjectPresentationLayoutRestoreOutcome? {
+        guard !project.projectID.isEmpty,
+              let leaderPanelID = workspace.panelID(
+                forPeerSurfaceID: project.leaderSurfaceID
+              )
+        else { return nil }
+        let agentPanelIDs = project.members.compactMap { member in
+            workspace.panelID(forPeerSurfaceID: member.surfaceID)
+        }
+        guard agentPanelIDs.count == project.members.count else { return nil }
+        return TeamOrchestrator.shared.finalizeRestoredProjectLayout(
+            projectID: project.projectID,
+            workspace: workspace,
+            anchorPanelID: anchorPanelID,
+            leaderPanelID: leaderPanelID,
+            agentPanelIDs: agentPanelIDs,
+            restoreFocus: false,
+            layoutStore: layoutStore
+        )
+    }
+
+    static func hostedProjectLayoutSignature(_ project: Termmesh_Peer_V1_Team) -> String {
+        let surfaces = ([project.leaderSurfaceID] + project.members.map(\.surfaceID))
+            .map { $0.base64EncodedString() }
+            .sorted()
+            .joined(separator: ",")
+        return "\(project.projectID)|\(project.presentationRevision)|\(surfaces)"
+    }
+
     struct ProjectClaim: Equatable {
         let projectID: String
         let name: String
@@ -772,6 +807,7 @@ enum SessionHostPanes {
     private static var reconcileInFlight = false
 
     private static var pollTask: Task<Void, Never>?
+    private static var finalizedProjectLayoutSignatures: [String: String] = [:]
 }
 
 extension SessionHostPanes {
@@ -929,8 +965,6 @@ extension SessionHostPanes {
         )
         let agentIDs = Set(routed.agent)
         let wanted = routed.terminal + routed.agent
-        guard !wanted.isEmpty else { return 0 }
-
         var opened = 0
         var autoCreatedAnchors: [UUID: UUID] = [:]
         var autoCreatedWorkspaceIDs = Set<UUID>()
@@ -1069,6 +1103,25 @@ extension SessionHostPanes {
                     "could not show session \(info.title.isEmpty ? "?" : info.title): \(error)"
                 )
             }
+        }
+        let selectedProjectIDs = Set(projectClaims.values.map(\.projectID))
+        finalizedProjectLayoutSignatures = finalizedProjectLayoutSignatures.filter {
+            selectedProjectIDs.contains($0.key)
+        }
+        for project in snapshot.teams where selectedProjectIDs.contains(project.projectID) {
+            let signature = hostedProjectLayoutSignature(project)
+            guard finalizedProjectLayoutSignatures[project.projectID] != signature,
+                  let workspace = managers.lazy.flatMap(\.tabs).first(where: {
+                    WorkspaceProjectNames.shared.projectID(for: $0.id) == project.projectID
+                  }),
+                  finalizeHostedProjectLayout(
+                    project: project,
+                    workspace: workspace,
+                    anchorPanelID: autoCreatedAnchors[workspace.id],
+                    layoutStore: nil
+                  ) != nil
+            else { continue }
+            finalizedProjectLayoutSignatures[project.projectID] = signature
         }
         if opened > 0 {
             RemoteWorkLog.info(
