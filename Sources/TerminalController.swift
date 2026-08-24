@@ -50,6 +50,11 @@ class TerminalController {
     #if DEBUG
     var debugPeerShellInspection: [String: Any]?
     var debugProjectDeletionStatus: [String: [String: Any]] = [:]
+    var debugProjectBootstrapStatus: [String: [String: Any]] = [:]
+    /// Async DEBUG calls that intentionally invoke the production New Project
+    /// transaction. Kept separate from deletion status so E2E can prove a
+    /// rejected create did not mutate teams or workspaces.
+    var debugProjectCreationStatus: [String: [String: Any]] = [:]
     var debugPeerRouteProbeStatus: [String: [String: Any]] = [:]
     #endif
 
@@ -1396,6 +1401,12 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugTeamAttachRemote(params: params))
         case "debug.project.create":
             return v2Result(id: id, self.v2DebugProjectCreate(params: params))
+        case "debug.project.create_status":
+            return v2Result(id: id, self.v2DebugProjectCreateStatus(params: params))
+        case "debug.project.creation_attempt":
+            return v2Result(id: id, self.v2DebugProjectCreationAttempt(params: params))
+        case "debug.project.creation_status":
+            return v2Result(id: id, self.v2DebugProjectCreationStatus(params: params))
         case "debug.project.delete":
             return v2Result(id: id, self.v2DebugProjectDelete(params: params))
         case "debug.project.delete_status":
@@ -3804,10 +3815,16 @@ class TerminalController {
             info["working_directory"] = agent.workingDirectory as Any? ?? NSNull()
             info["locality"] = TeamOrchestrator.agentLocality(hostKey: agent.hostKey)
             info["parallel_telemetry"] = [
+                // Agent status has no dispatch to group by, so this is an
+                // identity standing in for the field, never a stated wave. The
+                // companion flag says so explicitly: the same key on a task
+                // object CAN carry a real wave now, and a reader that assumed
+                // one shape for both would count every agent as its own wave.
                 "wave_id": (enrichment["active_task_id"] as? String) ?? agent.instanceId,
+                "wave_id_stated": false,
                 "task_id": enrichment["active_task_id"] ?? NSNull(),
                 "agent_instance_id": agent.instanceId,
-                "host": agent.hostKey ?? NSNull(),
+                "host": agent.hostKey as Any? ?? NSNull(),
                 "locality": TeamOrchestrator.agentLocality(hostKey: agent.hostKey),
                 // The pane's real cwd. A workspace UUID here reads like a
                 // machine identifier and was taken for one.
@@ -4409,6 +4426,24 @@ class TerminalController {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    /// Measurement-only routing fields, read verbatim off the wire.
+    ///
+    /// Pure and static for the same reason as `delegateRequestID`: three RPC
+    /// handlers read these, and a boundary that only compiles is a boundary
+    /// nothing checks. Blank normalizes to nil so an empty flag value cannot
+    /// later read as a stated classification — the whole point of the fields is
+    /// telling "the leader said direct" apart from "the leader said nothing".
+    nonisolated static func routingMeasurement(
+        from params: [String: Any]
+    ) -> (route: String?, waveId: String?) {
+        func value(_ key: String) -> String? {
+            guard let raw = params[key] as? String else { return nil }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return (route: value("route"), waveId: value("wave_id"))
+    }
+
     /// What is holding the pool, phrased so the next command is obvious.
     ///
     /// `review_ready` is the common one and the reason this exists: it is not a
@@ -4497,6 +4532,8 @@ class TerminalController {
         let taskTitle = params["task_title"] as? String
         let priority = params["priority"] as? Int
         let context = params["context"] as? String
+        // Measurement only: recorded verbatim, never validated or acted on.
+        let (route, waveId) = TerminalController.routingMeasurement(from: params)
         // The CLI has sent a stable id per delegate since d168ad61, and
         // `TeamDataStore.createTask` has deduped on it since 5c95ab10 — but
         // nothing in between read it, so a retried delegate still created a
@@ -4576,6 +4613,8 @@ class TerminalController {
                     context: context,
                     requestId: requestId,
                     tabManager: tabManager,
+                    route: route,
+                    waveId: waveId,
                     completion: { ok in resume(ok) }
                 )
                 capturedOutcome = outcome
@@ -5633,6 +5672,8 @@ class TerminalController {
         let parentTaskId = params["parent_task_id"] as? String
         let createdBy = params["created_by"] as? String ?? "leader"
         let worktreePolicy = params["worktree_policy"] as? String
+        // Measurement only: recorded verbatim, never validated or acted on.
+        let (route, waveId) = TerminalController.routingMeasurement(from: params)
 
         if let task = store.createTask(
             teamName: teamName,
@@ -5647,7 +5688,9 @@ class TerminalController {
             dependsOn: dependsOn,
             parentTaskId: parentTaskId,
             createdBy: createdBy,
-            worktreePolicy: worktreePolicy
+            worktreePolicy: worktreePolicy,
+            route: route,
+            waveId: waveId
         ) {
             // Note: task notification (sendTextToPanel to leader/assignee) is skipped
             // in the off-main data path. The caller already receives the task data
@@ -6824,6 +6867,8 @@ class TerminalController {
         let parentTaskId = params["parent_task_id"] as? String
         let createdBy = params["created_by"] as? String ?? "leader"
         let worktreePolicy = params["worktree_policy"] as? String
+        // Measurement only: recorded verbatim, never validated or acted on.
+        let (route, waveId) = TerminalController.routingMeasurement(from: params)
         let tabManager = v2ResolveTabManager(params: params)
 
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to create task", data: nil)
@@ -6840,7 +6885,9 @@ class TerminalController {
                 dependsOn: dependsOn,
                 parentTaskId: parentTaskId,
                 createdBy: createdBy,
-                worktreePolicy: worktreePolicy
+                worktreePolicy: worktreePolicy,
+                route: route,
+                waveId: waveId
             ) {
                 if let tabManager {
                     _ = TeamOrchestrator.shared.notifyTaskCreated(

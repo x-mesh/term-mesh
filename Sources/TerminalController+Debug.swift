@@ -786,19 +786,36 @@ extension TerminalController {
                             result = .err(code: "unavailable", message: "no TabManager", data: nil)
                             return
                         }
+                        let operationID = UUID().uuidString
+                        self.debugProjectBootstrapStatus[operationID] = [
+                            "state": "running",
+                            "team": URL(fileURLWithPath: directory).lastPathComponent,
+                        ]
                         Task { @MainActor in
-                            let primaryOwned = (try? await PeerProjectBootstrap.run(
-                                sshTarget: sshTarget, port: host.sshPort,
-                                identityFile: host.identityFile,
-                                plan: plan, gitURL: (gitURL?.isEmpty ?? true) ? nil : gitURL,
-                                // The project's name, the same one the team is
-                                // created under below — not `remotePath`'s leaf,
-                                // which is the host's own directory convention
-                                // and would pin a different id on every machine.
-                                memMeshProjectID: PeerProjectBootstrap.memMeshProjectID(
-                                    for: URL(fileURLWithPath: directory).lastPathComponent
+                            let primaryOwned: Bool
+                            do {
+                                primaryOwned = try await PeerProjectBootstrap.run(
+                                    sshTarget: sshTarget, port: host.sshPort,
+                                    identityFile: host.identityFile,
+                                    plan: plan, gitURL: (gitURL?.isEmpty ?? true) ? nil : gitURL,
+                                    // The project's name, the same one the team is
+                                    // created under below — not `remotePath`'s leaf,
+                                    // which is the host's own directory convention
+                                    // and would pin a different id on every machine.
+                                    memMeshProjectID: PeerProjectBootstrap.memMeshProjectID(
+                                        for: URL(fileURLWithPath: directory).lastPathComponent
+                                    )
                                 )
-                            )) ?? false
+                            } catch {
+                                self.debugProjectBootstrapStatus[operationID] = [
+                                    "state": "failed",
+                                    "team": URL(fileURLWithPath: directory).lastPathComponent,
+                                    "error": PeerProjectBootstrap.remoteFailureDescription(
+                                        error, gitURL: (gitURL?.isEmpty ?? true) ? nil : gitURL
+                                    ),
+                                ]
+                                return
+                            }
                             // Same rule as production: only what this run made.
                             var createdPaths: Set<PeerProjectBootstrap.CreatedPath> = []
                             if primaryOwned {
@@ -821,7 +838,7 @@ extension TerminalController {
                                 return row
                             }
                             precondition(rows.count == plan.agentCheckouts.count)
-                            TeamOrchestrator.shared.createTeam(
+                            let team = TeamOrchestrator.shared.createTeam(
                                 named: URL(fileURLWithPath: directory).lastPathComponent,
                                 rows: rows,
                                 workingDirectory: directory,
@@ -850,9 +867,26 @@ extension TerminalController {
                                 createdPaths: createdPaths,
                                 tabManager: tabManager
                             )
+                            if let team {
+                                self.debugProjectBootstrapStatus[operationID] = [
+                                    "state": "succeeded",
+                                    "team": team.id,
+                                    "workspace_id": team.workspaceId.uuidString,
+                                    "checkouts": plan.agentCheckouts.map {
+                                        ["agent": $0.agent, "path": $0.path, "branch": $0.branch]
+                                    },
+                                ]
+                            } else {
+                                self.debugProjectBootstrapStatus[operationID] = [
+                                    "state": "failed",
+                                    "team": URL(fileURLWithPath: directory).lastPathComponent,
+                                    "error": "team creation failed after checkout preparation",
+                                ]
+                            }
                         }
                         result = .ok([
                             "team": URL(fileURLWithPath: directory).lastPathComponent,
+                            "operation_id": operationID,
                             "primary": plan.primaryPath,
                             "checkouts": plan.agentCheckouts.map { ["agent": $0.agent, "path": $0.path, "branch": $0.branch] },
                         ])
@@ -971,12 +1005,167 @@ extension TerminalController {
         return result
     }
 
+    func v2DebugProjectCreateStatus(params: [String: Any]) -> V2CallResult {
+        guard let operationID = params["operation_id"] as? String,
+              !operationID.isEmpty else {
+            return .err(code: "invalid_params", message: "operation_id is required", data: nil)
+        }
+        guard let status = debugProjectBootstrapStatus[operationID] else {
+            return .err(code: "not_found", message: "project creation operation not found", data: nil)
+        }
+        return .ok(status)
+    }
+
     static func debugProjectPreset(
         named name: String,
         presets: [AgentRolePreset]
     ) -> AgentRolePreset? {
         presets.first(where: { $0.name == name })
             ?? AgentRolePresetManager.builtInPresets.first(where: { $0.name == name })
+    }
+
+    /// Calls the real `ProjectCreationFlow.create` entry point. Unlike
+    /// `debug.project.create`, this exists specifically to prove that its
+    /// duplicate-name rejection happens before checkouts, teams or workspaces
+    /// are mutated.
+    func v2DebugProjectCreationAttempt(params: [String: Any]) -> V2CallResult {
+        guard let name = params["name"] as? String, !name.isEmpty,
+              let directory = params["directory"] as? String, !directory.isEmpty,
+              let tabManager
+        else {
+            return .err(code: "invalid_params", message: "name and directory are required", data: nil)
+        }
+        let operationID = UUID().uuidString
+        let beforeTeams = TeamOrchestrator.shared.teams.count
+        let beforeWorkspaces = tabManager.tabs.count
+        let beforeParticipants = TeamOrchestrator.shared.teams.values.reduce(0) {
+            $0 + 1 + $1.agents.count
+        }
+        let beforeOwnedCheckouts = TeamOrchestrator.shared.teams.values.reduce(0) {
+            $0 + $1.remoteProjectLocations.filter(\.owned).count
+        }
+        let beforeProcesses = ProcessTreeSnapshot.currentDescendantPIDs(
+            of: ProcessInfo.processInfo.processIdentifier
+        )?.count ?? -1
+        let windowID = AppDelegate.shared?.windowId(for: tabManager)
+        let sheetWasOpen = windowID.flatMap {
+            AppDelegate.shared?.mainWindowSheetCoordinator(for: $0)?.activeSheetID
+        } == MainWindowSheet.projectCreation.id
+        debugProjectCreationStatus[operationID] = [
+            "state": "running", "name": name,
+            "before_team_count": beforeTeams,
+            "before_workspace_count": beforeWorkspaces,
+            "before_participant_count": beforeParticipants,
+            "before_owned_checkout_count": beforeOwnedCheckouts,
+            "before_process_count": beforeProcesses,
+            "sheet_was_open": sheetWasOpen,
+        ]
+        Task { @MainActor in
+            let source = ProjectSource(
+                hostKey: nil, projectPath: directory, gitURL: "",
+                isolateAgents: false, kind: .existingFolder
+            )
+            let leader = ProjectLeader(mode: "repl", model: "", endpoint: .local)
+            do {
+                _ = try await ProjectCreationFlow.create(
+                    name: name, directory: directory, rows: [], source: source,
+                    leader: leader, tabManager: tabManager
+                )
+                self.debugProjectCreationStatus[operationID] = [
+                    "state": "created", "name": name,
+                    "before_team_count": beforeTeams,
+                    "before_workspace_count": beforeWorkspaces,
+                    "after_team_count": TeamOrchestrator.shared.teams.count,
+                    "after_workspace_count": tabManager.tabs.count,
+                    "after_participant_count": TeamOrchestrator.shared.teams.values.reduce(0) {
+                        $0 + 1 + $1.agents.count
+                    },
+                    "after_owned_checkout_count": TeamOrchestrator.shared.teams.values.reduce(0) {
+                        $0 + $1.remoteProjectLocations.filter(\.owned).count
+                    },
+                    "after_process_count": ProcessTreeSnapshot.currentDescendantPIDs(
+                        of: ProcessInfo.processInfo.processIdentifier
+                    )?.count ?? -1,
+                ]
+            } catch let ProjectCreationFlow.CreationError.nameConflict(conflict) {
+                let (kind, action): (String, String) = switch conflict {
+                case .exactLive: ("exact_live", "open_existing")
+                case .exactDetached: ("exact_detached", "open_existing")
+                case .incomplete: ("incomplete", "resume_setup")
+                case .localNameCollision: ("local_name_collision", "rename")
+                case .remoteNameCollision: ("remote_name_collision", "rename")
+                case .reservedByAnotherRequest: ("reserved", "wait")
+                case .none: ("none", "create")
+                }
+                self.debugProjectCreationStatus[operationID] = [
+                    "state": "conflict", "name": name,
+                    "conflict": kind, "action": action,
+                    "location": Self.debugProjectConflictLocation(conflict),
+                    "sheet_stays_open": windowID.flatMap {
+                        AppDelegate.shared?.mainWindowSheetCoordinator(for: $0)?.activeSheetID
+                    } == MainWindowSheet.projectCreation.id,
+                    "shows_creation_failure_actions": false,
+                    "progress_state": "conflict",
+                    "before_team_count": beforeTeams,
+                    "before_workspace_count": beforeWorkspaces,
+                    "after_team_count": TeamOrchestrator.shared.teams.count,
+                    "after_workspace_count": tabManager.tabs.count,
+                    "before_participant_count": beforeParticipants,
+                    "after_participant_count": TeamOrchestrator.shared.teams.values.reduce(0) {
+                        $0 + 1 + $1.agents.count
+                    },
+                    "before_owned_checkout_count": beforeOwnedCheckouts,
+                    "after_owned_checkout_count": TeamOrchestrator.shared.teams.values.reduce(0) {
+                        $0 + $1.remoteProjectLocations.filter(\.owned).count
+                    },
+                    "before_process_count": beforeProcesses,
+                    "after_process_count": ProcessTreeSnapshot.currentDescendantPIDs(
+                        of: ProcessInfo.processInfo.processIdentifier
+                    )?.count ?? -1,
+                ]
+            } catch {
+                self.debugProjectCreationStatus[operationID] = [
+                    "state": "failed", "name": name,
+                    "error": error.localizedDescription,
+                    "before_team_count": beforeTeams,
+                    "before_workspace_count": beforeWorkspaces,
+                    "after_team_count": TeamOrchestrator.shared.teams.count,
+                    "after_workspace_count": tabManager.tabs.count,
+                ]
+            }
+        }
+        return .ok(["started": true, "operation_id": operationID])
+    }
+
+    nonisolated static func debugProjectConflictLocation(
+        _ conflict: TeamOrchestrator.ProjectNameConflict
+    ) -> String {
+        let record: TeamOrchestrator.ProjectConflictRecord? = switch conflict {
+        case .exactLive(let record), .exactDetached(let record),
+             .incomplete(let record), .localNameCollision(let record),
+             .remoteNameCollision(let record):
+            record
+        case .none, .reservedByAnotherRequest:
+            nil
+        }
+        guard let record else { return "none" }
+        return switch record.location {
+        case .currentWindow: "current_window"
+        case .otherWindow: "other_window"
+        case .detached: "detached"
+        case .remote(_, let hostName): "remote:\(hostName)"
+        }
+    }
+
+    func v2DebugProjectCreationStatus(params: [String: Any]) -> V2CallResult {
+        guard let operationID = params["operation_id"] as? String,
+              !operationID.isEmpty else {
+            return .err(code: "invalid_params", message: "operation_id is required", data: nil)
+        }
+        guard let status = debugProjectCreationStatus[operationID] else {
+            return .err(code: "not_found", message: "creation operation not found", data: nil)
+        }
+        return .ok(status)
     }
 
     func v2DebugProjectDelete(params: [String: Any]) -> V2CallResult {

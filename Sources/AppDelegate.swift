@@ -275,6 +275,7 @@ struct TermMeshWindowRoot<Content: View>: View {
                 )
             },
             onClose: { sheetCoordinator.dismiss() },
+            tabManager: tabManager,
             onDiscard: { name in
                 do {
                     try await TeamOrchestrator.shared.deleteProject(

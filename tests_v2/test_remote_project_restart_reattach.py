@@ -409,6 +409,19 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
     )
     if created.get("team") != team_name:
         raise termmeshError(f"remote project was not created: {created!r}")
+    operation_id = str(created.get("operation_id") or "")
+    if not operation_id:
+        raise termmeshError(f"remote Project bootstrap returned no operation id: {created!r}")
+
+    def bootstrap_finished():
+        status = c.debug_project_create_status(operation_id)
+        if status.get("state") == "failed":
+            raise termmeshError(f"remote Project bootstrap failed: {status.get('error')!r}")
+        return status if status.get("state") == "succeeded" else None
+
+    bootstrap = _wait(bootstrap_finished, timeout_s=90)
+    if bootstrap is None:
+        raise termmeshError("remote Project bootstrap did not finish")
     checkouts = created.get("checkouts")
     if not isinstance(checkouts, list) or len(checkouts) != len(roles):
         raise termmeshError(

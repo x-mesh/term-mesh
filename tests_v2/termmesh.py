@@ -1448,6 +1448,21 @@ class termmesh:
             params["preset_id"] = preset_id
         return dict(self._call("debug.project.create", params) or {})
 
+    def debug_project_creation_attempt(self, name: str, directory: str) -> dict:
+        return dict(self._call("debug.project.creation_attempt", {
+            "name": name, "directory": directory,
+        }) or {})
+
+    def debug_project_create_status(self, operation_id: str) -> dict:
+        return dict(self._call("debug.project.create_status", {
+            "operation_id": operation_id,
+        }) or {})
+
+    def debug_project_creation_status(self, operation_id: str) -> dict:
+        return dict(self._call("debug.project.creation_status", {
+            "operation_id": operation_id,
+        }) or {})
+
     def debug_project_delete(self, team_name: str) -> dict:
         return dict(self._call("debug.project.delete", {"team": team_name}) or {})
 

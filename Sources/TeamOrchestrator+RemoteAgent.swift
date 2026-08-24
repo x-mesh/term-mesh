@@ -352,6 +352,101 @@ final class PeerAgentPaneRecoveryCoordinator {
 }
 
 extension TeamOrchestrator {
+    /// Capture every namespace owner relevant to New Project. The snapshot is
+    /// read-only and spans all windows, preserved/detached viewers and live
+    /// remote manifests, so callers do not grow subtly different preflight
+    /// rules.
+    func projectConflictRecords(
+        currentTabManager: TabManager?,
+        hosts providedHosts: [HostEntry]? = nil
+    ) -> [ProjectConflictRecord] {
+        let hosts = providedHosts ?? RemoteHostStore.shared.sortedHosts
+        let currentWindowID = currentTabManager.flatMap {
+            AppDelegate.shared?.windowId(for: $0)
+        }
+        var records: [ProjectConflictRecord] = teams.values.map { team in
+            let identity = ProjectCreationIdentity(
+                projectID: Self.effectiveRemotePresentationProjectID(
+                    storedProjectID: team.remotePresentationProjectID,
+                    teamUUID: team.teamUuid, teamName: team.id
+                ),
+                // `workingDirectory` is the local source/working checkout. A
+                // remote leader does not move that checkout to its host.
+                hostKey: nil,
+                workingDirectory: team.workingDirectory
+            )
+            let location: ProjectConflictLocation
+            if let context = AppDelegate.shared?.contextContainingTabId(team.workspaceId) {
+                if context.windowId == currentWindowID {
+                    location = .currentWindow(
+                        windowID: context.windowId, workspaceID: team.workspaceId
+                    )
+                } else {
+                    location = .otherWindow(
+                        windowID: context.windowId, workspaceID: team.workspaceId
+                    )
+                }
+            } else {
+                location = .detached(workspaceID: team.workspaceId)
+            }
+            return ProjectConflictRecord(
+                name: team.id, identity: identity, location: location,
+                teamName: team.id, leaderReady: team.leaderReady,
+                failureDescription: team.leaderFailureDescription
+            )
+        }
+
+        // A Project may have its source checkout on a peer while its local
+        // `workingDirectory` is only the viewer/leader fallback. Preserve the
+        // same Project/location metadata but expose every recorded checkout as
+        // an identity alias so exact host+path matching does not depend on the
+        // leader placement.
+        let localRecords = records
+        for record in localRecords {
+            guard let teamName = record.teamName, let team = teams[teamName] else { continue }
+            for location in team.remoteProjectLocations {
+                var alias = record
+                alias.identity = ProjectCreationIdentity(
+                    projectID: record.identity.projectID,
+                    hostKey: location.hostKey,
+                    workingDirectory: location.path
+                )
+                records.append(alias)
+            }
+        }
+
+        for host in hosts where host.isConnected {
+            for remote in host.teams {
+                records.append(ProjectConflictRecord(
+                    name: remote.name,
+                    identity: ProjectCreationIdentity(
+                        projectID: remote.projectID, hostKey: host.id,
+                        workingDirectory: remote.workingDirectory
+                    ),
+                    location: .remote(hostKey: host.id, hostName: host.displayName),
+                    teamName: remote.name,
+                    leaderReady: remote.leaderProcessActiveKnown
+                        ? remote.leaderProcessActive : !remote.leaderSurfaceID.isEmpty,
+                    failureDescription: remote.leaderProcessActiveKnown
+                        && !remote.leaderProcessActive
+                        ? "Remote leader process is not active" : nil
+                ))
+            }
+        }
+        return records
+    }
+
+    func projectNameConflict(
+        name: String,
+        identity: ProjectCreationIdentity,
+        currentTabManager: TabManager?
+    ) -> ProjectNameConflict {
+        Self.classifyProjectNameConflict(
+            requestedName: name, requestedIdentity: identity,
+            candidates: projectConflictRecords(currentTabManager: currentTabManager)
+        )
+    }
+
     /// Publish complete remote presentation descriptors after the normal team
     /// state funnel runs. A viewer restart must learn this from the daemon;
     /// local UserDefaults/live snapshots are intentionally not part of the
@@ -3210,6 +3305,20 @@ extension TeamOrchestrator {
             teamName: teamName,
             closedPanelID: panelID
         )
+    }
+
+    /// Resume is explicit, but it still must not turn a merely existing local
+    /// pane into a successful recovery. Remote leaders have a reconstruction
+    /// protocol; local leaders currently do not, so local incomplete state
+    /// remains visible until readiness is authoritative.
+    func resumeIncompleteProjectSetup(teamName: String) async -> Bool {
+        guard let team = teams[teamName] else { return false }
+        switch team.leaderEndpoint {
+        case .peer:
+            return await recoverRemoteLeaderIfNeeded(teamName: teamName)
+        case .local:
+            return team.leaderReady
+        }
     }
 
     /// Rebuild the local workspace for a live peer-backed project whose
@@ -7277,6 +7386,8 @@ extension TeamOrchestrator {
         /// for a caller that did not run a bootstrap.
         createdPaths: Set<PeerProjectBootstrap.CreatedPath> = [],
         onRemoteAttach: ((RemoteAttachOutcome) -> Void)? = nil,
+        projectCreationReservation: ProjectCreationReservation? = nil,
+        projectCreationIdentity: ProjectCreationIdentity? = nil,
         tabManager: TabManager
     ) -> Team? {
         // Peer attachment is asynchronous. Record the requested endpoint from
@@ -7396,6 +7507,8 @@ extension TeamOrchestrator {
             leaderEndpoint: initialLeaderEndpoint,
             launchLeaderLocally: launchLeaderLocally,
             agentInstanceIds: rows.filter { $0.hostKey == nil }.map { $0.id.uuidString },
+            projectCreationReservation: projectCreationReservation,
+            projectCreationIdentity: projectCreationIdentity,
             tabManager: tabManager
         ) else { return nil }
 
@@ -7615,6 +7728,12 @@ extension TeamOrchestrator {
         guard let team = teams[teamName] else {
             throw RemoteAgentError.teamNotFound(teamName)
         }
+        // Destructive Project actions follow the workspace owner. A sheet in
+        // window A may resolve an incomplete Project in window B; using A's
+        // manager removes metadata while leaving B's workspace and processes
+        // alive. Resolve once, before any teardown side effect.
+        let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId)
+            ?? tabManager
         let deletionSuppression: String? = {
             guard case let .peer(hostKey) = team.leaderEndpoint,
                   let projectID = team.remotePresentationProjectID

@@ -1,5 +1,7 @@
 import XCTest
 import Observation
+import AppKit
+import SwiftUI
 
 #if canImport(term_mesh_DEV)
 @testable import term_mesh_DEV
@@ -2759,6 +2761,40 @@ final class AgentSessionTests: XCTestCase {
         let clis = ["claude", "codex", "kiro", "cursor", "agy", "gemini"]
         let drawn = Set(clis.map { AgentPanelView.mascot(for: $0).joined() })
         XCTAssertEqual(drawn.count, clis.count)
+    }
+
+    /// A peer title includes its host, and the header used to make that whole
+    /// string horizontally fixed. SwiftUI then reported the title's ideal
+    /// width instead of the pane proposal, so Bonsplit clipped the oversized
+    /// view and every transcript row wrapped outside the visible pane.
+    func testLongRemoteAgentNameDoesNotSetPaneMinimumWidth() {
+        let panel = AgentPanel(
+            agentName: "reviewer @jinwoo-macbook-pro-sub-with-a-deliberately-long-host-name",
+            teamName: "layout-test",
+            workingDirectory: "/tmp/layout-test",
+            cli: "claude",
+            color: "green"
+        )
+        panel.runtimeOwnership = .peerOwned(hostName: "jinwoo-macbook-pro-sub")
+        let view = AgentPanelView(
+            panel: panel,
+            isFocused: false,
+            isVisibleInUI: true,
+            appearance: PanelAppearance(
+                dividerColor: .secondary,
+                unfocusedOverlayNSColor: .clear,
+                unfocusedOverlayOpacity: 0
+            ),
+            onFocus: {}
+        )
+        let proposed = NSSize(width: 320, height: 480)
+        let fitted = NSHostingController(rootView: view).sizeThatFits(in: proposed)
+
+        XCTAssertLessThanOrEqual(
+            fitted.width,
+            proposed.width,
+            "the native pane must wrap to Bonsplit's width, not its title's ideal width"
+        )
     }
 
     // MARK: - Which CLIs a picker may offer
