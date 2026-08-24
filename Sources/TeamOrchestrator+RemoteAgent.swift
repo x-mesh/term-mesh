@@ -1599,6 +1599,8 @@ extension TeamOrchestrator {
         let workspace: Workspace
         var promptFile: String?
         var launchFile: String?
+        var turnHookFile: String?
+        var participationControlFile: String?
         var hostSockPath: String
         var surfaceID: Data?
         var session: PeerPaneSession?
@@ -1644,6 +1646,14 @@ extension TeamOrchestrator {
                 await TeamOrchestrator.removeRemoteLeaderFile(
                     host: host,
                     path: launchFile
+                )
+            }
+            if let turnHookFile {
+                await TeamOrchestrator.removeRemoteLeaderFile(host: host, path: turnHookFile)
+            }
+            if let participationControlFile {
+                await TeamOrchestrator.removeRemoteLeaderFile(
+                    host: host, path: participationControlFile
                 )
             }
         }
@@ -2725,6 +2735,30 @@ extension TeamOrchestrator {
             try await attempt.ensureCurrent()
         }
 
+        let turnHookFile: String?
+        if cli.lowercased() == "claude", let hookData = Self.localLeaderTurnHookData() {
+            turnHookFile = await Self.writeRemoteLeaderTurnHookOverSSH(
+                host: host, hookData: hookData, teamUUID: teamUUID
+            )
+            resources.turnHookFile = turnHookFile
+        } else {
+            turnHookFile = nil
+        }
+        let participationControlFile: String?
+        if cli.lowercased() == "claude", turnHookFile != nil,
+           let controlData = Self.leaderParticipationControlData(
+               teamName: teamName, sessionID: team.leaderSessionId, supportedLeader: true
+           ) {
+            participationControlFile = await Self.writeRemoteLeaderFileOverSSH(
+                host: host, data: controlData,
+                fileName: Self.remoteLeaderParticipationControlFileName(teamUUID: teamUUID),
+                mode: "600"
+            )
+            resources.participationControlFile = participationControlFile
+        } else {
+            participationControlFile = nil
+        }
+
         let launch = Self.remoteLeaderCommand(
             cli: cli,
             model: model,
@@ -2734,7 +2768,9 @@ extension TeamOrchestrator {
             leaderRequestToken: TeamDataStore.shared.prepareLeaderRequestToken(teamName: teamName),
             systemPromptFile: promptFile,
             environment: remoteEnvironment,
-            hostBinDirs: host.hostCLIBinDirs
+            hostBinDirs: host.hostCLIBinDirs,
+            turnHookFile: turnHookFile,
+            participationControlFile: participationControlFile
         )
         var command = Self.remoteLeaderCommandCheckingPrompt(
             launch: launch,
@@ -2806,6 +2842,12 @@ extension TeamOrchestrator {
             title: "👑 Leader (\(cli.capitalized)) @\(host.displayName)"
         )
         markLeaderPolicyState(teamName: teamName, state: "injected")
+        setLeaderMeasurementCapability(
+            teamName: teamName,
+            capability: cli.lowercased() == "claude"
+                ? (turnHookFile == nil ? .degraded : .supported)
+                : .unsupported
+        )
         replaceLeaderEndpoint(
             teamName: teamName,
             panelID: panel.id,
@@ -4075,6 +4117,107 @@ extension TeamOrchestrator {
                   !path.contains("\0"),
                   (path as NSString).lastPathComponent == fileName
             else { return nil }
+            return path
+        } catch {
+            return nil
+        }
+    }
+
+    static func remoteLeaderTurnHookSSHStageCommand(fileName: String) -> String {
+        let quotedName = shellQuoted((fileName as NSString).lastPathComponent)
+        return RemotePasteTransfer.serviceAccountCommand(
+            "umask 077; d=\"${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/leader-hooks\"; "
+                + "mkdir -p \"$d\" && chmod 700 \"$d\" || exit 1; "
+                + "p=\"$d\"/\(quotedName); t=\"$p.tmp.$$\"; "
+                + "trap 'rm -f \"$t\"' 0 1 2 15; "
+                + "if cat > \"$t\" && chmod 700 \"$t\" && mv -f \"$t\" \"$p\"; "
+                + "then trap - 0 1 2 15; printf %s \"$p\"; else exit 1; fi"
+        )
+    }
+
+    static func localLeaderTurnHookData() -> Data? {
+        [
+            Bundle.main.resourceURL?.appendingPathComponent("scripts/leader-turn-hook.sh"),
+            URL(fileURLWithPath: "scripts/leader-turn-hook.sh"),
+        ].compactMap { $0 }.compactMap { try? Data(contentsOf: $0) }.first
+    }
+
+    static func remoteLeaderTurnHookFileName(teamUUID: String) -> String {
+        let safeID = teamUUID.filter {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "." || $0 == "_" || $0 == "-")
+        }
+        return "leader-turn-\(safeID.isEmpty ? "unknown" : safeID).sh"
+    }
+
+    static func remoteLeaderParticipationControlFileName(teamUUID: String) -> String {
+        let safeID = teamUUID.filter {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "." || $0 == "_" || $0 == "-")
+        }
+        return "leader-participation-\(safeID.isEmpty ? "unknown" : safeID).json"
+    }
+
+    static func remoteLeaderFileSSHStageCommand(fileName: String, mode: String) -> String {
+        let quotedName = shellQuoted((fileName as NSString).lastPathComponent)
+        let safeMode = mode == "700" ? "700" : "600"
+        return RemotePasteTransfer.serviceAccountCommand(
+            "umask 077; d=\"${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/leader-hooks\"; "
+                + "mkdir -p \"$d\" && chmod 700 \"$d\" || exit 1; "
+                + "p=\"$d\"/\(quotedName); t=\"$p.tmp.$$\"; "
+                + "trap 'rm -f \"$t\"' 0 1 2 15; "
+                + "if cat > \"$t\" && chmod \(safeMode) \"$t\" && mv -f \"$t\" \"$p\"; "
+                + "then trap - 0 1 2 15; printf %s \"$p\"; else exit 1; fi"
+        )
+    }
+
+    private static func writeRemoteLeaderFileOverSSH(
+        host: HostEntry, data: Data, fileName: String, mode: String
+    ) async -> String? {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return nil }
+        do {
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget, port: host.sshPort, identityFile: host.identityFile,
+                script: remoteLeaderFileSSHStageCommand(fileName: fileName, mode: mode),
+                standardInput: data, timeoutSeconds: 20
+            )
+            let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard path.hasPrefix("/"), !path.contains("\n"),
+                  (path as NSString).lastPathComponent == fileName else { return nil }
+            return path
+        } catch {
+            return nil
+        }
+    }
+
+    static func refreshRemoteLeaderParticipationControl(
+        hostKey: String, teamUUID: String, teamName: String, sessionID: String,
+        supportedLeader: Bool
+    ) async {
+        guard let host = await MainActor.run(body: {
+            RemoteHostStore.shared.sortedHosts.first { $0.id == hostKey }
+        }), let data = leaderParticipationControlData(
+            teamName: teamName, sessionID: sessionID, supportedLeader: supportedLeader
+        ) else { return }
+        _ = await writeRemoteLeaderFileOverSSH(
+            host: host, data: data,
+            fileName: remoteLeaderParticipationControlFileName(teamUUID: teamUUID),
+            mode: "600"
+        )
+    }
+
+    private static func writeRemoteLeaderTurnHookOverSSH(
+        host: HostEntry, hookData: Data, teamUUID: String
+    ) async -> String? {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return nil }
+        let fileName = remoteLeaderTurnHookFileName(teamUUID: teamUUID)
+        do {
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget, port: host.sshPort, identityFile: host.identityFile,
+                script: remoteLeaderTurnHookSSHStageCommand(fileName: fileName),
+                standardInput: hookData, timeoutSeconds: 20
+            )
+            let path = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard path.hasPrefix("/"), !path.contains("\n"),
+                  (path as NSString).lastPathComponent == fileName else { return nil }
             return path
         } catch {
             return nil
@@ -8395,7 +8538,9 @@ extension TeamOrchestrator {
         // CLI's own sandbox; a leader's do not, so only it needs the socket
         // that sandbox denies. Widening every peer worker to full access
         // without a failure that calls for it is not a change to make quietly.
-        needsSocketAccess: Bool = false
+        needsSocketAccess: Bool = false,
+        turnHookFile: String? = nil,
+        participationControlFile: String? = nil
     ) -> String {
         let quotedDir = workingDirectory.replacingOccurrences(of: "'", with: "'\\''")
         // `mkdir -p` before `cd`, because a project on another machine has
@@ -8416,15 +8561,30 @@ extension TeamOrchestrator {
         let quotedModel = shellQuoted(model)
         switch cli {
         case "claude":
+            let settings = turnHookFile.flatMap(Self.remoteLeaderTurnHookSettingsJSON)
+                .map { " --settings \(shellQuoted($0))" } ?? ""
+            // The hook must outlive this viewer (the remote Claude process can
+            // keep running across an app restart), but it must not survive the
+            // leader itself. Attach compensation handles pre-launch failures;
+            // this process-lifetime epilogue handles normal exit and Project
+            // cleanup while preserving Claude's exit status.
+            let cleanupFiles = [turnHookFile, participationControlFile]
+                .compactMap { $0 }.map(shellQuoted).joined(separator: " " )
+            let hookCleanup = cleanupFiles.isEmpty
+                ? ""
+                : "; status=$?; rm -f -- \(cleanupFiles); exit \"$status\""
             guard let systemPromptFile else {
-                return "\(enter) && \(envPrefix)claude --model \(quotedModel) --dangerously-skip-permissions"
+                return "\(enter) && \(envPrefix)claude --model \(quotedModel)"
+                    + settings + " --dangerously-skip-permissions" + hookCleanup
             }
             let quotedFile = shellQuoted(systemPromptFile)
             return "\(enter) && TERMMESH_LEADER_PROMPT=$(cat \(quotedFile))"
                 + " && rm -f \(quotedFile)"
                 + " && \(envPrefix)claude --model \(quotedModel)"
                 + " --system-prompt \"$TERMMESH_LEADER_PROMPT\""
+                + settings
                 + " --dangerously-skip-permissions"
+                + hookCleanup
         case "codex", "kiro", "gemini":
             let autonomy = needsSocketAccess ? Self.leaderAutonomyFlags(cli: cli) : []
             let flags = autonomy.isEmpty ? "" : " " + autonomy.joined(separator: " ")
@@ -8443,6 +8603,21 @@ extension TeamOrchestrator {
         default:
             return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)"
         }
+    }
+
+    static func remoteLeaderTurnHookSettingsJSON(path: String) -> String? {
+        let hook: (String) -> [String: Any] = { mode in
+            ["type": "command", "command": "\"\(path)\" \(mode)", "timeout": 10]
+        }
+        let object: [String: Any] = [
+            "hooks": [
+                "UserPromptSubmit": [["matcher": "", "hooks": [hook("--start")]]],
+                "Stop": [["matcher": "", "hooks": [hook("--end")]]],
+            ],
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     /// The flags a leader CLI needs to act without a human at the keyboard.
@@ -8480,7 +8655,9 @@ extension TeamOrchestrator {
         leaderRequestToken: String,
         systemPromptFile: String? = nil,
         environment: [String: String] = [:],
-        hostBinDirs: [String] = []
+        hostBinDirs: [String] = [],
+        turnHookFile: String? = nil,
+        participationControlFile: String? = nil
     ) -> String {
         let hexGrant = grant.grantID.map { String(format: "%02x", $0) }.joined()
         let protectedValues = [
@@ -8490,6 +8667,7 @@ extension TeamOrchestrator {
             ("TERMMESH_LEADER_EXPIRES_AT", String(grant.expiresAtUnixSecs)),
             ("TERMMESH_LEADER_PEER_ID", PeerIdentity.hexString(PeerIdentity.defaultPeerID())),
             ("TERMMESH_LEADER_REQUEST_TOKEN", leaderRequestToken),
+            ("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE", participationControlFile ?? ""),
             ("TERMMESH_TEAM", teamName),
         ]
         let savedPrefix = "TERMMESH_SAVED_"
@@ -8510,7 +8688,9 @@ extension TeamOrchestrator {
             systemPromptFile: systemPromptFile,
             environment: environment.filter { $0.key == "PATH" },
             hostBinDirs: hostBinDirs,
-            needsSocketAccess: true
+            needsSocketAccess: true,
+            turnHookFile: turnHookFile,
+            participationControlFile: participationControlFile
         )
         // `export` applies to the final CLI, unlike a shell assignment prefix
         // before `mkdir`, which would have scoped the grant to that one setup

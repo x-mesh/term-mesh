@@ -1422,6 +1422,9 @@ class termmesh:
     def team_list(self) -> List[Dict[str, Any]]:
         return list(self._call("team.list", {}) or [])
 
+    def team_status(self, team_name: str) -> Dict[str, Any]:
+        return dict(self._call("team.status", {"team_name": team_name}) or {})
+
     def debug_project_create(self, directory: str, roles: List[str],
                              leader_cli: str = "claude",
                              leader_model: str = "sonnet",

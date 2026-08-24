@@ -199,13 +199,27 @@ else
     fi
 fi
 
+# A route command creates this short-lived marker after it appends its own
+# turn_route record. Reading a marker is safer than searching a log another
+# process may append to or that GC may rotate between the search and the end.
+ROUTE_STATUS=""
+if [ "$MODE" = --end ]; then
+    ROUTE_KEY="$(printf '%s' "$TURN_ID" | tr -cd 'A-Za-z0-9._-' 2>/dev/null || true)"
+    if [ -n "$ROUTE_KEY" ] && [ -f "$LOG_DIR/.turn-route-$ROUTE_KEY" ]; then
+        ROUTE_STATUS=stated
+        rm -f "$LOG_DIR/.turn-route-$ROUTE_KEY" 2>/dev/null || true
+    else
+        ROUTE_STATUS=unstated
+    fi
+fi
+
 TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
 [ -n "$TS" ] || TS=unknown
 
 if [ "$MODE" = --start ]; then
     LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"prompt_bytes\":$PROMPT_BYTES,\"prompt_sha256\":$(json_string "$PROMPT_SHA")}"
 else
-    LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID")}"
+    LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":$(json_string "$ROUTE_STATUS")}"
 fi
 
 # Open the append once per invocation and emit one complete line. Do not retain
