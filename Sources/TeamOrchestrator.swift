@@ -1020,6 +1020,25 @@ final class TeamOrchestrator: ObservableObject {
         /// there means "not known to have been delivered", which is the safe
         /// reading for an old board.
         var textDeliveredAt: Date? = nil
+        /// The leader's own classification of how it routed the request that
+        /// produced this task: `direct`, `probe`, or `parallel`.
+        ///
+        /// Measurement only. Nothing validates or rejects a value, and no
+        /// behavior depends on one — the field exists because the routing
+        /// decision is otherwise unrecoverable after the fact. Reconstructing
+        /// waves from `createdAt` proximity was tried and does not work: the
+        /// share of single-task waves slides continuously from 52% at a 15s
+        /// window to 19% at 600s across the existing boards, with no interval
+        /// where it settles. A leader that does not state a route leaves nil,
+        /// which reads as "not stated" rather than as any particular route.
+        var route: String? = nil
+        /// Groups the tasks of one dispatch. Every task the leader delegates in
+        /// the same wave carries the same value, so wave size is a `GROUP BY`
+        /// rather than a guess about clock gaps.
+        ///
+        /// Optional for the same reason as `route`, and independent of it: a
+        /// caller may group without classifying, or classify without grouping.
+        var waveId: String? = nil
         var result: String?
         var resultPath: String? = nil
         var worktreePolicy: String? = nil
@@ -4902,6 +4921,8 @@ final class TeamOrchestrator: ObservableObject {
         tabManager: TabManager,
         submit: Bool = false,
         panelId: UUID? = nil,
+        route: String? = nil,
+        waveId: String? = nil,
         completion: ((Bool) -> Void)? = nil
     ) -> DelegateOutcome {
         let title = taskTitle?.nilIfBlank ?? String(text.prefix(80))
@@ -4991,7 +5012,9 @@ final class TeamOrchestrator: ObservableObject {
             assignee: agentName,
             assigneeInstanceId: target.agentInstanceId,
             priority: priority ?? 2,
-            requestId: requestId
+            requestId: requestId,
+            route: route,
+            waveId: waveId
         ) else { return .taskCreateFailed }
         // A task that already exists may skip the paste only if that paste is
         // known to have landed. Otherwise this is a retry of a delivery that
@@ -7025,7 +7048,10 @@ final class TeamOrchestrator: ObservableObject {
                 info["working_directory"] = workingDirectory as Any? ?? NSNull()
                 info["locality"] = Self.agentLocality(hostKey: agent.hostKey)
                 info["parallel_telemetry"] = [
+                    // Identity standing in for the field, not a stated wave —
+                    // see the same block in `TerminalController`.
                     "wave_id": (enrichment["active_task_id"] as? String) ?? agent.agentInstanceId,
+                    "wave_id_stated": false,
                     "task_id": enrichment["active_task_id"] ?? NSNull(),
                     "agent_instance_id": agent.agentInstanceId,
                     "host": agent.hostKey as Any? ?? NSNull(),
@@ -8519,7 +8545,9 @@ final class TeamOrchestrator: ObservableObject {
         dependsOn: [String] = [],
         parentTaskId: String? = nil,
         createdBy: String = "leader",
-        worktreePolicy: String? = nil
+        worktreePolicy: String? = nil,
+        route: String? = nil,
+        waveId: String? = nil
     ) -> TeamTask? {
         guard teams[teamName] != nil else { return nil }
         let now = Date()
@@ -8555,6 +8583,8 @@ final class TeamOrchestrator: ObservableObject {
             blockedReason: nil,
             reviewSummary: nil,
             createdBy: normalizedCreatedBy,
+            route: route?.nilIfBlank,
+            waveId: waveId?.nilIfBlank,
             result: nil,
             resultPath: nil,
             worktreePolicy: worktreePolicy?.nilIfBlank,
@@ -8912,6 +8942,16 @@ final class TeamOrchestrator: ObservableObject {
             "blocked_reason": task.blockedReason as Any? ?? NSNull(),
             "review_summary": task.reviewSummary as Any? ?? NSNull(),
             "created_by": task.createdBy,
+            // The same two measurement fields TeamDataStore.taskDictionary
+            // emits. This second serializer is the one `daemonPayload` uses,
+            // so `fleet.state`, `/api/fleet` and every daemon team sync read
+            // through here — omitting them meant a route the leader actually
+            // stated reached board.json but was absent from the surface most
+            // analysis reads, and an absent field is indistinguishable from
+            // "the leader stated nothing". Any field added to one dictionary
+            // has to be added to both.
+            "route": task.route as Any? ?? NSNull(),
+            "wave_id": task.waveId as Any? ?? NSNull(),
             "result": task.result as Any? ?? NSNull(),
             "result_path": task.resultPath as Any? ?? NSNull(),
             "worktree_policy": task.worktreePolicy as Any? ?? NSNull(),
