@@ -2351,6 +2351,46 @@ enum LeaderCommands {
     /// Durable request queue
     #[command(subcommand)]
     Request(LeaderRequestCommands),
+    /// Per-turn measurement records
+    #[command(subcommand)]
+    Turn(LeaderTurnCommands),
+}
+
+#[derive(Subcommand)]
+enum LeaderTurnCommands {
+    /// Record the route this turn took. Measurement only: appends one line to
+    /// `~/.term-mesh/logs/turns.log` and touches no socket, so it works with no
+    /// daemon running and costs a leader nothing on a plain direct-answer turn.
+    ///
+    /// The count of these lines is only half the measurement. The harness hooks
+    /// write `turn_start`/`turn_end` independently; the gap
+    /// `count(turn_start) - count(turn_route)` is the number of turns where the
+    /// leader never reported a route, which is the number this exists to expose.
+    Route {
+        /// Identifies the turn. Omit it and the id is read from the harness
+        /// hook's per-surface state stack (`.turn-current-<surface>`), which is
+        /// what makes the two independent record streams joinable: a value the
+        /// leader invents would never match the `turn_start` the hook wrote.
+        #[arg(long = "turn-id")]
+        turn_id: Option<String>,
+        /// The leader's own classification: `direct`, `probe`, or `parallel`.
+        /// Stored verbatim — an unrecognized value is recorded, never rejected
+        /// and never normalized, because rejecting one would drop exactly the
+        /// anomalies worth seeing.
+        #[arg(long)]
+        route: String,
+        /// How the request was classified before the route was chosen.
+        #[arg(long = "task-shape")]
+        task_shape: Option<String>,
+        /// A risk condition that applied to this turn. Repeatable; every
+        /// occurrence collects into one `risk_reasons` array.
+        #[arg(long = "risk-reason")]
+        risk_reason: Vec<String>,
+        /// Groups this turn with the dispatch wave it produced. Same value as
+        /// the `--wave-id` passed to `delegate`.
+        #[arg(long = "wave-id")]
+        wave_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7414,6 +7454,37 @@ fn main() {
         return;
     }
 
+    // `leader turn route` writes a local append-only record and talks to nothing.
+    // It returns before socket resolution on purpose: the measurement is worthless
+    // if a leader skips the call whenever the daemon happens to be down, and the
+    // gap it measures would then read as "the leader chose not to classify".
+    if let Commands::Leader(LeaderCommands::Turn(LeaderTurnCommands::Route {
+        turn_id,
+        route,
+        task_shape,
+        risk_reason,
+        wave_id,
+    })) = &cli.command
+    {
+        // An omitted --turn-id is filled from the hook's state stack. Falling
+        // back to "unstated" rather than erroring keeps the call cheap enough
+        // that a leader still makes it when no hook is wired — a route record
+        // that joins nothing is worth more than a turn with no record at all.
+        let resolved_turn_id = turn_id
+            .clone()
+            .or_else(turn_id_from_hook_state)
+            .unwrap_or_else(|| "unstated".to_string());
+        print_result(run_leader_turn_route(
+            &resolve_team_name_with_source(cli.team.as_deref()),
+            &resolved_turn_id,
+            route,
+            task_shape.as_deref(),
+            risk_reason,
+            wave_id.as_deref(),
+        ));
+        return;
+    }
+
     let sock = match detect_socket() {
         Some(s) => s,
         None => {
@@ -7573,6 +7644,9 @@ fn main() {
                     }),
                 ),
             },
+            LeaderCommands::Turn(_) => {
+                unreachable!("leader turn commands return before detect_socket()")
+            }
         },
         Commands::Context(sub) => match sub {
             ContextCommands::Set { key, value } => {
@@ -14908,6 +14982,603 @@ fn iso8601_utc_now() -> String {
         .as_secs();
     let (year, month, day, hour, min, sec) = unix_ts_to_ymd_hms(now);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+// ── leader turn records: measurement-only per-turn log ───────────────
+// Two independent record sources, deliberately not joined at write time: the
+// Claude harness hooks write `turn_start`/`turn_end`, and the leader writes
+// `turn_route` through `tm-agent leader turn route`. The gap between the two
+// counts IS the measurement — `count(turn_start) - count(turn_route)` is the
+// number of turns where the leader never stated a route. Recording both from
+// one place would destroy that, because a missing leader report would become
+// indistinguishable from a turn that never happened.
+
+/// `~/.term-mesh/logs/turns.log`.
+///
+/// The `.log` extension is deliberate and load-bearing, not a naming
+/// preference: `scan_logs` in `term-meshd/src/gc.rs` filters on
+/// `extension() == Some("log")`, so a `turns.jsonl` would be an append-only
+/// file that grows without bound and that nothing would ever rotate. The
+/// contents are still one JSON object per line — the extension describes who
+/// manages the file's lifetime, not how to parse it.
+///
+/// Rotation is automatic, not opt-in: `CATEGORY_LOGS` is in `AUTO_CATEGORIES`
+/// (`gc.rs`), and the daemon runs `periodic_safe_sweep` once at startup and
+/// then every six hours (`term-meshd/src/main.rs`). A file over
+/// `LOG_ROTATE_BYTES` (10 MiB) is renamed to `turns.log.1`, so exactly one
+/// generation of history survives. Size the reader's expectations accordingly:
+/// a long-running measurement window may need `turns.log.1` too.
+///
+/// Same directory and the same `create(true).append(true)` discipline as
+/// `wt_log` in `term-meshd/src/worktree.rs`, so the daemon and this CLI stay
+/// consistent about where append-only records live.
+fn turn_log_path() -> Result<PathBuf, String> {
+    let home = env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| "HOME is not set; cannot locate ~/.term-mesh/logs".to_string())?;
+    Ok(Path::new(&home)
+        .join(".term-mesh")
+        .join("logs")
+        .join("turns.log"))
+}
+
+/// Build one `turn_route` record.
+///
+/// Pure and separate from the append so the field stance is testable without
+/// touching a filesystem — the same reason `delegate_rpc_params` is pure.
+///
+/// Stance inherited from 526649a1: `route` is stored verbatim (no validation,
+/// no normalization, no rejection), and an unstated optional field is OMITTED
+/// rather than written as `null`. Absence reads as "not stated"; a `null` would
+/// read as a value, and a blank flag value must not become an empty string that
+/// a later reader counts as a real classification.
+fn turn_route_record(
+    turn_id: &str,
+    route: &str,
+    task_shape: Option<&str>,
+    risk_reasons: &[String],
+    wave_id: Option<&str>,
+    team: &str,
+    surface_id: Option<&str>,
+    ts: &str,
+) -> Value {
+    let mut record = json!({
+        "event": "turn_route",
+        "turn_id": turn_id,
+        "ts": ts,
+        "route": route,
+        "team": team,
+    });
+    if let Some(shape) = task_shape.filter(|v| !v.trim().is_empty()) {
+        record["task_shape"] = json!(shape);
+    }
+    let reasons: Vec<&String> = risk_reasons.iter().filter(|r| !r.trim().is_empty()).collect();
+    if !reasons.is_empty() {
+        record["risk_reasons"] = json!(reasons);
+    }
+    if let Some(wave) = wave_id.filter(|v| !v.trim().is_empty()) {
+        record["wave_id"] = json!(wave);
+    }
+    if let Some(surface) = surface_id.filter(|v| !v.trim().is_empty()) {
+        record["surface_id"] = json!(surface);
+    }
+    record
+}
+
+/// Append one record as a single line.
+///
+/// One `write_all` of a fully-built line, never read-modify-write: the harness
+/// hook appends to this same file concurrently, and a read-then-write would
+/// drop whichever record landed in between.
+///
+/// The file is opened per record and the descriptor is never cached across
+/// calls. That is a correctness requirement, not a style choice: `rotate_log`
+/// (`term-meshd/src/gc.rs`) unlinks any prior `turns.log.1` and then renames
+/// `turns.log` onto it, and the sweep that calls it runs unattended at daemon
+/// startup and every six hours. A descriptor held across a rotation keeps
+/// writing into an inode that the NEXT rotation's `remove_file` deletes, so
+/// those records are lost with no error at the write site. Re-opening the path
+/// each time means a rotation costs at most nothing — the path is simply
+/// recreated by `create(true)` on the following append.
+fn append_turn_record(path: &Path, record: &Value) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    }
+    let mut line = serde_json::to_string(record)
+        .map_err(|e| format!("serialize turn record: {e}"))?;
+    line.push('\n');
+    // Owner-only: the sink stores prompt digests and byte counts, never content,
+    // but a digest next to a short length is still guessable. Whichever writer
+    // creates the file decides its mode, so every writer states 0600 rather than
+    // inheriting umask (the Swift writer passes S_IRUSR|S_IWUSR, the shell hook
+    // sets umask 077). Open-per-record, never a cached handle: term-meshd rotates
+    // this file automatically, and a retained descriptor would keep appending to
+    // the renamed inode that the next rotation unlinks.
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    file.write_all(line.as_bytes())
+        .map_err(|e| format!("append {}: {e}", path.display()))
+}
+
+/// `leader turn route` — record this turn's route and print what was written.
+///
+/// A missing team is an explicit error here, unlike the harness hook that
+/// silently no-ops: the leader ran this command deliberately, so a record
+/// filed against the wrong team (or against `live-team` by fallback) is worse
+/// than no record. `--team` still satisfies this, so an adopted leader pane
+/// that never had `TERMMESH_TEAM` injected can pass it explicitly.
+///
+/// `team` and `surface_id` are recorded as given and nothing more is derived
+/// from them. In particular a record is NOT evidence that a leader wrote it:
+/// `TERMMESH_TEAM` is injected into worker panes too, so inferring "this came
+/// from the leader" from its presence would manufacture an identity claim the
+/// data cannot support. Whoever ran the command is who ran it.
+/// The turn id the harness hook most recently recorded for this surface.
+///
+/// The hook keeps `.turn-current-<surface>` as a stack, not a slot, because
+/// queued input can start a second turn before the first ends. The last line is
+/// the innermost open turn, which is the one a route call belongs to. Reading it
+/// rather than inventing an id is what makes `turn_route` joinable to
+/// `turn_start`; an invented value still counts, but joins nothing.
+///
+/// Best-effort by design: a missing file just means no hook ran (a non-Claude
+/// leader, or a session started before the hook was wired), and that is a
+/// legitimate state to record, not an error to fail on.
+fn turn_id_from_hook_state() -> Option<String> {
+    let surface = env::var("TERMMESH_SURFACE_ID").ok()?;
+    let key: String = surface
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+        .collect();
+    if key.is_empty() {
+        return None;
+    }
+    let path = turn_log_path().ok()?.with_file_name(format!(".turn-current-{key}"));
+    let contents = fs::read_to_string(path).ok()?;
+    contents
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+fn run_leader_turn_route(
+    team_resolution: &TeamNameResolution,
+    turn_id: &str,
+    route: &str,
+    task_shape: Option<&str>,
+    risk_reasons: &[String],
+    wave_id: Option<&str>,
+) -> Result<Value, String> {
+    if turn_id.trim().is_empty() {
+        return Err("--turn-id must not be blank".to_string());
+    }
+    if route.trim().is_empty() {
+        return Err("--route must not be blank".to_string());
+    }
+    if team_resolution.source == TeamNameSource::LiveTeamFallback {
+        return Err(
+            "no team: pass --team <name> or set TERMMESH_TEAM. A turn record filed \
+             against the live-team fallback would attribute the turn to the wrong Project."
+                .to_string(),
+        );
+    }
+    let path = turn_log_path()?;
+    let record = turn_route_record(
+        turn_id,
+        route,
+        task_shape,
+        risk_reasons,
+        wave_id,
+        &team_resolution.name,
+        env::var("TERMMESH_SURFACE_ID").ok().as_deref(),
+        &iso8601_utc_now(),
+    );
+    append_turn_record(&path, &record)?;
+    Ok(json!({
+        "ok": true,
+        "path": path.display().to_string(),
+        "record": record,
+    }))
+}
+
+#[cfg(test)]
+mod leader_turn_record_tests {
+    use super::*;
+
+    fn reasons(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn full_record_round_trips_every_stated_field() {
+        let record = turn_route_record(
+            "turn-42",
+            "parallel",
+            Some("multi_unit"),
+            &reasons(&["cross_subsystem", "protocol_or_persistence"]),
+            Some("wave-7"),
+            "term-mesh",
+            Some("surface-9"),
+            "2026-08-24T09:15:00Z",
+        );
+        assert_eq!(record["event"], "turn_route");
+        assert_eq!(record["turn_id"], "turn-42");
+        assert_eq!(record["ts"], "2026-08-24T09:15:00Z");
+        assert_eq!(record["route"], "parallel");
+        assert_eq!(record["team"], "term-mesh");
+        assert_eq!(record["task_shape"], "multi_unit");
+        assert_eq!(
+            record["risk_reasons"],
+            json!(["cross_subsystem", "protocol_or_persistence"])
+        );
+        assert_eq!(record["wave_id"], "wave-7");
+        assert_eq!(record["surface_id"], "surface-9");
+
+        // Round-trips through the serialized line, not just the in-memory value:
+        // the line on disk is what a later reader actually parses.
+        let parsed: Value =
+            serde_json::from_str(&serde_json::to_string(&record).expect("serialize"))
+                .expect("parse");
+        assert_eq!(parsed, record);
+    }
+
+    /// The delegate-side equivalent of this is
+    /// `delegate_params_omit_unstated_measurement_fields`: absence is what "the
+    /// leader did not state this" looks like, and a `null` would read as a value.
+    #[test]
+    fn unstated_optional_fields_are_absent_not_null() {
+        let record = turn_route_record(
+            "turn-1",
+            "direct",
+            None,
+            &[],
+            None,
+            "term-mesh",
+            None,
+            "2026-08-24T09:15:00Z",
+        );
+        assert!(record.get("task_shape").is_none());
+        assert!(record.get("risk_reasons").is_none());
+        assert!(record.get("wave_id").is_none());
+        assert!(record.get("surface_id").is_none());
+
+        // A blank flag value must not create an empty field that later reads as
+        // a real one.
+        let blank = turn_route_record(
+            "turn-1",
+            "direct",
+            Some("   "),
+            &reasons(&["", "  "]),
+            Some(""),
+            "term-mesh",
+            Some("  "),
+            "2026-08-24T09:15:00Z",
+        );
+        assert!(blank.get("task_shape").is_none());
+        assert!(blank.get("risk_reasons").is_none());
+        assert!(blank.get("wave_id").is_none());
+        assert!(blank.get("surface_id").is_none());
+
+        // The serialized line must not carry the keys either — an omitted key and
+        // a key holding `null` look identical on the value side of some readers.
+        let line = serde_json::to_string(&record).expect("serialize");
+        assert!(!line.contains("task_shape"), "line was {line}");
+        assert!(!line.contains("risk_reasons"), "line was {line}");
+        assert!(!line.contains("wave_id"), "line was {line}");
+        assert!(!line.contains("null"), "line was {line}");
+    }
+
+    /// Stance from 526649a1: rejecting an unrecognized route would drop exactly
+    /// the anomalies worth seeing, so it is stored verbatim — not normalized,
+    /// not lowercased, not mapped to a known value.
+    #[test]
+    fn unknown_route_is_stored_verbatim() {
+        for stated in ["Parallel", "delegated", "probe-then-parallel", "🙂"] {
+            let record = turn_route_record(
+                "turn-x",
+                stated,
+                None,
+                &[],
+                None,
+                "term-mesh",
+                None,
+                "2026-08-24T09:15:00Z",
+            );
+            assert_eq!(record["route"], stated);
+        }
+    }
+
+    #[test]
+    fn repeated_risk_reason_flags_collect_into_an_array() {
+        let record = turn_route_record(
+            "turn-3",
+            "probe",
+            None,
+            &reasons(&["repeated_failure", "irreversible_or_release"]),
+            None,
+            "term-mesh",
+            None,
+            "2026-08-24T09:15:00Z",
+        );
+        let array = record["risk_reasons"]
+            .as_array()
+            .expect("risk_reasons is an array");
+        assert_eq!(array.len(), 2);
+        assert_eq!(array[0], "repeated_failure");
+        assert_eq!(array[1], "irreversible_or_release");
+
+        // A single occurrence is still an array, not a bare string: a reader that
+        // has to handle both shapes will eventually handle one of them wrong.
+        let single = turn_route_record(
+            "turn-4",
+            "probe",
+            None,
+            &reasons(&["repeated_failure"]),
+            None,
+            "term-mesh",
+            None,
+            "2026-08-24T09:15:00Z",
+        );
+        assert_eq!(single["risk_reasons"], json!(["repeated_failure"]));
+    }
+
+    #[test]
+    fn appended_line_ends_with_exactly_one_newline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("logs").join("turns.log");
+        let record = turn_route_record(
+            "turn-5",
+            "direct",
+            None,
+            &[],
+            None,
+            "term-mesh",
+            None,
+            "2026-08-24T09:15:00Z",
+        );
+        append_turn_record(&path, &record).expect("append");
+
+        let body = fs::read_to_string(&path).expect("read");
+        assert!(body.ends_with('\n'), "body was {body:?}");
+        assert!(!body.ends_with("\n\n"), "body was {body:?}");
+        // One record is one line: a record whose own body contained a newline
+        // would silently become two rows for a line-oriented reader.
+        assert_eq!(body.matches('\n').count(), 1, "body was {body:?}");
+    }
+
+    #[test]
+    fn two_sequential_appends_produce_two_parseable_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("logs").join("turns.log");
+        for (turn, route) in [("turn-a", "direct"), ("turn-b", "parallel")] {
+            let record = turn_route_record(
+                turn,
+                route,
+                None,
+                &[],
+                None,
+                "term-mesh",
+                None,
+                "2026-08-24T09:15:00Z",
+            );
+            append_turn_record(&path, &record).expect("append");
+        }
+
+        let body = fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "body was {body:?}");
+        let first: Value = serde_json::from_str(lines[0]).expect("parse first");
+        let second: Value = serde_json::from_str(lines[1]).expect("parse second");
+        assert_eq!(first["turn_id"], "turn-a");
+        assert_eq!(first["route"], "direct");
+        assert_eq!(second["turn_id"], "turn-b");
+        assert_eq!(second["route"], "parallel");
+        // The second append must not have truncated the first — the whole point
+        // of append mode over write mode.
+        assert_eq!(first["event"], "turn_route");
+    }
+
+    /// A leader ran this deliberately, so a record filed against the `live-team`
+    /// fallback would attribute the turn to the wrong Project. The harness hook
+    /// is the one allowed to no-op silently.
+    #[test]
+    fn missing_team_is_an_explicit_error() {
+        let fallback = TeamNameResolution {
+            name: "live-team".to_string(),
+            source: TeamNameSource::LiveTeamFallback,
+        };
+        let err = run_leader_turn_route(&fallback, "turn-6", "direct", None, &[], None)
+            .expect_err("live-team fallback must be rejected");
+        assert!(err.contains("no team"), "error was {err}");
+
+        // An explicit --team satisfies it, which is how an adopted leader pane
+        // with no TERMMESH_TEAM still records.
+        let explicit = TeamNameResolution {
+            name: "term-mesh".to_string(),
+            source: TeamNameSource::Explicit,
+        };
+        let blank_turn = run_leader_turn_route(&explicit, "  ", "direct", None, &[], None)
+            .expect_err("blank turn id must be rejected");
+        assert!(blank_turn.contains("--turn-id"), "error was {blank_turn}");
+        let blank_route = run_leader_turn_route(&explicit, "turn-7", "  ", None, &[], None)
+            .expect_err("blank route must be rejected");
+        assert!(blank_route.contains("--route"), "error was {blank_route}");
+    }
+
+    /// Reproduces what `rotate_log` in `term-meshd/src/gc.rs` does to this file
+    /// while the CLI is running: unlink any prior `.log.1`, then rename the live
+    /// log onto it. The sweep doing this is unattended (daemon startup, then
+    /// every six hours), so it WILL happen mid-measurement rather than only when
+    /// somebody runs `gc sweep --apply`.
+    ///
+    /// A `File` cached across appends would keep writing into the renamed inode
+    /// and lose every subsequent record with no error at the write site. Opening
+    /// per record means the post-rotation append recreates the path instead.
+    #[test]
+    fn append_survives_a_rotation_between_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("logs").join("turns.log");
+        let record = |turn: &str| {
+            turn_route_record(
+                turn,
+                "direct",
+                None,
+                &[],
+                None,
+                "term-mesh",
+                None,
+                "2026-08-24T09:15:00Z",
+            )
+        };
+
+        append_turn_record(&path, &record("before-rotation")).expect("first append");
+
+        // Exactly what rotate_log does, including the unlink of a pre-existing
+        // .log.1 — the step that makes a retained descriptor lose data on the
+        // SECOND rotation rather than the first.
+        let rotated = path.with_extension("log.1");
+        let _ = fs::remove_file(&rotated);
+        fs::rename(&path, &rotated).expect("rotate");
+        assert!(!path.exists(), "rotation should leave the live path absent");
+
+        append_turn_record(&path, &record("after-rotation")).expect("append after rotation");
+
+        // The live path was recreated and holds only the post-rotation record.
+        let live = fs::read_to_string(&path).expect("read live");
+        let live_lines: Vec<&str> = live.lines().collect();
+        assert_eq!(live_lines.len(), 1, "live log was {live:?}");
+        let parsed: Value = serde_json::from_str(live_lines[0]).expect("parse live");
+        assert_eq!(parsed["turn_id"], "after-rotation");
+
+        // One generation of history survives, so a reader spanning a rotation
+        // has to consult turns.log.1 as well.
+        let history = fs::read_to_string(&rotated).expect("read rotated");
+        let history_lines: Vec<&str> = history.lines().collect();
+        assert_eq!(history_lines.len(), 1, "rotated log was {history:?}");
+        let old: Value = serde_json::from_str(history_lines[0]).expect("parse rotated");
+        assert_eq!(old["turn_id"], "before-rotation");
+    }
+
+    /// `TERMMESH_TEAM` is injected into worker panes too, so the record must not
+    /// carry any claim that a leader produced it. `team` and `surface_id` are
+    /// recorded as given; there is no `role`, no `agent`, and no `is_leader`.
+    /// A reader counting leader turns has to join on the harness stream, not
+    /// trust a field this command could not honestly populate.
+    #[test]
+    fn record_makes_no_leader_identity_claim() {
+        let record = turn_route_record(
+            "turn-8",
+            "direct",
+            Some("single_unit"),
+            &reasons(&["repeated_failure"]),
+            Some("wave-1"),
+            "term-mesh",
+            Some("surface-3"),
+            "2026-08-24T09:15:00Z",
+        );
+        let object = record.as_object().expect("record is an object");
+        for forbidden in ["role", "agent", "agent_name", "is_leader", "leader", "actor"] {
+            assert!(
+                !object.contains_key(forbidden),
+                "record must not assert identity via {forbidden}: {record}"
+            );
+        }
+        // The full key set is closed — a new field is a deliberate decision, not
+        // something that arrives by accident.
+        let mut keys: Vec<&str> = object.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "event",
+                "risk_reasons",
+                "route",
+                "surface_id",
+                "task_shape",
+                "team",
+                "ts",
+                "turn_id",
+                "wave_id",
+            ]
+        );
+    }
+
+    /// The `.log` extension is load-bearing: `scan_logs` in
+    /// `term-meshd/src/gc.rs` skips every file whose extension is not exactly
+    /// `log`, so a `.jsonl` sink would never be offered for rotation.
+    #[test]
+    fn sink_is_a_dot_log_file_under_the_term_mesh_logs_dir() {
+        let path = turn_log_path().expect("HOME is set in the test environment");
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("log"));
+        assert_eq!(
+            path.file_name().and_then(|f| f.to_str()),
+            Some("turns.log")
+        );
+        assert!(path.ends_with(".term-mesh/logs/turns.log"), "path was {}", path.display());
+    }
+
+    /// A route record must be joinable to the `turn_start` the harness hook
+    /// wrote. The hook keeps the id in a per-surface stack whose last line is
+    /// the innermost open turn; reading that is the whole mechanism, so assert
+    /// on the stack semantics rather than on a single-line file.
+    #[test]
+    fn omitted_turn_id_comes_from_the_last_line_of_the_hook_state_stack() {
+        let home = std::env::temp_dir().join(format!("tm-turnid-{}", std::process::id()));
+        let logs = home.join(".term-mesh/logs");
+        fs::create_dir_all(&logs).expect("create temp logs dir");
+        fs::write(logs.join(".turn-current-surf-1"), "outer\ninner\n").expect("write stack");
+
+        let prev_home = env::var("HOME").ok();
+        let prev_surface = env::var("TERMMESH_SURFACE_ID").ok();
+        env::set_var("HOME", &home);
+        env::set_var("TERMMESH_SURFACE_ID", "surf-1");
+
+        let resolved = turn_id_from_hook_state();
+
+        // A surface with no state file is a legitimate state (no hook wired),
+        // not an error: it must read as absent so the caller can fall back.
+        env::set_var("TERMMESH_SURFACE_ID", "surf-absent");
+        let missing = turn_id_from_hook_state();
+
+        match prev_home {
+            Some(v) => env::set_var("HOME", v),
+            None => env::remove_var("HOME"),
+        }
+        match prev_surface {
+            Some(v) => env::set_var("TERMMESH_SURFACE_ID", v),
+            None => env::remove_var("TERMMESH_SURFACE_ID"),
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        assert_eq!(resolved.as_deref(), Some("inner"));
+        assert_eq!(missing, None);
+    }
+
+    /// The sink stores digests and byte counts, never content, but a digest next
+    /// to a short length is guessable — so the file must not inherit umask.
+    #[cfg(unix)]
+    #[test]
+    fn the_sink_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tm-turnmode-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("turns.log");
+        append_turn_record(&path, &json!({"event": "turn_route"})).expect("append");
+        let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(mode, 0o600, "mode was {mode:o}");
+    }
 }
 
 // ── xk-bridge: daemon events → x-kit .xm writeback ───────────────────

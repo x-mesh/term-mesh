@@ -3103,6 +3103,12 @@ mod tests {
             cwd: "/tmp".into(),
             branch: "develop".into(),
             agent_cli: String::new(),
+            // These fixtures do not exercise foreground-busy, and `known:
+            // false` is the value peer.proto documents as fail-safe: a client
+            // must not read protobuf's default `false` as authoritative
+            // idleness.
+            foreground_busy: false,
+            foreground_busy_known: false,
         }
     }
 
