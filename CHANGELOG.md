@@ -4,6 +4,21 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.212.0] - 2026-08-24
+
+### Fixed
+
+- Made duplicate Project names explicit and lossless. New Project now distinguishes an existing Project, an incomplete setup, and a different Project using the same name; it offers Open Existing, Resume Setup, Discard Existing, or Rename without silently closing the sheet or clearing existing task, message, result, checkout, or process state.
+- Added commit-time Project name reservation across windows, detached presentations, and connected remote hosts, including deterministic regression coverage for concurrent submissions and remote relay cleanup.
+- Constrained native agent pane titles so long labels no longer stretch or wrap the Project pane layout.
+
+### Changed
+
+- Recorded the leader's routing decision and timing so direct, probe, and parallel execution choices can be measured and reviewed.
+- Hardened the required remote Project release test so checkout/bootstrap failures are reported immediately instead of timing out as a missing team.
+
+Thanks to Jinwoo Jeong for this release.
+
 ## [0.211.0] - 2026-08-24
 
 ### Fixed
