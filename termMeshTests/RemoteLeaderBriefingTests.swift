@@ -329,6 +329,68 @@ final class RemoteLeaderAutonomyFlagsTests: XCTestCase {
         XCTAssertTrue(command(cli: "gemini").contains("--yolo"))
     }
 
+    func test_remoteClaudeLeaderCarriesPrivateTurnHookSettings() throws {
+        let command = TeamOrchestrator.remoteAgentCommand(
+            cli: "claude", model: "sonnet", agentName: "leader",
+            teamName: "xm", workingDirectory: "/srv/xm",
+            systemPromptFile: "/tmp/prompt", turnHookFile: "/cache/leader hook.sh"
+        )
+        XCTAssertTrue(command.contains("--settings"))
+        XCTAssertTrue(command.contains("UserPromptSubmit"))
+        XCTAssertTrue(command.contains("--start"))
+        XCTAssertTrue(command.contains("--end"))
+        XCTAssertFalse(command.contains("leader-request-token"))
+        XCTAssertTrue(command.contains("status=$?; rm -f -- '/cache/leader hook.sh'"))
+        XCTAssertTrue(command.contains("exit \"$status\""))
+
+        let json = try XCTUnwrap(
+            TeamOrchestrator.remoteLeaderTurnHookSettingsJSON(path: "/cache/leader hook.sh")
+        )
+        XCTAssertNoThrow(try JSONSerialization.jsonObject(with: Data(json.utf8)))
+    }
+
+    func test_remoteClaudeWithoutMeasurementHookHasNoCleanupEpilogue() {
+        let command = TeamOrchestrator.remoteAgentCommand(
+            cli: "claude", model: "sonnet", agentName: "leader",
+            teamName: "xm", workingDirectory: "/srv/xm",
+            systemPromptFile: "/tmp/prompt"
+        )
+        XCTAssertFalse(command.contains("status=$?; rm -f --"))
+    }
+
+    func test_remoteTurnHookStageIsAtomicAndOwnerOnly() {
+        let command = TeamOrchestrator.remoteLeaderTurnHookSSHStageCommand(
+            fileName: "leader-turn-team.sh"
+        )
+        XCTAssertTrue(command.contains("leader-hooks"))
+        XCTAssertTrue(command.contains("chmod 700"))
+        XCTAssertTrue(command.contains("cat >"))
+        XCTAssertTrue(command.contains("mv -f"))
+    }
+
+    func test_remoteTurnHookFileNameIsUniquePerProjectInstance() {
+        let first = TeamOrchestrator.remoteLeaderTurnHookFileName(teamUUID: "project-uuid-a")
+        let second = TeamOrchestrator.remoteLeaderTurnHookFileName(teamUUID: "project-uuid-b")
+
+        XCTAssertEqual(first, "leader-turn-project-uuid-a.sh")
+        XCTAssertEqual(second, "leader-turn-project-uuid-b.sh")
+        XCTAssertNotEqual(first, second)
+        XCTAssertFalse(first.contains("(teamUUID)"))
+    }
+
+    func test_remoteParticipationControlIsPrivateUniqueAndExported() throws {
+        let first = TeamOrchestrator.remoteLeaderParticipationControlFileName(teamUUID: "project-a")
+        let second = TeamOrchestrator.remoteLeaderParticipationControlFileName(teamUUID: "project-b")
+        XCTAssertNotEqual(first, second)
+        XCTAssertTrue(first.hasSuffix(".json"))
+        let stage = TeamOrchestrator.remoteLeaderFileSSHStageCommand(
+            fileName: first, mode: "600"
+        )
+        XCTAssertTrue(stage.contains("umask 077"))
+        XCTAssertTrue(stage.contains("chmod 600"))
+        XCTAssertTrue(stage.contains("mv -f"))
+    }
+
     /// Claude carries its own equivalent and must keep it.
     func test_aClaudeLeaderKeepsItsPermissionBypass() {
         XCTAssertTrue(command(cli: "claude").contains("--dangerously-skip-permissions"))

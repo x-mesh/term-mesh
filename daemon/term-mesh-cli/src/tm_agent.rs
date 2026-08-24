@@ -2382,6 +2382,11 @@ enum LeaderTurnCommands {
         /// How the request was classified before the route was chosen.
         #[arg(long = "task-shape")]
         task_shape: Option<String>,
+        /// Authoritative worker-capacity snapshot for this turn. Omit when the
+        /// roster is unavailable; unknown capacity always fails closed and
+        /// cannot produce an applied canary directive.
+        #[arg(long = "available-workers")]
+        available_workers: Option<u32>,
         /// A risk condition that applied to this turn. Repeatable; every
         /// occurrence collects into one `risk_reasons` array.
         #[arg(long = "risk-reason")]
@@ -7462,6 +7467,7 @@ fn main() {
         turn_id,
         route,
         task_shape,
+        available_workers,
         risk_reason,
         wave_id,
     })) = &cli.command
@@ -7479,6 +7485,7 @@ fn main() {
             &resolved_turn_id,
             route,
             task_shape.as_deref(),
+            *available_workers,
             risk_reason,
             wave_id.as_deref(),
         ));
@@ -15033,10 +15040,200 @@ fn turn_log_path() -> Result<PathBuf, String> {
 /// rather than written as `null`. Absence reads as "not stated"; a `null` would
 /// read as a value, and a blank flag value must not become an empty string that
 /// a later reader counts as a real classification.
-fn turn_route_record(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LeaderParticipationDirective {
+    participation: &'static str,
+    route: &'static str,
+    reasons: Vec<&'static str>,
+    dispatch_bounds: &'static str,
+}
+
+impl LeaderParticipationDirective {
+    fn from_input(
+        task_shape: Option<&str>,
+        risk_reasons: &[String],
+        available_workers: Option<u32>,
+    ) -> Self {
+        let shape = task_shape.map(str::trim).map(str::to_ascii_lowercase);
+        let Some(workers) = available_workers else {
+            return Self {
+                participation: "hands_on",
+                route: "direct",
+                reasons: vec!["unsupported_input"],
+                dispatch_bounds: "no required worker dispatch",
+            };
+        };
+        if risk_reasons.iter().any(|reason| !reason.trim().is_empty()) {
+            return Self {
+                participation: "balanced",
+                route: "probe",
+                reasons: vec!["high_risk"],
+                dispatch_bounds: "at most one read-only probe",
+            };
+        }
+        if workers >= 2
+            && matches!(
+                shape.as_deref(),
+                Some("multi_unit" | "cross_subsystem" | "parallelizable")
+            )
+        {
+            return Self {
+                participation: "coordinator",
+                route: "parallel",
+                reasons: vec!["parallel_ready"],
+                dispatch_bounds: "two or three dependency-ready, ownership-disjoint tasks",
+            };
+        }
+        if workers == 0 || shape.as_deref() == Some("single_unit") {
+            return Self {
+                participation: "hands_on",
+                route: "direct",
+                reasons: vec!["single_unit"],
+                dispatch_bounds: "no required worker dispatch",
+            };
+        }
+        Self {
+            participation: "balanced",
+            route: "probe",
+            reasons: vec!["limited_capacity"],
+            dispatch_bounds: "at most one read-only probe",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LeaderParticipationResolution {
+    mode: &'static str,
+    cohort: &'static str,
+    applied: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LeaderParticipationCanaryConfig {
+    mode: String,
+    percent: u8,
+    kill_switch: bool,
+    supported: bool,
+    healthy: bool,
+    opt_in: bool,
+    project_id: String,
+    session_id: String,
+}
+
+fn parse_bool_env(name: &str) -> bool {
+    matches!(
+        env::var(name).ok().as_deref().map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn stable_canary_bucket(project_id: &str, session_id: &str) -> u8 {
+    project_id
+        .bytes()
+        .chain(std::iter::once(b'|'))
+        .chain(session_id.bytes())
+        .fold(0u32, |bucket, byte| {
+            (bucket.wrapping_mul(31) + u32::from(byte)) % 100
+        }) as u8
+}
+
+fn resolve_participation(
+    config: &LeaderParticipationCanaryConfig,
+    known_input: bool,
+) -> LeaderParticipationResolution {
+    if config.mode == "shadow" {
+        return LeaderParticipationResolution {
+            mode: "shadow",
+            cohort: "shadow",
+            applied: false,
+        };
+    }
+    if config.mode != "canary"
+        || config.kill_switch
+        || !config.supported
+        || !config.healthy
+        || !config.opt_in
+        || !known_input
+    {
+        return LeaderParticipationResolution {
+            mode: "off",
+            cohort: "static",
+            applied: false,
+        };
+    }
+    if config.percent == 0 {
+        return LeaderParticipationResolution {
+            mode: "canary",
+            cohort: "holdout",
+            applied: false,
+        };
+    }
+    if config.project_id.trim().is_empty() || config.session_id.trim().is_empty() {
+        return LeaderParticipationResolution {
+            mode: "off",
+            cohort: "static",
+            applied: false,
+        };
+    }
+    if stable_canary_bucket(&config.project_id, &config.session_id) < config.percent {
+        LeaderParticipationResolution {
+            mode: "canary",
+            cohort: "canary",
+            applied: true,
+        }
+    } else {
+        LeaderParticipationResolution {
+            mode: "canary",
+            cohort: "holdout",
+            applied: false,
+        }
+    }
+}
+
+fn resolve_participation_from_env(known_input: bool) -> LeaderParticipationResolution {
+    let mut config = LeaderParticipationCanaryConfig {
+        mode: env::var("TERMMESH_LEADER_PARTICIPATION_MODE")
+            .unwrap_or_else(|_| "shadow".to_string())
+            .trim()
+            .to_ascii_lowercase(),
+        percent: env::var("TERMMESH_LEADER_PARTICIPATION_PERCENT")
+            .ok()
+            .and_then(|value| value.trim().parse::<u16>().ok())
+            .map(|value| value.min(100) as u8)
+            .unwrap_or(0),
+        kill_switch: parse_bool_env("TERMMESH_LEADER_PARTICIPATION_KILL_SWITCH"),
+        supported: parse_bool_env("TERMMESH_LEADER_PARTICIPATION_SUPPORTED"),
+        healthy: parse_bool_env("TERMMESH_LEADER_PARTICIPATION_HEALTHY"),
+        opt_in: parse_bool_env("TERMMESH_LEADER_PARTICIPATION_OPT_IN"),
+        project_id: env::var("TERMMESH_LEADER_PARTICIPATION_PROJECT_ID").unwrap_or_default(),
+        session_id: env::var("TERMMESH_LEADER_PARTICIPATION_SESSION_ID").unwrap_or_default(),
+    };
+    // The app rewrites this owner-only file whenever controls or health
+    // change. Reading it per route call makes a global kill switch affect the
+    // next evaluated turn without restarting the leader. Missing, malformed,
+    // or over-permissive files fail closed to the env/default snapshot.
+    if let Ok(path) = env::var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE") {
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                if let Some(mode) = value["mode"].as_str() { config.mode = mode.to_ascii_lowercase(); }
+                if let Some(percent) = value["percent"].as_u64() { config.percent = percent.min(100) as u8; }
+                if let Some(flag) = value["kill_switch"].as_bool() { config.kill_switch = flag; }
+                if let Some(flag) = value["supported"].as_bool() { config.supported = flag; }
+                if let Some(flag) = value["healthy"].as_bool() { config.healthy = flag; }
+                if let Some(flag) = value["opt_in"].as_bool() { config.opt_in = flag; }
+                if let Some(id) = value["project_id"].as_str() { config.project_id = id.to_string(); }
+                if let Some(id) = value["session_id"].as_str() { config.session_id = id.to_string(); }
+            }
+        }
+    }
+    resolve_participation(&config, known_input)
+}
+
+fn turn_route_record_with_policy_input(
     turn_id: &str,
     route: &str,
     task_shape: Option<&str>,
+    available_workers: Option<u32>,
     risk_reasons: &[String],
     wave_id: Option<&str>,
     team: &str,
@@ -15048,12 +15245,22 @@ fn turn_route_record(
         "turn_id": turn_id,
         "ts": ts,
         "route": route,
+        // The end hook uses the matching marker below to make omission
+        // observable. Keep the route record self-describing too, so a reader
+        // that only has rotated history never has to infer that this was a
+        // leader-stated classification.
+        "route_status": "stated",
+        "policy_version": "1",
+        "actual_route": route,
         "team": team,
     });
     if let Some(shape) = task_shape.filter(|v| !v.trim().is_empty()) {
         record["task_shape"] = json!(shape);
     }
-    let reasons: Vec<&String> = risk_reasons.iter().filter(|r| !r.trim().is_empty()).collect();
+    let reasons: Vec<&String> = risk_reasons
+        .iter()
+        .filter(|r| !r.trim().is_empty())
+        .collect();
     if !reasons.is_empty() {
         record["risk_reasons"] = json!(reasons);
     }
@@ -15063,7 +15270,41 @@ fn turn_route_record(
     if let Some(surface) = surface_id.filter(|v| !v.trim().is_empty()) {
         record["surface_id"] = json!(surface);
     }
+    let suggestion =
+        LeaderParticipationDirective::from_input(task_shape, risk_reasons, available_workers);
+    let resolution = resolve_participation_from_env(available_workers.is_some());
+    record["suggested_participation"] = json!(suggestion.participation);
+    record["suggested_route"] = json!(suggestion.route);
+    record["policy_reasons"] = json!(suggestion.reasons);
+    record["dispatch_bounds"] = json!(suggestion.dispatch_bounds);
+    record["policy_mode"] = json!(resolution.mode);
+    record["policy_applied"] = json!(resolution.applied);
+    record["cohort"] = json!(resolution.cohort);
     record
+}
+
+#[cfg(test)]
+fn turn_route_record(
+    turn_id: &str,
+    route: &str,
+    task_shape: Option<&str>,
+    risk_reasons: &[String],
+    wave_id: Option<&str>,
+    team: &str,
+    surface_id: Option<&str>,
+    ts: &str,
+) -> Value {
+    turn_route_record_with_policy_input(
+        turn_id,
+        route,
+        task_shape,
+        None,
+        risk_reasons,
+        wave_id,
+        team,
+        surface_id,
+        ts,
+    )
 }
 
 /// Append one record as a single line.
@@ -15152,11 +15393,44 @@ fn turn_id_from_hook_state() -> Option<String> {
         .map(str::to_string)
 }
 
+/// A per-turn marker lets the independent Stop hook distinguish "a route was
+/// stated" from "no route command ran" without parsing a concurrently
+/// appended, rotation-prone log. It is deliberately ephemeral and is removed
+/// by the hook after emitting turn_end.
+fn mark_turn_route_stated(path: &Path, turn_id: &str) -> Result<(), String> {
+    let key: String = turn_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+        .collect();
+    if key.is_empty() {
+        return Err("turn id contains no safe marker characters".to_string());
+    }
+    let marker = path.with_file_name(format!(".turn-route-{key}"));
+    fs::write(&marker, b"stated\n")
+        .map_err(|e| format!("write {}: {e}", marker.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod {}: {e}", marker.display()))?;
+    }
+    Ok(())
+}
+
+fn turn_route_marker_path(path: &Path, turn_id: &str) -> Option<PathBuf> {
+    let key: String = turn_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+        .collect();
+    (!key.is_empty()).then(|| path.with_file_name(format!(".turn-route-{key}")))
+}
+
 fn run_leader_turn_route(
     team_resolution: &TeamNameResolution,
     turn_id: &str,
     route: &str,
     task_shape: Option<&str>,
+    available_workers: Option<u32>,
     risk_reasons: &[String],
     wave_id: Option<&str>,
 ) -> Result<Value, String> {
@@ -15174,21 +15448,42 @@ fn run_leader_turn_route(
         );
     }
     let path = turn_log_path()?;
-    let record = turn_route_record(
+    let record = turn_route_record_with_policy_input(
         turn_id,
         route,
         task_shape,
+        available_workers,
         risk_reasons,
         wave_id,
         &team_resolution.name,
         env::var("TERMMESH_SURFACE_ID").ok().as_deref(),
         &iso8601_utc_now(),
     );
-    append_turn_record(&path, &record)?;
+    mark_turn_route_stated(&path, turn_id)?;
+    // The marker and the log line are a small two-phase local transaction. A
+    // failed append must not let Stop report a route that never reached the
+    // durable measurement stream.
+    if let Err(error) = append_turn_record(&path, &record) {
+        if let Some(marker) = turn_route_marker_path(&path, turn_id) {
+            let _ = fs::remove_file(marker);
+        }
+        return Err(error);
+    }
+    let directive = record["policy_applied"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(|| {
+            json!({
+                "participation": record["suggested_participation"],
+                "route": record["suggested_route"],
+                "dispatch_bounds": record["dispatch_bounds"],
+            })
+        });
     Ok(json!({
         "ok": true,
         "path": path.display().to_string(),
         "record": record,
+        "directive": directive,
     }))
 }
 
@@ -15198,6 +15493,99 @@ mod leader_turn_record_tests {
 
     fn reasons(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn canary_config(percent: u8) -> LeaderParticipationCanaryConfig {
+        LeaderParticipationCanaryConfig {
+            mode: "canary".to_string(),
+            percent,
+            kill_switch: false,
+            supported: true,
+            healthy: true,
+            opt_in: true,
+            project_id: "project-a".to_string(),
+            session_id: "session-a".to_string(),
+        }
+    }
+
+    #[test]
+    fn evaluator_matches_observable_dispatch_contract() {
+        let parallel = LeaderParticipationDirective::from_input(Some("multi_unit"), &[], Some(2));
+        assert_eq!(parallel.participation, "coordinator");
+        assert_eq!(parallel.route, "parallel");
+        assert_eq!(parallel.reasons, ["parallel_ready"]);
+        assert_eq!(
+            parallel.dispatch_bounds,
+            "two or three dependency-ready, ownership-disjoint tasks"
+        );
+
+        let risk = LeaderParticipationDirective::from_input(
+            Some("multi_unit"),
+            &reasons(&["release"]),
+            Some(3),
+        );
+        assert_eq!(risk.participation, "balanced");
+        assert_eq!(risk.route, "probe");
+        assert_eq!(risk.dispatch_bounds, "at most one read-only probe");
+
+        let unknown = LeaderParticipationDirective::from_input(Some("multi_unit"), &[], None);
+        assert_eq!(unknown.participation, "hands_on");
+        assert_eq!(unknown.route, "direct");
+        assert_eq!(unknown.reasons, ["unsupported_input"]);
+    }
+
+    #[test]
+    fn only_explicit_healthy_supported_canary_applies() {
+        let eligible = canary_config(100);
+        assert_eq!(
+            resolve_participation(&eligible, true),
+            LeaderParticipationResolution {
+                mode: "canary",
+                cohort: "canary",
+                applied: true
+            }
+        );
+
+        let mut cases = Vec::new();
+        let mut unsupported = eligible.clone();
+        unsupported.supported = false;
+        cases.push(unsupported);
+        let mut unhealthy = eligible.clone();
+        unhealthy.healthy = false;
+        cases.push(unhealthy);
+        let mut no_opt_in = eligible.clone();
+        no_opt_in.opt_in = false;
+        cases.push(no_opt_in);
+        let mut killed = eligible.clone();
+        killed.kill_switch = true;
+        cases.push(killed);
+        for config in cases {
+            assert!(
+                !resolve_participation(&config, true).applied,
+                "config was {config:?}"
+            );
+        }
+        assert!(!resolve_participation(&eligible, false).applied);
+    }
+
+    #[test]
+    fn zero_percentage_and_deterministic_holdout_never_apply() {
+        let zero = resolve_participation(&canary_config(0), true);
+        assert_eq!(zero.cohort, "holdout");
+        assert!(!zero.applied);
+
+        let mut holdout = canary_config(1);
+        for index in 0..1000 {
+            holdout.session_id = format!("session-{index}");
+            if stable_canary_bucket(&holdout.project_id, &holdout.session_id) >= holdout.percent {
+                break;
+            }
+        }
+        let first = resolve_participation(&holdout, true);
+        let second = resolve_participation(&holdout, true);
+        assert_eq!(first, second);
+        assert_eq!(first.cohort, "holdout");
+        assert!(!first.applied);
     }
 
     #[test]
@@ -15398,7 +15786,7 @@ mod leader_turn_record_tests {
             name: "live-team".to_string(),
             source: TeamNameSource::LiveTeamFallback,
         };
-        let err = run_leader_turn_route(&fallback, "turn-6", "direct", None, &[], None)
+        let err = run_leader_turn_route(&fallback, "turn-6", "direct", None, None, &[], None)
             .expect_err("live-team fallback must be rejected");
         assert!(err.contains("no team"), "error was {err}");
 
@@ -15408,12 +15796,27 @@ mod leader_turn_record_tests {
             name: "term-mesh".to_string(),
             source: TeamNameSource::Explicit,
         };
-        let blank_turn = run_leader_turn_route(&explicit, "  ", "direct", None, &[], None)
+        let blank_turn = run_leader_turn_route(&explicit, "  ", "direct", None, None, &[], None)
             .expect_err("blank turn id must be rejected");
         assert!(blank_turn.contains("--turn-id"), "error was {blank_turn}");
-        let blank_route = run_leader_turn_route(&explicit, "turn-7", "  ", None, &[], None)
+        let blank_route = run_leader_turn_route(&explicit, "turn-7", "  ", None, None, &[], None)
             .expect_err("blank route must be rejected");
         assert!(blank_route.contains("--route"), "error was {blank_route}");
+    }
+
+    #[test]
+    fn stated_route_marker_is_owner_only_and_uses_the_turn_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("logs").join("turns.log");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        mark_turn_route_stated(&path, "turn-42").expect("marker");
+        let marker = path.with_file_name(".turn-route-turn-42");
+        assert_eq!(fs::read_to_string(&marker).expect("read marker"), "stated\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(marker).expect("metadata").permissions().mode() & 0o777, 0o600);
+        }
     }
 
     /// Reproduces what `rotate_log` in `term-meshd/src/gc.rs` does to this file
@@ -15501,9 +15904,19 @@ mod leader_turn_record_tests {
         assert_eq!(
             keys,
             [
+                "actual_route",
+                "cohort",
+                "dispatch_bounds",
                 "event",
+                "policy_applied",
+                "policy_mode",
+                "policy_reasons",
+                "policy_version",
                 "risk_reasons",
                 "route",
+                "route_status",
+                "suggested_participation",
+                "suggested_route",
                 "surface_id",
                 "task_shape",
                 "team",

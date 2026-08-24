@@ -66,7 +66,22 @@ done
 
 # Build hooks settings JSON.
 # Claude Code merges --settings additively with the user's own settings.json.
-HOOKS_JSON='{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"term-mesh claude-hook session-start","timeout":10}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"term-mesh claude-hook stop","timeout":10}]}],"Notification":[{"matcher":"","hooks":[{"type":"command","command":"term-mesh claude-hook notification","timeout":10}]}]}}'
+# The leader-turn hook itself authorizes on TERMMESH_LEADER_REQUEST_TOKEN, which
+# only leader panes receive. It is therefore safe to install these callbacks
+# for every wrapped Claude session: worker and ordinary user sessions exit
+# before reading a payload or touching the turn log. Keep the hook path in an
+# inherited variable instead of interpolating a bundle path into JSON; app
+# bundle paths can contain spaces and this preserves the command boundary.
+WRAPPER_DIR="$(cd "$(dirname "$0")" && pwd)"
+LEADER_TURN_HOOK="$WRAPPER_DIR/../scripts/leader-turn-hook.sh"
+if [[ -x "$LEADER_TURN_HOOK" ]]; then
+    export TERMMESH_LEADER_TURN_HOOK="$LEADER_TURN_HOOK"
+    HOOKS_JSON='{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"term-mesh claude-hook session-start","timeout":10}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"\"$TERMMESH_LEADER_TURN_HOOK\" --start","timeout":10}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"term-mesh claude-hook stop","timeout":10},{"type":"command","command":"\"$TERMMESH_LEADER_TURN_HOOK\" --end","timeout":10}]}],"Notification":[{"matcher":"","hooks":[{"type":"command","command":"term-mesh claude-hook notification","timeout":10}]}]}}'
+else
+    # A partial/source installation can contain the wrapper without the hook.
+    # Preserve established callbacks; never inject an empty command.
+    HOOKS_JSON='{"hooks":{"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"term-mesh claude-hook session-start","timeout":10}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"term-mesh claude-hook stop","timeout":10}]}],"Notification":[{"matcher":"","hooks":[{"type":"command","command":"term-mesh claude-hook notification","timeout":10}]}]}}'
+fi
 
 if [[ "$SKIP_SESSION_ID" == true ]]; then
     exec "$REAL_CLAUDE" --settings "$HOOKS_JSON" "$@"

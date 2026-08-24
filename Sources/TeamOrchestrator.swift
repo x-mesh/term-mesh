@@ -411,6 +411,10 @@ final class TeamOrchestrator: ObservableObject {
         /// silently treated as a normal ready leader.
         var leaderPolicyState: String = "pending"
         var leaderPolicyFailureDescription: String? = nil
+        /// Independent from policy injection: a leader may run normally while
+        /// turn measurement is unsupported or degraded. Older snapshots and
+        /// adopted/non-Claude leaders safely decode to unsupported.
+        var leaderMeasurementCapability: LeaderTurnLog.MeasurementCapability = .unsupported
         let workingDirectory: String
         var workspaceId: UUID     // agent workspace (may differ from leader workspace in "adopted" mode)
         var agents: [AgentMember]
@@ -495,7 +499,7 @@ final class TeamOrchestrator: ObservableObject {
         let panelId: UUID?
     }
 
-    @Published private(set) var teams: [String: Team] = [:]
+    @Published var teams: [String: Team] = [:]
     /// Prevent repeated project clicks from attaching multiple local viewers
     /// to the same persistent remote leader surface.
     var remoteLeaderReattachInFlight: Set<String> = []
@@ -1041,6 +1045,16 @@ final class TeamOrchestrator: ObservableObject {
         guard var team = teams[teamName] else { return }
         team.leaderPolicyState = state
         team.leaderPolicyFailureDescription = failureDescription
+        teams[teamName] = team
+        syncTeamStateToDaemon()
+    }
+
+    func setLeaderMeasurementCapability(
+        teamName: String,
+        capability: LeaderTurnLog.MeasurementCapability
+    ) {
+        guard var team = teams[teamName] else { return }
+        team.leaderMeasurementCapability = capability
         teams[teamName] = team
         syncTeamStateToDaemon()
     }
@@ -2418,6 +2432,22 @@ final class TeamOrchestrator: ObservableObject {
             ? claudeAgentEnv
             : baseEnv.merging(["CLAUDECODE": ""]) { _, new in new }
         leaderEnv["TERMMESH_LEADER_REQUEST_TOKEN"] = leaderRequestToken
+        // Claude leaders are started by their resolved executable path, not by
+        // Resources/bin/claude. Give that direct launch the same bundled hook
+        // path as the wrapper so the measurement contract is not accidentally
+        // limited to ad-hoc shell invocations. The hook independently checks
+        // the request token above, so workers cannot write leader turns.
+        if leaderMode == "claude", let hookPath = Self.leaderTurnHookPath(workingDirectory: workingDirectory) {
+            leaderEnv["TERMMESH_LEADER_TURN_HOOK"] = hookPath
+        }
+        if leaderMode == "claude" {
+            let participationControlFile = Self.leaderParticipationControlFile(teamName: name)
+            leaderEnv["TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE"] = participationControlFile
+            Self.writeLeaderParticipationControl(
+                teamName: name, sessionID: leaderSessionId,
+                supportedLeader: leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil
+            )
+        }
 
         // Worktree isolation based on team-level mode.
         // Created early so both leader and agent panels can use the worktree path.
@@ -2657,6 +2687,9 @@ final class TeamOrchestrator: ObservableObject {
                     let escaped = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
                     let quotedPath = claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath
                     var claudeLeaderParts = ["\(quotedPath)", "--system-prompt '\(escaped)'", "--dangerously-skip-permissions"]
+                    if leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil {
+                        claudeLeaderParts.append("--settings '\(Self.leaderTurnHookSettingsJSON)'")
+                    }
                     if !leaderModel.isEmpty && leaderModel != "sonnet" {
                         claudeLeaderParts.append("--model '\(Self.resolveClaudeModelArg(leaderModel))'")
                     }
@@ -2909,6 +2942,8 @@ final class TeamOrchestrator: ObservableObject {
                 launchLeaderLocally: launchLeaderLocally, leaderMode: leaderMode
             )
             team.leaderPolicyState = leaderMode == "claude" ? "injected" : "pending"
+            team.leaderMeasurementCapability = leaderMode == "claude"
+                && leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil ? .supported : .unsupported
             teams[name] = team
             TeamDataStore.shared.registerTeam(name, agents: headlessMembers.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
             syncTeamStateToDaemon()
@@ -3095,6 +3130,8 @@ final class TeamOrchestrator: ObservableObject {
             launchLeaderLocally: launchLeaderLocally, leaderMode: leaderMode
         )
         team.leaderPolicyState = leaderMode == "claude" ? "injected" : "pending"
+        team.leaderMeasurementCapability = leaderMode == "claude"
+            && leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil ? .supported : .unsupported
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
         TeamDataStore.shared.registerTeam(name, agents: members.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
@@ -3694,6 +3731,116 @@ final class TeamOrchestrator: ObservableObject {
     /// A string a shell will read back as exactly one argument.
     static func shellQuoted(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    static func leaderParticipationControlFile(teamName: String) -> String {
+        let safe = teamName.unicodeScalars.map { scalar -> Character in
+            CharacterSet.alphanumerics.contains(scalar) || "._-".unicodeScalars.contains(scalar)
+                ? Character(String(scalar)) : "_"
+        }
+        let base = SessionRestoreSettings.stateDirectoryOverride()
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".term-mesh/state", isDirectory: true).path
+        return (base as NSString).appendingPathComponent("leader-participation-\(String(safe)).json")
+    }
+
+    static func writeLeaderParticipationControl(
+        teamName: String, sessionID: String, supportedLeader: Bool,
+        defaults: UserDefaults = .standard
+    ) {
+        guard let data = leaderParticipationControlData(
+            teamName: teamName, sessionID: sessionID,
+            supportedLeader: supportedLeader, defaults: defaults
+        ) else { return }
+        let file = URL(fileURLWithPath: leaderParticipationControlFile(teamName: teamName))
+        writeLeaderParticipationControlData(data, to: file)
+    }
+
+    static func leaderParticipationControlData(
+        teamName: String, sessionID: String, supportedLeader: Bool,
+        defaults: UserDefaults = .standard
+    ) -> Data? {
+        let settings = LeaderParticipationSettings.load(from: defaults)
+        let measurement = LeaderTurnLog.health()
+        let unknown = max(0, measurement.supportedTurns - measurement.statedTurns)
+        let health = LeaderParticipationSettings.Health(
+            supportedTurns: measurement.supportedTurns, observedDays: measurement.observedDays,
+            coverage: measurement.coverage, linkage: measurement.linkage,
+            unknownRate: measurement.supportedTurns == 0 ? 1
+                : Double(unknown) / Double(measurement.supportedTurns)
+        )
+        let payload = settings.controlPayload(
+            projectID: teamName, sessionID: sessionID,
+            supportedLeader: supportedLeader, health: health
+        )
+        return try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+    }
+
+    private static func writeLeaderParticipationControlData(_ data: Data, to file: URL) {
+        let directory = file.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let temporary = directory.appendingPathComponent(".\(file.lastPathComponent).\(UUID().uuidString).tmp")
+        do {
+            try data.write(to: temporary, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: temporary.path
+            )
+            _ = try FileManager.default.replaceItemAt(file, withItemAt: temporary)
+        } catch {
+            if !FileManager.default.fileExists(atPath: file.path) {
+                try? FileManager.default.moveItem(at: temporary, to: file)
+            } else {
+                try? FileManager.default.removeItem(at: temporary)
+            }
+        }
+    }
+
+    func refreshLeaderParticipationControls() {
+        for team in teams.values {
+            let supported = leaderMeasurementCapability(for: team) == .supported
+            switch team.leaderEndpoint {
+            case .local:
+                Self.writeLeaderParticipationControl(
+                    teamName: team.id, sessionID: team.leaderSessionId,
+                    supportedLeader: supported
+                )
+            case .peer(let hostKey):
+                guard team.leaderMode == "claude", let teamUUID = team.teamUuid else { continue }
+                Task {
+                    await Self.refreshRemoteLeaderParticipationControl(
+                        hostKey: hostKey, teamUUID: teamUUID, teamName: team.id,
+                        sessionID: team.leaderSessionId, supportedLeader: supported
+                    )
+                }
+            }
+        }
+    }
+
+    /// Settings injected only into supported Claude leader launches. The
+    /// command deliberately expands an inherited path at hook execution time:
+    /// encoding a bundle path here would make spaces in an app location part of
+    /// the command grammar. The hook's leader-request-token guard is the
+    /// authority boundary; it exits before reading payloads in every worker.
+    static let leaderTurnHookSettingsJSON = "{\"hooks\":{\"UserPromptSubmit\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"\\\"$TERMMESH_LEADER_TURN_HOOK\\\" --start\",\"timeout\":10}]}],\"Stop\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"\\\"$TERMMESH_LEADER_TURN_HOOK\\\" --end\",\"timeout\":10}]}]}}"
+
+    /// Resolve the hook from the installed app first, then development paths.
+    /// Returning nil makes a launch explicitly unsupported rather than adding
+    /// a settings callback that would fail on every turn.
+    static func leaderTurnHookPath(workingDirectory: String) -> String? {
+        let fileManager = FileManager.default
+        if let bundled = Bundle.main.resourceURL?
+            .appendingPathComponent("scripts/leader-turn-hook.sh").path,
+           fileManager.isExecutableFile(atPath: bundled) {
+            return bundled
+        }
+        let project = (workingDirectory as NSString)
+            .appendingPathComponent("scripts/leader-turn-hook.sh")
+        if fileManager.isExecutableFile(atPath: project) { return project }
+        let development = "scripts/leader-turn-hook.sh"
+        return fileManager.isExecutableFile(atPath: development) ? development : nil
     }
 
     /// Find the leader script for the given mode.
@@ -7246,6 +7393,11 @@ final class TeamOrchestrator: ObservableObject {
     func fleetState() -> [String: Any] {
         var payload = daemonPayload()
         payload["schema"] = 1
+        // Keep the measurement denominator and cohort inventory beside the
+        // fleet snapshot.  This is a read-only aggregation of append-only
+        // turn records: it must never affect dispatch, worker selection, or
+        // the leader policy that produced those records.
+        payload["leader_measurement"] = leaderMeasurementHealthPayload()
         let approvals = (payload["tasks"] as? [[String: Any]] ?? []).filter {
             ($0["status"] as? String) == "review_ready"
         }
@@ -7286,7 +7438,7 @@ final class TeamOrchestrator: ObservableObject {
     func teamStatus(name: String) -> [String: Any]? {
         guard let team = teams[name] else { return nil }
         let teamInbox = inboxItems(teamName: team.id)
-        return [
+        var status: [String: Any] = [
             "team_name": team.id,
             "leader_session_id": team.leaderSessionId,
             "leader_ready": team.leaderReady,
@@ -7371,6 +7523,9 @@ final class TeamOrchestrator: ObservableObject {
             "attention_count": teamInbox.count,
             "task_count": taskBoards[team.id, default: []].count
         ] as [String: Any]
+        status["leader_measurement_capability"] = leaderMeasurementCapability(for: team).rawValue
+        status["leader_measurement"] = leaderMeasurementHealthPayload()
+        return status
     }
 
     /// Destroy a team — send Ctrl-C to all agents and close the workspace.
@@ -7499,6 +7654,9 @@ final class TeamOrchestrator: ObservableObject {
         // Clean up leader prompt temp file
         let safeName = name.replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "..", with: "_")
         try? FileManager.default.removeItem(atPath: "/tmp/term-mesh-leader-\(safeName).md")
+        try? FileManager.default.removeItem(
+            atPath: Self.leaderParticipationControlFile(teamName: name)
+        )
 
         teams.removeValue(forKey: name)
         syncTeamStateToDaemon()
@@ -8711,6 +8869,52 @@ final class TeamOrchestrator: ObservableObject {
             "all_done": completed == team.agents.count,
             "agents": agentStatus
         ]
+    }
+
+    /// Health is deliberately calculated from an immutable log snapshot. A
+    /// process whose hook never runs cannot truthfully write `hook_missing`,
+    /// so the runtime leader inventory supplies capability cohorts separately
+    /// from the supported-turn denominator.
+    func leaderMeasurementHealthPayload() -> [String: Any] {
+        let capabilities = teams.values.map(leaderMeasurementCapability(for:))
+        let health = LeaderTurnLog.health(capabilities: capabilities)
+        let policy = LeaderTurnLog.policyReport()
+        return [
+            "supported_turns": health.supportedTurns,
+            "linked_start_route_end": health.linkedTurns,
+            "stated_turns": health.statedTurns,
+            "unstated_turns": health.unstatedTurns,
+            "unsupported_leaders": health.unsupportedTurns,
+            "degraded_leaders": health.degradedTurns,
+            "malformed_lines": health.malformedLines,
+            "observed_days": health.observedDays,
+            "coverage": health.coverage,
+            "linkage": health.linkage,
+            "policy": [
+                "cohort_counts": policy.cohortCounts,
+                "applied_turns": policy.appliedTurns,
+                "suggested_turns": policy.suggestedTurns,
+                "route_deviations": policy.routeDeviations,
+                "shadow_turns": policy.shadowTurns,
+                "canary_turns": policy.canaryTurns,
+                "holdout_turns": policy.holdoutTurns,
+                "outcome_metrics": [
+                    "quality": "unavailable",
+                    "failure_rework": "unavailable",
+                    "latency": "unavailable",
+                    "token_cost": "unavailable",
+                ],
+            ],
+        ]
+    }
+
+    private func leaderMeasurementCapability(for team: Team) -> LeaderTurnLog.MeasurementCapability {
+        // Created Claude leaders have the only lifecycle hook integrated in
+        // this release. Adopted and non-Claude leaders remain visible,
+        // explicitly unsupported cohorts rather than silently lowering the
+        // supported-turn coverage denominator.
+        guard team.leaderReady else { return .degraded }
+        return team.leaderMeasurementCapability
     }
 
     /// Clean up result files for a team.

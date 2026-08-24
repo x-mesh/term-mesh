@@ -4,6 +4,41 @@ import Foundation
 
 /// Append-only leader turn measurements shared by the app and CLI.
 enum LeaderTurnLog {
+    enum MeasurementCapability: String, Codable, CaseIterable {
+        case supported
+        case unsupported
+        case degraded
+    }
+
+    struct Health: Equatable {
+        let supportedTurns: Int
+        let linkedTurns: Int
+        let statedTurns: Int
+        let unstatedTurns: Int
+        let unsupportedTurns: Int
+        let degradedTurns: Int
+        let malformedLines: Int
+        let observedDays: Int
+
+        var coverage: Double {
+            supportedTurns == 0 ? 0 : Double(statedTurns + unstatedTurns) / Double(supportedTurns)
+        }
+
+        var linkage: Double {
+            supportedTurns == 0 ? 0 : Double(linkedTurns) / Double(supportedTurns)
+        }
+    }
+
+    struct PolicyReport: Equatable {
+        let cohortCounts: [String: Int]
+        let appliedTurns: Int
+        let suggestedTurns: Int
+        let routeDeviations: Int
+        let shadowTurns: Int
+        let canaryTurns: Int
+        let holdoutTurns: Int
+    }
+
     enum Event: String, Codable, CaseIterable {
         case turnStart = "turn_start"
         case turnRoute = "turn_route"
@@ -18,6 +53,19 @@ enum LeaderTurnLog {
         let surfaceID: String
         let promptBytes: Int?
         let promptSHA256: String?
+        let routeStatus: String?
+        /// Shadow-policy fields are additive. `actualRoute` is intentionally
+        /// distinct from `suggestedRoute`, and `policyApplied` remains false
+        /// unless a future health-gated canary explicitly changes behavior.
+        let actualRoute: String?
+        let suggestedParticipation: String?
+        let suggestedRoute: String?
+        let policyVersion: String?
+        let policyMode: String?
+        let policyApplied: Bool?
+        let cohort: String?
+        let policyReasons: [String]?
+        let dispatchBounds: String?
 
         private enum CodingKeys: String, CodingKey {
             case event
@@ -27,6 +75,16 @@ enum LeaderTurnLog {
             case surfaceID = "surface_id"
             case promptBytes = "prompt_bytes"
             case promptSHA256 = "prompt_sha256"
+            case routeStatus = "route_status"
+            case actualRoute = "actual_route"
+            case suggestedParticipation = "suggested_participation"
+            case suggestedRoute = "suggested_route"
+            case policyVersion = "policy_version"
+            case policyMode = "policy_mode"
+            case policyApplied = "policy_applied"
+            case cohort
+            case policyReasons = "policy_reasons"
+            case dispatchBounds = "dispatch_bounds"
         }
 
         private init(
@@ -36,7 +94,17 @@ enum LeaderTurnLog {
             team: String,
             surfaceID: String,
             promptBytes: Int?,
-            promptSHA256: String?
+            promptSHA256: String?,
+            routeStatus: String? = nil,
+            actualRoute: String? = nil,
+            suggestedParticipation: String? = nil,
+            suggestedRoute: String? = nil,
+            policyVersion: String? = nil,
+            policyMode: String? = nil,
+            policyApplied: Bool? = nil,
+            cohort: String? = nil,
+            policyReasons: [String]? = nil,
+            dispatchBounds: String? = nil
         ) {
             self.event = event
             self.turnID = turnID
@@ -45,6 +113,16 @@ enum LeaderTurnLog {
             self.surfaceID = surfaceID
             self.promptBytes = promptBytes
             self.promptSHA256 = promptSHA256
+            self.routeStatus = routeStatus
+            self.actualRoute = actualRoute
+            self.suggestedParticipation = suggestedParticipation
+            self.suggestedRoute = suggestedRoute
+            self.policyVersion = policyVersion
+            self.policyMode = policyMode
+            self.policyApplied = policyApplied
+            self.cohort = cohort
+            self.policyReasons = policyReasons
+            self.dispatchBounds = dispatchBounds
         }
 
         static func turnStart(
@@ -114,6 +192,16 @@ enum LeaderTurnLog {
                 promptBytes = nil
                 promptSHA256 = nil
             }
+            routeStatus = try container.decodeIfPresent(String.self, forKey: .routeStatus)
+            actualRoute = try container.decodeIfPresent(String.self, forKey: .actualRoute)
+            suggestedParticipation = try container.decodeIfPresent(String.self, forKey: .suggestedParticipation)
+            suggestedRoute = try container.decodeIfPresent(String.self, forKey: .suggestedRoute)
+            policyVersion = try container.decodeIfPresent(String.self, forKey: .policyVersion)
+            policyMode = try container.decodeIfPresent(String.self, forKey: .policyMode)
+            policyApplied = try container.decodeIfPresent(Bool.self, forKey: .policyApplied)
+            cohort = try container.decodeIfPresent(String.self, forKey: .cohort)
+            policyReasons = try container.decodeIfPresent([String].self, forKey: .policyReasons)
+            dispatchBounds = try container.decodeIfPresent(String.self, forKey: .dispatchBounds)
         }
 
         func encode(to encoder: Encoder) throws {
@@ -129,6 +217,16 @@ enum LeaderTurnLog {
                 try container.encode(promptBytes, forKey: .promptBytes)
                 try container.encode(promptSHA256, forKey: .promptSHA256)
             }
+            try container.encodeIfPresent(routeStatus, forKey: .routeStatus)
+            try container.encodeIfPresent(actualRoute, forKey: .actualRoute)
+            try container.encodeIfPresent(suggestedParticipation, forKey: .suggestedParticipation)
+            try container.encodeIfPresent(suggestedRoute, forKey: .suggestedRoute)
+            try container.encodeIfPresent(policyVersion, forKey: .policyVersion)
+            try container.encodeIfPresent(policyMode, forKey: .policyMode)
+            try container.encodeIfPresent(policyApplied, forKey: .policyApplied)
+            try container.encodeIfPresent(cohort, forKey: .cohort)
+            try container.encodeIfPresent(policyReasons, forKey: .policyReasons)
+            try container.encodeIfPresent(dispatchBounds, forKey: .dispatchBounds)
         }
     }
 
@@ -217,8 +315,98 @@ enum LeaderTurnLog {
         }
     }
 
+    /// One immutable measurement snapshot. Supported-turn denominator comes
+    /// only from `turn_start`; unsupported and degraded leader cohorts are
+    /// supplied from runtime capability inventory and never dilute coverage.
+    /// A linked turn owns start + route + end with the same non-placeholder id.
+    static func health(
+        from logFile: URL = logFile,
+        capabilities: [MeasurementCapability] = []
+    ) -> Health {
+        guard let data = try? Data(contentsOf: logFile), !data.isEmpty else {
+            return Health(
+                supportedTurns: 0, linkedTurns: 0, statedTurns: 0, unstatedTurns: 0,
+                unsupportedTurns: capabilities.filter { $0 == .unsupported }.count,
+                degradedTurns: capabilities.filter { $0 == .degraded }.count,
+                malformedLines: 0, observedDays: 0
+            )
+        }
+        var rawLines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+        if data.last == 0x0A { rawLines.removeLast() }
+        let decoder = JSONDecoder()
+        var malformed = 0
+        var records: [Record] = []
+        for line in rawLines where !line.isEmpty {
+            guard let record = try? decoder.decode(Record.self, from: Data(line)) else {
+                malformed += 1
+                continue
+            }
+            records.append(record)
+        }
+        let grouped = Dictionary(grouping: records, by: \.turnID)
+        let starts = records.filter { $0.event == .turnStart }
+        let observedDays: Int = {
+            let parser = ISO8601DateFormatter()
+            let dates = starts.compactMap { parser.date(from: $0.timestamp) }.sorted()
+            guard let first = dates.first, let last = dates.last, last >= first else { return 0 }
+            // Calendar-day observation uses inclusive days: activity on one
+            // UTC date is day 1, and seven distinct elapsed dates unlock the
+            // time path. Missing/malformed timestamps never promote.
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+            let start = calendar.startOfDay(for: first)
+            let end = calendar.startOfDay(for: last)
+            return max(1, (calendar.dateComponents([.day], from: start, to: end).day ?? 0) + 1)
+        }()
+        var linked = 0
+        var stated = 0
+        var unstated = 0
+        for start in starts {
+            let turn = grouped[start.turnID] ?? []
+            let hasRoute = turn.contains { $0.event == .turnRoute }
+            let ends = turn.filter { $0.event == .turnEnd }
+            // A durable route record is authoritative even if Stop raced the
+            // marker and wrote route_status=unstated. Count every supported
+            // turn in exactly one outcome cohort so coverage cannot exceed 1.
+            if hasRoute {
+                stated += 1
+            } else if !ends.isEmpty {
+                unstated += 1
+            }
+            if start.turnID != "unknown", start.turnID != "unstated",
+               hasRoute, !ends.isEmpty {
+                linked += 1
+            }
+        }
+        return Health(
+            supportedTurns: starts.count, linkedTurns: linked,
+            statedTurns: stated, unstatedTurns: unstated,
+            unsupportedTurns: capabilities.filter { $0 == .unsupported }.count,
+            degradedTurns: capabilities.filter { $0 == .degraded }.count,
+            malformedLines: malformed, observedDays: observedDays
+        )
+    }
+
     static func countsByEvent(from logFile: URL = logFile) -> [Event: Int] {
         Dictionary(grouping: readAll(from: logFile), by: \.event).mapValues(\.count)
+    }
+
+    static func policyReport(from logFile: URL = logFile) -> PolicyReport {
+        let routes = readAll(from: logFile).filter { $0.event == .turnRoute }
+        let cohorts = Dictionary(grouping: routes.compactMap(\.cohort), by: { $0 })
+            .mapValues(\.count)
+        return PolicyReport(
+            cohortCounts: cohorts,
+            appliedTurns: routes.filter { $0.policyApplied == true }.count,
+            suggestedTurns: routes.filter { $0.suggestedRoute != nil }.count,
+            routeDeviations: routes.filter { route in
+                guard let actual = route.actualRoute, let suggested = route.suggestedRoute else { return false }
+                return actual != suggested
+            }.count,
+            shadowTurns: routes.filter { $0.policyMode == "shadow" }.count,
+            canaryTurns: cohorts["canary", default: 0],
+            holdoutTurns: cohorts["holdout", default: 0]
+        )
     }
 
     private static func timestamp(_ date: Date) -> String {

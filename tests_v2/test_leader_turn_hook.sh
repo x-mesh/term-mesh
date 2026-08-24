@@ -81,6 +81,30 @@ for offset in (0, 2):
         raise SystemExit("FAIL: wrong prompt SHA-256")
 PY
 
+# Route status is an outcome, not a reconstruction from timestamps. A stated
+# route leaves a short-lived per-turn marker; Stop consumes it and records the
+# outcome on the matching end record. The first turn intentionally has no
+# marker and therefore proves the denominator's `unstated` branch.
+first_turn=$(python3 - "$LOG" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text().splitlines()[0])["turn_id"])
+PY
+)
+second_turn=$(python3 - "$LOG" <<'PY'
+import json, pathlib, sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text().splitlines()[2])["turn_id"])
+PY
+)
+python3 - "$LOG" "$first_turn" "$second_turn" <<'PY' || exit 1
+import json, pathlib, sys
+records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+ends = {record["turn_id"]: record for record in records if record["event"] == "turn_end"}
+if ends[sys.argv[2]].get("route_status") != "unstated":
+    raise SystemExit("FAIL: end without a route marker was not unstated")
+if ends[sys.argv[3]].get("route_status") != "unstated":
+    raise SystemExit("FAIL: unmarked end was not unstated")
+PY
+
 # With all three hash implementations hidden, start still records a line and
 # explicitly marks the digest unavailable. Provide only the POSIX tools the
 # hook needs through a controlled PATH.
@@ -130,6 +154,10 @@ overlap_hook() {
 }
 overlap_hook --start '{"prompt":"outer turn"}' || fail "overlap start A returned nonzero"
 overlap_hook --start '{"prompt":"inner turn"}' || fail "overlap start B returned nonzero"
+# Simulate `leader turn route` for the inner turn. The production CLI creates
+# this owner-only marker after atomically appending the stated route record.
+inner_turn=$(tail -n 1 "$OVERLAP_HOME/.term-mesh/logs/.turn-current-overlap-surface")
+printf 'stated\n' > "$OVERLAP_HOME/.term-mesh/logs/.turn-route-$inner_turn"
 overlap_hook --end '{}' || fail "overlap end 1 returned nonzero"
 overlap_hook --end '{}' || fail "overlap end 2 returned nonzero"
 
@@ -149,6 +177,14 @@ if sorted(starts) != sorted(ends):
     raise SystemExit(f"FAIL: starts {starts} did not all match ends {ends}")
 if ends[0] != starts[1] or ends[1] != starts[0]:
     raise SystemExit(f"FAIL: ends {ends} are not the LIFO pairing of starts {starts}")
+end_records = [l for l in lines if l["event"] == "turn_end"]
+if end_records[0].get("route_status") != "stated":
+    raise SystemExit("FAIL: stated route marker was not consumed by Stop")
+if end_records[1].get("route_status") != "unstated":
+    raise SystemExit("FAIL: unstated overlap turn was not recorded")
+marker = pathlib.Path(sys.argv[1]).with_name(f".turn-route-{ends[0]}")
+if marker.exists():
+    raise SystemExit("FAIL: consumed route marker was retained")
 PY
 
 # An argv-delivered payload must not sit in this process's argv: any same-user
@@ -156,4 +192,3 @@ PY
 grep -q 'set --' "$HOOK" || fail "argv is not cleared after the payload is copied"
 
 printf '%s\n' 'PASS: leader turn hook logs private, correlated start/end boundaries'
-

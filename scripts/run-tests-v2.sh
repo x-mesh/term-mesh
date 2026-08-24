@@ -92,6 +92,24 @@ if [ ! -x "$CLI" ]; then
   echo "ERROR: term-mesh CLI not found at expected path: $CLI" >&2
   exit 1
 fi
+# `xcodebuild` copies scripts but not the Rust binaries that an installed app
+# exposes under Resources/bin. Tests that found `tm-agent` on the runner PATH
+# therefore passed without proving the bundle contract. Materialize the same
+# layout as reload/release and re-sign after mutating the app bundle.
+APP_BIN_DIR="$APP/Contents/Resources/bin"
+mkdir -p "$APP_BIN_DIR"
+for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay tm-agent-bridge; do
+  src="$PWD/daemon/target/release/$bin"
+  if [ -x "$src" ]; then
+    cp "$src" "$APP_BIN_DIR/$bin"
+    chmod +x "$APP_BIN_DIR/$bin"
+  fi
+done
+if [ ! -x "$APP_BIN_DIR/tm-agent" ]; then
+  echo "ERROR: bundled tm-agent missing after Cargo build: $APP_BIN_DIR/tm-agent" >&2
+  exit 1
+fi
+/usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$APP" >/dev/null
 export TERMMESH_CLI="$CLI"
 export TERMMESH_CLI_BIN="$CLI"
 

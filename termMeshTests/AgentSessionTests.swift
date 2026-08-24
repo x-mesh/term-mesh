@@ -173,12 +173,12 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "10")
+        XCTAssertEqual(LeaderParallelPolicy.version, "11")
         XCTAssertEqual(LeaderParallelPolicy.activation, "runtime-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 10"))
+        XCTAssertTrue(first.contains("policy_version: 11"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(first.contains("policy_activation: runtime-enforced"))
     }
@@ -190,6 +190,7 @@ final class AgentSessionTests: XCTestCase {
             "team-aware-decomposition-default",
             "parallel-admission-gate",
             "structured-routing-decision",
+            "turn-route-measurement",
             "dag-readiness",
             "unified-placement-pool",
             "same-checkout-isolation",
@@ -215,6 +216,10 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(policy.contains("\"route\": \"direct|probe|parallel\""))
         XCTAssertTrue(policy.contains("probe has exactly one read-only implementation task"))
         XCTAssertTrue(policy.contains("parallel has two or three implementation tasks"))
+        XCTAssertTrue(policy.contains("tm-agent leader turn route --route"))
+        XCTAssertTrue(policy.contains("--available-workers <count>"))
+        XCTAssertTrue(policy.contains("A non-null `directive`"))
+        XCTAssertTrue(policy.contains("does not intercept or enforce arbitrary"))
         XCTAssertTrue(policy.contains("wait --mode any --tasks"))
         XCTAssertTrue(policy.contains("at most one additional wait/collect"))
         XCTAssertTrue(policy.contains("After the actual diff is integrated"))
@@ -237,6 +242,55 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(directive.contains("version \(LeaderParallelPolicy.version)"))
         XCTAssertTrue(directive.contains("digest \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(directive.contains("canonical Leader Adaptive Execution Policy"))
+    }
+
+    func testLeaderTurnHookSettingsContainOnlyTheSupportedBoundaries() throws {
+        let data = try XCTUnwrap(
+            TeamOrchestrator.leaderTurnHookSettingsJSON.data(using: .utf8)
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        let hooks = try XCTUnwrap(object["hooks"] as? [String: Any])
+
+        XCTAssertEqual(Set(hooks.keys), ["UserPromptSubmit", "Stop"])
+        for (event, mode) in [("UserPromptSubmit", "--start"), ("Stop", "--end")] {
+            let groups = try XCTUnwrap(hooks[event] as? [[String: Any]])
+            let group = try XCTUnwrap(groups.first)
+            let entries = try XCTUnwrap(group["hooks"] as? [[String: Any]])
+            let entry = try XCTUnwrap(entries.first)
+            XCTAssertEqual(entry["type"] as? String, "command")
+            XCTAssertEqual(entry["timeout"] as? Int, 10)
+            XCTAssertEqual(
+                entry["command"] as? String,
+                "\"$TERMMESH_LEADER_TURN_HOOK\" \(mode)"
+            )
+        }
+    }
+
+    func testLeaderTurnHookPathFindsDevelopmentAssetWhenNoBundleHookExists() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("leader-turn-hook-\(UUID().uuidString)", isDirectory: true)
+        let hook = root.appendingPathComponent("scripts/leader-turn-hook.sh")
+        try? FileManager.default.createDirectory(
+            at: hook.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        FileManager.default.createFile(atPath: hook.path, contents: Data("#!/bin/sh\n".utf8))
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: hook.path)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // Test bundles may contain the installed app resource. Its precedence
+        // is deliberate; when it is present the development checkout must not
+        // replace the version that is actually executing.
+        let resolved = TeamOrchestrator.leaderTurnHookPath(workingDirectory: root.path)
+        XCTAssertNotNil(resolved)
+        if let bundled = Bundle.main.resourceURL?
+            .appendingPathComponent("scripts/leader-turn-hook.sh").path,
+           FileManager.default.isExecutableFile(atPath: bundled) {
+            XCTAssertEqual(resolved, bundled)
+        } else {
+            XCTAssertEqual(resolved, hook.path)
+        }
     }
 
     /// Two same-named instances used to both write `<agent>-reply.md`,
