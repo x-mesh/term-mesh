@@ -181,6 +181,28 @@ final class RoutingInstrumentationTests: XCTestCase {
         XCTAssertEqual(waveOnly.waveId, "wave-3")
     }
 
+    func testMeasurementHealthPayloadKeepsCapabilityCohortsOutsideDenominator() throws {
+        let log = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("measurement-health-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        let lines = [
+            #"{"event":"turn_start","turn_id":"a","ts":"2026-08-24T00:00:00Z","team":"t","surface_id":"s"}"#,
+            #"{"event":"turn_route","turn_id":"a","ts":"2026-08-24T00:00:01Z","team":"t"}"#,
+            #"{"event":"turn_end","turn_id":"a","ts":"2026-08-24T00:00:02Z","team":"t","route_status":"stated"}"#,
+        ].joined(separator: "\n") + "\n"
+        try Data(lines.utf8).write(to: log)
+
+        let health = LeaderTurnLog.health(
+            from: log, capabilities: [.supported, .unsupported, .degraded]
+        )
+        XCTAssertEqual(health.supportedTurns, 1)
+        XCTAssertEqual(health.linkedTurns, 1)
+        XCTAssertEqual(health.unsupportedTurns, 1)
+        XCTAssertEqual(health.degradedTurns, 1)
+        XCTAssertEqual(health.coverage, 1)
+        XCTAssertEqual(health.linkage, 1)
+    }
+
     // MARK: - Backward compatibility with boards written before these fields
 
     func testLegacyBoardTaskJSONWithoutTheFieldsDecodesWithNil() throws {

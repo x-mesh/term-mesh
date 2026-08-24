@@ -16,7 +16,11 @@ from test_remote_project_host_matrix_reconnect import (
     _fully_deleted,
     _matrix,
 )
-from test_remote_project_restart_reattach import _assert_session_owner_route
+from test_remote_project_restart_reattach import (
+    _TerminalTestFailure,
+    _assert_session_owner_route,
+    _wait,
+)
 
 
 class FakeClient:
@@ -80,6 +84,37 @@ def main() -> int:
             rejects(lambda row=row: _assert_session_owner_route(row))
             for row in broken_routes
         )
+
+        # Release topology must fail before Project creation when the exact
+        # team endpoint cannot report foreground process liveness. A connected
+        # stale daemon is not a candidate fixture.
+        os.environ["TERMMESH_E2E_REQUIRE_REMOTE_PROJECT"] = "1"
+        os.environ["TERMMESH_E2E_REMOTE_FIXTURE_VERSION"] = "v0.213.0"
+        stale = {
+            "id": "fixture", "state": "connected", "launchable": True,
+            "authoritative_leader_liveness": False,
+            "serving_app_version": "v0.209.0",
+        }
+        assert rejects(
+            lambda: __import__("test_remote_project_restart_reattach")._connect(
+                type("Client", (), {
+                    "peer_host_list": lambda self: [stale],
+                    "peer_host_connect": lambda self, host: None,
+                })(), "fixture"
+            )
+        )
+        os.environ.pop("TERMMESH_E2E_REQUIRE_REMOTE_PROJECT", None)
+        os.environ.pop("TERMMESH_E2E_REMOTE_FIXTURE_VERSION", None)
+
+        calls = 0
+
+        def terminal_failure():
+            nonlocal calls
+            calls += 1
+            raise _TerminalTestFailure("terminal")
+
+        assert rejects(lambda: _wait(terminal_failure, timeout_s=1, interval_s=0.01))
+        assert calls == 1, "terminal async failures must not burn the polling timeout"
 
         state = {
             "team_name": "matrix-project",

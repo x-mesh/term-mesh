@@ -290,6 +290,12 @@ def validate_relay_e2e_receipt(receipt: dict[str, Any], candidate_sha: str) -> N
         raise ReleaseError("relay E2E receipt has an unsupported schema")
     if receipt.get("candidate_sha") != candidate_sha:
         raise ReleaseError("relay E2E receipt does not match the planned develop SHA")
+    if receipt.get("remote_fixture_candidate_sha") != candidate_sha:
+        raise ReleaseError(
+            "relay E2E remote daemon was not built from the planned develop SHA"
+        )
+    if not receipt.get("remote_fixture_version"):
+        raise ReleaseError("relay E2E receipt is missing the remote daemon version")
     if receipt.get("result") != "pass" or receipt.get("skipped") is not False:
         raise ReleaseError("relay E2E receipt is not an unskipped pass")
     if receipt.get("required_topology") is not True:

@@ -3758,7 +3758,7 @@ class TerminalController {
         // and `checkout` falling back to a workspace UUID. Derived here, on the
         // actor that owns the member, so both status implementations answer
         // with the same value.
-        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?, workingDirectory: String?)], createdAt: String, policyState: String, policyFailure: String?)? = await MainActor.run {
+        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?, workingDirectory: String?)], createdAt: String, policyState: String, policyFailure: String?, measurement: [String: Any])? = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teamStruct(name: teamName) else { return nil }
             return (
                 leaderSessionId: team.leaderSessionId,
@@ -3776,7 +3776,8 @@ class TerminalController {
                 },
                 createdAt: ISO8601DateFormatter().string(from: team.createdAt),
                 policyState: team.leaderPolicyState,
-                policyFailure: team.leaderPolicyFailureDescription
+                policyFailure: team.leaderPolicyFailureDescription,
+                measurement: TeamOrchestrator.shared.leaderMeasurementHealthPayload()
             )
         }
         guard let teamInfo else {
@@ -3849,6 +3850,7 @@ class TerminalController {
             "leader_policy_source": "LeaderParallelPolicy",
             "leader_policy_state": teamInfo.policyState,
             "leader_policy_failure": teamInfo.policyFailure as Any? ?? NSNull(),
+            "leader_measurement": teamInfo.measurement,
         ] as [String: Any])
     }
 

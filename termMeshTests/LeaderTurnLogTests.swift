@@ -79,7 +79,7 @@ final class LeaderTurnLogTests: XCTestCase {
             at: log.deletingLastPathComponent(), withIntermediateDirectories: true
         )
         let bytes = """
-        {"event":"turn_end","turn_id":"one","ts":"2026-08-24T00:00:00Z","team":"alpha","surface_id":"s1"}
+        {"event":"turn_end","turn_id":"one","ts":"2026-08-24T00:00:00Z","team":"alpha","surface_id":"s1","route_status":"unstated"}
         {not-json}
         {"event":"turn_route","turn_id":"two","ts":"2026-08-24T00:00:01Z","team":"alpha","surface_id":"s1"}
         {"event":"turn_end","turn_id":"torn"
@@ -89,6 +89,112 @@ final class LeaderTurnLogTests: XCTestCase {
         let records = LeaderTurnLog.readAll(from: log)
         XCTAssertEqual(records.map(\.turnID), ["one", "two"])
         XCTAssertEqual(records.map(\.event), [.turnEnd, .turnRoute])
+        XCTAssertEqual(records.first?.routeStatus, "unstated")
+    }
+
+    func testHealthUsesSupportedStartsAsDenominatorAndSeparatesCapabilities() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_start","turn_id":"a","ts":"2026-08-24T00:00:00Z","team":"t","surface_id":"s"}
+        {"event":"turn_route","turn_id":"a","ts":"2026-08-24T00:00:01Z","team":"t","route_status":"stated"}
+        {"event":"turn_end","turn_id":"a","ts":"2026-08-24T00:00:02Z","team":"t","route_status":"stated"}
+        {"event":"turn_start","turn_id":"b","ts":"2026-08-24T00:00:03Z","team":"t","surface_id":"s"}
+        {"event":"turn_end","turn_id":"b","ts":"2026-08-24T00:00:04Z","team":"t","route_status":"unstated"}
+        {not-json}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        let health = LeaderTurnLog.health(
+            from: log, capabilities: [.supported, .unsupported, .degraded]
+        )
+        XCTAssertEqual(health.supportedTurns, 2)
+        XCTAssertEqual(health.linkedTurns, 1)
+        XCTAssertEqual(health.statedTurns, 1)
+        XCTAssertEqual(health.unstatedTurns, 1)
+        XCTAssertEqual(health.unsupportedTurns, 1)
+        XCTAssertEqual(health.degradedTurns, 1)
+        XCTAssertEqual(health.malformedLines, 1)
+        XCTAssertEqual(health.coverage, 1)
+        XCTAssertEqual(health.linkage, 0.5)
+        XCTAssertEqual(health.observedDays, 1)
+    }
+
+    func testHealthComputesInclusiveObservedDaysForSevenDayPromotionPath() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_start","turn_id":"first","ts":"2026-08-18T23:59:00Z","team":"t"}
+        {"event":"turn_start","turn_id":"last","ts":"2026-08-24T00:01:00Z","team":"t"}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+        XCTAssertEqual(LeaderTurnLog.health(from: log).observedDays, 7)
+    }
+
+    func testRouteRecordWinsMarkerRaceAndCoverageNeverExceedsOne() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_start","turn_id":"raced","ts":"2026-08-24T00:00:00Z","team":"t"}
+        {"event":"turn_end","turn_id":"raced","ts":"2026-08-24T00:00:01Z","team":"t","route_status":"unstated"}
+        {"event":"turn_route","turn_id":"raced","ts":"2026-08-24T00:00:02Z","team":"t","route_status":"stated"}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        let health = LeaderTurnLog.health(from: log)
+        XCTAssertEqual(health.supportedTurns, 1)
+        XCTAssertEqual(health.statedTurns, 1)
+        XCTAssertEqual(health.unstatedTurns, 0)
+        XCTAssertEqual(health.coverage, 1)
+        XCTAssertLessThanOrEqual(health.coverage, 1)
+        XCTAssertLessThanOrEqual(health.linkage, 1)
+    }
+
+    func testShadowPolicyFieldsDecodeAdditivelyWithoutChangingLegacyRecords() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_route","turn_id":"policy","ts":"2026-08-24T00:00:00Z","team":"t","route":"parallel","actual_route":"parallel","suggested_participation":"hands_on","suggested_route":"direct","policy_version":"1","policy_mode":"shadow","policy_applied":false,"cohort":"shadow","policy_reasons":["unsupported_input"],"dispatch_bounds":"no required worker dispatch"}
+        {"event":"turn_route","turn_id":"legacy","ts":"2026-08-24T00:00:01Z","team":"t","route":"direct"}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        let records = LeaderTurnLog.readAll(from: log)
+        XCTAssertEqual(records[0].actualRoute, "parallel")
+        XCTAssertEqual(records[0].suggestedRoute, "direct")
+        XCTAssertEqual(records[0].policyApplied, false)
+        XCTAssertEqual(records[0].cohort, "shadow")
+        XCTAssertEqual(records[1].actualRoute, nil)
+        XCTAssertEqual(records[1].policyApplied, nil)
+    }
+
+    func testPolicyReportSeparatesCohortsAppliedAndSuggestedDeviation() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_route","turn_id":"s","ts":"2026-08-24T00:00:00Z","team":"t","actual_route":"direct","suggested_route":"parallel","policy_mode":"shadow","policy_applied":false,"cohort":"shadow"}
+        {"event":"turn_route","turn_id":"c","ts":"2026-08-24T00:00:01Z","team":"t","actual_route":"parallel","suggested_route":"parallel","policy_mode":"canary","policy_applied":true,"cohort":"canary"}
+        {"event":"turn_route","turn_id":"h","ts":"2026-08-24T00:00:02Z","team":"t","actual_route":"direct","suggested_route":"parallel","policy_mode":"canary","policy_applied":false,"cohort":"holdout"}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        let report = LeaderTurnLog.policyReport(from: log)
+        XCTAssertEqual(report.shadowTurns, 1)
+        XCTAssertEqual(report.canaryTurns, 1)
+        XCTAssertEqual(report.holdoutTurns, 1)
+        XCTAssertEqual(report.appliedTurns, 1)
+        XCTAssertEqual(report.suggestedTurns, 3)
+        XCTAssertEqual(report.routeDeviations, 2)
     }
 
     func testAppendCreatesMissingDirectory() throws {

@@ -5,7 +5,7 @@ import Foundation
 /// renderer consumes `renderedInstructions`; no renderer owns a fork of these
 /// scheduling rules.
 enum LeaderParallelPolicy {
-    static let version = "10"
+    static let version = "11"
     static let activation = "runtime-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do
@@ -23,6 +23,10 @@ enum LeaderParallelPolicy {
         (
             "structured-routing-decision",
             "Classify execution as direct, probe, or parallel before dispatch. Direct has no worker tasks. Probe has exactly one read-only task with a 60-90 second budget. Parallel has two or three dependency-ready tasks. Every worker task names its worker, goal, owned and forbidden paths, dependencies, verification command, mutation flag, and time estimate."
+        ),
+        (
+            "turn-route-measurement",
+            "For every supported leader turn, before dispatch or direct implementation, submit exactly one classification with `tm-agent leader turn route --route <direct|probe|parallel> --task-shape <single_unit|multi_unit|cross_subsystem|parallelizable> --available-workers <count>` and repeat `--risk-reason <reason>` for each risk; add `--wave-id <id>` only when a wave exists. Read the JSON result. A non-null `directive` is an observable tm-agent dispatch contract for an explicitly opted-in healthy canary; follow its route and dispatch_bounds. A null directive leaves the static policy unchanged. This contract does not intercept or enforce arbitrary file edits, shell commands, or other leader tool calls. Route omission remains observable and non-blocking."
         ),
         (
             "dag-readiness",

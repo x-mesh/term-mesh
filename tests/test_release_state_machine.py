@@ -43,6 +43,8 @@ class ReleaseStateMachineTests(unittest.TestCase):
         receipt = {
             "schema": 1,
             "candidate_sha": "abc123",
+            "remote_fixture_candidate_sha": "abc123",
+            "remote_fixture_version": "v0.213.0",
             "result": "pass",
             "required_topology": True,
             "skipped": False,
@@ -63,6 +65,7 @@ class ReleaseStateMachineTests(unittest.TestCase):
         release.validate_relay_e2e_receipt(receipt, "abc123")
         for key, value in (
             ("candidate_sha", "wrong"),
+            ("remote_fixture_candidate_sha", "wrong"),
             ("skipped", True),
             ("leader_relay_stability_seconds", 10),
             ("bytes_received", 0),

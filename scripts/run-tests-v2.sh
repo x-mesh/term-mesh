@@ -41,6 +41,64 @@ fi
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rust/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
+preflight_remote_project_fixture() {
+  [ "${TERMMESH_E2E_REATTACH_PHASE:-}" = "full" ] || return 0
+  [ "${TERMMESH_E2E_REQUIRE_REMOTE_PROJECT:-}" = "1" ] || return 0
+
+  local host="${TERMMESH_E2E_REMOTE_LEADER_HOST:-}"
+  local remote_dir="${TERMMESH_E2E_REMOTE_LEADER_DIR:-}"
+  local profiles="${TERMMESH_E2E_REMOTE_LEADER_HOST_PROFILE_JSON:-}"
+  if [ -z "$host" ] || [ -z "$remote_dir" ] || [ -z "$profiles" ]; then
+    echo "ERROR: required remote Project E2E needs host, directory, and seeded host profile JSON." >&2
+    return 1
+  fi
+
+  local ssh_target
+  ssh_target=$(/usr/bin/python3 - "$host" "$profiles" <<'PY'
+import json
+import sys
+
+host, raw = sys.argv[1:]
+try:
+    profiles = json.loads(raw)
+except (TypeError, ValueError) as exc:
+    raise SystemExit(f"invalid remote leader host profile JSON: {exc}")
+for profile in profiles:
+    target = str(profile.get("sshTarget") or "")
+    if target and host == f"ssh:{target}":
+        print(target)
+        break
+else:
+    raise SystemExit(f"no seeded profile matches remote host {host!r}")
+PY
+  ) || return 1
+
+  local remote_dir_q
+  printf -v remote_dir_q '%q' "$remote_dir"
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$ssh_target" \
+    "git -C $remote_dir_q rev-parse --verify HEAD >/dev/null"; then
+    echo "ERROR: remote Project source must be a reachable Git checkout with a committed HEAD: $ssh_target:$remote_dir" >&2
+    return 1
+  fi
+  echo "remote Project fixture ready: host=$host source=$remote_dir"
+}
+
+verify_runner_checkout() {
+  local expected_ghostty actual_ghostty
+  expected_ghostty=$(git ls-tree HEAD ghostty | awk '{print $3}')
+  actual_ghostty=$(git -C ghostty rev-parse HEAD 2>/dev/null || true)
+  if [ -z "$expected_ghostty" ] || [ "$actual_ghostty" != "$expected_ghostty" ]; then
+    echo "ERROR: ghostty submodule is not initialized at the commit pinned by this checkout; run ./scripts/setup.sh." >&2
+    return 1
+  fi
+  if [ ! -d GhosttyKit.xcframework ]; then
+    echo "ERROR: GhosttyKit.xcframework is missing; run ./scripts/setup.sh before E2E." >&2
+    return 1
+  fi
+}
+
+verify_runner_checkout
+
 DERIVED_DATA_PATH="$HOME/Library/Developer/Xcode/DerivedData/term-mesh-tests-v2"
 APP="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh DEV.app"
 CLI="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh"
@@ -51,9 +109,99 @@ DAEMON_SOCK_PATH="${TMPDIR:-/tmp}/term-meshd-e2e-${E2E_RUN_ID}.sock"
 DAEMON_LOG_PATH="/tmp/term-meshd-e2e-${E2E_RUN_ID}.log"
 E2E_APP_PID=""
 E2E_DAEMON_PID=""
+REMOTE_FIXTURE_SSH_TARGET=""
+REMOTE_FIXTURE_ROOT=""
 PYTHON_VENV="$DERIVED_DATA_PATH/python-venv"
 PYTHON="$PYTHON_VENV/bin/python3"
 SYSTEM_PYTHON="/usr/bin/python3"
+
+stage_remote_relay_fixture() {
+  [ "${TERMMESH_E2E_REATTACH_PHASE:-}" = "full" ] || return 0
+  [ "${TERMMESH_E2E_REQUIRE_REMOTE_PROJECT:-0}" = "1" ] || return 0
+  if [ "${TERMMESH_E2E_STAGE_REMOTE_FIXTURE:-0}" != "1" ]; then
+    echo "ERROR: required full relay E2E must set TERMMESH_E2E_STAGE_REMOTE_FIXTURE=1" >&2
+    echo "This prevents a stale production daemon from being mistaken for the candidate." >&2
+    exit 1
+  fi
+  REMOTE_FIXTURE_SSH_TARGET="${TERMMESH_E2E_REMOTE_FIXTURE_SSH_TARGET:-}"
+  if [ -z "$REMOTE_FIXTURE_SSH_TARGET" ]; then
+    echo "ERROR: TERMMESH_E2E_REMOTE_FIXTURE_SSH_TARGET is required" >&2
+    exit 1
+  fi
+
+  local candidate_sha expected_sha fixture_id remote_version remote_socket remote_dir
+  candidate_sha="${TERMMESH_E2E_CANDIDATE_SHA:-}"
+  expected_sha="$(git rev-parse HEAD)"
+  if [ -z "$candidate_sha" ] || [ "$candidate_sha" != "$expected_sha" ]; then
+    echo "ERROR: candidate SHA must equal the exact runner checkout HEAD" >&2
+    echo "expected=$expected_sha supplied=${candidate_sha:-<empty>}" >&2
+    exit 1
+  fi
+  if ! git diff --quiet -- daemon Proto || ! git diff --cached --quiet -- daemon Proto; then
+    echo "ERROR: daemon/proto must be clean so the remote fixture proves candidate_sha" >&2
+    exit 1
+  fi
+
+  fixture_id="${candidate_sha:0:12}-$E2E_RUN_ID"
+  REMOTE_FIXTURE_ROOT="/tmp/term-mesh-release-relay-$fixture_id"
+  remote_socket="$REMOTE_FIXTURE_ROOT/peer.sock"
+  remote_dir="$REMOTE_FIXTURE_ROOT/src"
+  echo "== stage remote candidate fixture ($REMOTE_FIXTURE_SSH_TARGET) =="
+  ssh "$REMOTE_FIXTURE_SSH_TARGET" "mkdir -p '$remote_dir'"
+  git archive HEAD \
+    | ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+      "tar -xf - -C '$remote_dir' && cd '$remote_dir' && git init -q && \
+       git add -A && git -c user.name=term-mesh-e2e -c user.email=e2e@invalid \
+       commit -qm candidate"
+  ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+    "cd '$REMOTE_FIXTURE_ROOT/src/daemon' && \
+     PATH=\"\$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:\$PATH\" \
+     CARGO_TARGET_DIR=/tmp/term-mesh-release-relay-target \
+     cargo build --release --locked -p term-meshd -p term-mesh-cli -p tm-agent-bridge"
+  remote_version="$(ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+    '/tmp/term-mesh-release-relay-target/release/term-meshd --version' | awk '{print $2}')"
+  if [ -z "$remote_version" ]; then
+    echo "ERROR: staged remote daemon did not report a version" >&2
+    exit 1
+  fi
+  ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+    "mkdir -p '$REMOTE_FIXTURE_ROOT/state' '$REMOTE_FIXTURE_ROOT/runtime'; \
+     chmod 700 '$REMOTE_FIXTURE_ROOT' '$REMOTE_FIXTURE_ROOT/state' '$REMOTE_FIXTURE_ROOT/runtime'; \
+     env XDG_DATA_HOME='$REMOTE_FIXTURE_ROOT/state' XDG_RUNTIME_DIR='$REMOTE_FIXTURE_ROOT/runtime' \
+       PATH=/tmp/term-mesh-release-relay-target/release:\$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:\$PATH \
+       TERMMESH_PEER_SOCKET='$remote_socket' \
+       TERMMESH_DAEMON_UNIX_PATH='$REMOTE_FIXTURE_ROOT/control.sock' \
+       nohup /tmp/term-mesh-release-relay-target/release/term-meshd \
+       >'$REMOTE_FIXTURE_ROOT/daemon.log' 2>&1 & echo \$! >'$REMOTE_FIXTURE_ROOT/pid'"
+  for _ in {1..120}; do
+    if ssh "$REMOTE_FIXTURE_SSH_TARGET" "test -S '$remote_socket'"; then break; fi
+    sleep 0.25
+  done
+  if ! ssh "$REMOTE_FIXTURE_SSH_TARGET" "test -S '$remote_socket'"; then
+    echo "ERROR: staged remote peer socket did not become ready" >&2
+    ssh "$REMOTE_FIXTURE_SSH_TARGET" "tail -100 '$REMOTE_FIXTURE_ROOT/daemon.log'" >&2 || true
+    exit 1
+  fi
+
+  export TERMMESH_E2E_REMOTE_LEADER_HOST="ssh:$REMOTE_FIXTURE_SSH_TARGET"
+  export TERMMESH_E2E_REMOTE_LEADER_DIR="$remote_dir"
+  export TERMMESH_E2E_REMOTE_FIXTURE_CANDIDATE_SHA="$candidate_sha"
+  export TERMMESH_E2E_REMOTE_FIXTURE_VERSION="v$remote_version"
+  export TERMMESH_E2E_REMOTE_LEADER_HOST_PROFILE_JSON
+  TERMMESH_E2E_REMOTE_LEADER_HOST_PROFILE_JSON="[{\"id\":\"11111111-1111-4111-8111-111111111111\",\"displayName\":\"release-candidate-relay\",\"sshTarget\":\"$REMOTE_FIXTURE_SSH_TARGET\",\"remoteSocket\":\"$remote_socket\",\"createdAt\":0}]"
+}
+
+cleanup_remote_relay_fixture() {
+  [ -n "$REMOTE_FIXTURE_SSH_TARGET" ] || return 0
+  [ -n "$REMOTE_FIXTURE_ROOT" ] || return 0
+  ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+    "if test -f '$REMOTE_FIXTURE_ROOT/pid'; then kill \$(cat '$REMOTE_FIXTURE_ROOT/pid') 2>/dev/null || true; fi; rm -rf '$REMOTE_FIXTURE_ROOT'" \
+    >/dev/null 2>&1 || true
+}
+
+trap 'cleanup_remote_relay_fixture' EXIT
+stage_remote_relay_fixture
+preflight_remote_project_fixture
 
 echo "== build =="
 ./scripts/generate-build-info.sh
@@ -92,6 +240,24 @@ if [ ! -x "$CLI" ]; then
   echo "ERROR: term-mesh CLI not found at expected path: $CLI" >&2
   exit 1
 fi
+# `xcodebuild` copies scripts but not the Rust binaries that an installed app
+# exposes under Resources/bin. Tests that found `tm-agent` on the runner PATH
+# therefore passed without proving the bundle contract. Materialize the same
+# layout as reload/release and re-sign after mutating the app bundle.
+APP_BIN_DIR="$APP/Contents/Resources/bin"
+mkdir -p "$APP_BIN_DIR"
+for bin in term-meshd term-mesh-run tm-agent term-mesh-peer-relay tm-agent-bridge; do
+  src="$PWD/daemon/target/release/$bin"
+  if [ -x "$src" ]; then
+    cp "$src" "$APP_BIN_DIR/$bin"
+    chmod +x "$APP_BIN_DIR/$bin"
+  fi
+done
+if [ ! -x "$APP_BIN_DIR/tm-agent" ]; then
+  echo "ERROR: bundled tm-agent missing after Cargo build: $APP_BIN_DIR/tm-agent" >&2
+  exit 1
+fi
+/usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$APP" >/dev/null
 export TERMMESH_CLI="$CLI"
 export TERMMESH_CLI_BIN="$CLI"
 
@@ -130,7 +296,7 @@ E2E_STATE_DIR="${TMPDIR:-/tmp}/termmesh-e2e-state.$$"
 export TERMMESH_E2E_STATE_DIR="$E2E_STATE_DIR"
 # A test that relaunches the app respawns this exact binary with this exact env.
 export TERMMESH_APP_BIN="$APP/Contents/MacOS/term-mesh DEV"
-trap 'cleanup; rm -rf "$E2E_STATE_DIR"; defaults delete com.termmesh.e2e >/dev/null 2>&1 || true' EXIT
+trap 'cleanup; cleanup_remote_relay_fixture; rm -rf "$E2E_STATE_DIR"; defaults delete com.termmesh.e2e >/dev/null 2>&1 || true' EXIT
 
 launch_and_wait() {
   local preserve_state="${1:-0}"

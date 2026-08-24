@@ -153,6 +153,14 @@ struct SettingsView: View {
     @AppStorage(ReviewBoardSettings.enabledKey)
     private var reviewBoardEnabled = ReviewBoardSettings.defaultEnabled
     @AppStorage("teamDefaultLeaderMode") private var teamDefaultLeaderMode = "claude"
+    @AppStorage(LeaderParticipationSettings.modeKey)
+    private var leaderParticipationMode = LeaderParticipationSettings.Mode.shadow.rawValue
+    @AppStorage(LeaderParticipationSettings.canaryPercentKey)
+    private var leaderParticipationCanaryPercent = 0
+    @AppStorage(LeaderParticipationSettings.killSwitchKey)
+    private var leaderParticipationKillSwitch = false
+    @AppStorage(LeaderParticipationSettings.optInProjectsCSVKey)
+    private var leaderParticipationOptInProjects = ""
 
     /// Whether agents get a pane the app draws instead of a terminal.
     ///
@@ -1458,6 +1466,69 @@ struct SettingsView: View {
                             }
                             .labelsHidden()
                             .pickerStyle(.menu)
+                        }
+
+                        if settingsMatch("leader", "participation", "shadow", "canary", "kill switch") {
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Leader Participation",
+                            subtitle: "Shadow only records suggestions. Canary applies observable tm-agent dispatch bounds only after health gates pass.",
+                            controlWidth: pickerColumnWidth
+                        ) {
+                            Picker("", selection: $leaderParticipationMode) {
+                                Text("Off").tag(LeaderParticipationSettings.Mode.off.rawValue)
+                                Text("Shadow").tag(LeaderParticipationSettings.Mode.shadow.rawValue)
+                                Text("Canary").tag(LeaderParticipationSettings.Mode.canary.rawValue)
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                        }
+                        .onChange(of: leaderParticipationMode) { _, _ in
+                            TeamOrchestrator.shared.refreshLeaderParticipationControls()
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Canary Percentage",
+                            subtitle: "Deterministic Project/session cohort. The shipped default is 0%.",
+                            controlWidth: pickerColumnWidth
+                        ) {
+                            Stepper(value: $leaderParticipationCanaryPercent, in: 0...100) {
+                                Text("\(leaderParticipationCanaryPercent)%")
+                                    .font(.system(.body, design: .monospaced))
+                            }
+                        }
+                        .onChange(of: leaderParticipationCanaryPercent) { _, _ in
+                            TeamOrchestrator.shared.refreshLeaderParticipationControls()
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Canary Projects",
+                            subtitle: "Explicit Project names, comma-separated. No Project is opted in by default."
+                        ) {
+                            TextField("project-a, project-b", text: $leaderParticipationOptInProjects)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 240)
+                        }
+                        .onChange(of: leaderParticipationOptInProjects) { _, _ in
+                            TeamOrchestrator.shared.refreshLeaderParticipationControls()
+                        }
+
+                        SettingsCardDivider()
+
+                        SettingsCardRow(
+                            "Kill Switch",
+                            subtitle: "Returns every existing local leader to static behavior on its next route evaluation."
+                        ) {
+                            Toggle("", isOn: $leaderParticipationKillSwitch).labelsHidden()
+                        }
+                        .onChange(of: leaderParticipationKillSwitch) { _, _ in
+                            TeamOrchestrator.shared.refreshLeaderParticipationControls()
+                        }
                         }
                         }
 

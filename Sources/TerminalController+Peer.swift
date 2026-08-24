@@ -72,6 +72,9 @@ extension TerminalController {
             // The authenticated PATH metadata lands on a second round trip.
             "launchable": host.isLaunchable,
         ]
+        if let version = host.servingVersionDisplay {
+            dict["serving_app_version"] = version
+        }
         if case .failed(let reason) = host.connectionState {
             dict["failure_reason"] = reason
         }
@@ -91,6 +94,8 @@ extension TerminalController {
             dict["team_host_readiness"] = "ready"
             dict["team_host_endpoint"] = snapshot.endpoint.description
             dict["durable_remote_creation"] = snapshot.supportsDurableRemoteCreation
+            dict["authoritative_leader_liveness"] =
+                snapshot.supportsAuthoritativeLeaderLiveness
         case .unreachable(let endpoint):
             dict["team_host_readiness"] = "unreachable"
             dict["team_host_endpoint"] = endpoint.description
