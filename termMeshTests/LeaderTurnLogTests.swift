@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import XCTest
 
 #if canImport(term_mesh_DEV)
@@ -125,10 +126,17 @@ final class LeaderTurnLogTests: XCTestCase {
 
     func testTurnIDIsDeterministicAndInputSensitive() {
         let promptHash = LeaderTurnLog.promptSHA256("same prompt")
-        let first = LeaderTurnLog.turnID(surfaceID: "surface-a", promptSHA256: promptHash)
-        let again = LeaderTurnLog.turnID(surfaceID: "surface-a", promptSHA256: promptHash)
-        let otherSurface = LeaderTurnLog.turnID(surfaceID: "surface-b", promptSHA256: promptHash)
+        let first = LeaderTurnLog.turnID(
+            sessionID: nil, surfaceID: "surface-a", promptSHA256: promptHash
+        )
+        let again = LeaderTurnLog.turnID(
+            sessionID: nil, surfaceID: "surface-a", promptSHA256: promptHash
+        )
+        let otherSurface = LeaderTurnLog.turnID(
+            sessionID: nil, surfaceID: "surface-b", promptSHA256: promptHash
+        )
         let otherPrompt = LeaderTurnLog.turnID(
+            sessionID: nil,
             surfaceID: "surface-a",
             promptSHA256: LeaderTurnLog.promptSHA256("different prompt")
         )
@@ -137,6 +145,51 @@ final class LeaderTurnLogTests: XCTestCase {
         XCTAssertEqual(first.count, 16)
         XCTAssertNotEqual(first, otherSurface)
         XCTAssertNotEqual(first, otherPrompt)
+    }
+
+    /// The shell hook is the writer that actually produces turn_start/turn_end,
+    /// and it prefers the CLI session ID over the surface ID as the hash
+    /// discriminator. This helper must agree byte-for-byte or the two writers
+    /// derive different IDs for the same turn — and since the join is by
+    /// turn_id alone, the records never meet and the miss looks exactly like a
+    /// leader that never reported a route. Recompute the hook's documented
+    /// derivation here rather than trusting the implementation.
+    func testTurnIDMatchesTheHookDiscriminatorPreference() {
+        let promptHash = LeaderTurnLog.promptSHA256("shared prompt")
+
+        // A session ID in the payload wins over the surface ID.
+        let withSession = LeaderTurnLog.turnID(
+            sessionID: "session-42", surfaceID: "surface-a", promptSHA256: promptHash
+        )
+        let sessionAsDiscriminator = Self.sha256Prefix16("session-42:\(promptHash)")
+        XCTAssertEqual(withSession, sessionAsDiscriminator)
+
+        // The surface ID is used only as the fallback: absent and empty behave
+        // identically, matching the hook's `${SESSION_ID:-$SURFACE_ID}`.
+        let surfaceFallback = Self.sha256Prefix16("surface-a:\(promptHash)")
+        XCTAssertEqual(
+            LeaderTurnLog.turnID(
+                sessionID: nil, surfaceID: "surface-a", promptSHA256: promptHash
+            ),
+            surfaceFallback
+        )
+        XCTAssertEqual(
+            LeaderTurnLog.turnID(
+                sessionID: "", surfaceID: "surface-a", promptSHA256: promptHash
+            ),
+            surfaceFallback
+        )
+
+        // And the two discriminators must not collide.
+        XCTAssertNotEqual(withSession, surfaceFallback)
+    }
+
+    private static func sha256Prefix16(_ input: String) -> String {
+        SHA256.hash(data: Data(input.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+            .prefix(16)
+            .description
     }
 
     func testPromptContentIsAbsentFromWrittenBytes() throws {

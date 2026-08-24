@@ -8942,6 +8942,16 @@ final class TeamOrchestrator: ObservableObject {
             "blocked_reason": task.blockedReason as Any? ?? NSNull(),
             "review_summary": task.reviewSummary as Any? ?? NSNull(),
             "created_by": task.createdBy,
+            // The same two measurement fields TeamDataStore.taskDictionary
+            // emits. This second serializer is the one `daemonPayload` uses,
+            // so `fleet.state`, `/api/fleet` and every daemon team sync read
+            // through here — omitting them meant a route the leader actually
+            // stated reached board.json but was absent from the surface most
+            // analysis reads, and an absent field is indistinguishable from
+            // "the leader stated nothing". Any field added to one dictionary
+            // has to be added to both.
+            "route": task.route as Any? ?? NSNull(),
+            "wave_id": task.waveId as Any? ?? NSNull(),
             "result": task.result as Any? ?? NSNull(),
             "result_path": task.resultPath as Any? ?? NSNull(),
             "worktree_policy": task.worktreePolicy as Any? ?? NSNull(),

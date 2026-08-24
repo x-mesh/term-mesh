@@ -51,12 +51,17 @@ enum LeaderTurnLog {
             team: String,
             surfaceID: String,
             prompt: String,
+            sessionID: String? = nil,
             timestamp: Date = Date()
         ) -> Record {
             let promptHash = LeaderTurnLog.promptSHA256(prompt)
             return Record(
                 event: .turnStart,
-                turnID: LeaderTurnLog.turnID(surfaceID: surfaceID, promptSHA256: promptHash),
+                turnID: LeaderTurnLog.turnID(
+                    sessionID: sessionID,
+                    surfaceID: surfaceID,
+                    promptSHA256: promptHash
+                ),
                 timestamp: LeaderTurnLog.timestamp(timestamp),
                 team: team,
                 surfaceID: surfaceID,
@@ -69,12 +74,17 @@ enum LeaderTurnLog {
             team: String,
             surfaceID: String,
             prompt: String,
+            sessionID: String? = nil,
             timestamp: Date = Date()
         ) -> Record {
             let promptHash = LeaderTurnLog.promptSHA256(prompt)
             return Record(
                 event: .turnEnd,
-                turnID: LeaderTurnLog.turnID(surfaceID: surfaceID, promptSHA256: promptHash),
+                turnID: LeaderTurnLog.turnID(
+                    sessionID: sessionID,
+                    surfaceID: surfaceID,
+                    promptSHA256: promptHash
+                ),
                 timestamp: LeaderTurnLog.timestamp(timestamp),
                 team: team,
                 surfaceID: surfaceID,
@@ -139,10 +149,20 @@ enum LeaderTurnLog {
     }
 
     /// Pure cross-process identity: first 16 lowercase hex characters of
-    /// SHA-256(UTF8(surface_id + ":" + prompt_sha256)). Both hook invocations
-    /// can recompute it without sharing state because they see the same inputs.
-    static func turnID(surfaceID: String, promptSHA256: String) -> String {
-        let input = Data("\(surfaceID):\(promptSHA256)".utf8)
+    /// SHA-256(UTF8(discriminator + ":" + prompt_sha256)).
+    ///
+    /// The discriminator MUST match `scripts/leader-turn-hook.sh`, which is the
+    /// writer that actually produces `turn_start`/`turn_end` today: it prefers
+    /// the CLI session ID from the hook payload and falls back to the surface
+    /// ID only when the payload carries none. An implementation here that hard-
+    /// coded the surface ID would derive a different ID for the same turn, and
+    /// because the join is by `turn_id` alone the two records would simply
+    /// never meet — no error, just a start with no route. Take the
+    /// discriminator as a parameter so a caller cannot silently pick the wrong
+    /// one, and let it carry the same preference order the hook uses.
+    static func turnID(sessionID: String?, surfaceID: String, promptSHA256: String) -> String {
+        let discriminator = (sessionID?.isEmpty == false) ? sessionID! : surfaceID
+        let input = Data("\(discriminator):\(promptSHA256)".utf8)
         return SHA256.hash(data: input)
             .map { String(format: "%02x", $0) }
             .joined()

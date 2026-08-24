@@ -234,4 +234,61 @@ final class RoutingInstrumentationTests: XCTestCase {
         XCTAssertEqual(restored.route, "parallel")
         XCTAssertEqual(restored.waveId, wave)
     }
+
+    /// There are TWO task serializers: `TeamDataStore.taskDictionary`, which the
+    /// v2 RPC handlers return, and `TeamOrchestrator.taskDictionary`, which
+    /// `daemonPayload` uses for `fleet.state`, `/api/fleet` and every daemon
+    /// team sync. The routing fields were originally added to only the first,
+    /// so a route the leader actually stated reached board.json but was missing
+    /// from the surface analysis reads — and an absent field reads exactly like
+    /// "the leader stated nothing", which is the one distinction these fields
+    /// exist to make. Assert both dictionaries agree.
+    @MainActor
+    func testBothTaskSerializersCarryTheRoutingFields() throws {
+        let team = registerTeam()
+        let wave = "wave-\(UUID().uuidString)"
+        let task = try XCTUnwrap(store.createTask(
+            teamName: team, title: "two serializers", assignee: "executor",
+            route: "parallel", waveId: wave
+        ))
+
+        let storeDict = store.taskDictionary(task)
+        let orchestratorDict = TeamOrchestrator.shared.taskDictionary(task)
+
+        for (label, dict) in [("store", storeDict), ("orchestrator", orchestratorDict)] {
+            XCTAssertEqual(
+                dict["route"] as? String, "parallel",
+                "\(label) serializer dropped the stated route"
+            )
+            XCTAssertEqual(
+                dict["wave_id"] as? String, wave,
+                "\(label) serializer dropped the stated wave"
+            )
+        }
+    }
+
+    /// An unstated route must be present-and-null in both serializers, not
+    /// absent from one of them: a reader cannot tell an omitted key from a
+    /// task that predates the field, so "not stated" has to be explicit.
+    @MainActor
+    func testUnstatedRoutingFieldsArePresentAndNullInBothSerializers() throws {
+        let team = registerTeam()
+        let task = try XCTUnwrap(store.createTask(
+            teamName: team, title: "unstated", assignee: "executor"
+        ))
+
+        for (label, dict) in [
+            ("store", store.taskDictionary(task)),
+            ("orchestrator", TeamOrchestrator.shared.taskDictionary(task)),
+        ] {
+            XCTAssertTrue(
+                dict.keys.contains("route"), "\(label) serializer omitted the route key"
+            )
+            XCTAssertTrue(
+                dict.keys.contains("wave_id"), "\(label) serializer omitted the wave_id key"
+            )
+            XCTAssertTrue(dict["route"] is NSNull, "\(label) route should be null")
+            XCTAssertTrue(dict["wave_id"] is NSNull, "\(label) wave_id should be null")
+        }
+    }
 }
