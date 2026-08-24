@@ -1006,11 +1006,7 @@ mod integration_tests {
             .delete_project_presentation_with_released(&owner, "team:uuid-attached")
             .unwrap()
             .unwrap();
-        for surface_id in released {
-            if !host.presentation_references_surface(&surface_id) {
-                let _ = host.terminate_surface(&surface_id);
-            }
-        }
+        assert_eq!(released, vec![leader.clone()]);
         assert!(manager.list().iter().all(|surface| surface.surface_id != leader));
     }
 
