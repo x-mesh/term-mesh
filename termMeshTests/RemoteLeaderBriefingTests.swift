@@ -358,6 +358,23 @@ final class RemoteLeaderAutonomyFlagsTests: XCTestCase {
         XCTAssertFalse(command.contains("status=$?; rm -f --"))
     }
 
+    func test_remoteCodexLeaderCarriesTurnHooksAndCleansPrivateFiles() {
+        let command = TeamOrchestrator.remoteAgentCommand(
+            cli: "codex", model: "gpt-5.6-sol", agentName: "leader",
+            teamName: "xm", workingDirectory: "/srv/xm",
+            systemPromptFile: "/tmp/prompt",
+            needsSocketAccess: true,
+            turnHookFile: "/cache/leader hook.sh",
+            participationControlFile: "/cache/participation.json"
+        )
+        XCTAssertTrue(command.contains("--dangerously-bypass-hook-trust"))
+        XCTAssertTrue(command.contains("hooks.UserPromptSubmit"))
+        XCTAssertTrue(command.contains("hooks.Stop"))
+        XCTAssertTrue(command.contains("--start"))
+        XCTAssertTrue(command.contains("--end"))
+        XCTAssertTrue(command.contains("rm -f -- '/cache/leader hook.sh' '/cache/participation.json'"))
+    }
+
     func test_remoteTurnHookStageIsAtomicAndOwnerOnly() {
         let command = TeamOrchestrator.remoteLeaderTurnHookSSHStageCommand(
             fileName: "leader-turn-team.sh"

@@ -183,6 +183,21 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(first.contains("policy_activation: runtime-enforced"))
     }
 
+    func testCodexLeaderTurnHooksUseVettedInlineLifecycleConfig() {
+        let args = TeamOrchestrator.codexLeaderTurnHookArguments(
+            path: "/Applications/term mesh/scripts/leader-turn-hook.sh"
+        )
+        XCTAssertTrue(args.contains("--dangerously-bypass-hook-trust"))
+        XCTAssertTrue(args.contains("--enable"))
+        XCTAssertTrue(args.contains("hooks"))
+        XCTAssertTrue(args.contains { $0.contains("hooks.UserPromptSubmit") && $0.contains("--start") })
+        XCTAssertTrue(args.contains { $0.contains("hooks.Stop") && $0.contains("--end") })
+        XCTAssertTrue(args.contains { $0.contains("/Applications/term mesh/scripts/leader-turn-hook.sh") })
+        XCTAssertTrue(TeamOrchestrator.supportsLeaderTurnMeasurement(cli: "claude"))
+        XCTAssertTrue(TeamOrchestrator.supportsLeaderTurnMeasurement(cli: "codex"))
+        XCTAssertFalse(TeamOrchestrator.supportsLeaderTurnMeasurement(cli: "kiro"))
+    }
+
     func testLeaderParallelPolicyContainsEveryRequiredRoutingRule() {
         let policy = LeaderParallelPolicy.renderedInstructions
 
