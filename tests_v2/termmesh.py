@@ -1453,6 +1453,11 @@ class termmesh:
             "name": name, "directory": directory,
         }) or {})
 
+    def debug_project_create_status(self, operation_id: str) -> dict:
+        return dict(self._call("debug.project.create_status", {
+            "operation_id": operation_id,
+        }) or {})
+
     def debug_project_creation_status(self, operation_id: str) -> dict:
         return dict(self._call("debug.project.creation_status", {
             "operation_id": operation_id,
