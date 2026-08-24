@@ -786,19 +786,36 @@ extension TerminalController {
                             result = .err(code: "unavailable", message: "no TabManager", data: nil)
                             return
                         }
+                        let operationID = UUID().uuidString
+                        self.debugProjectBootstrapStatus[operationID] = [
+                            "state": "running",
+                            "team": URL(fileURLWithPath: directory).lastPathComponent,
+                        ]
                         Task { @MainActor in
-                            let primaryOwned = (try? await PeerProjectBootstrap.run(
-                                sshTarget: sshTarget, port: host.sshPort,
-                                identityFile: host.identityFile,
-                                plan: plan, gitURL: (gitURL?.isEmpty ?? true) ? nil : gitURL,
-                                // The project's name, the same one the team is
-                                // created under below — not `remotePath`'s leaf,
-                                // which is the host's own directory convention
-                                // and would pin a different id on every machine.
-                                memMeshProjectID: PeerProjectBootstrap.memMeshProjectID(
-                                    for: URL(fileURLWithPath: directory).lastPathComponent
+                            let primaryOwned: Bool
+                            do {
+                                primaryOwned = try await PeerProjectBootstrap.run(
+                                    sshTarget: sshTarget, port: host.sshPort,
+                                    identityFile: host.identityFile,
+                                    plan: plan, gitURL: (gitURL?.isEmpty ?? true) ? nil : gitURL,
+                                    // The project's name, the same one the team is
+                                    // created under below — not `remotePath`'s leaf,
+                                    // which is the host's own directory convention
+                                    // and would pin a different id on every machine.
+                                    memMeshProjectID: PeerProjectBootstrap.memMeshProjectID(
+                                        for: URL(fileURLWithPath: directory).lastPathComponent
+                                    )
                                 )
-                            )) ?? false
+                            } catch {
+                                self.debugProjectBootstrapStatus[operationID] = [
+                                    "state": "failed",
+                                    "team": URL(fileURLWithPath: directory).lastPathComponent,
+                                    "error": PeerProjectBootstrap.remoteFailureDescription(
+                                        error, gitURL: (gitURL?.isEmpty ?? true) ? nil : gitURL
+                                    ),
+                                ]
+                                return
+                            }
                             // Same rule as production: only what this run made.
                             var createdPaths: Set<PeerProjectBootstrap.CreatedPath> = []
                             if primaryOwned {
@@ -821,7 +838,7 @@ extension TerminalController {
                                 return row
                             }
                             precondition(rows.count == plan.agentCheckouts.count)
-                            TeamOrchestrator.shared.createTeam(
+                            let team = TeamOrchestrator.shared.createTeam(
                                 named: URL(fileURLWithPath: directory).lastPathComponent,
                                 rows: rows,
                                 workingDirectory: directory,
@@ -850,9 +867,26 @@ extension TerminalController {
                                 createdPaths: createdPaths,
                                 tabManager: tabManager
                             )
+                            if let team {
+                                self.debugProjectBootstrapStatus[operationID] = [
+                                    "state": "succeeded",
+                                    "team": team.id,
+                                    "workspace_id": team.workspaceId.uuidString,
+                                    "checkouts": plan.agentCheckouts.map {
+                                        ["agent": $0.agent, "path": $0.path, "branch": $0.branch]
+                                    },
+                                ]
+                            } else {
+                                self.debugProjectBootstrapStatus[operationID] = [
+                                    "state": "failed",
+                                    "team": URL(fileURLWithPath: directory).lastPathComponent,
+                                    "error": "team creation failed after checkout preparation",
+                                ]
+                            }
                         }
                         result = .ok([
                             "team": URL(fileURLWithPath: directory).lastPathComponent,
+                            "operation_id": operationID,
                             "primary": plan.primaryPath,
                             "checkouts": plan.agentCheckouts.map { ["agent": $0.agent, "path": $0.path, "branch": $0.branch] },
                         ])
@@ -969,6 +1003,17 @@ extension TerminalController {
             }
         }
         return result
+    }
+
+    func v2DebugProjectCreateStatus(params: [String: Any]) -> V2CallResult {
+        guard let operationID = params["operation_id"] as? String,
+              !operationID.isEmpty else {
+            return .err(code: "invalid_params", message: "operation_id is required", data: nil)
+        }
+        guard let status = debugProjectBootstrapStatus[operationID] else {
+            return .err(code: "not_found", message: "project creation operation not found", data: nil)
+        }
+        return .ok(status)
     }
 
     static func debugProjectPreset(

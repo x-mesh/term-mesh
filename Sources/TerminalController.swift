@@ -50,6 +50,7 @@ class TerminalController {
     #if DEBUG
     var debugPeerShellInspection: [String: Any]?
     var debugProjectDeletionStatus: [String: [String: Any]] = [:]
+    var debugProjectBootstrapStatus: [String: [String: Any]] = [:]
     /// Async DEBUG calls that intentionally invoke the production New Project
     /// transaction. Kept separate from deletion status so E2E can prove a
     /// rejected create did not mutate teams or workspaces.
@@ -1400,6 +1401,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugTeamAttachRemote(params: params))
         case "debug.project.create":
             return v2Result(id: id, self.v2DebugProjectCreate(params: params))
+        case "debug.project.create_status":
+            return v2Result(id: id, self.v2DebugProjectCreateStatus(params: params))
         case "debug.project.creation_attempt":
             return v2Result(id: id, self.v2DebugProjectCreationAttempt(params: params))
         case "debug.project.creation_status":
