@@ -139,6 +139,17 @@ mod project_sync_cli_tests {
     }
 
     #[test]
+    fn wait_help_explains_tracked_any_and_uncorrelated_messages() {
+        let mut command = Cli::command();
+        let wait = command
+            .find_subcommand_mut("wait")
+            .expect("wait subcommand");
+        let help = wait.render_long_help().to_string();
+        assert!(help.contains("any requires a tracked task"));
+        assert!(help.contains("use msg for uncorrelated messages"));
+    }
+
+    #[test]
     fn parses_project_and_conflict_command_groups() {
         let project =
             Cli::try_parse_from(["tm-agent", "project", "scan", "00", "--request-id", "r1"])
@@ -1557,7 +1568,9 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Wait for agent signals (report, msg, blocked, review_ready, idle, any)
+    /// Wait for agent signals (report, msg, blocked, review_ready, idle, any).
+    /// any requires a tracked task and succeeds when its report completes or
+    /// a message arrives; use msg for uncorrelated messages.
     Wait {
         #[arg(long, default_value_t = 120)]
         timeout: u32,
@@ -17076,16 +17089,77 @@ fn run_wait(
     };
     eprintln!("Waiting for agents in team '{team}' (timeout: {timeout}s, mode: {mode}, agents: {filter_label})...");
 
-    let mut agent_names: Vec<String> = Vec::new();
-    if mode == "msg" || mode == "any" {
-        if let Ok(r) = rpc_call(sock, "team.status", json!({ "team_name": team })) {
-            if let Some(agents) = r["result"]["agents"].as_array() {
-                agent_names = agents
-                    .iter()
-                    .filter_map(|a| a["name"].as_str().map(String::from))
-                    .filter(|n| agent_filter.is_empty() || agent_filter.contains(n))
-                    .collect();
+    let needs_team_status = matches!(mode, "report" | "msg" | "any");
+    let team_status = if needs_team_status {
+        match rpc_call(sock, "team.status", json!({ "team_name": team })) {
+            Ok(response) => Some(response),
+            Err(error) => {
+                eprintln!("wait: could not inspect team '{team}': {error}");
+                process::exit(1);
             }
+        }
+    } else {
+        None
+    };
+    let status_agents = team_status
+        .as_ref()
+        .and_then(|response| response["result"]["agents"].as_array());
+    let agent_names: Vec<String> = if mode == "msg" || mode == "any" {
+        status_agents
+            .into_iter()
+            .flatten()
+            .filter_map(|agent| agent["name"].as_str().map(String::from))
+            .filter(|name| agent_filter.is_empty() || agent_filter.contains(name))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let message_baseline: std::collections::HashSet<String> = if mode == "msg" || mode == "any" {
+        rpc_call(sock, "team.message.list", json!({ "team_name": team }))
+            .ok()
+            .and_then(|response| response["result"]["messages"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|message| message["id"].as_str().map(String::from))
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    // report/any can only make a meaningful decision when a task is known.
+    // A plain broadcast has no task or correlation ID, so waiting for it used
+    // to consume the entire timeout while displaying report=0/0. Fail before
+    // subscribing or polling and point callers to the tracked healthcheck.
+    let mut initial_task_ids = explicit_task_ids.cloned().unwrap_or_default();
+    if let Some(id) = task_id.filter(|id| !id.trim().is_empty()) {
+        initial_task_ids.insert(id.to_string());
+    }
+    let mut initial_tracked_agents = std::collections::HashSet::new();
+    if matches!(mode, "report" | "any") && initial_task_ids.is_empty() {
+        if let Some(agents) = status_agents {
+            for agent in agents {
+                let name = agent["name"].as_str().unwrap_or("");
+                if !agent_filter.is_empty() && !agent_filter.contains(name) {
+                    continue;
+                }
+                let status = agent["active_task_status"].as_str().unwrap_or("");
+                let stale = agent["active_task_is_stale"].as_bool().unwrap_or(false);
+                if stale || matches!(status, "completed" | "failed" | "abandoned" | "cancelled") {
+                    continue;
+                }
+                if let Some(id) = agent["active_task_id"].as_str() {
+                    initial_task_ids.insert(id.to_string());
+                    if !name.is_empty() {
+                        initial_tracked_agents.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        if initial_task_ids.is_empty() {
+            eprintln!(
+                "wait: mode '{mode}' has no task or correlation to track; plain broadcast replies cannot be matched. Use 'tm-agent warmup' for ping/pong healthchecks, 'tm-agent fan-out' for tracked work, or pass --tasks <ids>."
+            );
+            process::exit(1);
         }
     }
 
@@ -17136,13 +17210,12 @@ fn run_wait(
     // For report mode: snapshot task IDs on first poll so we can track them
     // even after agents drop active_task_id on completion.
     // If explicit --tasks are provided, use those directly (no auto-discovery).
-    let mut tracked_task_ids: std::collections::HashSet<String> =
-        explicit_task_ids.cloned().unwrap_or_default();
-    let mut tracked_initialized = explicit_task_ids.is_some() && !tracked_task_ids.is_empty();
+    let mut tracked_task_ids = initial_task_ids;
+    let mut tracked_initialized = !tracked_task_ids.is_empty();
     // Accumulating set of agents observed with an active task at any poll. Used by
     // the result.status fallback so it doesn't count team members who were never
     // delegated to in this round (the root cause of wait hangs on partial fan-out).
-    let mut tracked_agents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut tracked_agents = initial_tracked_agents;
     while elapsed < timeout {
         if current_interval > 0 {
             // B1: push channel replaces sleep. Decay toward interval deadline in
@@ -17264,11 +17337,19 @@ fn run_wait(
             match rpc_call(sock, "team.message.list", json!({ "team_name": team })) {
                 Ok(r) => {
                     if let Some(messages) = r["result"]["messages"].as_array() {
-                        let senders: std::collections::HashSet<&str> =
-                            messages.iter().filter_map(|m| m["from"].as_str()).collect();
-                        let reported = agent_names
+                        let senders: std::collections::HashSet<&str> = messages
                             .iter()
-                            .filter(|a| senders.contains(a.as_str()))
+                            .filter(|message| {
+                                message["id"]
+                                    .as_str()
+                                    .map(|id| !message_baseline.contains(id))
+                                    .unwrap_or(false)
+                            })
+                            .filter_map(|message| message["from"].as_str())
+                            .collect();
+                        let reported = senders
+                            .iter()
+                            .filter(|sender| agent_names.iter().any(|agent| agent == **sender))
                             .count();
                         let total = agent_names.len();
                         msg_done = reported >= total && total > 0;
@@ -17582,10 +17663,21 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
     eprintln!("Warming up {count} agent(s) in team '{team}'...");
 
     // Delegate pong task to each agent
-    let mut task_ids: Vec<(String, String, Instant)> = Vec::new(); // (agent_name, task_id, start_time)
-    let mut failed: Vec<(String, u128, String)> = Vec::new(); // (agent, ms, reason)
+    let mut task_ids: Vec<(String, String, String, Instant)> = Vec::new(); // (name, instance, task, start)
+    let mut failed: Vec<(String, String, u128, String)> = Vec::new(); // (name, instance, ms, reason)
     for agent_val in &targets {
         let name = agent_val["name"].as_str().unwrap_or("?");
+        let instance_id = agent_val["agent_instance_id"].as_str().unwrap_or("");
+        if instance_id.is_empty() {
+            eprintln!("  {name}: missing agent_instance_id");
+            failed.push((
+                name.to_string(),
+                "unknown".to_string(),
+                0,
+                "missing agent_instance_id".into(),
+            ));
+            continue;
+        }
         let start = Instant::now();
         let result = run_delegate_result(
             sock,
@@ -17602,7 +17694,7 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
                 context: None,
                 fix_budget: None,
                 panel_id: None,
-                agent_instance_id: None,
+                agent_instance_id: Some(instance_id),
                 worktree_policy: WorktreePolicyArg::Off,
                 from_ref: None,
                 request_id: None,
@@ -17613,20 +17705,30 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
         match result {
             Ok(v) => {
                 if let Some(tid) = v["result"]["task"]["id"].as_str() {
-                    task_ids.push((name.to_string(), tid.to_string(), start));
+                    let assigned_instance = v["result"]["task"]["agent_instance_id"]
+                        .as_str()
+                        .unwrap_or(instance_id);
+                    task_ids.push((
+                        name.to_string(),
+                        assigned_instance.to_string(),
+                        tid.to_string(),
+                        start,
+                    ));
                 } else {
-                    eprintln!("  {name}: failed to create task");
+                    eprintln!("  {name} ({instance_id}): failed to create task");
                     failed.push((
                         name.to_string(),
+                        instance_id.to_string(),
                         start.elapsed().as_millis(),
                         "dispatch failed".into(),
                     ));
                 }
             }
             Err(e) => {
-                eprintln!("  {name}: delegate error: {e}");
+                eprintln!("  {name} ({instance_id}): delegate error: {e}");
                 failed.push((
                     name.to_string(),
+                    instance_id.to_string(),
                     start.elapsed().as_millis(),
                     "dispatch failed".into(),
                 ));
@@ -17641,13 +17743,13 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
 
     // Poll for completion
     let deadline = Instant::now() + Duration::from_secs(timeout as u64);
-    let mut completed: Vec<(String, u128, String)> = Vec::new(); // (agent, ms, result)
+    let mut completed: Vec<(String, String, u128, String)> = Vec::new(); // (name, instance, ms, result)
     let mut pending = task_ids.clone();
 
     while !pending.is_empty() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(500));
         let mut still_pending = Vec::new();
-        for (agent_name, tid, start) in &pending {
+        for (agent_name, instance_id, tid, start) in &pending {
             if let Ok(v) = rpc_call(
                 sock,
                 "team.task.get",
@@ -17660,14 +17762,19 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
                     let ms = start.elapsed().as_millis();
                     let result = v["result"]["result"].as_str().unwrap_or("").to_string();
                     if warmup_task_succeeded(status, &result) {
-                        completed.push((agent_name.clone(), ms, result));
+                        completed.push((agent_name.clone(), instance_id.clone(), ms, result));
                     } else {
-                        failed.push((agent_name.clone(), ms, status.to_string()));
+                        failed.push((
+                            agent_name.clone(),
+                            instance_id.clone(),
+                            ms,
+                            status.to_string(),
+                        ));
                     }
                     continue;
                 }
             }
-            still_pending.push((agent_name.clone(), tid.clone(), *start));
+            still_pending.push((agent_name.clone(), instance_id.clone(), tid.clone(), *start));
         }
         pending = still_pending;
     }
@@ -17676,20 +17783,20 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
     let pass = completed.len();
     let fail = failed.len() + pending.len();
     println!();
-    for (name, ms, result) in &completed {
+    for (name, instance_id, ms, result) in &completed {
         let icon = if result.to_lowercase().contains("pong") {
             "✓"
         } else {
             "?"
         };
-        println!("  {icon} {name}: {ms}ms");
+        println!("  {icon} {name} ({instance_id}): {ms}ms");
     }
-    for (name, _, start) in &pending {
+    for (name, instance_id, _, start) in &pending {
         let ms = start.elapsed().as_millis();
-        println!("  ✗ {name}: timeout ({ms}ms)");
+        println!("  ✗ {name} ({instance_id}): timeout ({ms}ms)");
     }
-    for (name, ms, reason) in &failed {
-        println!("  ✗ {name}: {reason} without pong ({ms}ms)");
+    for (name, instance_id, ms, reason) in &failed {
+        println!("  ✗ {name} ({instance_id}): {reason} without pong ({ms}ms)");
     }
     println!();
     if fail == 0 {
