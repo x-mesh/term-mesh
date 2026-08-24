@@ -527,7 +527,9 @@ async fn reader_loop(
                             Ok(released) => {
                                 let changed = released.is_some();
                                 for surface_id in released.into_iter().flatten() {
-                                    reap_if_abandoned(&host, &surface_id);
+                                    if !host.presentation_references_surface(&surface_id) {
+                                        let _ = host.terminate_surface(&surface_id);
+                                    }
                                 }
                                 (
                                     UpsertProjectPresentationResponse {

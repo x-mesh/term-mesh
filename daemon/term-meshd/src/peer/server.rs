@@ -981,6 +981,40 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn explicit_delete_terminates_a_project_surface_even_while_attached() {
+        let manager = Arc::new(crate::peer::surface::PtyManager::new());
+        let leader = vec![0xA2; 16];
+        manager.register_and_spawn_ephemeral(
+            leader.clone(),
+            crate::peer::surface::SpawnSpec {
+                title: "attached-project-leader".into(),
+                command: "/bin/cat".into(), args: vec![], cols: 80, rows: 24,
+                cwd: None, kind: crate::peer::surface::SurfaceKind::Pty,
+                agent_cli: String::new(),
+            },
+        );
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        let owner = vec![vec![0x72; 16]];
+        let project = peer_proto::v1::Team {
+            name: "attached".into(), team_uuid: "uuid-attached".into(),
+            working_directory: "/tmp".into(), leader_surface_id: leader.clone(),
+            project_id: "team:uuid-attached".into(), ..Default::default()
+        };
+        assert_eq!(host.upsert_project_presentation(&owner, &project), Ok((1, true)));
+        manager.note_attached(&leader);
+        let released = host
+            .delete_project_presentation_with_released(&owner, "team:uuid-attached")
+            .unwrap()
+            .unwrap();
+        for surface_id in released {
+            if !host.presentation_references_surface(&surface_id) {
+                let _ = host.terminate_surface(&surface_id);
+            }
+        }
+        assert!(manager.list().iter().all(|surface| surface.surface_id != leader));
+    }
+
+    #[tokio::test]
     async fn manifest_replacement_reaps_only_surfaces_with_no_remaining_project_reference() {
         let _grace = ABANDONED_GRACE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("TERMMESH_PEER_ABANDONED_GRACE_MS", "150");

@@ -155,7 +155,7 @@ stage_remote_relay_fixture() {
        commit -qm candidate"
   ssh "$REMOTE_FIXTURE_SSH_TARGET" \
     "cd '$REMOTE_FIXTURE_ROOT/src/daemon' && \
-     PATH=\"\$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:\$PATH\" \
+     PATH=\"\$HOME/.cargo/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:\$PATH\" \
      CARGO_TARGET_DIR=/tmp/term-mesh-release-relay-target \
      cargo build --release --locked -p term-meshd -p term-mesh-cli -p tm-agent-bridge"
   remote_version="$(ssh "$REMOTE_FIXTURE_SSH_TARGET" \
@@ -168,7 +168,7 @@ stage_remote_relay_fixture() {
     "mkdir -p '$REMOTE_FIXTURE_ROOT/state' '$REMOTE_FIXTURE_ROOT/runtime'; \
      chmod 700 '$REMOTE_FIXTURE_ROOT' '$REMOTE_FIXTURE_ROOT/state' '$REMOTE_FIXTURE_ROOT/runtime'; \
      env XDG_DATA_HOME='$REMOTE_FIXTURE_ROOT/state' XDG_RUNTIME_DIR='$REMOTE_FIXTURE_ROOT/runtime' \
-       PATH=/tmp/term-mesh-release-relay-target/release:\$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:\$PATH \
+       PATH=/tmp/term-mesh-release-relay-target/release:\$HOME/.cargo/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:\$PATH \
        TERMMESH_PEER_SOCKET='$remote_socket' \
        TERMMESH_DAEMON_UNIX_PATH='$REMOTE_FIXTURE_ROOT/control.sock' \
        nohup /tmp/term-mesh-release-relay-target/release/term-meshd \
@@ -262,6 +262,22 @@ export TERMMESH_CLI="$CLI"
 export TERMMESH_CLI_BIN="$CLI"
 
 cleanup() {
+  local app_descendants=""
+  if [ -n "$E2E_APP_PID" ] && kill -0 "$E2E_APP_PID" 2>/dev/null; then
+    local frontier="$E2E_APP_PID" next="" parent child
+    while [ -n "$frontier" ]; do
+      next=""
+      for parent in $frontier; do
+        for child in $(ps -axo pid=,ppid= | awk -v p="$parent" '$2 == p { print $1 }'); do
+          case " $app_descendants " in *" $child "*) ;; *)
+            app_descendants="$app_descendants $child"
+            next="$next $child"
+          esac
+        done
+      done
+      frontier="$next"
+    done
+  fi
   if [ -n "$E2E_APP_PID" ]; then kill "$E2E_APP_PID" 2>/dev/null || true; fi
   if [ -n "$E2E_DAEMON_PID" ]; then kill "$E2E_DAEMON_PID" 2>/dev/null || true; fi
   for _ in {1..30}; do
@@ -269,6 +285,27 @@ cleanup() {
       && { [ -z "$E2E_DAEMON_PID" ] || ! kill -0 "$E2E_DAEMON_PID" 2>/dev/null; } \
       && break
     sleep 0.1
+  done
+  # SSH relay helpers may daemonize/reparent while the app is terminating.
+  # Reap only exact descendants captured before SIGTERM; unrelated developer
+  # tunnels are never selected by a broad process-name match.
+  for child in $app_descendants; do
+    kill -0 "$child" 2>/dev/null || continue
+    kill "$child" 2>/dev/null || true
+  done
+  for _ in {1..30}; do
+    local survivors=0
+    for child in $app_descendants; do
+      kill -0 "$child" 2>/dev/null && survivors=$((survivors + 1))
+    done
+    [ "$survivors" -eq 0 ] && break
+    sleep 0.1
+  done
+  for child in $app_descendants; do
+    if kill -0 "$child" 2>/dev/null; then
+      echo "ERROR: app descendant survived E2E cleanup: pid=$child" >&2
+      return 1
+    fi
   done
   E2E_APP_PID=""
   E2E_DAEMON_PID=""

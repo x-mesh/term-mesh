@@ -1432,6 +1432,7 @@ class termmesh:
                              leader_directory: Optional[str] = None,
                              remote_host: Optional[str] = None,
                              remote_path: Optional[str] = None,
+                             worker_cli: Optional[str] = None,
                              preset_id: Optional[str] = None) -> dict:
         params: Dict[str, Any] = {
             "directory": directory,
@@ -1447,6 +1448,8 @@ class termmesh:
             params["host"] = remote_host
         if remote_path:
             params["remote_path"] = remote_path
+        if worker_cli:
+            params["worker_cli"] = worker_cli
         if preset_id:
             params["preset_id"] = preset_id
         return dict(self._call("debug.project.create", params) or {})
