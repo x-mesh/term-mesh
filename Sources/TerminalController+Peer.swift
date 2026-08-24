@@ -72,6 +72,9 @@ extension TerminalController {
             // The authenticated PATH metadata lands on a second round trip.
             "launchable": host.isLaunchable,
         ]
+        if let version = host.servingVersionDisplay {
+            dict["serving_app_version"] = version
+        }
         if case .failed(let reason) = host.connectionState {
             dict["failure_reason"] = reason
         }

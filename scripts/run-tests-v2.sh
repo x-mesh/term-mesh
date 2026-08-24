@@ -41,6 +41,65 @@ fi
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rust/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
+preflight_remote_project_fixture() {
+  [ "${TERMMESH_E2E_REATTACH_PHASE:-}" = "full" ] || return 0
+  [ "${TERMMESH_E2E_REQUIRE_REMOTE_PROJECT:-}" = "1" ] || return 0
+
+  local host="${TERMMESH_E2E_REMOTE_LEADER_HOST:-}"
+  local remote_dir="${TERMMESH_E2E_REMOTE_LEADER_DIR:-}"
+  local profiles="${TERMMESH_E2E_REMOTE_LEADER_HOST_PROFILE_JSON:-}"
+  if [ -z "$host" ] || [ -z "$remote_dir" ] || [ -z "$profiles" ]; then
+    echo "ERROR: required remote Project E2E needs host, directory, and seeded host profile JSON." >&2
+    return 1
+  fi
+
+  local ssh_target
+  ssh_target=$(/usr/bin/python3 - "$host" "$profiles" <<'PY'
+import json
+import sys
+
+host, raw = sys.argv[1:]
+try:
+    profiles = json.loads(raw)
+except (TypeError, ValueError) as exc:
+    raise SystemExit(f"invalid remote leader host profile JSON: {exc}")
+for profile in profiles:
+    target = str(profile.get("sshTarget") or "")
+    if target and host == f"ssh:{target}":
+        print(target)
+        break
+else:
+    raise SystemExit(f"no seeded profile matches remote host {host!r}")
+PY
+  ) || return 1
+
+  local remote_dir_q
+  printf -v remote_dir_q '%q' "$remote_dir"
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$ssh_target" \
+    "git -C $remote_dir_q rev-parse --verify HEAD >/dev/null"; then
+    echo "ERROR: remote Project source must be a reachable Git checkout with a committed HEAD: $ssh_target:$remote_dir" >&2
+    return 1
+  fi
+  echo "remote Project fixture ready: host=$host source=$remote_dir"
+}
+
+verify_runner_checkout() {
+  local expected_ghostty actual_ghostty
+  expected_ghostty=$(git ls-tree HEAD ghostty | awk '{print $3}')
+  actual_ghostty=$(git -C ghostty rev-parse HEAD 2>/dev/null || true)
+  if [ -z "$expected_ghostty" ] || [ "$actual_ghostty" != "$expected_ghostty" ]; then
+    echo "ERROR: ghostty submodule is not initialized at the commit pinned by this checkout; run ./scripts/setup.sh." >&2
+    return 1
+  fi
+  if [ ! -d GhosttyKit.xcframework ]; then
+    echo "ERROR: GhosttyKit.xcframework is missing; run ./scripts/setup.sh before E2E." >&2
+    return 1
+  fi
+}
+
+preflight_remote_project_fixture
+verify_runner_checkout
+
 DERIVED_DATA_PATH="$HOME/Library/Developer/Xcode/DerivedData/term-mesh-tests-v2"
 APP="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh DEV.app"
 CLI="$DERIVED_DATA_PATH/Build/Products/Debug/term-mesh"
