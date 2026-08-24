@@ -16,7 +16,11 @@ from test_remote_project_host_matrix_reconnect import (
     _fully_deleted,
     _matrix,
 )
-from test_remote_project_restart_reattach import _assert_session_owner_route
+from test_remote_project_restart_reattach import (
+    _TerminalTestFailure,
+    _assert_session_owner_route,
+    _wait,
+)
 
 
 class FakeClient:
@@ -80,6 +84,16 @@ def main() -> int:
             rejects(lambda row=row: _assert_session_owner_route(row))
             for row in broken_routes
         )
+
+        calls = 0
+
+        def terminal_failure():
+            nonlocal calls
+            calls += 1
+            raise _TerminalTestFailure("terminal")
+
+        assert rejects(lambda: _wait(terminal_failure, timeout_s=1, interval_s=0.01))
+        assert calls == 1, "terminal async failures must not burn the polling timeout"
 
         state = {
             "team_name": "matrix-project",

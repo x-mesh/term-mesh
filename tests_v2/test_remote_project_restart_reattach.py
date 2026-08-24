@@ -31,6 +31,10 @@ LEADER_RELAY_STABILITY_SECONDS = 15.0
 BACKGROUND_RESTORE_HOLD_SECONDS = 12.0
 
 
+class _TerminalTestFailure(termmeshError):
+    """A polled operation reached a terminal state and must not be retried."""
+
+
 def _wait(predicate, timeout_s: float = 45.0, interval_s: float = 0.2):
     deadline = time.time() + timeout_s
     last = None
@@ -39,6 +43,8 @@ def _wait(predicate, timeout_s: float = 45.0, interval_s: float = 0.2):
             value = predicate()
             if value:
                 return value
+        except _TerminalTestFailure:
+            raise
         except termmeshError as exc:
             last = exc
         time.sleep(interval_s)
@@ -114,8 +120,14 @@ def _assert_leader_relay_stable(
             None,
         )
         if not project or not project.get("leader_process_active_known"):
+            host_row = next(
+                (item for item in c.peer_host_list() if item.get("id") == host),
+                {},
+            )
             raise termmeshError(
-                f"host did not provide authoritative leader process liveness: {project!r}"
+                "host did not provide authoritative leader process liveness: "
+                f"serving_app_version={host_row.get('serving_app_version')!r} "
+                f"project={project!r}"
             )
         if not project.get("leader_process_active"):
             raise termmeshError(
@@ -379,14 +391,15 @@ def _connect(c, host: str) -> dict:
     return row
 
 
-def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
+def _phase_create_inner(
+    c, host: str, remote_dir: str, state_path: Path, team_name: str
+) -> None:
     host_row = next(item for item in c.peer_host_list() if item.get("id") == host)
     route = (
         _assert_session_owner_route(host_row)
         if os.environ.get(REQUIRE_SESSION_OWNER_REDIRECT_ENV, "").strip() == "1"
         else None
     )
-    team_name = f"remote-reattach-e2e-{uuid.uuid4().hex[:8]}"
     roles = [
         role.strip()
         for role in os.environ.get(ROLES_ENV, "executor,reviewer").split(",")
@@ -416,7 +429,9 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
     def bootstrap_finished():
         status = c.debug_project_create_status(operation_id)
         if status.get("state") == "failed":
-            raise termmeshError(f"remote Project bootstrap failed: {status.get('error')!r}")
+            raise _TerminalTestFailure(
+                f"remote Project bootstrap failed: {status.get('error')!r}"
+            )
         return status if status.get("state") == "succeeded" else None
 
     bootstrap = _wait(bootstrap_finished, timeout_s=90)
@@ -434,9 +449,9 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
         if team and team.get("leader_failure"):
             failure = str(team["leader_failure"])
             if "pending" not in failure.lower():
-                raise termmeshError(f"remote leader failed: {failure}")
+                raise _TerminalTestFailure(f"remote leader failed: {failure}")
         if team and team.get("remote_attach_failures"):
-            raise termmeshError(
+            raise _TerminalTestFailure(
                 f"remote worker failed: {team['remote_attach_failures']}"
             )
         agents = team.get("agents") if team else None
@@ -585,6 +600,27 @@ def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
         "layout": saved_layout,
         "create_relay_io": relay.get("io") or {},
     }))
+
+
+def _phase_create(c, host: str, remote_dir: str, state_path: Path) -> None:
+    """Create a fixture and reclaim it if any create-phase assertion fails."""
+    team_name = f"remote-reattach-e2e-{uuid.uuid4().hex[:8]}"
+    try:
+        _phase_create_inner(c, host, remote_dir, state_path, team_name)
+    except Exception as original:
+        cleanup_error = None
+        try:
+            deletion = c.debug_project_delete(team_name)
+            operation_id = deletion.get("operation_id")
+            if operation_id:
+                _wait_for_project_deletion(c, operation_id)
+        except Exception as exc:
+            cleanup_error = exc
+        if cleanup_error is not None:
+            raise termmeshError(
+                f"{original}; failed fixture cleanup for {team_name!r}: {cleanup_error}"
+            ) from original
+        raise
 
 
 def _phase_adopt(c, host: str, state_path: Path) -> None:
