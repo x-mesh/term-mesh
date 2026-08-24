@@ -188,6 +188,29 @@ final class TeamOrchestrator: ObservableObject {
         let normalized = normalizedProjectName(requestedName)
         guard !normalized.isEmpty else { return .none }
         let matching = candidates.filter { normalizedProjectName($0.name) == normalized }
+        let exact = matching.first(where: {
+            projectCreationIdentitiesMatch(requestedIdentity, $0.identity)
+        })
+
+        // An exact presentation must not hide a second Project that owns the
+        // same global name. One Project can legitimately contribute several
+        // location aliases (local source plus remote checkouts), so equal
+        // project IDs are one owner; a different non-empty ID is a namespace
+        // collision and takes precedence over Open Existing/Resume.
+        if let exact, let exactProjectID = exact.identity.projectID,
+           let collision = matching.first(where: { candidate in
+               guard let candidateProjectID = candidate.identity.projectID else {
+                   return false
+               }
+               return candidateProjectID != exactProjectID
+           }) {
+            switch collision.location {
+            case .remote:
+                return .remoteNameCollision(collision)
+            default:
+                return .localNameCollision(collision)
+            }
+        }
 
         if let incomplete = matching.first(where: { candidate in
             guard !candidate.leaderReady,
@@ -198,9 +221,7 @@ final class TeamOrchestrator: ObservableObject {
         }) {
             return .incomplete(incomplete)
         }
-        if let exact = matching.first(where: {
-            projectCreationIdentitiesMatch(requestedIdentity, $0.identity)
-        }) {
+        if let exact {
             switch exact.location {
             case .detached:
                 return .exactDetached(exact)
