@@ -33,6 +33,210 @@ final class TeamOrchestrator: ObservableObject {
     /// later window adopts the exact same presentation. Explicit team/project
     /// teardown remains the operation that ends those processes.
     private var detachedProjectWorkspaces: [String: Workspace] = [:]
+    private var projectCreationReservations: [String: UUID] = [:]
+
+    /// Stable identity used to decide whether a same-named Project is the
+    /// exact existing Project or a namespace collision. The display name is
+    /// deliberately absent: matching names only selects candidates; it never
+    /// proves identity.
+    struct ProjectCreationIdentity: Equatable, Sendable {
+        var projectID: String?
+        var hostKey: String?
+        var workingDirectory: String?
+
+        init(
+            projectID: String? = nil,
+            hostKey: String? = nil,
+            workingDirectory: String? = nil
+        ) {
+            self.projectID = projectID?.nilIfBlank
+            self.hostKey = hostKey?.nilIfBlank
+            self.workingDirectory = workingDirectory?.nilIfBlank
+        }
+    }
+
+    enum ProjectConflictLocation: Equatable, Sendable {
+        case currentWindow(windowID: UUID?, workspaceID: UUID)
+        case otherWindow(windowID: UUID, workspaceID: UUID)
+        case detached(workspaceID: UUID)
+        case remote(hostKey: String, hostName: String)
+    }
+
+    struct ProjectConflictRecord: Equatable, Sendable {
+        var name: String
+        var identity: ProjectCreationIdentity
+        var location: ProjectConflictLocation
+        var teamName: String?
+        var leaderReady: Bool
+        var failureDescription: String?
+    }
+
+    enum ProjectNameConflict: Equatable, Sendable {
+        case none
+        case exactLive(ProjectConflictRecord)
+        case exactDetached(ProjectConflictRecord)
+        case incomplete(ProjectConflictRecord)
+        case localNameCollision(ProjectConflictRecord)
+        case remoteNameCollision(ProjectConflictRecord)
+        case reservedByAnotherRequest(name: String)
+
+        var blocksCreate: Bool {
+            if case .none = self { return false }
+            return true
+        }
+    }
+
+    struct ProjectCreationReservation: Equatable, Sendable {
+        let normalizedName: String
+        let requestID: UUID
+    }
+
+    nonisolated static func normalizedProjectName(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+    }
+
+    func beginProjectCreationReservation(
+        name: String, requestID: UUID = UUID()
+    ) -> ProjectCreationReservation? {
+        let normalized = Self.normalizedProjectName(name)
+        guard !normalized.isEmpty, projectCreationReservations[normalized] == nil else {
+            return nil
+        }
+        projectCreationReservations[normalized] = requestID
+        return ProjectCreationReservation(
+            normalizedName: normalized, requestID: requestID
+        )
+    }
+
+    @discardableResult
+    func releaseProjectCreationReservation(
+        _ reservation: ProjectCreationReservation
+    ) -> Bool {
+        guard projectCreationReservations[reservation.normalizedName]
+            == reservation.requestID else { return false }
+        projectCreationReservations[reservation.normalizedName] = nil
+        return true
+    }
+
+    @discardableResult
+    func commitProjectCreationReservation(
+        _ reservation: ProjectCreationReservation, teamName: String
+    ) -> Bool {
+        guard projectCreationReservations[reservation.normalizedName]
+            == reservation.requestID,
+              Self.normalizedProjectName(teamName) == reservation.normalizedName,
+              teams[teamName] != nil
+        else { return false }
+        projectCreationReservations[reservation.normalizedName] = nil
+        return true
+    }
+
+    /// Verifies that this create transaction still owns its name before it
+    /// starts any irreversible work. Unlike `commitProjectCreationReservation`,
+    /// this does not consume the reservation: the caller commits only after the
+    /// team has actually been installed.
+    func ownsProjectCreationReservation(
+        _ reservation: ProjectCreationReservation, teamName: String
+    ) -> Bool {
+        projectCreationReservations[reservation.normalizedName] == reservation.requestID
+            && Self.normalizedProjectName(teamName) == reservation.normalizedName
+    }
+
+    func hasProjectCreationReservation(name: String) -> Bool {
+        projectCreationReservations[Self.normalizedProjectName(name)] != nil
+    }
+
+    /// Run Project creation's persisted-state reset only after both namespace
+    /// checks have succeeded. Keeping the side effect behind this tiny gate
+    /// makes the zero-mutation collision contract directly testable without
+    /// manufacturing a live workspace or touching the real task stores.
+    @discardableResult
+    nonisolated static func resetProjectCreationStateIfAuthorized(
+        hasNameConflict: Bool,
+        ownsReservation: Bool,
+        reset: () -> Void
+    ) -> Bool {
+        guard !hasNameConflict, ownsReservation else { return false }
+        reset()
+        return true
+    }
+
+    nonisolated static func projectCreationIdentitiesMatch(
+        _ lhs: ProjectCreationIdentity,
+        _ rhs: ProjectCreationIdentity
+    ) -> Bool {
+        if let lhsID = lhs.projectID, let rhsID = rhs.projectID {
+            return lhsID == rhsID && lhs.hostKey == rhs.hostKey
+        }
+        guard lhs.hostKey == rhs.hostKey,
+              let lhsPath = lhs.workingDirectory,
+              let rhsPath = rhs.workingDirectory
+        else { return false }
+        return (lhsPath as NSString).standardizingPath
+            == (rhsPath as NSString).standardizingPath
+    }
+
+    /// Pure classification step shared by the creation form and the
+    /// authoritative commit-time gate. Callers provide a read-only snapshot;
+    /// no Project, workspace or remote state is mutated here.
+    nonisolated static func classifyProjectNameConflict(
+        requestedName: String,
+        requestedIdentity: ProjectCreationIdentity,
+        candidates: [ProjectConflictRecord]
+    ) -> ProjectNameConflict {
+        let normalized = normalizedProjectName(requestedName)
+        guard !normalized.isEmpty else { return .none }
+        let matching = candidates.filter { normalizedProjectName($0.name) == normalized }
+        let exact = matching.first(where: {
+            projectCreationIdentitiesMatch(requestedIdentity, $0.identity)
+        })
+
+        // An exact presentation must not hide a second Project that owns the
+        // same global name. One Project can legitimately contribute several
+        // location aliases (local source plus remote checkouts), so equal
+        // project IDs are one owner; a different non-empty ID is a namespace
+        // collision and takes precedence over Open Existing/Resume.
+        if let exact, let exactProjectID = exact.identity.projectID,
+           let collision = matching.first(where: { candidate in
+               guard let candidateProjectID = candidate.identity.projectID else {
+                   return false
+               }
+               return candidateProjectID != exactProjectID
+           }) {
+            switch collision.location {
+            case .remote:
+                return .remoteNameCollision(collision)
+            default:
+                return .localNameCollision(collision)
+            }
+        }
+
+        if let incomplete = matching.first(where: { candidate in
+            guard !candidate.leaderReady,
+                  projectCreationIdentitiesMatch(requestedIdentity, candidate.identity)
+            else { return false }
+            if case .remote = candidate.location { return false }
+            return true
+        }) {
+            return .incomplete(incomplete)
+        }
+        if let exact {
+            switch exact.location {
+            case .detached:
+                return .exactDetached(exact)
+            default:
+                return .exactLive(exact)
+            }
+        }
+        guard let collision = matching.first else { return .none }
+        switch collision.location {
+        case .remote:
+            return .remoteNameCollision(collision)
+        default:
+            return .localNameCollision(collision)
+        }
+    }
 
     struct AgentMember: Identifiable {
         let id: String           // agent-name@team-name (legacy routing key)
@@ -648,6 +852,49 @@ final class TeamOrchestrator: ObservableObject {
 
     func hasPreservedProjectPresentation(teamName: String) -> Bool {
         detachedProjectWorkspaces[teamName] != nil
+    }
+
+    /// Performs the user's explicit "Open Existing" intent. Creation never
+    /// calls this path: selecting an existing Project is a separate action,
+    /// so a same-name create cannot close the sheet as a false success.
+    @discardableResult
+    func openExistingProject(
+        _ record: ProjectConflictRecord,
+        from tabManager: TabManager
+    ) async -> Bool {
+        guard let teamName = record.teamName else { return false }
+        switch record.location {
+        case .detached:
+            return await restoreDetachedProjectPresentation(
+                teamName: teamName, tabManager: tabManager
+            )
+        case let .currentWindow(_, workspaceID):
+            guard let workspace = tabManager.tabs.first(where: { $0.id == workspaceID })
+            else { return false }
+            tabManager.selectWorkspace(workspace)
+            return true
+        case let .otherWindow(windowID, workspaceID):
+            guard let manager = AppDelegate.shared?.tabManagerFor(windowId: windowID),
+                  let workspace = manager.tabs.first(where: { $0.id == workspaceID })
+            else { return false }
+            manager.selectWorkspace(workspace)
+            AppDelegate.shared?.windowForMainWindowId(windowID)?.makeKeyAndOrderFront(nil)
+            return true
+        case let .remote(hostKey, _):
+            // A remote manifest has no local workspace to select. Adopt its
+            // exact project identity, never merely its display name.
+            guard let projectID = record.identity.projectID,
+                  let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                      $0.id == hostKey && $0.isConnected
+                  }),
+                  let remote = host.teams.first(where: {
+                      $0.projectID == projectID
+                  })
+            else { return false }
+            return await adoptRemoteProjectPresentation(
+                remote, host: host, tabManager: tabManager
+            )
+        }
     }
 
     func beginProjectPresentationRestore(teamName: String, workspaceID: UUID) -> Bool {
@@ -1953,6 +2200,14 @@ final class TeamOrchestrator: ObservableObject {
         /// invoke each agent CLI with `--resume <sid>`. Pane-mode resume passes
         /// this; fresh team creation leaves it nil.
         agentResumeSessionIds: [String: String]? = nil,
+        /// Project creation holds this MainActor reservation from the conflict
+        /// check through installation. Ordinary ad-hoc teams do not participate
+        /// in that transaction and retain their existing lifecycle.
+        projectCreationReservation: ProjectCreationReservation? = nil,
+        /// Creation revalidates this identity after async checkout preparation.
+        /// A remote manifest can arrive after form preflight, so checking only
+        /// `teams` here would leave a commit-time split-brain window.
+        projectCreationIdentity: ProjectCreationIdentity? = nil,
         tabManager: TabManager
     ) -> Team? {
         // A team may start with no agents but its leader. That is the normal
@@ -1998,15 +2253,20 @@ final class TeamOrchestrator: ObservableObject {
             reservedAgentInstanceIds.insert(UUID().uuidString, at: 0)
         }
 
-        // Always clear stale on-disk state for this team name before creating.
-        // Result/message/task files in /tmp persist across app restarts and workspace closures,
-        // causing wait --mode report to return immediately with outdated data.
-        clearResults(teamName: name)
-        clearMessages(teamName: name)
-        clearTasks(teamName: name)
-
-        // Auto-cleanup: if a team with this name exists but its workspace was closed, remove the stale entry.
+        // Auto-cleanup for ordinary Team creation. Project creation treats
+        // both live and detached owners as explicit conflicts and never
+        // deletes or resets them implicitly.
         // Check across ALL windows (not just the current tabManager) to enforce global uniqueness.
+        let commitTimeConflict = projectCreationIdentity.map { identity in
+            projectNameConflict(
+                name: name, identity: identity, currentTabManager: tabManager
+            )
+        }
+        var projectHasNameConflict = commitTimeConflict?.blocksCreate ?? false
+        if projectHasNameConflict {
+            Logger.team.info("project '\(name, privacy: .public)' conflict changed before commit")
+            return nil
+        }
         if let existing = teams[name] {
             let workspaceAlive: Bool = {
                 // First check if any window still contains this workspace
@@ -2021,9 +2281,53 @@ final class TeamOrchestrator: ObservableObject {
                 Logger.team.info("team '\(name, privacy: .public)' already exists")
                 return nil
             }
-            Logger.team.info("cleaning up stale team '\(name, privacy: .public)' (workspace closed)")
-            stopRemoteLeaderGrantKeepalive(teamName: name, revoke: true)
-            teams.removeValue(forKey: name)
+            // A Project's closed workspace is intentionally retained as a
+            // detached viewer. Project creation must never reinterpret that
+            // durable state as stale, or overwrite its task/message/result
+            // stores while attempting a duplicate name.
+            if projectCreationReservation != nil {
+                projectHasNameConflict = true
+                Logger.team.info("project '\(name, privacy: .public)' already exists detached")
+            } else {
+                Logger.team.info("cleaning up stale team '\(name, privacy: .public)' (workspace closed)")
+                stopRemoteLeaderGrantKeepalive(teamName: name, revoke: true)
+                teams.removeValue(forKey: name)
+            }
+        }
+        // The Project flow owns the name before it may touch any persisted
+        // state. This is the authoritative TOCTOU gate; form preflight is
+        // intentionally advisory only.
+        if let projectCreationReservation {
+            let ownsReservation = ownsProjectCreationReservation(
+                projectCreationReservation, teamName: name
+            )
+            guard Self.resetProjectCreationStateIfAuthorized(
+                hasNameConflict: projectHasNameConflict,
+                ownsReservation: ownsReservation,
+                reset: {
+                    clearResults(teamName: name)
+                    clearMessages(teamName: name)
+                    clearTasks(teamName: name)
+                }
+            ) else {
+                if projectHasNameConflict {
+                    Logger.team.info(
+                        "project '\(name, privacy: .public)' already exists detached"
+                    )
+                } else {
+                    Logger.team.info(
+                        "project reservation lost for '\(name, privacy: .public)'"
+                    )
+                }
+                return nil
+            }
+        } else {
+            // Result/message/task files in /tmp persist across app restarts and
+            // workspace closures. Ordinary Team creation retains its legacy
+            // reset after live-name rejection and stale-team cleanup.
+            clearResults(teamName: name)
+            clearMessages(teamName: name)
+            clearTasks(teamName: name)
         }
         AgentEnvironmentComparisonStore.reset(teamName: name)
 

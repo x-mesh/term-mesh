@@ -48,8 +48,11 @@ struct NewProjectView: View {
         _ source: ProjectSource,
         _ leader: ProjectLeader,
         _ progress: @escaping @MainActor (ProjectCreationEvent) -> Void
-    ) async throws -> Void
+    ) async throws -> ProjectCreationFlow.CreationResult
     let onClose: () -> Void
+    /// The window-local workspace owner. Project conflict actions must route
+    /// through this exact manager rather than a process-global active window.
+    let tabManager: TabManager
     /// Undo a creation that came up incomplete: the team, its workspace, and
     /// the checkouts it made on every peer.
     ///
@@ -156,6 +159,12 @@ struct NewProjectView: View {
     @State private var showsBootCommands = true
     @State private var showsFailureDetail = false
     @State private var isDiscarding = false
+    @State private var isResolvingConflict = false
+    @State private var pendingConflictDiscardTeamName: String?
+    /// A conflict discovered after Create began (for example another window's
+    /// reservation) is not necessarily visible in the advisory snapshot yet.
+    /// Keep that typed result until the user changes the Project identity.
+    @State private var submissionConflict: TeamOrchestrator.ProjectNameConflict?
     @State private var agentPlacementMode: AgentPlacementMode = .sameAsLeader
     @State private var allAgentsHostKey: String?
     @State private var peerHostEditorContext: PeerHostEditorContext?
@@ -301,6 +310,9 @@ struct NewProjectView: View {
         .onChange(of: agents.map(\.id)) { _, _ in
             adoptProjectMachineForNewRows()
         }
+        .onChange(of: projectConflictInputID) { _, _ in
+            submissionConflict = nil
+        }
         .sheet(isPresented: $showingSavePreset) {
             savePresetSheet
         }
@@ -333,6 +345,28 @@ struct NewProjectView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(presetError ?? "")
+        }
+        .confirmationDialog(
+            "Discard incomplete Project?",
+            isPresented: Binding(
+                get: { pendingConflictDiscardTeamName != nil },
+                set: { if !$0 { pendingConflictDiscardTeamName = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Discard Project", role: .destructive) {
+                guard let teamName = pendingConflictDiscardTeamName else { return }
+                pendingConflictDiscardTeamName = nil
+                performConflictDiscard(teamName: teamName)
+            }
+            Button("Keep Project", role: .cancel) {
+                pendingConflictDiscardTeamName = nil
+            }
+        } message: {
+            Text(
+                "This stops the Project and removes its workspace plus any "
+                    + "checkouts term-mesh created. Existing user-owned folders are kept."
+            )
         }
         .accessibilityIdentifier("newProject.sheet")
     }
@@ -2012,19 +2046,29 @@ struct NewProjectView: View {
                 // A disabled button with no stated reason reads as a bug. When
                 // placement is what blocks it, say so here rather than leaving
                 // the summary to describe a run that cannot start.
-                let blocker = creationError ?? placementBlockerMessage
-                Text(blocker ?? creationSummary)
-                    .font(.caption)
-                    .foregroundStyle(
-                        creationError != nil
-                            ? Color.red
-                            : (blocker != nil ? Color.orange : Color.secondary)
-                    )
-                    .lineLimit(blocker == nil ? 1 : 2)
-                    .fixedSize(horizontal: false, vertical: blocker != nil)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .layoutPriority(0)
-                    .help(blocker ?? creationSummary)
+                let blocker = creationError ?? projectConflictMessage ?? placementBlockerMessage
+                HStack(spacing: 6) {
+                    if projectNameConflict.blocksCreate {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .accessibilityHidden(true)
+                    }
+                    Text(blocker ?? creationSummary)
+                        .font(.caption)
+                        .foregroundStyle(
+                            creationError != nil
+                                ? Color.red
+                                : (blocker != nil ? Color.orange : Color.secondary)
+                        )
+                        .lineLimit(blocker == nil ? 1 : 2)
+                        .fixedSize(horizontal: false, vertical: blocker != nil)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(0)
+                .help(blocker ?? creationSummary)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(blocker ?? creationSummary)
+                .accessibilityIdentifier("newProject.conflict.summary")
             }
             HStack(spacing: 10) {
                 if showsCreationProgress {
@@ -2081,17 +2125,7 @@ struct NewProjectView: View {
                     }
                     Button("Cancel", action: onClose)
                         .keyboardShortcut(.cancelAction)
-                    Button(createActionLabel) {
-                        startCreation()
-                    }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(
-                        !canCreate || !placementHostsAreReady
-                            || TeamAgentComposer.blocksRemoteTeamCreation(
-                                agents: agents, hosts: hostStore.sortedHosts,
-                                requiresDurableProject: true
-                            )
-                    )
+                    projectConflictAction
                 }
             }
             .fixedSize(horizontal: true, vertical: false)
@@ -2102,8 +2136,176 @@ struct NewProjectView: View {
         .padding(.vertical, 14)
     }
 
+    @ViewBuilder
+    private var projectConflictAction: some View {
+        switch projectNameConflict {
+        case .none:
+            Button(createActionLabel) {
+                startCreation()
+            }
+            .keyboardShortcut(.defaultAction)
+            .disabled(
+                !canCreate || !placementHostsAreReady
+                    || TeamAgentComposer.blocksRemoteTeamCreation(
+                        agents: agents, hosts: hostStore.sortedHosts,
+                        requiresDurableProject: true
+                    )
+            )
+            .accessibilityIdentifier("newProject.create")
+        case .exactLive(let record), .exactDetached(let record):
+            Button("Open Existing") { openExistingProject(record) }
+                .keyboardShortcut(.defaultAction)
+                .disabled(isResolvingConflict)
+                .accessibilityIdentifier("newProject.conflict.openExisting")
+        case .incomplete(let record):
+            Button("Resume Setup") { resumeExistingProject(record) }
+                .keyboardShortcut(.defaultAction)
+                .disabled(isResolvingConflict)
+                .accessibilityIdentifier("newProject.conflict.resume")
+            Button("Discard Existing", role: .destructive) {
+                discardExistingProject(record)
+            }
+                .disabled(isResolvingConflict)
+                .accessibilityIdentifier("newProject.conflict.discard")
+        case .localNameCollision, .remoteNameCollision, .reservedByAnotherRequest:
+            Button("Use “\(suggestedProjectName)”") { useSuggestedProjectName() }
+                .keyboardShortcut(.defaultAction)
+                .disabled(isResolvingConflict)
+                .accessibilityIdentifier("newProject.conflict.rename")
+        }
+    }
+
     private var effectiveIsolation: Bool {
         isolateAgents && !(sourceKind == .existingFolder && gitURL.isEmpty)
+    }
+
+    private var currentProjectSource: ProjectSource {
+        ProjectSource(
+            hostKey: runsOnHostKey,
+            projectPath: trimmedDirectory,
+            gitURL: gitURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            gitBranch: gitBranch.trimmingCharacters(in: .whitespacesAndNewlines),
+            isolateAgents: effectiveIsolation,
+            kind: sourceKind
+        )
+    }
+
+    private var currentProjectLeader: ProjectLeader {
+        ProjectLeader(
+            mode: leaderCli,
+            model: leaderModel,
+            endpoint: runsOnHostKey.map { .peer(hostKey: $0) } ?? .local
+        )
+    }
+
+    private var projectNameConflict: TeamOrchestrator.ProjectNameConflict {
+        if let submissionConflict { return submissionConflict }
+        guard !effectiveName.isEmpty, !trimmedDirectory.isEmpty else { return .none }
+        return TeamOrchestrator.shared.projectNameConflict(
+            name: effectiveName,
+            identity: ProjectCreationFlow.projectIdentity(
+                source: currentProjectSource, leader: currentProjectLeader
+            ),
+            currentTabManager: tabManager
+        )
+    }
+
+    private var projectConflictInputID: String {
+        [
+            effectiveName, trimmedDirectory, runsOnHostKey ?? "local",
+            sourceKind.rawValue, gitURL, gitBranch, leaderCli, leaderModel,
+        ].joined(separator: "\u{1f}")
+    }
+
+    private var projectConflictMessage: String? {
+        let conflict = projectNameConflict
+        guard conflict.blocksCreate else { return nil }
+        return ProjectCreationFlow.conflictDescription(conflict)
+    }
+
+    private var suggestedProjectName: String {
+        let base = effectiveName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !base.isEmpty else { return "Project 2" }
+        let records = TeamOrchestrator.shared.projectConflictRecords(
+            currentTabManager: tabManager
+        )
+        var suffix = 2
+        while records.contains(where: {
+            TeamOrchestrator.normalizedProjectName($0.name)
+                == TeamOrchestrator.normalizedProjectName("\(base) \(suffix)")
+        }) {
+            suffix += 1
+        }
+        return "\(base) \(suffix)"
+    }
+
+    private func useSuggestedProjectName() {
+        name = suggestedProjectName
+        nameEdited = true
+        creationError = nil
+        focusedField = .name
+    }
+
+    private func openExistingProject(
+        _ record: TeamOrchestrator.ProjectConflictRecord
+    ) {
+        isResolvingConflict = true
+        Task { @MainActor in
+            defer { isResolvingConflict = false }
+            guard await TeamOrchestrator.shared.openExistingProject(
+                record, from: tabManager
+            ) else {
+                creationError = "Could not open the existing Project. It may no longer be available."
+                return
+            }
+            onClose()
+        }
+    }
+
+    private func resumeExistingProject(
+        _ record: TeamOrchestrator.ProjectConflictRecord
+    ) {
+        guard let teamName = record.teamName else { return }
+        isResolvingConflict = true
+        Task { @MainActor in
+            defer { isResolvingConflict = false }
+            guard await TeamOrchestrator.shared.openExistingProject(record, from: tabManager)
+            else {
+                creationError = "Could not open the incomplete Project setup."
+                return
+            }
+            let repaired = await TeamOrchestrator.shared.resumeIncompleteProjectSetup(
+                teamName: teamName
+            )
+            if repaired {
+                onClose()
+            } else {
+                creationError = TeamOrchestrator.shared.teams[teamName]?.leaderFailureDescription
+                    ?? "Could not resume the Project setup."
+            }
+        }
+    }
+
+    private func discardExistingProject(
+        _ record: TeamOrchestrator.ProjectConflictRecord
+    ) {
+        guard let teamName = record.teamName else { return }
+        pendingConflictDiscardTeamName = teamName
+    }
+
+    private func performConflictDiscard(teamName: String) {
+        isResolvingConflict = true
+        Task { @MainActor in
+            defer { isResolvingConflict = false }
+            do {
+                try await TeamOrchestrator.shared.deleteProject(
+                    teamName: teamName, tabManager: tabManager
+                )
+                creationError = nil
+            } catch {
+                creationError = "Could not discard the incomplete Project: \(error.localizedDescription)"
+            }
+        }
     }
 
     private func startCreation() {
@@ -2140,7 +2342,7 @@ struct NewProjectView: View {
 
         Task { @MainActor in
             do {
-                try await onCreate(
+                let result = try await onCreate(
                     effectiveName,
                     localDirectory,
                     agents,
@@ -2148,7 +2350,28 @@ struct NewProjectView: View {
                     leader,
                     handleCreationEvent
                 )
-                onClose()
+                if case .created = result {
+                    onClose()
+                }
+            } catch let error as ProjectCreationFlow.CreationError {
+                if case .nameConflict(let conflict) = error {
+                    // A collision is not a failed partial creation. Returning
+                    // to settings removes the destructive failure actions that
+                    // could otherwise delete the existing Project we rejected.
+                    submissionConflict = conflict
+                    showsCreationProgress = false
+                    creationError = nil
+                    showsFailureDetail = false
+                    bootSteps = []
+                    RemoteWorkLog.error(
+                        "Could not create \(effectiveName): \(error.localizedDescription)"
+                    )
+                    return
+                }
+                let message = error.localizedDescription
+                creationError = message
+                failRunningBootStep(message: message)
+                RemoteWorkLog.error("Could not create \(effectiveName): \(message)")
             } catch {
                 let message = error.localizedDescription
                 creationError = message
@@ -3458,6 +3681,14 @@ private struct TeamPresetManagementRow: View {
 /// sidebar is not — so the sheet moved to the app and the work it does had to
 /// come with it, as something neither presenter owns.
 enum ProjectCreationFlow {
+    /// A Create submission has exactly one successful meaning: this
+    /// transaction installed a new Project. Existing Projects are represented
+    /// by `CreationError.nameConflict` and can only be opened or repaired by
+    /// the sheet's separate explicit actions.
+    enum CreationResult: Equatable {
+        case created(teamName: String, workspaceID: UUID)
+    }
+
     /// Every machine selected in the form, prepared before launching anyone.
     struct PreparedCheckouts {
         var rows: [TeamAgentRow]
@@ -3473,10 +3704,15 @@ enum ProjectCreationFlow {
         /// Primary checkout on the leader's machine. nil tells a local leader
         /// to use `localProjectPath`; a remote leader always receives a path.
         var leaderProjectPath: String?
+        /// Checkout preparation succeeds before team installation. If the
+        /// commit-time namespace gate then rejects the request, only this
+        /// transaction's tagged checkouts may be compensated.
+        var rollBackIfUnclaimed: (@MainActor () async -> Void)?
     }
 
     enum CreationError: LocalizedError {
         case teamCreationFailed
+        case nameConflict(TeamOrchestrator.ProjectNameConflict)
         case remoteHostUnavailable
         case remotePathMissing
         case remoteSetupFailed(host: String, detail: String)
@@ -3507,6 +3743,8 @@ enum ProjectCreationFlow {
             switch self {
             case .teamCreationFailed:
                 "Could not create the project team."
+            case .nameConflict(let conflict):
+                ProjectCreationFlow.conflictDescription(conflict)
             case .remoteHostUnavailable:
                 "The selected remote machine is unavailable."
             case .remotePathMissing:
@@ -3537,6 +3775,50 @@ enum ProjectCreationFlow {
                 detail.map { "Could not start the leader on retry: \($0)" }
                     ?? "Could not start the leader on retry."
             }
+        }
+    }
+
+    static func projectIdentity(
+        source: ProjectSource, leader: ProjectLeader
+    ) -> TeamOrchestrator.ProjectCreationIdentity {
+        TeamOrchestrator.ProjectCreationIdentity(
+            // Project identity follows the source checkout, not where its
+            // leader happens to run. A local source with a remote leader and a
+            // remote source with a local leader are both common topologies.
+            hostKey: source.hostKey,
+            workingDirectory: source.projectPath
+        )
+    }
+
+    static func conflictDescription(_ conflict: TeamOrchestrator.ProjectNameConflict) -> String {
+        switch conflict {
+        case .none:
+            ""
+        case .exactLive(let record):
+            switch record.location {
+            case .otherWindow:
+                "This Project is open in another window. Choose Open Existing to switch to it."
+            case .currentWindow:
+                "This Project is already open in this window. Choose Open Existing to select it."
+            case .detached:
+                "This Project is running without a window. Choose Open Existing to restore it."
+            case .remote(_, let hostName):
+                "This Project is available on \(hostName). Open it explicitly instead of creating it."
+            }
+        case .exactDetached:
+            "This Project is running without a window. Choose Open Existing to restore it."
+        case .incomplete(let record):
+            record.failureDescription ?? "This Project setup is incomplete. Resume or discard it explicitly."
+        case .localNameCollision:
+            "A different local Project already uses this name. Rename this Project before creating it."
+        case .remoteNameCollision(let record):
+            if case let .remote(_, hostName) = record.location {
+                "A different Project on \(hostName) already uses this name. Rename this Project before creating it."
+            } else {
+                "A different Project on a connected machine already uses this name. Rename this Project before creating it."
+            }
+        case .reservedByAnotherRequest:
+            "Another window is creating this Project name. Wait for it to finish, then refresh."
         }
     }
 
@@ -3603,52 +3885,19 @@ enum ProjectCreationFlow {
         leader: ProjectLeader,
         progress: @escaping @MainActor (ProjectCreationEvent) -> Void = { _ in },
         tabManager: TabManager
-    ) async throws {
-        // A name already in use usually means the project is open, not that
-        // something failed. Creating one silently returned nil and the sheet
-        // just closed, which reads as the button not working — so go to the
-        // one that is there.
-        //
-        // Unless it is the wreckage of a previous attempt. Keeping the sheet up
-        // on failure means a failed run leaves its team and workspace behind,
-        // so `Retry project` arrives here and this used to select the
-        // half-built workspace and report success — the recovery button closing
-        // the sheet without recovering anything. `leaderReady` is the
-        // difference: false while a requested peer leader is still connecting
-        // or failed to launch.
-        if let existing = TeamOrchestrator.shared.teams[name],
-           let workspace = tabManager.tabs.first(where: { $0.id == existing.workspaceId }) {
-            // A member the form asked for that never joined leaves the same
-            // false success as a missing leader, and `leaderReady` says nothing
-            // about it: an agent failure appends to the sheet's own list and
-            // writes nothing to the team. Reported rather than repaired,
-            // because re-attaching needs a checkout this one no longer has —
-            // a failed agent's checkout is reclaimed at the point it fails.
-            let joined = Set(existing.agents.map(\.name))
-            let missing = rows
-                .filter { $0.hostKey != nil && !joined.contains($0.preset.name) }
-                .map(\.preset.name)
-            guard missing.isEmpty else {
-                tabManager.selectWorkspace(workspace)
-                throw CreationError.membersMissing(names: missing)
-            }
-            guard existing.leaderReady else {
-                // Repair rather than rebuild: the checkouts exist, and
-                // `recoverRemoteLeaderIfNeeded` is documented as safe for an
-                // initial attach that failed before a surface was recorded.
-                tabManager.selectWorkspace(workspace)
-                let repaired = await TeamOrchestrator.shared
-                    .recoverRemoteLeaderIfNeeded(teamName: name)
-                guard repaired else {
-                    throw CreationError.leaderRepairFailed(
-                        detail: TeamOrchestrator.shared.teams[name]?.leaderFailureDescription
-                    )
-                }
-                return
-            }
-            tabManager.selectWorkspace(workspace)
-            return
+    ) async throws -> CreationResult {
+        let orchestrator = TeamOrchestrator.shared
+        let identity = projectIdentity(source: source, leader: leader)
+        let preflight = orchestrator.projectNameConflict(
+            name: name, identity: identity, currentTabManager: tabManager
+        )
+        guard case .none = preflight else {
+            throw CreationError.nameConflict(preflight)
         }
+        guard let reservation = orchestrator.beginProjectCreationReservation(name: name) else {
+            throw CreationError.nameConflict(.reservedByAnotherRequest(name: name))
+        }
+        defer { _ = orchestrator.releaseProjectCreationReservation(reservation) }
         // The checkouts have to exist before anyone is sent to work in them:
         // an agent whose directory is not there starts in a shell that failed
         // to `cd` and looks attached while being nothing of the kind.
@@ -3741,7 +3990,7 @@ enum ProjectCreationFlow {
             }
         }
 
-        guard TeamOrchestrator.shared.createTeam(
+        guard let createdTeam = orchestrator.createTeam(
             named: name,
             rows: prepared.rows,
             workingDirectory: prepared.localProjectPath ?? directory,
@@ -3756,10 +4005,27 @@ enum ProjectCreationFlow {
             projectSource: source,
             createdPaths: prepared.createdPaths,
             onRemoteAttach: onAttach,
+            projectCreationReservation: reservation,
+            projectCreationIdentity: identity,
             tabManager: tabManager
-        ) != nil else {
-            progress(.failed(id: "leader", message: "Could not create the project team."))
-            throw CreationError.teamCreationFailed
+        ) else {
+            await prepared.rollBackIfUnclaimed?()
+            let conflict = orchestrator.projectNameConflict(
+                name: name, identity: identity, currentTabManager: tabManager
+            )
+            guard conflict != .none else {
+                progress(.failed(id: "leader", message: "Could not create the project team."))
+                throw CreationError.teamCreationFailed
+            }
+            let message = conflictDescription(conflict)
+            progress(.failed(id: "leader", message: message))
+            throw CreationError.nameConflict(conflict)
+        }
+        guard orchestrator.commitProjectCreationReservation(reservation, teamName: name) else {
+            // This cannot occur while the MainActor-held reservation is owned
+            // by this transaction. Keep it typed rather than turning an
+            // unexpected CAS violation into a silent success.
+            throw CreationError.nameConflict(.reservedByAnotherRequest(name: name))
         }
 
         // Local participants are running the moment the team exists; only the
@@ -3811,6 +4077,7 @@ enum ProjectCreationFlow {
         // A project with agents in it is what the board is for, so making one
         // puts it up.
         ReviewBoardSettings.setVisible(true)
+        return .created(teamName: createdTeam.id, workspaceID: createdTeam.workspaceId)
     }
 
     /// A machine this transaction has already finished with, and what it would
@@ -4121,11 +4388,20 @@ enum ProjectCreationFlow {
         }
 
         PeerProjectBootstrap.finishTransaction(transactionKey)
+        let completedPlacements = completed
         return PreparedCheckouts(
             rows: prepared,
             createdPaths: createdPaths,
             localProjectPath: localProjectPath,
-            leaderProjectPath: leaderProjectPath
+            leaderProjectPath: leaderProjectPath,
+            rollBackIfUnclaimed: {
+                let reclaimed = await rollBack(
+                    completedPlacements, instanceTag: instanceTag, progress: progress
+                )
+                if reclaimed {
+                    PeerProjectBootstrap.finishTransaction(transactionKey)
+                }
+            }
         )
     }
 

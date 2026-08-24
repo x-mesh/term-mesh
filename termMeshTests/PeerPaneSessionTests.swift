@@ -18,6 +18,288 @@ private actor AsyncFlag {
 }
 
 final class PeerPaneSessionTests: XCTestCase {
+    private func conflictRecord(
+        name: String = "xm",
+        projectID: String = "team:one",
+        hostKey: String? = "ssh:mac-sub",
+        path: String = "/work/xm",
+        location: TeamOrchestrator.ProjectConflictLocation,
+        leaderReady: Bool = true
+    ) -> TeamOrchestrator.ProjectConflictRecord {
+        .init(
+            name: name,
+            identity: .init(
+                projectID: projectID, hostKey: hostKey, workingDirectory: path
+            ),
+            location: location, teamName: name, leaderReady: leaderReady,
+            failureDescription: leaderReady ? nil : "leader failed"
+        )
+    }
+
+    func testProjectNameConflictClassifiesExactLiveAndDetached() {
+        let identity = TeamOrchestrator.ProjectCreationIdentity(
+            projectID: "team:one", hostKey: "ssh:mac-sub",
+            workingDirectory: "/work/xm"
+        )
+        let live = conflictRecord(
+            location: .otherWindow(windowID: UUID(), workspaceID: UUID())
+        )
+        guard case .exactLive(let selected) = TeamOrchestrator.classifyProjectNameConflict(
+            requestedName: " XM ", requestedIdentity: identity, candidates: [live]
+        ) else { return XCTFail("exact live Project was not selected") }
+        XCTAssertEqual(selected.identity.projectID, "team:one")
+
+        let detached = conflictRecord(location: .detached(workspaceID: UUID()))
+        guard case .exactDetached = TeamOrchestrator.classifyProjectNameConflict(
+            requestedName: "xm", requestedIdentity: identity, candidates: [detached]
+        ) else { return XCTFail("detached exact Project was not selected") }
+    }
+
+    func testProjectNameConflictClassifiesIncompleteExactAttempt() {
+        let identity = TeamOrchestrator.ProjectCreationIdentity(
+            projectID: "team:one", hostKey: nil, workingDirectory: "/work/xm"
+        )
+        let incomplete = conflictRecord(
+            hostKey: nil, location: .currentWindow(windowID: nil, workspaceID: UUID()),
+            leaderReady: false
+        )
+        guard case .incomplete = TeamOrchestrator.classifyProjectNameConflict(
+            requestedName: "xm", requestedIdentity: identity, candidates: [incomplete]
+        ) else { return XCTFail("failed exact attempt was not classified incomplete") }
+    }
+
+    func testProjectNameConflictRejectsSameNameDifferentIdentity() {
+        let requested = TeamOrchestrator.ProjectCreationIdentity(
+            projectID: "team:new", hostKey: "ssh:mac-sub",
+            workingDirectory: "/work/xm"
+        )
+        let local = conflictRecord(
+            location: .currentWindow(windowID: nil, workspaceID: UUID())
+        )
+        guard case .localNameCollision = TeamOrchestrator.classifyProjectNameConflict(
+            requestedName: "xm", requestedIdentity: requested, candidates: [local]
+        ) else { return XCTFail("local name collision was not reported") }
+
+        let remote = conflictRecord(
+            location: .remote(hostKey: "ssh:mac-sub", hostName: "mac-sub")
+        )
+        guard case .remoteNameCollision = TeamOrchestrator.classifyProjectNameConflict(
+            requestedName: "xm", requestedIdentity: requested, candidates: [remote]
+        ) else { return XCTFail("remote name collision was not reported") }
+    }
+
+    func testProjectNameConflictDoesNotHideDifferentIdentityBehindExactMatch() {
+        let requested = TeamOrchestrator.ProjectCreationIdentity(
+            projectID: "team:one", hostKey: "ssh:mac-sub",
+            workingDirectory: "/work/xm"
+        )
+        let exact = conflictRecord(
+            projectID: "team:one",
+            location: .currentWindow(windowID: nil, workspaceID: UUID())
+        )
+        let duplicateRemote = conflictRecord(
+            projectID: "team:two",
+            location: .remote(hostKey: "ssh:mac-sub", hostName: "mac-sub")
+        )
+
+        guard case .remoteNameCollision(let selected) =
+            TeamOrchestrator.classifyProjectNameConflict(
+                requestedName: "xm", requestedIdentity: requested,
+                candidates: [exact, duplicateRemote]
+            )
+        else {
+            return XCTFail(
+                "a second UUID with the same name must not be hidden by Open Existing"
+            )
+        }
+        XCTAssertEqual(selected.identity.projectID, "team:two")
+    }
+
+    func testProjectNameConflictUsesPathFallbackOnlyOnSameHost() {
+        let local = TeamOrchestrator.ProjectCreationIdentity(
+            hostKey: nil, workingDirectory: "/work/../work/xm"
+        )
+        let same = TeamOrchestrator.ProjectCreationIdentity(
+            hostKey: nil, workingDirectory: "/work/xm"
+        )
+        XCTAssertTrue(TeamOrchestrator.projectCreationIdentitiesMatch(local, same))
+        XCTAssertFalse(TeamOrchestrator.projectCreationIdentitiesMatch(
+            .init(hostKey: "host-a", workingDirectory: "/work/xm"),
+            .init(hostKey: "host-b", workingDirectory: "/work/xm")
+        ))
+    }
+
+    func testProjectNameConflictIgnoresDifferentNames() {
+        let result = TeamOrchestrator.classifyProjectNameConflict(
+            requestedName: "new", requestedIdentity: .init(),
+            candidates: [conflictRecord(location: .detached(workspaceID: UUID()))]
+        )
+        XCTAssertEqual(result, .none)
+    }
+
+    @MainActor
+    func testProjectCreationReservationSerializesNormalizedNames() {
+        let orchestrator = TeamOrchestrator.shared
+        let first = orchestrator.beginProjectCreationReservation(
+            name: " XM ", requestID: UUID()
+        )
+        XCTAssertNotNil(first)
+        XCTAssertNil(orchestrator.beginProjectCreationReservation(name: "xm"))
+        XCTAssertTrue(orchestrator.hasProjectCreationReservation(name: "xM"))
+        if let first {
+            XCTAssertTrue(orchestrator.releaseProjectCreationReservation(first))
+            XCTAssertFalse(orchestrator.releaseProjectCreationReservation(first))
+        }
+        let next = orchestrator.beginProjectCreationReservation(name: "xm")
+        XCTAssertNotNil(next)
+        if let next {
+            XCTAssertTrue(orchestrator.releaseProjectCreationReservation(next))
+        }
+    }
+
+    @MainActor
+    func testProjectCreationReservationRejectsWrongOwnerAndReleasesOnce() {
+        let orchestrator = TeamOrchestrator.shared
+        let owner = UUID()
+        let reservation = orchestrator.beginProjectCreationReservation(
+            name: "reservation-contract", requestID: owner
+        )
+        XCTAssertNotNil(reservation)
+        guard let reservation else { return }
+
+        let wrong = TeamOrchestrator.ProjectCreationReservation(
+            normalizedName: reservation.normalizedName, requestID: UUID()
+        )
+        XCTAssertFalse(orchestrator.ownsProjectCreationReservation(wrong, teamName: "reservation-contract"))
+        XCTAssertFalse(orchestrator.releaseProjectCreationReservation(wrong))
+        XCTAssertTrue(orchestrator.ownsProjectCreationReservation(
+            reservation, teamName: " RESERVATION-CONTRACT "
+        ))
+        XCTAssertTrue(orchestrator.releaseProjectCreationReservation(reservation))
+        XCTAssertFalse(orchestrator.ownsProjectCreationReservation(
+            reservation, teamName: "reservation-contract"
+        ))
+    }
+
+    func testProjectCreationCollisionRunsNoPersistedStateReset() {
+        var resetCount = 0
+
+        XCTAssertFalse(TeamOrchestrator.resetProjectCreationStateIfAuthorized(
+            hasNameConflict: true,
+            ownsReservation: true,
+            reset: { resetCount += 1 }
+        ))
+        XCTAssertFalse(TeamOrchestrator.resetProjectCreationStateIfAuthorized(
+            hasNameConflict: false,
+            ownsReservation: false,
+            reset: { resetCount += 1 }
+        ))
+        XCTAssertEqual(resetCount, 0, "rejected creates must preserve existing state")
+
+        XCTAssertTrue(TeamOrchestrator.resetProjectCreationStateIfAuthorized(
+            hasNameConflict: false,
+            ownsReservation: true,
+            reset: { resetCount += 1 }
+        ))
+        XCTAssertEqual(resetCount, 1, "only the reservation owner may reset stale state")
+    }
+
+    func testProjectCreationSuccessHasTypedCreatedIdentity() {
+        let workspaceID = UUID()
+        let result = ProjectCreationFlow.CreationResult.created(
+            teamName: "xm", workspaceID: workspaceID
+        )
+        XCTAssertEqual(
+            result,
+            .created(teamName: "xm", workspaceID: workspaceID)
+        )
+    }
+
+    func testProjectIdentityFollowsSourceInsteadOfLeaderPlacement() {
+        let localSource = ProjectSource(
+            hostKey: nil, projectPath: "/work/local", gitURL: "",
+            isolateAgents: false, kind: .existingFolder
+        )
+        XCTAssertEqual(
+            ProjectCreationFlow.projectIdentity(
+                source: localSource,
+                leader: ProjectLeader(
+                    mode: "codex", model: "gpt-5.6-sol",
+                    endpoint: .peer(hostKey: "ssh:mac-sub")
+                )
+            ),
+            .init(hostKey: nil, workingDirectory: "/work/local")
+        )
+
+        let remoteSource = ProjectSource(
+            hostKey: "ssh:mac-sub", projectPath: "/work/remote", gitURL: "",
+            isolateAgents: false, kind: .existingFolder
+        )
+        XCTAssertEqual(
+            ProjectCreationFlow.projectIdentity(
+                source: remoteSource,
+                leader: ProjectLeader(mode: "repl", model: "", endpoint: .local)
+            ),
+            .init(hostKey: "ssh:mac-sub", workingDirectory: "/work/remote")
+        )
+    }
+
+    func testProjectConflictCopyIdentifiesLocationAndExplicitIntent() {
+        let otherWindow = conflictRecord(
+            location: .otherWindow(windowID: UUID(), workspaceID: UUID())
+        )
+        XCTAssertTrue(ProjectCreationFlow.conflictDescription(
+            .exactLive(otherWindow)
+        ).contains("another window"))
+        XCTAssertTrue(ProjectCreationFlow.conflictDescription(
+            .exactLive(otherWindow)
+        ).contains("Open Existing"))
+
+        let detached = conflictRecord(location: .detached(workspaceID: UUID()))
+        XCTAssertTrue(ProjectCreationFlow.conflictDescription(
+            .exactDetached(detached)
+        ).contains("without a window"))
+
+        let remote = conflictRecord(
+            location: .remote(hostKey: "ssh:mac-sub", hostName: "mac-sub")
+        )
+        XCTAssertTrue(ProjectCreationFlow.conflictDescription(
+            .remoteNameCollision(remote)
+        ).contains("mac-sub"))
+        XCTAssertTrue(ProjectCreationFlow.conflictDescription(
+            .remoteNameCollision(remote)
+        ).contains("Rename"))
+    }
+
+    func testProjectConflictDebugLocationUsesProductionRecord() {
+        let otherWindow = conflictRecord(
+            location: .otherWindow(windowID: UUID(), workspaceID: UUID())
+        )
+        XCTAssertEqual(
+            TerminalController.debugProjectConflictLocation(.exactLive(otherWindow)),
+            "other_window"
+        )
+        let remote = conflictRecord(
+            location: .remote(hostKey: "ssh:mac-sub", hostName: "mac-sub")
+        )
+        XCTAssertEqual(
+            TerminalController.debugProjectConflictLocation(.remoteNameCollision(remote)),
+            "remote:mac-sub"
+        )
+    }
+
+    @MainActor
+    func testIncompleteLocalProjectDoesNotReportResumeSuccessFromPaneExistence() async {
+        // A missing team is the same safety boundary as a local team whose
+        // leader is not ready: Resume must stay failed rather than close the
+        // sheet based only on a pane lookup. The live-team branch is exercised
+        // by the mac-sub Project E2E where the real workspace exists.
+        let resumed = await TeamOrchestrator.shared.resumeIncompleteProjectSetup(
+            teamName: "missing-incomplete-project"
+        )
+        XCTAssertFalse(resumed)
+    }
+
     private func waitForLeaderGateWaiters(
         _ gate: RelayLeaderSessionGate,
         commands: Int,
