@@ -2029,9 +2029,6 @@ final class RemoteHostStore: ObservableObject {
         }
     }
 
-    /// Re-read the project roster after a manifest upsert/delete. The daemon
-    /// has no team-roster push event, while the serving GUI's workspace stream
-    /// cannot observe changes on the separate session owner.
     /// Delete a durable Project manifest this installation owns, without
     /// adopting it as a team. Used by New Project's remote-name collision
     /// when the colliding record is ours: the host answers over the normal
@@ -2073,9 +2070,16 @@ final class RemoteHostStore: ObservableObject {
             )
         }
         RemoteWorkLog.info("Deleted owned Project record \(projectID) on \(hostKey)")
+        // Drop the record locally right away so collision classification
+        // stops naming it before the asynchronous roster refresh lands;
+        // that refresh then reconciles against the host's answer.
+        hosts[hostKey]?.teams.removeAll { $0.projectID == projectID }
         refreshTeamRoster(forHostKey: hostKey)
     }
 
+    /// Re-read the project roster after a manifest upsert/delete. The daemon
+    /// has no team-roster push event, while the serving GUI's workspace stream
+    /// cannot observe changes on the separate session owner.
     func refreshTeamRoster(forHostKey key: String) {
         guard let host = hosts[key], host.isConnected, !host.activeSockPath.isEmpty else {
             return

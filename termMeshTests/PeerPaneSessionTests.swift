@@ -97,6 +97,13 @@ final class PeerPaneSessionTests: XCTestCase {
         remote.presentationOwnedByRequester = true
         XCTAssertTrue(remote.canDeleteOwnedRemoteRecord)
 
+        remote.leaderProcessActiveKnown = true
+        remote.leaderReady = true
+        XCTAssertFalse(remote.canDeleteOwnedRemoteRecord, "a running leader is live work, not a leftover")
+        remote.leaderReady = false
+        XCTAssertTrue(remote.canDeleteOwnedRemoteRecord, "a known-idle leader shell may be cleaned up")
+        remote.leaderProcessActiveKnown = false
+
         remote.identity = .init(hostKey: "ssh:mac-sub", workingDirectory: "/work/xm")
         XCTAssertFalse(remote.canDeleteOwnedRemoteRecord, "deletion needs an exact Project ID")
 

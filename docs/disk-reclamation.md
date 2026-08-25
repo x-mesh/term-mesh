@@ -107,7 +107,10 @@ tm-agent daemon project-presentations prune --project-id team:<uuid> --apply
 
 New Project's remote-name collision shows the same facts (host, directory,
 Project ID, leader state, ownership) and offers "Delete Project record…" for
-records this installation owns; foreign records point here.
+records this installation owns whose leader is not running. That delete is
+the normal protocol delete: it also stops the panes only that manifest
+referenced (leader shell, agent panes); the workspace and files stay. Foreign
+records and running leaders point here or to the sidebar respectively.
 
 VERIFY:
 

@@ -10270,8 +10270,6 @@ fn parse_byte_size(raw: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("byte size overflow: {raw:?}"))
 }
 
-/// `tm-agent daemon replay-capacity [--set <value>]` — get or set the peer
-/// PTY-surface replay buffer capacity via the `peer.replay_capacity` RPC.
 /// One daemon RPC, printed. Exits non-zero on transport or RPC error so
 /// scripts can trust the status; returns the `result` for callers that
 /// add a human summary.
@@ -10296,6 +10294,8 @@ fn cmd_daemon_rpc_print(sock: &PathBuf, method: &str, params: serde_json::Value)
     }
 }
 
+/// `tm-agent daemon replay-capacity [--set <value>]` — get or set the peer
+/// PTY-surface replay buffer capacity via the `peer.replay_capacity` RPC.
 fn cmd_daemon_replay_capacity(sock: &PathBuf, set: Option<&str>) {
     let params = match set {
         Some(raw) => match parse_byte_size(raw) {

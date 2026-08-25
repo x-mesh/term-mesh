@@ -391,10 +391,11 @@ struct NewProjectView: View {
             if let record = pendingOwnedRecordRemoval,
                case let .remote(_, hostName) = record.location {
                 Text(
-                    "This removes only the Project record \(record.identity.projectID ?? "") "
-                        + "at \(record.identity.workingDirectory ?? "an unrecorded path") on \(hostName). "
-                        + "The Project can no longer be opened from this record. The daemon "
-                        + "workspace, its shell and any files stay in place."
+                    "This removes the Project record \(record.identity.projectID ?? "") "
+                        + "at \(record.identity.workingDirectory ?? "an unrecorded path") on \(hostName) "
+                        + "and stops the panes only it referenced: its leader shell and any agent panes. "
+                        + "The Project can no longer be opened from this record. The daemon workspace, "
+                        + "its own shell and all files stay in place."
                 )
             }
         }
@@ -2264,8 +2265,10 @@ struct NewProjectView: View {
                 }
                 Text(
                     record.canDeleteOwnedRemoteRecord
-                        ? "Delete the record if this Project is gone; a running Project should be opened from the sidebar instead."
-                        : "Only the owning installation can delete this record over the network. On the host, `tm-agent daemon project-presentations prune` lists and removes leftover records."
+                        ? "Delete the record if this Project is gone. Deleting also stops its leader shell and agent panes on the host; files and the workspace stay."
+                        : (record.presentationOwnedByRequester
+                            ? "The leader is running. Open the Project from the sidebar instead of deleting its record."
+                            : "Only the owning installation can delete this record over the network. On the host, `tm-agent daemon project-presentations prune` lists and removes leftover records.")
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)

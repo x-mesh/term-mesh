@@ -78,11 +78,16 @@ final class TeamOrchestrator: ObservableObject {
 
         /// A remote record this installation owns can be deleted straight
         /// from the collision UI, without adopting it as a team first.
-        /// Records other installations own need host-side cleanup
+        /// Deleting a manifest also stops the surfaces only it referenced
+        /// (its leader shell and agent panes), so a record whose leader
+        /// process is known to be running is never offered: that is live
+        /// work, to be opened from the sidebar. Records other installations
+        /// own need host-side cleanup
         /// (`tm-agent daemon project-presentations prune`).
         var canDeleteOwnedRemoteRecord: Bool {
             guard case .remote = location else { return false }
-            return presentationOwnedByRequester && identity.projectID != nil
+            guard presentationOwnedByRequester, identity.projectID != nil else { return false }
+            return !(leaderProcessActiveKnown && leaderReady)
         }
     }
 

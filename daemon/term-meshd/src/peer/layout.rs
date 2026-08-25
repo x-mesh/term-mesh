@@ -1029,16 +1029,6 @@ pub struct WorkspaceRosterEntry {
     pub is_default: bool,
 }
 
-/// Shared state of one daemon peer host: the PTYs, the workspaces they are
-/// arranged into, and the connections to push layout changes to. This is
-/// what `connection::run` receives instead of a bare `PtyManager`.
-///
-/// Lock discipline (as everywhere in `peer::`): guards never cross an
-/// `.await`, and mutation results are broadcast after unlock. Nesting is
-/// one-directional — a method may hold `workspaces` and, separately (never
-/// nested), `surface_workspace` — but no code path takes either lock while
-/// holding a manager guard, so the order is consistent and cannot
-/// deadlock.
 static ACTIVE_HOST: std::sync::OnceLock<Mutex<Weak<PeerHost>>> = std::sync::OnceLock::new();
 
 /// One durable manifest as an operator sees it (`peer.project_presentations.list`).
@@ -1068,6 +1058,16 @@ pub struct ProjectPresentationPruneReport {
     pub skipped: Vec<ProjectPresentationPruneSkip>,
 }
 
+/// Shared state of one daemon peer host: the PTYs, the workspaces they are
+/// arranged into, and the connections to push layout changes to. This is
+/// what `connection::run` receives instead of a bare `PtyManager`.
+///
+/// Lock discipline (as everywhere in `peer::`): guards never cross an
+/// `.await`, and mutation results are broadcast after unlock. Nesting is
+/// one-directional — a method may hold `workspaces` and, separately (never
+/// nested), `surface_workspace` — but no code path takes either lock while
+/// holding a manager guard, so the order is consistent and cannot
+/// deadlock.
 pub struct PeerHost {
     pub pty: Arc<PtyManager>,
     /// Every workspace this host currently serves, keyed by workspace id.
@@ -1433,6 +1433,31 @@ impl PeerHost {
             });
         }
 
+        // The liveness set above is a snapshot: an attach can respawn a dead
+        // surface (`get_or_respawn`) between it and the removal below. Look
+        // again right before committing so a record that just came back to
+        // life is reported as live instead of removed.
+        let live_now = self.live_surface_ids();
+        let (removed, revived): (Vec<_>, Vec<_>) = removed.into_iter().partition(|status| {
+            records
+                .get(&status.project_id)
+                .map(|record| Self::presentation_status(record, &live_now).live_surfaces == 0)
+                .unwrap_or(false)
+        });
+        for status in revived {
+            skipped.push(ProjectPresentationPruneSkip {
+                project_id: status.project_id,
+                reason: "live",
+            });
+        }
+        if removed.is_empty() {
+            return Ok(ProjectPresentationPruneReport {
+                applied: false,
+                backup_path: None,
+                removed,
+                skipped,
+            });
+        }
         let path = self.project_presentations_path.lock().unwrap().clone();
         let backup_path = match &path {
             Some(path) => Self::backup_project_presentations_file(path)?,
@@ -1474,6 +1499,9 @@ impl PeerHost {
         let mut candidate = path.with_file_name(format!("peer-project-presentations.{stamp}.bak.json"));
         let mut suffix = 1;
         while candidate.exists() {
+            if suffix > 1000 {
+                return Err("backup_failed");
+            }
             candidate = path.with_file_name(format!(
                 "peer-project-presentations.{stamp}-{suffix}.bak.json"
             ));
