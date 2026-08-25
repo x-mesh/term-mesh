@@ -782,10 +782,6 @@ struct TextBody {
     text: String,
     #[serde(default)]
     request_id: Option<String>,
-    /// Type the text into the surface as keystrokes even for a leader target
-    /// (direct-typing mode). Without it a leader gets a durable request.
-    #[serde(default)]
-    raw: bool,
 }
 
 async fn text_handler(
@@ -794,9 +790,7 @@ async fn text_handler(
     axum::Extension(caller): axum::Extension<Caller>,
     Json(body): Json<TextBody>,
 ) -> ApiResult {
-    // A durable request or composer message needs real content; direct
-    // typing (`raw`) legitimately sends single spaces and newlines.
-    if body.text.is_empty() || (!body.raw && body.text.trim().is_empty()) {
+    if body.text.trim().is_empty() {
         return Err(ApiError::bad_request(
             "empty_text",
             "text must not be empty",
@@ -828,12 +822,7 @@ async fn text_handler(
         entry.kind,
         body.text.len()
     );
-    let kind = if body.raw {
-        TargetKind::Pane
-    } else {
-        entry.kind
-    };
-    match kind {
+    match entry.kind {
         TargetKind::Leader => {
             let mut params = json!({ "team_name": entry.team_name, "text": body.text });
             if let Some(id) = &request_id {

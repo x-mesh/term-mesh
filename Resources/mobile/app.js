@@ -34,8 +34,6 @@
     requestsCount: $('requests-count'),
     requestsList: $('requests-list'),
     composer: $('composer'),
-    direct: $('direct'),
-    type: $('type'),
     keys: $('keys'),
     form: $('send-form'),
     text: $('text'),
@@ -50,10 +48,6 @@
     inFlight: false,
     lastText: null,
     lastError: null,
-    direct: false,       // direct-typing mode: keystrokes go straight to the pane
-    typeRefreshTimer: null,
-    typeQueue: [],       // pending keystrokes, sent one request at a time in order
-    typeBusy: false,
     rowKeys: [],         // per-row render keys for incremental redraws
     rowNodes: [],
   };
@@ -244,7 +238,6 @@
 
   function selectTarget(t, fromRender) {
     var changed = !state.selected || !t || state.selected.surface_id !== t.surface_id;
-    if (changed && state.direct) { setDirect(false); }
     state.selected = t || null;
     if (t) { el.target.value = t.surface_id; }
     var has = !!t;
@@ -342,7 +335,7 @@
   function startPolling() {
     stopPolling();
     state.pollTimer = window.setInterval(function () {
-      if (document.hidden || state.typeBusy || state.typeQueue.length) { return; }
+      if (document.hidden) { return; }
       refreshNow();
     }, POLL_MS);
   }
@@ -395,87 +388,6 @@
       });
   }
 
-  // ── direct typing ─────────────────────────────────────────────────────
-  // Tap the screen (or ⌨) and the phone keyboard types straight into the
-  // pane: printable text as keystrokes (raw, even on a leader), Enter and
-  // Backspace as keys. IME composition (Korean) is flushed only once the
-  // composed text is committed, so no syllable fragments reach the pane.
-
-  // Keystrokes are queued and sent one request at a time so they reach the
-  // pane in order; text queued while a request is in flight is coalesced
-  // into one POST. The screen refreshes once the queue drains, not per key.
-  function enqueueType(item) {
-    var last = state.typeQueue[state.typeQueue.length - 1];
-    if (item.kind === 'text' && last && last.kind === 'text') {
-      last.text += item.text;
-    } else {
-      state.typeQueue.push(item);
-    }
-    pumpType();
-  }
-
-  function pumpType() {
-    if (state.typeBusy) { return; }
-    if (!state.typeQueue.length) { scheduleTypeRefresh(); return; }
-    var t = state.selected;
-    if (!t) { state.typeQueue.length = 0; return; }
-    var item = state.typeQueue.shift();
-    var base = '/api/targets/' + encodeURIComponent(t.surface_id);
-    var req = item.kind === 'text'
-      ? api('POST', base + '/text', { text: item.text, request_id: requestId(), raw: true })
-      : api('POST', base + '/key', { key: item.key });
-    state.typeBusy = true;
-    req.catch(function (err) {
-      setSendStatus(describeError(err), true);
-      state.typeQueue.length = 0;
-    }).then(function () {
-      state.typeBusy = false;
-      pumpType();
-    });
-  }
-
-  function typeRaw(text) {
-    if (text) { enqueueType({ kind: 'text', text: text }); }
-  }
-
-  function typeKey(key) {
-    enqueueType({ kind: 'key', key: key });
-  }
-
-  function scheduleTypeRefresh() {
-    if (state.typeRefreshTimer) { window.clearTimeout(state.typeRefreshTimer); }
-    state.typeRefreshTimer = window.setTimeout(function () {
-      state.typeRefreshTimer = null;
-      refreshNow();
-    }, 120);
-  }
-
-  function flushTyped() {
-    var value = el.type.value;
-    if (!value) { return; }
-    el.type.value = '';
-    typeRaw(value);
-  }
-
-  function setDirect(on) {
-    state.direct = !!on;
-    el.screenWrap.classList.toggle('direct', state.direct);
-    el.direct.setAttribute('aria-pressed', state.direct ? 'true' : 'false');
-    if (state.direct) {
-      el.type.value = '';
-      el.type.focus();
-      setSendStatus('직접 입력: 키보드 입력이 pane으로 바로 갑니다 (⌨로 종료)');
-    } else {
-      el.type.blur();
-      setSendStatus('');
-    }
-  }
-
-  var HARDWARE_KEYS = {
-    ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
-    Escape: 'Escape', Tab: 'Tab',
-  };
-
   // ── wiring ───────────────────────────────────────────────────────────
 
   el.target.addEventListener('change', function () {
@@ -499,62 +411,6 @@
   el.jump.addEventListener('click', function () {
     el.screen.scrollTop = el.screen.scrollHeight;
     el.jump.hidden = true;
-  });
-
-  el.direct.addEventListener('click', function () {
-    setDirect(!state.direct);
-  });
-
-  el.screen.addEventListener('click', function () {
-    if (state.selected && !state.direct) { setDirect(true); }
-    else if (state.direct) { el.type.focus(); }
-  });
-
-  el.type.addEventListener('beforeinput', function (ev) {
-    if (!state.direct) { return; }
-    if (ev.inputType === 'insertLineBreak' || ev.inputType === 'insertParagraph') {
-      ev.preventDefault();
-      flushTyped();
-      typeKey('Enter');
-    } else if (ev.inputType === 'deleteContentBackward' && !el.type.value) {
-      ev.preventDefault();
-      typeKey('Backspace');
-    }
-  });
-
-  el.type.addEventListener('input', function (ev) {
-    if (!state.direct || ev.isComposing) { return; }
-    flushTyped();
-  });
-
-  el.type.addEventListener('compositionend', function () {
-    if (!state.direct) { return; }
-    // iOS fires a trailing non-composing input event as well; flushing here
-    // and there is safe because the field is emptied on the first flush.
-    window.setTimeout(flushTyped, 0);
-  });
-
-  el.type.addEventListener('keydown', function (ev) {
-    if (!state.direct) { return; }
-    if (ev.ctrlKey && (ev.key === 'c' || ev.key === 'C')) {
-      ev.preventDefault();
-      typeKey('C-c');
-      return;
-    }
-    var mapped = HARDWARE_KEYS[ev.key];
-    if (mapped) {
-      ev.preventDefault();
-      flushTyped();
-      typeKey(mapped);
-    }
-  });
-
-  el.type.addEventListener('blur', function () {
-    // Leaving the field (another control tapped) ends direct mode so the
-    // composer and key row behave normally again.
-    if (state.direct) { window.setTimeout(function () {
-      if (document.activeElement !== el.type) { setDirect(false); }
-    }, 100); }
   });
 
   el.keys.addEventListener('click', function (ev) {

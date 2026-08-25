@@ -190,11 +190,11 @@ wake instruction으로 깨어나고, 일반 pane은 텍스트가 그대로 타�
 문구와 실제 입력이 구분되고 커서가 어디 있는지 보인다. 2초 자동 refresh와 수동
 refresh, 사용자가 하단에 있을 때만 자동 scroll.
 
-입력은 두 가지다. (1) 직접 입력 모드: 화면을 탭하거나 ⌨ 버튼을 누르면 숨은 입력
-필드가 폰 키보드를 열고, 글자는 `POST /text {raw: true}`로, Enter·Backspace·화살표·
-Esc·Tab·Ctrl-C는 `POST /key`로 즉시 pane에 간다. IME(한글) 조합 중인 글자는 확정된 뒤에만
-보낸다. 리더 pane도 이 모드에서는 durable board를 거치지 않고 그대로 타이핑된다. (2)
-아래 composer: 여러 줄·붙여넣기용이며 리더 pane에서는 durable request로 보낸다. 하단에 composer, 키 버튼 행(Enter, Esc,
+입력은 아래 composer(여러 줄·붙여넣기, 리더 pane에서는 durable request)와 키 행
+뿐이다. 화면에 직접 타이핑하는 모드는 2026-08-25에 시도했다가 뺐다. 글자마다 요청이
+나가 폰에서 느리고 끊겼고(서버 비용은 화면 8 ms·글자 1 ms로 작았지만 왕복이 글자
+단위였다), 터미널 미러 위에 키보드를 얹는 것보다 native pane의 구조화 transcript를
+채팅으로 보여 주는 편이 맞는 방향이라 판단했다(§11). 하단에 composer, 키 버튼 행(Enter, Esc,
 y, n, 1–9, ↑, ↓, Tab, Ctrl-C), 리더면 최근 request 상태. 상태 저장은 없다.
 
 ## 5. 대상별 경로
@@ -228,7 +228,7 @@ frame-ancestors 'none'; base-uri 'none'; form-action 'none'`. CORS 없음. POST�
 | GET | `/api/targets` | | `{targets: [{surface_id, kind, team_name, agent_cli, title, cwd, source: gui\|headless, keys, owner, created_at, expires_at}], now}`. 호출 시 만료·dead socket entry를 prune |
 | GET | `/api/targets/{id}/screen?lines=200` | `lines` 20..1000 | `{surface_id, kind, lines, text, captured_at}` |
 | GET | `/api/targets/{id}/screen?lines=200&format=styled` | 위와 같음 | `{format: "styled", columns, rows: [[{t, fg?, bg?, b?, d?, i?, u?, inv?}]], cursor: {row, col}\|null, captured_at}`. 앱 `surface.read_screen_grid`(Ghostty render-grid 프레임)의 span을 daemon이 행별로 배치(열 간격은 공백으로 채움, invisible은 공백, scrollback 행 다음에 active 행, 커서·마지막 내용 아래의 빈 행은 제거). fg/bg는 `#rrggbb`(터미널 기본색이면 생략). 구형 앱이면 `format: "text"`로 내려감 |
-| POST | `/api/targets/{id}/text` | `{text, request_id?, raw?}` | leader: 202 `{request_id, stored, wake_dispatched, request_replayed, claimed_by_leader}` / pane 또는 `raw: true`: 200 `{delivered, deduplicated, request_id}`. `raw`는 직접 입력 모드용으로 리더 pane에도 durable board를 거치지 않고 키 입력으로 타이핑 |
+| POST | `/api/targets/{id}/text` | `{text, request_id?}` | leader: 202 `{request_id, stored, wake_dispatched, request_replayed, claimed_by_leader}` / pane: 200 `{delivered, deduplicated, request_id}` |
 | GET | `/api/targets/{id}/requests` | leader만(아니면 409 `not_leader`) | `{count, requests}` (`team.leader.request.list`, 본문 미포함) |
 | POST | `/api/targets/{id}/key` | `{key}` | 200 `{key, delivered}` |
 
