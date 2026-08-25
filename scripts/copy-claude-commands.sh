@@ -38,6 +38,12 @@ DEST_SKILLS="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/claude-ski
 SRC_CODEX="${SRCROOT}/Resources/CodexPrompts"
 DEST_CODEX="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/codex-prompts"
 
+# Codex skills: Codex lists ~/.codex/skills/<name>/SKILL.md under `$name`; it does
+# not expose ~/.codex/prompts as slash commands, so a command that must be
+# reachable from Codex's own composer ships as a skill too.
+SRC_CODEX_SKILLS="${SRCROOT}/Resources/CodexSkills"
+DEST_CODEX_SKILLS="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/codex-skills"
+
 # 설치할 커맨드 파일 목록 — 새 커맨드 추가 시 여기에 파일명 추가
 # 이 목록은 Sources/ClaudeCommandInstaller.swift 의 managedCommandNames 와 동기화 유지.
 COMMANDS=(tm.md team.md team-up.md tm-op.md tm-bench.md watch.md release.md rc.md)
@@ -49,6 +55,10 @@ SKILLS=(term-mesh-cli)
 # 설치할 Codex prompt 파일 목록 — Claude COMMANDS 와 짝을 이룬다.
 # 이 목록은 Sources/ClaudeCommandInstaller.swift 의 managedCodexPromptNames 와 동기화 유지.
 CODEX_PROMPTS=(team.md team-up.md tm.md tm-op.md tm-bench.md watch.md release.md rc.md)
+
+# 설치할 Codex skill 목록 (디렉토리명) — Resources/CodexSkills/<name>/SKILL.md.
+# 이 목록은 Sources/ClaudeCommandInstaller.swift 의 managedCodexSkillNames 와 동기화 유지.
+CODEX_SKILLS=(rc)
 
 mkdir -p "$DEST_CMDS"
 
@@ -120,6 +130,31 @@ for skill in "${SKILLS[@]}"; do
             }
         ' "$src_file" > "$DEST_SKILLS/$skill/SKILL.md"
         echo "Copied skill $skill to bundle"
+    else
+        echo "warning: $src_file not found, skipping"
+    fi
+done
+
+mkdir -p "$DEST_CODEX_SKILLS"
+
+for skill in "${CODEX_SKILLS[@]}"; do
+    src_file="$SRC_CODEX_SKILLS/$skill/SKILL.md"
+    if [ -f "$src_file" ]; then
+        mkdir -p "$DEST_CODEX_SKILLS/$skill"
+        # Same marker placement as Claude skills: right after the frontmatter.
+        awk '
+            BEGIN { in_fm = 0; printed_marker = 0 }
+            NR == 1 && /^---[[:space:]]*$/ { in_fm = 1; print; next }
+            in_fm && /^---[[:space:]]*$/ {
+                print
+                print "<!-- term-mesh-managed: do not remove this line -->"
+                in_fm = 0
+                printed_marker = 1
+                next
+            }
+            { print }
+        ' "$src_file" > "$DEST_CODEX_SKILLS/$skill/SKILL.md"
+        echo "Copied codex skill $skill to bundle"
     else
         echo "warning: $src_file not found, skipping"
     fi

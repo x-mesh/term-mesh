@@ -28,6 +28,8 @@ enum ClaudeCommandInstaller {
 
     /// 제거 migration이 실행된 개발 빌드에서도 전역 Codex prompt를 한 번 복구한다.
     private static let codexPromptRestoreMigrationKey = "termMeshCodexPromptRestoreV1"
+    /// Codex skills(~/.codex/skills) 최초 설치 게이트. 버전 게이트와 별개로 한 번은 실행한다.
+    private static let codexSkillsInstallKey = "termMeshCodexSkillsInstallV1"
 
     /// term-mesh가 소유권을 주장하는 슬래시 커맨드 파일 이름.
     /// 이 목록에 있는 파일은 사용자 버전(마커 없음)이라도 백업 후 강제 덮어쓰기 한다.
@@ -71,6 +73,13 @@ enum ClaudeCommandInstaller {
         Bundle.main.url(forResource: "codex-prompts", withExtension: nil)
     }
 
+    /// 번들 내 Codex skill 디렉토리 (codex-skills/<name>/SKILL.md). Codex는
+    /// ~/.codex/skills 의 SKILL.md 를 `$name` 으로 노출하고 prompts 는 슬래시
+    /// 명령으로 제공하지 않으므로, Codex composer 에서 직접 부를 명령은 skill 로도 싣는다.
+    private static var bundleCodexSkillsURL: URL? {
+        Bundle.main.url(forResource: "codex-skills", withExtension: nil)
+    }
+
     /// 대상: ~/.claude/commands/
     private static var targetURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -89,6 +98,12 @@ enum ClaudeCommandInstaller {
             .appendingPathComponent(".codex/prompts")
     }
 
+    /// 대상: ~/.codex/skills/ (tm-agent runbook 설치기와 같은 디렉토리)
+    private static var targetCodexSkillsURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/skills")
+    }
+
     /// 앱 시작 시 호출. 번들 버전이 더 새로우면 커맨드/스킬 파일을 설치한다.
     /// 에러는 조용히 실패 — 설치 실패가 앱 시작을 막아선 안 된다.
     static func installIfNeeded() {
@@ -105,7 +120,8 @@ enum ClaudeCommandInstaller {
         let needsVersionInstall = isNewer(current, than: installed)
         let needsMigration = !migrationDone
         let needsCodexPromptRestore = !codexPromptRestoreDone
-        guard needsVersionInstall || needsMigration || needsCodexPromptRestore else {
+        let needsCodexSkills = !UserDefaults.standard.bool(forKey: codexSkillsInstallKey)
+        guard needsVersionInstall || needsMigration || needsCodexPromptRestore || needsCodexSkills else {
             logger.debug("Claude commands/skills already installed for version \(current, privacy: .public)")
             return
         }
@@ -157,6 +173,19 @@ enum ClaudeCommandInstaller {
             }
         } else {
             logger.error("codex-prompts bundle resource not found")
+        }
+
+        // Codex skills → ~/.codex/skills/<name>/SKILL.md (`$name` in Codex's composer).
+        if let srcCodexSkills = bundleCodexSkillsURL {
+            do {
+                try installSkills(from: srcCodexSkills, to: targetCodexSkillsURL)
+                UserDefaults.standard.set(true, forKey: codexSkillsInstallKey)
+                logger.info("Codex skills installed for version \(current, privacy: .public)")
+            } catch {
+                logger.error("Codex skill install failed: \(error.localizedDescription, privacy: .public)")
+            }
+        } else {
+            logger.debug("codex-skills bundle resource not found (optional)")
         }
 
         UserDefaults.standard.set(current, forKey: installedVersionKey)

@@ -157,6 +157,12 @@ leader command 관례대로 네 곳을 함께 추가한다.
 3. `scripts/copy-claude-commands.sh`의 `COMMANDS`/`CODEX_PROMPTS`,
    `Sources/ClaudeCommandInstaller.swift`의 `managedCommandNames`/`managedCodexPromptNames`.
 4. `imeSlashCommandAliases()`에 `"/rc": "~/.codex/prompts/rc.md"`.
+5. `Resources/CodexSkills/rc/SKILL.md` — Codex가 `$rc`로 부르는 skill. Codex는
+   `~/.codex/skills/<name>/SKILL.md`(와 `~/.agents/skills/`)만 `$` 목록에 올리고
+   `~/.codex/prompts`는 슬래시 명령으로 제공하지 않는다. Codex pane에서 `/rc`는
+   term-mesh IME 입력 바의 별칭 확장으로만 동작하므로, Codex 자체 composer에서는
+   `$rc on …`을 쓴다. 번들은 `copy-claude-commands.sh`의 `CODEX_SKILLS`, 설치는
+   `ClaudeCommandInstaller`의 `managedCodexSkillNames`(`~/.codex/skills/rc/`).
 
 스킬이 하는 일은 `tm-agent remote on|off|status`를 실행하고 URL과 정책을 보여
 주는 것뿐이다. 에이전트는 polling하지 않는다. 리더는 지금처럼 durable request의
