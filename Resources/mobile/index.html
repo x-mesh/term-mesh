@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="color-scheme" content="light dark">
+<title>term-mesh remote</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="bar">
+  <div class="bar-row">
+    <label class="target-label" for="target">
+      <span class="brand">term-mesh</span>
+      <select id="target" aria-label="target pane"></select>
+    </label>
+    <button id="refresh" type="button" class="icon" title="refresh" aria-label="refresh">↻</button>
+  </div>
+  <div id="status" class="status" role="status" aria-live="polite">connecting…</div>
+  <div id="view-switch" class="view-switch" role="group" aria-label="view mode" hidden>
+    <button id="view-chat" type="button">Chat</button>
+    <button id="view-terminal" type="button">Terminal</button>
+  </div>
+</header>
+
+<main id="main">
+  <section id="empty" class="empty" hidden>
+    <p>노출된 pane이 없습니다.</p>
+    <p>term-mesh pane 안에서 <code>/rc on</code>을 실행하세요.</p>
+  </section>
+
+  <section id="screen-wrap" class="screen-wrap" hidden>
+    <pre id="screen" class="screen" tabindex="0"></pre>
+    <button id="jump" type="button" class="jump" hidden>↓ 최신</button>
+  </section>
+
+  <section id="chat" class="chat" hidden>
+    <div class="chat-heading">
+      <div class="chat-identity">
+        <span class="presence" aria-hidden="true"></span>
+        <span>
+          <strong id="chat-title">Agent session</strong>
+          <small id="chat-subtitle">Live transcript</small>
+        </span>
+      </div>
+      <span class="live-badge">Live</span>
+    </div>
+    <div id="chat-list" class="chat-list" role="log" aria-live="polite"></div>
+    <div class="chat-foot">
+      <span id="chat-state" class="muted"></span>
+      <button id="interrupt" type="button" class="danger" hidden>중단</button>
+    </div>
+  </section>
+
+  <section id="requests" class="requests" hidden>
+    <div class="requests-head">
+      <span>durable requests</span>
+      <span id="requests-count" class="muted"></span>
+    </div>
+    <ul id="requests-list"></ul>
+  </section>
+</main>
+
+<footer id="composer" class="composer" hidden>
+  <div class="keys" id="keys" aria-label="quick keys">
+    <button type="button" data-key="Enter">Enter</button>
+    <button type="button" data-key="Escape">Esc</button>
+    <button type="button" data-key="y">y</button>
+    <button type="button" data-key="n">n</button>
+    <button type="button" data-key="1">1</button>
+    <button type="button" data-key="2">2</button>
+    <button type="button" data-key="3">3</button>
+    <button type="button" data-key="Up">↑</button>
+    <button type="button" data-key="Down">↓</button>
+    <button type="button" data-key="Tab">Tab</button>
+    <button type="button" data-key="Backspace">⌫</button>
+    <button type="button" data-key="C-c" class="danger">^C</button>
+  </div>
+  <form id="send-form" class="send-form">
+    <textarea id="text" rows="2" placeholder="메시지…" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+    <button id="send" type="submit">보내기</button>
+  </form>
+  <div id="send-status" class="send-status muted"></div>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -126,7 +126,8 @@ Canonical details: [team lifecycle](.claude/commands/team.md),
   every commit since the last tag in user-facing language and upload the dSYM.
   The complete workflow is [`.claude/commands/release.md`](.claude/commands/release.md).
 - When adding a leader command, update its Claude command, Codex prompt,
-  installer managed-name lists, and IME alias map together.
+  Codex skill (`Resources/CodexSkills/<name>/SKILL.md`, so `$<name>` works in
+  Codex), installer managed-name lists, and IME alias map together.
 
 ## Lessons (x-humble)
 <!-- Section managed by x-humble. Manual editing allowed. -->

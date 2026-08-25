@@ -17,6 +17,13 @@ import SwiftUI
 /// parsing: turning the stream into things a view can draw as what they are.
 @MainActor
 final class AgentSessionTests: XCTestCase {
+    func testChatTurnPreservesLineBreaksAndNormalizesCarriageReturns() {
+        XCTAssertEqual(
+            TerminalSurface.normalizedChatTurn("first\r\nsecond\rthird"),
+            "first\nsecond\nthird"
+        )
+    }
+
     func testIsolatedWorktreeBranchUsesDurableInstanceIdentity() {
         let first = TeamOrchestrator.isolatedWorktreeBranch(
             teamName: "term-mesh", agentName: "executor",
@@ -2080,6 +2087,9 @@ final class AgentSessionTests: XCTestCase {
             Bundle.main.resourcePath.map { "\($0)/bin" }
         )
         XCTAssertTrue(environment["PATH"]?.contains("/usr/bin") == true)
+        // Skills run "$TERMMESH_APP_BIN/tm-agent" first; native panes only get
+        // it from here.
+        XCTAssertEqual(environment["TERMMESH_APP_BIN"], Bundle.main.resourcePath.map { "\($0)/bin" })
     }
 
     func testCLIProfileCannotReplaceAgentRoutingOrBundledCLI() {

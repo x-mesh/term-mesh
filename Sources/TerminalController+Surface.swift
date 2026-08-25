@@ -763,6 +763,37 @@ extension TerminalController {
         return result
     }
 
+    /// Submit one complete turn to an interactive terminal CLI. The app owns
+    /// text + Return as one operation so the mobile chat path never races a
+    /// separate key request against an unfinished paste.
+    func v2SurfaceSendTurn(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        guard let text = params["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .err(code: "invalid_params", message: "Missing text", data: nil)
+        }
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to submit turn", data: nil)
+        let completed = v2MainExec(timeout: kSendTextMainExecTimeout) {
+            guard let ws = self.v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId = self.v2UUID(params, "surface_id") ?? ws.focusedPanelId
+            guard let surfaceId, let panel = ws.terminalPanel(for: surfaceId) else {
+                result = .err(code: "invalid_params", message: "Surface is not a terminal", data: nil)
+                return
+            }
+            guard panel.sendIMETextPreservingNewlines(text, withReturn: true) else {
+                result = .err(code: "internal_error", message: "Terminal rejected the turn", data: nil)
+                return
+            }
+            panel.surface.forceRefresh()
+            result = .ok(["surface_id": surfaceId.uuidString, "submitted": true])
+        }
+        return completed ? result : .err(code: "timeout", message: "Main thread busy", data: nil)
+    }
+
     func v2SurfaceSendKey(params: [String: Any]) -> V2CallResult {
         guard let tabManager = v2ResolveTabManager(params: params) else {
             return .err(code: "unavailable", message: "TabManager not available", data: nil)
@@ -910,6 +941,71 @@ extension TerminalController {
                 "surface_ref": self.v2Ref(kind: .surface, uuid: surfaceId),
                 "window_id": self.v2OrNull(windowId?.uuidString),
                 "window_ref": self.v2Ref(kind: .window, uuid: windowId)
+            ])
+        }
+        if !completed {
+            return .err(code: "timeout", message: "Main thread busy (IME or modal UI active)", data: nil)
+        }
+        return result
+    }
+
+    /// `surface.read_screen_grid`: Ghostty's render-grid frame for mobile
+    /// mirrors (`ghostty_surface_render_grid_json_v2`, cmux fork): the active
+    /// area plus up to `scrollback_lines` history rows as styled spans
+    /// (`row_spans` / `scrollback_spans` referencing `styles`), the cursor,
+    /// and terminal modes. Anchored to the active area so the frame does not
+    /// depend on this surface's scroll position. Plain readers keep
+    /// `surface.read_text`.
+    func v2SurfaceReadScreenGrid(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        let scrollbackLines = v2Int(params, "scrollback_lines") ?? 200
+        guard (0...2000).contains(scrollbackLines) else {
+            return .err(code: "invalid_params", message: "scrollback_lines must be between 0 and 2000", data: nil)
+        }
+
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to read screen grid", data: nil)
+        let completed = v2MainExec {
+            guard let ws = self.v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId = self.v2UUID(params, "surface_id") ?? ws.focusedPanelId
+            guard let surfaceId else {
+                result = .err(code: "not_found", message: "No focused surface", data: nil)
+                return
+            }
+            guard let terminalPanel = ws.terminalPanel(for: surfaceId) else {
+                result = .err(code: "invalid_params", message: "Surface is not a terminal", data: ["surface_id": surfaceId.uuidString])
+                return
+            }
+            guard let surface = terminalPanel.surface.surface else {
+                result = .err(code: "internal_error", message: "Terminal surface not found", data: nil)
+                return
+            }
+            let idString = surfaceId.uuidString
+            let exported: ghostty_string_s = idString.withCString { cstr in
+                ghostty_surface_render_grid_json_v2(
+                    surface, cstr, UInt(idString.utf8.count), UInt64(0), UInt(scrollbackLines),
+                    /* include_theme */ false, /* anchor_active */ true
+                )
+            }
+            defer { ghostty_string_free(exported) }
+            guard let ptr = exported.ptr, exported.len > 0 else {
+                result = .err(code: "internal_error", message: "Render grid export returned nothing", data: nil)
+                return
+            }
+            let raw = UnsafeRawPointer(ptr).assumingMemoryBound(to: UInt8.self)
+            let data = Data(buffer: UnsafeBufferPointer(start: raw, count: Int(exported.len)))
+            guard let grid = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                result = .err(code: "internal_error", message: "Render grid export is not a JSON object", data: nil)
+                return
+            }
+            result = .ok([
+                "grid": grid,
+                "surface_id": surfaceId.uuidString,
+                "workspace_id": ws.id.uuidString
             ])
         }
         if !completed {

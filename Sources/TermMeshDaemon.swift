@@ -98,6 +98,76 @@ final class TermMeshDaemon: ObservableObject {
         set { Self.keychainSavePassword(newValue) }
     }
 
+    // MARK: - Mobile Remote Control Settings (UserDefaults)
+    // docs/mobile-remote-control.md §4.4. The listener is opt-in and loopback
+    // only; the tailnet reaches it through Tailscale Serve. Process-environment
+    // TERM_MESH_MOBILE_* values (reload.sh tags, E2E runners) override these.
+
+    /// Whether the mobile remote-control listener is enabled. Default off.
+    static let mobileEnabledKey = "termMeshMobileEnabled"
+    /// Loopback port for the listener. Default 9877.
+    static let mobilePortKey = "termMeshMobilePort"
+    /// Auth mode: "tailscale" (default, fail closed) or "loopback" (dev only).
+    static let mobileAuthKey = "termMeshMobileAuth"
+    /// Comma-separated tailnet logins allowed in tailscale mode.
+    static let mobileAllowedLoginsKey = "termMeshMobileAllowedLogins"
+    static let defaultMobilePort = 9877
+
+    var isMobileEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.mobileEnabledKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.mobileEnabledKey) }
+    }
+
+    var mobilePort: Int {
+        get {
+            let port = UserDefaults.standard.integer(forKey: Self.mobilePortKey)
+            return (1...65535).contains(port) ? port : Self.defaultMobilePort
+        }
+        set { UserDefaults.standard.set(newValue, forKey: Self.mobilePortKey) }
+    }
+
+    var mobileAuthMode: String {
+        get {
+            let raw = UserDefaults.standard.string(forKey: Self.mobileAuthKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            return raw == "loopback" ? "loopback" : "tailscale"
+        }
+        set { UserDefaults.standard.set(newValue, forKey: Self.mobileAuthKey) }
+    }
+
+    var mobileAllowedLogins: String {
+        get { UserDefaults.standard.string(forKey: Self.mobileAllowedLoginsKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: Self.mobileAllowedLoginsKey) }
+    }
+
+    /// Daemon environment for the mobile listener, or nil when it stays off.
+    /// A tagged build without an explicit TERM_MESH_MOBILE_ADDR is left off so
+    /// it can never take production's port; reload.sh supplies a tag port.
+    func mobileListenerEnvironment(
+        processEnv: [String: String],
+        isTaggedBuild: Bool
+    ) -> [String: String]? {
+        let envEnabled = processEnv["TERM_MESH_MOBILE_ENABLED"]
+            .map { $0 == "1" || $0.lowercased() == "true" }
+        let enabled = envEnabled ?? isMobileEnabled
+        guard enabled else { return nil }
+        let addr: String
+        if let explicit = processEnv["TERM_MESH_MOBILE_ADDR"], !explicit.isEmpty {
+            addr = explicit
+        } else if isTaggedBuild {
+            NSLog("[TermMeshDaemon] mobile listener stays off: tagged build without TERM_MESH_MOBILE_ADDR")
+            return nil
+        } else {
+            addr = "127.0.0.1:\(mobilePort)"
+        }
+        return [
+            "TERM_MESH_MOBILE_ENABLED": "1",
+            "TERM_MESH_MOBILE_ADDR": addr,
+            "TERM_MESH_MOBILE_AUTH": processEnv["TERM_MESH_MOBILE_AUTH"] ?? mobileAuthMode,
+            "TERM_MESH_MOBILE_ALLOWED_LOGINS": processEnv["TERM_MESH_MOBILE_ALLOWED_LOGINS"] ?? mobileAllowedLogins,
+        ]
+    }
+
     // MARK: - Keychain Helpers (Dashboard Password)
 
     private static let keychainService = "com.termmesh.dashboard"
@@ -548,6 +618,14 @@ final class TermMeshDaemon: ObservableObject {
             let dashPwd = self.dashboardPassword
             if !dashPwd.isEmpty {
                 env["TERM_MESH_HTTP_PASSWORD"] = dashPwd
+            }
+
+            // Mobile remote-control listener (opt-in, loopback only).
+            if let mobileEnv = self.mobileListenerEnvironment(
+                processEnv: ProcessInfo.processInfo.environment,
+                isTaggedBuild: isTaggedBuild
+            ) {
+                env.merge(mobileEnv) { _, new in new }
             }
 
             process.environment = env

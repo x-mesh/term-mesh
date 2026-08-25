@@ -10,7 +10,8 @@ yet built.
 term-mesh FIRST. Any frontend — Discord, x-remote, Slack, a mobile relay —
 consumes it. A terminal daemon must not hardcode one chat transport; the
 Discord/x-remote wiring below is a **deferred consumer example**, not the
-near-term deliverable.
+near-term deliverable. The first consumer specified on top of this contract
+is the tailnet mobile page: see [mobile-remote-control.md](./mobile-remote-control.md).
 
 ## Goal
 
