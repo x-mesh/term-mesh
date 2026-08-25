@@ -83,6 +83,7 @@ struct NewProjectView: View {
     @State private var knownAgentIDs: Set<UUID> = []
     @State private var inheritedAgentIDs: Set<UUID> = []
     @State private var agents: [TeamAgentRow] = []
+    @State private var delegationLevel: ProjectDelegationLevel = .leaderFirst
     /// The machine the leader and primary checkout live on.
     ///
     /// Asked first because everything after it depends on the answer. A folder
@@ -806,6 +807,24 @@ struct NewProjectView: View {
                         .foregroundStyle(.secondary)
                         .frame(width: 132, alignment: .leading)
                 }
+
+                Divider()
+                    .frame(height: 24)
+                    .padding(.horizontal, 4)
+
+                Text("Delegation")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+
+                Picker("Delegation", selection: $delegationLevel) {
+                    ForEach(ProjectDelegationLevel.allCases, id: \.self) { level in
+                        Text(level.displayName).tag(level)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 126)
+                .help(delegationLevel.detail)
+                .accessibilityIdentifier("newProject.delegationLevel")
 
                 Divider()
                     .frame(height: 24)
@@ -2194,7 +2213,8 @@ struct NewProjectView: View {
         ProjectLeader(
             mode: leaderCli,
             model: leaderModel,
-            endpoint: runsOnHostKey.map { .peer(hostKey: $0) } ?? .local
+            endpoint: runsOnHostKey.map { .peer(hostKey: $0) } ?? .local,
+            delegationLevel: delegationLevel
         )
     }
 
@@ -2328,7 +2348,8 @@ struct NewProjectView: View {
         let leader = ProjectLeader(
             mode: leaderCli,
             model: leaderModel,
-            endpoint: runsOnHostKey.map { .peer(hostKey: $0) } ?? .local
+            endpoint: runsOnHostKey.map { .peer(hostKey: $0) } ?? .local,
+            delegationLevel: delegationLevel
         )
 
         showsCreationProgress = true
@@ -4002,6 +4023,7 @@ enum ProjectCreationFlow {
                 && prepared.rows.contains(where: { $0.hostKey == nil })
                 ? "isolated"
                 : "off",
+            delegationLevel: leader.delegationLevel,
             projectSource: source,
             createdPaths: prepared.createdPaths,
             onRemoteAttach: onAttach,

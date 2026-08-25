@@ -967,6 +967,9 @@ message Team {
   // durable manifest with active=false names an idle shell, not a live leader.
   bool leader_process_active = 12;
   bool leader_process_active_known = 13;
+  string delegation_configured = 14;
+  string delegation_effective = 15;
+  string delegation_pending = 16;
 }
 
 message TeamMember {

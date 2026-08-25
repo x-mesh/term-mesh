@@ -1263,6 +1263,66 @@ struct SidebarProjectDelegateTarget: Identifiable {
     var id: String { rootPath ?? label }
 }
 
+private struct SidebarProjectDelegationTarget: Identifiable {
+    let teamName: String
+    let projectLabel: String
+    var id: String { teamName }
+}
+
+private struct SidebarProjectDelegationSheet: View {
+    let target: SidebarProjectDelegationTarget
+    let onClose: () -> Void
+    @State private var selection: ProjectDelegationLevel
+
+    init(target: SidebarProjectDelegationTarget, onClose: @escaping () -> Void) {
+        self.target = target
+        self.onClose = onClose
+        let level = TeamOrchestrator.shared.teams[target.teamName]?
+            .delegationState.configured ?? .leaderFirst
+        _selection = State(initialValue: level)
+    }
+
+    private var state: ProjectDelegationState {
+        TeamOrchestrator.shared.teams[target.teamName]?.delegationState ?? .default
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Delegation for \(target.projectLabel)")
+                .font(.headline)
+            Picker("Execution level", selection: $selection) {
+                ForEach(ProjectDelegationLevel.allCases, id: \.self) { level in
+                    Text(level.displayName).tag(level)
+                }
+            }
+            .pickerStyle(.radioGroup)
+            Text(selection.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let pending = state.pending {
+                Text("Current: \(state.effective.displayName) · Next request: \(pending.displayName)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", action: onClose)
+                    .keyboardShortcut(.cancelAction)
+                Button("Apply") {
+                    _ = TeamOrchestrator.shared.setProjectDelegationLevel(
+                        teamName: target.teamName, level: selection
+                    )
+                    onClose()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 410)
+    }
+}
+
 /// Hand a project some work. The coordinator picks which machine runs it, so
 /// this asks for the work and nothing about where — choosing a host here would
 /// re-decide, by hand and with less information, the one thing the coordinator
@@ -1594,6 +1654,7 @@ private struct SidebarPeerProjectsView: View {
     /// Non-nil presents the remote-agent sheet.
     @State private var remoteAgentTarget: SidebarRemoteAgentTarget?
     @State private var pairReviewTarget: PairReviewTarget?
+    @State private var delegationTarget: SidebarProjectDelegationTarget?
     @State private var deletionTarget: SidebarProjectDeletionTarget?
     @State private var deletionFailure: String?
     @State private var layoutResetFailure: String?
@@ -1940,6 +2001,14 @@ private struct SidebarPeerProjectsView: View {
         }
         .disabled(!canResetLayout(for: group))
         .accessibilityIdentifier("project.resetLayout")
+        Button("Delegation Settings…") {
+            guard let teamName = teamName(for: group) else { return }
+            delegationTarget = SidebarProjectDelegationTarget(
+                teamName: teamName, projectLabel: group.identity.label
+            )
+        }
+        .disabled(teamName(for: group) == nil)
+        .accessibilityIdentifier("project.delegationSettings")
         Divider()
         if let teamName = teamName(for: group),
            let team = TeamOrchestrator.shared.teams[teamName],
@@ -2102,6 +2171,9 @@ private struct SidebarPeerProjectsView: View {
         }
         .sheet(item: $pairReviewTarget) { target in
             PairReviewSheet(target: target) { pairReviewTarget = nil }
+        }
+        .sheet(item: $delegationTarget) { target in
+            SidebarProjectDelegationSheet(target: target) { delegationTarget = nil }
         }
         .alert(
             "Delete “\(deletionTarget?.label ?? "Project")”?",

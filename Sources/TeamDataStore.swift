@@ -93,6 +93,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     // Team registry: name → agents. `name` is a legacy routing alias; result
     // ownership uses the durable per-pane instance id whenever it is known.
     private var teamRegistry: [String: [AgentRegistration]] = [:]
+    /// Mirrors the Project's execution setting off-main. Requests snapshot the
+    /// effective value here so a later UI change cannot rewrite history.
+    private var projectDelegationStates: [String: ProjectDelegationState] = [:]
 
     /// The one gate `writeResult` and `AutoReplyEmit.emit` both call before
     /// attributing a report to a task, so the two paths cannot drift apart
@@ -136,6 +139,37 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         let createdAt: Date
         var claimedAt: Date?
         var completedAt: Date?
+        var delegationLevel: ProjectDelegationLevel?
+        var taskShape: ProjectTaskShape?
+        var riskReasons: [ProjectRoutingRisk]?
+        var selectedRoute: ProjectRoutingRoute?
+        var routeReasons: [String]?
+        var selectedWorkerCount: Int?
+
+        init(
+            id: String, content: String, contentSHA256: String, contentBytes: Int,
+            status: String, createdAt: Date, claimedAt: Date?, completedAt: Date?,
+            delegationLevel: ProjectDelegationLevel? = nil,
+            taskShape: ProjectTaskShape? = nil,
+            riskReasons: [ProjectRoutingRisk]? = nil,
+            selectedRoute: ProjectRoutingRoute? = nil,
+            routeReasons: [String]? = nil, selectedWorkerCount: Int? = nil
+        ) {
+            self.id = id
+            self.content = content
+            self.contentSHA256 = contentSHA256
+            self.contentBytes = contentBytes
+            self.status = status
+            self.createdAt = createdAt
+            self.claimedAt = claimedAt
+            self.completedAt = completedAt
+            self.delegationLevel = delegationLevel
+            self.taskShape = taskShape
+            self.riskReasons = riskReasons
+            self.selectedRoute = selectedRoute
+            self.routeReasons = routeReasons
+            self.selectedWorkerCount = selectedWorkerCount
+        }
     }
 
     enum LeaderRequestEnqueueResult {
@@ -227,15 +261,58 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
 
     // MARK: - Team Registry
 
-    func registerTeam(_ name: String, agentNames: [String]) {
-        registerTeam(name, agents: agentNames.map { AgentRegistration(name: $0, instanceId: nil) })
+    func registerTeam(
+        _ name: String, agentNames: [String],
+        delegationState: ProjectDelegationState = .default
+    ) {
+        registerTeam(
+            name, agents: agentNames.map { AgentRegistration(name: $0, instanceId: nil) },
+            delegationState: delegationState
+        )
     }
 
-    func registerTeam(_ name: String, agents: [AgentRegistration]) {
+    func registerTeam(
+        _ name: String, agents: [AgentRegistration],
+        delegationState: ProjectDelegationState = .default
+    ) {
         lock.lock()
         teamRegistry[name] = agents
+        projectDelegationStates[name] = delegationState
         lock.unlock()
         notifyChanged()
+    }
+
+    func projectDelegationState(teamName: String) -> ProjectDelegationState? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard teamRegistry[teamName] != nil else { return nil }
+        return projectDelegationStates[teamName] ?? .default
+    }
+
+    @discardableResult
+    func configureProjectDelegation(
+        teamName: String, level: ProjectDelegationLevel
+    ) -> ProjectDelegationState? {
+        lock.lock()
+        guard teamRegistry[teamName] != nil else {
+            lock.unlock()
+            return nil
+        }
+        var state = projectDelegationStates[teamName] ?? .default
+        let hasClaimedRequest = leaderRequests[teamName, default: []].contains {
+            $0.status == "claimed"
+        }
+        state.configured = level
+        if hasClaimedRequest {
+            state.pending = level == state.effective ? nil : level
+        } else {
+            state.effective = level
+            state.pending = nil
+        }
+        projectDelegationStates[teamName] = state
+        lock.unlock()
+        notifyChanged()
+        return state
     }
 
     func prepareLeaderRequestToken(teamName: String) -> String {
@@ -265,6 +342,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         contextStore.removeValue(forKey: name)
         leaderRequests.removeValue(forKey: name)
         leaderRequestTokens.removeValue(forKey: name)
+        projectDelegationStates.removeValue(forKey: name)
         parkedAgents.removeValue(forKey: name)
         watchDrifts.removeValue(forKey: name)
         let boardUuid = boardUuids.removeValue(forKey: name)
@@ -513,7 +591,9 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     }
 
     func enqueueLeaderRequest(
-        teamName: String, content: String, requestId: String? = nil, now: Date = Date()
+        teamName: String, content: String, requestId: String? = nil,
+        taskShape: ProjectTaskShape = .singleUnit,
+        riskReasons: Set<ProjectRoutingRisk> = [], now: Date = Date()
     ) -> LeaderRequestEnqueueResult {
         let requestedId = requestId?.trimmingCharacters(in: .whitespacesAndNewlines)
         let id = requestedId.flatMap { $0.isEmpty ? nil : $0 } ?? UUID().uuidString.lowercased()
@@ -542,10 +622,25 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             let persisted = persistLeaderRequestNow(teamName: teamName)
             return .replayed(existing, persisted: persisted)
         }
+        var state = projectDelegationStates[teamName] ?? .default
+        if !leaderRequests[teamName, default: []].contains(where: { $0.status == "claimed" }),
+           let pending = state.pending {
+            state.effective = pending
+            state.pending = nil
+            projectDelegationStates[teamName] = state
+        }
+        let decision = ProjectRoutingDecision.decide(
+            level: state.effective, taskShape: taskShape, risks: riskReasons,
+            availableWorkers: teamRegistry[teamName]?.count ?? 0
+        )
         let request = LeaderRequest(
             id: id, content: content, contentSHA256: digest,
             contentBytes: content.lengthOfBytes(using: .utf8), status: "queued",
-            createdAt: now, claimedAt: nil, completedAt: nil
+            createdAt: now, claimedAt: nil, completedAt: nil,
+            delegationLevel: state.effective, taskShape: taskShape,
+            riskReasons: riskReasons.sorted { $0.rawValue < $1.rawValue },
+            selectedRoute: decision.route, routeReasons: decision.reasons,
+            selectedWorkerCount: decision.workerCount
         )
         var requests = leaderRequests[teamName, default: []]
         if requests.count >= maxLeaderRequestsPerTeam {
@@ -649,6 +744,12 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             "created_at": ISO8601DateFormatter().string(from: request.createdAt),
             "claimed_at": request.claimedAt.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
             "completed_at": request.completedAt.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
+            "delegation_level": request.delegationLevel?.rawValue as Any? ?? NSNull(),
+            "task_shape": request.taskShape?.rawValue as Any? ?? NSNull(),
+            "risk_reasons": request.riskReasons?.map(\.rawValue) ?? [],
+            "selected_route": request.selectedRoute?.rawValue as Any? ?? NSNull(),
+            "route_reasons": request.routeReasons ?? [],
+            "selected_worker_count": request.selectedWorkerCount as Any? ?? NSNull(),
         ]
         if includeContent { result["content"] = request.content }
         return result

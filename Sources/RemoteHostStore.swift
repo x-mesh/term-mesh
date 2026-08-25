@@ -62,6 +62,7 @@ struct RemoteTeamSummary: Identifiable, Equatable {
     let presentationOwnedByRequester: Bool
     let leaderProcessActive: Bool
     let leaderProcessActiveKnown: Bool
+    let delegationState: ProjectDelegationState
 
     var id: String { teamUUID.isEmpty ? name : teamUUID }
 
@@ -77,7 +78,8 @@ struct RemoteTeamSummary: Identifiable, Equatable {
         presentationRevision: UInt64 = 0,
         presentationOwnedByRequester: Bool = false,
         leaderProcessActive: Bool = false,
-        leaderProcessActiveKnown: Bool = false
+        leaderProcessActiveKnown: Bool = false,
+        delegationState: ProjectDelegationState = .default
     ) {
         self.name = name
         self.teamUUID = teamUUID
@@ -91,6 +93,7 @@ struct RemoteTeamSummary: Identifiable, Equatable {
         self.presentationOwnedByRequester = presentationOwnedByRequester
         self.leaderProcessActive = leaderProcessActive
         self.leaderProcessActiveKnown = leaderProcessActiveKnown
+        self.delegationState = delegationState
     }
 }
 
@@ -2165,7 +2168,12 @@ final class RemoteHostStore: ObservableObject {
             presentationRevision: team.presentationRevision,
             presentationOwnedByRequester: team.presentationOwnedByRequester,
             leaderProcessActive: team.leaderProcessActive,
-            leaderProcessActiveKnown: team.leaderProcessActiveKnown
+            leaderProcessActiveKnown: team.leaderProcessActiveKnown,
+            delegationState: ProjectDelegationState(
+                configuredRaw: team.delegationConfigured,
+                effectiveRaw: team.delegationEffective,
+                pendingRaw: team.delegationPending
+            )
         )
     }
 
