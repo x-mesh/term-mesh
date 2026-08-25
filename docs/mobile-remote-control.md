@@ -357,12 +357,39 @@ pane 각각 `/rc on` → 읽기 → 텍스트 → 키가 동작.
 
 ### Phase 2 — Tailscale
 
-1. `tailscale serve --bg 9877`. term-mesh는 tailscale 상태를 바꾸지 않는다.
-2. `TERM_MESH_MOBILE_AUTH=tailscale`, `TERM_MESH_MOBILE_ALLOWED_LOGINS`. 앱 Settings에
-   listener 토글과 allowlist 입력.
-3. `tm-agent remote on` 출력 URL에 Serve hostname.
-4. 확인: 폰 Safari에서 목록·화면·텍스트·키. loopback `curl` 헤더 없음 403.
-   allowlist 밖 login 403. Funnel 미사용.
+구현: Settings ▸ Dashboard 아래 "Mobile Remote Control" 카드(토글, 인증 모드, 허용
+login, 포트; 바꾸면 daemon 자동 재시작), `tm-agent remote on|status`가
+`tailscale serve status --json`을 읽어 `tailnet:` 줄을 덧붙임(Serve가 없으면 실행할
+명령을, Funnel이 켜져 있으면 경고를 출력). term-mesh는 tailscale 상태를 바꾸지 않는다.
+
+운영 절차 (Mac에서 한 번):
+
+```bash
+# 1. Settings ▸ Dashboard ▸ Mobile Remote Control
+#    - 켜기, Authentication = Tailscale identity, Allowed Logins = 자기 tailnet login
+#      (`tailscale status --json`의 Self.UserID에 해당하는 User.LoginName, 예: you@example.com)
+#    - 포트는 기본 9877. daemon이 자동 재시작된다.
+# 2. Serve로 loopback listener를 tailnet HTTPS로 노출 (Funnel은 절대 켜지 않는다)
+tailscale serve --bg 9877
+tailscale serve status            # https://<mac>.<tailnet>.ts.net → http://127.0.0.1:9877
+# 3. pane 안에서
+/rc on                            # url: http://127.0.0.1:9877/t/<id>
+                                  # tailnet: https://<mac>.<tailnet>.ts.net/t/<id>
+# 4. 끄기
+tailscale serve reset                 # Serve 설정 전체 제거 (이 Mac은 mobile listener만 서빙)
+```
+
+확인 목록:
+
+- 폰(Tailscale 연결, 같은 tailnet 계정)의 Safari에서 `tailnet:` URL을 열어 목록·화면·
+  텍스트·키가 동작한다.
+- Mac에서 `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9877/api/health`는
+  403이다(Serve를 거치지 않아 신원 헤더가 없음). 같은 요청에
+  `-H 'Tailscale-User-Login: you@example.com'`을 붙이면 200이다(로컬 위조는 threat
+  model 밖).
+- allowlist에 없는 login으로 접속하면 403 `login_not_allowed`.
+- `tailscale funnel status`에 이 포트가 없어야 한다. `tm-agent remote status`가
+  Funnel 경고를 내면 `tailscale funnel off`.
 
 ### Phase 3 — relay
 
