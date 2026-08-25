@@ -13,6 +13,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     case agentModels = "agentModels"
     case worktrees = "worktrees"
     case dashboard = "dashboard"
+    case mobileRemoteControl = "mobileRemoteControl"
     case services = "services"
     case browser = "browser"
     case imeInputBar = "imeInputBar"
@@ -35,6 +36,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .agentModels: return "Agent Models"
         case .worktrees: return "Worktrees"
         case .dashboard: return "Dashboard"
+        case .mobileRemoteControl: return "Mobile Remote Control"
         case .services: return "Services"
         case .browser: return "Browser"
         case .imeInputBar: return "IME Input Bar"
@@ -57,6 +59,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .agentModels: return "cpu"
         case .worktrees: return "arrow.triangle.branch"
         case .dashboard: return "gauge.with.dots.needle.33percent"
+        case .mobileRemoteControl: return "iphone.radiowaves.left.and.right"
         case .services: return "stethoscope"
         case .browser: return "globe"
         case .imeInputBar: return "keyboard"
@@ -71,7 +74,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         switch self {
         case .app, .terminal, .workspaceColors: return .general
         case .automation, .agentTeams, .agentRunbooks, .agentCLIPaths, .agentModels, .worktrees: return .agents
-        case .dashboard, .services, .peerFederation, .projectSync: return .network
+        case .dashboard, .mobileRemoteControl, .services, .peerFederation, .projectSync: return .network
         case .browser: return .browser
         case .imeInputBar, .keyboardShortcuts: return .input
         case .reset: return .system
@@ -90,6 +93,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .agentModels: return ["model", "custom", "version", "gemini", "codex", "kiro", "claude", "preview"]
         case .worktrees: return ["worktrees", "worktree", "base directory", "cleanup", "auto"]
         case .dashboard: return ["dashboard", "http", "localhost", "port", "remote"]
+        case .mobileRemoteControl: return ["mobile", "remote control", "phone", "tailscale", "tailnet", "listener", "rc", "9877"]
         case .services: return ["services", "daemon", "doctor", "status", "restart", "subsystem", "log", "shell", "integration", "health"]
         case .browser: return ["browser", "search", "engine", "theme", "link", "history", "http", "insecure", "suggestion"]
         case .imeInputBar: return ["ime", "input", "bar", "font", "height", "cjk"]
@@ -712,6 +716,8 @@ struct SettingsView: View {
             sectionWorktrees
         case .dashboard:
             sectionDashboard
+        case .mobileRemoteControl:
+            sectionMobileRemoteControl
         case .services:
             sectionServices
         case .browser:
@@ -1863,7 +1869,6 @@ struct SettingsView: View {
                         SettingsCardNote("Dashboard settings auto-restart the daemon when changed. The dashboard shows system metrics, team status, agents, and task boards.")
         }
 
-        sectionMobileRemoteControl
     }
 
     // MARK: - Section: Mobile Remote Control

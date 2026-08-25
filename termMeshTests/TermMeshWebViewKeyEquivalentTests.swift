@@ -350,6 +350,14 @@ final class LanguageSettingsTests: XCTestCase {
         XCTAssertTrue(SettingsSearchIndex.table(for: Locale(identifier: "en")).isEmpty)
     }
 
+    func testMobileRemoteControlIsDiscoverableAsItsOwnNetworkSection() {
+        XCTAssertTrue(SettingsSection.allCases.contains(.mobileRemoteControl))
+        XCTAssertEqual(SettingsSection.mobileRemoteControl.category, .network)
+        XCTAssertEqual(SettingsSection.mobileRemoteControl.title, "Mobile Remote Control")
+        XCTAssertTrue(SettingsSection.mobileRemoteControl.searchKeywords.contains("tailscale"))
+        XCTAssertTrue(SettingsSection.mobileRemoteControl.searchKeywords.contains("9877"))
+    }
+
     // MARK: - Catalog keys must match the keys SwiftUI actually builds
 
     /// `Text("… \(value)")` does not key on the source text — SwiftUI rewrites

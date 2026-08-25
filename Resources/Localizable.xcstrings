@@ -1211,6 +1211,16 @@
         }
       }
     },
+    "Mobile Remote Control": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "모바일 원격 제어"
+          }
+        }
+      }
+    },
     "Dashboard is disabled. Daemon runs without HTTP server.": {
       "localizations": {
         "ko": {
