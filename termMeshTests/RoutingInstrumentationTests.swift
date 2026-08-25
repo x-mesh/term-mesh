@@ -109,6 +109,23 @@ final class RoutingInstrumentationTests: XCTestCase {
         XCTAssertEqual(third.selectedRoute, .delegated)
     }
 
+    func testMembershipReregistrationPreservesConfiguredDelegation() throws {
+        let team = registerTeam()
+        let configured = try XCTUnwrap(
+            store.configureProjectDelegation(teamName: team, level: .delegated)
+        )
+        XCTAssertEqual(configured.effective, .delegated)
+
+        // Adding or restarting an agent re-registers the roster without a
+        // delegation argument; the configured level must survive.
+        store.registerTeam(team, agentNames: ["executor", "reviewer"])
+        XCTAssertEqual(store.projectDelegationState(teamName: team), configured)
+
+        // An explicit state (create/resume) still replaces it.
+        store.registerTeam(team, agentNames: ["executor"], delegationState: .default)
+        XCTAssertEqual(store.projectDelegationState(teamName: team), .default)
+    }
+
     func testStatedRouteAndWaveSurviveCreateAndDictionary() throws {
         let team = registerTeam()
         let wave = "wave-\(UUID().uuidString)"

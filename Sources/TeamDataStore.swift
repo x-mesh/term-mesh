@@ -261,9 +261,12 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
 
     // MARK: - Team Registry
 
+    /// `delegationState` is only written when supplied. Membership updates
+    /// (add/detach/restart/adopt) re-register the same team name and must not
+    /// reset a configured level back to the default.
     func registerTeam(
         _ name: String, agentNames: [String],
-        delegationState: ProjectDelegationState = .default
+        delegationState: ProjectDelegationState? = nil
     ) {
         registerTeam(
             name, agents: agentNames.map { AgentRegistration(name: $0, instanceId: nil) },
@@ -273,11 +276,15 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
 
     func registerTeam(
         _ name: String, agents: [AgentRegistration],
-        delegationState: ProjectDelegationState = .default
+        delegationState: ProjectDelegationState? = nil
     ) {
         lock.lock()
         teamRegistry[name] = agents
-        projectDelegationStates[name] = delegationState
+        if let delegationState {
+            projectDelegationStates[name] = delegationState
+        } else if projectDelegationStates[name] == nil {
+            projectDelegationStates[name] = .default
+        }
         lock.unlock()
         notifyChanged()
     }
