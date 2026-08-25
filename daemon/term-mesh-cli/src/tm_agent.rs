@@ -12621,7 +12621,12 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
                     .unwrap_or_default()
             );
             match result["url"].as_str() {
-                Some(url) => println!("url: {url}"),
+                Some(url) => {
+                    println!("url: {url}");
+                    for line in remote_tailnet_lines(url, &surface_id) {
+                        println!("{line}");
+                    }
+                }
                 None => println!(
                     "url: unavailable ({})",
                     result["listener_error"].as_str().unwrap_or("listener address invalid")
@@ -12695,6 +12700,10 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
                 );
                 if let Some(url) = result["url"].as_str() {
                     println!("url: {url}");
+                    let sid = result["surface_id"].as_str().unwrap_or("");
+                    for line in remote_tailnet_lines(url, sid) {
+                        println!("{line}");
+                    }
                 }
                 if let Some(exp) = e["expires_at"].as_u64() {
                     println!("expires: in {} (unix {exp})", format_remote_relative(exp));
@@ -12832,6 +12841,138 @@ fn parse_ttl_secs(raw: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("ttl {raw:?} is too large"))
 }
 
+/// What Tailscale Serve says about the mobile listener (Phase 2,
+/// docs/mobile-remote-control.md §9). Read-only: `tailscale serve status --json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TailnetServe {
+    /// `https://<host>[:port][/path]` proxies to the listener. `funnel` means
+    /// the same host is also published to the public internet, which the
+    /// mobile listener refuses to serve (no identity header).
+    Served { base: String, funnel: bool },
+    /// Tailscale answered, but nothing proxies to the listener.
+    NotServed,
+}
+
+/// `127.0.0.1:9877` out of `http://127.0.0.1:9877/t/<id>`.
+fn listener_addr_from_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("http://")?;
+    let host_port = rest.split('/').next()?;
+    (!host_port.is_empty()).then(|| host_port.to_string())
+}
+
+/// Parse `tailscale serve status --json`. The shape is Tailscale's
+/// `ipn.ServeConfig`: `Web` maps `host:port` to `{Handlers: {path: {Proxy}}}`
+/// and `AllowFunnel` maps the same `host:port` keys to booleans.
+fn parse_serve_status(status: &Value, listener_addr: &str) -> TailnetServe {
+    let listener_port = listener_addr.rsplit(':').next().unwrap_or("");
+    let proxies_listener = |proxy: &str| {
+        let target = proxy
+            .strip_prefix("http://")
+            .or_else(|| proxy.strip_prefix("https://"))
+            .unwrap_or(proxy);
+        let target = target.trim_end_matches('/');
+        let (host, port) = match target.rsplit_once(':') {
+            Some((h, p)) => (h, p),
+            None => (target, ""),
+        };
+        matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1") && port == listener_port
+    };
+    let Some(web) = status.get("Web").and_then(Value::as_object) else {
+        return TailnetServe::NotServed;
+    };
+    for (host_port, site) in web {
+        let Some(handlers) = site.get("Handlers").and_then(Value::as_object) else {
+            continue;
+        };
+        for (path, handler) in handlers {
+            let Some(proxy) = handler.get("Proxy").and_then(Value::as_str) else {
+                continue;
+            };
+            if !proxies_listener(proxy) {
+                continue;
+            }
+            let (host, port) = host_port
+                .rsplit_once(':')
+                .unwrap_or((host_port.as_str(), "443"));
+            let mut base = format!("https://{host}");
+            if port != "443" {
+                base.push(':');
+                base.push_str(port);
+            }
+            let mount = path.trim_end_matches('/');
+            if !mount.is_empty() {
+                base.push_str(mount);
+            }
+            let funnel = status
+                .get("AllowFunnel")
+                .and_then(|f| f.get(host_port))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            return TailnetServe::Served { base, funnel };
+        }
+    }
+    TailnetServe::NotServed
+}
+
+fn tailscale_binary() -> Option<PathBuf> {
+    if let Ok(path_var) = env::var("PATH") {
+        for dir in path_var.split(':').filter(|d| !d.is_empty()) {
+            let candidate = Path::new(dir).join("tailscale");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let app = PathBuf::from("/Applications/Tailscale.app/Contents/MacOS/Tailscale");
+    app.is_file().then_some(app)
+}
+
+fn tailscale_serve_status() -> Option<Value> {
+    let bin = tailscale_binary()?;
+    let out = std::process::Command::new(bin)
+        .args(["serve", "status", "--json"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// Human lines for the tailnet side of a loopback listener URL. Empty when
+/// Tailscale is absent or does not answer: the loopback URL is still right.
+fn remote_tailnet_lines(listener_url: &str, surface_id: &str) -> Vec<String> {
+    let Some(addr) = listener_addr_from_url(listener_url) else {
+        return Vec::new();
+    };
+    let Some(status) = tailscale_serve_status() else {
+        return Vec::new();
+    };
+    tailnet_lines_for(&parse_serve_status(&status, &addr), &addr, surface_id)
+}
+
+fn tailnet_lines_for(serve: &TailnetServe, listener_addr: &str, surface_id: &str) -> Vec<String> {
+    match serve {
+        TailnetServe::Served { base, funnel } => {
+            let mut lines = vec![format!("tailnet: {base}/t/{surface_id}")];
+            if *funnel {
+                lines.push(
+                    "warning: Funnel is enabled for this host; the listener refuses public \
+                     requests (no Tailscale identity). Run: tailscale funnel off"
+                        .to_string(),
+                );
+            }
+            lines
+        }
+        TailnetServe::NotServed => {
+            let port = listener_addr.rsplit(':').next().unwrap_or("9877");
+            vec![format!(
+                "tailnet: not served yet; on this Mac run: tailscale serve --bg {port}"
+            )]
+        }
+    }
+}
+
 fn format_remote_relative(expires_at: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -12897,6 +13038,48 @@ mod remote_command_tests {
         assert!(!remote_leader_from(Some("tok"), Some("worker-1")));
         assert!(!remote_leader_from(None, None));
         assert!(!remote_leader_from(Some(" "), None));
+    }
+
+    #[test]
+    fn serve_status_maps_the_listener_to_its_tailnet_base() {
+        let status = json!({
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"mac.tail5b1e6.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9877"}}}},
+            "AllowFunnel": {}
+        });
+        assert_eq!(
+            parse_serve_status(&status, "127.0.0.1:9877"),
+            TailnetServe::Served { base: "https://mac.tail5b1e6.ts.net".into(), funnel: false }
+        );
+        // A different port is somebody else's serve.
+        assert_eq!(parse_serve_status(&status, "127.0.0.1:9876"), TailnetServe::NotServed);
+        assert_eq!(parse_serve_status(&json!({}), "127.0.0.1:9877"), TailnetServe::NotServed);
+
+        let mounted = json!({
+            "Web": {"mac.tail5b1e6.ts.net:8443": {"Handlers": {"/rc/": {"Proxy": "http://localhost:9877"}}}},
+            "AllowFunnel": {"mac.tail5b1e6.ts.net:8443": true}
+        });
+        assert_eq!(
+            parse_serve_status(&mounted, "127.0.0.1:9877"),
+            TailnetServe::Served { base: "https://mac.tail5b1e6.ts.net:8443/rc".into(), funnel: true }
+        );
+    }
+
+    #[test]
+    fn tailnet_lines_name_the_url_or_the_command_to_run() {
+        let served = TailnetServe::Served { base: "https://mac.ts.net".into(), funnel: false };
+        assert_eq!(
+            tailnet_lines_for(&served, "127.0.0.1:9877", "abc"),
+            vec!["tailnet: https://mac.ts.net/t/abc".to_string()]
+        );
+        let funnel = TailnetServe::Served { base: "https://mac.ts.net".into(), funnel: true };
+        let lines = tailnet_lines_for(&funnel, "127.0.0.1:9877", "abc");
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("tailscale funnel off"));
+        let not = tailnet_lines_for(&TailnetServe::NotServed, "127.0.0.1:20226", "abc");
+        assert_eq!(not, vec!["tailnet: not served yet; on this Mac run: tailscale serve --bg 20226".to_string()]);
+        assert_eq!(listener_addr_from_url("http://127.0.0.1:9877/t/abc").as_deref(), Some("127.0.0.1:9877"));
+        assert_eq!(listener_addr_from_url("https://x/t/abc"), None);
     }
 
     #[test]
