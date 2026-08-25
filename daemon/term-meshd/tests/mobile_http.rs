@@ -614,10 +614,7 @@ async fn keys_follow_policy_and_the_safe_allowlist() {
     );
     assert_eq!(
         calls[2],
-        (
-            "surface.send_text".into(),
-            json!({ "surface_id": "open", "text": "\u{1b}[A" })
-        )
+        ("surface.send_key".into(), json!({ "surface_id": "open", "key": "up" }))
     );
     assert_eq!(
         calls[3],
@@ -648,7 +645,8 @@ fn every_safe_key_has_a_gui_mapping_and_nothing_else_does() {
         assert!(gui_key(key).is_some(), "{key}");
     }
     assert_eq!(gui_key("Enter"), Some(GuiKey::Named("enter")));
-    assert_eq!(gui_key("Down"), Some(GuiKey::Text("\x1b[B")));
+    assert_eq!(gui_key("Down"), Some(GuiKey::Named("down")));
+    assert_eq!(gui_key("y"), Some(GuiKey::Text("y")));
     assert_eq!(gui_key("enter"), None, "exact match only");
     assert_eq!(gui_key("0"), None);
     assert_eq!(gui_key("C-d"), None);

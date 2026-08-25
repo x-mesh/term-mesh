@@ -224,11 +224,13 @@ frame-ancestors 'none'; base-uri 'none'; form-action 'none'`. CORS 없음. POST�
 
 키 allowlist(`keys=safe`): `Enter`, `Escape`, `Tab`, `Up`, `Down`, `Left`, `Right`,
 `y`, `n`, `1`–`9`, `C-c`(대소문자 정확히 일치). GUI pane 매핑(`http_mobile::gui_key`):
-`Enter`/`Escape`/`Tab`/`C-c`는 앱의 `sendNamedKey`가 아는 이름
-(`enter`/`escape`/`tab`/`ctrl-c`)으로 `surface.send_key`, `y`/`n`/숫자는 글자 그대로
-`surface.send_text`, 화살표는 app socket에 named key 경로가 없어 CSI 시퀀스
-(`ESC [ A` 등)를 `surface.send_text`로 보낸다(normal cursor mode 기준; T7 E2E에서
-Claude·Codex TUI 반응을 확인). daemon surface용 바이트 표 `key_bytes()`
+`Enter`/`Escape`/`Tab`/`C-c`/화살표는 앱의 `sendNamedKey`가 아는 이름
+(`enter`/`escape`/`tab`/`ctrl-c`/`up`/`down`/`left`/`right`)으로 `surface.send_key`,
+`y`/`n`/숫자는 글자 그대로 `surface.send_text`. 화살표를 `send_text`의 CSI 바이트로
+보내는 방식은 tagged smoke에서 Claude Code에 닿지 않았다. Claude Code가 kitty keyboard
+protocol을 켜므로 Ghostty가 ESC 바이트를 Escape 키로 인코딩해 시퀀스가 깨진다. 그래서
+화살표 named key를 앱(`TerminalController+DebugInput.swift` `sendNamedKey`)에 추가했고,
+이 앱 버전 이전에는 화살표가 `Unknown key`(502)로 실패한다. daemon surface용 바이트 표 `key_bytes()`
 (`daemon/term-mesh-cli/src/peer.rs:2092`)의 `peer-proto` 이동은 Phase 3.
 `keys=none`이면 `/key`는 403 `keys_disabled`, allowlist 밖 키는 403 `key_not_allowed`.
 

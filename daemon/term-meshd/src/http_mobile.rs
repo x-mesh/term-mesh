@@ -651,19 +651,20 @@ pub enum GuiKey {
     Text(&'static str),
 }
 
-/// Exact-match mapping for the safe allowlist. Arrow keys have no named-key
-/// path on the app socket, so they go as CSI sequences through the text
-/// path, which every full-screen agent CLI accepts in normal cursor mode.
+/// Exact-match mapping for the safe allowlist. Every non-printable key is a
+/// named key event (`surface.send_key`) so Ghostty encodes it for the
+/// keyboard protocol the pane negotiated; raw CSI bytes through the text
+/// path reach a plain shell but not a kitty-protocol TUI such as Claude Code.
 pub fn gui_key(key: &str) -> Option<GuiKey> {
     Some(match key {
         "Enter" => GuiKey::Named("enter"),
         "Escape" => GuiKey::Named("escape"),
         "Tab" => GuiKey::Named("tab"),
         "C-c" => GuiKey::Named("ctrl-c"),
-        "Up" => GuiKey::Text("\x1b[A"),
-        "Down" => GuiKey::Text("\x1b[B"),
-        "Right" => GuiKey::Text("\x1b[C"),
-        "Left" => GuiKey::Text("\x1b[D"),
+        "Up" => GuiKey::Named("up"),
+        "Down" => GuiKey::Named("down"),
+        "Right" => GuiKey::Named("right"),
+        "Left" => GuiKey::Named("left"),
         "y" => GuiKey::Text("y"),
         "n" => GuiKey::Text("n"),
         "1" => GuiKey::Text("1"),
