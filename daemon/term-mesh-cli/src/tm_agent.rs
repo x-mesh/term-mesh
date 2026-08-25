@@ -1929,16 +1929,24 @@ enum RemoteCommand {
         /// `--team`.
         #[arg(long)]
         leader: bool,
-        /// Expose a native agent pane of this team instead of this pane: the
-        /// page shows its structured transcript as a chat and sends turns.
-        /// Run from the leader pane (or pass `--team`).
-        #[arg(long, value_name = "AGENT", conflicts_with = "leader")]
+        /// Expose a team agent's pane as a chat: the page shows its
+        /// structured transcript and sends turns. NAME defaults to this
+        /// pane's own $TERMMESH_AGENT_NAME, which is also what a bare
+        /// `remote on` does inside a team agent pane; naming another agent
+        /// needs the leader pane (or `--team`).
+        #[arg(
+            long,
+            value_name = "AGENT",
+            num_args = 0..=1,
+            default_missing_value = "",
+            conflicts_with = "leader"
+        )]
         agent: Option<String>,
-        /// With `--agent`: how the page shows it. `auto` (default) asks the
-        /// app whether the pane is native and picks `chat` for a native pane
-        /// or `terminal` (screen mirror) otherwise; `chat`/`terminal` force it.
-        #[arg(long, default_value = "auto", value_parser = ["auto", "chat", "terminal"], requires = "agent")]
-        view: String,
+        /// Terminal mirror instead of chat: the page shows the screen and
+        /// types into it. Alone it exposes this pane's surface; with
+        /// `--agent NAME` it mirrors that agent's terminal pane.
+        #[arg(long)]
+        terminal: bool,
         /// App control socket that owns the surface. Defaults to this pane's
         /// $TERMMESH_SOCKET_PATH.
         #[arg(long)]
@@ -4487,7 +4495,10 @@ mod runbook_tests {
             Some(true)
         );
         // An older app that never learned the field keeps the legacy ladder.
-        assert_eq!(send_response_return_required(&json!({ "result": {} })), None);
+        assert_eq!(
+            send_response_return_required(&json!({ "result": {} })),
+            None
+        );
     }
 
     #[test]
@@ -4691,7 +4702,10 @@ mod durable_leader_request_tests {
             "ok": false,
             "error": {"code": "invalid_state", "message": "already claimed"}
         });
-        assert_eq!(verify_leader_request_response(response.clone()).unwrap(), response);
+        assert_eq!(
+            verify_leader_request_response(response.clone()).unwrap(),
+            response
+        );
     }
 }
 
@@ -4894,9 +4908,8 @@ fn remote_leader_route_from_file(path: &Path) -> Option<RemoteLeaderRoute> {
         .read_to_string(&mut text)
         .ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
-    let string_field = |key: &str| -> Option<String> {
-        value.get(key)?.as_str().map(|text| text.to_string())
-    };
+    let string_field =
+        |key: &str| -> Option<String> { value.get(key)?.as_str().map(|text| text.to_string()) };
     validated_remote_leader_route(RemoteLeaderRoute {
         grant_id_hex: string_field("grant_id_hex")?,
         project_id: string_field("project_id")?,
@@ -5127,7 +5140,9 @@ mod remote_leader_route_file_tests {
 
         env::set_var(REMOTE_LEADER_ROUTE_FILE_ENV, dir.path().join("absent.json"));
         assert_eq!(
-            remote_leader_route().expect("environment fallback").team_uuid,
+            remote_leader_route()
+                .expect("environment fallback")
+                .team_uuid,
             "env-team",
             "a worker spawned before route files existed keeps its own route"
         );
@@ -12549,18 +12564,44 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
             surface,
             leader,
             agent,
-            view,
+            terminal,
             app_socket,
             cli,
             title,
             json,
         } => {
-            if let Some(agent_name) = agent.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
-                run_remote_on_agent(sock, team_flag, agent_name, view, keys, ttl.as_deref(), title.as_deref(), *json);
+            let env_agent = env::var("TERMMESH_AGENT_NAME").ok();
+            let agent_name = remote_agent_target(
+                agent.as_deref(),
+                env_agent.as_deref(),
+                *leader || surface.is_some(),
+                *terminal,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+            if let Some(agent_name) = agent_name {
+                run_remote_on_agent(
+                    sock,
+                    team_flag,
+                    &agent_name,
+                    *terminal,
+                    keys,
+                    ttl.as_deref(),
+                    title.as_deref(),
+                    *json,
+                );
                 return;
             }
             let surface_id = resolve_remote_surface(surface.as_deref()).unwrap_or_else(|e| {
-                eprintln!("Error: {e}");
+                // A native agent pane has no terminal surface, so `--terminal`
+                // there cannot mean anything.
+                if *terminal && env_agent.as_deref().is_some_and(|a| !a.trim().is_empty()) {
+                    eprintln!("Error: this agent pane has no terminal to mirror; run without --terminal to expose it as a chat");
+                } else {
+                    eprintln!("Error: {e}");
+                }
                 process::exit(1);
             });
             let ttl_secs = match ttl.as_deref().map(parse_ttl_secs).transpose() {
@@ -12645,7 +12686,9 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
                 }
                 None => println!(
                     "url: unavailable ({})",
-                    result["listener_error"].as_str().unwrap_or("listener address invalid")
+                    result["listener_error"]
+                        .as_str()
+                        .unwrap_or("listener address invalid")
                 ),
             }
             if let Some(exp) = entry["expires_at"].as_u64() {
@@ -12655,6 +12698,12 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
                 eprintln!(
                     "note: the mobile listener is disabled on this daemon; enable it in \
                      Settings or set TERM_MESH_MOBILE_ENABLED=1 before the daemon starts"
+                );
+            }
+            if !is_leader && !*terminal {
+                eprintln!(
+                    "note: terminal mirror; the chat view needs a team agent pane (run this \
+                     inside a native agent pane, or `--agent <name>` from the leader pane)"
                 );
             }
         }
@@ -12735,14 +12784,15 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
     }
 }
 
-/// `tm-agent remote on --agent <name>`: expose a native agent pane as a chat
-/// target. The pane is found through the app's `team.status` (panel_id, cli),
-/// registered with `kind=agent`, and served from its structured transcript.
+/// `tm-agent remote on [--agent <name>]`: expose a team agent's pane as a
+/// chat target. The pane is found through the app's `team.status` (panel_id,
+/// cli), registered with `kind=agent`, and served from its structured
+/// transcript. `terminal` registers the pane as a screen mirror instead.
 fn run_remote_on_agent(
     sock: &PathBuf,
     team_flag: Option<&str>,
     agent_name: &str,
-    view: &str,
+    terminal: bool,
     keys: &str,
     ttl: Option<&str>,
     title: Option<&str>,
@@ -12750,7 +12800,9 @@ fn run_remote_on_agent(
 ) {
     let team_name = resolve_team_name(team_flag);
     let Some(app_sock) = detect_socket() else {
-        eprintln!("Error: no term-mesh app socket found to look up the agent (TERMMESH_SOCKET_PATH)");
+        eprintln!(
+            "Error: no term-mesh app socket found to look up the agent (TERMMESH_SOCKET_PATH)"
+        );
         process::exit(1);
     };
     let status = match rpc_call(&app_sock, "team.status", json!({ "team_name": team_name })) {
@@ -12780,35 +12832,36 @@ fn run_remote_on_agent(
         process::exit(1);
     };
     let Some(panel_id) = agent["panel_id"].as_str().filter(|p| !p.is_empty()) else {
-        eprintln!("Error: agent {agent_name:?} has no pane (headless agents cannot be exposed yet)");
+        eprintln!(
+            "Error: agent {agent_name:?} has no pane (headless agents cannot be exposed yet)"
+        );
         process::exit(1);
     };
     // Which view: a native pane has a structured transcript (chat); a
     // terminal-mode agent pane only has a screen (mirror). `team.status`
-    // does not say which, so `auto` asks for one transcript entry.
-    let kind = match view {
-        "chat" => "agent",
-        "terminal" => "pane",
-        _ => {
-            let probe = rpc_call(
-                &app_sock,
-                "team.agent.transcript",
-                json!({ "team_name": team_name, "agent_name": agent_name, "limit": 1 }),
-            );
-            match probe {
-                Ok(resp) if resp.get("error").is_none() => "agent",
-                Ok(resp) if resp["error"]["code"].as_str() == Some("not_native") => "pane",
-                Ok(resp) => {
-                    eprintln!(
-                        "Error: team.agent.transcript: {}",
-                        resp["error"]["message"].as_str().unwrap_or("rpc error")
-                    );
-                    process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Error: team.agent.transcript: {e}");
-                    process::exit(1);
-                }
+    // does not say which, so ask for one transcript entry unless the caller
+    // forced the mirror.
+    let kind = if terminal {
+        "pane"
+    } else {
+        let probe = rpc_call(
+            &app_sock,
+            "team.agent.transcript",
+            json!({ "team_name": team_name, "agent_name": agent_name, "limit": 1 }),
+        );
+        match probe {
+            Ok(resp) if resp.get("error").is_none() => "agent",
+            Ok(resp) if resp["error"]["code"].as_str() == Some("not_native") => "pane",
+            Ok(resp) => {
+                eprintln!(
+                    "Error: team.agent.transcript: {}",
+                    resp["error"]["message"].as_str().unwrap_or("rpc error")
+                );
+                process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: team.agent.transcript: {e}");
+                process::exit(1);
             }
         }
     };
@@ -12841,6 +12894,8 @@ fn run_remote_on_agent(
     }
     if kind == "agent" {
         println!("exposed agent {agent_name} of {team_name} as chat (native pane)");
+    } else if terminal {
+        println!("exposed agent {agent_name} of {team_name} as terminal mirror (--terminal, keys={keys})");
     } else {
         println!("exposed agent {agent_name} of {team_name} as terminal mirror (pane is not native, keys={keys})");
     }
@@ -12853,14 +12908,18 @@ fn run_remote_on_agent(
         }
         None => println!(
             "url: unavailable ({})",
-            result["listener_error"].as_str().unwrap_or("listener address invalid")
+            result["listener_error"]
+                .as_str()
+                .unwrap_or("listener address invalid")
         ),
     }
     if let Some(exp) = result["entry"]["expires_at"].as_u64() {
         println!("expires: in {} (unix {exp})", format_remote_relative(exp));
     }
     if result["listener_enabled"].as_bool() != Some(true) {
-        eprintln!("note: the mobile listener is disabled on this daemon; enable it in Settings first");
+        eprintln!(
+            "note: the mobile listener is disabled on this daemon; enable it in Settings first"
+        );
     }
 }
 
@@ -12927,6 +12986,30 @@ fn remote_app_socket_from(socket_path: Option<&str>, socket: Option<&str>) -> Op
 /// A leader pane the app launched carries `TERMMESH_LEADER_REQUEST_TOKEN` and
 /// no `TERMMESH_AGENT_NAME` (workers get the latter). Adopted leaders have
 /// neither and must pass `--leader`.
+/// Which agent `remote on` exposes as a chat, or `None` for this pane's own
+/// surface. `--agent NAME` names one; a bare `--agent` and the default both
+/// take the pane's own agent name, so an agent exposes itself without naming
+/// itself. `pane_flow` (`--leader` or `--surface`) and `--terminal` without a
+/// name keep the surface flow, which needs no team lookup.
+fn remote_agent_target(
+    flag: Option<&str>,
+    env_agent: Option<&str>,
+    pane_flow: bool,
+    terminal: bool,
+) -> Result<Option<String>, String> {
+    let env_agent = env_agent.map(str::trim).filter(|a| !a.is_empty());
+    match flag.map(str::trim) {
+        Some(name) if !name.is_empty() => Ok(Some(name.to_string())),
+        Some(_) => env_agent.map(|a| Some(a.to_string())).ok_or_else(|| {
+            "no agent name: pass --agent <name>, or run inside a team agent pane \
+             (TERMMESH_AGENT_NAME)"
+                .to_string()
+        }),
+        None if pane_flow || terminal => Ok(None),
+        None => Ok(env_agent.map(str::to_string)),
+    }
+}
+
 fn remote_pane_is_leader() -> bool {
     remote_leader_from(
         env::var("TERMMESH_LEADER_REQUEST_TOKEN").ok().as_deref(),
@@ -12980,7 +13063,11 @@ fn parse_ttl_secs(raw: &str) -> Result<u64, String> {
         "m" | "min" | "mins" => 60,
         "h" | "hr" | "hrs" => 3600,
         "d" | "day" | "days" => 86_400,
-        _ => return Err(format!("ttl {raw:?}: unknown unit {unit:?} (use s, m, h, d)")),
+        _ => {
+            return Err(format!(
+                "ttl {raw:?}: unknown unit {unit:?} (use s, m, h, d)"
+            ))
+        }
     };
     n.checked_mul(mult)
         .ok_or_else(|| format!("ttl {raw:?} is too large"))
@@ -13153,10 +13240,15 @@ mod remote_command_tests {
 
     #[test]
     fn surface_flag_wins_over_env_and_missing_is_an_error() {
-        assert_eq!(remote_surface_from(Some(" abc "), Some("env")).unwrap(), "abc");
+        assert_eq!(
+            remote_surface_from(Some(" abc "), Some("env")).unwrap(),
+            "abc"
+        );
         assert_eq!(remote_surface_from(Some("  "), Some("env")).unwrap(), "env");
         assert_eq!(remote_surface_from(None, Some("env")).unwrap(), "env");
-        assert!(remote_surface_from(None, None).unwrap_err().contains("--surface"));
+        assert!(remote_surface_from(None, None)
+            .unwrap_err()
+            .contains("--surface"));
         assert!(remote_surface_from(None, Some(" ")).is_err());
     }
 
@@ -13167,13 +13259,58 @@ mod remote_command_tests {
             Some("/tmp/term-mesh.sock".into())
         );
         // TERMMESH_SOCKET pointing at a daemon socket is not an app socket.
-        assert_eq!(remote_app_socket_from(None, Some("/tmp/term-meshd.sock")), None);
+        assert_eq!(
+            remote_app_socket_from(None, Some("/tmp/term-meshd.sock")),
+            None
+        );
         assert_eq!(
             remote_app_socket_from(None, Some("/tmp/term-mesh-debug-x.sock")),
             Some("/tmp/term-mesh-debug-x.sock".into())
         );
         assert_eq!(remote_app_socket_from(Some("relative.sock"), None), None);
         assert_eq!(remote_app_socket_from(None, None), None);
+    }
+
+    #[test]
+    fn agent_target_defaults_to_this_panes_agent_unless_the_pane_flow_is_forced() {
+        // Bare `remote on` inside a team agent pane exposes that agent.
+        assert_eq!(
+            remote_agent_target(None, Some("reviewer"), false, false)
+                .unwrap()
+                .as_deref(),
+            Some("reviewer")
+        );
+        // Outside a team it is the plain pane.
+        assert_eq!(remote_agent_target(None, None, false, false).unwrap(), None);
+        assert_eq!(
+            remote_agent_target(None, Some(" "), false, false).unwrap(),
+            None
+        );
+        // `--terminal`, `--leader`, and `--surface` keep the surface flow.
+        assert_eq!(
+            remote_agent_target(None, Some("reviewer"), false, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            remote_agent_target(None, Some("reviewer"), true, false).unwrap(),
+            None
+        );
+        // `--agent NAME` always names, `--agent` alone borrows the pane's name.
+        assert_eq!(
+            remote_agent_target(Some(" other "), Some("reviewer"), true, true)
+                .unwrap()
+                .as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            remote_agent_target(Some(""), Some("reviewer"), false, false)
+                .unwrap()
+                .as_deref(),
+            Some("reviewer")
+        );
+        assert!(remote_agent_target(Some(""), None, false, false)
+            .unwrap_err()
+            .contains("--agent <name>"));
     }
 
     #[test]
@@ -13194,11 +13331,20 @@ mod remote_command_tests {
         });
         assert_eq!(
             parse_serve_status(&status, "127.0.0.1:9877"),
-            TailnetServe::Served { base: "https://mac.tail5b1e6.ts.net".into(), funnel: false }
+            TailnetServe::Served {
+                base: "https://mac.tail5b1e6.ts.net".into(),
+                funnel: false
+            }
         );
         // A different port is somebody else's serve.
-        assert_eq!(parse_serve_status(&status, "127.0.0.1:9876"), TailnetServe::NotServed);
-        assert_eq!(parse_serve_status(&json!({}), "127.0.0.1:9877"), TailnetServe::NotServed);
+        assert_eq!(
+            parse_serve_status(&status, "127.0.0.1:9876"),
+            TailnetServe::NotServed
+        );
+        assert_eq!(
+            parse_serve_status(&json!({}), "127.0.0.1:9877"),
+            TailnetServe::NotServed
+        );
 
         let mounted = json!({
             "Web": {"mac.tail5b1e6.ts.net:8443": {"Handlers": {"/rc/": {"Proxy": "http://localhost:9877"}}}},
@@ -13206,30 +13352,50 @@ mod remote_command_tests {
         });
         assert_eq!(
             parse_serve_status(&mounted, "127.0.0.1:9877"),
-            TailnetServe::Served { base: "https://mac.tail5b1e6.ts.net:8443/rc".into(), funnel: true }
+            TailnetServe::Served {
+                base: "https://mac.tail5b1e6.ts.net:8443/rc".into(),
+                funnel: true
+            }
         );
     }
 
     #[test]
     fn tailnet_lines_name_the_url_or_the_command_to_run() {
-        let served = TailnetServe::Served { base: "https://mac.ts.net".into(), funnel: false };
+        let served = TailnetServe::Served {
+            base: "https://mac.ts.net".into(),
+            funnel: false,
+        };
         assert_eq!(
             tailnet_lines_for(&served, "127.0.0.1:9877", "abc"),
             vec!["tailnet: https://mac.ts.net/t/abc".to_string()]
         );
-        let funnel = TailnetServe::Served { base: "https://mac.ts.net".into(), funnel: true };
+        let funnel = TailnetServe::Served {
+            base: "https://mac.ts.net".into(),
+            funnel: true,
+        };
         let lines = tailnet_lines_for(&funnel, "127.0.0.1:9877", "abc");
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("tailscale funnel off"));
         let not = tailnet_lines_for(&TailnetServe::NotServed, "127.0.0.1:20226", "abc");
-        assert_eq!(not, vec!["tailnet: not served yet; on this Mac run: tailscale serve --bg 20226".to_string()]);
-        assert_eq!(listener_addr_from_url("http://127.0.0.1:9877/t/abc").as_deref(), Some("127.0.0.1:9877"));
+        assert_eq!(
+            not,
+            vec![
+                "tailnet: not served yet; on this Mac run: tailscale serve --bg 20226".to_string()
+            ]
+        );
+        assert_eq!(
+            listener_addr_from_url("http://127.0.0.1:9877/t/abc").as_deref(),
+            Some("127.0.0.1:9877")
+        );
         assert_eq!(listener_addr_from_url("https://x/t/abc"), None);
     }
 
     #[test]
     fn default_title_is_the_cwd_basename() {
-        assert_eq!(remote_default_title("/Users/me/work/term-mesh"), "term-mesh");
+        assert_eq!(
+            remote_default_title("/Users/me/work/term-mesh"),
+            "term-mesh"
+        );
         assert_eq!(remote_default_title("/"), "pane");
         assert_eq!(remote_default_title(""), "pane");
     }
@@ -16021,14 +16187,30 @@ fn resolve_participation_from_env(known_input: bool) -> LeaderParticipationResol
     if let Ok(path) = env::var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE") {
         if let Ok(text) = fs::read_to_string(path) {
             if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                if let Some(mode) = value["mode"].as_str() { config.mode = mode.to_ascii_lowercase(); }
-                if let Some(percent) = value["percent"].as_u64() { config.percent = percent.min(100) as u8; }
-                if let Some(flag) = value["kill_switch"].as_bool() { config.kill_switch = flag; }
-                if let Some(flag) = value["supported"].as_bool() { config.supported = flag; }
-                if let Some(flag) = value["healthy"].as_bool() { config.healthy = flag; }
-                if let Some(flag) = value["opt_in"].as_bool() { config.opt_in = flag; }
-                if let Some(id) = value["project_id"].as_str() { config.project_id = id.to_string(); }
-                if let Some(id) = value["session_id"].as_str() { config.session_id = id.to_string(); }
+                if let Some(mode) = value["mode"].as_str() {
+                    config.mode = mode.to_ascii_lowercase();
+                }
+                if let Some(percent) = value["percent"].as_u64() {
+                    config.percent = percent.min(100) as u8;
+                }
+                if let Some(flag) = value["kill_switch"].as_bool() {
+                    config.kill_switch = flag;
+                }
+                if let Some(flag) = value["supported"].as_bool() {
+                    config.supported = flag;
+                }
+                if let Some(flag) = value["healthy"].as_bool() {
+                    config.healthy = flag;
+                }
+                if let Some(flag) = value["opt_in"].as_bool() {
+                    config.opt_in = flag;
+                }
+                if let Some(id) = value["project_id"].as_str() {
+                    config.project_id = id.to_string();
+                }
+                if let Some(id) = value["session_id"].as_str() {
+                    config.session_id = id.to_string();
+                }
             }
         }
     }
@@ -16132,8 +16314,8 @@ fn append_turn_record(path: &Path, record: &Value) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     }
-    let mut line = serde_json::to_string(record)
-        .map_err(|e| format!("serialize turn record: {e}"))?;
+    let mut line =
+        serde_json::to_string(record).map_err(|e| format!("serialize turn record: {e}"))?;
     line.push('\n');
     // Owner-only: the sink stores prompt digests and byte counts, never content,
     // but a digest next to a short length is still guessable. Whichever writer
@@ -16189,7 +16371,9 @@ fn turn_id_from_hook_state() -> Option<String> {
     if key.is_empty() {
         return None;
     }
-    let path = turn_log_path().ok()?.with_file_name(format!(".turn-current-{key}"));
+    let path = turn_log_path()
+        .ok()?
+        .with_file_name(format!(".turn-current-{key}"));
     let contents = fs::read_to_string(path).ok()?;
     contents
         .lines()
@@ -16212,8 +16396,7 @@ fn mark_turn_route_stated(path: &Path, turn_id: &str) -> Result<(), String> {
         return Err("turn id contains no safe marker characters".to_string());
     }
     let marker = path.with_file_name(format!(".turn-route-{key}"));
-    fs::write(&marker, b"stated\n")
-        .map_err(|e| format!("write {}: {e}", marker.display()))?;
+    fs::write(&marker, b"stated\n").map_err(|e| format!("write {}: {e}", marker.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -16617,11 +16800,17 @@ mod leader_turn_record_tests {
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         mark_turn_route_stated(&path, "turn-42").expect("marker");
         let marker = path.with_file_name(".turn-route-turn-42");
-        assert_eq!(fs::read_to_string(&marker).expect("read marker"), "stated\n");
+        assert_eq!(
+            fs::read_to_string(&marker).expect("read marker"),
+            "stated\n"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(marker).expect("metadata").permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(marker).expect("metadata").permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 
@@ -16697,7 +16886,14 @@ mod leader_turn_record_tests {
             "2026-08-24T09:15:00Z",
         );
         let object = record.as_object().expect("record is an object");
-        for forbidden in ["role", "agent", "agent_name", "is_leader", "leader", "actor"] {
+        for forbidden in [
+            "role",
+            "agent",
+            "agent_name",
+            "is_leader",
+            "leader",
+            "actor",
+        ] {
             assert!(
                 !object.contains_key(forbidden),
                 "record must not assert identity via {forbidden}: {record}"
@@ -16740,11 +16936,12 @@ mod leader_turn_record_tests {
     fn sink_is_a_dot_log_file_under_the_term_mesh_logs_dir() {
         let path = turn_log_path().expect("HOME is set in the test environment");
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("log"));
-        assert_eq!(
-            path.file_name().and_then(|f| f.to_str()),
-            Some("turns.log")
+        assert_eq!(path.file_name().and_then(|f| f.to_str()), Some("turns.log"));
+        assert!(
+            path.ends_with(".term-mesh/logs/turns.log"),
+            "path was {}",
+            path.display()
         );
-        assert!(path.ends_with(".term-mesh/logs/turns.log"), "path was {}", path.display());
     }
 
     /// A route record must be joinable to the `turn_start` the harness hook

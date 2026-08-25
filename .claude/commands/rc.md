@@ -11,18 +11,19 @@ User provided: $ARGUMENTS
 ## Usage
 
 ```
-/rc on [--keys safe|none] [--ttl 12h] [--leader] [--title NAME]
-/rc on --agent <name> [--view auto|chat|terminal] [--ttl 12h]
+/rc on [--terminal] [--keys safe|none] [--ttl 12h] [--title NAME]
+/rc on --agent <name> [--terminal] [--ttl 12h]     # 리더 pane에서 다른 팀 에이전트를 노출
 /rc off
 /rc status [--all]
 /rc help
 ```
 
-- **on** — 이 pane을 노출한다. 다시 실행하면 entry를 교체하고 TTL을 다시 센다.
-- **--keys safe|none** — 모바일에서 보낼 수 있는 키. `safe`(기본)는 Enter/Esc/Tab/↑↓←→/y/n/1–9/Ctrl-C 고정 allowlist, `none`은 키 전송 차단.
+- **on** — 이 pane을 노출한다. 팀 에이전트 pane(native)이면 채팅 뷰(구조화 transcript + 턴 전송), 리더 pane이면 durable request 보드, 그 밖의 pane은 터미널 미러다. 다시 실행하면 entry를 교체하고 TTL을 다시 센다.
+- **--terminal** — 채팅 대신 터미널 미러(화면 + 타이핑)로 노출한다. native pane에는 터미널이 없으므로 오류가 난다.
+- **--agent [NAME]** — 노출할 팀 에이전트. NAME을 생략하면 이 pane의 에이전트(`TERMMESH_AGENT_NAME`)라서 기본 동작과 같다. 다른 에이전트를 노출하려면 리더 pane(또는 `--team`)에서 NAME을 준다. native가 아닌 에이전트 pane은 터미널 미러로 자동 등록된다.
+- **--keys safe|none** — 모바일에서 보낼 수 있는 키. `safe`(기본)는 Enter/Esc/Tab/↑↓←→/y/n/1–9/Ctrl-C 고정 allowlist, `none`은 키 전송 차단. 채팅 뷰에는 키가 없다.
 - **--ttl** — 노출 시간(`30m`, `12h`, `2d`, 초). 기본 24h, daemon이 60s–7d로 clamp.
 - **--leader** — 팀 리더로 등록. 앱이 띄운 리더 pane은 자동 감지되므로 보통 생략한다. adopt한 리더(`TERMMESH_TEAM` 없음)는 `--leader --team ws-<hex>`를 함께 준다.
-- **--agent NAME** — 이 pane 대신 팀 에이전트 NAME의 pane을 노출한다(리더 pane 또는 `--team`과 함께). native pane이면 채팅 뷰, 아니면 터미널 미러로 자동 등록하고 `--view chat|terminal`로 강제할 수 있다.
 - **off** — 노출 해제.
 - **status** — 이 pane의 노출 상태. `--all`은 daemon의 모든 노출 surface.
 
@@ -59,6 +60,7 @@ Do not retry or poll. Do not change team membership.
 
 ## What the exposure means
 
+- **Team agent pane** (`kind=agent`, the default inside a native agent pane): the phone shows the agent's structured transcript as a chat and sends whole turns (`team.send`); it can interrupt the running turn. There is no key row. A plain pane running Claude or Codex by hand is not a team agent and gets the terminal mirror; the command says so.
 - **Leader pane** (`kind=leader`): text from the phone arrives through the durable leader request board (`team.leader.send`), exactly like a worker's `tm-agent reply`. You will see the usual wake instruction; take the request as you normally do. Retries with the same request id do not duplicate.
 - **Any other pane** (`kind=pane`): text from the phone is typed into this terminal as if at the keyboard. Keys from the `safe` allowlist answer permission prompts and menus (`y`/`n`, digits, Enter, Esc, arrows, Ctrl-C).
 - The phone only ever sees this pane's screen text (last N lines of scrollback). Nothing else on the machine is exposed. `/rc off`, closing the pane, or the TTL removes the exposure.

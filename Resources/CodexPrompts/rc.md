@@ -13,12 +13,17 @@ Use this prompt as the Codex wrapper for `/rc`. All operations must use `tm-agen
 ## Usage
 
 ```text
-/rc on [--keys safe|none] [--ttl 12h] [--leader] [--title NAME]
-/rc on --agent <name> [--view auto|chat|terminal] [--ttl 12h]   # expose a team agent's pane (chat if native)
+/rc on [--terminal] [--keys safe|none] [--ttl 12h] [--title NAME]
+/rc on --agent <name> [--terminal] [--ttl 12h]   # from the leader pane: expose another team agent
 /rc off
 /rc status [--all]
 /rc help
 ```
+
+`on` exposes this pane: a team agent pane (native) as a chat, the leader pane
+as its durable request board, any other pane as a terminal mirror. `--terminal`
+forces the mirror. `--agent` takes this pane's own agent when NAME is omitted;
+naming another agent needs the leader pane (or `--team`).
 
 If the first token is `help`, print this usage block and stop.
 
@@ -38,6 +43,7 @@ Do not retry, poll, or change team membership.
 
 ## What the exposure means
 
+- Team agent pane (default inside a native agent pane): the phone shows the structured transcript as a chat, sends whole turns, and can interrupt. A pane running Claude or Codex by hand is not a team agent and gets the mirror.
 - Leader pane: phone text arrives as a durable leader request with the usual wake instruction; take it as you normally do.
 - Any other pane: phone text is typed into this terminal; `safe` keys (Enter/Esc/Tab/arrows/y/n/1–9/Ctrl-C) answer prompts and menus.
 - Only this pane's screen text is visible to the phone. `/rc off`, closing the pane, or the TTL removes the exposure.

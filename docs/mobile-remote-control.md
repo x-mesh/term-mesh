@@ -130,18 +130,23 @@ v1은 in-memory다. daemon 재시작 후에는 `/rc on`을 다시 친다.
 ### 4.2 `tm-agent remote`
 
 ```
-tm-agent remote on  [--keys safe|none] [--ttl 12h] [--surface <id>] [--leader]
-tm-agent remote on  --agent <name> [--ttl 12h]     # 팀의 native 에이전트를 채팅 대상으로
+tm-agent remote on  [--terminal] [--keys safe|none] [--ttl 12h] [--surface <id>] [--leader]
+tm-agent remote on  --agent <name> [--terminal] [--ttl 12h]   # 리더 pane에서 다른 팀 에이전트를
 tm-agent remote off [--surface <id>]
 tm-agent remote status
 ```
 
-`--agent`는 리더 pane(또는 `--team`)에서 실행한다. app socket `team.status`로 그 에이전트의
-`panel_id`·`cli`를 찾고, `--view auto`(기본)는 `team.agent.transcript`를 한 번 물어 native
-pane이면 `kind=agent`(채팅), 아니면(`not_native`) `kind=pane`(터미널 미러)로 등록한다.
-`--view chat|terminal`로 강제할 수 있다. 즉 "native로 볼지"는 등록 시점에 대상 단위로
-정해지고 페이지는 `kind`를 따른다. 에이전트 pane이 native인지 자체는 앱 Settings ▸ Agent
-Teams ▸ Agent Panes(Native/Terminal)가 정한다.
+기본값은 채팅이다. pane env에 `TERMMESH_AGENT_NAME`이 있으면(팀 에이전트 pane) 이름 없이도
+그 에이전트를 대상으로 잡고, app socket `team.status`로 `panel_id`·`cli`를 찾은 뒤
+`team.agent.transcript`를 한 번 물어 native pane이면 `kind=agent`(채팅), 아니면(`not_native`)
+`kind=pane`(터미널 미러)로 등록한다. `--agent <name>`은 리더 pane(또는 `--team`)에서 다른
+에이전트를 고를 때 쓰고, 이름을 생략한 `--agent`는 기본 동작과 같다. `--terminal`은 채팅 대신
+이 pane의 surface를 터미널 미러로 등록하며(native pane에는 surface가 없어 오류), `--agent
+<name> --terminal`은 그 에이전트의 터미널 pane을 미러한다. 팀 env가 없는 일반 pane(손으로
+띄운 Claude/Codex 포함)은 채팅 소스가 없으므로 터미널 미러로 등록하고 그 사실을 note로
+알린다. 즉 "native로 볼지"는 등록 시점에 대상 단위로 정해지고 페이지는 `kind`를 따른다.
+에이전트 pane이 native인지 자체는 앱 Settings ▸ Agent Teams ▸ Agent Panes(Native/Terminal)가
+정한다.
 
 - surface는 `TERMMESH_SURFACE_ID`에서, 팀은 `TERMMESH_TEAM`(없으면 `ws-<hex>`
   규칙)에서 읽는다. `--surface`는 term-mesh 밖에서 띄운 셸처럼 env가 없는 경우의
@@ -389,6 +394,13 @@ pane 각각 `/rc on` → 읽기 → 텍스트 → 키가 동작.
   `kind=agent` → `/transcript` 200 → `/text` 202(`delivery_scope: transport_write`) →
   2초 뒤 transcript에 `said`/`answered("pong")`/`turn_ended`. transcript의 `running`은
   프로세스 생존이라 턴 사이에도 true이고, 턴 진행은 `in_flight`/`thinking`으로 본다.
+- 기본값 채팅 전환(2026-08-25 tagged smoke, 같은 topology): 에이전트 env(`TERMMESH_AGENT_NAME`,
+  `TERMMESH_TEAM`)를 가진 셸에서 이름 없는 `remote on`과 `--agent` → `kind=agent`;
+  같은 env에서 `--terminal` → "no terminal to mirror" 오류(exit 1); 팀 env 없는 pane →
+  `kind=pane` + note; native Claude 에이전트가 자기 Bash 도구로
+  `"$TERMMESH_APP_BIN/tm-agent" remote on`을 실행해 22초 안에 자신을 `kind=agent`로 등록.
+  이때 native pane env에 `TERMMESH_APP_BIN`이 없던 것을 `buildAgentPaneEnv`에 추가해 고쳤다
+  (터미널 pane은 `GhosttyTerminalView`가 주입하지만 native pane은 그 경로를 지나지 않는다).
 - 두 가지를 구현 중에 고쳤다. (1) 화살표를 `send_text`의 CSI 바이트로 보내면 kitty
   keyboard protocol을 켠 Claude Code에 닿지 않아 앱 `sendNamedKey`/`queuedTextForNamedKey`에
   `up/down/left/right` 키 이벤트를 추가했다. (2) `team.leader.request.list`는 리더 pane의
