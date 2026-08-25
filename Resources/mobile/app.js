@@ -52,6 +52,10 @@
     lastError: null,
     direct: false,       // direct-typing mode: keystrokes go straight to the pane
     typeRefreshTimer: null,
+    typeQueue: [],       // pending keystrokes, sent one request at a time in order
+    typeBusy: false,
+    rowKeys: [],         // per-row render keys for incremental redraws
+    rowNodes: [],
   };
 
   // ── helpers ──────────────────────────────────────────────────────────
@@ -136,33 +140,60 @@
     return 'rgb(' + v + ',' + v + ',' + v + ')';
   }
 
-  // Draw styled rows (see http_mobile::styled_rows) into the <pre>. Colors go
-  // through the CSSOM, which the page's CSP allows; attribute classes carry
-  // bold/dim/italic/underline/inverse. The cursor cell gets a marker.
+  // Draw styled rows into the <pre>, touching only rows whose content or
+  // cursor changed: rebuilding hundreds of spans per refresh is what made
+  // typing feel slow on a phone. Colors go through the CSSOM, which the
+  // page's CSP allows; attribute classes carry bold/dim/italic/underline/
+  // inverse. The cursor cell gets a marker.
   function renderStyled(rows, cursor) {
-    var frag = document.createDocumentFragment();
-    rows.forEach(function (spans, rowIndex) {
-      var col = 0;
-      spans.forEach(function (s) {
-        var text = s.t || '';
-        var cursorHere = cursor && cursor.row === rowIndex && cursor.col >= col && cursor.col < col + text.length;
-        if (cursorHere) {
-          var at = cursor.col - col;
-          appendSpan(frag, text.slice(0, at), s, false);
-          appendSpan(frag, text.charAt(at) || ' ', s, true);
-          appendSpan(frag, text.slice(at + 1), s, false);
-        } else {
-          appendSpan(frag, text, s, false);
-        }
-        col += text.length;
-      });
-      if (cursor && cursor.row === rowIndex && cursor.col >= col) {
-        appendSpan(frag, ' ', {}, true);
+    var cursorRow = cursor ? cursor.row : -1;
+    for (var i = 0; i < rows.length; i++) {
+      var key = JSON.stringify(rows[i]) + (i === cursorRow ? '|c' + cursor.col : '');
+      if (state.rowKeys[i] === key && state.rowNodes[i]) { continue; }
+      var node = buildRow(rows[i], i === cursorRow ? cursor : null, i);
+      if (state.rowNodes[i]) {
+        el.screen.replaceChild(node, state.rowNodes[i]);
+      } else {
+        el.screen.appendChild(node);
       }
-      frag.appendChild(document.createTextNode('\n'));
-    });
+      state.rowNodes[i] = node;
+      state.rowKeys[i] = key;
+    }
+    while (state.rowNodes.length > rows.length) {
+      var extra = state.rowNodes.pop();
+      state.rowKeys.pop();
+      if (extra.parentNode === el.screen) { el.screen.removeChild(extra); }
+    }
+  }
+
+  function resetScreen() {
     el.screen.textContent = '';
-    el.screen.appendChild(frag);
+    state.rowKeys = [];
+    state.rowNodes = [];
+  }
+
+  function buildRow(spans, cursor, rowIndex) {
+    var row = document.createElement('span');
+    row.className = 'row';
+    var col = 0;
+    spans.forEach(function (s) {
+      var text = s.t || '';
+      var cursorHere = cursor && cursor.row === rowIndex && cursor.col >= col && cursor.col < col + text.length;
+      if (cursorHere) {
+        var at = cursor.col - col;
+        appendSpan(row, text.slice(0, at), s, false);
+        appendSpan(row, text.charAt(at) || ' ', s, true);
+        appendSpan(row, text.slice(at + 1), s, false);
+      } else {
+        appendSpan(row, text, s, false);
+      }
+      col += text.length;
+    });
+    if (cursor && cursor.row === rowIndex && cursor.col >= col) {
+      appendSpan(row, ' ', {}, true);
+    }
+    row.appendChild(document.createTextNode('\n'));
+    return row;
   }
 
   function appendSpan(parent, text, s, isCursor) {
@@ -229,7 +260,7 @@
     }
     if (changed) {
       state.lastText = null;
-      el.screen.textContent = '';
+      resetScreen();
       el.requestsList.textContent = '';
       el.requestsCount.textContent = '';
       if (!fromRender || has) { refreshNow(); }
@@ -252,6 +283,7 @@
           if (styled) {
             renderStyled(data.rows, data.cursor || null);
           } else {
+            resetScreen();
             el.screen.textContent = (data && data.text) || '';
           }
           if (stickToBottom) {
@@ -310,7 +342,7 @@
   function startPolling() {
     stopPolling();
     state.pollTimer = window.setInterval(function () {
-      if (document.hidden) { return; }
+      if (document.hidden || state.typeBusy || state.typeQueue.length) { return; }
       refreshNow();
     }, POLL_MS);
   }
@@ -369,29 +401,53 @@
   // Backspace as keys. IME composition (Korean) is flushed only once the
   // composed text is committed, so no syllable fragments reach the pane.
 
-  function typeRaw(text) {
+  // Keystrokes are queued and sent one request at a time so they reach the
+  // pane in order; text queued while a request is in flight is coalesced
+  // into one POST. The screen refreshes once the queue drains, not per key.
+  function enqueueType(item) {
+    var last = state.typeQueue[state.typeQueue.length - 1];
+    if (item.kind === 'text' && last && last.kind === 'text') {
+      last.text += item.text;
+    } else {
+      state.typeQueue.push(item);
+    }
+    pumpType();
+  }
+
+  function pumpType() {
+    if (state.typeBusy) { return; }
+    if (!state.typeQueue.length) { scheduleTypeRefresh(); return; }
     var t = state.selected;
-    if (!t || !text) { return; }
-    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/text',
-        { text: text, request_id: requestId(), raw: true })
-      .then(function () { scheduleTypeRefresh(); })
-      .catch(function (err) { setSendStatus(describeError(err), true); });
+    if (!t) { state.typeQueue.length = 0; return; }
+    var item = state.typeQueue.shift();
+    var base = '/api/targets/' + encodeURIComponent(t.surface_id);
+    var req = item.kind === 'text'
+      ? api('POST', base + '/text', { text: item.text, request_id: requestId(), raw: true })
+      : api('POST', base + '/key', { key: item.key });
+    state.typeBusy = true;
+    req.catch(function (err) {
+      setSendStatus(describeError(err), true);
+      state.typeQueue.length = 0;
+    }).then(function () {
+      state.typeBusy = false;
+      pumpType();
+    });
+  }
+
+  function typeRaw(text) {
+    if (text) { enqueueType({ kind: 'text', text: text }); }
   }
 
   function typeKey(key) {
-    var t = state.selected;
-    if (!t) { return; }
-    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/key', { key: key })
-      .then(function () { scheduleTypeRefresh(); })
-      .catch(function (err) { setSendStatus(describeError(err), true); });
+    enqueueType({ kind: 'key', key: key });
   }
 
   function scheduleTypeRefresh() {
-    if (state.typeRefreshTimer) { return; }
+    if (state.typeRefreshTimer) { window.clearTimeout(state.typeRefreshTimer); }
     state.typeRefreshTimer = window.setTimeout(function () {
       state.typeRefreshTimer = null;
       refreshNow();
-    }, 150);
+    }, 120);
   }
 
   function flushTyped() {

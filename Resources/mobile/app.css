@@ -169,6 +169,7 @@ button.icon {
   font-size: 16px; /* prevents iOS zoom on focus */
 }
 
+.screen .row { display: inline; }
 .screen .b { font-weight: 700; }
 .screen .d { opacity: 0.55; }
 .screen .i { font-style: italic; }
