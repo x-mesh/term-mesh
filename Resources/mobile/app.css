@@ -149,6 +149,13 @@ button.icon {
   tab-size: 4;
 }
 
+.screen .b { font-weight: 700; }
+.screen .d { opacity: 0.55; }
+.screen .i { font-style: italic; }
+.screen .u { text-decoration: underline; }
+.screen .inv { background: var(--screen-fg); color: var(--screen-bg); }
+.screen .cursor { outline: 1px solid var(--accent); outline-offset: -1px; background: rgba(10, 132, 255, 0.35); }
+
 .jump {
   position: absolute;
   right: 12px;

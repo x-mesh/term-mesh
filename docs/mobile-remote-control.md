@@ -67,6 +67,7 @@ decision this design consumes), [peer-federation.md](./peer-federation.md),
 | `tm-agent`의 daemon socket 해석 순서 `detect_watch_socket` | `daemon/term-mesh-cli/src/tm_agent.rs:12342` | `tm-agent remote`가 재사용 |
 | per-surface `vt100::Parser`, GridSnapshot = `contents_formatted()` | `daemon/term-meshd/src/peer/surface.rs:371`, `:410`, `:1870` | headless surface 화면 텍스트(`contents()`) |
 | 키 이름→바이트 표 `key_bytes()` (테스트 포함) | `daemon/term-mesh-cli/src/peer.rs:2092` | 키 allowlist 바이트 |
+| `ghostty_surface_read_screen_tail_vt` (cmux fork): 최근 N행을 렌더된 셀 스타일이 보존된 VT로 반환, `ghostty_surface_grid_metrics`로 커서 위치 | `ghostty/include/ghostty.h:1635`, `:1407` | 앱 RPC `surface.read_screen_vt` → 색·dim·반전·커서가 있는 화면 |
 | daemon RPC 이름 규칙 `watch.on/off/status`, HTTP→app socket proxy `rpc_team_socket` | `daemon/term-meshd/src/socket.rs`, `http.rs` | `remote.*` RPC, listener proxy |
 | leader command 설치 관례: Claude command + Codex prompt + managed 목록 + IME alias | `scripts/copy-claude-commands.sh`, `Sources/ClaudeCommandInstaller.swift`, `Sources/GhosttySurfaceScrollView.swift` `imeSlashCommandAliases()` | `/rc` 스킬 설치 |
 | peer tunnel이 원격 dashboard를 로컬 `19876+`로 forward | `Sources/PeerSSHTunnel.swift:142-262`, [peer-linux-host.md](./peer-linux-host.md) | Phase 3 relay 경로 |
@@ -184,8 +185,10 @@ wake instruction으로 깨어나고, 일반 pane은 텍스트가 그대로 타�
 
 ### 4.5 Mobile page
 
-대상 목록 → 대상 화면. 화면은 monospace 텍스트, 2초 자동 refresh와 수동 refresh,
-사용자가 하단에 있을 때만 자동 scroll. 하단에 composer, 키 버튼 행(Enter, Esc,
+대상 목록 → 대상 화면. 화면은 `format=styled`로 받은 셀 스타일(색·굵게·dim·기울임·
+밑줄·반전)과 커서 위치를 그대로 그린다. 그래서 Claude Code가 dim으로 띄우는 제안
+문구와 실제 입력이 구분되고 커서가 어디 있는지 보인다. 2초 자동 refresh와 수동
+refresh, 사용자가 하단에 있을 때만 자동 scroll. 하단에 composer, 키 버튼 행(Enter, Esc,
 y, n, 1–9, ↑, ↓, Tab, Ctrl-C), 리더면 최근 request 상태. 상태 저장은 없다.
 
 ## 5. 대상별 경로
@@ -218,6 +221,7 @@ frame-ancestors 'none'; base-uri 'none'; form-action 'none'`. CORS 없음. POST�
 | GET | `/api/health` | | `{ok, auth_mode, version}` |
 | GET | `/api/targets` | | `{targets: [{surface_id, kind, team_name, agent_cli, title, cwd, source: gui\|headless, keys, owner, created_at, expires_at}], now}`. 호출 시 만료·dead socket entry를 prune |
 | GET | `/api/targets/{id}/screen?lines=200` | `lines` 20..1000 | `{surface_id, kind, lines, text, captured_at}` |
+| GET | `/api/targets/{id}/screen?lines=200&format=styled` | 위와 같음 | `{format: "styled", columns, rows: [[{t, fg?, bg?, b?, d?, i?, u?, inv?}]], cursor: {row, col}\|null, captured_at}`. 앱 `surface.read_screen_vt`의 VT를 daemon이 `vt100`으로 재생해 셀 스타일을 span으로 묶음. fg/bg는 팔레트 index(0–255) 또는 `#rrggbb`. 페이지는 이 형식을 쓰고 구형 앱이면 plain text로 내려감 |
 | POST | `/api/targets/{id}/text` | `{text, request_id?}` | leader: 202 `{request_id, stored, wake_dispatched, request_replayed, claimed_by_leader}` / pane: 200 `{delivered, deduplicated, request_id}` |
 | GET | `/api/targets/{id}/requests` | leader만(아니면 409 `not_leader`) | `{count, requests}` (`team.leader.request.list`, 본문 미포함) |
 | POST | `/api/targets/{id}/key` | `{key}` | 200 `{key, delivered}` |

@@ -18,7 +18,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -444,6 +444,131 @@ async fn app_call(
 struct ScreenQuery {
     #[serde(default)]
     lines: Option<u32>,
+    /// `styled` asks for per-cell colors and attributes (needs an app with
+    /// `surface.read_screen_vt`); anything else returns plain text.
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// One run of cells sharing a style. Colors are `null` (terminal default),
+/// a 0–255 palette index, or `#rrggbb`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StyledSpan {
+    pub t: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fg: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bg: Option<Value>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub b: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub d: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub i: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub u: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub inv: bool,
+}
+
+fn color_json(color: vt100::Color) -> Option<Value> {
+    match color {
+        vt100::Color::Default => None,
+        vt100::Color::Idx(n) => Some(json!(n)),
+        vt100::Color::Rgb(r, g, b) => Some(json!(format!("#{r:02x}{g:02x}{b:02x}"))),
+    }
+}
+
+/// Render a VT tail (from `surface.read_screen_vt`) into rows of styled
+/// spans by replaying it through a scratch terminal of the pane's width.
+/// Trailing blank cells are dropped; wide-character continuation cells are
+/// folded into the character before them.
+pub fn styled_rows(vt: &str, columns: u16) -> Vec<Vec<StyledSpan>> {
+    let cols = if (20..=1000).contains(&columns) {
+        columns
+    } else {
+        500
+    };
+    // The tail separates rows with CRLF; a bare LF (defensive) would only
+    // move down and leave the next row indented.
+    let normalized = vt.replace("\r\n", "\n").replace('\n', "\r\n");
+    let row_count = normalized.split('\n').count().clamp(1, 2000) as u16;
+    let mut parser = vt100::Parser::new(row_count, cols, 0);
+    parser.process(normalized.as_bytes());
+    let screen = parser.screen();
+    let mut rows: Vec<Vec<StyledSpan>> = Vec::with_capacity(row_count as usize);
+    for r in 0..row_count {
+        let mut last = 0u16;
+        for c in 0..cols {
+            if let Some(cell) = screen.cell(r, c) {
+                if cell.has_contents()
+                    || cell.bgcolor() != vt100::Color::Default
+                    || cell.inverse()
+                {
+                    last = c + 1;
+                }
+            }
+        }
+        let mut spans: Vec<StyledSpan> = Vec::new();
+        for c in 0..last {
+            let Some(cell) = screen.cell(r, c) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let text = if cell.has_contents() {
+                cell.contents().to_string()
+            } else {
+                " ".to_string()
+            };
+            let next = StyledSpan {
+                t: text,
+                fg: color_json(cell.fgcolor()),
+                bg: color_json(cell.bgcolor()),
+                b: cell.bold(),
+                d: cell.dim(),
+                i: cell.italic(),
+                u: cell.underline(),
+                inv: cell.inverse(),
+            };
+            match spans.last_mut() {
+                Some(prev)
+                    if prev.fg == next.fg
+                        && prev.bg == next.bg
+                        && prev.b == next.b
+                        && prev.d == next.d
+                        && prev.i == next.i
+                        && prev.u == next.u
+                        && prev.inv == next.inv =>
+                {
+                    prev.t.push_str(&next.t)
+                }
+                _ => spans.push(next),
+            }
+        }
+        rows.push(spans);
+    }
+    while rows.last().is_some_and(Vec::is_empty) {
+        rows.pop();
+    }
+    rows
+}
+
+/// Where the cursor sits inside the returned tail: the viewport is the last
+/// `viewport_rows` rows of the tail, so shift the viewport-relative row.
+pub fn cursor_in_tail(
+    tail_rows: usize,
+    viewport_rows: u64,
+    cursor_row: u64,
+    cursor_col: u64,
+    in_viewport: bool,
+) -> Option<(usize, usize)> {
+    if !in_viewport || viewport_rows == 0 || tail_rows < viewport_rows as usize {
+        return None;
+    }
+    let row = tail_rows - viewport_rows as usize + cursor_row as usize;
+    (row < tail_rows).then_some((row, cursor_col as usize))
 }
 
 async fn screen_handler(
@@ -462,6 +587,38 @@ async fn screen_handler(
         }
     };
     let entry = live_entry(&state, &surface_id).await?;
+    if q.format.as_deref() == Some("styled") {
+        // Both kinds are GUI surfaces here; the leader's durable board only
+        // matters for writes.
+        let result = app_call(
+            &state,
+            &entry,
+            "surface.read_screen_vt",
+            json!({ "surface_id": entry.surface_id, "rows": lines }),
+        )
+        .await?;
+        let vt = result.get("vt").and_then(Value::as_str).unwrap_or("");
+        let columns = result.get("columns").and_then(Value::as_u64).unwrap_or(0) as u16;
+        let rows = styled_rows(vt, columns);
+        let cursor = cursor_in_tail(
+            rows.len(),
+            result.get("rows").and_then(Value::as_u64).unwrap_or(0),
+            result.get("cursor_row").and_then(Value::as_u64).unwrap_or(0),
+            result.get("cursor_column").and_then(Value::as_u64).unwrap_or(0),
+            result.get("cursor_in_viewport").and_then(Value::as_bool).unwrap_or(false),
+        );
+        return Ok(Json(json!({
+            "surface_id": entry.surface_id,
+            "kind": entry.kind,
+            "lines": lines,
+            "format": "styled",
+            "columns": columns,
+            "rows": rows,
+            "cursor": cursor.map(|(row, col)| json!({ "row": row, "col": col })),
+            "captured_at": remote::now_unix(),
+        }))
+        .into_response());
+    }
     let result = match entry.kind {
         TargetKind::Leader => {
             app_call(

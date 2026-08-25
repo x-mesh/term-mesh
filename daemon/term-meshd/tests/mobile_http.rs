@@ -9,7 +9,9 @@ mod http_mobile;
 #[path = "../src/remote.rs"]
 mod remote;
 
-use http_mobile::{gui_key, parse_logins, AuthMode, GuiKey, MobileConfig, SAFE_KEYS};
+use http_mobile::{
+    cursor_in_tail, gui_key, parse_logins, styled_rows, AuthMode, GuiKey, MobileConfig, SAFE_KEYS,
+};
 use remote::{EnableSpec, KeysPolicy, SharedRegistry, TargetKind};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
@@ -413,6 +415,53 @@ async fn screen_routes_pane_and_leader_to_the_right_rpc() {
     let unknown = get(&h, "/api/targets/nope/screen").await;
     assert_eq!(unknown.status, 404);
     assert_eq!(unknown.error_code(), "not_exposed");
+}
+
+#[tokio::test]
+async fn styled_screen_replays_vt_into_spans_with_a_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.reply(
+        "surface.read_screen_vt",
+        json!({
+            "vt": "\u{1b}[31mred\u{1b}[0m plain\r\n\u{1b}[2mdim\u{1b}[0m\u{1b}[7m inv\u{1b}[0m \u{1b}[38;2;1;2;3mrgb\u{1b}[0m\r\n❯ ",
+            "columns": 40, "rows": 3, "cursor_column": 2, "cursor_row": 2, "cursor_in_viewport": true
+        }),
+    );
+    let h = start_tailscale().await;
+    expose(&h, &app, "pane-1", TargetKind::Pane, KeysPolicy::Safe).await;
+
+    let r = get(&h, "/api/targets/pane-1/screen?lines=50&format=styled").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let j = r.json();
+    assert_eq!(j["format"], "styled");
+    assert_eq!(j["columns"], 40);
+    let rows = j["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{}", r.body);
+    assert_eq!(rows[0][0], json!({ "t": "red", "fg": 1 }));
+    assert_eq!(rows[0][1], json!({ "t": " plain" }));
+    assert_eq!(rows[1][0], json!({ "t": "dim", "d": true }));
+    assert_eq!(rows[1][1], json!({ "t": " inv", "inv": true }));
+    assert_eq!(rows[1][2], json!({ "t": " " }));
+    assert_eq!(rows[1][3], json!({ "t": "rgb", "fg": "#010203" }));
+    assert_eq!(rows[2][0]["t"], "❯ ", "explicit trailing spaces are content");
+    assert_eq!(j["cursor"], json!({ "row": 2, "col": 2 }));
+
+    let calls = app.calls();
+    assert_eq!(calls[0].0, "surface.read_screen_vt");
+    assert_eq!(calls[0].1, json!({ "surface_id": "pane-1", "rows": 50 }));
+}
+
+#[test]
+fn styled_rows_handles_width_fallback_and_cursor_math() {
+    let rows = styled_rows("a\nb\n\n", 0);
+    assert_eq!(rows.len(), 2, "trailing blank rows are dropped");
+    assert_eq!(rows[1][0].t, "b");
+    assert!(styled_rows("", 80).is_empty());
+    assert_eq!(cursor_in_tail(10, 4, 1, 7, true), Some((7, 7)));
+    assert_eq!(cursor_in_tail(10, 4, 1, 7, false), None);
+    assert_eq!(cursor_in_tail(2, 4, 1, 0, true), None, "tail shorter than the viewport");
+    assert_eq!(cursor_in_tail(10, 0, 0, 0, true), None);
 }
 
 #[tokio::test]

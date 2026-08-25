@@ -15,6 +15,11 @@
   var POLL_MS = 2000;
   var SCREEN_LINES = 200;
   var BOTTOM_SLACK_PX = 24;
+  // xterm-style 16-color palette; 16–231 is the 6x6x6 cube, 232–255 grays.
+  var ANSI16 = [
+    '#000000', '#cd3131', '#0dbc79', '#e5e510', '#2472c8', '#bc3fbc', '#11a8cd', '#e5e5e5',
+    '#666666', '#f14c4c', '#23d18b', '#f5f543', '#3b8eea', '#d670d6', '#29b8db', '#ffffff'
+  ];
 
   var $ = function (id) { return document.getElementById(id); };
   var el = {
@@ -113,6 +118,65 @@
     return bits.length ? head + ' · ' + bits.join(' ') : head;
   }
 
+  function paletteColor(c) {
+    if (c === null || c === undefined) { return null; }
+    if (typeof c === 'string') { return c; }
+    if (c < 16) { return ANSI16[c]; }
+    if (c < 232) {
+      var n = c - 16;
+      var steps = [0, 95, 135, 175, 215, 255];
+      var r = steps[Math.floor(n / 36)], g = steps[Math.floor(n / 6) % 6], b = steps[n % 6];
+      return 'rgb(' + r + ',' + g + ',' + b + ')';
+    }
+    var v = 8 + (c - 232) * 10;
+    return 'rgb(' + v + ',' + v + ',' + v + ')';
+  }
+
+  // Draw styled rows (see http_mobile::styled_rows) into the <pre>. Colors go
+  // through the CSSOM, which the page's CSP allows; attribute classes carry
+  // bold/dim/italic/underline/inverse. The cursor cell gets a marker.
+  function renderStyled(rows, cursor) {
+    var frag = document.createDocumentFragment();
+    rows.forEach(function (spans, rowIndex) {
+      var col = 0;
+      spans.forEach(function (s) {
+        var text = s.t || '';
+        var cursorHere = cursor && cursor.row === rowIndex && cursor.col >= col && cursor.col < col + text.length;
+        if (cursorHere) {
+          var at = cursor.col - col;
+          appendSpan(frag, text.slice(0, at), s, false);
+          appendSpan(frag, text.charAt(at) || ' ', s, true);
+          appendSpan(frag, text.slice(at + 1), s, false);
+        } else {
+          appendSpan(frag, text, s, false);
+        }
+        col += text.length;
+      });
+      if (cursor && cursor.row === rowIndex && cursor.col >= col) {
+        appendSpan(frag, ' ', {}, true);
+      }
+      frag.appendChild(document.createTextNode('\n'));
+    });
+    el.screen.textContent = '';
+    el.screen.appendChild(frag);
+  }
+
+  function appendSpan(parent, text, s, isCursor) {
+    if (!text && !isCursor) { return; }
+    var node = document.createElement('span');
+    node.textContent = text;
+    var fg = paletteColor(s.fg), bg = paletteColor(s.bg);
+    if (s.inv) { var tmp = fg; fg = bg; bg = tmp; node.classList.add('inv'); }
+    if (fg) { node.style.color = fg; }
+    if (bg) { node.style.backgroundColor = bg; }
+    if (s.b) { node.classList.add('b'); }
+    if (s.d) { node.classList.add('d'); }
+    if (s.i) { node.classList.add('i'); }
+    if (s.u) { node.classList.add('u'); }
+    if (isCursor) { node.classList.add('cursor'); }
+    parent.appendChild(node);
+  }
+
   function surfaceFromPath() {
     var m = /^\/t\/([A-Za-z0-9._-]+)\/?$/.exec(window.location.pathname);
     return m ? m[1] : null;
@@ -173,12 +237,18 @@
     var t = state.selected;
     if (!t) { return Promise.resolve(); }
     var stickToBottom = isAtBottom(el.screen);
-    return api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + '/screen?lines=' + SCREEN_LINES)
+    return api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + '/screen?lines=' + SCREEN_LINES + '&format=styled')
       .then(function (data) {
-        var text = (data && data.text) || '';
-        if (text !== state.lastText) {
-          state.lastText = text;
-          el.screen.textContent = text;
+        var styled = data && Array.isArray(data.rows);
+        // Compare the serialized frame so an unchanged screen is not redrawn.
+        var key = styled ? JSON.stringify([data.rows, data.cursor]) : ((data && data.text) || '');
+        if (key !== state.lastText) {
+          state.lastText = key;
+          if (styled) {
+            renderStyled(data.rows, data.cursor || null);
+          } else {
+            el.screen.textContent = (data && data.text) || '';
+          }
           if (stickToBottom) {
             el.screen.scrollTop = el.screen.scrollHeight;
           }
