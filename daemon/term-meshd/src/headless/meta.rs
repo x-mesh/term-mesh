@@ -49,6 +49,12 @@ pub struct TeamMeta {
     pub termmesh_app_version: String,
     pub app_socket_path_at_create: Option<String>,
     pub runbook_digest_hash: Option<String>,
+    #[serde(default = "default_delegation_level")]
+    pub delegation_configured: String,
+    #[serde(default = "default_delegation_level")]
+    pub delegation_effective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_pending: Option<String>,
     /// Schema v2 — live-snapshot support (Restore Fleet Layer 1).
     /// `true` while the team is (believed to be) running: the dir under
     /// `<team_uuid>/` is a continuously-refreshed snapshot, not an archive.
@@ -64,6 +70,10 @@ pub struct TeamMeta {
     /// when the fleet is restored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout_workspace_title: Option<String>,
+}
+
+fn default_delegation_level() -> String {
+    "leaderFirst".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

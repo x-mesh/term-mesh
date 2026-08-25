@@ -76,7 +76,8 @@ struct LeaderParticipationSettings: Equatable {
     }
 
     func controlPayload(
-        projectID: String, sessionID: String, supportedLeader: Bool, health: Health
+        projectID: String, sessionID: String, supportedLeader: Bool, health: Health,
+        delegationState: ProjectDelegationState = .default
     ) -> [String: Any] {
         [
             "schema_version": 1,
@@ -88,6 +89,9 @@ struct LeaderParticipationSettings: Equatable {
             "opt_in": optInProjects.contains(projectID),
             "project_id": projectID,
             "session_id": sessionID,
+            "delegation_configured": delegationState.configured.rawValue,
+            "delegation_effective": delegationState.effective.rawValue,
+            "delegation_pending": delegationState.pending?.rawValue as Any? ?? NSNull(),
         ]
     }
 }

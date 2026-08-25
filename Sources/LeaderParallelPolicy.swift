@@ -1,12 +1,131 @@
 import CryptoKit
 import Foundation
 
+enum ProjectDelegationLevel: String, CaseIterable, Codable, Sendable {
+    case leaderFirst
+    case guarded
+    case delegated
+
+    var displayName: String {
+        switch self {
+        case .leaderFirst: return "Leader first"
+        case .guarded: return "Guarded"
+        case .delegated: return "Delegated"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .leaderFirst:
+            return "The leader handles serial work and delegates only independent parallel units."
+        case .guarded:
+            return "Serial work stays with the leader; risk conditions add one read-only probe."
+        case .delegated:
+            return "Serial implementation goes to one worker; independent units still run in parallel."
+        }
+    }
+}
+
+struct ProjectDelegationState: Codable, Equatable, Sendable {
+    var configured: ProjectDelegationLevel
+    var effective: ProjectDelegationLevel
+    var pending: ProjectDelegationLevel?
+
+    static let `default` = Self(
+        configured: .leaderFirst, effective: .leaderFirst, pending: nil
+    )
+
+    init(
+        configured: ProjectDelegationLevel = .leaderFirst,
+        effective: ProjectDelegationLevel = .leaderFirst,
+        pending: ProjectDelegationLevel? = nil
+    ) {
+        self.configured = configured
+        self.effective = effective
+        self.pending = pending
+    }
+
+    init(
+        configuredRaw: String?, effectiveRaw: String?, pendingRaw: String?
+    ) {
+        let configured = ProjectDelegationLevel(rawValue: configuredRaw ?? "") ?? .leaderFirst
+        self.configured = configured
+        self.effective = ProjectDelegationLevel(rawValue: effectiveRaw ?? "") ?? configured
+        self.pending = ProjectDelegationLevel(rawValue: pendingRaw ?? "")
+    }
+}
+
+enum ProjectTaskShape: String, CaseIterable, Codable, Sendable {
+    case singleUnit = "single_unit"
+    case multiUnit = "multi_unit"
+    case crossSubsystem = "cross_subsystem"
+    case parallelizable
+
+    var supportsParallelWave: Bool { self != .singleUnit }
+}
+
+enum ProjectRoutingRisk: String, CaseIterable, Codable, Sendable {
+    case crossSubsystem = "cross_subsystem"
+    case protocolOrPersistence = "protocol_or_persistence"
+    case irreversibleOrRelease = "irreversible_or_release"
+    case unverifiedCoreAssumption = "unverified_core_assumption"
+    case repeatedFailure = "repeated_failure"
+}
+
+enum ProjectRoutingRoute: String, Codable, Sendable {
+    case direct
+    case probe
+    case delegated
+    case parallel
+}
+
+struct ProjectRoutingDecision: Codable, Equatable, Sendable {
+    let route: ProjectRoutingRoute
+    let reasons: [String]
+    let workerCount: Int
+
+    static func decide(
+        level: ProjectDelegationLevel,
+        taskShape: ProjectTaskShape,
+        risks: Set<ProjectRoutingRisk>,
+        availableWorkers: Int
+    ) -> Self {
+        let workers = max(0, availableWorkers)
+        guard workers > 0 else {
+            return Self(route: .direct, reasons: ["no_available_workers"], workerCount: 0)
+        }
+        if taskShape.supportsParallelWave, workers >= 2 {
+            return Self(
+                route: .parallel, reasons: ["parallel_ready"],
+                workerCount: min(3, workers)
+            )
+        }
+        switch level {
+        case .leaderFirst:
+            return Self(
+                route: .direct,
+                reasons: [taskShape.supportsParallelWave ? "limited_capacity" : "leader_first"],
+                workerCount: 0
+            )
+        case .guarded:
+            guard !risks.isEmpty else {
+                return Self(route: .direct, reasons: ["guard_not_required"], workerCount: 0)
+            }
+            return Self(
+                route: .probe, reasons: risks.map(\.rawValue).sorted(), workerCount: 1
+            )
+        case .delegated:
+            return Self(route: .delegated, reasons: ["delegated_serial_work"], workerCount: 1)
+        }
+    }
+}
+
 /// The one policy source for leader routing. Every local or peer leader prompt
 /// renderer consumes `renderedInstructions`; no renderer owns a fork of these
 /// scheduling rules.
 enum LeaderParallelPolicy {
     static let version = "11"
-    static let activation = "runtime-enforced"
+    static let activation = "request-boundary-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do
     /// not reorder them: a changed order is a policy change and must produce a

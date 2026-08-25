@@ -118,6 +118,12 @@ pub struct PersistedProjectPresentation {
     #[serde(default)]
     pub created_at_unix_secs: u64,
     pub leader_surface_id: String,
+    #[serde(default)]
+    pub delegation_configured: String,
+    #[serde(default)]
+    pub delegation_effective: String,
+    #[serde(default)]
+    pub delegation_pending: String,
     pub members: Vec<PersistedProjectMember>,
     pub revision: u64,
 }
@@ -512,6 +518,9 @@ mod tests {
             project_root: "/srv/demo".into(),
             created_at_unix_secs: 1_700_000_000,
             leader_surface_id: hex::encode([8u8; 16]),
+            delegation_configured: String::new(),
+            delegation_effective: String::new(),
+            delegation_pending: String::new(),
             members: vec![PersistedProjectMember {
                 name: "executor".into(),
                 agent_instance_id: "agent-instance".into(),

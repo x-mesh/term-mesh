@@ -1071,6 +1071,7 @@ struct ProjectLeader: Equatable {
     /// stages never need to infer locality from a pane UUID (which is only
     /// unique within its creating host).
     var endpoint: LeaderEndpoint = .local
+    var delegationLevel: ProjectDelegationLevel = .leaderFirst
 }
 
 /// A leader's address before (and after) it has a pane.  A remote pane ID is

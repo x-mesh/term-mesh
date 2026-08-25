@@ -1044,6 +1044,8 @@ class TerminalController {
             return v2Result(id: id, self.v2TeamLeaderRequestTake(params: params))
         case "team.leader.request.complete":
             return v2Result(id: id, self.v2TeamLeaderRequestComplete(params: params))
+        case "team.delegation.configure":
+            return v2Result(id: id, self.v2TeamDelegationConfigure(params: params))
         case "team.send":
             return v2Result(id: id, self.v2TeamSend(params: params))
         case "team.broadcast":
@@ -3419,9 +3421,16 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
         let requestId = params["request_id"] as? String
+        let taskShape = ProjectTaskShape(
+            rawValue: (params["task_shape"] as? String) ?? ""
+        ) ?? .singleUnit
+        let riskReasons = Set(
+            (params["risk_reasons"] as? [String] ?? []).compactMap(ProjectRoutingRisk.init(rawValue:))
+        )
         let stored: (request: TeamDataStore.LeaderRequest, replayed: Bool, persisted: Bool)
         switch TeamDataStore.shared.enqueueLeaderRequest(
-            teamName: teamName, content: text, requestId: requestId
+            teamName: teamName, content: text, requestId: requestId,
+            taskShape: taskShape, riskReasons: riskReasons
         ) {
         case .created(let request, let persisted): stored = (request, false, persisted)
         case .replayed(let request, let persisted): stored = (request, true, persisted)
@@ -5217,6 +5226,9 @@ class TerminalController {
         }
         switch store.takeLeaderRequest(teamName: teamName, requestId: requestId) {
         case .succeeded(let request):
+            DispatchQueue.main.async {
+                TeamOrchestrator.shared.syncDelegationStateFromStore(teamName: teamName)
+            }
             return v2Ok(id: id, result: store.leaderRequestDictionary(request, includeContent: true))
         case .notFound:
             return v2Error(id: id, code: "not_found", message: "Leader request not found")
@@ -6149,8 +6161,15 @@ class TerminalController {
         }
 
         let stored: (request: TeamDataStore.LeaderRequest, replayed: Bool, persisted: Bool)
+        let taskShape = ProjectTaskShape(
+            rawValue: (params["task_shape"] as? String) ?? ""
+        ) ?? .singleUnit
+        let riskReasons = Set(
+            (params["risk_reasons"] as? [String] ?? []).compactMap(ProjectRoutingRisk.init(rawValue:))
+        )
         switch TeamDataStore.shared.enqueueLeaderRequest(
-            teamName: teamName, content: text, requestId: params["request_id"] as? String
+            teamName: teamName, content: text, requestId: params["request_id"] as? String,
+            taskShape: taskShape, riskReasons: riskReasons
         ) {
         case .created(let request, let persisted): stored = (request, false, persisted)
         case .replayed(let request, let persisted): stored = (request, true, persisted)
@@ -6227,6 +6246,9 @@ class TerminalController {
         }
         switch TeamDataStore.shared.takeLeaderRequest(teamName: teamName, requestId: requestId) {
         case .succeeded(let request):
+            DispatchQueue.main.async {
+                TeamOrchestrator.shared.syncDelegationStateFromStore(teamName: teamName)
+            }
             return .ok(TeamDataStore.shared.leaderRequestDictionary(request, includeContent: true))
         case .notFound:
             return .err(code: "not_found", message: "Leader request not found", data: nil)
@@ -6257,6 +6279,37 @@ class TerminalController {
         case .persistenceFailed:
             return .err(code: "persistence_failed", message: "Could not persist leader request completion", data: nil)
         }
+    }
+
+    private func v2TeamDelegationConfigure(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String,
+              let rawLevel = params["level"] as? String,
+              let level = ProjectDelegationLevel(rawValue: rawLevel) else {
+            return .err(
+                code: "invalid_params",
+                message: "level must be leaderFirst, guarded, or delegated", data: nil
+            )
+        }
+        guard TeamDataStore.shared.isAuthorizedLeaderRequestToken(
+            teamName: teamName, token: params["leader_request_token"] as? String
+        ) else {
+            return .err(code: "unauthorized", message: "Leader request capability required", data: nil)
+        }
+        var state: ProjectDelegationState?
+        v2MainSync {
+            state = TeamOrchestrator.shared.setProjectDelegationLevel(
+                teamName: teamName, level: level
+            )
+        }
+        guard let state else {
+            return .err(code: "not_found", message: "Team not found", data: nil)
+        }
+        return .ok([
+            "team_name": teamName,
+            "configured": state.configured.rawValue,
+            "effective": state.effective.rawValue,
+            "pending": state.pending?.rawValue as Any? ?? NSNull(),
+        ])
     }
 
     private func v2TeamSend(params: [String: Any]) -> V2CallResult {

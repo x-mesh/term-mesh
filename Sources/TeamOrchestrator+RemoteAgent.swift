@@ -509,6 +509,9 @@ extension TeamOrchestrator {
             team.gitRepoRoot ?? "",
             hostKey,
             leaderID,
+            team.delegationState.configured.rawValue,
+            team.delegationState.effective.rawValue,
+            team.delegationState.pending?.rawValue ?? "",
             members,
         ].joined(separator: "\u{1d}")
     }
@@ -575,6 +578,9 @@ extension TeamOrchestrator {
         project.createdAtUnixSecs = UInt64(max(0, team.createdAt.timeIntervalSince1970))
         project.leaderSurfaceID = leaderSurfaceID
         project.projectID = Self.remoteProjectPresentationID(teamUUID: teamUUID)
+        project.delegationConfigured = team.delegationState.configured.rawValue
+        project.delegationEffective = team.delegationState.effective.rawValue
+        project.delegationPending = team.delegationState.pending?.rawValue ?? ""
         project.members = team.agents.compactMap { agent in
             guard let surfaceID = agent.remoteSurfaceID else { return nil }
             var member = Termmesh_Peer_V1_TeamMember()
@@ -1221,6 +1227,7 @@ extension TeamOrchestrator {
             remotePresentationHostKey: host.id,
             remoteLeaderSurfaceID: remote.leaderSurfaceID
         )
+        team.delegationState = remote.delegationState
         // A background pane is pending, while a selected workspace can finish
         // its relay before this team record is installed. Read the session's
         // actual state so neither ordering loses the readiness transition.
@@ -7532,6 +7539,7 @@ extension TeamOrchestrator {
         pairMode: String = "none",
         pairModel: String = "",
         pairSpec: String = "",
+        delegationLevel: ProjectDelegationLevel = .leaderFirst,
         projectSource: ProjectSource? = nil,
         /// What the bootstrap actually created, as the setup script reported
         /// it. Empty means nothing here is deletable, which is the safe answer
@@ -7653,6 +7661,7 @@ extension TeamOrchestrator {
             pairMode: pairMode,
             pairModel: pairModel,
             pairSpec: pairSpec,
+            delegationLevel: delegationLevel,
             resumeSessionId: resumeSessionId,
             worktreeMode: worktreeMode,
             executionMode: executionMode,

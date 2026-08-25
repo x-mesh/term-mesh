@@ -2422,6 +2422,9 @@ enum LeaderRequestCommands {
     Take { request_id: String },
     /// Mark a request completed
     Complete { request_id: String },
+    /// Change the Project's configured delegation level. Active work keeps its
+    /// current snapshot; the next request receives the pending value.
+    Configure { level: String },
 }
 
 #[derive(Subcommand)]
@@ -5074,6 +5077,7 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.leader.request.list"
             | "team.leader.request.take"
             | "team.leader.request.complete"
+            | "team.delegation.configure"
             | "team.message.list"
             | "team.correlation.register"
             | "team.correlation.get"
@@ -7660,6 +7664,15 @@ fn main() {
                     json!({
                         "team_name": team,
                         "request_id": request_id,
+                        "leader_request_token": env::var("TERMMESH_LEADER_REQUEST_TOKEN").unwrap_or_default(),
+                    }),
+                ),
+                LeaderRequestCommands::Configure { level } => rpc_call(
+                    &sock,
+                    "team.delegation.configure",
+                    json!({
+                        "team_name": team,
+                        "level": level,
                         "leader_request_token": env::var("TERMMESH_LEADER_REQUEST_TOKEN").unwrap_or_default(),
                     }),
                 ),
@@ -19266,6 +19279,7 @@ mod auto_watch_tests {
             "team.leader.request.list",
             "team.leader.request.take",
             "team.leader.request.complete",
+            "team.delegation.configure",
         ] {
             assert!(remote_leader_method_allowed(method), "{method}");
         }
