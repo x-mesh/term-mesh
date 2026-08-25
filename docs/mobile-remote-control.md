@@ -337,6 +337,24 @@ Mac 앱이 peer 프로토콜로 직접 읽고 쓰는 방식. `SurfaceInfo`에 `r
 완료 조건: 위 테스트 전부 통과. Tailscale 없이 loopback에서 Claude pane과 Codex
 pane 각각 `/rc on` → 읽기 → 텍스트 → 키가 동작.
 
+검증 기록 (2026-08-25, `feat/mobile-remote-control` e4cb0a7c):
+
+- 단위·통합: `remote_registry` 12, `mobile_http` 18, `term-mesh-cli` 223+5 통과.
+  release build, Debug xcodebuild(번들에 `rc.md` 복사) 통과.
+- mac-sub socket E2E `test_mobile_remote_control.py` PASS: shell pane에 `remote on` →
+  목록·화면 → 텍스트 타이핑 + `Enter` 실행 → request_id dedupe → `q` 403 →
+  `keys=none` 403 → `remote off` 404, repl 리더에 `--leader` → `team.read` 화면 →
+  `POST /text` 202 → `/requests`와 app board에서 request 확인.
+- tagged app(`--tag mobile-rc`, auth=loopback) 수동 smoke: Claude Code pane에서 텍스트
+  타이핑·`Enter`·`Up`/`Down`(입력 히스토리 이동으로 화면 변화 관찰)·`Escape` 전달 확인.
+  Codex pane에서 텍스트 타이핑, `/` 팝업 표시, `Escape`로 팝업 닫힘 확인. Codex 팝업의
+  선택 강조는 색상만 바뀌어 텍스트 화면으로는 화살표 효과를 관찰할 수 없었다.
+- 두 가지를 구현 중에 고쳤다. (1) 화살표를 `send_text`의 CSI 바이트로 보내면 kitty
+  keyboard protocol을 켠 Claude Code에 닿지 않아 앱 `sendNamedKey`/`queuedTextForNamedKey`에
+  `up/down/left/right` 키 이벤트를 추가했다. (2) `team.leader.request.list`는 리더 pane의
+  capability token이 필요해 `tm-agent remote on --leader`가 `TERMMESH_LEADER_REQUEST_TOKEN`을
+  registry에 넘기고(직렬화 안 함) listener가 목록 조회에만 전달한다.
+
 ### Phase 2 — Tailscale
 
 1. `tailscale serve --bg 9877`. term-mesh는 tailscale 상태를 바꾸지 않는다.
