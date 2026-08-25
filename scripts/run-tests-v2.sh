@@ -107,6 +107,10 @@ E2E_RUN_ID="$$"
 APP_SOCK_PATH="${TMPDIR:-/tmp}/term-mesh-e2e-app-${E2E_RUN_ID}.sock"
 DAEMON_SOCK_PATH="${TMPDIR:-/tmp}/term-meshd-e2e-${E2E_RUN_ID}.sock"
 DAEMON_LOG_PATH="/tmp/term-meshd-e2e-${E2E_RUN_ID}.log"
+# Mobile remote-control listener (docs/mobile-remote-control.md §9 T7): the
+# e2e daemon exposes it on a per-run loopback port in loopback auth mode so
+# tests_v2/test_mobile_remote_control.py can drive it without Tailscale.
+MOBILE_LISTENER_ADDR="127.0.0.1:$(( 21000 + E2E_RUN_ID % 1000 ))"
 E2E_APP_PID=""
 E2E_DAEMON_PID=""
 REMOTE_FIXTURE_SSH_TARGET=""
@@ -331,6 +335,7 @@ reset_e2e_state() {
 
 E2E_STATE_DIR="${TMPDIR:-/tmp}/termmesh-e2e-state.$$"
 export TERMMESH_E2E_STATE_DIR="$E2E_STATE_DIR"
+export TERMMESH_E2E_MOBILE_ADDR="$MOBILE_LISTENER_ADDR"
 # A test that relaunches the app respawns this exact binary with this exact env.
 export TERMMESH_APP_BIN="$APP/Contents/MacOS/term-mesh DEV"
 trap 'cleanup; cleanup_remote_relay_fixture; rm -rf "$E2E_STATE_DIR"; defaults delete com.termmesh.e2e >/dev/null 2>&1 || true' EXIT
@@ -353,6 +358,9 @@ launch_and_wait() {
 
   TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
   TERM_MESH_HTTP_DISABLED=1 \
+  TERM_MESH_MOBILE_ENABLED=1 \
+  TERM_MESH_MOBILE_AUTH=loopback \
+  TERM_MESH_MOBILE_ADDR="$MOBILE_LISTENER_ADDR" \
   "$DAEMON_BIN" >>"$DAEMON_LOG_PATH" 2>&1 &
   E2E_DAEMON_PID=$!
 

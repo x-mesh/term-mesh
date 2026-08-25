@@ -323,10 +323,14 @@ Mac 앱이 peer 프로토콜로 직접 읽고 쓰는 방식. `SurfaceInfo`에 `r
    - 일반 pane `remote on` → `POST /text` → `surface.read_text`로 수신 확인
    - `POST /key Enter` → 화면 변화 확인
    - `remote off` → 404 ; `keys=none` 재등록 → `/key` 403
-   - Claude pane과 Codex pane 각각 한 번
+   - mac-sub에는 agent CLI가 없으므로 E2E는 shell pane과 repl 리더로 돈다. Claude·Codex
+     실제 CLI에서의 `/rc on`·키 반응(화살표 CSI 포함)은 7번의 tagged app 수동 smoke로 확인한다.
 7. `(cd daemon && cargo build --release)`, `term-mesh-unit`, Debug build,
-   `./scripts/reload.sh --tag mobile-rc`로 tagged app을 띄워 `curl 127.0.0.1:<tag port>`
-   smoke, `--cleanup`.
+   `./scripts/reload.sh --tag mobile-rc`로 tagged app을 띄워(`defaults write
+   com.termmesh.app.debug termMeshMobileEnabled -bool true`, `termMeshMobileAuth loopback`)
+   Claude pane과 Codex pane에서 `/rc on` → 폰 대신 Mac Safari로 `curl`/페이지 smoke,
+   `--cleanup`. 러너는 daemon을 직접 띄우므로 `TERM_MESH_MOBILE_*`를 daemon 실행 줄에
+   넣고 `TERMMESH_E2E_MOBILE_ADDR`로 테스트에 전달한다.
 
 완료 조건: 위 테스트 전부 통과. Tailscale 없이 loopback에서 Claude pane과 Codex
 pane 각각 `/rc on` → 읽기 → 텍스트 → 키가 동작.
