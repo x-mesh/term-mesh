@@ -14,6 +14,7 @@ Use this prompt as the Codex wrapper for `/rc`. All operations must use `tm-agen
 
 ```text
 /rc on [--keys safe|none] [--ttl 12h] [--leader] [--title NAME]
+/rc on --agent <name> [--view auto|chat|terminal] [--ttl 12h]   # expose a team agent's pane (chat if native)
 /rc off
 /rc status [--all]
 /rc help

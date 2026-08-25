@@ -12,6 +12,7 @@ User provided: $ARGUMENTS
 
 ```
 /rc on [--keys safe|none] [--ttl 12h] [--leader] [--title NAME]
+/rc on --agent <name> [--view auto|chat|terminal] [--ttl 12h]
 /rc off
 /rc status [--all]
 /rc help
@@ -21,6 +22,7 @@ User provided: $ARGUMENTS
 - **--keys safe|none** — 모바일에서 보낼 수 있는 키. `safe`(기본)는 Enter/Esc/Tab/↑↓←→/y/n/1–9/Ctrl-C 고정 allowlist, `none`은 키 전송 차단.
 - **--ttl** — 노출 시간(`30m`, `12h`, `2d`, 초). 기본 24h, daemon이 60s–7d로 clamp.
 - **--leader** — 팀 리더로 등록. 앱이 띄운 리더 pane은 자동 감지되므로 보통 생략한다. adopt한 리더(`TERMMESH_TEAM` 없음)는 `--leader --team ws-<hex>`를 함께 준다.
+- **--agent NAME** — 이 pane 대신 팀 에이전트 NAME의 pane을 노출한다(리더 pane 또는 `--team`과 함께). native pane이면 채팅 뷰, 아니면 터미널 미러로 자동 등록하고 `--view chat|terminal`로 강제할 수 있다.
 - **off** — 노출 해제.
 - **status** — 이 pane의 노출 상태. `--all`은 daemon의 모든 노출 surface.
 
