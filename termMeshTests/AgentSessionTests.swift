@@ -17,6 +17,13 @@ import SwiftUI
 /// parsing: turning the stream into things a view can draw as what they are.
 @MainActor
 final class AgentSessionTests: XCTestCase {
+    func testChatTurnPreservesLineBreaksAndNormalizesCarriageReturns() {
+        XCTAssertEqual(
+            TerminalSurface.normalizedChatTurn("first\r\nsecond\rthird"),
+            "first\nsecond\nthird"
+        )
+    }
+
     func testIsolatedWorktreeBranchUsesDurableInstanceIdentity() {
         let first = TeamOrchestrator.isolatedWorktreeBranch(
             teamName: "term-mesh", agentName: "executor",

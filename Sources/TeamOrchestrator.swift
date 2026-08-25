@@ -7524,6 +7524,9 @@ final class TeamOrchestrator: ObservableObject {
                 if let pid = agent.panelId {
                     info["panel_id"] = pid.uuidString
                 }
+                if let sessionId = agent.claudeSessionId?.nilIfBlank {
+                    info["session_id"] = sessionId
+                }
                 if let branch = agent.worktreeBranch {
                     info["worktree_branch"] = branch
                 }

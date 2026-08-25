@@ -21,9 +21,10 @@ $rc status [--all]
 $rc help
 ```
 
-`on` exposes this pane: a team agent pane (native) as a chat, the leader pane
-as its durable request board, any other pane as a terminal mirror. `--terminal`
-forces the mirror. `--agent` takes this pane's own agent when NAME is omitted;
+`on` exposes this pane. A terminal-backed Claude/Codex session lets the mobile
+page switch between Chat and Terminal without changing the local pane. Native
+agent panes use Chat, leaders use the request board, and plain shells use
+Terminal only. `--terminal` forces the mirror. `--agent` takes this pane's own agent when NAME is omitted;
 naming another agent needs the leader pane (or `--team`).
 
 If the arguments are `help` or empty, print this usage block and stop.
@@ -45,6 +46,11 @@ running app's own binary (a tagged development app lives outside
 older binary answers `unrecognized subcommand 'remote'`; then try the next
 binary rather than another spelling.
 
+Invoke the selected binary directly and let the tool capture stdout, stderr,
+and the exit code. Do not wrap it in `output=$(...)`, append `status=$?`, or
+otherwise build a shell output-capture wrapper: `status` is read-only in zsh,
+and a wrapper failure can hide the command's real result after it already ran.
+
 Show the command output verbatim (URL, keys, expiry). After `on`, tell the user
 in one or two lines: the printed URL (loopback on the Mac; from a phone it is
 `https://<mac-hostname>.<tailnet>.ts.net/t/<surface_id>` once
@@ -61,7 +67,8 @@ Do not retry, poll, or change team membership.
   running Claude or Codex by hand is not a team agent and gets the mirror.
 - Leader pane: phone text arrives as a durable leader request with the usual
   wake instruction; take it as you normally do.
-- Any other pane: phone text is typed into this terminal; the safe key row
+- A terminal-backed Claude/Codex pane can switch between Chat (whole turns +
+  session transcript) and Terminal (screen + keys). Other panes use the safe key row
   (Enter/Esc/Tab/Backspace/arrows/y/n/1–9/Ctrl-C) answers prompts and menus.
 - Only this pane's screen is visible to the phone. `$rc off`, closing the pane,
   or the TTL removes the exposure.

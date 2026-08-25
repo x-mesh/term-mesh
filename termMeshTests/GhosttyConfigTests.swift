@@ -1233,6 +1233,19 @@ final class PostHogAnalyticsPropertiesTests: XCTestCase {
 /// The environment must be settled before `ghostty_init` records where it
 /// lives. See `GhosttyEnvironment`.
 final class GhosttyEnvironmentOrderingTests: XCTestCase {
+    func testNewPaneDropsInheritedAgentConversationIdentity() {
+        let cleaned = TerminalSurface.removingInheritedCLISessionIdentity(from: [
+            "CODEX_SESSION_ID": "parent-codex",
+            "CODEX_THREAD_ID": "parent-thread",
+            "CLAUDE_CODE_SESSION_ID": "parent-claude",
+            "PATH": "/usr/bin",
+        ])
+        XCTAssertEqual(cleaned["CODEX_SESSION_ID"], "")
+        XCTAssertEqual(cleaned["CODEX_THREAD_ID"], "")
+        XCTAssertEqual(cleaned["CLAUDE_CODE_SESSION_ID"], "")
+        XCTAssertEqual(cleaned["PATH"], "/usr/bin")
+    }
+
     /// The one combination that cost a release: adding a name after
     /// `ghostty_init` recorded the environment block. libc grows the array and
     /// moves it, and ghostty keeps reading the old address — which in 0.174.0

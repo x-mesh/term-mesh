@@ -205,8 +205,10 @@ wake instruction으로 깨어나고, 일반 pane은 텍스트가 그대로 타�
 
 ### 4.5 Mobile page
 
-대상 목록에는 터미널 pane(리더·일반)과 native 에이전트가 함께 나온다. 터미널 pane은
-화면 미러, native 에이전트(`kind=agent`)는 채팅 뷰다. 채팅 뷰는 `/transcript`를 2초마다
+대상 목록에는 터미널 pane(리더·일반)과 native 에이전트가 함께 나온다. Claude/Codex
+session id가 있는 터미널 pane은 상단 segmented control에서 Chat과 Terminal을 선택하고
+target별 선택을 브라우저에 저장한다. 일반 shell은 Terminal만, native 에이전트는 Chat만
+제공한다. Chat은 CLI JSONL session log를 읽고 `/transcript`를 2초마다
 (턴이 진행 중이면 1초마다) 받아 entry id별로 그린다: 사람/리더의 지시는 오른쪽 말풍선,
 답변은 왼쪽, thought는 흐리게, tool 호출은 접히는 행(이름·headline·`+N −M 경로`·결과),
 턴 종료는 비용·시간·토큰 메타. composer는 `team.send`로 한 턴을 보내고 진행 중이면

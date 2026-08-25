@@ -459,7 +459,10 @@ fn grid_fixture() -> Value {
 async fn styled_screen_maps_the_render_grid_into_spans_with_a_cursor() {
     let dir = tempfile::tempdir().unwrap();
     let app = FakeApp::spawn(dir.path());
-    app.reply("surface.read_screen_grid", json!({ "grid": grid_fixture() }));
+    app.reply(
+        "surface.read_screen_grid",
+        json!({ "grid": grid_fixture() }),
+    );
     let h = start_tailscale().await;
     expose(&h, &app, "pane-1", TargetKind::Pane, KeysPolicy::Safe).await;
 
@@ -475,15 +478,26 @@ async fn styled_screen_maps_the_render_grid_into_spans_with_a_cursor() {
     assert_eq!(rows[1][0], json!({ "t": "red", "fg": "#ff0000" }));
     assert_eq!(rows[1][1], json!({ "t": " plain" }));
     assert_eq!(rows[2][0], json!({ "t": "dim", "d": true }));
-    assert_eq!(rows[2][1], json!({ "t": "  " }), "column gap filled with spaces");
+    assert_eq!(
+        rows[2][1],
+        json!({ "t": "  " }),
+        "column gap filled with spaces"
+    );
     assert_eq!(rows[2][2], json!({ "t": "inv", "inv": true }));
-    assert_eq!(rows[2][3], json!({ "t": "      " }), "invisible text renders as spaces");
+    assert_eq!(
+        rows[2][3],
+        json!({ "t": "      " }),
+        "invisible text renders as spaces"
+    );
     assert_eq!(rows[3][0], json!({ "t": "❯ " }));
     assert_eq!(j["cursor"], json!({ "row": 3, "col": 2 }));
 
     let calls = app.calls();
     assert_eq!(calls[0].0, "surface.read_screen_grid");
-    assert_eq!(calls[0].1, json!({ "surface_id": "pane-1", "scrollback_lines": 50 }));
+    assert_eq!(
+        calls[0].1,
+        json!({ "surface_id": "pane-1", "scrollback_lines": 50 })
+    );
 }
 
 #[tokio::test]
@@ -501,7 +515,10 @@ async fn styled_falls_back_to_text_when_the_app_lacks_the_rpc() {
     assert_eq!(j["styled_unavailable"], true);
     assert_eq!(j["text"], "plain only");
     let methods: Vec<String> = app.calls().into_iter().map(|c| c.0).collect();
-    assert_eq!(methods, vec!["surface.read_screen_grid", "surface.read_text"]);
+    assert_eq!(
+        methods,
+        vec!["surface.read_screen_grid", "surface.read_text"]
+    );
 }
 
 #[test]
@@ -737,7 +754,10 @@ async fn keys_follow_policy_and_the_safe_allowlist() {
     );
     assert_eq!(
         calls[2],
-        ("surface.send_key".into(), json!({ "surface_id": "open", "key": "up" }))
+        (
+            "surface.send_key".into(),
+            json!({ "surface_id": "open", "key": "up" })
+        )
     );
     assert_eq!(
         calls[3],
@@ -952,19 +972,42 @@ async fn agent_targets_take_turns_and_show_the_transcript() {
     assert_eq!(j["running"], true);
     assert_eq!(j["entries"][1]["text"], "hi there");
     assert_eq!(app.calls()[0].0, "team.agent.transcript");
-    assert_eq!(app.calls()[0].1, json!({ "team_name": "live-team", "agent_name": "worker-1", "limit": 50 }));
+    assert_eq!(
+        app.calls()[0].1,
+        json!({ "team_name": "live-team", "agent_name": "worker-1", "limit": 50 })
+    );
 
-    let sent = post(&h, "/api/targets/panel-1/text", json!({ "text": "do it", "request_id": "a-1" })).await;
+    let sent = post(
+        &h,
+        "/api/targets/panel-1/text",
+        json!({ "text": "do it", "request_id": "a-1" }),
+    )
+    .await;
     assert_eq!(sent.status, 202, "{}", sent.body);
     assert_eq!(sent.json()["kind"], "agent");
     assert_eq!(sent.json()["delivery_scope"], "transport_write");
     assert_eq!(app.calls()[1].0, "team.send");
-    assert_eq!(app.calls()[1].1, json!({ "team_name": "live-team", "agent_name": "worker-1", "text": "do it" }));
-    let again = post(&h, "/api/targets/panel-1/text", json!({ "text": "do it", "request_id": "a-1" })).await;
+    assert_eq!(
+        app.calls()[1].1,
+        json!({ "team_name": "live-team", "agent_name": "worker-1", "text": "do it" })
+    );
+    let again = post(
+        &h,
+        "/api/targets/panel-1/text",
+        json!({ "text": "do it", "request_id": "a-1" }),
+    )
+    .await;
     assert_eq!(again.json()["deduplicated"], true);
     assert_eq!(app.calls().len(), 2, "retry must not send a second turn");
 
-    let stop = http(h.addr, "POST", "/api/targets/panel-1/interrupt", &auth(), Some("{}")).await;
+    let stop = http(
+        h.addr,
+        "POST",
+        "/api/targets/panel-1/interrupt",
+        &auth(),
+        Some("{}"),
+    )
+    .await;
     assert_eq!(stop.status, 200, "{}", stop.body);
     assert_eq!(stop.json()["interrupted"], true);
     assert_eq!(app.calls()[2].0, "team.interrupt");
@@ -984,6 +1027,197 @@ async fn agent_targets_take_turns_and_show_the_transcript() {
     let none = get(&h, "/api/targets/pane-1/transcript").await;
     assert_eq!(none.status, 409);
     assert_eq!(none.error_code(), "not_an_agent");
+}
+
+#[tokio::test]
+async fn terminal_chat_submits_one_turn_while_terminal_mode_only_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.reply("surface.send_turn", json!({ "submitted": true }));
+    app.reply("surface.send_text", json!({ "queued": false }));
+    let h = start_tailscale().await;
+    let mut spec = EnableSpec {
+        surface_id: "pane-chat".to_string(),
+        kind: TargetKind::Pane,
+        chat_capable: true,
+        agent_cli: "codex".to_string(),
+        session_id: Some("session-1".to_string()),
+        app_socket: Some(app.path_str()),
+        ..EnableSpec::default()
+    };
+    h.registry
+        .lock()
+        .await
+        .upsert(spec.clone(), remote::now_unix())
+        .unwrap();
+
+    let chat = post(
+        &h,
+        "/api/targets/pane-chat/text",
+        json!({
+            "text": "whole turn", "mode": "chat", "request_id": "chat-1"
+        }),
+    )
+    .await;
+    assert_eq!(chat.status, 200, "{}", chat.body);
+    assert_eq!(app.calls()[0].0, "surface.send_turn");
+    assert_eq!(app.calls()[0].1["text"], "whole turn");
+
+    let terminal = post(
+        &h,
+        "/api/targets/pane-chat/text",
+        json!({
+            "text": "typed", "mode": "terminal", "request_id": "terminal-1"
+        }),
+    )
+    .await;
+    assert_eq!(terminal.status, 200, "{}", terminal.body);
+    assert_eq!(app.calls()[1].0, "surface.send_text");
+
+    spec.surface_id = "plain".to_string();
+    spec.chat_capable = false;
+    spec.session_id = None;
+    h.registry
+        .lock()
+        .await
+        .upsert(spec, remote::now_unix())
+        .unwrap();
+    let unavailable = post(
+        &h,
+        "/api/targets/plain/text",
+        json!({
+            "text": "no", "mode": "chat", "request_id": "plain-1"
+        }),
+    )
+    .await;
+    assert_eq!(unavailable.status, 409);
+    assert_eq!(unavailable.error_code(), "chat_unavailable");
+}
+
+#[test]
+fn terminal_chat_running_tracks_the_live_surface_roster() {
+    let live = json!({ "surfaces": [{ "id": "live-pane" }] });
+    assert!(http_mobile::surface_roster_contains(&live, "live-pane"));
+    assert!(!http_mobile::surface_roster_contains(&live, "other"));
+    assert!(!http_mobile::surface_roster_contains(
+        &json!({ "surfaces": [] }),
+        "live-pane"
+    ));
+}
+
+#[tokio::test]
+async fn failed_terminal_chat_delivery_does_not_poison_request_dedupe() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.fail("surface.send_turn", "busy", "try again");
+    let h = start_tailscale().await;
+    let spec = EnableSpec {
+        surface_id: "retry-chat".into(),
+        kind: TargetKind::Pane,
+        chat_capable: true,
+        agent_cli: "codex".into(),
+        session_id: Some("session-1".into()),
+        app_socket: Some(app.path_str()),
+        ..EnableSpec::default()
+    };
+    h.registry
+        .lock()
+        .await
+        .upsert(spec, remote::now_unix())
+        .unwrap();
+    let body = json!({ "text": "retry me", "mode": "chat", "request_id": "retry-1" });
+
+    let first = post(&h, "/api/targets/retry-chat/text", body.clone()).await;
+    assert_eq!(first.status, 502, "{}", first.body);
+    app.reply("surface.send_turn", json!({ "submitted": true }));
+    let retry = post(&h, "/api/targets/retry-chat/text", body).await;
+    assert_eq!(retry.status, 200, "{}", retry.body);
+    assert_eq!(retry.json()["deduplicated"], false);
+    assert_eq!(
+        app.calls()
+            .iter()
+            .filter(|(m, _)| m == "surface.send_turn")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn session_logs_normalize_to_the_mobile_chat_shape() {
+    let claude = vec![
+        json!({ "type": "user", "uuid": "u1", "message": { "content": "hello" } }),
+        json!({ "type": "assistant", "uuid": "a1", "message": { "content": [
+            { "type": "text", "text": "hi" },
+            { "type": "tool_use", "id": "t1", "name": "Bash", "input": { "command": "pwd" } }
+        ] } }),
+        json!({ "type": "user", "uuid": "u2", "message": { "content": [
+            { "type": "tool_result", "tool_use_id": "t1", "content": "/repo" }
+        ] } }),
+    ];
+    let c = http_mobile::claude_entries(&claude);
+    assert_eq!(c[0]["kind"], "said");
+    assert_eq!(c[1]["kind"], "answered");
+    assert_eq!(c[2]["kind"], "tool");
+    assert_eq!(c[2]["result"], "/repo");
+    assert_eq!(c[2]["running"], false);
+
+    let codex = vec![
+        json!({ "type": "response_item", "payload": { "type": "message", "id": "hidden", "role": "user", "content": [{ "type": "input_text", "text": "# AGENTS.md instructions for /repo" }] } }),
+        json!({ "type": "response_item", "payload": { "type": "message", "id": "m1", "role": "user", "content": [{ "type": "input_text", "text": "hello" }] } }),
+        json!({ "type": "response_item", "payload": { "type": "custom_tool_call", "id": "x1", "call_id": "call1", "name": "exec", "input": "pwd" } }),
+        json!({ "type": "response_item", "payload": { "type": "custom_tool_call_output", "id": "x2", "call_id": "call1", "output": [{ "type": "input_text", "text": "/repo" }] } }),
+        json!({ "type": "response_item", "payload": { "type": "message", "id": "m2", "role": "assistant", "content": [{ "type": "output_text", "text": "done" }] } }),
+    ];
+    let x = http_mobile::codex_entries(&codex);
+    assert!(x.iter().all(|entry| entry["id"] != "hidden"));
+    assert_eq!(x[0]["kind"], "said");
+    assert_eq!(x[1]["kind"], "tool");
+    assert_eq!(x[1]["result"], "/repo");
+    assert_eq!(x[2]["kind"], "answered");
+
+    let secret = vec![json!({ "type": "response_item", "payload": {
+        "type": "custom_tool_call", "id": "secret", "call_id": "secret-call",
+        "name": "exec", "input": "OPENAI_API_KEY=do-not-show echo ok"
+    } })];
+    let hidden = http_mobile::codex_entries(&secret);
+    assert_eq!(hidden[0]["headline"], "[credential redacted]");
+    for raw in [
+        "GITHUB_TOKEN=ghp_example",
+        "HF_TOKEN=hf_example",
+        "AWS_ACCESS_KEY_ID=AKIAEXAMPLE",
+        "Authorization: Basic abc",
+        "https://example.test/?token=abc",
+        "ghp_exampletoken",
+        "sk-exampletoken",
+    ] {
+        assert_eq!(
+            http_mobile::redact_session_text(raw),
+            "[credential redacted]"
+        );
+    }
+}
+
+#[test]
+fn session_tail_reader_appends_without_reparsing_or_losing_partial_lines() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    std::fs::write(&path, b"{\"type\":\"one\"}\n{\"type\":").unwrap();
+    let first = http_mobile::tail_json_lines(&path).unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0]["type"], "one");
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    write!(file, "\"two\"}}\n{{\"type\":\"three\"}}\n").unwrap();
+    let second = http_mobile::tail_json_lines(&path).unwrap();
+    assert_eq!(second.len(), 3);
+    assert_eq!(second[1]["type"], "two");
+    assert_eq!(second[2]["type"], "three");
+    let unchanged = http_mobile::tail_json_lines(&path).unwrap();
+    assert_eq!(unchanged, second);
 }
 
 async fn targets_by_id_for(h: &Harness) -> serde_json::Map<String, Value> {

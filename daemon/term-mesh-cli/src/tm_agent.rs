@@ -12634,12 +12634,15 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_else(|| remote_default_title(&cwd));
             let agent_cli = cli.clone().unwrap_or_else(detect_remote_cli);
+            let session_id = remote_session_id(&agent_cli);
             let mut params = json!({
                 "surface_id": surface_id,
                 "kind": if is_leader { "leader" } else { "pane" },
                 "keys": keys,
                 "app_socket": app_socket,
                 "agent_cli": agent_cli,
+                "chat_capable": session_id.is_some(),
+                "session_id": session_id,
                 "title": title,
                 "cwd": cwd,
                 "owner": env::var("USER").ok(),
@@ -12701,10 +12704,13 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
                 );
             }
             if !is_leader && !*terminal {
-                eprintln!(
-                    "note: terminal mirror; the chat view needs a team agent pane (run this \
-                     inside a native agent pane, or `--agent <name>` from the leader pane)"
-                );
+                if entry["chat_capable"].as_bool() == Some(true) {
+                    eprintln!(
+                        "note: the mobile page can switch this target between Chat and Terminal"
+                    );
+                } else {
+                    eprintln!("note: terminal mirror only; no supported Claude/Codex session id was found");
+                }
             }
         }
         RemoteCommand::Off { surface, json } => {
@@ -12865,6 +12871,15 @@ fn run_remote_on_agent(
             }
         }
     };
+    let session_id = agent["session_id"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            let this_agent = env::var("TERMMESH_AGENT_NAME").ok();
+            (this_agent.as_deref().map(str::trim) == Some(agent_name))
+                .then(|| remote_session_id(agent["cli"].as_str().unwrap_or("")))
+                .flatten()
+        });
     let ttl_secs = match ttl.map(parse_ttl_secs).transpose() {
         Ok(v) => v,
         Err(e) => {
@@ -12880,8 +12895,13 @@ fn run_remote_on_agent(
         "keys": keys,
         "app_socket": app_sock.to_string_lossy(),
         "agent_cli": agent["cli"].as_str().unwrap_or(""),
+        "chat_capable": kind == "agent" || session_id.is_some(),
+        "session_id": session_id,
         "title": title.unwrap_or(agent_name),
-        "cwd": env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+        "cwd": agent["working_directory"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()),
         "owner": env::var("USER").ok(),
     });
     if let Some(ttl) = ttl_secs {
@@ -13030,11 +13050,29 @@ fn detect_remote_cli() -> String {
     let set = |k: &str| env::var(k).map(|v| !v.trim().is_empty()).unwrap_or(false);
     if set("CLAUDECODE") {
         "claude".into()
-    } else if set("CODEX_SANDBOX") || set("CODEX_SANDBOX_NETWORK_DISABLED") {
+    } else if set("CODEX_SANDBOX")
+        || set("CODEX_SANDBOX_NETWORK_DISABLED")
+        || set("CODEX_SESSION_ID")
+        || set("CODEX_THREAD_ID")
+    {
         "codex".into()
     } else {
         String::new()
     }
+}
+
+fn remote_session_id(cli: &str) -> Option<String> {
+    let keys: &[&str] = match cli {
+        "codex" => &["CODEX_SESSION_ID", "CODEX_THREAD_ID"],
+        "claude" => &["CLAUDE_CODE_SESSION_ID"],
+        _ => &[],
+    };
+    keys.iter().find_map(|key| {
+        env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn remote_default_title(cwd: &str) -> String {

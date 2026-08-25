@@ -763,6 +763,37 @@ extension TerminalController {
         return result
     }
 
+    /// Submit one complete turn to an interactive terminal CLI. The app owns
+    /// text + Return as one operation so the mobile chat path never races a
+    /// separate key request against an unfinished paste.
+    func v2SurfaceSendTurn(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        guard let text = params["text"] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .err(code: "invalid_params", message: "Missing text", data: nil)
+        }
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to submit turn", data: nil)
+        let completed = v2MainExec(timeout: kSendTextMainExecTimeout) {
+            guard let ws = self.v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId = self.v2UUID(params, "surface_id") ?? ws.focusedPanelId
+            guard let surfaceId, let panel = ws.terminalPanel(for: surfaceId) else {
+                result = .err(code: "invalid_params", message: "Surface is not a terminal", data: nil)
+                return
+            }
+            guard panel.sendIMETextPreservingNewlines(text, withReturn: true) else {
+                result = .err(code: "internal_error", message: "Terminal rejected the turn", data: nil)
+                return
+            }
+            panel.surface.forceRefresh()
+            result = .ok(["surface_id": surfaceId.uuidString, "submitted": true])
+        }
+        return completed ? result : .err(code: "timeout", message: "Main thread busy", data: nil)
+    }
+
     func v2SurfaceSendKey(params: [String: Any]) -> V2CallResult {
         guard let tabManager = v2ResolveTabManager(params: params) else {
             return .err(code: "unavailable", message: "TabManager not available", data: nil)

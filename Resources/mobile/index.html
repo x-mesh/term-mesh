@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="color-scheme" content="light dark">
@@ -19,6 +19,10 @@
     <button id="refresh" type="button" class="icon" title="refresh" aria-label="refresh">↻</button>
   </div>
   <div id="status" class="status" role="status" aria-live="polite">connecting…</div>
+  <div id="view-switch" class="view-switch" role="group" aria-label="view mode" hidden>
+    <button id="view-chat" type="button">Chat</button>
+    <button id="view-terminal" type="button">Terminal</button>
+  </div>
 </header>
 
 <main id="main">
@@ -33,7 +37,17 @@
   </section>
 
   <section id="chat" class="chat" hidden>
-    <ol id="chat-list" class="chat-list"></ol>
+    <div class="chat-heading">
+      <div class="chat-identity">
+        <span class="presence" aria-hidden="true"></span>
+        <span>
+          <strong id="chat-title">Agent session</strong>
+          <small id="chat-subtitle">Live transcript</small>
+        </span>
+      </div>
+      <span class="live-badge">Live</span>
+    </div>
+    <div id="chat-list" class="chat-list" role="log" aria-live="polite"></div>
     <div class="chat-foot">
       <span id="chat-state" class="muted"></span>
       <button id="interrupt" type="button" class="danger" hidden>중단</button>

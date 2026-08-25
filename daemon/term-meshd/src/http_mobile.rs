@@ -20,8 +20,13 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -45,8 +50,26 @@ pub const MAX_SCREEN_LINES: u32 = 1000;
 
 /// Keys the page may send when the entry's policy is `safe`.
 pub const SAFE_KEYS: &[&str] = &[
-    "Enter", "Escape", "Tab", "Backspace", "Up", "Down", "Left", "Right", "y", "n", "1", "2",
-    "3", "4", "5", "6", "7", "8", "9", "C-c",
+    "Enter",
+    "Escape",
+    "Tab",
+    "Backspace",
+    "Up",
+    "Down",
+    "Left",
+    "Right",
+    "y",
+    "n",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "C-c",
 ];
 
 const PAGE_HTML: &str = include_str!("../../../Resources/mobile/index.html");
@@ -117,8 +140,21 @@ pub fn parse_logins(raw: Option<&str>) -> BTreeSet<String> {
 pub struct MobileState {
     pub config: MobileConfig,
     pub registry: SharedRegistry,
-    /// `request_id` → first-seen instant for pane text sends.
-    dedupe: Mutex<HashMap<String, Instant>>,
+    /// Request ids are reserved while delivery is in flight and become
+    /// deduplicable only after the app acknowledges the write.
+    dedupe: Mutex<HashMap<String, (Instant, DedupeState)>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DedupeState {
+    Pending,
+    Delivered,
+}
+
+enum DedupeAdmission {
+    New,
+    Delivered,
+    Pending,
 }
 
 pub type SharedState = Arc<MobileState>;
@@ -185,8 +221,14 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/targets", get(targets_handler))
         .route("/api/targets/{surface_id}/screen", get(screen_handler))
         .route("/api/targets/{surface_id}/requests", get(requests_handler))
-        .route("/api/targets/{surface_id}/transcript", get(transcript_handler))
-        .route("/api/targets/{surface_id}/interrupt", post(interrupt_handler))
+        .route(
+            "/api/targets/{surface_id}/transcript",
+            get(transcript_handler),
+        )
+        .route(
+            "/api/targets/{surface_id}/interrupt",
+            post(interrupt_handler),
+        )
         .route("/api/targets/{surface_id}/text", post(text_handler))
         .route("/api/targets/{surface_id}/key", post(key_handler))
         .fallback(not_found_handler)
@@ -374,6 +416,7 @@ fn target_json(entry: &Entry) -> Value {
     json!({
         "surface_id": entry.surface_id,
         "kind": entry.kind,
+        "chat_capable": entry.chat_capable,
         "team_name": entry.team_name,
         "agent_name": entry.agent_name,
         "agent_cli": entry.agent_cli,
@@ -385,6 +428,436 @@ fn target_json(entry: &Entry) -> Value {
         "created_at": entry.created_at,
         "expires_at": entry.expires_at,
     })
+}
+
+const SESSION_SCAN_LINES: usize = 5_000;
+const SESSION_SCAN_BYTES: u64 = 8 * 1024 * 1024;
+const SESSION_TEXT_LIMIT: usize = 16 * 1024;
+const SESSION_HEADLINE_LIMIT: usize = 500;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Default)]
+struct SessionTailState {
+    identity: Option<FileIdentity>,
+    offset: u64,
+    carry: Vec<u8>,
+    lines: VecDeque<Value>,
+}
+
+fn bounded_text(value: &str) -> String {
+    let redacted = redact_session_text(value);
+    if redacted.len() <= SESSION_TEXT_LIMIT {
+        return redacted;
+    }
+    let mut end = SESSION_TEXT_LIMIT;
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n… truncated", &redacted[..end])
+}
+
+fn bounded_headline(value: &str) -> String {
+    let redacted = redact_session_text(value);
+    let compact = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= SESSION_HEADLINE_LIMIT {
+        return compact;
+    }
+    compact
+        .chars()
+        .take(SESSION_HEADLINE_LIMIT)
+        .collect::<String>()
+        + "…"
+}
+
+pub(crate) fn redact_session_text(value: &str) -> String {
+    const MARKERS: &[&str] = &[
+        "API_KEY",
+        "_KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PRIVATE_KEY",
+        "AUTHORIZATION",
+        "BEARER ",
+        "COOKIE",
+        "CREDENTIAL",
+        "GHP_",
+        "GSK_",
+        "GLPAT-",
+        "NVAPI-",
+        "AKIA",
+        "XOXB-",
+        "HF_",
+        "SK-",
+        "EYJ",
+    ];
+    value
+        .lines()
+        .map(|line| {
+            let upper = line.to_ascii_uppercase();
+            if MARKERS.iter().any(|marker| upper.contains(marker)) {
+                "[credential redacted]".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn tail_json_lines(path: &FsPath) -> Result<Vec<Value>, ApiError> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, SessionTailState>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut file = File::open(path).map_err(|e| {
+        ApiError::conflict(
+            "session_unavailable",
+            format!("cannot open session log: {e}"),
+        )
+    })?;
+    let metadata = file.metadata().map_err(|e| {
+        ApiError::conflict(
+            "session_unavailable",
+            format!("cannot stat session log: {e}"),
+        )
+    })?;
+    let identity = FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    let len = metadata.len();
+    let mut states = cache.lock().unwrap();
+    let state = states.entry(path.to_path_buf()).or_default();
+    let reset = state.identity != Some(identity) || len < state.offset;
+    if reset {
+        *state = SessionTailState {
+            identity: Some(identity),
+            ..SessionTailState::default()
+        };
+    }
+    if len == state.offset {
+        return Ok(state.lines.iter().cloned().collect());
+    }
+    let start = if state.offset == 0 {
+        len.saturating_sub(SESSION_SCAN_BYTES)
+    } else {
+        state.offset
+    };
+    file.seek(SeekFrom::Start(start)).map_err(|e| {
+        ApiError::conflict(
+            "session_unavailable",
+            format!("cannot seek session log: {e}"),
+        )
+    })?;
+    let mut bytes = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut bytes).map_err(|e| {
+        ApiError::conflict(
+            "session_unavailable",
+            format!("cannot read session log: {e}"),
+        )
+    })?;
+    if state.offset == 0 && start > 0 {
+        if let Some(newline) = bytes.iter().position(|b| *b == b'\n') {
+            bytes.drain(..=newline);
+        } else {
+            bytes.clear();
+        }
+    }
+    let mut buffer = std::mem::take(&mut state.carry);
+    buffer.extend_from_slice(&bytes);
+    let mut consumed = 0;
+    for (index, byte) in buffer.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        if let Ok(line) = std::str::from_utf8(&buffer[consumed..index]) {
+            if let Ok(value) = serde_json::from_str::<Value>(line) {
+                if state.lines.len() == SESSION_SCAN_LINES {
+                    state.lines.pop_front();
+                }
+                state.lines.push_back(value);
+            }
+        }
+        consumed = index + 1;
+    }
+    state.carry = buffer[consumed..].to_vec();
+    state.offset = file.stream_position().unwrap_or(len);
+    Ok(state.lines.iter().cloned().collect())
+}
+
+fn home_dir() -> Result<PathBuf, ApiError> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| ApiError::conflict("session_unavailable", "HOME is not set"))
+}
+
+fn claude_session_path(entry: &Entry, session_id: &str) -> Result<PathBuf, ApiError> {
+    let encoded = entry.cwd.replace('/', "-");
+    Ok(home_dir()?
+        .join(".claude/projects")
+        .join(encoded)
+        .join(format!("{session_id}.jsonl")))
+}
+
+fn codex_session_path(session_id: &str) -> Result<PathBuf, ApiError> {
+    static CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(path) = cache.lock().unwrap().get(session_id).cloned() {
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    let root = home_dir()?.join(".codex/sessions");
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let Ok(items) = fs::read_dir(dir) else {
+            continue;
+        };
+        for item in items.flatten() {
+            let path = item.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|v| v.to_str()) == Some("jsonl")
+                && path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .is_some_and(|n| n.contains(session_id))
+            {
+                cache
+                    .lock()
+                    .unwrap()
+                    .insert(session_id.to_string(), path.clone());
+                return Ok(path);
+            }
+        }
+    }
+    Err(ApiError::conflict(
+        "session_unavailable",
+        "Codex session log was not found",
+    ))
+}
+
+fn content_text(content: &Value, kinds: &[&str]) -> String {
+    match content {
+        Value::String(text) => bounded_text(text),
+        Value::Array(blocks) => bounded_text(
+            &blocks
+                .iter()
+                .filter(|block| {
+                    block
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kinds.contains(&kind))
+                })
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => String::new(),
+    }
+}
+
+fn user_visible_text(text: String) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("# AGENTS.md instructions")
+        || trimmed.starts_with("<skill>")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("You are a team agent named \"")
+    {
+        return None;
+    }
+    Some(text)
+}
+
+pub(crate) fn claude_entries(lines: &[Value]) -> Vec<Value> {
+    let mut entries = Vec::new();
+    let mut tools: HashMap<String, usize> = HashMap::new();
+    for row in lines {
+        let kind = row.get("type").and_then(Value::as_str).unwrap_or("");
+        let id = row.get("uuid").and_then(Value::as_str).unwrap_or("");
+        let message = row.get("message").unwrap_or(&Value::Null);
+        let content = message.get("content").unwrap_or(&Value::Null);
+        if kind == "user" {
+            if let Some(text) = user_visible_text(content_text(content, &["text"])) {
+                entries
+                    .push(json!({ "id": id, "kind": "said", "speaker": "person", "text": text }));
+            }
+            if let Some(blocks) = content.as_array() {
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                        continue;
+                    }
+                    let Some(tool_id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if let Some(index) = tools.get(tool_id).copied() {
+                        entries[index]["result"] = Value::String(content_text(
+                            block.get("content").unwrap_or(&Value::Null),
+                            &["text"],
+                        ));
+                        entries[index]["running"] = Value::Bool(false);
+                        entries[index]["failed"] = Value::Bool(
+                            block
+                                .get("is_error")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        );
+                    }
+                }
+            }
+        } else if kind == "assistant" {
+            if let Some(blocks) = content.as_array() {
+                for (index, block) in blocks.iter().enumerate() {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(text) = block
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .filter(|t| !t.trim().is_empty())
+                            {
+                                entries.push(json!({ "id": format!("{id}:{index}"), "kind": "answered", "text": bounded_text(text) }));
+                            }
+                        }
+                        Some("tool_use") => {
+                            let tool_id = block.get("id").and_then(Value::as_str).unwrap_or(id);
+                            let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                            let headline = block
+                                .get("input")
+                                .and_then(|v| serde_json::to_string(v).ok())
+                                .unwrap_or_default();
+                            tools.insert(tool_id.to_string(), entries.len());
+                            entries.push(json!({ "id": tool_id, "kind": "tool", "name": name, "headline": bounded_headline(&headline), "result": "", "running": true, "failed": false }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    entries
+}
+
+pub(crate) fn codex_entries(lines: &[Value]) -> Vec<Value> {
+    let mut entries = Vec::new();
+    let mut tools: HashMap<String, usize> = HashMap::new();
+    for row in lines {
+        if row.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let payload = row.get("payload").unwrap_or(&Value::Null);
+        let kind = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        let id = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("call_id").and_then(Value::as_str))
+            .unwrap_or("event");
+        if kind == "message" {
+            let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
+            let text = content_text(
+                payload.get("content").unwrap_or(&Value::Null),
+                &["input_text", "output_text"],
+            );
+            if role == "user" {
+                if let Some(text) = user_visible_text(text) {
+                    entries.push(
+                        json!({ "id": id, "kind": "said", "speaker": "person", "text": text }),
+                    );
+                }
+            } else if role == "assistant" {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                entries.push(json!({ "id": id, "kind": "answered", "text": text }));
+            }
+        } else if kind == "custom_tool_call" || kind == "function_call" {
+            let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or(id);
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let headline = payload
+                .get("input")
+                .or_else(|| payload.get("arguments"))
+                .and_then(|v| {
+                    if let Some(s) = v.as_str() {
+                        Some(s.to_string())
+                    } else {
+                        serde_json::to_string(v).ok()
+                    }
+                })
+                .unwrap_or_default();
+            tools.insert(call_id.to_string(), entries.len());
+            entries.push(json!({ "id": call_id, "kind": "tool", "name": name, "headline": bounded_headline(&headline), "result": "", "running": true, "failed": false }));
+        } else if kind == "custom_tool_call_output" || kind == "function_call_output" {
+            let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or(id);
+            if let Some(index) = tools.get(call_id).copied() {
+                let output = payload
+                    .get("output")
+                    .map(|v| content_text(v, &["input_text", "output_text"]))
+                    .unwrap_or_default();
+                entries[index]["result"] = Value::String(output);
+                entries[index]["running"] = Value::Bool(false);
+            }
+        }
+    }
+    entries
+}
+
+fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
+    let session_id = entry.session_id.as_deref().ok_or_else(|| {
+        ApiError::conflict(
+            "session_unavailable",
+            "the CLI session id is not available yet",
+        )
+    })?;
+    let path = match entry.agent_cli.as_str() {
+        "claude" => claude_session_path(entry, session_id)?,
+        "codex" => codex_session_path(session_id)?,
+        _ => {
+            return Err(ApiError::conflict(
+                "chat_unavailable",
+                "chat supports Claude and Codex sessions",
+            ))
+        }
+    };
+    let lines = tail_json_lines(&path)?;
+    let mut entries = match entry.agent_cli.as_str() {
+        "claude" => claude_entries(&lines),
+        "codex" => codex_entries(&lines),
+        _ => Vec::new(),
+    };
+    if entries.len() > limit {
+        entries = entries.split_off(entries.len() - limit);
+    }
+    let in_flight = entries.last().is_some_and(|entry| {
+        entry.get("kind").and_then(Value::as_str) == Some("said")
+            || (entry.get("kind").and_then(Value::as_str) == Some("tool")
+                && entry.get("running").and_then(Value::as_bool) == Some(true))
+    });
+    Ok(json!({
+        "running": true,
+        "thinking": false,
+        "in_flight": in_flight,
+        "summary": format!("{} · terminal", entry.agent_cli),
+        "total": entries.len(),
+        "entries": entries,
+    }))
+}
+
+pub(crate) fn surface_roster_contains(result: &Value, surface_id: &str) -> bool {
+    result
+        .get("surfaces")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("id").and_then(Value::as_str) == Some(surface_id))
+        })
 }
 
 async fn targets_handler(State(state): State<SharedState>) -> Response {
@@ -556,7 +1029,12 @@ fn push_span(row: &mut Vec<StyledSpan>, next: StyledSpan) {
 /// Place one span list (`row_spans` or `scrollback_spans`) into `rows`,
 /// offsetting row numbers by `row_offset` and filling column gaps with
 /// default-style spaces so text stays column-aligned.
-fn place_spans(rows: &mut [Vec<StyledSpan>], spans: &Value, row_offset: usize, styles: &[GridStyle]) {
+fn place_spans(
+    rows: &mut [Vec<StyledSpan>],
+    spans: &Value,
+    row_offset: usize,
+    styles: &[GridStyle],
+) {
     let Some(list) = spans.as_array() else {
         return;
     };
@@ -591,11 +1069,19 @@ fn place_spans(rows: &mut [Vec<StyledSpan>], spans: &Value, row_offset: usize, s
                 col = column;
             }
             let text = span.get("text").and_then(Value::as_str).unwrap_or("");
-            let width = span.get("cell_width").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+            let width = span
+                .get("cell_width")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .max(1) as usize;
             let style_id = span.get("style_id").and_then(Value::as_u64).unwrap_or(0) as usize;
             let style = styles.get(style_id).unwrap_or(&default_style);
             let chars = text.chars().count();
-            let shown = if style.invisible { " ".repeat(chars) } else { text.to_string() };
+            let shown = if style.invisible {
+                " ".repeat(chars)
+            } else {
+                text.to_string()
+            };
             push_span(
                 target,
                 StyledSpan {
@@ -621,7 +1107,10 @@ fn place_spans(rows: &mut [Vec<StyledSpan>], spans: &Value, row_offset: usize, s
 pub fn styled_from_grid(grid: &Value) -> StyledScreen {
     let columns = grid.get("columns").and_then(Value::as_u64).unwrap_or(0);
     let active_rows = grid.get("rows").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let scrollback_rows = grid.get("scrollback_rows").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let scrollback_rows = grid
+        .get("scrollback_rows")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
     let styles = grid_styles(grid);
     let mut rows: Vec<Vec<StyledSpan>> = vec![Vec::new(); scrollback_rows + active_rows];
     if let Some(spans) = grid.get("scrollback_spans") {
@@ -636,9 +1125,10 @@ pub fn styled_from_grid(grid: &Value) -> StyledScreen {
         let col = c.get("column").and_then(Value::as_u64)? as usize;
         (visible && row < rows.len()).then_some((row, col))
     });
-    let last_content = rows
-        .iter()
-        .rposition(|r| r.iter().any(|s| !s.t.trim().is_empty() || s.bg.is_some() || s.inv));
+    let last_content = rows.iter().rposition(|r| {
+        r.iter()
+            .any(|s| !s.t.trim().is_empty() || s.bg.is_some() || s.inv)
+    });
     let keep = match (last_content, cursor) {
         (Some(l), Some((c, _))) => l.max(c) + 1,
         (Some(l), None) => l + 1,
@@ -703,7 +1193,9 @@ async fn screen_handler(
         .await
         {
             Ok(result) => Some(result),
-            Err(err) if err.code == "app_rpc_failed" && err.message.contains("method_not_found") => {
+            Err(err)
+                if err.code == "app_rpc_failed" && err.message.contains("method_not_found") =>
+            {
                 tracing::info!(
                     "mobile: app has no surface.read_screen_grid, serving plain text for {}",
                     entry.surface_id
@@ -735,7 +1227,10 @@ async fn screen_handler(
     let result = match entry.kind {
         // Handled above; kept explicit so a new kind cannot fall through.
         TargetKind::Agent => {
-            return Err(ApiError::conflict("not_a_terminal", "native agent panes have no screen"))
+            return Err(ApiError::conflict(
+                "not_a_terminal",
+                "native agent panes have no screen",
+            ))
         }
         TargetKind::Leader => {
             app_call(
@@ -809,6 +1304,8 @@ struct TextBody {
     text: String,
     #[serde(default)]
     request_id: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 async fn text_handler(
@@ -852,15 +1349,21 @@ async fn text_handler(
     match entry.kind {
         TargetKind::Agent => {
             if let Some(id) = &request_id {
-                if state.remember_request(&entry.surface_id, id) {
-                    return Ok(Json(json!({
-                        "surface_id": entry.surface_id,
-                        "kind": "agent",
-                        "delivered": true,
-                        "deduplicated": true,
-                        "request_id": id,
-                    }))
-                    .into_response());
+                match state.reserve_request(&entry.surface_id, id) {
+                    DedupeAdmission::New => {}
+                    DedupeAdmission::Delivered => {
+                        return Ok(Json(json!({
+                            "surface_id": entry.surface_id, "kind": "agent",
+                            "delivered": true, "deduplicated": true, "request_id": id,
+                        }))
+                        .into_response())
+                    }
+                    DedupeAdmission::Pending => {
+                        return Err(ApiError::conflict(
+                            "request_in_flight",
+                            "a request with this id is still being delivered",
+                        ))
+                    }
                 }
             }
             let result = app_call(
@@ -869,7 +1372,19 @@ async fn text_handler(
                 "team.send",
                 json!({ "team_name": entry.team_name, "agent_name": entry.agent_name, "text": body.text }),
             )
-            .await?;
+            .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(id) = request_id.as_deref() {
+                        state.forget_request(&entry.surface_id, id);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(id) = request_id.as_deref() {
+                state.commit_request(&entry.surface_id, id);
+            }
             Ok((
                 StatusCode::ACCEPTED,
                 Json(json!({
@@ -905,28 +1420,61 @@ async fn text_handler(
                 .into_response())
         }
         TargetKind::Pane => {
+            let chat_mode = body.mode.as_deref() == Some("chat");
+            if chat_mode && !entry.chat_capable {
+                return Err(ApiError::conflict(
+                    "chat_unavailable",
+                    "this terminal has no supported CLI session",
+                ));
+            }
             if let Some(id) = &request_id {
-                if state.remember_request(&entry.surface_id, id) {
-                    return Ok(Json(json!({
-                        "surface_id": entry.surface_id,
-                        "kind": "pane",
-                        "delivered": true,
-                        "deduplicated": true,
-                        "request_id": id,
-                    }))
-                    .into_response());
+                match state.reserve_request(&entry.surface_id, id) {
+                    DedupeAdmission::New => {}
+                    DedupeAdmission::Delivered => {
+                        return Ok(Json(json!({
+                            "surface_id": entry.surface_id, "kind": "pane",
+                            "delivered": true, "deduplicated": true, "request_id": id,
+                        }))
+                        .into_response())
+                    }
+                    DedupeAdmission::Pending => {
+                        return Err(ApiError::conflict(
+                            "request_in_flight",
+                            "a request with this id is still being delivered",
+                        ))
+                    }
                 }
             }
-            app_call(
-                &state,
-                &entry,
-                "surface.send_text",
-                json!({ "surface_id": entry.surface_id, "text": body.text }),
-            )
-            .await?;
+            let delivery = if chat_mode {
+                app_call(
+                    &state,
+                    &entry,
+                    "surface.send_turn",
+                    json!({ "surface_id": entry.surface_id, "text": body.text }),
+                )
+                .await
+            } else {
+                app_call(
+                    &state,
+                    &entry,
+                    "surface.send_text",
+                    json!({ "surface_id": entry.surface_id, "text": body.text }),
+                )
+                .await
+            };
+            if let Err(error) = delivery {
+                if let Some(id) = request_id.as_deref() {
+                    state.forget_request(&entry.surface_id, id);
+                }
+                return Err(error);
+            }
+            if let Some(id) = request_id.as_deref() {
+                state.commit_request(&entry.surface_id, id);
+            }
             Ok(Json(json!({
                 "surface_id": entry.surface_id,
                 "kind": "pane",
+                "mode": if chat_mode { "chat" } else { "terminal" },
                 "delivered": true,
                 "deduplicated": false,
                 "request_id": request_id,
@@ -939,16 +1487,31 @@ async fn text_handler(
 impl MobileState {
     /// Returns true when this `request_id` was already delivered inside the
     /// dedupe window (so the caller must not type it again).
-    fn remember_request(&self, surface_id: &str, request_id: &str) -> bool {
+    fn reserve_request(&self, surface_id: &str, request_id: &str) -> DedupeAdmission {
         let key = format!("{surface_id}\u{0}{request_id}");
         let now = Instant::now();
         let mut seen = self.dedupe.lock().unwrap();
-        seen.retain(|_, first| now.duration_since(*first) < DEDUPE_WINDOW);
-        if seen.contains_key(&key) {
-            return true;
+        seen.retain(|_, (first, _)| now.duration_since(*first) < DEDUPE_WINDOW);
+        if let Some((_, state)) = seen.get(&key) {
+            return match state {
+                DedupeState::Delivered => DedupeAdmission::Delivered,
+                DedupeState::Pending => DedupeAdmission::Pending,
+            };
         }
-        seen.insert(key, now);
-        false
+        seen.insert(key, (now, DedupeState::Pending));
+        DedupeAdmission::New
+    }
+
+    fn commit_request(&self, surface_id: &str, request_id: &str) {
+        let key = format!("{surface_id}\u{0}{request_id}");
+        if let Some((_, state)) = self.dedupe.lock().unwrap().get_mut(&key) {
+            *state = DedupeState::Delivered;
+        }
+    }
+
+    fn forget_request(&self, surface_id: &str, request_id: &str) {
+        let key = format!("{surface_id}\u{0}{request_id}");
+        self.dedupe.lock().unwrap().remove(&key);
     }
 }
 
@@ -958,36 +1521,56 @@ struct TranscriptQuery {
     limit: Option<u32>,
 }
 
-/// `kind=agent`: the native pane's structured conversation
-/// (`team.agent.transcript`). Entries carry ids; the page re-renders by id
-/// because streaming answers and tool results change in place.
+/// Structured conversation for a native agent or a terminal-backed Claude /
+/// Codex session. The local pane stays a terminal; only this view is chat.
 async fn transcript_handler(
     State(state): State<SharedState>,
     Path(surface_id): Path<String>,
     Query(q): Query<TranscriptQuery>,
 ) -> ApiResult {
     let entry = live_entry(&state, &surface_id).await?;
-    if entry.kind != TargetKind::Agent {
+    if !entry.chat_capable {
         return Err(ApiError::conflict(
             "not_an_agent",
-            "transcripts exist only for native agent targets; use /screen",
+            "this target has no structured conversation; use /screen",
         ));
     }
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
-    let result = app_call(
-        &state,
-        &entry,
-        "team.agent.transcript",
-        json!({ "team_name": entry.team_name, "agent_name": entry.agent_name, "limit": limit }),
-    )
-    .await?;
+    let (result, terminal_running) = if entry.kind == TargetKind::Agent {
+        let value = app_call(
+            &state,
+            &entry,
+            "team.agent.transcript",
+            json!({ "team_name": entry.team_name, "agent_name": entry.agent_name, "limit": limit }),
+        )
+        .await?;
+        (value, None)
+    } else {
+        let surfaces = app_call(
+            &state,
+            &entry,
+            "surface.list",
+            json!({ "surface_id": entry.surface_id }),
+        )
+        .await?;
+        let running = surface_roster_contains(&surfaces, &entry.surface_id);
+        let session_entry = entry.clone();
+        let value =
+            tokio::task::spawn_blocking(move || session_transcript(&session_entry, limit as usize))
+                .await
+                .map_err(|e| {
+                    ApiError::conflict("session_unavailable", format!("session reader failed: {e}"))
+                })??;
+        (value, Some(running))
+    };
     let pick = |k: &str| result.get(k).cloned().unwrap_or(Value::Null);
     Ok(Json(json!({
         "surface_id": entry.surface_id,
         "kind": "agent",
+        "terminal_backed": entry.kind == TargetKind::Pane,
         "team_name": entry.team_name,
         "agent_name": entry.agent_name,
-        "running": pick("running"),
+        "running": terminal_running.map(Value::Bool).unwrap_or_else(|| pick("running")),
         "thinking": pick("thinking"),
         "in_flight": pick("in_flight"),
         "summary": pick("summary"),
@@ -1005,20 +1588,30 @@ async fn interrupt_handler(
     axum::Extension(caller): axum::Extension<Caller>,
 ) -> ApiResult {
     let entry = live_entry(&state, &surface_id).await?;
-    if entry.kind != TargetKind::Agent {
+    if !entry.chat_capable {
         return Err(ApiError::conflict(
             "not_an_agent",
             "interrupt exists only for native agent targets; send the C-c key instead",
         ));
     }
     tracing::info!("mobile: interrupt by {} to {}", caller.0, entry.surface_id);
-    let result = app_call(
-        &state,
-        &entry,
-        "team.interrupt",
-        json!({ "team_name": entry.team_name, "agent_name": entry.agent_name }),
-    )
-    .await?;
+    let result = if entry.kind == TargetKind::Agent {
+        app_call(
+            &state,
+            &entry,
+            "team.interrupt",
+            json!({ "team_name": entry.team_name, "agent_name": entry.agent_name }),
+        )
+        .await?
+    } else {
+        app_call(
+            &state,
+            &entry,
+            "surface.send_key",
+            json!({ "surface_id": entry.surface_id, "key": "ctrl-c" }),
+        )
+        .await?
+    };
     Ok(Json(json!({
         "surface_id": entry.surface_id,
         "interrupted": result.get("interrupted").cloned().unwrap_or(json!(true)),

@@ -198,11 +198,29 @@ fn leader_request_token_is_kept_but_never_serialized() {
 }
 
 #[test]
+fn chat_session_identity_is_kept_but_never_serialized() {
+    let mut reg = Registry::new();
+    let mut spec = pane_spec("chat-pane");
+    spec.chat_capable = true;
+    spec.agent_cli = "codex".into();
+    spec.session_id = Some("session-secret-123".into());
+    let entry = reg.upsert(spec, 1).unwrap();
+    assert!(entry.chat_capable);
+    assert_eq!(entry.session_id.as_deref(), Some("session-secret-123"));
+    let serialized = serde_json::to_value(&entry).unwrap();
+    assert_eq!(serialized["chat_capable"], true);
+    assert!(serialized.get("session_id").is_none());
+}
+
+#[test]
 fn agent_kind_requires_team_and_agent_names() {
     let mut reg = Registry::new();
     let mut agent = pane_spec("panel-1");
     agent.kind = TargetKind::Agent;
-    assert!(reg.upsert(agent.clone(), 0).unwrap_err().contains("team_name and agent_name"));
+    assert!(reg
+        .upsert(agent.clone(), 0)
+        .unwrap_err()
+        .contains("team_name and agent_name"));
     agent.team_name = Some("live-team".into());
     assert!(reg.upsert(agent.clone(), 0).is_err());
     agent.agent_name = Some(" worker-1 ".into());

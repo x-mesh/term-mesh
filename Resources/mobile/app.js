@@ -6,8 +6,8 @@
 //   GET  /api/targets/{id}/requests        (leader targets)
 //   POST /api/targets/{id}/text {text, request_id}
 //   POST /api/targets/{id}/key  {key}
-// The page keeps no state beyond the selected target; the host is the source
-// of truth and the screen is re-fetched every POLL_MS.
+// The host is the source of truth. Only the per-target Chat/Terminal view
+// preference is kept locally; screen and transcript data are always fetched.
 
 (function () {
   'use strict';
@@ -26,6 +26,9 @@
     target: $('target'),
     refresh: $('refresh'),
     status: $('status'),
+    viewSwitch: $('view-switch'),
+    viewChat: $('view-chat'),
+    viewTerminal: $('view-terminal'),
     empty: $('empty'),
     screenWrap: $('screen-wrap'),
     screen: $('screen'),
@@ -34,6 +37,8 @@
     requestsCount: $('requests-count'),
     requestsList: $('requests-list'),
     chat: $('chat'),
+    chatTitle: $('chat-title'),
+    chatSubtitle: $('chat-subtitle'),
     chatList: $('chat-list'),
     chatState: $('chat-state'),
     interrupt: $('interrupt'),
@@ -56,6 +61,7 @@
     rowNodes: [],
     chatNodes: {},       // entry id → {node, key} for the agent chat view
     chatRunning: false,
+    mode: 'terminal',
   };
 
   // ── helpers ──────────────────────────────────────────────────────────
@@ -110,6 +116,8 @@
       case 'app_unavailable': return 'term-mesh 앱에 연결할 수 없습니다';
       case 'keys_disabled': return '이 pane은 keys=none 으로 노출되었습니다';
       case 'key_not_allowed': return '허용되지 않은 키';
+      case 'mode_required': return '페이지가 업데이트되었습니다. 새로고침한 뒤 다시 보내세요';
+      case 'invalid_mode': return '잘못된 보기 모드입니다. 새로고침한 뒤 다시 보내세요';
       default: return (err.code ? err.code + ': ' : '') + (err.message || 'error');
     }
   }
@@ -119,6 +127,26 @@
   }
 
   function isAgent(t) { return !!t && t.kind === 'agent'; }
+  function isChat(t) { return !!t && (isAgent(t) || (t.chat_capable && state.mode === 'chat')); }
+
+  function storedMode(t) {
+    if (!t) { return 'terminal'; }
+    if (isAgent(t)) { return 'chat'; }
+    var saved = window.localStorage.getItem('term-mesh-view:' + t.surface_id);
+    if (saved === 'chat' && t.chat_capable) { return 'chat'; }
+    if (saved === 'terminal') { return 'terminal'; }
+    return t.chat_capable ? 'chat' : 'terminal';
+  }
+
+  function setMode(mode) {
+    var t = state.selected;
+    if (!t || (mode === 'chat' && !t.chat_capable && !isAgent(t))) { return; }
+    state.mode = isAgent(t) ? 'chat' : mode;
+    if (!isAgent(t)) { window.localStorage.setItem('term-mesh-view:' + t.surface_id, state.mode); }
+    resetScreen();
+    resetChat();
+    selectTarget(t, false);
+  }
 
   function targetLabel(t) {
     var bits = [];
@@ -250,16 +278,25 @@
     state.selected = t || null;
     if (t) { el.target.value = t.surface_id; }
     var has = !!t;
-    var agent = isAgent(t);
+    if (changed) { state.mode = storedMode(t); }
+    var agent = isChat(t);
     el.empty.hidden = has;
     el.screenWrap.hidden = !has || agent;
     el.chat.hidden = !agent;
     el.composer.hidden = !has;
     el.requests.hidden = !(has && t.kind === 'leader');
     el.keys.hidden = !has || agent || t.keys === 'none';
+    el.viewSwitch.hidden = !has || isAgent(t) || !t.chat_capable;
+    el.viewChat.disabled = !has || !t.chat_capable;
+    el.viewChat.setAttribute('aria-pressed', String(agent));
+    el.viewTerminal.setAttribute('aria-pressed', String(!agent));
+    document.body.classList.toggle('chat-mode', agent);
     if (agent) {
-      setStatus('chat · ' + (t.agent_name || '') + ' @ ' + (t.team_name || ''));
-      el.text.placeholder = (t.agent_name || 'agent') + '에게 보낼 턴…';
+      var chatName = t.agent_name || t.agent_cli || 'agent';
+      el.chatTitle.textContent = chatName.charAt(0).toUpperCase() + chatName.slice(1) + ' session';
+      el.chatSubtitle.textContent = t.cwd ? compactPath(t.cwd) : 'Live transcript';
+      setStatus('chat · ' + chatName + (t.team_name ? ' @ ' + t.team_name : ''));
+      el.text.placeholder = chatName + '에게 보낼 턴…';
     } else if (has) {
       setStatus(t.kind === 'leader' ? 'leader · ' + (t.team_name || '') : (t.agent_cli || 'pane') + ' · ' + (t.cwd || ''));
       el.text.placeholder = '메시지…';
@@ -294,28 +331,42 @@
       node = document.createElement('details');
       node.className = 'tool' + (e.running ? ' running' : '') + (e.failed ? ' failed' : '');
       var summary = document.createElement('summary');
-      var name = document.createElement('span'); name.className = 'tool-name'; name.textContent = e.name || 'tool';
-      var head = document.createElement('span'); head.className = 'tool-head'; head.textContent = e.headline || '';
-      summary.appendChild(name); summary.appendChild(head);
+      var marker = document.createElement('span'); marker.className = 'tool-marker'; marker.setAttribute('aria-hidden', 'true');
+      var body = document.createElement('span'); body.className = 'tool-summary-body';
+      var name = document.createElement('span'); name.className = 'tool-name'; name.textContent = toolLabel(e.name);
+      var head = document.createElement('span'); head.className = 'tool-head'; head.textContent = toolSummary(e);
+      var stateLabel = document.createElement('span'); stateLabel.className = 'tool-state';
+      stateLabel.textContent = e.failed ? 'Failed' : (e.running ? 'Running' : 'Done');
+      body.appendChild(name); body.appendChild(head);
+      summary.appendChild(marker); summary.appendChild(body); summary.appendChild(stateLabel);
       if (e.change) {
         var ch = document.createElement('span'); ch.className = 'tool-change';
         var add = document.createElement('span'); add.className = 'add'; add.textContent = '+' + (e.change.added || 0);
         var del = document.createElement('span'); del.className = 'del'; del.textContent = ' −' + (e.change.removed || 0);
         ch.appendChild(document.createTextNode((e.change.path || '') + ' ')); ch.appendChild(add); ch.appendChild(del);
-        summary.appendChild(ch);
+        body.appendChild(ch);
       }
       node.appendChild(summary);
-      if (e.result) {
-        var pre = document.createElement('pre'); pre.textContent = e.result; node.appendChild(pre);
+      var details = document.createElement('div'); details.className = 'tool-details';
+      if (e.headline) {
+        var commandLabel = document.createElement('div'); commandLabel.className = 'tool-section-label'; commandLabel.textContent = e.name === 'exec' ? 'Command' : 'Input';
+        var command = document.createElement('pre'); command.className = 'tool-command'; command.textContent = e.headline;
+        details.appendChild(commandLabel); details.appendChild(command);
       }
+      if (e.result) {
+        var resultLabel = document.createElement('div'); resultLabel.className = 'tool-section-label'; resultLabel.textContent = 'Output';
+        var pre = document.createElement('pre'); pre.className = 'tool-output'; pre.textContent = e.result;
+        details.appendChild(resultLabel); details.appendChild(pre);
+      }
+      if (details.childNodes.length) { node.appendChild(details); }
       return node;
     }
-    node = document.createElement('li');
+    node = document.createElement('article');
     if (e.kind === 'said') {
       node.className = 'msg said' + (e.speaker === 'leader' ? ' leader' : '');
-      node.textContent = e.text || '';
+      appendMessage(node, e.speaker === 'leader' ? 'Leader' : 'You', e.text || '');
     } else if (e.kind === 'answered') {
-      node.className = 'msg answered'; node.textContent = e.text || '';
+      node.className = 'msg answered'; appendMessage(node, 'Agent', e.text || '');
     } else if (e.kind === 'thought') {
       node.className = 'msg thought'; node.textContent = (e.text || '').slice(0, 400);
     } else if (e.kind === 'turn_ended') {
@@ -331,6 +382,35 @@
     return node;
   }
 
+  function appendMessage(node, label, text) {
+    var role = document.createElement('span'); role.className = 'msg-role'; role.textContent = label;
+    var content = document.createElement('span'); content.className = 'msg-content'; content.textContent = text;
+    node.appendChild(role); node.appendChild(content);
+  }
+
+  function toolLabel(name) {
+    if (name === 'exec') { return 'Command'; }
+    if (name === 'apply_patch') { return 'Edit'; }
+    return name || 'Tool';
+  }
+
+  function toolSummary(e) {
+    var raw = (e.headline || '').replace(/s+/g, ' ').trim();
+    if (!raw) { return e.running ? 'In progress' : 'Completed'; }
+    if (e.name === 'exec') {
+      var count = (raw.match(/tools.exec_command/g) || []).length;
+      if (count > 1) { return 'Ran ' + count + ' commands'; }
+      return 'Ran command';
+    }
+    return raw.slice(0, 88);
+  }
+
+  function compactPath(path) {
+    var parts = String(path).split('/').filter(Boolean);
+    if (parts.length < 2) { return path; }
+    return '…/' + parts.slice(-2).join('/');
+  }
+
   // Entries carry stable ids; answers stream and tool rows close in place,
   // so each entry is re-rendered only when its serialized form changes.
   function renderChat(data) {
@@ -338,6 +418,8 @@
     var stick = isAtBottom(el.chatList);
     var seen = {};
     var prev = null;
+    el.chatList.classList.toggle('empty', entries.length === 0);
+    el.chatList.setAttribute('data-empty', entries.length ? '' : 'No conversation yet');
     entries.forEach(function (e) {
       var id = e.id || (e.kind + ':' + (e.text || e.headline || ''));
       seen[id] = true;
@@ -380,12 +462,12 @@
 
   function refreshChat() {
     var t = state.selected;
-    if (!isAgent(t)) { return Promise.resolve(); }
+    if (!isChat(t)) { return Promise.resolve(); }
     return api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + '/transcript?limit=200')
       .then(function (data) {
         renderChat(data);
         state.lastError = null;
-        setStatus('chat · ' + (t.agent_name || '') + ' · ' + new Date().toLocaleTimeString());
+        setStatus('chat · ' + (t.agent_name || t.agent_cli || 'agent') + ' · ' + new Date().toLocaleTimeString());
       })
       .catch(function (err) {
         state.lastError = err;
@@ -398,7 +480,7 @@
 
   function refreshScreen() {
     var t = state.selected;
-    if (isAgent(t)) { return refreshChat(); }
+    if (isChat(t)) { return refreshChat(); }
     if (!t) { return Promise.resolve(); }
     var stickToBottom = isAtBottom(el.screen);
     return api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + '/screen?lines=' + SCREEN_LINES + '&format=styled')
@@ -475,7 +557,7 @@
     }, POLL_MS);
     // A running agent turn streams text; poll it twice as often.
     window.setInterval(function () {
-      if (document.hidden || !state.chatRunning || !isAgent(state.selected)) { return; }
+      if (document.hidden || !state.chatRunning || !isChat(state.selected)) { return; }
       refreshNow();
     }, POLL_MS / 2);
   }
@@ -495,9 +577,9 @@
     var id = requestId();
     el.send.disabled = true;
     setSendStatus('sending…');
-    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/text', { text: text, request_id: id })
+    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/text', { text: text, request_id: id, mode: isChat(t) ? 'chat' : 'terminal' })
       .then(function (data) {
-        if (isAgent(t)) {
+        if (isChat(t)) {
           setSendStatus(data.deduplicated ? 'already sent' : 'turn sent');
         } else if (t.kind === 'leader') {
           var bits = ['queued ' + String(data.request_id || id).slice(0, 8)];
@@ -546,6 +628,9 @@
     loadTargets().then(refreshNow, refreshNow);
   });
 
+  el.viewChat.addEventListener('click', function () { setMode('chat'); });
+  el.viewTerminal.addEventListener('click', function () { setMode('terminal'); });
+
   el.screen.addEventListener('scroll', function () {
     el.jump.hidden = isAtBottom(el.screen);
   });
@@ -557,7 +642,7 @@
 
   el.interrupt.addEventListener('click', function () {
     var t = state.selected;
-    if (!isAgent(t)) { return; }
+    if (!isChat(t)) { return; }
     el.interrupt.disabled = true;
     api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/interrupt', {})
       .then(function () { setSendStatus('interrupted'); refreshNow(); })

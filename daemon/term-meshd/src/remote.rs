@@ -41,8 +41,8 @@ pub const ENV_LISTENER_ADDR: &str = "TERM_MESH_MOBILE_ADDR";
 pub enum TargetKind {
     Leader,
     Pane,
-    /// A native agent pane: the page shows its structured transcript as a
-    /// chat and sends turns with `team.send`. No screen, no keys.
+    /// A native agent pane: the page shows its structured transcript as chat.
+    /// A terminal-backed session stays `Pane` and advertises `chat_capable`.
     Agent,
 }
 
@@ -68,16 +68,20 @@ pub struct Entry {
     /// Daemon surface: the hex id from `identity_environment`.
     pub surface_id: String,
     pub kind: TargetKind,
+    #[serde(default)]
+    pub chat_capable: bool,
     /// Required for `kind = leader`: the team whose durable request board
     /// receives the text. Required for `kind = agent` together with
     /// `agent_name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_name: Option<String>,
-    /// `kind = agent` only: the team member whose native pane this is.
+    /// Team member identity when this is a managed agent target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     #[serde(default)]
     pub agent_cli: String,
+    #[serde(default, skip_serializing)]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -114,11 +118,15 @@ pub struct EnableSpec {
     #[serde(default = "default_kind")]
     pub kind: TargetKind,
     #[serde(default)]
+    pub chat_capable: bool,
+    #[serde(default)]
     pub team_name: Option<String>,
     #[serde(default)]
     pub agent_name: Option<String>,
     #[serde(default)]
     pub agent_cli: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -181,6 +189,17 @@ impl EnableSpec {
                 return Err("kind=agent requires team_name and agent_name".into());
             }
         }
+        if let Some(session_id) = self.session_id.as_deref() {
+            let session_id = session_id.trim();
+            if session_id.is_empty()
+                || session_id.len() > 128
+                || !session_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err("session_id must be alphanumeric, '-' or '_' (max 128)".into());
+            }
+        }
         if let Some(sock) = self.app_socket.as_deref() {
             if !sock.starts_with('/') {
                 return Err("app_socket must be an absolute path".into());
@@ -224,6 +243,7 @@ impl Registry {
         let entry = Entry {
             surface_id: surface_id.clone(),
             kind: spec.kind,
+            chat_capable: spec.chat_capable || spec.kind == TargetKind::Agent,
             team_name: spec
                 .team_name
                 .map(|t| t.trim().to_string())
@@ -233,6 +253,10 @@ impl Registry {
                 .map(|a| a.trim().to_string())
                 .filter(|a| !a.is_empty()),
             agent_cli: spec.agent_cli.trim().to_string(),
+            session_id: spec
+                .session_id
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             title: spec.title.trim().to_string(),
             cwd: spec.cwd.trim().to_string(),
             app_socket: spec.app_socket,

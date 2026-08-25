@@ -1002,6 +1002,8 @@ class TerminalController {
             return v2Result(id: id, self.v2SurfaceHealth(params: params))
         case "surface.send_text":
             return v2Result(id: id, self.v2SurfaceSendText(params: params))
+        case "surface.send_turn":
+            return v2Result(id: id, self.v2SurfaceSendTurn(params: params))
         case "surface.send_key":
             return v2Result(id: id, self.v2SurfaceSendKey(params: params))
         case "surface.clear_history":
@@ -1549,6 +1551,7 @@ class TerminalController {
             "surface.rebuild_renderer",
             "surface.health",
             "surface.send_text",
+            "surface.send_turn",
             "surface.send_key",
             "surface.read_text",
             "surface.read_screen_grid",
