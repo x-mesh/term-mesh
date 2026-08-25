@@ -23,15 +23,13 @@ If the first token is `help`, print this usage block and stop.
 
 ## Execution
 
-Run the matching command and show its output verbatim (URL, keys, expiry):
+Pass the arguments through unchanged; `$ARGUMENTS` already starts with the subcommand, so never repeat it:
 
 ```bash
-tm-agent remote on $ARGUMENTS      # /rc on ...
-tm-agent remote off                # /rc off
-tm-agent remote status [--all]     # /rc status
+tm-agent remote $ARGUMENTS         # /rc on --keys none  →  tm-agent remote on --keys none
 ```
 
-If `tm-agent` is unavailable in PATH, run `./daemon/target/release/tm-agent` instead.
+Show the output verbatim (URL, keys, expiry). Prefer the app bundle's `Contents/Resources/bin/tm-agent`, then `tm-agent` in PATH, then `./daemon/target/release/tm-agent`; an older binary answers `unrecognized subcommand 'remote'`.
 
 After `on`, tell the user in one or two lines: the printed URL (loopback on the Mac; from a phone it is `https://<mac-hostname>.<tailnet>.ts.net/t/<surface_id>` once `tailscale serve --bg 9877` is active), and, if the output says the listener is disabled, that it must be enabled in Settings (Mobile remote control) or with `TERM_MESH_MOBILE_ENABLED=1` before the daemon starts.
 

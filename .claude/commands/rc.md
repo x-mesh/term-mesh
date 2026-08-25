@@ -28,19 +28,18 @@ User provided: $ARGUMENTS
 
 If the first token is `help`, print the usage block above and stop.
 
-Otherwise run the matching command and show its output verbatim (URL, keys, expiry):
+Otherwise pass the arguments through unchanged. `$ARGUMENTS` already starts
+with the subcommand (`on`, `off`, or `status`), so do not repeat it:
 
 ```bash
-tm-agent remote on $ARGUMENTS      # /rc on ...
-tm-agent remote off                # /rc off
-tm-agent remote status [--all]     # /rc status
+tm-agent remote $ARGUMENTS         # /rc on --keys none  →  tm-agent remote on --keys none
 ```
 
-If `tm-agent` is not in PATH, use the project-local binary:
-
-```bash
-./daemon/target/release/tm-agent remote on $ARGUMENTS
-```
+Show the output verbatim (URL, keys, expiry). Use the `tm-agent` that belongs
+to the app this pane runs in: the bundle's `Contents/Resources/bin/tm-agent`
+first, then `tm-agent` in PATH, then `./daemon/target/release/tm-agent`. An
+older `tm-agent` reports `unrecognized subcommand 'remote'`; then try the next
+binary rather than another spelling.
 
 After `on`, tell the user in one or two lines:
 
