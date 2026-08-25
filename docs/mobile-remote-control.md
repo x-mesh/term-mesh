@@ -188,7 +188,13 @@ wake instruction으로 깨어나고, 일반 pane은 텍스트가 그대로 타�
 대상 목록 → 대상 화면. 화면은 `format=styled`로 받은 셀 스타일(색·굵게·dim·기울임·
 밑줄·반전)과 커서 위치를 그대로 그린다. 그래서 Claude Code가 dim으로 띄우는 제안
 문구와 실제 입력이 구분되고 커서가 어디 있는지 보인다. 2초 자동 refresh와 수동
-refresh, 사용자가 하단에 있을 때만 자동 scroll. 하단에 composer, 키 버튼 행(Enter, Esc,
+refresh, 사용자가 하단에 있을 때만 자동 scroll.
+
+입력은 두 가지다. (1) 직접 입력 모드: 화면을 탭하거나 ⌨ 버튼을 누르면 숨은 입력
+필드가 폰 키보드를 열고, 글자는 `POST /text {raw: true}`로, Enter·Backspace·화살표·
+Esc·Tab·Ctrl-C는 `POST /key`로 즉시 pane에 간다. IME(한글) 조합 중인 글자는 확정된 뒤에만
+보낸다. 리더 pane도 이 모드에서는 durable board를 거치지 않고 그대로 타이핑된다. (2)
+아래 composer: 여러 줄·붙여넣기용이며 리더 pane에서는 durable request로 보낸다. 하단에 composer, 키 버튼 행(Enter, Esc,
 y, n, 1–9, ↑, ↓, Tab, Ctrl-C), 리더면 최근 request 상태. 상태 저장은 없다.
 
 ## 5. 대상별 경로
@@ -222,12 +228,12 @@ frame-ancestors 'none'; base-uri 'none'; form-action 'none'`. CORS 없음. POST�
 | GET | `/api/targets` | | `{targets: [{surface_id, kind, team_name, agent_cli, title, cwd, source: gui\|headless, keys, owner, created_at, expires_at}], now}`. 호출 시 만료·dead socket entry를 prune |
 | GET | `/api/targets/{id}/screen?lines=200` | `lines` 20..1000 | `{surface_id, kind, lines, text, captured_at}` |
 | GET | `/api/targets/{id}/screen?lines=200&format=styled` | 위와 같음 | `{format: "styled", columns, rows: [[{t, fg?, bg?, b?, d?, i?, u?, inv?}]], cursor: {row, col}\|null, captured_at}`. 앱 `surface.read_screen_grid`(Ghostty render-grid 프레임)의 span을 daemon이 행별로 배치(열 간격은 공백으로 채움, invisible은 공백, scrollback 행 다음에 active 행, 커서·마지막 내용 아래의 빈 행은 제거). fg/bg는 `#rrggbb`(터미널 기본색이면 생략). 구형 앱이면 `format: "text"`로 내려감 |
-| POST | `/api/targets/{id}/text` | `{text, request_id?}` | leader: 202 `{request_id, stored, wake_dispatched, request_replayed, claimed_by_leader}` / pane: 200 `{delivered, deduplicated, request_id}` |
+| POST | `/api/targets/{id}/text` | `{text, request_id?, raw?}` | leader: 202 `{request_id, stored, wake_dispatched, request_replayed, claimed_by_leader}` / pane 또는 `raw: true`: 200 `{delivered, deduplicated, request_id}`. `raw`는 직접 입력 모드용으로 리더 pane에도 durable board를 거치지 않고 키 입력으로 타이핑 |
 | GET | `/api/targets/{id}/requests` | leader만(아니면 409 `not_leader`) | `{count, requests}` (`team.leader.request.list`, 본문 미포함) |
 | POST | `/api/targets/{id}/key` | `{key}` | 200 `{key, delivered}` |
 
-키 allowlist(`keys=safe`): `Enter`, `Escape`, `Tab`, `Up`, `Down`, `Left`, `Right`,
-`y`, `n`, `1`–`9`, `C-c`(대소문자 정확히 일치). GUI pane 매핑(`http_mobile::gui_key`):
+키 allowlist(`keys=safe`): `Enter`, `Escape`, `Tab`, `Backspace`, `Up`, `Down`, `Left`,
+`Right`, `y`, `n`, `1`–`9`, `C-c`(대소문자 정확히 일치). GUI pane 매핑(`http_mobile::gui_key`):
 `Enter`/`Escape`/`Tab`/`C-c`/화살표는 앱의 `sendNamedKey`가 아는 이름
 (`enter`/`escape`/`tab`/`ctrl-c`/`up`/`down`/`left`/`right`)으로 `surface.send_key`,
 `y`/`n`/숫자는 글자 그대로 `surface.send_text`. 화살표를 `send_text`의 CSI 바이트로

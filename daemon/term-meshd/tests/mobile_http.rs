@@ -662,6 +662,25 @@ async fn leader_text_goes_to_the_durable_board_and_returns_202() {
     .await;
     assert_eq!(again.status, 202);
     assert_eq!(app.calls().len(), 2);
+
+    // Direct typing bypasses the board even on a leader.
+    app.reply("surface.send_text", json!({}));
+    let typed = post(
+        &h,
+        "/api/targets/leader-1/text",
+        json!({ "text": "ls", "raw": true }),
+    )
+    .await;
+    assert_eq!(typed.status, 200, "{}", typed.body);
+    assert_eq!(typed.json()["kind"], "pane");
+    let calls = app.calls();
+    assert_eq!(
+        calls[2],
+        (
+            "surface.send_text".into(),
+            json!({ "surface_id": "leader-1", "text": "ls" })
+        )
+    );
 }
 
 #[tokio::test]
@@ -714,7 +733,7 @@ async fn keys_follow_policy_and_the_safe_allowlist() {
     assert_eq!(forbidden.status, 403);
     assert!(app.calls().is_empty(), "refused keys never reach the app");
 
-    for key in ["Enter", "y", "Up", "C-c", "7", "Escape"] {
+    for key in ["Enter", "y", "Up", "C-c", "7", "Escape", "Backspace"] {
         let r = post(&h, "/api/targets/open/key", json!({ "key": key })).await;
         assert_eq!(r.status, 200, "{key}: {}", r.body);
         assert_eq!(r.json()["delivered"], true);
@@ -757,6 +776,13 @@ async fn keys_follow_policy_and_the_safe_allowlist() {
         (
             "surface.send_key".into(),
             json!({ "surface_id": "open", "key": "escape" })
+        )
+    );
+    assert_eq!(
+        calls[6],
+        (
+            "surface.send_key".into(),
+            json!({ "surface_id": "open", "key": "backspace" })
         )
     );
 }

@@ -34,6 +34,8 @@
     requestsCount: $('requests-count'),
     requestsList: $('requests-list'),
     composer: $('composer'),
+    direct: $('direct'),
+    type: $('type'),
     keys: $('keys'),
     form: $('send-form'),
     text: $('text'),
@@ -48,6 +50,8 @@
     inFlight: false,
     lastText: null,
     lastError: null,
+    direct: false,       // direct-typing mode: keystrokes go straight to the pane
+    typeRefreshTimer: null,
   };
 
   // ── helpers ──────────────────────────────────────────────────────────
@@ -209,6 +213,7 @@
 
   function selectTarget(t, fromRender) {
     var changed = !state.selected || !t || state.selected.surface_id !== t.surface_id;
+    if (changed && state.direct) { setDirect(false); }
     state.selected = t || null;
     if (t) { el.target.value = t.surface_id; }
     var has = !!t;
@@ -358,6 +363,63 @@
       });
   }
 
+  // ── direct typing ─────────────────────────────────────────────────────
+  // Tap the screen (or ⌨) and the phone keyboard types straight into the
+  // pane: printable text as keystrokes (raw, even on a leader), Enter and
+  // Backspace as keys. IME composition (Korean) is flushed only once the
+  // composed text is committed, so no syllable fragments reach the pane.
+
+  function typeRaw(text) {
+    var t = state.selected;
+    if (!t || !text) { return; }
+    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/text',
+        { text: text, request_id: requestId(), raw: true })
+      .then(function () { scheduleTypeRefresh(); })
+      .catch(function (err) { setSendStatus(describeError(err), true); });
+  }
+
+  function typeKey(key) {
+    var t = state.selected;
+    if (!t) { return; }
+    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/key', { key: key })
+      .then(function () { scheduleTypeRefresh(); })
+      .catch(function (err) { setSendStatus(describeError(err), true); });
+  }
+
+  function scheduleTypeRefresh() {
+    if (state.typeRefreshTimer) { return; }
+    state.typeRefreshTimer = window.setTimeout(function () {
+      state.typeRefreshTimer = null;
+      refreshNow();
+    }, 150);
+  }
+
+  function flushTyped() {
+    var value = el.type.value;
+    if (!value) { return; }
+    el.type.value = '';
+    typeRaw(value);
+  }
+
+  function setDirect(on) {
+    state.direct = !!on;
+    el.screenWrap.classList.toggle('direct', state.direct);
+    el.direct.setAttribute('aria-pressed', state.direct ? 'true' : 'false');
+    if (state.direct) {
+      el.type.value = '';
+      el.type.focus();
+      setSendStatus('직접 입력: 키보드 입력이 pane으로 바로 갑니다 (⌨로 종료)');
+    } else {
+      el.type.blur();
+      setSendStatus('');
+    }
+  }
+
+  var HARDWARE_KEYS = {
+    ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
+    Escape: 'Escape', Tab: 'Tab',
+  };
+
   // ── wiring ───────────────────────────────────────────────────────────
 
   el.target.addEventListener('change', function () {
@@ -381,6 +443,62 @@
   el.jump.addEventListener('click', function () {
     el.screen.scrollTop = el.screen.scrollHeight;
     el.jump.hidden = true;
+  });
+
+  el.direct.addEventListener('click', function () {
+    setDirect(!state.direct);
+  });
+
+  el.screen.addEventListener('click', function () {
+    if (state.selected && !state.direct) { setDirect(true); }
+    else if (state.direct) { el.type.focus(); }
+  });
+
+  el.type.addEventListener('beforeinput', function (ev) {
+    if (!state.direct) { return; }
+    if (ev.inputType === 'insertLineBreak' || ev.inputType === 'insertParagraph') {
+      ev.preventDefault();
+      flushTyped();
+      typeKey('Enter');
+    } else if (ev.inputType === 'deleteContentBackward' && !el.type.value) {
+      ev.preventDefault();
+      typeKey('Backspace');
+    }
+  });
+
+  el.type.addEventListener('input', function (ev) {
+    if (!state.direct || ev.isComposing) { return; }
+    flushTyped();
+  });
+
+  el.type.addEventListener('compositionend', function () {
+    if (!state.direct) { return; }
+    // iOS fires a trailing non-composing input event as well; flushing here
+    // and there is safe because the field is emptied on the first flush.
+    window.setTimeout(flushTyped, 0);
+  });
+
+  el.type.addEventListener('keydown', function (ev) {
+    if (!state.direct) { return; }
+    if (ev.ctrlKey && (ev.key === 'c' || ev.key === 'C')) {
+      ev.preventDefault();
+      typeKey('C-c');
+      return;
+    }
+    var mapped = HARDWARE_KEYS[ev.key];
+    if (mapped) {
+      ev.preventDefault();
+      flushTyped();
+      typeKey(mapped);
+    }
+  });
+
+  el.type.addEventListener('blur', function () {
+    // Leaving the field (another control tapped) ends direct mode so the
+    // composer and key row behave normally again.
+    if (state.direct) { window.setTimeout(function () {
+      if (document.activeElement !== el.type) { setDirect(false); }
+    }, 100); }
   });
 
   el.keys.addEventListener('click', function (ev) {

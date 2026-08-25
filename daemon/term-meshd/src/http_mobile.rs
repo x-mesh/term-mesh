@@ -45,8 +45,8 @@ pub const MAX_SCREEN_LINES: u32 = 1000;
 
 /// Keys the page may send when the entry's policy is `safe`.
 pub const SAFE_KEYS: &[&str] = &[
-    "Enter", "Escape", "Tab", "Up", "Down", "Left", "Right", "y", "n", "1", "2", "3", "4", "5",
-    "6", "7", "8", "9", "C-c",
+    "Enter", "Escape", "Tab", "Backspace", "Up", "Down", "Left", "Right", "y", "n", "1", "2",
+    "3", "4", "5", "6", "7", "8", "9", "C-c",
 ];
 
 const PAGE_HTML: &str = include_str!("../../../Resources/mobile/index.html");
@@ -782,6 +782,10 @@ struct TextBody {
     text: String,
     #[serde(default)]
     request_id: Option<String>,
+    /// Type the text into the surface as keystrokes even for a leader target
+    /// (direct-typing mode). Without it a leader gets a durable request.
+    #[serde(default)]
+    raw: bool,
 }
 
 async fn text_handler(
@@ -822,7 +826,12 @@ async fn text_handler(
         entry.kind,
         body.text.len()
     );
-    match entry.kind {
+    let kind = if body.raw {
+        TargetKind::Pane
+    } else {
+        entry.kind
+    };
+    match kind {
         TargetKind::Leader => {
             let mut params = json!({ "team_name": entry.team_name, "text": body.text });
             if let Some(id) = &request_id {
@@ -909,6 +918,7 @@ pub fn gui_key(key: &str) -> Option<GuiKey> {
         "Enter" => GuiKey::Named("enter"),
         "Escape" => GuiKey::Named("escape"),
         "Tab" => GuiKey::Named("tab"),
+        "Backspace" => GuiKey::Named("backspace"),
         "C-c" => GuiKey::Named("ctrl-c"),
         "Up" => GuiKey::Named("up"),
         "Down" => GuiKey::Named("down"),
