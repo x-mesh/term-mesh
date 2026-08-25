@@ -275,7 +275,9 @@ protocol을 켜므로 Ghostty가 ESC 바이트를 Escape 키로 인코딩해 시
 화살표 named key를 앱(`TerminalController+DebugInput.swift` `sendNamedKey`)에 추가했고,
 이 앱 버전 이전에는 화살표가 `Unknown key`(502)로 실패한다. daemon surface용 바이트 표 `key_bytes()`
 (`daemon/term-mesh-cli/src/peer.rs:2092`)의 `peer-proto` 이동은 Phase 3.
-`keys=none`이면 `/key`는 403 `keys_disabled`, allowlist 밖 키는 403 `key_not_allowed`.
+terminal-backed pane에서 `keys=none`이면 `/key`, `/text`, Chat turn/interrupt는
+403 `keys_disabled`, allowlist 밖 키는 403 `key_not_allowed`. 화면과 transcript 읽기는
+유지된다. Native Agent와 Leader의 semantic API에는 이 terminal-input 정책을 적용하지 않는다.
 
 멱등성: 리더 텍스트는 durable board가 `request_id`로 중복 실행을 막는다. pane
 텍스트는 listener가 `request_id`를 10분간 기억해 재시도 중복 타이핑을 막는다.

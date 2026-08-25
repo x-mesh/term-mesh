@@ -21,7 +21,7 @@ User provided: $ARGUMENTS
 - **on** — 이 pane을 노출한다. Claude/Codex session을 확인할 수 있는 terminal pane은 웹에서 Chat과 Terminal을 선택할 수 있다. Native agent pane은 Chat, 리더 pane은 durable request 보드, 일반 shell은 Terminal만 제공한다.
 - **--terminal** — 채팅 대신 터미널 미러(화면 + 타이핑)로 노출한다. native pane에는 터미널이 없으므로 오류가 난다.
 - **--agent [NAME]** — 노출할 팀 에이전트. NAME을 생략하면 이 pane의 에이전트(`TERMMESH_AGENT_NAME`)라서 기본 동작과 같다. 다른 에이전트를 노출하려면 리더 pane(또는 `--team`)에서 NAME을 준다. native가 아닌 에이전트 pane은 터미널 미러로 자동 등록된다.
-- **--keys safe|none** — 모바일에서 보낼 수 있는 키. `safe`(기본)는 Enter/Esc/Tab/↑↓←→/y/n/1–9/Ctrl-C 고정 allowlist, `none`은 키 전송 차단. 채팅 뷰에는 키가 없다.
+- **--keys safe|none** — terminal-backed pane에서 모바일이 보낼 수 있는 입력. `safe`(기본)는 text, Enter/Esc/Tab/Backspace/↑↓←→/y/n/1–9/Ctrl-C 고정 allowlist와 Chat turn/interrupt를 허용하고, `none`은 pane 입력을 모두 차단한다. 화면과 Chat transcript 읽기는 유지된다. Native Agent와 Leader의 semantic API에는 적용하지 않는다.
 - **--ttl** — 노출 시간(`30m`, `12h`, `2d`, 초). 기본 24h, daemon이 60s–7d로 clamp.
 - **--leader** — 팀 리더로 등록. 앱이 띄운 리더 pane은 자동 감지되므로 보통 생략한다. adopt한 리더(`TERMMESH_TEAM` 없음)는 `--leader --team ws-<hex>`를 함께 준다.
 - **off** — 노출 해제.

@@ -129,6 +129,12 @@
 
   function isAgent(t) { return !!t && t.kind === 'agent'; }
   function isChat(t) { return !!t && (isAgent(t) || (t.chat_capable && state.mode === 'chat')); }
+  function isCurrentTarget(t) {
+    return !!t && !!state.selected && state.selected.surface_id === t.surface_id && isChat(t);
+  }
+  function isPaneReadOnly(t) {
+    return !!t && t.kind === 'pane' && t.keys === 'none';
+  }
 
   function storedMode(t) {
     if (!t) { return 'terminal'; }
@@ -284,7 +290,8 @@
     el.empty.hidden = has;
     el.screenWrap.hidden = !has || agent;
     el.chat.hidden = !agent;
-    el.composer.hidden = !has;
+    var paneReadOnly = isPaneReadOnly(t);
+    el.composer.hidden = !has || paneReadOnly;
     el.requests.hidden = !(has && t.kind === 'leader');
     el.keys.hidden = !has || agent || t.keys === 'none';
     el.viewSwitch.hidden = !has || isAgent(t) || !t.chat_capable;
@@ -292,15 +299,18 @@
     el.viewChat.setAttribute('aria-pressed', String(agent));
     el.viewTerminal.setAttribute('aria-pressed', String(!agent));
     document.body.classList.toggle('chat-mode', agent);
+    el.interrupt.hidden = !agent || !state.chatRunning || paneReadOnly;
     if (agent) {
       var chatName = t.agent_name || t.agent_cli || 'agent';
       el.chatTitle.textContent = chatName.charAt(0).toUpperCase() + chatName.slice(1) + ' session';
       el.chatSubtitle.textContent = t.cwd ? compactPath(t.cwd) : 'Live transcript';
       setStatus('chat · ' + chatName + (t.team_name ? ' @ ' + t.team_name : ''));
       el.text.placeholder = chatName + '에게 보낼 턴…';
+      if (paneReadOnly) { setStatus('chat transcript · read only (keys=none)'); }
     } else if (has) {
       setStatus(t.kind === 'leader' ? 'leader · ' + (t.team_name || '') : (t.agent_cli || 'pane') + ' · ' + (t.cwd || ''));
       el.text.placeholder = '메시지…';
+      if (paneReadOnly) { setStatus('terminal · read only (keys=none)'); }
     } else {
       setStatus('no exposed panes');
     }
@@ -453,7 +463,7 @@
     // `running` means the agent process is alive between turns; a turn in
     // progress is `in_flight` (or `thinking` while it reasons).
     state.chatRunning = !!(data && (data.in_flight || data.thinking));
-    el.interrupt.hidden = !state.chatRunning;
+    el.interrupt.hidden = !state.chatRunning || isPaneReadOnly(state.selected);
     var alive = !!(data && data.running);
     el.chatState.textContent = state.chatRunning
       ? (data.thinking ? '생각 중…' : '작업 중…') + (data.summary ? ' · ' + data.summary : '')
@@ -466,12 +476,19 @@
     if (!isChat(t)) { return Promise.resolve(); }
     return api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + '/transcript?limit=200')
       .then(function (data) {
+        if (!isCurrentTarget(t)) { return; }
         renderChat(data);
         state.lastError = null;
-        setStatus('chat · ' + (t.agent_name || t.agent_cli || 'agent') + ' · ' + new Date().toLocaleTimeString());
+        var access = isPaneReadOnly(t) ? 'chat transcript · read only' : 'chat';
+        setStatus(access + ' · ' + (t.agent_name || t.agent_cli || 'agent') + ' · ' + new Date().toLocaleTimeString());
       })
       .catch(function (err) {
+        if (!isCurrentTarget(t)) { return; }
         state.lastError = err;
+        if (err.code === 'session_unavailable' && t.kind === 'pane') {
+          setStatus('chat session 준비 중 · 다음 poll에서 재시도', true);
+          return;
+        }
         setStatus(describeError(err), true);
         if (err.code === 'not_exposed' || err.code === 'target_gone') {
           return loadTargets();
@@ -578,7 +595,7 @@
 
   function sendText(text) {
     var t = state.selected;
-    if (!t) { return; }
+    if (!t || isPaneReadOnly(t)) { return; }
     var id = requestId();
     el.send.disabled = true;
     setSendStatus('sending…');
@@ -647,7 +664,7 @@
 
   el.interrupt.addEventListener('click', function () {
     var t = state.selected;
-    if (!isChat(t)) { return; }
+    if (!isChat(t) || isPaneReadOnly(t)) { return; }
     el.interrupt.disabled = true;
     api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/interrupt', {})
       .then(function () { setSendStatus('interrupted'); refreshNow(); })

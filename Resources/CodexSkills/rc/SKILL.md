@@ -70,6 +70,9 @@ Do not retry, poll, or change team membership.
 - A terminal-backed Claude/Codex pane can switch between Chat (whole turns +
   session transcript) and Terminal (screen + keys). Other panes use the safe key row
   (Enter/Esc/Tab/Backspace/arrows/y/n/1–9/Ctrl-C) answers prompts and menus.
+- For a terminal-backed pane, `--keys none` keeps screen and transcript reading
+  available but blocks pane text, Chat turn/interrupt paths, and the key row.
+  Native Agent and Leader semantic APIs are outside this terminal-input policy.
 - Only this pane's screen is visible to the phone. `$rc off`, closing the pane,
   or the TTL removes the exposure.
 

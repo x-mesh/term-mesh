@@ -315,6 +315,7 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    rpc_code: Option<String>,
 }
 
 impl ApiError {
@@ -323,6 +324,7 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            rpc_code: None,
         }
     }
     fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
@@ -348,11 +350,12 @@ impl ApiError {
             RpcFailure::Rpc { code, message } if code == "not_found" => {
                 Self::not_found("target_gone", message)
             }
-            RpcFailure::Rpc { code, message } => Self::new(
-                StatusCode::BAD_GATEWAY,
-                "app_rpc_failed",
-                format!("{code}: {message}"),
-            ),
+            RpcFailure::Rpc { code, message } => Self {
+                status: StatusCode::BAD_GATEWAY,
+                code: "app_rpc_failed",
+                message: format!("{code}: {message}"),
+                rpc_code: Some(code),
+            },
             RpcFailure::Transport(m) => Self::new(StatusCode::BAD_GATEWAY, "app_rpc_failed", m),
         }
     }
@@ -474,6 +477,51 @@ fn bounded_headline(value: &str) -> String {
         + "…"
 }
 
+fn without_terminal_controls(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for next in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    let mut escape = false;
+                    for next in chars.by_ref() {
+                        if next == '\u{7}' || (escape && next == '\\') {
+                            break;
+                        }
+                        escape = next == '\u{1b}';
+                    }
+                }
+                Some(_) | None => {}
+            }
+        } else if !ch.is_control() {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+fn without_control_bytes(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_control()).collect()
+}
+
+fn has_private_key_delimiter(value: &str, boundary: &str) -> bool {
+    let prefix = format!("-----{boundary} ");
+    value.match_indices(&prefix).any(|(start, _)| {
+        let label_start = start + prefix.len();
+        value[label_start..]
+            .find("-----")
+            .is_some_and(|end| value[label_start..label_start + end].contains("PRIVATE KEY"))
+    })
+}
+
 pub(crate) fn redact_session_text(value: &str) -> String {
     const MARKERS: &[&str] = &[
         "API_KEY",
@@ -493,21 +541,51 @@ pub(crate) fn redact_session_text(value: &str) -> String {
         "AKIA",
         "XOXB-",
         "HF_",
-        "SK-",
         "EYJ",
     ];
-    value
-        .lines()
-        .map(|line| {
-            let upper = line.to_ascii_uppercase();
-            if MARKERS.iter().any(|marker| upper.contains(marker)) {
-                "[credential redacted]".to_string()
-            } else {
-                line.to_string()
-            }
+    fn has_secret_key_prefix(value: &str) -> bool {
+        value.match_indices("SK-").any(|(index, _)| {
+            index == 0
+                || value[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|ch| !ch.is_ascii_alphanumeric())
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+    }
+
+    let mut redacted = Vec::new();
+    let mut private_key_block = false;
+    for line in value.lines() {
+        let upper = without_terminal_controls(line).to_ascii_uppercase();
+        let raw_upper = without_control_bytes(line).to_ascii_uppercase();
+        let begins_private_key = has_private_key_delimiter(&upper, "BEGIN")
+            || has_private_key_delimiter(&raw_upper, "BEGIN");
+        let ends_private_key = has_private_key_delimiter(&upper, "END")
+            || has_private_key_delimiter(&raw_upper, "END");
+        if begins_private_key {
+            redacted.push("[credential redacted]".to_string());
+            private_key_block = !ends_private_key;
+            continue;
+        }
+        if private_key_block {
+            if ends_private_key {
+                private_key_block = false;
+            }
+            redacted.push("[credential redacted]".to_string());
+            continue;
+        }
+        if MARKERS
+            .iter()
+            .any(|marker| upper.contains(marker) || raw_upper.contains(marker))
+            || has_secret_key_prefix(&upper)
+            || has_secret_key_prefix(&raw_upper)
+        {
+            redacted.push("[credential redacted]".to_string());
+        } else {
+            redacted.push(line.to_string());
+        }
+    }
+    redacted.join("\n")
 }
 
 pub(crate) fn tail_json_lines(path: &FsPath) -> Result<Vec<Value>, ApiError> {
@@ -674,10 +752,54 @@ fn user_visible_text(text: String) -> Option<String> {
     Some(text)
 }
 
+/// Remove private-key blocks inside the bounded retained window. An unmatched
+/// END means the window started inside a block; an unmatched BEGIN means it
+/// ended inside one. Both edges fail closed without scanning the whole file.
+fn without_private_key_rows(lines: &[Value]) -> Vec<&Value> {
+    fn delimiter_in_value(value: &Value, boundary: &str) -> bool {
+        match value {
+            Value::String(text) => {
+                let raw_upper = without_control_bytes(text).to_ascii_uppercase();
+                has_private_key_delimiter(&raw_upper, boundary)
+                    || has_private_key_delimiter(
+                        &without_terminal_controls(text).to_ascii_uppercase(),
+                        boundary,
+                    )
+            }
+            Value::Array(items) => items.iter().any(|item| delimiter_in_value(item, boundary)),
+            Value::Object(fields) => fields
+                .values()
+                .any(|item| delimiter_in_value(item, boundary)),
+            _ => false,
+        }
+    }
+    let mut redacted = vec![false; lines.len()];
+    let mut block_start: Option<usize> = None;
+    for (index, value) in lines.iter().enumerate() {
+        let begins = delimiter_in_value(value, "BEGIN");
+        let ends = delimiter_in_value(value, "END");
+        if begins && block_start.is_none() {
+            block_start = Some(index);
+        }
+        if ends {
+            let start = block_start.take().unwrap_or(0);
+            redacted[start..=index].fill(true);
+        }
+    }
+    if let Some(start) = block_start {
+        redacted[start..].fill(true);
+    }
+    lines
+        .iter()
+        .zip(redacted)
+        .filter_map(|(row, hidden)| (!hidden).then_some(row))
+        .collect()
+}
+
 pub(crate) fn claude_entries(lines: &[Value]) -> Vec<Value> {
     let mut entries = Vec::new();
     let mut tools: HashMap<String, usize> = HashMap::new();
-    for row in lines {
+    for row in without_private_key_rows(lines) {
         let kind = row.get("type").and_then(Value::as_str).unwrap_or("");
         let id = row.get("uuid").and_then(Value::as_str).unwrap_or("");
         let message = row.get("message").unwrap_or(&Value::Null);
@@ -745,7 +867,7 @@ pub(crate) fn claude_entries(lines: &[Value]) -> Vec<Value> {
 pub(crate) fn codex_entries(lines: &[Value]) -> Vec<Value> {
     let mut entries = Vec::new();
     let mut tools: HashMap<String, usize> = HashMap::new();
-    for row in lines {
+    for row in without_private_key_rows(lines) {
         if row.get("type").and_then(Value::as_str) != Some("response_item") {
             continue;
         }
@@ -1217,9 +1339,7 @@ async fn screen_handler(
         .await
         {
             Ok(result) => Some(result),
-            Err(err)
-                if err.code == "app_rpc_failed" && err.message.contains("method_not_found") =>
-            {
+            Err(err) if err.rpc_code.as_deref() == Some("method_not_found") => {
                 tracing::info!(
                     "mobile: app has no surface.read_screen_grid, serving plain text for {}",
                     entry.surface_id
@@ -1445,6 +1565,12 @@ async fn text_handler(
         }
         TargetKind::Pane => {
             let chat_mode = body.mode.as_deref() == Some("chat");
+            if entry.keys == KeysPolicy::None {
+                return Err(ApiError::forbidden(
+                    "keys_disabled",
+                    "terminal input is disabled with keys=none",
+                ));
+            }
             if chat_mode && !entry.chat_capable {
                 return Err(ApiError::conflict(
                     "chat_unavailable",
@@ -1616,6 +1742,12 @@ async fn interrupt_handler(
         return Err(ApiError::conflict(
             "not_an_agent",
             "interrupt exists only for native agent targets; send the C-c key instead",
+        ));
+    }
+    if entry.kind == TargetKind::Pane && entry.keys == KeysPolicy::None {
+        return Err(ApiError::forbidden(
+            "keys_disabled",
+            "terminal-backed chat interrupt is disabled with keys=none",
         ));
     }
     tracing::info!("mobile: interrupt by {} to {}", caller.0, entry.surface_id);

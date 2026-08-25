@@ -124,7 +124,7 @@ struct ProjectRoutingDecision: Codable, Equatable, Sendable {
 /// renderer consumes `renderedInstructions`; no renderer owns a fork of these
 /// scheduling rules.
 enum LeaderParallelPolicy {
-    static let version = "11"
+    static let version = "12"
     static let activation = "request-boundary-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do

@@ -50,6 +50,7 @@ Do not retry, poll, or change team membership.
 - Team agent pane (default inside a native agent pane): the phone shows the structured transcript as a chat, sends whole turns, and can interrupt. A pane running Claude or Codex by hand is not a team agent and gets the mirror.
 - Leader pane: phone text arrives as a durable leader request with the usual wake instruction; take it as you normally do.
 - A terminal-backed Claude/Codex pane can switch between Chat (whole turns + session transcript) and Terminal (screen + keys). Other panes use `safe` keys for prompts and menus.
+- For a terminal-backed pane, `--keys none` keeps screen and transcript reading available but blocks pane text, Chat turns, interrupts, and the key row. Native Agent and Leader semantic APIs are outside this terminal-input policy.
 - Only this pane's screen text is visible to the phone. `/rc off`, closing the pane, or the TTL removes the exposure.
 
 ## Failure modes

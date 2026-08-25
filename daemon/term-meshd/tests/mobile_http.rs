@@ -521,6 +521,29 @@ async fn styled_falls_back_to_text_when_the_app_lacks_the_rpc() {
     );
 }
 
+#[tokio::test]
+async fn styled_does_not_fall_back_when_only_the_rpc_message_mentions_method_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.fail(
+        "surface.read_screen_grid",
+        "internal_error",
+        "dependency said method_not_found",
+    );
+    app.reply("surface.read_text", json!({ "text": "must not be served" }));
+    let h = start_tailscale().await;
+    expose(&h, &app, "pane-1", TargetKind::Pane, KeysPolicy::Safe).await;
+
+    let r = get(&h, "/api/targets/pane-1/screen?format=styled").await;
+    assert_eq!(r.status, 502, "{}", r.body);
+    assert_eq!(r.error_code(), "app_rpc_failed");
+    assert_eq!(
+        app.calls().len(),
+        1,
+        "only the typed RPC code may trigger fallback"
+    );
+}
+
 #[test]
 fn styled_from_grid_trims_blank_rows_and_respects_cursor_visibility() {
     let mut grid = grid_fixture();
@@ -1074,7 +1097,36 @@ async fn terminal_chat_submits_one_turn_while_terminal_mode_only_types() {
     assert_eq!(terminal.status, 200, "{}", terminal.body);
     assert_eq!(app.calls()[1].0, "surface.send_text");
 
+    spec.surface_id = "locked-chat".to_string();
+    spec.keys = KeysPolicy::None;
+    h.registry
+        .lock()
+        .await
+        .upsert(spec.clone(), remote::now_unix())
+        .unwrap();
+    let locked_turn = post(
+        &h,
+        "/api/targets/locked-chat/text",
+        json!({ "text": "no", "mode": "chat", "request_id": "locked-1" }),
+    )
+    .await;
+    assert_eq!(locked_turn.status, 403);
+    assert_eq!(locked_turn.error_code(), "keys_disabled");
+    let locked_terminal = post(
+        &h,
+        "/api/targets/locked-chat/text",
+        json!({ "text": "no", "mode": "terminal", "request_id": "locked-2" }),
+    )
+    .await;
+    assert_eq!(locked_terminal.status, 403);
+    assert_eq!(locked_terminal.error_code(), "keys_disabled");
+    let locked_interrupt = post(&h, "/api/targets/locked-chat/interrupt", json!({})).await;
+    assert_eq!(locked_interrupt.status, 403);
+    assert_eq!(locked_interrupt.error_code(), "keys_disabled");
+    assert_eq!(app.calls().len(), 2, "blocked input must not reach the app");
+
     spec.surface_id = "plain".to_string();
+    spec.keys = KeysPolicy::Safe;
     spec.chat_capable = false;
     spec.session_id = None;
     h.registry
@@ -1192,6 +1244,15 @@ fn session_logs_normalize_to_the_mobile_chat_shape() {
     } })];
     let hidden = http_mobile::codex_entries(&secret);
     assert_eq!(hidden[0]["headline"], "[credential redacted]");
+    let ansi_split_private_key = vec![
+        json!({ "type": "response_item", "payload": { "type": "message", "id": "a1", "role": "assistant", "content": [{ "type": "output_text", "text": "-----BE\u{1b}[31mGIN PRIVATE KEY-----" }] } }),
+        json!({ "type": "response_item", "payload": { "type": "message", "id": "a2", "role": "assistant", "content": [{ "type": "output_text", "text": "YWJjZGVm" }] } }),
+        json!({ "type": "response_item", "payload": { "type": "message", "id": "a3", "role": "assistant", "content": [{ "type": "output_text", "text": "-----END PRIVATE KEY-----" }] } }),
+        json!({ "type": "response_item", "payload": { "type": "message", "id": "safe-ansi", "role": "assistant", "content": [{ "type": "output_text", "text": "after" }] } }),
+    ];
+    let ansi_hidden = http_mobile::codex_entries(&ansi_split_private_key);
+    assert_eq!(ansi_hidden.len(), 1);
+    assert_eq!(ansi_hidden[0]["id"], "safe-ansi");
     for raw in [
         "GITHUB_TOKEN=ghp_example",
         "HF_TOKEN=hf_example",
@@ -1205,6 +1266,73 @@ fn session_logs_normalize_to_the_mobile_chat_shape() {
             http_mobile::redact_session_text(raw),
             "[credential redacted]"
         );
+    }
+    assert_eq!(
+        http_mobile::redact_session_text(
+            "before\n-----BEGIN PRIVATE KEY-----\nYWJjZGVm\n-----END PRIVATE KEY-----\nafter"
+        ),
+        "before\n[credential redacted]\n[credential redacted]\n[credential redacted]\nafter"
+    );
+    for wrapped in [
+        "`sk-exampletoken`",
+        "(sk-exampletoken)",
+        "[sk-exampletoken]",
+    ] {
+        assert_eq!(
+            http_mobile::redact_session_text(wrapped),
+            "[credential redacted]"
+        );
+    }
+    assert_eq!(
+        http_mobile::redact_session_text("\u{1b}[31msk-exampletoken\u{1b}[0m"),
+        "[credential redacted]"
+    );
+    assert_eq!(
+        http_mobile::redact_session_text("\u{1b}]0;title\u{7}sk-exampletoken"),
+        "[credential redacted]"
+    );
+    assert_eq!(
+        http_mobile::redact_session_text("\u{1b}[sk-exampletoken"),
+        "[credential redacted]"
+    );
+    for malformed in [
+        "\u{1b}]unterminated AKIAEXAMPLE",
+        "\u{1b}[unterminated API_KEY=secret",
+    ] {
+        assert_eq!(
+            http_mobile::redact_session_text(malformed),
+            "[credential redacted]"
+        );
+    }
+    let malformed_escape_block = vec![
+        json!({ "type": "response_item", "payload": { "type": "message", "id": "bad1", "role": "assistant", "content": [{ "type": "output_text", "text": "\u{1b}]unterminated -----BEGIN PRIVATE KEY-----" }] } }),
+        json!({ "type": "response_item", "payload": { "type": "message", "id": "bad2", "role": "assistant", "content": [{ "type": "output_text", "text": "YWJjZGVm" }] } }),
+        json!({ "type": "response_item", "payload": { "type": "message", "id": "bad3", "role": "assistant", "content": [{ "type": "output_text", "text": "-----END PRIVATE KEY-----" }] } }),
+        json!({ "type": "response_item", "payload": { "type": "message", "id": "safe-malformed", "role": "assistant", "content": [{ "type": "output_text", "text": "after" }] } }),
+    ];
+    let malformed_hidden = http_mobile::codex_entries(&malformed_escape_block);
+    assert_eq!(malformed_hidden.len(), 1);
+    assert_eq!(malformed_hidden[0]["id"], "safe-malformed");
+    assert_eq!(
+        http_mobile::redact_session_text(
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nbody\n-----END PGP PRIVATE KEY BLOCK-----"
+        ),
+        "[credential redacted]\n[credential redacted]\n[credential redacted]"
+    );
+    assert_eq!(
+        http_mobile::redact_session_text(
+            "-----BEGIN PRIVATE KEY-----YWJj-----END PRIVATE KEY-----\nafter"
+        ),
+        "[credential redacted]\nafter"
+    );
+    assert_eq!(
+        http_mobile::redact_session_text(
+            "-----BEGIN PRIVATE KEY-----\npartial body\nafter without end"
+        ),
+        "[credential redacted]\n[credential redacted]\n[credential redacted]"
+    );
+    for ordinary in ["task-runner", "risk-aware", "disk-space"] {
+        assert_eq!(http_mobile::redact_session_text(ordinary), ordinary);
     }
 }
 
@@ -1229,6 +1357,25 @@ fn session_tail_reader_appends_without_reparsing_or_losing_partial_lines() {
     assert_eq!(second[2]["type"], "three");
     let unchanged = http_mobile::tail_json_lines(&path).unwrap();
     assert_eq!(unchanged, second);
+}
+
+#[test]
+fn session_tail_reader_keeps_private_key_state_across_the_initial_tail_window() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("private-key-window.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    writeln!(file, "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"begin\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"-----BEGIN PRIVATE KEY-----\"}}]}}}}").unwrap();
+    let key_padding = "x".repeat(9 * 1024 * 1024);
+    writeln!(file, "{{\"padding\":\"{key_padding}\"}}").unwrap();
+    writeln!(file, "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"body\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"YWJjZGVm\"}}]}}}}").unwrap();
+    writeln!(file, "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"end\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"-----END PRIVATE KEY-----\"}}]}}}}").unwrap();
+    writeln!(file, "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"id\":\"safe\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"after\"}}]}}}}").unwrap();
+
+    let lines = http_mobile::tail_json_lines(&path).unwrap();
+    let visible = http_mobile::codex_entries(&lines);
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0]["id"], "safe");
 }
 
 async fn targets_by_id_for(h: &Harness) -> serde_json::Map<String, Value> {

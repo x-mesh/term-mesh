@@ -35,6 +35,11 @@ enum ClaudeCommandInstaller {
     /// tagged 앱) 번들 내용이 바뀌면 managed 파일을 다시 설치한다. 마커 없는 사용자
     /// 파일은 여전히 건드리지 않는다.
     private static let managedContentDigestKey = "termMeshManagedContentDigestV1"
+    /// Version/digest gate와 별개로 실패한 component만 다음 launch에서 재시도한다.
+    private static let commandInstallRetryKey = "termMeshClaudeCommandInstallRetryV1"
+    private static let claudeSkillsInstallRetryKey = "termMeshClaudeSkillsInstallRetryV1"
+    private static let codexPromptInstallRetryKey = "termMeshCodexPromptInstallRetryV1"
+    private static let codexSkillsInstallRetryKey = "termMeshCodexSkillsInstallRetryV1"
 
     /// term-mesh가 소유권을 주장하는 슬래시 커맨드 파일 이름.
     /// 이 목록에 있는 파일은 사용자 버전(마커 없음)이라도 백업 후 강제 덮어쓰기 한다.
@@ -126,17 +131,21 @@ enum ClaudeCommandInstaller {
         let needsMigration = !migrationDone
         let needsCodexPromptRestore = !codexPromptRestoreDone
         let needsCodexSkills = !UserDefaults.standard.bool(forKey: codexSkillsInstallKey)
+        let needsCommandRetry = UserDefaults.standard.bool(forKey: commandInstallRetryKey)
+        let needsClaudeSkillsRetry = UserDefaults.standard.bool(forKey: claudeSkillsInstallRetryKey)
+        let needsCodexPromptRetry = UserDefaults.standard.bool(forKey: codexPromptInstallRetryKey)
+        let needsCodexSkillsRetry = UserDefaults.standard.bool(forKey: codexSkillsInstallRetryKey)
         let bundleDigest = managedBundleDigest()
         let needsContentRefresh = bundleDigest != UserDefaults.standard.string(forKey: managedContentDigestKey)
-        guard needsVersionInstall || needsMigration || needsCodexPromptRestore || needsCodexSkills || needsContentRefresh else {
+        guard needsVersionInstall || needsMigration || needsCodexPromptRestore || needsCodexSkills || needsContentRefresh || needsCommandRetry || needsClaudeSkillsRetry || needsCodexPromptRetry || needsCodexSkillsRetry else {
             logger.debug("Claude commands/skills already installed for version \(current, privacy: .public)")
             return
         }
         if needsMigration && !needsVersionInstall {
             logger.info("Running one-time managed-name backup migration for existing user")
         }
-
-        if let src = bundleCommandsURL {
+        let installCommands = needsVersionInstall || needsMigration || needsContentRefresh || needsCommandRetry
+        if installCommands, let src = bundleCommandsURL {
             do {
                 try installManagedMarkdown(
                     from: src,
@@ -144,28 +153,36 @@ enum ClaudeCommandInstaller {
                     managedNames: managedCommandNames,
                     isManaged: isManagedFile
                 )
+                UserDefaults.standard.set(false, forKey: commandInstallRetryKey)
                 logger.info("Claude commands installed for version \(current, privacy: .public)")
             } catch {
+                UserDefaults.standard.set(true, forKey: commandInstallRetryKey)
                 logger.error("Command install failed: \(error.localizedDescription, privacy: .public)")
             }
-        } else {
+        } else if installCommands {
+            UserDefaults.standard.set(true, forKey: commandInstallRetryKey)
             logger.error("claude-commands bundle resource not found")
         }
 
-        if let srcSkills = bundleSkillsURL {
+        let installClaudeSkills = needsVersionInstall || needsMigration || needsContentRefresh || needsClaudeSkillsRetry
+        if installClaudeSkills, let srcSkills = bundleSkillsURL {
             do {
                 try installSkills(from: srcSkills, to: targetSkillsURL)
+                UserDefaults.standard.set(false, forKey: claudeSkillsInstallRetryKey)
                 logger.info("Claude skills installed for version \(current, privacy: .public)")
             } catch {
+                UserDefaults.standard.set(true, forKey: claudeSkillsInstallRetryKey)
                 logger.error("Skill install failed: \(error.localizedDescription, privacy: .public)")
             }
-        } else {
+        } else if installClaudeSkills {
+            UserDefaults.standard.set(false, forKey: claudeSkillsInstallRetryKey)
             logger.debug("claude-skills bundle resource not found (optional)")
         }
 
         // Codex prompts → ~/.codex/prompts/ (native Codex command support).
         // 배포 원본은 Resources/CodexPrompts이며 프로젝트 로컬 .codex/prompts는 만들지 않는다.
-        if let srcCodex = bundleCodexPromptsURL {
+        let installCodexPrompts = needsVersionInstall || needsMigration || needsContentRefresh || needsCodexPromptRestore || needsCodexPromptRetry
+        if installCodexPrompts, let srcCodex = bundleCodexPromptsURL {
             do {
                 try installManagedMarkdown(
                     from: srcCodex,
@@ -174,24 +191,31 @@ enum ClaudeCommandInstaller {
                     isManaged: isManagedSkillFile
                 )
                 UserDefaults.standard.set(true, forKey: codexPromptRestoreMigrationKey)
+                UserDefaults.standard.set(false, forKey: codexPromptInstallRetryKey)
                 logger.info("Codex prompts installed for version \(current, privacy: .public)")
             } catch {
+                UserDefaults.standard.set(true, forKey: codexPromptInstallRetryKey)
                 logger.error("Codex prompt install failed: \(error.localizedDescription, privacy: .public)")
             }
-        } else {
+        } else if installCodexPrompts {
+            UserDefaults.standard.set(true, forKey: codexPromptInstallRetryKey)
             logger.error("codex-prompts bundle resource not found")
         }
 
         // Codex skills → ~/.codex/skills/<name>/SKILL.md (`$name` in Codex's composer).
-        if let srcCodexSkills = bundleCodexSkillsURL {
+        let installCodexSkills = needsVersionInstall || needsContentRefresh || needsCodexSkills || needsCodexSkillsRetry
+        if installCodexSkills, let srcCodexSkills = bundleCodexSkillsURL {
             do {
                 try installSkills(from: srcCodexSkills, to: targetCodexSkillsURL)
                 UserDefaults.standard.set(true, forKey: codexSkillsInstallKey)
+                UserDefaults.standard.set(false, forKey: codexSkillsInstallRetryKey)
                 logger.info("Codex skills installed for version \(current, privacy: .public)")
             } catch {
+                UserDefaults.standard.set(true, forKey: codexSkillsInstallRetryKey)
                 logger.error("Codex skill install failed: \(error.localizedDescription, privacy: .public)")
             }
-        } else {
+        } else if installCodexSkills {
+            UserDefaults.standard.set(false, forKey: codexSkillsInstallRetryKey)
             logger.debug("codex-skills bundle resource not found (optional)")
         }
 

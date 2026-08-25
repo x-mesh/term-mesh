@@ -47,7 +47,8 @@ pub enum TargetKind {
 }
 
 /// Which keys the mobile page may send. `safe` is the fixed allowlist in
-/// `docs/mobile-remote-control.md` §6; `none` disables `/key` entirely.
+/// `docs/mobile-remote-control.md` §6; for terminal-backed panes, `none`
+/// disables `/key`, `/text`, and Chat turn/interrupt input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeysPolicy {

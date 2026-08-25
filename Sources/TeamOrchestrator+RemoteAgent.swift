@@ -4119,7 +4119,7 @@ extension TeamOrchestrator {
         guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return nil }
         let contents = "umask 077\nrm -f -- \"$0\"\n"
             + command
-            + "\nstatus=$?\nstty echo\nexit \"$status\"\n"
+            + "\nterm_mesh_exit_status=$?\nstty echo\nexit \"$term_mesh_exit_status\"\n"
         do {
             let output = try await PeerHostReadinessChecker.runScript(
                 sshTarget: sshTarget,
@@ -8592,7 +8592,7 @@ extension TeamOrchestrator {
                 .compactMap { $0 }.map(shellQuoted).joined(separator: " " )
             let hookCleanup = cleanupFiles.isEmpty
                 ? ""
-                : "; status=$?; rm -f -- \(cleanupFiles); exit \"$status\""
+                : "; term_mesh_exit_status=$?; rm -f -- \(cleanupFiles); exit \"$term_mesh_exit_status\""
             guard let systemPromptFile else {
                 return "\(enter) && \(envPrefix)claude --model \(quotedModel)"
                     + settings + " --dangerously-skip-permissions" + hookCleanup
@@ -8615,7 +8615,7 @@ extension TeamOrchestrator {
             let cleanupFiles = cli == "codex" ? [turnHookFile, participationControlFile]
                 .compactMap { $0 }.map(shellQuoted).joined(separator: " ") : ""
             let cleanup = cleanupFiles.isEmpty ? ""
-                : "; status=$?; rm -f -- \(cleanupFiles); exit \"$status\""
+                : "; term_mesh_exit_status=$?; rm -f -- \(cleanupFiles); exit \"$term_mesh_exit_status\""
             guard let systemPromptFile else {
                 return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)\(flags)" + cleanup
             }

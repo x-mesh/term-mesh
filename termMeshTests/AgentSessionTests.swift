@@ -180,14 +180,14 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "11")
-        XCTAssertEqual(LeaderParallelPolicy.activation, "runtime-enforced")
+        XCTAssertEqual(LeaderParallelPolicy.version, "12")
+        XCTAssertEqual(LeaderParallelPolicy.activation, "request-boundary-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 11"))
+        XCTAssertTrue(first.contains("policy_version: 12"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
-        XCTAssertTrue(first.contains("policy_activation: runtime-enforced"))
+        XCTAssertTrue(first.contains("policy_activation: request-boundary-enforced"))
     }
 
     func testCodexLeaderTurnHooksUseVettedInlineLifecycleConfig() {
