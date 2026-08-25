@@ -135,12 +135,13 @@ def check_pane_flow(c: termmesh, cli: Path) -> None:
                     {"text": f"echo {MARKER}", "request_id": req_id}, expect=200)
     if not again.get("deduplicated"):
         raise termmeshError(f"retry with the same request_id must dedupe: {again}")
+    wait_for(lambda: f"echo {MARKER}" in read_text(c, sid) or None, 10, "typed command in the pane")
     http("POST", f"/api/targets/{sid}/key", {"key": "Enter"}, expect=200)
-    wait_for(lambda: MARKER in read_text(c, sid) or None, 10, "echo output in the pane")
+    # The marker shows once on the command line as soon as it is typed and a
+    # second time as the echo output only after Enter ran it.
+    wait_for(lambda: read_text(c, sid).count(MARKER) >= 2 or None, 10,
+             "echo output after Enter (surface.send_key enter)")
     text = read_text(c, sid)
-    if text.count(MARKER) < 2:
-        # once on the command line, once as output; a duplicate typing would add more
-        raise termmeshError(f"expected the marker as command + output: {text[-400:]!r}")
     if text.count(f"echo {MARKER}") != 1:
         raise termmeshError(f"the command must be typed exactly once: {text[-400:]!r}")
 
