@@ -1320,7 +1320,13 @@ impl PeerHost {
     /// and never register.
     pub fn register_active_host(self: &Arc<Self>) {
         let slot = ACTIVE_HOST.get_or_init(|| Mutex::new(Weak::new()));
-        *slot.lock().unwrap() = Arc::downgrade(self);
+        let mut current = slot.lock().unwrap();
+        if let Some(previous) = current.upgrade() {
+            if !Arc::ptr_eq(&previous, self) {
+                tracing::warn!("replacing a live active peer host; control RPCs now target the new one");
+            }
+        }
+        *current = Arc::downgrade(self);
     }
 
     pub fn active_host() -> Option<Arc<PeerHost>> {

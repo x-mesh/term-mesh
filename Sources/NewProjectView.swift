@@ -391,7 +391,7 @@ struct NewProjectView: View {
             if let record = pendingOwnedRecordRemoval,
                case let .remote(_, hostName) = record.location {
                 Text(
-                    "This removes the Project record \(record.identity.projectID ?? "") "
+                    "This removes the Project record \(record.identity.projectID ?? "unknown") "
                         + "at \(record.identity.workingDirectory ?? "an unrecorded path") on \(hostName) "
                         + "and stops the panes only it referenced: its leader shell and any agent panes. "
                         + "The Project can no longer be opened from this record. The daemon workspace, "

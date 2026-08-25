@@ -10270,25 +10270,28 @@ fn parse_byte_size(raw: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("byte size overflow: {raw:?}"))
 }
 
-/// One daemon RPC, printed. Exits non-zero on transport or RPC error so
-/// scripts can trust the status; returns the `result` for callers that
-/// add a human summary.
-fn cmd_daemon_rpc_print(sock: &PathBuf, method: &str, params: serde_json::Value) -> serde_json::Value {
+/// One daemon RPC: the `result` value, or the transport/RPC error message.
+fn cmd_daemon_rpc(sock: &PathBuf, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
     match rpc_call(sock, method, params) {
-        Ok(resp) if resp["error"].is_null() => {
-            println!("{}", pretty(&resp["result"]));
-            resp["result"].clone()
+        Ok(resp) if resp["error"].is_null() => Ok(resp["result"].clone()),
+        Ok(resp) => Err(resp["error"]["message"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{method} failed"))),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Print a daemon RPC result, or the error and a non-zero exit so scripts
+/// can trust the status. Returns the result for callers adding a summary.
+fn cmd_daemon_rpc_print(sock: &PathBuf, method: &str, params: serde_json::Value) -> serde_json::Value {
+    match cmd_daemon_rpc(sock, method, params) {
+        Ok(result) => {
+            println!("{}", pretty(&result));
+            result
         }
-        Ok(resp) => {
-            let msg = resp["error"]["message"]
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("{method} failed"));
+        Err(msg) => {
             eprintln!("Error: {msg}");
-            process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Error: {e}");
             process::exit(1);
         }
     }
