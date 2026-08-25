@@ -429,7 +429,9 @@ extension TeamOrchestrator {
                         ? remote.leaderProcessActive : !remote.leaderSurfaceID.isEmpty,
                     failureDescription: remote.leaderProcessActiveKnown
                         && !remote.leaderProcessActive
-                        ? "Remote leader process is not active" : nil
+                        ? "Remote leader process is not active" : nil,
+                    presentationOwnedByRequester: remote.presentationOwnedByRequester,
+                    leaderProcessActiveKnown: remote.leaderProcessActiveKnown
                 ))
             }
         }

@@ -162,6 +162,7 @@ struct NewProjectView: View {
     @State private var isDiscarding = false
     @State private var isResolvingConflict = false
     @State private var pendingConflictDiscardTeamName: String?
+    @State private var pendingOwnedRecordRemoval: TeamOrchestrator.ProjectConflictRecord?
     /// A conflict discovered after Create began (for example another window's
     /// reservation) is not necessarily visible in the advisory snapshot yet.
     /// Keep that typed result until the user changes the Project identity.
@@ -229,6 +230,7 @@ struct NewProjectView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         projectFields
+                        remoteCollisionDetails
                         Divider()
                         teamSummaryRow
                         if showsTeamEditor {
@@ -368,6 +370,33 @@ struct NewProjectView: View {
                 "This stops the Project and removes its workspace plus any "
                     + "checkouts term-mesh created. Existing user-owned folders are kept."
             )
+        }
+        .confirmationDialog(
+            "Delete remote Project record?",
+            isPresented: Binding(
+                get: { pendingOwnedRecordRemoval != nil },
+                set: { if !$0 { pendingOwnedRecordRemoval = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete Project record", role: .destructive) {
+                guard let record = pendingOwnedRecordRemoval else { return }
+                pendingOwnedRecordRemoval = nil
+                removeOwnedProjectRecord(record)
+            }
+            Button("Keep record", role: .cancel) {
+                pendingOwnedRecordRemoval = nil
+            }
+        } message: {
+            if let record = pendingOwnedRecordRemoval,
+               case let .remote(_, hostName) = record.location {
+                Text(
+                    "This removes only the Project record \(record.identity.projectID ?? "") "
+                        + "at \(record.identity.workingDirectory ?? "an unrecorded path") on \(hostName). "
+                        + "The Project can no longer be opened from this record. The daemon "
+                        + "workspace, its shell and any files stay in place."
+                )
+            }
         }
         .accessibilityIdentifier("newProject.sheet")
     }
@@ -2186,11 +2215,98 @@ struct NewProjectView: View {
             }
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.discard")
-        case .localNameCollision, .remoteNameCollision, .reservedByAnotherRequest:
+        case .remoteNameCollision(let record):
+            if record.canDeleteOwnedRemoteRecord {
+                Button("Delete Project record…", role: .destructive) {
+                    pendingOwnedRecordRemoval = record
+                }
+                .disabled(isResolvingConflict)
+                .accessibilityIdentifier("newProject.conflict.deleteOwnedRecord")
+            }
             Button("Use “\(suggestedProjectName)”") { useSuggestedProjectName() }
                 .keyboardShortcut(.defaultAction)
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.rename")
+        case .localNameCollision, .reservedByAnotherRequest:
+            Button("Use “\(suggestedProjectName)”") { useSuggestedProjectName() }
+                .keyboardShortcut(.defaultAction)
+                .disabled(isResolvingConflict)
+                .accessibilityIdentifier("newProject.conflict.rename")
+        }
+    }
+
+    /// What owns the colliding name on the remote host, so the user can tell
+    /// a live Project from a leftover record and act on the right one.
+    @ViewBuilder
+    private var remoteCollisionDetails: some View {
+        if case let .remoteNameCollision(record) = projectNameConflict,
+           case let .remote(_, hostName) = record.location {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Remote Project name is already in use", systemImage: "exclamationmark.triangle.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.orange)
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 5) {
+                    conflictDetailRow("Host", hostName)
+                    conflictDetailRow("Directory", record.identity.workingDirectory ?? "Not recorded")
+                    conflictDetailRow("Project ID", record.identity.projectID ?? "Not recorded")
+                    conflictDetailRow(
+                        "Leader",
+                        record.leaderProcessActiveKnown
+                            ? (record.leaderReady ? "Active" : "Idle shell")
+                            : (record.leaderReady ? "Surface present" : "No surface")
+                    )
+                    conflictDetailRow(
+                        "Ownership",
+                        record.presentationOwnedByRequester
+                            ? "This installation"
+                            : "Another installation"
+                    )
+                }
+                Text(
+                    record.canDeleteOwnedRemoteRecord
+                        ? "Delete the record if this Project is gone; a running Project should be opened from the sidebar instead."
+                        : "Only the owning installation can delete this record over the network. On the host, `tm-agent daemon project-presentations prune` lists and removes leftover records."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("newProject.conflict.remoteDetails")
+        }
+    }
+
+    private func conflictDetailRow(_ label: String, _ value: String) -> some View {
+        GridRow {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .gridColumnAlignment(.trailing)
+            Text(value)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .lineLimit(2)
+                .truncationMode(.middle)
+        }
+    }
+
+    private func removeOwnedProjectRecord(_ record: TeamOrchestrator.ProjectConflictRecord) {
+        guard case let .remote(hostKey, _) = record.location,
+              let projectID = record.identity.projectID else { return }
+        isResolvingConflict = true
+        Task { @MainActor in
+            defer { isResolvingConflict = false }
+            do {
+                try await hostStore.deleteOwnedProjectRecord(hostKey: hostKey, projectID: projectID)
+                submissionConflict = nil
+                creationError = nil
+                RemoteWorkLog.info("Deleted remote Project record \(projectID) from New Project")
+            } catch {
+                creationError = "Could not delete the Project record: \(error.localizedDescription)"
+            }
         }
     }
 

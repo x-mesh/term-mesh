@@ -2032,6 +2032,50 @@ final class RemoteHostStore: ObservableObject {
     /// Re-read the project roster after a manifest upsert/delete. The daemon
     /// has no team-roster push event, while the serving GUI's workspace stream
     /// cannot observe changes on the separate session owner.
+    /// Delete a durable Project manifest this installation owns, without
+    /// adopting it as a team. Used by New Project's remote-name collision
+    /// when the colliding record is ours: the host answers over the normal
+    /// owner-authorized `project.presentation.v1` delete, so a record another
+    /// installation published is refused (`notOwner`) rather than bypassed.
+    func deleteOwnedProjectRecord(hostKey: String, projectID: String) async throws {
+        guard let host = hosts[hostKey], host.isConnected, let spec = host.teamHostSpec else {
+            throw OwnedProjectRecordRemovalError.hostUnavailable
+        }
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await PeerPaneHostRegistry.shared.acquire(spec)
+        } catch {
+            throw OwnedProjectRecordRemovalError.hostUnavailable
+        }
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+        let connection: PeerRelayConnection
+        do {
+            connection = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+        } catch {
+            throw OwnedProjectRecordRemovalError.hostUnavailable
+        }
+        defer { Task { await connection.cancel() } }
+        guard connection.hostCapabilities.has(PeerCapability.projectPresentationV1) else {
+            throw OwnedProjectRecordRemovalError.unsupported
+        }
+        let response: Termmesh_Peer_V1_UpsertProjectPresentationResponse
+        do {
+            response = try await connection.session.deleteProjectPresentation(projectID: projectID)
+        } catch {
+            throw OwnedProjectRecordRemovalError.rejected(error.localizedDescription)
+        }
+        guard response.ok else {
+            if response.errorCode == "not_owner" {
+                throw OwnedProjectRecordRemovalError.notOwner
+            }
+            throw OwnedProjectRecordRemovalError.rejected(
+                response.errorMessage.isEmpty ? response.errorCode : response.errorMessage
+            )
+        }
+        RemoteWorkLog.info("Deleted owned Project record \(projectID) on \(hostKey)")
+        refreshTeamRoster(forHostKey: hostKey)
+    }
+
     func refreshTeamRoster(forHostKey key: String) {
         guard let host = hosts[key], host.isConnected, !host.activeSockPath.isEmpty else {
             return
@@ -2458,6 +2502,27 @@ final class RemoteHostStore: ObservableObject {
                 for: path, key: key,
                 provenance: self.hosts[key]?.hostCLIBinDirsProvenance
             )
+        }
+    }
+}
+
+enum OwnedProjectRecordRemovalError: LocalizedError {
+    case hostUnavailable
+    case unsupported
+    case notOwner
+    case rejected(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .hostUnavailable:
+            "The host is not connected."
+        case .unsupported:
+            "The remote daemon does not support Project record deletion. Update and restart it."
+        case .notOwner:
+            "Another installation owns this Project record. Remove it on the host with "
+                + "`tm-agent daemon project-presentations prune --project-id <id> --apply`."
+        case .rejected(let detail):
+            "The host refused to delete the Project record: \(detail)"
         }
     }
 }
