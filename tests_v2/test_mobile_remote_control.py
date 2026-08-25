@@ -10,6 +10,7 @@ exports the listener address as TERMMESH_E2E_MOBILE_ADDR.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -109,10 +110,17 @@ def targets_by_id() -> dict:
     return {t["surface_id"]: t for t in (payload or {}).get("targets", [])}
 
 
+def prompt_ready(c: termmesh, surface_id: str):
+    """The shell prompt is drawn once the last non-empty line ends in a prompt
+    character. Typing before that leaves the text echoed twice in scrollback."""
+    lines = [l.rstrip() for l in read_text(c, surface_id).splitlines() if l.strip()]
+    return bool(lines) and re.search(r"[%$#>]\s*$", lines[-1]) is not None
+
+
 def check_pane_flow(c: termmesh, cli: Path) -> None:
     sid = c.new_surface(panel_type="terminal")
     c.focus_surface(sid)
-    wait_for(lambda: read_text(c, sid).strip() or None, 15, "shell prompt in the new pane")
+    wait_for(lambda: prompt_ready(c, sid) or None, 20, "shell prompt in the new pane")
 
     out = rc(cli, ["on", "--title", "e2e-pane", "--cli", "shell", "--ttl", "10m"], surface_id=sid)
     if f"/t/{sid}" not in out:
@@ -142,8 +150,11 @@ def check_pane_flow(c: termmesh, cli: Path) -> None:
     wait_for(lambda: read_text(c, sid).count(MARKER) >= 2 or None, 10,
              "echo output after Enter (surface.send_key enter)")
     text = read_text(c, sid)
-    if text.count(f"echo {MARKER}") != 1:
-        raise termmeshError(f"the command must be typed exactly once: {text[-400:]!r}")
+    # Exactly one output line: a second execution (duplicate typing or a
+    # duplicate Enter) would print the marker twice on its own line.
+    outputs = [l for l in text.splitlines() if l.strip() == MARKER]
+    if len(outputs) != 1:
+        raise termmeshError(f"expected exactly one echo output line, got {len(outputs)}: {text[-400:]!r}")
 
     # The listener's screen matches what the app reports.
     _, screen = http("GET", f"/api/targets/{sid}/screen?lines=100", expect=200)
@@ -180,7 +191,7 @@ def check_leader_flow(c: termmesh, cli: Path) -> None:
     if not leader_sid:
         raise termmeshError(f"team.create did not return the leader surface id: {created}")
     try:
-        wait_for(lambda: read_text(c, leader_sid).strip() or None, 15, "leader pane prompt")
+        wait_for(lambda: prompt_ready(c, leader_sid) or None, 20, "leader pane prompt")
         rc(cli, ["on", "--leader", "--title", "e2e-leader", "--ttl", "10m"],
            surface_id=leader_sid, team=team)
         target = targets_by_id().get(leader_sid)
