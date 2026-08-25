@@ -4,6 +4,42 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.214.0] - 2026-08-26
+
+**터미널은 그대로 유지하면서, 휴대폰에서는 안전한 Terminal 또는 native-like Chat으로 원격 제어할 수 있습니다.**
+
+### Added
+
+- **Tailscale 기반 Mobile Remote Control** — Settings에서 listener를 켜고 `/rc on`을 실행하면 노출한 pane만 휴대폰에서 볼 수 있습니다. 일반 pane은 styled terminal 화면과 안전한 입력을 제공하고, terminal-backed Claude/Codex session은 같은 로컬 터미널을 바꾸지 않은 채 Chat과 Terminal 보기를 선택할 수 있습니다. Native Agent는 구조화된 대화와 turn 전송·interrupt를, Leader는 durable request board를 사용합니다. (`daemon/term-meshd/src/http_mobile.rs`, `Resources/mobile/`, `daemon/term-mesh-cli/src/tm_agent.rs`, `Sources/SettingsView.swift`)
+
+- **Codex에서도 `$rc` 지원** — 실행 중인 앱의 `tm-agent`를 사용하도록 Claude command, Codex prompt, Codex skill을 함께 배포하며 tagged 개발 앱에서도 올바른 binary를 선택합니다. (`.claude/commands/rc.md`, `Resources/CodexPrompts/rc.md`, `Resources/CodexSkills/rc/SKILL.md`)
+
+- **Project별 delegation level** — leader-first, guarded, delegated 정책을 Project에 저장하고 local·peer leader가 동일한 policy version과 digest를 사용합니다. (`Sources/LeaderParallelPolicy.swift`, `Sources/LeaderParticipationSettings.swift`, `Sources/TeamDataStore.swift`)
+
+### Changed
+
+- **Mobile Chat UI를 session 중심 transcript로 재설계** — assistant 답변은 일반 transcript block으로, 사용자 turn은 accent bubble로 표시하고, command 실행은 기본 접힌 timeline으로 정리했습니다. composer와 live 상태도 작은 화면에 맞춰 조정했습니다. (`Resources/mobile/index.html`, `Resources/mobile/app.css`, `Resources/mobile/app.js`)
+
+- **Project manifest lifecycle을 실제 surface 상태와 일치** — host가 stale Project manifest를 prune하고, reopen 후 hosted layout을 다시 적용해 종료되거나 재연결된 pane 구성이 남지 않게 했습니다. (`daemon/term-meshd/src/peer/layout.rs`, `Sources/RemoteHostStore.swift`)
+
+### Fixed
+
+- **원격 Project 재시작·재연결 안정성** — hosted layout finalize/reapply, stale manifest cleanup, surface exit deadlock 회피로 app restart와 host disconnect/reconnect 뒤에도 exact leader surface와 pane layout을 유지합니다. (`Sources/PeerProjectBootstrap.swift`, `daemon/term-meshd/src/peer/connection.rs`, `daemon/term-meshd/src/peer/surface.rs`)
+
+- **Mobile 입력과 transcript 보안 경계** — `keys=none`은 terminal-backed pane의 text/key/Chat turn/interrupt를 서버와 UI에서 차단하면서 읽기는 유지합니다. session transcript의 token, PEM/PGP private-key block, ANSI·malformed escape 변형을 redaction하고, tail window 경계에서도 key body가 노출되지 않게 했습니다. (`daemon/term-meshd/src/http_mobile.rs`, `daemon/term-meshd/tests/mobile_http.rs`)
+
+- **managed command 설치 복구** — bundle content가 같은 version에서 바뀌거나 일부 component 설치가 실패해도 해당 component만 다음 launch에 재시도합니다. (`Sources/ClaudeCommandInstaller.swift`)
+
+- **remote leader zsh cleanup** — zsh의 read-only `status` 변수와 충돌하지 않고 Claude/Codex 종료 code를 보존하면서 private hook 파일을 정리합니다. (`Sources/TeamOrchestrator+RemoteAgent.swift`)
+
+### Performance
+
+- **모바일 terminal redraw 비용 감소** — Ghostty render grid의 변경된 row만 다시 그리고 입력을 순서대로 전달해 휴대폰의 polling·typing 중 불필요한 DOM 재생성을 줄였습니다. (`Resources/mobile/app.js`, `Sources/TerminalController+Surface.swift`)
+
+### Thanks to 1 contributor!
+
+- [@JINWOO-J](https://github.com/JINWOO-J)
+
 ## [0.213.0] - 2026-08-24
 
 ### Added
