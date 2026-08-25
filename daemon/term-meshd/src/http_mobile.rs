@@ -445,7 +445,7 @@ struct ScreenQuery {
     #[serde(default)]
     lines: Option<u32>,
     /// `styled` asks for per-cell colors and attributes (needs an app with
-    /// `surface.read_screen_vt`); anything else returns plain text.
+    /// `surface.read_screen_grid`); anything else returns plain text.
     #[serde(default)]
     format: Option<String>,
 }
@@ -471,104 +471,183 @@ pub struct StyledSpan {
     pub inv: bool,
 }
 
-fn color_json(color: vt100::Color) -> Option<Value> {
-    match color {
-        vt100::Color::Default => None,
-        vt100::Color::Idx(n) => Some(json!(n)),
-        vt100::Color::Rgb(r, g, b) => Some(json!(format!("#{r:02x}{g:02x}{b:02x}"))),
-    }
+/// What the page draws: rows of styled spans (scrollback first, then the
+/// active area), the cursor cell, and the pane width.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StyledScreen {
+    pub rows: Vec<Vec<StyledSpan>>,
+    pub cursor: Option<(usize, usize)>,
+    pub columns: u64,
 }
 
-/// Render a VT tail (from `surface.read_screen_vt`) into rows of styled
-/// spans by replaying it through a scratch terminal of the pane's width.
-/// Trailing blank cells are dropped; wide-character continuation cells are
-/// folded into the character before them.
-pub fn styled_rows(vt: &str, columns: u16) -> Vec<Vec<StyledSpan>> {
-    let cols = if (20..=1000).contains(&columns) {
-        columns
-    } else {
-        500
-    };
-    // The tail separates rows with CRLF; a bare LF (defensive) would only
-    // move down and leave the next row indented.
-    let normalized = vt.replace("\r\n", "\n").replace('\n', "\r\n");
-    let row_count = normalized.split('\n').count().clamp(1, 2000) as u16;
-    let mut parser = vt100::Parser::new(row_count, cols, 0);
-    parser.process(normalized.as_bytes());
-    let screen = parser.screen();
-    let mut rows: Vec<Vec<StyledSpan>> = Vec::with_capacity(row_count as usize);
-    for r in 0..row_count {
-        let mut last = 0u16;
-        for c in 0..cols {
-            if let Some(cell) = screen.cell(r, c) {
-                if cell.has_contents()
-                    || cell.bgcolor() != vt100::Color::Default
-                    || cell.inverse()
-                {
-                    last = c + 1;
-                }
-            }
-        }
-        let mut spans: Vec<StyledSpan> = Vec::new();
-        for c in 0..last {
-            let Some(cell) = screen.cell(r, c) else {
-                continue;
-            };
-            if cell.is_wide_continuation() {
-                continue;
-            }
-            let text = if cell.has_contents() {
-                cell.contents().to_string()
-            } else {
-                " ".to_string()
-            };
-            let next = StyledSpan {
-                t: text,
-                fg: color_json(cell.fgcolor()),
-                bg: color_json(cell.bgcolor()),
-                b: cell.bold(),
-                d: cell.dim(),
-                i: cell.italic(),
-                u: cell.underline(),
-                inv: cell.inverse(),
-            };
-            match spans.last_mut() {
-                Some(prev)
-                    if prev.fg == next.fg
-                        && prev.bg == next.bg
-                        && prev.b == next.b
-                        && prev.d == next.d
-                        && prev.i == next.i
-                        && prev.u == next.u
-                        && prev.inv == next.inv =>
-                {
-                    prev.t.push_str(&next.t)
-                }
-                _ => spans.push(next),
-            }
-        }
-        rows.push(spans);
-    }
-    while rows.last().is_some_and(Vec::is_empty) {
-        rows.pop();
-    }
-    rows
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct GridStyle {
+    fg: Option<Value>,
+    bg: Option<Value>,
+    b: bool,
+    d: bool,
+    i: bool,
+    u: bool,
+    inv: bool,
+    invisible: bool,
 }
 
-/// Where the cursor sits inside the returned tail: the viewport is the last
-/// `viewport_rows` rows of the tail, so shift the viewport-relative row.
-pub fn cursor_in_tail(
-    tail_rows: usize,
-    viewport_rows: u64,
-    cursor_row: u64,
-    cursor_col: u64,
-    in_viewport: bool,
-) -> Option<(usize, usize)> {
-    if !in_viewport || viewport_rows == 0 || tail_rows < viewport_rows as usize {
+fn grid_color(style: &Value, key: &str) -> Option<Value> {
+    // Ghostty resolves every color to RGB; `*_source` says whether it is
+    // the terminal default, which the page renders with its own theme.
+    if style.get(&format!("{key}_source")).and_then(Value::as_str) == Some("default") {
         return None;
     }
-    let row = tail_rows - viewport_rows as usize + cursor_row as usize;
-    (row < tail_rows).then_some((row, cursor_col as usize))
+    style
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|c| json!(c.to_ascii_lowercase()))
+}
+
+fn grid_styles(grid: &Value) -> Vec<GridStyle> {
+    let Some(list) = grid.get("styles").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let flag = |style: &Value, key: &str| style.get(key).and_then(Value::as_bool).unwrap_or(false);
+    let mut table: Vec<GridStyle> = Vec::new();
+    for style in list {
+        let id = style
+            .get("id")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(table.len());
+        if table.len() <= id {
+            table.resize(id + 1, GridStyle::default());
+        }
+        table[id] = GridStyle {
+            fg: grid_color(style, "foreground"),
+            bg: grid_color(style, "background"),
+            b: flag(style, "bold"),
+            d: flag(style, "faint"),
+            i: flag(style, "italic"),
+            u: flag(style, "underline"),
+            inv: flag(style, "inverse"),
+            invisible: flag(style, "invisible"),
+        };
+    }
+    table
+}
+
+fn push_span(row: &mut Vec<StyledSpan>, next: StyledSpan) {
+    match row.last_mut() {
+        Some(prev)
+            if prev.fg == next.fg
+                && prev.bg == next.bg
+                && prev.b == next.b
+                && prev.d == next.d
+                && prev.i == next.i
+                && prev.u == next.u
+                && prev.inv == next.inv =>
+        {
+            prev.t.push_str(&next.t)
+        }
+        _ => row.push(next),
+    }
+}
+
+/// Place one span list (`row_spans` or `scrollback_spans`) into `rows`,
+/// offsetting row numbers by `row_offset` and filling column gaps with
+/// default-style spaces so text stays column-aligned.
+fn place_spans(rows: &mut [Vec<StyledSpan>], spans: &Value, row_offset: usize, styles: &[GridStyle]) {
+    let Some(list) = spans.as_array() else {
+        return;
+    };
+    let mut by_row: HashMap<usize, Vec<(usize, &Value)>> = HashMap::new();
+    for span in list {
+        let row = span.get("row").and_then(Value::as_u64).unwrap_or(0) as usize + row_offset;
+        let column = span.get("column").and_then(Value::as_u64).unwrap_or(0) as usize;
+        if row < rows.len() {
+            by_row.entry(row).or_default().push((column, span));
+        }
+    }
+    let default_style = GridStyle::default();
+    for (row, mut entries) in by_row {
+        entries.sort_by_key(|(column, _)| *column);
+        let target = &mut rows[row];
+        let mut col = 0usize;
+        for (column, span) in entries {
+            if column > col {
+                push_span(
+                    target,
+                    StyledSpan {
+                        t: " ".repeat(column - col),
+                        fg: None,
+                        bg: None,
+                        b: false,
+                        d: false,
+                        i: false,
+                        u: false,
+                        inv: false,
+                    },
+                );
+                col = column;
+            }
+            let text = span.get("text").and_then(Value::as_str).unwrap_or("");
+            let width = span.get("cell_width").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+            let style_id = span.get("style_id").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let style = styles.get(style_id).unwrap_or(&default_style);
+            let chars = text.chars().count();
+            let shown = if style.invisible { " ".repeat(chars) } else { text.to_string() };
+            push_span(
+                target,
+                StyledSpan {
+                    t: shown,
+                    fg: style.fg.clone(),
+                    bg: style.bg.clone(),
+                    b: style.b,
+                    d: style.d,
+                    i: style.i,
+                    u: style.u,
+                    inv: style.inv,
+                },
+            );
+            col += chars * width;
+        }
+    }
+}
+
+/// Turn a render-grid frame (`surface.read_screen_grid`) into styled rows.
+/// Scrollback rows come first, then the active area; blank rows below both
+/// the last content and the cursor are dropped so a tall pane does not
+/// render as a wall of empty lines.
+pub fn styled_from_grid(grid: &Value) -> StyledScreen {
+    let columns = grid.get("columns").and_then(Value::as_u64).unwrap_or(0);
+    let active_rows = grid.get("rows").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let scrollback_rows = grid.get("scrollback_rows").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let styles = grid_styles(grid);
+    let mut rows: Vec<Vec<StyledSpan>> = vec![Vec::new(); scrollback_rows + active_rows];
+    if let Some(spans) = grid.get("scrollback_spans") {
+        place_spans(&mut rows, spans, 0, &styles);
+    }
+    if let Some(spans) = grid.get("row_spans") {
+        place_spans(&mut rows, spans, scrollback_rows, &styles);
+    }
+    let cursor = grid.get("cursor").and_then(|c| {
+        let visible = c.get("visible").and_then(Value::as_bool).unwrap_or(false);
+        let row = c.get("row").and_then(Value::as_u64)? as usize + scrollback_rows;
+        let col = c.get("column").and_then(Value::as_u64)? as usize;
+        (visible && row < rows.len()).then_some((row, col))
+    });
+    let last_content = rows
+        .iter()
+        .rposition(|r| r.iter().any(|s| !s.t.trim().is_empty() || s.bg.is_some() || s.inv));
+    let keep = match (last_content, cursor) {
+        (Some(l), Some((c, _))) => l.max(c) + 1,
+        (Some(l), None) => l + 1,
+        (None, Some((c, _))) => c + 1,
+        (None, None) => 0,
+    };
+    rows.truncate(keep);
+    StyledScreen {
+        rows,
+        cursor,
+        columns,
+    }
 }
 
 async fn screen_handler(
@@ -587,34 +666,45 @@ async fn screen_handler(
         }
     };
     let entry = live_entry(&state, &surface_id).await?;
-    if q.format.as_deref() == Some("styled") {
-        // Both kinds are GUI surfaces here; the leader's durable board only
-        // matters for writes.
-        let result = app_call(
+    let styled = q.format.as_deref() == Some("styled");
+    // An app that predates `surface.read_screen_grid` answers method_not_found;
+    // fall through to the plain read and say so in `format` so the page can
+    // tell the two apart.
+    let styled_result = if styled {
+        match app_call(
             &state,
             &entry,
-            "surface.read_screen_vt",
-            json!({ "surface_id": entry.surface_id, "rows": lines }),
+            "surface.read_screen_grid",
+            json!({ "surface_id": entry.surface_id, "scrollback_lines": lines }),
         )
-        .await?;
-        let vt = result.get("vt").and_then(Value::as_str).unwrap_or("");
-        let columns = result.get("columns").and_then(Value::as_u64).unwrap_or(0) as u16;
-        let rows = styled_rows(vt, columns);
-        let cursor = cursor_in_tail(
-            rows.len(),
-            result.get("rows").and_then(Value::as_u64).unwrap_or(0),
-            result.get("cursor_row").and_then(Value::as_u64).unwrap_or(0),
-            result.get("cursor_column").and_then(Value::as_u64).unwrap_or(0),
-            result.get("cursor_in_viewport").and_then(Value::as_bool).unwrap_or(false),
-        );
+        .await
+        {
+            Ok(result) => Some(result),
+            Err(err) if err.code == "app_rpc_failed" && err.message.contains("method_not_found") => {
+                tracing::info!(
+                    "mobile: app has no surface.read_screen_grid, serving plain text for {}",
+                    entry.surface_id
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        }
+    } else {
+        None
+    };
+    if let Some(result) = styled_result {
+        // Both kinds are GUI surfaces here; the leader's durable board only
+        // matters for writes.
+        let empty = json!({});
+        let screen = styled_from_grid(result.get("grid").unwrap_or(&empty));
         return Ok(Json(json!({
             "surface_id": entry.surface_id,
             "kind": entry.kind,
             "lines": lines,
             "format": "styled",
-            "columns": columns,
-            "rows": rows,
-            "cursor": cursor.map(|(row, col)| json!({ "row": row, "col": col })),
+            "columns": screen.columns,
+            "rows": screen.rows,
+            "cursor": screen.cursor.map(|(row, col)| json!({ "row": row, "col": col })),
             "captured_at": remote::now_unix(),
         }))
         .into_response());
@@ -652,6 +742,8 @@ async fn screen_handler(
         "surface_id": entry.surface_id,
         "kind": entry.kind,
         "lines": lines,
+        "format": "text",
+        "styled_unavailable": styled,
         "text": text,
         "captured_at": remote::now_unix(),
     }))

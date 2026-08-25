@@ -10,7 +10,7 @@ mod http_mobile;
 mod remote;
 
 use http_mobile::{
-    cursor_in_tail, gui_key, parse_logins, styled_rows, AuthMode, GuiKey, MobileConfig, SAFE_KEYS,
+    gui_key, parse_logins, styled_from_grid, AuthMode, GuiKey, MobileConfig, SAFE_KEYS,
 };
 use remote::{EnableSpec, KeysPolicy, SharedRegistry, TargetKind};
 use serde_json::{json, Value};
@@ -417,17 +417,48 @@ async fn screen_routes_pane_and_leader_to_the_right_rpc() {
     assert_eq!(unknown.error_code(), "not_exposed");
 }
 
+fn grid_fixture() -> Value {
+    let style = |id: u64, fg: &str, fg_src: &str, extra: Value| {
+        let mut v = json!({
+            "id": id, "foreground": fg, "background": "#101114",
+            "foreground_source": fg_src, "background_source": "default",
+            "bold": false, "faint": false, "italic": false, "underline": false,
+            "blink": false, "inverse": false, "invisible": false, "strikethrough": false, "overline": false
+        });
+        for (k, val) in extra.as_object().cloned().unwrap_or_default() {
+            v[k] = val;
+        }
+        v
+    };
+    json!({
+        "format": "render-grid", "columns": 40, "rows": 4, "scrollback_rows": 1,
+        "cursor": { "row": 2, "column": 2, "visible": true, "style": "block", "blinking": false },
+        "styles": [
+            style(0, "#E6E6E6", "default", json!({})),
+            style(1, "#FF0000", "palette", json!({ "foreground_palette_index": 1 })),
+            style(2, "#E6E6E6", "default", json!({ "faint": true })),
+            style(3, "#E6E6E6", "default", json!({ "inverse": true })),
+            style(4, "#E6E6E6", "default", json!({ "invisible": true })),
+        ],
+        "scrollback_spans": [
+            { "row": 0, "column": 0, "style_id": 0, "cell_width": 1, "text": "old line" }
+        ],
+        "row_spans": [
+            { "row": 0, "column": 0, "style_id": 1, "cell_width": 1, "text": "red" },
+            { "row": 0, "column": 3, "style_id": 0, "cell_width": 1, "text": " plain" },
+            { "row": 1, "column": 0, "style_id": 2, "cell_width": 1, "text": "dim" },
+            { "row": 1, "column": 5, "style_id": 3, "cell_width": 1, "text": "inv" },
+            { "row": 1, "column": 8, "style_id": 4, "cell_width": 1, "text": "secret" },
+            { "row": 2, "column": 0, "style_id": 0, "cell_width": 1, "text": "❯ " }
+        ]
+    })
+}
+
 #[tokio::test]
-async fn styled_screen_replays_vt_into_spans_with_a_cursor() {
+async fn styled_screen_maps_the_render_grid_into_spans_with_a_cursor() {
     let dir = tempfile::tempdir().unwrap();
     let app = FakeApp::spawn(dir.path());
-    app.reply(
-        "surface.read_screen_vt",
-        json!({
-            "vt": "\u{1b}[31mred\u{1b}[0m plain\r\n\u{1b}[2mdim\u{1b}[0m\u{1b}[7m inv\u{1b}[0m \u{1b}[38;2;1;2;3mrgb\u{1b}[0m\r\n❯ ",
-            "columns": 40, "rows": 3, "cursor_column": 2, "cursor_row": 2, "cursor_in_viewport": true
-        }),
-    );
+    app.reply("surface.read_screen_grid", json!({ "grid": grid_fixture() }));
     let h = start_tailscale().await;
     expose(&h, &app, "pane-1", TargetKind::Pane, KeysPolicy::Safe).await;
 
@@ -437,31 +468,66 @@ async fn styled_screen_replays_vt_into_spans_with_a_cursor() {
     assert_eq!(j["format"], "styled");
     assert_eq!(j["columns"], 40);
     let rows = j["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 3, "{}", r.body);
-    assert_eq!(rows[0][0], json!({ "t": "red", "fg": 1 }));
-    assert_eq!(rows[0][1], json!({ "t": " plain" }));
-    assert_eq!(rows[1][0], json!({ "t": "dim", "d": true }));
-    assert_eq!(rows[1][1], json!({ "t": " inv", "inv": true }));
-    assert_eq!(rows[1][2], json!({ "t": " " }));
-    assert_eq!(rows[1][3], json!({ "t": "rgb", "fg": "#010203" }));
-    assert_eq!(rows[2][0]["t"], "❯ ", "explicit trailing spaces are content");
-    assert_eq!(j["cursor"], json!({ "row": 2, "col": 2 }));
+    // 1 scrollback row + active rows up to the cursor; the blank 4th active row is dropped.
+    assert_eq!(rows.len(), 4, "{}", r.body);
+    assert_eq!(rows[0][0], json!({ "t": "old line" }));
+    assert_eq!(rows[1][0], json!({ "t": "red", "fg": "#ff0000" }));
+    assert_eq!(rows[1][1], json!({ "t": " plain" }));
+    assert_eq!(rows[2][0], json!({ "t": "dim", "d": true }));
+    assert_eq!(rows[2][1], json!({ "t": "  " }), "column gap filled with spaces");
+    assert_eq!(rows[2][2], json!({ "t": "inv", "inv": true }));
+    assert_eq!(rows[2][3], json!({ "t": "      " }), "invisible text renders as spaces");
+    assert_eq!(rows[3][0], json!({ "t": "❯ " }));
+    assert_eq!(j["cursor"], json!({ "row": 3, "col": 2 }));
 
     let calls = app.calls();
-    assert_eq!(calls[0].0, "surface.read_screen_vt");
-    assert_eq!(calls[0].1, json!({ "surface_id": "pane-1", "rows": 50 }));
+    assert_eq!(calls[0].0, "surface.read_screen_grid");
+    assert_eq!(calls[0].1, json!({ "surface_id": "pane-1", "scrollback_lines": 50 }));
+}
+
+#[tokio::test]
+async fn styled_falls_back_to_text_when_the_app_lacks_the_rpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    // surface.read_screen_grid is unscripted → the fake answers method_not_found.
+    app.reply("surface.read_text", json!({ "text": "plain only" }));
+    let h = start_tailscale().await;
+    expose(&h, &app, "pane-1", TargetKind::Pane, KeysPolicy::Safe).await;
+    let r = get(&h, "/api/targets/pane-1/screen?format=styled").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let j = r.json();
+    assert_eq!(j["format"], "text");
+    assert_eq!(j["styled_unavailable"], true);
+    assert_eq!(j["text"], "plain only");
+    let methods: Vec<String> = app.calls().into_iter().map(|c| c.0).collect();
+    assert_eq!(methods, vec!["surface.read_screen_grid", "surface.read_text"]);
 }
 
 #[test]
-fn styled_rows_handles_width_fallback_and_cursor_math() {
-    let rows = styled_rows("a\nb\n\n", 0);
-    assert_eq!(rows.len(), 2, "trailing blank rows are dropped");
-    assert_eq!(rows[1][0].t, "b");
-    assert!(styled_rows("", 80).is_empty());
-    assert_eq!(cursor_in_tail(10, 4, 1, 7, true), Some((7, 7)));
-    assert_eq!(cursor_in_tail(10, 4, 1, 7, false), None);
-    assert_eq!(cursor_in_tail(2, 4, 1, 0, true), None, "tail shorter than the viewport");
-    assert_eq!(cursor_in_tail(10, 0, 0, 0, true), None);
+fn styled_from_grid_trims_blank_rows_and_respects_cursor_visibility() {
+    let mut grid = grid_fixture();
+    let screen = styled_from_grid(&grid);
+    assert_eq!(screen.rows.len(), 4);
+    assert_eq!(screen.cursor, Some((3, 2)));
+
+    // A cursor below the last content keeps the blank rows up to it.
+    grid["cursor"]["row"] = json!(3);
+    let screen = styled_from_grid(&grid);
+    assert_eq!(screen.rows.len(), 5);
+    assert!(screen.rows[4].is_empty());
+    assert_eq!(screen.cursor, Some((4, 2)));
+
+    // Hidden cursor: no cursor, blank tail dropped.
+    grid["cursor"]["visible"] = json!(false);
+    let screen = styled_from_grid(&grid);
+    assert_eq!(screen.cursor, None);
+    assert_eq!(screen.rows.len(), 4);
+
+    // Empty frame.
+    let empty = styled_from_grid(&json!({}));
+    assert!(empty.rows.is_empty());
+    assert_eq!(empty.cursor, None);
+    assert_eq!(empty.columns, 0);
 }
 
 #[tokio::test]
