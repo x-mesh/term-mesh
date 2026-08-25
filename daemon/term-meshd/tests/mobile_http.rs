@@ -137,7 +137,8 @@ async fn expose(h: &Harness, app: &FakeApp, id: &str, kind: TargetKind, keys: Ke
     let spec = EnableSpec {
         surface_id: id.to_string(),
         kind,
-        team_name: (kind == TargetKind::Leader).then(|| "live-team".to_string()),
+        team_name: (kind != TargetKind::Pane).then(|| "live-team".to_string()),
+        agent_name: (kind == TargetKind::Agent).then(|| "worker-1".to_string()),
         app_socket: Some(app.path_str()),
         keys,
         leader_request_token: (kind == TargetKind::Leader).then(|| "tok-leader".to_string()),
@@ -918,4 +919,78 @@ fn config_from_env_defaults_to_tailscale_and_rejects_bad_modes() {
     std::env::remove_var(remote::ENV_LISTENER_ADDR);
     std::env::remove_var(http_mobile::ENV_AUTH_MODE);
     std::env::remove_var(http_mobile::ENV_ALLOWED_LOGINS);
+}
+
+#[tokio::test]
+async fn agent_targets_take_turns_and_show_the_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.reply(
+        "team.agent.transcript",
+        json!({
+            "team_name": "live-team", "agent_name": "worker-1", "running": true, "thinking": false,
+            "in_flight": true, "summary": "working", "total": 2,
+            "entries": [
+                { "id": "e1", "kind": "said", "speaker": "person", "text": "hello" },
+                { "id": "e2", "kind": "answered", "text": "hi there" }
+            ]
+        }),
+    );
+    app.reply("team.send", json!({ "delivery_scope": "transport_write" }));
+    app.reply("team.interrupt", json!({ "interrupted": true }));
+    app.reply("team.read", json!({ "text": "hello\nhi there" }));
+    let h = start_tailscale().await;
+    expose(&h, &app, "panel-1", TargetKind::Agent, KeysPolicy::Safe).await;
+
+    let listed = targets_by_id_for(&h).await;
+    assert_eq!(listed["panel-1"]["kind"], "agent");
+    assert_eq!(listed["panel-1"]["agent_name"], "worker-1");
+
+    let t = get(&h, "/api/targets/panel-1/transcript?limit=50").await;
+    assert_eq!(t.status, 200, "{}", t.body);
+    let j = t.json();
+    assert_eq!(j["running"], true);
+    assert_eq!(j["entries"][1]["text"], "hi there");
+    assert_eq!(app.calls()[0].0, "team.agent.transcript");
+    assert_eq!(app.calls()[0].1, json!({ "team_name": "live-team", "agent_name": "worker-1", "limit": 50 }));
+
+    let sent = post(&h, "/api/targets/panel-1/text", json!({ "text": "do it", "request_id": "a-1" })).await;
+    assert_eq!(sent.status, 202, "{}", sent.body);
+    assert_eq!(sent.json()["kind"], "agent");
+    assert_eq!(sent.json()["delivery_scope"], "transport_write");
+    assert_eq!(app.calls()[1].0, "team.send");
+    assert_eq!(app.calls()[1].1, json!({ "team_name": "live-team", "agent_name": "worker-1", "text": "do it" }));
+    let again = post(&h, "/api/targets/panel-1/text", json!({ "text": "do it", "request_id": "a-1" })).await;
+    assert_eq!(again.json()["deduplicated"], true);
+    assert_eq!(app.calls().len(), 2, "retry must not send a second turn");
+
+    let stop = http(h.addr, "POST", "/api/targets/panel-1/interrupt", &auth(), Some("{}")).await;
+    assert_eq!(stop.status, 200, "{}", stop.body);
+    assert_eq!(stop.json()["interrupted"], true);
+    assert_eq!(app.calls()[2].0, "team.interrupt");
+
+    let key = post(&h, "/api/targets/panel-1/key", json!({ "key": "Enter" })).await;
+    assert_eq!(key.status, 409);
+    assert_eq!(key.error_code(), "not_a_terminal");
+
+    let screen = get(&h, "/api/targets/panel-1/screen?format=styled").await;
+    assert_eq!(screen.status, 200, "{}", screen.body);
+    assert_eq!(screen.json()["format"], "text");
+    assert_eq!(screen.json()["text"], "hello\nhi there");
+    assert_eq!(app.calls()[3].0, "team.read");
+
+    // Terminal targets have no transcript or interrupt.
+    expose(&h, &app, "pane-1", TargetKind::Pane, KeysPolicy::Safe).await;
+    let none = get(&h, "/api/targets/pane-1/transcript").await;
+    assert_eq!(none.status, 409);
+    assert_eq!(none.error_code(), "not_an_agent");
+}
+
+async fn targets_by_id_for(h: &Harness) -> serde_json::Map<String, Value> {
+    let r = get(h, "/api/targets").await;
+    let mut out = serde_json::Map::new();
+    for t in r.json()["targets"].as_array().unwrap() {
+        out.insert(t["surface_id"].as_str().unwrap().to_string(), t.clone());
+    }
+    out
 }

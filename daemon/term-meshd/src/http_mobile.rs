@@ -185,6 +185,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/targets", get(targets_handler))
         .route("/api/targets/{surface_id}/screen", get(screen_handler))
         .route("/api/targets/{surface_id}/requests", get(requests_handler))
+        .route("/api/targets/{surface_id}/transcript", get(transcript_handler))
+        .route("/api/targets/{surface_id}/interrupt", post(interrupt_handler))
         .route("/api/targets/{surface_id}/text", post(text_handler))
         .route("/api/targets/{surface_id}/key", post(key_handler))
         .fallback(not_found_handler)
@@ -373,6 +375,7 @@ fn target_json(entry: &Entry) -> Value {
         "surface_id": entry.surface_id,
         "kind": entry.kind,
         "team_name": entry.team_name,
+        "agent_name": entry.agent_name,
         "agent_cli": entry.agent_cli,
         "title": entry.title,
         "cwd": entry.cwd,
@@ -666,6 +669,26 @@ async fn screen_handler(
         }
     };
     let entry = live_entry(&state, &surface_id).await?;
+    if entry.kind == TargetKind::Agent {
+        // A native pane has no grid; `team.read` returns its transcript text.
+        let result = app_call(
+            &state,
+            &entry,
+            "team.read",
+            json!({ "team_name": entry.team_name, "agent_name": entry.agent_name, "lines": lines }),
+        )
+        .await?;
+        let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+        return Ok(Json(json!({
+            "surface_id": entry.surface_id,
+            "kind": entry.kind,
+            "lines": lines,
+            "format": "text",
+            "text": text,
+            "captured_at": remote::now_unix(),
+        }))
+        .into_response());
+    }
     let styled = q.format.as_deref() == Some("styled");
     // An app that predates `surface.read_screen_grid` answers method_not_found;
     // fall through to the plain read and say so in `format` so the page can
@@ -710,6 +733,10 @@ async fn screen_handler(
         .into_response());
     }
     let result = match entry.kind {
+        // Handled above; kept explicit so a new kind cannot fall through.
+        TargetKind::Agent => {
+            return Err(ApiError::conflict("not_a_terminal", "native agent panes have no screen"))
+        }
         TargetKind::Leader => {
             app_call(
                 &state,
@@ -823,6 +850,39 @@ async fn text_handler(
         body.text.len()
     );
     match entry.kind {
+        TargetKind::Agent => {
+            if let Some(id) = &request_id {
+                if state.remember_request(&entry.surface_id, id) {
+                    return Ok(Json(json!({
+                        "surface_id": entry.surface_id,
+                        "kind": "agent",
+                        "delivered": true,
+                        "deduplicated": true,
+                        "request_id": id,
+                    }))
+                    .into_response());
+                }
+            }
+            let result = app_call(
+                &state,
+                &entry,
+                "team.send",
+                json!({ "team_name": entry.team_name, "agent_name": entry.agent_name, "text": body.text }),
+            )
+            .await?;
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "surface_id": entry.surface_id,
+                    "kind": "agent",
+                    "delivered": true,
+                    "deduplicated": false,
+                    "request_id": request_id,
+                    "delivery_scope": result.get("delivery_scope").cloned().unwrap_or(Value::Null),
+                })),
+            )
+                .into_response())
+        }
         TargetKind::Leader => {
             let mut params = json!({ "team_name": entry.team_name, "text": body.text });
             if let Some(id) = &request_id {
@@ -892,6 +952,80 @@ impl MobileState {
     }
 }
 
+#[derive(Deserialize)]
+struct TranscriptQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// `kind=agent`: the native pane's structured conversation
+/// (`team.agent.transcript`). Entries carry ids; the page re-renders by id
+/// because streaming answers and tool results change in place.
+async fn transcript_handler(
+    State(state): State<SharedState>,
+    Path(surface_id): Path<String>,
+    Query(q): Query<TranscriptQuery>,
+) -> ApiResult {
+    let entry = live_entry(&state, &surface_id).await?;
+    if entry.kind != TargetKind::Agent {
+        return Err(ApiError::conflict(
+            "not_an_agent",
+            "transcripts exist only for native agent targets; use /screen",
+        ));
+    }
+    let limit = q.limit.unwrap_or(200).clamp(1, 2000);
+    let result = app_call(
+        &state,
+        &entry,
+        "team.agent.transcript",
+        json!({ "team_name": entry.team_name, "agent_name": entry.agent_name, "limit": limit }),
+    )
+    .await?;
+    let pick = |k: &str| result.get(k).cloned().unwrap_or(Value::Null);
+    Ok(Json(json!({
+        "surface_id": entry.surface_id,
+        "kind": "agent",
+        "team_name": entry.team_name,
+        "agent_name": entry.agent_name,
+        "running": pick("running"),
+        "thinking": pick("thinking"),
+        "in_flight": pick("in_flight"),
+        "summary": pick("summary"),
+        "total": pick("total"),
+        "entries": result.get("entries").cloned().unwrap_or_else(|| json!([])),
+        "captured_at": remote::now_unix(),
+    }))
+    .into_response())
+}
+
+/// `kind=agent`: stop the agent's current turn (`team.interrupt`).
+async fn interrupt_handler(
+    State(state): State<SharedState>,
+    Path(surface_id): Path<String>,
+    axum::Extension(caller): axum::Extension<Caller>,
+) -> ApiResult {
+    let entry = live_entry(&state, &surface_id).await?;
+    if entry.kind != TargetKind::Agent {
+        return Err(ApiError::conflict(
+            "not_an_agent",
+            "interrupt exists only for native agent targets; send the C-c key instead",
+        ));
+    }
+    tracing::info!("mobile: interrupt by {} to {}", caller.0, entry.surface_id);
+    let result = app_call(
+        &state,
+        &entry,
+        "team.interrupt",
+        json!({ "team_name": entry.team_name, "agent_name": entry.agent_name }),
+    )
+    .await?;
+    Ok(Json(json!({
+        "surface_id": entry.surface_id,
+        "interrupted": result.get("interrupted").cloned().unwrap_or(json!(true)),
+    }))
+    .into_response())
+}
+
 /// How a safe key reaches a GUI surface: a named key the app understands
 /// (`surface.send_key`) or literal bytes typed as text (`surface.send_text`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -943,6 +1077,12 @@ async fn key_handler(
 ) -> ApiResult {
     let key = body.key.trim();
     let entry = live_entry(&state, &surface_id).await?;
+    if entry.kind == TargetKind::Agent {
+        return Err(ApiError::conflict(
+            "not_a_terminal",
+            "native agent panes take turns, not keys; use /text or /interrupt",
+        ));
+    }
     if entry.keys == KeysPolicy::None {
         return Err(ApiError::forbidden(
             "keys_disabled",

@@ -198,6 +198,22 @@ fn leader_request_token_is_kept_but_never_serialized() {
 }
 
 #[test]
+fn agent_kind_requires_team_and_agent_names() {
+    let mut reg = Registry::new();
+    let mut agent = pane_spec("panel-1");
+    agent.kind = TargetKind::Agent;
+    assert!(reg.upsert(agent.clone(), 0).unwrap_err().contains("team_name and agent_name"));
+    agent.team_name = Some("live-team".into());
+    assert!(reg.upsert(agent.clone(), 0).is_err());
+    agent.agent_name = Some(" worker-1 ".into());
+    let entry = reg.upsert(agent, 0).unwrap();
+    assert_eq!(entry.kind, TargetKind::Agent);
+    assert_eq!(entry.agent_name.as_deref(), Some("worker-1"));
+    let json = serde_json::to_string(&entry).unwrap();
+    assert!(json.contains("\"kind\":\"agent\""), "{json}");
+}
+
+#[test]
 fn ttl_is_clamped_not_rejected() {
     let mut reg = Registry::new();
     let mut tiny = pane_spec("tiny");

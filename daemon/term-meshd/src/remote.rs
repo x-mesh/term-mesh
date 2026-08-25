@@ -41,6 +41,9 @@ pub const ENV_LISTENER_ADDR: &str = "TERM_MESH_MOBILE_ADDR";
 pub enum TargetKind {
     Leader,
     Pane,
+    /// A native agent pane: the page shows its structured transcript as a
+    /// chat and sends turns with `team.send`. No screen, no keys.
+    Agent,
 }
 
 /// Which keys the mobile page may send. `safe` is the fixed allowlist in
@@ -66,9 +69,13 @@ pub struct Entry {
     pub surface_id: String,
     pub kind: TargetKind,
     /// Required for `kind = leader`: the team whose durable request board
-    /// receives the text.
+    /// receives the text. Required for `kind = agent` together with
+    /// `agent_name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_name: Option<String>,
+    /// `kind = agent` only: the team member whose native pane this is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
     #[serde(default)]
     pub agent_cli: String,
     #[serde(default)]
@@ -108,6 +115,8 @@ pub struct EnableSpec {
     pub kind: TargetKind,
     #[serde(default)]
     pub team_name: Option<String>,
+    #[serde(default)]
+    pub agent_name: Option<String>,
     #[serde(default)]
     pub agent_cli: String,
     #[serde(default)]
@@ -152,15 +161,25 @@ impl EnableSpec {
         {
             return Err("surface_id must be alphanumeric, '-', '_' or '.'".into());
         }
-        if self.kind == TargetKind::Leader
-            && self
-                .team_name
+        let has_team = !self
+            .team_name
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty();
+        if self.kind == TargetKind::Leader && !has_team {
+            return Err("kind=leader requires team_name".into());
+        }
+        if self.kind == TargetKind::Agent {
+            let has_agent = !self
+                .agent_name
                 .as_deref()
                 .map(str::trim)
                 .unwrap_or("")
-                .is_empty()
-        {
-            return Err("kind=leader requires team_name".into());
+                .is_empty();
+            if !has_team || !has_agent {
+                return Err("kind=agent requires team_name and agent_name".into());
+            }
         }
         if let Some(sock) = self.app_socket.as_deref() {
             if !sock.starts_with('/') {
@@ -209,6 +228,10 @@ impl Registry {
                 .team_name
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty()),
+            agent_name: spec
+                .agent_name
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty()),
             agent_cli: spec.agent_cli.trim().to_string(),
             title: spec.title.trim().to_string(),
             cwd: spec.cwd.trim().to_string(),

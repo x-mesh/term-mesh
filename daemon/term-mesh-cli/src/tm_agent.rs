@@ -1929,6 +1929,11 @@ enum RemoteCommand {
         /// `--team`.
         #[arg(long)]
         leader: bool,
+        /// Expose a native agent pane of this team instead of this pane: the
+        /// page shows its structured transcript as a chat and sends turns.
+        /// Run from the leader pane (or pass `--team`).
+        #[arg(long, value_name = "AGENT", conflicts_with = "leader")]
+        agent: Option<String>,
         /// App control socket that owns the surface. Defaults to this pane's
         /// $TERMMESH_SOCKET_PATH.
         #[arg(long)]
@@ -12538,11 +12543,16 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
             ttl,
             surface,
             leader,
+            agent,
             app_socket,
             cli,
             title,
             json,
         } => {
+            if let Some(agent_name) = agent.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+                run_remote_on_agent(sock, team_flag, agent_name, keys, ttl.as_deref(), title.as_deref(), *json);
+                return;
+            }
             let surface_id = resolve_remote_surface(surface.as_deref()).unwrap_or_else(|e| {
                 eprintln!("Error: {e}");
                 process::exit(1);
@@ -12716,6 +12726,101 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
                 );
             }
         }
+    }
+}
+
+/// `tm-agent remote on --agent <name>`: expose a native agent pane as a chat
+/// target. The pane is found through the app's `team.status` (panel_id, cli),
+/// registered with `kind=agent`, and served from its structured transcript.
+fn run_remote_on_agent(
+    sock: &PathBuf,
+    team_flag: Option<&str>,
+    agent_name: &str,
+    keys: &str,
+    ttl: Option<&str>,
+    title: Option<&str>,
+    json: bool,
+) {
+    let team_name = resolve_team_name(team_flag);
+    let Some(app_sock) = detect_socket() else {
+        eprintln!("Error: no term-mesh app socket found to look up the agent (TERMMESH_SOCKET_PATH)");
+        process::exit(1);
+    };
+    let status = match rpc_call(&app_sock, "team.status", json!({ "team_name": team_name })) {
+        Ok(resp) if resp.get("error").is_none() => resp["result"].clone(),
+        Ok(resp) => {
+            eprintln!(
+                "Error: team.status: {}",
+                resp["error"]["message"].as_str().unwrap_or("rpc error")
+            );
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error: team.status: {e}");
+            process::exit(1);
+        }
+    };
+    let agent = status["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|a| {
+            a["agent_name"].as_str() == Some(agent_name) || a["name"].as_str() == Some(agent_name)
+        })
+        .cloned();
+    let Some(agent) = agent else {
+        eprintln!("Error: agent {agent_name:?} is not in team {team_name:?}");
+        process::exit(1);
+    };
+    let Some(panel_id) = agent["panel_id"].as_str().filter(|p| !p.is_empty()) else {
+        eprintln!("Error: agent {agent_name:?} has no pane (headless agents cannot be exposed yet)");
+        process::exit(1);
+    };
+    let ttl_secs = match ttl.map(parse_ttl_secs).transpose() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+    let mut params = json!({
+        "surface_id": panel_id,
+        "kind": "agent",
+        "team_name": team_name,
+        "agent_name": agent_name,
+        "keys": keys,
+        "app_socket": app_sock.to_string_lossy(),
+        "agent_cli": agent["cli"].as_str().unwrap_or(""),
+        "title": title.unwrap_or(agent_name),
+        "cwd": env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+        "owner": env::var("USER").ok(),
+    });
+    if let Some(ttl) = ttl_secs {
+        params["ttl_secs"] = json!(ttl);
+    }
+    let result = remote_rpc(sock, "remote.on", params);
+    if json {
+        println!("{}", pretty(&result));
+        return;
+    }
+    println!("exposed agent {agent_name} of {team_name} (chat, keys not applicable)");
+    match result["url"].as_str() {
+        Some(url) => {
+            println!("url: {url}");
+            for line in remote_tailnet_lines(url, panel_id) {
+                println!("{line}");
+            }
+        }
+        None => println!(
+            "url: unavailable ({})",
+            result["listener_error"].as_str().unwrap_or("listener address invalid")
+        ),
+    }
+    if let Some(exp) = result["entry"]["expires_at"].as_u64() {
+        println!("expires: in {} (unix {exp})", format_remote_relative(exp));
+    }
+    if result["listener_enabled"].as_bool() != Some(true) {
+        eprintln!("note: the mobile listener is disabled on this daemon; enable it in Settings first");
     }
 }
 

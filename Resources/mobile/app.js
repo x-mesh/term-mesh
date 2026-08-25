@@ -33,6 +33,10 @@
     requests: $('requests'),
     requestsCount: $('requests-count'),
     requestsList: $('requests-list'),
+    chat: $('chat'),
+    chatList: $('chat-list'),
+    chatState: $('chat-state'),
+    interrupt: $('interrupt'),
     composer: $('composer'),
     keys: $('keys'),
     form: $('send-form'),
@@ -50,6 +54,8 @@
     lastError: null,
     rowKeys: [],         // per-row render keys for incremental redraws
     rowNodes: [],
+    chatNodes: {},       // entry id → {node, key} for the agent chat view
+    chatRunning: false,
   };
 
   // ── helpers ──────────────────────────────────────────────────────────
@@ -112,9 +118,12 @@
     return node.scrollHeight - node.scrollTop - node.clientHeight <= BOTTOM_SLACK_PX;
   }
 
+  function isAgent(t) { return !!t && t.kind === 'agent'; }
+
   function targetLabel(t) {
     var bits = [];
     if (t.kind === 'leader') { bits.push('leader'); }
+    if (t.kind === 'agent') { bits.push('chat'); }
     if (t.agent_cli) { bits.push(t.agent_cli); }
     var head = t.title || t.surface_id.slice(0, 8);
     return bits.length ? head + ' · ' + bits.join(' ') : head;
@@ -241,19 +250,26 @@
     state.selected = t || null;
     if (t) { el.target.value = t.surface_id; }
     var has = !!t;
+    var agent = isAgent(t);
     el.empty.hidden = has;
-    el.screenWrap.hidden = !has;
+    el.screenWrap.hidden = !has || agent;
+    el.chat.hidden = !agent;
     el.composer.hidden = !has;
     el.requests.hidden = !(has && t.kind === 'leader');
-    el.keys.hidden = !!(has && t.keys === 'none');
-    if (has) {
+    el.keys.hidden = !has || agent || t.keys === 'none';
+    if (agent) {
+      setStatus('chat · ' + (t.agent_name || '') + ' @ ' + (t.team_name || ''));
+      el.text.placeholder = (t.agent_name || 'agent') + '에게 보낼 턴…';
+    } else if (has) {
       setStatus(t.kind === 'leader' ? 'leader · ' + (t.team_name || '') : (t.agent_cli || 'pane') + ' · ' + (t.cwd || ''));
+      el.text.placeholder = '메시지…';
     } else {
       setStatus('no exposed panes');
     }
     if (changed) {
       state.lastText = null;
       resetScreen();
+      resetChat();
       el.requestsList.textContent = '';
       el.requestsCount.textContent = '';
       if (!fromRender || has) { refreshNow(); }
@@ -262,8 +278,127 @@
 
   // ── screen ───────────────────────────────────────────────────────────
 
+  // ── agent chat ───────────────────────────────────────────────────────
+
+  function resetChat() {
+    el.chatList.textContent = '';
+    state.chatNodes = {};
+    state.chatRunning = false;
+    el.chatState.textContent = '';
+    el.interrupt.hidden = true;
+  }
+
+  function buildEntry(e) {
+    var node;
+    if (e.kind === 'tool') {
+      node = document.createElement('details');
+      node.className = 'tool' + (e.running ? ' running' : '') + (e.failed ? ' failed' : '');
+      var summary = document.createElement('summary');
+      var name = document.createElement('span'); name.className = 'tool-name'; name.textContent = e.name || 'tool';
+      var head = document.createElement('span'); head.className = 'tool-head'; head.textContent = e.headline || '';
+      summary.appendChild(name); summary.appendChild(head);
+      if (e.change) {
+        var ch = document.createElement('span'); ch.className = 'tool-change';
+        var add = document.createElement('span'); add.className = 'add'; add.textContent = '+' + (e.change.added || 0);
+        var del = document.createElement('span'); del.className = 'del'; del.textContent = ' −' + (e.change.removed || 0);
+        ch.appendChild(document.createTextNode((e.change.path || '') + ' ')); ch.appendChild(add); ch.appendChild(del);
+        summary.appendChild(ch);
+      }
+      node.appendChild(summary);
+      if (e.result) {
+        var pre = document.createElement('pre'); pre.textContent = e.result; node.appendChild(pre);
+      }
+      return node;
+    }
+    node = document.createElement('li');
+    if (e.kind === 'said') {
+      node.className = 'msg said' + (e.speaker === 'leader' ? ' leader' : '');
+      node.textContent = e.text || '';
+    } else if (e.kind === 'answered') {
+      node.className = 'msg answered'; node.textContent = e.text || '';
+    } else if (e.kind === 'thought') {
+      node.className = 'msg thought'; node.textContent = (e.text || '').slice(0, 400);
+    } else if (e.kind === 'turn_ended') {
+      node.className = 'msg turn' + (e.failed ? ' failed' : '');
+      var bits = [e.failed ? 'failed' : 'done'];
+      if (e.duration) { bits.push(Math.round(e.duration) + 's'); }
+      if (e.cost) { bits.push('$' + Number(e.cost).toFixed(3)); }
+      if (e.tokens_in || e.tokens_out) { bits.push('↑' + (e.tokens_in || 0) + ' ↓' + (e.tokens_out || 0)); }
+      node.textContent = bits.join(' · ');
+    } else {
+      node.className = 'msg notice'; node.textContent = e.text || '';
+    }
+    return node;
+  }
+
+  // Entries carry stable ids; answers stream and tool rows close in place,
+  // so each entry is re-rendered only when its serialized form changes.
+  function renderChat(data) {
+    var entries = (data && data.entries) || [];
+    var stick = isAtBottom(el.chatList);
+    var seen = {};
+    var prev = null;
+    entries.forEach(function (e) {
+      var id = e.id || (e.kind + ':' + (e.text || e.headline || ''));
+      seen[id] = true;
+      var key = JSON.stringify(e);
+      var cached = state.chatNodes[id];
+      var node;
+      if (cached && cached.key === key) {
+        node = cached.node;
+      } else {
+        node = buildEntry(e);
+        if (cached) {
+          if (cached.node.open) { node.open = true; }
+          el.chatList.replaceChild(node, cached.node);
+        } else if (prev && prev.nextSibling) {
+          el.chatList.insertBefore(node, prev.nextSibling);
+        } else {
+          el.chatList.appendChild(node);
+        }
+        state.chatNodes[id] = { node: node, key: key };
+      }
+      prev = node;
+    });
+    Object.keys(state.chatNodes).forEach(function (id) {
+      if (!seen[id]) {
+        var gone = state.chatNodes[id].node;
+        if (gone.parentNode === el.chatList) { el.chatList.removeChild(gone); }
+        delete state.chatNodes[id];
+      }
+    });
+    // `running` means the agent process is alive between turns; a turn in
+    // progress is `in_flight` (or `thinking` while it reasons).
+    state.chatRunning = !!(data && (data.in_flight || data.thinking));
+    el.interrupt.hidden = !state.chatRunning;
+    var alive = !!(data && data.running);
+    el.chatState.textContent = state.chatRunning
+      ? (data.thinking ? '생각 중…' : '작업 중…') + (data.summary ? ' · ' + data.summary : '')
+      : (alive ? '대기 중' : '중지됨') + (data && data.summary ? ' · ' + data.summary : '');
+    if (stick) { el.chatList.scrollTop = el.chatList.scrollHeight; }
+  }
+
+  function refreshChat() {
+    var t = state.selected;
+    if (!isAgent(t)) { return Promise.resolve(); }
+    return api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + '/transcript?limit=200')
+      .then(function (data) {
+        renderChat(data);
+        state.lastError = null;
+        setStatus('chat · ' + (t.agent_name || '') + ' · ' + new Date().toLocaleTimeString());
+      })
+      .catch(function (err) {
+        state.lastError = err;
+        setStatus(describeError(err), true);
+        if (err.code === 'not_exposed' || err.code === 'target_gone') {
+          return loadTargets();
+        }
+      });
+  }
+
   function refreshScreen() {
     var t = state.selected;
+    if (isAgent(t)) { return refreshChat(); }
     if (!t) { return Promise.resolve(); }
     var stickToBottom = isAtBottom(el.screen);
     return api('GET', '/api/targets/' + encodeURIComponent(t.surface_id) + '/screen?lines=' + SCREEN_LINES + '&format=styled')
@@ -338,6 +473,11 @@
       if (document.hidden) { return; }
       refreshNow();
     }, POLL_MS);
+    // A running agent turn streams text; poll it twice as often.
+    window.setInterval(function () {
+      if (document.hidden || !state.chatRunning || !isAgent(state.selected)) { return; }
+      refreshNow();
+    }, POLL_MS / 2);
   }
 
   function stopPolling() {
@@ -357,7 +497,9 @@
     setSendStatus('sending…');
     api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/text', { text: text, request_id: id })
       .then(function (data) {
-        if (t.kind === 'leader') {
+        if (isAgent(t)) {
+          setSendStatus(data.deduplicated ? 'already sent' : 'turn sent');
+        } else if (t.kind === 'leader') {
           var bits = ['queued ' + String(data.request_id || id).slice(0, 8)];
           if (data.wake_dispatched) { bits.push('leader woken'); }
           if (data.request_replayed) { bits.push('replayed'); }
@@ -411,6 +553,16 @@
   el.jump.addEventListener('click', function () {
     el.screen.scrollTop = el.screen.scrollHeight;
     el.jump.hidden = true;
+  });
+
+  el.interrupt.addEventListener('click', function () {
+    var t = state.selected;
+    if (!isAgent(t)) { return; }
+    el.interrupt.disabled = true;
+    api('POST', '/api/targets/' + encodeURIComponent(t.surface_id) + '/interrupt', {})
+      .then(function () { setSendStatus('interrupted'); refreshNow(); })
+      .catch(function (err) { setSendStatus(describeError(err), true); })
+      .then(function () { el.interrupt.disabled = false; });
   });
 
   el.keys.addEventListener('click', function (ev) {

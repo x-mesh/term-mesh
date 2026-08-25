@@ -102,9 +102,10 @@ term-meshd mobile listener  127.0.0.1:9877
 
 ```
 entry {
-  surface_id     GUI: panel UUID / daemon: hex id
-  kind           leader | pane
-  team_name      kind=leader일 때 필수
+  surface_id     GUI: panel UUID / daemon: hex id (agent: native pane의 panel UUID)
+  kind           leader | pane | agent
+  team_name      kind=leader|agent일 때 필수
+  agent_name     kind=agent일 때 필수 (팀 구성원 이름)
   agent_cli      claude | codex | … (pane 프로필 또는 SurfaceInfo.agent_cli)
   keys           safe | none        (기본 safe)
   owner          등록 요청자 (CLI면 로컬 사용자, HTTP면 tailnet login)
@@ -130,9 +131,13 @@ v1은 in-memory다. daemon 재시작 후에는 `/rc on`을 다시 친다.
 
 ```
 tm-agent remote on  [--keys safe|none] [--ttl 12h] [--surface <id>] [--leader]
+tm-agent remote on  --agent <name> [--ttl 12h]     # 팀의 native 에이전트를 채팅 대상으로
 tm-agent remote off [--surface <id>]
 tm-agent remote status
 ```
+
+`--agent`는 리더 pane(또는 `--team`)에서 실행한다. app socket `team.status`로 그 에이전트의
+`panel_id`·`cli`를 찾아 `kind=agent`로 등록하며, 페이지는 이 대상을 채팅으로 보여 준다.
 
 - surface는 `TERMMESH_SURFACE_ID`에서, 팀은 `TERMMESH_TEAM`(없으면 `ws-<hex>`
   규칙)에서 읽는다. `--surface`는 term-mesh 밖에서 띄운 셸처럼 env가 없는 경우의
@@ -191,7 +196,15 @@ wake instruction으로 깨어나고, 일반 pane은 텍스트가 그대로 타�
 
 ### 4.5 Mobile page
 
-대상 목록 → 대상 화면. 화면은 `format=styled`로 받은 셀 스타일(색·굵게·dim·기울임·
+대상 목록에는 터미널 pane(리더·일반)과 native 에이전트가 함께 나온다. 터미널 pane은
+화면 미러, native 에이전트(`kind=agent`)는 채팅 뷰다. 채팅 뷰는 `/transcript`를 2초마다
+(턴이 진행 중이면 1초마다) 받아 entry id별로 그린다: 사람/리더의 지시는 오른쪽 말풍선,
+답변은 왼쪽, thought는 흐리게, tool 호출은 접히는 행(이름·headline·`+N −M 경로`·결과),
+턴 종료는 비용·시간·토큰 메타. composer는 `team.send`로 한 턴을 보내고 진행 중이면
+"중단" 버튼이 `team.interrupt`를 부른다. 키 행·화면·커서는 없다. 이것이 Claude
+remote-control과 같은 형태이며, 터미널 미러의 색·커서·키·IME 문제가 없다.
+
+터미널 pane 화면: 대상 목록 → 대상 화면. 화면은 `format=styled`로 받은 셀 스타일(색·굵게·dim·기울임·
 밑줄·반전)과 커서 위치를 그대로 그린다. 그래서 Claude Code가 dim으로 띄우는 제안
 문구와 실제 입력이 구분되고 커서가 어디 있는지 보인다. 2초 자동 refresh와 수동
 refresh, 사용자가 하단에 있을 때만 자동 scroll.
@@ -234,8 +247,10 @@ frame-ancestors 'none'; base-uri 'none'; form-action 'none'`. CORS 없음. POST�
 | GET | `/api/targets` | | `{targets: [{surface_id, kind, team_name, agent_cli, title, cwd, source: gui\|headless, keys, owner, created_at, expires_at}], now}`. 호출 시 만료·dead socket entry를 prune |
 | GET | `/api/targets/{id}/screen?lines=200` | `lines` 20..1000 | `{surface_id, kind, lines, text, captured_at}` |
 | GET | `/api/targets/{id}/screen?lines=200&format=styled` | 위와 같음 | `{format: "styled", columns, rows: [[{t, fg?, bg?, b?, d?, i?, u?, inv?}]], cursor: {row, col}\|null, captured_at}`. 앱 `surface.read_screen_grid`(Ghostty render-grid 프레임)의 span을 daemon이 행별로 배치(열 간격은 공백으로 채움, invisible은 공백, scrollback 행 다음에 active 행, 커서·마지막 내용 아래의 빈 행은 제거). fg/bg는 `#rrggbb`(터미널 기본색이면 생략). 구형 앱이면 `format: "text"`로 내려감 |
-| POST | `/api/targets/{id}/text` | `{text, request_id?}` | leader: 202 `{request_id, stored, wake_dispatched, request_replayed, claimed_by_leader}` / pane: 200 `{delivered, deduplicated, request_id}` |
+| POST | `/api/targets/{id}/text` | `{text, request_id?}` | leader: 202 `{request_id, stored, wake_dispatched, request_replayed, claimed_by_leader}` / pane: 200 `{delivered, deduplicated, request_id}` / agent: 202 `{delivered, delivery_scope}` (`team.send`로 한 턴 전달, request_id 10분 dedupe) |
 | GET | `/api/targets/{id}/requests` | leader만(아니면 409 `not_leader`) | `{count, requests}` (`team.leader.request.list`, 본문 미포함) |
+| GET | `/api/targets/{id}/transcript?limit=200` | agent만(아니면 409 `not_an_agent`) | `{running, thinking, in_flight, summary, total, entries: [{id, kind: said\|answered\|thought\|tool\|turn_ended\|notice, …}]}` (`team.agent.transcript`). entry는 id가 안정적이고 답변·tool 결과는 제자리에서 바뀌므로 페이지는 id별로 다시 그림 |
+| POST | `/api/targets/{id}/interrupt` | agent만 | 202 아님, 200 `{interrupted}` (`team.interrupt`) |
 | POST | `/api/targets/{id}/key` | `{key}` | 200 `{key, delivered}` |
 
 키 allowlist(`keys=safe`): `Enter`, `Escape`, `Tab`, `Backspace`, `Up`, `Down`, `Left`,
@@ -365,6 +380,11 @@ pane 각각 `/rc on` → 읽기 → 텍스트 → 키가 동작.
   타이핑·`Enter`·`Up`/`Down`(입력 히스토리 이동으로 화면 변화 관찰)·`Escape` 전달 확인.
   Codex pane에서 텍스트 타이핑, `/` 팝업 표시, `Escape`로 팝업 닫힘 확인. Codex 팝업의
   선택 강조는 색상만 바뀌어 텍스트 화면으로는 화살표 효과를 관찰할 수 없었다.
+- native 채팅 대상(`kind=agent`, 2026-08-25 tagged smoke): app socket으로 native Claude
+  에이전트 1명짜리 팀 생성 → `tm-agent remote on --agent chat --team …` → `/api/targets`에
+  `kind=agent` → `/transcript` 200 → `/text` 202(`delivery_scope: transport_write`) →
+  2초 뒤 transcript에 `said`/`answered("pong")`/`turn_ended`. transcript의 `running`은
+  프로세스 생존이라 턴 사이에도 true이고, 턴 진행은 `in_flight`/`thinking`으로 본다.
 - 두 가지를 구현 중에 고쳤다. (1) 화살표를 `send_text`의 CSI 바이트로 보내면 kitty
   keyboard protocol을 켠 Claude Code에 닿지 않아 앱 `sendNamedKey`/`queuedTextForNamedKey`에
   `up/down/left/right` 키 이벤트를 추가했다. (2) `team.leader.request.list`는 리더 pane의
