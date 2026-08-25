@@ -1664,10 +1664,15 @@ impl PtySurface {
             return true;
         };
         let exited = Self::observe_exit_locked(&mut child, &self.reap_owners);
+        // `mark_dead` records lifecycle details by taking `child` again. Drop
+        // this guard first: std::sync::Mutex is not reentrant, and calling it
+        // while still locked deadlocks the Tokio worker running ListSurfaces
+        // or ListWorkspaces. Enough concurrent peer probes then park every
+        // runtime worker, including the accept loop and SIGTERM handler.
+        drop(child);
         if exited {
             self.mark_dead("child_exit_observed");
         }
-        drop(child);
         exited
     }
 
@@ -4123,6 +4128,27 @@ mod tests {
         assert_eq!(surface.child.lock().unwrap().state, ChildState::Reaped);
         surface.hangup();
         assert_eq!(surface.signal_owners.load(Ordering::Relaxed), 1);
+    }
+
+    /// Regression for the jwserver69 relay outage. `ListSurfaces` and
+    /// `ListWorkspaces` both call `is_live`, which reaches
+    /// `child_has_exited`. When that call observed a reaped child it invoked
+    /// `mark_dead` while still holding `child`; `mark_dead` locks `child` to
+    /// log the receipt, so one dead pane permanently parked a Tokio worker.
+    /// Concurrent sidebar probes eventually parked every worker, including
+    /// the peer accept loop and signal handler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observing_an_already_reaped_child_does_not_relock_lifecycle_mutex() {
+        let surface = cat_surface();
+        surface.shutdown_forcibly();
+        assert_eq!(surface.child.lock().unwrap().state, ChildState::Reaped);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            assert!(surface.child_has_exited());
+        })
+        .await
+        .expect("exit observation must not deadlock while marking the surface dead");
+        assert!(surface.dead.load(Ordering::Acquire));
     }
 
     /// `Abandoned` is terminal. It is reached when a SIGKILLed child cannot be
