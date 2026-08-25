@@ -187,9 +187,15 @@ def check_pane_flow(c: termmesh, cli: Path) -> None:
 def check_leader_flow(c: termmesh, cli: Path) -> None:
     team = f"mobile-e2e-{os.getpid()}"
     created = c.team_create(team, [], leader_mode="repl")
-    leader_sid = str(created.get("surface_id") or "")
-    if not leader_sid:
-        raise termmeshError(f"team.create did not return the leader surface id: {created}")
+    # team.create reports surface_id only for adopted leaders; a repl leader is
+    # the sole terminal in the fresh team workspace it returns.
+    ws = str(created.get("workspace_id") or "")
+    if not ws:
+        raise termmeshError(f"team.create did not return the team workspace: {created}")
+    surfaces = [sid for (_, sid, _) in c.list_surfaces(ws)]
+    if len(surfaces) != 1:
+        raise termmeshError(f"expected exactly one surface in the team workspace, got {surfaces}")
+    leader_sid = surfaces[0]
     try:
         wait_for(lambda: prompt_ready(c, leader_sid) or None, 20, "leader pane prompt")
         rc(cli, ["on", "--leader", "--title", "e2e-leader", "--ttl", "10m"],
