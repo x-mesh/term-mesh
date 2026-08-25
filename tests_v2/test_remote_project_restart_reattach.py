@@ -23,6 +23,8 @@ DIR_ENV = "TERMMESH_E2E_REMOTE_LEADER_DIR"
 PHASE_ENV = "TERMMESH_E2E_REATTACH_PHASE"
 STATE_ENV = "TERMMESH_E2E_REATTACH_STATE"
 ROLES_ENV = "TERMMESH_E2E_REATTACH_ROLES"
+LEADER_CLI_ENV = "TERMMESH_E2E_REMOTE_LEADER_CLI"
+WORKER_CLI_ENV = "TERMMESH_E2E_REMOTE_WORKER_CLI"
 REQUIRE_SESSION_OWNER_REDIRECT_ENV = "TERMMESH_E2E_REQUIRE_SESSION_OWNER_REDIRECT"
 REQUIRE_REMOTE_PROJECT_ENV = "TERMMESH_E2E_REQUIRE_REMOTE_PROJECT"
 RECEIPT_ENV = "TERMMESH_E2E_RELAY_RECEIPT"
@@ -440,12 +442,17 @@ def _phase_create_inner(
     created = c.debug_project_create(
         directory=f"/tmp/{team_name}",
         roles=roles,
-        leader_cli="claude",
-        leader_model="sonnet",
+        leader_cli=os.environ.get(LEADER_CLI_ENV, "claude").strip() or "claude",
+        leader_model=(
+            "gpt-5.6-sol"
+            if os.environ.get(LEADER_CLI_ENV, "claude").strip() == "codex"
+            else "sonnet"
+        ),
         leader_host=host,
         leader_directory=remote_dir,
         remote_host=host,
         remote_path=remote_dir,
+        worker_cli=os.environ.get(WORKER_CLI_ENV, "").strip() or None,
     )
     if created.get("team") != team_name:
         raise termmeshError(f"remote project was not created: {created!r}")

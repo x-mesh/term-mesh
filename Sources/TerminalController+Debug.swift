@@ -829,9 +829,14 @@ extension TerminalController {
                                 )
                             }
                             let rows: [TeamAgentRow] = plan.agentCheckouts.compactMap { checkout in
-                                guard let preset = Self.debugProjectPreset(
+                                guard var preset = Self.debugProjectPreset(
                                     named: checkout.agent, presets: presets
                                 ) else { return nil }
+                                if let workerCLI = params["worker_cli"] as? String,
+                                   !workerCLI.isEmpty {
+                                    preset.cli = workerCLI
+                                    preset.model = AgentRolePreset.defaultModel(for: workerCLI)
+                                }
                                 var row = TeamAgentRow(preset: preset, customInstructions: "")
                                 row.hostKey = hostKey
                                 row.hostDirectory = checkout.path

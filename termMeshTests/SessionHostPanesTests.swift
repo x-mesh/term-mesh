@@ -19,6 +19,94 @@ import PeerProto
 /// mirror showed one. These tests cover the per-surface decision instead.
 @MainActor
 final class SessionHostPanesTests: XCTestCase {
+    func test_hostAutoOpenFinalizesHalfSplitChainAsCanonicalProjectGrid() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("host-project-layout-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProjectPresentationLayoutStore(
+            fileURL: directory.appendingPathComponent("layouts.json")
+        )
+        let workspace = Workspace(title: "host-project-layout")
+        let leaderPanel = try XCTUnwrap(workspace.focusedPanelId)
+        var agentPanels: [UUID] = []
+        var splitFrom = leaderPanel
+        for _ in 0..<3 {
+            let panel = try XCTUnwrap(workspace.newTerminalSplit(
+                from: splitFrom, orientation: .horizontal, focus: false
+            )?.id)
+            agentPanels.append(panel)
+            splitFrom = panel
+        }
+        let surfaces = (0..<4).map { Data(repeating: UInt8(0x70 + $0), count: 16) }
+        workspace.debugProjectLayoutSurfaceIDs = Dictionary(
+            uniqueKeysWithValues: zip([leaderPanel] + agentPanels, surfaces)
+        )
+        var project = Termmesh_Peer_V1_Team()
+        project.name = "hosted"
+        project.projectID = "team:hosted"
+        project.teamUuid = "hosted"
+        project.leaderSurfaceID = surfaces[0]
+        project.members = surfaces.dropFirst().enumerated().map { index, surfaceID in
+            var member = Termmesh_Peer_V1_TeamMember()
+            member.name = "agent-\(index)"
+            member.surfaceID = surfaceID
+            return member
+        }
+
+        XCTAssertEqual(
+            SessionHostPanes.finalizeHostedProjectLayout(
+                project: project, workspace: workspace,
+                anchorPanelID: nil, layoutStore: store
+            ),
+            .rebuiltCanonical
+        )
+        let saved = try XCTUnwrap(store.snapshot(projectID: project.projectID))
+        XCTAssertEqual(saved.surfaceIDs, Set(surfaces))
+        guard case .split(let root) = workspace.bonsplitController.treeSnapshot() else {
+            return XCTFail("expected canonical leader and agent split")
+        }
+        XCTAssertEqual(root.dividerPosition, 0.5, accuracy: 0.001)
+        guard case .split = root.second else {
+            return XCTFail("expected canonical agent subtree")
+        }
+    }
+
+    func test_hostLayoutSignatureChangesWithRevisionOrSurfaceRoster() {
+        var project = Termmesh_Peer_V1_Team()
+        project.projectID = "team:hosted"
+        project.presentationRevision = 3
+        project.leaderSurfaceID = sid(1)
+        var member = Termmesh_Peer_V1_TeamMember()
+        member.surfaceID = sid(2)
+        project.members = [member]
+        let original = SessionHostPanes.hostedProjectLayoutSignature(project)
+
+        project.presentationRevision = 4
+        XCTAssertNotEqual(SessionHostPanes.hostedProjectLayoutSignature(project), original)
+        project.presentationRevision = 3
+        project.members[0].surfaceID = sid(3)
+        XCTAssertNotEqual(SessionHostPanes.hostedProjectLayoutSignature(project), original)
+    }
+
+    func test_hostLayoutFinalizationIdentityChangesWhenWorkspaceIsRecreated() {
+        var project = Termmesh_Peer_V1_Team()
+        project.projectID = "team:hosted"
+        project.presentationRevision = 3
+        project.leaderSurfaceID = sid(1)
+        let firstWorkspace = UUID()
+        let replacementWorkspace = UUID()
+
+        XCTAssertNotEqual(
+            SessionHostPanes.hostedProjectLayoutFinalizationID(
+                project: project, workspaceID: firstWorkspace
+            ),
+            SessionHostPanes.hostedProjectLayoutFinalizationID(
+                project: project, workspaceID: replacementWorkspace
+            ),
+            "a replacement workspace must not inherit the old workspace's finalized state"
+        )
+    }
+
     func test_sessionHostStartupRetryOutlivesSlowSiblingDaemonStartup() {
         let total = RemoteHostStore.sessionHostStartupRetryDelays.reduce(0.0) { sum, delay in
             sum + Double(delay.components.seconds)

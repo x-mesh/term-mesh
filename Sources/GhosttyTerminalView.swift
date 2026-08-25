@@ -759,6 +759,11 @@ final class TerminalSurface: Identifiable, ObservableObject {
         let socketPath = SocketControlSettings.socketPath()
         env["TERMMESH_SOCKET_PATH"] = socketPath
         env["CMUX_SOCKET_PATH"] = socketPath
+        // A parent agent CLI exports its own conversation identity. Carrying
+        // that into a fresh terminal makes `$rc on` expose the parent's JSONL
+        // as if it belonged to the child pane. Only the CLI running inside the
+        // pane may add its session identity to tool subprocesses.
+        env = Self.removingInheritedCLISessionIdentity(from: env)
         // P15: expose THIS instance's term-meshd daemon socket so `tm-agent watch
         // on/off/status` (which target the daemon's `watch.*` RPC) reach this app's
         // own daemon — tagged/isolated builds included — without the user setting
@@ -824,6 +829,11 @@ final class TerminalSurface: Identifiable, ObservableObject {
             let resourcePath = resourceURL.path
             let overlayTerminfo = resourceURL.appendingPathComponent("terminfo-overlay").path
             let bundledGhostty = resourceURL.appendingPathComponent("ghostty").path
+            // Where this app's own CLIs live (tm-agent, term-mesh, term-meshd).
+            // PATH may still resolve `tm-agent` to an older release from brew,
+            // and a tagged development app lives outside /Applications, so
+            // skills such as /rc run "$TERMMESH_APP_BIN/tm-agent" first.
+            env["TERMMESH_APP_BIN"] = resourceURL.appendingPathComponent("bin").path
             let resolvedTerminfo = (env["TERMINFO"]?.isEmpty == false ? env["TERMINFO"] : nil)
                 ?? getenv("TERMINFO").map { String(cString: $0) }
                 ?? ProcessInfo.processInfo.environment["TERMINFO"]
@@ -1099,6 +1109,17 @@ final class TerminalSurface: Identifiable, ObservableObject {
             "widthPx": Int(lastPixelWidth),
             "heightPx": Int(lastPixelHeight)
         ])
+    }
+
+    nonisolated static func removingInheritedCLISessionIdentity(
+        from environment: [String: String]
+    ) -> [String: String] {
+        var environment = environment
+        for key in ["CODEX_SESSION_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"] {
+            // Omitting the key lets Ghostty inherit it again from the app.
+            environment[key] = ""
+        }
+        return environment
     }
 
     func updateSize(
@@ -1919,6 +1940,30 @@ final class TerminalSurface: Identifiable, ObservableObject {
                                   enqueuedAt: ProcessInfo.processInfo.systemUptime, completion: nil))
         drainPasteQueue()
         return true
+    }
+
+    /// Chat turns preserve embedded newlines. Existing terminal automation
+    /// keeps its historical single-line normalization through `sendIMEText`.
+    @discardableResult
+    func sendIMETextPreservingNewlines(_ text: String, withReturn: Bool = true) -> Bool {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                _ = self?.sendIMETextPreservingNewlines(text, withReturn: withReturn)
+            }
+            return true
+        }
+        let normalized = Self.normalizedChatTurn(text)
+        enqueuePaste(PendingPaste(
+            text: normalized, needsReturn: withReturn,
+            enqueuedAt: ProcessInfo.processInfo.systemUptime, completion: nil
+        ))
+        drainPasteQueue()
+        return true
+    }
+
+    nonisolated static func normalizedChatTurn(_ text: String) -> String {
+        text.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
     }
 
     /// Result-based variant for callers that want structured error feedback.
@@ -3163,6 +3208,11 @@ func pushTargetSurfaceSize(_ size: CGSize) {
     @discardableResult
     func sendIMEText(_ text: String, withReturn: Bool = true) -> Bool {
         terminalSurface?.sendIMEText(text, withReturn: withReturn) ?? false
+    }
+
+    @discardableResult
+    func sendIMETextPreservingNewlines(_ text: String, withReturn: Bool = true) -> Bool {
+        terminalSurface?.sendIMETextPreservingNewlines(text, withReturn: withReturn) ?? false
     }
 
     func sendIMETextResult(_ text: String, withReturn: Bool = true,

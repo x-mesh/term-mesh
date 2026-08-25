@@ -139,6 +139,17 @@ mod project_sync_cli_tests {
     }
 
     #[test]
+    fn wait_help_explains_tracked_any_and_uncorrelated_messages() {
+        let mut command = Cli::command();
+        let wait = command
+            .find_subcommand_mut("wait")
+            .expect("wait subcommand");
+        let help = wait.render_long_help().to_string();
+        assert!(help.contains("any requires a tracked task"));
+        assert!(help.contains("use msg for uncorrelated messages"));
+    }
+
+    #[test]
     fn parses_project_and_conflict_command_groups() {
         let project =
             Cli::try_parse_from(["tm-agent", "project", "scan", "00", "--request-id", "r1"])
@@ -1557,7 +1568,9 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
-    /// Wait for agent signals (report, msg, blocked, review_ready, idle, any)
+    /// Wait for agent signals (report, msg, blocked, review_ready, idle, any).
+    /// any requires a tracked task and succeeds when its report completes or
+    /// a message arrives; use msg for uncorrelated messages.
     Wait {
         #[arg(long, default_value_t = 120)]
         timeout: u32,
@@ -1849,6 +1862,11 @@ enum Commands {
     /// term-meshd socket — no team/app socket required).
     Daemon(DaemonCommands),
 
+    /// Mobile remote control: expose this pane to the tailnet mobile page
+    /// (`/rc` skill, docs/mobile-remote-control.md). Talks directly to the
+    /// term-meshd socket like `daemon`.
+    Remote(RemoteCommands),
+
     /// Distributed workspace coordinator control-plane operations.
     ///
     /// Talks directly to TERMMESH_COORDINATOR_UNIX_PATH or the default
@@ -1880,6 +1898,120 @@ enum DaemonCommand {
         /// the current value.
         #[arg(long)]
         set: Option<String>,
+    },
+    /// Inspect or prune this host's durable Project manifests
+    /// (`peer-project-presentations.json`). Records another installation
+    /// owns cannot be deleted over the peer protocol; this is the
+    /// host-side path for them.
+    ProjectPresentations(ProjectPresentationsCommands),
+}
+
+#[derive(clap::Args)]
+struct ProjectPresentationsCommands {
+    #[command(subcommand)]
+    command: ProjectPresentationsCommand,
+}
+
+#[derive(Subcommand)]
+enum ProjectPresentationsCommand {
+    /// List every manifest with its referenced/live surface counts, owner
+    /// and whether the recorded directory still exists.
+    List,
+    /// Remove manifests nothing can resume. Without --project-id only
+    /// records whose directory is gone and whose surfaces are all dead are
+    /// candidates; a record with any live surface is never removed. Reports
+    /// only unless --apply is given; an applied prune writes a timestamped
+    /// .bak copy next to the file first. Workspaces are never touched.
+    Prune {
+        /// Restrict to these Project IDs (repeatable). Explicitly named
+        /// records are removed even if their directory still exists.
+        #[arg(long = "project-id")]
+        project_ids: Vec<String>,
+        /// Perform the removal instead of previewing it.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(clap::Args)]
+struct RemoteCommands {
+    #[command(subcommand)]
+    command: RemoteCommand,
+}
+
+#[derive(Subcommand)]
+enum RemoteCommand {
+    /// Expose this pane to the mobile page (`remote.on`). Running it again
+    /// replaces the entry and restarts the TTL.
+    On {
+        /// Keys the page may send: `safe` (Enter/Esc/Tab/arrows/y/n/1-9/C-c)
+        /// or `none`.
+        #[arg(long, default_value = "safe", value_parser = ["safe", "none"])]
+        keys: String,
+        /// Lifetime such as `12h`, `30m`, `2d`, or plain seconds. Default 24h;
+        /// the daemon clamps to 60s..7d.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Surface id. Defaults to this pane's $TERMMESH_SURFACE_ID.
+        #[arg(long)]
+        surface: Option<String>,
+        /// Register as the team leader: text from the page goes through the
+        /// durable leader request board instead of being typed. Auto-detected
+        /// for leader panes the app launched; adopted leaders pass it with
+        /// `--team`.
+        #[arg(long)]
+        leader: bool,
+        /// Expose a team agent's pane as a chat: the page shows its
+        /// structured transcript and sends turns. NAME defaults to this
+        /// pane's own $TERMMESH_AGENT_NAME, which is also what a bare
+        /// `remote on` does inside a team agent pane; naming another agent
+        /// needs the leader pane (or `--team`).
+        #[arg(
+            long,
+            value_name = "AGENT",
+            num_args = 0..=1,
+            default_missing_value = "",
+            conflicts_with = "leader"
+        )]
+        agent: Option<String>,
+        /// Terminal mirror instead of chat: the page shows the screen and
+        /// types into it. Alone it exposes this pane's surface; with
+        /// `--agent NAME` it mirrors that agent's terminal pane.
+        #[arg(long)]
+        terminal: bool,
+        /// App control socket that owns the surface. Defaults to this pane's
+        /// $TERMMESH_SOCKET_PATH.
+        #[arg(long)]
+        app_socket: Option<String>,
+        /// Agent CLI label for the page (claude, codex, ...). Auto-detected
+        /// from the environment when omitted.
+        #[arg(long)]
+        cli: Option<String>,
+        /// Title for the page. Defaults to the working directory name.
+        #[arg(long)]
+        title: Option<String>,
+        /// Print the raw RPC result.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop exposing this pane (`remote.off`).
+    Off {
+        /// Surface id. Defaults to this pane's $TERMMESH_SURFACE_ID.
+        #[arg(long)]
+        surface: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show this pane's exposure, or every exposed surface with `--all`.
+    Status {
+        /// Surface id. Defaults to this pane's $TERMMESH_SURFACE_ID.
+        #[arg(long)]
+        surface: Option<String>,
+        /// List every exposed surface on this daemon.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2409,6 +2541,9 @@ enum LeaderRequestCommands {
     Take { request_id: String },
     /// Mark a request completed
     Complete { request_id: String },
+    /// Change the Project's configured delegation level. Active work keeps its
+    /// current snapshot; the next request receives the pending value.
+    Configure { level: String },
 }
 
 #[derive(Subcommand)]
@@ -4395,7 +4530,10 @@ mod runbook_tests {
             Some(true)
         );
         // An older app that never learned the field keeps the legacy ladder.
-        assert_eq!(send_response_return_required(&json!({ "result": {} })), None);
+        assert_eq!(
+            send_response_return_required(&json!({ "result": {} })),
+            None
+        );
     }
 
     #[test]
@@ -4599,7 +4737,10 @@ mod durable_leader_request_tests {
             "ok": false,
             "error": {"code": "invalid_state", "message": "already claimed"}
         });
-        assert_eq!(verify_leader_request_response(response.clone()).unwrap(), response);
+        assert_eq!(
+            verify_leader_request_response(response.clone()).unwrap(),
+            response
+        );
     }
 }
 
@@ -4802,9 +4943,8 @@ fn remote_leader_route_from_file(path: &Path) -> Option<RemoteLeaderRoute> {
         .read_to_string(&mut text)
         .ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
-    let string_field = |key: &str| -> Option<String> {
-        value.get(key)?.as_str().map(|text| text.to_string())
-    };
+    let string_field =
+        |key: &str| -> Option<String> { value.get(key)?.as_str().map(|text| text.to_string()) };
     validated_remote_leader_route(RemoteLeaderRoute {
         grant_id_hex: string_field("grant_id_hex")?,
         project_id: string_field("project_id")?,
@@ -5035,7 +5175,9 @@ mod remote_leader_route_file_tests {
 
         env::set_var(REMOTE_LEADER_ROUTE_FILE_ENV, dir.path().join("absent.json"));
         assert_eq!(
-            remote_leader_route().expect("environment fallback").team_uuid,
+            remote_leader_route()
+                .expect("environment fallback")
+                .team_uuid,
             "env-team",
             "a worker spawned before route files existed keeps its own route"
         );
@@ -5061,6 +5203,7 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.leader.request.list"
             | "team.leader.request.take"
             | "team.leader.request.complete"
+            | "team.delegation.configure"
             | "team.message.list"
             | "team.correlation.register"
             | "team.correlation.get"
@@ -7436,7 +7579,48 @@ fn main() {
                 cmd_daemon_replay_capacity(&sock, set.as_deref());
                 return;
             }
+            DaemonCommand::ProjectPresentations(cmd) => {
+                let sock = detect_daemon_socket()
+                    .or_else(detect_socket)
+                    .unwrap_or_else(|| {
+                        eprintln!("Error: no daemon socket found");
+                        process::exit(1);
+                    });
+                match &cmd.command {
+                    ProjectPresentationsCommand::List => {
+                        cmd_daemon_rpc_print(&sock, "peer.project_presentations.list", json!({}));
+                    }
+                    ProjectPresentationsCommand::Prune { project_ids, apply } => {
+                        let result = cmd_daemon_rpc_print(
+                            &sock,
+                            "peer.project_presentations.prune",
+                            json!({ "project_ids": project_ids, "apply": apply }),
+                        );
+                        let removed = result["removed"].as_array().map(|r| r.len()).unwrap_or(0);
+                        if !apply && removed > 0 {
+                            println!("(dry-run — pass --apply to remove {removed} record(s))");
+                        }
+                    }
+                }
+                return;
+            }
         }
+    }
+
+    // `remote <on|off|status>` mutates the daemon's mobile exposure registry
+    // (`remote.*` RPCs), so it resolves the daemon socket the same way `watch`
+    // does: the app-injected TERMMESH_DAEMON_UNIX_PATH first, a daemon-typed
+    // TERMMESH_SOCKET (daemon-spawned panes) next.
+    if let Commands::Remote(ref remote_cmd) = cli.command {
+        let sock = detect_watch_socket().unwrap_or_else(|| {
+            eprintln!(
+                "Error: no term-meshd socket found (set TERMMESH_DAEMON_SOCKET, \
+                 TERMMESH_DAEMON_UNIX_PATH, or TERMMESH_SOCKET to the daemon socket)"
+            );
+            process::exit(1);
+        });
+        run_remote_command(&sock, cli.team.as_deref(), &remote_cmd.command);
+        return;
     }
 
     // `watch <on|off|status>` controls the term-meshd (daemon) drift-watch
@@ -7647,6 +7831,15 @@ fn main() {
                     json!({
                         "team_name": team,
                         "request_id": request_id,
+                        "leader_request_token": env::var("TERMMESH_LEADER_REQUEST_TOKEN").unwrap_or_default(),
+                    }),
+                ),
+                LeaderRequestCommands::Configure { level } => rpc_call(
+                    &sock,
+                    "team.delegation.configure",
+                    json!({
+                        "team_name": team,
+                        "level": level,
                         "leader_request_token": env::var("TERMMESH_LEADER_REQUEST_TOKEN").unwrap_or_default(),
                     }),
                 ),
@@ -8092,6 +8285,7 @@ fn main() {
         Commands::Runbook(_) => unreachable!("runbook commands exit before detect_socket()"),
         Commands::Doctor { .. } => unreachable!("doctor command exits before detect_socket()"),
         Commands::Daemon(_) => unreachable!("daemon command exits before detect_socket()"),
+        Commands::Remote(_) => unreachable!("remote command exits before detect_socket()"),
         Commands::Status => {
             // Inject version info into the team.status response JSON
             let mut status = rpc_call(&sock, "team.status", json!({ "team_name": team }))
@@ -10185,6 +10379,33 @@ fn parse_byte_size(raw: &str) -> Result<usize, String> {
         .map_err(|e| format!("invalid byte size {raw:?}: {e}"))?;
     n.checked_mul(multiplier)
         .ok_or_else(|| format!("byte size overflow: {raw:?}"))
+}
+
+/// One daemon RPC: the `result` value, or the transport/RPC error message.
+fn cmd_daemon_rpc(sock: &PathBuf, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    match rpc_call(sock, method, params) {
+        Ok(resp) if resp["error"].is_null() => Ok(resp["result"].clone()),
+        Ok(resp) => Err(resp["error"]["message"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{method} failed"))),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Print a daemon RPC result, or the error and a non-zero exit so scripts
+/// can trust the status. Returns the result for callers adding a summary.
+fn cmd_daemon_rpc_print(sock: &PathBuf, method: &str, params: serde_json::Value) -> serde_json::Value {
+    match cmd_daemon_rpc(sock, method, params) {
+        Ok(result) => {
+            println!("{}", pretty(&result));
+            result
+        }
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            process::exit(1);
+        }
+    }
 }
 
 /// `tm-agent daemon replay-capacity [--set <value>]` — get or set the peer
@@ -12426,6 +12647,912 @@ fn detect_daemon_socket() -> Option<PathBuf> {
         Some(path)
     } else {
         None
+    }
+}
+
+// ── `tm-agent remote` (docs/mobile-remote-control.md §4.2) ─────────────
+
+/// Run one `remote` subcommand against the daemon control socket.
+fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteCommand) {
+    match cmd {
+        RemoteCommand::On {
+            keys,
+            ttl,
+            surface,
+            leader,
+            agent,
+            terminal,
+            app_socket,
+            cli,
+            title,
+            json,
+        } => {
+            let env_agent = env::var("TERMMESH_AGENT_NAME").ok();
+            let agent_name = remote_agent_target(
+                agent.as_deref(),
+                env_agent.as_deref(),
+                *leader || surface.is_some(),
+                *terminal,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+            if let Some(agent_name) = agent_name {
+                run_remote_on_agent(
+                    sock,
+                    team_flag,
+                    &agent_name,
+                    *terminal,
+                    keys,
+                    ttl.as_deref(),
+                    title.as_deref(),
+                    *json,
+                );
+                return;
+            }
+            let surface_id = resolve_remote_surface(surface.as_deref()).unwrap_or_else(|e| {
+                // A native agent pane has no terminal surface, so `--terminal`
+                // there cannot mean anything.
+                if *terminal && env_agent.as_deref().is_some_and(|a| !a.trim().is_empty()) {
+                    eprintln!("Error: this agent pane has no terminal to mirror; run without --terminal to expose it as a chat");
+                } else {
+                    eprintln!("Error: {e}");
+                }
+                process::exit(1);
+            });
+            let ttl_secs = match ttl.as_deref().map(parse_ttl_secs).transpose() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            };
+            let is_leader = *leader || remote_pane_is_leader();
+            let team_name = is_leader.then(|| resolve_team_name(team_flag));
+            let app_socket = app_socket
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(resolve_remote_app_socket);
+            if app_socket.is_none() {
+                eprintln!(
+                    "Error: no app socket for this surface (TERMMESH_SOCKET_PATH is not set); \
+                     run inside a term-mesh pane or pass --app-socket <path>"
+                );
+                process::exit(1);
+            }
+            let cwd = env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let title = title
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| remote_default_title(&cwd));
+            let agent_cli = cli.clone().unwrap_or_else(detect_remote_cli);
+            let session_id = (!*terminal)
+                .then(|| remote_session_id(&agent_cli))
+                .flatten();
+            let mut params = json!({
+                "surface_id": surface_id,
+                "kind": if is_leader { "leader" } else { "pane" },
+                "keys": keys,
+                "app_socket": app_socket,
+                "agent_cli": agent_cli,
+                "chat_capable": session_id.is_some(),
+                "session_id": session_id,
+                "title": title,
+                "cwd": cwd,
+                "owner": env::var("USER").ok(),
+            });
+            if let Some(team) = &team_name {
+                params["team_name"] = json!(team);
+            }
+            if let Some(ttl) = ttl_secs {
+                params["ttl_secs"] = json!(ttl);
+            }
+            if is_leader {
+                // The durable board's list RPC needs the leader pane's capability
+                // token; only the daemon ever sees it.
+                if let Some(token) = env::var("TERMMESH_LEADER_REQUEST_TOKEN")
+                    .ok()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                {
+                    params["leader_request_token"] = json!(token);
+                }
+            }
+            let result = remote_rpc(sock, "remote.on", params);
+            if *json {
+                println!("{}", pretty(&result));
+                return;
+            }
+            let entry = &result["entry"];
+            println!(
+                "exposed {} ({}, keys={}{})",
+                entry["surface_id"].as_str().unwrap_or(&surface_id),
+                entry["kind"].as_str().unwrap_or("pane"),
+                entry["keys"].as_str().unwrap_or(keys),
+                team_name
+                    .as_deref()
+                    .map(|t| format!(", team={t}"))
+                    .unwrap_or_default()
+            );
+            match result["url"].as_str() {
+                Some(url) => {
+                    println!("url: {url}");
+                    for line in remote_tailnet_lines(url, &surface_id) {
+                        println!("{line}");
+                    }
+                }
+                None => println!(
+                    "url: unavailable ({})",
+                    result["listener_error"]
+                        .as_str()
+                        .unwrap_or("listener address invalid")
+                ),
+            }
+            if let Some(exp) = entry["expires_at"].as_u64() {
+                println!("expires: in {} (unix {exp})", format_remote_relative(exp));
+            }
+            if result["listener_enabled"].as_bool() != Some(true) {
+                eprintln!(
+                    "note: the mobile listener is disabled on this daemon; enable it in \
+                     Settings or set TERM_MESH_MOBILE_ENABLED=1 before the daemon starts"
+                );
+            }
+            if !is_leader && !*terminal {
+                if entry["chat_capable"].as_bool() == Some(true) {
+                    eprintln!(
+                        "note: the mobile page can switch this target between Chat and Terminal"
+                    );
+                } else {
+                    eprintln!("note: terminal mirror only; no supported Claude/Codex session id was found");
+                }
+            }
+        }
+        RemoteCommand::Off { surface, json } => {
+            let surface_id = resolve_remote_surface(surface.as_deref()).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+            let result = remote_rpc(sock, "remote.off", json!({ "surface_id": surface_id }));
+            if *json {
+                println!("{}", pretty(&result));
+                return;
+            }
+            if result["removed"].as_bool() == Some(true) {
+                println!("no longer exposed: {surface_id}");
+            } else {
+                println!("was not exposed: {surface_id}");
+            }
+        }
+        RemoteCommand::Status { surface, all, json } => {
+            let params = if *all {
+                json!({})
+            } else {
+                let surface_id = resolve_remote_surface(surface.as_deref()).unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                });
+                json!({ "surface_id": surface_id })
+            };
+            let result = remote_rpc(sock, "remote.status", params);
+            if *json {
+                println!("{}", pretty(&result));
+                return;
+            }
+            let listener = if result["listener_enabled"].as_bool() == Some(true) {
+                "enabled".to_string()
+            } else {
+                "disabled".to_string()
+            };
+            if *all {
+                let entries = result["entries"].as_array().cloned().unwrap_or_default();
+                println!("listener: {listener}; exposed surfaces: {}", entries.len());
+                for e in entries {
+                    println!(
+                        "  {}  {}  keys={}  {}",
+                        e["surface_id"].as_str().unwrap_or("?"),
+                        e["kind"].as_str().unwrap_or("?"),
+                        e["keys"].as_str().unwrap_or("?"),
+                        e["title"].as_str().unwrap_or("")
+                    );
+                }
+            } else if result["exposed"].as_bool() == Some(true) {
+                let e = &result["entry"];
+                println!(
+                    "exposed: {} ({}, keys={})",
+                    result["surface_id"].as_str().unwrap_or("?"),
+                    e["kind"].as_str().unwrap_or("?"),
+                    e["keys"].as_str().unwrap_or("?")
+                );
+                if let Some(url) = result["url"].as_str() {
+                    println!("url: {url}");
+                    let sid = result["surface_id"].as_str().unwrap_or("");
+                    for line in remote_tailnet_lines(url, sid) {
+                        println!("{line}");
+                    }
+                }
+                if let Some(exp) = e["expires_at"].as_u64() {
+                    println!("expires: in {} (unix {exp})", format_remote_relative(exp));
+                }
+                println!("listener: {listener}");
+            } else {
+                println!(
+                    "not exposed: {} (listener {listener})",
+                    result["surface_id"].as_str().unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// `tm-agent remote on [--agent <name>]`: expose a team agent's pane as a
+/// chat target. The pane is found through the app's `team.status` (panel_id,
+/// cli), registered with `kind=agent`, and served from its structured
+/// transcript. `terminal` registers the pane as a screen mirror instead.
+fn run_remote_on_agent(
+    sock: &PathBuf,
+    team_flag: Option<&str>,
+    agent_name: &str,
+    terminal: bool,
+    keys: &str,
+    ttl: Option<&str>,
+    title: Option<&str>,
+    json: bool,
+) {
+    let team_name = resolve_team_name(team_flag);
+    let Some(app_sock) = detect_socket() else {
+        eprintln!(
+            "Error: no term-mesh app socket found to look up the agent (TERMMESH_SOCKET_PATH)"
+        );
+        process::exit(1);
+    };
+    let status = match rpc_call(&app_sock, "team.status", json!({ "team_name": team_name })) {
+        Ok(resp) if resp.get("error").is_none() => resp["result"].clone(),
+        Ok(resp) => {
+            eprintln!(
+                "Error: team.status: {}",
+                resp["error"]["message"].as_str().unwrap_or("rpc error")
+            );
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error: team.status: {e}");
+            process::exit(1);
+        }
+    };
+    let agent = status["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|a| {
+            a["agent_name"].as_str() == Some(agent_name) || a["name"].as_str() == Some(agent_name)
+        })
+        .cloned();
+    let Some(agent) = agent else {
+        eprintln!("Error: agent {agent_name:?} is not in team {team_name:?}");
+        process::exit(1);
+    };
+    let Some(panel_id) = agent["panel_id"].as_str().filter(|p| !p.is_empty()) else {
+        eprintln!(
+            "Error: agent {agent_name:?} has no pane (headless agents cannot be exposed yet)"
+        );
+        process::exit(1);
+    };
+    // Which view: a native pane has a structured transcript (chat); a
+    // terminal-mode agent pane only has a screen (mirror). `team.status`
+    // does not say which, so ask for one transcript entry unless the caller
+    // forced the mirror.
+    let kind = if terminal {
+        "pane"
+    } else {
+        let probe = rpc_call(
+            &app_sock,
+            "team.agent.transcript",
+            json!({ "team_name": team_name, "agent_name": agent_name, "limit": 1 }),
+        );
+        match probe {
+            Ok(resp) if resp.get("error").is_none() => "agent",
+            Ok(resp) if resp["error"]["code"].as_str() == Some("not_native") => "pane",
+            Ok(resp) => {
+                eprintln!(
+                    "Error: team.agent.transcript: {}",
+                    resp["error"]["message"].as_str().unwrap_or("rpc error")
+                );
+                process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: team.agent.transcript: {e}");
+                process::exit(1);
+            }
+        }
+    };
+    let session_id = agent["session_id"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            let this_agent = env::var("TERMMESH_AGENT_NAME").ok();
+            (this_agent.as_deref().map(str::trim) == Some(agent_name))
+                .then(|| remote_session_id(agent["cli"].as_str().unwrap_or("")))
+                .flatten()
+        });
+    let ttl_secs = match ttl.map(parse_ttl_secs).transpose() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+    let mut params = json!({
+        "surface_id": panel_id,
+        "kind": kind,
+        "team_name": team_name,
+        "agent_name": agent_name,
+        "keys": keys,
+        "app_socket": app_sock.to_string_lossy(),
+        "agent_cli": agent["cli"].as_str().unwrap_or(""),
+        "chat_capable": kind == "agent" || session_id.is_some(),
+        "session_id": session_id,
+        "title": title.unwrap_or(agent_name),
+        "cwd": agent["working_directory"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()),
+        "owner": env::var("USER").ok(),
+    });
+    if let Some(ttl) = ttl_secs {
+        params["ttl_secs"] = json!(ttl);
+    }
+    let result = remote_rpc(sock, "remote.on", params);
+    if json {
+        println!("{}", pretty(&result));
+        return;
+    }
+    if kind == "agent" {
+        println!("exposed agent {agent_name} of {team_name} as chat (native pane)");
+    } else if terminal {
+        println!("exposed agent {agent_name} of {team_name} as terminal mirror (--terminal, keys={keys})");
+    } else {
+        println!("exposed agent {agent_name} of {team_name} as terminal mirror (pane is not native, keys={keys})");
+    }
+    match result["url"].as_str() {
+        Some(url) => {
+            println!("url: {url}");
+            for line in remote_tailnet_lines(url, panel_id) {
+                println!("{line}");
+            }
+        }
+        None => println!(
+            "url: unavailable ({})",
+            result["listener_error"]
+                .as_str()
+                .unwrap_or("listener address invalid")
+        ),
+    }
+    if let Some(exp) = result["entry"]["expires_at"].as_u64() {
+        println!("expires: in {} (unix {exp})", format_remote_relative(exp));
+    }
+    if result["listener_enabled"].as_bool() != Some(true) {
+        eprintln!(
+            "note: the mobile listener is disabled on this daemon; enable it in Settings first"
+        );
+    }
+}
+
+/// One `remote.*` RPC; any failure is fatal for the command.
+fn remote_rpc(sock: &PathBuf, method: &str, params: Value) -> Value {
+    match rpc_call(sock, method, params) {
+        Ok(resp) => {
+            if let Some(err) = resp.get("error") {
+                let msg = err["message"].as_str().unwrap_or("rpc error");
+                eprintln!("Error: {method}: {msg}");
+                process::exit(1);
+            }
+            resp.get("result").cloned().unwrap_or(Value::Null)
+        }
+        Err(e) => {
+            eprintln!("Error: {method}: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// `--surface` wins; otherwise the pane's own `TERMMESH_SURFACE_ID`.
+fn resolve_remote_surface(explicit: Option<&str>) -> Result<String, String> {
+    remote_surface_from(explicit, env::var("TERMMESH_SURFACE_ID").ok().as_deref())
+}
+
+fn remote_surface_from(explicit: Option<&str>, env_value: Option<&str>) -> Result<String, String> {
+    if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(s.to_string());
+    }
+    env_value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            "no surface id: run inside a term-mesh pane (TERMMESH_SURFACE_ID) or pass --surface <id>"
+                .to_string()
+        })
+}
+
+/// The app socket that owns this pane. `TERMMESH_SOCKET_PATH` is what the app
+/// injects into every pane; `TERMMESH_SOCKET` counts only when it is an app
+/// socket (agent panes get it too, but daemon-spawned panes get the daemon's).
+fn resolve_remote_app_socket() -> Option<String> {
+    remote_app_socket_from(
+        env::var("TERMMESH_SOCKET_PATH").ok().as_deref(),
+        env::var("TERMMESH_SOCKET").ok().as_deref(),
+    )
+}
+
+fn remote_app_socket_from(socket_path: Option<&str>, socket: Option<&str>) -> Option<String> {
+    let absolute = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty() && s.starts_with('/')).then(|| s.to_string())
+    };
+    if let Some(p) = socket_path.and_then(absolute) {
+        return Some(p);
+    }
+    socket
+        .and_then(absolute)
+        .filter(|p| is_app_socket_path(Path::new(p)))
+}
+
+/// A leader pane the app launched carries `TERMMESH_LEADER_REQUEST_TOKEN` and
+/// no `TERMMESH_AGENT_NAME` (workers get the latter). Adopted leaders have
+/// neither and must pass `--leader`.
+/// Which agent `remote on` exposes as a chat, or `None` for this pane's own
+/// surface. `--agent NAME` names one; a bare `--agent` and the default both
+/// take the pane's own agent name, so an agent exposes itself without naming
+/// itself. `pane_flow` (`--leader` or `--surface`) and `--terminal` without a
+/// name keep the surface flow, which needs no team lookup.
+fn remote_agent_target(
+    flag: Option<&str>,
+    env_agent: Option<&str>,
+    pane_flow: bool,
+    terminal: bool,
+) -> Result<Option<String>, String> {
+    let env_agent = env_agent.map(str::trim).filter(|a| !a.is_empty());
+    match flag.map(str::trim) {
+        Some(name) if !name.is_empty() => Ok(Some(name.to_string())),
+        Some(_) => env_agent.map(|a| Some(a.to_string())).ok_or_else(|| {
+            "no agent name: pass --agent <name>, or run inside a team agent pane \
+             (TERMMESH_AGENT_NAME)"
+                .to_string()
+        }),
+        None if pane_flow || terminal => Ok(None),
+        None => Ok(env_agent.map(str::to_string)),
+    }
+}
+
+fn remote_pane_is_leader() -> bool {
+    remote_leader_from(
+        env::var("TERMMESH_LEADER_REQUEST_TOKEN").ok().as_deref(),
+        env::var("TERMMESH_AGENT_NAME").ok().as_deref(),
+    )
+}
+
+fn remote_leader_from(leader_token: Option<&str>, agent_name: Option<&str>) -> bool {
+    let has_token = leader_token.map(str::trim).is_some_and(|t| !t.is_empty());
+    let is_worker = agent_name.map(str::trim).is_some_and(|a| !a.is_empty());
+    has_token && !is_worker
+}
+
+/// Best-effort label for the page. Claude Code exports `CLAUDECODE` into the
+/// shells it runs; Codex marks its sandboxed commands. Unknown stays empty
+/// rather than guessing.
+fn detect_remote_cli() -> String {
+    let set = |k: &str| env::var(k).map(|v| !v.trim().is_empty()).unwrap_or(false);
+    if set("CLAUDECODE") {
+        "claude".into()
+    } else if set("CODEX_SANDBOX")
+        || set("CODEX_SANDBOX_NETWORK_DISABLED")
+        || set("CODEX_SESSION_ID")
+        || set("CODEX_THREAD_ID")
+    {
+        "codex".into()
+    } else {
+        String::new()
+    }
+}
+
+fn remote_session_id(cli: &str) -> Option<String> {
+    remote_session_id_from(cli, |key| env::var(key).ok())
+}
+
+fn remote_session_id_from<F>(cli: &str, mut get: F) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let keys: &[&str] = match cli {
+        // CODEX_SESSION_ID can describe the parent shell while THREAD_ID is
+        // the active conversation whose rollout the mobile page must follow.
+        "codex" => &["CODEX_THREAD_ID", "CODEX_SESSION_ID"],
+        "claude" => &["CLAUDE_CODE_SESSION_ID"],
+        _ => &[],
+    };
+    keys.iter().find_map(|key| {
+        get(key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn remote_default_title(cwd: &str) -> String {
+    Path::new(cwd)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "pane".to_string())
+}
+
+/// `12h`, `30m`, `2d`, `90s`, or plain seconds.
+fn parse_ttl_secs(raw: &str) -> Result<u64, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("ttl is empty".into());
+    }
+    let (digits, unit) = match s.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => (&s[..i], s[i..].trim()),
+        None => (s, ""),
+    };
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("ttl {raw:?} must be a number with an optional s/m/h/d suffix"))?;
+    let mult = match unit {
+        "" | "s" | "sec" | "secs" => 1,
+        "m" | "min" | "mins" => 60,
+        "h" | "hr" | "hrs" => 3600,
+        "d" | "day" | "days" => 86_400,
+        _ => {
+            return Err(format!(
+                "ttl {raw:?}: unknown unit {unit:?} (use s, m, h, d)"
+            ))
+        }
+    };
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("ttl {raw:?} is too large"))
+}
+
+/// What Tailscale Serve says about the mobile listener (Phase 2,
+/// docs/mobile-remote-control.md §9). Read-only: `tailscale serve status --json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TailnetServe {
+    /// `https://<host>[:port][/path]` proxies to the listener. `funnel` means
+    /// the same host is also published to the public internet, which the
+    /// mobile listener refuses to serve (no identity header).
+    Served { base: String, funnel: bool },
+    /// Tailscale answered, but nothing proxies to the listener.
+    NotServed,
+}
+
+/// `127.0.0.1:9877` out of `http://127.0.0.1:9877/t/<id>`.
+fn listener_addr_from_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("http://")?;
+    let host_port = rest.split('/').next()?;
+    (!host_port.is_empty()).then(|| host_port.to_string())
+}
+
+/// Parse `tailscale serve status --json`. The shape is Tailscale's
+/// `ipn.ServeConfig`: `Web` maps `host:port` to `{Handlers: {path: {Proxy}}}`
+/// and `AllowFunnel` maps the same `host:port` keys to booleans.
+fn parse_serve_status(status: &Value, listener_addr: &str) -> TailnetServe {
+    let listener_port = listener_addr.rsplit(':').next().unwrap_or("");
+    let proxies_listener = |proxy: &str| {
+        let target = proxy
+            .strip_prefix("http://")
+            .or_else(|| proxy.strip_prefix("https://"))
+            .unwrap_or(proxy);
+        let target = target.trim_end_matches('/');
+        let (host, port) = match target.rsplit_once(':') {
+            Some((h, p)) => (h, p),
+            None => (target, ""),
+        };
+        matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1") && port == listener_port
+    };
+    let Some(web) = status.get("Web").and_then(Value::as_object) else {
+        return TailnetServe::NotServed;
+    };
+    for (host_port, site) in web {
+        let Some(handlers) = site.get("Handlers").and_then(Value::as_object) else {
+            continue;
+        };
+        for (path, handler) in handlers {
+            let Some(proxy) = handler.get("Proxy").and_then(Value::as_str) else {
+                continue;
+            };
+            if !proxies_listener(proxy) {
+                continue;
+            }
+            let (host, port) = host_port
+                .rsplit_once(':')
+                .unwrap_or((host_port.as_str(), "443"));
+            let mut base = format!("https://{host}");
+            if port != "443" {
+                base.push(':');
+                base.push_str(port);
+            }
+            let mount = path.trim_end_matches('/');
+            if !mount.is_empty() {
+                base.push_str(mount);
+            }
+            let funnel = status
+                .get("AllowFunnel")
+                .and_then(|f| f.get(host_port))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            return TailnetServe::Served { base, funnel };
+        }
+    }
+    TailnetServe::NotServed
+}
+
+fn tailscale_binary() -> Option<PathBuf> {
+    if let Ok(path_var) = env::var("PATH") {
+        for dir in path_var.split(':').filter(|d| !d.is_empty()) {
+            let candidate = Path::new(dir).join("tailscale");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let app = PathBuf::from("/Applications/Tailscale.app/Contents/MacOS/Tailscale");
+    app.is_file().then_some(app)
+}
+
+fn tailscale_serve_status() -> Option<Value> {
+    let bin = tailscale_binary()?;
+    let out = std::process::Command::new(bin)
+        .args(["serve", "status", "--json"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// Human lines for the tailnet side of a loopback listener URL. Empty when
+/// Tailscale is absent or does not answer: the loopback URL is still right.
+fn remote_tailnet_lines(listener_url: &str, surface_id: &str) -> Vec<String> {
+    let Some(addr) = listener_addr_from_url(listener_url) else {
+        return Vec::new();
+    };
+    let Some(status) = tailscale_serve_status() else {
+        return Vec::new();
+    };
+    tailnet_lines_for(&parse_serve_status(&status, &addr), &addr, surface_id)
+}
+
+fn tailnet_lines_for(serve: &TailnetServe, listener_addr: &str, surface_id: &str) -> Vec<String> {
+    match serve {
+        TailnetServe::Served { base, funnel } => {
+            let mut lines = vec![format!("tailnet: {base}/t/{surface_id}")];
+            if *funnel {
+                lines.push(
+                    "warning: Funnel is enabled for this host; the listener refuses public \
+                     requests (no Tailscale identity). Run: tailscale funnel off"
+                        .to_string(),
+                );
+            }
+            lines
+        }
+        TailnetServe::NotServed => {
+            let port = listener_addr.rsplit(':').next().unwrap_or("9877");
+            vec![format!(
+                "tailnet: not served yet; on this Mac run: tailscale serve --bg {port}"
+            )]
+        }
+    }
+}
+
+fn format_remote_relative(expires_at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let left = expires_at.saturating_sub(now);
+    if left >= 86_400 {
+        format!("{}d {}h", left / 86_400, (left % 86_400) / 3600)
+    } else if left >= 3600 {
+        format!("{}h {}m", left / 3600, (left % 3600) / 60)
+    } else {
+        format!("{}m", left / 60)
+    }
+}
+
+#[cfg(test)]
+mod remote_command_tests {
+    use super::*;
+
+    #[test]
+    fn ttl_accepts_units_and_plain_seconds() {
+        assert_eq!(parse_ttl_secs("90").unwrap(), 90);
+        assert_eq!(parse_ttl_secs("90s").unwrap(), 90);
+        assert_eq!(parse_ttl_secs("30m").unwrap(), 1800);
+        assert_eq!(parse_ttl_secs("12h").unwrap(), 43_200);
+        assert_eq!(parse_ttl_secs("2d").unwrap(), 172_800);
+        assert_eq!(parse_ttl_secs(" 1 h ").unwrap(), 3600);
+        assert!(parse_ttl_secs("").is_err());
+        assert!(parse_ttl_secs("h").is_err());
+        assert!(parse_ttl_secs("12w").is_err());
+        assert!(parse_ttl_secs("99999999999999999999d").is_err());
+    }
+
+    #[test]
+    fn surface_flag_wins_over_env_and_missing_is_an_error() {
+        assert_eq!(
+            remote_surface_from(Some(" abc "), Some("env")).unwrap(),
+            "abc"
+        );
+        assert_eq!(remote_surface_from(Some("  "), Some("env")).unwrap(), "env");
+        assert_eq!(remote_surface_from(None, Some("env")).unwrap(), "env");
+        assert!(remote_surface_from(None, None)
+            .unwrap_err()
+            .contains("--surface"));
+        assert!(remote_surface_from(None, Some(" ")).is_err());
+    }
+
+    #[test]
+    fn app_socket_prefers_pane_socket_path_then_app_typed_socket() {
+        assert_eq!(
+            remote_app_socket_from(Some("/tmp/term-mesh.sock"), Some("/tmp/term-meshd.sock")),
+            Some("/tmp/term-mesh.sock".into())
+        );
+        // TERMMESH_SOCKET pointing at a daemon socket is not an app socket.
+        assert_eq!(
+            remote_app_socket_from(None, Some("/tmp/term-meshd.sock")),
+            None
+        );
+        assert_eq!(
+            remote_app_socket_from(None, Some("/tmp/term-mesh-debug-x.sock")),
+            Some("/tmp/term-mesh-debug-x.sock".into())
+        );
+        assert_eq!(remote_app_socket_from(Some("relative.sock"), None), None);
+        assert_eq!(remote_app_socket_from(None, None), None);
+    }
+
+    #[test]
+    fn agent_target_defaults_to_this_panes_agent_unless_the_pane_flow_is_forced() {
+        // Bare `remote on` inside a team agent pane exposes that agent.
+        assert_eq!(
+            remote_agent_target(None, Some("reviewer"), false, false)
+                .unwrap()
+                .as_deref(),
+            Some("reviewer")
+        );
+        // Outside a team it is the plain pane.
+        assert_eq!(remote_agent_target(None, None, false, false).unwrap(), None);
+        assert_eq!(
+            remote_agent_target(None, Some(" "), false, false).unwrap(),
+            None
+        );
+        // `--terminal`, `--leader`, and `--surface` keep the surface flow.
+        assert_eq!(
+            remote_agent_target(None, Some("reviewer"), false, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            remote_agent_target(None, Some("reviewer"), true, false).unwrap(),
+            None
+        );
+        // `--agent NAME` always names, `--agent` alone borrows the pane's name.
+        assert_eq!(
+            remote_agent_target(Some(" other "), Some("reviewer"), true, true)
+                .unwrap()
+                .as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            remote_agent_target(Some(""), Some("reviewer"), false, false)
+                .unwrap()
+                .as_deref(),
+            Some("reviewer")
+        );
+        assert!(remote_agent_target(Some(""), None, false, false)
+            .unwrap_err()
+            .contains("--agent <name>"));
+    }
+
+    #[test]
+    fn leader_detection_needs_token_and_no_worker_name() {
+        assert!(remote_leader_from(Some("tok"), None));
+        assert!(remote_leader_from(Some("tok"), Some("")));
+        assert!(!remote_leader_from(Some("tok"), Some("worker-1")));
+        assert!(!remote_leader_from(None, None));
+        assert!(!remote_leader_from(Some(" "), None));
+    }
+
+    #[test]
+    fn codex_remote_prefers_the_active_thread_over_the_parent_session() {
+        let id = remote_session_id_from("codex", |key| match key {
+            "CODEX_THREAD_ID" => Some("active-thread".into()),
+            "CODEX_SESSION_ID" => Some("parent-session".into()),
+            _ => None,
+        });
+        assert_eq!(id.as_deref(), Some("active-thread"));
+    }
+
+    #[test]
+    fn serve_status_maps_the_listener_to_its_tailnet_base() {
+        let status = json!({
+            "TCP": {"443": {"HTTPS": true}},
+            "Web": {"mac.tail5b1e6.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9877"}}}},
+            "AllowFunnel": {}
+        });
+        assert_eq!(
+            parse_serve_status(&status, "127.0.0.1:9877"),
+            TailnetServe::Served {
+                base: "https://mac.tail5b1e6.ts.net".into(),
+                funnel: false
+            }
+        );
+        // A different port is somebody else's serve.
+        assert_eq!(
+            parse_serve_status(&status, "127.0.0.1:9876"),
+            TailnetServe::NotServed
+        );
+        assert_eq!(
+            parse_serve_status(&json!({}), "127.0.0.1:9877"),
+            TailnetServe::NotServed
+        );
+
+        let mounted = json!({
+            "Web": {"mac.tail5b1e6.ts.net:8443": {"Handlers": {"/rc/": {"Proxy": "http://localhost:9877"}}}},
+            "AllowFunnel": {"mac.tail5b1e6.ts.net:8443": true}
+        });
+        assert_eq!(
+            parse_serve_status(&mounted, "127.0.0.1:9877"),
+            TailnetServe::Served {
+                base: "https://mac.tail5b1e6.ts.net:8443/rc".into(),
+                funnel: true
+            }
+        );
+    }
+
+    #[test]
+    fn tailnet_lines_name_the_url_or_the_command_to_run() {
+        let served = TailnetServe::Served {
+            base: "https://mac.ts.net".into(),
+            funnel: false,
+        };
+        assert_eq!(
+            tailnet_lines_for(&served, "127.0.0.1:9877", "abc"),
+            vec!["tailnet: https://mac.ts.net/t/abc".to_string()]
+        );
+        let funnel = TailnetServe::Served {
+            base: "https://mac.ts.net".into(),
+            funnel: true,
+        };
+        let lines = tailnet_lines_for(&funnel, "127.0.0.1:9877", "abc");
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("tailscale funnel off"));
+        let not = tailnet_lines_for(&TailnetServe::NotServed, "127.0.0.1:20226", "abc");
+        assert_eq!(
+            not,
+            vec![
+                "tailnet: not served yet; on this Mac run: tailscale serve --bg 20226".to_string()
+            ]
+        );
+        assert_eq!(
+            listener_addr_from_url("http://127.0.0.1:9877/t/abc").as_deref(),
+            Some("127.0.0.1:9877")
+        );
+        assert_eq!(listener_addr_from_url("https://x/t/abc"), None);
+    }
+
+    #[test]
+    fn default_title_is_the_cwd_basename() {
+        assert_eq!(
+            remote_default_title("/Users/me/work/term-mesh"),
+            "term-mesh"
+        );
+        assert_eq!(remote_default_title("/"), "pane");
+        assert_eq!(remote_default_title(""), "pane");
     }
 }
 
@@ -15215,14 +16342,30 @@ fn resolve_participation_from_env(known_input: bool) -> LeaderParticipationResol
     if let Ok(path) = env::var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE") {
         if let Ok(text) = fs::read_to_string(path) {
             if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                if let Some(mode) = value["mode"].as_str() { config.mode = mode.to_ascii_lowercase(); }
-                if let Some(percent) = value["percent"].as_u64() { config.percent = percent.min(100) as u8; }
-                if let Some(flag) = value["kill_switch"].as_bool() { config.kill_switch = flag; }
-                if let Some(flag) = value["supported"].as_bool() { config.supported = flag; }
-                if let Some(flag) = value["healthy"].as_bool() { config.healthy = flag; }
-                if let Some(flag) = value["opt_in"].as_bool() { config.opt_in = flag; }
-                if let Some(id) = value["project_id"].as_str() { config.project_id = id.to_string(); }
-                if let Some(id) = value["session_id"].as_str() { config.session_id = id.to_string(); }
+                if let Some(mode) = value["mode"].as_str() {
+                    config.mode = mode.to_ascii_lowercase();
+                }
+                if let Some(percent) = value["percent"].as_u64() {
+                    config.percent = percent.min(100) as u8;
+                }
+                if let Some(flag) = value["kill_switch"].as_bool() {
+                    config.kill_switch = flag;
+                }
+                if let Some(flag) = value["supported"].as_bool() {
+                    config.supported = flag;
+                }
+                if let Some(flag) = value["healthy"].as_bool() {
+                    config.healthy = flag;
+                }
+                if let Some(flag) = value["opt_in"].as_bool() {
+                    config.opt_in = flag;
+                }
+                if let Some(id) = value["project_id"].as_str() {
+                    config.project_id = id.to_string();
+                }
+                if let Some(id) = value["session_id"].as_str() {
+                    config.session_id = id.to_string();
+                }
             }
         }
     }
@@ -15326,8 +16469,8 @@ fn append_turn_record(path: &Path, record: &Value) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     }
-    let mut line = serde_json::to_string(record)
-        .map_err(|e| format!("serialize turn record: {e}"))?;
+    let mut line =
+        serde_json::to_string(record).map_err(|e| format!("serialize turn record: {e}"))?;
     line.push('\n');
     // Owner-only: the sink stores prompt digests and byte counts, never content,
     // but a digest next to a short length is still guessable. Whichever writer
@@ -15383,7 +16526,9 @@ fn turn_id_from_hook_state() -> Option<String> {
     if key.is_empty() {
         return None;
     }
-    let path = turn_log_path().ok()?.with_file_name(format!(".turn-current-{key}"));
+    let path = turn_log_path()
+        .ok()?
+        .with_file_name(format!(".turn-current-{key}"));
     let contents = fs::read_to_string(path).ok()?;
     contents
         .lines()
@@ -15406,8 +16551,7 @@ fn mark_turn_route_stated(path: &Path, turn_id: &str) -> Result<(), String> {
         return Err("turn id contains no safe marker characters".to_string());
     }
     let marker = path.with_file_name(format!(".turn-route-{key}"));
-    fs::write(&marker, b"stated\n")
-        .map_err(|e| format!("write {}: {e}", marker.display()))?;
+    fs::write(&marker, b"stated\n").map_err(|e| format!("write {}: {e}", marker.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -15811,11 +16955,17 @@ mod leader_turn_record_tests {
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         mark_turn_route_stated(&path, "turn-42").expect("marker");
         let marker = path.with_file_name(".turn-route-turn-42");
-        assert_eq!(fs::read_to_string(&marker).expect("read marker"), "stated\n");
+        assert_eq!(
+            fs::read_to_string(&marker).expect("read marker"),
+            "stated\n"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(marker).expect("metadata").permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(marker).expect("metadata").permissions().mode() & 0o777,
+                0o600
+            );
         }
     }
 
@@ -15891,7 +17041,14 @@ mod leader_turn_record_tests {
             "2026-08-24T09:15:00Z",
         );
         let object = record.as_object().expect("record is an object");
-        for forbidden in ["role", "agent", "agent_name", "is_leader", "leader", "actor"] {
+        for forbidden in [
+            "role",
+            "agent",
+            "agent_name",
+            "is_leader",
+            "leader",
+            "actor",
+        ] {
             assert!(
                 !object.contains_key(forbidden),
                 "record must not assert identity via {forbidden}: {record}"
@@ -15934,11 +17091,12 @@ mod leader_turn_record_tests {
     fn sink_is_a_dot_log_file_under_the_term_mesh_logs_dir() {
         let path = turn_log_path().expect("HOME is set in the test environment");
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("log"));
-        assert_eq!(
-            path.file_name().and_then(|f| f.to_str()),
-            Some("turns.log")
+        assert_eq!(path.file_name().and_then(|f| f.to_str()), Some("turns.log"));
+        assert!(
+            path.ends_with(".term-mesh/logs/turns.log"),
+            "path was {}",
+            path.display()
         );
-        assert!(path.ends_with(".term-mesh/logs/turns.log"), "path was {}", path.display());
     }
 
     /// A route record must be joinable to the `turn_start` the harness hook
@@ -17076,16 +18234,77 @@ fn run_wait(
     };
     eprintln!("Waiting for agents in team '{team}' (timeout: {timeout}s, mode: {mode}, agents: {filter_label})...");
 
-    let mut agent_names: Vec<String> = Vec::new();
-    if mode == "msg" || mode == "any" {
-        if let Ok(r) = rpc_call(sock, "team.status", json!({ "team_name": team })) {
-            if let Some(agents) = r["result"]["agents"].as_array() {
-                agent_names = agents
-                    .iter()
-                    .filter_map(|a| a["name"].as_str().map(String::from))
-                    .filter(|n| agent_filter.is_empty() || agent_filter.contains(n))
-                    .collect();
+    let needs_team_status = matches!(mode, "report" | "msg" | "any");
+    let team_status = if needs_team_status {
+        match rpc_call(sock, "team.status", json!({ "team_name": team })) {
+            Ok(response) => Some(response),
+            Err(error) => {
+                eprintln!("wait: could not inspect team '{team}': {error}");
+                process::exit(1);
             }
+        }
+    } else {
+        None
+    };
+    let status_agents = team_status
+        .as_ref()
+        .and_then(|response| response["result"]["agents"].as_array());
+    let agent_names: Vec<String> = if mode == "msg" || mode == "any" {
+        status_agents
+            .into_iter()
+            .flatten()
+            .filter_map(|agent| agent["name"].as_str().map(String::from))
+            .filter(|name| agent_filter.is_empty() || agent_filter.contains(name))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let message_baseline: std::collections::HashSet<String> = if mode == "msg" || mode == "any" {
+        rpc_call(sock, "team.message.list", json!({ "team_name": team }))
+            .ok()
+            .and_then(|response| response["result"]["messages"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|message| message["id"].as_str().map(String::from))
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    // report/any can only make a meaningful decision when a task is known.
+    // A plain broadcast has no task or correlation ID, so waiting for it used
+    // to consume the entire timeout while displaying report=0/0. Fail before
+    // subscribing or polling and point callers to the tracked healthcheck.
+    let mut initial_task_ids = explicit_task_ids.cloned().unwrap_or_default();
+    if let Some(id) = task_id.filter(|id| !id.trim().is_empty()) {
+        initial_task_ids.insert(id.to_string());
+    }
+    let mut initial_tracked_agents = std::collections::HashSet::new();
+    if matches!(mode, "report" | "any") && initial_task_ids.is_empty() {
+        if let Some(agents) = status_agents {
+            for agent in agents {
+                let name = agent["name"].as_str().unwrap_or("");
+                if !agent_filter.is_empty() && !agent_filter.contains(name) {
+                    continue;
+                }
+                let status = agent["active_task_status"].as_str().unwrap_or("");
+                let stale = agent["active_task_is_stale"].as_bool().unwrap_or(false);
+                if stale || matches!(status, "completed" | "failed" | "abandoned" | "cancelled") {
+                    continue;
+                }
+                if let Some(id) = agent["active_task_id"].as_str() {
+                    initial_task_ids.insert(id.to_string());
+                    if !name.is_empty() {
+                        initial_tracked_agents.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        if initial_task_ids.is_empty() {
+            eprintln!(
+                "wait: mode '{mode}' has no task or correlation to track; plain broadcast replies cannot be matched. Use 'tm-agent warmup' for ping/pong healthchecks, 'tm-agent fan-out' for tracked work, or pass --tasks <ids>."
+            );
+            process::exit(1);
         }
     }
 
@@ -17136,13 +18355,12 @@ fn run_wait(
     // For report mode: snapshot task IDs on first poll so we can track them
     // even after agents drop active_task_id on completion.
     // If explicit --tasks are provided, use those directly (no auto-discovery).
-    let mut tracked_task_ids: std::collections::HashSet<String> =
-        explicit_task_ids.cloned().unwrap_or_default();
-    let mut tracked_initialized = explicit_task_ids.is_some() && !tracked_task_ids.is_empty();
+    let mut tracked_task_ids = initial_task_ids;
+    let mut tracked_initialized = !tracked_task_ids.is_empty();
     // Accumulating set of agents observed with an active task at any poll. Used by
     // the result.status fallback so it doesn't count team members who were never
     // delegated to in this round (the root cause of wait hangs on partial fan-out).
-    let mut tracked_agents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut tracked_agents = initial_tracked_agents;
     while elapsed < timeout {
         if current_interval > 0 {
             // B1: push channel replaces sleep. Decay toward interval deadline in
@@ -17264,11 +18482,19 @@ fn run_wait(
             match rpc_call(sock, "team.message.list", json!({ "team_name": team })) {
                 Ok(r) => {
                     if let Some(messages) = r["result"]["messages"].as_array() {
-                        let senders: std::collections::HashSet<&str> =
-                            messages.iter().filter_map(|m| m["from"].as_str()).collect();
-                        let reported = agent_names
+                        let senders: std::collections::HashSet<&str> = messages
                             .iter()
-                            .filter(|a| senders.contains(a.as_str()))
+                            .filter(|message| {
+                                message["id"]
+                                    .as_str()
+                                    .map(|id| !message_baseline.contains(id))
+                                    .unwrap_or(false)
+                            })
+                            .filter_map(|message| message["from"].as_str())
+                            .collect();
+                        let reported = senders
+                            .iter()
+                            .filter(|sender| agent_names.iter().any(|agent| agent == **sender))
                             .count();
                         let total = agent_names.len();
                         msg_done = reported >= total && total > 0;
@@ -17582,10 +18808,21 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
     eprintln!("Warming up {count} agent(s) in team '{team}'...");
 
     // Delegate pong task to each agent
-    let mut task_ids: Vec<(String, String, Instant)> = Vec::new(); // (agent_name, task_id, start_time)
-    let mut failed: Vec<(String, u128, String)> = Vec::new(); // (agent, ms, reason)
+    let mut task_ids: Vec<(String, String, String, Instant)> = Vec::new(); // (name, instance, task, start)
+    let mut failed: Vec<(String, String, u128, String)> = Vec::new(); // (name, instance, ms, reason)
     for agent_val in &targets {
         let name = agent_val["name"].as_str().unwrap_or("?");
+        let instance_id = agent_val["agent_instance_id"].as_str().unwrap_or("");
+        if instance_id.is_empty() {
+            eprintln!("  {name}: missing agent_instance_id");
+            failed.push((
+                name.to_string(),
+                "unknown".to_string(),
+                0,
+                "missing agent_instance_id".into(),
+            ));
+            continue;
+        }
         let start = Instant::now();
         let result = run_delegate_result(
             sock,
@@ -17602,7 +18839,7 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
                 context: None,
                 fix_budget: None,
                 panel_id: None,
-                agent_instance_id: None,
+                agent_instance_id: Some(instance_id),
                 worktree_policy: WorktreePolicyArg::Off,
                 from_ref: None,
                 request_id: None,
@@ -17613,20 +18850,30 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
         match result {
             Ok(v) => {
                 if let Some(tid) = v["result"]["task"]["id"].as_str() {
-                    task_ids.push((name.to_string(), tid.to_string(), start));
+                    let assigned_instance = v["result"]["task"]["agent_instance_id"]
+                        .as_str()
+                        .unwrap_or(instance_id);
+                    task_ids.push((
+                        name.to_string(),
+                        assigned_instance.to_string(),
+                        tid.to_string(),
+                        start,
+                    ));
                 } else {
-                    eprintln!("  {name}: failed to create task");
+                    eprintln!("  {name} ({instance_id}): failed to create task");
                     failed.push((
                         name.to_string(),
+                        instance_id.to_string(),
                         start.elapsed().as_millis(),
                         "dispatch failed".into(),
                     ));
                 }
             }
             Err(e) => {
-                eprintln!("  {name}: delegate error: {e}");
+                eprintln!("  {name} ({instance_id}): delegate error: {e}");
                 failed.push((
                     name.to_string(),
+                    instance_id.to_string(),
                     start.elapsed().as_millis(),
                     "dispatch failed".into(),
                 ));
@@ -17641,13 +18888,13 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
 
     // Poll for completion
     let deadline = Instant::now() + Duration::from_secs(timeout as u64);
-    let mut completed: Vec<(String, u128, String)> = Vec::new(); // (agent, ms, result)
+    let mut completed: Vec<(String, String, u128, String)> = Vec::new(); // (name, instance, ms, result)
     let mut pending = task_ids.clone();
 
     while !pending.is_empty() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(500));
         let mut still_pending = Vec::new();
-        for (agent_name, tid, start) in &pending {
+        for (agent_name, instance_id, tid, start) in &pending {
             if let Ok(v) = rpc_call(
                 sock,
                 "team.task.get",
@@ -17660,14 +18907,19 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
                     let ms = start.elapsed().as_millis();
                     let result = v["result"]["result"].as_str().unwrap_or("").to_string();
                     if warmup_task_succeeded(status, &result) {
-                        completed.push((agent_name.clone(), ms, result));
+                        completed.push((agent_name.clone(), instance_id.clone(), ms, result));
                     } else {
-                        failed.push((agent_name.clone(), ms, status.to_string()));
+                        failed.push((
+                            agent_name.clone(),
+                            instance_id.clone(),
+                            ms,
+                            status.to_string(),
+                        ));
                     }
                     continue;
                 }
             }
-            still_pending.push((agent_name.clone(), tid.clone(), *start));
+            still_pending.push((agent_name.clone(), instance_id.clone(), tid.clone(), *start));
         }
         pending = still_pending;
     }
@@ -17676,20 +18928,20 @@ fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
     let pass = completed.len();
     let fail = failed.len() + pending.len();
     println!();
-    for (name, ms, result) in &completed {
+    for (name, instance_id, ms, result) in &completed {
         let icon = if result.to_lowercase().contains("pong") {
             "✓"
         } else {
             "?"
         };
-        println!("  {icon} {name}: {ms}ms");
+        println!("  {icon} {name} ({instance_id}): {ms}ms");
     }
-    for (name, _, start) in &pending {
+    for (name, instance_id, _, start) in &pending {
         let ms = start.elapsed().as_millis();
-        println!("  ✗ {name}: timeout ({ms}ms)");
+        println!("  ✗ {name} ({instance_id}): timeout ({ms}ms)");
     }
-    for (name, ms, reason) in &failed {
-        println!("  ✗ {name}: {reason} without pong ({ms}ms)");
+    for (name, instance_id, ms, reason) in &failed {
+        println!("  ✗ {name} ({instance_id}): {reason} without pong ({ms}ms)");
     }
     println!();
     if fail == 0 {
@@ -19159,6 +20411,7 @@ mod auto_watch_tests {
             "team.leader.request.list",
             "team.leader.request.take",
             "team.leader.request.complete",
+            "team.delegation.configure",
         ] {
             assert!(remote_leader_method_allowed(method), "{method}");
         }

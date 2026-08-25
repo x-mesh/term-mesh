@@ -2561,6 +2561,61 @@
         }
       }
     },
+    "Canary": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "시험 적용" } }
+      }
+    },
+    "Canary Percentage": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "시험 적용 비율" } }
+      }
+    },
+    "Canary Projects": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "시험 적용 프로젝트" } }
+      }
+    },
+    "Deterministic Project/session cohort. The shipped default is 0%.": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "프로젝트와 세션에 따라 적용 대상을 일관되게 나눕니다. 기본값은 0%입니다." } }
+      }
+    },
+    "Explicit Project names, comma-separated. No Project is opted in by default.": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "적용할 프로젝트 이름을 쉼표로 구분해 입력합니다. 기본으로 선택되는 프로젝트는 없습니다." } }
+      }
+    },
+    "Kill Switch": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "긴급 중지" } }
+      }
+    },
+    "Leader Participation": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "리더 참여 방식" } }
+      }
+    },
+    "Returns every existing local leader to static behavior on its next route evaluation.": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "실행 중인 모든 리더를 다음 경로 평가부터 기존 고정 동작으로 되돌립니다." } }
+      }
+    },
+    "Shadow": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "관찰만" } }
+      }
+    },
+    "Shadow only records suggestions. Canary applies observable tm-agent dispatch bounds only after health gates pass.": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "관찰만 모드에서는 제안만 기록합니다. 시험 적용은 상태 기준을 통과한 뒤 tm-agent로 확인 가능한 작업 분배 범위에만 반영됩니다." } }
+      }
+    },
+    "project-a, project-b": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "프로젝트-a, 프로젝트-b" } }
+      }
+    },
     "Off": {
       "localizations": {
         "ko": {

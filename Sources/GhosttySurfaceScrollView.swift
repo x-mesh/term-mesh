@@ -1288,6 +1288,7 @@ final class GhosttySurfaceScrollView: NSView {
             "/tm-bench": "~/.codex/prompts/tm-bench.md",
             "/watch": "~/.codex/prompts/watch.md",
             "/release": "~/.codex/prompts/release.md",
+            "/rc": "~/.codex/prompts/rc.md",
         ]
     }
 

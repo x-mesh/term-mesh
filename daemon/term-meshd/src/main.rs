@@ -5,16 +5,19 @@
 )]
 
 mod agent;
+mod app_socket;
 mod auto_reply;
 mod auto_reply_emit;
 mod codex_tokens;
 mod gc;
 mod headless;
 mod http;
+mod http_mobile;
 mod monitor;
 mod pane_tracker;
 mod paste_cleanup;
 mod peer;
+mod remote;
 mod socket;
 mod supervisor;
 #[allow(dead_code)]
@@ -396,6 +399,11 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // 3c. Mobile remote-control exposure registry (docs/mobile-remote-control.md
+    // §4.1). Shared by the control-socket `remote.*` RPCs and the mobile
+    // listener. In-memory only.
+    let remote_registry = remote::new_registry();
+
     // 4. HTTP server (can be disabled via TERM_MESH_HTTP_DISABLED=1)
     let http_disabled = std::env::var("TERM_MESH_HTTP_DISABLED")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -428,6 +436,27 @@ async fn main() -> anyhow::Result<()> {
             shutdown_rx.clone(),
         ))
     };
+
+    // 4b. Mobile remote-control listener (docs/mobile-remote-control.md §4.4).
+    // Opt-in via TERM_MESH_MOBILE_ENABLED=1; loopback only; a bad address or
+    // auth mode is a visible startup error, not a fallback.
+    let mobile_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
+        if remote::listener_enabled() {
+            match http_mobile::MobileConfig::from_env() {
+                Ok(config) => Some(tokio::spawn(http_mobile::serve(
+                    config,
+                    remote_registry.clone(),
+                    shutdown_rx.clone(),
+                ))),
+                Err(e) => {
+                    tracing::error!("mobile listener not started: {e}");
+                    None
+                }
+            }
+        } else {
+            tracing::info!("mobile listener disabled (set TERM_MESH_MOBILE_ENABLED=1 to enable)");
+            None
+        };
 
     // 5a. Peer federation server (opt-in via TERMMESH_PEER_SOCKET).
     let (peer_started_tx, peer_started_rx) = tokio::sync::watch::channel(false);
@@ -467,6 +496,7 @@ async fn main() -> anyhow::Result<()> {
         watch_registry,
         watch_runner_for_serve,
         watch_sink_for_serve,
+        remote_registry.clone(),
         shutdown_rx,
         control_started_tx,
     ));
@@ -569,6 +599,9 @@ async fn main() -> anyhow::Result<()> {
     let timeout = tokio::time::Duration::from_secs(5);
     match tokio::time::timeout(timeout, async {
         let _ = http_task.await;
+        if let Some(t) = mobile_task {
+            let _ = t.await;
+        }
         if !peer_task_finished {
             if let Some(t) = peer_task {
                 let _ = t.await;

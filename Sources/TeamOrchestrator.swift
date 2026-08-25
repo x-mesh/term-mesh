@@ -69,6 +69,26 @@ final class TeamOrchestrator: ObservableObject {
         var teamName: String?
         var leaderReady: Bool
         var failureDescription: String?
+        /// Remote manifests only: this installation published the record, so
+        /// the normal owner-authorized deletion applies to it.
+        var presentationOwnedByRequester: Bool = false
+        /// Whether `leaderReady` reflects a real foreground probe rather than
+        /// mere surface presence.
+        var leaderProcessActiveKnown: Bool = false
+
+        /// A remote record this installation owns can be deleted straight
+        /// from the collision UI, without adopting it as a team first.
+        /// Deleting a manifest also stops the surfaces only it referenced
+        /// (its leader shell and agent panes), so a record whose leader
+        /// process is known to be running is never offered: that is live
+        /// work, to be opened from the sidebar. Records other installations
+        /// own need host-side cleanup
+        /// (`tm-agent daemon project-presentations prune`).
+        var canDeleteOwnedRemoteRecord: Bool {
+            guard case .remote = location else { return false }
+            guard presentationOwnedByRequester, identity.projectID != nil else { return false }
+            return !(leaderProcessActiveKnown && leaderReady)
+        }
     }
 
     enum ProjectNameConflict: Equatable, Sendable {
@@ -415,6 +435,10 @@ final class TeamOrchestrator: ObservableObject {
         /// turn measurement is unsupported or degraded. Older snapshots and
         /// adopted/non-Claude leaders safely decode to unsupported.
         var leaderMeasurementCapability: LeaderTurnLog.MeasurementCapability = .unsupported
+        /// Project-scoped execution intensity. `pending` is promoted only at
+        /// a durable request boundary, so changing the setting never reroutes
+        /// work already in progress. Missing persisted values decode here.
+        var delegationState: ProjectDelegationState = .default
         let workingDirectory: String
         var workspaceId: UUID     // agent workspace (may differ from leader workspace in "adopted" mode)
         var agents: [AgentMember]
@@ -918,7 +942,8 @@ final class TeamOrchestrator: ObservableObject {
         teams[team.id] = team
         TeamDataStore.shared.registerTeam(
             team.id,
-            agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) }
+            agents: team.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) },
+            delegationState: team.delegationState
         )
         syncTeamStateToDaemon()
         return true
@@ -984,6 +1009,33 @@ final class TeamOrchestrator: ObservableObject {
         team.agents[index].panelId = panelID
         teams[teamName] = team
         syncTeamStateToDaemon()
+    }
+
+    @discardableResult
+    func setProjectDelegationLevel(
+        teamName: String, level: ProjectDelegationLevel
+    ) -> ProjectDelegationState? {
+        guard var team = teams[teamName],
+              let state = TeamDataStore.shared.configureProjectDelegation(
+                  teamName: teamName, level: level
+              ) else { return nil }
+        team.delegationState = state
+        teams[teamName] = team
+        refreshLeaderParticipationControls()
+        syncTeamStateToDaemon()
+        scheduleRemoteProjectManifestPublication()
+        return state
+    }
+
+    func syncDelegationStateFromStore(teamName: String) {
+        guard var team = teams[teamName],
+              let state = TeamDataStore.shared.projectDelegationState(teamName: teamName),
+              state != team.delegationState else { return }
+        team.delegationState = state
+        teams[teamName] = team
+        refreshLeaderParticipationControls()
+        syncTeamStateToDaemon()
+        scheduleRemoteProjectManifestPublication()
     }
 
     func isLeaderPaneAttached(teamName: String) -> Bool {
@@ -1600,6 +1652,7 @@ final class TeamOrchestrator: ObservableObject {
     /// - Team identity (TERMMESH_TEAM*, CMUX_TEAM*)
     /// - CLAUDECODE flag (only for `agentCli == "claude"`; codex/gemini/kiro must not have it)
     /// - Per-agent routing (TERMMESH_AGENT_NAME, TERMMESH_AGENT_ROLE, TERMMESH_WINDOW_ID, TERMMESH_WORKSPACE_ID)
+    /// - App binary directory (TERMMESH_APP_BIN) for skills that call the bundled tm-agent
     static func buildAgentPaneEnv(
         teamName: String,
         agentName: String,
@@ -1646,6 +1699,12 @@ final class TeamOrchestrator: ObservableObject {
             "TERMMESH_CLI": agentCli,
             "PATH": currentPath,
         ]
+        // Native agent panes never pass through GhosttyTerminalView, which
+        // is where terminal panes get TERMMESH_APP_BIN; skills such as /rc run
+        // "$TERMMESH_APP_BIN/tm-agent" first, so name the app's binary here too.
+        if !resourceBin.isEmpty {
+            env["TERMMESH_APP_BIN"] = resourceBin
+        }
 
         // Only claude agents get CLAUDECODE=1 (Anthropic-specific; codex/gemini/kiro must not).
         if agentCli == "claude" {
@@ -2199,6 +2258,7 @@ final class TeamOrchestrator: ObservableObject {
         pairMode: String = "none",
         pairModel: String = "",
         pairSpec: String = "",
+        delegationLevel: ProjectDelegationLevel = .leaderFirst,
         resumeSessionId: String? = nil,
         worktreeMode: String = "off",
         executionMode: String = "pane",
@@ -2437,10 +2497,11 @@ final class TeamOrchestrator: ObservableObject {
         // path as the wrapper so the measurement contract is not accidentally
         // limited to ad-hoc shell invocations. The hook independently checks
         // the request token above, so workers cannot write leader turns.
-        if leaderMode == "claude", let hookPath = Self.leaderTurnHookPath(workingDirectory: workingDirectory) {
+        if Self.supportsLeaderTurnMeasurement(cli: leaderMode),
+           let hookPath = Self.leaderTurnHookPath(workingDirectory: workingDirectory) {
             leaderEnv["TERMMESH_LEADER_TURN_HOOK"] = hookPath
         }
-        if leaderMode == "claude" {
+        if Self.supportsLeaderTurnMeasurement(cli: leaderMode) {
             let participationControlFile = Self.leaderParticipationControlFile(teamName: name)
             leaderEnv["TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE"] = participationControlFile
             Self.writeLeaderParticipationControl(
@@ -2706,7 +2767,12 @@ final class TeamOrchestrator: ObservableObject {
                 } else { leaderCommand = nil }
             case "codex":
                 if let path = agentBinaryPath(cli: "codex") {
-                    leaderCommand = buildCodexCommand(codexPath: path, agentName: "leader", teamName: name, model: leaderModel)
+                    let hookArgs = leaderEnv["TERMMESH_LEADER_TURN_HOOK"]
+                        .map(Self.codexLeaderTurnHookArguments) ?? []
+                    leaderCommand = buildCodexCommand(
+                        codexPath: path, agentName: "leader", teamName: name,
+                        model: leaderModel, extraArgs: hookArgs
+                    )
                 } else { leaderCommand = nil }
             case "gemini":
                 if let path = agentBinaryPath(cli: "gemini") {
@@ -2938,14 +3004,21 @@ final class TeamOrchestrator: ObservableObject {
                 sharedWorktreePath: nil,
                 sharedWorktreeBranch: nil
             )
+            team.delegationState = ProjectDelegationState(
+                configured: delegationLevel, effective: delegationLevel
+            )
             team.leaderReady = launchLeaderLocally && !Self.localLeaderNeedsReadinessProbe(
                 launchLeaderLocally: launchLeaderLocally, leaderMode: leaderMode
             )
-            team.leaderPolicyState = leaderMode == "claude" ? "injected" : "pending"
-            team.leaderMeasurementCapability = leaderMode == "claude"
+            team.leaderPolicyState = Self.supportsLeaderTurnMeasurement(cli: leaderMode) ? "injected" : "pending"
+            team.leaderMeasurementCapability = Self.supportsLeaderTurnMeasurement(cli: leaderMode)
                 && leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil ? .supported : .unsupported
             teams[name] = team
-            TeamDataStore.shared.registerTeam(name, agents: headlessMembers.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
+            TeamDataStore.shared.registerTeam(
+                name,
+                agents: headlessMembers.map { .init(name: $0.name, instanceId: $0.agentInstanceId) },
+                delegationState: team.delegationState
+            )
             syncTeamStateToDaemon()
             scheduleLocalLeaderReadinessProbeIfNeeded(
                 teamName: name, leaderMode: leaderMode, workspaceId: workspace.id,
@@ -3126,15 +3199,21 @@ final class TeamOrchestrator: ObservableObject {
             pairModel: pairEligible ? pairModel : "",
             pairPanelId: pairEligible ? members.first?.panelId : nil
         )
+        team.delegationState = ProjectDelegationState(
+            configured: delegationLevel, effective: delegationLevel
+        )
         team.leaderReady = launchLeaderLocally && !Self.localLeaderNeedsReadinessProbe(
             launchLeaderLocally: launchLeaderLocally, leaderMode: leaderMode
         )
-        team.leaderPolicyState = leaderMode == "claude" ? "injected" : "pending"
-        team.leaderMeasurementCapability = leaderMode == "claude"
+        team.leaderPolicyState = Self.supportsLeaderTurnMeasurement(cli: leaderMode) ? "injected" : "pending"
+        team.leaderMeasurementCapability = Self.supportsLeaderTurnMeasurement(cli: leaderMode)
             && leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil ? .supported : .unsupported
         teams[name] = team
         // Register in thread-safe data store for off-main access (approach C: dual queue)
-        TeamDataStore.shared.registerTeam(name, agents: members.map { .init(name: $0.name, instanceId: $0.agentInstanceId) })
+        TeamDataStore.shared.registerTeam(
+            name, agents: members.map { .init(name: $0.name, instanceId: $0.agentInstanceId) },
+            delegationState: team.delegationState
+        )
         syncTeamStateToDaemon()
         scheduleLocalLeaderReadinessProbeIfNeeded(
             teamName: name, leaderMode: leaderMode, workspaceId: workspace.id,
@@ -3746,11 +3825,13 @@ final class TeamOrchestrator: ObservableObject {
 
     static func writeLeaderParticipationControl(
         teamName: String, sessionID: String, supportedLeader: Bool,
+        delegationState: ProjectDelegationState = .default,
         defaults: UserDefaults = .standard
     ) {
         guard let data = leaderParticipationControlData(
             teamName: teamName, sessionID: sessionID,
-            supportedLeader: supportedLeader, defaults: defaults
+            supportedLeader: supportedLeader, delegationState: delegationState,
+            defaults: defaults
         ) else { return }
         let file = URL(fileURLWithPath: leaderParticipationControlFile(teamName: teamName))
         writeLeaderParticipationControlData(data, to: file)
@@ -3758,6 +3839,7 @@ final class TeamOrchestrator: ObservableObject {
 
     static func leaderParticipationControlData(
         teamName: String, sessionID: String, supportedLeader: Bool,
+        delegationState: ProjectDelegationState = .default,
         defaults: UserDefaults = .standard
     ) -> Data? {
         let settings = LeaderParticipationSettings.load(from: defaults)
@@ -3771,7 +3853,8 @@ final class TeamOrchestrator: ObservableObject {
         )
         let payload = settings.controlPayload(
             projectID: teamName, sessionID: sessionID,
-            supportedLeader: supportedLeader, health: health
+            supportedLeader: supportedLeader, health: health,
+            delegationState: delegationState
         )
         return try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
     }
@@ -3805,10 +3888,11 @@ final class TeamOrchestrator: ObservableObject {
             case .local:
                 Self.writeLeaderParticipationControl(
                     teamName: team.id, sessionID: team.leaderSessionId,
-                    supportedLeader: supported
+                    supportedLeader: supported, delegationState: team.delegationState
                 )
             case .peer(let hostKey):
-                guard team.leaderMode == "claude", let teamUUID = team.teamUuid else { continue }
+                guard Self.supportsLeaderTurnMeasurement(cli: team.leaderMode),
+                      let teamUUID = team.teamUuid else { continue }
                 Task {
                     await Self.refreshRemoteLeaderParticipationControl(
                         hostKey: hostKey, teamUUID: teamUUID, teamName: team.id,
@@ -3817,6 +3901,29 @@ final class TeamOrchestrator: ObservableObject {
                 }
             }
         }
+    }
+
+    static func supportsLeaderTurnMeasurement(cli: String) -> Bool {
+        ["claude", "codex"].contains(cli.lowercased())
+    }
+
+    static func codexLeaderTurnHookArguments(path: String) -> [String] {
+        func tomlString(_ value: String) -> String {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.withoutEscapingSlashes]
+            let data = try? encoder.encode(value)
+            return data.flatMap { String(data: $0, encoding: .utf8) } ?? "\"\""
+        }
+        let startCommand = tomlString("\(shellQuoted(path)) --start")
+        let stopCommand = tomlString("\(shellQuoted(path)) --end")
+        let start = "[{matcher=\"\",hooks=[{type=\"command\",command=\(startCommand),timeout=10}]}]"
+        let stop = "[{matcher=\"\",hooks=[{type=\"command\",command=\(stopCommand),timeout=10}]}]"
+        return [
+            "--dangerously-bypass-hook-trust",
+            "--enable", "hooks",
+            "-c", "hooks.UserPromptSubmit=\(start)",
+            "-c", "hooks.Stop=\(stop)",
+        ]
     }
 
     /// Settings injected only into supported Claude leader launches. The
@@ -5095,12 +5202,33 @@ final class TeamOrchestrator: ObservableObject {
             + "After the requested work succeeds, run exactly: \(tmAgent) leader request complete \(requestId) immediately before your final response."
     }
 
+    static func leaderRequestWake(
+        request: TeamDataStore.LeaderRequest, tmAgent: String
+    ) -> String {
+        let route = request.selectedRoute?.rawValue ?? ProjectRoutingRoute.direct.rawValue
+        let level = request.delegationLevel?.rawValue ?? ProjectDelegationLevel.leaderFirst.rawValue
+        let reasons = (request.routeReasons ?? []).joined(separator: ",")
+        return leaderRequestWake(requestId: request.id, tmAgent: tmAgent)
+            + " Engine decision: delegation=\(level), route=\(route), reasons=\(reasons). "
+            + "Execute this route; any override must be explicit in the turn route record."
+    }
+
+    static func projectDelegationDirective(_ level: ProjectDelegationLevel) -> String {
+        "Project delegation level: \(level.rawValue). Durable requests carry an "
+            + "engine-selected route; execute that route rather than reclassifying it."
+    }
+
     func leaderRequestWake(teamName: String, requestId: String) -> String {
         let tmAgent: String
         if let team = teams[teamName], case .local = team.leaderEndpoint {
             tmAgent = Self.localTMAgentCommand()
         } else {
             tmAgent = "tm-agent"
+        }
+        if let request = TeamDataStore.shared.listLeaderRequests(
+            teamName: teamName, includeCompleted: true
+        )?.first(where: { $0.id == requestId }) {
+            return Self.leaderRequestWake(request: request, tmAgent: tmAgent)
         }
         return Self.leaderRequestWake(requestId: requestId, tmAgent: tmAgent)
     }
@@ -7323,6 +7451,9 @@ final class TeamOrchestrator: ObservableObject {
                 "leader_policy_source": "LeaderParallelPolicy",
                 "leader_policy_state": team.leaderPolicyState,
                 "leader_policy_failure": team.leaderPolicyFailureDescription as Any? ?? NSNull(),
+                "delegation_configured": team.delegationState.configured.rawValue,
+                "delegation_effective": team.delegationState.effective.rawValue,
+                "delegation_pending": team.delegationState.pending?.rawValue as Any? ?? NSNull(),
             ] as [String: Any]
         }
     }
@@ -7449,6 +7580,9 @@ final class TeamOrchestrator: ObservableObject {
             "leader_policy_source": "LeaderParallelPolicy",
             "leader_policy_state": team.leaderPolicyState,
             "leader_policy_failure": team.leaderPolicyFailureDescription as Any? ?? NSNull(),
+            "delegation_configured": team.delegationState.configured.rawValue,
+            "delegation_effective": team.delegationState.effective.rawValue,
+            "delegation_pending": team.delegationState.pending?.rawValue as Any? ?? NSNull(),
             "workspace_id": team.workspaceId.uuidString,
             "team_uuid": team.teamUuid as Any? ?? NSNull(),
             "remote_project_id": Self.effectiveRemotePresentationProjectID(
@@ -7486,6 +7620,9 @@ final class TeamOrchestrator: ObservableObject {
                 info["completed_task_count"] = agent.completedTaskCount
                 if let pid = agent.panelId {
                     info["panel_id"] = pid.uuidString
+                }
+                if let sessionId = agent.claudeSessionId?.nilIfBlank {
+                    info["session_id"] = sessionId
                 }
                 if let branch = agent.worktreeBranch {
                     info["worktree_branch"] = branch
@@ -7704,6 +7841,11 @@ final class TeamOrchestrator: ObservableObject {
         let leaderSessionId = (leaderDict?["session_id"] as? String) ?? ""
         let leaderMode = (leaderDict?["mode"] as? String) ?? "claude"
         let leaderModel = (leaderDict?["model"] as? String) ?? "sonnet"
+        let restoredDelegation = ProjectDelegationState(
+            configuredRaw: result["delegation_configured"] as? String,
+            effectiveRaw: result["delegation_effective"] as? String,
+            pendingRaw: result["delegation_pending"] as? String
+        )
 
         // worktree mode from archive (off / shared / isolated). If the archive
         // had a shared worktree, the createTeam path will reuse the same
@@ -7785,6 +7927,7 @@ final class TeamOrchestrator: ObservableObject {
             leaderSessionId: freshLeaderSessionId,
             leaderMode: leaderMode,
             leaderModel: leaderModel,
+            delegationLevel: restoredDelegation.configured,
             resumeSessionId: leaderClaudeSid,
             worktreeMode: archivedWorktreeMode,
             executionMode: "pane",
@@ -7799,6 +7942,7 @@ final class TeamOrchestrator: ObservableObject {
         // live team round-trips: a future destroy archives to the same UUID
         // and carries forward each agent's resume identity.
         if var t = teams[teamName] {
+            t.delegationState = restoredDelegation
             if let uuid = archivedTeamUuid, !uuid.isEmpty {
                 t.teamUuid = uuid
                 // Same-run destroy → resume: lift the snapshot retirement so
@@ -7843,6 +7987,11 @@ final class TeamOrchestrator: ObservableObject {
                 }
             }
             teams[teamName] = t
+            TeamDataStore.shared.registerTeam(
+                teamName,
+                agents: t.agents.map { .init(name: $0.name, instanceId: $0.agentInstanceId) },
+                delegationState: restoredDelegation
+            )
         }
 
         Logger.team.info("[pane-resume] adopted team '\(teamName, privacy: .public)' with \(agentTuples.count) agent(s); leader resumed via --resume, agents start fresh (per-agent --resume is a follow-up)")
@@ -8051,6 +8200,9 @@ final class TeamOrchestrator: ObservableObject {
             "leader_session_id": leaderSid,
             "leader_mode": team.leaderMode,
             "leader_model": team.leaderModel,
+            "delegation_configured": team.delegationState.configured.rawValue,
+            "delegation_effective": team.delegationState.effective.rawValue,
+            "delegation_pending": team.delegationState.pending?.rawValue as Any? ?? NSNull(),
             "working_directory": team.workingDirectory,
             "termmesh_app_version": appVersion,
             "agents": team.agents.map { a -> [String: Any] in
@@ -8250,6 +8402,9 @@ final class TeamOrchestrator: ObservableObject {
             "leader_session_id": leaderSid,
             "leader_mode": team.leaderMode,
             "leader_model": team.leaderModel,
+            "delegation_configured": team.delegationState.configured.rawValue,
+            "delegation_effective": team.delegationState.effective.rawValue,
+            "delegation_pending": team.delegationState.pending?.rawValue as Any? ?? NSNull(),
             "working_directory": team.workingDirectory,
             "termmesh_app_version": appVersion,
             "layout_workspace_title": team.id,

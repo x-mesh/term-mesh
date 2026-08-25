@@ -77,3 +77,43 @@ check on code that runs `rm -rf`. `test-reload-cleanup.sh` sources reload.sh wit
 path-guard rejections, per-tag isolation, and the two cases where reclamation
 must refuse — a tag whose app is still running behind a stale manifest PID, and a
 rebuild that failed while the previous build is live.
+
+## Stale Project manifests on a host (`tm-agent daemon project-presentations`)
+
+A daemon keeps one durable record per published Project in
+`peer-project-presentations.json`. Records whose surfaces are gone are hidden
+from the roster, so they cause no collisions, but they stay on disk and only
+the installation that published them may delete them over the peer protocol
+(`not_owner` otherwise). The host-side command is the path for everything the
+protocol refuses:
+
+```bash
+tm-agent daemon project-presentations list
+tm-agent daemon project-presentations prune                     # dry-run
+tm-agent daemon project-presentations prune --apply
+tm-agent daemon project-presentations prune --project-id team:<uuid> --apply
+```
+
+- `list` shows every record with its live/referenced surface counts, owner and
+  whether the recorded directory still exists.
+- `prune` without `--project-id` considers only records whose directory is gone
+  and whose surfaces are all dead. Named records are removed even if their
+  directory exists. A record with any live surface is never removed, whichever
+  way it was selected.
+- `--apply` first copies the file to `peer-project-presentations.<unix>.bak.json`
+  beside it, then removes only the selected records. Workspaces, shells and
+  files are never touched; restore by copying the backup back and restarting
+  the daemon.
+
+New Project's remote-name collision shows the same facts (host, directory,
+Project ID, leader state, ownership) and offers "Delete Project record…" for
+records this installation owns whose leader is not running. That delete is
+the normal protocol delete: it also stops the panes only that manifest
+referenced (leader shell, agent panes); the workspace and files stay. Foreign
+records and running leaders point here or to the sidebar respectively.
+
+VERIFY:
+
+```bash
+(cd daemon && cargo test -p term-meshd prune_removes_only_dead_records)
+```

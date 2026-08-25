@@ -429,7 +429,9 @@ extension TeamOrchestrator {
                         ? remote.leaderProcessActive : !remote.leaderSurfaceID.isEmpty,
                     failureDescription: remote.leaderProcessActiveKnown
                         && !remote.leaderProcessActive
-                        ? "Remote leader process is not active" : nil
+                        ? "Remote leader process is not active" : nil,
+                    presentationOwnedByRequester: remote.presentationOwnedByRequester,
+                    leaderProcessActiveKnown: remote.leaderProcessActiveKnown
                 ))
             }
         }
@@ -509,6 +511,9 @@ extension TeamOrchestrator {
             team.gitRepoRoot ?? "",
             hostKey,
             leaderID,
+            team.delegationState.configured.rawValue,
+            team.delegationState.effective.rawValue,
+            team.delegationState.pending?.rawValue ?? "",
             members,
         ].joined(separator: "\u{1d}")
     }
@@ -575,6 +580,9 @@ extension TeamOrchestrator {
         project.createdAtUnixSecs = UInt64(max(0, team.createdAt.timeIntervalSince1970))
         project.leaderSurfaceID = leaderSurfaceID
         project.projectID = Self.remoteProjectPresentationID(teamUUID: teamUUID)
+        project.delegationConfigured = team.delegationState.configured.rawValue
+        project.delegationEffective = team.delegationState.effective.rawValue
+        project.delegationPending = team.delegationState.pending?.rawValue ?? ""
         project.members = team.agents.compactMap { agent in
             guard let surfaceID = agent.remoteSurfaceID else { return nil }
             var member = Termmesh_Peer_V1_TeamMember()
@@ -1221,6 +1229,7 @@ extension TeamOrchestrator {
             remotePresentationHostKey: host.id,
             remoteLeaderSurfaceID: remote.leaderSurfaceID
         )
+        team.delegationState = remote.delegationState
         // A background pane is pending, while a selected workspace can finish
         // its relay before this team record is installed. Read the session's
         // actual state so neither ordering loses the readiness transition.
@@ -2744,7 +2753,8 @@ extension TeamOrchestrator {
         }
 
         let turnHookFile: String?
-        if cli.lowercased() == "claude", let hookData = Self.localLeaderTurnHookData() {
+        if Self.supportsLeaderTurnMeasurement(cli: cli),
+           let hookData = Self.localLeaderTurnHookData() {
             turnHookFile = await Self.writeRemoteLeaderTurnHookOverSSH(
                 host: host, hookData: hookData, teamUUID: teamUUID
             )
@@ -2753,7 +2763,7 @@ extension TeamOrchestrator {
             turnHookFile = nil
         }
         let participationControlFile: String?
-        if cli.lowercased() == "claude", turnHookFile != nil,
+        if Self.supportsLeaderTurnMeasurement(cli: cli), turnHookFile != nil,
            let controlData = Self.leaderParticipationControlData(
                teamName: teamName, sessionID: team.leaderSessionId, supportedLeader: true
            ) {
@@ -2852,7 +2862,7 @@ extension TeamOrchestrator {
         markLeaderPolicyState(teamName: teamName, state: "injected")
         setLeaderMeasurementCapability(
             teamName: teamName,
-            capability: cli.lowercased() == "claude"
+            capability: Self.supportsLeaderTurnMeasurement(cli: cli)
                 ? (turnHookFile == nil ? .degraded : .supported)
                 : .unsupported
         )
@@ -4109,7 +4119,7 @@ extension TeamOrchestrator {
         guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return nil }
         let contents = "umask 077\nrm -f -- \"$0\"\n"
             + command
-            + "\nstatus=$?\nstty echo\nexit \"$status\"\n"
+            + "\nterm_mesh_exit_status=$?\nstty echo\nexit \"$term_mesh_exit_status\"\n"
         do {
             let output = try await PeerHostReadinessChecker.runScript(
                 sshTarget: sshTarget,
@@ -7531,6 +7541,7 @@ extension TeamOrchestrator {
         pairMode: String = "none",
         pairModel: String = "",
         pairSpec: String = "",
+        delegationLevel: ProjectDelegationLevel = .leaderFirst,
         projectSource: ProjectSource? = nil,
         /// What the bootstrap actually created, as the setup script reported
         /// it. Empty means nothing here is deletable, which is the safe answer
@@ -7652,6 +7663,7 @@ extension TeamOrchestrator {
             pairMode: pairMode,
             pairModel: pairModel,
             pairSpec: pairSpec,
+            delegationLevel: delegationLevel,
             resumeSessionId: resumeSessionId,
             worktreeMode: worktreeMode,
             executionMode: executionMode,
@@ -8580,7 +8592,7 @@ extension TeamOrchestrator {
                 .compactMap { $0 }.map(shellQuoted).joined(separator: " " )
             let hookCleanup = cleanupFiles.isEmpty
                 ? ""
-                : "; status=$?; rm -f -- \(cleanupFiles); exit \"$status\""
+                : "; term_mesh_exit_status=$?; rm -f -- \(cleanupFiles); exit \"$term_mesh_exit_status\""
             guard let systemPromptFile else {
                 return "\(enter) && \(envPrefix)claude --model \(quotedModel)"
                     + settings + " --dangerously-skip-permissions" + hookCleanup
@@ -8595,9 +8607,17 @@ extension TeamOrchestrator {
                 + hookCleanup
         case "codex", "kiro", "gemini":
             let autonomy = needsSocketAccess ? Self.leaderAutonomyFlags(cli: cli) : []
-            let flags = autonomy.isEmpty ? "" : " " + autonomy.joined(separator: " ")
+            let codexHooks = cli == "codex" ? turnHookFile.map {
+                Self.codexLeaderTurnHookArguments(path: $0).map(shellQuoted).joined(separator: " ")
+            } ?? "" : ""
+            let allFlags = autonomy + (codexHooks.isEmpty ? [] : [codexHooks])
+            let flags = allFlags.isEmpty ? "" : " " + allFlags.joined(separator: " ")
+            let cleanupFiles = cli == "codex" ? [turnHookFile, participationControlFile]
+                .compactMap { $0 }.map(shellQuoted).joined(separator: " ") : ""
+            let cleanup = cleanupFiles.isEmpty ? ""
+                : "; term_mesh_exit_status=$?; rm -f -- \(cleanupFiles); exit \"$term_mesh_exit_status\""
             guard let systemPromptFile else {
-                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)\(flags)"
+                return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)\(flags)" + cleanup
             }
             let directive = LeaderParallelPolicy.launchDirective(promptFile: systemPromptFile)
             switch cli {
@@ -8606,7 +8626,7 @@ extension TeamOrchestrator {
                     + " \(shellQuoted(directive))"
             default:
                 return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)\(flags)"
-                    + " \(shellQuoted(directive))"
+                    + " \(shellQuoted(directive))" + cleanup
             }
         default:
             return "\(enter) && \(envPrefix)\(cli) --model \(quotedModel)"

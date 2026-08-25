@@ -33,6 +33,99 @@ final class RoutingInstrumentationTests: XCTestCase {
 
     // MARK: - Stated values round-trip
 
+    func testProjectRoutingDecisionMatrixIsDeterministic() {
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .leaderFirst, taskShape: .singleUnit, risks: [], availableWorkers: 2
+            ),
+            .init(route: .direct, reasons: ["leader_first"], workerCount: 0)
+        )
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .guarded, taskShape: .singleUnit,
+                risks: [.protocolOrPersistence], availableWorkers: 2
+            ),
+            .init(route: .probe, reasons: ["protocol_or_persistence"], workerCount: 1)
+        )
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .delegated, taskShape: .singleUnit, risks: [], availableWorkers: 1
+            ),
+            .init(route: .delegated, reasons: ["delegated_serial_work"], workerCount: 1)
+        )
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .guarded, taskShape: .multiUnit,
+                risks: [.irreversibleOrRelease], availableWorkers: 3
+            ),
+            .init(route: .parallel, reasons: ["parallel_ready"], workerCount: 3)
+        )
+    }
+
+    func testLeaderRequestSnapshotsEffectiveDelegationAndEngineRoute() throws {
+        let team = registerTeam()
+        _ = store.configureProjectDelegation(teamName: team, level: .guarded)
+        guard case .created(let request, _) = store.enqueueLeaderRequest(
+            teamName: team, content: "change protocol storage", requestId: "route-snapshot",
+            taskShape: .singleUnit, riskReasons: [.protocolOrPersistence]
+        ) else { return XCTFail("request was not created") }
+
+        XCTAssertEqual(request.delegationLevel, .guarded)
+        XCTAssertEqual(request.selectedRoute, .probe)
+        XCTAssertEqual(request.riskReasons, [.protocolOrPersistence])
+        let dictionary = store.leaderRequestDictionary(request, includeContent: false)
+        XCTAssertEqual(dictionary["selected_route"] as? String, "probe")
+        XCTAssertEqual(dictionary["delegation_level"] as? String, "guarded")
+    }
+
+    func testDelegationChangeDuringClaimBecomesNextRequestSnapshot() throws {
+        let team = registerTeam()
+        store.updateBoardUuids([team: UUID().uuidString])
+        guard case .created(let first, _) = store.enqueueLeaderRequest(
+            teamName: team, content: "first", requestId: "first"
+        ) else { return XCTFail("first request missing") }
+        guard case .succeeded = store.takeLeaderRequest(teamName: team, requestId: first.id) else {
+            return XCTFail("first request was not claimed")
+        }
+
+        let pending = try XCTUnwrap(
+            store.configureProjectDelegation(teamName: team, level: .delegated)
+        )
+        XCTAssertEqual(pending.effective, .leaderFirst)
+        XCTAssertEqual(pending.pending, .delegated)
+
+        guard case .created(let second, _) = store.enqueueLeaderRequest(
+            teamName: team, content: "second", requestId: "second"
+        ) else { return XCTFail("second request missing") }
+        XCTAssertEqual(second.delegationLevel, .leaderFirst)
+
+        guard case .succeeded = store.completeLeaderRequest(teamName: team, requestId: first.id) else {
+            return XCTFail("first request was not completed")
+        }
+        guard case .created(let third, _) = store.enqueueLeaderRequest(
+            teamName: team, content: "third", requestId: "third"
+        ) else { return XCTFail("third request missing") }
+        XCTAssertEqual(third.delegationLevel, .delegated)
+        XCTAssertEqual(third.selectedRoute, .delegated)
+    }
+
+    func testMembershipReregistrationPreservesConfiguredDelegation() throws {
+        let team = registerTeam()
+        let configured = try XCTUnwrap(
+            store.configureProjectDelegation(teamName: team, level: .delegated)
+        )
+        XCTAssertEqual(configured.effective, .delegated)
+
+        // Adding or restarting an agent re-registers the roster without a
+        // delegation argument; the configured level must survive.
+        store.registerTeam(team, agentNames: ["executor", "reviewer"])
+        XCTAssertEqual(store.projectDelegationState(teamName: team), configured)
+
+        // An explicit state (create/resume) still replaces it.
+        store.registerTeam(team, agentNames: ["executor"], delegationState: .default)
+        XCTAssertEqual(store.projectDelegationState(teamName: team), .default)
+    }
+
     func testStatedRouteAndWaveSurviveCreateAndDictionary() throws {
         let team = registerTeam()
         let wave = "wave-\(UUID().uuidString)"

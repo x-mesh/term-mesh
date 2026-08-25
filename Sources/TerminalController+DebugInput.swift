@@ -182,6 +182,12 @@ extension TerminalController {
         case "tab": return "\t"
         case "escape", "esc": return "\u{1b}"
         case "backspace": return "\u{7f}"
+        // Queued fallback for a surface that is not up yet: plain CSI arrows.
+        // Once the surface exists, sendNamedKey delivers real key events.
+        case "up", "arrow-up": return "\u{1b}[A"
+        case "down", "arrow-down": return "\u{1b}[B"
+        case "right", "arrow-right": return "\u{1b}[C"
+        case "left", "arrow-left": return "\u{1b}[D"
         default:
             guard normalized.hasPrefix("ctrl-") || normalized.hasPrefix("ctrl+") else {
                 return nil
@@ -216,6 +222,18 @@ extension TerminalController {
             return sendKeyEvent(surface: surface, keycode: UInt32(kVK_Escape), text: "\u{1b}")
         case "backspace":
             return sendKeyEvent(surface: surface, keycode: UInt32(kVK_Delete), text: "\u{7f}")
+        // Arrow keys as real key events so Ghostty encodes them for whatever
+        // keyboard protocol the pane negotiated (kitty in Claude Code). Raw
+        // CSI bytes through surface.send_text would be encoded as an Escape
+        // key press followed by text there.
+        case "up", "arrow-up":
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_UpArrow))
+        case "down", "arrow-down":
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_DownArrow))
+        case "left", "arrow-left":
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_LeftArrow))
+        case "right", "arrow-right":
+            return sendKeyEvent(surface: surface, keycode: UInt32(kVK_RightArrow))
         default:
             if keyName.lowercased().hasPrefix("ctrl-") || keyName.lowercased().hasPrefix("ctrl+") {
                 let letter = keyName.dropFirst(5)

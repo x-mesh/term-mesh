@@ -17,6 +17,13 @@ import SwiftUI
 /// parsing: turning the stream into things a view can draw as what they are.
 @MainActor
 final class AgentSessionTests: XCTestCase {
+    func testChatTurnPreservesLineBreaksAndNormalizesCarriageReturns() {
+        XCTAssertEqual(
+            TerminalSurface.normalizedChatTurn("first\r\nsecond\rthird"),
+            "first\nsecond\nthird"
+        )
+    }
+
     func testIsolatedWorktreeBranchUsesDurableInstanceIdentity() {
         let first = TeamOrchestrator.isolatedWorktreeBranch(
             teamName: "term-mesh", agentName: "executor",
@@ -173,14 +180,29 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "11")
-        XCTAssertEqual(LeaderParallelPolicy.activation, "runtime-enforced")
+        XCTAssertEqual(LeaderParallelPolicy.version, "12")
+        XCTAssertEqual(LeaderParallelPolicy.activation, "request-boundary-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 11"))
+        XCTAssertTrue(first.contains("policy_version: 12"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
-        XCTAssertTrue(first.contains("policy_activation: runtime-enforced"))
+        XCTAssertTrue(first.contains("policy_activation: request-boundary-enforced"))
+    }
+
+    func testCodexLeaderTurnHooksUseVettedInlineLifecycleConfig() {
+        let args = TeamOrchestrator.codexLeaderTurnHookArguments(
+            path: "/Applications/term mesh/scripts/leader-turn-hook.sh"
+        )
+        XCTAssertTrue(args.contains("--dangerously-bypass-hook-trust"))
+        XCTAssertTrue(args.contains("--enable"))
+        XCTAssertTrue(args.contains("hooks"))
+        XCTAssertTrue(args.contains { $0.contains("hooks.UserPromptSubmit") && $0.contains("--start") })
+        XCTAssertTrue(args.contains { $0.contains("hooks.Stop") && $0.contains("--end") })
+        XCTAssertTrue(args.contains { $0.contains("/Applications/term mesh/scripts/leader-turn-hook.sh") })
+        XCTAssertTrue(TeamOrchestrator.supportsLeaderTurnMeasurement(cli: "claude"))
+        XCTAssertTrue(TeamOrchestrator.supportsLeaderTurnMeasurement(cli: "codex"))
+        XCTAssertFalse(TeamOrchestrator.supportsLeaderTurnMeasurement(cli: "kiro"))
     }
 
     func testLeaderParallelPolicyContainsEveryRequiredRoutingRule() {
@@ -2065,6 +2087,9 @@ final class AgentSessionTests: XCTestCase {
             Bundle.main.resourcePath.map { "\($0)/bin" }
         )
         XCTAssertTrue(environment["PATH"]?.contains("/usr/bin") == true)
+        // Skills run "$TERMMESH_APP_BIN/tm-agent" first; native panes only get
+        // it from here.
+        XCTAssertEqual(environment["TERMMESH_APP_BIN"], Bundle.main.resourcePath.map { "\($0)/bin" })
     }
 
     func testCLIProfileCannotReplaceAgentRoutingOrBundledCLI() {

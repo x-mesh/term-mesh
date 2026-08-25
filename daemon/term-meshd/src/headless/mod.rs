@@ -1174,6 +1174,9 @@ impl HeadlessManager {
                 .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
             app_socket_path_at_create: params.app_socket_path.clone(),
             runbook_digest_hash: params.runbook_digest_hash.clone(),
+            delegation_configured: default_delegation_level(),
+            delegation_effective: default_delegation_level(),
+            delegation_pending: None,
             live: false,
             last_snapshot_at: None,
             layout_workspace_title: None,
@@ -1447,6 +1450,9 @@ impl HeadlessManager {
                 .unwrap_or_else(|| "unknown".to_string()),
             app_socket_path_at_create: None,
             runbook_digest_hash: None,
+            delegation_configured: params.delegation_configured.clone(),
+            delegation_effective: params.delegation_effective.clone(),
+            delegation_pending: params.delegation_pending.clone(),
             live: false,
             last_snapshot_at: None,
             layout_workspace_title: None,
@@ -1649,6 +1655,9 @@ impl HeadlessManager {
                 .unwrap_or_else(|| "unknown".to_string()),
             app_socket_path_at_create: params.app_socket_path.clone(),
             runbook_digest_hash: None,
+            delegation_configured: params.delegation_configured.clone(),
+            delegation_effective: params.delegation_effective.clone(),
+            delegation_pending: params.delegation_pending.clone(),
             live: true,
             last_snapshot_at: Some(now),
             layout_workspace_title: params.layout_workspace_title.clone(),
@@ -1765,6 +1774,9 @@ impl HeadlessManager {
             leader: team_meta.leader,
             agents,
             worktree: team_meta.worktree,
+            delegation_configured: team_meta.delegation_configured,
+            delegation_effective: team_meta.delegation_effective,
+            delegation_pending: team_meta.delegation_pending,
         })
     }
 
@@ -3032,6 +3044,10 @@ pub struct ResumeTeamParams {
     pub accept_branch_drift: bool,
 }
 
+fn default_delegation_level() -> String {
+    "leaderFirst".to_string()
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResumeTeamResult {
     #[serde(flatten)]
@@ -3054,6 +3070,12 @@ pub struct ArchivePaneParams {
     pub leader_session_id: String,
     pub leader_mode: String,
     pub leader_model: String,
+    #[serde(default = "default_delegation_level")]
+    pub delegation_configured: String,
+    #[serde(default = "default_delegation_level")]
+    pub delegation_effective: String,
+    #[serde(default)]
+    pub delegation_pending: Option<String>,
     pub working_directory: String,
     #[serde(default)]
     pub git_root: Option<String>,
@@ -3111,6 +3133,12 @@ pub struct SnapshotPaneParams {
     pub leader_session_id: String,
     pub leader_mode: String,
     pub leader_model: String,
+    #[serde(default = "default_delegation_level")]
+    pub delegation_configured: String,
+    #[serde(default = "default_delegation_level")]
+    pub delegation_effective: String,
+    #[serde(default)]
+    pub delegation_pending: Option<String>,
     pub working_directory: String,
     #[serde(default)]
     pub git_root: Option<String>,
@@ -3203,6 +3231,9 @@ pub struct ResumePaneResult {
     pub leader: meta::LeaderMeta,
     pub agents: Vec<ResumePaneAgent>,
     pub worktree: Option<meta::WorktreeMeta>,
+    pub delegation_configured: String,
+    pub delegation_effective: String,
+    pub delegation_pending: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3337,6 +3368,9 @@ fn make_pre_phase2_stub(team: &HeadlessTeam, destroyed_at: u64) -> meta::TeamMet
         termmesh_app_version: env!("CARGO_PKG_VERSION").into(),
         app_socket_path_at_create: None,
         runbook_digest_hash: None,
+        delegation_configured: default_delegation_level(),
+        delegation_effective: default_delegation_level(),
+        delegation_pending: None,
         live: false,
         last_snapshot_at: None,
         layout_workspace_title: None,
@@ -3705,6 +3739,9 @@ mod tests {
             termmesh_app_version: "0.72.0".into(),
             app_socket_path_at_create: None,
             runbook_digest_hash: None,
+            delegation_configured: default_delegation_level(),
+            delegation_effective: default_delegation_level(),
+            delegation_pending: None,
             live: false,
             last_snapshot_at: None,
             layout_workspace_title: None,
@@ -3794,6 +3831,9 @@ mod tests {
             termmesh_app_version: "test".into(),
             app_socket_path_at_create: None,
             runbook_digest_hash: None,
+            delegation_configured: default_delegation_level(),
+            delegation_effective: default_delegation_level(),
+            delegation_pending: None,
             live: false,
             last_snapshot_at: None,
             layout_workspace_title: None,
@@ -3986,6 +4026,9 @@ mod tests {
             leader_session_id: "lead-sid".into(),
             leader_mode: "claude".into(),
             leader_model: "sonnet".into(),
+            delegation_configured: default_delegation_level(),
+            delegation_effective: default_delegation_level(),
+            delegation_pending: None,
             working_directory: "/tmp/iso".into(),
             git_root: None,
             git_branch_at_create: None,
@@ -4059,6 +4102,9 @@ mod tests {
             leader_session_id: "lead-sid".into(),
             leader_mode: "claude".into(),
             leader_model: "sonnet".into(),
+            delegation_configured: default_delegation_level(),
+            delegation_effective: default_delegation_level(),
+            delegation_pending: None,
             working_directory: "/tmp/iso".into(),
             git_root: None,
             git_branch_at_create: None,
@@ -4344,6 +4390,9 @@ mod tests {
             termmesh_app_version: "test".into(),
             app_socket_path_at_create: None,
             runbook_digest_hash: None,
+            delegation_configured: default_delegation_level(),
+            delegation_effective: default_delegation_level(),
+            delegation_pending: None,
             live: false,
             last_snapshot_at: None,
             layout_workspace_title: None,
@@ -4435,6 +4484,9 @@ mod tests {
             termmesh_app_version: "test".into(),
             app_socket_path_at_create: None,
             runbook_digest_hash: None,
+            delegation_configured: default_delegation_level(),
+            delegation_effective: default_delegation_level(),
+            delegation_pending: None,
             live: false,
             last_snapshot_at: None,
             layout_workspace_title: None,

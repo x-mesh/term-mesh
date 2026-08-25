@@ -458,6 +458,11 @@ fi
 if [[ -n "$TAG" ]]; then
   TAG_ID="$(sanitize_bundle "$TAG")"
   TAG_SLUG="$(sanitize_path "$TAG")"
+  # Mobile remote-control listener (docs/mobile-remote-control.md §4.4): a
+  # stable per-tag loopback port so a tagged daemon never takes production's
+  # 9877. The app starts the listener only when the termMeshMobileEnabled
+  # default is on for this tagged bundle id.
+  TERM_MESH_MOBILE_ADDR="127.0.0.1:$(( 20000 + $(printf '%s' "$TAG_SLUG" | cksum | cut -d' ' -f1) % 1000 ))"
   if [[ "$NAME_SET" -eq 0 ]]; then
     APP_NAME="term-mesh DEV ${TAG}"
     APP_DISPLAY_NAME="Term-Mesh DEV ${TAG}"
@@ -617,6 +622,8 @@ if [[ -n "$TAG" && "$APP_NAME" != "$SEARCH_APP_NAME" ]]; then
         || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:TERMMESH_SOCKET_PATH string \"${TERMMESH_SOCKET}\"" "$INFO_PLIST"
       /usr/libexec/PlistBuddy -c "Set :LSEnvironment:TERMMESH_DEBUG_LOG \"${TERMMESH_DEBUG_LOG}\"" "$INFO_PLIST" 2>/dev/null \
         || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:TERMMESH_DEBUG_LOG string \"${TERMMESH_DEBUG_LOG}\"" "$INFO_PLIST"
+      /usr/libexec/PlistBuddy -c "Set :LSEnvironment:TERM_MESH_MOBILE_ADDR \"${TERM_MESH_MOBILE_ADDR}\"" "$INFO_PLIST" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Add :LSEnvironment:TERM_MESH_MOBILE_ADDR string \"${TERM_MESH_MOBILE_ADDR}\"" "$INFO_PLIST"
     fi
   fi
   APP_PATH="$TAG_APP_PATH"
@@ -756,7 +763,8 @@ if [[ -n "${TAG_SLUG:-}" && -n "${TERMMESH_SOCKET:-}" ]]; then
     "TERMMESH_TAG=$TAG_SLUG" \
     "TERMMESH_SOCKET_PATH=$TERMMESH_SOCKET" \
     "TERMMESH_DAEMON_UNIX_PATH=$TERMMESH_DAEMON_SOCKET" \
-    "TERMMESH_DEBUG_LOG=$TERMMESH_DEBUG_LOG"
+    "TERMMESH_DEBUG_LOG=$TERMMESH_DEBUG_LOG" \
+    "TERM_MESH_MOBILE_ADDR=${TERM_MESH_MOBILE_ADDR:-}"
 elif [[ -n "${TAG_SLUG:-}" ]]; then
   open_clean "${EXTRA_ENV[@]}" \
     "TERMMESH_TAG=$TAG_SLUG" \

@@ -108,6 +108,9 @@ pub async fn serve(
     // Only the daemon has agent teams; without this the host answers no
     // ListTeams and never advertises team.roster.v1.
     host.set_teams(teams);
+    // Lets control-socket RPCs (tm-agent daemon project-presentations …)
+    // reach the one production host.
+    host.register_active_host();
     // And the task board, which is what `team.task.diff` reads a worktree path
     // out of. Wired here for the same reason as the manager above: only the
     // daemon has one, and a host without it says so rather than guessing.
@@ -978,6 +981,36 @@ mod integration_tests {
             "a retired project must not keep its pane alive forever"
         );
         std::env::remove_var("TERMMESH_PEER_ABANDONED_GRACE_MS");
+    }
+
+    #[tokio::test]
+    async fn explicit_delete_terminates_a_project_surface_even_while_attached() {
+        let manager = Arc::new(crate::peer::surface::PtyManager::new());
+        let leader = vec![0xA2; 16];
+        manager.register_and_spawn_ephemeral(
+            leader.clone(),
+            crate::peer::surface::SpawnSpec {
+                title: "attached-project-leader".into(),
+                command: "/bin/cat".into(), args: vec![], cols: 80, rows: 24,
+                cwd: None, kind: crate::peer::surface::SurfaceKind::Pty,
+                agent_cli: String::new(),
+            },
+        );
+        let host = Arc::new(PeerHost::new(manager.clone()));
+        let owner = vec![vec![0x72; 16]];
+        let project = peer_proto::v1::Team {
+            name: "attached".into(), team_uuid: "uuid-attached".into(),
+            working_directory: "/tmp".into(), leader_surface_id: leader.clone(),
+            project_id: "team:uuid-attached".into(), ..Default::default()
+        };
+        assert_eq!(host.upsert_project_presentation(&owner, &project), Ok((1, true)));
+        manager.note_attached(&leader);
+        let released = host
+            .delete_project_presentation_with_released(&owner, "team:uuid-attached")
+            .unwrap()
+            .unwrap();
+        assert_eq!(released, vec![leader.clone()]);
+        assert!(manager.list().iter().all(|surface| surface.surface_id != leader));
     }
 
     #[tokio::test]

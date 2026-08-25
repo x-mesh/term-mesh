@@ -234,6 +234,11 @@ final class TerminalPanel: Panel, ObservableObject {
         return surface.sendIMEText(text, withReturn: withReturn)
     }
 
+    @discardableResult
+    func sendIMETextPreservingNewlines(_ text: String, withReturn: Bool = true) -> Bool {
+        surface.sendIMETextPreservingNewlines(text, withReturn: withReturn)
+    }
+
     /// Send text using the proven socket-style delivery (per-character key events).
     /// Most reliable path for team agent text delivery.
     @discardableResult

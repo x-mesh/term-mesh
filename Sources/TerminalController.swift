@@ -1002,6 +1002,8 @@ class TerminalController {
             return v2Result(id: id, self.v2SurfaceHealth(params: params))
         case "surface.send_text":
             return v2Result(id: id, self.v2SurfaceSendText(params: params))
+        case "surface.send_turn":
+            return v2Result(id: id, self.v2SurfaceSendTurn(params: params))
         case "surface.send_key":
             return v2Result(id: id, self.v2SurfaceSendKey(params: params))
         case "surface.clear_history":
@@ -1044,6 +1046,8 @@ class TerminalController {
             return v2Result(id: id, self.v2TeamLeaderRequestTake(params: params))
         case "team.leader.request.complete":
             return v2Result(id: id, self.v2TeamLeaderRequestComplete(params: params))
+        case "team.delegation.configure":
+            return v2Result(id: id, self.v2TeamDelegationConfigure(params: params))
         case "team.send":
             return v2Result(id: id, self.v2TeamSend(params: params))
         case "team.broadcast":
@@ -1298,6 +1302,8 @@ class TerminalController {
             return v2Result(id: id, self.v2BrowserInputTouch(params: params))
         case "surface.read_text":
             return v2Result(id: id, self.v2SurfaceReadText(params: params))
+        case "surface.read_screen_grid":
+            return v2Result(id: id, self.v2SurfaceReadScreenGrid(params: params))
 
         // Peer-federation saved hosts. Not DEBUG-gated: unlike the
         // `debug.peer.*` family below (raw socket paths, bypassing
@@ -1547,8 +1553,10 @@ class TerminalController {
             "surface.rebuild_renderer",
             "surface.health",
             "surface.send_text",
+            "surface.send_turn",
             "surface.send_key",
             "surface.read_text",
+            "surface.read_screen_grid",
             "peer.host.list",
             "peer.host.connect",
             "peer.host.retry",
@@ -2511,6 +2519,8 @@ class TerminalController {
             return await asyncTeamBroadcast(params: params, id: id)
         case "team.read":
             return await asyncTeamRead(params: params, id: id)
+        case "team.agent.transcript":
+            return await asyncTeamAgentTranscript(params: params, id: id)
 #if DEBUG
         // Named under `team.` rather than `debug.` because only that prefix
         // reaches this dispatcher (see the `hasPrefix("team.")` gate).
@@ -3419,9 +3429,16 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
         let requestId = params["request_id"] as? String
+        let taskShape = ProjectTaskShape(
+            rawValue: (params["task_shape"] as? String) ?? ""
+        ) ?? .singleUnit
+        let riskReasons = Set(
+            (params["risk_reasons"] as? [String] ?? []).compactMap(ProjectRoutingRisk.init(rawValue:))
+        )
         let stored: (request: TeamDataStore.LeaderRequest, replayed: Bool, persisted: Bool)
         switch TeamDataStore.shared.enqueueLeaderRequest(
-            teamName: teamName, content: text, requestId: requestId
+            teamName: teamName, content: text, requestId: requestId,
+            taskShape: taskShape, riskReasons: riskReasons
         ) {
         case .created(let request, let persisted): stored = (request, false, persisted)
         case .replayed(let request, let persisted): stored = (request, true, persisted)
@@ -3684,6 +3701,80 @@ class TerminalController {
         ])
     }
 #endif
+
+    /// `team.agent.transcript`: a native agent pane's structured conversation
+    /// (`AgentSession.Entry`) for consumers that draw a chat instead of a
+    /// terminal — the mobile remote-control listener first. Entries carry
+    /// stable ids; streaming answers and tool results mutate in place, so
+    /// callers re-render by id rather than appending blindly. `limit` keeps
+    /// the tail (default 200).
+    private func asyncTeamAgentTranscript(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String, !teamName.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard let agentName = params["agent_name"] as? String, !agentName.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing agent_name")
+        }
+        let limit = max(1, min(params["limit"] as? Int ?? 200, 2000))
+        let selection = await resolveTeamAgentInstance(params: params, teamName: teamName, agentName: agentName)
+        if let failure = selection.failure { return v2Result(id: id, failure) }
+        guard let instanceId = selection.instanceId else {
+            return v2Error(id: id, code: "not_found", message: "Agent not found")
+        }
+        let snapshot: [String: Any]? = await MainActor.run {
+            guard let session = TeamOrchestrator.shared.nativeAgentSession(
+                teamName: teamName, agentName: agentName, agentInstanceId: instanceId
+            ) else { return nil }
+            let entries = session.entries
+            let tail = entries.count > limit ? Array(entries.suffix(limit)) : entries
+            return [
+                "team_name": teamName,
+                "agent_name": agentName,
+                "agent_instance_id": instanceId,
+                "running": session.isRunning,
+                "thinking": session.isThinking,
+                "in_flight": TeamOrchestrator.shared.isNativeTurnInFlight(teamName: teamName, agentName: agentName),
+                "summary": session.summary ?? "",
+                "total": entries.count,
+                "entries": tail.map(Self.describeAgentEntry),
+            ]
+        }
+        guard let snapshot else {
+            return v2Error(id: id, code: "not_native", message: "Agent is not a native pane")
+        }
+        return v2Ok(id: id, result: snapshot)
+    }
+
+    /// Wire form of one native transcript entry. Shared shape with the DEBUG
+    /// `debug.agent.transcript`, plus the id the mobile page keys on.
+    private static func describeAgentEntry(_ entry: AgentSession.Entry) -> [String: Any] {
+        switch entry {
+        case .said(let id, let speaker, let text):
+            return ["id": id.uuidString, "kind": "said",
+                    "speaker": speaker == .person ? "person" : "leader", "text": text]
+        case .answered(let id, let text):
+            return ["id": id.uuidString, "kind": "answered", "text": text]
+        case .thought(let id, let body):
+            return ["id": id.uuidString, "kind": "thought", "text": body ?? ""]
+        case .tool(let id, let call):
+            var described: [String: Any] = [
+                "id": id.uuidString, "kind": "tool", "name": call.name, "headline": call.headline,
+                "result": call.result ?? "", "failed": call.failed, "running": call.isRunning]
+            if let change = call.change {
+                described["change"] = [
+                    "path": change.path, "added": change.added, "removed": change.removed,
+                    "lines": change.lines.count, "elided": change.elided, "everywhere": change.everywhere]
+            }
+            return described
+        case .turnEnded(let id, let end):
+            return ["id": id.uuidString, "kind": "turn_ended", "stop": end.stop, "failed": end.failed,
+                    "cost": end.cost ?? 0, "duration": end.duration ?? 0,
+                    "tokens_in": end.tokensIn ?? 0, "tokens_out": end.tokensOut ?? 0,
+                    "completed_at": end.completedAt.timeIntervalSince1970]
+        case .notice(let id, let text):
+            return ["id": id.uuidString, "kind": "notice", "text": text]
+        }
+    }
 
     private func asyncTeamCollect(params: [String: Any], id: Any?) async -> String {
         guard let teamName = params["team_name"] as? String else {
@@ -5217,6 +5308,9 @@ class TerminalController {
         }
         switch store.takeLeaderRequest(teamName: teamName, requestId: requestId) {
         case .succeeded(let request):
+            DispatchQueue.main.async {
+                TeamOrchestrator.shared.syncDelegationStateFromStore(teamName: teamName)
+            }
             return v2Ok(id: id, result: store.leaderRequestDictionary(request, includeContent: true))
         case .notFound:
             return v2Error(id: id, code: "not_found", message: "Leader request not found")
@@ -6149,8 +6243,15 @@ class TerminalController {
         }
 
         let stored: (request: TeamDataStore.LeaderRequest, replayed: Bool, persisted: Bool)
+        let taskShape = ProjectTaskShape(
+            rawValue: (params["task_shape"] as? String) ?? ""
+        ) ?? .singleUnit
+        let riskReasons = Set(
+            (params["risk_reasons"] as? [String] ?? []).compactMap(ProjectRoutingRisk.init(rawValue:))
+        )
         switch TeamDataStore.shared.enqueueLeaderRequest(
-            teamName: teamName, content: text, requestId: params["request_id"] as? String
+            teamName: teamName, content: text, requestId: params["request_id"] as? String,
+            taskShape: taskShape, riskReasons: riskReasons
         ) {
         case .created(let request, let persisted): stored = (request, false, persisted)
         case .replayed(let request, let persisted): stored = (request, true, persisted)
@@ -6227,6 +6328,9 @@ class TerminalController {
         }
         switch TeamDataStore.shared.takeLeaderRequest(teamName: teamName, requestId: requestId) {
         case .succeeded(let request):
+            DispatchQueue.main.async {
+                TeamOrchestrator.shared.syncDelegationStateFromStore(teamName: teamName)
+            }
             return .ok(TeamDataStore.shared.leaderRequestDictionary(request, includeContent: true))
         case .notFound:
             return .err(code: "not_found", message: "Leader request not found", data: nil)
@@ -6257,6 +6361,37 @@ class TerminalController {
         case .persistenceFailed:
             return .err(code: "persistence_failed", message: "Could not persist leader request completion", data: nil)
         }
+    }
+
+    private func v2TeamDelegationConfigure(params: [String: Any]) -> V2CallResult {
+        guard let teamName = params["team_name"] as? String,
+              let rawLevel = params["level"] as? String,
+              let level = ProjectDelegationLevel(rawValue: rawLevel) else {
+            return .err(
+                code: "invalid_params",
+                message: "level must be leaderFirst, guarded, or delegated", data: nil
+            )
+        }
+        guard TeamDataStore.shared.isAuthorizedLeaderRequestToken(
+            teamName: teamName, token: params["leader_request_token"] as? String
+        ) else {
+            return .err(code: "unauthorized", message: "Leader request capability required", data: nil)
+        }
+        var state: ProjectDelegationState?
+        v2MainSync {
+            state = TeamOrchestrator.shared.setProjectDelegationLevel(
+                teamName: teamName, level: level
+            )
+        }
+        guard let state else {
+            return .err(code: "not_found", message: "Team not found", data: nil)
+        }
+        return .ok([
+            "team_name": teamName,
+            "configured": state.configured.rawValue,
+            "effective": state.effective.rawValue,
+            "pending": state.pending?.rawValue as Any? ?? NSNull(),
+        ])
     }
 
     private func v2TeamSend(params: [String: Any]) -> V2CallResult {

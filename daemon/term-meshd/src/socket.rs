@@ -247,6 +247,10 @@ pub struct Context {
     /// User-triggered, non-persistent Pair Reviews. This registry is separate
     /// from autonomous Watch so a one-shot review cannot enable, disable, or
     /// otherwise perturb a team's continuous configuration.
+    /// Mobile remote-control exposure registry (`docs/mobile-remote-control.md`
+    /// §4.1). `remote.on/off/status/list` mutate it; the mobile listener in
+    /// `crate::http_mobile` reads it. In-memory only.
+    pub remote_registry: crate::remote::SharedRegistry,
     pub pair_reviews: Arc<tokio::sync::Mutex<HashMap<String, PairReviewRun>>>,
     pub pane_tracker: PaneTracker,
     pub event_tx: EventSender,
@@ -1353,6 +1357,7 @@ pub async fn serve(
     watch_sink: Option<
         tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>,
     >,
+    remote_registry: crate::remote::SharedRegistry,
     mut shutdown_rx: watch::Receiver<bool>,
     started: watch::Sender<bool>,
 ) -> anyhow::Result<()> {
@@ -1386,6 +1391,7 @@ pub async fn serve(
         watch_registry,
         watch_runner,
         watch_sink,
+        remote_registry,
         pair_reviews: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         pane_tracker,
         event_tx,
@@ -3920,6 +3926,111 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
+        // ── mobile remote-control exposure registry ──────────────────────
+        // `docs/mobile-remote-control.md` §4.1. In-memory registry mutations
+        // only; the listener (`crate::http_mobile`) is the consumer. No focus
+        // side effects. Not persisted: a daemon restart forgets every entry.
+        "remote.on" => {
+            match serde_json::from_value::<crate::remote::EnableSpec>(req.params.clone()) {
+                Ok(spec) => {
+                    let now = crate::remote::now_unix();
+                    let mut reg = ctx.remote_registry.lock().await;
+                    match reg.upsert(spec, now) {
+                        Ok(entry) => {
+                            let listener_enabled = crate::remote::listener_enabled();
+                            let (url, listener_error) = match crate::remote::listener_addr() {
+                                Ok(addr) => (
+                                    Some(crate::remote::target_url(&addr, &entry.surface_id)),
+                                    None,
+                                ),
+                                Err(e) => (None, Some(e)),
+                            };
+                            Ok(serde_json::json!({
+                                "status": "ok",
+                                "entry": entry,
+                                "url": url,
+                                "listener_enabled": listener_enabled,
+                                "listener_error": listener_error,
+                            }))
+                        }
+                        Err(e) => Err(format!("invalid params: {e}")),
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "remote.off" => {
+            #[derive(Deserialize)]
+            struct P {
+                surface_id: String,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let mut reg = ctx.remote_registry.lock().await;
+                    let removed = reg.remove(&p.surface_id);
+                    Ok(serde_json::json!({
+                        "status": "ok",
+                        "surface_id": p.surface_id.trim(),
+                        "removed": removed,
+                    }))
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "remote.status" => {
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)]
+                surface_id: Option<String>,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(p) => {
+                    let now = crate::remote::now_unix();
+                    let reg = ctx.remote_registry.lock().await;
+                    let listener_enabled = crate::remote::listener_enabled();
+                    let listener_addr = crate::remote::listener_addr().ok();
+                    match p.surface_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(id) => {
+                            let entry = reg.get(id).cloned();
+                            let expired = entry.as_ref().map(|e| e.is_expired(now)).unwrap_or(false);
+                            Ok(serde_json::json!({
+                                "status": "ok",
+                                "surface_id": id,
+                                "exposed": entry.is_some() && !expired,
+                                "expired": expired,
+                                "entry": entry,
+                                "url": entry.as_ref().and_then(|e| listener_addr.as_ref().map(|a| crate::remote::target_url(a, &e.surface_id))),
+                                "listener_enabled": listener_enabled,
+                                "now": now,
+                            }))
+                        }
+                        None => Ok(serde_json::json!({
+                            "status": "ok",
+                            "count": reg.len(),
+                            "entries": reg.list(),
+                            "listener_enabled": listener_enabled,
+                            "listener_addr": listener_addr.map(|a| a.to_string()),
+                            "now": now,
+                        })),
+                    }
+                }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        "remote.list" => {
+            // Prune first: expired entries and GUI entries whose app socket is
+            // gone. Liveness of the surface itself is observed lazily by the
+            // listener (a `not_found` from the app socket drops the entry).
+            let now = crate::remote::now_unix();
+            let mut reg = ctx.remote_registry.lock().await;
+            let pruned = reg.prune(now, crate::remote::app_socket_alive);
+            Ok(serde_json::json!({
+                "status": "ok",
+                "entries": reg.list(),
+                "pruned": pruned,
+                "now": now,
+            }))
+        }
         // ── watcher Phase 2 (P4): drift-watch on/off/status ──────────────
         // In-memory registry mutations only. NO focus side effects (no send_key,
         // window.focus, or pane.focus). Config-file persistence is P6.
@@ -4956,6 +5067,40 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Ok(P { bytes: None }) => {
                     Ok(serde_json::json!({"bytes": surface::replay_capacity()}))
                 }
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+        // Operator view of durable Project manifests: every record with its
+        // live-surface count and whether its directory still exists.
+        "peer.project_presentations.list" => {
+            match crate::peer::layout::PeerHost::active_host() {
+                Some(host) => Ok(serde_json::json!({
+                    "records": host.project_presentation_statuses()
+                })),
+                None => Err("peer host is not running (daemon started without TERMMESH_PEER_SOCKET)".to_string()),
+            }
+        }
+        // Host-side removal of manifests nothing can resume (issue #389).
+        // Dry-run unless `apply`; live records are never removed; an applied
+        // prune backs the file up first. Never touches workspaces.
+        "peer.project_presentations.prune" => {
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)]
+                project_ids: Vec<String>,
+                #[serde(default)]
+                apply: bool,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(params) => match crate::peer::layout::PeerHost::active_host() {
+                    Some(host) => host
+                        .prune_stale_project_presentations(&params.project_ids, params.apply)
+                        .map_err(|code| code.to_string())
+                        .and_then(|report| {
+                            serde_json::to_value(report).map_err(|e| e.to_string())
+                        }),
+                    None => Err("peer host is not running (daemon started without TERMMESH_PEER_SOCKET)".to_string()),
+                },
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }

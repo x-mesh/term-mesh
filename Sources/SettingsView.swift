@@ -191,6 +191,12 @@ struct SettingsView: View {
     @AppStorage(TermMeshDaemon.dashboardLocalhostOnlyKey) private var dashboardLocalhostOnly = true
     @AppStorage(TermMeshDaemon.dashboardPortKey) private var dashboardPort = 9876
     @AppStorage(TermMeshDaemon.dashboardPasswordKey) private var dashboardPassword = ""
+    // Mobile remote control (docs/mobile-remote-control.md §4.4). Same
+    // auto-restart contract as the dashboard: the daemon reads these at start.
+    @AppStorage(TermMeshDaemon.mobileEnabledKey) private var mobileEnabled = false
+    @AppStorage(TermMeshDaemon.mobileAuthKey) private var mobileAuth = "tailscale"
+    @AppStorage(TermMeshDaemon.mobileAllowedLoginsKey) private var mobileAllowedLogins = ""
+    @AppStorage(TermMeshDaemon.mobilePortKey) private var mobilePort = TermMeshDaemon.defaultMobilePort
     @AppStorage(TerminalSettingsOverride.fontFamilyKey) private var terminalFontFamily = ""
     @AppStorage(TerminalSettingsOverride.fontSizeKey) private var terminalFontSize: Double = 0
     @AppStorage(TerminalSettingsOverride.themeLightKey) private var terminalThemeLight = ""
@@ -1468,7 +1474,8 @@ struct SettingsView: View {
                             .pickerStyle(.menu)
                         }
 
-                        if settingsMatch("leader", "participation", "shadow", "canary", "kill switch") {
+                        if settingsMatch("leader", "participation", "shadow", "canary", "kill switch",
+                                         "리더", "참여", "관찰", "시험 적용", "긴급 중지") {
                         SettingsCardDivider()
 
                         SettingsCardRow(
@@ -1510,7 +1517,7 @@ struct SettingsView: View {
                             "Canary Projects",
                             subtitle: "Explicit Project names, comma-separated. No Project is opted in by default."
                         ) {
-                            TextField("project-a, project-b", text: $leaderParticipationOptInProjects)
+                            TextField(LocalizedStringKey("project-a, project-b"), text: $leaderParticipationOptInProjects)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 240)
                         }
@@ -1854,6 +1861,86 @@ struct SettingsView: View {
                         SettingsCardDivider()
 
                         SettingsCardNote("Dashboard settings auto-restart the daemon when changed. The dashboard shows system metrics, team status, agents, and task boards.")
+        }
+
+        sectionMobileRemoteControl
+    }
+
+    // MARK: - Section: Mobile Remote Control
+
+    @ViewBuilder
+    private var sectionMobileRemoteControl: some View {
+        SettingsCard {
+            SettingsCardRow(
+                "Mobile Remote Control",
+                verbatimSubtitle: mobileEnabled
+                    ? String(
+                        format: LanguageSettings.localized("Loopback listener at 127.0.0.1:%@. Expose it to your tailnet with `tailscale serve --bg %@`."),
+                        String(mobilePort), String(mobilePort)
+                      )
+                    : LanguageSettings.localized("Disabled. Panes exposed with /rc stay unreachable until the listener is on.")
+            ) {
+                Toggle("", isOn: $mobileEnabled)
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .onChange(of: mobileEnabled) { _ in
+                        scheduleDaemonRestart(delay: 0)
+                    }
+            }
+
+            if mobileEnabled {
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Authentication",
+                    subtitle: mobileAuth == "loopback"
+                        ? "⚠️ Every local process passes. Development only."
+                        : "Requests must carry a Tailscale identity from an allowed login (Tailscale Serve adds it; Funnel is refused).",
+                    controlWidth: pickerColumnWidth
+                ) {
+                    Picker("", selection: $mobileAuth) {
+                        Text("Tailscale identity").tag("tailscale")
+                        Text("Loopback (development)").tag("loopback")
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .onChange(of: mobileAuth) { _ in
+                        scheduleDaemonRestart(delay: 0)
+                    }
+                }
+
+                if mobileAuth == "tailscale" {
+                    SettingsCardDivider()
+
+                    SettingsCardRow(
+                        "Allowed Logins",
+                        subtitle: "Comma-separated tailnet logins, e.g. you@example.com. Empty refuses everyone.",
+                        controlWidth: pickerColumnWidth
+                    ) {
+                        TextField("you@example.com", text: $mobileAllowedLogins)
+                            .textFieldStyle(.roundedBorder)
+                            .multilineTextAlignment(.trailing)
+                            .onChange(of: mobileAllowedLogins) { _ in
+                                scheduleDaemonRestart(delay: 1.5)
+                            }
+                    }
+                }
+
+                SettingsCardDivider()
+
+                SettingsCardRow("Port", subtitle: "Loopback port for the mobile listener.", controlWidth: pickerColumnWidth) {
+                    TextField("", value: $mobilePort, format: .number.grouping(.never))
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.trailing)
+                        .onChange(of: mobilePort) { _ in
+                            scheduleDaemonRestart(delay: 1.5)
+                        }
+                }
+            }
+
+            SettingsCardDivider()
+
+            SettingsCardNote("Only panes registered with /rc are exposed, and only on loopback. Reach them from your phone through Tailscale Serve; the daemon restarts when these settings change.")
         }
     }
 

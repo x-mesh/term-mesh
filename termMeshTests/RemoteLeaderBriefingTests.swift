@@ -340,8 +340,8 @@ final class RemoteLeaderAutonomyFlagsTests: XCTestCase {
         XCTAssertTrue(command.contains("--start"))
         XCTAssertTrue(command.contains("--end"))
         XCTAssertFalse(command.contains("leader-request-token"))
-        XCTAssertTrue(command.contains("status=$?; rm -f -- '/cache/leader hook.sh'"))
-        XCTAssertTrue(command.contains("exit \"$status\""))
+        XCTAssertTrue(command.contains("term_mesh_exit_status=$?; rm -f -- '/cache/leader hook.sh'"))
+        XCTAssertTrue(command.contains("exit \"$term_mesh_exit_status\""))
 
         let json = try XCTUnwrap(
             TeamOrchestrator.remoteLeaderTurnHookSettingsJSON(path: "/cache/leader hook.sh")
@@ -355,7 +355,26 @@ final class RemoteLeaderAutonomyFlagsTests: XCTestCase {
             teamName: "xm", workingDirectory: "/srv/xm",
             systemPromptFile: "/tmp/prompt"
         )
-        XCTAssertFalse(command.contains("status=$?; rm -f --"))
+        XCTAssertFalse(command.contains("term_mesh_exit_status=$?; rm -f --"))
+    }
+
+    func test_remoteCodexLeaderCarriesTurnHooksAndCleansPrivateFiles() {
+        let command = TeamOrchestrator.remoteAgentCommand(
+            cli: "codex", model: "gpt-5.6-sol", agentName: "leader",
+            teamName: "xm", workingDirectory: "/srv/xm",
+            systemPromptFile: "/tmp/prompt",
+            needsSocketAccess: true,
+            turnHookFile: "/cache/leader hook.sh",
+            participationControlFile: "/cache/participation.json"
+        )
+        XCTAssertTrue(command.contains("--dangerously-bypass-hook-trust"))
+        XCTAssertTrue(command.contains("hooks.UserPromptSubmit"))
+        XCTAssertTrue(command.contains("hooks.Stop"))
+        XCTAssertTrue(command.contains("--start"))
+        XCTAssertTrue(command.contains("--end"))
+        XCTAssertTrue(command.contains("rm -f -- '/cache/leader hook.sh' '/cache/participation.json'"))
+        XCTAssertTrue(command.contains("term_mesh_exit_status=$?"))
+        XCTAssertTrue(command.contains("exit \"$term_mesh_exit_status\""))
     }
 
     func test_remoteTurnHookStageIsAtomicAndOwnerOnly() {

@@ -421,6 +421,9 @@ async fn reader_loop(
                             members.iter().map(|member| member.name.clone()).collect();
                         team.members = members;
                         team.presentation_revision = manifest.revision;
+                        team.delegation_configured = manifest.delegation_configured;
+                        team.delegation_effective = manifest.delegation_effective;
+                        team.delegation_pending = manifest.delegation_pending;
                         team.created_at_unix_secs = manifest.created_at_unix_secs;
                         team.presentation_owned_by_requester =
                             project_owner_hex.contains(&manifest.owner_peer_id);
@@ -450,6 +453,9 @@ async fn reader_loop(
                                 .is_some_and(|info| info.foreground_busy),
                             leader_process_active_known: leader_info
                                 .is_some_and(|info| info.foreground_busy_known),
+                            delegation_configured: manifest.delegation_configured,
+                            delegation_effective: manifest.delegation_effective,
+                            delegation_pending: manifest.delegation_pending,
                         });
                     }
                 }
@@ -526,9 +532,6 @@ async fn reader_loop(
                         ) {
                             Ok(released) => {
                                 let changed = released.is_some();
-                                for surface_id in released.into_iter().flatten() {
-                                    reap_if_abandoned(&host, &surface_id);
-                                }
                                 (
                                     UpsertProjectPresentationResponse {
                                         request_id: request.request_id,
