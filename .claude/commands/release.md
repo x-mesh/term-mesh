@@ -30,7 +30,7 @@ Accepted forms:
    python3 scripts/release.py prepare <version> --notes-file <temp-file> --relay-e2e-receipt <receipt-path> --yes --json
    ```
 
-5. Report gates and the release PR receipt. Show publish effects: squash merge, exact merge-SHA tag, Release build, dSYM, DMG, GitHub/Linux assets, Homebrew cask, and develop resync. Ask one explicit confirmation. On approval:
+5. Report gates and the release PR receipt. Show publish effects: squash merge, exact merge-SHA tag, Release build, dSYM, DMG, GitHub/Linux assets, Homebrew cask, develop resync, and cleanup. Ask one explicit confirmation. On approval:
 
    ```bash
    python3 scripts/release.py publish <version> --yes --json
@@ -43,6 +43,8 @@ Accepted forms:
    ```
 
 7. Completion requires `state: complete`, matching `main`/`develop`/tag SHAs, the pinned relay E2E receipt, and all required assets in the `verify` receipt.
+
+8. `cleanup` runs last and reclaims the release checkouts under `~/.cache/term-mesh/release-worktrees` plus the local `chore/release-v*` branches whose tag already shipped. It only touches the current version and older ones, so a concurrent newer release is safe. Pass `--keep-worktrees` to publish or resume when a checkout must survive for post-release debugging.
 
 ## Status
 

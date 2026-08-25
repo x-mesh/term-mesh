@@ -152,5 +152,86 @@ class ReleaseStateMachineTests(unittest.TestCase):
         )
 
 
+    def test_cleanup_runs_after_verify(self):
+        self.assertEqual(release.STEP_ORDER[-1], "cleanup")
+        self.assertLess(release.STEP_ORDER.index("verify"), release.STEP_ORDER.index("cleanup"))
+
+    def test_load_state_backfills_steps_added_after_the_file_was_written(self):
+        with tempfile.TemporaryDirectory() as directory, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": directory}
+        ):
+            (Path(directory) / "v0.202.0.json").write_text(json.dumps({
+                "schema": 1, "version": "0.202.0",
+                "steps": {"develop_to_main": {"status": "completed"}},
+            }))
+            state = release.load_state("0.202.0")
+            self.assertTrue(release.completed(state, "develop_to_main"))
+            self.assertFalse(release.completed(state, "cleanup"))
+
+    def test_cleanup_claims_this_version_and_older_but_never_develop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("develop", "v0.212.0-source", "v0.213.0-source",
+                         "v0.213.0-artifact-2e00f3b16eea", "v0.214.0-source"):
+                (root / name).mkdir()
+            with unittest.mock.patch.object(release, "RELEASE_WORKTREES", root):
+                claimed = [path.name for path in release.obsolete_release_worktrees("0.213.0")]
+        self.assertEqual(claimed, ["v0.212.0-source", "v0.213.0-artifact-2e00f3b16eea", "v0.213.0-source"])
+
+    def test_cleanup_only_claims_release_branches_whose_tag_shipped(self):
+        def fake_git(*args, **kwargs):
+            if args[0] == "branch":
+                return "chore/release-v0.212.0\nchore/release-v0.213.0\nchore/release-v0.214.0"
+            if args[0] == "tag":
+                return args[2] if args[2] in ("v0.212.0",) else ""
+            raise AssertionError(args)
+
+        with unittest.mock.patch.object(release, "git", fake_git):
+            self.assertEqual(release.obsolete_release_branches("0.213.0"), ["chore/release-v0.212.0"])
+
+    def test_cleanup_records_what_it_reclaimed(self):
+        with tempfile.TemporaryDirectory() as directory, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": directory}
+        ):
+            state = {"schema": 1, "version": "0.213.0",
+                     "release_branch": "chore/release-v0.213.0",
+                     "steps": {name: {"status": "pending"} for name in release.STEP_ORDER}}
+            deleted = []
+            with unittest.mock.patch.object(
+                release, "obsolete_release_worktrees",
+                return_value=[Path("/tmp/v0.213.0-source")],
+            ), unittest.mock.patch.object(
+                release, "obsolete_release_branches", return_value=["chore/release-v0.213.0"],
+            ), unittest.mock.patch.object(
+                release, "remove_worktree", return_value=True,
+            ), unittest.mock.patch.object(
+                release, "run", side_effect=lambda *args, **kwargs: deleted.append(args) or "",
+            ):
+                release.cleanup(state, keep_worktrees=False)
+        self.assertEqual(deleted, [("git", "branch", "-D", "chore/release-v0.213.0")])
+        self.assertEqual(state["steps"]["cleanup"]["worktrees"], ["/tmp/v0.213.0-source"])
+        self.assertEqual(state["steps"]["cleanup"]["branches"], ["chore/release-v0.213.0"])
+
+    def test_cleanup_opt_out_touches_nothing(self):
+        with tempfile.TemporaryDirectory() as directory, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": directory}
+        ):
+            state = {"schema": 1, "version": "0.213.0",
+                     "release_branch": "chore/release-v0.213.0",
+                     "steps": {name: {"status": "pending"} for name in release.STEP_ORDER}}
+            with unittest.mock.patch.object(release, "remove_worktree") as remover:
+                release.cleanup(state, keep_worktrees=True)
+        remover.assert_not_called()
+        self.assertEqual(state["steps"]["cleanup"]["skipped"], "--keep-worktrees")
+
+    def test_a_finished_release_does_not_rebuild_its_worktrees(self):
+        source = (ROOT / "scripts/release.py").read_text()
+        self.assertIn(
+            'wt = None if completed(state, "release_metadata") else release_worktree(state, main_sha)',
+            source,
+        )
+        self.assertIn("if any(not completed(state, name) for name in artifact_steps)", source)
+
+
 if __name__ == "__main__":
     unittest.main()
