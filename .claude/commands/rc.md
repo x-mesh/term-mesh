@@ -36,10 +36,17 @@ tm-agent remote $ARGUMENTS         # /rc on --keys none  →  tm-agent remote on
 ```
 
 Show the output verbatim (URL, keys, expiry). Use the `tm-agent` that belongs
-to the app this pane runs in: the bundle's `Contents/Resources/bin/tm-agent`
-first, then `tm-agent` in PATH, then `./daemon/target/release/tm-agent`. An
-older `tm-agent` reports `unrecognized subcommand 'remote'`; then try the next
-binary rather than another spelling.
+to the app this pane runs in — the pane environment names it:
+
+```bash
+"$TERMMESH_APP_BIN/tm-agent" remote $ARGUMENTS   # the running app's own binary (preferred)
+tm-agent remote $ARGUMENTS                      # PATH fallback (may be an older release)
+```
+
+An older `tm-agent` reports `unrecognized subcommand 'remote'`; then try the
+next binary rather than another spelling. Do not guess `/Applications/…`
+paths: a tagged development app lives elsewhere and `$TERMMESH_APP_BIN` already
+points at it.
 
 After `on`, tell the user in one or two lines:
 

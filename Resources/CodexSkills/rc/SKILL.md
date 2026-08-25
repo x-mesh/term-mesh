@@ -33,11 +33,11 @@ tm-agent remote off
 tm-agent remote status --all
 ```
 
-Prefer the `tm-agent` bundled with the app this pane runs in
-(`<app>/Contents/Resources/bin/tm-agent`), then `tm-agent` in PATH, then
-`./daemon/target/release/tm-agent`. An older binary answers
-`unrecognized subcommand 'remote'`; then try the next binary rather than another
-spelling.
+Run `"$TERMMESH_APP_BIN/tm-agent"` first: the pane environment names the
+running app's own binary (a tagged development app lives outside
+`/Applications`, so never guess that path). Fall back to `tm-agent` in PATH. An
+older binary answers `unrecognized subcommand 'remote'`; then try the next
+binary rather than another spelling.
 
 Show the command output verbatim (URL, keys, expiry). After `on`, tell the user
 in one or two lines: the printed URL (loopback on the Mac; from a phone it is

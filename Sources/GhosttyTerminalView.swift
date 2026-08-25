@@ -824,6 +824,11 @@ final class TerminalSurface: Identifiable, ObservableObject {
             let resourcePath = resourceURL.path
             let overlayTerminfo = resourceURL.appendingPathComponent("terminfo-overlay").path
             let bundledGhostty = resourceURL.appendingPathComponent("ghostty").path
+            // Where this app's own CLIs live (tm-agent, term-mesh, term-meshd).
+            // PATH may still resolve `tm-agent` to an older release from brew,
+            // and a tagged development app lives outside /Applications, so
+            // skills such as /rc run "$TERMMESH_APP_BIN/tm-agent" first.
+            env["TERMMESH_APP_BIN"] = resourceURL.appendingPathComponent("bin").path
             let resolvedTerminfo = (env["TERMINFO"]?.isEmpty == false ? env["TERMINFO"] : nil)
                 ?? getenv("TERMINFO").map { String(cString: $0) }
                 ?? ProcessInfo.processInfo.environment["TERMINFO"]

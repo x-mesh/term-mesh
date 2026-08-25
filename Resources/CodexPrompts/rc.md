@@ -29,7 +29,7 @@ Pass the arguments through unchanged; `$ARGUMENTS` already starts with the subco
 tm-agent remote $ARGUMENTS         # /rc on --keys none  →  tm-agent remote on --keys none
 ```
 
-Show the output verbatim (URL, keys, expiry). Prefer the app bundle's `Contents/Resources/bin/tm-agent`, then `tm-agent` in PATH, then `./daemon/target/release/tm-agent`; an older binary answers `unrecognized subcommand 'remote'`.
+Show the output verbatim (URL, keys, expiry). Run `"$TERMMESH_APP_BIN/tm-agent"` first (the pane environment names the running app's own binary), then `tm-agent` in PATH; an older binary answers `unrecognized subcommand 'remote'`. Do not guess `/Applications/…` paths.
 
 After `on`, tell the user in one or two lines: the printed URL (loopback on the Mac; from a phone it is `https://<mac-hostname>.<tailnet>.ts.net/t/<surface_id>` once `tailscale serve --bg 9877` is active), and, if the output says the listener is disabled, that it must be enabled in Settings (Mobile remote control) or with `TERM_MESH_MOBILE_ENABLED=1` before the daemon starts.
 
