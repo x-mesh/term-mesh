@@ -108,6 +108,9 @@ pub async fn serve(
     // Only the daemon has agent teams; without this the host answers no
     // ListTeams and never advertises team.roster.v1.
     host.set_teams(teams);
+    // Lets control-socket RPCs (tm-agent daemon project-presentations …)
+    // reach the one production host.
+    host.register_active_host();
     // And the task board, which is what `team.task.diff` reads a worktree path
     // out of. Wired here for the same reason as the manager above: only the
     // daemon has one, and a host without it says so rather than guessing.

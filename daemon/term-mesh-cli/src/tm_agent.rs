@@ -1894,6 +1894,38 @@ enum DaemonCommand {
         #[arg(long)]
         set: Option<String>,
     },
+    /// Inspect or prune this host's durable Project manifests
+    /// (`peer-project-presentations.json`). Records another installation
+    /// owns cannot be deleted over the peer protocol; this is the
+    /// host-side path for them.
+    ProjectPresentations(ProjectPresentationsCommands),
+}
+
+#[derive(clap::Args)]
+struct ProjectPresentationsCommands {
+    #[command(subcommand)]
+    command: ProjectPresentationsCommand,
+}
+
+#[derive(Subcommand)]
+enum ProjectPresentationsCommand {
+    /// List every manifest with its referenced/live surface counts, owner
+    /// and whether the recorded directory still exists.
+    List,
+    /// Remove manifests nothing can resume. Without --project-id only
+    /// records whose directory is gone and whose surfaces are all dead are
+    /// candidates; a record with any live surface is never removed. Reports
+    /// only unless --apply is given; an applied prune writes a timestamped
+    /// .bak copy next to the file first. Workspaces are never touched.
+    Prune {
+        /// Restrict to these Project IDs (repeatable). Explicitly named
+        /// records are removed even if their directory still exists.
+        #[arg(long = "project-id")]
+        project_ids: Vec<String>,
+        /// Perform the removal instead of previewing it.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7453,6 +7485,31 @@ fn main() {
                 cmd_daemon_replay_capacity(&sock, set.as_deref());
                 return;
             }
+            DaemonCommand::ProjectPresentations(cmd) => {
+                let sock = detect_daemon_socket()
+                    .or_else(detect_socket)
+                    .unwrap_or_else(|| {
+                        eprintln!("Error: no daemon socket found");
+                        process::exit(1);
+                    });
+                match &cmd.command {
+                    ProjectPresentationsCommand::List => {
+                        cmd_daemon_rpc_print(&sock, "peer.project_presentations.list", json!({}));
+                    }
+                    ProjectPresentationsCommand::Prune { project_ids, apply } => {
+                        let result = cmd_daemon_rpc_print(
+                            &sock,
+                            "peer.project_presentations.prune",
+                            json!({ "project_ids": project_ids, "apply": apply }),
+                        );
+                        let removed = result["removed"].as_array().map(|r| r.len()).unwrap_or(0);
+                        if !apply && removed > 0 {
+                            println!("(dry-run — pass --apply to remove {removed} record(s))");
+                        }
+                    }
+                }
+                return;
+            }
         }
     }
 
@@ -10211,6 +10268,33 @@ fn parse_byte_size(raw: &str) -> Result<usize, String> {
         .map_err(|e| format!("invalid byte size {raw:?}: {e}"))?;
     n.checked_mul(multiplier)
         .ok_or_else(|| format!("byte size overflow: {raw:?}"))
+}
+
+/// One daemon RPC: the `result` value, or the transport/RPC error message.
+fn cmd_daemon_rpc(sock: &PathBuf, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    match rpc_call(sock, method, params) {
+        Ok(resp) if resp["error"].is_null() => Ok(resp["result"].clone()),
+        Ok(resp) => Err(resp["error"]["message"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{method} failed"))),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Print a daemon RPC result, or the error and a non-zero exit so scripts
+/// can trust the status. Returns the result for callers adding a summary.
+fn cmd_daemon_rpc_print(sock: &PathBuf, method: &str, params: serde_json::Value) -> serde_json::Value {
+    match cmd_daemon_rpc(sock, method, params) {
+        Ok(result) => {
+            println!("{}", pretty(&result));
+            result
+        }
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            process::exit(1);
+        }
+    }
 }
 
 /// `tm-agent daemon replay-capacity [--set <value>]` — get or set the peer

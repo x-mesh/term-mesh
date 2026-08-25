@@ -88,6 +88,30 @@ final class PeerPaneSessionTests: XCTestCase {
         ) else { return XCTFail("remote name collision was not reported") }
     }
 
+    func testRemoteCollisionOffersDeletionOnlyForOwnedRemoteRecordsWithProjectID() {
+        var remote = conflictRecord(
+            location: .remote(hostKey: "ssh:mac-sub", hostName: "mac-sub")
+        )
+        XCTAssertFalse(remote.canDeleteOwnedRemoteRecord, "foreign records need host-side cleanup")
+
+        remote.presentationOwnedByRequester = true
+        XCTAssertTrue(remote.canDeleteOwnedRemoteRecord)
+
+        remote.leaderProcessActiveKnown = true
+        remote.leaderReady = true
+        XCTAssertFalse(remote.canDeleteOwnedRemoteRecord, "a running leader is live work, not a leftover")
+        remote.leaderReady = false
+        XCTAssertTrue(remote.canDeleteOwnedRemoteRecord, "a known-idle leader shell may be cleaned up")
+        remote.leaderProcessActiveKnown = false
+
+        remote.identity = .init(hostKey: "ssh:mac-sub", workingDirectory: "/work/xm")
+        XCTAssertFalse(remote.canDeleteOwnedRemoteRecord, "deletion needs an exact Project ID")
+
+        var local = conflictRecord(location: .detached(workspaceID: UUID()))
+        local.presentationOwnedByRequester = true
+        XCTAssertFalse(local.canDeleteOwnedRemoteRecord, "local lifecycle uses normal teardown")
+    }
+
     func testProjectNameConflictDoesNotHideDifferentIdentityBehindExactMatch() {
         let requested = TeamOrchestrator.ProjectCreationIdentity(
             projectID: "team:one", hostKey: "ssh:mac-sub",

@@ -4959,6 +4959,40 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
+        // Operator view of durable Project manifests: every record with its
+        // live-surface count and whether its directory still exists.
+        "peer.project_presentations.list" => {
+            match crate::peer::layout::PeerHost::active_host() {
+                Some(host) => Ok(serde_json::json!({
+                    "records": host.project_presentation_statuses()
+                })),
+                None => Err("peer host is not running (daemon started without TERMMESH_PEER_SOCKET)".to_string()),
+            }
+        }
+        // Host-side removal of manifests nothing can resume (issue #389).
+        // Dry-run unless `apply`; live records are never removed; an applied
+        // prune backs the file up first. Never touches workspaces.
+        "peer.project_presentations.prune" => {
+            #[derive(Deserialize)]
+            struct P {
+                #[serde(default)]
+                project_ids: Vec<String>,
+                #[serde(default)]
+                apply: bool,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(params) => match crate::peer::layout::PeerHost::active_host() {
+                    Some(host) => host
+                        .prune_stale_project_presentations(&params.project_ids, params.apply)
+                        .map_err(|code| code.to_string())
+                        .and_then(|report| {
+                            serde_json::to_value(report).map_err(|e| e.to_string())
+                        }),
+                    None => Err("peer host is not running (daemon started without TERMMESH_PEER_SOCKET)".to_string()),
+                },
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
 
         _ => Err(format!("unknown method: {}", req.method)),
     };
