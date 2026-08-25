@@ -184,6 +184,20 @@ fn validation_rejects_what_the_listener_cannot_serve() {
 }
 
 #[test]
+fn leader_request_token_is_kept_but_never_serialized() {
+    let mut reg = Registry::new();
+    let mut leader = pane_spec("surf-leader");
+    leader.kind = TargetKind::Leader;
+    leader.team_name = Some("live-team".into());
+    leader.leader_request_token = Some(" tok-123 ".into());
+    let entry = reg.upsert(leader, 0).unwrap();
+    assert_eq!(entry.leader_request_token.as_deref(), Some("tok-123"));
+    let json = serde_json::to_string(&entry).unwrap();
+    assert!(!json.contains("tok-123"), "{json}");
+    assert!(!json.contains("leader_request_token"), "{json}");
+}
+
+#[test]
 fn ttl_is_clamped_not_rejected() {
     let mut reg = Registry::new();
     let mut tiny = pane_spec("tiny");

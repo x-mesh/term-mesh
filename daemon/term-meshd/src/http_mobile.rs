@@ -512,13 +512,13 @@ async fn requests_handler(
             "durable requests exist only for leader targets",
         ));
     }
-    let result = app_call(
-        &state,
-        &entry,
-        "team.leader.request.list",
-        json!({ "team_name": entry.team_name }),
-    )
-    .await?;
+    // The app gates the board behind the leader pane's capability token;
+    // `tm-agent remote on --leader` captured it from the pane environment.
+    let mut params = json!({ "team_name": entry.team_name });
+    if let Some(token) = &entry.leader_request_token {
+        params["leader_request_token"] = json!(token);
+    }
+    let result = app_call(&state, &entry, "team.leader.request.list", params).await?;
     Ok(Json(json!({
         "surface_id": entry.surface_id,
         "team_name": entry.team_name,

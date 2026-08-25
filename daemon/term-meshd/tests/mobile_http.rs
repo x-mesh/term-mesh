@@ -138,6 +138,7 @@ async fn expose(h: &Harness, app: &FakeApp, id: &str, kind: TargetKind, keys: Ke
         team_name: (kind == TargetKind::Leader).then(|| "live-team".to_string()),
         app_socket: Some(app.path_str()),
         keys,
+        leader_request_token: (kind == TargetKind::Leader).then(|| "tok-leader".to_string()),
         ..EnableSpec::default()
     };
     h.registry
@@ -568,7 +569,13 @@ async fn requests_exist_only_for_leaders() {
     assert_eq!(leader.status, 200, "{}", leader.body);
     assert_eq!(leader.json()["count"], 1);
     assert_eq!(leader.json()["requests"][0]["id"], "req-9");
-    assert_eq!(app.calls()[0].1, json!({ "team_name": "live-team" }));
+    assert_eq!(
+        app.calls()[0].1,
+        json!({ "team_name": "live-team", "leader_request_token": "tok-leader" })
+    );
+    // The token never leaves the daemon: not in the target listing.
+    let listing = get(&h, "/api/targets").await;
+    assert!(!listing.body.contains("tok-leader"), "{}", listing.body);
 }
 
 #[tokio::test]

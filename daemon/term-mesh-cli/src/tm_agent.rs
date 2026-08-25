@@ -12593,6 +12593,17 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
             if let Some(ttl) = ttl_secs {
                 params["ttl_secs"] = json!(ttl);
             }
+            if is_leader {
+                // The durable board's list RPC needs the leader pane's capability
+                // token; only the daemon ever sees it.
+                if let Some(token) = env::var("TERMMESH_LEADER_REQUEST_TOKEN")
+                    .ok()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                {
+                    params["leader_request_token"] = json!(token);
+                }
+            }
             let result = remote_rpc(sock, "remote.on", params);
             if *json {
                 println!("{}", pretty(&result));

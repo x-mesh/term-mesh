@@ -86,6 +86,11 @@ pub struct Entry {
     pub owner: String,
     pub created_at: u64,
     pub expires_at: u64,
+    /// Leader panes only: the app's leader-request capability token
+    /// (`TERMMESH_LEADER_REQUEST_TOKEN`), needed to list the durable board.
+    /// Never serialized: it stays inside the daemon.
+    #[serde(default, skip_serializing)]
+    pub leader_request_token: Option<String>,
 }
 
 impl Entry {
@@ -117,6 +122,8 @@ pub struct EnableSpec {
     pub owner: Option<String>,
     #[serde(default)]
     pub ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub leader_request_token: Option<String>,
 }
 
 fn default_kind() -> TargetKind {
@@ -214,6 +221,10 @@ impl Registry {
                 .unwrap_or_else(|| "local".to_string()),
             created_at: now,
             expires_at: now.saturating_add(ttl),
+            leader_request_token: spec
+                .leader_request_token
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty()),
         };
         self.next_seq += 1;
         self.order.insert(surface_id.clone(), self.next_seq);
