@@ -1600,6 +1600,7 @@ final class TeamOrchestrator: ObservableObject {
     /// - Team identity (TERMMESH_TEAM*, CMUX_TEAM*)
     /// - CLAUDECODE flag (only for `agentCli == "claude"`; codex/gemini/kiro must not have it)
     /// - Per-agent routing (TERMMESH_AGENT_NAME, TERMMESH_AGENT_ROLE, TERMMESH_WINDOW_ID, TERMMESH_WORKSPACE_ID)
+    /// - App binary directory (TERMMESH_APP_BIN) for skills that call the bundled tm-agent
     static func buildAgentPaneEnv(
         teamName: String,
         agentName: String,
@@ -1646,6 +1647,12 @@ final class TeamOrchestrator: ObservableObject {
             "TERMMESH_CLI": agentCli,
             "PATH": currentPath,
         ]
+        // Native agent panes never pass through GhosttyTerminalView, which
+        // is where terminal panes get TERMMESH_APP_BIN; skills such as /rc run
+        // "$TERMMESH_APP_BIN/tm-agent" first, so name the app's binary here too.
+        if !resourceBin.isEmpty {
+            env["TERMMESH_APP_BIN"] = resourceBin
+        }
 
         // Only claude agents get CLAUDECODE=1 (Anthropic-specific; codex/gemini/kiro must not).
         if agentCli == "claude" {

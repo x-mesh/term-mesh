@@ -2080,6 +2080,9 @@ final class AgentSessionTests: XCTestCase {
             Bundle.main.resourcePath.map { "\($0)/bin" }
         )
         XCTAssertTrue(environment["PATH"]?.contains("/usr/bin") == true)
+        // Skills run "$TERMMESH_APP_BIN/tm-agent" first; native panes only get
+        // it from here.
+        XCTAssertEqual(environment["TERMMESH_APP_BIN"], Bundle.main.resourcePath.map { "\($0)/bin" })
     }
 
     func testCLIProfileCannotReplaceAgentRoutingOrBundledCLI() {
