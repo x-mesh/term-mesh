@@ -1862,6 +1862,11 @@ enum Commands {
     /// term-meshd socket — no team/app socket required).
     Daemon(DaemonCommands),
 
+    /// Mobile remote control: expose this pane to the tailnet mobile page
+    /// (`/rc` skill, docs/mobile-remote-control.md). Talks directly to the
+    /// term-meshd socket like `daemon`.
+    Remote(RemoteCommands),
+
     /// Distributed workspace coordinator control-plane operations.
     ///
     /// Talks directly to TERMMESH_COORDINATOR_UNIX_PATH or the default
@@ -1893,6 +1898,70 @@ enum DaemonCommand {
         /// the current value.
         #[arg(long)]
         set: Option<String>,
+    },
+}
+
+#[derive(clap::Args)]
+struct RemoteCommands {
+    #[command(subcommand)]
+    command: RemoteCommand,
+}
+
+#[derive(Subcommand)]
+enum RemoteCommand {
+    /// Expose this pane to the mobile page (`remote.on`). Running it again
+    /// replaces the entry and restarts the TTL.
+    On {
+        /// Keys the page may send: `safe` (Enter/Esc/Tab/arrows/y/n/1-9/C-c)
+        /// or `none`.
+        #[arg(long, default_value = "safe", value_parser = ["safe", "none"])]
+        keys: String,
+        /// Lifetime such as `12h`, `30m`, `2d`, or plain seconds. Default 24h;
+        /// the daemon clamps to 60s..7d.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Surface id. Defaults to this pane's $TERMMESH_SURFACE_ID.
+        #[arg(long)]
+        surface: Option<String>,
+        /// Register as the team leader: text from the page goes through the
+        /// durable leader request board instead of being typed. Auto-detected
+        /// for leader panes the app launched; adopted leaders pass it with
+        /// `--team`.
+        #[arg(long)]
+        leader: bool,
+        /// App control socket that owns the surface. Defaults to this pane's
+        /// $TERMMESH_SOCKET_PATH.
+        #[arg(long)]
+        app_socket: Option<String>,
+        /// Agent CLI label for the page (claude, codex, ...). Auto-detected
+        /// from the environment when omitted.
+        #[arg(long)]
+        cli: Option<String>,
+        /// Title for the page. Defaults to the working directory name.
+        #[arg(long)]
+        title: Option<String>,
+        /// Print the raw RPC result.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop exposing this pane (`remote.off`).
+    Off {
+        /// Surface id. Defaults to this pane's $TERMMESH_SURFACE_ID.
+        #[arg(long)]
+        surface: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show this pane's exposure, or every exposed surface with `--all`.
+    Status {
+        /// Surface id. Defaults to this pane's $TERMMESH_SURFACE_ID.
+        #[arg(long)]
+        surface: Option<String>,
+        /// List every exposed surface on this daemon.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -7452,6 +7521,22 @@ fn main() {
         }
     }
 
+    // `remote <on|off|status>` mutates the daemon's mobile exposure registry
+    // (`remote.*` RPCs), so it resolves the daemon socket the same way `watch`
+    // does: the app-injected TERMMESH_DAEMON_UNIX_PATH first, a daemon-typed
+    // TERMMESH_SOCKET (daemon-spawned panes) next.
+    if let Commands::Remote(ref remote_cmd) = cli.command {
+        let sock = detect_watch_socket().unwrap_or_else(|| {
+            eprintln!(
+                "Error: no term-meshd socket found (set TERMMESH_DAEMON_SOCKET, \
+                 TERMMESH_DAEMON_UNIX_PATH, or TERMMESH_SOCKET to the daemon socket)"
+            );
+            process::exit(1);
+        });
+        run_remote_command(&sock, cli.team.as_deref(), &remote_cmd.command);
+        return;
+    }
+
     // `watch <on|off|status>` controls the term-meshd (daemon) drift-watch
     // scheduler via the `watch.*` RPCs, so resolve the daemon socket directly
     // (falling back to the app socket). Bare `watch` (no subcommand) is the event
@@ -8105,6 +8190,7 @@ fn main() {
         Commands::Runbook(_) => unreachable!("runbook commands exit before detect_socket()"),
         Commands::Doctor { .. } => unreachable!("doctor command exits before detect_socket()"),
         Commands::Daemon(_) => unreachable!("daemon command exits before detect_socket()"),
+        Commands::Remote(_) => unreachable!("remote command exits before detect_socket()"),
         Commands::Status => {
             // Inject version info into the team.status response JSON
             let mut status = rpc_call(&sock, "team.status", json!({ "team_name": team }))
@@ -12439,6 +12525,374 @@ fn detect_daemon_socket() -> Option<PathBuf> {
         Some(path)
     } else {
         None
+    }
+}
+
+// ── `tm-agent remote` (docs/mobile-remote-control.md §4.2) ─────────────
+
+/// Run one `remote` subcommand against the daemon control socket.
+fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteCommand) {
+    match cmd {
+        RemoteCommand::On {
+            keys,
+            ttl,
+            surface,
+            leader,
+            app_socket,
+            cli,
+            title,
+            json,
+        } => {
+            let surface_id = resolve_remote_surface(surface.as_deref()).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+            let ttl_secs = match ttl.as_deref().map(parse_ttl_secs).transpose() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            };
+            let is_leader = *leader || remote_pane_is_leader();
+            let team_name = is_leader.then(|| resolve_team_name(team_flag));
+            let app_socket = app_socket
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(resolve_remote_app_socket);
+            if app_socket.is_none() {
+                eprintln!(
+                    "Error: no app socket for this surface (TERMMESH_SOCKET_PATH is not set); \
+                     run inside a term-mesh pane or pass --app-socket <path>"
+                );
+                process::exit(1);
+            }
+            let cwd = env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let title = title
+                .clone()
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| remote_default_title(&cwd));
+            let agent_cli = cli.clone().unwrap_or_else(detect_remote_cli);
+            let mut params = json!({
+                "surface_id": surface_id,
+                "kind": if is_leader { "leader" } else { "pane" },
+                "keys": keys,
+                "app_socket": app_socket,
+                "agent_cli": agent_cli,
+                "title": title,
+                "cwd": cwd,
+                "owner": env::var("USER").ok(),
+            });
+            if let Some(team) = &team_name {
+                params["team_name"] = json!(team);
+            }
+            if let Some(ttl) = ttl_secs {
+                params["ttl_secs"] = json!(ttl);
+            }
+            let result = remote_rpc(sock, "remote.on", params);
+            if *json {
+                println!("{}", pretty(&result));
+                return;
+            }
+            let entry = &result["entry"];
+            println!(
+                "exposed {} ({}, keys={}{})",
+                entry["surface_id"].as_str().unwrap_or(&surface_id),
+                entry["kind"].as_str().unwrap_or("pane"),
+                entry["keys"].as_str().unwrap_or(keys),
+                team_name
+                    .as_deref()
+                    .map(|t| format!(", team={t}"))
+                    .unwrap_or_default()
+            );
+            match result["url"].as_str() {
+                Some(url) => println!("url: {url}"),
+                None => println!(
+                    "url: unavailable ({})",
+                    result["listener_error"].as_str().unwrap_or("listener address invalid")
+                ),
+            }
+            if let Some(exp) = entry["expires_at"].as_u64() {
+                println!("expires: in {} (unix {exp})", format_remote_relative(exp));
+            }
+            if result["listener_enabled"].as_bool() != Some(true) {
+                eprintln!(
+                    "note: the mobile listener is disabled on this daemon; enable it in \
+                     Settings or set TERM_MESH_MOBILE_ENABLED=1 before the daemon starts"
+                );
+            }
+        }
+        RemoteCommand::Off { surface, json } => {
+            let surface_id = resolve_remote_surface(surface.as_deref()).unwrap_or_else(|e| {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            });
+            let result = remote_rpc(sock, "remote.off", json!({ "surface_id": surface_id }));
+            if *json {
+                println!("{}", pretty(&result));
+                return;
+            }
+            if result["removed"].as_bool() == Some(true) {
+                println!("no longer exposed: {surface_id}");
+            } else {
+                println!("was not exposed: {surface_id}");
+            }
+        }
+        RemoteCommand::Status { surface, all, json } => {
+            let params = if *all {
+                json!({})
+            } else {
+                let surface_id = resolve_remote_surface(surface.as_deref()).unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                });
+                json!({ "surface_id": surface_id })
+            };
+            let result = remote_rpc(sock, "remote.status", params);
+            if *json {
+                println!("{}", pretty(&result));
+                return;
+            }
+            let listener = if result["listener_enabled"].as_bool() == Some(true) {
+                "enabled".to_string()
+            } else {
+                "disabled".to_string()
+            };
+            if *all {
+                let entries = result["entries"].as_array().cloned().unwrap_or_default();
+                println!("listener: {listener}; exposed surfaces: {}", entries.len());
+                for e in entries {
+                    println!(
+                        "  {}  {}  keys={}  {}",
+                        e["surface_id"].as_str().unwrap_or("?"),
+                        e["kind"].as_str().unwrap_or("?"),
+                        e["keys"].as_str().unwrap_or("?"),
+                        e["title"].as_str().unwrap_or("")
+                    );
+                }
+            } else if result["exposed"].as_bool() == Some(true) {
+                let e = &result["entry"];
+                println!(
+                    "exposed: {} ({}, keys={})",
+                    result["surface_id"].as_str().unwrap_or("?"),
+                    e["kind"].as_str().unwrap_or("?"),
+                    e["keys"].as_str().unwrap_or("?")
+                );
+                if let Some(url) = result["url"].as_str() {
+                    println!("url: {url}");
+                }
+                if let Some(exp) = e["expires_at"].as_u64() {
+                    println!("expires: in {} (unix {exp})", format_remote_relative(exp));
+                }
+                println!("listener: {listener}");
+            } else {
+                println!(
+                    "not exposed: {} (listener {listener})",
+                    result["surface_id"].as_str().unwrap_or("?")
+                );
+            }
+        }
+    }
+}
+
+/// One `remote.*` RPC; any failure is fatal for the command.
+fn remote_rpc(sock: &PathBuf, method: &str, params: Value) -> Value {
+    match rpc_call(sock, method, params) {
+        Ok(resp) => {
+            if let Some(err) = resp.get("error") {
+                let msg = err["message"].as_str().unwrap_or("rpc error");
+                eprintln!("Error: {method}: {msg}");
+                process::exit(1);
+            }
+            resp.get("result").cloned().unwrap_or(Value::Null)
+        }
+        Err(e) => {
+            eprintln!("Error: {method}: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// `--surface` wins; otherwise the pane's own `TERMMESH_SURFACE_ID`.
+fn resolve_remote_surface(explicit: Option<&str>) -> Result<String, String> {
+    remote_surface_from(explicit, env::var("TERMMESH_SURFACE_ID").ok().as_deref())
+}
+
+fn remote_surface_from(explicit: Option<&str>, env_value: Option<&str>) -> Result<String, String> {
+    if let Some(s) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(s.to_string());
+    }
+    env_value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            "no surface id: run inside a term-mesh pane (TERMMESH_SURFACE_ID) or pass --surface <id>"
+                .to_string()
+        })
+}
+
+/// The app socket that owns this pane. `TERMMESH_SOCKET_PATH` is what the app
+/// injects into every pane; `TERMMESH_SOCKET` counts only when it is an app
+/// socket (agent panes get it too, but daemon-spawned panes get the daemon's).
+fn resolve_remote_app_socket() -> Option<String> {
+    remote_app_socket_from(
+        env::var("TERMMESH_SOCKET_PATH").ok().as_deref(),
+        env::var("TERMMESH_SOCKET").ok().as_deref(),
+    )
+}
+
+fn remote_app_socket_from(socket_path: Option<&str>, socket: Option<&str>) -> Option<String> {
+    let absolute = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty() && s.starts_with('/')).then(|| s.to_string())
+    };
+    if let Some(p) = socket_path.and_then(absolute) {
+        return Some(p);
+    }
+    socket
+        .and_then(absolute)
+        .filter(|p| is_app_socket_path(Path::new(p)))
+}
+
+/// A leader pane the app launched carries `TERMMESH_LEADER_REQUEST_TOKEN` and
+/// no `TERMMESH_AGENT_NAME` (workers get the latter). Adopted leaders have
+/// neither and must pass `--leader`.
+fn remote_pane_is_leader() -> bool {
+    remote_leader_from(
+        env::var("TERMMESH_LEADER_REQUEST_TOKEN").ok().as_deref(),
+        env::var("TERMMESH_AGENT_NAME").ok().as_deref(),
+    )
+}
+
+fn remote_leader_from(leader_token: Option<&str>, agent_name: Option<&str>) -> bool {
+    let has_token = leader_token.map(str::trim).is_some_and(|t| !t.is_empty());
+    let is_worker = agent_name.map(str::trim).is_some_and(|a| !a.is_empty());
+    has_token && !is_worker
+}
+
+/// Best-effort label for the page. Claude Code exports `CLAUDECODE` into the
+/// shells it runs; Codex marks its sandboxed commands. Unknown stays empty
+/// rather than guessing.
+fn detect_remote_cli() -> String {
+    let set = |k: &str| env::var(k).map(|v| !v.trim().is_empty()).unwrap_or(false);
+    if set("CLAUDECODE") {
+        "claude".into()
+    } else if set("CODEX_SANDBOX") || set("CODEX_SANDBOX_NETWORK_DISABLED") {
+        "codex".into()
+    } else {
+        String::new()
+    }
+}
+
+fn remote_default_title(cwd: &str) -> String {
+    Path::new(cwd)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "pane".to_string())
+}
+
+/// `12h`, `30m`, `2d`, `90s`, or plain seconds.
+fn parse_ttl_secs(raw: &str) -> Result<u64, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("ttl is empty".into());
+    }
+    let (digits, unit) = match s.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => (&s[..i], s[i..].trim()),
+        None => (s, ""),
+    };
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("ttl {raw:?} must be a number with an optional s/m/h/d suffix"))?;
+    let mult = match unit {
+        "" | "s" | "sec" | "secs" => 1,
+        "m" | "min" | "mins" => 60,
+        "h" | "hr" | "hrs" => 3600,
+        "d" | "day" | "days" => 86_400,
+        _ => return Err(format!("ttl {raw:?}: unknown unit {unit:?} (use s, m, h, d)")),
+    };
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("ttl {raw:?} is too large"))
+}
+
+fn format_remote_relative(expires_at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let left = expires_at.saturating_sub(now);
+    if left >= 86_400 {
+        format!("{}d {}h", left / 86_400, (left % 86_400) / 3600)
+    } else if left >= 3600 {
+        format!("{}h {}m", left / 3600, (left % 3600) / 60)
+    } else {
+        format!("{}m", left / 60)
+    }
+}
+
+#[cfg(test)]
+mod remote_command_tests {
+    use super::*;
+
+    #[test]
+    fn ttl_accepts_units_and_plain_seconds() {
+        assert_eq!(parse_ttl_secs("90").unwrap(), 90);
+        assert_eq!(parse_ttl_secs("90s").unwrap(), 90);
+        assert_eq!(parse_ttl_secs("30m").unwrap(), 1800);
+        assert_eq!(parse_ttl_secs("12h").unwrap(), 43_200);
+        assert_eq!(parse_ttl_secs("2d").unwrap(), 172_800);
+        assert_eq!(parse_ttl_secs(" 1 h ").unwrap(), 3600);
+        assert!(parse_ttl_secs("").is_err());
+        assert!(parse_ttl_secs("h").is_err());
+        assert!(parse_ttl_secs("12w").is_err());
+        assert!(parse_ttl_secs("99999999999999999999d").is_err());
+    }
+
+    #[test]
+    fn surface_flag_wins_over_env_and_missing_is_an_error() {
+        assert_eq!(remote_surface_from(Some(" abc "), Some("env")).unwrap(), "abc");
+        assert_eq!(remote_surface_from(Some("  "), Some("env")).unwrap(), "env");
+        assert_eq!(remote_surface_from(None, Some("env")).unwrap(), "env");
+        assert!(remote_surface_from(None, None).unwrap_err().contains("--surface"));
+        assert!(remote_surface_from(None, Some(" ")).is_err());
+    }
+
+    #[test]
+    fn app_socket_prefers_pane_socket_path_then_app_typed_socket() {
+        assert_eq!(
+            remote_app_socket_from(Some("/tmp/term-mesh.sock"), Some("/tmp/term-meshd.sock")),
+            Some("/tmp/term-mesh.sock".into())
+        );
+        // TERMMESH_SOCKET pointing at a daemon socket is not an app socket.
+        assert_eq!(remote_app_socket_from(None, Some("/tmp/term-meshd.sock")), None);
+        assert_eq!(
+            remote_app_socket_from(None, Some("/tmp/term-mesh-debug-x.sock")),
+            Some("/tmp/term-mesh-debug-x.sock".into())
+        );
+        assert_eq!(remote_app_socket_from(Some("relative.sock"), None), None);
+        assert_eq!(remote_app_socket_from(None, None), None);
+    }
+
+    #[test]
+    fn leader_detection_needs_token_and_no_worker_name() {
+        assert!(remote_leader_from(Some("tok"), None));
+        assert!(remote_leader_from(Some("tok"), Some("")));
+        assert!(!remote_leader_from(Some("tok"), Some("worker-1")));
+        assert!(!remote_leader_from(None, None));
+        assert!(!remote_leader_from(Some(" "), None));
+    }
+
+    #[test]
+    fn default_title_is_the_cwd_basename() {
+        assert_eq!(remote_default_title("/Users/me/work/term-mesh"), "term-mesh");
+        assert_eq!(remote_default_title("/"), "pane");
+        assert_eq!(remote_default_title(""), "pane");
     }
 }
 
