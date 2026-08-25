@@ -121,6 +121,9 @@ pub mod capability {
     /// ids, allowing a different authenticated viewer to discover and attach
     /// the already-running presentation without spawning replacement work.
     pub const PROJECT_PRESENTATION_V1: &str = "project.presentation.v1";
+    /// Explicit stale-manifest inspection plus authenticated owner-mismatch
+    /// repair with bounded evidence and a recoverable persistence backup.
+    pub const PROJECT_PRESENTATION_REPAIR_V1: &str = "project.presentation.repair.v1";
     /// Daemon-owned workers read a transferable scoped team route from an
     /// owner-only file on every tm-agent invocation. Required before a viewer
     /// may promise that an adopted worker keeps team RPCs after handoff.
@@ -148,6 +151,7 @@ pub mod capability {
         TEAM_CALL_V1,
         TEAM_LEADER_V1,
         PROJECT_PRESENTATION_V1,
+        PROJECT_PRESENTATION_REPAIR_V1,
         TEAM_ROUTE_FILE_V1,
     ];
 
@@ -734,7 +738,15 @@ mod tests {
         assert!(capability::SUPPORTED.contains(&capability::SURFACE_AGENT_V1));
         assert_eq!(capability::TEAM_ROUTE_FILE_V1, "team.route-file.v1");
         assert!(capability::SUPPORTED.contains(&capability::TEAM_ROUTE_FILE_V1));
-        assert_eq!(capability::supported_vec().len(), capability::SUPPORTED.len());
+        assert_eq!(
+            capability::PROJECT_PRESENTATION_REPAIR_V1,
+            "project.presentation.repair.v1"
+        );
+        assert!(capability::SUPPORTED.contains(&capability::PROJECT_PRESENTATION_REPAIR_V1));
+        assert_eq!(
+            capability::supported_vec().len(),
+            capability::SUPPORTED.len()
+        );
 
         let unique: std::collections::HashSet<&str> =
             capability::SUPPORTED.iter().copied().collect();
@@ -747,10 +759,7 @@ mod tests {
 
     #[test]
     fn supported_capabilities_advertise_ensure_env_host_support() {
-        assert_eq!(
-            capability::SURFACE_ENSURE_ENV_V1,
-            "surface.ensure-env.v1"
-        );
+        assert_eq!(capability::SURFACE_ENSURE_ENV_V1, "surface.ensure-env.v1");
         assert!(
             capability::SUPPORTED.contains(&capability::SURFACE_ENSURE_ENV_V1),
             "new daemons must advertise that EnsureSurfaceRequest.env is applied"

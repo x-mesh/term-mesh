@@ -1133,6 +1133,12 @@ pub enum RemoveWorkspaceError {
     LastWorkspace,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectPresentationInspection {
+    pub record: super::persist::PersistedProjectPresentation,
+    pub surfaces: Vec<(Vec<u8>, String, bool)>,
+}
+
 impl PeerHost {
     /// Convenience constructor for callers that don't care about
     /// persistence (every existing test, and any future in-process
@@ -1284,6 +1290,97 @@ impl PeerHost {
             .collect()
     }
 
+    /// Inspect one exact manifest without reviving any declared surface.
+    /// `present` requires a currently registered, non-dead process; specs and
+    /// workspace layout entries are not liveness evidence.
+    pub fn inspect_project_presentation(
+        &self,
+        project_id: &str,
+    ) -> Option<ProjectPresentationInspection> {
+        let record = self
+            .project_presentations
+            .lock()
+            .ok()?
+            .get(project_id)
+            .cloned()?;
+        let live: HashSet<Vec<u8>> = self
+            .pty
+            .list()
+            .into_iter()
+            .filter(|surface| !surface.dead.load(Ordering::Acquire))
+            .map(|surface| surface.surface_id.clone())
+            .collect();
+        let mut surfaces = Vec::with_capacity(record.members.len() + 1);
+        if let Ok(id) = hex::decode(&record.leader_surface_id) {
+            surfaces.push((id.clone(), "leader".to_string(), live.contains(&id)));
+        }
+        for member in &record.members {
+            if let Ok(id) = hex::decode(&member.surface_id) {
+                surfaces.push((
+                    id.clone(),
+                    format!("member:{}", member.name),
+                    live.contains(&id),
+                ));
+            }
+        }
+        Some(ProjectPresentationInspection { record, surfaces })
+    }
+
+    /// Remove one exact stale manifest through the administrative repair path.
+    /// The caller supplies bounded evidence, but this method independently
+    /// revalidates revision and liveness while persistence is serialized.
+    pub fn repair_stale_project_presentation(
+        &self,
+        project_id: &str,
+        expected_revision: u64,
+    ) -> Result<Option<PathBuf>, &'static str> {
+        if project_id.is_empty() || project_id.len() > 128 {
+            return Err("invalid_manifest");
+        }
+        let _persist_guard = self.project_presentations_persistence.lock().unwrap();
+        let mut records = self.project_presentations.lock().unwrap();
+        let Some(existing) = records.get(project_id) else {
+            return Err("not_found");
+        };
+        if existing.revision != expected_revision {
+            return Err("revision_changed");
+        }
+        let mut surface_ids = Self::presentation_surface_ids(existing);
+        surface_ids.sort();
+        surface_ids.dedup();
+        let lifecycle_locks = surface_ids
+            .iter()
+            .map(|surface_id| self.surface_lifecycle_lock(surface_id))
+            .collect::<Vec<_>>();
+        let _lifecycle_guards = lifecycle_locks
+            .iter()
+            .map(|lock| lock.lock().map_err(|_| "surface_lifecycle_poisoned"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_live_surface = self.pty.list().into_iter().any(|surface| {
+            !surface.dead.load(Ordering::Acquire)
+                && surface_ids.iter().any(|id| id == &surface.surface_id)
+        });
+        if has_live_surface {
+            return Err("project_live");
+        }
+        let path = self
+            .project_presentations_path
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("persistence_unavailable")?;
+        let before: Vec<_> = records.values().cloned().collect();
+        let backup = super::persist::backup_project_presentations(&path, &before)
+            .map_err(|_| "backup_failed")?;
+        let removed = records.remove(project_id).expect("checked above");
+        let after: Vec<_> = records.values().cloned().collect();
+        if super::persist::save_project_presentations(&path, &after).is_err() {
+            records.insert(project_id.to_string(), removed);
+            return Err("persistence_failed");
+        }
+        Ok(Some(backup))
+    }
+
     /// Every surface id a stored manifest names, leader first.
     ///
     /// Malformed entries are skipped rather than failing the caller: a record
@@ -1354,13 +1451,20 @@ impl PeerHost {
                 return Err("persistence_failed");
             }
         }
-        let unreferenced = released.iter().filter(|surface_id| {
-            let encoded = hex::encode(surface_id);
-            !records.values().any(|record| {
-                record.leader_surface_id == encoded
-                    || record.members.iter().any(|member| member.surface_id == encoded)
+        let unreferenced = released
+            .iter()
+            .filter(|surface_id| {
+                let encoded = hex::encode(surface_id);
+                !records.values().any(|record| {
+                    record.leader_surface_id == encoded
+                        || record
+                            .members
+                            .iter()
+                            .any(|member| member.surface_id == encoded)
+                })
             })
-        }).cloned().collect::<Vec<_>>();
+            .cloned()
+            .collect::<Vec<_>>();
         drop(records);
         drop(_persist_guard);
         for surface_id in unreferenced {
@@ -1479,18 +1583,26 @@ impl PeerHost {
         let _persist_guard = self.project_presentations_persistence.lock().unwrap();
         let mut ordered_surface_ids = seen_surfaces.iter().cloned().collect::<Vec<_>>();
         ordered_surface_ids.sort();
-        let lifecycle_locks = ordered_surface_ids.iter()
+        let lifecycle_locks = ordered_surface_ids
+            .iter()
             .map(|surface_id| self.surface_lifecycle_lock(surface_id))
             .collect::<Vec<_>>();
-        let _lifecycle_guards = lifecycle_locks.iter()
+        let _lifecycle_guards = lifecycle_locks
+            .iter()
             .map(|lock| lock.lock().map_err(|_| "surface_lifecycle_poisoned"))
             .collect::<Result<Vec<_>, _>>()?;
-        let surfaces: HashMap<Vec<u8>, _> = self.pty.list().into_iter()
-            .map(|surface| (surface.surface_id.clone(), surface)).collect();
+        let surfaces: HashMap<Vec<u8>, _> = self
+            .pty
+            .list()
+            .into_iter()
+            .map(|surface| (surface.surface_id.clone(), surface))
+            .collect();
         let Some(leader) = surfaces.get(&project.leader_surface_id) else {
             return Err("leader_surface_missing");
         };
-        if !leader.info().attachable { return Err("leader_surface_missing"); }
+        if !leader.info().attachable {
+            return Err("leader_surface_missing");
+        }
         let mut members = Vec::with_capacity(project.members.len());
         for member in &project.members {
             let Some(surface) = surfaces.get(&member.surface_id) else {
@@ -2564,11 +2676,7 @@ mod tests {
     async fn duplicate_request_id_rejects_a_different_command() {
         let router = Arc::new(Broadcaster::new());
         let (viewer_tx, mut viewer_rx) = mpsc::channel(4);
-        let _viewer = router.register(
-            viewer_tx,
-            Arc::new(AtomicU64::new(10)),
-            vec![0xA1; 16],
-        );
+        let _viewer = router.register(viewer_tx, Arc::new(AtomicU64::new(10)), vec![0xA1; 16]);
         let request = TeamLeaderCommandRequest {
             request_id: vec![0x45; peer_proto::team_leader::REQUEST_ID_BYTES],
             method: "team.status".into(),
@@ -2578,7 +2686,9 @@ mod tests {
         let first_router = Arc::clone(&router);
         let first_request = request.clone();
         let first = tokio::spawn(async move {
-            first_router.call_team_leader(first_request, &[0xA1; 16]).await
+            first_router
+                .call_team_leader(first_request, &[0xA1; 16])
+                .await
         });
         viewer_rx.recv().await.expect("first request");
 
@@ -4584,35 +4694,70 @@ mod tests {
     async fn concurrent_delete_and_new_presentation_never_publish_a_dead_surface() {
         let manager = Arc::new(PtyManager::new());
         let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
-        let leader = host.ensure_surface("delete-upsert-shared-leader", &SurfaceSpec {
-            cwd: "/tmp".into(), executable: "/bin/cat".into(), args: Vec::new(),
-            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
-            kind: super::super::surface::SurfaceKind::Pty, agent_cli: String::new(),
-        }).unwrap();
+        let leader = host
+            .ensure_surface(
+                "delete-upsert-shared-leader",
+                &SurfaceSpec {
+                    cwd: "/tmp".into(),
+                    executable: "/bin/cat".into(),
+                    args: Vec::new(),
+                    restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+                    kind: super::super::surface::SurfaceKind::Pty,
+                    agent_cli: String::new(),
+                },
+            )
+            .unwrap();
         let owner = vec![vec![0x5A; 16]];
         let project = |project_id: &str| peer_proto::v1::Team {
-            name: project_id.into(), team_uuid: format!("uuid-{project_id}"),
-            working_directory: "/tmp".into(), leader_surface_id: leader.surface_id.clone(),
-            project_id: format!("team:{project_id}"), ..Default::default()
+            name: project_id.into(),
+            team_uuid: format!("uuid-{project_id}"),
+            working_directory: "/tmp".into(),
+            leader_surface_id: leader.surface_id.clone(),
+            project_id: format!("team:{project_id}"),
+            ..Default::default()
         };
-        assert_eq!(host.upsert_project_presentation(&owner, &project("before")), Ok((1, true)));
+        assert_eq!(
+            host.upsert_project_presentation(&owner, &project("before")),
+            Ok((1, true))
+        );
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let deleting = {
-            let host = Arc::clone(&host); let owner = owner.clone(); let barrier = Arc::clone(&barrier);
-            tokio::task::spawn_blocking(move || { barrier.wait(); host.delete_project_presentation_with_released(&owner, "team:before") })
+            let host = Arc::clone(&host);
+            let owner = owner.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                host.delete_project_presentation_with_released(&owner, "team:before")
+            })
         };
         let publishing = {
-            let host = Arc::clone(&host); let owner = owner.clone(); let after = project("after"); let barrier = Arc::clone(&barrier);
-            tokio::task::spawn_blocking(move || { barrier.wait(); host.upsert_project_presentation(&owner, &after) })
+            let host = Arc::clone(&host);
+            let owner = owner.clone();
+            let after = project("after");
+            let barrier = Arc::clone(&barrier);
+            tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                host.upsert_project_presentation(&owner, &after)
+            })
         };
         deleting.await.unwrap().unwrap();
         let publish_result = publishing.await.unwrap();
-        let after_exists = host.project_presentations().iter().any(|record| record.project_id == "team:after");
-        let leader_live = manager.list().iter().any(|surface| surface.surface_id == leader.surface_id);
-        assert_eq!(after_exists, leader_live, "a published Project must never retain a deleted surface");
+        let after_exists = host
+            .project_presentations()
+            .iter()
+            .any(|record| record.project_id == "team:after");
+        let leader_live = manager
+            .list()
+            .iter()
+            .any(|surface| surface.surface_id == leader.surface_id);
+        assert_eq!(
+            after_exists, leader_live,
+            "a published Project must never retain a deleted surface"
+        );
         if after_exists {
             assert!(publish_result.is_ok());
-            host.delete_project_presentation_with_released(&owner, "team:after").unwrap();
+            host.delete_project_presentation_with_released(&owner, "team:after")
+                .unwrap();
         } else {
             assert_eq!(publish_result, Err("leader_surface_missing"));
         }
@@ -4661,5 +4806,91 @@ mod tests {
                 format!("after-{index}")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stale_presentation_repair_backups_and_preserves_workspace_and_other_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_path = dir.path().join("peer-workspaces.json");
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(workspace_path.clone());
+        let original_workspace_ids: Vec<_> = host
+            .list_workspaces()
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect();
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let stale_surface = host.ensure_surface("repair-stale", &spec).unwrap();
+        let unrelated_surface = host.ensure_surface("repair-unrelated", &spec).unwrap();
+        let project = |name: &str, id: &str, surface_id: Vec<u8>| peer_proto::v1::Team {
+            name: name.into(),
+            team_uuid: format!("uuid-{name}"),
+            working_directory: format!("/tmp/{name}"),
+            leader_surface_id: surface_id,
+            project_id: id.into(),
+            ..Default::default()
+        };
+        host.upsert_project_presentation(
+            &[vec![1; 16]],
+            &project("stale", "team:stale", stale_surface.surface_id.clone()),
+        )
+        .unwrap();
+        host.upsert_project_presentation(
+            &[vec![2; 16]],
+            &project(
+                "unrelated",
+                "team:unrelated",
+                unrelated_surface.surface_id.clone(),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.repair_stale_project_presentation("team:stale", 1),
+            Err("project_live"),
+            "a live Project must never be repaired as stale"
+        );
+        host.terminate_surface(&stale_surface.surface_id).unwrap();
+        let inspection = host
+            .inspect_project_presentation("team:stale")
+            .expect("stale record remains inspectable");
+        assert!(inspection.surfaces.iter().all(|(_, _, present)| !present));
+
+        let backup = host
+            .repair_stale_project_presentation("team:stale", 1)
+            .expect("repair accepted")
+            .expect("repair backup");
+        assert!(backup.is_file());
+        let backed_up = crate::peer::persist::load_project_presentations(&backup);
+        assert_eq!(
+            backed_up.len(),
+            2,
+            "backup contains the full pre-repair store"
+        );
+        let remaining = host.project_presentations();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].project_id, "team:unrelated");
+        assert_eq!(
+            host.list_workspaces()
+                .into_iter()
+                .map(|workspace| workspace.id)
+                .collect::<Vec<_>>(),
+            original_workspace_ids,
+            "Project repair must not mutate the daemon workspace lifecycle"
+        );
+        assert!(host
+            .pty
+            .list()
+            .iter()
+            .any(|surface| surface.surface_id == unrelated_surface.surface_id));
+        host.terminate_surface(&unrelated_surface.surface_id)
+            .unwrap();
     }
 }

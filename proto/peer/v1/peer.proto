@@ -102,6 +102,12 @@ message Envelope {
     // present it. Gated behind capability "project.presentation.v1".
     UpsertProjectPresentationRequest upsert_project_presentation_request = 62;
     UpsertProjectPresentationResponse upsert_project_presentation_response = 63;
+    // Explicit stale-record inspection and owner-mismatch administrative repair.
+    // Gated behind capability "project.presentation.repair.v1".
+    InspectProjectPresentationRequest inspect_project_presentation_request = 64;
+    InspectProjectPresentationResponse inspect_project_presentation_response = 65;
+    RepairProjectPresentationRequest repair_project_presentation_request = 66;
+    RepairProjectPresentationResponse repair_project_presentation_response = 67;
 
     Error error = 99;
   }
@@ -967,6 +973,8 @@ message Team {
   // durable manifest with active=false names an idle shell, not a live leader.
   bool leader_process_active = 12;
   bool leader_process_active_known = 13;
+  uint32 referenced_surface_count = 14;
+  uint32 live_referenced_surface_count = 15;
 }
 
 message TeamMember {
@@ -992,12 +1000,61 @@ message UpsertProjectPresentationRequest {
   Team project = 2;
   // Owner-authorized lifecycle end. Mutually exclusive with project.
   string delete_project_id = 3;
+  // Optional proof returned by InspectProjectPresentationResponse. When set,
+  // deletion is accepted only if the exact revision is still durably stale.
+  bytes stale_evidence_token = 4;
 }
 
 message UpsertProjectPresentationResponse {
   bytes request_id = 1;
   bool ok = 2;
   uint64 revision = 3;
+  string error_code = 4;
+  string error_message = 5;
+}
+
+message ProjectPresentationSurfaceStatus {
+  bytes surface_id = 1;
+  string role = 2;
+  bool present = 3;
+}
+
+// Inspection is deliberately two-step. The first all-missing observation
+// records bounded evidence; only a later request on the same authenticated
+// connection can return stale=true and an evidence token.
+message InspectProjectPresentationRequest {
+  bytes request_id = 1;
+  string project_id = 2;
+}
+
+message InspectProjectPresentationResponse {
+  bytes request_id = 1;
+  bool ok = 2;
+  string project_id = 3;
+  string team_name = 4;
+  string working_directory = 5;
+  uint64 revision = 6;
+  bool owned_by_requester = 7;
+  repeated ProjectPresentationSurfaceStatus surfaces = 8;
+  bool stale = 9;
+  bytes stale_evidence_token = 10;
+  string error_code = 11;
+  string error_message = 12;
+}
+
+// Administrative repair is only for owner mismatch. The authenticated
+// connection must present the evidence token for the exact Project revision.
+message RepairProjectPresentationRequest {
+  bytes request_id = 1;
+  string project_id = 2;
+  uint64 expected_revision = 3;
+  bytes stale_evidence_token = 4;
+}
+
+message RepairProjectPresentationResponse {
+  bytes request_id = 1;
+  bool ok = 2;
+  string backup_path = 3;
   string error_code = 4;
   string error_message = 5;
 }

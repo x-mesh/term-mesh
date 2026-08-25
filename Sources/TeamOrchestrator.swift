@@ -69,6 +69,17 @@ final class TeamOrchestrator: ObservableObject {
         var teamName: String?
         var leaderReady: Bool
         var failureDescription: String?
+        var presentationRevision: UInt64 = 0
+        var presentationOwnedByRequester: Bool = false
+        var referencedSurfaceCount: Int = 0
+        var liveReferencedSurfaceCount: Int = 0
+
+        var canOfferStaleRemoteRemoval: Bool {
+            guard case .remote = location else { return false }
+            return identity.projectID != nil
+                && referencedSurfaceCount > 0
+                && liveReferencedSurfaceCount == 0
+        }
     }
 
     enum ProjectNameConflict: Equatable, Sendable {

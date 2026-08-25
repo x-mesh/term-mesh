@@ -161,6 +161,7 @@ struct NewProjectView: View {
     @State private var isDiscarding = false
     @State private var isResolvingConflict = false
     @State private var pendingConflictDiscardTeamName: String?
+    @State private var pendingStaleProjectRemoval: TeamOrchestrator.ProjectConflictRecord?
     /// A conflict discovered after Create began (for example another window's
     /// reservation) is not necessarily visible in the advisory snapshot yet.
     /// Keep that typed result until the user changes the Project identity.
@@ -228,6 +229,7 @@ struct NewProjectView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         projectFields
+                        remoteCollisionDetails
                         Divider()
                         teamSummaryRow
                         if showsTeamEditor {
@@ -367,6 +369,30 @@ struct NewProjectView: View {
                 "This stops the Project and removes its workspace plus any "
                     + "checkouts term-mesh created. Existing user-owned folders are kept."
             )
+        }
+        .confirmationDialog(
+            "Remove stale remote Project record?",
+            isPresented: Binding(
+                get: { pendingStaleProjectRemoval != nil },
+                set: { if !$0 { pendingStaleProjectRemoval = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Remove stale Project record", role: .destructive) {
+                guard let record = pendingStaleProjectRemoval else { return }
+                pendingStaleProjectRemoval = nil
+                removeStaleProjectRecord(record)
+            }
+            Button("Keep record", role: .cancel) {
+                pendingStaleProjectRemoval = nil
+            }
+        } message: {
+            if let record = pendingStaleProjectRemoval,
+               case let .remote(_, hostName) = record.location {
+                Text(
+                    "term-mesh will recheck every referenced surface on \(hostName), then remove only Project \(record.identity.projectID ?? "unknown") at \(record.identity.workingDirectory ?? "unknown path"). The daemon workspace and unrelated shell remain intact. An ownership-mismatch repair creates a recoverable backup first."
+                )
+            }
         }
         .accessibilityIdentifier("newProject.sheet")
     }
@@ -2167,11 +2193,75 @@ struct NewProjectView: View {
             }
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.discard")
-        case .localNameCollision, .remoteNameCollision, .reservedByAnotherRequest:
+        case .remoteNameCollision(let record):
+            if record.canOfferStaleRemoteRemoval {
+                Button("Remove stale Project record…", role: .destructive) {
+                    pendingStaleProjectRemoval = record
+                }
+                .disabled(isResolvingConflict)
+                .accessibilityIdentifier("newProject.conflict.removeStale")
+            }
             Button("Use “\(suggestedProjectName)”") { useSuggestedProjectName() }
                 .keyboardShortcut(.defaultAction)
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.rename")
+        case .localNameCollision, .reservedByAnotherRequest:
+            Button("Use “\(suggestedProjectName)”") { useSuggestedProjectName() }
+                .keyboardShortcut(.defaultAction)
+                .disabled(isResolvingConflict)
+                .accessibilityIdentifier("newProject.conflict.rename")
+        }
+    }
+
+    @ViewBuilder
+    private var remoteCollisionDetails: some View {
+        if case let .remoteNameCollision(record) = projectNameConflict,
+           case let .remote(_, hostName) = record.location {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Remote Project name is already reserved", systemImage: "exclamationmark.triangle.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.orange)
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 5) {
+                    conflictDetailRow("Host", hostName)
+                    conflictDetailRow("Directory", record.identity.workingDirectory ?? "Not recorded")
+                    conflictDetailRow("Project ID", record.identity.projectID ?? "Not recorded")
+                    conflictDetailRow(
+                        "Surfaces",
+                        "\(record.liveReferencedSurfaceCount) live of \(record.referencedSurfaceCount) referenced"
+                    )
+                    conflictDetailRow(
+                        "Ownership",
+                        record.presentationOwnedByRequester
+                            ? "Owned by this installation"
+                            : "Owned by another installation; administrative repair required"
+                    )
+                }
+                Text(
+                    record.liveReferencedSurfaceCount == 0
+                        ? "Removal performs a bounded liveness recheck. It is refused if any surface returns."
+                        : "This record is live and cannot be removed as stale."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("newProject.conflict.remoteDetails")
+        }
+    }
+
+    private func conflictDetailRow(_ label: String, _ value: String) -> some View {
+        GridRow {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+                .help(value)
         }
     }
 
@@ -2304,6 +2394,28 @@ struct NewProjectView: View {
                 creationError = nil
             } catch {
                 creationError = "Could not discard the incomplete Project: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func removeStaleProjectRecord(
+        _ record: TeamOrchestrator.ProjectConflictRecord
+    ) {
+        guard case let .remote(hostKey, _) = record.location,
+              let projectID = record.identity.projectID
+        else { return }
+        isResolvingConflict = true
+        creationError = nil
+        Task { @MainActor in
+            defer { isResolvingConflict = false }
+            do {
+                _ = try await hostStore.removeStaleProjectRecord(
+                    hostKey: hostKey, projectID: projectID
+                )
+                submissionConflict = nil
+                creationError = nil
+            } catch {
+                creationError = error.localizedDescription
             }
         }
     }

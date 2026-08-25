@@ -444,179 +444,170 @@ public nonisolated enum Termmesh_Peer_V1_TeamLeaderRole: SwiftProtobuf.Enum, Swi
 
 /// Every frame on the wire is a length-prefixed Envelope.
 /// Frames larger than 16 MiB must be rejected with ERR_FRAME_TOO_LARGE.
-public nonisolated struct Termmesh_Peer_V1_Envelope: @unchecked Sendable {
+public nonisolated struct Termmesh_Peer_V1_Envelope: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   /// Monotonic per sender, starts at 1.
-  public var seq: UInt64 {
-    get {_storage._seq}
-    set {_uniqueStorage()._seq = newValue}
-  }
+  public var seq: UInt64 = 0
 
   /// Echoes a request's seq on replies, 0 otherwise.
-  public var correlationID: UInt64 {
-    get {_storage._correlationID}
-    set {_uniqueStorage()._correlationID = newValue}
-  }
+  public var correlationID: UInt64 = 0
 
-  public var payload: OneOf_Payload? {
-    get {return _storage._payload}
-    set {_uniqueStorage()._payload = newValue}
-  }
+  public var payload: Termmesh_Peer_V1_Envelope.OneOf_Payload? = nil
 
   public var hello: Termmesh_Peer_V1_Hello {
     get {
-      if case .hello(let v)? = _storage._payload {return v}
+      if case .hello(let v)? = payload {return v}
       return Termmesh_Peer_V1_Hello()
     }
-    set {_uniqueStorage()._payload = .hello(newValue)}
+    set {payload = .hello(newValue)}
   }
 
   public var authChallenge: Termmesh_Peer_V1_AuthChallenge {
     get {
-      if case .authChallenge(let v)? = _storage._payload {return v}
+      if case .authChallenge(let v)? = payload {return v}
       return Termmesh_Peer_V1_AuthChallenge()
     }
-    set {_uniqueStorage()._payload = .authChallenge(newValue)}
+    set {payload = .authChallenge(newValue)}
   }
 
   public var auth: Termmesh_Peer_V1_Auth {
     get {
-      if case .auth(let v)? = _storage._payload {return v}
+      if case .auth(let v)? = payload {return v}
       return Termmesh_Peer_V1_Auth()
     }
-    set {_uniqueStorage()._payload = .auth(newValue)}
+    set {payload = .auth(newValue)}
   }
 
   public var authResult: Termmesh_Peer_V1_AuthResult {
     get {
-      if case .authResult(let v)? = _storage._payload {return v}
+      if case .authResult(let v)? = payload {return v}
       return Termmesh_Peer_V1_AuthResult()
     }
-    set {_uniqueStorage()._payload = .authResult(newValue)}
+    set {payload = .authResult(newValue)}
   }
 
   public var listSurfaces: Termmesh_Peer_V1_ListSurfaces {
     get {
-      if case .listSurfaces(let v)? = _storage._payload {return v}
+      if case .listSurfaces(let v)? = payload {return v}
       return Termmesh_Peer_V1_ListSurfaces()
     }
-    set {_uniqueStorage()._payload = .listSurfaces(newValue)}
+    set {payload = .listSurfaces(newValue)}
   }
 
   public var surfaceList: Termmesh_Peer_V1_SurfaceList {
     get {
-      if case .surfaceList(let v)? = _storage._payload {return v}
+      if case .surfaceList(let v)? = payload {return v}
       return Termmesh_Peer_V1_SurfaceList()
     }
-    set {_uniqueStorage()._payload = .surfaceList(newValue)}
+    set {payload = .surfaceList(newValue)}
   }
 
   public var attachSurface: Termmesh_Peer_V1_AttachSurface {
     get {
-      if case .attachSurface(let v)? = _storage._payload {return v}
+      if case .attachSurface(let v)? = payload {return v}
       return Termmesh_Peer_V1_AttachSurface()
     }
-    set {_uniqueStorage()._payload = .attachSurface(newValue)}
+    set {payload = .attachSurface(newValue)}
   }
 
   public var attachResult: Termmesh_Peer_V1_AttachResult {
     get {
-      if case .attachResult(let v)? = _storage._payload {return v}
+      if case .attachResult(let v)? = payload {return v}
       return Termmesh_Peer_V1_AttachResult()
     }
-    set {_uniqueStorage()._payload = .attachResult(newValue)}
+    set {payload = .attachResult(newValue)}
   }
 
   public var detachSurface: Termmesh_Peer_V1_DetachSurface {
     get {
-      if case .detachSurface(let v)? = _storage._payload {return v}
+      if case .detachSurface(let v)? = payload {return v}
       return Termmesh_Peer_V1_DetachSurface()
     }
-    set {_uniqueStorage()._payload = .detachSurface(newValue)}
+    set {payload = .detachSurface(newValue)}
   }
 
   public var listWorkspaces: Termmesh_Peer_V1_ListWorkspaces {
     get {
-      if case .listWorkspaces(let v)? = _storage._payload {return v}
+      if case .listWorkspaces(let v)? = payload {return v}
       return Termmesh_Peer_V1_ListWorkspaces()
     }
-    set {_uniqueStorage()._payload = .listWorkspaces(newValue)}
+    set {payload = .listWorkspaces(newValue)}
   }
 
   public var workspaceList: Termmesh_Peer_V1_WorkspaceList {
     get {
-      if case .workspaceList(let v)? = _storage._payload {return v}
+      if case .workspaceList(let v)? = payload {return v}
       return Termmesh_Peer_V1_WorkspaceList()
     }
-    set {_uniqueStorage()._payload = .workspaceList(newValue)}
+    set {payload = .workspaceList(newValue)}
   }
 
   public var workspaceControl: Termmesh_Peer_V1_WorkspaceControl {
     get {
-      if case .workspaceControl(let v)? = _storage._payload {return v}
+      if case .workspaceControl(let v)? = payload {return v}
       return Termmesh_Peer_V1_WorkspaceControl()
     }
-    set {_uniqueStorage()._payload = .workspaceControl(newValue)}
+    set {payload = .workspaceControl(newValue)}
   }
 
   /// Gated behind capability "workspace.lifecycle.v1" (Hello.capabilities).
   public var createWorkspaceRequest: Termmesh_Peer_V1_CreateWorkspaceRequest {
     get {
-      if case .createWorkspaceRequest(let v)? = _storage._payload {return v}
+      if case .createWorkspaceRequest(let v)? = payload {return v}
       return Termmesh_Peer_V1_CreateWorkspaceRequest()
     }
-    set {_uniqueStorage()._payload = .createWorkspaceRequest(newValue)}
+    set {payload = .createWorkspaceRequest(newValue)}
   }
 
   public var createWorkspaceResponse: Termmesh_Peer_V1_CreateWorkspaceResponse {
     get {
-      if case .createWorkspaceResponse(let v)? = _storage._payload {return v}
+      if case .createWorkspaceResponse(let v)? = payload {return v}
       return Termmesh_Peer_V1_CreateWorkspaceResponse()
     }
-    set {_uniqueStorage()._payload = .createWorkspaceResponse(newValue)}
+    set {payload = .createWorkspaceResponse(newValue)}
   }
 
   public var ptyData: Termmesh_Peer_V1_PtyData {
     get {
-      if case .ptyData(let v)? = _storage._payload {return v}
+      if case .ptyData(let v)? = payload {return v}
       return Termmesh_Peer_V1_PtyData()
     }
-    set {_uniqueStorage()._payload = .ptyData(newValue)}
+    set {payload = .ptyData(newValue)}
   }
 
   public var input: Termmesh_Peer_V1_Input {
     get {
-      if case .input(let v)? = _storage._payload {return v}
+      if case .input(let v)? = payload {return v}
       return Termmesh_Peer_V1_Input()
     }
-    set {_uniqueStorage()._payload = .input(newValue)}
+    set {payload = .input(newValue)}
   }
 
   public var resize: Termmesh_Peer_V1_Resize {
     get {
-      if case .resize(let v)? = _storage._payload {return v}
+      if case .resize(let v)? = payload {return v}
       return Termmesh_Peer_V1_Resize()
     }
-    set {_uniqueStorage()._payload = .resize(newValue)}
+    set {payload = .resize(newValue)}
   }
 
   public var gridSnapshot: Termmesh_Peer_V1_GridSnapshot {
     get {
-      if case .gridSnapshot(let v)? = _storage._payload {return v}
+      if case .gridSnapshot(let v)? = payload {return v}
       return Termmesh_Peer_V1_GridSnapshot()
     }
-    set {_uniqueStorage()._payload = .gridSnapshot(newValue)}
+    set {payload = .gridSnapshot(newValue)}
   }
 
   public var dataAck: Termmesh_Peer_V1_DataAck {
     get {
-      if case .dataAck(let v)? = _storage._payload {return v}
+      if case .dataAck(let v)? = payload {return v}
       return Termmesh_Peer_V1_DataAck()
     }
-    set {_uniqueStorage()._payload = .dataAck(newValue)}
+    set {payload = .dataAck(newValue)}
   }
 
   /// Gated behind capability "grid.snapshot.v1" (Hello.capabilities) —
@@ -624,137 +615,137 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: @unchecked Sendable {
   /// typed snapshot has the empty local scrollback these fill.
   public var scrollbackRequest: Termmesh_Peer_V1_ScrollbackRequest {
     get {
-      if case .scrollbackRequest(let v)? = _storage._payload {return v}
+      if case .scrollbackRequest(let v)? = payload {return v}
       return Termmesh_Peer_V1_ScrollbackRequest()
     }
-    set {_uniqueStorage()._payload = .scrollbackRequest(newValue)}
+    set {payload = .scrollbackRequest(newValue)}
   }
 
   public var scrollbackChunk: Termmesh_Peer_V1_ScrollbackChunk {
     get {
-      if case .scrollbackChunk(let v)? = _storage._payload {return v}
+      if case .scrollbackChunk(let v)? = payload {return v}
       return Termmesh_Peer_V1_ScrollbackChunk()
     }
-    set {_uniqueStorage()._payload = .scrollbackChunk(newValue)}
+    set {payload = .scrollbackChunk(newValue)}
   }
 
   public var workspaceUpdate: Termmesh_Peer_V1_WorkspaceUpdate {
     get {
-      if case .workspaceUpdate(let v)? = _storage._payload {return v}
+      if case .workspaceUpdate(let v)? = payload {return v}
       return Termmesh_Peer_V1_WorkspaceUpdate()
     }
-    set {_uniqueStorage()._payload = .workspaceUpdate(newValue)}
+    set {payload = .workspaceUpdate(newValue)}
   }
 
   /// Gated behind capability "workspace.lifecycle.v1" (Hello.capabilities).
   public var renameWorkspaceRequest: Termmesh_Peer_V1_RenameWorkspaceRequest {
     get {
-      if case .renameWorkspaceRequest(let v)? = _storage._payload {return v}
+      if case .renameWorkspaceRequest(let v)? = payload {return v}
       return Termmesh_Peer_V1_RenameWorkspaceRequest()
     }
-    set {_uniqueStorage()._payload = .renameWorkspaceRequest(newValue)}
+    set {payload = .renameWorkspaceRequest(newValue)}
   }
 
   public var deleteWorkspaceRequest: Termmesh_Peer_V1_DeleteWorkspaceRequest {
     get {
-      if case .deleteWorkspaceRequest(let v)? = _storage._payload {return v}
+      if case .deleteWorkspaceRequest(let v)? = payload {return v}
       return Termmesh_Peer_V1_DeleteWorkspaceRequest()
     }
-    set {_uniqueStorage()._payload = .deleteWorkspaceRequest(newValue)}
+    set {payload = .deleteWorkspaceRequest(newValue)}
   }
 
   /// Gated behind capability "surface.ensure.v1" (Hello.capabilities).
   public var ensureSurfaceRequest: Termmesh_Peer_V1_EnsureSurfaceRequest {
     get {
-      if case .ensureSurfaceRequest(let v)? = _storage._payload {return v}
+      if case .ensureSurfaceRequest(let v)? = payload {return v}
       return Termmesh_Peer_V1_EnsureSurfaceRequest()
     }
-    set {_uniqueStorage()._payload = .ensureSurfaceRequest(newValue)}
+    set {payload = .ensureSurfaceRequest(newValue)}
   }
 
   public var ensureSurfaceResponse: Termmesh_Peer_V1_EnsureSurfaceResponse {
     get {
-      if case .ensureSurfaceResponse(let v)? = _storage._payload {return v}
+      if case .ensureSurfaceResponse(let v)? = payload {return v}
       return Termmesh_Peer_V1_EnsureSurfaceResponse()
     }
-    set {_uniqueStorage()._payload = .ensureSurfaceResponse(newValue)}
+    set {payload = .ensureSurfaceResponse(newValue)}
   }
 
   /// Gated behind capability "surface.terminate.v1" (Hello.capabilities).
   public var terminateSurfaceRequest: Termmesh_Peer_V1_TerminateSurfaceRequest {
     get {
-      if case .terminateSurfaceRequest(let v)? = _storage._payload {return v}
+      if case .terminateSurfaceRequest(let v)? = payload {return v}
       return Termmesh_Peer_V1_TerminateSurfaceRequest()
     }
-    set {_uniqueStorage()._payload = .terminateSurfaceRequest(newValue)}
+    set {payload = .terminateSurfaceRequest(newValue)}
   }
 
   public var terminateSurfaceResponse: Termmesh_Peer_V1_TerminateSurfaceResponse {
     get {
-      if case .terminateSurfaceResponse(let v)? = _storage._payload {return v}
+      if case .terminateSurfaceResponse(let v)? = payload {return v}
       return Termmesh_Peer_V1_TerminateSurfaceResponse()
     }
-    set {_uniqueStorage()._payload = .terminateSurfaceResponse(newValue)}
+    set {payload = .terminateSurfaceResponse(newValue)}
   }
 
   /// Host-pushed, gated behind capability "host.stats.v1" (Hello.capabilities).
   public var hostStats: Termmesh_Peer_V1_HostStats {
     get {
-      if case .hostStats(let v)? = _storage._payload {return v}
+      if case .hostStats(let v)? = payload {return v}
       return Termmesh_Peer_V1_HostStats()
     }
-    set {_uniqueStorage()._payload = .hostStats(newValue)}
+    set {payload = .hostStats(newValue)}
   }
 
   /// Gated behind capability "team.roster.v1" (Hello.capabilities).
   public var listTeams: Termmesh_Peer_V1_ListTeams {
     get {
-      if case .listTeams(let v)? = _storage._payload {return v}
+      if case .listTeams(let v)? = payload {return v}
       return Termmesh_Peer_V1_ListTeams()
     }
-    set {_uniqueStorage()._payload = .listTeams(newValue)}
+    set {payload = .listTeams(newValue)}
   }
 
   public var teamList: Termmesh_Peer_V1_TeamList {
     get {
-      if case .teamList(let v)? = _storage._payload {return v}
+      if case .teamList(let v)? = payload {return v}
       return Termmesh_Peer_V1_TeamList()
     }
-    set {_uniqueStorage()._payload = .teamList(newValue)}
+    set {payload = .teamList(newValue)}
   }
 
   /// Gated behind capability "team.call.v1" (Hello.capabilities).
   public var teamCallRequest: Termmesh_Peer_V1_TeamCallRequest {
     get {
-      if case .teamCallRequest(let v)? = _storage._payload {return v}
+      if case .teamCallRequest(let v)? = payload {return v}
       return Termmesh_Peer_V1_TeamCallRequest()
     }
-    set {_uniqueStorage()._payload = .teamCallRequest(newValue)}
+    set {payload = .teamCallRequest(newValue)}
   }
 
   public var teamCallResponse: Termmesh_Peer_V1_TeamCallResponse {
     get {
-      if case .teamCallResponse(let v)? = _storage._payload {return v}
+      if case .teamCallResponse(let v)? = payload {return v}
       return Termmesh_Peer_V1_TeamCallResponse()
     }
-    set {_uniqueStorage()._payload = .teamCallResponse(newValue)}
+    set {payload = .teamCallResponse(newValue)}
   }
 
   /// Gated behind capability "team.leader.v1" (Hello.capabilities).
   public var teamLeaderBootstrapRequest: Termmesh_Peer_V1_TeamLeaderBootstrapRequest {
     get {
-      if case .teamLeaderBootstrapRequest(let v)? = _storage._payload {return v}
+      if case .teamLeaderBootstrapRequest(let v)? = payload {return v}
       return Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
     }
-    set {_uniqueStorage()._payload = .teamLeaderBootstrapRequest(newValue)}
+    set {payload = .teamLeaderBootstrapRequest(newValue)}
   }
 
   public var teamLeaderBootstrapResponse: Termmesh_Peer_V1_TeamLeaderBootstrapResponse {
     get {
-      if case .teamLeaderBootstrapResponse(let v)? = _storage._payload {return v}
+      if case .teamLeaderBootstrapResponse(let v)? = payload {return v}
       return Termmesh_Peer_V1_TeamLeaderBootstrapResponse()
     }
-    set {_uniqueStorage()._payload = .teamLeaderBootstrapResponse(newValue)}
+    set {payload = .teamLeaderBootstrapResponse(newValue)}
   }
 
   /// Client opts into host-pushed complete workspace rosters. Gated behind
@@ -763,18 +754,18 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: @unchecked Sendable {
   /// response-waiting ListWorkspaces RPC on the same session.
   public var subscribeWorkspaceList: Termmesh_Peer_V1_SubscribeWorkspaceList {
     get {
-      if case .subscribeWorkspaceList(let v)? = _storage._payload {return v}
+      if case .subscribeWorkspaceList(let v)? = payload {return v}
       return Termmesh_Peer_V1_SubscribeWorkspaceList()
     }
-    set {_uniqueStorage()._payload = .subscribeWorkspaceList(newValue)}
+    set {payload = .subscribeWorkspaceList(newValue)}
   }
 
   public var workspaceListChanged: Termmesh_Peer_V1_WorkspaceListChanged {
     get {
-      if case .workspaceListChanged(let v)? = _storage._payload {return v}
+      if case .workspaceListChanged(let v)? = payload {return v}
       return Termmesh_Peer_V1_WorkspaceListChanged()
     }
-    set {_uniqueStorage()._payload = .workspaceListChanged(newValue)}
+    set {payload = .workspaceListChanged(newValue)}
   }
 
   /// Scoped remote-leader command return route. This is deliberately not
@@ -782,78 +773,112 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: @unchecked Sendable {
   /// idempotency key validated by the authoritative control plane.
   public var teamLeaderCommandRequest: Termmesh_Peer_V1_TeamLeaderCommandRequest {
     get {
-      if case .teamLeaderCommandRequest(let v)? = _storage._payload {return v}
+      if case .teamLeaderCommandRequest(let v)? = payload {return v}
       return Termmesh_Peer_V1_TeamLeaderCommandRequest()
     }
-    set {_uniqueStorage()._payload = .teamLeaderCommandRequest(newValue)}
+    set {payload = .teamLeaderCommandRequest(newValue)}
   }
 
   public var teamLeaderCommandResponse: Termmesh_Peer_V1_TeamLeaderCommandResponse {
     get {
-      if case .teamLeaderCommandResponse(let v)? = _storage._payload {return v}
+      if case .teamLeaderCommandResponse(let v)? = payload {return v}
       return Termmesh_Peer_V1_TeamLeaderCommandResponse()
     }
-    set {_uniqueStorage()._payload = .teamLeaderCommandResponse(newValue)}
+    set {payload = .teamLeaderCommandResponse(newValue)}
   }
 
   public var ping: Termmesh_Peer_V1_Ping {
     get {
-      if case .ping(let v)? = _storage._payload {return v}
+      if case .ping(let v)? = payload {return v}
       return Termmesh_Peer_V1_Ping()
     }
-    set {_uniqueStorage()._payload = .ping(newValue)}
+    set {payload = .ping(newValue)}
   }
 
   public var pong: Termmesh_Peer_V1_Pong {
     get {
-      if case .pong(let v)? = _storage._payload {return v}
+      if case .pong(let v)? = payload {return v}
       return Termmesh_Peer_V1_Pong()
     }
-    set {_uniqueStorage()._payload = .pong(newValue)}
+    set {payload = .pong(newValue)}
   }
 
   public var goodbye: Termmesh_Peer_V1_Goodbye {
     get {
-      if case .goodbye(let v)? = _storage._payload {return v}
+      if case .goodbye(let v)? = payload {return v}
       return Termmesh_Peer_V1_Goodbye()
     }
-    set {_uniqueStorage()._payload = .goodbye(newValue)}
+    set {payload = .goodbye(newValue)}
   }
 
   /// Host-pushed after the final PtyData for a dead surface. Gated behind
   /// capability "surface.exit.v1".
   public var surfaceExited: Termmesh_Peer_V1_SurfaceExited {
     get {
-      if case .surfaceExited(let v)? = _storage._payload {return v}
+      if case .surfaceExited(let v)? = payload {return v}
       return Termmesh_Peer_V1_SurfaceExited()
     }
-    set {_uniqueStorage()._payload = .surfaceExited(newValue)}
+    set {payload = .surfaceExited(newValue)}
   }
 
   /// Durable mapping from a peer-owned project to the exact surfaces that
   /// present it. Gated behind capability "project.presentation.v1".
   public var upsertProjectPresentationRequest: Termmesh_Peer_V1_UpsertProjectPresentationRequest {
     get {
-      if case .upsertProjectPresentationRequest(let v)? = _storage._payload {return v}
+      if case .upsertProjectPresentationRequest(let v)? = payload {return v}
       return Termmesh_Peer_V1_UpsertProjectPresentationRequest()
     }
-    set {_uniqueStorage()._payload = .upsertProjectPresentationRequest(newValue)}
+    set {payload = .upsertProjectPresentationRequest(newValue)}
   }
 
   public var upsertProjectPresentationResponse: Termmesh_Peer_V1_UpsertProjectPresentationResponse {
     get {
-      if case .upsertProjectPresentationResponse(let v)? = _storage._payload {return v}
+      if case .upsertProjectPresentationResponse(let v)? = payload {return v}
       return Termmesh_Peer_V1_UpsertProjectPresentationResponse()
     }
-    set {_uniqueStorage()._payload = .upsertProjectPresentationResponse(newValue)}
+    set {payload = .upsertProjectPresentationResponse(newValue)}
+  }
+
+  /// Explicit stale-record inspection and owner-mismatch administrative repair.
+  /// Gated behind capability "project.presentation.repair.v1".
+  public var inspectProjectPresentationRequest: Termmesh_Peer_V1_InspectProjectPresentationRequest {
+    get {
+      if case .inspectProjectPresentationRequest(let v)? = payload {return v}
+      return Termmesh_Peer_V1_InspectProjectPresentationRequest()
+    }
+    set {payload = .inspectProjectPresentationRequest(newValue)}
+  }
+
+  public var inspectProjectPresentationResponse: Termmesh_Peer_V1_InspectProjectPresentationResponse {
+    get {
+      if case .inspectProjectPresentationResponse(let v)? = payload {return v}
+      return Termmesh_Peer_V1_InspectProjectPresentationResponse()
+    }
+    set {payload = .inspectProjectPresentationResponse(newValue)}
+  }
+
+  public var repairProjectPresentationRequest: Termmesh_Peer_V1_RepairProjectPresentationRequest {
+    get {
+      if case .repairProjectPresentationRequest(let v)? = payload {return v}
+      return Termmesh_Peer_V1_RepairProjectPresentationRequest()
+    }
+    set {payload = .repairProjectPresentationRequest(newValue)}
+  }
+
+  public var repairProjectPresentationResponse: Termmesh_Peer_V1_RepairProjectPresentationResponse {
+    get {
+      if case .repairProjectPresentationResponse(let v)? = payload {return v}
+      return Termmesh_Peer_V1_RepairProjectPresentationResponse()
+    }
+    set {payload = .repairProjectPresentationResponse(newValue)}
   }
 
   public var error: Termmesh_Peer_V1_Error {
     get {
-      if case .error(let v)? = _storage._payload {return v}
+      if case .error(let v)? = payload {return v}
       return Termmesh_Peer_V1_Error()
     }
-    set {_uniqueStorage()._payload = .error(newValue)}
+    set {payload = .error(newValue)}
   }
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
@@ -926,13 +951,17 @@ public nonisolated struct Termmesh_Peer_V1_Envelope: @unchecked Sendable {
     /// present it. Gated behind capability "project.presentation.v1".
     case upsertProjectPresentationRequest(Termmesh_Peer_V1_UpsertProjectPresentationRequest)
     case upsertProjectPresentationResponse(Termmesh_Peer_V1_UpsertProjectPresentationResponse)
+    /// Explicit stale-record inspection and owner-mismatch administrative repair.
+    /// Gated behind capability "project.presentation.repair.v1".
+    case inspectProjectPresentationRequest(Termmesh_Peer_V1_InspectProjectPresentationRequest)
+    case inspectProjectPresentationResponse(Termmesh_Peer_V1_InspectProjectPresentationResponse)
+    case repairProjectPresentationRequest(Termmesh_Peer_V1_RepairProjectPresentationRequest)
+    case repairProjectPresentationResponse(Termmesh_Peer_V1_RepairProjectPresentationResponse)
     case error(Termmesh_Peer_V1_Error)
 
   }
 
   public init() {}
-
-  fileprivate var _storage = _StorageClass.defaultInstance
 }
 
 public nonisolated struct Termmesh_Peer_V1_Hello: Sendable {
@@ -2500,6 +2529,10 @@ public nonisolated struct Termmesh_Peer_V1_Team: Sendable {
 
   public var leaderProcessActiveKnown: Bool = false
 
+  public var referencedSurfaceCount: UInt32 = 0
+
+  public var liveReferencedSurfaceCount: UInt32 = 0
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -2539,30 +2572,43 @@ public nonisolated struct Termmesh_Peer_V1_TeamMember: Sendable {
 /// member topology changes. The host binds the record to the authenticated
 /// peer_id on first write; another installation may discover and attach it but
 /// cannot silently rewrite ownership.
-public nonisolated struct Termmesh_Peer_V1_UpsertProjectPresentationRequest: Sendable {
+public nonisolated struct Termmesh_Peer_V1_UpsertProjectPresentationRequest: @unchecked Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
-  public var requestID: Data = Data()
+  public var requestID: Data {
+    get {_storage._requestID}
+    set {_uniqueStorage()._requestID = newValue}
+  }
 
   public var project: Termmesh_Peer_V1_Team {
-    get {_project ?? Termmesh_Peer_V1_Team()}
-    set {_project = newValue}
+    get {_storage._project ?? Termmesh_Peer_V1_Team()}
+    set {_uniqueStorage()._project = newValue}
   }
   /// Returns true if `project` has been explicitly set.
-  public var hasProject: Bool {self._project != nil}
+  public var hasProject: Bool {_storage._project != nil}
   /// Clears the value of `project`. Subsequent reads from it will return its default value.
-  public mutating func clearProject() {self._project = nil}
+  public mutating func clearProject() {_uniqueStorage()._project = nil}
 
   /// Owner-authorized lifecycle end. Mutually exclusive with project.
-  public var deleteProjectID: String = String()
+  public var deleteProjectID: String {
+    get {_storage._deleteProjectID}
+    set {_uniqueStorage()._deleteProjectID = newValue}
+  }
+
+  /// Optional proof returned by InspectProjectPresentationResponse. When set,
+  /// deletion is accepted only if the exact revision is still durably stale.
+  public var staleEvidenceToken: Data {
+    get {_storage._staleEvidenceToken}
+    set {_uniqueStorage()._staleEvidenceToken = newValue}
+  }
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 
-  fileprivate var _project: Termmesh_Peer_V1_Team? = nil
+  fileprivate var _storage = _StorageClass.defaultInstance
 }
 
 public nonisolated struct Termmesh_Peer_V1_UpsertProjectPresentationResponse: Sendable {
@@ -2575,6 +2621,113 @@ public nonisolated struct Termmesh_Peer_V1_UpsertProjectPresentationResponse: Se
   public var ok: Bool = false
 
   public var revision: UInt64 = 0
+
+  public var errorCode: String = String()
+
+  public var errorMessage: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_ProjectPresentationSurfaceStatus: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var surfaceID: Data = Data()
+
+  public var role: String = String()
+
+  public var present: Bool = false
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+/// Inspection is deliberately two-step. The first all-missing observation
+/// records bounded evidence; only a later request on the same authenticated
+/// connection can return stale=true and an evidence token.
+public nonisolated struct Termmesh_Peer_V1_InspectProjectPresentationRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var requestID: Data = Data()
+
+  public var projectID: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_InspectProjectPresentationResponse: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var requestID: Data = Data()
+
+  public var ok: Bool = false
+
+  public var projectID: String = String()
+
+  public var teamName: String = String()
+
+  public var workingDirectory: String = String()
+
+  public var revision: UInt64 = 0
+
+  public var ownedByRequester: Bool = false
+
+  public var surfaces: [Termmesh_Peer_V1_ProjectPresentationSurfaceStatus] = []
+
+  public var stale: Bool = false
+
+  public var staleEvidenceToken: Data = Data()
+
+  public var errorCode: String = String()
+
+  public var errorMessage: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+/// Administrative repair is only for owner mismatch. The authenticated
+/// connection must present the evidence token for the exact Project revision.
+public nonisolated struct Termmesh_Peer_V1_RepairProjectPresentationRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var requestID: Data = Data()
+
+  public var projectID: String = String()
+
+  public var expectedRevision: UInt64 = 0
+
+  public var staleEvidenceToken: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Termmesh_Peer_V1_RepairProjectPresentationResponse: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var requestID: Data = Data()
+
+  public var ok: Bool = false
+
+  public var backupPath: String = String()
 
   public var errorCode: String = String()
 
@@ -2842,864 +2995,892 @@ nonisolated extension Termmesh_Peer_V1_TeamLeaderRole: SwiftProtobuf._ProtoNameP
 
 nonisolated extension Termmesh_Peer_V1_Envelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{3}scrollback_request\0\u{3}scrollback_chunk\0\u{4}\u{4}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{3}ensure_surface_request\0\u{3}ensure_surface_response\0\u{3}terminate_surface_request\0\u{3}terminate_surface_response\0\u{3}host_stats\0\u{3}list_teams\0\u{3}team_list\0\u{1}ping\0\u{1}pong\0\u{3}team_call_request\0\u{3}team_call_response\0\u{3}team_leader_bootstrap_request\0\u{3}team_leader_bootstrap_response\0\u{3}subscribe_workspace_list\0\u{3}workspace_list_changed\0\u{3}team_leader_command_request\0\u{3}team_leader_command_response\0\u{1}goodbye\0\u{3}surface_exited\0\u{3}upsert_project_presentation_request\0\u{3}upsert_project_presentation_response\0\u{2}$error\0")
-
-  fileprivate class _StorageClass {
-    var _seq: UInt64 = 0
-    var _correlationID: UInt64 = 0
-    var _payload: Termmesh_Peer_V1_Envelope.OneOf_Payload?
-
-      // This property is used as the initial default value for new instances of the type.
-      // The type itself is protecting the reference to its storage via CoW semantics.
-      // This will force a copy to be made of this reference when the first mutation occurs;
-      // hence, it is safe to mark this as `nonisolated(unsafe)`.
-      static nonisolated(unsafe) let defaultInstance = _StorageClass()
-
-    private init() {}
-
-    init(copying source: _StorageClass) {
-      _seq = source._seq
-      _correlationID = source._correlationID
-      _payload = source._payload
-    }
-  }
-
-  fileprivate mutating func _uniqueStorage() -> _StorageClass {
-    if !isKnownUniquelyReferenced(&_storage) {
-      _storage = _StorageClass(copying: _storage)
-    }
-    return _storage
-  }
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}seq\0\u{3}correlation_id\0\u{2}\u{8}hello\0\u{3}auth_challenge\0\u{1}auth\0\u{3}auth_result\0\u{4}\u{7}list_surfaces\0\u{3}surface_list\0\u{3}attach_surface\0\u{3}attach_result\0\u{3}detach_surface\0\u{3}list_workspaces\0\u{3}workspace_list\0\u{3}workspace_control\0\u{3}create_workspace_request\0\u{3}create_workspace_response\0\u{3}pty_data\0\u{1}input\0\u{1}resize\0\u{3}grid_snapshot\0\u{3}data_ack\0\u{3}scrollback_request\0\u{3}scrollback_chunk\0\u{4}\u{4}workspace_update\0\u{3}rename_workspace_request\0\u{3}delete_workspace_request\0\u{3}ensure_surface_request\0\u{3}ensure_surface_response\0\u{3}terminate_surface_request\0\u{3}terminate_surface_response\0\u{3}host_stats\0\u{3}list_teams\0\u{3}team_list\0\u{1}ping\0\u{1}pong\0\u{3}team_call_request\0\u{3}team_call_response\0\u{3}team_leader_bootstrap_request\0\u{3}team_leader_bootstrap_response\0\u{3}subscribe_workspace_list\0\u{3}workspace_list_changed\0\u{3}team_leader_command_request\0\u{3}team_leader_command_response\0\u{1}goodbye\0\u{3}surface_exited\0\u{3}upsert_project_presentation_request\0\u{3}upsert_project_presentation_response\0\u{3}inspect_project_presentation_request\0\u{3}inspect_project_presentation_response\0\u{3}repair_project_presentation_request\0\u{3}repair_project_presentation_response\0\u{2} error\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    _ = _uniqueStorage()
-    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
-      while let fieldNumber = try decoder.nextFieldNumber() {
-        // The use of inline closures is to circumvent an issue where the compiler
-        // allocates stack space for every case branch when no optimizations are
-        // enabled. https://github.com/apple/swift-protobuf/issues/1034
-        switch fieldNumber {
-        case 1: try { try decoder.decodeSingularUInt64Field(value: &_storage._seq) }()
-        case 2: try { try decoder.decodeSingularUInt64Field(value: &_storage._correlationID) }()
-        case 10: try {
-          var v: Termmesh_Peer_V1_Hello?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .hello(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .hello(v)
-          }
-        }()
-        case 11: try {
-          var v: Termmesh_Peer_V1_AuthChallenge?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .authChallenge(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .authChallenge(v)
-          }
-        }()
-        case 12: try {
-          var v: Termmesh_Peer_V1_Auth?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .auth(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .auth(v)
-          }
-        }()
-        case 13: try {
-          var v: Termmesh_Peer_V1_AuthResult?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .authResult(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .authResult(v)
-          }
-        }()
-        case 20: try {
-          var v: Termmesh_Peer_V1_ListSurfaces?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .listSurfaces(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .listSurfaces(v)
-          }
-        }()
-        case 21: try {
-          var v: Termmesh_Peer_V1_SurfaceList?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .surfaceList(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .surfaceList(v)
-          }
-        }()
-        case 22: try {
-          var v: Termmesh_Peer_V1_AttachSurface?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .attachSurface(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .attachSurface(v)
-          }
-        }()
-        case 23: try {
-          var v: Termmesh_Peer_V1_AttachResult?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .attachResult(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .attachResult(v)
-          }
-        }()
-        case 24: try {
-          var v: Termmesh_Peer_V1_DetachSurface?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .detachSurface(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .detachSurface(v)
-          }
-        }()
-        case 25: try {
-          var v: Termmesh_Peer_V1_ListWorkspaces?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .listWorkspaces(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .listWorkspaces(v)
-          }
-        }()
-        case 26: try {
-          var v: Termmesh_Peer_V1_WorkspaceList?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .workspaceList(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .workspaceList(v)
-          }
-        }()
-        case 27: try {
-          var v: Termmesh_Peer_V1_WorkspaceControl?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .workspaceControl(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .workspaceControl(v)
-          }
-        }()
-        case 28: try {
-          var v: Termmesh_Peer_V1_CreateWorkspaceRequest?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .createWorkspaceRequest(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .createWorkspaceRequest(v)
-          }
-        }()
-        case 29: try {
-          var v: Termmesh_Peer_V1_CreateWorkspaceResponse?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .createWorkspaceResponse(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .createWorkspaceResponse(v)
-          }
-        }()
-        case 30: try {
-          var v: Termmesh_Peer_V1_PtyData?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .ptyData(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .ptyData(v)
-          }
-        }()
-        case 31: try {
-          var v: Termmesh_Peer_V1_Input?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .input(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .input(v)
-          }
-        }()
-        case 32: try {
-          var v: Termmesh_Peer_V1_Resize?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .resize(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .resize(v)
-          }
-        }()
-        case 33: try {
-          var v: Termmesh_Peer_V1_GridSnapshot?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .gridSnapshot(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .gridSnapshot(v)
-          }
-        }()
-        case 34: try {
-          var v: Termmesh_Peer_V1_DataAck?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .dataAck(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .dataAck(v)
-          }
-        }()
-        case 35: try {
-          var v: Termmesh_Peer_V1_ScrollbackRequest?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .scrollbackRequest(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .scrollbackRequest(v)
-          }
-        }()
-        case 36: try {
-          var v: Termmesh_Peer_V1_ScrollbackChunk?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .scrollbackChunk(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .scrollbackChunk(v)
-          }
-        }()
-        case 40: try {
-          var v: Termmesh_Peer_V1_WorkspaceUpdate?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .workspaceUpdate(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .workspaceUpdate(v)
-          }
-        }()
-        case 41: try {
-          var v: Termmesh_Peer_V1_RenameWorkspaceRequest?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .renameWorkspaceRequest(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .renameWorkspaceRequest(v)
-          }
-        }()
-        case 42: try {
-          var v: Termmesh_Peer_V1_DeleteWorkspaceRequest?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .deleteWorkspaceRequest(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .deleteWorkspaceRequest(v)
-          }
-        }()
-        case 43: try {
-          var v: Termmesh_Peer_V1_EnsureSurfaceRequest?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .ensureSurfaceRequest(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .ensureSurfaceRequest(v)
-          }
-        }()
-        case 44: try {
-          var v: Termmesh_Peer_V1_EnsureSurfaceResponse?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .ensureSurfaceResponse(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .ensureSurfaceResponse(v)
-          }
-        }()
-        case 45: try {
-          var v: Termmesh_Peer_V1_TerminateSurfaceRequest?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .terminateSurfaceRequest(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .terminateSurfaceRequest(v)
-          }
-        }()
-        case 46: try {
-          var v: Termmesh_Peer_V1_TerminateSurfaceResponse?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .terminateSurfaceResponse(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .terminateSurfaceResponse(v)
-          }
-        }()
-        case 47: try {
-          var v: Termmesh_Peer_V1_HostStats?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .hostStats(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .hostStats(v)
-          }
-        }()
-        case 48: try {
-          var v: Termmesh_Peer_V1_ListTeams?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .listTeams(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .listTeams(v)
-          }
-        }()
-        case 49: try {
-          var v: Termmesh_Peer_V1_TeamList?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .teamList(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .teamList(v)
-          }
-        }()
-        case 50: try {
-          var v: Termmesh_Peer_V1_Ping?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .ping(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .ping(v)
-          }
-        }()
-        case 51: try {
-          var v: Termmesh_Peer_V1_Pong?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .pong(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .pong(v)
-          }
-        }()
-        case 52: try {
-          var v: Termmesh_Peer_V1_TeamCallRequest?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .teamCallRequest(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .teamCallRequest(v)
-          }
-        }()
-        case 53: try {
-          var v: Termmesh_Peer_V1_TeamCallResponse?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .teamCallResponse(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .teamCallResponse(v)
-          }
-        }()
-        case 54: try {
-          var v: Termmesh_Peer_V1_TeamLeaderBootstrapRequest?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .teamLeaderBootstrapRequest(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .teamLeaderBootstrapRequest(v)
-          }
-        }()
-        case 55: try {
-          var v: Termmesh_Peer_V1_TeamLeaderBootstrapResponse?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .teamLeaderBootstrapResponse(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .teamLeaderBootstrapResponse(v)
-          }
-        }()
-        case 56: try {
-          var v: Termmesh_Peer_V1_SubscribeWorkspaceList?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .subscribeWorkspaceList(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .subscribeWorkspaceList(v)
-          }
-        }()
-        case 57: try {
-          var v: Termmesh_Peer_V1_WorkspaceListChanged?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .workspaceListChanged(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .workspaceListChanged(v)
-          }
-        }()
-        case 58: try {
-          var v: Termmesh_Peer_V1_TeamLeaderCommandRequest?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .teamLeaderCommandRequest(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .teamLeaderCommandRequest(v)
-          }
-        }()
-        case 59: try {
-          var v: Termmesh_Peer_V1_TeamLeaderCommandResponse?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .teamLeaderCommandResponse(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .teamLeaderCommandResponse(v)
-          }
-        }()
-        case 60: try {
-          var v: Termmesh_Peer_V1_Goodbye?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .goodbye(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .goodbye(v)
-          }
-        }()
-        case 61: try {
-          var v: Termmesh_Peer_V1_SurfaceExited?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .surfaceExited(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .surfaceExited(v)
-          }
-        }()
-        case 62: try {
-          var v: Termmesh_Peer_V1_UpsertProjectPresentationRequest?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .upsertProjectPresentationRequest(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .upsertProjectPresentationRequest(v)
-          }
-        }()
-        case 63: try {
-          var v: Termmesh_Peer_V1_UpsertProjectPresentationResponse?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .upsertProjectPresentationResponse(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .upsertProjectPresentationResponse(v)
-          }
-        }()
-        case 99: try {
-          var v: Termmesh_Peer_V1_Error?
-          var hadOneofValue = false
-          if let current = _storage._payload {
-            hadOneofValue = true
-            if case .error(let m) = current {v = m}
-          }
-          try decoder.decodeSingularMessageField(value: &v)
-          if let v = v {
-            if hadOneofValue {try decoder.handleConflictingOneOf()}
-            _storage._payload = .error(v)
-          }
-        }()
-        default: break
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.seq) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.correlationID) }()
+      case 10: try {
+        var v: Termmesh_Peer_V1_Hello?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .hello(let m) = current {v = m}
         }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .hello(v)
+        }
+      }()
+      case 11: try {
+        var v: Termmesh_Peer_V1_AuthChallenge?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .authChallenge(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .authChallenge(v)
+        }
+      }()
+      case 12: try {
+        var v: Termmesh_Peer_V1_Auth?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .auth(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .auth(v)
+        }
+      }()
+      case 13: try {
+        var v: Termmesh_Peer_V1_AuthResult?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .authResult(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .authResult(v)
+        }
+      }()
+      case 20: try {
+        var v: Termmesh_Peer_V1_ListSurfaces?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .listSurfaces(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .listSurfaces(v)
+        }
+      }()
+      case 21: try {
+        var v: Termmesh_Peer_V1_SurfaceList?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .surfaceList(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .surfaceList(v)
+        }
+      }()
+      case 22: try {
+        var v: Termmesh_Peer_V1_AttachSurface?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .attachSurface(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .attachSurface(v)
+        }
+      }()
+      case 23: try {
+        var v: Termmesh_Peer_V1_AttachResult?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .attachResult(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .attachResult(v)
+        }
+      }()
+      case 24: try {
+        var v: Termmesh_Peer_V1_DetachSurface?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .detachSurface(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .detachSurface(v)
+        }
+      }()
+      case 25: try {
+        var v: Termmesh_Peer_V1_ListWorkspaces?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .listWorkspaces(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .listWorkspaces(v)
+        }
+      }()
+      case 26: try {
+        var v: Termmesh_Peer_V1_WorkspaceList?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .workspaceList(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .workspaceList(v)
+        }
+      }()
+      case 27: try {
+        var v: Termmesh_Peer_V1_WorkspaceControl?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .workspaceControl(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .workspaceControl(v)
+        }
+      }()
+      case 28: try {
+        var v: Termmesh_Peer_V1_CreateWorkspaceRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .createWorkspaceRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .createWorkspaceRequest(v)
+        }
+      }()
+      case 29: try {
+        var v: Termmesh_Peer_V1_CreateWorkspaceResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .createWorkspaceResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .createWorkspaceResponse(v)
+        }
+      }()
+      case 30: try {
+        var v: Termmesh_Peer_V1_PtyData?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .ptyData(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .ptyData(v)
+        }
+      }()
+      case 31: try {
+        var v: Termmesh_Peer_V1_Input?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .input(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .input(v)
+        }
+      }()
+      case 32: try {
+        var v: Termmesh_Peer_V1_Resize?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .resize(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .resize(v)
+        }
+      }()
+      case 33: try {
+        var v: Termmesh_Peer_V1_GridSnapshot?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .gridSnapshot(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .gridSnapshot(v)
+        }
+      }()
+      case 34: try {
+        var v: Termmesh_Peer_V1_DataAck?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .dataAck(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .dataAck(v)
+        }
+      }()
+      case 35: try {
+        var v: Termmesh_Peer_V1_ScrollbackRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .scrollbackRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .scrollbackRequest(v)
+        }
+      }()
+      case 36: try {
+        var v: Termmesh_Peer_V1_ScrollbackChunk?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .scrollbackChunk(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .scrollbackChunk(v)
+        }
+      }()
+      case 40: try {
+        var v: Termmesh_Peer_V1_WorkspaceUpdate?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .workspaceUpdate(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .workspaceUpdate(v)
+        }
+      }()
+      case 41: try {
+        var v: Termmesh_Peer_V1_RenameWorkspaceRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .renameWorkspaceRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .renameWorkspaceRequest(v)
+        }
+      }()
+      case 42: try {
+        var v: Termmesh_Peer_V1_DeleteWorkspaceRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .deleteWorkspaceRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .deleteWorkspaceRequest(v)
+        }
+      }()
+      case 43: try {
+        var v: Termmesh_Peer_V1_EnsureSurfaceRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .ensureSurfaceRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .ensureSurfaceRequest(v)
+        }
+      }()
+      case 44: try {
+        var v: Termmesh_Peer_V1_EnsureSurfaceResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .ensureSurfaceResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .ensureSurfaceResponse(v)
+        }
+      }()
+      case 45: try {
+        var v: Termmesh_Peer_V1_TerminateSurfaceRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .terminateSurfaceRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .terminateSurfaceRequest(v)
+        }
+      }()
+      case 46: try {
+        var v: Termmesh_Peer_V1_TerminateSurfaceResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .terminateSurfaceResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .terminateSurfaceResponse(v)
+        }
+      }()
+      case 47: try {
+        var v: Termmesh_Peer_V1_HostStats?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .hostStats(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .hostStats(v)
+        }
+      }()
+      case 48: try {
+        var v: Termmesh_Peer_V1_ListTeams?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .listTeams(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .listTeams(v)
+        }
+      }()
+      case 49: try {
+        var v: Termmesh_Peer_V1_TeamList?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .teamList(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .teamList(v)
+        }
+      }()
+      case 50: try {
+        var v: Termmesh_Peer_V1_Ping?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .ping(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .ping(v)
+        }
+      }()
+      case 51: try {
+        var v: Termmesh_Peer_V1_Pong?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .pong(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .pong(v)
+        }
+      }()
+      case 52: try {
+        var v: Termmesh_Peer_V1_TeamCallRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .teamCallRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .teamCallRequest(v)
+        }
+      }()
+      case 53: try {
+        var v: Termmesh_Peer_V1_TeamCallResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .teamCallResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .teamCallResponse(v)
+        }
+      }()
+      case 54: try {
+        var v: Termmesh_Peer_V1_TeamLeaderBootstrapRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .teamLeaderBootstrapRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .teamLeaderBootstrapRequest(v)
+        }
+      }()
+      case 55: try {
+        var v: Termmesh_Peer_V1_TeamLeaderBootstrapResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .teamLeaderBootstrapResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .teamLeaderBootstrapResponse(v)
+        }
+      }()
+      case 56: try {
+        var v: Termmesh_Peer_V1_SubscribeWorkspaceList?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .subscribeWorkspaceList(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .subscribeWorkspaceList(v)
+        }
+      }()
+      case 57: try {
+        var v: Termmesh_Peer_V1_WorkspaceListChanged?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .workspaceListChanged(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .workspaceListChanged(v)
+        }
+      }()
+      case 58: try {
+        var v: Termmesh_Peer_V1_TeamLeaderCommandRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .teamLeaderCommandRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .teamLeaderCommandRequest(v)
+        }
+      }()
+      case 59: try {
+        var v: Termmesh_Peer_V1_TeamLeaderCommandResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .teamLeaderCommandResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .teamLeaderCommandResponse(v)
+        }
+      }()
+      case 60: try {
+        var v: Termmesh_Peer_V1_Goodbye?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .goodbye(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .goodbye(v)
+        }
+      }()
+      case 61: try {
+        var v: Termmesh_Peer_V1_SurfaceExited?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .surfaceExited(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .surfaceExited(v)
+        }
+      }()
+      case 62: try {
+        var v: Termmesh_Peer_V1_UpsertProjectPresentationRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .upsertProjectPresentationRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .upsertProjectPresentationRequest(v)
+        }
+      }()
+      case 63: try {
+        var v: Termmesh_Peer_V1_UpsertProjectPresentationResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .upsertProjectPresentationResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .upsertProjectPresentationResponse(v)
+        }
+      }()
+      case 64: try {
+        var v: Termmesh_Peer_V1_InspectProjectPresentationRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .inspectProjectPresentationRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .inspectProjectPresentationRequest(v)
+        }
+      }()
+      case 65: try {
+        var v: Termmesh_Peer_V1_InspectProjectPresentationResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .inspectProjectPresentationResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .inspectProjectPresentationResponse(v)
+        }
+      }()
+      case 66: try {
+        var v: Termmesh_Peer_V1_RepairProjectPresentationRequest?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .repairProjectPresentationRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .repairProjectPresentationRequest(v)
+        }
+      }()
+      case 67: try {
+        var v: Termmesh_Peer_V1_RepairProjectPresentationResponse?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .repairProjectPresentationResponse(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .repairProjectPresentationResponse(v)
+        }
+      }()
+      case 99: try {
+        var v: Termmesh_Peer_V1_Error?
+        var hadOneofValue = false
+        if let current = self.payload {
+          hadOneofValue = true
+          if case .error(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.payload = .error(v)
+        }
+      }()
+      default: break
       }
     }
   }
 
   public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every if/case branch local when no optimizations
-      // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
-      // https://github.com/apple/swift-protobuf/issues/1182
-      if _storage._seq != 0 {
-        try visitor.visitSingularUInt64Field(value: _storage._seq, fieldNumber: 1)
-      }
-      if _storage._correlationID != 0 {
-        try visitor.visitSingularUInt64Field(value: _storage._correlationID, fieldNumber: 2)
-      }
-      switch _storage._payload {
-      case .hello?: try {
-        guard case .hello(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 10)
-      }()
-      case .authChallenge?: try {
-        guard case .authChallenge(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 11)
-      }()
-      case .auth?: try {
-        guard case .auth(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 12)
-      }()
-      case .authResult?: try {
-        guard case .authResult(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 13)
-      }()
-      case .listSurfaces?: try {
-        guard case .listSurfaces(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 20)
-      }()
-      case .surfaceList?: try {
-        guard case .surfaceList(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 21)
-      }()
-      case .attachSurface?: try {
-        guard case .attachSurface(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 22)
-      }()
-      case .attachResult?: try {
-        guard case .attachResult(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 23)
-      }()
-      case .detachSurface?: try {
-        guard case .detachSurface(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 24)
-      }()
-      case .listWorkspaces?: try {
-        guard case .listWorkspaces(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 25)
-      }()
-      case .workspaceList?: try {
-        guard case .workspaceList(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 26)
-      }()
-      case .workspaceControl?: try {
-        guard case .workspaceControl(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 27)
-      }()
-      case .createWorkspaceRequest?: try {
-        guard case .createWorkspaceRequest(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 28)
-      }()
-      case .createWorkspaceResponse?: try {
-        guard case .createWorkspaceResponse(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 29)
-      }()
-      case .ptyData?: try {
-        guard case .ptyData(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 30)
-      }()
-      case .input?: try {
-        guard case .input(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 31)
-      }()
-      case .resize?: try {
-        guard case .resize(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 32)
-      }()
-      case .gridSnapshot?: try {
-        guard case .gridSnapshot(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 33)
-      }()
-      case .dataAck?: try {
-        guard case .dataAck(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 34)
-      }()
-      case .scrollbackRequest?: try {
-        guard case .scrollbackRequest(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 35)
-      }()
-      case .scrollbackChunk?: try {
-        guard case .scrollbackChunk(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 36)
-      }()
-      case .workspaceUpdate?: try {
-        guard case .workspaceUpdate(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 40)
-      }()
-      case .renameWorkspaceRequest?: try {
-        guard case .renameWorkspaceRequest(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 41)
-      }()
-      case .deleteWorkspaceRequest?: try {
-        guard case .deleteWorkspaceRequest(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 42)
-      }()
-      case .ensureSurfaceRequest?: try {
-        guard case .ensureSurfaceRequest(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 43)
-      }()
-      case .ensureSurfaceResponse?: try {
-        guard case .ensureSurfaceResponse(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 44)
-      }()
-      case .terminateSurfaceRequest?: try {
-        guard case .terminateSurfaceRequest(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 45)
-      }()
-      case .terminateSurfaceResponse?: try {
-        guard case .terminateSurfaceResponse(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 46)
-      }()
-      case .hostStats?: try {
-        guard case .hostStats(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 47)
-      }()
-      case .listTeams?: try {
-        guard case .listTeams(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 48)
-      }()
-      case .teamList?: try {
-        guard case .teamList(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 49)
-      }()
-      case .ping?: try {
-        guard case .ping(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 50)
-      }()
-      case .pong?: try {
-        guard case .pong(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 51)
-      }()
-      case .teamCallRequest?: try {
-        guard case .teamCallRequest(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 52)
-      }()
-      case .teamCallResponse?: try {
-        guard case .teamCallResponse(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 53)
-      }()
-      case .teamLeaderBootstrapRequest?: try {
-        guard case .teamLeaderBootstrapRequest(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 54)
-      }()
-      case .teamLeaderBootstrapResponse?: try {
-        guard case .teamLeaderBootstrapResponse(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 55)
-      }()
-      case .subscribeWorkspaceList?: try {
-        guard case .subscribeWorkspaceList(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 56)
-      }()
-      case .workspaceListChanged?: try {
-        guard case .workspaceListChanged(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 57)
-      }()
-      case .teamLeaderCommandRequest?: try {
-        guard case .teamLeaderCommandRequest(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 58)
-      }()
-      case .teamLeaderCommandResponse?: try {
-        guard case .teamLeaderCommandResponse(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 59)
-      }()
-      case .goodbye?: try {
-        guard case .goodbye(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 60)
-      }()
-      case .surfaceExited?: try {
-        guard case .surfaceExited(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 61)
-      }()
-      case .upsertProjectPresentationRequest?: try {
-        guard case .upsertProjectPresentationRequest(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 62)
-      }()
-      case .upsertProjectPresentationResponse?: try {
-        guard case .upsertProjectPresentationResponse(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 63)
-      }()
-      case .error?: try {
-        guard case .error(let v)? = _storage._payload else { preconditionFailure() }
-        try visitor.visitSingularMessageField(value: v, fieldNumber: 99)
-      }()
-      case nil: break
-      }
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
+    if self.seq != 0 {
+      try visitor.visitSingularUInt64Field(value: self.seq, fieldNumber: 1)
+    }
+    if self.correlationID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.correlationID, fieldNumber: 2)
+    }
+    switch self.payload {
+    case .hello?: try {
+      guard case .hello(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 10)
+    }()
+    case .authChallenge?: try {
+      guard case .authChallenge(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 11)
+    }()
+    case .auth?: try {
+      guard case .auth(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 12)
+    }()
+    case .authResult?: try {
+      guard case .authResult(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 13)
+    }()
+    case .listSurfaces?: try {
+      guard case .listSurfaces(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 20)
+    }()
+    case .surfaceList?: try {
+      guard case .surfaceList(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 21)
+    }()
+    case .attachSurface?: try {
+      guard case .attachSurface(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 22)
+    }()
+    case .attachResult?: try {
+      guard case .attachResult(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 23)
+    }()
+    case .detachSurface?: try {
+      guard case .detachSurface(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 24)
+    }()
+    case .listWorkspaces?: try {
+      guard case .listWorkspaces(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 25)
+    }()
+    case .workspaceList?: try {
+      guard case .workspaceList(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 26)
+    }()
+    case .workspaceControl?: try {
+      guard case .workspaceControl(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 27)
+    }()
+    case .createWorkspaceRequest?: try {
+      guard case .createWorkspaceRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 28)
+    }()
+    case .createWorkspaceResponse?: try {
+      guard case .createWorkspaceResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 29)
+    }()
+    case .ptyData?: try {
+      guard case .ptyData(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 30)
+    }()
+    case .input?: try {
+      guard case .input(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 31)
+    }()
+    case .resize?: try {
+      guard case .resize(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 32)
+    }()
+    case .gridSnapshot?: try {
+      guard case .gridSnapshot(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 33)
+    }()
+    case .dataAck?: try {
+      guard case .dataAck(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 34)
+    }()
+    case .scrollbackRequest?: try {
+      guard case .scrollbackRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 35)
+    }()
+    case .scrollbackChunk?: try {
+      guard case .scrollbackChunk(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 36)
+    }()
+    case .workspaceUpdate?: try {
+      guard case .workspaceUpdate(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 40)
+    }()
+    case .renameWorkspaceRequest?: try {
+      guard case .renameWorkspaceRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 41)
+    }()
+    case .deleteWorkspaceRequest?: try {
+      guard case .deleteWorkspaceRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 42)
+    }()
+    case .ensureSurfaceRequest?: try {
+      guard case .ensureSurfaceRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 43)
+    }()
+    case .ensureSurfaceResponse?: try {
+      guard case .ensureSurfaceResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 44)
+    }()
+    case .terminateSurfaceRequest?: try {
+      guard case .terminateSurfaceRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 45)
+    }()
+    case .terminateSurfaceResponse?: try {
+      guard case .terminateSurfaceResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 46)
+    }()
+    case .hostStats?: try {
+      guard case .hostStats(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 47)
+    }()
+    case .listTeams?: try {
+      guard case .listTeams(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 48)
+    }()
+    case .teamList?: try {
+      guard case .teamList(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 49)
+    }()
+    case .ping?: try {
+      guard case .ping(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 50)
+    }()
+    case .pong?: try {
+      guard case .pong(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 51)
+    }()
+    case .teamCallRequest?: try {
+      guard case .teamCallRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 52)
+    }()
+    case .teamCallResponse?: try {
+      guard case .teamCallResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 53)
+    }()
+    case .teamLeaderBootstrapRequest?: try {
+      guard case .teamLeaderBootstrapRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 54)
+    }()
+    case .teamLeaderBootstrapResponse?: try {
+      guard case .teamLeaderBootstrapResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 55)
+    }()
+    case .subscribeWorkspaceList?: try {
+      guard case .subscribeWorkspaceList(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 56)
+    }()
+    case .workspaceListChanged?: try {
+      guard case .workspaceListChanged(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 57)
+    }()
+    case .teamLeaderCommandRequest?: try {
+      guard case .teamLeaderCommandRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 58)
+    }()
+    case .teamLeaderCommandResponse?: try {
+      guard case .teamLeaderCommandResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 59)
+    }()
+    case .goodbye?: try {
+      guard case .goodbye(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 60)
+    }()
+    case .surfaceExited?: try {
+      guard case .surfaceExited(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 61)
+    }()
+    case .upsertProjectPresentationRequest?: try {
+      guard case .upsertProjectPresentationRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 62)
+    }()
+    case .upsertProjectPresentationResponse?: try {
+      guard case .upsertProjectPresentationResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 63)
+    }()
+    case .inspectProjectPresentationRequest?: try {
+      guard case .inspectProjectPresentationRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 64)
+    }()
+    case .inspectProjectPresentationResponse?: try {
+      guard case .inspectProjectPresentationResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 65)
+    }()
+    case .repairProjectPresentationRequest?: try {
+      guard case .repairProjectPresentationRequest(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 66)
+    }()
+    case .repairProjectPresentationResponse?: try {
+      guard case .repairProjectPresentationResponse(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 67)
+    }()
+    case .error?: try {
+      guard case .error(let v)? = self.payload else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 99)
+    }()
+    case nil: break
     }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: Termmesh_Peer_V1_Envelope, rhs: Termmesh_Peer_V1_Envelope) -> Bool {
-    if lhs._storage !== rhs._storage {
-      let storagesAreEqual: Bool = withExtendedLifetime((lhs._storage, rhs._storage)) { (_args: (_StorageClass, _StorageClass)) in
-        let _storage = _args.0
-        let rhs_storage = _args.1
-        if _storage._seq != rhs_storage._seq {return false}
-        if _storage._correlationID != rhs_storage._correlationID {return false}
-        if _storage._payload != rhs_storage._payload {return false}
-        return true
-      }
-      if !storagesAreEqual {return false}
-    }
+    if lhs.seq != rhs.seq {return false}
+    if lhs.correlationID != rhs.correlationID {return false}
+    if lhs.payload != rhs.payload {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -6474,7 +6655,7 @@ nonisolated extension Termmesh_Peer_V1_TeamList: SwiftProtobuf.Message, SwiftPro
 
 nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Team"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}name\0\u{3}team_uuid\0\u{3}working_directory\0\u{3}project_root\0\u{3}agent_names\0\u{3}created_at_unix_secs\0\u{3}leader_surface_id\0\u{1}members\0\u{3}project_id\0\u{3}presentation_revision\0\u{3}presentation_owned_by_requester\0\u{3}leader_process_active\0\u{3}leader_process_active_known\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}name\0\u{3}team_uuid\0\u{3}working_directory\0\u{3}project_root\0\u{3}agent_names\0\u{3}created_at_unix_secs\0\u{3}leader_surface_id\0\u{1}members\0\u{3}project_id\0\u{3}presentation_revision\0\u{3}presentation_owned_by_requester\0\u{3}leader_process_active\0\u{3}leader_process_active_known\0\u{3}referenced_surface_count\0\u{3}live_referenced_surface_count\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6495,6 +6676,8 @@ nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobu
       case 11: try { try decoder.decodeSingularBoolField(value: &self.presentationOwnedByRequester) }()
       case 12: try { try decoder.decodeSingularBoolField(value: &self.leaderProcessActive) }()
       case 13: try { try decoder.decodeSingularBoolField(value: &self.leaderProcessActiveKnown) }()
+      case 14: try { try decoder.decodeSingularUInt32Field(value: &self.referencedSurfaceCount) }()
+      case 15: try { try decoder.decodeSingularUInt32Field(value: &self.liveReferencedSurfaceCount) }()
       default: break
       }
     }
@@ -6540,6 +6723,12 @@ nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobu
     if self.leaderProcessActiveKnown != false {
       try visitor.visitSingularBoolField(value: self.leaderProcessActiveKnown, fieldNumber: 13)
     }
+    if self.referencedSurfaceCount != 0 {
+      try visitor.visitSingularUInt32Field(value: self.referencedSurfaceCount, fieldNumber: 14)
+    }
+    if self.liveReferencedSurfaceCount != 0 {
+      try visitor.visitSingularUInt32Field(value: self.liveReferencedSurfaceCount, fieldNumber: 15)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -6557,6 +6746,8 @@ nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobu
     if lhs.presentationOwnedByRequester != rhs.presentationOwnedByRequester {return false}
     if lhs.leaderProcessActive != rhs.leaderProcessActive {return false}
     if lhs.leaderProcessActiveKnown != rhs.leaderProcessActiveKnown {return false}
+    if lhs.referencedSurfaceCount != rhs.referencedSurfaceCount {return false}
+    if lhs.liveReferencedSurfaceCount != rhs.liveReferencedSurfaceCount {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -6634,43 +6825,90 @@ nonisolated extension Termmesh_Peer_V1_TeamMember: SwiftProtobuf.Message, SwiftP
 
 nonisolated extension Termmesh_Peer_V1_UpsertProjectPresentationRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".UpsertProjectPresentationRequest"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{1}project\0\u{3}delete_project_id\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{1}project\0\u{3}delete_project_id\0\u{3}stale_evidence_token\0")
+
+  fileprivate class _StorageClass {
+    var _requestID: Data = Data()
+    var _project: Termmesh_Peer_V1_Team? = nil
+    var _deleteProjectID: String = String()
+    var _staleEvidenceToken: Data = Data()
+
+      // This property is used as the initial default value for new instances of the type.
+      // The type itself is protecting the reference to its storage via CoW semantics.
+      // This will force a copy to be made of this reference when the first mutation occurs;
+      // hence, it is safe to mark this as `nonisolated(unsafe)`.
+      static nonisolated(unsafe) let defaultInstance = _StorageClass()
+
+    private init() {}
+
+    init(copying source: _StorageClass) {
+      _requestID = source._requestID
+      _project = source._project
+      _deleteProjectID = source._deleteProjectID
+      _staleEvidenceToken = source._staleEvidenceToken
+    }
+  }
+
+  fileprivate mutating func _uniqueStorage() -> _StorageClass {
+    if !isKnownUniquelyReferenced(&_storage) {
+      _storage = _StorageClass(copying: _storage)
+    }
+    return _storage
+  }
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
-      case 2: try { try decoder.decodeSingularMessageField(value: &self._project) }()
-      case 3: try { try decoder.decodeSingularStringField(value: &self.deleteProjectID) }()
-      default: break
+    _ = _uniqueStorage()
+    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
+      while let fieldNumber = try decoder.nextFieldNumber() {
+        // The use of inline closures is to circumvent an issue where the compiler
+        // allocates stack space for every case branch when no optimizations are
+        // enabled. https://github.com/apple/swift-protobuf/issues/1034
+        switch fieldNumber {
+        case 1: try { try decoder.decodeSingularBytesField(value: &_storage._requestID) }()
+        case 2: try { try decoder.decodeSingularMessageField(value: &_storage._project) }()
+        case 3: try { try decoder.decodeSingularStringField(value: &_storage._deleteProjectID) }()
+        case 4: try { try decoder.decodeSingularBytesField(value: &_storage._staleEvidenceToken) }()
+        default: break
+        }
       }
     }
   }
 
   public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    // The use of inline closures is to circumvent an issue where the compiler
-    // allocates stack space for every if/case branch local when no optimizations
-    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
-    // https://github.com/apple/swift-protobuf/issues/1182
-    if !self.requestID.isEmpty {
-      try visitor.visitSingularBytesField(value: self.requestID, fieldNumber: 1)
-    }
-    try { if let v = self._project {
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
-    } }()
-    if !self.deleteProjectID.isEmpty {
-      try visitor.visitSingularStringField(value: self.deleteProjectID, fieldNumber: 3)
+    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every if/case branch local when no optimizations
+      // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+      // https://github.com/apple/swift-protobuf/issues/1182
+      if !_storage._requestID.isEmpty {
+        try visitor.visitSingularBytesField(value: _storage._requestID, fieldNumber: 1)
+      }
+      try { if let v = _storage._project {
+        try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
+      } }()
+      if !_storage._deleteProjectID.isEmpty {
+        try visitor.visitSingularStringField(value: _storage._deleteProjectID, fieldNumber: 3)
+      }
+      if !_storage._staleEvidenceToken.isEmpty {
+        try visitor.visitSingularBytesField(value: _storage._staleEvidenceToken, fieldNumber: 4)
+      }
     }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: Termmesh_Peer_V1_UpsertProjectPresentationRequest, rhs: Termmesh_Peer_V1_UpsertProjectPresentationRequest) -> Bool {
-    if lhs.requestID != rhs.requestID {return false}
-    if lhs._project != rhs._project {return false}
-    if lhs.deleteProjectID != rhs.deleteProjectID {return false}
+    if lhs._storage !== rhs._storage {
+      let storagesAreEqual: Bool = withExtendedLifetime((lhs._storage, rhs._storage)) { (_args: (_StorageClass, _StorageClass)) in
+        let _storage = _args.0
+        let rhs_storage = _args.1
+        if _storage._requestID != rhs_storage._requestID {return false}
+        if _storage._project != rhs_storage._project {return false}
+        if _storage._deleteProjectID != rhs_storage._deleteProjectID {return false}
+        if _storage._staleEvidenceToken != rhs_storage._staleEvidenceToken {return false}
+        return true
+      }
+      if !storagesAreEqual {return false}
+    }
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -6719,6 +6957,261 @@ nonisolated extension Termmesh_Peer_V1_UpsertProjectPresentationResponse: SwiftP
     if lhs.requestID != rhs.requestID {return false}
     if lhs.ok != rhs.ok {return false}
     if lhs.revision != rhs.revision {return false}
+    if lhs.errorCode != rhs.errorCode {return false}
+    if lhs.errorMessage != rhs.errorMessage {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_ProjectPresentationSurfaceStatus: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ProjectPresentationSurfaceStatus"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{1}role\0\u{1}present\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.surfaceID) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.role) }()
+      case 3: try { try decoder.decodeSingularBoolField(value: &self.present) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.surfaceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.surfaceID, fieldNumber: 1)
+    }
+    if !self.role.isEmpty {
+      try visitor.visitSingularStringField(value: self.role, fieldNumber: 2)
+    }
+    if self.present != false {
+      try visitor.visitSingularBoolField(value: self.present, fieldNumber: 3)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_ProjectPresentationSurfaceStatus, rhs: Termmesh_Peer_V1_ProjectPresentationSurfaceStatus) -> Bool {
+    if lhs.surfaceID != rhs.surfaceID {return false}
+    if lhs.role != rhs.role {return false}
+    if lhs.present != rhs.present {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_InspectProjectPresentationRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".InspectProjectPresentationRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{3}project_id\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.projectID) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.requestID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.requestID, fieldNumber: 1)
+    }
+    if !self.projectID.isEmpty {
+      try visitor.visitSingularStringField(value: self.projectID, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_InspectProjectPresentationRequest, rhs: Termmesh_Peer_V1_InspectProjectPresentationRequest) -> Bool {
+    if lhs.requestID != rhs.requestID {return false}
+    if lhs.projectID != rhs.projectID {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_InspectProjectPresentationResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".InspectProjectPresentationResponse"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{1}ok\0\u{3}project_id\0\u{3}team_name\0\u{3}working_directory\0\u{1}revision\0\u{3}owned_by_requester\0\u{1}surfaces\0\u{1}stale\0\u{3}stale_evidence_token\0\u{3}error_code\0\u{3}error_message\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
+      case 2: try { try decoder.decodeSingularBoolField(value: &self.ok) }()
+      case 3: try { try decoder.decodeSingularStringField(value: &self.projectID) }()
+      case 4: try { try decoder.decodeSingularStringField(value: &self.teamName) }()
+      case 5: try { try decoder.decodeSingularStringField(value: &self.workingDirectory) }()
+      case 6: try { try decoder.decodeSingularUInt64Field(value: &self.revision) }()
+      case 7: try { try decoder.decodeSingularBoolField(value: &self.ownedByRequester) }()
+      case 8: try { try decoder.decodeRepeatedMessageField(value: &self.surfaces) }()
+      case 9: try { try decoder.decodeSingularBoolField(value: &self.stale) }()
+      case 10: try { try decoder.decodeSingularBytesField(value: &self.staleEvidenceToken) }()
+      case 11: try { try decoder.decodeSingularStringField(value: &self.errorCode) }()
+      case 12: try { try decoder.decodeSingularStringField(value: &self.errorMessage) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.requestID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.requestID, fieldNumber: 1)
+    }
+    if self.ok != false {
+      try visitor.visitSingularBoolField(value: self.ok, fieldNumber: 2)
+    }
+    if !self.projectID.isEmpty {
+      try visitor.visitSingularStringField(value: self.projectID, fieldNumber: 3)
+    }
+    if !self.teamName.isEmpty {
+      try visitor.visitSingularStringField(value: self.teamName, fieldNumber: 4)
+    }
+    if !self.workingDirectory.isEmpty {
+      try visitor.visitSingularStringField(value: self.workingDirectory, fieldNumber: 5)
+    }
+    if self.revision != 0 {
+      try visitor.visitSingularUInt64Field(value: self.revision, fieldNumber: 6)
+    }
+    if self.ownedByRequester != false {
+      try visitor.visitSingularBoolField(value: self.ownedByRequester, fieldNumber: 7)
+    }
+    if !self.surfaces.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.surfaces, fieldNumber: 8)
+    }
+    if self.stale != false {
+      try visitor.visitSingularBoolField(value: self.stale, fieldNumber: 9)
+    }
+    if !self.staleEvidenceToken.isEmpty {
+      try visitor.visitSingularBytesField(value: self.staleEvidenceToken, fieldNumber: 10)
+    }
+    if !self.errorCode.isEmpty {
+      try visitor.visitSingularStringField(value: self.errorCode, fieldNumber: 11)
+    }
+    if !self.errorMessage.isEmpty {
+      try visitor.visitSingularStringField(value: self.errorMessage, fieldNumber: 12)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_InspectProjectPresentationResponse, rhs: Termmesh_Peer_V1_InspectProjectPresentationResponse) -> Bool {
+    if lhs.requestID != rhs.requestID {return false}
+    if lhs.ok != rhs.ok {return false}
+    if lhs.projectID != rhs.projectID {return false}
+    if lhs.teamName != rhs.teamName {return false}
+    if lhs.workingDirectory != rhs.workingDirectory {return false}
+    if lhs.revision != rhs.revision {return false}
+    if lhs.ownedByRequester != rhs.ownedByRequester {return false}
+    if lhs.surfaces != rhs.surfaces {return false}
+    if lhs.stale != rhs.stale {return false}
+    if lhs.staleEvidenceToken != rhs.staleEvidenceToken {return false}
+    if lhs.errorCode != rhs.errorCode {return false}
+    if lhs.errorMessage != rhs.errorMessage {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_RepairProjectPresentationRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".RepairProjectPresentationRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{3}project_id\0\u{3}expected_revision\0\u{3}stale_evidence_token\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.projectID) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.expectedRevision) }()
+      case 4: try { try decoder.decodeSingularBytesField(value: &self.staleEvidenceToken) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.requestID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.requestID, fieldNumber: 1)
+    }
+    if !self.projectID.isEmpty {
+      try visitor.visitSingularStringField(value: self.projectID, fieldNumber: 2)
+    }
+    if self.expectedRevision != 0 {
+      try visitor.visitSingularUInt64Field(value: self.expectedRevision, fieldNumber: 3)
+    }
+    if !self.staleEvidenceToken.isEmpty {
+      try visitor.visitSingularBytesField(value: self.staleEvidenceToken, fieldNumber: 4)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_RepairProjectPresentationRequest, rhs: Termmesh_Peer_V1_RepairProjectPresentationRequest) -> Bool {
+    if lhs.requestID != rhs.requestID {return false}
+    if lhs.projectID != rhs.projectID {return false}
+    if lhs.expectedRevision != rhs.expectedRevision {return false}
+    if lhs.staleEvidenceToken != rhs.staleEvidenceToken {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_RepairProjectPresentationResponse: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".RepairProjectPresentationResponse"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{1}ok\0\u{3}backup_path\0\u{3}error_code\0\u{3}error_message\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.requestID) }()
+      case 2: try { try decoder.decodeSingularBoolField(value: &self.ok) }()
+      case 3: try { try decoder.decodeSingularStringField(value: &self.backupPath) }()
+      case 4: try { try decoder.decodeSingularStringField(value: &self.errorCode) }()
+      case 5: try { try decoder.decodeSingularStringField(value: &self.errorMessage) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.requestID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.requestID, fieldNumber: 1)
+    }
+    if self.ok != false {
+      try visitor.visitSingularBoolField(value: self.ok, fieldNumber: 2)
+    }
+    if !self.backupPath.isEmpty {
+      try visitor.visitSingularStringField(value: self.backupPath, fieldNumber: 3)
+    }
+    if !self.errorCode.isEmpty {
+      try visitor.visitSingularStringField(value: self.errorCode, fieldNumber: 4)
+    }
+    if !self.errorMessage.isEmpty {
+      try visitor.visitSingularStringField(value: self.errorMessage, fieldNumber: 5)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_RepairProjectPresentationResponse, rhs: Termmesh_Peer_V1_RepairProjectPresentationResponse) -> Bool {
+    if lhs.requestID != rhs.requestID {return false}
+    if lhs.ok != rhs.ok {return false}
+    if lhs.backupPath != rhs.backupPath {return false}
     if lhs.errorCode != rhs.errorCode {return false}
     if lhs.errorMessage != rhs.errorMessage {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}

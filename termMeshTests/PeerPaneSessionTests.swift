@@ -88,6 +88,25 @@ final class PeerPaneSessionTests: XCTestCase {
         ) else { return XCTFail("remote name collision was not reported") }
     }
 
+    func testRemoteCollisionOffersRepairOnlyForDurablyMissingReferencedSurfaces() {
+        var remote = conflictRecord(
+            location: .remote(hostKey: "ssh:mac-sub", hostName: "mac-sub")
+        )
+        remote.referencedSurfaceCount = 3
+        remote.liveReferencedSurfaceCount = 0
+        XCTAssertTrue(remote.canOfferStaleRemoteRemoval)
+
+        remote.liveReferencedSurfaceCount = 1
+        XCTAssertFalse(remote.canOfferStaleRemoteRemoval, "live records are never removable")
+        remote.liveReferencedSurfaceCount = 0
+        remote.identity = .init(hostKey: "ssh:mac-sub", workingDirectory: "/work/xm")
+        XCTAssertFalse(remote.canOfferStaleRemoteRemoval, "repair requires an exact Project ID")
+
+        var local = conflictRecord(location: .detached(workspaceID: UUID()))
+        local.referencedSurfaceCount = 1
+        XCTAssertFalse(local.canOfferStaleRemoteRemoval, "local lifecycle uses normal teardown")
+    }
+
     func testProjectNameConflictDoesNotHideDifferentIdentityBehindExactMatch() {
         let requested = TeamOrchestrator.ProjectCreationIdentity(
             projectID: "team:one", hostKey: "ssh:mac-sub",

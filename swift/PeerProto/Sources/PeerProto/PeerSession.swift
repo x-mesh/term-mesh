@@ -567,6 +567,7 @@ public actor PeerSession {
     /// Remove a durable project manifest owned by this installation.
     public func deleteProjectPresentation(
         projectID: String,
+        staleEvidenceToken: Data = Data(),
         timeoutSeconds: TimeInterval = 10
     ) async throws -> Termmesh_Peer_V1_UpsertProjectPresentationResponse {
         try requireHostCapability(PeerCapability.projectPresentationV1)
@@ -575,6 +576,7 @@ public actor PeerSession {
         var request = Termmesh_Peer_V1_UpsertProjectPresentationRequest()
         request.requestID = Self.makeEnsureRequestID()
         request.deleteProjectID = projectID
+        request.staleEvidenceToken = staleEvidenceToken
         try await sendEnvelope { env in
             env.upsertProjectPresentationRequest = request
         }
@@ -583,6 +585,56 @@ public actor PeerSession {
             operation: "deleteProjectPresentation"
         )
         guard case .upsertProjectPresentationResponse(let response) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return response
+    }
+
+    public func inspectProjectPresentation(
+        projectID: String,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Termmesh_Peer_V1_InspectProjectPresentationResponse {
+        try requireHostCapability(PeerCapability.projectPresentationRepairV1)
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        var request = Termmesh_Peer_V1_InspectProjectPresentationRequest()
+        request.requestID = Self.makeEnsureRequestID()
+        request.projectID = projectID
+        try await sendEnvelope { env in
+            env.inspectProjectPresentationRequest = request
+        }
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "inspectProjectPresentation"
+        )
+        guard case .inspectProjectPresentationResponse(let response) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return response
+    }
+
+    public func repairProjectPresentation(
+        projectID: String,
+        expectedRevision: UInt64,
+        staleEvidenceToken: Data,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Termmesh_Peer_V1_RepairProjectPresentationResponse {
+        try requireHostCapability(PeerCapability.projectPresentationRepairV1)
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        var request = Termmesh_Peer_V1_RepairProjectPresentationRequest()
+        request.requestID = Self.makeEnsureRequestID()
+        request.projectID = projectID
+        request.expectedRevision = expectedRevision
+        request.staleEvidenceToken = staleEvidenceToken
+        try await sendEnvelope { env in
+            env.repairProjectPresentationRequest = request
+        }
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "repairProjectPresentation"
+        )
+        guard case .repairProjectPresentationResponse(let response) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
         }
         return response

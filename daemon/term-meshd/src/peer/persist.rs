@@ -129,7 +129,9 @@ struct ProjectPresentationFile {
 }
 
 pub fn load_project_presentations(path: &Path) -> Vec<PersistedProjectPresentation> {
-    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
     let file: ProjectPresentationFile = match serde_json::from_slice(&bytes) {
         Ok(file) => file,
         Err(error) => {
@@ -140,7 +142,9 @@ pub fn load_project_presentations(path: &Path) -> Vec<PersistedProjectPresentati
             return Vec::new();
         }
     };
-    if file.version != 1 { return Vec::new(); }
+    if file.version != 1 {
+        return Vec::new();
+    }
     let mut project_ids = HashSet::new();
     file.records
         .into_iter()
@@ -165,6 +169,34 @@ pub fn save_project_presentations(
     })
     .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
     atomic_save(path, &bytes)
+}
+
+/// Write a recoverable, immutable copy beside the presentation store before
+/// administrative repair. The backup contains the complete pre-repair file,
+/// never just the selected record, so restoring it is a single file operation.
+pub fn backup_project_presentations(
+    path: &Path,
+    records: &[PersistedProjectPresentation],
+) -> std::io::Result<PathBuf> {
+    let bytes = serde_json::to_vec_pretty(&ProjectPresentationFile {
+        version: 1,
+        records: records.to_vec(),
+    })
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let backup = path.with_file_name(format!(
+        "peer-project-presentations.backup-{}.json",
+        hex::encode(random_peer_bytes(16))
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&backup)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(backup)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

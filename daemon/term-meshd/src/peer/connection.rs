@@ -11,18 +11,20 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use peer_proto::v1::envelope::Payload;
 use peer_proto::v1::{
     workspace_update, AttachMode, AttachResult, AuthChallenge, AuthResult, CreateWorkspaceResponse,
     EnsureSurfaceError as WireEnsureError, EnsureSurfaceErrorCode, EnsureSurfaceRequest,
     EnsureSurfaceResponse, EnsureSurfaceRestartPolicy, EnsureSurfaceResult, Envelope, Error,
-    GridSnapshot, Hello, HostStats, Pong, PtyData, ScrollbackChunk, SurfaceExited, SurfaceList,
-    Team, TeamCallResponse, TeamList, TeamMember, TerminateSurfaceError as WireTerminateError,
-    TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
-    TerminateSurfaceResult, UpsertProjectPresentationResponse, Workspace, WorkspaceList,
-    WorkspaceListChanged, WorkspaceMeta, WorkspaceUpdate,
+    GridSnapshot, Hello, HostStats, InspectProjectPresentationResponse, Pong,
+    ProjectPresentationSurfaceStatus, PtyData, RepairProjectPresentationResponse, ScrollbackChunk,
+    SurfaceExited, SurfaceList, Team, TeamCallResponse, TeamList, TeamMember,
+    TerminateSurfaceError as WireTerminateError, TerminateSurfaceErrorCode,
+    TerminateSurfaceRequest, TerminateSurfaceResponse, TerminateSurfaceResult,
+    UpsertProjectPresentationResponse, Workspace, WorkspaceList, WorkspaceListChanged,
+    WorkspaceMeta, WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
 use sha2::{Digest, Sha256};
@@ -55,6 +57,15 @@ struct AttachEntry {
     task: JoinHandle<()>,
     cancel: Arc<Notify>,
 }
+
+struct MissingPresentationEvidence {
+    revision: u64,
+    first_missing_at: Instant,
+    token: Vec<u8>,
+}
+
+const STALE_PRESENTATION_RECHECK: Duration = Duration::from_millis(500);
+const STALE_PRESENTATION_EVIDENCE_TTL: Duration = Duration::from_secs(30);
 
 pub async fn run(stream: UnixStream, host: Arc<PeerHost>) -> anyhow::Result<()> {
     let (reader, writer) = stream.into_split();
@@ -96,6 +107,8 @@ async fn reader_loop(
     // Request ids are one-shot for the authenticated connection. Insert before
     // starting work so two back-to-back frames cannot race through ensure.
     let mut lifecycle_request_ids: HashSet<Vec<u8>> = HashSet::new();
+    let mut missing_presentation_evidence: HashMap<String, MissingPresentationEvidence> =
+        HashMap::new();
     // Acquired by the reader before an ensure task is spawned. Waiting here
     // applies socket backpressure instead of accumulating unbounded queued
     // tasks while keeping up to this many independent keys concurrent.
@@ -377,20 +390,20 @@ async fn reader_loop(
                     .filter_map(|surface| {
                         let info = surface.info();
                         let mut info = info;
-                        info.foreground_busy_known = peer_capabilities
-                            .has(capability::SURFACE_FOREGROUND_V1);
-                        info.attachable.then_some((surface.surface_id.clone(), info))
+                        info.foreground_busy_known =
+                            peer_capabilities.has(capability::SURFACE_FOREGROUND_V1);
+                        info.attachable
+                            .then_some((surface.surface_id.clone(), info))
                     })
                     .collect();
                 let project_owner_hex: HashSet<String> =
                     project_owner_peer_ids.iter().map(hex::encode).collect();
                 for manifest in host.project_presentations() {
-                    let Some(leader_surface_id) = hex::decode(&manifest.leader_surface_id)
-                        .ok()
-                        .filter(|id| live_surfaces.contains_key(id))
-                    else {
-                        continue;
-                    };
+                    // Durable manifests remain inspectable even after every
+                    // surface disappears. Omitting them made a stale global
+                    // name impossible to explain or repair from the client.
+                    let leader_surface_id =
+                        hex::decode(&manifest.leader_surface_id).unwrap_or_default();
                     let members = manifest
                         .members
                         .iter()
@@ -411,6 +424,12 @@ async fn reader_loop(
                                 })
                         })
                         .collect::<Vec<TeamMember>>();
+                    let referenced_surface_count = 1 + manifest.members.len() as u32;
+                    let live_referenced_surface_count = std::iter::once(&manifest.leader_surface_id)
+                        .chain(manifest.members.iter().map(|member| &member.surface_id))
+                        .filter_map(|encoded| hex::decode(encoded).ok())
+                        .filter(|surface_id| live_surfaces.contains_key(surface_id))
+                        .count() as u32;
                     if let Some(team) = teams
                         .iter_mut()
                         .find(|team| team.team_uuid == manifest.team_uuid)
@@ -424,6 +443,8 @@ async fn reader_loop(
                         team.created_at_unix_secs = manifest.created_at_unix_secs;
                         team.presentation_owned_by_requester =
                             project_owner_hex.contains(&manifest.owner_peer_id);
+                        team.referenced_surface_count = referenced_surface_count;
+                        team.live_referenced_surface_count = live_referenced_surface_count;
                         if let Some(info) = live_surfaces.get(&team.leader_surface_id) {
                             team.leader_process_active = info.foreground_busy;
                             team.leader_process_active_known = info.foreground_busy_known;
@@ -446,6 +467,8 @@ async fn reader_loop(
                             presentation_revision: manifest.revision,
                             presentation_owned_by_requester: project_owner_hex
                                 .contains(&manifest.owner_peer_id),
+                            referenced_surface_count,
+                            live_referenced_surface_count,
                             leader_process_active: leader_info
                                 .is_some_and(|info| info.foreground_busy),
                             leader_process_active_known: leader_info
@@ -511,41 +534,74 @@ async fn reader_loop(
                             false,
                         )
                     } else {
-                        // Retiring a manifest also drops the durable reference
-                        // that kept its surfaces out of the abandoned-surface
-                        // reap, so each one is re-evaluated here; otherwise a
-                        // deleted project would strand every spawned pane it
-                        // had named. The ids come back FROM the delete rather
-                        // than from a read before it: the record removed under
-                        // the lock is the only one whose surfaces this call may
-                        // release, and a concurrent replace must not be able to
-                        // redirect the reap at another manifest's panes.
-                        match host.delete_project_presentation_with_released(
-                            &project_owner_peer_ids,
-                            &request.delete_project_id,
-                        ) {
-                            Ok(released) => {
-                                let changed = released.is_some();
-                                (
-                                    UpsertProjectPresentationResponse {
-                                        request_id: request.request_id,
-                                        ok: true,
-                                        ..Default::default()
-                                    },
-                                    changed,
-                                )
-                            }
-                            Err(code) => (
+                        let stale_evidence_valid = request.stale_evidence_token.is_empty()
+                            || missing_presentation_evidence
+                                .get(&request.delete_project_id)
+                                .is_some_and(|evidence| {
+                                    evidence.token == request.stale_evidence_token
+                                        && evidence.first_missing_at.elapsed()
+                                            <= STALE_PRESENTATION_EVIDENCE_TTL
+                                        && host
+                                            .inspect_project_presentation(
+                                                &request.delete_project_id,
+                                            )
+                                            .is_some_and(|inspection| {
+                                                inspection.record.revision == evidence.revision
+                                                    && inspection
+                                                        .surfaces
+                                                        .iter()
+                                                        .all(|(_, _, present)| !present)
+                                            })
+                                });
+                        if !stale_evidence_valid {
+                            (
                                 UpsertProjectPresentationResponse {
                                     request_id: request.request_id,
                                     ok: false,
-                                    error_code: code.into(),
-                                    error_message: "project presentation deletion was rejected"
+                                    error_code: "stale_evidence_invalid".into(),
+                                    error_message: "stale evidence expired or liveness changed"
                                         .into(),
                                     ..Default::default()
                                 },
                                 false,
-                            ),
+                            )
+                        } else {
+                            // Retiring a manifest also drops the durable reference
+                            // that kept its surfaces out of the abandoned-surface
+                            // reap, so each one is re-evaluated here; otherwise a
+                            // deleted project would strand every spawned pane it
+                            // had named. The ids come back FROM the delete rather
+                            // than from a read before it: the record removed under
+                            // the lock is the only one whose surfaces this call may
+                            // release, and a concurrent replace must not be able to
+                            // redirect the reap at another manifest's panes.
+                            match host.delete_project_presentation_with_released(
+                                &project_owner_peer_ids,
+                                &request.delete_project_id,
+                            ) {
+                                Ok(released) => {
+                                    let changed = released.is_some();
+                                    (
+                                        UpsertProjectPresentationResponse {
+                                            request_id: request.request_id,
+                                            ok: true,
+                                            ..Default::default()
+                                        },
+                                        changed,
+                                    )
+                                }
+                                Err(code) => (
+                                    UpsertProjectPresentationResponse {
+                                        request_id: request.request_id,
+                                        ok: false,
+                                        error_code: code.into(),
+                                        error_message: "project presentation deletion was rejected"
+                                            .into(),
+                                        ..Default::default()
+                                    },
+                                    false,
+                                ),
+                            }
                         }
                     }
                 } else if let Some(project) = request.project.as_ref() {
@@ -605,6 +661,162 @@ async fn reader_loop(
                     // perform a debounced ListTeams refresh.
                     host.broadcast_workspace_roster();
                 }
+            }
+
+            (HandshakeState::Ready, Payload::InspectProjectPresentationRequest(request)) => {
+                let mut response = InspectProjectPresentationResponse {
+                    request_id: request.request_id.clone(),
+                    project_id: request.project_id.clone(),
+                    ..Default::default()
+                };
+                if !peer_capabilities.has(capability::PROJECT_PRESENTATION_REPAIR_V1) {
+                    response.error_code = "capability_unavailable".into();
+                    response.error_message =
+                        "project.presentation.repair.v1 was not negotiated".into();
+                } else if request.request_id.len() != 16
+                    || request.project_id.is_empty()
+                    || request.project_id.len() > 128
+                {
+                    response.error_code = "invalid_request".into();
+                    response.error_message = "invalid request_id or project_id".into();
+                } else if !lifecycle_request_ids.insert(request.request_id.clone()) {
+                    response.error_code = "duplicate_request_id".into();
+                    response.error_message = "request_id was already used".into();
+                } else if let Some(inspection) =
+                    host.inspect_project_presentation(&request.project_id)
+                {
+                    response.ok = true;
+                    response.team_name = inspection.record.team_name.clone();
+                    response.working_directory = inspection.record.working_directory.clone();
+                    response.revision = inspection.record.revision;
+                    response.owned_by_requester = project_owner_peer_ids
+                        .iter()
+                        .any(|id| inspection.record.owner_peer_id == hex::encode(id));
+                    response.surfaces = inspection
+                        .surfaces
+                        .iter()
+                        .map(
+                            |(surface_id, role, present)| ProjectPresentationSurfaceStatus {
+                                surface_id: surface_id.clone(),
+                                role: role.clone(),
+                                present: *present,
+                            },
+                        )
+                        .collect();
+                    let all_missing = !response.surfaces.is_empty()
+                        && response.surfaces.iter().all(|surface| !surface.present);
+                    if all_missing {
+                        let now = Instant::now();
+                        let evidence = missing_presentation_evidence
+                            .entry(request.project_id.clone())
+                            .or_insert_with(|| MissingPresentationEvidence {
+                                revision: inspection.record.revision,
+                                first_missing_at: now,
+                                token: random_peer_bytes(32),
+                            });
+                        if evidence.revision != inspection.record.revision
+                            || now.duration_since(evidence.first_missing_at)
+                                > STALE_PRESENTATION_EVIDENCE_TTL
+                        {
+                            *evidence = MissingPresentationEvidence {
+                                revision: inspection.record.revision,
+                                first_missing_at: now,
+                                token: random_peer_bytes(32),
+                            };
+                        }
+                        if now.duration_since(evidence.first_missing_at)
+                            >= STALE_PRESENTATION_RECHECK
+                        {
+                            response.stale = true;
+                            response.stale_evidence_token = evidence.token.clone();
+                        }
+                    } else {
+                        missing_presentation_evidence.remove(&request.project_id);
+                    }
+                } else {
+                    response.error_code = "not_found".into();
+                    response.error_message = "project presentation was not found".into();
+                }
+                send(
+                    &outgoing_tx,
+                    Envelope {
+                        seq: next_seq(&seq_counter),
+                        correlation_id: env.seq,
+                        payload: Some(Payload::InspectProjectPresentationResponse(response)),
+                    },
+                )
+                .await?;
+            }
+
+            (HandshakeState::Ready, Payload::RepairProjectPresentationRequest(request)) => {
+                let mut response = RepairProjectPresentationResponse {
+                    request_id: request.request_id.clone(),
+                    ..Default::default()
+                };
+                if !peer_capabilities.has(capability::PROJECT_PRESENTATION_REPAIR_V1) {
+                    response.error_code = "capability_unavailable".into();
+                    response.error_message =
+                        "project.presentation.repair.v1 was not negotiated".into();
+                } else if request.request_id.len() != 16
+                    || request.project_id.is_empty()
+                    || request.project_id.len() > 128
+                {
+                    response.error_code = "invalid_request".into();
+                    response.error_message = "invalid request_id or project_id".into();
+                } else if !lifecycle_request_ids.insert(request.request_id.clone()) {
+                    response.error_code = "duplicate_request_id".into();
+                    response.error_message = "request_id was already used".into();
+                } else if host
+                    .inspect_project_presentation(&request.project_id)
+                    .is_some_and(|inspection| {
+                        project_owner_peer_ids
+                            .iter()
+                            .any(|id| inspection.record.owner_peer_id == hex::encode(id))
+                    })
+                {
+                    response.error_code = "owner_must_delete".into();
+                    response.error_message = "owners must use normal presentation deletion".into();
+                } else {
+                    let valid_evidence = missing_presentation_evidence
+                        .get(&request.project_id)
+                        .is_some_and(|evidence| {
+                            evidence.revision == request.expected_revision
+                                && evidence.token == request.stale_evidence_token
+                                && evidence.first_missing_at.elapsed()
+                                    <= STALE_PRESENTATION_EVIDENCE_TTL
+                        });
+                    if !valid_evidence {
+                        response.error_code = "stale_evidence_required".into();
+                        response.error_message = "fresh bounded stale evidence is required".into();
+                    } else {
+                        match host.repair_stale_project_presentation(
+                            &request.project_id,
+                            request.expected_revision,
+                        ) {
+                            Ok(Some(backup)) => {
+                                response.ok = true;
+                                response.backup_path = backup.to_string_lossy().into_owned();
+                                missing_presentation_evidence.remove(&request.project_id);
+                                host.broadcast_workspace_roster();
+                            }
+                            Ok(None) => unreachable!("repair always returns a backup"),
+                            Err(code) => {
+                                response.error_code = code.into();
+                                response.error_message =
+                                    "project presentation repair was rejected".into();
+                            }
+                        }
+                    }
+                }
+                send(
+                    &outgoing_tx,
+                    Envelope {
+                        seq: next_seq(&seq_counter),
+                        correlation_id: env.seq,
+                        payload: Some(Payload::RepairProjectPresentationResponse(response)),
+                    },
+                )
+                .await?;
             }
 
             (HandshakeState::Ready, Payload::TeamCallRequest(request)) => {
@@ -4207,15 +4419,16 @@ mod agent_surface_tests {
     use peer_proto::capability;
     use peer_proto::v1::envelope::Payload;
     use peer_proto::v1::{
-        AttachMode, AttachSurface, Auth, DetachSurface, Envelope, Hello, Input, ListSurfaces,
-        ListTeams, Ping, SubscribeWorkspaceList, SurfaceList, Team, TeamMember,
+        AttachMode, AttachSurface, Auth, DetachSurface, Envelope, Hello, Input,
+        InspectProjectPresentationRequest, ListSurfaces, ListTeams, Ping,
+        RepairProjectPresentationRequest, SubscribeWorkspaceList, SurfaceList, Team, TeamMember,
         UpsertProjectPresentationRequest,
     };
     use tempfile::TempDir;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
     use tokio::net::UnixStream;
 
-    use super::{run, PeerHost, PROTOCOL_VERSION};
+    use super::{run, PeerHost, PROTOCOL_VERSION, STALE_PRESENTATION_RECHECK};
     use crate::peer::framing::{read_envelope, write_envelope};
     use crate::peer::surface::{
         surface_id_from_name, EnsureRestartPolicy, PtyManager, PtySurface, SurfaceKind, SurfaceSpec,
@@ -4382,6 +4595,7 @@ mod agent_surface_tests {
                     UpsertProjectPresentationRequest {
                         request_id: vec![0x10; 16],
                         delete_project_id: String::new(),
+                        stale_evidence_token: Vec::new(),
                         project: Some(Team {
                             name: "durable-demo".into(),
                             team_uuid: "uuid-durable-demo".into(),
@@ -4464,6 +4678,7 @@ mod agent_surface_tests {
                         request_id: vec![0x11; 16],
                         delete_project_id: "team:uuid-durable-demo".into(),
                         project: None,
+                        stale_evidence_token: Vec::new(),
                     },
                 )),
             },
@@ -4518,7 +4733,11 @@ mod agent_surface_tests {
                 other => panic!("expected team list, got {other:?}"),
             }
         };
-        assert_eq!(list.teams.len(), 1, "a live leader keeps the project discoverable");
+        assert_eq!(
+            list.teams.len(),
+            1,
+            "a live leader keeps the project discoverable"
+        );
         assert_eq!(list.teams[0].leader_surface_id, leader_id);
         assert!(
             list.teams[0].members.is_empty(),
@@ -4542,6 +4761,7 @@ mod agent_surface_tests {
                         request_id: vec![0x12; 16],
                         delete_project_id: "team:uuid-durable-demo".into(),
                         project: None,
+                        stale_evidence_token: Vec::new(),
                     },
                 )),
             },
@@ -4560,6 +4780,156 @@ mod agent_surface_tests {
             )
         )
         .is_empty());
+    }
+
+    #[tokio::test]
+    async fn owner_mismatch_repair_requires_bounded_recheck_and_exact_token() {
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_path = tmp.path().join("peer-workspaces.json");
+        let presentation_path = crate::peer::persist::project_presentations_path(&workspace_path);
+        crate::peer::persist::save_project_presentations(
+            &presentation_path,
+            &[crate::peer::persist::PersistedProjectPresentation {
+                owner_peer_id: hex::encode(vec![0x41; 16]),
+                project_id: "team:stale".into(),
+                team_name: "stale".into(),
+                team_uuid: "uuid-stale".into(),
+                working_directory: "/tmp/stale".into(),
+                project_root: "/tmp/stale".into(),
+                created_at_unix_secs: 1,
+                leader_surface_id: hex::encode(vec![0x77; 16]),
+                members: vec![],
+                revision: 3,
+            }],
+        )
+        .expect("persist stale manifest");
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(workspace_path);
+        let workspace_ids: Vec<_> = host
+            .list_workspaces()
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect();
+        let (mut reader, mut writer) =
+            handshake_as(host.clone(), capability::supported_vec(), vec![0x42; 16]).await;
+
+        let inspect = |seq: u64, request_byte: u8| Envelope {
+            seq,
+            correlation_id: 0,
+            payload: Some(Payload::InspectProjectPresentationRequest(
+                InspectProjectPresentationRequest {
+                    request_id: vec![request_byte; 16],
+                    project_id: "team:stale".into(),
+                },
+            )),
+        };
+        write_envelope(&mut writer, &inspect(10, 0x10))
+            .await
+            .expect("first inspect");
+        let first = match recv(&mut reader).await.payload {
+            Some(Payload::InspectProjectPresentationResponse(response)) => response,
+            other => panic!("expected inspect response, got {other:?}"),
+        };
+        assert!(first.ok);
+        assert!(
+            !first.stale,
+            "one missing observation is not durable evidence"
+        );
+        assert!(!first.owned_by_requester);
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 11,
+                correlation_id: 0,
+                payload: Some(Payload::RepairProjectPresentationRequest(
+                    RepairProjectPresentationRequest {
+                        request_id: vec![0x11; 16],
+                        project_id: "team:stale".into(),
+                        expected_revision: 3,
+                        stale_evidence_token: vec![],
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("premature repair");
+        match recv(&mut reader).await.payload {
+            Some(Payload::RepairProjectPresentationResponse(response)) => {
+                assert!(!response.ok);
+                assert_eq!(response.error_code, "stale_evidence_required");
+            }
+            other => panic!("expected repair refusal, got {other:?}"),
+        }
+
+        tokio::time::sleep(STALE_PRESENTATION_RECHECK + Duration::from_millis(50)).await;
+        write_envelope(&mut writer, &inspect(12, 0x12))
+            .await
+            .expect("verified inspect");
+        let verified = match recv(&mut reader).await.payload {
+            Some(Payload::InspectProjectPresentationResponse(response)) => response,
+            other => panic!("expected verified inspect, got {other:?}"),
+        };
+        assert!(verified.stale);
+        assert!(!verified.stale_evidence_token.is_empty());
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 13,
+                correlation_id: 0,
+                payload: Some(Payload::RepairProjectPresentationRequest(
+                    RepairProjectPresentationRequest {
+                        request_id: vec![0x13; 16],
+                        project_id: "team:stale".into(),
+                        expected_revision: verified.revision,
+                        stale_evidence_token: vec![0xff; 32],
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("forged repair");
+        match recv(&mut reader).await.payload {
+            Some(Payload::RepairProjectPresentationResponse(response)) => {
+                assert!(!response.ok);
+                assert_eq!(response.error_code, "stale_evidence_required");
+            }
+            other => panic!("expected forged repair refusal, got {other:?}"),
+        }
+
+        write_envelope(
+            &mut writer,
+            &Envelope {
+                seq: 14,
+                correlation_id: 0,
+                payload: Some(Payload::RepairProjectPresentationRequest(
+                    RepairProjectPresentationRequest {
+                        request_id: vec![0x14; 16],
+                        project_id: "team:stale".into(),
+                        expected_revision: verified.revision,
+                        stale_evidence_token: verified.stale_evidence_token,
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("verified repair");
+        match recv(&mut reader).await.payload {
+            Some(Payload::RepairProjectPresentationResponse(response)) => {
+                assert!(response.ok, "{}", response.error_code);
+                assert!(std::path::Path::new(&response.backup_path).is_file());
+            }
+            other => panic!("expected repair success, got {other:?}"),
+        }
+        assert!(host.project_presentations().is_empty());
+        assert_eq!(
+            host.list_workspaces()
+                .into_iter()
+                .map(|workspace| workspace.id)
+                .collect::<Vec<_>>(),
+            workspace_ids
+        );
     }
 
     async fn recv(reader: &mut OwnedReadHalf) -> Envelope {

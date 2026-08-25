@@ -62,6 +62,8 @@ struct RemoteTeamSummary: Identifiable, Equatable {
     let presentationOwnedByRequester: Bool
     let leaderProcessActive: Bool
     let leaderProcessActiveKnown: Bool
+    let referencedSurfaceCount: Int
+    let liveReferencedSurfaceCount: Int
 
     var id: String { teamUUID.isEmpty ? name : teamUUID }
 
@@ -77,7 +79,9 @@ struct RemoteTeamSummary: Identifiable, Equatable {
         presentationRevision: UInt64 = 0,
         presentationOwnedByRequester: Bool = false,
         leaderProcessActive: Bool = false,
-        leaderProcessActiveKnown: Bool = false
+        leaderProcessActiveKnown: Bool = false,
+        referencedSurfaceCount: Int = 0,
+        liveReferencedSurfaceCount: Int = 0
     ) {
         self.name = name
         self.teamUUID = teamUUID
@@ -91,6 +95,36 @@ struct RemoteTeamSummary: Identifiable, Equatable {
         self.presentationOwnedByRequester = presentationOwnedByRequester
         self.leaderProcessActive = leaderProcessActive
         self.leaderProcessActiveKnown = leaderProcessActiveKnown
+        self.referencedSurfaceCount = referencedSurfaceCount
+        self.liveReferencedSurfaceCount = liveReferencedSurfaceCount
+    }
+}
+
+struct StaleProjectRepairResult: Equatable, Sendable {
+    let usedAdministrativeRepair: Bool
+    let backupPath: String?
+}
+
+enum StaleProjectRepairError: LocalizedError {
+    case hostUnavailable
+    case unsupported
+    case inspectionFailed(String)
+    case notStale
+    case mutationFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .hostUnavailable:
+            "The Project host is no longer available. Reconnect it and try again."
+        case .unsupported:
+            "The remote daemon does not support safe stale Project repair. Update and restart it."
+        case .inspectionFailed(let detail):
+            "Could not inspect the remote Project record: \(detail)"
+        case .notStale:
+            "The Project is live or its missing surfaces were not absent long enough. Nothing was removed."
+        case .mutationFailed(let detail):
+            "Could not remove the stale Project record: \(detail)"
+        }
     }
 }
 
@@ -2036,6 +2070,93 @@ final class RemoteHostStore: ObservableObject {
         scheduleTeamRosterRefresh(for: host.activeSockPath, key: key)
     }
 
+    /// Inspect twice on one authenticated connection, then remove exactly one
+    /// stale manifest. Owners use the normal lifecycle RPC; only an ownership
+    /// mismatch enters the administrative backup-and-repair path.
+    func removeStaleProjectRecord(
+        hostKey: String, projectID: String
+    ) async throws -> StaleProjectRepairResult {
+        guard let host = hosts[hostKey], host.isConnected,
+              let spec = host.teamHostSpec
+        else { throw StaleProjectRepairError.hostUnavailable }
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await PeerPaneHostRegistry.shared.acquire(spec)
+        } catch {
+            throw StaleProjectRepairError.hostUnavailable
+        }
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+        let connection: PeerRelayConnection
+        do {
+            connection = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+        } catch {
+            throw StaleProjectRepairError.hostUnavailable
+        }
+        defer { Task { await connection.cancel() } }
+        guard connection.hostCapabilities.has(PeerCapability.projectPresentationRepairV1) else {
+            throw StaleProjectRepairError.unsupported
+        }
+
+        func inspect() async throws -> Termmesh_Peer_V1_InspectProjectPresentationResponse {
+            let response = try await connection.session.inspectProjectPresentation(
+                projectID: projectID
+            )
+            guard response.ok else {
+                throw StaleProjectRepairError.inspectionFailed(
+                    response.errorMessage.isEmpty ? response.errorCode : response.errorMessage
+                )
+            }
+            return response
+        }
+
+        let first = try await inspect()
+        guard !first.surfaces.isEmpty, first.surfaces.allSatisfy({ !$0.present }) else {
+            throw StaleProjectRepairError.notStale
+        }
+        try await Task.sleep(for: .milliseconds(600))
+        let verified = try await inspect()
+        guard verified.stale, !verified.staleEvidenceToken.isEmpty,
+              verified.revision == first.revision,
+              verified.surfaces.allSatisfy({ !$0.present })
+        else { throw StaleProjectRepairError.notStale }
+
+        let result: StaleProjectRepairResult
+        if verified.ownedByRequester {
+            let response = try await connection.session.deleteProjectPresentation(
+                projectID: projectID,
+                staleEvidenceToken: verified.staleEvidenceToken
+            )
+            guard response.ok else {
+                throw StaleProjectRepairError.mutationFailed(
+                    response.errorMessage.isEmpty ? response.errorCode : response.errorMessage
+                )
+            }
+            result = StaleProjectRepairResult(
+                usedAdministrativeRepair: false, backupPath: nil
+            )
+        } else {
+            let response = try await connection.session.repairProjectPresentation(
+                projectID: projectID, expectedRevision: verified.revision,
+                staleEvidenceToken: verified.staleEvidenceToken
+            )
+            guard response.ok else {
+                throw StaleProjectRepairError.mutationFailed(
+                    response.errorMessage.isEmpty ? response.errorCode : response.errorMessage
+                )
+            }
+            result = StaleProjectRepairResult(
+                usedAdministrativeRepair: true,
+                backupPath: response.backupPath.isEmpty ? nil : response.backupPath
+            )
+        }
+
+        // Remove only the exact manifest from the local snapshot immediately;
+        // the authenticated roster refresh remains the authoritative follow-up.
+        hosts[hostKey]?.teams.removeAll { $0.projectID == projectID }
+        refreshTeamRoster(forHostKey: hostKey)
+        return result
+    }
+
     /// Read team/project manifests from their owning endpoint. Ordinary hosts
     /// reuse the serving socket. A redirecting Mac gets a short registry lease
     /// to its advertised session owner for the whole ListTeams RPC.
@@ -2165,7 +2286,9 @@ final class RemoteHostStore: ObservableObject {
             presentationRevision: team.presentationRevision,
             presentationOwnedByRequester: team.presentationOwnedByRequester,
             leaderProcessActive: team.leaderProcessActive,
-            leaderProcessActiveKnown: team.leaderProcessActiveKnown
+            leaderProcessActiveKnown: team.leaderProcessActiveKnown,
+            referencedSurfaceCount: Int(team.referencedSurfaceCount),
+            liveReferencedSurfaceCount: Int(team.liveReferencedSurfaceCount)
         )
     }
 

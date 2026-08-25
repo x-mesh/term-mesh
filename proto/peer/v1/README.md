@@ -11,7 +11,7 @@ See `docs/peer-federation-protocol.md` for the authoritative design. This direct
 ## Consumers
 
 - **Rust** (daemon, CLI): `daemon/peer-proto` crate. Generated at build time via `prost-build` + `protox` (pure-Rust, no `protoc` dependency). Nothing to commit.
-- **Swift** (macOS app): generated files go under `Sources/Generated/Peer_V1/` and are committed. Regenerate with `scripts/gen-proto.sh` after schema changes. (Swift side wired up in Phase 2.2.)
+- **Swift** (macOS app): generated files live in `swift/PeerProto/Sources/PeerProto/` and are committed. Regenerate with `scripts/gen-swift-proto.sh` after schema changes.
 
 ## Regenerating
 
@@ -20,7 +20,7 @@ Rust is automatic — `cargo build -p peer-proto` regenerates from `peer.proto`.
 Swift requires `protoc` + `protoc-gen-swift` installed and regeneration via:
 
 ```bash
-./scripts/gen-proto.sh
+./scripts/gen-swift-proto.sh
 ```
 
 The script is idempotent. Commit the resulting `.pb.swift` files.

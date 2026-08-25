@@ -99,12 +99,13 @@ public enum PeerCapability {
     /// widen that generic allow-list.
     public static let teamLeaderV1 = "team.leader.v1"
     public static let projectPresentationV1 = "project.presentation.v1"
+    public static let projectPresentationRepairV1 = "project.presentation.repair.v1"
     public static let teamRouteFileV1 = "team.route-file.v1"
 
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, gridSnapshotV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, teamRouteFileV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, gridSnapshotV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, projectPresentationRepairV1, teamRouteFileV1]
 }
 
 /// Strict validation for host-controlled Hello.cli_bin_dirs. Invalid input
