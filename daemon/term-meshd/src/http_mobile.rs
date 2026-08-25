@@ -794,7 +794,9 @@ async fn text_handler(
     axum::Extension(caller): axum::Extension<Caller>,
     Json(body): Json<TextBody>,
 ) -> ApiResult {
-    if body.text.trim().is_empty() {
+    // A durable request or composer message needs real content; direct
+    // typing (`raw`) legitimately sends single spaces and newlines.
+    if body.text.is_empty() || (!body.raw && body.text.trim().is_empty()) {
         return Err(ApiError::bad_request(
             "empty_text",
             "text must not be empty",

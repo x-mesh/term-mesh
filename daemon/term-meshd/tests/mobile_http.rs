@@ -681,6 +681,16 @@ async fn leader_text_goes_to_the_durable_board_and_returns_202() {
             json!({ "surface_id": "leader-1", "text": "ls" })
         )
     );
+
+    // Raw typing may send a lone space; the durable path still refuses blanks.
+    let space = post(&h, "/api/targets/leader-1/text", json!({ "text": " ", "raw": true })).await;
+    assert_eq!(space.status, 200, "{}", space.body);
+    assert_eq!(app.calls()[3].1["text"], " ");
+    let blank = post(&h, "/api/targets/leader-1/text", json!({ "text": "   " })).await;
+    assert_eq!(blank.status, 400);
+    assert_eq!(blank.error_code(), "empty_text");
+    let empty_raw = post(&h, "/api/targets/leader-1/text", json!({ "text": "", "raw": true })).await;
+    assert_eq!(empty_raw.status, 400);
 }
 
 #[tokio::test]
