@@ -105,6 +105,19 @@ def wait_for(predicate, timeout_s: float, what: str):
     raise termmeshError(f"timed out waiting for {what}")
 
 
+def leader_token_from_process_env(surface_id: str):
+    """`ps -E` prints each process's environment; the leader pane's shell is
+    the one carrying this surface id together with the leader token."""
+    out = subprocess.run(["ps", "-E", "-ax", "-o", "command="], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if f"TERMMESH_SURFACE_ID={surface_id}" not in line:
+            continue
+        m = re.search(r"TERMMESH_LEADER_REQUEST_TOKEN=(\S+)", line)
+        if m:
+            return m.group(1)
+    return None
+
+
 def targets_by_id() -> dict:
     _, payload = http("GET", "/api/targets", expect=200)
     return {t["surface_id"]: t for t in (payload or {}).get("targets", [])}
@@ -114,7 +127,7 @@ def prompt_ready(c: termmesh, surface_id: str):
     """The shell prompt is drawn once the last non-empty line ends in a prompt
     character. Typing before that leaves the text echoed twice in scrollback."""
     lines = [l.rstrip() for l in read_text(c, surface_id).splitlines() if l.strip()]
-    return bool(lines) and re.search(r"[%$#>]\s*$", lines[-1]) is not None
+    return bool(lines) and re.search(r"[%$#>➜❯]\s*$", lines[-1]) is not None
 
 
 def check_pane_flow(c: termmesh, cli: Path) -> None:
@@ -198,8 +211,13 @@ def check_leader_flow(c: termmesh, cli: Path) -> None:
     leader_sid = surfaces[0]
     try:
         wait_for(lambda: prompt_ready(c, leader_sid) or None, 20, "leader pane prompt")
+        # The leader pane carries the board capability token in its env; the
+        # test is not that pane, so read it from the pane's shell process the
+        # way the daemon's pane tracker does and hand it over as the pane would.
+        token = wait_for(lambda: leader_token_from_process_env(leader_sid), 15,
+                         "TERMMESH_LEADER_REQUEST_TOKEN in the leader pane environment")
         rc(cli, ["on", "--leader", "--title", "e2e-leader", "--ttl", "10m"],
-           surface_id=leader_sid, team=team)
+           surface_id=leader_sid, team=team, extra_env={"TERMMESH_LEADER_REQUEST_TOKEN": token})
         target = targets_by_id().get(leader_sid)
         if not target or target.get("kind") != "leader" or target.get("team_name") != team:
             raise termmeshError(f"leader not listed as expected: {target}")
