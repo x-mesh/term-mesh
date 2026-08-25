@@ -90,7 +90,14 @@ def rc(cli: Path, args, *, surface_id: str, team: str = None, extra_env=None) ->
 
 
 def read_text(c: termmesh, surface_id: str, lines: int = 80) -> str:
-    result = c._call("surface.read_text", {"surface_id": surface_id, "lines": lines, "scrollback": True})
+    """Scrollback text, or "" while the pane's terminal is still starting
+    (the app answers `Terminal surface not found` for a moment after create)."""
+    try:
+        result = c._call("surface.read_text", {"surface_id": surface_id, "lines": lines, "scrollback": True})
+    except termmeshError as err:
+        if "not found" in str(err).lower():
+            return ""
+        raise
     return str((result or {}).get("text") or "")
 
 
@@ -237,7 +244,8 @@ def check_leader_flow(c: termmesh, cli: Path) -> None:
         if req_id not in ids:
             raise termmeshError(f"durable request missing from /requests: {listed}")
 
-        board = c._call("team.leader.request.list", {"team_name": team}) or {}
+        board = c._call("team.leader.request.list",
+                        {"team_name": team, "leader_request_token": token}) or {}
         board_ids = {str(r.get("id") or r.get("request_id")) for r in board.get("requests", [])}
         if req_id not in board_ids:
             raise termmeshError(f"durable request missing from the app board: {board}")
