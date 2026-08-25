@@ -1934,6 +1934,11 @@ enum RemoteCommand {
         /// Run from the leader pane (or pass `--team`).
         #[arg(long, value_name = "AGENT", conflicts_with = "leader")]
         agent: Option<String>,
+        /// With `--agent`: how the page shows it. `auto` (default) asks the
+        /// app whether the pane is native and picks `chat` for a native pane
+        /// or `terminal` (screen mirror) otherwise; `chat`/`terminal` force it.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "chat", "terminal"], requires = "agent")]
+        view: String,
         /// App control socket that owns the surface. Defaults to this pane's
         /// $TERMMESH_SOCKET_PATH.
         #[arg(long)]
@@ -12544,13 +12549,14 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
             surface,
             leader,
             agent,
+            view,
             app_socket,
             cli,
             title,
             json,
         } => {
             if let Some(agent_name) = agent.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
-                run_remote_on_agent(sock, team_flag, agent_name, keys, ttl.as_deref(), title.as_deref(), *json);
+                run_remote_on_agent(sock, team_flag, agent_name, view, keys, ttl.as_deref(), title.as_deref(), *json);
                 return;
             }
             let surface_id = resolve_remote_surface(surface.as_deref()).unwrap_or_else(|e| {
@@ -12736,6 +12742,7 @@ fn run_remote_on_agent(
     sock: &PathBuf,
     team_flag: Option<&str>,
     agent_name: &str,
+    view: &str,
     keys: &str,
     ttl: Option<&str>,
     title: Option<&str>,
@@ -12776,6 +12783,35 @@ fn run_remote_on_agent(
         eprintln!("Error: agent {agent_name:?} has no pane (headless agents cannot be exposed yet)");
         process::exit(1);
     };
+    // Which view: a native pane has a structured transcript (chat); a
+    // terminal-mode agent pane only has a screen (mirror). `team.status`
+    // does not say which, so `auto` asks for one transcript entry.
+    let kind = match view {
+        "chat" => "agent",
+        "terminal" => "pane",
+        _ => {
+            let probe = rpc_call(
+                &app_sock,
+                "team.agent.transcript",
+                json!({ "team_name": team_name, "agent_name": agent_name, "limit": 1 }),
+            );
+            match probe {
+                Ok(resp) if resp.get("error").is_none() => "agent",
+                Ok(resp) if resp["error"]["code"].as_str() == Some("not_native") => "pane",
+                Ok(resp) => {
+                    eprintln!(
+                        "Error: team.agent.transcript: {}",
+                        resp["error"]["message"].as_str().unwrap_or("rpc error")
+                    );
+                    process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Error: team.agent.transcript: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+    };
     let ttl_secs = match ttl.map(parse_ttl_secs).transpose() {
         Ok(v) => v,
         Err(e) => {
@@ -12785,7 +12821,7 @@ fn run_remote_on_agent(
     };
     let mut params = json!({
         "surface_id": panel_id,
-        "kind": "agent",
+        "kind": kind,
         "team_name": team_name,
         "agent_name": agent_name,
         "keys": keys,
@@ -12803,7 +12839,11 @@ fn run_remote_on_agent(
         println!("{}", pretty(&result));
         return;
     }
-    println!("exposed agent {agent_name} of {team_name} (chat, keys not applicable)");
+    if kind == "agent" {
+        println!("exposed agent {agent_name} of {team_name} as chat (native pane)");
+    } else {
+        println!("exposed agent {agent_name} of {team_name} as terminal mirror (pane is not native, keys={keys})");
+    }
     match result["url"].as_str() {
         Some(url) => {
             println!("url: {url}");

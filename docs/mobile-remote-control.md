@@ -137,7 +137,11 @@ tm-agent remote status
 ```
 
 `--agent`는 리더 pane(또는 `--team`)에서 실행한다. app socket `team.status`로 그 에이전트의
-`panel_id`·`cli`를 찾아 `kind=agent`로 등록하며, 페이지는 이 대상을 채팅으로 보여 준다.
+`panel_id`·`cli`를 찾고, `--view auto`(기본)는 `team.agent.transcript`를 한 번 물어 native
+pane이면 `kind=agent`(채팅), 아니면(`not_native`) `kind=pane`(터미널 미러)로 등록한다.
+`--view chat|terminal`로 강제할 수 있다. 즉 "native로 볼지"는 등록 시점에 대상 단위로
+정해지고 페이지는 `kind`를 따른다. 에이전트 pane이 native인지 자체는 앱 Settings ▸ Agent
+Teams ▸ Agent Panes(Native/Terminal)가 정한다.
 
 - surface는 `TERMMESH_SURFACE_ID`에서, 팀은 `TERMMESH_TEAM`(없으면 `ws-<hex>`
   규칙)에서 읽는다. `--surface`는 term-mesh 밖에서 띄운 셸처럼 env가 없는 경우의
