@@ -1175,6 +1175,17 @@ fn session_logs_normalize_to_the_mobile_chat_shape() {
     assert_eq!(x[1]["result"], "/repo");
     assert_eq!(x[2]["kind"], "answered");
 
+    let active = vec![
+        json!({ "type": "event_msg", "payload": { "type": "task_started" } }),
+        json!({ "type": "response_item", "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "streaming" }] } }),
+    ];
+    assert_eq!(http_mobile::codex_turn_in_flight(&active), Some(true));
+    let complete = vec![
+        active[0].clone(),
+        json!({ "type": "event_msg", "payload": { "type": "task_complete" } }),
+    ];
+    assert_eq!(http_mobile::codex_turn_in_flight(&complete), Some(false));
+
     let secret = vec![json!({ "type": "response_item", "payload": {
         "type": "custom_tool_call", "id": "secret", "call_id": "secret-call",
         "name": "exec", "input": "OPENAI_API_KEY=do-not-show echo ok"

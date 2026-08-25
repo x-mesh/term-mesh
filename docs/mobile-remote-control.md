@@ -1,7 +1,7 @@
 # Mobile Remote Control over Tailscale
 
 Last updated: August 25, 2026
-Status: Approved design v2, not implemented. Supersedes the 2026-08-21
+Status: Implemented and verified. Supersedes the 2026-08-21
 "Tailscale Serve 기반 모바일 리더 제어면" plan (mem-mesh decision `c0220ed0`).
 Code references are against `develop` 7f2be7ad.
 
@@ -27,7 +27,8 @@ decision this design consumes), [peer-federation.md](./peer-federation.md),
 6. 쓰기는 텍스트(durable request 또는 send_text)와 고정 allowlist 키만 허용한다.
 7. Phase 1은 Tailscale 없이 localhost에서 끝내고, Phase 2에서 Serve를 붙이며,
    relay(peer host) surface는 Phase 3에서 다룬다.
-8. 푸시 알림, 풀 터미널, 구조화 transcript는 v1 범위 밖이다.
+8. 푸시 알림과 Tailscale Funnel은 범위 밖이다. 터미널 미러와 Claude/Codex
+   session 기반 구조화 Chat은 구현됐다.
 
 ## 1. 목표, 범위, 단계
 
@@ -42,7 +43,7 @@ decision this design consumes), [peer-federation.md](./peer-federation.md),
 - 브라우저 풀 터미널(xterm.js), 임의 키 입력, WebSocket/SSE 스트리밍
 - Tailscale Funnel, 기존 dashboard API의 tailnet 노출
 - task create/delegate/approve 같은 팀 제어
-- 구조화 transcript(jsonl 채팅 뷰) — v2 후보
+- 임의 CLI session을 위한 범용 transcript adapter(현재 Claude/Codex 지원)
 
 ### 단계
 

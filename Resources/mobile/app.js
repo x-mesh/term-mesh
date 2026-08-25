@@ -54,6 +54,7 @@
     targets: [],
     selected: null,      // target object
     pollTimer: null,
+    fastPollTimer: null,
     inFlight: false,
     lastText: null,
     lastError: null,
@@ -395,7 +396,7 @@
   }
 
   function toolSummary(e) {
-    var raw = (e.headline || '').replace(/s+/g, ' ').trim();
+    var raw = (e.headline || '').replace(/\s+/g, ' ').trim();
     if (!raw) { return e.running ? 'In progress' : 'Completed'; }
     if (e.name === 'exec') {
       var count = (raw.match(/tools.exec_command/g) || []).length;
@@ -556,7 +557,7 @@
       refreshNow();
     }, POLL_MS);
     // A running agent turn streams text; poll it twice as often.
-    window.setInterval(function () {
+    state.fastPollTimer = window.setInterval(function () {
       if (document.hidden || !state.chatRunning || !isChat(state.selected)) { return; }
       refreshNow();
     }, POLL_MS / 2);
@@ -566,6 +567,10 @@
     if (state.pollTimer) {
       window.clearInterval(state.pollTimer);
       state.pollTimer = null;
+    }
+    if (state.fastPollTimer) {
+      window.clearInterval(state.fastPollTimer);
+      state.fastPollTimer = null;
     }
   }
 

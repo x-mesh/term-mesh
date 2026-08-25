@@ -12634,7 +12634,9 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
                 .filter(|t| !t.trim().is_empty())
                 .unwrap_or_else(|| remote_default_title(&cwd));
             let agent_cli = cli.clone().unwrap_or_else(detect_remote_cli);
-            let session_id = remote_session_id(&agent_cli);
+            let session_id = (!*terminal)
+                .then(|| remote_session_id(&agent_cli))
+                .flatten();
             let mut params = json!({
                 "surface_id": surface_id,
                 "kind": if is_leader { "leader" } else { "pane" },
@@ -13062,14 +13064,22 @@ fn detect_remote_cli() -> String {
 }
 
 fn remote_session_id(cli: &str) -> Option<String> {
+    remote_session_id_from(cli, |key| env::var(key).ok())
+}
+
+fn remote_session_id_from<F>(cli: &str, mut get: F) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let keys: &[&str] = match cli {
-        "codex" => &["CODEX_SESSION_ID", "CODEX_THREAD_ID"],
+        // CODEX_SESSION_ID can describe the parent shell while THREAD_ID is
+        // the active conversation whose rollout the mobile page must follow.
+        "codex" => &["CODEX_THREAD_ID", "CODEX_SESSION_ID"],
         "claude" => &["CLAUDE_CODE_SESSION_ID"],
         _ => &[],
     };
     keys.iter().find_map(|key| {
-        env::var(key)
-            .ok()
+        get(key)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     })
@@ -13358,6 +13368,16 @@ mod remote_command_tests {
         assert!(!remote_leader_from(Some("tok"), Some("worker-1")));
         assert!(!remote_leader_from(None, None));
         assert!(!remote_leader_from(Some(" "), None));
+    }
+
+    #[test]
+    fn codex_remote_prefers_the_active_thread_over_the_parent_session() {
+        let id = remote_session_id_from("codex", |key| match key {
+            "CODEX_THREAD_ID" => Some("active-thread".into()),
+            "CODEX_SESSION_ID" => Some("parent-session".into()),
+            _ => None,
+        });
+        assert_eq!(id.as_deref(), Some("active-thread"));
     }
 
     #[test]

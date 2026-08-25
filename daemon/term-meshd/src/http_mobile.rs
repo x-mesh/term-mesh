@@ -808,6 +808,23 @@ pub(crate) fn codex_entries(lines: &[Value]) -> Vec<Value> {
     entries
 }
 
+pub(crate) fn codex_turn_in_flight(lines: &[Value]) -> Option<bool> {
+    lines.iter().rev().find_map(|row| {
+        if row.get("type").and_then(Value::as_str) != Some("event_msg") {
+            return None;
+        }
+        match row
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(Value::as_str)
+        {
+            Some("task_started") => Some(true),
+            Some("task_complete") | Some("turn_aborted") => Some(false),
+            _ => None,
+        }
+    })
+}
+
 fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
     let session_id = entry.session_id.as_deref().ok_or_else(|| {
         ApiError::conflict(
@@ -834,10 +851,17 @@ fn session_transcript(entry: &Entry, limit: usize) -> Result<Value, ApiError> {
     if entries.len() > limit {
         entries = entries.split_off(entries.len() - limit);
     }
-    let in_flight = entries.last().is_some_and(|entry| {
-        entry.get("kind").and_then(Value::as_str) == Some("said")
-            || (entry.get("kind").and_then(Value::as_str) == Some("tool")
-                && entry.get("running").and_then(Value::as_bool) == Some(true))
+    let in_flight = if entry.agent_cli == "codex" {
+        codex_turn_in_flight(&lines)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
+        entries.last().is_some_and(|entry| {
+            entry.get("kind").and_then(Value::as_str) == Some("said")
+                || (entry.get("kind").and_then(Value::as_str) == Some("tool")
+                    && entry.get("running").and_then(Value::as_bool) == Some(true))
+        })
     });
     Ok(json!({
         "running": true,
