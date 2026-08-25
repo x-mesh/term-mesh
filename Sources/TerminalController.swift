@@ -1298,6 +1298,8 @@ class TerminalController {
             return v2Result(id: id, self.v2BrowserInputTouch(params: params))
         case "surface.read_text":
             return v2Result(id: id, self.v2SurfaceReadText(params: params))
+        case "surface.read_screen_vt":
+            return v2Result(id: id, self.v2SurfaceReadScreenVT(params: params))
 
         // Peer-federation saved hosts. Not DEBUG-gated: unlike the
         // `debug.peer.*` family below (raw socket paths, bypassing
@@ -1549,6 +1551,7 @@ class TerminalController {
             "surface.send_text",
             "surface.send_key",
             "surface.read_text",
+            "surface.read_screen_vt",
             "peer.host.list",
             "peer.host.connect",
             "peer.host.retry",

@@ -918,6 +918,79 @@ extension TerminalController {
         return result
     }
 
+    /// `surface.read_screen_vt`: the most recent `rows` screen/history rows as
+    /// VT text that keeps Ghostty's rendered cell styles (colors, bold, dim,
+    /// inverse, conceal) but no raw PTY control sequences
+    /// (`ghostty_surface_read_screen_tail_vt`, cmux fork). Used by the mobile
+    /// remote-control listener to draw a styled screen; plain readers keep
+    /// `surface.read_text`. Grid metrics ride along so the caller can place the
+    /// cursor: `cursor_row` is relative to the viewport, which is the last
+    /// `rows` rows of the returned tail when the viewport is at the bottom.
+    func v2SurfaceReadScreenVT(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        let rows = v2Int(params, "rows") ?? 200
+        guard (1...2000).contains(rows) else {
+            return .err(code: "invalid_params", message: "rows must be between 1 and 2000", data: nil)
+        }
+        let maxBytes = v2Int(params, "max_bytes") ?? 1_048_576
+        guard (1...(8 * 1_048_576)).contains(maxBytes) else {
+            return .err(code: "invalid_params", message: "max_bytes must be between 1 and 8 MiB", data: nil)
+        }
+
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to read screen", data: nil)
+        let completed = v2MainExec {
+            guard let ws = self.v2ResolveWorkspace(params: params, tabManager: tabManager) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: nil)
+                return
+            }
+            let surfaceId = self.v2UUID(params, "surface_id") ?? ws.focusedPanelId
+            guard let surfaceId else {
+                result = .err(code: "not_found", message: "No focused surface", data: nil)
+                return
+            }
+            guard let terminalPanel = ws.terminalPanel(for: surfaceId) else {
+                result = .err(code: "invalid_params", message: "Surface is not a terminal", data: ["surface_id": surfaceId.uuidString])
+                return
+            }
+            guard let surface = terminalPanel.surface.surface else {
+                result = .err(code: "internal_error", message: "Terminal surface not found", data: nil)
+                return
+            }
+            var text = ghostty_text_s()
+            guard ghostty_surface_read_screen_tail_vt(surface, UInt(rows), UInt(maxBytes), &text) else {
+                result = .err(code: "internal_error", message: "Failed to read screen VT", data: nil)
+                return
+            }
+            defer { ghostty_surface_free_text(surface, &text) }
+            let data: Data
+            if let ptr = text.text, text.text_len > 0 {
+                data = Data(bytes: ptr, count: Int(text.text_len))
+            } else {
+                data = Data()
+            }
+            let vt = String(decoding: data, as: UTF8.self)
+
+            var metrics = ghostty_surface_grid_metrics_s()
+            let haveMetrics = ghostty_surface_grid_metrics(surface, &metrics)
+            result = .ok([
+                "vt": vt,
+                "columns": haveMetrics ? Int(metrics.columns) : 0,
+                "rows": haveMetrics ? Int(metrics.rows) : 0,
+                "cursor_column": haveMetrics ? Int(metrics.cursor_column) : 0,
+                "cursor_row": haveMetrics ? Int(metrics.cursor_row) : 0,
+                "cursor_in_viewport": haveMetrics ? metrics.cursor_in_viewport : false,
+                "surface_id": surfaceId.uuidString,
+                "workspace_id": ws.id.uuidString
+            ])
+        }
+        if !completed {
+            return .err(code: "timeout", message: "Main thread busy (IME or modal UI active)", data: nil)
+        }
+        return result
+    }
+
     func readTerminalTextBase64(terminalPanel: TerminalPanel, includeScrollback: Bool = false, lineLimit: Int? = nil) -> String {
         guard let surface = terminalPanel.surface.surface else { return "ERROR: Terminal surface not found" }
 
