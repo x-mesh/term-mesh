@@ -4,6 +4,36 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.215.0] - 2026-08-26
+
+**Mobile Remote Control 설정을 Settings에서 열 수 있고, 한국어 설정 화면에서 잘못 안내되거나 아예 표시되지 않던 문구를 바로잡았습니다.**
+
+### Fixed
+
+- **Mobile Remote Control 설정 화면 노출** — 0.214.0에 기능은 들어갔지만 Settings 사이드바에 항목이 없어 listener를 켜거나 포트·인증 방식을 바꿀 수 없었습니다. Network 그룹에 항목을 추가했습니다. (`Sources/SettingsView.swift`)
+
+- **컴퓨터 ID 재생성 안내가 반대로 읽히던 문제** — 원문은 "진행 중인 연결을 직접 다시 시작하라"는 안내인데, 한국어에서는 앱이 알아서 다시 시작한다는 뜻으로 표시됐습니다. 실제로 앱은 세션을 다시 시작하지 않으므로, 안내를 믿고 아무것도 하지 않으면 진행 중인 연결이 무효해진 ID에 묶인 채 남았습니다. 확인 창과 완료 메시지 모두 고쳤습니다. (`Resources/Localizable.xcstrings`)
+
+- **표시되지 않던 한국어 안내문 18개** — 설정 카드 아래 설명글이 번역 대신 항상 영어로 나왔습니다. Tailscale 연결 안내를 포함해 모든 카드 설명이 이제 한국어로 표시됩니다. (`Sources/SettingsView.swift`, `Sources/ProjectSyncPanelView.swift`)
+
+- **화면에 반영되지 않던 문구 수정 2건** — 문자열 카탈로그에 같은 항목이 중복 선언되어 고친 문구가 표시되지 않았고, 편집기가 다음 저장에서 한쪽을 조용히 지울 수 있는 상태였습니다. (`Resources/Localizable.xcstrings`)
+
+- **"모든 설정 초기화" 버튼 이름 복원** — 이름이 "초기화"로 줄어 항목별 초기화 버튼과 구분되지 않았습니다. 이 버튼은 확인 창 없이 전체 설정을 지웁니다. (`Resources/Localizable.xcstrings`)
+
+- **Services 목록의 한국어·영어 혼용** — 서비스 상태가 "사용 안 함"·"알 수 없음"으로 번역되지 않고 영어로 남아, 한 줄은 한국어 다음 줄은 영어로 보였습니다. (`Sources/SettingsView.swift`)
+
+- **브라우저 허용 목록의 입력 형식 안내 복원** — 한 줄에 하나씩 적는다는 설명과 와일드카드 예시가 빠져 있었습니다. 바로 옆 칸이 쉼표 구분을 안내하기 때문에 같은 방식으로 적기 쉬웠고, 그러면 목록이 어떤 주소와도 일치하지 않았습니다. (`Resources/Localizable.xcstrings`)
+
+- **보안 경고 표시 복원** — "이 Mac의 모든 앱 허용"과 "0.0.0.0 바인딩" 안내에서 ⚠️가 빠져, 안전한 선택지와 똑같은 회색 설명으로 보였습니다. (`Resources/Localizable.xcstrings`)
+
+- **Tailscale 설정 카드 정확도** — listener가 꺼져 있으면 카드를 감춥니다. 세 단계 어디에도 listener를 켜라는 안내가 없어 그대로 따라 해도 연결되지 않았습니다. 복사되는 명령도 실제로 사용되는 포트를 쓰도록 고쳤습니다. 범위를 벗어난 포트를 입력하면 안내된 명령이 아무것도 듣지 않는 포트를 가리켰습니다. (`Sources/SettingsView.swift`)
+
+- **릴리즈 후 디스크 회수** — 릴리즈마다 쌓이던 체크아웃(버전당 약 725MB)과 로컬 릴리즈 브랜치를 정리합니다. 아직 태그가 나가지 않았거나 진행 중인 릴리즈, `git worktree lock`으로 보호했거나 `--keep-worktrees`로 남긴 체크아웃은 건드리지 않으며, 정리에 실패해도 이미 끝난 릴리즈를 실패로 만들지 않고 회수하지 못한 대상을 receipt에 남깁니다. (`scripts/release.py`)
+
+- **`make install-commands`가 일부 커맨드를 빠뜨리던 문제** — 앱이 배포하는 8개 중 5개만 설치해 `tm`, `watch`, `rc`가 누락됐습니다. (`Makefile`)
+
+### Thanks to 1 contributor!
+
 ## [0.214.0] - 2026-08-26
 
 **터미널은 그대로 유지하면서, 휴대폰에서는 안전한 Terminal 또는 native-like Chat으로 원격 제어할 수 있습니다.**
