@@ -446,7 +446,7 @@
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "터미널 링크와 `open https://...` 호출 중 목록에 있는 주소만 term-mesh에서 엽니다. 비워 두면 모든 주소를 term-mesh에서 엽니다."
+            "value": "터미널 링크와 `open https://...` 호출 중 목록에 있는 주소만 term-mesh에서 열고, 나머지는 기본 브라우저에서 엽니다. 한 줄에 주소나 와일드카드를 하나씩 적습니다(예: example.com, *.internal.example). 비워 두면 모든 주소를 term-mesh에서 엽니다."
           }
         }
       }
@@ -1276,7 +1276,7 @@
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "기존 컴퓨터 연결이 끊길 수 있지만 이 Mac의 프로젝트 소유권은 유지됩니다. ID를 다시 만들면 진행 중인 연결도 다시 시작합니다."
+            "value": "기존 컴퓨터 연결이 끊길 수 있지만 이 Mac의 프로젝트 소유권은 유지됩니다. ID를 다시 만든 뒤 진행 중인 연결을 직접 다시 시작하세요."
           }
         }
       }
@@ -2686,7 +2686,7 @@
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "없음(팀 기본값 사용)"
+            "value": "없음(팀 기본값)"
           }
         }
       }
@@ -2811,7 +2811,7 @@
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "한 줄에 KEY=VALUE 하나씩 적습니다."
+            "value": "한 줄에 KEY=VALUE 하나를 입력합니다."
           }
         }
       }
@@ -3561,7 +3561,7 @@
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "초기화"
+            "value": "모든 설정 초기화"
           }
         }
       }
@@ -5075,17 +5075,17 @@
     "Model Override": {
       "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "모델 지정" } } }
     },
+    "Disabled": {
+      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "사용 안 함" } } }
+    },
+    "Unknown": {
+      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "알 수 없음" } } }
+    },
     "No log": {
       "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "로그 없음" } } }
     },
     "No panels": {
       "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "패널 없음" } } }
-    },
-    "None (use team default)": {
-      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "없음(팀 기본값)" } } }
-    },
-    "One KEY=VALUE per line.": {
-      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "한 줄에 KEY=VALUE 하나를 입력합니다." } } }
     },
     "Preview": {
       "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "미리보기" } } }
@@ -5100,7 +5100,7 @@
       "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "사용할 수 없음" } } }
     },
     "Regenerated. Restart active peer sessions.": {
-      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "ID를 다시 만들었습니다. 진행 중인 연결을 다시 시작합니다." } } }
+      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "ID를 다시 만들었습니다. 진행 중인 연결을 직접 다시 시작하세요." } } }
     },
     "Enter a password first.": {
       "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "암호를 먼저 입력합니다." } } }
@@ -5178,14 +5178,14 @@
       "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "분할선 색상" } } }
     },
     "⚠️ Every local process passes. Development only.": {
-      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "이 Mac의 모든 앱이 연결할 수 있습니다. 개발 환경에서만 사용합니다." } } }
+      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "⚠️ 이 Mac의 모든 앱이 연결할 수 있습니다. 개발 환경에서만 사용합니다." } } }
     },
     "⚠️ Accessible from any network interface (0.0.0.0). Set a password for security.": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "0.0.0.0을 사용하면 모든 네트워크에서 접근할 수 있습니다. 암호 설정이 필요합니다."
+            "value": "⚠️ 0.0.0.0을 사용하면 모든 네트워크에서 접근할 수 있습니다. 암호를 설정하세요."
           }
         }
       }

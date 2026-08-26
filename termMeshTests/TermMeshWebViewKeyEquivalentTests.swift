@@ -440,10 +440,37 @@ final class LanguageSettingsTests: XCTestCase {
 
         for key in descriptionKeys {
             let value = String(localized: String.LocalizationValue(key), bundle: .main, locale: ko)
+            // Without this the test cannot fail for the regression it exists to catch:
+            // a missing ko entry returns the English source, which carries none of the
+            // Korean banned tokens and already ends with a period.
+            XCTAssertNotEqual(value, key, "catalog has no ko entry for \(key)")
             for token in banned {
                 XCTAssertFalse(value.contains(token), "\(key): \(value) contains \(token)")
             }
             XCTAssertTrue(value.hasSuffix("."), "description must end with a period: \(value)")
+        }
+    }
+
+    /// An English imperative must stay an imperative in Korean.
+    ///
+    /// `regeneratePeerIdentity()` writes the new hex and a status string and nothing
+    /// else — it never restarts a session. A declarative Korean rendering ("연결을 다시
+    /// 시작합니다") reads as the app doing the work, so the user skips the manual step
+    /// and leaves every active session bound to an invalidated ID.
+    func testActionRequiredCopyStaysImperativeInKorean() {
+        let ko = Locale(identifier: "ko")
+        let keys = [
+            "Existing peer pairings may stop working. Durable Project ownership is retained on this Mac. Restart active peer sessions after regenerating this ID.",
+            "Regenerated. Restart active peer sessions.",
+        ]
+
+        for key in keys {
+            let value = String(localized: String.LocalizationValue(key), bundle: .main, locale: ko)
+            XCTAssertNotEqual(value, key, "catalog has no ko entry for \(key)")
+            XCTAssertTrue(
+                value.contains("다시 시작하세요"),
+                "\(key) must ask the user to act, not report that the app did: \(value)"
+            )
         }
     }
 }

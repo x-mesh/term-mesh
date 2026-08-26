@@ -1883,7 +1883,7 @@ struct SettingsView: View {
                 verbatimSubtitle: mobileEnabled
                     ? String(
                         format: LanguageSettings.localized("Loopback listener at 127.0.0.1:%@. Expose it to your tailnet with `tailscale serve --bg %@`."),
-                        String(mobilePort), String(mobilePort)
+                        String(resolvedMobilePort), String(resolvedMobilePort)
                       )
                     : LanguageSettings.localized("Disabled. Panes exposed with /rc stay unreachable until the listener is on.")
             ) {
@@ -1950,18 +1950,31 @@ struct SettingsView: View {
             SettingsCardNote("Only panes registered with /rc are exposed, and only on loopback. Reach them from your phone through Tailscale Serve; the daemon restarts when these settings change.")
         }
 
-        SettingsCard {
-            SettingsCardNote("Connect from your phone with Tailscale")
-            MobileSetupCommandRow(step: "1", command: "tailscale serve --bg \(mobilePort)", isCopied: mobileSetupCopiedCommand == "tailscale serve --bg \(mobilePort)") { copyMobileSetupCommand("tailscale serve --bg \(mobilePort)") }
-            SettingsCardDivider()
-            MobileSetupCommandRow(step: "2", command: "tailscale serve status", isCopied: mobileSetupCopiedCommand == "tailscale serve status") { copyMobileSetupCommand("tailscale serve status") }
-            SettingsCardDivider()
-            MobileSetupCommandRow(step: "3", command: "/rc on", isCopied: mobileSetupCopiedCommand == "/rc on") { copyMobileSetupCommand("/rc on") }
-            SettingsCardDivider()
-            SettingsCardNote("Run the first two commands in a Mac terminal. Run /rc on inside the term-mesh pane you want to open on your phone, then use the URL it prints.")
+        if mobileEnabled {
+            SettingsCard {
+                SettingsCardNote("Connect from your phone with Tailscale")
+                MobileSetupCommandRow(step: "1", command: serveCommand, isCopied: mobileSetupCopiedCommand == serveCommand) { copyMobileSetupCommand(serveCommand) }
+                SettingsCardDivider()
+                MobileSetupCommandRow(step: "2", command: "tailscale serve status", isCopied: mobileSetupCopiedCommand == "tailscale serve status") { copyMobileSetupCommand("tailscale serve status") }
+                SettingsCardDivider()
+                MobileSetupCommandRow(step: "3", command: "/rc on", isCopied: mobileSetupCopiedCommand == "/rc on") { copyMobileSetupCommand("/rc on") }
+                SettingsCardDivider()
+                SettingsCardNote("Run the first two commands in a Mac terminal. Run /rc on inside the term-mesh pane you want to open on your phone, then use the URL it prints.")
+            }
         }
         }
     }
+
+    /// The port the daemon will actually bind, mirroring TermMeshDaemon.mobilePort.
+    ///
+    /// The Port field accepts any integer; the daemon clamps to 1...65535 and otherwise
+    /// falls back to its default, so the raw stored value would name a port nothing
+    /// listens on in a command the user can copy in one click.
+    private var resolvedMobilePort: Int {
+        (1...65535).contains(mobilePort) ? mobilePort : TermMeshDaemon.defaultMobilePort
+    }
+
+    private var serveCommand: String { "tailscale serve --bg \(resolvedMobilePort)" }
 
     private func copyMobileSetupCommand(_ command: String) {
         NSPasteboard.general.clearContents()
@@ -2102,7 +2115,7 @@ struct SettingsView: View {
                                         Circle()
                                             .fill(sub.status == "running" ? Color.green : (sub.status == "disabled" ? Color.gray : Color.orange))
                                             .frame(width: 7, height: 7)
-                                        Text(LocalizedStringKey(sub.status.capitalized))
+                                        subsystemStatusLabel(sub.status)
                                             .font(.system(size: 11, design: .monospaced))
                                             .foregroundColor(.secondary)
                                     }
@@ -4047,20 +4060,47 @@ private struct ShellHealthEntry: Identifiable {
     let isAgentPanel: Bool
 }
 
+/// An explanatory note under a settings card.
+///
+/// The text is a `LocalizedStringKey` for the same reason `SettingsCardRow`'s is:
+/// `Text(String)` selects the verbatim initializer, so every translation the
+/// catalog holds for a note used to render in English. Runtime text (an error, a
+/// daemon-supplied summary) goes through `verbatim:` instead.
 struct SettingsCardNote: View {
-    let text: String
+    private let text: Text
 
-    init(_ text: String) {
-        self.text = text
+    init(_ text: LocalizedStringKey) {
+        self.text = Text(text)
+    }
+
+    init(verbatim text: String) {
+        self.text = Text(verbatim: text)
     }
 
     var body: some View {
-        Text(text)
+        text
             .font(.caption)
             .foregroundColor(.secondary)
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A localized label for a daemon subsystem status.
+///
+/// The daemon emits a closed set — `running`, `disabled`, `starting` (socket.rs) —
+/// plus `unknown` when a subsystem entry is malformed (TermMeshDaemon.swift). Mapping
+/// those explicitly keeps a daemon-supplied string from being turned into a catalog
+/// key: `Text(LocalizedStringKey(sub.status.capitalized))` rendered a Korean row above
+/// an English one whenever the value had no matching entry.
+private func subsystemStatusLabel(_ status: String) -> Text {
+    switch status {
+    case "running": return Text("Running")
+    case "disabled": return Text("Disabled")
+    case "starting": return Text("Starting")
+    case "unknown": return Text("Unknown")
+    default: return Text(verbatim: status.capitalized)
     }
 }
 
