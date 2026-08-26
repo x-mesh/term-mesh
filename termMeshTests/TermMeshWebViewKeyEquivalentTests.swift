@@ -402,6 +402,51 @@ final class LanguageSettingsTests: XCTestCase {
         }
     }
 
+    /// The shell health summary is built in Swift, not read from a catalog key, so a
+    /// missing entry shows English under Korean labels instead of failing anywhere.
+    /// Only the empty-panel case used to be localized; the common steady state did not.
+    func testShellHealthSummaryStringsAreTranslated() {
+        guard let defaults = isolatedDefaults("ShellHealth", language: .korean) else { return }
+
+        for key in ["No panels", "All healthy", "Starting..."] {
+            let value = LanguageSettings.localized(key, defaults: defaults)
+            XCTAssertNotEqual(value, key, "no ko entry for \(key)")
+        }
+        for key in ["%lld agent", "%lld agents", "%lld not loaded", "%lld degraded"] {
+            let value = LanguageSettings.localized(key, defaults: defaults)
+            XCTAssertNotEqual(value, key, "no ko entry for \(key)")
+            XCTAssertTrue(value.contains("%lld"), "\(key) lost its %lld specifier: \(value)")
+        }
+    }
+
+    /// A description may only quote a label the user can actually find on screen.
+    func testSettingsDescriptionsQuoteLabelsThatExist() {
+        let ko = Locale(identifier: "ko")
+        func localized(_ key: String) -> String {
+            String(localized: String.LocalizationValue(key), bundle: .main, locale: ko)
+        }
+
+        let overrides = localized(
+            "These settings override your ghostty config file. Select \"Default\" or \"Reset\" to use the config file value."
+        )
+        XCTAssertTrue(overrides.contains(localized("Default (from config)")), overrides)
+        XCTAssertTrue(overrides.contains(localized("Reset")), overrides)
+
+        // The toggle and its section title must not render the same label, or the
+        // section note naming one of them resolves to nothing on screen.
+        XCTAssertNotEqual(localized("Enable peer server"), localized("Peer Federation"))
+        let peerNote = localized(
+            "Peer federation lets another term-mesh.app instance attach this Mac's terminal panes via SSH (workspace mirror with live layout sync). \"Enable peer server\" controls the running state right now; \"Auto-start at app launch\" persists across restarts."
+        )
+        for label in ["Enable peer server", "Auto-start at app launch"] {
+            let rendered = localized(label)
+            XCTAssertTrue(
+                peerNote.contains(rendered.prefix(5)),
+                "the note does not name \(label) as it renders (\(rendered)): \(peerNote)"
+            )
+        }
+    }
+
     func testSettingsKoreanCopyUsesNativeUILabelsAndUserFacingTerms() {
         let ko = Locale(identifier: "ko")
         let expected: [String: String] = [
