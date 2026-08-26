@@ -7613,7 +7613,28 @@ final class TerminalControllerSocketTextChunkTests: XCTestCase {
         XCTAssertEqual(TerminalController.queuedTextForNamedKey("EOF"), "\u{04}")
         XCTAssertEqual(TerminalController.queuedTextForNamedKey("ctrl-a"), "\u{01}")
         XCTAssertEqual(TerminalController.queuedTextForNamedKey("return"), "\r")
-        XCTAssertNil(TerminalController.queuedTextForNamedKey("left"))
+    }
+
+    /// An arrow queued before its surface exists falls back to a plain CSI sequence.
+    ///
+    /// This assertion used to require nil, which stopped matching when arrow names
+    /// were accepted in `surface.send_key`: returning nil makes that command reject
+    /// an arrow with `invalid_params: Unknown key` for as long as the surface is
+    /// still starting. Once the surface is up, `sendNamedKey` sends a real key event
+    /// instead, so Ghostty encodes it for whatever keyboard protocol the pane
+    /// negotiated rather than delivering raw CSI bytes.
+    func testQueuedTextForNamedKeyFallsBackToCSIArrows() {
+        XCTAssertEqual(TerminalController.queuedTextForNamedKey("up"), "\u{1b}[A")
+        XCTAssertEqual(TerminalController.queuedTextForNamedKey("arrow-down"), "\u{1b}[B")
+        XCTAssertEqual(TerminalController.queuedTextForNamedKey("right"), "\u{1b}[C")
+        XCTAssertEqual(TerminalController.queuedTextForNamedKey("arrow-left"), "\u{1b}[D")
+    }
+
+    func testQueuedTextForNamedKeyRejectsNamesItCannotSend() {
+        XCTAssertNil(TerminalController.queuedTextForNamedKey("home"))
+        XCTAssertNil(TerminalController.queuedTextForNamedKey("f1"))
+        XCTAssertNil(TerminalController.queuedTextForNamedKey("ctrl-1"))
+        XCTAssertNil(TerminalController.queuedTextForNamedKey("ctrl-"))
     }
 
     func testSocketTextChunksReturnsSingleChunkForPlainText() {
