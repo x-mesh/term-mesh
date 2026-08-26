@@ -30,7 +30,7 @@ Accepted forms:
    python3 scripts/release.py prepare <version> --notes-file <temp-file> --relay-e2e-receipt <receipt-path> --yes --json
    ```
 
-5. Report gates and the release PR receipt. Show publish effects: squash merge, exact merge-SHA tag, Release build, dSYM, DMG, GitHub/Linux assets, Homebrew cask, and develop resync. Ask one explicit confirmation. On approval:
+5. Report gates and the release PR receipt. Show publish effects: squash merge, exact merge-SHA tag, Release build, dSYM, DMG, GitHub/Linux assets, Homebrew cask, develop resync, and cleanup. Ask one explicit confirmation. On approval:
 
    ```bash
    python3 scripts/release.py publish <version> --yes --json
@@ -43,6 +43,14 @@ Accepted forms:
    ```
 
 7. Completion requires `state: complete`, matching `main`/`develop`/tag SHAs, the pinned relay E2E receipt, and all required assets in the `verify` receipt.
+
+8. `cleanup` runs last and reclaims the release checkouts under `~/.cache/term-mesh/release-worktrees` plus the local `chore/release-v*` branches. It is destructive: `git worktree remove --force` discards whatever is in the tree, and `git branch -D` is required because the squash merge leaves the branch unreachable from `main`.
+
+   It claims a version only when that version's own release is settled — the current one, or an older one whose tag shipped, whose lock is free, and whose receipt has `verify` completed. An abandoned or still-running release keeps its checkout, and a branch is deleted only when its tip still equals the commit its own `release_metadata` receipt recorded.
+
+   Because it runs after the release is provably complete, cleanup never fails it: anything it could not reclaim is printed to stderr and recorded in the receipt as `failed_worktrees` / `failed_branches`. Check those before assuming the disk was freed.
+
+   `--keep-worktrees` on publish or resume leaves every claimed checkout in place. For this version's own checkouts the opt-out persists: it drops a `.keep-<name>` sidecar beside each one that later releases honor, listed in the receipt as `kept`. Older checkouts are only deferred to the next release (`deferred`), so keeping one debugging tree does not pin the whole cache. `git worktree lock` is the permanent opt-out for any checkout; delete the sidecar or unlock to hand it back.
 
 ## Status
 

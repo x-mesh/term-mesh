@@ -13,6 +13,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -23,6 +24,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "x-mesh/term-mesh"
+RELEASE_WORKTREES = Path.home() / ".cache/term-mesh/release-worktrees"
+RELEASE_WORKTREE_NAME = re.compile(r"^v(\d+\.\d+\.\d+)-(?:source|artifact-[0-9a-f]+)$")
 STEP_ORDER = [
     "develop_to_main",
     "release_metadata",
@@ -36,6 +39,7 @@ STEP_ORDER = [
     "homebrew",
     "develop_resync",
     "verify",
+    "cleanup",
 ]
 RELAY_E2E_PATH_PREFIXES = (
     "Sources/Peer",
@@ -152,7 +156,10 @@ def load_state(version: str) -> dict[str, Any]:
     path = state_path(version)
     if not path.exists():
         raise ReleaseError(f"no release state for v{version}; run plan first")
-    return json.loads(path.read_text())
+    state = json.loads(path.read_text())
+    for name in STEP_ORDER:
+        state["steps"].setdefault(name, {"status": "pending"})
+    return state
 
 
 def save_state(state: dict[str, Any]) -> None:
@@ -441,7 +448,7 @@ def merge_develop_to_main(state: dict[str, Any]) -> None:
 
 def release_worktree(state: dict[str, Any], ref: str, *, artifact: bool = False) -> Path:
     suffix = f"artifact-{ref[:12]}" if artifact else "source"
-    path = Path.home() / ".cache/term-mesh/release-worktrees" / f"v{state['version']}-{suffix}"
+    path = RELEASE_WORKTREES / f"v{state['version']}-{suffix}"
     if path.exists():
         actual = git("-C", str(path), "rev-parse", "HEAD")
         if artifact:
@@ -479,12 +486,203 @@ def branch_worktree(branch: str, *, allow_dirty: bool = False) -> Path:
             if not allow_dirty and git("-C", str(current), "status", "--porcelain"):
                 raise ReleaseError(f"{branch} worktree is dirty: {current}")
             return current
-    path = Path.home() / ".cache/term-mesh/release-worktrees" / branch
+    path = RELEASE_WORKTREES / branch
     if path.exists():
         raise ReleaseError(f"unregistered path blocks {branch} worktree: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     run("git", "worktree", "add", str(path), branch)
     return path
+
+
+def keep_marker(path: Path) -> Path:
+    """Sidecar that opts a release checkout out of reclamation for good.
+
+    It sits beside the checkout rather than inside it: a file within the worktree
+    would make `git status --porcelain` dirty and trip release_worktree's guard.
+    Delete the sidecar to hand the checkout back to the next release.
+    """
+    return path.parent / f".keep-{path.name}"
+
+
+def registered_worktrees() -> dict[Path, bool]:
+    """Every checkout git knows about, mapped to whether it is locked."""
+    found: dict[Path, bool] = {}
+    current: Path | None = None
+    for line in git("worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            current = Path(line.removeprefix("worktree "))
+            found[current.resolve()] = False
+        elif line.startswith("locked") and current is not None:
+            found[current.resolve()] = True
+    return found
+
+
+def release_is_running(version: str) -> bool:
+    """Whether another process currently holds that version's release lock."""
+    path = state_dir() / f"v{version}.lock"
+    if not path.exists():
+        return False
+    with path.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    return False
+
+
+def release_is_settled(version: str, current: str) -> bool:
+    """Whether a version's release finished, so its checkout is safe to reclaim.
+
+    cleanup runs after verify, so the version being published is settled by
+    construction. Every other version has to prove it: an untagged one was abandoned
+    before `tag` and still needs its worktree, because release_worktree refuses to
+    rebuild a checkout while its branch exists. A tagged one may still be mid-publish
+    under its own per-version lock, which does not serialize against this release.
+    """
+    if version == current:
+        return True
+    if not git("tag", "-l", f"v{version}"):
+        return False
+    if release_is_running(version):
+        return False
+    receipt = release_receipt(version)
+    if receipt is None:
+        return True
+    return receipt.get("steps", {}).get("verify", {}).get("status") == "completed"
+
+
+def release_receipt(version: str) -> dict[str, Any] | None:
+    """That version's state file, or None when it is missing or unreadable."""
+    path = state_path(version)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def remove_worktree(path: Path) -> str:
+    """Drop a release checkout, reporting which of three outcomes happened.
+
+    Returns "absent", "removed", or "failed" so the caller can tell "nothing to
+    reclaim" from "reclaim failed". --force is required: the tree carries the
+    ghostty submodule. The rmtree fallback only covers a directory git does not
+    know about; a registered checkout git refused to drop is reported, never forced.
+    """
+    if not path.exists():
+        return "absent"
+    run("git", "worktree", "remove", "--force", str(path), check=False)
+    if path.exists():
+        if path.resolve() in registered_worktrees():
+            return "failed"
+        shutil.rmtree(path, ignore_errors=True)
+    run("git", "worktree", "prune", check=False)
+    return "removed" if not path.exists() else "failed"
+
+
+def obsolete_release_worktrees(version: str) -> list[Path]:
+    """Release checkouts this release may reclaim.
+
+    A checkout is claimed only when its own release is settled, so a concurrent
+    publish keeps its tree and an abandoned release keeps the tree its resume needs.
+    branch_worktree parks a plain `develop` checkout in the same directory; the name
+    pattern skips it. A `.keep-<name>` sidecar or a `git worktree lock` opts a
+    checkout out permanently, not just for the release that set it.
+    """
+    if not RELEASE_WORKTREES.is_dir():
+        return []
+    ceiling = tuple(int(part) for part in version.split("."))
+    locked = {path for path, is_locked in registered_worktrees().items() if is_locked}
+    found = []
+    for path in sorted(RELEASE_WORKTREES.iterdir()):
+        if not path.is_dir() or path.resolve() in locked or keep_marker(path).exists():
+            continue
+        name = RELEASE_WORKTREE_NAME.match(path.name)
+        if not name or tuple(int(part) for part in name.group(1).split(".")) > ceiling:
+            continue
+        if release_is_settled(name.group(1), version):
+            found.append(path)
+    return found
+
+
+def obsolete_release_branches(version: str) -> list[str]:
+    """Local release branches whose release shipped and whose tip is what shipped.
+
+    The release PR is squash-merged with --delete-branch, so the local branch holds a
+    commit no longer reachable from main and release_worktree refuses to run again
+    while it exists. `git branch -d` therefore always refuses and -D is required,
+    which leaves the recorded-tip comparison as the only guard against destroying a
+    commit added to the branch after its tag.
+    """
+    ceiling = tuple(int(part) for part in version.split("."))
+    kept = (
+        {path.name.removeprefix(".keep-") for path in RELEASE_WORKTREES.glob(".keep-*")}
+        if RELEASE_WORKTREES.is_dir()
+        else set()
+    )
+    found = []
+    for name in git("branch", "--list", "chore/release-v*", "--format=%(refname:short)").split():
+        candidate = name.removeprefix("chore/release-v")
+        if not re.fullmatch(r"\d+\.\d+\.\d+", candidate):
+            continue
+        if tuple(int(part) for part in candidate.split(".")) > ceiling:
+            continue
+        if f"v{candidate}-source" in kept:
+            continue
+        if not release_is_settled(candidate, version):
+            continue
+        receipt = release_receipt(candidate) or {}
+        shipped = receipt.get("steps", {}).get("release_metadata", {}).get("commit")
+        if not shipped or git("rev-parse", name) != shipped:
+            continue
+        found.append(name)
+    return found
+
+
+def cleanup(state: dict[str, Any], *, keep_worktrees: bool) -> None:
+    """Reclaim the release checkouts once verify passed.
+
+    Each release parks a source and an artifact worktree under RELEASE_WORKTREES,
+    roughly 725MB per version, and nothing ever removed them. This runs after the
+    release is provably complete, so nothing here may fail it: every outcome lands
+    in the receipt and on stderr instead of raising.
+    """
+    claimed = obsolete_release_worktrees(state["version"])
+    if keep_worktrees:
+        prefix = f"v{state['version']}-"
+        kept, deferred = [], []
+        for path in claimed:
+            if not path.name.startswith(prefix):
+                deferred.append(str(path))
+                continue
+            keep_marker(path).write_text(f"kept by release v{state['version']} at {utc_now()}\n")
+            kept.append(str(path))
+        mark(state, "cleanup", skipped="--keep-worktrees", kept=kept, deferred=deferred)
+        return
+    worktrees, stuck_worktrees = [], []
+    for path in claimed:
+        outcome = remove_worktree(path)
+        if outcome == "removed":
+            worktrees.append(str(path))
+        elif outcome == "failed":
+            stuck_worktrees.append(str(path))
+    branches, stuck_branches = [], []
+    for name in obsolete_release_branches(state["version"]):
+        run("git", "branch", "-D", name, check=False)
+        (stuck_branches if git("branch", "--list", name) else branches).append(name)
+    receipt: dict[str, Any] = {"worktrees": worktrees, "branches": branches}
+    if stuck_worktrees:
+        receipt["failed_worktrees"] = stuck_worktrees
+    if stuck_branches:
+        receipt["failed_branches"] = stuck_branches
+    if stuck_worktrees or stuck_branches:
+        print(
+            f"[release] cleanup could not reclaim: {stuck_worktrees + stuck_branches}",
+            file=sys.stderr, flush=True,
+        )
+    mark(state, "cleanup", **receipt)
 
 
 def install_notes(changelog: Path, version: str, notes: str) -> None:
@@ -512,7 +710,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         raise ReleaseError("prepare requires --notes-file once; notes are then stored for resume")
     merge_develop_to_main(state)
     main_sha = state["steps"]["develop_to_main"]["main_sha"]
-    wt = release_worktree(state, main_sha)
+    wt = None if completed(state, "release_metadata") else release_worktree(state, main_sha)
     if not completed(state, "release_metadata"):
         begin(state, "release_metadata")
         fetch()
@@ -588,7 +786,12 @@ def publish(args: argparse.Namespace) -> dict[str, Any]:
         if not remote_tag:
             run("git", "push", "origin", tag)
         mark(state, "tag", tag=tag, commit=merge_sha)
-    artifact_wt = release_worktree(state, merge_sha, artifact=True)
+    artifact_steps = ("release_build", "dsym", "dmg", "github_release", "homebrew")
+    artifact_wt = (
+        release_worktree(state, merge_sha, artifact=True)
+        if any(not completed(state, name) for name in artifact_steps)
+        else None
+    )
     if not completed(state, "release_build"):
         begin(state, "release_build")
         derived = Path("/tmp") / f"term-mesh-release-{state['version']}"
@@ -677,6 +880,9 @@ def publish(args: argparse.Namespace) -> dict[str, Any]:
             state, "verify", main_sha=main_sha, develop_sha=develop_sha,
             release_url=release["url"], assets=assets, linux_run=run_receipt,
         )
+    if not completed(state, "cleanup"):
+        begin(state, "cleanup")
+        cleanup(state, keep_worktrees=args.keep_worktrees)
     return state
 
 
@@ -704,6 +910,8 @@ def parser() -> argparse.ArgumentParser:
         if name in ("prepare", "resume"):
             sub.add_argument("--notes-file")
             sub.add_argument("--relay-e2e-receipt")
+        if name in ("publish", "resume"):
+            sub.add_argument("--keep-worktrees", action="store_true")
     s = subs.add_parser("status")
     s.add_argument("version")
     s.add_argument("--json", action="store_true")

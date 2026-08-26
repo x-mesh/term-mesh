@@ -152,5 +152,298 @@ class ReleaseStateMachineTests(unittest.TestCase):
         )
 
 
+    def test_cleanup_runs_after_verify(self):
+        self.assertEqual(release.STEP_ORDER[-1], "cleanup")
+        self.assertLess(release.STEP_ORDER.index("verify"), release.STEP_ORDER.index("cleanup"))
+
+    def test_load_state_backfills_steps_added_after_the_file_was_written(self):
+        with tempfile.TemporaryDirectory() as directory, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": directory}
+        ):
+            (Path(directory) / "v0.202.0.json").write_text(json.dumps({
+                "schema": 1, "version": "0.202.0",
+                "steps": {"develop_to_main": {"status": "completed"}},
+            }))
+            state = release.load_state("0.202.0")
+            self.assertTrue(release.completed(state, "develop_to_main"))
+            self.assertFalse(release.completed(state, "cleanup"))
+
+    @staticmethod
+    def _write_receipt(state_dir, version, *, verify="completed", commit="deadbeef"):
+        steps = {name: {"status": "completed"} for name in release.STEP_ORDER}
+        steps["release_metadata"] = {"status": "completed", "commit": commit}
+        steps["verify"] = {"status": verify}
+        (Path(state_dir) / f"v{version}.json").write_text(json.dumps({
+            "schema": 1, "version": version,
+            "release_branch": f"chore/release-v{version}", "steps": steps,
+        }))
+
+    @staticmethod
+    def _fake_git(*, tags=(), branches=(), tips=None, worktrees=""):
+        tips = tips or {}
+
+        def fake(*args, **kwargs):
+            if args[0] == "worktree":
+                return worktrees
+            if args[0] == "tag":
+                return args[2] if args[2] in tags else ""
+            if args[0] == "branch" and args[1] == "--list":
+                if args[2] == "chore/release-v*":
+                    return "\n".join(branches)
+                return args[2] if args[2] in branches else ""
+            if args[0] == "rev-parse":
+                return tips.get(args[1], "")
+            raise AssertionError(args)
+
+        return fake
+
+    def test_cleanup_claims_this_version_and_older_but_never_develop(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, \
+                unittest.mock.patch.dict("os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}):
+            root = Path(directory)
+            for name in ("develop", "v0.212.0-source", "v0.213.0-source",
+                         "v0.213.0-artifact-2e00f3b16eea", "v0.214.0-source"):
+                (root / name).mkdir()
+            self._write_receipt(state, "0.212.0")
+            with unittest.mock.patch.object(release, "RELEASE_WORKTREES", root), \
+                    unittest.mock.patch.object(release, "git", self._fake_git(tags=("v0.212.0",))):
+                claimed = [path.name for path in release.obsolete_release_worktrees("0.213.0")]
+        self.assertEqual(claimed, ["v0.212.0-source", "v0.213.0-artifact-2e00f3b16eea", "v0.213.0-source"])
+
+    def test_cleanup_spares_a_release_that_never_reached_its_tag(self):
+        """An abandoned release keeps the checkout its resume needs.
+
+        release_worktree refuses to rebuild a checkout while its branch exists, so
+        reclaiming an untagged version's worktree would strand it permanently.
+        """
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, \
+                unittest.mock.patch.dict("os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}):
+            root = Path(directory)
+            for name in ("v0.212.0-source", "v0.213.0-source"):
+                (root / name).mkdir()
+            with unittest.mock.patch.object(release, "RELEASE_WORKTREES", root), \
+                    unittest.mock.patch.object(release, "git", self._fake_git()):
+                claimed = [path.name for path in release.obsolete_release_worktrees("0.213.0")]
+        self.assertEqual(claimed, ["v0.213.0-source"])
+
+    def test_cleanup_spares_an_older_release_that_is_still_running(self):
+        """Per-version locks do not serialize two releases, so cleanup must check."""
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, \
+                unittest.mock.patch.dict("os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}):
+            root = Path(directory)
+            (root / "v0.212.0-source").mkdir()
+            self._write_receipt(state, "0.212.0", verify="pending")
+            with unittest.mock.patch.object(release, "RELEASE_WORKTREES", root), \
+                    unittest.mock.patch.object(release, "git", self._fake_git(tags=("v0.212.0",))):
+                self.assertEqual(release.obsolete_release_worktrees("0.213.0"), [])
+                with release.release_lock("0.212.0"):
+                    self.assertTrue(release.release_is_running("0.212.0"))
+
+    def test_cleanup_spares_locked_and_marked_checkouts(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, \
+                unittest.mock.patch.dict("os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}):
+            root = Path(directory)
+            for name in ("v0.211.0-source", "v0.212.0-source", "v0.213.0-source"):
+                (root / name).mkdir()
+            self._write_receipt(state, "0.211.0")
+            self._write_receipt(state, "0.212.0")
+            release.keep_marker(root / "v0.212.0-source").write_text("kept\n")
+            porcelain = f"worktree {root / 'v0.211.0-source'}\nlocked\n"
+            with unittest.mock.patch.object(release, "RELEASE_WORKTREES", root), \
+                    unittest.mock.patch.object(
+                        release, "git",
+                        self._fake_git(tags=("v0.211.0", "v0.212.0"), worktrees=porcelain)):
+                claimed = [path.name for path in release.obsolete_release_worktrees("0.213.0")]
+        self.assertEqual(claimed, ["v0.213.0-source"])
+
+    def test_keep_worktrees_survives_the_next_release(self):
+        """--keep-worktrees has to persist, or it only defers destruction by one release."""
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state, \
+                unittest.mock.patch.dict("os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}):
+            root = Path(directory)
+            kept = root / "v0.213.0-source"
+            kept.mkdir()
+            (root / "v0.212.0-source").mkdir()
+            self._write_receipt(state, "0.212.0")
+            current = {"schema": 1, "version": "0.213.0",
+                       "release_branch": "chore/release-v0.213.0",
+                       "steps": {name: {"status": "pending"} for name in release.STEP_ORDER}}
+            with unittest.mock.patch.object(release, "RELEASE_WORKTREES", root), \
+                    unittest.mock.patch.object(
+                        release, "git", self._fake_git(tags=("v0.212.0",))), \
+                    unittest.mock.patch.object(release, "remove_worktree") as remover:
+                release.cleanup(current, keep_worktrees=True)
+                remover.assert_not_called()
+                self.assertEqual(current["steps"]["cleanup"]["kept"], [str(kept)])
+                self.assertEqual(current["steps"]["cleanup"]["deferred"],
+                                 [str(root / "v0.212.0-source")])
+                self.assertFalse(release.keep_marker(root / "v0.212.0-source").exists())
+                self._write_receipt(state, "0.213.0")
+                with unittest.mock.patch.object(
+                    release, "git", self._fake_git(tags=("v0.213.0",),
+                                                   branches=("chore/release-v0.213.0",))
+                ):
+                    self.assertEqual(release.obsolete_release_worktrees("0.214.0"), [])
+                    self.assertEqual(release.obsolete_release_branches("0.214.0"), [])
+
+    def test_cleanup_only_claims_release_branches_whose_tip_is_what_shipped(self):
+        """-D is forced by the squash merge, so the recorded tip is the only guard."""
+        with tempfile.TemporaryDirectory() as state, \
+                unittest.mock.patch.dict("os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}):
+            self._write_receipt(state, "0.211.0", commit="bbb222")
+            self._write_receipt(state, "0.212.0", commit="aaa111")
+            fake = self._fake_git(
+                tags=("v0.211.0", "v0.212.0"),
+                branches=("chore/release-v0.211.0", "chore/release-v0.212.0",
+                          "chore/release-v0.214.0", "chore/release-v0.201.0-prep"),
+                tips={"chore/release-v0.211.0": "moved-past-the-tag",
+                      "chore/release-v0.212.0": "aaa111"},
+            )
+            with unittest.mock.patch.object(release, "RELEASE_WORKTREES", Path(state) / "absent"), \
+                    unittest.mock.patch.object(release, "git", fake):
+                self.assertEqual(release.obsolete_release_branches("0.213.0"),
+                                 ["chore/release-v0.212.0"])
+
+    def test_cleanup_records_what_it_reclaimed(self):
+        with tempfile.TemporaryDirectory() as directory, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": directory}
+        ):
+            state = {"schema": 1, "version": "0.213.0",
+                     "release_branch": "chore/release-v0.213.0",
+                     "steps": {name: {"status": "pending"} for name in release.STEP_ORDER}}
+            deleted = []
+            with unittest.mock.patch.object(
+                release, "obsolete_release_worktrees",
+                return_value=[Path("/tmp/v0.213.0-source")],
+            ), unittest.mock.patch.object(
+                release, "obsolete_release_branches", return_value=["chore/release-v0.213.0"],
+            ), unittest.mock.patch.object(
+                release, "remove_worktree", return_value="removed",
+            ), unittest.mock.patch.object(
+                release, "RELEASE_WORKTREES", Path(directory) / "worktrees",
+            ), unittest.mock.patch.object(
+                release, "git", self._fake_git(),
+            ), unittest.mock.patch.object(
+                release, "run", side_effect=lambda *args, **kwargs: deleted.append(args) or "",
+            ):
+                release.cleanup(state, keep_worktrees=False)
+        self.assertEqual(deleted, [("git", "branch", "-D", "chore/release-v0.213.0")])
+        self.assertEqual(state["steps"]["cleanup"]["worktrees"], ["/tmp/v0.213.0-source"])
+        self.assertEqual(state["steps"]["cleanup"]["branches"], ["chore/release-v0.213.0"])
+        self.assertNotIn("failed_worktrees", state["steps"]["cleanup"])
+
+    def test_cleanup_records_what_it_could_not_reclaim(self):
+        """A checkout that survived must be named, not filtered out of the receipt."""
+        with tempfile.TemporaryDirectory() as directory, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": directory}
+        ):
+            state = {"schema": 1, "version": "0.213.0",
+                     "release_branch": "chore/release-v0.213.0",
+                     "steps": {name: {"status": "pending"} for name in release.STEP_ORDER}}
+            with unittest.mock.patch.object(
+                release, "obsolete_release_worktrees",
+                return_value=[Path("/tmp/v0.213.0-source")],
+            ), unittest.mock.patch.object(
+                release, "obsolete_release_branches", return_value=[],
+            ), unittest.mock.patch.object(
+                release, "remove_worktree", return_value="failed",
+            ), unittest.mock.patch.object(
+                release, "RELEASE_WORKTREES", Path(directory) / "worktrees",
+            ), unittest.mock.patch.object(release, "run", return_value=""):
+                release.cleanup(state, keep_worktrees=False)
+        self.assertEqual(state["steps"]["cleanup"]["worktrees"], [])
+        self.assertEqual(state["steps"]["cleanup"]["failed_worktrees"], ["/tmp/v0.213.0-source"])
+        self.assertEqual(state["steps"]["cleanup"]["status"], "completed")
+
+    def test_cleanup_cannot_fail_a_release_that_already_shipped(self):
+        """Reclamation runs after verify, so a refused delete may not block the release."""
+        with tempfile.TemporaryDirectory() as directory, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": directory}
+        ):
+            state = {"schema": 1, "version": "0.213.0",
+                     "release_branch": "chore/release-v0.213.0",
+                     "steps": {name: {"status": "pending"} for name in release.STEP_ORDER}}
+            with unittest.mock.patch.object(
+                release, "obsolete_release_worktrees", return_value=[],
+            ), unittest.mock.patch.object(
+                release, "obsolete_release_branches", return_value=["chore/release-v0.213.0"],
+            ), unittest.mock.patch.object(
+                release, "git", self._fake_git(branches=("chore/release-v0.213.0",)),
+            ), unittest.mock.patch.object(
+                release, "RELEASE_WORKTREES", Path(directory) / "worktrees",
+            ), unittest.mock.patch.object(release, "run", return_value=""):
+                release.cleanup(state, keep_worktrees=False)
+        self.assertEqual(state["steps"]["cleanup"]["status"], "completed")
+        self.assertEqual(state["steps"]["cleanup"]["branches"], [])
+        self.assertEqual(state["steps"]["cleanup"]["failed_branches"], ["chore/release-v0.213.0"])
+
+    def test_remove_worktree_reports_absent_removed_and_failed(self):
+        """The primitive that actually deletes, exercised rather than mocked out."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(release.remove_worktree(root / "never-existed"), "absent")
+
+            unregistered = root / "v0.213.0-source"
+            unregistered.mkdir()
+            (unregistered / "file").write_text("x")
+            with unittest.mock.patch.object(release, "run", return_value=""), \
+                    unittest.mock.patch.object(release, "registered_worktrees", return_value={}):
+                self.assertEqual(release.remove_worktree(unregistered), "removed")
+            self.assertFalse(unregistered.exists())
+
+            protected = root / "v0.212.0-source"
+            protected.mkdir()
+            (protected / "file").write_text("x")
+            with unittest.mock.patch.object(release, "run", return_value=""), \
+                    unittest.mock.patch.object(
+                        release, "registered_worktrees",
+                        return_value={protected.resolve(): True}):
+                self.assertEqual(release.remove_worktree(protected), "failed")
+            self.assertTrue((protected / "file").exists())
+
+    def _publishable_state(self, state_dir, **overrides):
+        steps = {name: {"status": "completed"} for name in release.STEP_ORDER}
+        steps["release_pr"] = {"status": "completed", "pr": 1}
+        steps["release_merge"] = {"status": "completed", "merge_sha": "abc123"}
+        steps["release_build"] = {"status": "completed", "dsym": "/tmp/term-mesh.app.dSYM",
+                                  "derived_data": "/tmp/derived"}
+        steps["dmg"] = {"status": "completed", "path": "/tmp/term-mesh.dmg", "sha256": "f" * 64}
+        steps["cleanup"] = {"status": "pending"}
+        steps.update(overrides)
+        (Path(state_dir) / "v0.213.0.json").write_text(json.dumps({
+            "schema": 1, "version": "0.213.0",
+            "release_branch": "chore/release-v0.213.0", "steps": steps,
+        }))
+        return type("Args", (), {"version": "0.213.0", "yes": True, "keep_worktrees": False})()
+
+    def test_a_finished_release_does_not_rebuild_its_worktrees(self):
+        with tempfile.TemporaryDirectory() as state, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}
+        ):
+            args = self._publishable_state(state)
+            with unittest.mock.patch.object(release, "release_worktree") as builder, \
+                    unittest.mock.patch.object(release, "cleanup") as janitor:
+                release.publish(args)
+        builder.assert_not_called()
+        janitor.assert_called_once()
+
+    def test_an_outstanding_artifact_step_still_builds_its_worktree(self):
+        with tempfile.TemporaryDirectory() as state, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}
+        ):
+            args = self._publishable_state(state, dsym={"status": "pending"})
+            with unittest.mock.patch.object(
+                release, "release_worktree", return_value=Path("/tmp/artifact-wt"),
+            ) as builder, unittest.mock.patch.object(
+                release, "cleanup",
+            ), unittest.mock.patch.object(release, "run", return_value="") as runner:
+                release.publish(args)
+        builder.assert_called_once()
+        self.assertIn(
+            ("./scripts/upload-dsym.sh", "/tmp/term-mesh.app.dSYM"),
+            [call.args for call in runner.call_args_list],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
