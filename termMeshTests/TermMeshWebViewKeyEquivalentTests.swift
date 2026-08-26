@@ -401,6 +401,51 @@ final class LanguageSettingsTests: XCTestCase {
             XCTAssertTrue(value.contains("%lld"), "\(key) lost its %lld specifier")
         }
     }
+
+    func testSettingsKoreanCopyUsesNativeUILabelsAndUserFacingTerms() {
+        let ko = Locale(identifier: "ko")
+        let expected: [String: String] = [
+            "Save Copied Text to Paste Shelf": "클립보드 기록",
+            "Reorder on Notification": "알림 오면 맨 위로",
+            "Warn Before Quit": "종료할 때 확인",
+            "Rename Selects Existing Name": "이름 바꿀 때 전체 선택",
+            "Peer Federation": "다른 컴퓨터 연결",
+            "Mobile Remote Control": "모바일 원격 제어",
+            "Loopback (development)": "이 Mac만(개발용)",
+            "Authentication": "인증 방식",
+            "Allowed Logins": "허용 계정",
+            "Model Override": "모델 지정",
+            "Delete Worktree?": "워크트리를 삭제할까요?",
+        ]
+
+        for (key, value) in expected {
+            XCTAssertEqual(
+                String(localized: String.LocalizationValue(key), bundle: .main, locale: ko),
+                value,
+                key
+            )
+        }
+    }
+
+    func testSettingsKoreanDescriptionsAvoidInternalTermsAndImperativeEndings() {
+        let ko = Locale(identifier: "ko")
+        let descriptionKeys = [
+            "Controls access to the local Unix socket for programmatic control. Choose a mode that matches your threat model.",
+            "Separates local workspaces from Peer Hosts and presents peer workspaces as mirror actions.",
+            "Peer federation lets another term-mesh.app instance attach this Mac's terminal panes via SSH (workspace mirror with live layout sync). \"Enable peer server\" controls the running state right now; \"Auto-start at app launch\" persists across restarts.",
+            "Project discovery is not exposed by the current daemon. Register a project before starting a manifest scan.",
+            "Runbooks are loaded from .agent-runbooks/<role>.md. Claude, Codex, and OpenCode files are generated projections.",
+        ]
+        let banned = ["하세요", "활성화", "비활성화", "피어", "미러", "데몬", "pane", "프로젝션"]
+
+        for key in descriptionKeys {
+            let value = String(localized: String.LocalizationValue(key), bundle: .main, locale: ko)
+            for token in banned {
+                XCTAssertFalse(value.contains(token), "\(key): \(value) contains \(token)")
+            }
+            XCTAssertTrue(value.hasSuffix("."), "description must end with a period: \(value)")
+        }
+    }
 }
 
 final class SidebarTeamRuntimeSnapshotTests: XCTestCase {
