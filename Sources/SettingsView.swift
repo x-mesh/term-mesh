@@ -246,6 +246,7 @@ struct SettingsView: View {
     @State private var daemonLogTail: AttributedString?
     @State private var shellHealthEntries: [ShellHealthEntry] = []
     @State private var shellFixCopied = false
+    @State private var mobileSetupCopiedCommand: String?
     @State private var peerFederationPeerIDHex = "Loading..."
     @State private var peerFederationPeerIDStatusMessage: String?
     @State private var peerFederationPeerIDStatusIsError = false
@@ -334,7 +335,7 @@ struct SettingsView: View {
     private func saveSocketPassword() {
         let trimmed = socketPasswordDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            socketPasswordStatusMessage = "Enter a password first."
+            socketPasswordStatusMessage = LanguageSettings.localized("Enter a password first.")
             socketPasswordStatusIsError = true
             return
         }
@@ -342,7 +343,7 @@ struct SettingsView: View {
         do {
             try SocketControlPasswordStore.savePassword(trimmed)
             socketPasswordDraft = ""
-            socketPasswordStatusMessage = "Password saved to keychain."
+            socketPasswordStatusMessage = LanguageSettings.localized("Password saved to keychain.")
             socketPasswordStatusIsError = false
         } catch {
             socketPasswordStatusMessage = "Failed to save password (\(error.localizedDescription))."
@@ -354,7 +355,7 @@ struct SettingsView: View {
         do {
             try SocketControlPasswordStore.clearPassword()
             socketPasswordDraft = ""
-            socketPasswordStatusMessage = "Password cleared."
+            socketPasswordStatusMessage = LanguageSettings.localized("Password cleared.")
             socketPasswordStatusIsError = false
         } catch {
             socketPasswordStatusMessage = "Failed to clear password (\(error.localizedDescription))."
@@ -1875,13 +1876,14 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var sectionMobileRemoteControl: some View {
+        VStack(alignment: .leading, spacing: 14) {
         SettingsCard {
             SettingsCardRow(
                 "Mobile Remote Control",
                 verbatimSubtitle: mobileEnabled
                     ? String(
                         format: LanguageSettings.localized("Loopback listener at 127.0.0.1:%@. Expose it to your tailnet with `tailscale serve --bg %@`."),
-                        String(mobilePort), String(mobilePort)
+                        String(resolvedMobilePort), String(resolvedMobilePort)
                       )
                     : LanguageSettings.localized("Disabled. Panes exposed with /rc stay unreachable until the listener is on.")
             ) {
@@ -1947,6 +1949,40 @@ struct SettingsView: View {
 
             SettingsCardNote("Only panes registered with /rc are exposed, and only on loopback. Reach them from your phone through Tailscale Serve; the daemon restarts when these settings change.")
         }
+
+        if mobileEnabled {
+            SettingsCard {
+                SettingsCardNote("Connect from your phone with Tailscale")
+                MobileSetupCommandRow(step: "1", command: serveCommand, isCopied: mobileSetupCopiedCommand == serveCommand) { copyMobileSetupCommand(serveCommand) }
+                SettingsCardDivider()
+                MobileSetupCommandRow(step: "2", command: "tailscale serve status", isCopied: mobileSetupCopiedCommand == "tailscale serve status") { copyMobileSetupCommand("tailscale serve status") }
+                SettingsCardDivider()
+                MobileSetupCommandRow(step: "3", command: "/rc on", isCopied: mobileSetupCopiedCommand == "/rc on") { copyMobileSetupCommand("/rc on") }
+                SettingsCardDivider()
+                SettingsCardNote("Run the first two commands in a Mac terminal. Run /rc on inside the term-mesh pane you want to open on your phone, then use the URL it prints.")
+            }
+        }
+        }
+    }
+
+    /// The port the daemon will actually bind, mirroring TermMeshDaemon.mobilePort.
+    ///
+    /// The Port field accepts any integer; the daemon clamps to 1...65535 and otherwise
+    /// falls back to its default, so the raw stored value would name a port nothing
+    /// listens on in a command the user can copy in one click.
+    private var resolvedMobilePort: Int {
+        (1...65535).contains(mobilePort) ? mobilePort : TermMeshDaemon.defaultMobilePort
+    }
+
+    private var serveCommand: String { "tailscale serve --bg \(resolvedMobilePort)" }
+
+    private func copyMobileSetupCommand(_ command: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
+        mobileSetupCopiedCommand = command
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            if mobileSetupCopiedCommand == command { mobileSetupCopiedCommand = nil }
+        }
     }
 
     // MARK: - Section: Services
@@ -1977,7 +2013,7 @@ struct SettingsView: View {
                                 Circle()
                                     .fill(daemonStatusInfo?.connected == true ? Color.green : Color.red)
                                     .frame(width: 8, height: 8)
-                                Text(daemonStatusInfo?.connected == true ? "Running" : "Stopped")
+                                Text(LocalizedStringKey(daemonStatusInfo?.connected == true ? "Running" : "Stopped"))
                                     .font(.system(size: 12, weight: .medium, design: .monospaced))
                                     .foregroundColor(.secondary)
                             }
@@ -1995,7 +2031,7 @@ struct SettingsView: View {
                                     Circle()
                                         .fill(status.socketExists ? Color.green : Color.red)
                                         .frame(width: 7, height: 7)
-                                    Text(status.socketExists ? "Exists" : "Missing")
+                                    Text(LocalizedStringKey(status.socketExists ? "Exists" : "Missing"))
                                         .font(.system(size: 11, design: .monospaced))
                                         .foregroundColor(.secondary)
                                 }
@@ -2039,7 +2075,7 @@ struct SettingsView: View {
                                     Circle()
                                         .fill(status.logExists ? Color.green : Color.gray)
                                         .frame(width: 7, height: 7)
-                                    Text(status.logExists ? "Exists" : "No log")
+                                    Text(LocalizedStringKey(status.logExists ? "Exists" : "No log"))
                                         .font(.system(size: 11, design: .monospaced))
                                         .foregroundColor(.secondary)
                                 }
@@ -2079,7 +2115,7 @@ struct SettingsView: View {
                                         Circle()
                                             .fill(sub.status == "running" ? Color.green : (sub.status == "disabled" ? Color.gray : Color.orange))
                                             .frame(width: 7, height: 7)
-                                        Text(sub.status.capitalized)
+                                        subsystemStatusLabel(sub.status)
                                             .font(.system(size: 11, design: .monospaced))
                                             .foregroundColor(.secondary)
                                     }
@@ -2185,7 +2221,7 @@ struct SettingsView: View {
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
-                            .help("Copy system diagnostics to clipboard for bug reports")
+                            .help(LocalizedStringKey("Copy system diagnostics to clipboard for bug reports"))
                             Spacer(minLength: 0)
                         }
                         .padding(.horizontal, 14)
@@ -2547,7 +2583,7 @@ struct SettingsView: View {
                     peerFederationPeerIDStatusMessage = nil
                     peerFederationPeerIDStatusIsError = false
                 case .failure(let error):
-                    peerFederationPeerIDHex = "Unavailable"
+                    peerFederationPeerIDHex = LanguageSettings.localized("Unavailable")
                     peerFederationPeerIDStatusMessage = String(describing: error)
                     peerFederationPeerIDStatusIsError = true
                 }
@@ -2562,7 +2598,7 @@ struct SettingsView: View {
                 switch result {
                 case .success(let id):
                     peerFederationPeerIDHex = PeerIdentity.hexString(id)
-                    peerFederationPeerIDStatusMessage = "Regenerated. Restart active peer sessions."
+                    peerFederationPeerIDStatusMessage = LanguageSettings.localized("Regenerated. Restart active peer sessions.")
                     peerFederationPeerIDStatusIsError = false
                 case .failure(let error):
                     peerFederationPeerIDStatusMessage = String(describing: error)
@@ -2657,7 +2693,7 @@ struct SettingsView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             guard let data = FileManager.default.contents(atPath: logPath),
                   let content = String(data: data, encoding: .utf8) else {
-                let fallback = AttributedString("(no log file found)")
+                let fallback = AttributedString(LanguageSettings.localized("(no log file found)"))
                 DispatchQueue.main.async { daemonLogTail = fallback }
                 return
             }
@@ -2797,7 +2833,7 @@ struct SettingsView: View {
                             Circle()
                                 .fill(displayStatus.settingsColor)
                                 .frame(width: 7, height: 7)
-                            Text(displayStatus.label)
+                            Text(LocalizedStringKey(displayStatus.label))
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundColor(.secondary)
                         }
@@ -2820,7 +2856,9 @@ struct SettingsView: View {
                         }
                     } label: {
                         Label(
-                            shellFixCopied ? (isZshShell ? "Copied — opens a fixed shell" : "Copied!") : "Copy Fix Command",
+                            shellFixCopied
+                                ? LanguageSettings.localized(isZshShell ? "Copied — opens a fixed shell" : "Copied!")
+                                : LanguageSettings.localized("Copy Fix Command"),
                             systemImage: shellFixCopied ? "checkmark" : "doc.on.clipboard"
                         )
                     }
@@ -2869,7 +2907,7 @@ struct SettingsView: View {
     }
 
     private var shellHealthOverallLabel: String {
-        if shellHealthEntries.isEmpty { return "No panels" }
+        if shellHealthEntries.isEmpty { return LanguageSettings.localized("No panels") }
         let agentCount = shellHealthEntries.filter { $0.isAgentPanel }.count
         // Evaluate health only for non-agent panels.
         let nonAgentStatuses = shellHealthEntries
@@ -3291,8 +3329,13 @@ private struct CLIPathRow: View {
                 Circle()
                     .fill(resolvedPath.isEmpty ? Color.red : (pathExists ? Color.green : Color.red))
                     .frame(width: 8, height: 8)
-                    .help(resolvedPath.isEmpty ? "Not found"
-                          : (pathExists ? "Found" : "File not found at path"))
+                    .help(
+                        LocalizedStringKey(
+                            resolvedPath.isEmpty
+                                ? "Not found"
+                                : (pathExists ? "Found" : "File not found at path")
+                        )
+                    )
 
                 Text(activeProfile?.name ?? "auto-detect")
                     .font(.system(size: 12))
@@ -3458,7 +3501,13 @@ private struct CLIProfileManageSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("\(cliLabel) Profiles")
+            Text(
+                String(
+                    format: LanguageSettings.localized("%@ Profiles"),
+                    locale: LanguageSettings.currentLocale(),
+                    cliLabel
+                )
+            )
                     .font(.headline)
                 Spacer()
                 Button("Done") { dismiss() }
@@ -3504,7 +3553,7 @@ private struct CLIProfileManageSheet: View {
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                 if !profile.extraArgs.isEmpty {
-                                    Text("args: " + profile.extraArgs.joined(separator: " "))
+                                    Text(LanguageSettings.localized("Args:") + " " + profile.extraArgs.joined(separator: " "))
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                         .lineLimit(1)
@@ -3861,7 +3910,14 @@ private struct CLICustomModelsSection: View {
                     .foregroundColor(.secondary)
                     .textCase(.uppercase)
                 Spacer()
-                Text("\(AgentRolePreset.builtInModels(for: cli).count) built-in, \(customModels.count) custom")
+                Text(
+                    String(
+                        format: LanguageSettings.localized("%lld built-in, %lld custom"),
+                        locale: LanguageSettings.currentLocale(),
+                        AgentRolePreset.builtInModels(for: cli).count,
+                        customModels.count
+                    )
+                )
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
@@ -4004,20 +4060,75 @@ private struct ShellHealthEntry: Identifiable {
     let isAgentPanel: Bool
 }
 
+/// An explanatory note under a settings card.
+///
+/// The text is a `LocalizedStringKey` for the same reason `SettingsCardRow`'s is:
+/// `Text(String)` selects the verbatim initializer, so every translation the
+/// catalog holds for a note used to render in English. Runtime text (an error, a
+/// daemon-supplied summary) goes through `verbatim:` instead.
 struct SettingsCardNote: View {
-    let text: String
+    private let text: Text
 
-    init(_ text: String) {
-        self.text = text
+    init(_ text: LocalizedStringKey) {
+        self.text = Text(text)
+    }
+
+    init(verbatim text: String) {
+        self.text = Text(verbatim: text)
     }
 
     var body: some View {
-        Text(text)
+        text
             .font(.caption)
             .foregroundColor(.secondary)
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A localized label for a daemon subsystem status.
+///
+/// The daemon emits a closed set — `running`, `disabled`, `starting` (socket.rs) —
+/// plus `unknown` when a subsystem entry is malformed (TermMeshDaemon.swift). Mapping
+/// those explicitly keeps a daemon-supplied string from being turned into a catalog
+/// key: `Text(LocalizedStringKey(sub.status.capitalized))` rendered a Korean row above
+/// an English one whenever the value had no matching entry.
+private func subsystemStatusLabel(_ status: String) -> Text {
+    switch status {
+    case "running": return Text("Running")
+    case "disabled": return Text("Disabled")
+    case "starting": return Text("Starting")
+    case "unknown": return Text("Unknown")
+    default: return Text(verbatim: status.capitalized)
+    }
+}
+
+private struct MobileSetupCommandRow: View {
+    let step: String
+    let command: String
+    let isCopied: Bool
+    let copy: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(step)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundColor(.secondary)
+                .frame(width: 18, height: 18)
+                .background(Circle().fill(Color.secondary.opacity(0.12)))
+            Text(verbatim: command)
+                .font(.system(size: 12, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button { copy() } label: {
+                Label(isCopied ? "Copied" : "Copy", systemImage: isCopied ? "checkmark" : "doc.on.doc")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
     }
 }
 
@@ -4093,7 +4204,13 @@ private struct WorktreeManagerSection: View {
             if isScanning {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text("Scanning \(baseDir)…")
+                    Text(
+                        String(
+                            format: LanguageSettings.localized("Scanning %@…"),
+                            locale: LanguageSettings.currentLocale(),
+                            baseDir
+                        )
+                    )
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -4132,12 +4249,25 @@ private struct WorktreeManagerSection: View {
             titleVisibility: .visible
         ) {
             if let wt = confirmDelete {
-                Button("Delete \"\(wt.name)\"", role: .destructive) { delete(wt) }
+                Button(
+                    String(
+                        format: LanguageSettings.localized("Delete \"%@\""),
+                        locale: LanguageSettings.currentLocale(),
+                        wt.name
+                    ),
+                    role: .destructive
+                ) { delete(wt) }
                 Button("Cancel", role: .cancel) {}
             }
         } message: {
             if let wt = confirmDelete {
-                Text("This removes the worktree and its git registration:\n\(wt.path)\n\nA worktree with uncommitted changes is kept — you will be asked again before anything is discarded.")
+                Text(
+                    String(
+                        format: LanguageSettings.localized("This removes the worktree and its git registration:\n%@\n\nA worktree with uncommitted changes is kept — you will be asked again before anything is discarded."),
+                        locale: LanguageSettings.currentLocale(),
+                        wt.path
+                    )
+                )
             }
         }
         // A refused delete is a second, explicitly destructive decision: the
@@ -4158,7 +4288,14 @@ private struct WorktreeManagerSection: View {
             }
         } message: {
             if let prompt = confirmForceDelete {
-                Text("\(prompt.worktree.path)\n\n\(prompt.reason)\n\nDeleting now throws that work away permanently.")
+                Text(
+                    String(
+                        format: LanguageSettings.localized("%@\n\n%@\n\nDeleting now throws that work away permanently."),
+                        locale: LanguageSettings.currentLocale(),
+                        prompt.worktree.path,
+                        prompt.reason
+                    )
+                )
             }
         }
         // Re-scan when baseDir changes (e.g. user edits the base directory setting)
@@ -4207,9 +4344,11 @@ private struct WorktreeManagerSection: View {
                     worktrees.removeAll { $0.id == wt.id }
                     return
                 }
-                let reason = (status?.dirty ?? false)
-                    ? "It has uncommitted changes."
-                    : "The daemon refused to remove it."
+                let reason = LanguageSettings.localized(
+                    (status?.dirty ?? false)
+                        ? "It has uncommitted changes."
+                        : "The daemon refused to remove it."
+                )
                 confirmForceDelete = ForceDeletePrompt(worktree: wt, reason: reason)
             }
         }
@@ -4234,7 +4373,7 @@ private struct WorktreeManagerSection: View {
                 await MainActor.run {
                     worktrees.removeAll { $0.id == wtId }
                     if repoPath != nil {
-                        errorMessage = "Removed the directory only — run `git worktree prune` in the parent repo to clear its metadata."
+                        errorMessage = LanguageSettings.localized("Removed the directory only — run `git worktree prune` in the parent repo to clear its metadata.")
                     }
                 }
             } catch {
@@ -4267,7 +4406,7 @@ private struct WorktreeRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 HStack(spacing: 4) {
-                    Text("branch:")
+                    Text(LocalizedStringKey("Branch:"))
                         .font(.caption2)
                         .foregroundColor(.secondary)
                     Text(worktree.branch)
@@ -4285,7 +4424,7 @@ private struct WorktreeRow: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(.secondary)
-                .help("Open in Finder")
+                .help(LocalizedStringKey("Open in Finder"))
 
                 Button(role: .destructive) {
                     onDelete()
@@ -4294,7 +4433,7 @@ private struct WorktreeRow: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(.red)
-                .help("Delete worktree directory")
+                .help(LocalizedStringKey("Delete worktree directory"))
             }
         }
         .padding(.horizontal, 14)

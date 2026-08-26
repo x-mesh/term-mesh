@@ -42,7 +42,7 @@ struct ProjectSyncPanelView: View {
             sectionTitle("Devices")
             SettingsCard {
                 if viewModel.snapshot.devices.isEmpty {
-                    SettingsCardNote(unavailableText(.devices, fallback: "No approved devices are visible yet."))
+                    SettingsCardNote(verbatim: unavailableText(.devices, fallback: "No approved devices are visible yet."))
                 } else {
                     ForEach(Array(viewModel.snapshot.devices.enumerated()), id: \.element.id) { index, device in
                         if index > 0 { SettingsCardDivider() }
@@ -87,7 +87,7 @@ struct ProjectSyncPanelView: View {
                 }
                 if let error = viewModel.errorMessage {
                     SettingsCardDivider()
-                    SettingsCardNote(error)
+                    SettingsCardNote(verbatim: error)
                         .accessibilityIdentifier("projectSync.error")
                 }
             }
