@@ -379,16 +379,18 @@ dmg-package:
 	@echo "  Install: open $(DMG_NAME), drag term-mesh to Applications"
 	@echo "  Unsigned: run 'xattr -cr /Applications/term-mesh.app' after install"
 	@echo "================================================"
+# 이 목록은 scripts/copy-claude-commands.sh 의 COMMANDS 배열과 동기화 유지.
+# tests/test_release_distribution.py 가 두 목록이 어긋나면 실패한다.
 install-commands:
 	@echo "==> Installing Claude commands to ~/.claude/commands/..."
 	@mkdir -p "$(HOME)/.claude/commands"
-	@for cmd in tm-op team team-up tm-bench release; do \
+	@for cmd in tm team team-up tm-op tm-bench watch release rc; do \
 		SRC="$(PROJECT_DIR)/.claude/commands/$$cmd.md"; \
 		if [ -f "$$SRC" ]; then \
 			cp "$$SRC" "$(HOME)/.claude/commands/$$cmd.md"; \
 		fi; \
 	done
-	@echo "==> Claude commands installed (tm-op, team, team-up, tm-bench, release)"
+	@echo "==> Claude commands installed (tm, team, team-up, tm-op, tm-bench, watch, release, rc)"
 
 clean:
 	@echo "==> Cleaning build artifacts..."
