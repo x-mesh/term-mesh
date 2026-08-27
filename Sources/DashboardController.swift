@@ -226,7 +226,6 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     private var trackingTimer: Timer?
     private var trackingSyncInFlight = false
     private var alertPollInFlight = false
-    private var trackedPIDs: Set<Int32> = []
     private var messageHandler: DashboardMessageHandler?
 
     /// Project roots currently being watched — keyed by tab ID to avoid duplicates.
@@ -705,29 +704,23 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         return ProcessTreeSnapshot.descendantPIDs(of: appPID, in: processes)
     }
 
-    /// Reconcile tracked PIDs with discovered descendants. Must be called on @MainActor.
+    /// Reconcile the daemon's watch list with the discovered descendants.
+    ///
+    /// The daemon's list is the source of truth, asked for once per pass.
+    /// Keeping a private copy here and sending only the difference made a
+    /// single drop permanent: the daemon discards an entry whose pid was
+    /// recycled, this side still believed it was watched, and the live
+    /// descendant lost Budget Guard coverage for the rest of its life with
+    /// nothing able to notice. One extra RPC removes the divergence rather
+    /// than trying to mirror it.
     private func reconcileTrackedPIDs(_ allDescendants: Set<Int32>) {
         let daemon = self.daemon
-
-        let newPIDs = allDescendants.subtracting(trackedPIDs)
-        for pid in newPIDs {
-            trackedPIDs.insert(pid)
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                guard daemon.trackPID(pid) else {
-                    // The daemon declined, so drop the optimistic record and
-                    // let the next pass re-send it. Keeping it would make one
-                    // refusal permanent: this set is the only thing deciding
-                    // what gets sent, and a pid already in it never is again.
-                    Task { @MainActor in self?.trackedPIDs.remove(pid) }
-                    return
-                }
+        DispatchQueue.global(qos: .utility).async {
+            guard let watched = daemon.trackedPIDs() else { return }
+            for pid in allDescendants.subtracting(watched) {
+                _ = daemon.trackPID(pid)
             }
-        }
-
-        let deadPIDs = trackedPIDs.subtracting(allDescendants)
-        for pid in deadPIDs {
-            trackedPIDs.remove(pid)
-            DispatchQueue.global(qos: .utility).async {
+            for pid in watched.subtracting(allDescendants) {
                 daemon.untrackPID(pid)
             }
         }

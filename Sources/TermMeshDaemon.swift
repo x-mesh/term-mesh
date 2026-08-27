@@ -1009,14 +1009,27 @@ final class TermMeshDaemon: ObservableObject {
     ///
     /// The daemon declines a pid it cannot read an identity for, so the
     /// caller must not record the request as satisfied on its own.
-    @discardableResult
     func trackPID(_ pid: Int32) -> Bool {
-        guard let response = rpcCall(method: "monitor.track", params: ["pid": pid]) as? [String: Any],
-              let result = response["result"] as? [String: Any] else {
+        // `rpcCall` already hands back the `result` payload, the way
+        // `stopProcess` below reads it. Unwrapping a second time returns nil
+        // for every answer, which reads as "declined" for pids the daemon
+        // actually tracked.
+        guard let response = rpcCall(method: "monitor.track", params: ["pid": pid]) as? [String: Any] else {
             return false
         }
         // An older daemon answers without the field; it always tracked.
-        return result["tracked"] as? Bool ?? true
+        return response["tracked"] as? Bool ?? true
+    }
+
+    /// The pids the daemon is watching, or nil when it could not be asked.
+    ///
+    /// nil and empty are different answers: an unreachable daemon must not
+    /// read as "watching nothing", which would untrack every live descendant.
+    func trackedPIDs() -> Set<Int32>? {
+        guard let response = rpcCall(method: "monitor.tracked", params: [:]) as? [Any] else {
+            return nil
+        }
+        return Set(response.compactMap { ($0 as? NSNumber)?.int32Value })
     }
 
     /// Untrack a process.

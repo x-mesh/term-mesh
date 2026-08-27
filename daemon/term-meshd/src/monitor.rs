@@ -276,23 +276,32 @@ pub fn start_monitor(
             // Drop entries whose pid no longer holds the process we recorded.
             // Testing liveness alone was the reuse hole: a recycled pid looks
             // alive, so the old entry stayed and pointed at a stranger.
-            let still_ours = |pid: u32, start_time: u64| {
-                sys.process(Pid::from_u32(pid)).map(|p| p.start_time()) == Some(start_time)
+            //
+            // Judge only what the refresh above actually covered. `track_pid`
+            // runs on socket threads and can add an entry after the snapshot
+            // was taken; that pid was never passed to `refresh_processes`, so
+            // `sys.process` reports nothing for it and a bare liveness test
+            // would delete a registration made moments earlier — one the app
+            // has already recorded as satisfied and will not send again.
+            let covered: HashSet<u32> = tracked_pid_list.iter().copied().collect();
+            let judged = |pid: u32, start_time: u64| {
+                !covered.contains(&pid)
+                    || sys.process(Pid::from_u32(pid)).map(|p| p.start_time()) == Some(start_time)
             };
 
             // Remove dead or replaced PIDs from tracked list
             {
                 let mut tracked = pids.lock().unwrap();
-                tracked.retain(|t| still_ours(t.pid, t.start_time));
+                tracked.retain(|t| judged(t.pid, t.start_time));
             }
 
             // Clean up stopped set for dead or replaced processes
             {
                 let mut stopped_set = stopped.lock().unwrap();
-                stopped_set.retain(|&pid, &mut start_time| still_ours(pid, start_time));
+                stopped_set.retain(|&pid, &mut start_time| judged(pid, start_time));
             }
             // Clean up high_cpu_ticks for dead or replaced processes
-            high_cpu_ticks.retain(|t, _| still_ours(t.pid, t.start_time));
+            high_cpu_ticks.retain(|t, _| judged(t.pid, t.start_time));
 
             let tracked: Vec<TrackedProcess> = pids.lock().unwrap().clone();
             let stopped_set: HashSet<u32> = stopped.lock().unwrap().keys().copied().collect();
@@ -360,9 +369,7 @@ pub fn start_monitor(
 
                     if cpu > config.cpu_threshold_percent {
                         let action = if should_auto_stop {
-                            if proc.start_time() == identity
-                                && send_signal(pid, libc::SIGSTOP)
-                            {
+                            if send_signal_checked(pid, identity, libc::SIGSTOP) {
                                 stopped.lock().unwrap().insert(pid, identity);
                                 tracing::warn!(
                                     "SIGSTOP sent to PID {pid} ({name}): CPU {cpu:.1}% > {:.1}%",
@@ -405,9 +412,7 @@ pub fn start_monitor(
 
                     if mem > config.memory_threshold_bytes {
                         let action = if should_auto_stop {
-                            if proc.start_time() == identity
-                                && send_signal(pid, libc::SIGSTOP)
-                            {
+                            if send_signal_checked(pid, identity, libc::SIGSTOP) {
                                 stopped.lock().unwrap().insert(pid, identity);
                                 tracing::warn!(
                                     "SIGSTOP sent to PID {pid} ({name}): mem {mem} > {}",
@@ -668,23 +673,33 @@ impl MonitorHandle {
     /// Resume all stopped processes (SIGCONT) and clear the stopped set.
     /// Used during graceful shutdown to avoid leaving orphaned stopped processes.
     pub fn resume_all_stopped(&self) -> usize {
-        // Drain first, signal after. Each checked signal reads the process
-        // table, and holding the mutex across those reads would block the
-        // monitor tick — which takes the same lock to record a SIGSTOP it has
-        // just sent. A stop recorded into a map this method was about to
-        // clear would leave that process suspended with nothing left to
-        // resume it, which is exactly what shutdown must not do.
-        let drained: Vec<(u32, u64)> = {
-            let mut stopped = self.stopped_pids.lock().unwrap();
-            stopped.drain().collect()
-        };
+        // Silence the source before draining. The monitor tick has no
+        // shutdown branch — it runs until the process exits — so a SIGSTOP it
+        // sends and records after a single drain would land in a map nothing
+        // drains again, leaving that process suspended with nothing left to
+        // resume it. Clearing auto-stop closes both tick paths, and the loop
+        // below then catches anything a tick already in flight recorded.
+        self.auto_stop
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let mut resumed = 0;
-        for (pid, start_time) in drained {
-            if send_signal_checked(pid, start_time, libc::SIGCONT) {
-                tracing::info!("shutdown: SIGCONT sent to PID {pid}");
-                resumed += 1;
-            } else {
-                tracing::warn!("shutdown: failed to SIGCONT PID {pid} (exited or pid reused)");
+        loop {
+            // Drain under the lock, signal outside it: each checked signal
+            // reads the process table, and the tick takes this same lock to
+            // record a stop it has just sent.
+            let drained: Vec<(u32, u64)> = {
+                let mut stopped = self.stopped_pids.lock().unwrap();
+                stopped.drain().collect()
+            };
+            if drained.is_empty() {
+                break;
+            }
+            for (pid, start_time) in drained {
+                if send_signal_checked(pid, start_time, libc::SIGCONT) {
+                    tracing::info!("shutdown: SIGCONT sent to PID {pid}");
+                    resumed += 1;
+                } else {
+                    tracing::warn!("shutdown: failed to SIGCONT PID {pid} (exited or pid reused)");
+                }
             }
         }
         resumed
