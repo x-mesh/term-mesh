@@ -172,7 +172,28 @@ pub mod team_leader {
     pub const MAX_BOOTSTRAP_PAYLOAD_BYTES: usize = 512;
     /// Extra methods available only through a project-bound leader grant.
     /// Generic `team.call.v1` must continue to reject these scoped operations.
-    pub const SCOPED_METHODS: &[&str] = &["team.add_agent", "team.send_key"];
+    ///
+    /// Keep in lockstep with `PeerTeamLeader.scopedMethods` in Swift and with
+    /// the CLI's `remote_leader_method_allowed`; two tests in
+    /// `term-meshd::peer::connection` parse those sources and diff them
+    /// against this list, because a leader that is allowed to send what no
+    /// owner accepts fails at the far end with nothing to point at.
+    ///
+    /// The leader-request family and the delegation level also carry a bearer
+    /// of their own — `TERMMESH_LEADER_REQUEST_TOKEN`, staged into the
+    /// leader's environment by the owning app — so the grant alone does not
+    /// reach them. `team.task.metrics` is a plain read of the same task board
+    /// `team.task.list` already exposes; it is here rather than in the
+    /// generic list so a peer without a grant gains nothing.
+    pub const SCOPED_METHODS: &[&str] = &[
+        "team.add_agent",
+        "team.send_key",
+        "team.leader.request.list",
+        "team.leader.request.take",
+        "team.leader.request.complete",
+        "team.delegation.configure",
+        "team.task.metrics",
+    ];
 
     pub fn scoped_method_allowed(method: &str) -> bool {
         SCOPED_METHODS.contains(&method)
@@ -470,6 +491,13 @@ mod team_leader_tests {
     fn only_leader_specific_input_methods_are_scoped_beyond_generic_team_calls() {
         assert!(scoped_method_allowed("team.add_agent"));
         assert!(scoped_method_allowed("team.send_key"));
+        // The leader's own request queue and its delegation level: bound to
+        // one team by the grant and gated again by the leader request token.
+        assert!(scoped_method_allowed("team.leader.request.list"));
+        assert!(scoped_method_allowed("team.leader.request.take"));
+        assert!(scoped_method_allowed("team.leader.request.complete"));
+        assert!(scoped_method_allowed("team.delegation.configure"));
+        assert!(scoped_method_allowed("team.task.metrics"));
         for method in [
             "team.create",
             "team.destroy",
