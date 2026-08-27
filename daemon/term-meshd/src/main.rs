@@ -18,6 +18,7 @@ mod pane_tracker;
 mod paste_cleanup;
 mod peer;
 mod remote;
+mod shutdown;
 mod socket;
 mod supervisor;
 #[allow(dead_code)]
@@ -46,6 +47,18 @@ use tracing_subscriber::EnvFilter;
 
 /// Global start time for uptime reporting.
 static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// How long the whole teardown may take before the watchdog exits the
+/// process. The sum of the per-step limits below stays under this.
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
+/// How far the runtime heartbeat may fall behind before the watchdog reports
+/// the runtime as stalled.
+const RUNTIME_STALL_THRESHOLD: Duration = Duration::from_secs(10);
+/// Per-step teardown limits.
+const HEADLESS_LIMIT: Duration = Duration::from_secs(8);
+const AGENT_LIMIT: Duration = Duration::from_secs(12);
+const RESUME_LIMIT: Duration = Duration::from_secs(3);
+const SERVER_JOIN_LIMIT: Duration = Duration::from_secs(5);
 /// GUI owner PID, when the daemon was launched as an app child. Standalone and
 /// headless daemon launches intentionally leave this unset.
 static OWNER_PID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
@@ -110,6 +123,12 @@ async fn main() -> anyhow::Result<()> {
 
     START_TIME.get_or_init(Instant::now);
     tracing::info!("term-meshd starting");
+
+    // Bound teardown ourselves. Every per-step limit below adds up to less
+    // than this budget, and the budget is far under the unit's
+    // TimeoutStopSec, so a stuck step costs seconds of relay downtime
+    // instead of the full stop timeout.
+    shutdown::install(SHUTDOWN_BUDGET, RUNTIME_STALL_THRESHOLD);
     let owner_pid = configured_owner_pid();
     if let Some(pid) = owner_pid {
         tracing::info!("GUI owner supervision enabled (pid: {pid})");
@@ -552,6 +571,7 @@ async fn main() -> anyhow::Result<()> {
         }
         }
     };
+    shutdown::begin();
     tracing::info!("received {shutdown_reason}, initiating graceful shutdown...");
 
     // 7. Shutdown sequence
@@ -573,31 +593,42 @@ async fn main() -> anyhow::Result<()> {
         );
     } else {
         // b. Terminate all headless agents
-        headless_manager.lock().await.terminate_all().await;
-        tracing::info!("headless agents terminated");
+        let headless = headless_manager.clone();
+        shutdown::step(shutdown::STEP_HEADLESS, HEADLESS_LIMIT, async move {
+            headless.lock().await.terminate_all().await;
+        })
+        .await;
 
         // c. Terminate all agent sessions (cleanup worktrees + PIDs)
         // terminate_all() contains a blocking sleep (SIGTERM → wait → SIGKILL), so
         // offload it to a blocking thread to avoid starving the tokio executor.
-        {
-            let mgr = agent_manager.clone();
-            let wh = watcher_handle.clone();
+        let mgr = agent_manager.clone();
+        let wh = watcher_handle.clone();
+        shutdown::step(shutdown::STEP_AGENTS, AGENT_LIMIT, async move {
             let _ = tokio::task::spawn_blocking(move || mgr.terminate_all(&wh)).await;
-        }
-        tracing::info!("agent sessions terminated");
+        })
+        .await;
 
-        // c. Resume all stopped processes
-        let resumed = monitor_handle.resume_all_stopped();
+        // d. Resume all stopped processes. This one is synchronous, so it
+        // runs on the blocking pool: on the runtime it would ignore its own
+        // limit whenever the executor is the thing that is stuck.
+        let monitor = monitor_handle.clone();
+        let resumed = shutdown::step(shutdown::STEP_RESUME, RESUME_LIMIT, async move {
+            tokio::task::spawn_blocking(move || monitor.resume_all_stopped())
+                .await
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0);
         if resumed > 0 {
             tracing::info!("resumed {resumed} stopped process(es)");
         }
     }
 
-    // d. Wait for servers to finish (with timeout). `socket_task` was already
+    // e. Wait for servers to finish (with timeout). `socket_task` was already
     // consumed by the select above (that is how control-socket death is
     // observed), so only the remaining servers are joined here.
-    let timeout = tokio::time::Duration::from_secs(5);
-    match tokio::time::timeout(timeout, async {
+    shutdown::step(shutdown::STEP_SERVERS, SERVER_JOIN_LIMIT, async {
         let _ = http_task.await;
         if let Some(t) = mobile_task {
             let _ = t.await;
@@ -608,16 +639,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     })
-    .await
-    {
-        Ok(_) => tracing::info!("servers shut down cleanly"),
-        Err(_) => tracing::warn!("server shutdown timed out after 5s"),
-    }
+    .await;
 
     // `socket::serve` removes only the pathname inode it bound. Do not add a
     // second unconditional cleanup here: another daemon may have replaced
     // the pathname while this instance was shutting down.
 
+    shutdown::finish();
     tracing::info!("shutdown complete");
     Ok(())
 }
