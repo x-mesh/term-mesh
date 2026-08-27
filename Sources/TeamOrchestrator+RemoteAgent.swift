@@ -2693,7 +2693,14 @@ extension TeamOrchestrator {
         }
 
         var bootstrap = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
-        bootstrap.projectID = "name:\(teamName)"
+        // Never the raw display name: the wire grammar cannot spell a space
+        // or any non-ASCII character, and New Project's duplicate suffix
+        // ("<repo> 2") produces one by itself.
+        let bootstrapProjectID = PeerTeamLeader.projectID(
+            teamName: teamName,
+            teamUUID: teamUUID
+        )
+        bootstrap.projectID = bootstrapProjectID
         bootstrap.leaderPlacement = .peer
         var requestUUID = UUID().uuid
         bootstrap.requestID = withUnsafeBytes(of: &requestUUID) { Data($0) }
@@ -2702,7 +2709,7 @@ extension TeamOrchestrator {
             encodedBytes: (try? bootstrap.serializedData().count) ?? 513,
             audiencePeerID: PeerIdentity.defaultPeerID()
         ) { projectID in
-            projectID == "name:\(teamName)" ? teamUUID : nil
+            projectID == bootstrapProjectID ? teamUUID : nil
         }
         guard grantResponse.ok else {
             await attempt.compensate()
@@ -2933,7 +2940,13 @@ extension TeamOrchestrator {
             throw RemoteAgentError.teamNotFound(teamName)
         }
         var bootstrap = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
-        bootstrap.projectID = "name:\(teamName)"
+        // Same identifier rule as the leader grant: a display name the wire
+        // grammar cannot spell would fail every worker's route bootstrap.
+        let bootstrapProjectID = PeerTeamLeader.projectID(
+            teamName: teamName,
+            teamUUID: teamUUID
+        )
+        bootstrap.projectID = bootstrapProjectID
         bootstrap.leaderPlacement = .peer
         var requestUUID = UUID().uuid
         bootstrap.requestID = withUnsafeBytes(of: &requestUUID) { Data($0) }
@@ -2942,7 +2955,7 @@ extension TeamOrchestrator {
             encodedBytes: (try? bootstrap.serializedData().count) ?? 513,
             audiencePeerID: PeerIdentity.defaultPeerID()
         ) { projectID in
-            projectID == "name:\(teamName)" ? teamUUID : nil
+            projectID == bootstrapProjectID ? teamUUID : nil
         }
         guard response.ok else { throw RemoteAgentError.paneCreationFailed }
         return response.grant

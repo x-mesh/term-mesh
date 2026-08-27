@@ -25,6 +25,29 @@ public enum PeerTeamLeader {
         PeerTeamCall.isAllowed(method) || scopedMethods.contains(method)
     }
 
+    /// The project identifier a bootstrap request may carry for `teamName`.
+    ///
+    /// A team's display name is not an identifier. The wire grammar accepts
+    /// only `[0-9A-Za-z] - . : _`, so New Project's own duplicate suffix
+    /// (`term-mesh 2`) and every non-ASCII name fail `validateBootstrap`,
+    /// which the caller can only report as a generic bootstrap failure. The
+    /// team UUID is the identifier the host resolver already accepts
+    /// alongside `name:<team>`, so an unspellable name falls back to it
+    /// rather than minting a grant the same process is about to reject.
+    ///
+    /// An empty name takes the same fallback: `name:` on its own passes the
+    /// grammar but names no team, so it would fail one step later in the
+    /// project resolver instead.
+    ///
+    /// A `teamUUID` that is itself unspellable stays unspellable here: this
+    /// resolves display names, it does not paper over a malformed UUID that
+    /// `validateGrant` would reject on the next hop anyway.
+    public static func projectID(teamName: String, teamUUID: String) -> String {
+        guard !teamName.isEmpty else { return teamUUID }
+        let named = "name:\(teamName)"
+        return isSafeIdentifier(named, maxBytes: maxProjectIDBytes) ? named : teamUUID
+    }
+
     public enum ValidationError: String, Error, Sendable, Equatable {
         case payloadTooLarge = "payload_too_large"
         case invalidProject = "invalid_project"
