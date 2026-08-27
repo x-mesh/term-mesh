@@ -187,6 +187,55 @@ if marker.exists():
     raise SystemExit("FAIL: consumed route marker was retained")
 PY
 
+# A mid-turn prompt absorbed into the running turn: TWO UserPromptSubmit events
+# and ONE Stop. Plain LIFO closed the absorbed prompt and stranded the turn that
+# had stated a route, leaving it start+route with no end — a shape `health()`
+# counts in no outcome cohort and can never link, while the prompt that stated
+# nothing was recorded `unstated`. Stop must close the route-marked turn.
+ABSORB_HOME="$TEST_TMP/absorb-home"
+absorb_hook() {
+    env HOME="$ABSORB_HOME" TERMMESH_TEAM=term-mesh \
+        TERMMESH_SURFACE_ID=absorb-surface \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        "$HOOK" "$@"
+}
+absorb_hook --start '{"prompt":"routed turn"}' || fail "absorb start A returned nonzero"
+ABSORB_LOGS="$ABSORB_HOME/.term-mesh/logs"
+routed_turn=$(tail -n 1 "$ABSORB_LOGS/.turn-current-absorb-surface")
+printf 'stated\n' > "$ABSORB_LOGS/.turn-route-$routed_turn"
+# The mid-turn message arrives before any Stop and never gets its own Stop.
+absorb_hook --start '{"prompt":"mid-turn message"}' || fail "absorb start B returned nonzero"
+absorb_hook --end '{}' || fail "absorb end returned nonzero"
+
+python3 - "$ABSORB_LOGS/turns.log" "$routed_turn" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [json.loads(l) for l in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+routed = sys.argv[2]
+ends = [r for r in records if r["event"] == "turn_end"]
+if len(ends) != 1:
+    raise SystemExit(f"FAIL: expected exactly one turn_end, got {len(ends)}")
+if ends[0]["turn_id"] != routed:
+    raise SystemExit(
+        f"FAIL: Stop closed {ends[0]['turn_id']}, stranding routed turn {routed}"
+    )
+if ends[0].get("route_status") != "stated":
+    raise SystemExit("FAIL: the routed turn's end was not recorded stated")
+marker = pathlib.Path(sys.argv[1]).with_name(f".turn-route-{routed}")
+if marker.exists():
+    raise SystemExit("FAIL: consumed route marker was retained")
+# The absorbed prompt has no Stop of its own, so it must stay open on the stack
+# rather than being silently discarded by the pop.
+stack = pathlib.Path(sys.argv[1]).with_name(".turn-current-absorb-surface")
+remaining = [l for l in stack.read_text().splitlines() if l.strip()] if stack.exists() else []
+starts = [r["turn_id"] for r in records if r["event"] == "turn_start"]
+absorbed = [t for t in starts if t != routed]
+if remaining != absorbed:
+    raise SystemExit(f"FAIL: stack holds {remaining}, expected still-open {absorbed}")
+PY
+
 # An argv-delivered payload must not sit in this process's argv: any same-user
 # process can read a prompt out of `ps`. The hook copies it and clears argv.
 grep -q 'set --' "$HOOK" || fail "argv is not cleared after the payload is copied"

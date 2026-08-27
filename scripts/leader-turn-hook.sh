@@ -184,13 +184,52 @@ sys.stdout.buffer.write(prompt.encode("utf-8"))
     { printf '%s\n' "$TURN_ID" >> "$STATE_FILE"; } 2>/dev/null || true
 else
     if [ -f "$STATE_FILE" ]; then
-        # Pop the most recent unmatched start (LIFO: the innermost turn ends
-        # first). An empty stack leaves TURN_ID as "unknown" rather than
-        # dropping the record — a turn_end we cannot attribute is still
-        # evidence that a turn ended.
-        _turn_popped="$(tail -n 1 "$STATE_FILE" 2>/dev/null || true)"
+        # Which entry does this Stop close? LIFO alone is wrong whenever the
+        # harness folds a mid-turn prompt into the turn already running: that
+        # produces two UserPromptSubmit events and ONE Stop, so popping the
+        # newest entry closes the absorbed prompt and strands the entry that
+        # actually stated a route. The stranded entry can never be closed —
+        # every later Stop pops a newer line — so it stays start+route with no
+        # end, which `health()` counts in no outcome cohort at all and can
+        # never link. That inverts the measurement: the turn that reported a
+        # route reads as incomplete while the one that did not reads as
+        # `unstated`.
+        #
+        # Prefer the newest entry that owns a route marker, since a stated
+        # route is durable evidence that the leader classified that turn and is
+        # the pairing worth preserving. With no marker anywhere, fall back to
+        # plain LIFO (the innermost turn ends first). An empty stack leaves
+        # TURN_ID as "unknown" rather than dropping the record — a turn_end we
+        # cannot attribute is still evidence that a turn ended.
+        _turn_popped=""
+        _turn_marked=""
+        while IFS= read -r _turn_line; do
+            [ -n "$_turn_line" ] || continue
+            _turn_line_key="$(printf '%s' "$_turn_line" | tr -cd 'A-Za-z0-9._-' 2>/dev/null || true)"
+            if [ -n "$_turn_line_key" ] && [ -f "$LOG_DIR/.turn-route-$_turn_line_key" ]; then
+                _turn_marked="$_turn_line"
+            fi
+            _turn_popped="$_turn_line"
+        done < "$STATE_FILE"
+        [ -n "$_turn_marked" ] && _turn_popped="$_turn_marked"
         [ -n "$_turn_popped" ] && TURN_ID="$_turn_popped"
-        _turn_rest="$(sed '$d' "$STATE_FILE" 2>/dev/null || true)"
+        # Remove only the chosen entry, keeping every other line and its order.
+        # Deleting the last line unconditionally would drop a still-open turn
+        # whenever the marked entry was not the newest one.
+        if [ -n "$_turn_popped" ]; then
+            _turn_rest="$(
+                _turn_dropped=0
+                while IFS= read -r _turn_line; do
+                    if [ "$_turn_dropped" -eq 0 ] && [ "$_turn_line" = "$_turn_popped" ]; then
+                        _turn_dropped=1
+                        continue
+                    fi
+                    printf '%s\n' "$_turn_line"
+                done < "$STATE_FILE"
+            )"
+        else
+            _turn_rest=""
+        fi
         if [ -n "$_turn_rest" ]; then
             { printf '%s\n' "$_turn_rest" > "$STATE_FILE"; } 2>/dev/null || true
         else
