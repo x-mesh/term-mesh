@@ -712,8 +712,15 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         let newPIDs = allDescendants.subtracting(trackedPIDs)
         for pid in newPIDs {
             trackedPIDs.insert(pid)
-            DispatchQueue.global(qos: .utility).async {
-                daemon.trackPID(pid)
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard daemon.trackPID(pid) else {
+                    // The daemon declined, so drop the optimistic record and
+                    // let the next pass re-send it. Keeping it would make one
+                    // refusal permanent: this set is the only thing deciding
+                    // what gets sent, and a pid already in it never is again.
+                    Task { @MainActor in self?.trackedPIDs.remove(pid) }
+                    return
+                }
             }
         }
 

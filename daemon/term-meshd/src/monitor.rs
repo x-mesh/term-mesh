@@ -158,7 +158,7 @@ fn refresh_tracked_processes(system: &mut System, tracked: &[u32]) {
 /// Second granularity is the limit of this check. A pid reused inside the
 /// same second as its predecessor stays indistinguishable here; closing that
 /// would need the parent pid too, which buys little for how unlikely it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TrackedProcess {
     pid: u32,
     start_time: u64,
@@ -252,7 +252,7 @@ pub fn start_monitor(
         // Track consecutive ticks where each PID exceeded the CPU threshold.
         // Keyed by identity, not pid: a reused pid must not inherit the
         // previous process's high-CPU streak.
-        let mut high_cpu_ticks: HashMap<(u32, u64), u32> = HashMap::new();
+        let mut high_cpu_ticks: HashMap<TrackedProcess, u32> = HashMap::new();
 
         loop {
             tick.tick().await;
@@ -292,7 +292,7 @@ pub fn start_monitor(
                 stopped_set.retain(|&pid, &mut start_time| still_ours(pid, start_time));
             }
             // Clean up high_cpu_ticks for dead or replaced processes
-            high_cpu_ticks.retain(|&(pid, start_time), _| still_ours(pid, start_time));
+            high_cpu_ticks.retain(|t, _| still_ours(t.pid, t.start_time));
 
             let tracked: Vec<TrackedProcess> = pids.lock().unwrap().clone();
             let stopped_set: HashSet<u32> = stopped.lock().unwrap().keys().copied().collect();
@@ -385,7 +385,7 @@ pub fn start_monitor(
                         });
 
                         // Track sustained high CPU for anomaly detection
-                        let count = high_cpu_ticks.entry((pid, identity)).or_insert(0);
+                        let count = high_cpu_ticks.entry(*tracked_proc).or_insert(0);
                         *count += 1;
                         if *count == HIGH_CPU_TICKS_THRESHOLD {
                             anomalies.push(Anomaly {
@@ -400,7 +400,7 @@ pub fn start_monitor(
                         }
                     } else {
                         // Reset counter when CPU drops below threshold
-                        high_cpu_ticks.remove(&(pid, identity));
+                        high_cpu_ticks.remove(tracked_proc);
                     }
 
                     if mem > config.memory_threshold_bytes {
@@ -547,18 +547,36 @@ pub struct MonitorHandle {
 }
 
 impl MonitorHandle {
-    pub fn track_pid(&self, pid: u32) {
-        // Read the identity before taking the lock: this is a syscall, and
+    /// Returns whether this monitor is tracking `pid` when the call returns.
+    ///
+    /// The app re-sends every descendant pid every few seconds, so the
+    /// membership check comes first and costs nothing: reading an identity is
+    /// a process-table syscall, and paying it per already-tracked pid per
+    /// reconcile would be the bulk of the work. A pid that is already tracked
+    /// keeps the identity it was admitted with; if the pid has since been
+    /// reused, the tick's identity retain drops that entry within one period
+    /// and the next reconcile re-admits it with a fresh reading. Until then a
+    /// stale entry can only refuse signals, never misdirect one.
+    ///
+    /// A pid with no readable identity is not tracked at all — there would be
+    /// nothing to check a later signal against. The caller is told, because a
+    /// silent decline is unrepairable: the app records what it has sent.
+    pub fn track_pid(&self, pid: u32) -> bool {
+        if self.tracked_pids.lock().unwrap().iter().any(|t| t.pid == pid) {
+            return true;
+        }
+        // Read the identity with the lock released: this is a syscall, and
         // holding the mutex across it would stall the monitor tick.
         let Some(start_time) = process_start_time(pid) else {
             tracing::debug!("not tracking PID {pid}: process is already gone");
-            return;
+            return false;
         };
         let mut pids = self.tracked_pids.lock().unwrap();
         if !pids.iter().any(|t| t.pid == pid) {
             pids.push(TrackedProcess { pid, start_time });
             tracing::info!("tracking PID {pid}");
         }
+        true
     }
 
     pub fn untrack_pid(&self, pid: u32) {
@@ -650,9 +668,18 @@ impl MonitorHandle {
     /// Resume all stopped processes (SIGCONT) and clear the stopped set.
     /// Used during graceful shutdown to avoid leaving orphaned stopped processes.
     pub fn resume_all_stopped(&self) -> usize {
-        let mut stopped = self.stopped_pids.lock().unwrap();
+        // Drain first, signal after. Each checked signal reads the process
+        // table, and holding the mutex across those reads would block the
+        // monitor tick — which takes the same lock to record a SIGSTOP it has
+        // just sent. A stop recorded into a map this method was about to
+        // clear would leave that process suspended with nothing left to
+        // resume it, which is exactly what shutdown must not do.
+        let drained: Vec<(u32, u64)> = {
+            let mut stopped = self.stopped_pids.lock().unwrap();
+            stopped.drain().collect()
+        };
         let mut resumed = 0;
-        for (&pid, &start_time) in stopped.iter() {
+        for (pid, start_time) in drained {
             if send_signal_checked(pid, start_time, libc::SIGCONT) {
                 tracing::info!("shutdown: SIGCONT sent to PID {pid}");
                 resumed += 1;
@@ -660,7 +687,6 @@ impl MonitorHandle {
                 tracing::warn!("shutdown: failed to SIGCONT PID {pid} (exited or pid reused)");
             }
         }
-        stopped.clear();
         resumed
     }
 
@@ -700,13 +726,33 @@ mod tests {
 
     // ── Process identity ──
 
+    /// A pid with no process behind it, chosen at runtime.
+    ///
+    /// Hard-coding one is not portable: macOS caps pids near 99999, but a
+    /// Linux host with a raised `kernel.pid_max` hands out 999999 to real
+    /// processes, and an assertion resting on that constant would silently
+    /// test the opposite of what it says. `kill(pid, 0)` delivers nothing and
+    /// costs one syscall, so it screens candidates before the process-table
+    /// read confirms them.
+    fn unused_pid() -> u32 {
+        let mut pid = std::process::id().saturating_add(1);
+        for _ in 0..1_000 {
+            let unreachable = unsafe { libc::kill(pid as i32, 0) } != 0;
+            if unreachable && process_start_time(pid).is_none() {
+                return pid;
+            }
+            pid = pid.saturating_add(1);
+        }
+        panic!("no unused pid found near {}", std::process::id());
+    }
+
     #[test]
     fn process_start_time_is_stable_for_self() {
         let current = std::process::id();
         let first = process_start_time(current).expect("this process must be visible");
         let second = process_start_time(current).expect("this process must be visible");
         assert_eq!(first, second);
-        assert!(process_start_time(999_999).is_none());
+        assert!(process_start_time(unused_pid()).is_none());
     }
 
     #[test]
@@ -718,7 +764,7 @@ mod tests {
         // SIGSTOP here would freeze the test runner.
         assert!(send_signal_checked(current, start_time, 0));
         assert!(!send_signal_checked(current, start_time.wrapping_add(1), 0));
-        assert!(!send_signal_checked(999_999, start_time, 0));
+        assert!(!send_signal_checked(unused_pid(), start_time, 0));
     }
 
     // ── MonitorHandle PID tracking ──
@@ -740,11 +786,11 @@ mod tests {
 
         assert!(handle.tracked_pids().is_empty());
 
-        handle.track_pid(current);
+        assert!(handle.track_pid(current));
         assert_eq!(handle.tracked_pids(), vec![current]);
 
         // Duplicate tracking should not add twice
-        handle.track_pid(current);
+        assert!(handle.track_pid(current));
         assert_eq!(handle.tracked_pids(), vec![current]);
 
         handle.untrack_pid(current);
@@ -756,8 +802,9 @@ mod tests {
         let handle = test_handle(Vec::new(), HashMap::new());
 
         // Nothing to record an identity from, so there would be nothing to
-        // check a later signal against.
-        handle.track_pid(999_999);
+        // check a later signal against — and the caller is told, so it can
+        // send the pid again rather than believing it is watched.
+        assert!(!handle.track_pid(unused_pid()));
 
         assert!(handle.tracked_pids().is_empty());
     }

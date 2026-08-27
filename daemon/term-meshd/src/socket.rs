@@ -3229,8 +3229,11 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
             }
             match serde_json::from_value::<TrackParams>(req.params.clone()) {
                 Ok(p) => {
-                    ctx.monitor_handle.track_pid(p.pid);
-                    Ok(serde_json::json!({"status": "ok"}))
+                    // `tracked` is the answer that matters: a pid whose
+                    // identity could not be read is not watched, and a client
+                    // that recorded the request as done would never resend it.
+                    let tracked = ctx.monitor_handle.track_pid(p.pid);
+                    Ok(serde_json::json!({"status": "ok", "tracked": tracked}))
                 }
                 Err(e) => Err(format!("invalid params: {e}")),
             }
