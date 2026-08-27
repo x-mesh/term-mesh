@@ -1628,6 +1628,92 @@ private struct SidebarPeerProjectGroup: Identifiable {
     var spansPeer: Bool { items.contains { !$0.isLocal } }
 }
 
+/// One durable Project manifest a peer daemon holds, offered for adoption.
+///
+/// Shared by both axes on purpose. The Host axis lists what a host serves from
+/// its `activeSockPath`, and on a Mac peer that socket belongs to the GUI app,
+/// which publishes no project manifest — only its session-owner daemon does.
+/// A Project created on such a host was therefore absent from the machine it
+/// runs on, and absence reads as deletion rather than as a second endpoint
+/// holding the answer. Listing the same manifests under the host closes that
+/// gap without asking the user to know which socket answered.
+private struct SidebarRemoteProjectRow: View {
+    @Environment(TabManager.self) private var tabManager
+    @ObservedObject private var orchestrator = TeamOrchestrator.shared
+    let host: HostEntry
+    let team: RemoteTeamSummary
+    /// Axis-specific so a manifest listed under both does not answer to one
+    /// identifier twice.
+    let accessibilityPrefix: String
+    @State private var isRestoring = false
+    @State private var failureMessage: String?
+
+    var body: some View {
+        let isUpdate = TeamOrchestrator.sidebarRemoteManifestState(
+            localTeam: orchestrator.teams[team.name],
+            remote: team, hostKey: host.id
+        ).isUpdate
+        Button {
+            guard !isRestoring else { return }
+            isRestoring = true
+            Task { @MainActor in
+                let restored = await orchestrator.adoptRemoteProjectPresentation(
+                    team,
+                    host: host,
+                    tabManager: tabManager
+                )
+                isRestoring = false
+                if !restored {
+                    failureMessage =
+                        "The live project surfaces could not be attached from \(host.displayName)."
+                }
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Text(team.name)
+                        .font(.system(size: 12, weight: .semibold))
+                    Image(systemName: "server.rack")
+                        .font(.system(size: 8))
+                        .foregroundColor(.orange)
+                    Spacer(minLength: 0)
+                    if isRestoring {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                Text(
+                    "\(isUpdate ? "Update from" : "Open on") \(host.displayName)"
+                        + " · \(team.members.count) agents"
+                )
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isRestoring)
+        .accessibilityIdentifier("\(accessibilityPrefix).\(team.name)")
+        .help(
+            isUpdate
+                ? "Replace this viewer with the host's latest project topology"
+                : "Attach the leader and agents already running on this host"
+        )
+        .alert(
+            "Could not open project",
+            isPresented: Binding(
+                get: { failureMessage != nil },
+                set: { if !$0 { failureMessage = nil } }
+            )
+        ) {
+            Button("OK") { failureMessage = nil }
+        } message: {
+            Text(failureMessage ?? "")
+        }
+    }
+}
+
 /// Project-axis rendering of the peer section. Deliberately shows NOTHING but
 /// projects: a host that contributes no workspace has no place on this axis,
 /// and listing it here just reproduced the Host view one toggle away. Host
@@ -1849,57 +1935,10 @@ private struct SidebarPeerProjectsView: View {
     }
 
     private func remoteManifestRow(_ item: RemoteManifestItem) -> some View {
-        let restoreKey = item.id
-        let isUpdate = TeamOrchestrator.sidebarRemoteManifestState(
-            localTeam: orchestrator.teams[item.team.name],
-            remote: item.team, hostKey: item.host.id
-        ).isUpdate
-        return Button {
-            guard !restoringTeamNames.contains(restoreKey) else { return }
-            restoringTeamNames.insert(restoreKey)
-            Task { @MainActor in
-                let restored = await orchestrator.adoptRemoteProjectPresentation(
-                    item.team,
-                    host: item.host,
-                    tabManager: tabManager
-                )
-                restoringTeamNames.remove(restoreKey)
-                if !restored {
-                    presentationRestoreFailure =
-                        "The live project surfaces could not be attached from \(item.host.displayName)."
-                }
-            }
-        } label: {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 5) {
-                    Text(item.team.name)
-                        .font(.system(size: 12, weight: .semibold))
-                    Image(systemName: "server.rack")
-                        .font(.system(size: 8))
-                        .foregroundColor(.orange)
-                    Spacer(minLength: 0)
-                    if restoringTeamNames.contains(restoreKey) {
-                        ProgressView().controlSize(.small)
-                    }
-                }
-                Text(
-                    "\(isUpdate ? "Update from" : "Open on") \(item.host.displayName)"
-                        + " · \(item.team.members.count) agents"
-                )
-                    .font(.system(size: 9))
-                    .foregroundColor(.secondary)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 6)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(restoringTeamNames.contains(restoreKey))
-        .accessibilityIdentifier("sidebar.projects.remote.\(item.team.name)")
-        .help(
-            isUpdate
-                ? "Replace this viewer with the host's latest project topology"
-                : "Attach the leader and agents already running on this host"
+        SidebarRemoteProjectRow(
+            host: item.host,
+            team: item.team,
+            accessibilityPrefix: "sidebar.projects.remote"
         )
     }
 
@@ -2628,6 +2667,9 @@ private struct PeerShellCleanupSheet: View {
 
 struct RemoteHostGroupView: View, Equatable {
     @Environment(\.colorScheme) private var colorScheme
+    /// Adopting a project elsewhere changes what this host still has to offer,
+    /// and `Equatable` above only compares the inputs the parent passes down.
+    @ObservedObject private var orchestrator = TeamOrchestrator.shared
     let host: HostEntry
     let store: RemoteHostStore
     let usesSeparatedPresentation: Bool
@@ -3005,8 +3047,56 @@ struct RemoteHostGroupView: View, Equatable {
         }
     }
 
+    /// Manifests this host's session owner holds that no local team has taken
+    /// over yet.
+    ///
+    /// These never reach `host.workspaces` on a Mac peer: workspaces come from
+    /// the serving GUI socket, manifests from the separate session-owner
+    /// daemon (`RemoteHostStore.fetchTeamRoster`). Reusing the Project axis's
+    /// own offer rule keeps one answer to "is this worth showing" rather than
+    /// two that can disagree.
+    private var offeredProjects: [RemoteTeamSummary] {
+        TeamOrchestrator.hostAxisOfferedManifests(
+            isConnected: host.isConnected,
+            teams: host.teams,
+            hostKey: host.id,
+            localTeamForName: { orchestrator.teams[$0] }
+        )
+    }
+
+    /// Listed above the workspaces on purpose: a Project is the thing the user
+    /// named and went looking for, while the workspaces under it are where it
+    /// happens to be running.
+    private var projectsSubsection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Projects")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(Color.secondary.opacity(0.7))
+                .padding(.leading, 20)
+                .padding(.bottom, 1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            ForEach(offeredProjects) { team in
+                SidebarRemoteProjectRow(
+                    host: host,
+                    team: team,
+                    accessibilityPrefix: "sidebar.hosts.project"
+                )
+            }
+        }
+    }
+
     @ViewBuilder
     private var hostContent: some View {
+        VStack(spacing: 4) {
+            if !offeredProjects.isEmpty {
+                projectsSubsection
+            }
+            hostWorkspacesContent
+        }
+    }
+
+    @ViewBuilder
+    private var hostWorkspacesContent: some View {
         if host.workspaces.isEmpty {
             HStack(spacing: 8) {
                 Text(emptyBodyText)

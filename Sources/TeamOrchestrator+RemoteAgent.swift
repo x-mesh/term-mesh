@@ -720,6 +720,31 @@ extension TeamOrchestrator {
         return (shouldOffer, matching)
     }
 
+    /// The manifests a host lists under its own row in the Host axis.
+    ///
+    /// Deliberately the same rule the Project axis applies, because a machine's
+    /// projects appearing in one view and not the other is what made a Project
+    /// on a Mac peer look deleted: workspaces come from the serving GUI socket,
+    /// which publishes no manifest, so the Host axis had nothing to show and
+    /// said nothing about it. A manifest with no leader surface is skipped for
+    /// the same reason the Project axis skips it — there is nothing to attach.
+    nonisolated static func hostAxisOfferedManifests(
+        isConnected: Bool,
+        teams: [RemoteTeamSummary],
+        hostKey: String,
+        localTeamForName: (String) -> Team?
+    ) -> [RemoteTeamSummary] {
+        guard isConnected else { return [] }
+        return teams.filter { team in
+            guard !team.leaderSurfaceID.isEmpty else { return false }
+            return sidebarRemoteManifestState(
+                localTeam: localTeamForName(team.name),
+                remote: team,
+                hostKey: hostKey
+            ).shouldOffer
+        }
+    }
+
     /// Pick the one daemon manifest this installation may restore without a
     /// click. Team names are presentation copy and can repeat; the newest
     /// locally-owned leader record is the durable join key that prevents an
