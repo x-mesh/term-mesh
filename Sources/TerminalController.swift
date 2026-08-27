@@ -1102,8 +1102,6 @@ class TerminalController {
             return v2Result(id: id, self.v2TeamTaskUpdate(params: params))
         case "team.task.list":
             return v2Result(id: id, self.v2TeamTaskList(params: params))
-        case "team.task.metrics":
-            return v2Result(id: id, self.v2TeamTaskMetrics(params: params))
         case "team.task.clear":
             return v2Result(id: id, self.v2TeamTaskClear(params: params))
         case "team.context.set":
@@ -7170,18 +7168,6 @@ class TerminalController {
             result = .ok(["team_name": teamName, "tasks": formatted, "count": formatted.count])
         }
         return result
-    }
-
-    private func v2TeamTaskMetrics(params: [String: Any]) -> V2CallResult {
-        guard let teamName = params["team_name"] as? String else {
-            return .err(code: "invalid_params", message: "Missing team_name", data: nil)
-        }
-        guard let metrics = TeamDataStore.shared.coordinationMetrics(
-            teamName: teamName, requestId: params["request_id"] as? String
-        ) else {
-            return .err(code: "not_found", message: "No durable leader request found", data: nil)
-        }
-        return .ok(metrics)
     }
 
     // Feature D: Clear tasks
