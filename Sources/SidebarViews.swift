@@ -1009,7 +1009,7 @@ struct SidebarAxisPicker: View, Equatable {
         .padding(.horizontal, 12)
         .accessibilityIdentifier("sidebar.axis")
         .accessibilityLabel("Sidebar grouping")
-        .help("Group the sidebar by host or by project")
+        .help("Lead with machines, or lead with projects")
     }
 }
 
