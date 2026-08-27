@@ -184,12 +184,10 @@ pub mod team_leader {
     /// by the owning app and checked by each handler. That second gate is the
     /// reason a project-bound grant may reach them at all.
     ///
-    /// `team.task.metrics` is deliberately NOT here. Its name suggests a task
-    /// board read, but its handler answers from the leader-request store and
-    /// is the one sibling with no token check — so admitting it would hand a
-    /// grant holder leader-request timing without the second bearer the rest
-    /// of this list depends on. It goes back only once that handler gates the
-    /// way `team.leader.request.*` does.
+    /// `team.task.metrics` is named for the task board but answers from the
+    /// leader-request store, which is why it belongs here and not in the
+    /// generic list: it was admitted only after its handler started demanding
+    /// the same capability its siblings do.
     pub const SCOPED_METHODS: &[&str] = &[
         "team.add_agent",
         "team.send_key",
@@ -197,6 +195,7 @@ pub mod team_leader {
         "team.leader.request.take",
         "team.leader.request.complete",
         "team.delegation.configure",
+        "team.task.metrics",
     ];
 
     pub fn scoped_method_allowed(method: &str) -> bool {
@@ -501,15 +500,14 @@ mod team_leader_tests {
         assert!(scoped_method_allowed("team.leader.request.take"));
         assert!(scoped_method_allowed("team.leader.request.complete"));
         assert!(scoped_method_allowed("team.delegation.configure"));
+        // Reads the leader-request store, so it is scoped rather than generic.
+        assert!(scoped_method_allowed("team.task.metrics"));
         for method in [
             "team.create",
             "team.destroy",
             "team.attach",
             "team.restart",
             "team.preset.list",
-            // Reads the leader-request store without the token check its
-            // siblings apply, so the grant alone must not reach it.
-            "team.task.metrics",
         ] {
             assert!(!scoped_method_allowed(method), "{method}");
         }

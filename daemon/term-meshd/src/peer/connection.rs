@@ -3973,6 +3973,87 @@ mod team_call_allow_list_tests {
         assert_eq!(mirrored, rust, "Swift and Rust allow-lists diverged");
     }
 
+    /// Every method a leader may send has to reach a handler at the owner.
+    ///
+    /// The other tests in this module diff one allow-list against another.
+    /// None of them can see whether the app answers, which is how a method
+    /// got allow-listed on all three sides and still died at the far end as
+    /// `unknown_method` — the exact failure this family exists to prevent.
+    #[test]
+    fn every_leader_method_reaches_an_owner_side_handler() {
+        let swift = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Sources/TerminalController.swift");
+        let source = std::fs::read_to_string(&swift)
+            .unwrap_or_else(|e| panic!("read {}: {e}", swift.display()));
+
+        fn quoted(body: &str) -> Vec<String> {
+            body.lines()
+                .map(str::trim)
+                .filter(|line| !line.starts_with("//"))
+                .filter_map(|line| {
+                    let start = line.find('"')? + 1;
+                    let end = start + line[start..].find('"')?;
+                    Some(line[start..end].to_string())
+                })
+                .collect()
+        }
+
+        // The data-only set, and the case labels of the async UI dispatcher:
+        // together these are every route `peerTeamCommandAsync` can take.
+        let data_set = source
+            .split_once("static let teamDataCommands")
+            .expect("the teamDataCommands set")
+            .1
+            .split_once("\n    ]")
+            .expect("its closing bracket")
+            .0;
+        let ui_switch = source
+            .split_once("private func processTeamUICommandAsync")
+            .expect("the async UI dispatcher")
+            .1
+            .split_once("\n    }")
+            .expect("its closing brace")
+            .0;
+
+        let mut served = quoted(data_set);
+        served.extend(
+            ui_switch
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("case \""))
+                .flat_map(quoted),
+        );
+        assert!(
+            served.len() > 20,
+            "parsed too little out of the dispatchers: {served:?}"
+        );
+
+        // Allow-listed but implemented nowhere in the app — not merely
+        // unwired. `team.task.diff` is sent by ReviewBoardCoordinatorService
+        // and by the peer server, so the receiving side answers
+        // unknown_method today. Writing those handlers is a feature rather
+        // than a wiring fix, so they are named here to keep this guard live.
+        // Remove an entry the moment its handler lands.
+        const UNIMPLEMENTED: &[&str] = &["team.reports", "team.task.diff"];
+
+        let mut missing: Vec<&str> = TEAM_CALL_ALLOWED_METHODS
+            .iter()
+            .copied()
+            .chain(peer_proto::team_leader::SCOPED_METHODS.iter().copied())
+            .filter(|method| *method != "team.list")
+            .filter(|method| !served.iter().any(|s| s == method))
+            .collect();
+        missing.sort();
+        missing.dedup();
+        let mut known: Vec<&str> = UNIMPLEMENTED.to_vec();
+        known.sort();
+        assert_eq!(
+            missing, known,
+            "a leader-callable method has no handler at the owner (or a listed \
+             exception was implemented and should be removed from UNIMPLEMENTED)"
+        );
+    }
+
     #[test]
     fn swift_and_rust_scoped_leader_allow_lists_match() {
         let swift = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

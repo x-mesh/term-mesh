@@ -3961,11 +3961,13 @@ class TerminalController {
 
     /// Peer-path twin of `v2TeamDelegationConfigure`.
     ///
-    /// The app socket reaches that one through `processV2Command`; a remote
-    /// leader arrives through `peerTeamCommandAsync` instead, which never ran
-    /// that switch — so an allow-listed `team.delegation.configure` died at
-    /// the far end as `unknown_method`. The gate is the same leader request
-    /// token; only the UI hop differs, because this dispatcher is already
+    /// Every `team.` method goes through `dispatchTeamCommandAsync` — the
+    /// `hasPrefix("team.")` gate in `processV2Command` returns before that
+    /// function's own switch, so the `team.*` cases still sitting there are
+    /// unreachable. `team.delegation.configure` had no live handler on any
+    /// route until this one: an allow-listed call died as `unknown_method`.
+    /// The gate is the same leader request token `v2TeamDelegationConfigure`
+    /// applies; only the UI hop differs, because this dispatcher is already
     /// async and must not block on `v2MainSync`.
     private func asyncTeamDelegationConfigure(params: [String: Any], id: Any?) async -> String {
         guard let teamName = params["team_name"] as? String,
@@ -5703,9 +5705,20 @@ class TerminalController {
         ])
     }
 
+    /// Named for the task board, but it answers from the leader-request
+    /// store: request id, status and coordination timing. Every sibling that
+    /// reads that store — `team.leader.request.list/take/complete` — demands
+    /// the leader request capability, and this one did not, so any process
+    /// that could open the app socket read timings it was refused the
+    /// requests for.
     private func teamDataTaskMetrics(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
         guard let teamName = params["team_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        guard store.isAuthorizedLeaderRequestToken(
+            teamName: teamName, token: params["leader_request_token"] as? String
+        ) else {
+            return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
         }
         guard let metrics = store.coordinationMetrics(
             teamName: teamName, requestId: params["request_id"] as? String

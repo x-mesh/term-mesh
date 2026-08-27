@@ -20,7 +20,6 @@ public enum PeerTeamLeader {
     /// Mirrors `SCOPED_METHODS` in `daemon/peer-proto`; a Rust test parses
     /// this literal and diffs it, so keep one method per line.
     ///
-    /// `team.task.metrics` is deliberately absent — see the Rust list for why.
     public static let scopedMethods: Set<String> = [
         "team.add_agent",
         "team.send_key",
@@ -31,6 +30,9 @@ public enum PeerTeamLeader {
         "team.leader.request.take",
         "team.leader.request.complete",
         "team.delegation.configure",
+        // Named for the task board but answers from the leader-request store,
+        // and gated by the same capability, so it is scoped rather than generic.
+        "team.task.metrics",
     ]
 
     public static func isAllowed(_ method: String) -> Bool {

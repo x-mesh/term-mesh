@@ -5216,9 +5216,6 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.delegate"
             | "team.message.post"
             | "team.task.list"
-            // team.task.metrics is intentionally absent: it answers from the
-            // leader-request store without that store's token check, so no
-            // owner accepts it over the leader route.
             | "team.task.get"
             | "team.task.create"
             | "team.task.update"
@@ -8039,7 +8036,13 @@ fn main() {
                     }
                 }
                 TaskCommands::Metrics { request_id } => {
-                    let mut params = json!({ "team_name": team });
+                    // Reads the leader-request store, so it carries the same
+                    // capability the leader-request commands do.
+                    let mut params = json!({
+                        "team_name": team,
+                        "leader_request_token":
+                            env::var("TERMMESH_LEADER_REQUEST_TOKEN").unwrap_or_default(),
+                    });
                     if let Some(request_id) = request_id {
                         params["request_id"] = json!(request_id);
                     }
@@ -20404,6 +20407,7 @@ mod auto_watch_tests {
             "team.task.unblock",
             "team.task.approve",
             "team.task.list",
+            "team.task.metrics",
             "team.task.diff",
             // These come from peer-proto's SCOPED_METHODS, not from the
             // match arm above; asserting them here proves the delegation.
@@ -20423,7 +20427,6 @@ mod auto_watch_tests {
             "team.attach",
             "team.restart",
             "team.task.reassign",
-            "team.task.metrics",
             "surface.send_key",
         ] {
             assert!(!remote_leader_method_allowed(method), "{method}");
