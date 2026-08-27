@@ -179,10 +179,18 @@ pub mod team_leader {
     /// against this list, because a leader that is allowed to send what no
     /// owner accepts fails at the far end with nothing to point at.
     ///
-    /// Every entry here carries a bearer of its own beyond the grant:
+    /// Two different rules live here, and they are not interchangeable.
+    ///
+    /// The leader-request family, the delegation level and the metrics read
+    /// each demand a second bearer beyond the grant —
     /// `TERMMESH_LEADER_REQUEST_TOKEN`, staged into the leader's environment
-    /// by the owning app and checked by each handler. That second gate is the
-    /// reason a project-bound grant may reach them at all.
+    /// by the owning app and checked by their handlers.
+    ///
+    /// `team.add_agent` and `team.send_key` check no such token: the grant
+    /// alone admits them, and what keeps them safe is that the owning app
+    /// rewrites the placement (`scopedLeaderParameters`) so the caller cannot
+    /// choose a machine or a directory. Nothing enforces either rule from
+    /// this list, so do not read membership as evidence of a token check.
     ///
     /// `team.task.metrics` is named for the task board but answers from the
     /// leader-request store, which is why it belongs here and not in the

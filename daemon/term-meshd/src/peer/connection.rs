@@ -3998,42 +3998,75 @@ mod team_call_allow_list_tests {
                 .collect()
         }
 
-        // The data-only set, and the case labels of the async UI dispatcher:
-        // together these are every route `peerTeamCommandAsync` can take.
-        let data_set = source
-            .split_once("static let teamDataCommands")
-            .expect("the teamDataCommands set")
-            .1
-            .split_once("\n    ]")
-            .expect("its closing bracket")
-            .0;
-        let ui_switch = source
-            .split_once("private func processTeamUICommandAsync")
-            .expect("the async UI dispatcher")
-            .1
-            .split_once("\n    }")
-            .expect("its closing brace")
-            .0;
-
-        let mut served = quoted(data_set);
-        served.extend(
-            ui_switch
-                .lines()
+        fn case_labels(body: &str) -> Vec<String> {
+            body.lines()
                 .map(str::trim)
                 .filter(|line| line.starts_with("case \""))
-                .flat_map(quoted),
+                .flat_map(quoted)
+                .collect()
+        }
+        fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("{start} not found"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("end of {start} not found"))
+                .0
+        }
+
+        // `teamDataCommands` only decides the ROUTE (TerminalController's
+        // `peerTeamCommandAsync`); the handlers are a separate switch in
+        // `dispatchTeamDataCommandDirect`. Reading the set alone would call a
+        // method served when it is merely routed to a switch that drops it,
+        // so both halves are read and required to agree.
+        let data_set = quoted(section(
+            &source,
+            "static let teamDataCommands",
+            "\n    ]",
+        ));
+        let data_cases = case_labels(section(
+            &source,
+            "private func dispatchTeamDataCommandDirect",
+            "\n    }",
+        ));
+        let ui_cases = case_labels(section(
+            &source,
+            "private func processTeamUICommandAsync",
+            "\n    }",
+        ));
+
+        let mut routed = data_set.clone();
+        routed.sort();
+        let mut handled = data_cases.clone();
+        handled.sort();
+        assert_eq!(
+            routed, handled,
+            "teamDataCommands and dispatchTeamDataCommandDirect disagree: a \
+             method routed to the data path with no case there is dropped"
         );
+
+        let mut served = data_cases;
+        served.extend(ui_cases);
         assert!(
             served.len() > 20,
             "parsed too little out of the dispatchers: {served:?}"
         );
 
-        // Allow-listed but implemented nowhere in the app — not merely
-        // unwired. `team.task.diff` is sent by ReviewBoardCoordinatorService
-        // and by the peer server, so the receiving side answers
-        // unknown_method today. Writing those handlers is a feature rather
-        // than a wiring fix, so they are named here to keep this guard live.
-        // Remove an entry the moment its handler lands.
+        // Allow-listed with no handler in the Swift app. The two are not the
+        // same shape of hole:
+        //
+        // `team.task.diff` already works when the owner is a headless daemon
+        // — `run_headless_team_call` serves it above — and it has live
+        // senders (`ReviewBoardCoordinatorService` and this crate's peer
+        // server), so only an app-owned project answers unknown_method. Its
+        // fix is an app handler mirroring the headless one.
+        //
+        // `team.reports` has no sender anywhere; it is allow-listed surface
+        // nothing calls yet.
+        //
+        // Both are named so this guard stays live. Remove an entry the moment
+        // its handler lands.
         const UNIMPLEMENTED: &[&str] = &["team.reports", "team.task.diff"];
 
         let mut missing: Vec<&str> = TEAM_CALL_ALLOWED_METHODS
