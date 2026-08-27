@@ -193,6 +193,34 @@ fn send_signal_checked(pid: u32, expected_start_time: u64, signal: i32) -> bool 
     }
 }
 
+/// Record a stop the tick just made, unless shutdown has already begun.
+///
+/// The flag is read while holding the map's lock, and that is what orders
+/// this against `resume_all_stopped`: it clears the flag and then drains
+/// under the same lock, so a stop either lands before that drain and is
+/// resumed by it, or sees the cleared flag here and is undone. Draining in a
+/// retry loop cannot close the same window — an empty map ends the loop
+/// before the in-flight tick reaches its insert.
+fn record_stop(
+    stopped: &std::sync::Mutex<HashMap<u32, u64>>,
+    auto_stop: &std::sync::atomic::AtomicBool,
+    pid: u32,
+    identity: u64,
+) -> bool {
+    {
+        let mut map = stopped.lock().unwrap();
+        if auto_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            map.insert(pid, identity);
+            return true;
+        }
+    }
+    // Shutdown began between the decision and the record. Leaving it
+    // suspended would strand it with nothing left to resume it.
+    tracing::warn!("shutdown began mid-stop; resuming PID {pid} instead of recording it");
+    let _ = send_signal_checked(pid, identity, libc::SIGCONT);
+    false
+}
+
 fn iso8601_now() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -270,8 +298,17 @@ pub fn start_monitor(
             // `remove_dead_processes` remains true so a registered process that
             // exits disappears from both sysinfo and the tracked list below.
             let tracked_snapshot: Vec<TrackedProcess> = pids.lock().unwrap().clone();
-            let tracked_pid_list: Vec<u32> = tracked_snapshot.iter().map(|t| t.pid).collect();
-            refresh_tracked_processes(&mut sys, &tracked_pid_list);
+            // Refresh everything the retains below will judge, not only the
+            // tracked list. `stopped_pids` and `high_cpu_ticks` can still hold
+            // a pid the tracked list has dropped, and an entry the refresh
+            // never covered is skipped by the judgement — which for those two
+            // maps is a permanent condition, so the entry would never be
+            // cleaned rather than being spared for one tick.
+            let mut covered: HashSet<u32> = tracked_snapshot.iter().map(|t| t.pid).collect();
+            covered.extend(stopped.lock().unwrap().keys().copied());
+            covered.extend(high_cpu_ticks.keys().map(|t| t.pid));
+            let refresh_list: Vec<u32> = covered.iter().copied().collect();
+            refresh_tracked_processes(&mut sys, &refresh_list);
 
             // Drop entries whose pid no longer holds the process we recorded.
             // Testing liveness alone was the reuse hole: a recycled pid looks
@@ -283,7 +320,8 @@ pub fn start_monitor(
             // `sys.process` reports nothing for it and a bare liveness test
             // would delete a registration made moments earlier — one the app
             // has already recorded as satisfied and will not send again.
-            let covered: HashSet<u32> = tracked_pid_list.iter().copied().collect();
+            // Everything else was refreshed above, so the escape hatch now
+            // fires only for that case.
             let judged = |pid: u32, start_time: u64| {
                 !covered.contains(&pid)
                     || sys.process(Pid::from_u32(pid)).map(|p| p.start_time()) == Some(start_time)
@@ -369,8 +407,9 @@ pub fn start_monitor(
 
                     if cpu > config.cpu_threshold_percent {
                         let action = if should_auto_stop {
-                            if send_signal_checked(pid, identity, libc::SIGSTOP) {
-                                stopped.lock().unwrap().insert(pid, identity);
+                            if send_signal_checked(pid, identity, libc::SIGSTOP)
+                                && record_stop(&stopped, &auto_stop, pid, identity)
+                            {
                                 tracing::warn!(
                                     "SIGSTOP sent to PID {pid} ({name}): CPU {cpu:.1}% > {:.1}%",
                                     config.cpu_threshold_percent
@@ -412,8 +451,9 @@ pub fn start_monitor(
 
                     if mem > config.memory_threshold_bytes {
                         let action = if should_auto_stop {
-                            if send_signal_checked(pid, identity, libc::SIGSTOP) {
-                                stopped.lock().unwrap().insert(pid, identity);
+                            if send_signal_checked(pid, identity, libc::SIGSTOP)
+                                && record_stop(&stopped, &auto_stop, pid, identity)
+                            {
                                 tracing::warn!(
                                     "SIGSTOP sent to PID {pid} ({name}): mem {mem} > {}",
                                     config.memory_threshold_bytes
@@ -554,18 +594,22 @@ pub struct MonitorHandle {
 impl MonitorHandle {
     /// Returns whether this monitor is tracking `pid` when the call returns.
     ///
-    /// The app re-sends every descendant pid every few seconds, so the
-    /// membership check comes first and costs nothing: reading an identity is
-    /// a process-table syscall, and paying it per already-tracked pid per
-    /// reconcile would be the bulk of the work. A pid that is already tracked
-    /// keeps the identity it was admitted with; if the pid has since been
-    /// reused, the tick's identity retain drops that entry within one period
-    /// and the next reconcile re-admits it with a fresh reading. Until then a
-    /// stale entry can only refuse signals, never misdirect one.
+    /// The membership check comes first so a repeated registration costs
+    /// nothing: reading an identity is a process-table syscall, and the app
+    /// can offer the same pid again — overlapping reconcile passes, a
+    /// restarted watcher — without paying for it.
     ///
-    /// A pid with no readable identity is not tracked at all — there would be
-    /// nothing to check a later signal against. The caller is told, because a
-    /// silent decline is unrepairable: the app records what it has sent.
+    /// A pid that is already tracked keeps the identity it was admitted with.
+    /// Once that pid is reused the tick's identity retain drops the entry, and
+    /// nothing re-admits it: the app records what it has sent and offers only
+    /// pids it has not, so that process goes unwatched until it exits. That is
+    /// a monitoring gap rather than a safety one — a stale entry can refuse a
+    /// signal but never misdirect one — and closing it needs this side to
+    /// report the drop, which it has no channel for today.
+    ///
+    /// A pid with no readable identity is not tracked at all: there would be
+    /// nothing to check a later signal against. The caller is told so it can
+    /// drop its own record and offer the pid again.
     pub fn track_pid(&self, pid: u32) -> bool {
         if self.tracked_pids.lock().unwrap().iter().any(|t| t.pid == pid) {
             return true;
@@ -673,33 +717,28 @@ impl MonitorHandle {
     /// Resume all stopped processes (SIGCONT) and clear the stopped set.
     /// Used during graceful shutdown to avoid leaving orphaned stopped processes.
     pub fn resume_all_stopped(&self) -> usize {
-        // Silence the source before draining. The monitor tick has no
-        // shutdown branch — it runs until the process exits — so a SIGSTOP it
-        // sends and records after a single drain would land in a map nothing
-        // drains again, leaving that process suspended with nothing left to
-        // resume it. Clearing auto-stop closes both tick paths, and the loop
-        // below then catches anything a tick already in flight recorded.
+        // Clear the flag, then drain under the lock. The monitor tick has no
+        // shutdown branch — it runs until the process exits — and it records
+        // a stop only while holding this same lock and only while the flag is
+        // still set (see `record_stop`), so a stop either lands before this
+        // drain and is resumed by it, or is undone by the tick itself. This
+        // turns auto-stop off for the rest of the process's life, which is
+        // what shutdown means; nothing re-enables it.
         self.auto_stop
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Signal outside the lock: each checked signal reads the process
+        // table, and the tick needs this lock to make progress.
+        let drained: Vec<(u32, u64)> = {
+            let mut stopped = self.stopped_pids.lock().unwrap();
+            stopped.drain().collect()
+        };
         let mut resumed = 0;
-        loop {
-            // Drain under the lock, signal outside it: each checked signal
-            // reads the process table, and the tick takes this same lock to
-            // record a stop it has just sent.
-            let drained: Vec<(u32, u64)> = {
-                let mut stopped = self.stopped_pids.lock().unwrap();
-                stopped.drain().collect()
-            };
-            if drained.is_empty() {
-                break;
-            }
-            for (pid, start_time) in drained {
-                if send_signal_checked(pid, start_time, libc::SIGCONT) {
-                    tracing::info!("shutdown: SIGCONT sent to PID {pid}");
-                    resumed += 1;
-                } else {
-                    tracing::warn!("shutdown: failed to SIGCONT PID {pid} (exited or pid reused)");
-                }
+        for (pid, start_time) in drained {
+            if send_signal_checked(pid, start_time, libc::SIGCONT) {
+                tracing::info!("shutdown: SIGCONT sent to PID {pid}");
+                resumed += 1;
+            } else {
+                tracing::warn!("shutdown: failed to SIGCONT PID {pid} (exited or pid reused)");
             }
         }
         resumed
