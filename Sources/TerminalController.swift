@@ -2537,6 +2537,8 @@ class TerminalController {
             return await asyncTeamInbox(params: params, id: id)
         case "team.agent.status":
             return await asyncTeamAgentStatus(params: params, id: id)
+        case "team.delegation.configure":
+            return await asyncTeamDelegationConfigure(params: params, id: id)
         case "team.task.start":
             return await asyncTeamTaskStart(params: params, id: id)
         case "team.task.block":
@@ -3955,6 +3957,42 @@ class TerminalController {
             TeamOrchestrator.shared.inboxItems(teamName: teamName, agentName: agentName, topOnly: topOnly)
         }
         return v2Ok(id: id, result: ["team_name": teamName, "items": items, "count": items.count])
+    }
+
+    /// Peer-path twin of `v2TeamDelegationConfigure`.
+    ///
+    /// The app socket reaches that one through `processV2Command`; a remote
+    /// leader arrives through `peerTeamCommandAsync` instead, which never ran
+    /// that switch — so an allow-listed `team.delegation.configure` died at
+    /// the far end as `unknown_method`. The gate is the same leader request
+    /// token; only the UI hop differs, because this dispatcher is already
+    /// async and must not block on `v2MainSync`.
+    private func asyncTeamDelegationConfigure(params: [String: Any], id: Any?) async -> String {
+        guard let teamName = params["team_name"] as? String,
+              let rawLevel = params["level"] as? String,
+              let level = ProjectDelegationLevel(rawValue: rawLevel) else {
+            return v2Error(
+                id: id, code: "invalid_params",
+                message: "level must be leaderFirst, guarded, or delegated"
+            )
+        }
+        guard TeamDataStore.shared.isAuthorizedLeaderRequestToken(
+            teamName: teamName, token: params["leader_request_token"] as? String
+        ) else {
+            return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
+        }
+        let state = await MainActor.run {
+            TeamOrchestrator.shared.setProjectDelegationLevel(teamName: teamName, level: level)
+        }
+        guard let state else {
+            return v2Error(id: id, code: "not_found", message: "Team not found")
+        }
+        return v2Ok(id: id, result: [
+            "team_name": teamName,
+            "configured": state.configured.rawValue,
+            "effective": state.effective.rawValue,
+            "pending": state.pending?.rawValue as Any? ?? NSNull(),
+        ])
     }
 
     private func asyncTeamAgentStatus(params: [String: Any], id: Any?) async -> String {

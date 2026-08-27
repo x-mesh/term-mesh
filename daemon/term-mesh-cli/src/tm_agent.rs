@@ -5190,6 +5190,13 @@ mod remote_leader_route_file_tests {
     }
 }
 
+/// What a remote leader may proxy to the project's owner.
+///
+/// The generic half is spelled out; the grant-scoped half is not, because
+/// `peer_proto::team_leader::SCOPED_METHODS` is the one definition both
+/// acceptors use. Mirroring it here is what let this list drift ahead of them
+/// — sending methods no owner would honour, with the failure landing at the
+/// far end where nothing pointed back at the cause.
 fn remote_leader_method_allowed(method: &str) -> bool {
     matches!(
         method,
@@ -5200,21 +5207,18 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.result.status"
             | "team.result.collect"
             | "team.inbox"
-            | "team.leader.request.list"
-            | "team.leader.request.take"
-            | "team.leader.request.complete"
-            | "team.delegation.configure"
             | "team.message.list"
             | "team.correlation.register"
             | "team.correlation.get"
             | "team.correlation.cancel"
             | "team.send"
-            | "team.send_key"
             | "team.broadcast"
             | "team.delegate"
             | "team.message.post"
             | "team.task.list"
-            | "team.task.metrics"
+            // team.task.metrics is intentionally absent: it answers from the
+            // leader-request store without that store's token check, so no
+            // owner accepts it over the leader route.
             | "team.task.get"
             | "team.task.create"
             | "team.task.update"
@@ -5224,11 +5228,7 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.task.unblock"
             | "team.task.approve"
             | "team.task.diff"
-            // Unlike a generic team.call.v1 peer, a remote leader carries a
-            // grant bound to one project/team. The owning app additionally
-            // overwrites host and directory from that project's placement.
-            | "team.add_agent"
-    )
+    ) || peer_proto::team_leader::scoped_method_allowed(method)
 }
 
 fn scoped_team_list_from_status(mut status: Value) -> Value {
@@ -20404,8 +20404,9 @@ mod auto_watch_tests {
             "team.task.unblock",
             "team.task.approve",
             "team.task.list",
-            "team.task.metrics",
             "team.task.diff",
+            // These come from peer-proto's SCOPED_METHODS, not from the
+            // match arm above; asserting them here proves the delegation.
             "team.add_agent",
             "team.send_key",
             "team.leader.request.list",
@@ -20422,6 +20423,7 @@ mod auto_watch_tests {
             "team.attach",
             "team.restart",
             "team.task.reassign",
+            "team.task.metrics",
             "surface.send_key",
         ] {
             assert!(!remote_leader_method_allowed(method), "{method}");

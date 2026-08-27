@@ -3989,8 +3989,15 @@ mod team_call_allow_list_tests {
 
         let mut mirrored: Vec<String> = body
             .lines()
+            // Drop the rationale comments; only the quoted names are the list.
+            // Without this the parser would read a method name out of any
+            // comment that happens to quote one, and the only thing keeping
+            // that from happening would be a note asking humans not to.
             .filter_map(|line| {
                 let line = line.trim();
+                if line.starts_with("//") {
+                    return None;
+                }
                 let start = line.find('\"')? + 1;
                 let end = start + line[start..].find('\"')?;
                 Some(line[start..end].to_string())
@@ -4045,22 +4052,29 @@ mod team_call_allow_list_tests {
             .0;
         let mut cli_methods: Vec<&str> = body
             .lines()
+            // Same reason as the Swift mirror above: the match arm carries
+            // rationale comments, and a quoted method name inside one is not
+            // a list entry.
             .filter_map(|line| {
+                let line = line.trim();
+                if line.starts_with("//") {
+                    return None;
+                }
                 let start = line.find('\"')? + 1;
                 let end = start + line[start..].find('\"')?;
                 Some(&line[start..end])
             })
             .collect();
+        // Only the generic half is compared. The CLI no longer spells the
+        // grant-scoped methods out at all — `remote_leader_method_allowed`
+        // ORs in `peer_proto::team_leader::scoped_method_allowed`, so that
+        // half cannot drift by construction and there is nothing here to
+        // diff it against.
         let mut daemon_methods: Vec<&str> = TEAM_CALL_ALLOWED_METHODS
             .iter()
             .copied()
             .filter(|method| *method != "team.list")
             .collect();
-        // A remote leader is bound to one project/team by its grant. It may
-        // ask that project to add a member, while generic team.call.v1 peers
-        // remain unable to spawn anything. The Swift owner overwrites the
-        // requested host and directory from the granted project's placement.
-        daemon_methods.extend(peer_proto::team_leader::SCOPED_METHODS.iter().copied());
         cli_methods.sort();
         daemon_methods.sort();
 

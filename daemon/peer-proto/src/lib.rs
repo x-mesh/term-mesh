@@ -179,12 +179,17 @@ pub mod team_leader {
     /// against this list, because a leader that is allowed to send what no
     /// owner accepts fails at the far end with nothing to point at.
     ///
-    /// The leader-request family and the delegation level also carry a bearer
-    /// of their own — `TERMMESH_LEADER_REQUEST_TOKEN`, staged into the
-    /// leader's environment by the owning app — so the grant alone does not
-    /// reach them. `team.task.metrics` is a plain read of the same task board
-    /// `team.task.list` already exposes; it is here rather than in the
-    /// generic list so a peer without a grant gains nothing.
+    /// Every entry here carries a bearer of its own beyond the grant:
+    /// `TERMMESH_LEADER_REQUEST_TOKEN`, staged into the leader's environment
+    /// by the owning app and checked by each handler. That second gate is the
+    /// reason a project-bound grant may reach them at all.
+    ///
+    /// `team.task.metrics` is deliberately NOT here. Its name suggests a task
+    /// board read, but its handler answers from the leader-request store and
+    /// is the one sibling with no token check — so admitting it would hand a
+    /// grant holder leader-request timing without the second bearer the rest
+    /// of this list depends on. It goes back only once that handler gates the
+    /// way `team.leader.request.*` does.
     pub const SCOPED_METHODS: &[&str] = &[
         "team.add_agent",
         "team.send_key",
@@ -192,7 +197,6 @@ pub mod team_leader {
         "team.leader.request.take",
         "team.leader.request.complete",
         "team.delegation.configure",
-        "team.task.metrics",
     ];
 
     pub fn scoped_method_allowed(method: &str) -> bool {
@@ -497,13 +501,15 @@ mod team_leader_tests {
         assert!(scoped_method_allowed("team.leader.request.take"));
         assert!(scoped_method_allowed("team.leader.request.complete"));
         assert!(scoped_method_allowed("team.delegation.configure"));
-        assert!(scoped_method_allowed("team.task.metrics"));
         for method in [
             "team.create",
             "team.destroy",
             "team.attach",
             "team.restart",
             "team.preset.list",
+            // Reads the leader-request store without the token check its
+            // siblings apply, so the grant alone must not reach it.
+            "team.task.metrics",
         ] {
             assert!(!scoped_method_allowed(method), "{method}");
         }
