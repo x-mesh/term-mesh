@@ -1021,17 +1021,6 @@ final class TermMeshDaemon: ObservableObject {
         return response["tracked"] as? Bool ?? true
     }
 
-    /// The pids the daemon is watching, or nil when it could not be asked.
-    ///
-    /// nil and empty are different answers: an unreachable daemon must not
-    /// read as "watching nothing", which would untrack every live descendant.
-    func trackedPIDs() -> Set<Int32>? {
-        guard let response = rpcCall(method: "monitor.tracked", params: [:]) as? [Any] else {
-            return nil
-        }
-        return Set(response.compactMap { ($0 as? NSNumber)?.int32Value })
-    }
-
     /// Untrack a process.
     func untrackPID(_ pid: Int32) {
         let _ = rpcCall(method: "monitor.untrack", params: ["pid": pid])

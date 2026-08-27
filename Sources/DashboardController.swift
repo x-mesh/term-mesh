@@ -224,6 +224,7 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     private var uiFetchInFlight = false
     private var uiFetchGeneration = 0
     private var trackingTimer: Timer?
+    private var trackedPIDs: Set<Int32> = []
     private var trackingSyncInFlight = false
     private var alertPollInFlight = false
     private var messageHandler: DashboardMessageHandler?
@@ -704,23 +705,42 @@ final class DashboardController: NSObject, WKNavigationDelegate {
         return ProcessTreeSnapshot.descendantPIDs(of: appPID, in: processes)
     }
 
-    /// Reconcile the daemon's watch list with the discovered descendants.
+    /// Reconcile tracked PIDs with discovered descendants. Must be called on @MainActor.
     ///
-    /// The daemon's list is the source of truth, asked for once per pass.
-    /// Keeping a private copy here and sending only the difference made a
-    /// single drop permanent: the daemon discards an entry whose pid was
-    /// recycled, this side still believed it was watched, and the live
-    /// descendant lost Budget Guard coverage for the rest of its life with
-    /// nothing able to notice. One extra RPC removes the divergence rather
-    /// than trying to mirror it.
+    /// This side sends only the difference and untracks only what it tracked.
+    /// Reading the daemon's whole list instead looks tidier and is worse: the
+    /// list is not this app's property — another instance sharing the socket
+    /// is in it — and untracking a pid also resumes it if Budget Guard had it
+    /// stopped, so "reconcile" would reach into a stranger's processes.
+    ///
+    /// The cost is a known gap: when a pid is recycled the daemon drops the
+    /// stale entry (it cannot tell whether the new owner is a descendant of
+    /// this app), while this set still holds the pid, so it is never offered
+    /// again and that process goes unwatched until it exits. A decline is
+    /// repaired — the record is dropped below and the next pass re-sends —
+    /// but a silent drop is not. Closing it needs the daemon to report the
+    /// drop, not this side to guess.
     private func reconcileTrackedPIDs(_ allDescendants: Set<Int32>) {
         let daemon = self.daemon
-        DispatchQueue.global(qos: .utility).async {
-            guard let watched = daemon.trackedPIDs() else { return }
-            for pid in allDescendants.subtracting(watched) {
-                _ = daemon.trackPID(pid)
+
+        let newPIDs = allDescendants.subtracting(trackedPIDs)
+        for pid in newPIDs {
+            trackedPIDs.insert(pid)
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard daemon.trackPID(pid) else {
+                    // Drop the optimistic record so the next pass re-sends.
+                    // Keeping it would make one refusal permanent: this set
+                    // decides what gets sent, and a pid in it never is again.
+                    Task { @MainActor in self?.trackedPIDs.remove(pid) }
+                    return
+                }
             }
-            for pid in watched.subtracting(allDescendants) {
+        }
+
+        let deadPIDs = trackedPIDs.subtracting(allDescendants)
+        for pid in deadPIDs {
+            trackedPIDs.remove(pid)
+            DispatchQueue.global(qos: .utility).async {
                 daemon.untrackPID(pid)
             }
         }
