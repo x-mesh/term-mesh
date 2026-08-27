@@ -31,11 +31,6 @@ DIR_ENV = "TERMMESH_E2E_REMOTE_LEADER_DIR"
 # The exact shape New Project produces for a second project of the same repo.
 UNSPELLABLE_SUFFIX = " 2"
 
-# Progress, not a verdict: the team carries this while the relay is still
-# coming up, so treating it as a failure ends the wait before the leader has
-# had a chance to start.
-PENDING_FAILURE = "Remote leader relay is pending"
-
 # The exact symptom a rejected grant produced, on every leader and worker.
 PANE_FAILURE = "could not open the remote pane"
 
@@ -99,18 +94,14 @@ def main() -> int:
 
         # What this test gates on, and why:
         #
-        # NOT `leader_panel_id`: New Project installs a placeholder anchor pane
-        # before the remote attach runs, so that id exists even when the grant
-        # is about to be rejected — gating on it passed against a deliberately
-        # unfixed build.
+        # NOT `leader_panel_id` on its own: New Project installs a placeholder
+        # anchor pane before the remote attach runs, so that id exists even
+        # when the grant is about to be rejected — gating on it alone passed
+        # against a deliberately unfixed build.
         #
-        # NOT `leader_ready`: peer leaders sample `isRelayStarted` once when the
-        # team record is installed and nothing re-reads it, so a relay that
-        # finishes a moment later leaves the team on "Remote leader relay is
-        # pending" forever. That race is a separate defect.
-        #
-        # The rendered CLI is the observable that only a granted leader can
-        # reach, and PANE_FAILURE is the exact symptom of a rejected one.
+        # A granted leader ends up with all three: no pane failure, a started
+        # relay (`leader_ready`), and its CLI drawn in the pane. A rejected one
+        # reaches none of them and carries PANE_FAILURE within ~2s.
         try:
             def verdict():
                 team = next(
@@ -123,7 +114,7 @@ def main() -> int:
                 if PANE_FAILURE in str(team.get("leader_failure") or ""):
                     return ("rejected", team, "")
                 panel_id = team.get("leader_panel_id")
-                if not panel_id:
+                if not panel_id or not team.get("leader_ready"):
                     return None
                 try:
                     screen = c.read_terminal_text(panel_id)

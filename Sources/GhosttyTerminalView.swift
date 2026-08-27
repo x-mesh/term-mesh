@@ -318,6 +318,14 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// temporarily unattached (surface not yet created / reparenting) even while the panel
     /// is already in the window.
     var isViewInWindow: Bool { hostedView.window != nil }
+    /// Fired when this terminal's view lands in a window.
+    ///
+    /// A remote pane needs an edge here, not a sample. `TerminalPanelView`'s
+    /// `onAppear` can run before `bindRemotePane` assigns `peerPaneSession`,
+    /// in which case its optional chain starts nothing; `bindRemotePane`'s own
+    /// start is skipped when the view has not reached a window yet. Either
+    /// side can be last, so both must be able to arm the relay.
+    var onDidEnterWindow: (() -> Void)?
     let id: UUID
     private(set) var tabId: UUID
     /// Port ordinal for TERMMESH_PORT range assignment
@@ -2802,6 +2810,7 @@ static func focusLog(_ message: String) {
 
         // If the surface creation was deferred while detached, create/attach it now.
         terminalSurface?.attachToView(self)
+        terminalSurface?.onDidEnterWindow?()
 
         windowObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeScreenNotification,
