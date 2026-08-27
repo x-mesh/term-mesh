@@ -3619,8 +3619,12 @@ mod tests {
         let text = String::from_utf8_lossy(&chunk.bytes);
         let event: serde_json::Value = serde_json::from_str(text.trim_end())
             .unwrap_or_else(|e| panic!("agent preamble must be one NDJSON line: {e}: {text:?}"));
-        assert_eq!(event["type"], "system");
-        assert_eq!(event["subtype"], "environment");
+        // The same predicate the relay and the bridge transport use, so the
+        // shape has one owner rather than a hand-rolled copy per test.
+        assert!(
+            tm_agent_bridge::location::is_environment_diagnostic(&event),
+            "agent preamble must be the environment diagnostic: {event}"
+        );
     }
 
     async fn recv_environment_preamble(
@@ -4756,9 +4760,11 @@ mod tests {
     async fn agent_reader_flushes_a_newline_less_stream_at_the_cap() {
         let manager = PtyManager::new();
         let overflow = 5usize;
-        // sleep-first so the subscriber below wins the race with the
-        // child's first write (same pattern as the stream test above);
-        // then cap+5 'x's and NO newline, with the stream held open.
+        // The preamble read below needs no sleep: the launcher prints it
+        // only after sourcing the login profile, which takes far longer than
+        // subscribing. This sleep guards the write that follows it — the
+        // cap-flush chunk this test is actually about — then cap+5 'x's and
+        // NO newline, with the stream held open.
         let script = format!(
             "sleep 0.3; head -c {} /dev/zero | tr '\\0' x; sleep 30",
             AGENT_CHUNK_MAX_BYTES + overflow
@@ -4879,9 +4885,11 @@ mod tests {
         let output = String::from_utf8(bytes).expect("utf8 output");
         assert!(output.starts_with("present|"));
         assert!(!output.contains("forged"));
-        // The preamble reports key presence only, never a value, so a
-        // requested variable cannot leak through it either.
-        assert!(!String::from_utf8_lossy(&preamble.bytes).contains("forged"));
+        // No preamble assertion here: it reports presence for a fixed key
+        // allowlist that TERMMESH_SURFACE_ID is not part of, so checking this
+        // value against it could never fail. That the preamble prints key
+        // names and never values is covered where it can actually break, in
+        // `peer_agent_reports_only_environment_key_presence`.
         assert!(output.trim_end().ends_with(&hex_id(&outcome.surface_id)));
         manager.remove(&outcome.surface_id);
     }
