@@ -344,7 +344,12 @@ enum LeaderTurnLog {
             records.append(record)
         }
         let grouped = Dictionary(grouping: records, by: \.turnID)
-        let starts = records.filter { $0.event == .turnStart }
+        let absorbedTurnIDs = Set(records.compactMap { record in
+            record.event == .turnEnd && record.routeStatus == "absorbed" ? record.turnID : nil
+        })
+        let starts = records.filter {
+            $0.event == .turnStart && !absorbedTurnIDs.contains($0.turnID)
+        }
         let observedDays: Int = {
             let parser = ISO8601DateFormatter()
             let dates = starts.compactMap { parser.date(from: $0.timestamp) }.sorted()

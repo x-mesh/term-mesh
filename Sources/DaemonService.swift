@@ -31,7 +31,10 @@ protocol DaemonService: AnyObject {
     func cleanupAllStaleWorktrees() -> (removed: Int, skippedDirty: Int)
 
     // MARK: - Process Management
-    func trackPID(_ pid: Int32)
+    /// Returns whether the daemon is watching `pid` once the call returns.
+    /// It declines a pid whose process it cannot identify, and a caller that
+    /// records the request as satisfied would never send that pid again.
+    func trackPID(_ pid: Int32) -> Bool
     func untrackPID(_ pid: Int32)
     func stopProcess(pid: Int32) -> Bool
     func resumeProcess(pid: Int32) -> Bool

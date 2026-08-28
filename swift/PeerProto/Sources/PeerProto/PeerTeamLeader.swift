@@ -16,9 +16,23 @@ public enum PeerTeamLeader {
 
     /// Extra methods available only to a project-scoped autonomous leader.
     /// Generic `team.call.v1` peers must not inherit these permissions.
+    ///
+    /// Mirrors `SCOPED_METHODS` in `daemon/peer-proto`; a Rust test parses
+    /// this literal and diffs it, so keep one method per line.
+    ///
     public static let scopedMethods: Set<String> = [
         "team.add_agent",
         "team.send_key",
+        // The leader's own request queue and its delegation level. Bound to
+        // one team by the grant, and gated again by the leader request token
+        // the owning app stages into the leader environment.
+        "team.leader.request.list",
+        "team.leader.request.take",
+        "team.leader.request.complete",
+        "team.delegation.configure",
+        // Named for the task board but answers from the leader-request store,
+        // and gated by the same capability, so it is scoped rather than generic.
+        "team.task.metrics",
     ]
 
     public static func isAllowed(_ method: String) -> Bool {

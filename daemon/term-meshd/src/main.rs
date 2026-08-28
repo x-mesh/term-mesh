@@ -610,8 +610,8 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
         // d. Resume all stopped processes. This one is synchronous, so it
-        // runs on the blocking pool: on the runtime it would ignore its own
-        // limit whenever the executor is the thing that is stuck.
+        // runs on the blocking pool: each resume reads the process table to
+        // confirm identity, and it must not block a runtime worker.
         let monitor = monitor_handle.clone();
         let resumed = shutdown::step(shutdown::STEP_RESUME, RESUME_LIMIT, async move {
             tokio::task::spawn_blocking(move || monitor.resume_all_stopped())
