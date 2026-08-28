@@ -107,7 +107,27 @@ def main() -> int:
                 client.team_create(TEAM_NAME, [])
                 try:
                     env = os.environ.copy()
+                    # Run against the app this bench launched, not the leader's.
+                    # A leader pane exports a remote-leader route; inheriting it
+                    # makes `tm-agent` proxy every call to the leader's host, so
+                    # the numbers came from another machine — or the run failed
+                    # with `noMatchingLeaderSession`, an error name that exists
+                    # nowhere in this tree because a differently-versioned app
+                    # answered.
+                    for leaked in (
+                        "TERMMESH_LEADER_GRANT_ID",
+                        "TERMMESH_LEADER_PROJECT_ID",
+                        "TERMMESH_LEADER_TEAM_UUID",
+                        "TERMMESH_LEADER_EXPIRES_AT",
+                        "TERMMESH_LEADER_PEER_ID",
+                        "TERMMESH_LEADER_ROUTE_FILE",
+                        "TERMMESH_PEER_SOCKET",
+                        "TERMMESH_DAEMON_SOCKET",
+                        "TERMMESH_DAEMON_UNIX_PATH",
+                    ):
+                        env.pop(leaked, None)
                     env["TERMMESH_SOCKET"] = client.socket_path
+                    env["TERMMESH_SOCKET_PATH"] = client.socket_path
                     env["TERMMESH_TEAM"] = TEAM_NAME
                     for agent in AGENTS:
                         add = subprocess.run(
