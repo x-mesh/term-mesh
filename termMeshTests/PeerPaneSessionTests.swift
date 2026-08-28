@@ -555,6 +555,95 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertFalse(staleState.isUpdate, "same display name is not an update identity")
     }
 
+    /// A Mac peer serves workspaces from its GUI socket, which carries no
+    /// project manifest, so the Host axis has to list the session owner's
+    /// manifests itself or the machine that runs a Project shows no sign of it.
+    @MainActor
+    func testHostAxisOffersManifestsTheProjectAxisWouldOffer() {
+        let adoptedUUID = "6D0BB300-6622-418F-97BC-AB81C92AF46B"
+        let adopted = TeamOrchestrator.Team(
+            id: "term-mesh2", leaderSessionId: "leader", leaderMode: "claude",
+            leaderModel: "opus", leaderCli: "claude",
+            leaderPanelId: UUID(), leaderEndpoint: .peer(hostKey: "ssh:mac-sub"),
+            workingDirectory: "/Users/jinwoo", workspaceId: UUID(),
+            agents: [], createdAt: Date(), worktreeMode: "off",
+            teamUuid: adoptedUUID, ownsRemotePresentation: true
+        )
+        let alreadyAdopted = RemoteTeamSummary(
+            name: "term-mesh2", teamUUID: adoptedUUID,
+            workingDirectory: "/Users/jinwoo", projectRootPath: nil,
+            agentNames: [], projectID: "team:\(adoptedUUID)",
+            leaderSurfaceID: Data(repeating: 3, count: 16),
+            presentationRevision: 5, presentationOwnedByRequester: true
+        )
+        let notAdopted = RemoteTeamSummary(
+            name: "term-mesh3", teamUUID: "F5FCE2C8-8B07-42EA-AF87-2727DDAEC90F",
+            workingDirectory: "/Users/jinwoo", projectRootPath: nil,
+            agentNames: [], projectID: "team:F5FCE2C8-8B07-42EA-AF87-2727DDAEC90F",
+            leaderSurfaceID: Data(repeating: 4, count: 16),
+            presentationRevision: 1, presentationOwnedByRequester: true
+        )
+        // A manifest whose leader surface died is not attachable; the daemon
+        // stops reporting it, and a stale copy must not become a dead row.
+        let leaderless = RemoteTeamSummary(
+            name: "term-mesh", teamUUID: "16890533-11D3-4FB9-B1F3-0C77E3341A6E",
+            workingDirectory: "/Users/jinwoo", projectRootPath: nil,
+            agentNames: [], projectID: "team:16890533-11D3-4FB9-B1F3-0C77E3341A6E",
+            leaderSurfaceID: Data(),
+            presentationRevision: 8, presentationOwnedByRequester: true
+        )
+        let teams = [alreadyAdopted, notAdopted, leaderless]
+        let localTeams = ["term-mesh2": adopted]
+
+        let offered = TeamOrchestrator.hostAxisOfferedManifests(
+            isConnected: true, teams: teams, hostKey: "ssh:mac-sub",
+            localTeamForName: { localTeams[$0] }
+        )
+        XCTAssertEqual(offered.map(\.name), ["term-mesh3"])
+
+        XCTAssertTrue(
+            TeamOrchestrator.hostAxisOfferedManifests(
+                isConnected: false, teams: teams, hostKey: "ssh:mac-sub",
+                localTeamForName: { localTeams[$0] }
+            ).isEmpty,
+            "a disconnected host cannot attach anything it last reported"
+        )
+
+        // Both production axes call this helper; pin deterministic ordering so
+        // roster refreshes cannot visually shuffle the same project rows.
+        let second = RemoteTeamSummary(
+            name: "Alpha", teamUUID: "AAAAA2C8-8B07-42EA-AF87-2727DDAEC90F",
+            workingDirectory: "/Users/jinwoo", projectRootPath: nil,
+            agentNames: [], projectID: "team:alpha",
+            leaderSurfaceID: Data(repeating: 5, count: 16),
+            presentationRevision: 1, presentationOwnedByRequester: true
+        )
+        let sorted = TeamOrchestrator.hostAxisOfferedManifests(
+            isConnected: true, teams: [notAdopted, second], hostKey: "ssh:mac-sub",
+            localTeamForName: { localTeams[$0] }
+        )
+        XCTAssertEqual(sorted.map(\.name), ["Alpha", "term-mesh3"])
+    }
+
+    func testRemoteManifestUIKeySeparatesHostsAndProjects() {
+        let first = RemoteTeamSummary(
+            name: "same-name", teamUUID: "one", workingDirectory: "/work",
+            projectRootPath: nil, agentNames: [], projectID: "project-one"
+        )
+        let second = RemoteTeamSummary(
+            name: "same-name", teamUUID: "two", workingDirectory: "/work",
+            projectRootPath: nil, agentNames: [], projectID: "project-two"
+        )
+        XCTAssertNotEqual(
+            TeamOrchestrator.sidebarRemoteManifestKey(hostID: "host-a", team: first),
+            TeamOrchestrator.sidebarRemoteManifestKey(hostID: "host-b", team: first)
+        )
+        XCTAssertNotEqual(
+            TeamOrchestrator.sidebarRemoteManifestKey(hostID: "host-a", team: first),
+            TeamOrchestrator.sidebarRemoteManifestKey(hostID: "host-a", team: second)
+        )
+    }
+
     @MainActor
     func testAutomaticRestoreChoosesExactLatestOwnedLeaderRecord() {
         let oldID = Data(repeating: 0x11, count: 16)
