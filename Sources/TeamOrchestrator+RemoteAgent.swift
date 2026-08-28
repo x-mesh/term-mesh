@@ -742,7 +742,22 @@ extension TeamOrchestrator {
                 remote: team,
                 hostKey: hostKey
             ).shouldOffer
+        }.sorted { lhs, rhs in
+            let order = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+            if order != .orderedSame { return order == .orderedAscending }
+            return sidebarRemoteManifestKey(hostID: hostKey, team: lhs)
+                < sidebarRemoteManifestKey(hostID: hostKey, team: rhs)
         }
+    }
+
+    /// Team names are presentation copy and can repeat across hosts. Project
+    /// identity plus host identity is stable for restore state and automation.
+    nonisolated static func sidebarRemoteManifestKey(
+        hostID: String, team: RemoteTeamSummary
+    ) -> String {
+        let projectIdentity = team.projectID.isEmpty ? team.id : team.projectID
+        return Data(hostID.utf8).base64EncodedString() + "."
+            + Data(projectIdentity.utf8).base64EncodedString()
     }
 
     /// Pick the one daemon manifest this installation may restore without a

@@ -609,15 +609,39 @@ final class PeerPaneSessionTests: XCTestCase {
             "a disconnected host cannot attach anything it last reported"
         )
 
-        // The two axes must not disagree about what exists on one machine.
-        let projectAxis = teams.filter { team in
-            !team.leaderSurfaceID.isEmpty
-                && TeamOrchestrator.sidebarRemoteManifestState(
-                    localTeam: localTeams[team.name],
-                    remote: team, hostKey: "ssh:mac-sub"
-                ).shouldOffer
-        }
-        XCTAssertEqual(offered.map(\.id), projectAxis.map(\.id))
+        // Both production axes call this helper; pin deterministic ordering so
+        // roster refreshes cannot visually shuffle the same project rows.
+        let second = RemoteTeamSummary(
+            name: "Alpha", teamUUID: "AAAAA2C8-8B07-42EA-AF87-2727DDAEC90F",
+            workingDirectory: "/Users/jinwoo", projectRootPath: nil,
+            agentNames: [], projectID: "team:alpha",
+            leaderSurfaceID: Data(repeating: 5, count: 16),
+            presentationRevision: 1, presentationOwnedByRequester: true
+        )
+        let sorted = TeamOrchestrator.hostAxisOfferedManifests(
+            isConnected: true, teams: [notAdopted, second], hostKey: "ssh:mac-sub",
+            localTeamForName: { localTeams[$0] }
+        )
+        XCTAssertEqual(sorted.map(\.name), ["Alpha", "term-mesh3"])
+    }
+
+    func testRemoteManifestUIKeySeparatesHostsAndProjects() {
+        let first = RemoteTeamSummary(
+            name: "same-name", teamUUID: "one", workingDirectory: "/work",
+            projectRootPath: nil, agentNames: [], projectID: "project-one"
+        )
+        let second = RemoteTeamSummary(
+            name: "same-name", teamUUID: "two", workingDirectory: "/work",
+            projectRootPath: nil, agentNames: [], projectID: "project-two"
+        )
+        XCTAssertNotEqual(
+            TeamOrchestrator.sidebarRemoteManifestKey(hostID: "host-a", team: first),
+            TeamOrchestrator.sidebarRemoteManifestKey(hostID: "host-b", team: first)
+        )
+        XCTAssertNotEqual(
+            TeamOrchestrator.sidebarRemoteManifestKey(hostID: "host-a", team: first),
+            TeamOrchestrator.sidebarRemoteManifestKey(hostID: "host-a", team: second)
+        )
     }
 
     @MainActor
