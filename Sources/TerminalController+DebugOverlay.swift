@@ -427,15 +427,19 @@ extension TerminalController {
         var result = "ERROR: No window"
         let completed = v2MainExec {
             guard let window = self.debugMainTerminalWindow(),
-                  let contentView = window.contentView,
-                  let themeFrame = contentView.superview else { return }
+                  let tabManager = self.tabManager,
+                  let tabID = tabManager.selectedTabId,
+                  let workspace = tabManager.tabs.first(where: { $0.id == tabID }) else { return }
 
-            // Convert normalized top-left coordinates into a window point.
-            let pointInTheme = NSPoint(
-                x: contentView.frame.minX + (contentView.bounds.width * nx),
-                y: contentView.frame.maxY - (contentView.bounds.height * ny)
+            // The contract is normalized terminal-container coordinates, not
+            // whole-window content coordinates. The latter includes the
+            // sidebar and can place x=0.75 past a visible right-hand terminal.
+            let container = workspace.bonsplitController.layoutSnapshot().containerFrame
+            guard container.width > 0, container.height > 0 else { return }
+            let windowPoint = NSPoint(
+                x: container.x + (container.width * nx),
+                y: container.y + container.height - (container.height * ny)
             )
-            let windowPoint = themeFrame.convert(pointInTheme, to: nil)
 
             if let overlay = objc_getAssociatedObject(window, &fileDropOverlayKey) as? FileDropOverlayView,
                let terminal = overlay.terminalUnderPoint(windowPoint),
