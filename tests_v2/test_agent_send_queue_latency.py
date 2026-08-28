@@ -70,7 +70,7 @@ QUEUE_CEILING_MS = 1500.0
 # records, on its own clock, the moment each `turn/start` arrived on stdin and
 # the moment it finished. Written to a trace file the test reads afterwards, so
 # no measurement crosses a process boundary or depends on the app.
-# NOTE the two `%s` placeholders: the fake agent is spawned by the APP through
+# NOTE the two `%r` placeholders: the fake agent is spawned by the APP through
 # the bridge, not by this test process, so it inherits none of this process's
 # environment. The trace path and turn length are therefore baked into the
 # script text rather than passed as env vars.
@@ -244,6 +244,8 @@ def main() -> int:
                         "TERMMESH_LEADER_PEER_ID",
                         "TERMMESH_LEADER_ROUTE_FILE",
                         "TERMMESH_PEER_SOCKET",
+                        "TERMMESH_DAEMON_SOCKET",
+                        "TERMMESH_DAEMON_UNIX_PATH",
                     ):
                         env.pop(leaked, None)
                     env["TERMMESH_SOCKET"] = client.socket_path

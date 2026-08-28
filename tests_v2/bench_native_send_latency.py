@@ -122,6 +122,8 @@ def main() -> int:
                         "TERMMESH_LEADER_PEER_ID",
                         "TERMMESH_LEADER_ROUTE_FILE",
                         "TERMMESH_PEER_SOCKET",
+                        "TERMMESH_DAEMON_SOCKET",
+                        "TERMMESH_DAEMON_UNIX_PATH",
                     ):
                         env.pop(leaked, None)
                     env["TERMMESH_SOCKET"] = client.socket_path

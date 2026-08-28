@@ -9049,7 +9049,7 @@ final class TeamOrchestrator: ObservableObject {
         // path — a behavior change, not a measurement correction.
         let recordedElsewhere = teams.values.filter { team in
             guard case .peer = team.leaderEndpoint else { return false }
-            return Self.supportsLeaderTurnMeasurement(cli: team.leaderMode)
+            return team.leaderMeasurementCapability == .supported
         }.count
         return [
             "records_scope": "this_host",

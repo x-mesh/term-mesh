@@ -61,6 +61,36 @@ LOG_FILE="$LOG_DIR/turns.log"
 STATE_KEY="$(printf '%s' "$SURFACE_ID" | tr -cd 'A-Za-z0-9._-' 2>/dev/null || true)"
 [ -n "$STATE_KEY" ] || STATE_KEY=unknown
 STATE_FILE="$LOG_DIR/.turn-current-$STATE_KEY"
+STATE_LOCK="$STATE_FILE.lock"
+STATE_LOCK_HELD=0
+
+release_state_lock() {
+    if [ "$STATE_LOCK_HELD" -eq 1 ]; then
+        rm -rf "$STATE_LOCK" 2>/dev/null || true
+        STATE_LOCK_HELD=0
+    fi
+}
+
+acquire_state_lock() {
+    _lock_attempt=0
+    while [ "$_lock_attempt" -lt 100 ]; do
+        if mkdir "$STATE_LOCK" 2>/dev/null; then
+            printf '%s\n' "$$" > "$STATE_LOCK/pid" 2>/dev/null || true
+            STATE_LOCK_HELD=1
+            return 0
+        fi
+        _lock_pid="$(cat "$STATE_LOCK/pid" 2>/dev/null || true)"
+        if [ -n "$_lock_pid" ] && ! kill -0 "$_lock_pid" 2>/dev/null; then
+            rm -rf "$STATE_LOCK" 2>/dev/null || true
+            continue
+        fi
+        _lock_attempt=$((_lock_attempt + 1))
+        sleep 0.01
+    done
+    return 1
+}
+
+trap release_state_lock EXIT HUP INT TERM
 
 mkdir -p "$LOG_DIR" 2>/dev/null || exit 0
 # The sink holds prompt digests and byte counts, never content, but a digest
@@ -181,61 +211,93 @@ sys.stdout.buffer.write(prompt.encode("utf-8"))
     # able from a turn the leader never reported a route for. Appending instead,
     # and popping the last line at end, keeps turns matched under overlap.
     # Failure stays silent, including the redirection's own stderr.
-    { printf '%s\n' "$TURN_ID" >> "$STATE_FILE"; } 2>/dev/null || true
+    if acquire_state_lock; then
+        { printf '%s\n' "$TURN_ID" >> "$STATE_FILE"; } 2>/dev/null || true
+        release_state_lock
+    fi
 else
-    if [ -f "$STATE_FILE" ]; then
+    if acquire_state_lock && [ -f "$STATE_FILE" ]; then
         # Which entry does this Stop close? LIFO alone is wrong whenever the
         # harness folds a mid-turn prompt into the turn already running: that
         # produces two UserPromptSubmit events and ONE Stop, so popping the
         # newest entry closes the absorbed prompt and strands the entry that
         # actually stated a route. The stranded entry can never be closed —
         # every later Stop pops a newer line — so it stays start+route with no
-        # end, which `health()` counts in no outcome cohort at all and can
-        # never link. That inverts the measurement: the turn that reported a
-        # route reads as incomplete while the one that did not reads as
-        # `unstated`.
+        # end, so the routed turn remains stated but can never link. That
+        # inverts the linkage measurement: the turn that reported a route
+        # reads as incomplete while the absorbed prompt reads as `unstated`.
         #
-        # Prefer the newest entry that owns a route marker, since a stated
-        # route is durable evidence that the leader classified that turn and is
-        # the pairing worth preserving. With no marker anywhere, fall back to
-        # plain LIFO (the innermost turn ends first). An empty stack leaves
+        # Prefer the oldest entry that owns a route marker, since a stated
+        # route is durable evidence that the leader classified that running
+        # turn. With no marker, close the oldest entry: later starts were
+        # prompts absorbed into it and do not get their own Stop. An empty stack leaves
         # TURN_ID as "unknown" rather than dropping the record — a turn_end we
         # cannot attribute is still evidence that a turn ended.
         _turn_popped=""
         _turn_marked=""
+        _turn_index=0
+        _turn_popped_index=0
+        _turn_marked_index=0
         while IFS= read -r _turn_line; do
             [ -n "$_turn_line" ] || continue
-            _turn_line_key="$(printf '%s' "$_turn_line" | tr -cd 'A-Za-z0-9._-' 2>/dev/null || true)"
-            if [ -n "$_turn_line_key" ] && [ -f "$LOG_DIR/.turn-route-$_turn_line_key" ]; then
+            _turn_index=$((_turn_index + 1))
+            case "$_turn_line" in
+                *[!A-Za-z0-9._-]*) _turn_line_key="" ;;
+                *) _turn_line_key=$_turn_line ;;
+            esac
+            if [ -z "$_turn_marked" ] && [ -n "$_turn_line_key" ] && [ -f "$LOG_DIR/.turn-route-$_turn_line_key" ]; then
                 _turn_marked="$_turn_line"
+                _turn_marked_index=$_turn_index
             fi
-            _turn_popped="$_turn_line"
-        done < "$STATE_FILE"
-        [ -n "$_turn_marked" ] && _turn_popped="$_turn_marked"
+            if [ -z "$_turn_popped" ]; then
+                _turn_popped="$_turn_line"
+                _turn_popped_index=$_turn_index
+            fi
+        done < "$STATE_FILE" 2>/dev/null
+        if [ -n "$_turn_marked" ]; then
+            _turn_popped="$_turn_marked"
+            _turn_popped_index=$_turn_marked_index
+        fi
         [ -n "$_turn_popped" ] && TURN_ID="$_turn_popped"
         # Remove only the chosen entry, keeping every other line and its order.
         # Deleting the last line unconditionally would drop a still-open turn
         # whenever the marked entry was not the newest one.
         if [ -n "$_turn_popped" ]; then
+            _turn_absorbed=""
+            rm -f "$STATE_FILE.absorbed.$$" 2>/dev/null || true
             _turn_rest="$(
-                _turn_dropped=0
+                _turn_index=0
                 while IFS= read -r _turn_line; do
-                    if [ "$_turn_dropped" -eq 0 ] && [ "$_turn_line" = "$_turn_popped" ]; then
-                        _turn_dropped=1
+                    [ -n "$_turn_line" ] || continue
+                    _turn_index=$((_turn_index + 1))
+                    if [ "$_turn_index" -eq "$_turn_popped_index" ]; then
+                        continue
+                    fi
+                    if [ "$_turn_index" -gt "$_turn_popped_index" ]; then
+                        printf '%s\n' "$_turn_line" >> "$STATE_FILE.absorbed.$$"
                         continue
                     fi
                     printf '%s\n' "$_turn_line"
-                done < "$STATE_FILE"
+                done < "$STATE_FILE" 2>/dev/null
             )"
+            _turn_absorbed="$(cat "$STATE_FILE.absorbed.$$" 2>/dev/null || true)"
+            rm -f "$STATE_FILE.absorbed.$$" 2>/dev/null || true
         else
+            _turn_absorbed=""
             _turn_rest=""
         fi
         if [ -n "$_turn_rest" ]; then
-            { printf '%s\n' "$_turn_rest" > "$STATE_FILE"; } 2>/dev/null || true
+            _turn_state_tmp="$STATE_FILE.tmp.$$"
+            if { printf '%s\n' "$_turn_rest" > "$_turn_state_tmp"; } 2>/dev/null; then
+                mv -f "$_turn_state_tmp" "$STATE_FILE" 2>/dev/null || true
+            else
+                rm -f "$_turn_state_tmp" 2>/dev/null || true
+            fi
         else
             rm -f "$STATE_FILE" 2>/dev/null || true
         fi
     fi
+    release_state_lock
 fi
 
 # A route command creates this short-lived marker after it appends its own
@@ -254,6 +316,19 @@ fi
 
 TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
 [ -n "$TS" ] || TS=unknown
+
+# Entries newer than the routed turn were prompts absorbed into that running
+# turn. Record and remove them explicitly so health metrics do not count them
+# as independent turns that can never acquire a route or Stop.
+if [ "$MODE" = --end ] && [ -n "${_turn_absorbed:-}" ]; then
+    while IFS= read -r _turn_absorbed_id; do
+        [ -n "$_turn_absorbed_id" ] || continue
+        _turn_absorbed_line="{\"event\":\"turn_end\",\"turn_id\":$(json_string "$_turn_absorbed_id"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":\"absorbed\"}"
+        { printf '%s\n' "$_turn_absorbed_line" >> "$LOG_FILE"; } 2>/dev/null || true
+    done <<EOF
+$_turn_absorbed
+EOF
+fi
 
 if [ "$MODE" = --start ]; then
     LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"prompt_bytes\":$PROMPT_BYTES,\"prompt_sha256\":$(json_string "$PROMPT_SHA")}"
