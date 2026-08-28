@@ -3609,6 +3609,35 @@ mod tests {
     /// stand-in for a bridge: the daemon owns executable+args verbatim, so
     /// a shell that prints NDJSON-shaped lines exercises exactly the same
     /// spawn/reader path a real `tm-agent-bridge` would.
+    /// Every agent surface opens with the launcher's environment event —
+    /// one NDJSON line — before the child's own output. Tests that assert on
+    /// that output have to step past it, and checking the shape here keeps
+    /// them honest about what they are stepping past. Only the envelope is
+    /// asserted: the contents are host specific (which shell, which keys are
+    /// present), so pinning them would fail on someone else's machine.
+    fn assert_environment_preamble(chunk: &PtyChunk) {
+        let text = String::from_utf8_lossy(&chunk.bytes);
+        let event: serde_json::Value = serde_json::from_str(text.trim_end())
+            .unwrap_or_else(|e| panic!("agent preamble must be one NDJSON line: {e}: {text:?}"));
+        // The same predicate the relay and the bridge transport use, so the
+        // shape has one owner rather than a hand-rolled copy per test.
+        assert!(
+            tm_agent_bridge::location::is_environment_diagnostic(&event),
+            "agent preamble must be the environment diagnostic: {event}"
+        );
+    }
+
+    async fn recv_environment_preamble(
+        rx: &mut tokio::sync::broadcast::Receiver<PtyChunk>,
+    ) -> PtyChunk {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("environment preamble within timeout")
+            .expect("agent broadcast open");
+        assert_environment_preamble(&chunk);
+        chunk
+    }
+
     fn agent_ensure_spec(script: &str) -> SurfaceSpec {
         SurfaceSpec {
             cwd: "/tmp".into(),
@@ -4519,6 +4548,7 @@ mod tests {
         let surface = outcome.surface.clone();
         assert_eq!(surface.kind(), SurfaceKind::Agent);
         let mut rx = surface.subscribe();
+        let preamble = recv_environment_preamble(&mut rx).await;
 
         let expected: [&[u8]; 3] = [
             b"{\"type\":\"assistant\"}\n",
@@ -4541,8 +4571,9 @@ mod tests {
             received.push(chunk);
         }
 
-        // Chunk boundaries == line boundaries, and seqs tile the stream.
-        let mut expected_seq = 0u64;
+        // Chunk boundaries == line boundaries, and seqs tile the stream
+        // from where the preamble left off.
+        let mut expected_seq = preamble.bytes.len() as u64;
         for chunk in &received {
             assert_eq!(chunk.seq, expected_seq);
             expected_seq += chunk.bytes.len() as u64;
@@ -4552,7 +4583,14 @@ mod tests {
         // The replay ring holds the same line-aligned chunks (push happens
         // before the broadcast send, so having received them proves the
         // ring is complete).
-        assert_eq!(surface.replay_snapshot(), received);
+        let ring = surface.replay_snapshot();
+        assert_eq!(
+            ring.len(),
+            received.len() + 1,
+            "the ring holds the preamble and then one chunk per line"
+        );
+        assert_environment_preamble(&ring[0]);
+        assert_eq!(&ring[1..], received.as_slice());
 
         // Reported identity: agent surface, its CLI, no grid.
         let info = surface.info();
@@ -4597,6 +4635,7 @@ mod tests {
             .expect("ensure agent surface");
         let surface = outcome.surface.clone();
         let mut rx = surface.subscribe();
+        let preamble = recv_environment_preamble(&mut rx).await;
 
         let total = line_len + 1;
         let mut received: Vec<PtyChunk> = Vec::new();
@@ -4635,7 +4674,7 @@ mod tests {
         }
         // Byte-transparent: seqs tile the stream and reassembly restores
         // the original line, newline only on the final piece.
-        let mut expected_seq = 0u64;
+        let mut expected_seq = preamble.bytes.len() as u64;
         let mut reassembled = Vec::new();
         for chunk in &received {
             assert_eq!(chunk.seq, expected_seq);
@@ -4649,7 +4688,10 @@ mod tests {
         assert!(!received[0].bytes.ends_with(b"\n"));
         // The ring holds the same bounded chunks — a reattach replays
         // legal frames, not the killer.
-        assert_eq!(surface.replay_snapshot(), received);
+        let ring = surface.replay_snapshot();
+        assert_eq!(ring.len(), received.len() + 1, "preamble plus the split chunks");
+        assert_environment_preamble(&ring[0]);
+        assert_eq!(&ring[1..], received.as_slice());
 
         manager.remove(&outcome.surface_id);
     }
@@ -4687,17 +4729,23 @@ mod tests {
         let expected_second = b"tail-no-newline\n".to_vec();
 
         let replay = surface.replay_snapshot();
-        assert_eq!(replay.len(), 2, "one chunk per line, EOF tail included");
         assert_eq!(
-            replay[0].bytes, expected_first,
+            replay.len(),
+            3,
+            "environment preamble, one chunk per line, EOF tail included"
+        );
+        assert_environment_preamble(&replay[0]);
+        let preamble_len = replay[0].bytes.len() as u64;
+        assert_eq!(
+            replay[1].bytes, expected_first,
             "non-UTF-8 bytes must pass through undecoded and unmangled"
         );
         assert_eq!(
-            replay[1].bytes, expected_second,
+            replay[2].bytes, expected_second,
             "the EOF partial must arrive newline-terminated"
         );
-        assert_eq!(replay[0].seq, 0);
-        assert_eq!(replay[1].seq, expected_first.len() as u64);
+        assert_eq!(replay[1].seq, preamble_len);
+        assert_eq!(replay[2].seq, preamble_len + expected_first.len() as u64);
 
         manager.remove(&outcome.surface_id);
     }
@@ -4712,9 +4760,11 @@ mod tests {
     async fn agent_reader_flushes_a_newline_less_stream_at_the_cap() {
         let manager = PtyManager::new();
         let overflow = 5usize;
-        // sleep-first so the subscriber below wins the race with the
-        // child's first write (same pattern as the stream test above);
-        // then cap+5 'x's and NO newline, with the stream held open.
+        // The preamble read below needs no sleep: the launcher prints it
+        // only after sourcing the login profile, which takes far longer than
+        // subscribing. This sleep guards the write that follows it — the
+        // cap-flush chunk this test is actually about — then cap+5 'x's and
+        // NO newline, with the stream held open.
         let script = format!(
             "sleep 0.3; head -c {} /dev/zero | tr '\\0' x; sleep 30",
             AGENT_CHUNK_MAX_BYTES + overflow
@@ -4724,12 +4774,13 @@ mod tests {
             .expect("ensure agent surface");
         let surface = outcome.surface.clone();
         let mut rx = surface.subscribe();
+        let preamble = recv_environment_preamble(&mut rx).await;
 
         let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
             .await
             .expect("bounded flush must not wait for a newline")
             .expect("agent broadcast open");
-        assert_eq!(chunk.seq, 0);
+        assert_eq!(chunk.seq, preamble.bytes.len() as u64);
         assert_eq!(
             chunk.bytes.len(),
             AGENT_CHUNK_MAX_BYTES,
@@ -4742,7 +4793,10 @@ mod tests {
         );
         // The sub-cap remainder stays pending in the reader — bounded,
         // not emitted: no newline has arrived and neither has EOF.
-        assert_eq!(surface.current_byte_seq(), AGENT_CHUNK_MAX_BYTES as u64);
+        assert_eq!(
+            surface.current_byte_seq(),
+            preamble.bytes.len() as u64 + AGENT_CHUNK_MAX_BYTES as u64
+        );
 
         manager.remove(&outcome.surface_id);
     }
@@ -4766,6 +4820,7 @@ mod tests {
             .expect("ensure agent cat");
         let surface = outcome.surface.clone();
         let mut rx = surface.subscribe();
+        recv_environment_preamble(&mut rx).await;
 
         let turn = b"{\"type\":\"user\",\"text\":\"ping\"}\n";
         surface.write_all(turn).expect("write turn input");
@@ -4823,14 +4878,18 @@ mod tests {
         })
         .await
         .expect("agent exits");
-        let bytes: Vec<u8> = surface
-            .replay_snapshot()
-            .into_iter()
-            .flat_map(|chunk| chunk.bytes)
-            .collect();
+        let ring = surface.replay_snapshot();
+        let (preamble, rest) = ring.split_first().expect("agent output");
+        assert_environment_preamble(preamble);
+        let bytes: Vec<u8> = rest.iter().flat_map(|chunk| chunk.bytes.clone()).collect();
         let output = String::from_utf8(bytes).expect("utf8 output");
         assert!(output.starts_with("present|"));
         assert!(!output.contains("forged"));
+        // No preamble assertion here: it reports presence for a fixed key
+        // allowlist that TERMMESH_SURFACE_ID is not part of, so checking this
+        // value against it could never fail. That the preamble prints key
+        // names and never values is covered where it can actually break, in
+        // `peer_agent_reports_only_environment_key_presence`.
         assert!(output.trim_end().ends_with(&hex_id(&outcome.surface_id)));
         manager.remove(&outcome.surface_id);
     }

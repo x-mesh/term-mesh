@@ -172,7 +172,39 @@ pub mod team_leader {
     pub const MAX_BOOTSTRAP_PAYLOAD_BYTES: usize = 512;
     /// Extra methods available only through a project-bound leader grant.
     /// Generic `team.call.v1` must continue to reject these scoped operations.
-    pub const SCOPED_METHODS: &[&str] = &["team.add_agent", "team.send_key"];
+    ///
+    /// Keep in lockstep with `PeerTeamLeader.scopedMethods` in Swift and with
+    /// the CLI's `remote_leader_method_allowed`; two tests in
+    /// `term-meshd::peer::connection` parse those sources and diff them
+    /// against this list, because a leader that is allowed to send what no
+    /// owner accepts fails at the far end with nothing to point at.
+    ///
+    /// Two different rules live here, and they are not interchangeable.
+    ///
+    /// The leader-request family, the delegation level and the metrics read
+    /// each demand a second bearer beyond the grant —
+    /// `TERMMESH_LEADER_REQUEST_TOKEN`, staged into the leader's environment
+    /// by the owning app and checked by their handlers.
+    ///
+    /// `team.add_agent` and `team.send_key` check no such token: the grant
+    /// alone admits them, and what keeps them safe is that the owning app
+    /// rewrites the placement (`scopedLeaderParameters`) so the caller cannot
+    /// choose a machine or a directory. Nothing enforces either rule from
+    /// this list, so do not read membership as evidence of a token check.
+    ///
+    /// `team.task.metrics` is named for the task board but answers from the
+    /// leader-request store, which is why it belongs here and not in the
+    /// generic list: it was admitted only after its handler started demanding
+    /// the same capability its siblings do.
+    pub const SCOPED_METHODS: &[&str] = &[
+        "team.add_agent",
+        "team.send_key",
+        "team.leader.request.list",
+        "team.leader.request.take",
+        "team.leader.request.complete",
+        "team.delegation.configure",
+        "team.task.metrics",
+    ];
 
     pub fn scoped_method_allowed(method: &str) -> bool {
         SCOPED_METHODS.contains(&method)
@@ -470,6 +502,14 @@ mod team_leader_tests {
     fn only_leader_specific_input_methods_are_scoped_beyond_generic_team_calls() {
         assert!(scoped_method_allowed("team.add_agent"));
         assert!(scoped_method_allowed("team.send_key"));
+        // The leader's own request queue and its delegation level: bound to
+        // one team by the grant and gated again by the leader request token.
+        assert!(scoped_method_allowed("team.leader.request.list"));
+        assert!(scoped_method_allowed("team.leader.request.take"));
+        assert!(scoped_method_allowed("team.leader.request.complete"));
+        assert!(scoped_method_allowed("team.delegation.configure"));
+        // Reads the leader-request store, so it is scoped rather than generic.
+        assert!(scoped_method_allowed("team.task.metrics"));
         for method in [
             "team.create",
             "team.destroy",

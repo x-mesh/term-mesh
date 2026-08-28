@@ -224,9 +224,9 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     private var uiFetchInFlight = false
     private var uiFetchGeneration = 0
     private var trackingTimer: Timer?
+    private var trackedPIDs: Set<Int32> = []
     private var trackingSyncInFlight = false
     private var alertPollInFlight = false
-    private var trackedPIDs: Set<Int32> = []
     private var messageHandler: DashboardMessageHandler?
 
     /// Project roots currently being watched — keyed by tab ID to avoid duplicates.
@@ -706,14 +706,34 @@ final class DashboardController: NSObject, WKNavigationDelegate {
     }
 
     /// Reconcile tracked PIDs with discovered descendants. Must be called on @MainActor.
+    ///
+    /// This side sends only the difference and untracks only what it tracked.
+    /// Reading the daemon's whole list instead looks tidier and is worse: the
+    /// list is not this app's property — another instance sharing the socket
+    /// is in it — and untracking a pid also resumes it if Budget Guard had it
+    /// stopped, so "reconcile" would reach into a stranger's processes.
+    ///
+    /// The cost is a known gap: when a pid is recycled the daemon drops the
+    /// stale entry (it cannot tell whether the new owner is a descendant of
+    /// this app), while this set still holds the pid, so it is never offered
+    /// again and that process goes unwatched until it exits. A decline is
+    /// repaired — the record is dropped below and the next pass re-sends —
+    /// but a silent drop is not. Closing it needs the daemon to report the
+    /// drop, not this side to guess.
     private func reconcileTrackedPIDs(_ allDescendants: Set<Int32>) {
         let daemon = self.daemon
 
         let newPIDs = allDescendants.subtracting(trackedPIDs)
         for pid in newPIDs {
             trackedPIDs.insert(pid)
-            DispatchQueue.global(qos: .utility).async {
-                daemon.trackPID(pid)
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard daemon.trackPID(pid) else {
+                    // Drop the optimistic record so the next pass re-sends.
+                    // Keeping it would make one refusal permanent: this set
+                    // decides what gets sent, and a pid in it never is again.
+                    Task { @MainActor in self?.trackedPIDs.remove(pid) }
+                    return
+                }
             }
         }
 

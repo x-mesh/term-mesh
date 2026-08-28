@@ -3973,6 +3973,120 @@ mod team_call_allow_list_tests {
         assert_eq!(mirrored, rust, "Swift and Rust allow-lists diverged");
     }
 
+    /// Every method a leader may send has to reach a handler at the owner.
+    ///
+    /// The other tests in this module diff one allow-list against another.
+    /// None of them can see whether the app answers, which is how a method
+    /// got allow-listed on all three sides and still died at the far end as
+    /// `unknown_method` — the exact failure this family exists to prevent.
+    #[test]
+    fn every_leader_method_reaches_an_owner_side_handler() {
+        let swift = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../Sources/TerminalController.swift");
+        let source = std::fs::read_to_string(&swift)
+            .unwrap_or_else(|e| panic!("read {}: {e}", swift.display()));
+
+        fn quoted(body: &str) -> Vec<String> {
+            body.lines()
+                .map(str::trim)
+                .filter(|line| !line.starts_with("//"))
+                .filter_map(|line| {
+                    let start = line.find('"')? + 1;
+                    let end = start + line[start..].find('"')?;
+                    Some(line[start..end].to_string())
+                })
+                .collect()
+        }
+
+        fn case_labels(body: &str) -> Vec<String> {
+            body.lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("case \""))
+                .flat_map(quoted)
+                .collect()
+        }
+        fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("{start} not found"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("end of {start} not found"))
+                .0
+        }
+
+        // `teamDataCommands` only decides the ROUTE (TerminalController's
+        // `peerTeamCommandAsync`); the handlers are a separate switch in
+        // `dispatchTeamDataCommandDirect`. Reading the set alone would call a
+        // method served when it is merely routed to a switch that drops it,
+        // so both halves are read and required to agree.
+        let data_set = quoted(section(
+            &source,
+            "static let teamDataCommands",
+            "\n    ]",
+        ));
+        let data_cases = case_labels(section(
+            &source,
+            "private func dispatchTeamDataCommandDirect",
+            "\n    }",
+        ));
+        let ui_cases = case_labels(section(
+            &source,
+            "private func processTeamUICommandAsync",
+            "\n    }",
+        ));
+
+        let mut routed = data_set.clone();
+        routed.sort();
+        let mut handled = data_cases.clone();
+        handled.sort();
+        assert_eq!(
+            routed, handled,
+            "teamDataCommands and dispatchTeamDataCommandDirect disagree: a \
+             method routed to the data path with no case there is dropped"
+        );
+
+        let mut served = data_cases;
+        served.extend(ui_cases);
+        assert!(
+            served.len() > 20,
+            "parsed too little out of the dispatchers: {served:?}"
+        );
+
+        // Allow-listed with no handler in the Swift app. The two are not the
+        // same shape of hole:
+        //
+        // `team.task.diff` already works when the owner is a headless daemon
+        // — `run_headless_team_call` serves it above — and it has live
+        // senders (`ReviewBoardCoordinatorService` and this crate's peer
+        // server), so only an app-owned project answers unknown_method. Its
+        // fix is an app handler mirroring the headless one.
+        //
+        // `team.reports` has no sender anywhere; it is allow-listed surface
+        // nothing calls yet.
+        //
+        // Both are named so this guard stays live. Remove an entry the moment
+        // its handler lands.
+        const UNIMPLEMENTED: &[&str] = &["team.reports", "team.task.diff"];
+
+        let mut missing: Vec<&str> = TEAM_CALL_ALLOWED_METHODS
+            .iter()
+            .copied()
+            .chain(peer_proto::team_leader::SCOPED_METHODS.iter().copied())
+            .filter(|method| *method != "team.list")
+            .filter(|method| !served.iter().any(|s| s == method))
+            .collect();
+        missing.sort();
+        missing.dedup();
+        let mut known: Vec<&str> = UNIMPLEMENTED.to_vec();
+        known.sort();
+        assert_eq!(
+            missing, known,
+            "a leader-callable method has no handler at the owner (or a listed \
+             exception was implemented and should be removed from UNIMPLEMENTED)"
+        );
+    }
+
     #[test]
     fn swift_and_rust_scoped_leader_allow_lists_match() {
         let swift = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3989,8 +4103,15 @@ mod team_call_allow_list_tests {
 
         let mut mirrored: Vec<String> = body
             .lines()
+            // Drop the rationale comments; only the quoted names are the list.
+            // Without this the parser would read a method name out of any
+            // comment that happens to quote one, and the only thing keeping
+            // that from happening would be a note asking humans not to.
             .filter_map(|line| {
                 let line = line.trim();
+                if line.starts_with("//") {
+                    return None;
+                }
                 let start = line.find('\"')? + 1;
                 let end = start + line[start..].find('\"')?;
                 Some(line[start..end].to_string())
@@ -4045,22 +4166,29 @@ mod team_call_allow_list_tests {
             .0;
         let mut cli_methods: Vec<&str> = body
             .lines()
+            // Same reason as the Swift mirror above: the match arm carries
+            // rationale comments, and a quoted method name inside one is not
+            // a list entry.
             .filter_map(|line| {
+                let line = line.trim();
+                if line.starts_with("//") {
+                    return None;
+                }
                 let start = line.find('\"')? + 1;
                 let end = start + line[start..].find('\"')?;
                 Some(&line[start..end])
             })
             .collect();
+        // Only the generic half is compared. The CLI no longer spells the
+        // grant-scoped methods out at all — `remote_leader_method_allowed`
+        // ORs in `peer_proto::team_leader::scoped_method_allowed`, so that
+        // half cannot drift by construction and there is nothing here to
+        // diff it against.
         let mut daemon_methods: Vec<&str> = TEAM_CALL_ALLOWED_METHODS
             .iter()
             .copied()
             .filter(|method| *method != "team.list")
             .collect();
-        // A remote leader is bound to one project/team by its grant. It may
-        // ask that project to add a member, while generic team.call.v1 peers
-        // remain unable to spawn anything. The Swift owner overwrites the
-        // requested host and directory from the granted project's placement.
-        daemon_methods.extend(peer_proto::team_leader::SCOPED_METHODS.iter().copied());
         cli_methods.sort();
         daemon_methods.sort();
 

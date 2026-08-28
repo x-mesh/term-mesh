@@ -586,8 +586,13 @@ async fn main() -> anyhow::Result<()> {
         }
         tracing::info!("agent sessions terminated");
 
-        // c. Resume all stopped processes
-        let resumed = monitor_handle.resume_all_stopped();
+        // c. Resume all stopped processes. Offloaded for the same reason as
+        // `terminate_all` above: each resume now reads the process table to
+        // confirm identity, and that must not run on a runtime thread.
+        let mh = monitor_handle.clone();
+        let resumed = tokio::task::spawn_blocking(move || mh.resume_all_stopped())
+            .await
+            .unwrap_or(0);
         if resumed > 0 {
             tracing::info!("resumed {resumed} stopped process(es)");
         }
