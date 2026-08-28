@@ -31,6 +31,12 @@ serde_json = "1"
 sysinfo = "0.33"
 libc = "0.2"
 
+# Second SIGTERM/SIGINT observer for the shutdown watchdog. tokio::signal
+# registers through this same crate, which chains handlers instead of
+# replacing them, so the watchdog sees a stop request even when the runtime
+# stops polling its own listener.
+signal-hook-registry = "1.4"
+
 # JSONL usage tracking (F-03/F-04 Budget Guard)
 # Uses Claude Code's local JSONL logs for real token/cost data
 
