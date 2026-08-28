@@ -339,6 +339,19 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         return leaderRequestTokens[teamName] == token
     }
 
+    func isAuthorizedLeaderMetrics(
+        teamName: String, token: String?, callerTTYDevice: UInt32?,
+        adoptedLeaderTTYDevice: UInt32?
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let token, !token.isEmpty, leaderRequestTokens[teamName] == token {
+            return true
+        }
+        guard let callerTTYDevice, let adoptedLeaderTTYDevice else { return false }
+        return callerTTYDevice == adoptedLeaderTTYDevice
+    }
+
     func unregisterTeam(_ name: String) {
         lock.lock()
         teamRegistry.removeValue(forKey: name)

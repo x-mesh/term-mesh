@@ -379,13 +379,15 @@ class TerminalController {
 
     func handleClient(_ socket: Int32, peerPid: pid_t? = nil) {
         defer { close(socket) }
+        let clientPID = peerPid ?? getPeerPid(socket)
+        let clientTTYDevice = clientPID.flatMap(Self.controllingTTYDevice(of:))
 
         // In termMeshOnly mode, verify the connecting process is a descendant of term-mesh.
         // Other modes allow external clients and apply separate auth controls.
         if accessMode == .termMeshOnly {
             // Use pre-captured peer PID if available (captured in accept loop before
             // the peer can disconnect), falling back to live lookup.
-            let pid = peerPid ?? getPeerPid(socket)
+            let pid = clientPID
             if let pid {
                 guard isDescendant(pid) else {
                     let msg = "ERROR: Access denied — only processes started inside term-mesh can connect\n"
@@ -441,7 +443,7 @@ class TerminalController {
                     continue
                 }
 
-                let response = processCommand(trimmed)
+                let response = processCommand(trimmed, callerTTYDevice: clientTTYDevice)
                 writeSocketResponse(response, to: socket)
             }
         }
@@ -499,13 +501,13 @@ class TerminalController {
         return frames
     }
 
-    private func processCommand(_ command: String) -> String {
+    private func processCommand(_ command: String, callerTTYDevice: UInt32? = nil) -> String {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "ERROR: Empty command" }
 
         // v2 protocol: newline-delimited JSON.
         if trimmed.hasPrefix("{") {
-            return processV2Command(trimmed)
+            return processV2Command(trimmed, callerTTYDevice: callerTTYDevice)
         }
 
         let parts = trimmed.split(separator: " ", maxSplits: 1).map(String.init)
@@ -838,7 +840,9 @@ class TerminalController {
 
     // MARK: - V2 JSON Socket Protocol
 
-    private func processV2Command(_ jsonLine: String) -> String {
+    private func processV2Command(
+        _ jsonLine: String, callerTTYDevice: UInt32? = nil
+    ) -> String {
         // v1 access-mode gating applies to v2 as well. We can't know which v2 method maps
         // to which v1 command without parsing, so parse first and then apply allow-list.
 
@@ -879,7 +883,10 @@ class TerminalController {
         // cooperative `await MainActor.run` instead of blocking `DispatchQueue.main.sync`.
         // This eliminates deadlocks and minimizes main-thread hold time.
         if method.hasPrefix("team.") {
-            return dispatchTeamCommandAsync(method: method, params: params, id: id)
+            return dispatchTeamCommandAsync(
+                method: method, params: params, id: id,
+                callerTTYDevice: callerTTYDevice
+            )
         }
 
         // Refresh handle refs asynchronously to avoid blocking the socket thread.
@@ -2393,11 +2400,53 @@ class TerminalController {
         return await processTeamUICommandAsync(method: method, params: params, id: 1)
     }
 
-    private func dispatchTeamCommandAsync(method: String, params: [String: Any], id: Any?) -> String {
+    private func dispatchTeamCommandAsync(
+        method: String, params: [String: Any], id: Any?,
+        callerTTYDevice: UInt32? = nil
+    ) -> String {
+        // An adopted leader already existed when the team was created, so no
+        // bearer can be injected into its environment. Authenticate metrics
+        // against the live PTY instead: the socket peer and leader surface must
+        // resolve to the same kernel device. Only this identity snapshot touches
+        // MainActor; the store read remains on teamDataQueue.
+        if method == "team.task.metrics", callerTTYDevice != nil {
+            let semaphore = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var leaderTTYDevice: UInt32?
+            Task {
+                let teamName = params["team_name"] as? String
+                leaderTTYDevice = teamName.flatMap { name in
+                    guard let team = TeamOrchestrator.shared.teams[name],
+                          team.leaderMode == "adopted",
+                          let located = AppDelegate.shared?.locateSurface(
+                            surfaceId: team.leaderPanelId
+                          ),
+                          let workspace = located.tabManager.tabs.first(
+                            where: { $0.id == located.workspaceId }
+                          ),
+                          let panel = workspace.panels[team.leaderPanelId] as? TerminalPanel
+                    else { return nil }
+                    return panel.surface.controllingTTYDevice
+                }
+                semaphore.signal()
+            }
+            if semaphore.wait(timeout: .now() + 5) == .timedOut {
+                return "{\"ok\":false,\"error\":{\"code\":\"timeout\",\"message\":\"team command timed out\"}}"
+            }
+            return teamDataQueue.sync {
+                teamDataTaskMetrics(
+                    params: params, id: id, store: TeamDataStore.shared,
+                    callerTTYDevice: callerTTYDevice,
+                    adoptedLeaderTTYDevice: leaderTTYDevice
+                )
+            }
+        }
+
         // Fast path: data-only commands don't need async bridge at all
         if Self.teamDataCommands.contains(method) {
             return teamDataQueue.sync {
-                dispatchTeamDataCommandDirect(method: method, params: params, id: id)
+                dispatchTeamDataCommandDirect(
+                    method: method, params: params, id: id
+                )
             }
         }
 
@@ -2434,7 +2483,9 @@ class TerminalController {
     }
 
     /// Direct dispatch for data-only team commands (called within teamDataQueue).
-    private func dispatchTeamDataCommandDirect(method: String, params: [String: Any], id: Any?) -> String {
+    private func dispatchTeamDataCommandDirect(
+        method: String, params: [String: Any], id: Any?, peerPid: pid_t? = nil
+    ) -> String {
         let store = TeamDataStore.shared
         switch method {
         case "team.message.post":
@@ -5703,20 +5754,24 @@ class TerminalController {
         ])
     }
 
-    /// Named for the task board, but it answers from the leader-request
-    /// store: request id, status and coordination timing. Every sibling that
-    /// reads that store — `team.leader.request.list/take/complete` — demands
-    /// the leader request capability, and this one did not, so any process
-    /// that could open the app socket read timings it was refused the
-    /// requests for.
-    private func teamDataTaskMetrics(params: [String: Any], id: Any?, store: TeamDataStore) -> String {
+    /// Named for the task board, but it answers from the leader-request store.
+    /// App-launched leaders authenticate with the request token. An adopted
+    /// leader cannot receive that environment value after its shell starts, so
+    /// its local socket call instead has to come from the leader surface's live
+    /// controlling TTY. Request bodies and claim operations remain token-only.
+    private func teamDataTaskMetrics(
+        params: [String: Any], id: Any?, store: TeamDataStore,
+        callerTTYDevice: UInt32? = nil, adoptedLeaderTTYDevice: UInt32? = nil
+    ) -> String {
         guard let teamName = params["team_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
-        guard store.isAuthorizedLeaderRequestToken(
-            teamName: teamName, token: params["leader_request_token"] as? String
+        guard store.isAuthorizedLeaderMetrics(
+            teamName: teamName, token: params["leader_request_token"] as? String,
+            callerTTYDevice: callerTTYDevice,
+            adoptedLeaderTTYDevice: adoptedLeaderTTYDevice
         ) else {
-            return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
+            return v2Error(id: id, code: "unauthorized", message: "Leader metrics capability required")
         }
         guard let metrics = store.coordinationMetrics(
             teamName: teamName, requestId: params["request_id"] as? String
