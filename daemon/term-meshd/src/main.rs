@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
     // than this budget, and the budget is far under the unit's
     // TimeoutStopSec, so a stuck step costs seconds of relay downtime
     // instead of the full stop timeout.
-    shutdown::install(SHUTDOWN_BUDGET, RUNTIME_STALL_THRESHOLD);
+    let raw_signal_observer = shutdown::install(SHUTDOWN_BUDGET, RUNTIME_STALL_THRESHOLD);
     let owner_pid = configured_owner_pid();
     if let Some(pid) = owner_pid {
         tracing::info!("GUI owner supervision enabled (pid: {pid})");
@@ -529,6 +529,17 @@ async fn main() -> anyhow::Result<()> {
     // silent zombie.
     let owner_exit = wait_for_owner_exit(owner_pid);
     tokio::pin!(owner_exit);
+    let runtime_signal = async {
+        if raw_signal_observer {
+            std::future::pending::<()>().await;
+        } else {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm() => {},
+            }
+        }
+    };
+    tokio::pin!(runtime_signal);
     let (shutdown_reason, peer_task_finished) = {
         let peer_wait = async {
             match peer_task.as_mut() {
@@ -538,8 +549,8 @@ async fn main() -> anyhow::Result<()> {
         };
         tokio::pin!(peer_wait);
         tokio::select! {
-        _ = tokio::signal::ctrl_c() => ("SIGINT (Ctrl-C)", false),
-        _ = sigterm() => ("SIGTERM", false),
+        _ = shutdown::stop_requested() => ("SIGTERM/SIGINT", false),
+        _ = &mut runtime_signal => ("SIGTERM/SIGINT (runtime fallback)", false),
         _ = &mut owner_exit => ("GUI owner process exited", false),
         result = socket_task => {
             let reason = match result {
@@ -594,10 +605,20 @@ async fn main() -> anyhow::Result<()> {
     } else {
         // b. Terminate all headless agents
         let headless = headless_manager.clone();
-        shutdown::step(shutdown::STEP_HEADLESS, HEADLESS_LIMIT, async move {
-            headless.lock().await.terminate_all().await;
-        })
-        .await;
+        // Snapshot process groups before awaiting the manager mutex. If a
+        // handler holds that lock forever, timeout still drops this guard and
+        // kills every registered headless group.
+        let mut headless_kill_guard = headless::shutdown_kill_guard();
+        let headless_finished =
+            shutdown::step(shutdown::STEP_HEADLESS, HEADLESS_LIMIT, async move {
+                headless.lock().await.terminate_all().await;
+            })
+            .await;
+        if headless_finished.is_some() {
+            headless_kill_guard.disarm();
+        } else {
+            drop(headless_kill_guard);
+        }
 
         // c. Terminate all agent sessions (cleanup worktrees + PIDs)
         // terminate_all() contains a blocking sleep (SIGTERM → wait → SIGKILL), so
@@ -645,12 +666,10 @@ async fn main() -> anyhow::Result<()> {
     // second unconditional cleanup here: another daemon may have replaced
     // the pathname while this instance was shutting down.
 
-    shutdown::finish();
     tracing::info!("shutdown complete");
-    Ok(())
+    shutdown::exit_success()
 }
 
-/// Wait for SIGTERM signal.
 async fn sigterm() {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sig = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");

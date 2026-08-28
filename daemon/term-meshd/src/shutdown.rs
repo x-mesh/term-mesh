@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+const FORCED_EXIT_CODE: i32 = 2;
+
 /// Teardown steps, in the order `main` runs them. `STEP_NAMES` is indexed by
 /// the values below, so the two must stay in sync.
 pub const STEP_IDLE: usize = 0;
@@ -55,6 +57,7 @@ static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 /// Set by the raw SIGTERM/SIGINT handler. The watchdog trusts this even when
 /// the runtime never delivers the signal to its own listener.
 static SIGNALLED: AtomicBool = AtomicBool::new(false);
+static EXITING: AtomicBool = AtomicBool::new(false);
 
 fn now_ms() -> u64 {
     BASE.get()
@@ -71,22 +74,32 @@ fn now_ms() -> u64 {
 ///
 /// `stall_threshold` is how far the runtime heartbeat may fall behind before
 /// the watchdog reports the runtime as stalled.
-pub fn install(budget: Duration, stall_threshold: Duration) {
+pub fn install(budget: Duration, stall_threshold: Duration) -> bool {
     let base = *BASE.get_or_init(Instant::now);
     HEARTBEAT.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
 
-    observe_stop_signals();
+    let signals_installed = observe_stop_signals();
     spawn_heartbeat();
+    spawn_hard_exit(budget);
     spawn_watchdog(budget, stall_threshold);
+    signals_installed
 }
 
-/// Register a second handler for the stop signals, alongside the runtime's.
+/// Wait for the raw signal observer rather than registering a second, late
+/// Tokio listener. The atomic latch preserves a signal received during daemon
+/// initialization until the runtime reaches its shutdown select.
+pub async fn stop_requested() {
+    while !SIGNALLED.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Register the early stop-signal observer.
 ///
-/// `tokio::signal` registers through `signal_hook_registry`, which chains
-/// handlers rather than replacing them, so this observer runs without
-/// disturbing the runtime's own listener. The handler only stores into
-/// atomics, which is async-signal-safe.
-fn observe_stop_signals() {
+/// The handler only stores into atomics, which is async-signal-safe. Returns
+/// false when either registration fails so main can retain a Tokio fallback.
+fn observe_stop_signals() -> bool {
+    let mut installed = true;
     for signal in [libc::SIGTERM, libc::SIGINT] {
         // SAFETY: the callback touches nothing but atomics, so it is safe to
         // run from a signal handler.
@@ -96,9 +109,11 @@ fn observe_stop_signals() {
             })
         };
         if let Err(error) = registered {
+            installed = false;
             tracing::warn!("shutdown watchdog could not observe signal {signal}: {error}");
         }
     }
+    installed
 }
 
 /// Stamp a heartbeat every second so the watchdog can tell a slow teardown
@@ -175,26 +190,73 @@ fn spawn_watchdog(budget: Duration, stall_threshold: Duration) {
                 // Leaving the rest of teardown undone is the point: the
                 // socket is already closed, so every extra second is relay
                 // downtime a restart cannot recover.
-                std::process::exit(0);
+                // `shutdown-hard-exit` owns termination. This thread only
+                // reports diagnostics and is allowed to block in a writer.
             }
         })
         .expect("failed to spawn the shutdown watchdog thread");
 }
 
+fn budget_expired(started: u64, now: u64, step: usize, budget_ms: u64) -> bool {
+    started != 0 && now.saturating_sub(started) >= budget_ms && step != STEP_DONE
+}
+
+/// Enforce the absolute deadline without logging, allocating, or depending on
+/// Tokio. The diagnostic watchdog may block in a tracing writer; this separate
+/// thread still exits the process at the budget with a failure status.
+fn spawn_hard_exit(budget: Duration) {
+    std::thread::Builder::new()
+        .name("shutdown-hard-exit".to_string())
+        .spawn(move || {
+            let mut signalled_at: Option<Instant> = None;
+            loop {
+                std::thread::sleep(Duration::from_millis(25));
+                if signalled_at.is_none() && SIGNALLED.load(Ordering::SeqCst) {
+                    signalled_at = Some(Instant::now());
+                }
+                let signal_expired = signalled_at.is_some_and(|at| at.elapsed() >= budget);
+                let teardown_expired = budget_expired(
+                    SHUTDOWN_AT.load(Ordering::SeqCst),
+                    now_ms(),
+                    STEP.load(Ordering::SeqCst),
+                    budget.as_millis() as u64,
+                );
+                if (signal_expired || teardown_expired)
+                    && STEP.load(Ordering::SeqCst) != STEP_DONE
+                    && EXITING
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    std::process::exit(FORCED_EXIT_CODE);
+                }
+            }
+        })
+        .expect("failed to spawn the shutdown hard-exit thread");
+}
+
 /// Mark teardown as started. Safe to call after the watchdog already noticed
 /// the signal; the earlier timestamp wins.
 pub fn begin() {
-    let _ = SHUTDOWN_AT.compare_exchange(
-        0,
-        now_ms().max(1),
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-    );
+    let _ = SHUTDOWN_AT.compare_exchange(0, now_ms().max(1), Ordering::SeqCst, Ordering::SeqCst);
 }
 
 /// Mark teardown as finished so the watchdog stops applying the budget.
-pub fn finish() {
+fn finish() {
     STEP.store(STEP_DONE, Ordering::SeqCst);
+}
+
+/// Exit before the `#[tokio::main]` runtime is dropped. Tokio waits forever
+/// for a stuck `spawn_blocking` task during normal drop; an explicit exit is
+/// therefore part of the shutdown bound, not merely an optimization.
+pub fn exit_success() -> ! {
+    while EXITING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        std::thread::yield_now();
+    }
+    finish();
+    std::process::exit(0)
 }
 
 /// Run one teardown step under a bound, logging entry and exit with the time
@@ -265,5 +327,27 @@ mod tests {
         })
         .await;
         assert!(value.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_early_raw_signal_is_observed_later() {
+        SIGNALLED.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_millis(50), stop_requested())
+            .await
+            .expect("latched signal was not observed");
+        SIGNALLED.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn forced_shutdown_is_not_reported_as_success() {
+        assert_ne!(FORCED_EXIT_CODE, 0);
+    }
+
+    #[test]
+    fn hard_deadline_ignores_logging_and_stops_after_completion() {
+        assert!(!budget_expired(0, 1_000, STEP_IDLE, 100));
+        assert!(!budget_expired(100, 199, STEP_AGENTS, 100));
+        assert!(budget_expired(100, 200, STEP_AGENTS, 100));
+        assert!(!budget_expired(100, 500, STEP_DONE, 100));
     }
 }
