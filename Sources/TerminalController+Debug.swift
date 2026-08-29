@@ -290,7 +290,8 @@ extension TerminalController {
     /// before, silently. Runs off-main, one poll per render pass.
     private func waitForCommandPaletteInputFocus(windowId: UUID, timeout: TimeInterval = 2.0) {
         guard !Thread.isMainThread else { return }
-        let deadline = Date().addingTimeInterval(timeout)
+        let start = Date()
+        let deadline = start.addingTimeInterval(timeout)
         while Date() < deadline {
             var owned = false
             _ = v2MainExec(timeout: 1) {
@@ -298,9 +299,19 @@ extension TerminalController {
                       let responder = window.firstResponder else { return }
                 owned = AppDelegate.shared?.isCommandPaletteResponder(responder) ?? false
             }
-            if owned { return }
-            Thread.sleep(forTimeInterval: 0.01)
+            if owned {
+                // How long the palette was on screen without owning input.
+                // The keyboard path opens through the same SwiftUI work and
+                // does not wait, so this is the size of the window a person
+                // can type into and lose the keystroke.
+                AppDelegate.shared?.noteCommandPaletteFocusWait(
+                    seconds: Date().timeIntervalSince(start)
+                )
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.002)
         }
+        AppDelegate.shared?.noteCommandPaletteFocusWait(seconds: -1)
     }
 
     /// Inspect (and with `simulate: true`, force) a terminal's automatic
@@ -458,6 +469,7 @@ extension TerminalController {
         var navModifierRejectCount = 0
         var navLastModifiersRaw = -1
         var firstResponderInPalette = false
+        var focusWaitMs = -1
 
         _ = v2MainExec(timeout: 5) {
             visible = AppDelegate.shared?.isCommandPaletteVisible(windowId: windowId) ?? false
@@ -466,6 +478,7 @@ extension TerminalController {
             navKeyPressCount = AppDelegate.shared?.commandPaletteNavigationKeyPressCount ?? 0
             navModifierRejectCount = AppDelegate.shared?.commandPaletteNavigationModifierRejectCount ?? 0
             navLastModifiersRaw = AppDelegate.shared?.commandPaletteLastNavigationModifiersRaw ?? -1
+            focusWaitMs = AppDelegate.shared?.commandPaletteLastFocusWaitMs ?? -1
             // Whether keystrokes actually land in the palette right now. The
             // AppKit first responder is the authority here: a field editor
             // holding focus says nothing about which field it belongs to, and
@@ -501,7 +514,8 @@ extension TerminalController {
             "nav_key_press_count": navKeyPressCount,
             "nav_modifier_reject_count": navModifierRejectCount,
             "nav_last_modifiers_raw": navLastModifiersRaw,
-            "first_responder_in_palette": firstResponderInPalette
+            "first_responder_in_palette": firstResponderInPalette,
+            "last_focus_wait_ms": focusWaitMs
         ])
     }
 
