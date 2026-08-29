@@ -85,6 +85,7 @@ def _palette_debug_state(client: termmesh, window_id: str) -> str:
             f"nav_presses={results.get('nav_key_press_count')} "
             f"nav_mod_rejects={results.get('nav_modifier_reject_count')} "
             f"nav_last_mods={results.get('nav_last_modifiers_raw')} "
+            f"fr_in_palette={results.get('first_responder_in_palette')} "
             f"index={_palette_selected_index(client, window_id)} "
             f"mode={results.get('mode')!r} query={results.get('query')!r} "
             f"results={len(results.get('results') or [])}"
@@ -98,6 +99,16 @@ def _open_palette_with_query(
 ) -> None:
     _set_palette_visible(client, window_id, False)
     _set_palette_visible(client, window_id, True)
+    # Opening the palette moves input focus to it on a later run loop pass, so
+    # text typed before that lands wherever focus still is. Wait for the AppKit
+    # first responder to actually be inside the palette before typing.
+    _wait_until(
+        lambda: bool(
+            client.command_palette_results(window_id=window_id, limit=20)
+            .get("first_responder_in_palette")
+        ),
+        message=f"palette never took input focus: {_palette_debug_state(client, window_id)}",
+    )
     client.simulate_type(query)
     # Wait for the typed query itself, not just for a row count: the palette
     # opens holding every command, so `>= min_results` is already true against

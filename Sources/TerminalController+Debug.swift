@@ -427,6 +427,7 @@ extension TerminalController {
         var navKeyPressCount = 0
         var navModifierRejectCount = 0
         var navLastModifiersRaw = -1
+        var firstResponderInPalette = false
 
         _ = v2MainExec(timeout: 5) {
             visible = AppDelegate.shared?.isCommandPaletteVisible(windowId: windowId) ?? false
@@ -435,6 +436,15 @@ extension TerminalController {
             navKeyPressCount = AppDelegate.shared?.commandPaletteNavigationKeyPressCount ?? 0
             navModifierRejectCount = AppDelegate.shared?.commandPaletteNavigationModifierRejectCount ?? 0
             navLastModifiersRaw = AppDelegate.shared?.commandPaletteLastNavigationModifiersRaw ?? -1
+            // Whether keystrokes actually land in the palette right now. The
+            // AppKit first responder is the authority here: a field editor
+            // holding focus says nothing about which field it belongs to, and
+            // the view's own focus state is read through a stale copy.
+            if let window = AppDelegate.shared?.mainWindow(for: windowId),
+               let responder = window.firstResponder {
+                firstResponderInPalette =
+                    AppDelegate.shared?.isCommandPaletteResponder(responder) ?? false
+            }
         }
 
         let rows = Array(snapshot.results.prefix(limit)).map { row in
@@ -460,7 +470,8 @@ extension TerminalController {
             "nav_ignored_empty_count": snapshot.navigationIgnoredEmptyCount,
             "nav_key_press_count": navKeyPressCount,
             "nav_modifier_reject_count": navModifierRejectCount,
-            "nav_last_modifiers_raw": navLastModifiersRaw
+            "nav_last_modifiers_raw": navLastModifiersRaw,
+            "first_responder_in_palette": firstResponderInPalette
         ])
     }
 
