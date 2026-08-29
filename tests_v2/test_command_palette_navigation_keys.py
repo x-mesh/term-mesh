@@ -78,7 +78,14 @@ def _palette_debug_state(client: termmesh, window_id: str) -> str:
         results = client.command_palette_results(window_id=window_id, limit=20)
         return (
             f"visible={_palette_visible(client, window_id)} "
-            f"focused={_palette_input_focused(client, window_id)} "
+            f"field_editor_focused={_palette_input_focused(client, window_id)} "
+            f"search_focused={results.get('search_focused')} "
+            f"rename_focused={results.get('rename_focused')} "
+            f"nav_ignored_empty={results.get('nav_ignored_empty_count')} "
+            f"nav_presses={results.get('nav_key_press_count')} "
+            f"nav_mod_rejects={results.get('nav_modifier_reject_count')} "
+            f"nav_last_mods={results.get('nav_last_modifiers_raw')} "
+            f"fr_in_palette={results.get('first_responder_in_palette')} "
             f"index={_palette_selected_index(client, window_id)} "
             f"mode={results.get('mode')!r} query={results.get('query')!r} "
             f"results={len(results.get('results') or [])}"
@@ -92,21 +99,50 @@ def _open_palette_with_query(
 ) -> None:
     _set_palette_visible(client, window_id, False)
     _set_palette_visible(client, window_id, True)
-    client.simulate_type(query)
-    # The query is matched asynchronously, and a selected index of 0 is also
-    # what an empty list reports. Sending Down before the list holds that many
-    # rows moves the selection nowhere, so wait for the rows themselves.
+    # Opening the palette moves input focus to it on a later run loop pass, so
+    # text typed before that lands wherever focus still is. Wait for the AppKit
+    # first responder to actually be inside the palette before typing.
+    _wait_until(
+        lambda: bool(
+            client.command_palette_results(window_id=window_id, limit=20)
+            .get("first_responder_in_palette")
+        ),
+        message=f"palette never took input focus: {_palette_debug_state(client, window_id)}",
+    )
+    # Wait for the typed query itself, not just for a row count: the palette
+    # opens holding every command, so `>= min_results` is already true against
+    # the pre-typing list and waits for nothing.
+    #
+    # Retype rather than fail when it has not landed. simulate_type inserts
+    # into the field editor directly, and that edit reaching the SwiftUI
+    # binding is not guaranteed by the call returning. Only retype from empty,
+    # so a partially delivered query is a failure and not a doubled one.
+    def _typed() -> bool:
+        current = str(
+            client.command_palette_results(window_id=window_id, limit=20).get("query") or ""
+        )
+        if current == query:
+            return True
+        if current == "":
+            client.simulate_type(query)
+        return False
+
+    try:
+        _wait_until(_typed, message="type timeout")
+    except termmeshError:
+        raise termmeshError(
+            f"palette query never became {query!r}: "
+            f"{_palette_debug_state(client, window_id)}"
+        )
     _wait_until(
         lambda: _palette_result_count(client, window_id) >= min_results,
         message=f"palette query {query!r} did not produce {min_results} result(s)",
     )
-    # The palette's input takes focus a run loop pass after the palette opens.
-    # A navigation key sent before that is routed somewhere else and the
-    # selection never moves, which reads as a seeding failure further down.
-    _wait_until(
-        lambda: _palette_input_focused(client, window_id),
-        message=f"palette input never took focus: {_palette_debug_state(client, window_id)}",
-    )
+    # Not waiting on `search_focused`: it stays false through runs that pass,
+    # so it does not separate a ready palette from an unready one. Record the
+    # state each case starts from instead, so a pass and a failure can be
+    # compared on the same fields.
+    print(f"[palette] ready {query!r}: {_palette_debug_state(client, window_id)}", flush=True)
     _wait_until(
         lambda: _palette_selected_index(client, window_id) == 0,
         message="palette selected index did not reset to zero",
@@ -137,12 +173,21 @@ def _assert_move(client: termmesh, window_id: str, combo: str, start_index: int,
             f"{_palette_debug_state(client, window_id)}"
         )
 
+    # Sample before sending: a key dropped for want of focus leaves no trace
+    # afterwards, because focus usually arrives while the wait is still running.
+    before = _palette_debug_state(client, window_id)
     client.simulate_shortcut(combo)
-    _wait_until(
-        lambda: _palette_visible(client, window_id)
-        and _palette_selected_index(client, window_id) == expected_index,
-        message=f"{combo} did not move selection from {start_index} to {expected_index}",
-    )
+    try:
+        _wait_until(
+            lambda: _palette_visible(client, window_id)
+            and _palette_selected_index(client, window_id) == expected_index,
+            message="move timeout",
+        )
+    except termmeshError:
+        raise termmeshError(
+            f"{combo} did not move selection from {start_index} to {expected_index}: "
+            f"before=[{before}] after=[{_palette_debug_state(client, window_id)}]"
+        )
 
 
 def _assert_can_navigate_past_ten_results(client: termmesh, window_id: str) -> None:

@@ -264,6 +264,7 @@ struct ContentView: View {
     private var commandPaletteRenameSelectAllOnFocus = CommandPaletteRenameSelectionSettings.defaultSelectAllOnFocus
     @FocusState private var isCommandPaletteSearchFocused: Bool
     @FocusState private var isCommandPaletteRenameFocused: Bool
+    @State private var commandPaletteNavigationIgnoredEmptyCount: Int = 0
     @StateObject private var reviewBoardViewModel = ReviewBoardViewModel()
 
     private static let fixedSidebarResizeCursor = NSCursor(
@@ -4598,6 +4599,10 @@ struct ContentView: View {
     private func moveCommandPaletteSelection(by delta: Int) {
         let count = commandPaletteResults.count
         guard count > 0 else {
+            // Record the drop: from the outside this is identical to a key
+            // that never reached a handler, and the two have different causes.
+            commandPaletteNavigationIgnoredEmptyCount += 1
+            syncCommandPaletteDebugStateForObservedWindow()
             NSSound.beep()
             return
         }
@@ -4610,10 +4615,15 @@ struct ContentView: View {
         modifiers: EventModifiers,
         delta: Int
     ) -> BackportKeyPressResult {
-        guard modifiers.contains(.control),
-              !modifiers.contains(.command),
-              !modifiers.contains(.shift),
-              !modifiers.contains(.option) else {
+        let accepted = modifiers.contains(.control)
+            && !modifiers.contains(.command)
+            && !modifiers.contains(.shift)
+            && !modifiers.contains(.option)
+        AppDelegate.shared?.noteCommandPaletteNavigationKeyPress(
+            modifiersRaw: Int(modifiers.rawValue),
+            accepted: accepted
+        )
+        guard accepted else {
             return .ignored
         }
         moveCommandPaletteSelection(by: delta)
@@ -4766,7 +4776,10 @@ struct ContentView: View {
         return CommandPaletteDebugSnapshot(
             query: commandPaletteQueryForMatching,
             mode: mode,
-            results: rows
+            results: rows,
+            searchFocused: isCommandPaletteSearchFocused,
+            renameFocused: isCommandPaletteRenameFocused,
+            navigationIgnoredEmptyCount: commandPaletteNavigationIgnoredEmptyCount
         )
     }
 
@@ -4878,6 +4891,10 @@ struct ContentView: View {
                 isCommandPaletteRenameFocused = true
             }
             applyCommandPaletteTextSelection(policy.selectionBehavior)
+            // The callers sync before this block runs, so without this the
+            // published state keeps reporting the focus the palette had
+            // before the policy was applied — for the whole time it holds.
+            syncCommandPaletteDebugStateForObservedWindow()
         }
     }
 
