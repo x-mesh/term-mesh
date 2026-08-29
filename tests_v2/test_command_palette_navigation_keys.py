@@ -140,12 +140,21 @@ def _assert_move(client: termmesh, window_id: str, combo: str, start_index: int,
             f"{_palette_debug_state(client, window_id)}"
         )
 
+    # Sample before sending: a key dropped for want of focus leaves no trace
+    # afterwards, because focus usually arrives while the wait is still running.
+    before = _palette_debug_state(client, window_id)
     client.simulate_shortcut(combo)
-    _wait_until(
-        lambda: _palette_visible(client, window_id)
-        and _palette_selected_index(client, window_id) == expected_index,
-        message=f"{combo} did not move selection from {start_index} to {expected_index}",
-    )
+    try:
+        _wait_until(
+            lambda: _palette_visible(client, window_id)
+            and _palette_selected_index(client, window_id) == expected_index,
+            message="move timeout",
+        )
+    except termmeshError:
+        raise termmeshError(
+            f"{combo} did not move selection from {start_index} to {expected_index}: "
+            f"before=[{before}] after=[{_palette_debug_state(client, window_id)}]"
+        )
 
 
 def _assert_can_navigate_past_ten_results(client: termmesh, window_id: str) -> None:
