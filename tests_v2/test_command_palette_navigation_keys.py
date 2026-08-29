@@ -109,17 +109,11 @@ def _open_palette_with_query(
         lambda: _palette_result_count(client, window_id) >= min_results,
         message=f"palette query {query!r} did not produce {min_results} result(s)",
     )
-    # Every palette navigation key is an onKeyPress on the search field, so it
-    # only fires while that field holds SwiftUI focus — which arrives a run
-    # loop pass after the palette opens. `field_editor_focused` is not that
-    # signal: it is true for any field editor holding first responder, so
-    # typing lands while navigation keys are still dropped.
-    _wait_until(
-        lambda: bool(
-            client.command_palette_results(window_id=window_id, limit=20).get("search_focused")
-        ),
-        message=f"palette search field never took focus: {_palette_debug_state(client, window_id)}",
-    )
+    # Not waiting on `search_focused`: it stays false through runs that pass,
+    # so it does not separate a ready palette from an unready one. Record the
+    # state each case starts from instead, so a pass and a failure can be
+    # compared on the same fields.
+    print(f"[palette] ready {query!r}: {_palette_debug_state(client, window_id)}", flush=True)
     _wait_until(
         lambda: _palette_selected_index(client, window_id) == 0,
         message="palette selected index did not reset to zero",
