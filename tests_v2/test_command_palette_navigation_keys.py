@@ -84,7 +84,7 @@ def _palette_debug_state(client: termmesh, window_id: str) -> str:
             f"nav_ignored_empty={results.get('nav_ignored_empty_count')} "
             f"nav_presses={results.get('nav_key_press_count')} "
             f"nav_mod_rejects={results.get('nav_modifier_reject_count')} "
-            f"nav_last_mods={results.get('nav_last_modifiers_raw')} "
+            f"nav_last_event_mods={results.get('nav_last_event_modifiers_raw')} "
             f"fr_in_palette={results.get('first_responder_in_palette')} "
             f"index={_palette_selected_index(client, window_id)} "
             f"mode={results.get('mode')!r} query={results.get('query')!r} "

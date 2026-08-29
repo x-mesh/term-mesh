@@ -139,7 +139,15 @@ Useful probes (all `#if DEBUG`, see `TerminalController+Debug.swift`):
 `down` / `up` / `return` / `cmd+shift+p` …), `debug.command_palette.toggle`,
 `debug.command_palette.visible`, `debug.command_palette.selection`,
 `debug.command_palette.results` (returns `mode`, `query`, `selected_index`,
-and each row's `command_id` / `title` / `trailing_label`).
+and each row's `command_id` / `title` / `trailing_label`). It also reports
+whether the palette owns keyboard input right now — `first_responder_in_palette`,
+the AppKit answer and the one to assert on — alongside the SwiftUI focus flags
+`search_focused` / `rename_focused`, which lag and read false through runs that
+pass. The rest is navigation diagnostics: `nav_key_press_count`,
+`nav_modifier_reject_count`, `nav_last_event_modifiers_raw` (SwiftUI
+`EventModifiers`, null until a navigation key arrives), `nav_ignored_empty_count`
+(drops against an empty list, reset each open) and `last_focus_wait_ms` (how long
+the last open waited for input focus; null when unmeasured or when it gave up).
 
 Rules learned the hard way:
 

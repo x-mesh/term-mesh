@@ -505,11 +505,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// straight back.
     private(set) var commandPaletteNavigationKeyPressCount: Int = 0
     private(set) var commandPaletteNavigationModifierRejectCount: Int = 0
-    private(set) var commandPaletteLastNavigationModifiersRaw: Int = -1
+    /// SwiftUI `EventModifiers` — NOT `NSEvent.ModifierFlags`, whose bits
+    /// differ. The absorb path on this same object takes AppKit flags, so the
+    /// name carries which vocabulary this one is in. `nil` until a navigation
+    /// key arrives.
+    private(set) var commandPaletteLastNavigationEventModifiersRaw: Int?
 
     /// Milliseconds the palette spent visible without owning input on the last
-    /// open, or -1 when it never took it. Negative-safe: read as a diagnostic.
-    private(set) var commandPaletteLastFocusWaitMs: Int = -1
+    /// open. `nil` when it has not been measured, or when the wait gave up —
+    /// the two cases a sentinel number lets a caller misread as "fast".
+    private(set) var commandPaletteLastFocusWaitMs: Int?
 
     /// Text typed while the palette was on screen but did not own input yet.
     /// That gap measured 47ms on average and 96ms at worst, which is inside a
@@ -577,12 +582,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func noteCommandPaletteFocusWait(seconds: TimeInterval) {
-        commandPaletteLastFocusWaitMs = seconds < 0 ? -1 : Int((seconds * 1000).rounded())
+        commandPaletteLastFocusWaitMs = Int((max(0, seconds) * 1000).rounded())
     }
 
-    func noteCommandPaletteNavigationKeyPress(modifiersRaw: Int, accepted: Bool) {
+    func noteCommandPaletteFocusWaitTimeout() {
+        commandPaletteLastFocusWaitMs = nil
+    }
+
+    func noteCommandPaletteNavigationKeyPress(eventModifiersRaw: Int, accepted: Bool) {
         commandPaletteNavigationKeyPressCount += 1
-        commandPaletteLastNavigationModifiersRaw = modifiersRaw
+        commandPaletteLastNavigationEventModifiersRaw = eventModifiersRaw
         if !accepted {
             commandPaletteNavigationModifierRejectCount += 1
         }

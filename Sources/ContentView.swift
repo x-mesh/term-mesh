@@ -4629,7 +4629,7 @@ struct ContentView: View {
             && !modifiers.contains(.shift)
             && !modifiers.contains(.option)
         AppDelegate.shared?.noteCommandPaletteNavigationKeyPress(
-            modifiersRaw: Int(modifiers.rawValue),
+            eventModifiersRaw: Int(modifiers.rawValue),
             accepted: accepted
         )
         guard accepted else {
@@ -4753,13 +4753,22 @@ struct ContentView: View {
     private func syncCommandPaletteDebugStateForObservedWindow() {
         guard let window = observedWindow ?? NSApp.keyWindow ?? NSApp.mainWindow else { return }
         AppDelegate.shared?.setCommandPaletteVisible(isCommandPalettePresented, for: window)
-        let visibleResultCount = commandPaletteResults.count
-        let selectedIndex = isCommandPalettePresented ? commandPaletteSelectedIndex(resultCount: visibleResultCount) : 0
+        // Evaluated once and passed down: `commandPaletteResults` rebuilds the
+        // command registry, fuzzy-scores it and sorts, with no cache, and this
+        // runs on the palette-open path whose latency the focus work exists to
+        // cut.
+        let results = isCommandPalettePresented ? commandPaletteResults : []
+        let selectedIndex = isCommandPalettePresented ? commandPaletteSelectedIndex(resultCount: results.count) : 0
         AppDelegate.shared?.setCommandPaletteSelectionIndex(selectedIndex, for: window)
-        AppDelegate.shared?.setCommandPaletteSnapshot(commandPaletteDebugSnapshot(), for: window)
+        AppDelegate.shared?.setCommandPaletteSnapshot(
+            commandPaletteDebugSnapshot(results: results),
+            for: window
+        )
     }
 
-    private func commandPaletteDebugSnapshot() -> CommandPaletteDebugSnapshot {
+    private func commandPaletteDebugSnapshot(
+        results: [CommandPaletteSearchResult]
+    ) -> CommandPaletteDebugSnapshot {
         guard isCommandPalettePresented else { return .empty }
 
         let mode: String
@@ -4772,7 +4781,7 @@ struct ContentView: View {
             mode = "rename_confirm"
         }
 
-        let rows = Array(commandPaletteResults.prefix(20)).map { result in
+        let rows = Array(results.prefix(20)).map { result in
             CommandPaletteDebugResultRow(
                 commandId: result.command.id,
                 title: result.command.title,
@@ -4811,8 +4820,10 @@ struct ContentView: View {
             commandPaletteRestoreFocusTarget = nil
         }
         isCommandPalettePresented = true
-        // Nothing from a previous open may leak into this query.
+        // Nothing from a previous open may leak into this query, and the drop
+        // counter reports on this open, not on the window's whole lifetime.
         AppDelegate.shared?.clearCommandPalettePendingInput()
+        commandPaletteNavigationIgnoredEmptyCount = 0
         refreshCommandPaletteUsageHistory()
         resetCommandPaletteListState(initialQuery: initialQuery)
     }
