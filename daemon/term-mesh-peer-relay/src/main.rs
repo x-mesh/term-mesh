@@ -63,6 +63,30 @@ fn relay_debug_enabled() -> bool {
     })
 }
 
+/// Hex-dump a stdin chunk, but only when it is not ordinary typed text.
+///
+/// Two reasons for the filter. A relay carries everything a person types, and
+/// a debug log that records all of it is a keylog. And the case worth seeing
+/// is the one that should not be there at all — a stray control or high byte
+/// arriving with no one at the keyboard, which is how `ÿ` (0xFF) came to sit
+/// in a remote prompt after the pane was left idle.
+/// Whether a chunk is nothing but text a person could have typed. Such a chunk
+/// is never logged: printable ASCII plus tab/CR/LF is the shape of ordinary
+/// keystrokes, and recording those would make the debug log a keylog.
+fn is_ordinary_typed_text(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|&b| (0x20..0x7F).contains(&b) || b == b'\n' || b == b'\r' || b == 0x09)
+}
+
+fn rlog_stdin_bytes(label: &str, bytes: &[u8]) {
+    if bytes.is_empty() || !relay_debug_enabled() || is_ordinary_typed_text(bytes) {
+        return;
+    }
+    let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    rlog(&format!("{label}: {} bytes [{}]", bytes.len(), hex.join(" ")));
+}
+
 fn rlog(msg: &str) {
     if !relay_debug_enabled() {
         return;
@@ -868,17 +892,24 @@ fn main() {
             }
             if ret == 0 {
                 let flushed = response_filter.flush_pending_sequence();
+                rlog_stdin_bytes("stdin flushed-incomplete", &flushed);
                 if !send_frame(&tx_stdin, &flushed) {
                     rlog("stdin exit: send_frame failed (channel closed) after sequence flush");
                     break;
                 }
                 continue;
             }
-            if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                rlog(&format!("stdin exit: poll revents={:#x}", pfd.revents));
-                break;
-            }
+            // POLLHUP can arrive with POLLIN still set: the writer closed its
+            // end, but bytes it wrote before that are still in the buffer.
+            // Leaving on the hangup alone discarded them — the last keystrokes
+            // before a pane closes. Read while POLLIN stands; read() returning
+            // 0 is the real end of stream and already breaks below.
+            let hangup = pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
             if pfd.revents & libc::POLLIN == 0 {
+                if hangup {
+                    rlog(&format!("stdin exit: poll revents={:#x}", pfd.revents));
+                    break;
+                }
                 continue;
             }
             let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
@@ -896,7 +927,10 @@ fn main() {
                     }
                 }
             }
-            let filtered = response_filter.process(&buf[..n as usize]);
+            let chunk = &buf[..n as usize];
+            rlog_stdin_bytes("stdin raw", chunk);
+            let filtered = response_filter.process(chunk);
+            rlog_stdin_bytes("stdin forwarded", &filtered);
             if !send_frame(&tx_stdin, &filtered) {
                 rlog("stdin exit: send_frame failed (channel closed)");
                 break;
@@ -1010,6 +1044,32 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_typing_is_never_logged() {
+        use super::is_ordinary_typed_text;
+        assert!(is_ordinary_typed_text(b"ls -la"));
+        assert!(is_ordinary_typed_text(b"hello\n"));
+        assert!(is_ordinary_typed_text(b"a\tb\r\n"));
+        assert!(is_ordinary_typed_text(b""));
+    }
+
+    /// The bytes worth seeing: a stray high byte with nobody at the keyboard
+    /// (0xFF turning up as an idle remote prompt's stray glyph), and escape
+    /// sequences, which are terminal traffic rather than typing.
+    #[test]
+    fn control_and_high_bytes_are_logged() {
+        use super::is_ordinary_typed_text;
+        assert!(!is_ordinary_typed_text(&[0xFF]));
+        assert!(!is_ordinary_typed_text(&[0x1B, b'[', b'A']));
+        assert!(!is_ordinary_typed_text(&[0x00]));
+        assert!(!is_ordinary_typed_text(&[0x7F]));
+        // Non-ASCII text is logged too; that is deliberate — a chunk that is
+        // not plain ASCII typing is exactly what this exists to show.
+        assert!(!is_ordinary_typed_text("\u{d55c}".as_bytes()));
+        // One stray byte in an otherwise ordinary chunk still counts.
+        assert!(!is_ordinary_typed_text(&[b'a', b'b', 0xFF, b'c']));
+    }
+
     use super::*;
 
     fn filter(input: &[u8]) -> Vec<u8> {

@@ -264,6 +264,7 @@ struct ContentView: View {
     private var commandPaletteRenameSelectAllOnFocus = CommandPaletteRenameSelectionSettings.defaultSelectAllOnFocus
     @FocusState private var isCommandPaletteSearchFocused: Bool
     @FocusState private var isCommandPaletteRenameFocused: Bool
+    @State private var commandPaletteNavigationIgnoredEmptyCount: Int = 0
     @StateObject private var reviewBoardViewModel = ReviewBoardViewModel()
 
     private static let fixedSidebarResizeCursor = NSCursor(
@@ -2659,6 +2660,15 @@ struct ContentView: View {
         .onChange(of: commandPaletteSelectedResultIndex) { _ in
             syncCommandPaletteDebugStateForObservedWindow()
         }
+        // Watches the flag rather than the mode: CommandPaletteMode carries
+        // associated values and is not Equatable, and this is the transition
+        // that matters — text held for a mode that owns the query is not text
+        // for one that does not. Dropping it here keeps it from surfacing in
+        // the search query after a rename ends.
+        .onChange(of: commandPaletteAcceptsAbsorbedInput) { _ in
+            AppDelegate.shared?.clearCommandPalettePendingInput()
+            syncCommandPaletteDebugStateForObservedWindow()
+        }
     }
 
     private func commandPaletteRenameInputView(target: CommandPaletteRenameTarget) -> some View {
@@ -4598,6 +4608,10 @@ struct ContentView: View {
     private func moveCommandPaletteSelection(by delta: Int) {
         let count = commandPaletteResults.count
         guard count > 0 else {
+            // Record the drop: from the outside this is identical to a key
+            // that never reached a handler, and the two have different causes.
+            commandPaletteNavigationIgnoredEmptyCount += 1
+            syncCommandPaletteDebugStateForObservedWindow()
             NSSound.beep()
             return
         }
@@ -4610,10 +4624,15 @@ struct ContentView: View {
         modifiers: EventModifiers,
         delta: Int
     ) -> BackportKeyPressResult {
-        guard modifiers.contains(.control),
-              !modifiers.contains(.command),
-              !modifiers.contains(.shift),
-              !modifiers.contains(.option) else {
+        let accepted = modifiers.contains(.control)
+            && !modifiers.contains(.command)
+            && !modifiers.contains(.shift)
+            && !modifiers.contains(.option)
+        AppDelegate.shared?.noteCommandPaletteNavigationKeyPress(
+            eventModifiersRaw: Int(modifiers.rawValue),
+            accepted: accepted
+        )
+        guard accepted else {
             return .ignored
         }
         moveCommandPaletteSelection(by: delta)
@@ -4734,13 +4753,22 @@ struct ContentView: View {
     private func syncCommandPaletteDebugStateForObservedWindow() {
         guard let window = observedWindow ?? NSApp.keyWindow ?? NSApp.mainWindow else { return }
         AppDelegate.shared?.setCommandPaletteVisible(isCommandPalettePresented, for: window)
-        let visibleResultCount = commandPaletteResults.count
-        let selectedIndex = isCommandPalettePresented ? commandPaletteSelectedIndex(resultCount: visibleResultCount) : 0
+        // Evaluated once and passed down: `commandPaletteResults` rebuilds the
+        // command registry, fuzzy-scores it and sorts, with no cache, and this
+        // runs on the palette-open path whose latency the focus work exists to
+        // cut.
+        let results = isCommandPalettePresented ? commandPaletteResults : []
+        let selectedIndex = isCommandPalettePresented ? commandPaletteSelectedIndex(resultCount: results.count) : 0
         AppDelegate.shared?.setCommandPaletteSelectionIndex(selectedIndex, for: window)
-        AppDelegate.shared?.setCommandPaletteSnapshot(commandPaletteDebugSnapshot(), for: window)
+        AppDelegate.shared?.setCommandPaletteSnapshot(
+            commandPaletteDebugSnapshot(results: results),
+            for: window
+        )
     }
 
-    private func commandPaletteDebugSnapshot() -> CommandPaletteDebugSnapshot {
+    private func commandPaletteDebugSnapshot(
+        results: [CommandPaletteSearchResult]
+    ) -> CommandPaletteDebugSnapshot {
         guard isCommandPalettePresented else { return .empty }
 
         let mode: String
@@ -4753,7 +4781,7 @@ struct ContentView: View {
             mode = "rename_confirm"
         }
 
-        let rows = Array(commandPaletteResults.prefix(20)).map { result in
+        let rows = Array(results.prefix(20)).map { result in
             CommandPaletteDebugResultRow(
                 commandId: result.command.id,
                 title: result.command.title,
@@ -4766,8 +4794,20 @@ struct ContentView: View {
         return CommandPaletteDebugSnapshot(
             query: commandPaletteQueryForMatching,
             mode: mode,
-            results: rows
+            results: rows,
+            searchFocused: isCommandPaletteSearchFocused,
+            renameFocused: isCommandPaletteRenameFocused,
+            navigationIgnoredEmptyCount: commandPaletteNavigationIgnoredEmptyCount,
+            acceptsAbsorbedInput: commandPaletteAcceptsAbsorbedInput
         )
+    }
+
+    /// Held keystrokes are only ever applied to the search query, so nothing
+    /// may be held in a mode that does not own it.
+    private var commandPaletteAcceptsAbsorbedInput: Bool {
+        guard isCommandPalettePresented else { return false }
+        if case .commands = commandPaletteMode { return true }
+        return false
     }
 
     private func presentCommandPalette(initialQuery: String) {
@@ -4780,6 +4820,10 @@ struct ContentView: View {
             commandPaletteRestoreFocusTarget = nil
         }
         isCommandPalettePresented = true
+        // Nothing from a previous open may leak into this query, and the drop
+        // counter reports on this open, not on the window's whole lifetime.
+        AppDelegate.shared?.clearCommandPalettePendingInput()
+        commandPaletteNavigationIgnoredEmptyCount = 0
         refreshCommandPaletteUsageHistory()
         resetCommandPaletteListState(initialQuery: initialQuery)
     }
@@ -4799,6 +4843,9 @@ struct ContentView: View {
     private func dismissCommandPalette(restoreFocus: Bool = true) {
         let focusTarget = commandPaletteRestoreFocusTarget
         isCommandPalettePresented = false
+        // Anything still held for a palette that is closing is discarded, not
+        // applied to whatever opens next.
+        AppDelegate.shared?.clearCommandPalettePendingInput()
         commandPaletteMode = .commands
         commandPaletteQuery = ""
         commandPaletteRenameDraft = ""
@@ -4868,17 +4915,25 @@ struct ContentView: View {
     }
 
     private func applyCommandPaletteInputFocusPolicy(_ policy: CommandPaletteInputFocusPolicy) {
-        DispatchQueue.main.async {
-            switch policy.focusTarget {
-            case .search:
-                isCommandPaletteRenameFocused = false
-                isCommandPaletteSearchFocused = true
-            case .rename:
-                isCommandPaletteSearchFocused = false
-                isCommandPaletteRenameFocused = true
-            }
-            applyCommandPaletteTextSelection(policy.selectionBehavior)
+        // Set the focus target synchronously. Deferring it to the next run
+        // loop pass leaves the palette on screen while input still goes to
+        // whatever held focus before it opened, which drops both typing and
+        // the navigation keys — every one of them is an onKeyPress on the
+        // search field. A FocusState value that is already set when the
+        // focused field appears is applied as the field appears, so there is
+        // nothing here that has to wait for the view.
+        switch policy.focusTarget {
+        case .search:
+            isCommandPaletteRenameFocused = false
+            isCommandPaletteSearchFocused = true
+        case .rename:
+            isCommandPaletteSearchFocused = false
+            isCommandPaletteRenameFocused = true
         }
+        // The selection does need the field editor, which does not exist
+        // until the field is on screen; this call retries until it does.
+        applyCommandPaletteTextSelection(policy.selectionBehavior)
+        syncCommandPaletteDebugStateForObservedWindow()
     }
 
     private func applyCommandPaletteTextSelection(
@@ -4900,6 +4955,24 @@ struct ContentView: View {
         guard let window = observedWindow ?? NSApp.keyWindow ?? NSApp.mainWindow else { return }
 
         if let editor = window.firstResponder as? NSTextView, editor.isFieldEditor {
+            // The palette now owns input; anything typed while it did not is
+            // waiting to be applied. Do it before placing the caret, and let
+            // the next attempt position that caret against the text the
+            // binding produces — the editor still holds the pre-flush string.
+            if commandPaletteAcceptsAbsorbedInput,
+               let pending = AppDelegate.shared?.takeCommandPalettePendingInput(),
+               !pending.isEmpty {
+                commandPaletteQuery += pending
+                if attemptsRemaining > 0 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+                        applyCommandPaletteTextSelection(
+                            behavior,
+                            attemptsRemaining: attemptsRemaining - 1
+                        )
+                    }
+                }
+                return
+            }
             let length = (editor.string as NSString).length
             switch behavior {
             case .selectAll:

@@ -37,7 +37,16 @@ class ProjectLayout(TypedDict):
 
 
 class termmeshError(Exception):
-    """Exception raised for term-mesh errors."""
+    """Exception raised for term-mesh errors.
+
+    `code` carries the protocol's own error code when the failure came back
+    over the socket, so callers can branch on it instead of matching prose
+    that is free to change.
+    """
+
+    def __init__(self, message: str, code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _default_socket_path() -> str:
@@ -328,8 +337,8 @@ class termmesh:
         msg = err.get("message") or "Unknown error"
         data = err.get("data")
         if data is not None:
-            raise termmeshError(f"{code}: {msg} ({data})")
-        raise termmeshError(f"{code}: {msg}")
+            raise termmeshError(f"{code}: {msg} ({data})", code=code)
+        raise termmeshError(f"{code}: {msg}", code=code)
 
     # ---------------------------------------------------------------------
     # ID resolution helpers (index -> id)
@@ -1036,6 +1045,37 @@ class termmesh:
                 return
             time.sleep(0.05)
         raise termmeshError(f"Timed out waiting for webview focus: {panel_id}")
+
+    def wait_for_terminal_text(
+        self,
+        panel: Union[str, int, None] = None,
+        timeout_s: float = 10.0,
+        interval_s: float = 0.2,
+    ) -> str:
+        """Poll a surface until it has rendered text, then return that text.
+
+        `surface.create` answers with an id before the surface is registered
+        for reads, so a read issued right after it fails with "Terminal surface
+        not found". That is a not-ready signal while the deadline holds; any
+        other error propagates on the spot.
+        """
+        deadline = time.time() + timeout_s
+        while True:
+            try:
+                text = self.read_terminal_text(panel)
+                if text.strip():
+                    return text
+            except termmeshError as exc:
+                # Only the surface being unknown *yet* is a not-ready signal.
+                # A wrong id raises the same code, so the deadline below is
+                # what separates them; every other failure is immediate.
+                if exc.code != "internal_error" or "surface not found" not in str(exc).lower():
+                    raise
+            if time.time() >= deadline:
+                raise termmeshError(
+                    f"surface {panel!r} rendered no text within {timeout_s}s"
+                )
+            time.sleep(interval_s)
 
     # ---------------------------------------------------------------------
     # Sidebar state
