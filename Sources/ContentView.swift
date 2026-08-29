@@ -4886,6 +4886,10 @@ struct ContentView: View {
                 isCommandPaletteRenameFocused = true
             }
             applyCommandPaletteTextSelection(policy.selectionBehavior)
+            // The callers sync before this block runs, so without this the
+            // published state keeps reporting the focus the palette had
+            // before the policy was applied — for the whole time it holds.
+            syncCommandPaletteDebugStateForObservedWindow()
         }
     }
 

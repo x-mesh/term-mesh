@@ -96,19 +96,29 @@ def _open_palette_with_query(
     _set_palette_visible(client, window_id, False)
     _set_palette_visible(client, window_id, True)
     client.simulate_type(query)
-    # The query is matched asynchronously, and a selected index of 0 is also
-    # what an empty list reports. Sending Down before the list holds that many
-    # rows moves the selection nowhere, so wait for the rows themselves.
+    # Wait for the typed query itself, not just for a row count: the palette
+    # opens holding every command, so `>= min_results` is already true against
+    # the pre-typing list and waits for nothing.
+    _wait_until(
+        lambda: str(
+            client.command_palette_results(window_id=window_id, limit=20).get("query") or ""
+        ) == query,
+        message=f"palette query never became {query!r}",
+    )
     _wait_until(
         lambda: _palette_result_count(client, window_id) >= min_results,
         message=f"palette query {query!r} did not produce {min_results} result(s)",
     )
-    # The palette's input takes focus a run loop pass after the palette opens.
-    # A navigation key sent before that is routed somewhere else and the
-    # selection never moves, which reads as a seeding failure further down.
+    # Every palette navigation key is an onKeyPress on the search field, so it
+    # only fires while that field holds SwiftUI focus — which arrives a run
+    # loop pass after the palette opens. `field_editor_focused` is not that
+    # signal: it is true for any field editor holding first responder, so
+    # typing lands while navigation keys are still dropped.
     _wait_until(
-        lambda: _palette_input_focused(client, window_id),
-        message=f"palette input never took focus: {_palette_debug_state(client, window_id)}",
+        lambda: bool(
+            client.command_palette_results(window_id=window_id, limit=20).get("search_focused")
+        ),
+        message=f"palette search field never took focus: {_palette_debug_state(client, window_id)}",
     )
     _wait_until(
         lambda: _palette_selected_index(client, window_id) == 0,
