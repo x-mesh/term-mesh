@@ -96,7 +96,12 @@ def main() -> int:
         try:
             before_teams = len(c.team_list())
             before_workspaces = len(c.list_workspaces())
-            status = start_and_wait(c, team, directory)
+            # Same resampling the other-window case uses: the fixture Project's
+            # own leader is still settling here, so a single sample can catch a
+            # process count that moves for reasons this test is not about.
+            status = wait_for_zero_delta_conflict(
+                c, team, directory, "same-window duplicate create"
+            )
             expected = {
                 "state": "conflict",
                 "conflict": "exact_live",

@@ -91,6 +91,14 @@ def main() -> int:
             message="palette did not open in commands mode",
         )
 
+        # Opening the palette hands focus to its input on a later run loop
+        # pass, so this wait is a precondition, not the thing under test. What
+        # the test asserts is that the workspace spawn below cannot take that
+        # focus away, and those samples stay immediate.
+        _wait_until(
+            lambda: bool(_palette_input_selection(client, window_id).get("focused")),
+            message="palette input never took focus after opening",
+        )
         selection = _palette_input_selection(client, window_id)
         _assert_caret_at_end(selection, "initial state")
 

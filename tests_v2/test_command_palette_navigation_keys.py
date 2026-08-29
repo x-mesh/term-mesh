@@ -60,10 +60,24 @@ def _set_palette_visible(client: termmesh, window_id: str, visible: bool) -> Non
     )
 
 
-def _open_palette_with_query(client: termmesh, window_id: str, query: str) -> None:
+def _palette_result_count(client: termmesh, window_id: str) -> int:
+    res = client.command_palette_results(window_id=window_id, limit=20)
+    return len(res.get("results") or [])
+
+
+def _open_palette_with_query(
+    client: termmesh, window_id: str, query: str, min_results: int = 1
+) -> None:
     _set_palette_visible(client, window_id, False)
     _set_palette_visible(client, window_id, True)
     client.simulate_type(query)
+    # The query is matched asynchronously, and a selected index of 0 is also
+    # what an empty list reports. Sending Down before the list holds that many
+    # rows moves the selection nowhere, so wait for the rows themselves.
+    _wait_until(
+        lambda: _palette_result_count(client, window_id) >= min_results,
+        message=f"palette query {query!r} did not produce {min_results} result(s)",
+    )
     _wait_until(
         lambda: _palette_selected_index(client, window_id) == 0,
         message="palette selected index did not reset to zero",
@@ -71,7 +85,9 @@ def _open_palette_with_query(client: termmesh, window_id: str, query: str) -> No
 
 
 def _assert_move(client: termmesh, window_id: str, combo: str, start_index: int, expected_index: int) -> None:
-    _open_palette_with_query(client, window_id, "new")
+    _open_palette_with_query(
+        client, window_id, "new", min_results=max(start_index, expected_index) + 1
+    )
     for _ in range(start_index):
         client.simulate_shortcut("down")
     _wait_until(
