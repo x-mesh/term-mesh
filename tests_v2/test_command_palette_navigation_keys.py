@@ -109,16 +109,31 @@ def _open_palette_with_query(
         ),
         message=f"palette never took input focus: {_palette_debug_state(client, window_id)}",
     )
-    client.simulate_type(query)
     # Wait for the typed query itself, not just for a row count: the palette
     # opens holding every command, so `>= min_results` is already true against
     # the pre-typing list and waits for nothing.
-    _wait_until(
-        lambda: str(
+    #
+    # Retype rather than fail when it has not landed. simulate_type inserts
+    # into the field editor directly, and that edit reaching the SwiftUI
+    # binding is not guaranteed by the call returning. Only retype from empty,
+    # so a partially delivered query is a failure and not a doubled one.
+    def _typed() -> bool:
+        current = str(
             client.command_palette_results(window_id=window_id, limit=20).get("query") or ""
-        ) == query,
-        message=f"palette query never became {query!r}",
-    )
+        )
+        if current == query:
+            return True
+        if current == "":
+            client.simulate_type(query)
+        return False
+
+    try:
+        _wait_until(_typed, message="type timeout")
+    except termmeshError:
+        raise termmeshError(
+            f"palette query never became {query!r}: "
+            f"{_palette_debug_state(client, window_id)}"
+        )
     _wait_until(
         lambda: _palette_result_count(client, window_id) >= min_results,
         message=f"palette query {query!r} did not produce {min_results} result(s)",
