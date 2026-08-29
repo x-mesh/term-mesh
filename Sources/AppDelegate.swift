@@ -507,6 +507,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private(set) var commandPaletteNavigationModifierRejectCount: Int = 0
     private(set) var commandPaletteLastNavigationModifiersRaw: Int = -1
 
+    /// Milliseconds the palette spent visible without owning input on the last
+    /// open, or -1 when it never took it. Negative-safe: read as a diagnostic.
+    private(set) var commandPaletteLastFocusWaitMs: Int = -1
+
+    func noteCommandPaletteFocusWait(seconds: TimeInterval) {
+        commandPaletteLastFocusWaitMs = seconds < 0 ? -1 : Int((seconds * 1000).rounded())
+    }
+
     func noteCommandPaletteNavigationKeyPress(modifiersRaw: Int, accepted: Bool) {
         commandPaletteNavigationKeyPressCount += 1
         commandPaletteLastNavigationModifiersRaw = modifiersRaw
