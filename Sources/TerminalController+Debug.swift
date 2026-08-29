@@ -448,7 +448,10 @@ extension TerminalController {
             "selected_index": max(0, selectedIndex),
             "query": snapshot.query,
             "mode": snapshot.mode,
-            "results": rows
+            "results": rows,
+            "search_focused": snapshot.searchFocused,
+            "rename_focused": snapshot.renameFocused,
+            "nav_ignored_empty_count": snapshot.navigationIgnoredEmptyCount
         ])
     }
 

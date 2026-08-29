@@ -325,8 +325,24 @@ struct CommandPaletteDebugSnapshot {
     let query: String
     let mode: String
     let results: [CommandPaletteDebugResultRow]
+    /// Whether the palette's search field holds SwiftUI focus. Every palette
+    /// navigation key is an `onKeyPress` on that field, so a key sent while
+    /// this is false reaches no handler at all — which is indistinguishable
+    /// from a handled key that moved nothing unless it is reported.
+    let searchFocused: Bool
+    let renameFocused: Bool
+    /// How many navigation keys reached the handler and were dropped because
+    /// the result list was empty at that instant.
+    let navigationIgnoredEmptyCount: Int
 
-    static let empty = CommandPaletteDebugSnapshot(query: "", mode: "commands", results: [])
+    static let empty = CommandPaletteDebugSnapshot(
+        query: "",
+        mode: "commands",
+        results: [],
+        searchFocused: false,
+        renameFocused: false,
+        navigationIgnoredEmptyCount: 0
+    )
 }
 
 func browserZoomShortcutAction(

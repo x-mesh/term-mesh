@@ -264,6 +264,7 @@ struct ContentView: View {
     private var commandPaletteRenameSelectAllOnFocus = CommandPaletteRenameSelectionSettings.defaultSelectAllOnFocus
     @FocusState private var isCommandPaletteSearchFocused: Bool
     @FocusState private var isCommandPaletteRenameFocused: Bool
+    @State private var commandPaletteNavigationIgnoredEmptyCount: Int = 0
     @StateObject private var reviewBoardViewModel = ReviewBoardViewModel()
 
     private static let fixedSidebarResizeCursor = NSCursor(
@@ -4598,6 +4599,10 @@ struct ContentView: View {
     private func moveCommandPaletteSelection(by delta: Int) {
         let count = commandPaletteResults.count
         guard count > 0 else {
+            // Record the drop: from the outside this is identical to a key
+            // that never reached a handler, and the two have different causes.
+            commandPaletteNavigationIgnoredEmptyCount += 1
+            syncCommandPaletteDebugStateForObservedWindow()
             NSSound.beep()
             return
         }
@@ -4766,7 +4771,10 @@ struct ContentView: View {
         return CommandPaletteDebugSnapshot(
             query: commandPaletteQueryForMatching,
             mode: mode,
-            results: rows
+            results: rows,
+            searchFocused: isCommandPaletteSearchFocused,
+            renameFocused: isCommandPaletteRenameFocused,
+            navigationIgnoredEmptyCount: commandPaletteNavigationIgnoredEmptyCount
         )
     }
 

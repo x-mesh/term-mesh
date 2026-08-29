@@ -78,7 +78,10 @@ def _palette_debug_state(client: termmesh, window_id: str) -> str:
         results = client.command_palette_results(window_id=window_id, limit=20)
         return (
             f"visible={_palette_visible(client, window_id)} "
-            f"focused={_palette_input_focused(client, window_id)} "
+            f"field_editor_focused={_palette_input_focused(client, window_id)} "
+            f"search_focused={results.get('search_focused')} "
+            f"rename_focused={results.get('rename_focused')} "
+            f"nav_ignored_empty={results.get('nav_ignored_empty_count')} "
             f"index={_palette_selected_index(client, window_id)} "
             f"mode={results.get('mode')!r} query={results.get('query')!r} "
             f"results={len(results.get('results') or [])}"
