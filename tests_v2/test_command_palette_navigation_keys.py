@@ -60,10 +60,53 @@ def _set_palette_visible(client: termmesh, window_id: str, visible: bool) -> Non
     )
 
 
-def _open_palette_with_query(client: termmesh, window_id: str, query: str) -> None:
+def _palette_result_count(client: termmesh, window_id: str) -> int:
+    res = client.command_palette_results(window_id=window_id, limit=20)
+    return len(res.get("results") or [])
+
+
+def _palette_input_focused(client: termmesh, window_id: str) -> bool:
+    res = client._call(
+        "debug.command_palette.rename_input.selection", {"window_id": window_id}
+    ) or {}
+    return bool(res.get("focused"))
+
+
+def _palette_debug_state(client: termmesh, window_id: str) -> str:
+    """What the palette actually reports, for a failure that says nothing."""
+    try:
+        results = client.command_palette_results(window_id=window_id, limit=20)
+        return (
+            f"visible={_palette_visible(client, window_id)} "
+            f"focused={_palette_input_focused(client, window_id)} "
+            f"index={_palette_selected_index(client, window_id)} "
+            f"mode={results.get('mode')!r} query={results.get('query')!r} "
+            f"results={len(results.get('results') or [])}"
+        )
+    except termmeshError as exc:
+        return f"<state unreadable: {exc}>"
+
+
+def _open_palette_with_query(
+    client: termmesh, window_id: str, query: str, min_results: int = 1
+) -> None:
     _set_palette_visible(client, window_id, False)
     _set_palette_visible(client, window_id, True)
     client.simulate_type(query)
+    # The query is matched asynchronously, and a selected index of 0 is also
+    # what an empty list reports. Sending Down before the list holds that many
+    # rows moves the selection nowhere, so wait for the rows themselves.
+    _wait_until(
+        lambda: _palette_result_count(client, window_id) >= min_results,
+        message=f"palette query {query!r} did not produce {min_results} result(s)",
+    )
+    # The palette's input takes focus a run loop pass after the palette opens.
+    # A navigation key sent before that is routed somewhere else and the
+    # selection never moves, which reads as a seeding failure further down.
+    _wait_until(
+        lambda: _palette_input_focused(client, window_id),
+        message=f"palette input never took focus: {_palette_debug_state(client, window_id)}",
+    )
     _wait_until(
         lambda: _palette_selected_index(client, window_id) == 0,
         message="palette selected index did not reset to zero",
@@ -71,13 +114,28 @@ def _open_palette_with_query(client: termmesh, window_id: str, query: str) -> No
 
 
 def _assert_move(client: termmesh, window_id: str, combo: str, start_index: int, expected_index: int) -> None:
-    _open_palette_with_query(client, window_id, "new")
-    for _ in range(start_index):
-        client.simulate_shortcut("down")
-    _wait_until(
-        lambda: _palette_selected_index(client, window_id) == start_index,
-        message=f"failed to seed start index {start_index}",
+    _open_palette_with_query(
+        client, window_id, "new", min_results=max(start_index, expected_index) + 1
     )
+    # Seeding is this case's precondition, not its assertion — what is under
+    # test is where `combo` moves the selection from here. A navigation key
+    # can be swallowed with the palette visible, focused and populated
+    # (observed: index=0 with 11 rows), so drive the selection to the start
+    # index rather than sending once and hoping it landed.
+    def _seeded() -> bool:
+        index = _palette_selected_index(client, window_id)
+        if index == start_index:
+            return True
+        client.simulate_shortcut("down" if index < start_index else "up")
+        return False
+
+    try:
+        _wait_until(_seeded, message="seed timeout")
+    except termmeshError:
+        raise termmeshError(
+            f"failed to seed start index {start_index} with {combo}: "
+            f"{_palette_debug_state(client, window_id)}"
+        )
 
     client.simulate_shortcut(combo)
     _wait_until(

@@ -44,8 +44,7 @@ def main() -> int:
         # real tree.
         sid = c.new_surface(panel_type="terminal")
         c.focus_surface(sid)
-        if not _wait(lambda: c.read_terminal_text(sid).strip() != "", timeout_s=10):
-            raise termmeshError("seed surface never rendered")
+        c.wait_for_terminal_text(sid, timeout_s=10)
         c.new_split("right")
         time.sleep(1.0)
 

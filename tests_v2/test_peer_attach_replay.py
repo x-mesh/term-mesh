@@ -54,8 +54,7 @@ def main() -> int:
         marker1 = f"REPLAYCHK_{token1}"
         sid1 = c.new_surface(panel_type="terminal")
         c.focus_surface(sid1)
-        if not _wait(lambda: c.read_terminal_text(sid1).strip() != "", timeout_s=10):
-            raise termmeshError(f"surface {sid1} shell prompt never rendered")
+        c.wait_for_terminal_text(sid1, timeout_s=10)
 
         # Arm: creates the PtyTapHub + registers the real PTY tap callback.
         # Nothing has been produced yet, so this call's own result isn't
