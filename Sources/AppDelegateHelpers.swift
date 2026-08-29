@@ -330,6 +330,10 @@ struct CommandPaletteDebugSnapshot {
     /// this is false reaches no handler at all — which is indistinguishable
     /// from a handled key that moved nothing unless it is reported.
     let searchFocused: Bool
+    /// SwiftUI focus on the rename field, with the same caveat as
+    /// `searchFocused`. Neither is the AppKit first responder — for "does the
+    /// palette have the keyboard right now", ask
+    /// `AppDelegate.isCommandPaletteResponder(window.firstResponder)`.
     let renameFocused: Bool
     /// How many navigation keys reached the handler and were dropped because
     /// the result list was empty at that instant.
@@ -399,6 +403,23 @@ func shouldRouteTerminalFontZoomShortcutToGhostty(
 ) -> Bool {
     guard firstResponderIsGhostty else { return false }
     return browserZoomShortcutAction(flags: flags, chars: chars, keyCode: keyCode) != nil
+}
+
+/// Whether a keystroke belongs to the command palette's query while the palette
+/// is waiting for focus. Chords are left alone — they are shortcuts, not text —
+/// and so are control keys (escape, return, tab) and the function-key range that
+/// carries the arrows, which must keep reaching their own handlers.
+///
+/// Characters only: whether an input method is composing, and which mode the
+/// palette is in, are decided by `absorbCommandPaletteKeyIfUnfocused`.
+func commandPaletteAbsorbsKey(characters: String, flags: NSEvent.ModifierFlags) -> Bool {
+    guard flags.intersection(.deviceIndependentFlagsMask)
+        .isDisjoint(with: [.command, .control, .option]) else { return false }
+    guard !characters.isEmpty else { return false }
+    return characters.unicodeScalars.allSatisfy { scalar in
+        !CharacterSet.controlCharacters.contains(scalar)
+            && !(0xF700...0xF8FF).contains(scalar.value)
+    }
 }
 
 func termMeshOwningGhosttyView(for responder: NSResponder?) -> GhosttyNSView? {

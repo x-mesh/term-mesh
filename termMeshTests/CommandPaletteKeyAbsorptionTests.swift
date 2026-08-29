@@ -15,10 +15,9 @@ import AppKit
 /// decided by `absorbCommandPaletteKeyIfUnfocused`, which additionally
 /// declines while an input method is composing and while the palette is in
 /// rename mode; neither condition is visible from the characters.
-@MainActor
 final class CommandPaletteKeyAbsorptionTests: XCTestCase {
-    private func absorbs(_ characters: String?, _ flags: NSEvent.ModifierFlags = []) -> Bool {
-        AppDelegate.commandPaletteAbsorbsKey(characters: characters, flags: flags)
+    private func absorbs(_ characters: String, _ flags: NSEvent.ModifierFlags = []) -> Bool {
+        commandPaletteAbsorbsKey(characters: characters, flags: flags)
     }
 
     func testPlainTextIsHeldForThePalette() {
@@ -61,8 +60,7 @@ final class CommandPaletteKeyAbsorptionTests: XCTestCase {
         XCTAssertFalse(absorbs(String(UnicodeScalar(0xF704)!)))  // F1
     }
 
-    func testEmptyAndMissingCharactersAreLeftAlone() {
-        XCTAssertFalse(absorbs(nil))
+    func testEmptyCharactersAreLeftAlone() {
         XCTAssertFalse(absorbs(""))
     }
 

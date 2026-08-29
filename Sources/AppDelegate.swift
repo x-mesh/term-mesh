@@ -503,7 +503,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// closure captured, which is how `searchFocused` came to read false
     /// through runs that passed. These are written at the call and read
     /// straight back.
-    private(set) var commandPaletteNavigationKeyPressCount: Int = 0
+    ///
+    /// Process-wide, unlike the per-window dictionaries above: with two windows
+    /// open these describe whichever one most recently produced the event.
+    ///
+    /// "Candidate" is literal — the handler behind these is bound to the n/p/j/k
+    /// keys, so typing those letters into the query counts here too, and the
+    /// arrows do not count at all because they move the selection directly.
+    private(set) var commandPaletteNavigationCandidateKeyCount: Int = 0
     private(set) var commandPaletteNavigationModifierRejectCount: Int = 0
     /// SwiftUI `EventModifiers` — NOT `NSEvent.ModifierFlags`, whose bits
     /// differ. The absorb path on this same object takes AppKit flags, so the
@@ -521,23 +528,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// fast typist's first keystroke, so these characters used to go to
     /// whatever held focus before the palette opened.
     private(set) var commandPalettePendingInput: String = ""
-
-    /// Whether a keystroke belongs to the palette's query while it is waiting
-    /// for focus. Chords are left alone — they are shortcuts, not text — and so
-    /// are control keys (escape, return, tab) and the function-key range that
-    /// carries the arrows, which must keep reaching their own handlers.
-    static func commandPaletteAbsorbsKey(
-        characters: String?,
-        flags: NSEvent.ModifierFlags
-    ) -> Bool {
-        guard flags.intersection(.deviceIndependentFlagsMask)
-            .isDisjoint(with: [.command, .control, .option]) else { return false }
-        guard let characters, !characters.isEmpty else { return false }
-        return characters.unicodeScalars.allSatisfy { scalar in
-            !CharacterSet.controlCharacters.contains(scalar)
-                && !(0xF700...0xF8FF).contains(scalar.value)
-        }
-    }
 
     /// Hold a keystroke for the palette when it is visible but not yet focused.
     /// Returns true when the event was taken, so the caller consumes it.
@@ -564,11 +554,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard commandPaletteSnapshot(windowId: windowId).acceptsAbsorbedInput else {
             return false
         }
-        guard Self.commandPaletteAbsorbsKey(
-            characters: event.characters,
-            flags: event.modifierFlags
-        ) else { return false }
-        commandPalettePendingInput += event.characters ?? ""
+        guard let characters = event.characters,
+              commandPaletteAbsorbsKey(characters: characters, flags: event.modifierFlags)
+        else { return false }
+        commandPalettePendingInput += characters
         return true
     }
 
@@ -590,7 +579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func noteCommandPaletteNavigationKeyPress(eventModifiersRaw: Int, accepted: Bool) {
-        commandPaletteNavigationKeyPressCount += 1
+        commandPaletteNavigationCandidateKeyCount += 1
         commandPaletteLastNavigationEventModifiersRaw = eventModifiersRaw
         if !accepted {
             commandPaletteNavigationModifierRejectCount += 1

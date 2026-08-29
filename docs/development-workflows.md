@@ -143,7 +143,9 @@ and each row's `command_id` / `title` / `trailing_label`). It also reports
 whether the palette owns keyboard input right now — `first_responder_in_palette`,
 the AppKit answer and the one to assert on — alongside the SwiftUI focus flags
 `search_focused` / `rename_focused`, which lag and read false through runs that
-pass. The rest is navigation diagnostics: `nav_key_press_count`,
+pass. The rest is navigation diagnostics: `nav_candidate_key_count`
+(n/p/j/k reaching the palette handler — typing those letters counts, arrows do
+not — and process-wide, not per window),
 `nav_modifier_reject_count`, `nav_last_event_modifiers_raw` (SwiftUI
 `EventModifiers`, null until a navigation key arrives), `nav_ignored_empty_count`
 (drops against an empty list, reset each open) and `last_focus_wait_ms` (how long

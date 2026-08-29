@@ -63,6 +63,13 @@ def wait_for_zero_delta_conflict(
     last: dict = {}
     while time.monotonic() < deadline:
         last = start_and_wait(c, name, directory)
+        # Resampling exists for unrelated startup noise in the counts. A
+        # duplicate that stopped being a typed conflict is the regression this
+        # test guards, and retrying it would report a timeout instead.
+        if last.get("state") != "conflict":
+            raise termmeshError(
+                f"{label}: duplicate create was not a typed conflict: {last!r}"
+            )
         if all(
             last.get(f"before_{resource}_count")
             == last.get(f"after_{resource}_count")
