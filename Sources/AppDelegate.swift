@@ -511,6 +511,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// open, or -1 when it never took it. Negative-safe: read as a diagnostic.
     private(set) var commandPaletteLastFocusWaitMs: Int = -1
 
+    /// Text typed while the palette was on screen but did not own input yet.
+    /// That gap measured 47ms on average and 96ms at worst, which is inside a
+    /// fast typist's first keystroke, so these characters used to go to
+    /// whatever held focus before the palette opened.
+    private(set) var commandPalettePendingInput: String = ""
+
+    /// Whether a keystroke belongs to the palette's query while it is waiting
+    /// for focus. Chords are left alone — they are shortcuts, not text — and so
+    /// are control keys (escape, return, tab) and the function-key range that
+    /// carries the arrows, which must keep reaching their own handlers.
+    static func commandPaletteAbsorbsKey(
+        characters: String?,
+        flags: NSEvent.ModifierFlags
+    ) -> Bool {
+        guard flags.intersection(.deviceIndependentFlagsMask)
+            .isDisjoint(with: [.command, .control, .option]) else { return false }
+        guard let characters, !characters.isEmpty else { return false }
+        return characters.unicodeScalars.allSatisfy { scalar in
+            !CharacterSet.controlCharacters.contains(scalar)
+                && !(0xF700...0xF8FF).contains(scalar.value)
+        }
+    }
+
+    /// Hold a keystroke for the palette when it is visible but not yet focused.
+    /// Returns true when the event was taken, so the caller consumes it.
+    func absorbCommandPaletteKeyIfUnfocused(event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return false }
+        guard let window = NSApp.keyWindow,
+              let windowId = mainWindowId(for: window),
+              isCommandPaletteVisible(windowId: windowId) else { return false }
+        // Once the palette owns input, SwiftUI routes keys to it directly.
+        if let responder = window.firstResponder, isCommandPaletteResponder(responder) {
+            return false
+        }
+        guard Self.commandPaletteAbsorbsKey(
+            characters: event.characters,
+            flags: event.modifierFlags
+        ) else { return false }
+        commandPalettePendingInput += event.characters ?? ""
+        return true
+    }
+
+    func takeCommandPalettePendingInput() -> String {
+        defer { commandPalettePendingInput = "" }
+        return commandPalettePendingInput
+    }
+
+    func clearCommandPalettePendingInput() {
+        commandPalettePendingInput = ""
+    }
+
     func noteCommandPaletteFocusWait(seconds: TimeInterval) {
         commandPaletteLastFocusWaitMs = seconds < 0 ? -1 : Int((seconds * 1000).rounded())
     }
@@ -2617,6 +2668,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #if DEBUG
                     dlog("  → consumed by handleCustomShortcut")
                     DebugEventLog.shared.dump()
+#endif
+                    return nil // Consume the event
+                }
+                if self.absorbCommandPaletteKeyIfUnfocused(event: event) {
+#if DEBUG
+                    dlog("  → held for the command palette, which has no input focus yet")
 #endif
                     return nil // Consume the event
                 }

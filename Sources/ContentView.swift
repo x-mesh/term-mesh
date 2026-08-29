@@ -4793,6 +4793,8 @@ struct ContentView: View {
             commandPaletteRestoreFocusTarget = nil
         }
         isCommandPalettePresented = true
+        // Nothing from a previous open may leak into this query.
+        AppDelegate.shared?.clearCommandPalettePendingInput()
         refreshCommandPaletteUsageHistory()
         resetCommandPaletteListState(initialQuery: initialQuery)
     }
@@ -4812,6 +4814,9 @@ struct ContentView: View {
     private func dismissCommandPalette(restoreFocus: Bool = true) {
         let focusTarget = commandPaletteRestoreFocusTarget
         isCommandPalettePresented = false
+        // Anything still held for a palette that is closing is discarded, not
+        // applied to whatever opens next.
+        AppDelegate.shared?.clearCommandPalettePendingInput()
         commandPaletteMode = .commands
         commandPaletteQuery = ""
         commandPaletteRenameDraft = ""
@@ -4921,6 +4926,24 @@ struct ContentView: View {
         guard let window = observedWindow ?? NSApp.keyWindow ?? NSApp.mainWindow else { return }
 
         if let editor = window.firstResponder as? NSTextView, editor.isFieldEditor {
+            // The palette now owns input; anything typed while it did not is
+            // waiting to be applied. Do it before placing the caret, and let
+            // the next attempt position that caret against the text the
+            // binding produces — the editor still holds the pre-flush string.
+            if case .commands = commandPaletteMode,
+               let pending = AppDelegate.shared?.takeCommandPalettePendingInput(),
+               !pending.isEmpty {
+                commandPaletteQuery += pending
+                if attemptsRemaining > 0 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+                        applyCommandPaletteTextSelection(
+                            behavior,
+                            attemptsRemaining: attemptsRemaining - 1
+                        )
+                    }
+                }
+                return
+            }
             let length = (editor.string as NSString).length
             switch behavior {
             case .selectAll:
