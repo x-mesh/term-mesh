@@ -117,13 +117,20 @@ def _assert_move(client: termmesh, window_id: str, combo: str, start_index: int,
     _open_palette_with_query(
         client, window_id, "new", min_results=max(start_index, expected_index) + 1
     )
-    for _ in range(start_index):
-        client.simulate_shortcut("down")
+    # Seeding is this case's precondition, not its assertion — what is under
+    # test is where `combo` moves the selection from here. A navigation key
+    # can be swallowed with the palette visible, focused and populated
+    # (observed: index=0 with 11 rows), so drive the selection to the start
+    # index rather than sending once and hoping it landed.
+    def _seeded() -> bool:
+        index = _palette_selected_index(client, window_id)
+        if index == start_index:
+            return True
+        client.simulate_shortcut("down" if index < start_index else "up")
+        return False
+
     try:
-        _wait_until(
-            lambda: _palette_selected_index(client, window_id) == start_index,
-            message="seed timeout",
-        )
+        _wait_until(_seeded, message="seed timeout")
     except termmeshError:
         raise termmeshError(
             f"failed to seed start index {start_index} with {combo}: "
