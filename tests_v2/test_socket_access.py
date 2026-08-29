@@ -111,9 +111,17 @@ def _derived_app_candidates_for_current_worktree():
 
 
 def _find_app():
-    explicit = os.environ.get("TERMMESH_APP_PATH") or os.environ.get("TERMMESH_APP_PATH")
+    explicit = os.environ.get("TERMMESH_APP_PATH")
     if explicit and os.path.exists(explicit):
         return explicit
+    app_binary = os.environ.get("TERMMESH_APP_BIN")
+    if app_binary:
+        binary_path = os.path.realpath(app_binary)
+        marker = ".app/Contents/MacOS/"
+        if marker in binary_path:
+            app_path = binary_path.split(marker, 1)[0] + ".app"
+            if os.path.exists(app_path):
+                return app_path
 
     preferred_slug = _preferred_worktree_slug()
     if preferred_slug:
@@ -646,6 +654,7 @@ def run_tests():
         print("Error: Could not find term-mesh DEV.app in DerivedData")
         return 1
     print(f"App: {app_path}")
+    runner_owned_app = bool(os.environ.get("TERMMESH_APP_BIN"))
 
     socket_path = f"/tmp/termmesh-test-socket-access-{os.getpid()}.sock"
     try:
@@ -704,9 +713,13 @@ def run_tests():
     run_test(test_password_mode_cli_exit_code, socket_path, app_path)
     print()
 
-    # ── Cleanup: leave term-mesh in termMeshOnly mode ──
+    # Standalone/manual runs retain the historic convenience of leaving an app
+    # running. The E2E runner owns its app lifecycle and launches the next test
+    # itself; relaunching here leaked a second DerivedData app that later stole
+    # the shared socket and made the suite's next launch connect-refused.
     _kill_app(app_path)
-    _launch_app(app_path, socket_path, mode="termMeshOnly")
+    if not runner_owned_app:
+        _launch_app(app_path, socket_path, mode="termMeshOnly")
 
     # ── Summary ──
     print("=" * 60)

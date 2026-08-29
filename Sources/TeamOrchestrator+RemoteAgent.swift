@@ -720,6 +720,46 @@ extension TeamOrchestrator {
         return (shouldOffer, matching)
     }
 
+    /// The manifests a host lists under its own row in the Host axis.
+    ///
+    /// Deliberately the same rule the Project axis applies, because a machine's
+    /// projects appearing in one view and not the other is what made a Project
+    /// on a Mac peer look deleted: workspaces come from the serving GUI socket,
+    /// which publishes no manifest, so the Host axis had nothing to show and
+    /// said nothing about it. A manifest with no leader surface is skipped for
+    /// the same reason the Project axis skips it — there is nothing to attach.
+    nonisolated static func hostAxisOfferedManifests(
+        isConnected: Bool,
+        teams: [RemoteTeamSummary],
+        hostKey: String,
+        localTeamForName: (String) -> Team?
+    ) -> [RemoteTeamSummary] {
+        guard isConnected else { return [] }
+        return teams.filter { team in
+            guard !team.leaderSurfaceID.isEmpty else { return false }
+            return sidebarRemoteManifestState(
+                localTeam: localTeamForName(team.name),
+                remote: team,
+                hostKey: hostKey
+            ).shouldOffer
+        }.sorted { lhs, rhs in
+            let order = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+            if order != .orderedSame { return order == .orderedAscending }
+            return sidebarRemoteManifestKey(hostID: hostKey, team: lhs)
+                < sidebarRemoteManifestKey(hostID: hostKey, team: rhs)
+        }
+    }
+
+    /// Team names are presentation copy and can repeat across hosts. Project
+    /// identity plus host identity is stable for restore state and automation.
+    nonisolated static func sidebarRemoteManifestKey(
+        hostID: String, team: RemoteTeamSummary
+    ) -> String {
+        let projectIdentity = team.projectID.isEmpty ? team.id : team.projectID
+        return Data(hostID.utf8).base64EncodedString() + "."
+            + Data(projectIdentity.utf8).base64EncodedString()
+    }
+
     /// Pick the one daemon manifest this installation may restore without a
     /// click. Team names are presentation copy and can repeat; the newest
     /// locally-owned leader record is the durable join key that prevents an
@@ -2693,7 +2733,14 @@ extension TeamOrchestrator {
         }
 
         var bootstrap = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
-        bootstrap.projectID = "name:\(teamName)"
+        // Never the raw display name: the wire grammar cannot spell a space
+        // or any non-ASCII character, and New Project's duplicate suffix
+        // ("<repo> 2") produces one by itself.
+        let bootstrapProjectID = PeerTeamLeader.projectID(
+            teamName: teamName,
+            teamUUID: teamUUID
+        )
+        bootstrap.projectID = bootstrapProjectID
         bootstrap.leaderPlacement = .peer
         var requestUUID = UUID().uuid
         bootstrap.requestID = withUnsafeBytes(of: &requestUUID) { Data($0) }
@@ -2702,7 +2749,7 @@ extension TeamOrchestrator {
             encodedBytes: (try? bootstrap.serializedData().count) ?? 513,
             audiencePeerID: PeerIdentity.defaultPeerID()
         ) { projectID in
-            projectID == "name:\(teamName)" ? teamUUID : nil
+            projectID == bootstrapProjectID ? teamUUID : nil
         }
         guard grantResponse.ok else {
             await attempt.compensate()
@@ -2933,7 +2980,13 @@ extension TeamOrchestrator {
             throw RemoteAgentError.teamNotFound(teamName)
         }
         var bootstrap = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
-        bootstrap.projectID = "name:\(teamName)"
+        // Same identifier rule as the leader grant: a display name the wire
+        // grammar cannot spell would fail every worker's route bootstrap.
+        let bootstrapProjectID = PeerTeamLeader.projectID(
+            teamName: teamName,
+            teamUUID: teamUUID
+        )
+        bootstrap.projectID = bootstrapProjectID
         bootstrap.leaderPlacement = .peer
         var requestUUID = UUID().uuid
         bootstrap.requestID = withUnsafeBytes(of: &requestUUID) { Data($0) }
@@ -2942,7 +2995,7 @@ extension TeamOrchestrator {
             encodedBytes: (try? bootstrap.serializedData().count) ?? 513,
             audiencePeerID: PeerIdentity.defaultPeerID()
         ) { projectID in
-            projectID == "name:\(teamName)" ? teamUUID : nil
+            projectID == bootstrapProjectID ? teamUUID : nil
         }
         guard response.ok else { throw RemoteAgentError.paneCreationFailed }
         return response.grant

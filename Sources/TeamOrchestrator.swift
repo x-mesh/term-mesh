@@ -9034,7 +9034,26 @@ final class TeamOrchestrator: ObservableObject {
         let capabilities = teams.values.map(leaderMeasurementCapability(for:))
         let health = LeaderTurnLog.health(capabilities: capabilities)
         let policy = LeaderTurnLog.policyReport()
+        // Turn records are per-host: the hook appends to the HOME of whichever
+        // machine runs the leader pane, and this aggregate can only ever read
+        // this process's own log. So when a team's leader lives on a peer, a
+        // zero denominator here means "those turns are not readable from this
+        // host", NOT "the leader reported no turns" — and a reader that cannot
+        // tell those apart concludes the instrument is broken when it is
+        // merely pointed at the wrong machine.
+        //
+        // Report the scope instead of silently implying it. This stays out of
+        // `leaderMeasurementCapability(for:)` on purpose: that value also
+        // feeds the participation control payload and `resolve()`, where
+        // forcing `.degraded` for a peer leader would switch it off the canary
+        // path — a behavior change, not a measurement correction.
+        let recordedElsewhere = teams.values.filter { team in
+            guard case .peer = team.leaderEndpoint else { return false }
+            return team.leaderMeasurementCapability == .supported
+        }.count
         return [
+            "records_scope": "this_host",
+            "leaders_recording_on_other_hosts": recordedElsewhere,
             "supported_turns": health.supportedTurns,
             "linked_start_route_end": health.linkedTurns,
             "stated_turns": health.statedTurns,

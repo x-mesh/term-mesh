@@ -509,6 +509,97 @@ final class PeerTeamLeaderTests: XCTestCase {
         )
     }
 
+    /// The failure this fixes: New Project appends a duplicate suffix
+    /// ("term-mesh 2"), the old caller spelled that display name straight
+    /// into the grant, `validateBootstrap` rejected it as `invalid_project`,
+    /// and every leader/agent start reported the generic pane error instead.
+    func testProjectIdentifierBootstrapsDisplayNamesTheGrammarCannotSpell() async {
+        let teamUUID = "8E4C1B2A-0000-4000-8000-0123456789AB"
+        let names = [
+            "term-mesh 2",       // New Project's own duplicate suffix
+            "한글 프로젝트",         // non-ASCII display name
+            "web/api",           // path-like name
+            String(repeating: "n", count: PeerTeamLeader.maxProjectIDBytes),
+        ]
+        for name in names {
+            let controlPlane = PeerTeamLeaderControlPlane()
+            var request = validRequest()
+            request.projectID = PeerTeamLeader.projectID(
+                teamName: name,
+                teamUUID: teamUUID
+            )
+            let response = await controlPlane.bootstrap(
+                request,
+                encodedBytes: 64,
+                audiencePeerID: nil
+            ) { projectID in
+                projectID == request.projectID ? teamUUID : nil
+            }
+            XCTAssertTrue(
+                response.ok,
+                "\(name) still failed bootstrap: \(response.errorCode)"
+            )
+            XCTAssertEqual(response.teamUuid, teamUUID, name)
+            XCTAssertEqual(response.grant.projectID, request.projectID, name)
+        }
+    }
+
+    /// The grammar boundary itself: a spellable name keeps the readable
+    /// `name:<team>` form, and everything the wire cannot carry falls back to
+    /// the team UUID rather than minting a grant bootstrap would reject.
+    func testProjectIdentifierKeepsTheNamedFormOnlyForSpellableNames() {
+        let teamUUID = "8E4C1B2A-0000-4000-8000-0123456789AB"
+
+        let spellable = "abcXYZ019-._:"
+        XCTAssertEqual(
+            PeerTeamLeader.projectID(teamName: spellable, teamUUID: teamUUID),
+            "name:\(spellable)"
+        )
+
+        // One character past the byte budget, counted on the wire form.
+        let budget = PeerTeamLeader.maxProjectIDBytes - "name:".utf8.count
+        XCTAssertEqual(
+            PeerTeamLeader.projectID(
+                teamName: String(repeating: "n", count: budget),
+                teamUUID: teamUUID
+            ),
+            "name:" + String(repeating: "n", count: budget)
+        )
+        XCTAssertEqual(
+            PeerTeamLeader.projectID(
+                teamName: String(repeating: "n", count: budget + 1),
+                teamUUID: teamUUID
+            ),
+            teamUUID
+        )
+
+        for rejected in [" ", "/", "\\", "\"", "'", ";", "$", "\n", "\t", "가", "é", "\u{0}"] {
+            XCTAssertEqual(
+                PeerTeamLeader.projectID(
+                    teamName: "demo\(rejected)2",
+                    teamUUID: teamUUID
+                ),
+                teamUUID,
+                "expected fallback for \(rejected.debugDescription)"
+            )
+        }
+
+        // An empty name has no wire form either.
+        XCTAssertEqual(
+            PeerTeamLeader.projectID(teamName: "", teamUUID: teamUUID),
+            teamUUID
+        )
+
+        // The fallback must itself be spellable, or this trades one silent
+        // bootstrap failure for another.
+        var request = validRequest()
+        request.projectID = PeerTeamLeader.projectID(
+            teamName: "term-mesh 2",
+            teamUUID: teamUUID
+        )
+        XCTAssertSuccess(PeerTeamLeader.validateBootstrap(request, encodedBytes: 64))
+    }
+
     private func validRequest() -> Termmesh_Peer_V1_TeamLeaderBootstrapRequest {
         var request = Termmesh_Peer_V1_TeamLeaderBootstrapRequest()
         request.projectID = "name:demo"

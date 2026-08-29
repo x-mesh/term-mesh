@@ -7,6 +7,7 @@ pub mod protocol;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
@@ -50,6 +51,51 @@ pub(crate) fn signal_agent_process_group(pid: u32, signal: libc::c_int) -> Resul
         libc::kill(pid_i32, signal);
     }
     Ok(())
+}
+
+/// Cancellation guard for daemon shutdown. `terminate_all` is itself bounded
+/// by the outer shutdown step; if that future is dropped, every process group
+/// that was told to stop must still receive SIGKILL.
+pub(crate) struct ShutdownKillGuard {
+    pids: Vec<u32>,
+    armed: bool,
+}
+
+impl ShutdownKillGuard {
+    fn new(pids: Vec<u32>) -> Self {
+        Self { pids, armed: true }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+static LIVE_AGENT_PIDS: OnceLock<std::sync::Mutex<HashSet<u32>>> = OnceLock::new();
+
+fn live_agent_pids() -> &'static std::sync::Mutex<HashSet<u32>> {
+    LIVE_AGENT_PIDS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+pub(crate) fn shutdown_kill_guard() -> ShutdownKillGuard {
+    let pids = live_agent_pids()
+        .lock()
+        .expect("live agent pid registry poisoned")
+        .iter()
+        .copied()
+        .collect();
+    ShutdownKillGuard::new(pids)
+}
+
+impl Drop for ShutdownKillGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for pid in &self.pids {
+            let _ = signal_agent_process_group(*pid, libc::SIGKILL);
+        }
+    }
 }
 
 /// Status of a headless agent subprocess.
@@ -507,6 +553,17 @@ impl HeadlessManager {
         }
     }
 
+    fn remove_agent_entry(&mut self, agent_id: &str) -> Option<HeadlessAgent> {
+        let removed = self.agents.remove(agent_id);
+        if let Some(agent) = removed.as_ref() {
+            live_agent_pids()
+                .lock()
+                .expect("live agent pid registry poisoned")
+                .remove(&agent.pid);
+        }
+        removed
+    }
+
     #[allow(dead_code)] // exposed for diagnostics + future RPC
     pub fn idle_park_minutes(&self) -> u32 {
         self.idle_park_minutes
@@ -847,6 +904,10 @@ impl HeadlessManager {
                 completed_task_count: args.preloaded_completed_task_count,
             },
         );
+        live_agent_pids()
+            .lock()
+            .expect("live agent pid registry poisoned")
+            .insert(pid);
 
         Ok(info)
     }
@@ -855,6 +916,7 @@ impl HeadlessManager {
     /// Call at the entry of RPC handlers so stale Running entries are cleared
     /// before any logic that depends on agent.status or agent.stdin.
     fn reap_exited_agents(&mut self) {
+        let mut reaped_pids = Vec::new();
         for a in self.agents.values_mut() {
             if a.status == AgentStatus::Running {
                 if let Some(child) = a.child.as_mut() {
@@ -862,8 +924,17 @@ impl HeadlessManager {
                         a.status = AgentStatus::Terminated;
                         a.stdin = None; // closes parent write-end fd
                         a.child = None; // drops reaped child handle
+                        reaped_pids.push(a.pid);
                     }
                 }
+            }
+        }
+        if !reaped_pids.is_empty() {
+            let mut live = live_agent_pids()
+                .lock()
+                .expect("live agent pid registry poisoned");
+            for pid in reaped_pids {
+                live.remove(&pid);
             }
         }
     }
@@ -941,7 +1012,7 @@ impl HeadlessManager {
                 .get(agent_id)
                 .ok_or_else(|| format!("agent not found: {agent_id}"))?;
             if agent.status == AgentStatus::Terminated || agent.status == AgentStatus::Parked {
-                self.agents.remove(agent_id);
+                self.remove_agent_entry(agent_id);
                 return Ok(());
             }
             agent.pid
@@ -970,7 +1041,7 @@ impl HeadlessManager {
             }
         }
 
-        self.agents.remove(agent_id);
+        self.remove_agent_entry(agent_id);
         Ok(())
     }
 
@@ -1272,7 +1343,7 @@ impl HeadlessManager {
             }
         }
         for agent_id in &team.agents {
-            self.agents.remove(agent_id);
+            self.remove_agent_entry(agent_id);
         }
 
         // Update on-disk metadata (best-effort — disk divergence is preferable
@@ -1848,6 +1919,22 @@ impl HeadlessManager {
     }
 
     pub async fn terminate_all(&mut self) {
+        // Start every grace period together. Sequentially waiting five seconds
+        // per agent made the outer eight-second bound cancel cleanup before
+        // later process groups had even received SIGTERM.
+        let pids: Vec<u32> = self
+            .agents
+            .values()
+            .filter(|agent| agent.status == AgentStatus::Running)
+            .map(|agent| agent.pid)
+            .collect();
+        let mut kill_guard = ShutdownKillGuard::new(pids.clone());
+        for pid in pids {
+            if let Err(error) = signal_agent_process_group(pid, libc::SIGTERM) {
+                tracing::warn!("failed to start shutdown for headless pid {pid}: {error}");
+            }
+        }
+
         let team_names: Vec<String> = self.teams.keys().cloned().collect();
         for name in team_names {
             let _ = self.destroy_team(&name).await;
@@ -1857,6 +1944,11 @@ impl HeadlessManager {
             let _ = self.terminate(&id).await;
         }
         self.agents.clear();
+        live_agent_pids()
+            .lock()
+            .expect("live agent pid registry poisoned")
+            .clear();
+        kill_guard.disarm();
     }
 
     /// Recycle the agent identified by the fully-qualified `name@team_name` key.
@@ -2096,7 +2188,7 @@ impl HeadlessManager {
                     info.id
                 );
                 let _ = self.terminate(&info.id).await;
-                self.agents.remove(&info.id);
+                self.remove_agent_entry(&info.id);
                 return Err(format!(
                     "team '{}' was removed during agent spawn",
                     team_name
@@ -2168,6 +2260,10 @@ impl HeadlessManager {
         agent.status = AgentStatus::Parked;
         agent.child = None;
         agent.stdin = None;
+        live_agent_pids()
+            .lock()
+            .expect("live agent pid registry poisoned")
+            .remove(&pid);
 
         // Phase 2.5: snapshot current usage so the same rewrite of agent.json
         // can carry it. Consumes the flush-dirty bit (don't double-flush).
@@ -2240,7 +2336,7 @@ impl HeadlessManager {
         };
 
         // Remove the parked stub entry so spawn_internal can re-insert.
-        self.agents.remove(&agent_id);
+        self.remove_agent_entry(&agent_id);
 
         let internal = InternalSpawnArgs {
             name: agent_name.to_string(),
@@ -4550,5 +4646,40 @@ mod tests {
         );
         assert!(a.child.is_none(), "child handle should be cleared");
         assert!(a.stdin.is_none(), "stdin handle should be cleared");
+    }
+
+    #[test]
+    fn shutdown_kill_guard_kills_a_term_ignoring_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("spawn term-ignoring process group");
+        let pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        drop(ShutdownKillGuard::new(vec![pid]));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if child.try_wait().expect("poll child").is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "kill guard did not terminate the process group"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

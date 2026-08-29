@@ -25,6 +25,7 @@ import select
 import socket
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, TypedDict, Union
 
 
@@ -230,11 +231,14 @@ class termmesh:
         else:
             raise termmeshError(f"{app_name} did not quit")
 
-        subprocess.Popen(
+        relaunched = subprocess.Popen(
             [app_bin], env=dict(os.environ),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        pid_file = os.environ.get("TERMMESH_E2E_APP_PID_FILE")
+        if pid_file:
+            Path(pid_file).write_text(f"{relaunched.pid}\n")
 
         deadline = time.time() + timeout_s
         last: Optional[Exception] = None

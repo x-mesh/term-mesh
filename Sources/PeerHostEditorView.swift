@@ -865,8 +865,14 @@ struct PeerHostEditorView: View {
                 if details.sessionOwnerVerified,
                    let owner = details.sessionOwnerSocket,
                    owner != details.connectedSocket {
+                    // Says where the projects end up, not just that the route
+                    // resolved. The old wording was accurate about the wiring
+                    // and silent about the consequence, so a host whose
+                    // projects live on the second socket still read as a host
+                    // with no projects.
                     Label(
-                        "Projects use the verified session-owner route automatically",
+                        "Projects on this host run on its daemon, not the socket above."
+                            + " They are listed under this host in the sidebar.",
                         systemImage: "checkmark.circle"
                     )
                     .font(.caption2)

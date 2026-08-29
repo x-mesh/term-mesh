@@ -1646,7 +1646,7 @@
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "다른 컴퓨터 연결"
+            "value": "연결 서버 사용"
           }
         }
       }
@@ -4481,7 +4481,7 @@
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "이 설정은 ghostty 설정 파일보다 우선합니다. 기본값이나 초기화를 선택하면 설정 파일 값을 사용합니다."
+            "value": "이 설정은 ghostty 설정 파일보다 우선합니다. \"기본값(설정 파일)\"이나 \"초기화\"를 선택하면 설정 파일 값을 사용합니다."
           }
         }
       }
@@ -5080,6 +5080,24 @@
     },
     "Unknown": {
       "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "알 수 없음" } } }
+    },
+    "%lld agent": {
+      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "에이전트 %lld개" } } }
+    },
+    "%lld agents": {
+      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "에이전트 %lld개" } } }
+    },
+    "%lld degraded": {
+      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "%lld개 문제 있음" } } }
+    },
+    "%lld not loaded": {
+      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "%lld개 불러오지 못함" } } }
+    },
+    "All healthy": {
+      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "모두 정상" } } }
+    },
+    "Starting...": {
+      "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "시작 중…" } } }
     },
     "No log": {
       "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "로그 없음" } } }

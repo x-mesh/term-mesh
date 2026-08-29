@@ -569,6 +569,15 @@ final class PeerPaneSession {
     /// starting here at model creation used to arm a 10s accept timeout that
     /// could never succeed. Multiple onAppear/update passes remain idempotent.
     func startRelayIfNeeded() {
+        #if DEBUG
+        // "Never asked to start" and "asked, but the accept never resolved"
+        // leave identical outside state — a pane stuck on `.pending`/`.starting`
+        // with no relay. Name which one happened.
+        dlog(
+            "peer.pane.relay.request surface=\(surfaceTitle) "
+                + "state=\(relayStartupState) torndown=\(isTorndown)"
+        )
+        #endif
         guard !isTorndown, relayStartupState == .pending else { return }
         relayStartupState = .starting
         Task { @MainActor [weak self] in
@@ -577,10 +586,18 @@ final class PeerPaneSession {
                 try await self.start()
                 guard !self.isTorndown else { return }
                 self.relayStartupState = .started
+                #if DEBUG
+                dlog("peer.pane.relay.started surface=\(self.surfaceTitle)")
+                #endif
                 self.relayStartupSucceeded?()
             } catch {
                 guard !self.isTorndown else { return }
                 self.relayStartupState = .failed
+                #if DEBUG
+                dlog(
+                    "peer.pane.relay.failed surface=\(self.surfaceTitle) error=\(error)"
+                )
+                #endif
                 self.relayStartupFailure?(error)
             }
         }

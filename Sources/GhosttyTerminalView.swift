@@ -17,6 +17,15 @@ enum TerminalAutoBlankRecoveryDecision: Equatable {
     case rebuild
 }
 
+/// Device identity of a terminal special file. `FileAttributeKey.systemNumber`
+/// is the containing filesystem's `st_dev`, not the terminal's `st_rdev`.
+nonisolated func terminalDeviceNumber(at path: String) -> UInt32? {
+    guard path.hasPrefix("/dev/") else { return nil }
+    var info = stat()
+    guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFCHR else { return nil }
+    return UInt32(truncatingIfNeeded: info.st_rdev)
+}
+
 /// Pure policy for the timing-sensitive blank-pane recovery state machine.
 /// Keeping the decision separate from AppKit/renderer side effects lets tests
 /// pin the healthy, confirmation, cooldown, and rebuild paths deterministically.
@@ -301,6 +310,20 @@ final class TerminalSurface: Identifiable, ObservableObject {
     @MainActor var isRendererReadyForImmediateVisibility: Bool {
         surface != nil && rendererRealized
     }
+
+    /// Kernel device identity of this surface's PTY. Adopted leaders cannot
+    /// receive a new environment capability after their shell has started, so
+    /// this gives the socket boundary a non-forgeable identity to compare with
+    /// the connecting process's controlling TTY.
+    @MainActor var controllingTTYDevice: UInt32? {
+        guard let surface else { return nil }
+        let value = ghostty_surface_tty_name(surface)
+        defer { ghostty_string_free(value) }
+        guard let ptr = value.ptr, value.len > 0 else { return nil }
+        let raw = UnsafeRawPointer(ptr).assumingMemoryBound(to: UInt8.self)
+        let path = String(decoding: UnsafeBufferPointer(start: raw, count: Int(value.len)), as: UTF8.self)
+        return terminalDeviceNumber(at: path)
+    }
     /// Debounced unrealize work item, so transient reparent/workspace flaps don't
     /// thrash the swap chain (recreate cost) when a surface briefly goes invisible.
     private var rendererUnrealizeWork: DispatchWorkItem?
@@ -318,6 +341,14 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// temporarily unattached (surface not yet created / reparenting) even while the panel
     /// is already in the window.
     var isViewInWindow: Bool { hostedView.window != nil }
+    /// Fired when this terminal's view lands in a window.
+    ///
+    /// A remote pane needs an edge here, not a sample. `TerminalPanelView`'s
+    /// `onAppear` can run before `bindRemotePane` assigns `peerPaneSession`,
+    /// in which case its optional chain starts nothing; `bindRemotePane`'s own
+    /// start is skipped when the view has not reached a window yet. Either
+    /// side can be last, so both must be able to arm the relay.
+    var onDidEnterWindow: (() -> Void)?
     let id: UUID
     private(set) var tabId: UUID
     /// Port ordinal for TERMMESH_PORT range assignment
@@ -2802,6 +2833,7 @@ static func focusLog(_ message: String) {
 
         // If the surface creation was deferred while detached, create/attach it now.
         terminalSurface?.attachToView(self)
+        terminalSurface?.onDidEnterWindow?()
 
         windowObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didChangeScreenNotification,

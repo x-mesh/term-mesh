@@ -1005,8 +1005,20 @@ final class TermMeshDaemon: ObservableObject {
     // MARK: - Monitor (F-03/F-04)
 
     /// Track a process by PID for resource monitoring.
-    func trackPID(_ pid: Int32) {
-        let _ = rpcCall(method: "monitor.track", params: ["pid": pid])
+    /// Ask the daemon to watch `pid`. Returns whether it is watched.
+    ///
+    /// The daemon declines a pid it cannot read an identity for, so the
+    /// caller must not record the request as satisfied on its own.
+    func trackPID(_ pid: Int32) -> Bool {
+        // `rpcCall` already hands back the `result` payload, the way
+        // `stopProcess` below reads it. Unwrapping a second time returns nil
+        // for every answer, which reads as "declined" for pids the daemon
+        // actually tracked.
+        guard let response = rpcCall(method: "monitor.track", params: ["pid": pid]) as? [String: Any] else {
+            return false
+        }
+        // An older daemon answers without the field; it always tracked.
+        return response["tracked"] as? Bool ?? true
     }
 
     /// Untrack a process.

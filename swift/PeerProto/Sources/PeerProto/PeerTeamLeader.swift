@@ -16,13 +16,50 @@ public enum PeerTeamLeader {
 
     /// Extra methods available only to a project-scoped autonomous leader.
     /// Generic `team.call.v1` peers must not inherit these permissions.
+    ///
+    /// Mirrors `SCOPED_METHODS` in `daemon/peer-proto`; a Rust test parses
+    /// this literal and diffs it, so keep one method per line.
+    ///
     public static let scopedMethods: Set<String> = [
         "team.add_agent",
         "team.send_key",
+        // The leader's own request queue and its delegation level. Bound to
+        // one team by the grant, and gated again by the leader request token
+        // the owning app stages into the leader environment.
+        "team.leader.request.list",
+        "team.leader.request.take",
+        "team.leader.request.complete",
+        "team.delegation.configure",
+        // Named for the task board but answers from the leader-request store,
+        // and gated by the same capability, so it is scoped rather than generic.
+        "team.task.metrics",
     ]
 
     public static func isAllowed(_ method: String) -> Bool {
         PeerTeamCall.isAllowed(method) || scopedMethods.contains(method)
+    }
+
+    /// The project identifier a bootstrap request may carry for `teamName`.
+    ///
+    /// A team's display name is not an identifier. The wire grammar accepts
+    /// only `[0-9A-Za-z] - . : _`, so New Project's own duplicate suffix
+    /// (`term-mesh 2`) and every non-ASCII name fail `validateBootstrap`,
+    /// which the caller can only report as a generic bootstrap failure. The
+    /// team UUID is the identifier the host resolver already accepts
+    /// alongside `name:<team>`, so an unspellable name falls back to it
+    /// rather than minting a grant the same process is about to reject.
+    ///
+    /// An empty name takes the same fallback: `name:` on its own passes the
+    /// grammar but names no team, so it would fail one step later in the
+    /// project resolver instead.
+    ///
+    /// A `teamUUID` that is itself unspellable stays unspellable here: this
+    /// resolves display names, it does not paper over a malformed UUID that
+    /// `validateGrant` would reject on the next hop anyway.
+    public static func projectID(teamName: String, teamUUID: String) -> String {
+        guard !teamName.isEmpty else { return teamUUID }
+        let named = "name:\(teamName)"
+        return isSafeIdentifier(named, maxBytes: maxProjectIDBytes) ? named : teamUUID
     }
 
     public enum ValidationError: String, Error, Sendable, Equatable {

@@ -5,10 +5,19 @@ from __future__ import annotations
 import sys
 import time
 import uuid
+import re
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from termmesh import termmesh, termmeshError
+
+
+def canonical_policy_version() -> str:
+    source = (Path(__file__).resolve().parents[1] / "Sources/LeaderParallelPolicy.swift").read_text()
+    match = re.search(r'static let version = "([^"]+)"', source)
+    if not match:
+        raise termmeshError("canonical leader policy version not found")
+    return match.group(1)
 
 
 def main() -> int:
@@ -51,8 +60,11 @@ def main() -> int:
             instance_ids = [row.get("agent_instance_id") for row in status["agents"]]
             if len(set(instance_ids)) != len(instance_ids) or any(not item for item in instance_ids):
                 raise termmeshError(f"agent instance IDs are not unique: {instance_ids!r}")
-            if status.get("leader_policy_version") != "10":
-                raise termmeshError(f"leader policy v10 not injected: {status!r}")
+            expected_policy_version = canonical_policy_version()
+            if status.get("leader_policy_version") != expected_policy_version:
+                raise termmeshError(
+                    f"leader policy v{expected_policy_version} not injected: {status!r}"
+                )
             if any(row.get("read_only_default") is not True for row in status["agents"]):
                 raise termmeshError(f"validator mutation defaults are unsafe: {status['agents']!r}")
 

@@ -2906,6 +2906,12 @@ struct SettingsView: View {
         return .green
     }
 
+    /// "N agents", using the manual plural-key convention the catalog already uses
+    /// for the unread-notification counts.
+    private func shellHealthAgentPhrase(_ count: Int) -> String {
+        String(format: LanguageSettings.localized(count == 1 ? "%lld agent" : "%lld agents"), count)
+    }
+
     private var shellHealthOverallLabel: String {
         if shellHealthEntries.isEmpty { return LanguageSettings.localized("No panels") }
         let agentCount = shellHealthEntries.filter { $0.isAgentPanel }.count
@@ -2914,21 +2920,19 @@ struct SettingsView: View {
             .filter { !$0.isAgentPanel }
             .map { $0.health.status }
         if nonAgentStatuses.isEmpty {
-            return "\(agentCount) agent\(agentCount == 1 ? "" : "s")"
+            return shellHealthAgentPhrase(agentCount)
         }
+        let suffix = agentCount > 0 ? " · \(shellHealthAgentPhrase(agentCount))" : ""
         let notLoadedCount = nonAgentStatuses.filter { $0 == .notLoaded }.count
         if notLoadedCount > 0 {
-            let suffix = agentCount > 0 ? " · \(agentCount) agent\(agentCount == 1 ? "" : "s")" : ""
-            return "\(notLoadedCount) not loaded\(suffix)"
+            return String(format: LanguageSettings.localized("%lld not loaded"), notLoadedCount) + suffix
         }
         let problemCount = nonAgentStatuses.filter { $0 == .partial || $0 == .stale }.count
         if problemCount > 0 {
-            let suffix = agentCount > 0 ? " · \(agentCount) agent\(agentCount == 1 ? "" : "s")" : ""
-            return "\(problemCount) degraded\(suffix)"
+            return String(format: LanguageSettings.localized("%lld degraded"), problemCount) + suffix
         }
-        if nonAgentStatuses.allSatisfy({ $0 == .starting }) { return "Starting..." }
-        let suffix = agentCount > 0 ? " · \(agentCount) agent\(agentCount == 1 ? "" : "s")" : ""
-        return "All healthy\(suffix)"
+        if nonAgentStatuses.allSatisfy({ $0 == .starting }) { return LanguageSettings.localized("Starting...") }
+        return LanguageSettings.localized("All healthy") + suffix
     }
 
     private func shellHealthDetail(_ entry: ShellHealthEntry) -> String {

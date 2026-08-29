@@ -3370,9 +3370,21 @@ final class Workspace: Identifiable {
         #if DEBUG
         dlog("peer.pane.open workspace=\(id.uuidString.prefix(8)) host=\(session.lease.key) title=\(session.surfaceTitle)")
         #endif
-        // TerminalPanelView.onAppear starts the helper. A background Project
-        // has no mounted Ghostty view yet, so arming accept here would always
-        // time out and leave a torn-down pane before the user opens it.
+        // Arming accept needs a mounted Ghostty view — a background Project has
+        // none, and starting early would burn the 10s accept timeout and tear
+        // the pane down before anyone opened it. But the mount and this binding
+        // race, and until both have happened nothing can start the helper:
+        // `TerminalPanelView.onAppear` runs `panel.startPeerRelayIfNeeded()`
+        // through an optional chain that finds no session when the view wins,
+        // and the check below finds no window when the binding wins. Missing
+        // both left the leader pane showing only its login banner while the
+        // remote CLI ran unseen, with the team stuck on "relay is pending".
+        //
+        // So take whichever edge is last. `startRelayIfNeeded` only acts on a
+        // `.pending` session, which makes the double-arm idempotent.
+        panel.surface.onDidEnterWindow = { [weak panel] in
+            panel?.startPeerRelayIfNeeded()
+        }
         if panel.surface.isViewInWindow { panel.startPeerRelayIfNeeded() }
     }
 
