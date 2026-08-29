@@ -2660,6 +2660,15 @@ struct ContentView: View {
         .onChange(of: commandPaletteSelectedResultIndex) { _ in
             syncCommandPaletteDebugStateForObservedWindow()
         }
+        // Watches the flag rather than the mode: CommandPaletteMode carries
+        // associated values and is not Equatable, and this is the transition
+        // that matters — text held for a mode that owns the query is not text
+        // for one that does not. Dropping it here keeps it from surfacing in
+        // the search query after a rename ends.
+        .onChange(of: commandPaletteAcceptsAbsorbedInput) { _ in
+            AppDelegate.shared?.clearCommandPalettePendingInput()
+            syncCommandPaletteDebugStateForObservedWindow()
+        }
     }
 
     private func commandPaletteRenameInputView(target: CommandPaletteRenameTarget) -> some View {
@@ -4779,8 +4788,17 @@ struct ContentView: View {
             results: rows,
             searchFocused: isCommandPaletteSearchFocused,
             renameFocused: isCommandPaletteRenameFocused,
-            navigationIgnoredEmptyCount: commandPaletteNavigationIgnoredEmptyCount
+            navigationIgnoredEmptyCount: commandPaletteNavigationIgnoredEmptyCount,
+            acceptsAbsorbedInput: commandPaletteAcceptsAbsorbedInput
         )
+    }
+
+    /// Held keystrokes are only ever applied to the search query, so nothing
+    /// may be held in a mode that does not own it.
+    private var commandPaletteAcceptsAbsorbedInput: Bool {
+        guard isCommandPalettePresented else { return false }
+        if case .commands = commandPaletteMode { return true }
+        return false
     }
 
     private func presentCommandPalette(initialQuery: String) {
@@ -4930,7 +4948,7 @@ struct ContentView: View {
             // waiting to be applied. Do it before placing the caret, and let
             // the next attempt position that caret against the text the
             // binding produces — the editor still holds the pre-flush string.
-            if case .commands = commandPaletteMode,
+            if commandPaletteAcceptsAbsorbedInput,
                let pending = AppDelegate.shared?.takeCommandPalettePendingInput(),
                !pending.isEmpty {
                 commandPaletteQuery += pending

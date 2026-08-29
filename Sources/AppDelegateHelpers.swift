@@ -334,6 +334,11 @@ struct CommandPaletteDebugSnapshot {
     /// How many navigation keys reached the handler and were dropped because
     /// the result list was empty at that instant.
     let navigationIgnoredEmptyCount: Int
+    /// Whether keystrokes held while the palette lacks focus may be applied to
+    /// it. Only the search query is ever a flush target, so this is false in
+    /// rename mode — the one place that decides it, for both the code that
+    /// holds keys and the code that applies them.
+    let acceptsAbsorbedInput: Bool
 
     static let empty = CommandPaletteDebugSnapshot(
         query: "",
@@ -341,7 +346,8 @@ struct CommandPaletteDebugSnapshot {
         results: [],
         searchFocused: false,
         renameFocused: false,
-        navigationIgnoredEmptyCount: 0
+        navigationIgnoredEmptyCount: 0,
+        acceptsAbsorbedInput: false
     )
 }
 
