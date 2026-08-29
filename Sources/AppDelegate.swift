@@ -498,6 +498,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var commandPaletteVisibilityByWindowId: [UUID: Bool] = [:]
     var commandPaletteSelectionByWindowId: [UUID: Int] = [:]
     var commandPaletteSnapshotByWindowId: [UUID: CommandPaletteDebugSnapshot] = [:]
+    /// Counted here rather than in the palette view: a view's own @State and
+    /// @FocusState are read back through whatever copy of the struct the
+    /// closure captured, which is how `searchFocused` came to read false
+    /// through runs that passed. These are written at the call and read
+    /// straight back.
+    private(set) var commandPaletteNavigationKeyPressCount: Int = 0
+    private(set) var commandPaletteNavigationModifierRejectCount: Int = 0
+    private(set) var commandPaletteLastNavigationModifiersRaw: Int = -1
+
+    func noteCommandPaletteNavigationKeyPress(modifiersRaw: Int, accepted: Bool) {
+        commandPaletteNavigationKeyPressCount += 1
+        commandPaletteLastNavigationModifiersRaw = modifiersRaw
+        if !accepted {
+            commandPaletteNavigationModifierRejectCount += 1
+        }
+    }
 
     override init() {
         super.init()

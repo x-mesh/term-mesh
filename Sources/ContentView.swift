@@ -4615,10 +4615,15 @@ struct ContentView: View {
         modifiers: EventModifiers,
         delta: Int
     ) -> BackportKeyPressResult {
-        guard modifiers.contains(.control),
-              !modifiers.contains(.command),
-              !modifiers.contains(.shift),
-              !modifiers.contains(.option) else {
+        let accepted = modifiers.contains(.control)
+            && !modifiers.contains(.command)
+            && !modifiers.contains(.shift)
+            && !modifiers.contains(.option)
+        AppDelegate.shared?.noteCommandPaletteNavigationKeyPress(
+            modifiersRaw: Int(modifiers.rawValue),
+            accepted: accepted
+        )
+        guard accepted else {
             return .ignored
         }
         moveCommandPaletteSelection(by: delta)

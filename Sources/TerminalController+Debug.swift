@@ -424,11 +424,17 @@ extension TerminalController {
         var visible = false
         var selectedIndex = 0
         var snapshot = CommandPaletteDebugSnapshot.empty
+        var navKeyPressCount = 0
+        var navModifierRejectCount = 0
+        var navLastModifiersRaw = -1
 
         _ = v2MainExec(timeout: 5) {
             visible = AppDelegate.shared?.isCommandPaletteVisible(windowId: windowId) ?? false
             selectedIndex = AppDelegate.shared?.commandPaletteSelectionIndex(windowId: windowId) ?? 0
             snapshot = AppDelegate.shared?.commandPaletteSnapshot(windowId: windowId) ?? .empty
+            navKeyPressCount = AppDelegate.shared?.commandPaletteNavigationKeyPressCount ?? 0
+            navModifierRejectCount = AppDelegate.shared?.commandPaletteNavigationModifierRejectCount ?? 0
+            navLastModifiersRaw = AppDelegate.shared?.commandPaletteLastNavigationModifiersRaw ?? -1
         }
 
         let rows = Array(snapshot.results.prefix(limit)).map { row in
@@ -451,7 +457,10 @@ extension TerminalController {
             "results": rows,
             "search_focused": snapshot.searchFocused,
             "rename_focused": snapshot.renameFocused,
-            "nav_ignored_empty_count": snapshot.navigationIgnoredEmptyCount
+            "nav_ignored_empty_count": snapshot.navigationIgnoredEmptyCount,
+            "nav_key_press_count": navKeyPressCount,
+            "nav_modifier_reject_count": navModifierRejectCount,
+            "nav_last_modifiers_raw": navLastModifiersRaw
         ])
     }
 
