@@ -491,7 +491,7 @@ extension TerminalController {
         var visible = false
         var selectedIndex = 0
         var snapshot = CommandPaletteDebugSnapshot.empty
-        var navKeyPressCount = 0
+        var navCandidateKeyCount = 0
         var navModifierRejectCount = 0
         var navLastEventModifiersRaw: Int?
         var firstResponderInPalette = false
@@ -501,7 +501,7 @@ extension TerminalController {
             visible = AppDelegate.shared?.isCommandPaletteVisible(windowId: windowId) ?? false
             selectedIndex = AppDelegate.shared?.commandPaletteSelectionIndex(windowId: windowId) ?? 0
             snapshot = AppDelegate.shared?.commandPaletteSnapshot(windowId: windowId) ?? .empty
-            navKeyPressCount = AppDelegate.shared?.commandPaletteNavigationKeyPressCount ?? 0
+            navCandidateKeyCount = AppDelegate.shared?.commandPaletteNavigationCandidateKeyCount ?? 0
             navModifierRejectCount = AppDelegate.shared?.commandPaletteNavigationModifierRejectCount ?? 0
             navLastEventModifiersRaw = AppDelegate.shared?.commandPaletteLastNavigationEventModifiersRaw
             focusWaitMs = AppDelegate.shared?.commandPaletteLastFocusWaitMs
@@ -537,7 +537,7 @@ extension TerminalController {
             "search_focused": snapshot.searchFocused,
             "rename_focused": snapshot.renameFocused,
             "nav_ignored_empty_count": snapshot.navigationIgnoredEmptyCount,
-            "nav_key_press_count": navKeyPressCount,
+            "nav_candidate_key_count": navCandidateKeyCount,
             "nav_modifier_reject_count": navModifierRejectCount,
             "nav_last_event_modifiers_raw": v2OrNull(navLastEventModifiersRaw),
             "first_responder_in_palette": firstResponderInPalette,

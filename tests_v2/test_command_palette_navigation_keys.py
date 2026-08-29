@@ -82,7 +82,7 @@ def _palette_debug_state(client: termmesh, window_id: str) -> str:
             f"search_focused={results.get('search_focused')} "
             f"rename_focused={results.get('rename_focused')} "
             f"nav_ignored_empty={results.get('nav_ignored_empty_count')} "
-            f"nav_presses={results.get('nav_key_press_count')} "
+            f"nav_candidates={results.get('nav_candidate_key_count')} "
             f"nav_mod_rejects={results.get('nav_modifier_reject_count')} "
             f"nav_last_event_mods={results.get('nav_last_event_modifiers_raw')} "
             f"fr_in_palette={results.get('first_responder_in_palette')} "
@@ -117,13 +117,21 @@ def _open_palette_with_query(
     # into the field editor directly, and that edit reaching the SwiftUI
     # binding is not guaranteed by the call returning. Only retype from empty,
     # so a partially delivered query is a failure and not a doubled one.
+    # simulate_type inserts into the field editor, and that edit reaching the
+    # SwiftUI binding is not guaranteed by the call returning. Retype on a
+    # cadence slower than that hand-off, or a poll that is merely early types
+    # the query a second time and leaves "newnew", which never converges.
+    retype_state = {"last_attempt": 0.0}
+
     def _typed() -> bool:
         current = str(
             client.command_palette_results(window_id=window_id, limit=20).get("query") or ""
         )
         if current == query:
             return True
-        if current == "":
+        now = time.time()
+        if current == "" and now - retype_state["last_attempt"] >= 0.5:
+            retype_state["last_attempt"] = now
             client.simulate_type(query)
         return False
 

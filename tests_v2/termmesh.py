@@ -37,7 +37,16 @@ class ProjectLayout(TypedDict):
 
 
 class termmeshError(Exception):
-    """Exception raised for term-mesh errors."""
+    """Exception raised for term-mesh errors.
+
+    `code` carries the protocol's own error code when the failure came back
+    over the socket, so callers can branch on it instead of matching prose
+    that is free to change.
+    """
+
+    def __init__(self, message: str, code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _default_socket_path() -> str:
@@ -328,8 +337,8 @@ class termmesh:
         msg = err.get("message") or "Unknown error"
         data = err.get("data")
         if data is not None:
-            raise termmeshError(f"{code}: {msg} ({data})")
-        raise termmeshError(f"{code}: {msg}")
+            raise termmeshError(f"{code}: {msg} ({data})", code=code)
+        raise termmeshError(f"{code}: {msg}", code=code)
 
     # ---------------------------------------------------------------------
     # ID resolution helpers (index -> id)
@@ -1057,7 +1066,10 @@ class termmesh:
                 if text.strip():
                     return text
             except termmeshError as exc:
-                if "not found" not in str(exc):
+                # Only the surface being unknown *yet* is a not-ready signal.
+                # A wrong id raises the same code, so the deadline below is
+                # what separates them; every other failure is immediate.
+                if exc.code != "internal_error" or "surface not found" not in str(exc).lower():
                     raise
             if time.time() >= deadline:
                 raise termmeshError(
