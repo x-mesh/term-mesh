@@ -10,6 +10,11 @@ import AppKit
 /// The palette is on screen for ~47ms (96ms at worst, measured) before it owns
 /// input. Keys arriving in that window are held for it instead of going to
 /// whatever had focus before — but only the ones that are text.
+///
+/// This covers the character test alone. Whether a key may be held at all is
+/// decided by `absorbCommandPaletteKeyIfUnfocused`, which additionally
+/// declines while an input method is composing and while the palette is in
+/// rename mode; neither condition is visible from the characters.
 @MainActor
 final class CommandPaletteKeyAbsorptionTests: XCTestCase {
     private func absorbs(_ characters: String?, _ flags: NSEvent.ModifierFlags = []) -> Bool {
@@ -21,6 +26,9 @@ final class CommandPaletteKeyAbsorptionTests: XCTestCase {
         XCTAssertTrue(absorbs("Z"))
         XCTAssertTrue(absorbs("7"))
         XCTAssertTrue(absorbs(" "))
+        // Committed text, i.e. what a keyDown carries once no input method is
+        // composing. A key pressed mid-composition never reaches this test's
+        // subject — absorbCommandPaletteKeyIfUnfocused declines it first.
         XCTAssertTrue(absorbs("한"))
         XCTAssertTrue(absorbs("é"))
     }

@@ -545,6 +545,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if let responder = window.firstResponder, isCommandPaletteResponder(responder) {
             return false
         }
+        // Mid-composition keys belong to the input method, which is why
+        // handleCustomShortcut declines them just above this call. Taking them
+        // here would strand the composition: neither continued nor committed,
+        // with the raw scalar appended to the query instead of the syllable.
+        if let ghosttyView = termMeshOwningGhosttyView(for: window.firstResponder),
+           ghosttyView.hasMarkedText() {
+            return false
+        }
+        // Rename has its own field and its own draft, but held text is only
+        // ever applied to the search query. Absorbing here loses the keystroke
+        // and replays it into the query once the mode flips back.
+        guard commandPaletteSnapshot(windowId: windowId).acceptsAbsorbedInput else {
+            return false
+        }
         guard Self.commandPaletteAbsorbsKey(
             characters: event.characters,
             flags: event.modifierFlags
