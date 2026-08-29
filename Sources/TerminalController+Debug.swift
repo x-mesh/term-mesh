@@ -253,6 +253,7 @@ extension TerminalController {
     func v2DebugToggleCommandPalette(params: [String: Any]) -> V2CallResult {
         let requestedWindowId = v2UUID(params, "window_id")
         var result: V2CallResult = .ok([:])
+        var openedWindowId: UUID?
         _ = v2MainExec(timeout: 5) {
             let targetWindow: NSWindow?
             if let requestedWindowId {
@@ -268,9 +269,38 @@ extension TerminalController {
             } else {
                 targetWindow = NSApp.keyWindow ?? NSApp.mainWindow
             }
+            if let targetWindow,
+               let windowId = AppDelegate.shared?.mainWindowId(for: targetWindow),
+               AppDelegate.shared?.isCommandPaletteVisible(windowId: windowId) != true {
+                openedWindowId = windowId
+            }
             NotificationCenter.default.post(name: .commandPaletteToggleRequested, object: targetWindow)
         }
+        if let openedWindowId {
+            waitForCommandPaletteInputFocus(windowId: openedWindowId)
+        }
         return result
+    }
+
+    /// Opening the palette is only useful to a caller once keystrokes land in
+    /// it, and SwiftUI moves the first responder on a later render pass than
+    /// the one that shows the palette. Returning before that happened made
+    /// this command's completion a signal the caller could not act on: text
+    /// and navigation keys sent right after it went to whatever held focus
+    /// before, silently. Runs off-main, one poll per render pass.
+    private func waitForCommandPaletteInputFocus(windowId: UUID, timeout: TimeInterval = 2.0) {
+        guard !Thread.isMainThread else { return }
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            var owned = false
+            _ = v2MainExec(timeout: 1) {
+                guard let window = AppDelegate.shared?.mainWindow(for: windowId),
+                      let responder = window.firstResponder else { return }
+                owned = AppDelegate.shared?.isCommandPaletteResponder(responder) ?? false
+            }
+            if owned { return }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
     }
 
     /// Inspect (and with `simulate: true`, force) a terminal's automatic

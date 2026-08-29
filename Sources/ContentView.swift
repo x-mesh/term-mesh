@@ -4881,21 +4881,25 @@ struct ContentView: View {
     }
 
     private func applyCommandPaletteInputFocusPolicy(_ policy: CommandPaletteInputFocusPolicy) {
-        DispatchQueue.main.async {
-            switch policy.focusTarget {
-            case .search:
-                isCommandPaletteRenameFocused = false
-                isCommandPaletteSearchFocused = true
-            case .rename:
-                isCommandPaletteSearchFocused = false
-                isCommandPaletteRenameFocused = true
-            }
-            applyCommandPaletteTextSelection(policy.selectionBehavior)
-            // The callers sync before this block runs, so without this the
-            // published state keeps reporting the focus the palette had
-            // before the policy was applied — for the whole time it holds.
-            syncCommandPaletteDebugStateForObservedWindow()
+        // Set the focus target synchronously. Deferring it to the next run
+        // loop pass leaves the palette on screen while input still goes to
+        // whatever held focus before it opened, which drops both typing and
+        // the navigation keys — every one of them is an onKeyPress on the
+        // search field. A FocusState value that is already set when the
+        // focused field appears is applied as the field appears, so there is
+        // nothing here that has to wait for the view.
+        switch policy.focusTarget {
+        case .search:
+            isCommandPaletteRenameFocused = false
+            isCommandPaletteSearchFocused = true
+        case .rename:
+            isCommandPaletteSearchFocused = false
+            isCommandPaletteRenameFocused = true
         }
+        // The selection does need the field editor, which does not exist
+        // until the field is on screen; this call retries until it does.
+        applyCommandPaletteTextSelection(policy.selectionBehavior)
+        syncCommandPaletteDebugStateForObservedWindow()
     }
 
     private func applyCommandPaletteTextSelection(
