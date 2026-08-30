@@ -309,6 +309,7 @@
 			FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */; };
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */; };
+		A15100000000000000000045 /* RemoteWorkLogRetentionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000046 /* RemoteWorkLogRetentionTests.swift */; };
 		A15100000000000000000043 /* InputInjectionLogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000044 /* InputInjectionLogTests.swift */; };
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */; };
 			FD000010A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000011A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift */; };
@@ -673,6 +674,7 @@
 			FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceManualUnreadTests.swift; sourceTree = "<group>"; };
 			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
 			FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirrorTests.swift; sourceTree = "<group>"; };
+			A15100000000000000000046 /* RemoteWorkLogRetentionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteWorkLogRetentionTests.swift; sourceTree = "<group>"; };
 			A15100000000000000000044 /* InputInjectionLogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputInjectionLogTests.swift; sourceTree = "<group>"; };
 			FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDaemonVersionTests.swift; sourceTree = "<group>"; };
 			FD000011A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalOverrideIsolationTests.swift; sourceTree = "<group>"; };
@@ -1107,6 +1109,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				FE000009A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift */,
 				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
 				FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */,
+				A15100000000000000000046 /* RemoteWorkLogRetentionTests.swift */,
 				A15100000000000000000044 /* InputInjectionLogTests.swift */,
 				FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */,
 				FD000011A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift */,
@@ -1557,6 +1560,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				FE000008A1B2C3D4E5F60718 /* WorkspaceManualUnreadTests.swift in Sources */,
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */,
+				A15100000000000000000045 /* RemoteWorkLogRetentionTests.swift in Sources */,
 				A15100000000000000000043 /* InputInjectionLogTests.swift in Sources */,
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */,
 				FD000010A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift in Sources */,

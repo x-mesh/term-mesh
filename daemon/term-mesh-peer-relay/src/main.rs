@@ -93,12 +93,27 @@ fn rlog(msg: &str) {
     }
     let path =
         env::var("TERMMESH_PEER_RELAY_DEBUG_PATH").unwrap_or_else(|_| RELAY_DEBUG_LOG.to_string());
+    // Format first, then ONE write.
+    //
+    // `writeln!` on a `File` is unbuffered, so it issues a syscall per format
+    // fragment — `"[relay pid="`, the pid, `"] "`, the message, the newline.
+    // Every relay process on this machine appends to this same file, and
+    // O_APPEND makes each individual write atomic but says nothing about five
+    // of them in a row. Concurrent relays therefore shredded each other's
+    // lines, which is visible in a recorded log as the prefix appearing
+    // twice in a row with two pids spliced together:
+    //
+    //     [relay pid=[relay pid=4084640846] [relay pid=…stdin exit: …0x1140024
+    //
+    // Half the lines in that log were unreadable — in a file whose whole
+    // purpose is telling one process's bytes from another's.
+    let line = format!("[relay pid={}] {}\n", std::process::id(), msg);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "[relay pid={}] {}", std::process::id(), msg);
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -1044,6 +1059,65 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// Concurrent writers must not shred each other's lines.
+    ///
+    /// Every relay process on the machine appends to one shared file, and the
+    /// file exists to tell one process's bytes from another's — a spliced line
+    /// destroys exactly the thing it is read for. `writeln!` on an unbuffered
+    /// `File` issues one syscall per format fragment, so O_APPEND's per-write
+    /// atomicity did not cover a line; half the lines in a recorded log came
+    /// out unreadable.
+    ///
+    /// Threads reproduce it as faithfully as processes: `rlog` opens its own
+    /// handle per call either way.
+    #[test]
+    fn concurrent_writers_produce_whole_lines() {
+        use std::io::Read;
+        let path = std::env::temp_dir().join(format!(
+            "term-mesh-relay-log-atomicity-{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::env::set_var("TERMMESH_PEER_RELAY_DEBUG", "1");
+        std::env::set_var("TERMMESH_PEER_RELAY_DEBUG_PATH", &path);
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 200;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        super::rlog(&format!("writer={t} line={i}"));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut text = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            THREADS * PER_THREAD,
+            "line count changed — writes were split or merged"
+        );
+        for line in lines {
+            assert!(
+                line.starts_with("[relay pid=") && line.matches("[relay pid=").count() == 1,
+                "spliced line: {line:?}"
+            );
+            assert!(line.contains("] writer="), "truncated line: {line:?}");
+        }
+    }
+
     #[test]
     fn ordinary_typing_is_never_logged() {
         use super::is_ordinary_typed_text;
