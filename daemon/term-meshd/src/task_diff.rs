@@ -359,11 +359,17 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), "git_error");
-        assert!(
-            error.message().to_lowercase().contains("not a git repository"),
-            "{}",
-            error.message()
-        );
+        // Ask git for the same refusal rather than matching an English string:
+        // the message is passed through verbatim, so its wording follows the
+        // locale git runs under and a fixed phrase fails on a translated one.
+        let refusal = SyncCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git");
+        let refusal = String::from_utf8_lossy(&refusal.stderr).trim().to_string();
+        assert!(!refusal.is_empty(), "git produced no stderr to pass through");
+        assert_eq!(error.message(), refusal);
     }
 
     /// The security property `team.task.diff` was allowed on: a caller-supplied

@@ -2345,13 +2345,13 @@ final class ProjectCreationRecoveryTests: XCTestCase {
             ],
             method: "team.add_agent",
             teamName: "xm",
-            leaderHostKey: "ssh:root@131.186.23.19",
+            leaderHostKey: "ssh:root@leader-host.example",
             leaderDirectory: "/app/tm-prj/xm"
         )
 
         XCTAssertEqual(params["team"] as? String, "xm")
         XCTAssertEqual(params["team_name"] as? String, "xm")
-        XCTAssertEqual(params["host"] as? String, "ssh:root@131.186.23.19")
+        XCTAssertEqual(params["host"] as? String, "ssh:root@leader-host.example")
         XCTAssertEqual(params["directory"] as? String, "/app/tm-prj/xm")
         XCTAssertEqual(params["cli"] as? String, "codex")
     }

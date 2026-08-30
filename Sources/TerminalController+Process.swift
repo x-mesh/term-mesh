@@ -89,6 +89,18 @@ extension TerminalController {
         return info.kp_eproc.e_ppid
     }
 
+    /// Kernel-assigned controlling TTY device for a socket client process.
+    /// Unlike an environment variable or RPC parameter, callers cannot forge
+    /// this without actually running inside that terminal session.
+    nonisolated static func controllingTTYDevice(of pid: pid_t) -> UInt32? {
+        guard pid > 0 else { return nil }
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        let result = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size)
+        guard result == size, info.e_tdev != UInt32.max else { return nil }
+        return info.e_tdev
+    }
+
     func start(tabManager: TabManager, socketPath: String, accessMode: SocketControlMode) {
         self.tabManager = tabManager
         self.accessMode = accessMode

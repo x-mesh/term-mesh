@@ -253,6 +253,7 @@ extension TerminalController {
     func v2DebugToggleCommandPalette(params: [String: Any]) -> V2CallResult {
         let requestedWindowId = v2UUID(params, "window_id")
         var result: V2CallResult = .ok([:])
+        var openedWindowId: UUID?
         _ = v2MainExec(timeout: 5) {
             let targetWindow: NSWindow?
             if let requestedWindowId {
@@ -268,9 +269,80 @@ extension TerminalController {
             } else {
                 targetWindow = NSApp.keyWindow ?? NSApp.mainWindow
             }
+            if let targetWindow,
+               let windowId = AppDelegate.shared?.mainWindowId(for: targetWindow),
+               AppDelegate.shared?.isCommandPaletteVisible(windowId: windowId) != true {
+                openedWindowId = windowId
+            }
             NotificationCenter.default.post(name: .commandPaletteToggleRequested, object: targetWindow)
         }
+        if let openedWindowId {
+            // Parked: this wait can run for up to its budget, and holding the
+            // "socket command executing" depth that long suppresses activation
+            // for windows the user makes in the meantime.
+            let ready = withSocketCommandExecutionParked {
+                waitForCommandPaletteInputFocus(windowId: openedWindowId)
+            }
+            // Giving up used to look identical to success, so a caller that
+            // opened and immediately typed got an ok and lost the text.
+            if case .ok(let payload) = result {
+                var merged = (payload as? [String: Any]) ?? [:]
+                merged["input_focus_ready"] = ready
+                result = .ok(merged)
+            }
+        }
         return result
+    }
+
+    /// Opening the palette is only useful to a caller once keystrokes land in
+    /// it, and SwiftUI moves the first responder on a later render pass than
+    /// the one that shows the palette. Returning before that happened made
+    /// this command's completion a signal the caller could not act on: text
+    /// and navigation keys sent right after it went to whatever held focus
+    /// before, silently. Runs off-main, one poll per render pass.
+    /// Returns whether the palette owned input by the time it gave up.
+    @discardableResult
+    private func waitForCommandPaletteInputFocus(
+        windowId: UUID,
+        timeout: TimeInterval = 2.0
+    ) -> Bool {
+        guard !Thread.isMainThread else { return false }
+        let start = Date()
+        let deadline = start.addingTimeInterval(timeout)
+        while true {
+            let remaining = deadline.timeIntervalSinceNow
+            if remaining <= 0 { break }
+            var owned = false
+            // `timeout` is what actually bounds this call: v2MainExec waits a
+            // further 4x once the body has started, so a fixed 1s here made the
+            // real worst case 5s per poll against a 2s budget. Spend at most a
+            // fifth of what is left.
+            let execBudget = max(0.05, min(remaining / 5, 0.25))
+            _ = v2MainExec(timeout: execBudget) {
+                guard let window = AppDelegate.shared?.mainWindow(for: windowId),
+                      let responder = window.firstResponder else { return }
+                owned = AppDelegate.shared?.isCommandPaletteResponder(responder) ?? false
+                if owned {
+                    // How long the palette was on screen without owning input.
+                    // The keyboard path opens through the same SwiftUI work and
+                    // does not wait, so this is the size of the window a person
+                    // can type into and lose the keystroke. Recorded on the
+                    // main thread, like every other AppDelegate access here.
+                    AppDelegate.shared?.noteCommandPaletteFocusWait(
+                        seconds: Date().timeIntervalSince(start)
+                    )
+                }
+            }
+            if owned { return true }
+            // The overlay moves the first responder from an 80ms timer, so
+            // polling faster only floods the main queue with hops that contend
+            // with the render pass being waited for.
+            Thread.sleep(forTimeInterval: min(0.02, max(0, deadline.timeIntervalSinceNow)))
+        }
+        _ = v2MainExec(timeout: 0.25) {
+            AppDelegate.shared?.noteCommandPaletteFocusWaitTimeout()
+        }
+        return false
     }
 
     /// Inspect (and with `simulate: true`, force) a terminal's automatic
@@ -424,11 +496,29 @@ extension TerminalController {
         var visible = false
         var selectedIndex = 0
         var snapshot = CommandPaletteDebugSnapshot.empty
+        var navCandidateKeyCount = 0
+        var navModifierRejectCount = 0
+        var navLastEventModifiersRaw: Int?
+        var firstResponderInPalette = false
+        var focusWaitMs: Int?
 
         _ = v2MainExec(timeout: 5) {
             visible = AppDelegate.shared?.isCommandPaletteVisible(windowId: windowId) ?? false
             selectedIndex = AppDelegate.shared?.commandPaletteSelectionIndex(windowId: windowId) ?? 0
             snapshot = AppDelegate.shared?.commandPaletteSnapshot(windowId: windowId) ?? .empty
+            navCandidateKeyCount = AppDelegate.shared?.commandPaletteNavigationCandidateKeyCount ?? 0
+            navModifierRejectCount = AppDelegate.shared?.commandPaletteNavigationModifierRejectCount ?? 0
+            navLastEventModifiersRaw = AppDelegate.shared?.commandPaletteLastNavigationEventModifiersRaw
+            focusWaitMs = AppDelegate.shared?.commandPaletteLastFocusWaitMs
+            // Whether keystrokes actually land in the palette right now. The
+            // AppKit first responder is the authority here: a field editor
+            // holding focus says nothing about which field it belongs to, and
+            // the view's own focus state is read through a stale copy.
+            if let window = AppDelegate.shared?.mainWindow(for: windowId),
+               let responder = window.firstResponder {
+                firstResponderInPalette =
+                    AppDelegate.shared?.isCommandPaletteResponder(responder) ?? false
+            }
         }
 
         let rows = Array(snapshot.results.prefix(limit)).map { row in
@@ -448,7 +538,15 @@ extension TerminalController {
             "selected_index": max(0, selectedIndex),
             "query": snapshot.query,
             "mode": snapshot.mode,
-            "results": rows
+            "results": rows,
+            "search_focused": snapshot.searchFocused,
+            "rename_focused": snapshot.renameFocused,
+            "nav_ignored_empty_count": snapshot.navigationIgnoredEmptyCount,
+            "nav_candidate_key_count": navCandidateKeyCount,
+            "nav_modifier_reject_count": navModifierRejectCount,
+            "nav_last_event_modifiers_raw": v2OrNull(navLastEventModifiersRaw),
+            "first_responder_in_palette": firstResponderInPalette,
+            "last_focus_wait_ms": v2OrNull(focusWaitMs)
         ])
     }
 

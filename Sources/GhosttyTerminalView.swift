@@ -17,6 +17,15 @@ enum TerminalAutoBlankRecoveryDecision: Equatable {
     case rebuild
 }
 
+/// Device identity of a terminal special file. `FileAttributeKey.systemNumber`
+/// is the containing filesystem's `st_dev`, not the terminal's `st_rdev`.
+nonisolated func terminalDeviceNumber(at path: String) -> UInt32? {
+    guard path.hasPrefix("/dev/") else { return nil }
+    var info = stat()
+    guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFCHR else { return nil }
+    return UInt32(truncatingIfNeeded: info.st_rdev)
+}
+
 /// Pure policy for the timing-sensitive blank-pane recovery state machine.
 /// Keeping the decision separate from AppKit/renderer side effects lets tests
 /// pin the healthy, confirmation, cooldown, and rebuild paths deterministically.
@@ -300,6 +309,20 @@ final class TerminalSurface: Identifiable, ObservableObject {
     private var rendererRealized = true
     @MainActor var isRendererReadyForImmediateVisibility: Bool {
         surface != nil && rendererRealized
+    }
+
+    /// Kernel device identity of this surface's PTY. Adopted leaders cannot
+    /// receive a new environment capability after their shell has started, so
+    /// this gives the socket boundary a non-forgeable identity to compare with
+    /// the connecting process's controlling TTY.
+    @MainActor var controllingTTYDevice: UInt32? {
+        guard let surface else { return nil }
+        let value = ghostty_surface_tty_name(surface)
+        defer { ghostty_string_free(value) }
+        guard let ptr = value.ptr, value.len > 0 else { return nil }
+        let raw = UnsafeRawPointer(ptr).assumingMemoryBound(to: UInt8.self)
+        let path = String(decoding: UnsafeBufferPointer(start: raw, count: Int(value.len)), as: UTF8.self)
+        return terminalDeviceNumber(at: path)
     }
     /// Debounced unrealize work item, so transient reparent/workspace flaps don't
     /// thrash the swap chain (recreate cost) when a surface briefly goes invisible.
@@ -1733,6 +1756,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
     func sendSocketStyleText(_ text: String, withReturn: Bool = true) -> Bool {
         guard let surface = surface else { return false }
         let payload = withReturn ? text + "\r" : text
+        InputInjectionLog.record(site: "sendSocketStyleText", surface: id, text: payload)
         for scalar in payload.unicodeScalars {
             switch scalar.value {
             case 0x0A, 0x0D:
@@ -1776,6 +1800,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// e.g. when the panel is in a non-active tab.
     func sendSurfaceKeyPress(keycode: UInt16, text: String? = nil) {
         guard let surface = surface else { return }
+        InputInjectionLog.recordKey(
+            site: "sendSurfaceKeyPress", surface: id, keycode: keycode, text: text
+        )
         var keyEvent = ghostty_input_key_s()
         keyEvent.action = GHOSTTY_ACTION_PRESS
         keyEvent.keycode = UInt32(keycode)
@@ -1809,6 +1836,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
         func flush() {
             guard !buffered.isEmpty else { return }
+            InputInjectionLog.record(site: "sendInputText.flush", surface: id, text: buffered)
             var keyEvent = ghostty_input_key_s()
             keyEvent.action = GHOSTTY_ACTION_PRESS
             keyEvent.keycode = 0
@@ -2178,6 +2206,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
             while idx < chars.count {
                 let end = min(idx + chunkChars, chars.count)
                 let chunk = String(chars[idx..<end])
+                InputInjectionLog.record(site: "processPaste", surface: id, text: chunk)
                 let data = chunk.utf8
                 let len = UInt(data.count)
                 data.withContiguousStorageIfAvailable { buf in
@@ -2317,6 +2346,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// a "functional" key, which can be silently dropped by TUI apps in certain
     /// states (e.g., Claude Code's "thinking" mode returning to idle).
     func sendReturnKey(to surface: ghostty_surface_t) -> Bool {
+        InputInjectionLog.recordKey(
+            site: "sendReturnKey", surface: id, keycode: 36, text: "\r"
+        )
         var keyEvent = ghostty_input_key_s()
         keyEvent.action = GHOSTTY_ACTION_PRESS
         keyEvent.keycode = 36 // kVK_Return
@@ -2383,6 +2415,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     private func writeTextData(_ data: Data, to surface: ghostty_surface_t) {
+        InputInjectionLog.record(
+            site: "writeTextData", surface: id, text: String(decoding: data, as: UTF8.self)
+        )
         data.withUnsafeBytes { rawBuffer in
             guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: CChar.self) else { return }
             ghostty_surface_text(surface, baseAddress, UInt(rawBuffer.count))

@@ -60,6 +60,7 @@
 		A15000000000000000000002 /* WorkspaceRemoteRetrievalModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15000000000000000000004 /* WorkspaceRemoteRetrievalModelsTests.swift */; };
 		A15100000000000000000001 /* RemoteGitCheckpointService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000005 /* RemoteGitCheckpointService.swift */; };
 		A15100000000000000000039 /* RemoteWorkLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1510000000000000000003A /* RemoteWorkLog.swift */; };
+		A15100000000000000000041 /* InputInjectionLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000042 /* InputInjectionLog.swift */; };
 		A15100000000000000000034 /* RemotePasteTransfer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000038 /* RemotePasteTransfer.swift */; };
 		A15100000000000000000002 /* WorkspaceRetrievalStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000006 /* WorkspaceRetrievalStore.swift */; };
 		A15100000000000000000003 /* WorkspaceRetrievalViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000007 /* WorkspaceRetrievalViews.swift */; };
@@ -259,6 +260,7 @@
 					D0E0F0B2A1B2C3D4E5F60718 /* BrowserOmnibarSuggestionsUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0E0F0B3A1B2C3D4E5F60718 /* BrowserOmnibarSuggestionsUITests.swift */; };
 					E1000000A1B2C3D4E5F60718 /* MenuKeyEquivalentRoutingUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1000001A1B2C3D4E5F60718 /* MenuKeyEquivalentRoutingUITests.swift */; };
 				F1000000A1B2C3D4E5F60718 /* TermMeshWebViewKeyEquivalentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1000001A1B2C3D4E5F60718 /* TermMeshWebViewKeyEquivalentTests.swift */; };
+			F1000A02A1B2C3D4E5F60718 /* CommandPaletteKeyAbsorptionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1000A03A1B2C3D4E5F60718 /* CommandPaletteKeyAbsorptionTests.swift */; };
 				F2000000A1B2C3D4E5F60718 /* UpdatePillReleaseVisibilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000001A1B2C3D4E5F60718 /* UpdatePillReleaseVisibilityTests.swift */; };
 				D2A100000000000000000001 /* MainWindowSheetCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2A100000000000000000002 /* MainWindowSheetCoordinatorTests.swift */; };
 				F3000000A1B2C3D4E5F60718 /* CJKIMEInputTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */; };
@@ -309,6 +311,8 @@
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */; };
 		FC000002A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000003A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift */; };
 		FC000004A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */; };
+		A15100000000000000000045 /* RemoteWorkLogRetentionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000046 /* RemoteWorkLogRetentionTests.swift */; };
+		A15100000000000000000043 /* InputInjectionLogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000044 /* InputInjectionLogTests.swift */; };
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */; };
 			FD000010A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000011A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift */; };
 			FD000020A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000021A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift */; };
@@ -425,6 +429,7 @@
 			A15000000000000000000004 /* WorkspaceRemoteRetrievalModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRemoteRetrievalModelsTests.swift; sourceTree = "<group>"; };
 			A15100000000000000000005 /* RemoteGitCheckpointService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteGitCheckpointService.swift; sourceTree = "<group>"; };
 			A1510000000000000000003A /* RemoteWorkLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteWorkLog.swift; sourceTree = "<group>"; };
+			A15100000000000000000042 /* InputInjectionLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputInjectionLog.swift; sourceTree = "<group>"; };
 			A15100000000000000000038 /* RemotePasteTransfer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemotePasteTransfer.swift; sourceTree = "<group>"; };
 			A15100000000000000000006 /* WorkspaceRetrievalStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalStore.swift; sourceTree = "<group>"; };
 			A15100000000000000000007 /* WorkspaceRetrievalViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalViews.swift; sourceTree = "<group>"; };
@@ -621,6 +626,7 @@
 					D0E0F0B3A1B2C3D4E5F60718 /* BrowserOmnibarSuggestionsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserOmnibarSuggestionsUITests.swift; sourceTree = "<group>"; };
 					E1000001A1B2C3D4E5F60718 /* MenuKeyEquivalentRoutingUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuKeyEquivalentRoutingUITests.swift; sourceTree = "<group>"; };
 			F1000001A1B2C3D4E5F60718 /* TermMeshWebViewKeyEquivalentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TermMeshWebViewKeyEquivalentTests.swift; sourceTree = "<group>"; };
+		F1000A03A1B2C3D4E5F60718 /* CommandPaletteKeyAbsorptionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandPaletteKeyAbsorptionTests.swift; sourceTree = "<group>"; };
 			F2000001A1B2C3D4E5F60718 /* UpdatePillReleaseVisibilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdatePillReleaseVisibilityTests.swift; sourceTree = "<group>"; };
 			D2A100000000000000000002 /* MainWindowSheetCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowSheetCoordinatorTests.swift; sourceTree = "<group>"; };
 			F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CJKIMEInputTests.swift; sourceTree = "<group>"; };
@@ -672,6 +678,8 @@
 			FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirrorTests.swift; sourceTree = "<group>"; };
 		FC000003A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerServerHostLayoutTests.swift; sourceTree = "<group>"; };
 		FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSSHTunnelBudgetTests.swift; sourceTree = "<group>"; };
+			A15100000000000000000046 /* RemoteWorkLogRetentionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteWorkLogRetentionTests.swift; sourceTree = "<group>"; };
+			A15100000000000000000044 /* InputInjectionLogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputInjectionLogTests.swift; sourceTree = "<group>"; };
 			FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDaemonVersionTests.swift; sourceTree = "<group>"; };
 			FD000011A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalOverrideIsolationTests.swift; sourceTree = "<group>"; };
 			FD000021A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerTerminalQueryStripperTests.swift; sourceTree = "<group>"; };
@@ -829,6 +837,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 					A15000000000000000000003 /* WorkspaceRemoteRetrievalModels.swift */,
 					A15100000000000000000005 /* RemoteGitCheckpointService.swift */,
 					A1510000000000000000003A /* RemoteWorkLog.swift */,
+					A15100000000000000000042 /* InputInjectionLog.swift */,
 					A15100000000000000000038 /* RemotePasteTransfer.swift */,
 					A15100000000000000000006 /* WorkspaceRetrievalStore.swift */,
 					A15100000000000000000007 /* WorkspaceRetrievalViews.swift */,
@@ -1054,6 +1063,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 			isa = PBXGroup;
 			children = (
 				F1000001A1B2C3D4E5F60718 /* TermMeshWebViewKeyEquivalentTests.swift */,
+				F1000A03A1B2C3D4E5F60718 /* CommandPaletteKeyAbsorptionTests.swift */,
 				F2000001A1B2C3D4E5F60718 /* UpdatePillReleaseVisibilityTests.swift */,
 				D2A100000000000000000002 /* MainWindowSheetCoordinatorTests.swift */,
 				F3000001A1B2C3D4E5F60718 /* CJKIMEInputTests.swift */,
@@ -1105,6 +1115,8 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */,
 				FC000003A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift */,
 				FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */,
+				A15100000000000000000046 /* RemoteWorkLogRetentionTests.swift */,
+				A15100000000000000000044 /* InputInjectionLogTests.swift */,
 				FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */,
 				FD000011A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift */,
 				FD000021A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift */,
@@ -1305,6 +1317,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 					A15000000000000000000001 /* WorkspaceRemoteRetrievalModels.swift in Sources */,
 					A15100000000000000000001 /* RemoteGitCheckpointService.swift in Sources */,
 					A15100000000000000000039 /* RemoteWorkLog.swift in Sources */,
+					A15100000000000000000041 /* InputInjectionLog.swift in Sources */,
 					A15100000000000000000034 /* RemotePasteTransfer.swift in Sources */,
 					A15100000000000000000002 /* WorkspaceRetrievalStore.swift in Sources */,
 					A15100000000000000000003 /* WorkspaceRetrievalViews.swift in Sources */,
@@ -1503,6 +1516,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 			buildActionMask = 2147483647;
 			files = (
 				F1000000A1B2C3D4E5F60718 /* TermMeshWebViewKeyEquivalentTests.swift in Sources */,
+				F1000A02A1B2C3D4E5F60718 /* CommandPaletteKeyAbsorptionTests.swift in Sources */,
 				F2000000A1B2C3D4E5F60718 /* UpdatePillReleaseVisibilityTests.swift in Sources */,
 				D2A100000000000000000001 /* MainWindowSheetCoordinatorTests.swift in Sources */,
 				F3000000A1B2C3D4E5F60718 /* CJKIMEInputTests.swift in Sources */,
@@ -1554,6 +1568,8 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */,
 				FC000002A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift in Sources */,
 				FC000004A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift in Sources */,
+				A15100000000000000000045 /* RemoteWorkLogRetentionTests.swift in Sources */,
+				A15100000000000000000043 /* InputInjectionLogTests.swift in Sources */,
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */,
 				FD000010A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift in Sources */,
 				FD000020A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift in Sources */,
@@ -1686,7 +1702,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 283;
+				CURRENT_PROJECT_VERSION = 286;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1695,7 +1711,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.215.0;
+				MARKETING_VERSION = 0.218.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1725,7 +1741,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 283;
+				CURRENT_PROJECT_VERSION = 286;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1734,7 +1750,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.215.0;
+				MARKETING_VERSION = 0.218.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1788,10 +1804,10 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 283;
+				CURRENT_PROJECT_VERSION = 286;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.215.0;
+				MARKETING_VERSION = 0.218.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1805,10 +1821,10 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 283;
+				CURRENT_PROJECT_VERSION = 286;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.215.0;
+				MARKETING_VERSION = 0.218.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1822,10 +1838,10 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 283;
+				CURRENT_PROJECT_VERSION = 286;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.215.0;
+				MARKETING_VERSION = 0.218.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1841,10 +1857,10 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 283;
+				CURRENT_PROJECT_VERSION = 286;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.215.0;
+				MARKETING_VERSION = 0.218.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";

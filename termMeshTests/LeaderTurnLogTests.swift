@@ -156,6 +156,28 @@ final class LeaderTurnLogTests: XCTestCase {
         XCTAssertLessThanOrEqual(health.linkage, 1)
     }
 
+    func testAbsorbedPromptsAreExcludedFromTurnHealth() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_start","turn_id":"running","ts":"2026-08-24T00:00:00Z","team":"t"}
+        {"event":"turn_route","turn_id":"running","ts":"2026-08-24T00:00:01Z","team":"t"}
+        {"event":"turn_start","turn_id":"absorbed","ts":"2026-08-24T00:00:02Z","team":"t"}
+        {"event":"turn_end","turn_id":"absorbed","ts":"2026-08-24T00:00:03Z","team":"t","route_status":"absorbed"}
+        {"event":"turn_end","turn_id":"running","ts":"2026-08-24T00:00:03Z","team":"t","route_status":"stated"}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        let health = LeaderTurnLog.health(from: log)
+        XCTAssertEqual(health.supportedTurns, 1)
+        XCTAssertEqual(health.statedTurns, 1)
+        XCTAssertEqual(health.unstatedTurns, 0)
+        XCTAssertEqual(health.coverage, 1)
+        XCTAssertEqual(health.linkage, 1)
+    }
+
     func testShadowPolicyFieldsDecodeAdditivelyWithoutChangingLegacyRecords() throws {
         let log = try temporaryLog()
         try FileManager.default.createDirectory(

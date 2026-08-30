@@ -28,6 +28,7 @@ struct VerticalTabsSidebar: View {
     @ObservedObject private var remoteHostStore = RemoteHostStore.shared
     @ObservedObject private var teamOrchestrator = TeamOrchestrator.shared
     @ObservedObject private var activeDrag = SidebarActiveDrag.shared
+    @StateObject private var remoteProjectRestoreState = SidebarRemoteProjectRestoreState()
     @State private var draggedTabId: UUID?
     @State private var dropIndicator: SidebarDropIndicator?
     @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
@@ -155,12 +156,14 @@ struct VerticalTabsSidebar: View {
 
                             SidebarRemoteHostsSection(
                                 store: remoteHostStore,
+                                remoteRestoreState: remoteProjectRestoreState,
                                 usesSeparatedPresentation: sidebarSeparatedSectionsEnabled
                             )
                             .equatable()
                         case .project:
                             SidebarProjectsSection(
                                 store: remoteHostStore,
+                                remoteRestoreState: remoteProjectRestoreState,
                                 usesSeparatedPresentation: sidebarSeparatedSectionsEnabled
                             )
                         }
@@ -1009,7 +1012,7 @@ struct SidebarAxisPicker: View, Equatable {
         .padding(.horizontal, 12)
         .accessibilityIdentifier("sidebar.axis")
         .accessibilityLabel("Sidebar grouping")
-        .help("Group the sidebar by host or by project")
+        .help("Lead with machines, or lead with projects")
     }
 }
 
@@ -1017,6 +1020,7 @@ struct SidebarAxisPicker: View, Equatable {
 /// by the project it works inside.
 struct SidebarProjectsSection: View {
     @ObservedObject var store: RemoteHostStore
+    @ObservedObject var remoteRestoreState: SidebarRemoteProjectRestoreState
     let usesSeparatedPresentation: Bool
     @AppStorage(SidebarLayoutSettings.localTabsCollapsedKey)
     private var isCollapsed = false
@@ -1083,6 +1087,7 @@ struct SidebarProjectsSection: View {
 
             if !isCollapsed {
                 SidebarPeerProjectsView(
+                    remoteRestoreState: remoteRestoreState,
                     hosts: store.sortedHosts,
                     store: store,
                     usesSeparatedPresentation: usesSeparatedPresentation,
@@ -1098,6 +1103,7 @@ struct SidebarProjectsSection: View {
 struct SidebarRemoteHostsSection: View, Equatable {
     @ObservedObject var store: RemoteHostStore
     @ObservedObject private var hostStats = PeerHostStatsStore.shared
+    @ObservedObject var remoteRestoreState: SidebarRemoteProjectRestoreState
     let usesSeparatedPresentation: Bool
     @AppStorage(SidebarLayoutSettings.remoteHostsCollapsedKey)
     private var isCollapsed = false
@@ -1112,6 +1118,7 @@ struct SidebarRemoteHostsSection: View, Equatable {
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.store === rhs.store
             && lhs.usesSeparatedPresentation == rhs.usesSeparatedPresentation
+            && lhs.remoteRestoreState === rhs.remoteRestoreState
     }
 
     private var hasPeerPaneDetails: Bool {
@@ -1219,7 +1226,8 @@ struct SidebarRemoteHostsSection: View, Equatable {
                                 expandSignal: store.expandSignal,
                                 diskWarningText: host.isConnected
                                     ? hostStats.stats(for: host.paneHostSpec.hostKey)?.diskWarningText
-                                    : nil
+                                    : nil,
+                                restoreState: remoteRestoreState
                             ) { context in
                                 editorContext = context
                             }
@@ -1230,6 +1238,17 @@ struct SidebarRemoteHostsSection: View, Equatable {
             }
         }
         .padding(.bottom, 4)
+        .alert(
+            "Couldn’t Open Project",
+            isPresented: Binding(
+                get: { remoteRestoreState.failureMessage != nil },
+                set: { if !$0 { remoteRestoreState.failureMessage = nil } }
+            )
+        ) {
+            Button("OK") { remoteRestoreState.failureMessage = nil }
+        } message: {
+            Text(remoteRestoreState.failureMessage ?? "")
+        }
         .sheet(item: $editorContext) { context in
             PeerHostEditorView(
                 context: context,
@@ -1628,6 +1647,106 @@ private struct SidebarPeerProjectGroup: Identifiable {
     var spansPeer: Bool { items.contains { !$0.isLocal } }
 }
 
+@MainActor
+final class SidebarRemoteProjectRestoreState: ObservableObject {
+    @Published private(set) var restoringKeys: Set<String> = []
+    @Published var failureMessage: String?
+
+    func begin(host: HostEntry, team: RemoteTeamSummary) -> String? {
+        let key = TeamOrchestrator.sidebarRemoteManifestKey(hostID: host.id, team: team)
+        guard restoringKeys.insert(key).inserted else { return nil }
+        return key
+    }
+
+    func finish(key: String, failure: String? = nil) {
+        restoringKeys.remove(key)
+        if let failure { failureMessage = failure }
+    }
+
+    func isRestoring(host: HostEntry, team: RemoteTeamSummary) -> Bool {
+        restoringKeys.contains(
+            TeamOrchestrator.sidebarRemoteManifestKey(hostID: host.id, team: team)
+        )
+    }
+}
+
+/// One durable Project manifest a peer daemon holds, offered for adoption.
+///
+/// Shared by both axes on purpose. The Host axis lists what a host serves from
+/// its `activeSockPath`, and on a Mac peer that socket belongs to the GUI app,
+/// which publishes no project manifest — only its session-owner daemon does.
+/// A Project created on such a host was therefore absent from the machine it
+/// runs on, and absence reads as deletion rather than as a second endpoint
+/// holding the answer. Listing the same manifests under the host closes that
+/// gap without asking the user to know which socket answered.
+private struct SidebarRemoteProjectRow: View {
+    @Environment(TabManager.self) private var tabManager
+    @ObservedObject private var orchestrator = TeamOrchestrator.shared
+    @ObservedObject var restoreState: SidebarRemoteProjectRestoreState
+    let host: HostEntry
+    let team: RemoteTeamSummary
+    /// Axis-specific so a manifest listed under both does not answer to one
+    /// identifier twice.
+    let accessibilityPrefix: String
+
+    var body: some View {
+        let isRestoring = restoreState.isRestoring(host: host, team: team)
+        let isUpdate = TeamOrchestrator.sidebarRemoteManifestState(
+            localTeam: orchestrator.teams[team.name],
+            remote: team, hostKey: host.id
+        ).isUpdate
+        Button {
+            guard let restoreKey = restoreState.begin(host: host, team: team) else { return }
+            Task { @MainActor in
+                let restored = await orchestrator.adoptRemoteProjectPresentation(
+                    team,
+                    host: host,
+                    tabManager: tabManager
+                )
+                restoreState.finish(
+                    key: restoreKey,
+                    failure: restored ? nil :
+                        "The live project surfaces could not be attached from \(host.displayName)."
+                )
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Text(team.name)
+                        .font(.system(size: 12, weight: .semibold))
+                    Image(systemName: "server.rack")
+                        .font(.system(size: 8))
+                        .foregroundColor(.orange)
+                    Spacer(minLength: 0)
+                    if isRestoring {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+                Text(
+                    "\(isUpdate ? "Update from" : "Open on") \(host.displayName)"
+                        + " · \(team.members.count) agents"
+                )
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isRestoring)
+        .accessibilityIdentifier(
+            "\(accessibilityPrefix)."
+                + TeamOrchestrator.sidebarRemoteManifestKey(hostID: host.id, team: team)
+        )
+        .help(
+            isUpdate
+                ? "Replace this viewer with the host's latest project topology"
+                : "Attach the leader and agents already running on this host"
+        )
+    }
+}
+
 /// Project-axis rendering of the peer section. Deliberately shows NOTHING but
 /// projects: a host that contributes no workspace has no place on this axis,
 /// and listing it here just reproduced the Host view one toggle away. Host
@@ -1641,6 +1760,7 @@ private struct SidebarPeerProjectsView: View {
     @Environment(TabManager.self) private var tabManager
     @ObservedObject private var coordinator = ReviewBoardCoordinatorService.shared
     @ObservedObject private var orchestrator = TeamOrchestrator.shared
+    @ObservedObject var remoteRestoreState: SidebarRemoteProjectRestoreState
     let hosts: [HostEntry]
     let store: RemoteHostStore
     let usesSeparatedPresentation: Bool
@@ -1661,22 +1781,29 @@ private struct SidebarPeerProjectsView: View {
     @State private var presentationRestoreFailure: String?
     @State private var restoringTeamNames: Set<String> = []
 
+    private var projectOpenFailure: String? {
+        presentationRestoreFailure ?? remoteRestoreState.failureMessage
+    }
+
+    private func clearProjectOpenFailure() {
+        presentationRestoreFailure = nil
+        remoteRestoreState.failureMessage = nil
+    }
+
     private var connectedHosts: [HostEntry] {
         hosts.filter { $0.isConnected && !$0.workspaces.isEmpty }
     }
 
     private var discoverableRemoteProjects: [RemoteManifestItem] {
         hosts
-            .filter(\.isConnected)
             .flatMap { host in
-                host.teams.compactMap { team in
-                    guard !team.leaderSurfaceID.isEmpty else { return nil }
-                    let state = TeamOrchestrator.sidebarRemoteManifestState(
-                        localTeam: orchestrator.teams[team.name],
-                        remote: team, hostKey: host.id
-                    )
-                    guard state.shouldOffer else { return nil }
-                    return RemoteManifestItem(host: host, team: team)
+                TeamOrchestrator.hostAxisOfferedManifests(
+                    isConnected: host.isConnected,
+                    teams: host.teams,
+                    hostKey: host.id,
+                    localTeamForName: { orchestrator.teams[$0] }
+                ).map { team in
+                    RemoteManifestItem(host: host, team: team)
                 }
             }
             .sorted {
@@ -1849,57 +1976,11 @@ private struct SidebarPeerProjectsView: View {
     }
 
     private func remoteManifestRow(_ item: RemoteManifestItem) -> some View {
-        let restoreKey = item.id
-        let isUpdate = TeamOrchestrator.sidebarRemoteManifestState(
-            localTeam: orchestrator.teams[item.team.name],
-            remote: item.team, hostKey: item.host.id
-        ).isUpdate
-        return Button {
-            guard !restoringTeamNames.contains(restoreKey) else { return }
-            restoringTeamNames.insert(restoreKey)
-            Task { @MainActor in
-                let restored = await orchestrator.adoptRemoteProjectPresentation(
-                    item.team,
-                    host: item.host,
-                    tabManager: tabManager
-                )
-                restoringTeamNames.remove(restoreKey)
-                if !restored {
-                    presentationRestoreFailure =
-                        "The live project surfaces could not be attached from \(item.host.displayName)."
-                }
-            }
-        } label: {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 5) {
-                    Text(item.team.name)
-                        .font(.system(size: 12, weight: .semibold))
-                    Image(systemName: "server.rack")
-                        .font(.system(size: 8))
-                        .foregroundColor(.orange)
-                    Spacer(minLength: 0)
-                    if restoringTeamNames.contains(restoreKey) {
-                        ProgressView().controlSize(.small)
-                    }
-                }
-                Text(
-                    "\(isUpdate ? "Update from" : "Open on") \(item.host.displayName)"
-                        + " · \(item.team.members.count) agents"
-                )
-                    .font(.system(size: 9))
-                    .foregroundColor(.secondary)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 6)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(restoringTeamNames.contains(restoreKey))
-        .accessibilityIdentifier("sidebar.projects.remote.\(item.team.name)")
-        .help(
-            isUpdate
-                ? "Replace this viewer with the host's latest project topology"
-                : "Attach the leader and agents already running on this host"
+        SidebarRemoteProjectRow(
+            restoreState: remoteRestoreState,
+            host: item.host,
+            team: item.team,
+            accessibilityPrefix: "sidebar.projects.remote"
         )
     }
 
@@ -2232,13 +2313,13 @@ private struct SidebarPeerProjectsView: View {
         .alert(
             "Couldn’t Open Project",
             isPresented: Binding(
-                get: { presentationRestoreFailure != nil },
-                set: { if !$0 { presentationRestoreFailure = nil } }
+                get: { projectOpenFailure != nil },
+                set: { if !$0 { clearProjectOpenFailure() } }
             )
         ) {
-            Button("OK") { presentationRestoreFailure = nil }
+            Button("OK") { clearProjectOpenFailure() }
         } message: {
-            Text(presentationRestoreFailure ?? "")
+            Text(projectOpenFailure ?? "")
         }
     }
 
@@ -2628,12 +2709,16 @@ private struct PeerShellCleanupSheet: View {
 
 struct RemoteHostGroupView: View, Equatable {
     @Environment(\.colorScheme) private var colorScheme
+    /// Adopting a project elsewhere changes what this host still has to offer,
+    /// and `Equatable` above only compares the inputs the parent passes down.
+    @ObservedObject private var orchestrator = TeamOrchestrator.shared
     let host: HostEntry
     let store: RemoteHostStore
     let usesSeparatedPresentation: Bool
     let paneExpansionCommand: PeerPaneExpansionCommand
     let expandSignal: RemoteHostStore.ExpandSignal
     let diskWarningText: String?
+    @ObservedObject var restoreState: SidebarRemoteProjectRestoreState
     /// Opens the shared add/edit sheet (owned by the section view).
     let onEdit: (PeerHostEditorContext) -> Void
     @State private var isExpanded: Bool
@@ -2651,6 +2736,7 @@ struct RemoteHostGroupView: View, Equatable {
          paneExpansionCommand: PeerPaneExpansionCommand,
          expandSignal: RemoteHostStore.ExpandSignal,
          diskWarningText: String?,
+         restoreState: SidebarRemoteProjectRestoreState,
          onEdit: @escaping (PeerHostEditorContext) -> Void) {
         self.host = host
         self.store = store
@@ -2658,6 +2744,7 @@ struct RemoteHostGroupView: View, Equatable {
         self.paneExpansionCommand = paneExpansionCommand
         self.expandSignal = expandSignal
         self.diskWarningText = diskWarningText
+        self.restoreState = restoreState
         self.onEdit = onEdit
         // Fold state persists per stable host key; default is expanded.
         _isExpanded = State(initialValue: !SidebarLayoutSettings.isHostCollapsed(host.id))
@@ -2669,6 +2756,7 @@ struct RemoteHostGroupView: View, Equatable {
             && lhs.paneExpansionCommand == rhs.paneExpansionCommand
             && lhs.expandSignal == rhs.expandSignal
             && lhs.diskWarningText == rhs.diskWarningText
+            && lhs.restoreState === rhs.restoreState
     }
 
     /// Profile-management items shared by every connection state.
@@ -3005,36 +3093,87 @@ struct RemoteHostGroupView: View, Equatable {
         }
     }
 
+    /// Manifests this host's session owner holds that no local team has taken
+    /// over yet.
+    ///
+    /// These never reach `host.workspaces` on a Mac peer: workspaces come from
+    /// the serving GUI socket, manifests from the separate session-owner
+    /// daemon (`RemoteHostStore.fetchTeamRoster`). Reusing the Project axis's
+    /// own offer rule keeps one answer to "is this worth showing" rather than
+    /// two that can disagree.
+    private var offeredProjects: [RemoteTeamSummary] {
+        TeamOrchestrator.hostAxisOfferedManifests(
+            isConnected: host.isConnected,
+            teams: host.teams,
+            hostKey: host.id,
+            localTeamForName: { orchestrator.teams[$0] }
+        )
+    }
+
+    /// Listed above the workspaces on purpose: a Project is the thing the user
+    /// named and went looking for, while the workspaces under it are where it
+    /// happens to be running.
+    private var projectsSubsection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Projects")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(Color.secondary.opacity(0.7))
+                .padding(.leading, 20)
+                .padding(.bottom, 1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            ForEach(offeredProjects) { team in
+                SidebarRemoteProjectRow(
+                    restoreState: restoreState,
+                    host: host,
+                    team: team,
+                    accessibilityPrefix: "sidebar.hosts.project"
+                )
+            }
+        }
+    }
+
     @ViewBuilder
     private var hostContent: some View {
-        if host.workspaces.isEmpty {
-            HStack(spacing: 8) {
-                Text(emptyBodyText)
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
-                if case .connecting = host.connectionState {
-                    Spacer(minLength: 4)
-                    Button("Cancel") { store.cancelConnectingHost(host) }
-                        .buttonStyle(.borderless)
-                        .controlSize(.mini)
-                        .help("Cancel connection attempt")
-                    Button("Retry") { store.retryConnectingHost(host) }
-                        .buttonStyle(.borderless)
-                        .controlSize(.mini)
-                        .help("Abandon this attempt and start a new one")
-                }
-                if case .failed = host.connectionState, host.sshTarget != nil {
-                    Spacer(minLength: 4)
-                    Button("Retry") { store.retryConnectingHost(host) }
-                        .buttonStyle(.borderless)
-                        .controlSize(.mini)
-                        .help("Try connecting again")
-                }
+        VStack(spacing: 4) {
+            if !offeredProjects.isEmpty {
+                projectsSubsection
             }
-            .padding(.leading, 20)
-            .padding(.trailing, 8)
-            .padding(.vertical, 4)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            hostWorkspacesContent
+        }
+    }
+
+    @ViewBuilder
+    private var hostWorkspacesContent: some View {
+        if host.workspaces.isEmpty {
+            if offeredProjects.isEmpty {
+                HStack(spacing: 8) {
+                    Text(emptyBodyText)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                    if case .connecting = host.connectionState {
+                        Spacer(minLength: 4)
+                        Button("Cancel") { store.cancelConnectingHost(host) }
+                            .buttonStyle(.borderless)
+                            .controlSize(.mini)
+                            .help("Cancel connection attempt")
+                        Button("Retry") { store.retryConnectingHost(host) }
+                            .buttonStyle(.borderless)
+                            .controlSize(.mini)
+                            .help("Abandon this attempt and start a new one")
+                    }
+                    if case .failed = host.connectionState, host.sshTarget != nil {
+                        Spacer(minLength: 4)
+                        Button("Retry") { store.retryConnectingHost(host) }
+                            .buttonStyle(.borderless)
+                            .controlSize(.mini)
+                            .help("Try connecting again")
+                    }
+                }
+                .padding(.leading, 20)
+                .padding(.trailing, 8)
+                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
         } else {
             let windowGroups = groupWorkspacesByWindow(
                 host.workspaces,

@@ -498,6 +498,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var commandPaletteVisibilityByWindowId: [UUID: Bool] = [:]
     var commandPaletteSelectionByWindowId: [UUID: Int] = [:]
     var commandPaletteSnapshotByWindowId: [UUID: CommandPaletteDebugSnapshot] = [:]
+    /// Counted here rather than in the palette view: a view's own @State and
+    /// @FocusState are read back through whatever copy of the struct the
+    /// closure captured, which is how `searchFocused` came to read false
+    /// through runs that passed. These are written at the call and read
+    /// straight back.
+    ///
+    /// Process-wide, unlike the per-window dictionaries above: with two windows
+    /// open these describe whichever one most recently produced the event.
+    ///
+    /// "Candidate" is literal — the handler behind these is bound to the n/p/j/k
+    /// keys, so typing those letters into the query counts here too, and the
+    /// arrows do not count at all because they move the selection directly.
+    private(set) var commandPaletteNavigationCandidateKeyCount: Int = 0
+    private(set) var commandPaletteNavigationModifierRejectCount: Int = 0
+    /// SwiftUI `EventModifiers` — NOT `NSEvent.ModifierFlags`, whose bits
+    /// differ. The absorb path on this same object takes AppKit flags, so the
+    /// name carries which vocabulary this one is in. `nil` until a navigation
+    /// key arrives.
+    private(set) var commandPaletteLastNavigationEventModifiersRaw: Int?
+
+    /// Milliseconds the palette spent visible without owning input on the last
+    /// open. `nil` when it has not been measured, or when the wait gave up —
+    /// the two cases a sentinel number lets a caller misread as "fast".
+    private(set) var commandPaletteLastFocusWaitMs: Int?
+
+    /// Text typed while the palette was on screen but did not own input yet.
+    /// That gap measured 47ms on average and 96ms at worst, which is inside a
+    /// fast typist's first keystroke, so these characters used to go to
+    /// whatever held focus before the palette opened.
+    private(set) var commandPalettePendingInput: String = ""
+
+    /// Hold a keystroke for the palette when it is visible but not yet focused.
+    /// Returns true when the event was taken, so the caller consumes it.
+    func absorbCommandPaletteKeyIfUnfocused(event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return false }
+        guard let window = NSApp.keyWindow,
+              let windowId = mainWindowId(for: window),
+              isCommandPaletteVisible(windowId: windowId) else { return false }
+        // Once the palette owns input, SwiftUI routes keys to it directly.
+        if let responder = window.firstResponder, isCommandPaletteResponder(responder) {
+            return false
+        }
+        // Mid-composition keys belong to the input method, which is why
+        // handleCustomShortcut declines them just above this call. Taking them
+        // here would strand the composition: neither continued nor committed,
+        // with the raw scalar appended to the query instead of the syllable.
+        if let ghosttyView = termMeshOwningGhosttyView(for: window.firstResponder),
+           ghosttyView.hasMarkedText() {
+            return false
+        }
+        // Rename has its own field and its own draft, but held text is only
+        // ever applied to the search query. Absorbing here loses the keystroke
+        // and replays it into the query once the mode flips back.
+        guard commandPaletteSnapshot(windowId: windowId).acceptsAbsorbedInput else {
+            return false
+        }
+        guard let characters = event.characters,
+              commandPaletteAbsorbsKey(characters: characters, flags: event.modifierFlags)
+        else { return false }
+        commandPalettePendingInput += characters
+        return true
+    }
+
+    func takeCommandPalettePendingInput() -> String {
+        defer { commandPalettePendingInput = "" }
+        return commandPalettePendingInput
+    }
+
+    func clearCommandPalettePendingInput() {
+        commandPalettePendingInput = ""
+    }
+
+    func noteCommandPaletteFocusWait(seconds: TimeInterval) {
+        commandPaletteLastFocusWaitMs = Int((max(0, seconds) * 1000).rounded())
+    }
+
+    func noteCommandPaletteFocusWaitTimeout() {
+        commandPaletteLastFocusWaitMs = nil
+    }
+
+    func noteCommandPaletteNavigationKeyPress(eventModifiersRaw: Int, accepted: Bool) {
+        commandPaletteNavigationCandidateKeyCount += 1
+        commandPaletteLastNavigationEventModifiersRaw = eventModifiersRaw
+        if !accepted {
+            commandPaletteNavigationModifierRejectCount += 1
+        }
+    }
 
     override init() {
         super.init()
@@ -2593,6 +2680,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #if DEBUG
                     dlog("  → consumed by handleCustomShortcut")
                     DebugEventLog.shared.dump()
+#endif
+                    return nil // Consume the event
+                }
+                if self.absorbCommandPaletteKeyIfUnfocused(event: event) {
+#if DEBUG
+                    dlog("  → held for the command palette, which has no input focus yet")
 #endif
                     return nil // Consume the event
                 }

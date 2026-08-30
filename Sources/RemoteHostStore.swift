@@ -262,10 +262,15 @@ enum SidebarAxis: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Says what each axis leads with rather than that it "groups", which read
+    /// as "the same rows, rearranged" and cost a user the search for a Project
+    /// that was one toggle away.
     var accessibilityDescription: String {
         switch self {
-        case .host: return "Group the sidebar by machine"
-        case .project: return "Group the sidebar by project"
+        case .host:
+            return "List machines, with the projects and workspaces on each"
+        case .project:
+            return "List projects, with the workspaces that make them up"
         }
     }
 }

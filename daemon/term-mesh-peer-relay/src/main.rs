@@ -63,18 +63,57 @@ fn relay_debug_enabled() -> bool {
     })
 }
 
+/// Hex-dump a stdin chunk, but only when it is not ordinary typed text.
+///
+/// Two reasons for the filter. A relay carries everything a person types, and
+/// a debug log that records all of it is a keylog. And the case worth seeing
+/// is the one that should not be there at all — a stray control or high byte
+/// arriving with no one at the keyboard, which is how `ÿ` (0xFF) came to sit
+/// in a remote prompt after the pane was left idle.
+/// Whether a chunk is nothing but text a person could have typed. Such a chunk
+/// is never logged: printable ASCII plus tab/CR/LF is the shape of ordinary
+/// keystrokes, and recording those would make the debug log a keylog.
+fn is_ordinary_typed_text(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|&b| (0x20..0x7F).contains(&b) || b == b'\n' || b == b'\r' || b == 0x09)
+}
+
+fn rlog_stdin_bytes(label: &str, bytes: &[u8]) {
+    if bytes.is_empty() || !relay_debug_enabled() || is_ordinary_typed_text(bytes) {
+        return;
+    }
+    let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    rlog(&format!("{label}: {} bytes [{}]", bytes.len(), hex.join(" ")));
+}
+
 fn rlog(msg: &str) {
     if !relay_debug_enabled() {
         return;
     }
     let path =
         env::var("TERMMESH_PEER_RELAY_DEBUG_PATH").unwrap_or_else(|_| RELAY_DEBUG_LOG.to_string());
+    // Format first, then ONE write.
+    //
+    // `writeln!` on a `File` is unbuffered, so it issues a syscall per format
+    // fragment — `"[relay pid="`, the pid, `"] "`, the message, the newline.
+    // Every relay process on this machine appends to this same file, and
+    // O_APPEND makes each individual write atomic but says nothing about five
+    // of them in a row. Concurrent relays therefore shredded each other's
+    // lines, which is visible in a recorded log as the prefix appearing
+    // twice in a row with two pids spliced together:
+    //
+    //     [relay pid=[relay pid=4084640846] [relay pid=…stdin exit: …0x1140024
+    //
+    // Half the lines in that log were unreadable — in a file whose whole
+    // purpose is telling one process's bytes from another's.
+    let line = format!("[relay pid={}] {}\n", std::process::id(), msg);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "[relay pid={}] {}", std::process::id(), msg);
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -469,6 +508,21 @@ fn is_terminal_csi_response(seq: &[u8]) -> bool {
                 && !body[1..].is_empty()
                 && body[1..].iter().all(|b| b.is_ascii_digit() || *b == b';')
         }
+        // Window-manipulation reports: ESC [ 8 ; rows ; cols t and friends
+        // (3;x;y position, 4;h;w pixel size, 9;h;w screen size). Same shape
+        // as every case above — a query the host asked, answered by the
+        // relay's own terminal, arriving on the input path where the host
+        // reads it as something to run.
+        //
+        // Only the REPORT shape is dropped. `CSI 22t` / `CSI 23t` push and
+        // pop the title, but those are commands and travel host → viewer,
+        // never up this path; requiring at least one `;` keeps them out of
+        // scope anyway. Digits and semicolons only, matching the `R` and `n`
+        // cases, which accept the same vanishingly small risk of swallowing
+        // a user who types the sequence by hand.
+        b't' => {
+            body.contains(&b';') && body.iter().all(|b| b.is_ascii_digit() || *b == b';')
+        }
         _ => false,
     }
 }
@@ -646,6 +700,22 @@ fn is_terminal_osc_response(seq_without_terminator: &[u8]) -> bool {
         return false;
     }
     let payload = &seq_without_terminator[2..];
+    // Title and icon-label reports: `OSC l <title> ST` and `OSC L <label> ST`,
+    // the answers to `CSI 21 t` / `CSI 20 t`. They are the reason this case
+    // has to come before the `;` split below — their Ps is a bare letter with
+    // no semicolon after it, so the split returns None and the whole reply
+    // used to fall through as ordinary user input.
+    //
+    // These carry the most text of any reply here. A terminal title is set
+    // from whatever is running, so a title report hands the host a line of
+    // screen-derived text on its INPUT path — and the host shell runs it. A
+    // live machine showed that as `zsh: command not found: OH*thinking`,
+    // which is a status line from a different pane arriving as a command.
+    // The OSC 52 case below already accepts a broad drop for a narrower
+    // version of this risk.
+    if payload.first().is_some_and(|&b| b == b'l' || b == b'L') {
+        return true;
+    }
     let Some(semi) = payload.iter().position(|&b| b == b';') else {
         return false;
     };
@@ -868,17 +938,24 @@ fn main() {
             }
             if ret == 0 {
                 let flushed = response_filter.flush_pending_sequence();
+                rlog_stdin_bytes("stdin flushed-incomplete", &flushed);
                 if !send_frame(&tx_stdin, &flushed) {
                     rlog("stdin exit: send_frame failed (channel closed) after sequence flush");
                     break;
                 }
                 continue;
             }
-            if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-                rlog(&format!("stdin exit: poll revents={:#x}", pfd.revents));
-                break;
-            }
+            // POLLHUP can arrive with POLLIN still set: the writer closed its
+            // end, but bytes it wrote before that are still in the buffer.
+            // Leaving on the hangup alone discarded them — the last keystrokes
+            // before a pane closes. Read while POLLIN stands; read() returning
+            // 0 is the real end of stream and already breaks below.
+            let hangup = pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
             if pfd.revents & libc::POLLIN == 0 {
+                if hangup {
+                    rlog(&format!("stdin exit: poll revents={:#x}", pfd.revents));
+                    break;
+                }
                 continue;
             }
             let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
@@ -896,7 +973,10 @@ fn main() {
                     }
                 }
             }
-            let filtered = response_filter.process(&buf[..n as usize]);
+            let chunk = &buf[..n as usize];
+            rlog_stdin_bytes("stdin raw", chunk);
+            let filtered = response_filter.process(chunk);
+            rlog_stdin_bytes("stdin forwarded", &filtered);
             if !send_frame(&tx_stdin, &filtered) {
                 rlog("stdin exit: send_frame failed (channel closed)");
                 break;
@@ -1010,6 +1090,155 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// Concurrent writers must not shred each other's lines.
+    ///
+    /// Every relay process on the machine appends to one shared file, and the
+    /// file exists to tell one process's bytes from another's — a spliced line
+    /// destroys exactly the thing it is read for. `writeln!` on an unbuffered
+    /// `File` issues one syscall per format fragment, so O_APPEND's per-write
+    /// atomicity did not cover a line; half the lines in a recorded log came
+    /// out unreadable.
+    ///
+    /// Threads reproduce it as faithfully as processes: `rlog` opens its own
+    /// handle per call either way.
+    #[test]
+    fn concurrent_writers_produce_whole_lines() {
+        use std::io::Read;
+        let path = std::env::temp_dir().join(format!(
+            "term-mesh-relay-log-atomicity-{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::env::set_var("TERMMESH_PEER_RELAY_DEBUG", "1");
+        std::env::set_var("TERMMESH_PEER_RELAY_DEBUG_PATH", &path);
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 200;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        super::rlog(&format!("writer={t} line={i}"));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut text = String::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            THREADS * PER_THREAD,
+            "line count changed — writes were split or merged"
+        );
+        for line in lines {
+            assert!(
+                line.starts_with("[relay pid=") && line.matches("[relay pid=").count() == 1,
+                "spliced line: {line:?}"
+            );
+            assert!(line.contains("] writer="), "truncated line: {line:?}");
+        }
+    }
+
+    // ── Window-op and title reports on the input path ───────────────
+    //
+    // A query the host asked, answered by the RELAY's terminal, arriving on
+    // the path the host reads as typing. Every case in
+    // `is_terminal_csi_response` exists for that; these two shapes were
+    // missing, and they are the ones carrying the most text.
+
+    #[test]
+    fn drops_text_area_size_report() {
+        use super::TerminalResponseFilter;
+        let mut f = TerminalResponseFilter::default();
+        assert_eq!(f.process(b"\x1b[8;46;120t"), b"");
+    }
+
+    #[test]
+    fn drops_window_position_and_pixel_size_reports() {
+        use super::TerminalResponseFilter;
+        let mut f = TerminalResponseFilter::default();
+        assert_eq!(f.process(b"\x1b[3;0;25t"), b"");
+        assert_eq!(f.process(b"\x1b[4;1080;1920t"), b"");
+    }
+
+    #[test]
+    fn keeps_a_window_op_command_that_carries_no_parameters() {
+        // `CSI 22t` / `CSI 23t` push and pop the title. They are commands,
+        // not reports, and requiring a `;` is what keeps them out of scope —
+        // a filter that swallowed every `t` would silently eat them.
+        use super::TerminalResponseFilter;
+        let mut f = TerminalResponseFilter::default();
+        assert_eq!(f.process(b"\x1b[22t"), b"\x1b[22t");
+        assert_eq!(f.process(b"\x1b[23t"), b"\x1b[23t");
+    }
+
+    #[test]
+    fn drops_the_title_report_that_carried_another_panes_status_line() {
+        // Observed on a live machine as `zsh: command not found: OH*thinking`
+        // — a status line from a Codex pane arriving in a different pane's
+        // shell and being RUN. A title is set from whatever is running, so a
+        // title report hands the host a line of screen text on its input
+        // path. `OSC l <title> ST` has no semicolon after its Ps, which is
+        // exactly why it fell through the payload split.
+        use super::TerminalResponseFilter;
+        let mut f = TerminalResponseFilter::default();
+        assert_eq!(f.process(b"\x1b]lthinking with xhigh effort\x1b\\"), b"");
+    }
+
+    #[test]
+    fn drops_the_icon_label_report() {
+        use super::TerminalResponseFilter;
+        let mut f = TerminalResponseFilter::default();
+        assert_eq!(f.process(b"\x1b]Lsome icon\x07"), b"");
+    }
+
+    #[test]
+    fn keeps_a_title_the_user_sets() {
+        // `OSC 0 ; title` and `OSC 2 ; title` SET the title and are ordinary
+        // traffic. Only the lowercase/uppercase `l` reply form is a report,
+        // and confusing the two would stop a remote pane naming itself.
+        use super::TerminalResponseFilter;
+        let mut f = TerminalResponseFilter::default();
+        assert_eq!(f.process(b"\x1b]0;my title\x07"), b"\x1b]0;my title\x07");
+        assert_eq!(f.process(b"\x1b]2;my title\x07"), b"\x1b]2;my title\x07");
+    }
+
+    #[test]
+    fn ordinary_typing_is_never_logged() {
+        use super::is_ordinary_typed_text;
+        assert!(is_ordinary_typed_text(b"ls -la"));
+        assert!(is_ordinary_typed_text(b"hello\n"));
+        assert!(is_ordinary_typed_text(b"a\tb\r\n"));
+        assert!(is_ordinary_typed_text(b""));
+    }
+
+    /// The bytes worth seeing: a stray high byte with nobody at the keyboard
+    /// (0xFF turning up as an idle remote prompt's stray glyph), and escape
+    /// sequences, which are terminal traffic rather than typing.
+    #[test]
+    fn control_and_high_bytes_are_logged() {
+        use super::is_ordinary_typed_text;
+        assert!(!is_ordinary_typed_text(&[0xFF]));
+        assert!(!is_ordinary_typed_text(&[0x1B, b'[', b'A']));
+        assert!(!is_ordinary_typed_text(&[0x00]));
+        assert!(!is_ordinary_typed_text(&[0x7F]));
+        // Non-ASCII text is logged too; that is deliberate — a chunk that is
+        // not plain ASCII typing is exactly what this exists to show.
+        assert!(!is_ordinary_typed_text("\u{d55c}".as_bytes()));
+        // One stray byte in an otherwise ordinary chunk still counts.
+        assert!(!is_ordinary_typed_text(&[b'a', b'b', 0xFF, b'c']));
+    }
+
     use super::*;
 
     fn filter(input: &[u8]) -> Vec<u8> {

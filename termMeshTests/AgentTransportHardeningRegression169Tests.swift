@@ -618,6 +618,41 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
         XCTAssertNil(board.leaderRequestToken)
     }
 
+    func testLeaderMetricsAcceptsOnlyTokenOrExactAdoptedTTYDevice() {
+        let store = TeamDataStore.shared
+        let team = "leader-metrics-auth-\(UUID().uuidString)"
+        store.registerTeam(team, agentNames: [])
+        defer { store.unregisterTeam(team) }
+
+        let token = store.prepareLeaderRequestToken(teamName: team)
+        XCTAssertTrue(store.isAuthorizedLeaderMetrics(
+            teamName: team, token: token, callerTTYDevice: nil,
+            adoptedLeaderTTYDevice: nil
+        ))
+        XCTAssertTrue(store.isAuthorizedLeaderMetrics(
+            teamName: team, token: nil, callerTTYDevice: 0x1234,
+            adoptedLeaderTTYDevice: 0x1234
+        ))
+        XCTAssertFalse(store.isAuthorizedLeaderMetrics(
+            teamName: team, token: nil, callerTTYDevice: 0x5678,
+            adoptedLeaderTTYDevice: 0x1234
+        ))
+        XCTAssertFalse(store.isAuthorizedLeaderMetrics(
+            teamName: team, token: "wrong", callerTTYDevice: nil,
+            adoptedLeaderTTYDevice: nil
+        ))
+    }
+
+    func testTerminalDeviceNumberUsesCharacterDeviceIdentity() {
+        var info = stat()
+        XCTAssertEqual(lstat("/dev/null", &info), 0)
+        XCTAssertEqual(
+            terminalDeviceNumber(at: "/dev/null"),
+            UInt32(truncatingIfNeeded: info.st_rdev)
+        )
+        XCTAssertNil(terminalDeviceNumber(at: "/tmp"))
+    }
+
     func testDurableLeaderRequestCannotCompleteBeforeClaim() {
         let store = TeamDataStore.shared
         let team = "leader-request-transition-\(UUID().uuidString)"

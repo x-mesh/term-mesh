@@ -113,6 +113,7 @@ DAEMON_LOG_PATH="/tmp/term-meshd-e2e-${E2E_RUN_ID}.log"
 MOBILE_LISTENER_ADDR="127.0.0.1:$(( 21000 + E2E_RUN_ID % 1000 ))"
 E2E_APP_PID=""
 E2E_DAEMON_PID=""
+E2E_APP_PID_FILE="${TMPDIR:-/tmp}/term-mesh-e2e-app-${E2E_RUN_ID}.pid"
 REMOTE_FIXTURE_SSH_TARGET=""
 REMOTE_FIXTURE_ROOT=""
 PYTHON_VENV="$DERIVED_DATA_PATH/python-venv"
@@ -267,6 +268,14 @@ export TERMMESH_CLI_BIN="$CLI"
 
 cleanup() {
   local app_descendants=""
+  local relaunched_app_pid=""
+  if [ -f "$E2E_APP_PID_FILE" ]; then
+    relaunched_app_pid=$(cat "$E2E_APP_PID_FILE" 2>/dev/null || true)
+    case "$relaunched_app_pid" in
+      ''|*[!0-9]*) ;;
+      *) E2E_APP_PID="$relaunched_app_pid" ;;
+    esac
+  fi
   if [ -n "$E2E_APP_PID" ] && kill -0 "$E2E_APP_PID" 2>/dev/null; then
     local frontier="$E2E_APP_PID" next="" parent child
     while [ -n "$frontier" ]; do
@@ -313,7 +322,7 @@ cleanup() {
   done
   E2E_APP_PID=""
   E2E_DAEMON_PID=""
-  rm -f "$APP_SOCK_PATH" "$DAEMON_SOCK_PATH" || true
+  rm -f "$APP_SOCK_PATH" "$DAEMON_SOCK_PATH" "$E2E_APP_PID_FILE" || true
 }
 
 # State a test is allowed to destroy. `SessionRestoreSettings.sessionFilePath` is
@@ -338,6 +347,7 @@ export TERMMESH_E2E_STATE_DIR="$E2E_STATE_DIR"
 export TERMMESH_E2E_MOBILE_ADDR="$MOBILE_LISTENER_ADDR"
 # A test that relaunches the app respawns this exact binary with this exact env.
 export TERMMESH_APP_BIN="$APP/Contents/MacOS/term-mesh DEV"
+export TERMMESH_E2E_APP_PID_FILE="$E2E_APP_PID_FILE"
 trap 'cleanup; cleanup_remote_relay_fixture; rm -rf "$E2E_STATE_DIR"; defaults delete com.termmesh.e2e >/dev/null 2>&1 || true' EXIT
 
 launch_and_wait() {
@@ -373,6 +383,7 @@ launch_and_wait() {
   TERMMESH_UI_TEST_MODE=1 \
   "$APP/Contents/MacOS/term-mesh DEV" >/dev/null 2>&1 &
   E2E_APP_PID=$!
+  printf '%s\n' "$E2E_APP_PID" > "$E2E_APP_PID_FILE"
 
   SOCK="$APP_SOCK_PATH"
   for _ in {1..120}; do
