@@ -470,6 +470,30 @@ final class PeerSSHTunnel: @unchecked Sendable {
         return signals.contains { lowered.contains($0) }
     }
 
+    /// ssh's own TCP connect budget, and this side's budget for the forward
+    /// socket to appear. Their ORDER is the contract, not their values:
+    /// whichever expires first decides what a slow link looks like in the log.
+    ///
+    /// This pair used to be (unset, 10s), and unset means OpenSSH waits out
+    /// the system TCP timeout — tens of seconds. So on a slow link our 10s
+    /// always won, and winning meant killing ssh while it was still mid
+    /// handshake with nothing written to stderr yet. Every such failure
+    /// therefore read `socketNeverAppeared(… ssh stderr: )` with an empty
+    /// tail: the one class of tunnel failure that happens most here was also
+    /// the only one that never said why.
+    ///
+    /// Letting ssh time out FIRST makes it report its own reason ("connect to
+    /// host …: Operation timed out") and exit, which the `!proc.isRunning`
+    /// branch below turns into a `spawnFailed(exitReason)` — a diagnosis
+    /// instead of a shrug. `socketNeverAppeared` then means what its name
+    /// says: ssh lived, connected, and still produced no socket.
+    ///
+    /// Cost of the ordering: a dead link is now called dead a few seconds
+    /// later. That is the trade — slower to fail, but able to say why.
+    /// `test_forwardSocketDeadlineOutlivesSSHConnectTimeout` pins it.
+    static let sshConnectTimeoutSeconds = 10
+    static let forwardSocketDeadlineSeconds: TimeInterval = 15
+
     private func spawnAttempt(dashboardLocalPort: Int?) async throws {
         lock.lock()
         dashboardPort = dashboardLocalPort
@@ -548,6 +572,14 @@ final class PeerSSHTunnel: @unchecked Sendable {
             // 4 KB tail and only surfaces on the `Tunnel down` line.
             "-o", "LogLevel=INFO",
             "-o", "ExitOnForwardFailure=yes",
+            // Bounded on purpose, and bounded BELOW this side's own deadline
+            // — see `sshConnectTimeoutSeconds`. Unset, ssh waits out the
+            // system TCP timeout, which is long enough that our deadline
+            // always fired first and killed the one witness to the failure.
+            // The probe paths (`PeerHostDoctor`, `PeerHostReadiness`,
+            // `PeerSocketProber`) have always set this; the real tunnel was
+            // the only ssh in the app that did not.
+            "-o", "ConnectTimeout=\(Self.sshConnectTimeoutSeconds)",
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
             "-o", "StreamLocalBindMask=0177",
@@ -616,12 +648,26 @@ final class PeerSSHTunnel: @unchecked Sendable {
         lock.unlock()
 
         let fm = FileManager.default
-        let deadline = Date().addingTimeInterval(10)
+        let deadline = Date().addingTimeInterval(Self.forwardSocketDeadlineSeconds)
         while !fm.fileExists(atPath: localSockPath) {
             if Date() > deadline {
+                // Sampling stderr for only 200 ms produced an EMPTY tail on
+                // every timeout in the field, which is how a whole class of
+                // tunnel failure stayed undiagnosable. Wait for the pipe's
+                // EOF instead, so ssh's last word on the way out is included.
+                //
+                // `stillRunning` must be read BEFORE the kill (after it, it is
+                // always false) and is half the diagnosis on its own: "still
+                // running, no stderr" is a slow link, and without that word it
+                // reads exactly like a crash.
+                let stillRunning = proc.isRunning
                 terminateCurrentProcess()
+                let detail = errTail.snapshot(waitForEOFUpTo: 1.0, lines: 4)
                 throw PeerSSHTunnelError.socketNeverAppeared(
-                    "ssh forward never created \(localSockPath); ssh stderr: \(errTail.snapshot(waitForEOFUpTo: 0.2, lines: 4))"
+                    "ssh forward never created \(localSockPath) within "
+                        + "\(Int(Self.forwardSocketDeadlineSeconds))s (ssh was "
+                        + "\(stillRunning ? "still running" : "already gone")); "
+                        + "ssh stderr: \(detail.isEmpty ? "<none>" : detail)"
                 )
             }
             if !proc.isRunning {

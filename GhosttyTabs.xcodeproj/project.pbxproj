@@ -308,6 +308,7 @@
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */; };
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */; };
 		FC000002A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000003A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift */; };
+		FC000004A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */; };
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */; };
 			FD000010A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000011A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift */; };
 			FD000020A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000021A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift */; };
@@ -670,6 +671,7 @@
 			FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerPaneSessionTests.swift; sourceTree = "<group>"; };
 			FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerWorkspaceMirrorTests.swift; sourceTree = "<group>"; };
 		FC000003A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerServerHostLayoutTests.swift; sourceTree = "<group>"; };
+		FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSSHTunnelBudgetTests.swift; sourceTree = "<group>"; };
 			FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDaemonVersionTests.swift; sourceTree = "<group>"; };
 			FD000011A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalOverrideIsolationTests.swift; sourceTree = "<group>"; };
 			FD000021A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerTerminalQueryStripperTests.swift; sourceTree = "<group>"; };
@@ -1102,6 +1104,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				FB000001A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift */,
 				FC000001A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift */,
 				FC000003A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift */,
+				FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */,
 				FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */,
 				FD000011A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift */,
 				FD000021A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift */,
@@ -1550,6 +1553,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				FB000000A1B2C3D4E5F60718 /* PeerPaneSessionTests.swift in Sources */,
 				FC000000A1B2C3D4E5F60718 /* PeerWorkspaceMirrorTests.swift in Sources */,
 				FC000002A1B2C3D4E5F60718 /* PeerServerHostLayoutTests.swift in Sources */,
+				FC000004A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift in Sources */,
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */,
 				FD000010A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift in Sources */,
 				FD000020A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift in Sources */,
