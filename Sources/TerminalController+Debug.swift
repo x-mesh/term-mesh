@@ -277,7 +277,12 @@ extension TerminalController {
             NotificationCenter.default.post(name: .commandPaletteToggleRequested, object: targetWindow)
         }
         if let openedWindowId {
-            let ready = waitForCommandPaletteInputFocus(windowId: openedWindowId)
+            // Parked: this wait can run for up to its budget, and holding the
+            // "socket command executing" depth that long suppresses activation
+            // for windows the user makes in the meantime.
+            let ready = withSocketCommandExecutionParked {
+                waitForCommandPaletteInputFocus(windowId: openedWindowId)
+            }
             // Giving up used to look identical to success, so a caller that
             // opened and immediately typed got an ok and lost the text.
             if case .ok(let payload) = result {
