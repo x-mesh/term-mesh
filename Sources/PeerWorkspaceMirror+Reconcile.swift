@@ -72,19 +72,40 @@ extension PeerWorkspaceMirrorController {
         // `.pending` and `.starting` are NOT torn down and must not be swept:
         // a pane spawned moments ago is in exactly that state, and treating
         // it as dead would respawn it on every push forever.
+        //
+        // `isRelayEnded`, not `isTorndown`: the relay reaches its own
+        // teardown (heartbeat dead, host goodbye, a reconnect loop that
+        // stopped) without the PANE session being torn down, and it is the
+        // relay's death that makes the panel permanently blank.
         let livePanelIDs = Set(workspace.panels.keys.filter { panelId in
             guard let session = workspace.terminalPanel(for: panelId)?.peerPaneSession
             else { return true }
-            return !session.isTorndown
+            return !session.isRelayEnded
         })
         let orphaned = Self.orphanedSurfaceIDs(
             panelBySurfaceID: panelBySurfaceID,
             livePanelIDs: livePanelIDs
         )
         if !orphaned.isEmpty {
-            for surfaceID in orphaned { panelBySurfaceID.removeValue(forKey: surfaceID) }
+            // Unmapping is enough only when the PANEL is gone too. A panel
+            // that still exists but whose relay ended must also be CLOSED,
+            // and dropping its mapping is precisely what removes the only
+            // two handles anything has on it: B3's stale-close loop iterates
+            // the map, and B3b iterates `pendingStalePanelIds`. Miss both and
+            // the leaf reattaches as a second tab while the first survives as
+            // a ghost holding a dead relay helper open — the v0.159 leak,
+            // re-entered through the sweep meant to prevent it.
+            var stranded: [UUID] = []
+            for surfaceID in orphaned {
+                guard let panelId = panelBySurfaceID.removeValue(forKey: surfaceID)
+                else { continue }
+                if workspace.panels[panelId] != nil { stranded.append(panelId) }
+            }
+            pendingStalePanelIds.append(contentsOf: stranded)
             RemoteWorkLog.debugOffMain(
-                "Dropped \(orphaned.count) mirror mapping(s) whose pane was already gone — they will be re-attached"
+                "Dropped \(orphaned.count) mirror mapping(s) whose pane was already gone"
+                    + " (\(stranded.count) still-open panel(s) queued to close)"
+                    + " — they will be re-attached"
             )
         }
 
@@ -115,7 +136,12 @@ extension PeerWorkspaceMirrorController {
         // Name the surfaces the host stopped reporting BEFORE B3 acts on
         // them, so a pane that vanishes mid-session is answerable afterwards
         // instead of requiring a Debug host to reproduce.
-        if let last = lastAppliedLayout {
+        // `dropDiagnosticsBaseline` is the reconnect's copy of
+        // `lastAppliedLayout`, which that path has to clear to force the full
+        // reconcile. Without it a reconnect would be the one path that cannot
+        // name what the host dropped — and a pane vanishing across a
+        // reconnect is the incident this line was written for.
+        if let last = lastAppliedLayout ?? dropDiagnosticsBaseline {
             let previousLeaves = Self.preorderLeaves(last)
             let dropped = previousLeaves.filter { !activeIDs.contains($0.surfaceID) }
             if !dropped.isEmpty {

@@ -1383,6 +1383,29 @@ final class PeerRelaySession {
 
     /// Counter snapshot for `debugPaneStatus()` — lets a live probe tell
     /// "nothing ever arrived" from "arrived and was lost downstream".
+    /// Where this session's transport stands right now, as opposed to
+    /// whether it ever started.
+    ///
+    /// `.live` is the ordinary case AND the not-yet-started case: a session
+    /// exists only because an attach succeeded, and a pane still arming its
+    /// helper has nothing wrong with its transport. `.reconnecting` means the
+    /// owned retry loop has it; that loop is uncapped by design, so this state
+    /// can persist indefinitely. `.ended` is terminal.
+    enum TransportLiveness: String {
+        case live
+        case reconnecting
+        case ended
+    }
+
+    /// Deliberately derived, never stored: a stored copy would need writing
+    /// on every teardown path (`disconnect` funnels three of them) and the
+    /// one that got missed would report a dead pane as live — the exact
+    /// mistake this property exists to stop the mirror from making.
+    var transportLiveness: TransportLiveness {
+        if isTorndown { return .ended }
+        return reconnectInFlight ? .reconnecting : .live
+    }
+
     var ioSnapshot: [String: Any] {
         let c = ioStats.read()
         return [
@@ -1455,6 +1478,16 @@ final class PeerRelaySession {
     private var transport: UnixSocketTransport?
     private var pumpTask: Task<Void, Never>?
     private var isTorndown = false
+    /// True only while `reconnectOwnedSession`'s retry loop is running.
+    ///
+    /// Nothing else could answer "is this transport up RIGHT NOW".
+    /// `isTorndown` answers "is it finished", and `PeerPaneSession`'s
+    /// `relayStartupState` latches at `.started` on the first successful
+    /// start and is never written again — a pane whose transport died an
+    /// hour ago still reports `.started`. The workspace mirror has to
+    /// distinguish those three states before it decides a pane needs no
+    /// respawn, so the reconnect loop records its own presence here.
+    private var reconnectInFlight = false
     // Stored (not just local to `startPumping`) so `performResumeHeal` can
     // read the live remote size and re-target its session after a swap.
     // Relay delivery only; callback mode never creates one.
@@ -3283,6 +3316,11 @@ final class PeerRelaySession {
         ) else {
             return session !== failedSession
         }
+        // From here to the return, this pane is RECONNECTING rather than
+        // live — the distinction the workspace mirror reads before it keeps
+        // a pane instead of respawning it.
+        reconnectInFlight = true
+        defer { reconnectInFlight = false }
         await failedSession.stopHeartbeat()
         await refreshOwnedTransportForReconnect(reason: "owned peer session lost")
         guard Self.shouldReconnectOwnedSession(

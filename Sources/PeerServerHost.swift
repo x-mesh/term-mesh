@@ -536,6 +536,13 @@ final class PeerHostCoordinator: NSObject {
             // pre-existing mirror session to carry the change.
             await server.broadcastWorkspaceListChanged(workspaces)
             let leaves = Self.leafTitles(updated.layout)
+            // A newer schedule cancels this task, but cancellation is
+            // cooperative and the awaits above are already past: without this
+            // check a superseded task still records ITS leaves after the
+            // newer one recorded the current ones, so the next push diffs
+            // against a stale baseline and names panes that never left. The
+            // same check keeps it from evicting the newer task's own entry.
+            if Task.isCancelled { return }
             await MainActor.run { [weak self] in
                 self?.noteLayoutBroadcast(workspaceID: workspaceID, leaves: leaves)
                 self?.layoutBroadcastDebounce.removeValue(forKey: workspaceID)

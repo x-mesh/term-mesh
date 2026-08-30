@@ -564,6 +564,34 @@ final class PeerPaneSession {
     var relayEnvironment: [String: String] { relaySession.relayEnvironment }
     var isRelayStarted: Bool { relayStartupState == .started && !isTorndown }
 
+    /// Where this pane's transport stands RIGHT NOW.
+    ///
+    /// `isRelayStarted` above cannot answer that and must not be changed to
+    /// try: `relayStartupState` is a start latch — written once when the
+    /// first `start()` returns and never again — and `TeamOrchestrator`'s
+    /// remote-leader recovery depends on exactly that latching. A pane whose
+    /// relay died and whose uncapped retry loop will never succeed still
+    /// reports `.started` forever, which is why "keep the panes that
+    /// recovered" cannot be spelled with it.
+    var relayLiveness: PeerRelaySession.TransportLiveness {
+        isTorndown ? .ended : relaySession.transportLiveness
+    }
+
+    /// Started, and its transport is up. The only state in which a mirrored
+    /// pane may be kept across a reconnect with nothing further owed to it.
+    var isRelayLive: Bool { relayStartupState == .started && relayLiveness == .live }
+
+    /// Started, and its own retry loop currently holds it. Worth keeping —
+    /// respawning would throw away a recovery already in progress — but only
+    /// under a deadline, because that loop is uncapped.
+    var isRelayRecovering: Bool {
+        relayStartupState == .started && relayLiveness == .reconnecting
+    }
+
+    /// The relay is finished: it renders nothing and never will again,
+    /// whether this pane session was torn down or only its relay was.
+    var isRelayEnded: Bool { relayLiveness == .ended }
+
     /// Start only after SwiftUI has mounted this panel. Background Project
     /// restoration creates pane models before their Ghostty views exist;
     /// starting here at model creation used to arm a 10s accept timeout that

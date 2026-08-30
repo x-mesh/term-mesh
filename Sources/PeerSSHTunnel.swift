@@ -262,9 +262,11 @@ final class PeerSSHTunnel: @unchecked Sendable {
     private static let dashboardPortBase = 19876
     private static let dashboardPortScanRange = 100
 
-    /// Spawns `ssh -N -T -L local:remote target` and waits up to 10s
-    /// for the local socket to materialise. Throws on spawn failure or
-    /// timeout (and tears the ssh process down on timeout). On a
+    /// Spawns `ssh -N -T -L local:remote target` and waits
+    /// `forwardSocketDeadlineSeconds` for the local socket to materialise —
+    /// deliberately longer than ssh's own `sshConnectTimeoutSeconds`, so a
+    /// dead link is reported by ssh rather than killed by us. Throws on spawn
+    /// failure or timeout (and tears the ssh process down on timeout). On a
     /// successful return, the auto-restart loop is armed.
     func start() async throws {
         lock.lock()

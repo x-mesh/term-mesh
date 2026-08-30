@@ -52,6 +52,11 @@ final class PeerWorkspaceMirrorController {
     /// Last layout we reconciled to — the baseline for no-op/divider-only
     /// fast paths and for outbound divider diffs.
     private(set) var lastAppliedLayout: Termmesh_Peer_V1_WorkspaceLayout?
+    /// `lastAppliedLayout` as it stood when a reconnect cleared it to force
+    /// the full reconcile path. Only reconcile's drop diagnostics read it:
+    /// naming the panes a host push removed needs a baseline, and the
+    /// reconnect is the very path that has to clear the real one.
+    var dropDiagnosticsBaseline: Termmesh_Peer_V1_WorkspaceLayout?
     /// Wire surfaceID → local TerminalPanel.id for every mirrored leaf.
     var panelBySurfaceID: [Data: UUID] = [:]
     /// Host split id bytes → local bonsplit split UUID. Rebuilt on every
@@ -497,29 +502,34 @@ final class PeerWorkspaceMirrorController {
                     + " — each is respawned even though its relay had recovered"
             )
         }
+        // Everything is being respawned, so any pane this deadline was still
+        // waiting on is already handled — and its mapping is gone, which is
+        // the exact staleness `respawnPanesThatNeverRecovered` guards against.
+        recoveringPaneWatchdog?.cancel()
+        recoveringPaneWatchdog = nil
         pendingStalePanelIds.append(contentsOf: panelBySurfaceID.values)
         panelBySurfaceID.removeAll()
         hostSplitToLocal.removeAll()
     }
 
-    /// Mirrored panes whose own relay session is currently up.
+    /// Mirrored panes whose transport is up right now.
     ///
-    /// Deliberately reads the pane's own startup state rather than probing
-    /// the socket: this is a cost measurement, not a health check, and a
-    /// half-alive socket that the pane still believes in is exactly the case
-    /// worth counting — the wipe discards it either way.
+    /// Reads `isRelayLive`, not `isRelayStarted`: the latter latches at the
+    /// first successful start, so counting it would report every pane that
+    /// EVER worked as live and make this measurement — whose whole job is to
+    /// say what the wipe costs — read the same whether the wipe cost four
+    /// working panes or nothing at all.
     private func liveMirroredPaneCount() -> Int {
         guard let workspace else { return 0 }
         return panelBySurfaceID.values.reduce(into: 0) { count, panelId in
-            if workspace.terminalPanel(for: panelId)?.peerPaneSession?.isRelayStarted == true {
+            if workspace.terminalPanel(for: panelId)?.peerPaneSession?.isRelayLive == true {
                 count += 1
             }
         }
     }
 
     /// Reconnect-only variant of `markAllPanesStale`: a pane whose own relay
-    /// already recovered keeps its panel, its helper process, and its
-    /// scrollback.
+    /// is up keeps its panel, its helper process, and its scrollback.
     ///
     /// The two recoveries are independent. `PeerRelaySession` reconnects a
     /// pane's own transport and logs "Remote pane reconnected on attempt N";
@@ -529,10 +539,24 @@ final class PeerWorkspaceMirrorController {
     /// respawns a helper process and a Ghostty surface for panes that were
     /// already working, and closes the working ones.
     ///
-    /// Only `.started` counts as recovered. A pane still `.pending` or
-    /// `.starting` is treated as stale on purpose: respawning one is merely
-    /// wasteful, while keeping one that never comes up leaves the user a
-    /// pane that does nothing and no event to explain it.
+    /// The classification is three-way, and it has to be. `isRelayStarted`
+    /// looks like the right test and is not: it latches at the first
+    /// successful start and is never written again, so a pane whose transport
+    /// died reports `.started` for the rest of its life. Keeping on that test
+    /// keeps dead panes as readily as live ones, prints the same
+    /// "respawning 0" either way, and — because the mapping now survives a
+    /// reconnect — leaves the dead one mapped, blank, and never retried,
+    /// where every reconnect used to hand it a fresh attach.
+    ///
+    ///   `.live`         keep, nothing owed
+    ///   `.reconnecting` keep, but under `recoveringPaneGraceSeconds`: its
+    ///                   own retry loop is uncapped, so without a deadline
+    ///                   "it is recovering" is indistinguishable from "it
+    ///                   will never come back"
+    ///   `.ended`, or still `.pending`/`.starting`
+    ///                   respawn. Keeping a pane that never came up leaves
+    ///                   the user something that does nothing and no event
+    ///                   to explain it.
     ///
     /// RECONNECT ONLY. `forceResync` (the user pressing Retry) and
     /// `resumeAfterHostReconnect` (a new lease, so every pane's transport is
@@ -545,16 +569,21 @@ final class PeerWorkspaceMirrorController {
         }
         let split = Self.partitionForReconnect(
             panelBySurfaceID: panelBySurfaceID,
-            isRecovered: { panelId in
-                workspace.terminalPanel(for: panelId)?.peerPaneSession?.isRelayStarted == true
+            classify: { panelId in
+                guard let session = workspace.terminalPanel(for: panelId)?.peerPaneSession
+                else { return .respawn }
+                if session.isRelayLive { return .keep }
+                if session.isRelayRecovering { return .watch }
+                return .respawn
             }
         )
-        guard !split.keep.isEmpty else {
+        let kept = split.keep.merging(split.watch) { first, _ in first }
+        guard !kept.isEmpty else {
             markAllPanesStale()
             return
         }
         pendingStalePanelIds.append(contentsOf: split.respawn.values)
-        panelBySurfaceID = split.keep
+        panelBySurfaceID = kept
         // Keyed by host split ids from a layout that is no longer
         // authoritative. Keeping panes does not make the split map valid;
         // reconcile's B5 rebuilds it.
@@ -564,31 +593,121 @@ final class PeerWorkspaceMirrorController {
         // return without touching the tree — which would skip the portal
         // reattach every kept pane needs after its transport was replaced,
         // leaving correct state behind a blank view.
+        //
+        // Hand the layout to `dropDiagnosticsBaseline` on the way out rather
+        // than dropping it: reconcile names the panes a host push removed by
+        // diffing against the last layout this viewer applied, and clearing
+        // that here would make the reconnect — the exact path the pane-loss
+        // incident took — the one path unable to say what the host dropped.
+        dropDiagnosticsBaseline = lastAppliedLayout
         lastAppliedLayout = nil
         RemoteWorkLog.infoOffMain(
-            "Mirror resync kept \(split.keep.count) recovered pane(s)"
+            "Mirror resync kept \(split.keep.count) live pane(s)"
+                + ", watching \(split.watch.count) still reconnecting"
                 + ", respawning \(split.respawn.count)"
         )
+        watchRecoveringPanes(split.watch)
     }
 
-    /// Which mirrored panes a reconnect may keep, and which it must respawn.
+    /// What a reconnect owes each mirrored pane.
+    enum ReconnectDisposition {
+        /// Transport up: keep it and owe it nothing.
+        case keep
+        /// Mid-reconnect: keep it, but only until the grace deadline.
+        case watch
+        /// Finished, or never started: respawn it.
+        case respawn
+    }
+
+    /// Which mirrored panes a reconnect may keep, which it must watch, and
+    /// which it must respawn.
     ///
     /// Pure so the rule survives review and regression without a workspace,
     /// a host, or a live relay behind it.
     nonisolated static func partitionForReconnect(
         panelBySurfaceID: [Data: UUID],
-        isRecovered: (UUID) -> Bool
-    ) -> (keep: [Data: UUID], respawn: [Data: UUID]) {
+        classify: (UUID) -> ReconnectDisposition
+    ) -> (keep: [Data: UUID], watch: [Data: UUID], respawn: [Data: UUID]) {
         var keep: [Data: UUID] = [:]
+        var watch: [Data: UUID] = [:]
         var respawn: [Data: UUID] = [:]
         for (surfaceID, panelId) in panelBySurfaceID {
-            if isRecovered(panelId) {
-                keep[surfaceID] = panelId
-            } else {
-                respawn[surfaceID] = panelId
+            switch classify(panelId) {
+            case .keep: keep[surfaceID] = panelId
+            case .watch: watch[surfaceID] = panelId
+            case .respawn: respawn[surfaceID] = panelId
             }
         }
-        return (keep, respawn)
+        return (keep, watch, respawn)
+    }
+
+    // MARK: - Kept-pane grace deadline
+
+    /// How long a pane kept mid-reconnect has to finish before the mirror
+    /// stops believing it and respawns it.
+    ///
+    /// A number is needed because `PeerRelaySession`'s owned retry loop has
+    /// no cap: it backs off and retries for the life of the pane, so
+    /// "reconnecting" is a state a pane can hold forever. Without a deadline,
+    /// keeping such a pane trades the old cost (a needless respawn) for a
+    /// worse one — a permanently blank pane that no later push can fix,
+    /// because the host still reports its surface and the mapping still
+    /// points at a panel that exists.
+    ///
+    /// 20s is past the first few backoff attempts, and far short of the
+    /// subscription's own 30s reconnect cadence, so a mirror that keeps
+    /// flapping cannot starve this.
+    static let recoveringPaneGraceSeconds: UInt64 = 20
+
+    /// Panes kept mid-reconnect by the last resync, awaiting the deadline.
+    private var recoveringPaneWatchdog: Task<Void, Never>?
+    /// Set once the deadline actually respawned something, so an e2e can
+    /// assert the net was needed and caught it rather than inferring from
+    /// pane counts.
+    private(set) var strandedPaneRespawnCount = 0
+
+    private func watchRecoveringPanes(_ watched: [Data: UUID]) {
+        recoveringPaneWatchdog?.cancel()
+        recoveringPaneWatchdog = nil
+        guard !watched.isEmpty else { return }
+        let graceNs = Self.recoveringPaneGraceSeconds * 1_000_000_000
+        recoveringPaneWatchdog = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: graceNs)
+            guard let self, !Task.isCancelled, !self.isTornDown else { return }
+            self.respawnPanesThatNeverRecovered(watched)
+        }
+    }
+
+    /// Give up on the panes that were kept mid-reconnect and never came back.
+    ///
+    /// Only panes whose mapping is still the one this deadline was armed for
+    /// are touched: a later reconcile may have respawned or closed the panel
+    /// already, and respawning against a stale mapping would close a pane that
+    /// is now somebody else's.
+    private func respawnPanesThatNeverRecovered(_ watched: [Data: UUID]) {
+        guard let workspace, let layout = lastAppliedLayout else { return }
+        var stranded: [Data: UUID] = [:]
+        for (surfaceID, panelId) in watched where panelBySurfaceID[surfaceID] == panelId {
+            guard let session = workspace.terminalPanel(for: panelId)?.peerPaneSession
+            else { continue }
+            if session.isRelayLive { continue }
+            stranded[surfaceID] = panelId
+        }
+        guard !stranded.isEmpty else { return }
+        for (surfaceID, panelId) in stranded {
+            panelBySurfaceID.removeValue(forKey: surfaceID)
+            pendingStalePanelIds.append(panelId)
+        }
+        strandedPaneRespawnCount += stranded.count
+        RemoteWorkLog.infoOffMain(
+            "\(stranded.count) kept pane(s) never finished reconnecting within "
+                + "\(Self.recoveringPaneGraceSeconds)s — respawning"
+        )
+        // Same reason as the resync itself: with panes still mapped, the
+        // no-op fast path would match and return without spawning anything.
+        dropDiagnosticsBaseline = layout
+        lastAppliedLayout = nil
+        scheduleApply(layout)
     }
 
     // MARK: - Connection loss / reconnect
@@ -942,6 +1061,8 @@ final class PeerWorkspaceMirrorController {
         reconnectTask = nil
         applyTask?.cancel()
         applyTask = nil
+        recoveringPaneWatchdog?.cancel()
+        recoveringPaneWatchdog = nil
         for (_, task) in dividerDebounce { task.cancel() }
         dividerDebounce.removeAll()
         let session = subscriptionSession
@@ -1031,6 +1152,10 @@ final class PeerWorkspaceMirrorController {
 
     func recordApplied(_ layout: Termmesh_Peer_V1_WorkspaceLayout) {
         lastAppliedLayout = layout
+        // Consumed: the real baseline is back, and leaving the reconnect's
+        // copy behind would let a later push diff against a layout two
+        // reconciles old and name panes that were replaced, not dropped.
+        dropDiagnosticsBaseline = nil
         RemoteHostStore.shared.recordLiveMirrorLayout(
             layout,
             hostKey: lease.key,

@@ -476,40 +476,65 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
     /// discard panes that were already working — a fresh helper process and
     /// Ghostty surface for each, and the live one closed. These pin which
     /// side of the split each pane lands on.
+    ///
+    /// The split is three-way and must stay that way. A two-way keep/respawn
+    /// rule has to answer "recovered?" with a single predicate, and the only
+    /// one available (`isRelayStarted`) latches at the first successful start
+    /// — so it keeps dead panes as readily as live ones, and a kept mapping
+    /// now survives the reconnect that used to give the dead one a fresh
+    /// attach.
 
-    func test_partitionForReconnect_keepsOnlyRecoveredPanes() {
-        let recovered = UUID()
-        let notRecovered = UUID()
+    func test_partitionForReconnect_keepsOnlyLivePanes() {
+        let live = UUID()
+        let ended = UUID()
         let split = PeerWorkspaceMirrorController.partitionForReconnect(
-            panelBySurfaceID: [Data([1]): recovered, Data([2]): notRecovered],
-            isRecovered: { $0 == recovered }
+            panelBySurfaceID: [Data([1]): live, Data([2]): ended],
+            classify: { $0 == live ? .keep : .respawn }
         )
-        XCTAssertEqual(split.keep, [Data([1]): recovered])
-        XCTAssertEqual(split.respawn, [Data([2]): notRecovered])
+        XCTAssertEqual(split.keep, [Data([1]): live])
+        XCTAssertEqual(split.respawn, [Data([2]): ended])
+        XCTAssertTrue(split.watch.isEmpty)
     }
 
-    func test_partitionForReconnect_allRecoveredRespawnsNothing() {
+    func test_partitionForReconnect_allLiveRespawnsNothing() {
         // The case the change exists for: every pane came back on its own,
         // so the reconnect should cost nothing at all.
         let a = UUID(), b = UUID()
         let split = PeerWorkspaceMirrorController.partitionForReconnect(
             panelBySurfaceID: [Data([1]): a, Data([2]): b],
-            isRecovered: { _ in true }
+            classify: { _ in .keep }
         )
         XCTAssertEqual(split.keep.count, 2)
+        XCTAssertTrue(split.watch.isEmpty)
         XCTAssertTrue(split.respawn.isEmpty)
     }
 
-    func test_partitionForReconnect_noneRecoveredKeepsNothing() {
+    func test_partitionForReconnect_reconnectingPanesAreWatchedNotKeptOutright() {
+        // A pane mid-reconnect is worth keeping — respawning it throws away a
+        // recovery already in flight — but its retry loop is uncapped, so it
+        // must land somewhere the grace deadline can find it. Folding it into
+        // `keep` is what would leave a pane blank forever.
+        let recovering = UUID()
+        let split = PeerWorkspaceMirrorController.partitionForReconnect(
+            panelBySurfaceID: [Data([1]): recovering],
+            classify: { _ in .watch }
+        )
+        XCTAssertTrue(split.keep.isEmpty)
+        XCTAssertEqual(split.watch, [Data([1]): recovering])
+        XCTAssertTrue(split.respawn.isEmpty)
+    }
+
+    func test_partitionForReconnect_noneKeptOrWatchedFallsBackToFullWipe() {
         // Degenerate case, and the caller reads it as its signal to fall back
         // to the full wipe. A pane still `.pending` or `.starting` lands here
         // on purpose: respawning it wastes work, whereas keeping one that
         // never comes up leaves the user a pane that does nothing.
         let split = PeerWorkspaceMirrorController.partitionForReconnect(
             panelBySurfaceID: [Data([1]): UUID(), Data([2]): UUID()],
-            isRecovered: { _ in false }
+            classify: { _ in .respawn }
         )
         XCTAssertTrue(split.keep.isEmpty)
+        XCTAssertTrue(split.watch.isEmpty)
         XCTAssertEqual(split.respawn.count, 2)
     }
 
@@ -522,21 +547,70 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
         for (index, panel) in panels.enumerated() {
             map[Data([UInt8(index)])] = panel
         }
+        let dispositions: [PeerWorkspaceMirrorController.ReconnectDisposition] =
+            [.keep, .watch, .respawn]
         let split = PeerWorkspaceMirrorController.partitionForReconnect(
             panelBySurfaceID: map,
-            isRecovered: { panelId in panels.firstIndex(of: panelId)! % 2 == 0 }
+            classify: { panelId in
+                dispositions[panels.firstIndex(of: panelId)! % dispositions.count]
+            }
         )
-        XCTAssertEqual(split.keep.count + split.respawn.count, map.count)
-        XCTAssertTrue(Set(split.keep.keys).isDisjoint(with: Set(split.respawn.keys)))
+        XCTAssertEqual(
+            split.keep.count + split.watch.count + split.respawn.count,
+            map.count
+        )
+        let keys = [Set(split.keep.keys), Set(split.watch.keys), Set(split.respawn.keys)]
+        for (i, a) in keys.enumerated() {
+            for b in keys[(i + 1)...] {
+                XCTAssertTrue(a.isDisjoint(with: b))
+            }
+        }
     }
 
-    func test_partitionForReconnect_emptyMapIsEmptyOnBothSides() {
+    func test_partitionForReconnect_emptyMapIsEmptyOnEverySide() {
         let split = PeerWorkspaceMirrorController.partitionForReconnect(
             panelBySurfaceID: [:],
-            isRecovered: { _ in true }
+            classify: { _ in .keep }
         )
         XCTAssertTrue(split.keep.isEmpty)
+        XCTAssertTrue(split.watch.isEmpty)
         XCTAssertTrue(split.respawn.isEmpty)
+    }
+
+    func test_recoveringPaneGraceIsBoundedAndShorterThanTheMirrorRetryCadence() {
+        // The grace exists only because `PeerRelaySession`'s owned retry loop
+        // is uncapped: "reconnecting" is a state a pane can hold forever, so
+        // an unbounded grace is the same permanent blank pane by another
+        // name. It must also stay under the subscription's own 30s reconnect
+        // cadence, or a flapping mirror would re-arm the deadline before it
+        // ever fires and the net would never catch anything.
+        XCTAssertGreaterThan(PeerWorkspaceMirrorController.recoveringPaneGraceSeconds, 0)
+        XCTAssertLessThan(PeerWorkspaceMirrorController.recoveringPaneGraceSeconds, 30)
+    }
+
+    // MARK: - orphan sweep
+
+    func test_orphanedSurfaceIDs_reportsMappingsWhoseRelayEnded() {
+        // The sweep's caller closes what it unmaps when the PANEL still
+        // exists. This pins the half that decides which mappings reach that
+        // code at all.
+        let gone = UUID()
+        let alive = UUID()
+        let orphaned = PeerWorkspaceMirrorController.orphanedSurfaceIDs(
+            panelBySurfaceID: [Data([1]): gone, Data([2]): alive],
+            livePanelIDs: [alive]
+        )
+        XCTAssertEqual(orphaned, [Data([1])])
+    }
+
+    func test_orphanedSurfaceIDs_keepsEveryMappingWhenAllPanelsAreLive() {
+        let a = UUID(), b = UUID()
+        XCTAssertTrue(
+            PeerWorkspaceMirrorController.orphanedSurfaceIDs(
+                panelBySurfaceID: [Data([1]): a, Data([2]): b],
+                livePanelIDs: [a, b]
+            ).isEmpty
+        )
     }
 }
 
