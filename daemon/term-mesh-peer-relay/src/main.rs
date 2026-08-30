@@ -508,6 +508,21 @@ fn is_terminal_csi_response(seq: &[u8]) -> bool {
                 && !body[1..].is_empty()
                 && body[1..].iter().all(|b| b.is_ascii_digit() || *b == b';')
         }
+        // Window-manipulation reports: ESC [ 8 ; rows ; cols t and friends
+        // (3;x;y position, 4;h;w pixel size, 9;h;w screen size). Same shape
+        // as every case above — a query the host asked, answered by the
+        // relay's own terminal, arriving on the input path where the host
+        // reads it as something to run.
+        //
+        // Only the REPORT shape is dropped. `CSI 22t` / `CSI 23t` push and
+        // pop the title, but those are commands and travel host → viewer,
+        // never up this path; requiring at least one `;` keeps them out of
+        // scope anyway. Digits and semicolons only, matching the `R` and `n`
+        // cases, which accept the same vanishingly small risk of swallowing
+        // a user who types the sequence by hand.
+        b't' => {
+            body.contains(&b';') && body.iter().all(|b| b.is_ascii_digit() || *b == b';')
+        }
         _ => false,
     }
 }
@@ -685,6 +700,22 @@ fn is_terminal_osc_response(seq_without_terminator: &[u8]) -> bool {
         return false;
     }
     let payload = &seq_without_terminator[2..];
+    // Title and icon-label reports: `OSC l <title> ST` and `OSC L <label> ST`,
+    // the answers to `CSI 21 t` / `CSI 20 t`. They are the reason this case
+    // has to come before the `;` split below — their Ps is a bare letter with
+    // no semicolon after it, so the split returns None and the whole reply
+    // used to fall through as ordinary user input.
+    //
+    // These carry the most text of any reply here. A terminal title is set
+    // from whatever is running, so a title report hands the host a line of
+    // screen-derived text on its INPUT path — and the host shell runs it. A
+    // live machine showed that as `zsh: command not found: OH*thinking`,
+    // which is a status line from a different pane arriving as a command.
+    // The OSC 52 case below already accepts a broad drop for a narrower
+    // version of this risk.
+    if payload.first().is_some_and(|&b| b == b'l' || b == b'L') {
+        return true;
+    }
     let Some(semi) = payload.iter().position(|&b| b == b';') else {
         return false;
     };
@@ -1116,6 +1147,70 @@ mod tests {
             );
             assert!(line.contains("] writer="), "truncated line: {line:?}");
         }
+    }
+
+    // ── Window-op and title reports on the input path ───────────────
+    //
+    // A query the host asked, answered by the RELAY's terminal, arriving on
+    // the path the host reads as typing. Every case in
+    // `is_terminal_csi_response` exists for that; these two shapes were
+    // missing, and they are the ones carrying the most text.
+
+    #[test]
+    fn drops_text_area_size_report() {
+        use super::TerminalResponseFilter;
+        let mut f = TerminalResponseFilter::default();
+        assert_eq!(f.process(b"\x1b[8;46;120t"), b"");
+    }
+
+    #[test]
+    fn drops_window_position_and_pixel_size_reports() {
+        use super::TerminalResponseFilter;
+        let mut f = TerminalResponseFilter::default();
+        assert_eq!(f.process(b"\x1b[3;0;25t"), b"");
+        assert_eq!(f.process(b"\x1b[4;1080;1920t"), b"");
+    }
+
+    #[test]
+    fn keeps_a_window_op_command_that_carries_no_parameters() {
+        // `CSI 22t` / `CSI 23t` push and pop the title. They are commands,
+        // not reports, and requiring a `;` is what keeps them out of scope —
+        // a filter that swallowed every `t` would silently eat them.
+        use super::TerminalResponseFilter;
+        let mut f = TerminalResponseFilter::default();
+        assert_eq!(f.process(b"\x1b[22t"), b"\x1b[22t");
+        assert_eq!(f.process(b"\x1b[23t"), b"\x1b[23t");
+    }
+
+    #[test]
+    fn drops_the_title_report_that_carried_another_panes_status_line() {
+        // Observed on a live machine as `zsh: command not found: OH*thinking`
+        // — a status line from a Codex pane arriving in a different pane's
+        // shell and being RUN. A title is set from whatever is running, so a
+        // title report hands the host a line of screen text on its input
+        // path. `OSC l <title> ST` has no semicolon after its Ps, which is
+        // exactly why it fell through the payload split.
+        use super::TerminalResponseFilter;
+        let mut f = TerminalResponseFilter::default();
+        assert_eq!(f.process(b"\x1b]lthinking with xhigh effort\x1b\\"), b"");
+    }
+
+    #[test]
+    fn drops_the_icon_label_report() {
+        use super::TerminalResponseFilter;
+        let mut f = TerminalResponseFilter::default();
+        assert_eq!(f.process(b"\x1b]Lsome icon\x07"), b"");
+    }
+
+    #[test]
+    fn keeps_a_title_the_user_sets() {
+        // `OSC 0 ; title` and `OSC 2 ; title` SET the title and are ordinary
+        // traffic. Only the lowercase/uppercase `l` reply form is a report,
+        // and confusing the two would stop a remote pane naming itself.
+        use super::TerminalResponseFilter;
+        let mut f = TerminalResponseFilter::default();
+        assert_eq!(f.process(b"\x1b]0;my title\x07"), b"\x1b]0;my title\x07");
+        assert_eq!(f.process(b"\x1b]2;my title\x07"), b"\x1b]2;my title\x07");
     }
 
     #[test]
