@@ -1130,6 +1130,23 @@ final class PeerWorkspaceMirrorController {
         return true
     }
 
+    /// Tear down one mirrored pane's PANE SESSION while leaving its panel in
+    /// the tree.
+    ///
+    /// Production reaches this through `relayStartupFailure`, which banners
+    /// the pane and tears its session down without closing the panel. It is
+    /// the state in which unmapping alone strands the panel: nothing left
+    /// iterates it, so it stays open holding a dead relay helper while the
+    /// next push reattaches the surface as a second tab.
+    @discardableResult
+    func debugTeardownPaneSession(surfaceID: Data) -> Bool {
+        guard let workspace, let panelId = panelBySurfaceID[surfaceID],
+              let session = workspace.terminalPanel(for: panelId)?.peerPaneSession
+        else { return false }
+        session.teardown()
+        return true
+    }
+
     /// Surface ids currently mirrored, in a stable order, so a test can name
     /// one without guessing at dictionary iteration order.
     func debugMirroredSurfaceIDs() -> [Data] {

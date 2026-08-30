@@ -1892,6 +1892,31 @@ extension TerminalController {
         return .ok(["ok": true, "surface_id": endedSurface ?? ""])
     }
 
+    /// Test-only: tear down one mirrored pane's SESSION while its panel stays
+    /// in the tree — what `relayStartupFailure` leaves behind, and the state in
+    /// which unmapping alone strands the panel as a ghost tab.
+    func v2DebugPeerMirrorTeardownPaneSession(params: [String: Any]) -> V2CallResult {
+        let requested = v2String(params, "surface_id")
+            .flatMap { Data(base64Encoded: $0) }
+        var torndownSurface: String?
+        var failure: String?
+        let ok = v2MainExec(timeout: 5) {
+            MainActor.assumeIsolated {
+                let outcome = PeerClientCoordinator.shared
+                    .debugTeardownMirrorPaneSession(surfaceID: requested)
+                torndownSurface = outcome.surface
+                failure = outcome.error
+            }
+        }
+        guard ok else {
+            return .err(code: "internal_error", message: "teardown pane session timed out", data: nil)
+        }
+        if let failure {
+            return .err(code: "not_found", message: failure, data: nil)
+        }
+        return .ok(["ok": true, "surface_id": torndownSurface ?? ""])
+    }
+
     /// Test-only: run the real tunnel spawn against a target that cannot
     /// answer, and report which error came back and how long it took.
     ///

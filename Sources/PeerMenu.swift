@@ -1800,6 +1800,21 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         return true
     }
 
+    /// Tear down one mirrored pane's session, leaving its panel in the tree.
+    /// A nil `surfaceID` takes the first mirrored surface in sorted order.
+    func debugTeardownMirrorPaneSession(surfaceID: Data?) -> (surface: String?, error: String?) {
+        guard let mirror = openWorkspaceMirrors.first else {
+            return (nil, "no live workspace mirror")
+        }
+        guard let target = surfaceID ?? mirror.debugMirroredSurfaceIDs().first else {
+            return (nil, "mirror has no mapped surface")
+        }
+        guard mirror.debugTeardownPaneSession(surfaceID: target) else {
+            return (nil, "surface is not mirrored here")
+        }
+        return (target.base64EncodedString(), nil)
+    }
+
     /// End one mirrored pane's relay, leaving its pane session intact.
     /// A nil `surfaceID` takes the first mirrored surface in sorted order.
     func debugEndMirrorPaneRelay(surfaceID: Data?) -> (surface: String?, error: String?) {

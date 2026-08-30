@@ -137,6 +137,47 @@ def main() -> int:
                     f"{row['panel_id']} → {after[surface]['panel_id']}"
                 )
 
+        # ── the exact ghost. Above, the relay ended while the pane session
+        #    lived on, so the sweep had to notice it at all. Here the PANE
+        #    SESSION is torn down with its panel left in the tree — what
+        #    `relayStartupFailure` leaves in production — which the sweep does
+        #    notice, and then unmaps. Unmapping is where the panel is lost:
+        #    B3 iterates the map and B3b iterates the queued stale panels, so
+        #    a panel in neither is never closed while the surface reattaches
+        #    beside it.
+        before = _panes_by_surface(c.peer_mirror_status())
+        victim2 = sorted(before)[-1]
+        torndown = c.peer_mirror_teardown_pane_session(victim2)
+        if not torndown.get("ok"):
+            raise termmeshError(f"teardown pane session refused: {torndown!r}")
+        if not _wait(
+            lambda: (_panes_by_surface(c.peer_mirror_status()).get(victim2) or {}).get(
+                "pane_torn_down"
+            )
+            is True,
+            timeout_s=30,
+        ):
+            raise termmeshError(
+                f"pane {victim2} session never reported torn down: {c.peer_mirror_status()!r}"
+            )
+
+        # Push a layout so the sweep runs, then count what the workspace holds.
+        c.select_workspace(ws_a)
+        time.sleep(0.5)
+        c.close_surface()
+        target2 = target - 1
+        if not _wait(lambda: _all_live(target2), timeout_s=90):
+            raise termmeshError(
+                f"mirror never reached {target2} live panes after the host close: "
+                f"{c.peer_mirror_status()!r}"
+            )
+        actual2 = len(c.list_surfaces(ws_b))
+        if actual2 != target2:
+            raise termmeshError(
+                f"mirror workspace holds {actual2} surfaces for {target2} mirrored leaves "
+                "— the unmapped panel was never closed (ghost tab + leaked relay helper)"
+            )
+
         print("PASS: a mirrored pane whose relay ended is closed, not orphaned")
         return 0
 

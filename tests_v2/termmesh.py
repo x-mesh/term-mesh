@@ -1420,6 +1420,18 @@ class termmesh:
         params = {"surface_id": surface_id} if surface_id else {}
         return dict(self._call("debug.peer.mirror_end_pane_relay", params) or {})
 
+    def peer_mirror_teardown_pane_session(self, surface_id: Optional[str] = None) -> dict:
+        """Tear down one mirrored pane's SESSION while its panel stays in the
+        tree (`debug.peer.mirror_teardown_pane_session`, DEBUG-only).
+
+        What `relayStartupFailure` leaves behind in production: the pane is
+        bannered and its session torn down, but the panel is not closed. It is
+        the state in which unmapping alone strands the panel — nothing left
+        iterates it, so it stays open holding a dead relay helper while the
+        next push reattaches the surface as a second tab."""
+        params = {"surface_id": surface_id} if surface_id else {}
+        return dict(self._call("debug.peer.mirror_teardown_pane_session", params) or {})
+
     def peer_tunnel_probe(self, target: str, remote_sock: Optional[str] = None,
                           timeout_s: float = 60.0) -> dict:
         """Spawn the real SSH tunnel against `target` and report what came

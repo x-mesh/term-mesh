@@ -38,12 +38,10 @@ def main() -> int:
         deadline = probe.get("forward_socket_deadline_s")
         if not isinstance(connect_budget, int) or not isinstance(deadline, int):
             raise termmeshError(f"probe did not report both budgets: {probe!r}")
-        if connect_budget >= deadline:
-            raise termmeshError(
-                f"ssh's connect budget ({connect_budget}s) must expire before this "
-                f"side's deadline ({deadline}s), or ssh is killed before it reports"
-            )
 
+        # The outcome comes first on purpose. The budgets are the mechanism;
+        # which error a dead link produces is the symptom the field saw, and a
+        # test that reports the mechanism instead hides what actually broke.
         outcome = probe.get("outcome")
         if outcome == "connected":
             raise termmeshError(
@@ -62,6 +60,12 @@ def main() -> int:
         if not detail:
             raise termmeshError(
                 f"ssh exited without saying why — the diagnostic is still empty: {probe!r}"
+            )
+
+        if connect_budget >= deadline:
+            raise termmeshError(
+                f"ssh's connect budget ({connect_budget}s) must expire before this "
+                f"side's deadline ({deadline}s), or ssh is killed before it reports"
             )
 
         # It must fail on ssh's clock, not ours: at or after the connect
