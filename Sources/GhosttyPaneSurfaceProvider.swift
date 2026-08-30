@@ -2126,6 +2126,16 @@ private func trailingIncompleteUTF8(_ arr: [UInt8]) -> Int {
 
 @MainActor
 private func sendPeerInputBytes(_ surface: ghostty_surface_t, bytes: Data, finalFlush: Bool = false) {
+    // Every byte a connected peer client types into this host arrives here.
+    // Recorded because it is the only place that can tell "the user typed
+    // this" from "a remote viewer's terminal answered our own output back
+    // into our PTY" — the two are indistinguishable once the bytes are in
+    // the surface. Off unless the marker file exists; see `InputInjectionLog`.
+    InputInjectionLog.recordPeerInput(
+        site: "sendPeerInputBytes",
+        label: String(UInt(bitPattern: surface.hashValue), radix: 16).suffix(8).description,
+        bytes: bytes
+    )
     // FIX 2 / FIX B: prepend any bytes carried over from the previous chunk,
     // then trim any new incomplete ESC tail before the main parse loop so that
     // split CSI/OSC/SS3 heads ("\e[", "\e[<35", etc.) are also deferred — not

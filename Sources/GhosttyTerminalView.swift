@@ -1756,6 +1756,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
     func sendSocketStyleText(_ text: String, withReturn: Bool = true) -> Bool {
         guard let surface = surface else { return false }
         let payload = withReturn ? text + "\r" : text
+        InputInjectionLog.record(site: "sendSocketStyleText", surface: id, text: payload)
         for scalar in payload.unicodeScalars {
             switch scalar.value {
             case 0x0A, 0x0D:
@@ -1799,6 +1800,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// e.g. when the panel is in a non-active tab.
     func sendSurfaceKeyPress(keycode: UInt16, text: String? = nil) {
         guard let surface = surface else { return }
+        InputInjectionLog.recordKey(
+            site: "sendSurfaceKeyPress", surface: id, keycode: keycode, text: text
+        )
         var keyEvent = ghostty_input_key_s()
         keyEvent.action = GHOSTTY_ACTION_PRESS
         keyEvent.keycode = UInt32(keycode)
@@ -1832,6 +1836,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
         func flush() {
             guard !buffered.isEmpty else { return }
+            InputInjectionLog.record(site: "sendInputText.flush", surface: id, text: buffered)
             var keyEvent = ghostty_input_key_s()
             keyEvent.action = GHOSTTY_ACTION_PRESS
             keyEvent.keycode = 0
@@ -2201,6 +2206,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
             while idx < chars.count {
                 let end = min(idx + chunkChars, chars.count)
                 let chunk = String(chars[idx..<end])
+                InputInjectionLog.record(site: "processPaste", surface: id, text: chunk)
                 let data = chunk.utf8
                 let len = UInt(data.count)
                 data.withContiguousStorageIfAvailable { buf in
@@ -2340,6 +2346,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// a "functional" key, which can be silently dropped by TUI apps in certain
     /// states (e.g., Claude Code's "thinking" mode returning to idle).
     func sendReturnKey(to surface: ghostty_surface_t) -> Bool {
+        InputInjectionLog.recordKey(
+            site: "sendReturnKey", surface: id, keycode: 36, text: "\r"
+        )
         var keyEvent = ghostty_input_key_s()
         keyEvent.action = GHOSTTY_ACTION_PRESS
         keyEvent.keycode = 36 // kVK_Return
@@ -2406,6 +2415,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     }
 
     private func writeTextData(_ data: Data, to surface: ghostty_surface_t) {
+        InputInjectionLog.record(
+            site: "writeTextData", surface: id, text: String(decoding: data, as: UTF8.self)
+        )
         data.withUnsafeBytes { rawBuffer in
             guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: CChar.self) else { return }
             ghostty_surface_text(surface, baseAddress, UInt(rawBuffer.count))
