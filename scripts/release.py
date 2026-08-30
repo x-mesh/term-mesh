@@ -51,6 +51,11 @@ RELAY_E2E_PATH_PREFIXES = (
     "proto/peer/",
     "daemon/peer-proto/",
     "daemon/term-meshd/src/peer/",
+    # The relay helper carries every keystroke and every byte of PTY output on
+    # a remote pane. v0.217.0 changed its stdin teardown with this gate not
+    # firing, because the list had the daemon's peer module but not the helper
+    # that talks to it.
+    "daemon/term-mesh-peer-relay/",
     "swift/PeerProto/",
     "tests_v2/test_remote_project",
     "scripts/run-tests-v2.sh",
