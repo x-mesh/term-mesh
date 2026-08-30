@@ -115,55 +115,73 @@ def main() -> int:
             )
 
         if not _wait(
-            lambda: len(_mirror().get("dropped_pane_names") or []) == 1
+            lambda: _mirror().get("dropped_pane_reports", 0) > 0
             and _mirror().get("leaf_count") == shrunk,
             timeout_s=60,
         ):
             raise termmeshError(
                 f"the viewer never named the pane the host dropped: {_mirror()!r}"
             )
-
-        # ── 3. the same, but across a reconnect. The resync clears the
-        #       baseline the diff reads, so this is the case that regressed.
-        if not _wait(lambda: _all_live(shrunk), timeout_s=90):
-            raise termmeshError(f"mirror never settled at {shrunk} live panes: {_mirror()!r}")
-        marker = list(_mirror().get("dropped_pane_names") or [])
-
-        dropped = c.peer_mirror_drop_subscription()
-        if not dropped.get("dropped"):
-            raise termmeshError(f"subscription drop refused: {dropped!r}")
-        if not _wait(
-            lambda: _mirror().get("subscription_alive")
-            and (_mirror().get("resync") or {}).get("kept", 0) > 0,
-            timeout_s=90,
-        ):
-            raise termmeshError(f"mirror never resynced: {_mirror()!r}")
-
-        # The resync itself must not invent a drop: nothing left the layout.
-        if list(_mirror().get("dropped_pane_names") or []) != marker:
-            raise termmeshError(
-                "the reconnect reported a drop of its own — the kept baseline is "
-                f"being diffed against the wrong layout: {_mirror()!r}"
-            )
-
-        # Now drop a pane while that reconnect's baseline is the only one there
-        # is. Before the baseline was carried across, this push was silent.
-        c.select_workspace(ws_a)
-        time.sleep(0.5)
-        c.close_surface()
-        final = shrunk - 1
-        if not _wait(
-            lambda: _mirror().get("leaf_count") == final
-            and list(_mirror().get("dropped_pane_names") or []) != marker,
-            timeout_s=60,
-        ):
-            raise termmeshError(
-                "a host drop right after a reconnect went unnamed — the reconnect's "
-                f"baseline was lost: {_mirror()!r}"
-            )
         if len(_mirror().get("dropped_pane_names") or []) != 1:
             raise termmeshError(
-                f"post-reconnect drop named the wrong count: {_mirror()!r}"
+                f"viewer named the wrong number of dropped panes: {_mirror()!r}"
+            )
+
+        # ── 3. the drop that arrives WHILE the subscription is down.
+        #
+        # This is the incident's own shape, and the path the fast reconnect
+        # has to clear `lastAppliedLayout` on — so it is the one path with no
+        # baseline to diff a removal against. Hold the reconnect down so the
+        # host change lands inside the window rather than racing the 2s
+        # first-attempt backoff.
+        if not _wait(lambda: _all_live(shrunk), timeout_s=90):
+            raise termmeshError(f"mirror never settled at {shrunk} live panes: {_mirror()!r}")
+        # Counts, not names: every pane here is titled "Terminal", so two drops
+        # in a row produce identical name lists and a list comparison cannot
+        # tell the second drop from silence.
+        reports_before = _mirror().get("dropped_pane_reports", 0)
+        baseline_reports_before = _mirror().get("dropped_pane_reports_after_reconnect", 0)
+
+        c.select_workspace(ws_a)
+        time.sleep(0.5)
+        dropped = c.peer_mirror_drop_subscription(hold_reconnect_s=8)
+        if not dropped.get("dropped"):
+            raise termmeshError(f"subscription drop refused: {dropped!r}")
+        if not _wait(lambda: not _mirror().get("subscription_alive"), timeout_s=20):
+            raise termmeshError(f"subscription never went down: {_mirror()!r}")
+
+        # The host loses a pane with nobody listening.
+        c.close_surface()
+        final = shrunk - 1
+        if not _wait(lambda: len(c.list_panes()) == final, timeout_s=20):
+            raise termmeshError(f"host did not lose the pane: {c.list_panes()!r}")
+        if _mirror().get("dropped_pane_reports", 0) != reports_before:
+            raise termmeshError(
+                "the viewer saw the drop while its subscription was down — the hold "
+                f"did not hold: {_mirror()!r}"
+            )
+
+        # Now let it back up. The reconnect's own reconcile is what must name
+        # the removal, reading the baseline the resync handed forward.
+        if not _wait(
+            lambda: _mirror().get("subscription_alive")
+            and _mirror().get("leaf_count") == final,
+            timeout_s=90,
+        ):
+            raise termmeshError(f"mirror never reconnected: {_mirror()!r}")
+        mirror = _mirror()
+        if mirror.get("dropped_pane_reports_after_reconnect", 0) <= baseline_reports_before:
+            raise termmeshError(
+                "the reconnect's reconcile did not name the pane the host dropped "
+                f"while it was down — the baseline was lost: {mirror!r}"
+            )
+        if len(mirror.get("dropped_pane_names") or []) != 1:
+            raise termmeshError(
+                f"post-reconnect drop named the wrong count: {mirror!r}"
+            )
+        if not _wait(lambda: _all_live(final), timeout_s=90):
+            raise termmeshError(
+                f"mirror never settled at {final} live panes: {_mirror()!r}"
             )
 
         print("PASS: host and viewer both name a dropped pane, reconnect included")

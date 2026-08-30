@@ -1765,6 +1765,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                     "stranded_respawned": mirror.strandedPaneRespawnCount,
                 ]
                 entry["dropped_pane_names"] = mirror.lastDroppedPaneNames
+                entry["dropped_pane_reports"] = mirror.droppedPaneReportCount
+                entry["dropped_pane_reports_after_reconnect"] =
+                    mirror.droppedPaneReportsFromReconnectBaseline
                 // Per-pane liveness, since `relay_startup_state` latching at
                 // `started` for the life of the pane is precisely the trap
                 // this data exists to make visible.
@@ -1791,9 +1794,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     /// Drop the first live mirror's layout subscription and nothing else.
     /// `openWorkspaceMirrors` stays private: the socket layer gets the two
     /// verbs it needs, not the collection.
-    func debugDropMirrorSubscription() -> Bool {
+    func debugDropMirrorSubscription(holdReconnectSeconds: TimeInterval = 0) -> Bool {
         guard let mirror = openWorkspaceMirrors.first else { return false }
-        mirror.debugDropSubscription()
+        mirror.debugDropSubscription(holdReconnectSeconds: holdReconnectSeconds)
         return true
     }
 

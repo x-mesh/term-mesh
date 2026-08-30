@@ -1371,7 +1371,15 @@ class termmesh:
         it found — keeping four live panes and respawning four dead ones both
         settle at four leaves — and `panes[]` carries each pane's
         `relay_startup_state` beside its real `relay_liveness`, which is where
-        the two visibly disagree."""
+        the two visibly disagree.
+
+        `dropped_pane_reports` counts pushes that named a removal;
+        `dropped_pane_names` names the last one's. Assert on the COUNT: panes
+        carry their shell's title, so two consecutive drops both read
+        `["Terminal"]` and the list cannot tell a repeat from silence.
+        `dropped_pane_reports_after_reconnect` counts only those a reconnect's
+        own reconcile named — the path that had no baseline to diff against
+        and was therefore silent."""
         reply = dict(self._call("debug.peer.mirror_status", {}) or {})
         mirrors = (reply.get("status") or {}).get("mirrors") or []
         return dict(mirrors[0]) if mirrors else {}
@@ -1384,14 +1392,21 @@ class termmesh:
         reply = dict(self._call("debug.peer.host_status", {}) or {})
         return dict(reply.get("status") or {})
 
-    def peer_mirror_drop_subscription(self) -> dict:
+    def peer_mirror_drop_subscription(self, hold_reconnect_s: float = 0) -> dict:
         """Drop the live mirror's layout subscription and NOTHING else
         (`debug.peer.mirror_drop_subscription`, DEBUG-only).
 
         The only way to produce "the mirror resynced while every pane was
         fine": killing the tunnel takes the panes down with it, which is the
-        opposite of the case under test."""
-        return dict(self._call("debug.peer.mirror_drop_subscription", {}) or {})
+        opposite of the case under test.
+
+        `hold_reconnect_s` keeps it down that long, so a test can change the
+        host layout WHILE it is down. Without it, doing so is a race against
+        the 2s first-attempt backoff."""
+        params: Dict[str, Any] = {}
+        if hold_reconnect_s:
+            params["hold_reconnect_s"] = hold_reconnect_s
+        return dict(self._call("debug.peer.mirror_drop_subscription", params) or {})
 
     def peer_mirror_end_pane_relay(self, surface_id: Optional[str] = None) -> dict:
         """End one mirrored pane's relay WITHOUT tearing down its pane session

@@ -684,6 +684,16 @@ final class PeerWorkspaceMirrorController {
     /// Titles/markers named by the last host push that removed a leaf, so an
     /// e2e can assert the diagnostic fired without scraping a log file.
     var lastDroppedPaneNames: [String] = []
+    /// How many pushes have named a removal. The names alone cannot witness a
+    /// second removal: panes carry their shell's title, so two drops in a row
+    /// both read `["Terminal"]` and an assertion on the list cannot tell a
+    /// repeat from a diagnostic that never fired.
+    var droppedPaneReportCount = 0
+    /// The subset of those that had to read `dropDiagnosticsBaseline` because
+    /// a reconnect had already cleared `lastAppliedLayout`. Counting them
+    /// separately is what distinguishes "the drop was named" from "the drop
+    /// was named on the path that used to be silent".
+    var droppedPaneReportsFromReconnectBaseline = 0
 
     private func watchRecoveringPanes(_ watched: [Data: UUID]) {
         recoveringPaneWatchdog?.cancel()
@@ -786,6 +796,17 @@ final class PeerWorkspaceMirrorController {
 
     private func reconnectLoop(after failedGeneration: UInt64) async {
         var attempt = 0
+        #if DEBUG
+        // Test-only. The one case this whole file exists for — the host
+        // dropping a pane WHILE the subscription is down — is otherwise a
+        // race against the 2s first-attempt backoff, and a test that wins a
+        // race by a wide margin is still a test that can lose it. Holding
+        // here makes the window explicit instead. Release has no such branch.
+        while let hold = debugReconnectHoldUntil, Date() < hold, !isTornDown {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        debugReconnectHoldUntil = nil
+        #endif
         // "lost its host — reconnecting" is a promise, and this loop can exit
         // without keeping it: when the last pane goes the workspace is torn
         // down, the condition below is false on the first pass, and not one
@@ -1068,6 +1089,10 @@ final class PeerWorkspaceMirrorController {
     // MARK: - Test actuators
 
     #if DEBUG
+    /// Set by `debugDropSubscription(holdReconnectSeconds:)`; `reconnectLoop`
+    /// waits past it before its first attempt.
+    var debugReconnectHoldUntil: Date?
+
     /// Drop ONLY the layout subscription, leaving every pane's own relay
     /// transport untouched.
     ///
@@ -1076,8 +1101,16 @@ final class PeerWorkspaceMirrorController {
     /// "the mirror resynced while the panes were fine" would never occur.
     /// Closing the subscription transport makes `startReceiveLoop`'s read
     /// fail, which is the same door a host-side drop comes through.
-    func debugDropSubscription() {
+    ///
+    /// `holdReconnectSeconds` keeps the subscription down for that long, so a
+    /// test can change the host layout while it is down and exercise the
+    /// reconnect's own reconcile — the path that has to clear
+    /// `lastAppliedLayout`, and therefore the one that could not name a drop.
+    func debugDropSubscription(holdReconnectSeconds: TimeInterval = 0) {
         guard !isTornDown, let transport = subscriptionTransport else { return }
+        debugReconnectHoldUntil = holdReconnectSeconds > 0
+            ? Date().addingTimeInterval(holdReconnectSeconds)
+            : nil
         Task { await transport.close() }
     }
 

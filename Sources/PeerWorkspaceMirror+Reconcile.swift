@@ -151,6 +151,8 @@ extension PeerWorkspaceMirrorController {
                         : leaf.title
                 }
                 lastDroppedPaneNames = names
+                droppedPaneReportCount += 1
+                if lastAppliedLayout == nil { droppedPaneReportsFromReconnectBaseline += 1 }
                 RemoteWorkLog.infoOffMain(
                     "Host dropped \(dropped.count) pane(s) from the mirrored layout"
                         + " — closing locally: \(names.joined(separator: ", "))"

@@ -1843,11 +1843,16 @@ extension TerminalController {
     /// Killing the tunnel would take the panes down with it, which is the
     /// opposite of the case under test, and waiting for a real host to flap
     /// is not a test.
-    func v2DebugPeerMirrorDropSubscription(params _: [String: Any]) -> V2CallResult {
+    func v2DebugPeerMirrorDropSubscription(params: [String: Any]) -> V2CallResult {
+        // Optional: keep the subscription down this long, so a test can change
+        // the host layout WHILE it is down and reach the reconnect's own
+        // reconcile instead of racing the 2s first-attempt backoff.
+        let hold = (params["hold_reconnect_s"] as? NSNumber)?.doubleValue ?? 0
         var dropped = false
         let ok = v2MainExec(timeout: 5) {
             MainActor.assumeIsolated {
-                dropped = PeerClientCoordinator.shared.debugDropMirrorSubscription()
+                dropped = PeerClientCoordinator.shared
+                    .debugDropMirrorSubscription(holdReconnectSeconds: hold)
             }
         }
         guard ok else {
@@ -1856,7 +1861,7 @@ extension TerminalController {
         guard dropped else {
             return .err(code: "not_found", message: "no live workspace mirror", data: nil)
         }
-        return .ok(["ok": true, "dropped": true])
+        return .ok(["ok": true, "dropped": true, "hold_reconnect_s": hold])
     }
 
     /// Test-only: end one mirrored pane's relay without tearing down its pane
