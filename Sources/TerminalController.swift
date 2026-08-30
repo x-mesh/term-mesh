@@ -216,6 +216,34 @@ class TerminalController {
         Self.allowsInAppFocusMutationsForActiveSocketCommand()
     }
 
+    /// Run `body` outside this command's "a socket command is executing" window.
+    ///
+    /// `shouldSuppressSocketCommandActivation()` reads the depth so socket work
+    /// cannot steal focus, and the depth is process-wide. A command that blocks
+    /// therefore holds it for the whole wait, and a window the *user* creates
+    /// meanwhile is suppressed as though the socket had made it — never becoming
+    /// key. Waiting is not executing, so park the depth while parked.
+    ///
+    /// The allowance stack is left alone on purpose: it is a LIFO with no owner
+    /// per entry, so popping here could remove a concurrent command's entry
+    /// rather than this one's.
+    func withSocketCommandExecutionParked<T>(_ body: () -> T) -> T {
+        Self.socketCommandPolicyLock.lock()
+        let parked = Self.socketCommandPolicyDepth > 0
+        if parked {
+            Self.socketCommandPolicyDepth -= 1
+        }
+        Self.socketCommandPolicyLock.unlock()
+        defer {
+            if parked {
+                Self.socketCommandPolicyLock.lock()
+                Self.socketCommandPolicyDepth += 1
+                Self.socketCommandPolicyLock.unlock()
+            }
+        }
+        return body()
+    }
+
     func v2FocusAllowed(requested: Bool = true) -> Bool {
         requested && socketCommandAllowsInAppFocusMutations()
     }
