@@ -1361,6 +1361,65 @@ class termmesh:
         reply = dict(self._call("peer.pane.status", {}) or {})
         return dict(reply.get("status") or {})
 
+    def peer_mirror_status(self) -> dict:
+        """First live workspace mirror's state via `debug.peer.mirror_status`,
+        or {} when none is open.
+
+        Beyond `leaf_count`/`subscription_alive`, carries what a leaf count
+        cannot witness: `resync` ({kept, watching, respawned,
+        stranded_respawned}) says how the last reconnect classified the panes
+        it found — keeping four live panes and respawning four dead ones both
+        settle at four leaves — and `panes[]` carries each pane's
+        `relay_startup_state` beside its real `relay_liveness`, which is where
+        the two visibly disagree."""
+        reply = dict(self._call("debug.peer.mirror_status", {}) or {})
+        mirrors = (reply.get("status") or {}).get("mirrors") or []
+        return dict(mirrors[0]) if mirrors else {}
+
+    def peer_host_status(self) -> dict:
+        """Host-side layout-broadcast diagnostics via
+        `debug.peer.host_status`: `dropping_broadcasts` counts pushes that
+        removed a leaf, `last_dropped_leaves` names the ones the last such
+        push removed."""
+        reply = dict(self._call("debug.peer.host_status", {}) or {})
+        return dict(reply.get("status") or {})
+
+    def peer_mirror_drop_subscription(self) -> dict:
+        """Drop the live mirror's layout subscription and NOTHING else
+        (`debug.peer.mirror_drop_subscription`, DEBUG-only).
+
+        The only way to produce "the mirror resynced while every pane was
+        fine": killing the tunnel takes the panes down with it, which is the
+        opposite of the case under test."""
+        return dict(self._call("debug.peer.mirror_drop_subscription", {}) or {})
+
+    def peer_mirror_end_pane_relay(self, surface_id: Optional[str] = None) -> dict:
+        """End one mirrored pane's relay WITHOUT tearing down its pane session
+        (`debug.peer.mirror_end_pane_relay`, DEBUG-only). `surface_id` is
+        base64 as reported by `peer_mirror_status()["panes"]`; omitted, the
+        first mirrored surface is used.
+
+        That combination is what a heartbeat death leaves behind, and it is
+        the state in which `relay_startup_state` still reads `started` — the
+        reason a start latch cannot answer "did this pane recover"."""
+        params = {"surface_id": surface_id} if surface_id else {}
+        return dict(self._call("debug.peer.mirror_end_pane_relay", params) or {})
+
+    def peer_tunnel_probe(self, target: str, remote_sock: Optional[str] = None,
+                          timeout_s: float = 60.0) -> dict:
+        """Spawn the real SSH tunnel against `target` and report what came
+        back (`debug.peer.tunnel_probe`, DEBUG-only): {outcome, detail,
+        elapsed_ms, ssh_connect_timeout_s, forward_socket_deadline_s}.
+
+        `outcome` is the claim under test. `spawn_failed` means ssh spent its
+        own connect budget and reported why; `socket_never_appeared` means
+        this side's deadline fired first and killed it, which is what produced
+        an empty stderr tail on every timeout in the field."""
+        params: Dict[str, Any] = {"target": target}
+        if remote_sock:
+            params["remote_sock"] = remote_sock
+        return dict(self._call("debug.peer.tunnel_probe", params, timeout_s=timeout_s) or {})
+
     def coalesce_probe(self) -> dict:
         """Exercise the real `PtyDataCoalescer` (Phase P7) via
         `debug.peer.coalesce_probe` (DEBUG-only). No live 2-node peer

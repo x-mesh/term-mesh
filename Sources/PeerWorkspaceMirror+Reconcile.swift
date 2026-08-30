@@ -150,6 +150,7 @@ extension PeerWorkspaceMirrorController {
                         ? "surface \(Self.surfaceMarker(leaf.surfaceID))"
                         : leaf.title
                 }
+                lastDroppedPaneNames = names
                 RemoteWorkLog.infoOffMain(
                     "Host dropped \(dropped.count) pane(s) from the mirrored layout"
                         + " — closing locally: \(names.joined(separator: ", "))"

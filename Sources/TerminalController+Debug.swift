@@ -1822,6 +1822,128 @@ extension TerminalController {
         return .ok(["ok": true, "status": status])
     }
 
+    /// Test-only: host-side layout-broadcast diagnostics — how many pushes
+    /// removed a leaf, and which leaves the last one named.
+    func v2DebugPeerHostStatus(params _: [String: Any]) -> V2CallResult {
+        var status: [String: Any] = [:]
+        let ok = v2MainExec(timeout: 5) {
+            MainActor.assumeIsolated {
+                status = PeerHostCoordinator.shared.debugHostStatus()
+            }
+        }
+        guard ok else {
+            return .err(code: "internal_error", message: "host status timed out", data: nil)
+        }
+        return .ok(["ok": true, "status": status])
+    }
+
+    /// Test-only: drop the live mirror's layout subscription and nothing else.
+    ///
+    /// The only way to reach "the mirror resynced while every pane was fine".
+    /// Killing the tunnel would take the panes down with it, which is the
+    /// opposite of the case under test, and waiting for a real host to flap
+    /// is not a test.
+    func v2DebugPeerMirrorDropSubscription(params _: [String: Any]) -> V2CallResult {
+        var dropped = false
+        let ok = v2MainExec(timeout: 5) {
+            MainActor.assumeIsolated {
+                dropped = PeerClientCoordinator.shared.debugDropMirrorSubscription()
+            }
+        }
+        guard ok else {
+            return .err(code: "internal_error", message: "drop subscription timed out", data: nil)
+        }
+        guard dropped else {
+            return .err(code: "not_found", message: "no live workspace mirror", data: nil)
+        }
+        return .ok(["ok": true, "dropped": true])
+    }
+
+    /// Test-only: end one mirrored pane's relay without tearing down its pane
+    /// session — the state a heartbeat death leaves, and the one in which
+    /// `relay_startup_state` still reads `started`.
+    ///
+    /// `surface_id` is base64, matching `mirror_status`'s `panes[].surface_id`;
+    /// omitted, the first mirrored surface in sorted order is used.
+    func v2DebugPeerMirrorEndPaneRelay(params: [String: Any]) -> V2CallResult {
+        let requested = v2String(params, "surface_id")
+            .flatMap { Data(base64Encoded: $0) }
+        var endedSurface: String?
+        var failure: String?
+        let ok = v2MainExec(timeout: 5) {
+            MainActor.assumeIsolated {
+                let outcome = PeerClientCoordinator.shared
+                    .debugEndMirrorPaneRelay(surfaceID: requested)
+                endedSurface = outcome.surface
+                failure = outcome.error
+            }
+        }
+        guard ok else {
+            return .err(code: "internal_error", message: "end pane relay timed out", data: nil)
+        }
+        if let failure {
+            return .err(code: "not_found", message: failure, data: nil)
+        }
+        return .ok(["ok": true, "surface_id": endedSurface ?? ""])
+    }
+
+    /// Test-only: run the real tunnel spawn against a target that cannot
+    /// answer, and report which error came back and how long it took.
+    ///
+    /// The budget ordering (`sshConnectTimeoutSeconds` below
+    /// `forwardSocketDeadlineSeconds`) is a claim about what a dead link
+    /// produces: ssh reporting its own reason (`spawnFailed`) rather than
+    /// being killed mid-handshake with an empty stderr tail
+    /// (`socketNeverAppeared`). A unit test can only pin the two numbers'
+    /// order; only spawning real ssh shows which branch that ordering
+    /// actually reaches.
+    func v2DebugPeerTunnelProbe(params: [String: Any]) -> V2CallResult {
+        guard let target = v2String(params, "target"), !target.isEmpty else {
+            return .err(code: "invalid_params", message: "target is required", data: nil)
+        }
+        let remoteSock = v2String(params, "remote_sock") ?? "/tmp/term-mesh-probe.sock"
+        let semaphore = DispatchSemaphore(value: 0)
+        var payload: [String: Any] = [:]
+        // Bounded above the tunnel's own deadline so a hung probe still
+        // answers instead of wedging the socket command.
+        let budget = PeerSSHTunnel.forwardSocketDeadlineSeconds + 20
+        Task.detached {
+            let tunnel = PeerSSHTunnel(sshTarget: target, remoteSockPath: remoteSock)
+            let started = Date()
+            var kind = "connected"
+            var detail = ""
+            do {
+                try await tunnel.start()
+            } catch let error as PeerSSHTunnelError {
+                switch error {
+                case .spawnFailed(let message): kind = "spawn_failed"; detail = message
+                case .socketNeverAppeared(let message):
+                    kind = "socket_never_appeared"; detail = message
+                case .alreadyRunning: kind = "already_running"
+                case .invalidArgument(let message): kind = "invalid_argument"; detail = message
+                }
+            } catch {
+                kind = "other"
+                detail = String(describing: error)
+            }
+            let elapsed = Date().timeIntervalSince(started)
+            await tunnel.stop()
+            payload = [
+                "ok": true,
+                "outcome": kind,
+                "detail": detail,
+                "elapsed_ms": Int(elapsed * 1000),
+                "ssh_connect_timeout_s": PeerSSHTunnel.sshConnectTimeoutSeconds,
+                "forward_socket_deadline_s": Int(PeerSSHTunnel.forwardSocketDeadlineSeconds),
+            ]
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + budget) == .success else {
+            return .err(code: "internal_error", message: "tunnel probe timed out", data: nil)
+        }
+        return .ok(payload)
+    }
+
     /// Test-only: exercises the real `PtyDataCoalescer` (Phase P7) with
     /// synthetic, precisely-timed chunk submissions. `pumpByteStream`'s
     /// owning `PeerServerSession` actor is package-internal to PeerProto

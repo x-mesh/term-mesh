@@ -132,6 +132,12 @@ final class PeerHostCoordinator: NSObject {
     /// teardown. Keeping the previous leaves is what lets the removal be
     /// named on the side that actually knows.
     private var lastBroadcastLeaves: [UUID: [Data: String]] = [:]
+    /// Names the last removing broadcast reported, and how many such
+    /// broadcasts this host has made. The log line is the product here, and a
+    /// log line is not assertable from a socket — these make the host half of
+    /// the diagnostic testable on the same footing as the viewer half.
+    private(set) var lastDroppedLeafNames: [String] = []
+    private(set) var droppingBroadcastCount = 0
 
     /// Launch-time hook. Start the peer server when either the
     /// `TERMMESH_PEER_SERVER_PATH` (or legacy
@@ -601,6 +607,8 @@ final class PeerHostCoordinator: NSObject {
                     : title
             }
             .sorted()
+        lastDroppedLeafNames = names
+        droppingBroadcastCount += 1
         RemoteWorkLog.info(
             "Broadcasting a layout that drops \(removed.count) pane(s) to attached peers: "
                 + names.joined(separator: ", ")
@@ -671,6 +679,18 @@ final class PeerHostCoordinator: NSObject {
         for (_, task) in layoutBroadcastDebounce { task.cancel() }
         layoutBroadcastDebounce.removeAll()
         lastBroadcastLeaves.removeAll()
+        lastDroppedLeafNames = []
+        droppingBroadcastCount = 0
+    }
+
+    /// Host-side layout-broadcast diagnostics, for e2e assertions.
+    func debugHostStatus() -> [String: Any] {
+        [
+            "socket_path": socketPath ?? "",
+            "tracked_workspaces": lastBroadcastLeaves.count,
+            "dropping_broadcasts": droppingBroadcastCount,
+            "last_dropped_leaves": lastDroppedLeafNames,
+        ]
     }
 
     private func presentAlert(_ alert: NSAlert,

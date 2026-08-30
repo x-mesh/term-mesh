@@ -1754,10 +1754,64 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 if let workspaceId = mirror.workspace?.id.uuidString {
                     entry["workspace_id"] = workspaceId
                 }
+                // How the last resync classified what it found. Leaf counts
+                // cannot witness this: keeping four live panes and respawning
+                // four dead ones both settle at four leaves, and the whole
+                // claim under test is which of the two happened.
+                entry["resync"] = [
+                    "kept": mirror.lastResyncKept,
+                    "watching": mirror.lastResyncWatching,
+                    "respawned": mirror.lastResyncRespawned,
+                    "stranded_respawned": mirror.strandedPaneRespawnCount,
+                ]
+                entry["dropped_pane_names"] = mirror.lastDroppedPaneNames
+                // Per-pane liveness, since `relay_startup_state` latching at
+                // `started` for the life of the pane is precisely the trap
+                // this data exists to make visible.
+                entry["panes"] = mirror.panelBySurfaceID
+                    .sorted { $0.key.lexicographicallyPrecedes($1.key) }
+                    .map { surfaceID, panelId -> [String: Any] in
+                        let session = mirror.workspace?
+                            .terminalPanel(for: panelId)?.peerPaneSession
+                        return [
+                            "surface_id": surfaceID.base64EncodedString(),
+                            "panel_id": panelId.uuidString,
+                            "relay_startup_state": session
+                                .map { String(describing: $0.relayStartupState) } ?? "none",
+                            "relay_liveness": session?.relayLiveness.rawValue ?? "none",
+                            "pane_torn_down": session?.isTorndown ?? true,
+                        ]
+                    }
                 return entry
             }
         ]
     }
+
+    #if DEBUG
+    /// Drop the first live mirror's layout subscription and nothing else.
+    /// `openWorkspaceMirrors` stays private: the socket layer gets the two
+    /// verbs it needs, not the collection.
+    func debugDropMirrorSubscription() -> Bool {
+        guard let mirror = openWorkspaceMirrors.first else { return false }
+        mirror.debugDropSubscription()
+        return true
+    }
+
+    /// End one mirrored pane's relay, leaving its pane session intact.
+    /// A nil `surfaceID` takes the first mirrored surface in sorted order.
+    func debugEndMirrorPaneRelay(surfaceID: Data?) -> (surface: String?, error: String?) {
+        guard let mirror = openWorkspaceMirrors.first else {
+            return (nil, "no live workspace mirror")
+        }
+        guard let target = surfaceID ?? mirror.debugMirroredSurfaceIDs().first else {
+            return (nil, "mirror has no mapped surface")
+        }
+        guard mirror.debugEndPaneRelay(surfaceID: target) else {
+            return (nil, "surface is not mirrored here")
+        }
+        return (target.base64EncodedString(), nil)
+    }
+    #endif
 
     /// Snapshot of remote-pane state for e2e assertions.
     func debugPaneStatus() -> [String: Any] {

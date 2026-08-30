@@ -507,6 +507,9 @@ final class PeerWorkspaceMirrorController {
         // the exact staleness `respawnPanesThatNeverRecovered` guards against.
         recoveringPaneWatchdog?.cancel()
         recoveringPaneWatchdog = nil
+        lastResyncKept = 0
+        lastResyncWatching = 0
+        lastResyncRespawned = panelBySurfaceID.count
         pendingStalePanelIds.append(contentsOf: panelBySurfaceID.values)
         panelBySurfaceID.removeAll()
         hostSplitToLocal.removeAll()
@@ -582,6 +585,9 @@ final class PeerWorkspaceMirrorController {
             markAllPanesStale()
             return
         }
+        lastResyncKept = split.keep.count
+        lastResyncWatching = split.watch.count
+        lastResyncRespawned = split.respawn.count
         pendingStalePanelIds.append(contentsOf: split.respawn.values)
         panelBySurfaceID = kept
         // Keyed by host split ids from a layout that is no longer
@@ -665,6 +671,19 @@ final class PeerWorkspaceMirrorController {
     /// assert the net was needed and caught it rather than inferring from
     /// pane counts.
     private(set) var strandedPaneRespawnCount = 0
+
+    /// How the last resync classified the panes it found.
+    ///
+    /// Pane counts alone cannot witness this: keeping four live panes and
+    /// respawning four dead ones both end at four panes. The counts are what
+    /// separate "the reconnect cost nothing" from "the reconnect rebuilt
+    /// everything", which is the entire claim under test.
+    private(set) var lastResyncKept = 0
+    private(set) var lastResyncWatching = 0
+    private(set) var lastResyncRespawned = 0
+    /// Titles/markers named by the last host push that removed a leaf, so an
+    /// e2e can assert the diagnostic fired without scraping a log file.
+    var lastDroppedPaneNames: [String] = []
 
     private func watchRecoveringPanes(_ watched: [Data: UUID]) {
         recoveringPaneWatchdog?.cancel()
@@ -1045,6 +1064,45 @@ final class PeerWorkspaceMirrorController {
         let base = "\(hostWorkspaceTitle.isEmpty ? "Workspace" : hostWorkspaceTitle) ⌁ \(PeerHostProfileStore.shared.displayLabel(for: spec.hostKey))"
         workspace.title = suffix.map { "\(base) — \($0)" } ?? base
     }
+
+    // MARK: - Test actuators
+
+    #if DEBUG
+    /// Drop ONLY the layout subscription, leaving every pane's own relay
+    /// transport untouched.
+    ///
+    /// This is the shape of the real incident and the one a test cannot
+    /// otherwise produce: killing the tunnel takes the panes down with it, so
+    /// "the mirror resynced while the panes were fine" would never occur.
+    /// Closing the subscription transport makes `startReceiveLoop`'s read
+    /// fail, which is the same door a host-side drop comes through.
+    func debugDropSubscription() {
+        guard !isTornDown, let transport = subscriptionTransport else { return }
+        Task { await transport.close() }
+    }
+
+    /// End one mirrored pane's relay WITHOUT tearing down its `PeerPaneSession`.
+    ///
+    /// That combination — relay finished, pane session not torn down — is
+    /// exactly what a heartbeat death or an exhausted reconnect leaves
+    /// behind, and it is the state in which `relayStartupState` still reads
+    /// `.started`. No production path can be asked for it on demand, so the
+    /// regression it causes was only ever visible in the field.
+    @discardableResult
+    func debugEndPaneRelay(surfaceID: Data) -> Bool {
+        guard let workspace, let panelId = panelBySurfaceID[surfaceID],
+              let session = workspace.terminalPanel(for: panelId)?.peerPaneSession
+        else { return false }
+        Task { await session.relaySession.stop() }
+        return true
+    }
+
+    /// Surface ids currently mirrored, in a stable order, so a test can name
+    /// one without guessing at dictionary iteration order.
+    func debugMirroredSurfaceIDs() -> [Data] {
+        panelBySurfaceID.keys.sorted { $0.lexicographicallyPrecedes($1) }
+    }
+    #endif
 
     // MARK: - Teardown
 
