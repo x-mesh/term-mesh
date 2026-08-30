@@ -480,9 +480,115 @@ final class PeerWorkspaceMirrorController {
         // panels, so snapshot them first — `reconcile` closes them once
         // it has spawned their replacements (B3b), reaping each old pane's
         // relay helper process instead of orphaning it as a ghost tab.
+        //
+        // Measure what the wipe costs before deciding it is cheap. Pane
+        // relay recovery (`PeerRelaySession`'s "Remote pane reconnected on
+        // attempt N") runs independently of this mirror-level reconnect and
+        // frequently WINS it — the panes are back, and then this runs and
+        // discards them anyway, respawning a helper process and a Ghostty
+        // surface for each while closing the working one. That is invisible
+        // today: the log shows a respawn either way, so a reconnect that
+        // threw away four healthy panes reads exactly like one that
+        // recovered four dead ones.
+        let live = liveMirroredPaneCount()
+        if live > 0 {
+            RemoteWorkLog.debugOffMain(
+                "Mirror resync discards \(live) live pane(s) of \(panelBySurfaceID.count)"
+                    + " — each is respawned even though its relay had recovered"
+            )
+        }
         pendingStalePanelIds.append(contentsOf: panelBySurfaceID.values)
         panelBySurfaceID.removeAll()
         hostSplitToLocal.removeAll()
+    }
+
+    /// Mirrored panes whose own relay session is currently up.
+    ///
+    /// Deliberately reads the pane's own startup state rather than probing
+    /// the socket: this is a cost measurement, not a health check, and a
+    /// half-alive socket that the pane still believes in is exactly the case
+    /// worth counting — the wipe discards it either way.
+    private func liveMirroredPaneCount() -> Int {
+        guard let workspace else { return 0 }
+        return panelBySurfaceID.values.reduce(into: 0) { count, panelId in
+            if workspace.terminalPanel(for: panelId)?.peerPaneSession?.isRelayStarted == true {
+                count += 1
+            }
+        }
+    }
+
+    /// Reconnect-only variant of `markAllPanesStale`: a pane whose own relay
+    /// already recovered keeps its panel, its helper process, and its
+    /// scrollback.
+    ///
+    /// The two recoveries are independent. `PeerRelaySession` reconnects a
+    /// pane's own transport and logs "Remote pane reconnected on attempt N";
+    /// this mirror reconnects only the layout subscription. The pane one
+    /// routinely finishes FIRST — observed four panes back at 23:05:51 and
+    /// all four discarded by the mirror four seconds later — so wiping here
+    /// respawns a helper process and a Ghostty surface for panes that were
+    /// already working, and closes the working ones.
+    ///
+    /// Only `.started` counts as recovered. A pane still `.pending` or
+    /// `.starting` is treated as stale on purpose: respawning one is merely
+    /// wasteful, while keeping one that never comes up leaves the user a
+    /// pane that does nothing and no event to explain it.
+    ///
+    /// RECONNECT ONLY. `forceResync` (the user pressing Retry) and
+    /// `resumeAfterHostReconnect` (a new lease, so every pane's transport is
+    /// gone anyway) still wipe everything — there, distrusting what is on
+    /// screen is the entire point.
+    func markPanesStaleKeepingRecovered() {
+        guard let workspace else {
+            markAllPanesStale()
+            return
+        }
+        let split = Self.partitionForReconnect(
+            panelBySurfaceID: panelBySurfaceID,
+            isRecovered: { panelId in
+                workspace.terminalPanel(for: panelId)?.peerPaneSession?.isRelayStarted == true
+            }
+        )
+        guard !split.keep.isEmpty else {
+            markAllPanesStale()
+            return
+        }
+        pendingStalePanelIds.append(contentsOf: split.respawn.values)
+        panelBySurfaceID = split.keep
+        // Keyed by host split ids from a layout that is no longer
+        // authoritative. Keeping panes does not make the split map valid;
+        // reconcile's B5 rebuilds it.
+        hostSplitToLocal.removeAll()
+        // Force the FULL reconcile path. With panes kept, the no-op and
+        // divider-only fast paths can both match the incoming layout and
+        // return without touching the tree — which would skip the portal
+        // reattach every kept pane needs after its transport was replaced,
+        // leaving correct state behind a blank view.
+        lastAppliedLayout = nil
+        RemoteWorkLog.infoOffMain(
+            "Mirror resync kept \(split.keep.count) recovered pane(s)"
+                + ", respawning \(split.respawn.count)"
+        )
+    }
+
+    /// Which mirrored panes a reconnect may keep, and which it must respawn.
+    ///
+    /// Pure so the rule survives review and regression without a workspace,
+    /// a host, or a live relay behind it.
+    nonisolated static func partitionForReconnect(
+        panelBySurfaceID: [Data: UUID],
+        isRecovered: (UUID) -> Bool
+    ) -> (keep: [Data: UUID], respawn: [Data: UUID]) {
+        var keep: [Data: UUID] = [:]
+        var respawn: [Data: UUID] = [:]
+        for (surfaceID, panelId) in panelBySurfaceID {
+            if isRecovered(panelId) {
+                keep[surfaceID] = panelId
+            } else {
+                respawn[surfaceID] = panelId
+            }
+        }
+        return (keep, respawn)
     }
 
     // MARK: - Connection loss / reconnect
@@ -667,7 +773,10 @@ final class PeerWorkspaceMirrorController {
                     )
                     Task { await weakTransport.close() }
                 }
-                markAllPanesStale()
+                // Only the SUBSCRIPTION was lost here; each pane's own relay
+                // has its own reconnect and may already be back. Keep the
+                // ones that are.
+                markPanesStaleKeepingRecovered()
                 try await reconcile(target: target.layout)
                 startReceiveLoop(session: session)
                 markWorkspaceTitle(suffix: nil)

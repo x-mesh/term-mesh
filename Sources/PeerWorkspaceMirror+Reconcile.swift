@@ -58,9 +58,28 @@ extension PeerWorkspaceMirrorController {
         // attach failure behind it. Nothing recovered it because nothing could:
         // the host kept reporting those surfaces, which is exactly the
         // condition under which the existing sweep declines to act.
+        //
+        // A panel whose peer session has TORN DOWN counts as gone too: it
+        // renders nothing and never will again. That could not happen while
+        // every reconnect rebuilt every mapping from scratch, so "the panel
+        // object still exists" was a sufficient liveness test. Now that
+        // `markPanesStaleKeepingRecovered` lets a mapping outlive a
+        // reconnect, a kept pane whose relay dies afterwards would otherwise
+        // stay mapped forever — permanently blank, with the host still
+        // reporting its surface, which is precisely the case the sweep below
+        // declines to act on. This is the safety net under keeping panes.
+        //
+        // `.pending` and `.starting` are NOT torn down and must not be swept:
+        // a pane spawned moments ago is in exactly that state, and treating
+        // it as dead would respawn it on every push forever.
+        let livePanelIDs = Set(workspace.panels.keys.filter { panelId in
+            guard let session = workspace.terminalPanel(for: panelId)?.peerPaneSession
+            else { return true }
+            return !session.isTorndown
+        })
         let orphaned = Self.orphanedSurfaceIDs(
             panelBySurfaceID: panelBySurfaceID,
-            livePanelIDs: Set(workspace.panels.keys)
+            livePanelIDs: livePanelIDs
         )
         if !orphaned.isEmpty {
             for surfaceID in orphaned { panelBySurfaceID.removeValue(forKey: surfaceID) }
@@ -89,6 +108,29 @@ extension PeerWorkspaceMirrorController {
         // ── Phase A (async, no tree mutation): sessions for new leaves.
         guard !targetLeaves.isEmpty else { return }
         let activeIDs = Set(targetLeaves.map(\.surfaceID))
+        // A push that DROPS a leaf is the only layout change that destroys
+        // local state — the pane and its scrollback go with it — and it used
+        // to be indistinguishable in the log from the user closing that same
+        // pane, since "Remote pane closed: …" is the whole record either way.
+        // Name the surfaces the host stopped reporting BEFORE B3 acts on
+        // them, so a pane that vanishes mid-session is answerable afterwards
+        // instead of requiring a Debug host to reproduce.
+        if let last = lastAppliedLayout {
+            let previousLeaves = Self.preorderLeaves(last)
+            let dropped = previousLeaves.filter { !activeIDs.contains($0.surfaceID) }
+            if !dropped.isEmpty {
+                let names = dropped.map { leaf in
+                    leaf.title.isEmpty
+                        ? "surface \(Self.surfaceMarker(leaf.surfaceID))"
+                        : leaf.title
+                }
+                RemoteWorkLog.infoOffMain(
+                    "Host dropped \(dropped.count) pane(s) from the mirrored layout"
+                        + " — closing locally: \(names.joined(separator: ", "))"
+                        + " (\(previousLeaves.count) → \(targetLeaves.count) pane(s))"
+                )
+            }
+        }
         let missing = targetLeaves.filter { panelBySurfaceID[$0.surfaceID] == nil }
         var newSessions: [Data: PeerPaneSession] = [:]
         for leaf in missing {
@@ -422,11 +464,17 @@ extension PeerWorkspaceMirrorController {
         walkHostSplits(split.second, visit: visit)
     }
 
+    /// First 4 bytes of a surface id as hex — the short form peer log lines
+    /// use to name a surface without spelling out its full identity.
+    nonisolated static func surfaceMarker(_ surfaceID: Data) -> String {
+        surfaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
+    }
+
     /// Compact structural fingerprint for debug/e2e assertions.
     nonisolated static func shapeHash(_ node: Termmesh_Peer_V1_WorkspaceLayout) -> String {
         switch node.node {
         case .pane(let pane):
-            return "p[\(pane.surfaceID.prefix(4).map { String(format: "%02x", $0) }.joined())]"
+            return "p[\(surfaceMarker(pane.surfaceID))]"
         case .split(let split):
             let o = split.orientation.hasPrefix("h") ? "h" : "v"
             return "\(o)(\(shapeHash(split.first)),\(shapeHash(split.second)))"
