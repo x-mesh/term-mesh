@@ -124,6 +124,14 @@ final class PeerHostCoordinator: NSObject {
     /// the network/CPU cost proportional to "drag ended" rather than
     /// "frame settled."
     private var layoutBroadcastDebounce: [UUID: Task<Void, Never>] = [:]
+    /// Leaf surface id → title as of the last layout broadcast, per
+    /// workspace. Only the host knows a pane left for a LOCAL reason (tab
+    /// closed, shell exited) rather than because a peer asked for it, and it
+    /// used to say nothing at all: an attached viewer logged "Remote pane
+    /// closed" and that line cannot tell a host-side removal from its own
+    /// teardown. Keeping the previous leaves is what lets the removal be
+    /// named on the side that actually knows.
+    private var lastBroadcastLeaves: [UUID: [Data: String]] = [:]
 
     /// Launch-time hook. Start the peer server when either the
     /// `TERMMESH_PEER_SERVER_PATH` (or legacy
@@ -527,11 +535,70 @@ final class PeerHostCoordinator: NSObject {
             // a newly created workspace or a locally renamed tab has no
             // pre-existing mirror session to carry the change.
             await server.broadcastWorkspaceListChanged(workspaces)
+            let leaves = Self.leafTitles(updated.layout)
             await MainActor.run { [weak self] in
+                self?.noteLayoutBroadcast(workspaceID: workspaceID, leaves: leaves)
                 self?.layoutBroadcastDebounce.removeValue(forKey: workspaceID)
             }
         }
         layoutBroadcastDebounce[workspaceID] = task
+    }
+
+    /// Surface id → title for every leaf of a layout tree.
+    nonisolated static func leafTitles(
+        _ node: Termmesh_Peer_V1_WorkspaceLayout
+    ) -> [Data: String] {
+        switch node.node {
+        case .pane(let pane):
+            return [pane.surfaceID: pane.title]
+        case .split(let split):
+            return leafTitles(split.first)
+                .merging(leafTitles(split.second)) { first, _ in first }
+        case .none:
+            return [:]
+        }
+    }
+
+    /// Leaves present in `previous` but gone from `current`. Split out as a
+    /// pure function because it decides whether a push destroyed a pane, and
+    /// that rule deserves a test that needs no server, workspace, or peer.
+    nonisolated static func droppedLeaves(
+        previous: [Data: String],
+        current: [Data: String]
+    ) -> [Data: String] {
+        previous.filter { current[$0.key] == nil }
+    }
+
+    /// Record this broadcast's leaves and, when the push REMOVES one, say so.
+    ///
+    /// A removal is the only layout change that costs an attached viewer a
+    /// pane — the pane and its scrollback go with it — so it is the one push
+    /// worth a line even at `info`. Everything else (splits, renames, divider
+    /// moves) is recoverable and stays silent.
+    private func noteLayoutBroadcast(workspaceID: UUID, leaves: [Data: String]) {
+        let previous = lastBroadcastLeaves[workspaceID]
+        lastBroadcastLeaves[workspaceID] = leaves
+        // First broadcast for this workspace: everything is "new", nothing
+        // was dropped. Without this guard a fresh subscription would report
+        // its own baseline as a removal.
+        guard let previous else { return }
+        let removed = Self.droppedLeaves(previous: previous, current: leaves)
+        guard !removed.isEmpty else { return }
+        let names = removed
+            .map { id, title in
+                // A surface with no title is still worth naming; the short
+                // hex marker is what every other peer log line uses, so the
+                // two sides' logs can be read against each other.
+                title.isEmpty
+                    ? "surface \(id.prefix(4).map { String(format: "%02x", $0) }.joined())"
+                    : title
+            }
+            .sorted()
+        RemoteWorkLog.info(
+            "Broadcasting a layout that drops \(removed.count) pane(s) to attached peers: "
+                + names.joined(separator: ", ")
+                + " (\(previous.count) → \(leaves.count) pane(s))"
+        )
     }
 
     /// Bridge from `TabManager.closeWorkspace`'s `.peerWorkspaceDidClose`
@@ -565,6 +632,11 @@ final class PeerHostCoordinator: NSObject {
             // call and closes the narrow theoretical window where an
             // in-flight broadcast Task races this one on the wire.
             self?.layoutBroadcastDebounce.removeValue(forKey: workspaceID)?.cancel()
+            // The workspace is gone, not shrunk: dropping its baseline here
+            // keeps a later workspace that reuses this id from having its
+            // first broadcast diffed against a dead one — every leaf would
+            // read as removed.
+            self?.lastBroadcastLeaves.removeValue(forKey: workspaceID)
             let provider = self?.provider
             let idBytes = withUnsafeBytes(of: workspaceID.uuid) { Data($0) }
             #if DEBUG
@@ -591,6 +663,7 @@ final class PeerHostCoordinator: NSObject {
         }
         for (_, task) in layoutBroadcastDebounce { task.cancel() }
         layoutBroadcastDebounce.removeAll()
+        lastBroadcastLeaves.removeAll()
     }
 
     private func presentAlert(_ alert: NSAlert,
