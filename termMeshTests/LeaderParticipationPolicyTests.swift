@@ -90,9 +90,29 @@ final class LeaderParticipationPolicyTests: XCTestCase {
             JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
         XCTAssertEqual(payload["kill_switch"] as? Bool, true)
+        XCTAssertEqual(payload["health_scope"] as? String, "control_host")
         XCTAssertFalse((path as NSString).lastPathComponent.contains("/"))
         let mode = try FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? NSNumber
         XCTAssertEqual(mode?.intValue, 0o600)
+    }
+
+    func testRemoteControlPayloadDelegatesHealthToExecutionHost() throws {
+        let suite = "leader-remote-control.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.set(LeaderParticipationSettings.Mode.canary.rawValue,
+                     forKey: LeaderParticipationSettings.modeKey)
+        defaults.set(100, forKey: LeaderParticipationSettings.canaryPercentKey)
+        defaults.set(["p"], forKey: LeaderParticipationSettings.optInProjectsKey)
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+
+        let data = try XCTUnwrap(TeamOrchestrator.leaderParticipationControlData(
+            teamName: "p", sessionID: "s", supportedLeader: true,
+            healthScope: .executionHost, defaults: defaults
+        ))
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(payload["health_scope"] as? String, "execution_host")
     }
 
     func testUnsupportedLeaderControlPayloadCannotApplyCanary() {

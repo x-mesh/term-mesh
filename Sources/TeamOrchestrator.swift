@@ -3874,6 +3874,7 @@ final class TeamOrchestrator: ObservableObject {
     static func leaderParticipationControlData(
         teamName: String, sessionID: String, supportedLeader: Bool,
         delegationState: ProjectDelegationState = .default,
+        healthScope: LeaderParticipationSettings.HealthScope = .controlHost,
         defaults: UserDefaults = .standard
     ) -> Data? {
         let settings = LeaderParticipationSettings.load(from: defaults)
@@ -3890,7 +3891,9 @@ final class TeamOrchestrator: ObservableObject {
             supportedLeader: supportedLeader, health: health,
             delegationState: delegationState
         )
-        return try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        var scopedPayload = payload
+        scopedPayload["health_scope"] = healthScope.rawValue
+        return try? JSONSerialization.data(withJSONObject: scopedPayload, options: [.sortedKeys])
     }
 
     private static func writeLeaderParticipationControlData(_ data: Data, to file: URL) {
