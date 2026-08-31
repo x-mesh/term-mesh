@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.220.0] - 2026-08-31
+
+기존 remote Project와 이름이 겹칠 때 새 Project 이름을 만들도록 유도하지 않고, 현재 Project를 계속 열 수 있습니다.
+
+### Changed
+
+- 같은 이름의 remote Project를 New Project 화면에서 바로 엽니다. 기존 Project의 checkout 경로가 현재 입력한 경로와 다르더라도 정확한 Project ID가 있으면 Open Existing을 기본 행동으로 제공합니다. 별도 Project가 필요할 때만 새 이름을 선택합니다. (Sources/NewProjectView.swift, Sources/TeamOrchestrator.swift)
+
+### Fixed
+
+- 정확히 일치하는 기존 Project가 다른 same-name record에 가려지던 문제를 고쳤습니다. host와 path가 같은 live/detached Project가 있으면 stale 또는 별도 remote record보다 우선해 기존 workspace를 엽니다. socket 진단도 UI와 같은 open_existing action을 보고합니다. (Sources/TeamOrchestrator.swift, Sources/TerminalController+Debug.swift)
+
 ## [0.219.0] - 2026-08-31
 
 피어 연결이 잠시 끊겨도 살아 있는 pane을 유지하고, 사라진 pane과 터널 실패 원인을 진단할 수 있습니다.
