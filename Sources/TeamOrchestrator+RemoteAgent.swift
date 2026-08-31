@@ -720,6 +720,23 @@ extension TeamOrchestrator {
         return (shouldOffer, matching)
     }
 
+    nonisolated static func sidebarProjectIdentity(
+        declared: PeerProjectIdentity?,
+        runtimeTeamName: String?,
+        inferred: PeerProjectIdentity
+    ) -> PeerProjectIdentity {
+        if let declared { return declared }
+        if let name = runtimeTeamName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !name.isEmpty {
+            return PeerProjectIdentity(
+                key: "name:\(name.lowercased())",
+                label: name,
+                isUnknown: false
+            )
+        }
+        return inferred
+    }
+
     /// The manifests a host lists under its own row in the Host axis.
     ///
     /// Deliberately the same rule the Project axis applies, because a machine's
@@ -8235,14 +8252,18 @@ extension TeamOrchestrator {
                     throw error
                 }
                 await connection.cancel()
-                guard let workspace = workspaces.first(where: { $0.workspaceID == workspaceID }),
-                      workspace.hasLayout
-                else {
+                guard let surfaceIDs = Self.remoteWorkspaceSurfaceIDs(
+                    workspaces: workspaces, workspaceID: workspaceID
+                ) else {
                     throw RemoteAgentError.projectDeletionIncomplete(
-                        "host returned no layout for \(label)"
+                        "host returned no workspace for \(label)"
                     )
                 }
-                ownedWorkspaceSurfaceIDs[hostKey] = peerSurfaceIDs(workspace.layout)
+                // An empty layout means the workspace lifecycle already shed
+                // its panes. Continue with individual surface confirmation and
+                // DeleteWorkspace instead of turning partial cleanup into an
+                // unrecoverable inspection failure.
+                ownedWorkspaceSurfaceIDs[hostKey] = surfaceIDs
             } catch {
                 workspaceInspectionFailedHosts.insert(hostKey)
                 failures.append("\(label): could not inspect workspace surfaces: \(error)")
@@ -8441,6 +8462,15 @@ extension TeamOrchestrator {
         belongsToOwnedWorkspace: Bool
     ) -> Bool {
         isAgent || !belongsToOwnedWorkspace
+    }
+
+    nonisolated static func remoteWorkspaceSurfaceIDs(
+        workspaces: [Termmesh_Peer_V1_Workspace],
+        workspaceID: Data
+    ) -> Set<Data>? {
+        guard let workspace = workspaces.first(where: { $0.workspaceID == workspaceID })
+        else { return nil }
+        return workspace.hasLayout ? peerSurfaceIDs(workspace.layout) : []
     }
 
     /// The dedicated project workspace for `teamName` on one host, re-derived

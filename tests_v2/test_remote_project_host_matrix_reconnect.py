@@ -37,6 +37,8 @@ from test_remote_project_restart_reattach import (
     _assert_session_owner_route,
     _connect,
     _phase_create,
+    _phase_create_inner,
+    _wait_for_project_deletion,
     _wait,
 )
 
@@ -72,6 +74,8 @@ def _matrix() -> list[dict]:
             "platform": platform,
             "host": host,
             "directory": directory,
+            "ssh_port": item.get("ssh_port"),
+            "identity_file": str(item.get("identity_file") or "").strip() or None,
             "require_session_owner_redirect": bool(
                 item.get("require_session_owner_redirect", False)
             ),
@@ -115,6 +119,21 @@ def _live_team(c: termmesh, team_name: str) -> dict | None:
     return matches[0] if matches else None
 
 
+def _visible_project(c: termmesh, team: dict, project_id: str) -> dict | None:
+    workspace_id = str(team.get("workspace_id") or "")
+    if not workspace_id:
+        return None
+    for window in c.list_windows():
+        window_id = str(window.get("id") or "")
+        if any(candidate == workspace_id
+               for _, candidate, _, _ in c.list_workspaces(window_id)):
+            return next((
+                row for row in c.debug_sidebar_projects(window_id)
+                if row.get("project_id") == project_id
+            ), None)
+    return None
+
+
 def _fully_deleted(c: termmesh, host: str, state: dict, panel_ids: set[str]) -> bool:
     project_exists = any(
         item.get("project_id") == state["project_id"]
@@ -131,9 +150,17 @@ def _ssh_target(host: str) -> str:
     return host.removeprefix("ssh:")
 
 
-def _remote_stdout(host: str, command: str) -> str:
+def _remote_stdout(
+    host: str, command: str, ssh_port: int | None = None,
+    identity_file: str | None = None,
+) -> str:
+    ssh = ["ssh", "-o", "BatchMode=yes"]
+    if ssh_port is not None:
+        ssh.extend(["-p", str(ssh_port)])
+    if identity_file:
+        ssh.extend(["-i", identity_file])
     completed = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", _ssh_target(host), command],
+        [*ssh, _ssh_target(host), command],
         capture_output=True, text=True, timeout=30,
     )
     if completed.returncode != 0:
@@ -144,12 +171,15 @@ def _remote_stdout(host: str, command: str) -> str:
     return completed.stdout.strip()
 
 
-def _source_head(host: str, directory: str) -> str:
+def _source_head(host: str, directory: str, case: dict) -> str:
     path = shlex.quote(directory)
-    return _remote_stdout(host, f"git -C {path} rev-parse HEAD")
+    return _remote_stdout(
+        host, f"git -C {path} rev-parse HEAD",
+        case.get("ssh_port"), case.get("identity_file")
+    )
 
 
-def _assert_created_checkouts_removed(host: str, state: dict) -> None:
+def _assert_created_checkouts_removed(host: str, state: dict, case: dict) -> None:
     paths = [
         str(checkout.get("path") or "")
         for checkout in state.get("checkouts", [])
@@ -159,7 +189,7 @@ def _assert_created_checkouts_removed(host: str, state: dict) -> None:
     if not paths:
         raise termmeshError("matrix Project did not report an owned worker checkout")
     tests = " && ".join(f"test ! -e {shlex.quote(path)}" for path in paths)
-    _remote_stdout(host, tests)
+    _remote_stdout(host, tests, case.get("ssh_port"), case.get("identity_file"))
 
 
 def _run_case(c: termmesh, case: dict) -> dict:
@@ -184,7 +214,7 @@ def _run_case(c: termmesh, case: dict) -> dict:
                 f"{platform} direct-daemon case unexpectedly redirected: {row!r}"
             )
 
-        source_head = _source_head(host, case["directory"])
+        source_head = _source_head(host, case["directory"], case)
         _phase_create(c, host, case["directory"], state_path)
         state = json.loads(state_path.read_text())
         before = _wait(lambda: _exact_presentation(c, host, state), timeout_s=45)
@@ -193,6 +223,18 @@ def _run_case(c: termmesh, case: dict) -> dict:
         team = _live_team(c, state["team_name"])
         if team is None:
             raise termmeshError(f"{platform} Project has a manifest but no local team")
+        visible = _wait(
+            lambda: _visible_project(c, team, state["project_id"]), timeout_s=20
+        )
+        if visible is None:
+            raise termmeshError(
+                f"{platform} authoritative Project is absent from the local Project list"
+            )
+        screenshot = c.screenshot(f"project-host-matrix-{platform}-visible")
+        if not screenshot.get("path"):
+            raise termmeshError(
+                f"{platform} Project visibility screenshot failed: {screenshot!r}"
+            )
         known_panels = {team["leader_panel_id"]} | {
             agent["panel_id"] for agent in team.get("agents", [])
         }
@@ -254,16 +296,45 @@ def _run_case(c: termmesh, case: dict) -> dict:
             raise termmeshError(
                 f"{platform} deletion left a manifest, team, or relay pane behind"
             )
-        if _source_head(host, case["directory"]) != source_head:
+        if _source_head(host, case["directory"], case) != source_head:
             raise termmeshError(
                 f"{platform} Delete Project changed or removed the selected source checkout"
             )
-        _assert_created_checkouts_removed(host, state)
+        _assert_created_checkouts_removed(host, state, case)
+
+        recreated_path = Path(tempfile.gettempdir()) / f"term-mesh-project-matrix-{platform}-recreated.json"
+        recreated_path.unlink(missing_ok=True)
+        _phase_create_inner(
+            c, host, case["directory"], recreated_path, state["team_name"]
+        )
+        recreated = json.loads(recreated_path.read_text())
+        if recreated.get("team_name") != state["team_name"]:
+            raise termmeshError(
+                f"{platform} same-name Project was renamed: {recreated!r}"
+            )
+        recreated_team = _live_team(c, state["team_name"])
+        if recreated_team is None or _wait(
+            lambda: _visible_project(c, recreated_team, recreated["project_id"]),
+            timeout_s=20,
+        ) is None:
+            raise termmeshError(
+                f"{platform} same-name recreated Project is absent from the Project list"
+            )
+        cleanup = c.debug_project_delete(state["team_name"])
+        cleanup_id = str(cleanup.get("operation_id") or "")
+        if not cleanup_id:
+            raise termmeshError(
+                f"{platform} same-name Project cleanup returned no operation id"
+            )
+        _wait_for_project_deletion(c, cleanup_id)
+        recreated_path.unlink(missing_ok=True)
         state_path.unlink(missing_ok=True)
         return {
             "platform": platform, "host": host,
             "project_id": state["project_id"],
             "leader_surface_id": state["leader_surface_id"],
+            "project_visibility_screenshot": screenshot["path"],
+            "same_name_recreated": True,
         }
     finally:
         if state is not None and _live_team(c, state["team_name"]) is not None:

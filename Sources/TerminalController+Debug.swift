@@ -157,6 +157,43 @@ extension TerminalController {
         return result
     }
 
+    func v2DebugSidebarProjects(params: [String: Any]) -> V2CallResult {
+        guard let windowID = v2UUID(params, "window_id") else {
+            return .err(code: "invalid_params", message: "Missing window_id", data: nil)
+        }
+        var result: V2CallResult = .err(code: "not_found", message: "Window not found", data: nil)
+        _ = v2MainExec(timeout: 5) {
+            guard let manager = AppDelegate.shared?.tabManagerFor(windowId: windowID) else { return }
+            let rows = manager.tabs.compactMap { workspace -> [String: Any]? in
+                guard !workspace.isPeerMirror else { return nil }
+                let declared = WorkspaceProjectNames.shared.identity(for: workspace.id)
+                let runtimeTeam = TeamOrchestrator.shared.teams.values.first {
+                    $0.workspaceId == workspace.id
+                }
+                let panelPaths = workspace.panelDirectories.values.filter { !$0.isEmpty }
+                let directories = panelPaths.isEmpty
+                    ? (workspace.currentDirectory.isEmpty ? [] : [workspace.currentDirectory])
+                    : Array(panelPaths)
+                let identity = TeamOrchestrator.sidebarProjectIdentity(
+                    declared: declared,
+                    runtimeTeamName: runtimeTeam?.id,
+                    inferred: projectIdentity(forWorkingDirectories: directories)
+                )
+                guard !identity.isUnknown else { return nil }
+                return [
+                    "workspace_id": workspace.id.uuidString,
+                    "project_name": identity.label,
+                    "project_key": identity.key,
+                    "project_id": WorkspaceProjectNames.shared.projectID(for: workspace.id)
+                        ?? runtimeTeam?.remotePresentationProjectID
+                        ?? NSNull(),
+                ]
+            }
+            result = .ok(["window_id": windowID.uuidString, "projects": rows])
+        }
+        return result
+    }
+
     func v2DebugShortcutSet(params: [String: Any]) -> V2CallResult {
         guard let name = v2String(params, "name"),
               let combo = v2String(params, "combo") else {
