@@ -2217,6 +2217,12 @@ struct NewProjectView: View {
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.discard")
         case .remoteNameCollision(let record):
+            if record.canOpenRemoteProject {
+                Button("Open Existing") { openExistingProject(record) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isResolvingConflict)
+                    .accessibilityIdentifier("newProject.conflict.openExisting")
+            }
             if record.canDeleteOwnedRemoteRecord {
                 Button("Delete Project record…", role: .destructive) {
                     pendingOwnedRecordRemoval = record
@@ -2225,7 +2231,7 @@ struct NewProjectView: View {
                 .accessibilityIdentifier("newProject.conflict.deleteOwnedRecord")
             }
             Button("Use “\(suggestedProjectName)”") { useSuggestedProjectName() }
-                .keyboardShortcut(.defaultAction)
+                .keyboardShortcut(record.canOpenRemoteProject ? nil : .defaultAction)
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.rename")
         case .localNameCollision, .reservedByAnotherRequest:
@@ -2243,9 +2249,15 @@ struct NewProjectView: View {
         if case let .remoteNameCollision(record) = projectNameConflict,
            case let .remote(_, hostName) = record.location {
             VStack(alignment: .leading, spacing: 8) {
-                Label("Remote Project name is already in use", systemImage: "exclamationmark.triangle.fill")
+                Label(
+                    "Existing remote Project",
+                    systemImage: record.canOpenRemoteProject
+                        ? "folder.fill" : "exclamationmark.triangle.fill"
+                )
                     .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(
+                        record.canOpenRemoteProject ? Color.accentColor : Color.orange
+                    )
                 Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 5) {
                     conflictDetailRow("Host", hostName)
                     conflictDetailRow("Directory", record.identity.workingDirectory ?? "Not recorded")
@@ -2265,10 +2277,10 @@ struct NewProjectView: View {
                 }
                 Text(
                     record.canDeleteOwnedRemoteRecord
-                        ? "Delete the record if this Project is gone. Deleting also stops its leader shell and agent panes on the host; files and the workspace stay."
+                        ? "Open Existing to reuse this Project. Delete the record only if this Project is gone; files and the workspace stay."
                         : (record.presentationOwnedByRequester
-                            ? "The leader is running. Open the Project from the sidebar instead of deleting its record."
-                            : "Only the owning installation can delete this record over the network. On the host, `tm-agent daemon project-presentations prune` lists and removes leftover records.")
+                            ? "Open Existing to reuse this Project. Its leader is running, so the record cannot be deleted."
+                            : "Open Existing to reuse this Project. Only the owning installation can delete its record.")
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -2276,7 +2288,10 @@ struct NewProjectView: View {
             }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            .background(
+                (record.canOpenRemoteProject ? Color.accentColor : Color.orange).opacity(0.08),
+                in: RoundedRectangle(cornerRadius: 8)
+            )
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("newProject.conflict.remoteDetails")
         }
@@ -3953,7 +3968,9 @@ enum ProjectCreationFlow {
             "A different local Project already uses this name. Rename this Project before creating it."
         case .remoteNameCollision(let record):
             if case let .remote(_, hostName) = record.location {
-                "A different Project on \(hostName) already uses this name. Rename this Project before creating it."
+                record.canOpenRemoteProject
+                    ? "A Project with this name already exists on \(hostName). Choose Open Existing to reuse it, or use another name for a separate Project."
+                    : "A different Project on \(hostName) already uses this name. Rename this Project before creating it."
             } else {
                 "A different Project on a connected machine already uses this name. Rename this Project before creating it."
             }

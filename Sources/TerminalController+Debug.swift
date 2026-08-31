@@ -1191,15 +1191,16 @@ extension TerminalController {
                     )?.count ?? -1,
                 ]
             } catch let ProjectCreationFlow.CreationError.nameConflict(conflict) {
-                let (kind, action): (String, String) = switch conflict {
-                case .exactLive: ("exact_live", "open_existing")
-                case .exactDetached: ("exact_detached", "open_existing")
-                case .incomplete: ("incomplete", "resume_setup")
-                case .localNameCollision: ("local_name_collision", "rename")
-                case .remoteNameCollision: ("remote_name_collision", "rename")
-                case .reservedByAnotherRequest: ("reserved", "wait")
-                case .none: ("none", "create")
+                let kind: String = switch conflict {
+                case .exactLive: "exact_live"
+                case .exactDetached: "exact_detached"
+                case .incomplete: "incomplete"
+                case .localNameCollision: "local_name_collision"
+                case .remoteNameCollision: "remote_name_collision"
+                case .reservedByAnotherRequest: "reserved"
+                case .none: "none"
                 }
+                let action = Self.debugProjectConflictAction(conflict)
                 self.debugProjectCreationStatus[operationID] = [
                     "state": "conflict", "name": name,
                     "conflict": kind, "action": action,
@@ -1257,6 +1258,25 @@ extension TerminalController {
         case .otherWindow: "other_window"
         case .detached: "detached"
         case .remote(_, let hostName): "remote:\(hostName)"
+        }
+    }
+
+    nonisolated static func debugProjectConflictAction(
+        _ conflict: TeamOrchestrator.ProjectNameConflict
+    ) -> String {
+        switch conflict {
+        case .exactLive, .exactDetached:
+            "open_existing"
+        case .incomplete:
+            "resume_setup"
+        case .localNameCollision:
+            "rename"
+        case .remoteNameCollision(let record):
+            record.canOpenRemoteProject ? "open_existing" : "rename"
+        case .reservedByAnotherRequest:
+            "wait"
+        case .none:
+            "create"
         }
     }
 
