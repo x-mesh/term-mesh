@@ -139,6 +139,195 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertEqual(selected.identity.projectID, "team:two")
     }
 
+    // MARK: - Which owner a same-name collision reports
+    //
+    // `projectConflictRecords` builds candidates in a fixed order: local teams
+    // first (their location is `.currentWindow`/`.otherWindow`/`.detached`,
+    // never `.remote`, because it is decided by whether a local window shows
+    // them — not by where the leader runs), then those teams' remote-checkout
+    // aliases, which keep the local location, and only then remote manifests.
+    // Picking "the first match" therefore reports a local record whenever one
+    // exists, hiding a remote manifest that owns the same name — and remote is
+    // the record with a detail view and the `canDeleteOwnedRemoteRecord`
+    // cleanup, while a local Project is already visible in the sidebar.
+    //
+    // Reported from the field: creating a Project from an EXISTING folder on a
+    // remote host was blocked as "A different local Project already uses this
+    // name", with only "Use “eBPF 2”" offered, while the actual owner was a
+    // leftover remote manifest the user could not see or delete.
+
+    /// The requested identity a creation form actually builds: no project ID
+    /// yet, host and path from the chosen source (`ProjectCreationFlow
+    /// .projectIdentity`). Getting this wrong would make the test exercise the
+    /// project-ID branch instead of the path branch.
+    private func newProjectIdentity(
+        hostKey: String? = "ssh:builder",
+        path: String = "/app/term-mesh/eBPF"
+    ) -> TeamOrchestrator.ProjectCreationIdentity {
+        .init(hostKey: hostKey, workingDirectory: path)
+    }
+
+    func testProjectNameConflictReportsTheRemoteOwnerAheadOfALocalOne() {
+        // Candidate order as `projectConflictRecords` emits it.
+        let localLeftover = conflictRecord(
+            name: "eBPF", projectID: "team:local", hostKey: "ssh:builder",
+            path: "/app/term-mesh/eBPF",
+            location: .detached(workspaceID: UUID())
+        )
+        let remoteLeftover = conflictRecord(
+            name: "eBPF", projectID: "team:remote", hostKey: "ssh:builder",
+            path: "/app/term-mesh/eBPF",
+            location: .remote(hostKey: "ssh:builder", hostName: "builder")
+        )
+
+        guard case .remoteNameCollision(let selected) =
+            TeamOrchestrator.classifyProjectNameConflict(
+                requestedName: "eBPF",
+                requestedIdentity: newProjectIdentity(),
+                candidates: [localLeftover, remoteLeftover]
+            )
+        else {
+            return XCTFail(
+                "a remote manifest owning the name was hidden behind a local record"
+            )
+        }
+        XCTAssertEqual(selected.identity.projectID, "team:remote")
+    }
+
+    func testProjectNameConflictReportsTheRemoteOwnerRegardlessOfCandidateOrder() {
+        // `teams` is a dictionary, so local records arrive in an unspecified
+        // order; the answer must not depend on it.
+        let local = conflictRecord(
+            name: "eBPF", projectID: "team:local", hostKey: "ssh:builder",
+            path: "/app/term-mesh/eBPF", location: .detached(workspaceID: UUID())
+        )
+        let remote = conflictRecord(
+            name: "eBPF", projectID: "team:remote", hostKey: "ssh:builder",
+            path: "/app/term-mesh/eBPF",
+            location: .remote(hostKey: "ssh:builder", hostName: "builder")
+        )
+        for candidates in [[local, remote], [remote, local]] {
+            guard case .remoteNameCollision(let selected) =
+                TeamOrchestrator.classifyProjectNameConflict(
+                    requestedName: "eBPF",
+                    requestedIdentity: newProjectIdentity(),
+                    candidates: candidates
+                )
+            else { return XCTFail("order changed the answer: \(candidates)") }
+            XCTAssertEqual(selected.identity.projectID, "team:remote")
+        }
+    }
+
+    func testProjectNameConflictReportsTheRemoteOwnerBehindAnExactMatch() {
+        // The Existing-folder shape: the requested host+path matches a record
+        // exactly, so Open Existing would normally be offered, but a second
+        // owner of the name takes precedence. That precedence is deliberate —
+        // this pins WHICH of several owners is named.
+        let exact = conflictRecord(
+            name: "eBPF", projectID: "team:exact", hostKey: "ssh:builder",
+            path: "/app/term-mesh/eBPF",
+            location: .currentWindow(windowID: nil, workspaceID: UUID())
+        )
+        let localLeftover = conflictRecord(
+            name: "eBPF", projectID: "team:other-local", hostKey: "ssh:builder",
+            path: "/app/term-mesh/eBPF-old",
+            location: .detached(workspaceID: UUID())
+        )
+        let remoteLeftover = conflictRecord(
+            name: "eBPF", projectID: "team:remote", hostKey: "ssh:builder",
+            path: "/app/term-mesh/eBPF",
+            location: .remote(hostKey: "ssh:builder", hostName: "builder")
+        )
+
+        guard case .remoteNameCollision(let selected) =
+            TeamOrchestrator.classifyProjectNameConflict(
+                requestedName: "eBPF",
+                requestedIdentity: newProjectIdentity(),
+                candidates: [exact, localLeftover, remoteLeftover]
+            )
+        else {
+            return XCTFail("the remote owner was hidden behind a local leftover")
+        }
+        XCTAssertEqual(selected.identity.projectID, "team:remote")
+    }
+
+    func testProjectNameConflictTreatsOneProjectsTwoPresentationsAsOneOwner() {
+        // A single Project routinely appears twice: its local presentation and
+        // the manifest it published on the host it runs on. Same project ID,
+        // so it is one owner and there is no collision — Open Existing is the
+        // right answer, aimed at the local presentation.
+        let workspace = UUID()
+        let localPresentation = conflictRecord(
+            name: "eBPF", projectID: "team:one", hostKey: "ssh:builder",
+            path: "/app/term-mesh/eBPF",
+            location: .currentWindow(windowID: nil, workspaceID: workspace)
+        )
+        let ownManifest = conflictRecord(
+            name: "eBPF", projectID: "team:one", hostKey: "ssh:builder",
+            path: "/app/term-mesh/eBPF",
+            location: .remote(hostKey: "ssh:builder", hostName: "builder")
+        )
+        for candidates in [[localPresentation, ownManifest], [ownManifest, localPresentation]] {
+            guard case .exactLive(let selected) =
+                TeamOrchestrator.classifyProjectNameConflict(
+                    requestedName: "eBPF",
+                    requestedIdentity: newProjectIdentity(),
+                    candidates: candidates
+                )
+            else {
+                return XCTFail("a Project's own manifest was read as a rival owner")
+            }
+            // The local presentation, not the manifest: Open Existing and
+            // Resume act on a window, and naming the manifest here would send
+            // the user to the wrong one.
+            guard case .currentWindow = selected.location else {
+                return XCTFail("the manifest was chosen over the local presentation")
+            }
+        }
+    }
+
+    func testProjectNameConflictStaysLocalWhenNoRemoteOwnsTheName() {
+        // The preference must not invent a remote owner. With only local
+        // records the answer is unchanged, and the local branch is correct:
+        // that Project is visible in the sidebar and has a normal teardown.
+        let localA = conflictRecord(
+            name: "eBPF", projectID: "team:a", hostKey: "ssh:builder",
+            path: "/app/term-mesh/eBPF-a", location: .detached(workspaceID: UUID())
+        )
+        let localB = conflictRecord(
+            name: "eBPF", projectID: "team:b", hostKey: "ssh:builder",
+            path: "/app/term-mesh/eBPF-b",
+            location: .otherWindow(windowID: UUID(), workspaceID: UUID())
+        )
+        guard case .localNameCollision = TeamOrchestrator.classifyProjectNameConflict(
+            requestedName: "eBPF",
+            requestedIdentity: newProjectIdentity(),
+            candidates: [localA, localB]
+        ) else { return XCTFail("an all-local collision must stay local") }
+    }
+
+    func testProjectNameConflictPrefersRemoteOnlyAmongActualCollisions() {
+        // A remote record with a DIFFERENT name is not a collision at all and
+        // must not be dragged in by the preference — the filter runs first.
+        let localCollision = conflictRecord(
+            name: "eBPF", projectID: "team:local", hostKey: "ssh:builder",
+            path: "/app/term-mesh/eBPF-old", location: .detached(workspaceID: UUID())
+        )
+        let unrelatedRemote = conflictRecord(
+            name: "something-else", projectID: "team:remote", hostKey: "ssh:builder",
+            path: "/app/other",
+            location: .remote(hostKey: "ssh:builder", hostName: "builder")
+        )
+        guard case .localNameCollision(let selected) =
+            TeamOrchestrator.classifyProjectNameConflict(
+                requestedName: "eBPF",
+                requestedIdentity: newProjectIdentity(),
+                candidates: [localCollision, unrelatedRemote]
+            )
+        else { return XCTFail("an unrelated remote name was treated as the owner") }
+        XCTAssertEqual(selected.identity.projectID, "team:local")
+    }
+
     func testProjectNameConflictUsesPathFallbackOnlyOnSameHost() {
         let local = TeamOrchestrator.ProjectCreationIdentity(
             hostKey: nil, workingDirectory: "/work/../work/xm"

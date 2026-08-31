@@ -208,27 +208,41 @@ final class TeamOrchestrator: ObservableObject {
         let normalized = normalizedProjectName(requestedName)
         guard !normalized.isEmpty else { return .none }
         let matching = candidates.filter { normalizedProjectName($0.name) == normalized }
-        let exact = matching.first(where: {
+        // Several records can match the requested identity at once: one Project
+        // contributes a record per checkout, and two Projects can claim the
+        // same host and path. Which one is treated as "this location" must not
+        // depend on candidate order, and it must not be the remote manifest
+        // while a local presentation also matches — picking the manifest moves
+        // the local Project into the rival set and reports THAT, which is
+        // backwards. The local one is already on screen; the manifest is what
+        // the user cannot see.
+        let exactMatches = matching.filter {
             projectCreationIdentitiesMatch(requestedIdentity, $0.identity)
-        })
+        }
+        let exact = exactMatches.first { candidate in
+            if case .remote = candidate.location { return false }
+            return true
+        } ?? exactMatches.first
 
         // An exact presentation must not hide a second Project that owns the
         // same global name. One Project can legitimately contribute several
         // location aliases (local source plus remote checkouts), so equal
         // project IDs are one owner; a different non-empty ID is a namespace
         // collision and takes precedence over Open Existing/Resume.
-        if let exact, let exactProjectID = exact.identity.projectID,
-           let collision = matching.first(where: { candidate in
-               guard let candidateProjectID = candidate.identity.projectID else {
-                   return false
-               }
-               return candidateProjectID != exactProjectID
-           }) {
-            switch collision.location {
-            case .remote:
-                return .remoteNameCollision(collision)
-            default:
-                return .localNameCollision(collision)
+        if let exact, let exactProjectID = exact.identity.projectID {
+            let rivals = matching.filter { candidate in
+                guard let candidateProjectID = candidate.identity.projectID else {
+                    return false
+                }
+                return candidateProjectID != exactProjectID
+            }
+            if let collision = preferredCollisionOwner(rivals) {
+                switch collision.location {
+                case .remote:
+                    return .remoteNameCollision(collision)
+                default:
+                    return .localNameCollision(collision)
+                }
             }
         }
 
@@ -249,13 +263,46 @@ final class TeamOrchestrator: ObservableObject {
                 return .exactLive(exact)
             }
         }
-        guard let collision = matching.first else { return .none }
+        guard let collision = preferredCollisionOwner(matching) else { return .none }
         switch collision.location {
         case .remote:
             return .remoteNameCollision(collision)
         default:
             return .localNameCollision(collision)
         }
+    }
+
+    /// Which of several same-name owners to name in the collision.
+    ///
+    /// Taking "the first one" reported whichever record `projectConflictRecords`
+    /// happened to emit first, and that order is neither neutral nor stable. It
+    /// emits local teams, then those teams' remote-checkout aliases, then remote
+    /// manifests — and a team's location is decided by whether a local window
+    /// shows it, never by where its leader runs, so a Project living entirely on
+    /// a peer still lands in the local group. `teams` is a dictionary on top of
+    /// that, so which local record won varied between launches.
+    ///
+    /// Preferring a remote manifest is not a tie-break for its own sake. It is
+    /// the only record with somewhere to go: `.remoteNameCollision` renders the
+    /// host, directory, project ID and ownership, and offers
+    /// `canDeleteOwnedRemoteRecord` cleanup, while `.localNameCollision` offers
+    /// a rename and nothing else. A local Project is also already visible in the
+    /// sidebar, whereas a leftover manifest is invisible — so reporting the
+    /// local one hides the owner the user cannot otherwise find. Observed in the
+    /// field as an Existing-folder create blocked by "A different local Project
+    /// already uses this name" when the actual owner was a stale remote record.
+    ///
+    /// Within one group the candidate order still decides, which is stable for
+    /// remote records (built from arrays) and unspecified for local ones. That
+    /// is not observable today: the local branch renders nothing drawn from the
+    /// record itself.
+    nonisolated static func preferredCollisionOwner(
+        _ candidates: [ProjectConflictRecord]
+    ) -> ProjectConflictRecord? {
+        candidates.first { candidate in
+            if case .remote = candidate.location { return true }
+            return false
+        } ?? candidates.first
     }
 
     struct AgentMember: Identifiable {
