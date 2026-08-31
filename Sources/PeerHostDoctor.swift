@@ -178,6 +178,7 @@ enum PeerHostDoctor {
         "curl -fsSL https://raw.githubusercontent.com/x-mesh/term-mesh/main/scripts/install-linux.sh | bash"
 
     struct MacAppRuntimeStatus: Equatable {
+        var isInstalled: Bool
         var installedVersion: String?
         var isRunning: Bool
     }
@@ -185,14 +186,19 @@ enum PeerHostDoctor {
     /// Distinguishes a dead/stale macOS app socket from a live server that
     /// rejected the protocol. Fixed shell text; no user input enters syntax.
     static let macAppRuntimeProbeCommand =
-        #"sh -c 'if [ "$(uname -s)" != Darwin ]; then exit 44; fi; v=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null); [ -n "$v" ] && echo "app-version=$v"; if /usr/bin/pgrep -f "^/Applications/term-mesh[.]app/Contents/MacOS/term-mesh$" >/dev/null 2>&1; then echo app-running=1; else echo app-running=0; fi; exit 0'"#
+        #"sh -c 'if [ "$(uname -s)" != Darwin ]; then exit 44; fi; if [ -d /Applications/term-mesh.app ]; then echo app-installed=1; else echo app-installed=0; fi; v=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null); [ -n "$v" ] && echo "app-version=$v"; if /usr/bin/pgrep -f "^/Applications/term-mesh[.]app/Contents/MacOS/term-mesh$" >/dev/null 2>&1; then echo app-running=1; else echo app-running=0; fi; exit 0'"#
 
     static func parseMacAppRuntimeStatus(_ output: String) -> MacAppRuntimeStatus? {
+        var installed: Bool?
         var version: String?
         var running: Bool?
         for rawLine in output.split(whereSeparator: { $0.isNewline }) {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.hasPrefix("app-version=") {
+            if line == "app-installed=1" {
+                installed = true
+            } else if line == "app-installed=0" {
+                installed = false
+            } else if line.hasPrefix("app-version=") {
                 version = String(line.dropFirst("app-version=".count)).nonEmpty
             } else if line == "app-running=1" {
                 running = true
@@ -200,8 +206,10 @@ enum PeerHostDoctor {
                 running = false
             }
         }
-        guard let running else { return nil }
-        return MacAppRuntimeStatus(installedVersion: version, isRunning: running)
+        guard let installed, let running else { return nil }
+        return MacAppRuntimeStatus(
+            isInstalled: installed, installedVersion: version, isRunning: running
+        )
     }
 
     private static func macAppRuntimeStatus(
@@ -224,7 +232,7 @@ enum PeerHostDoctor {
         message: String,
         macAppStatus: MacAppRuntimeStatus?
     ) -> PeerHostTestResult {
-        if let macAppStatus, !macAppStatus.isRunning {
+        if let macAppStatus, macAppStatus.isInstalled, !macAppStatus.isRunning {
             return .appNotRunning(
                 details: details,
                 installedVersion: macAppStatus.installedVersion
@@ -1231,9 +1239,12 @@ enum PeerHostDoctor {
            let cli = inventory.cli, cli.path.hasPrefix("/") {
             let searched = Set(loginPath.split(separator: ":").map(String.init))
             let candidates = [cli] + inventory.cliShadowed
+            let daemonPrepends = inventory.homeDirectory.map {
+                ($0 as NSString).appendingPathComponent(".local/bin")
+            }
             let matchingVisible = candidates.contains { candidate in
                 let directory = (candidate.path as NSString).deletingLastPathComponent
-                return searched.contains(directory) && candidate.version == cli.version
+                return searched.contains(directory) || directory == daemonPrepends
             }
             let homebrew = candidates.first { candidate in
                 candidate.path == "/opt/homebrew/bin/tm-agent"
@@ -1241,12 +1252,8 @@ enum PeerHostDoctor {
             }
             let reported = homebrew ?? cli
             let directory = (reported.path as NSString).deletingLastPathComponent
-            let daemonPrepends = inventory.homeDirectory.map {
-                ($0 as NSString).appendingPathComponent(".local/bin")
-            }
             if !matchingVisible,
-               !directory.isEmpty,
-               directory != daemonPrepends {
+               !directory.isEmpty {
                 let shell = inventory.loginShell ?? "the login shell"
                 warnings.append(
                     "Terminal panes cannot find tm-agent: it is installed in \(directory), and "

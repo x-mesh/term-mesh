@@ -29,6 +29,7 @@ final class PeerDaemonVersionTests: XCTestCase {
         let body = String(command.dropFirst("sh -c '".count).dropLast())
         XCTAssertFalse(body.contains("'"))
         XCTAssertTrue(body.contains("/Applications/term-mesh.app/Contents/Info.plist"))
+        XCTAssertTrue(body.contains("app-installed=0"))
         XCTAssertTrue(body.contains("app-running=0"))
         XCTAssertTrue(body.contains("pgrep"))
     }
@@ -36,14 +37,15 @@ final class PeerDaemonVersionTests: XCTestCase {
     func testMacAppRuntimeParserSeparatesInstalledFromRunning() {
         XCTAssertEqual(
             PeerHostDoctor.parseMacAppRuntimeStatus("""
+            app-installed=1
             app-version=0.220.0
             app-running=0
             """),
-            .init(installedVersion: "0.220.0", isRunning: false)
+            .init(isInstalled: true, installedVersion: "0.220.0", isRunning: false)
         )
         XCTAssertEqual(
-            PeerHostDoctor.parseMacAppRuntimeStatus("app-running=1\n"),
-            .init(installedVersion: nil, isRunning: true)
+            PeerHostDoctor.parseMacAppRuntimeStatus("app-installed=1\napp-running=1\n"),
+            .init(isInstalled: true, installedVersion: nil, isRunning: true)
         )
         XCTAssertNil(PeerHostDoctor.parseMacAppRuntimeStatus("app-version=0.220.0\n"))
     }
@@ -53,11 +55,27 @@ final class PeerDaemonVersionTests: XCTestCase {
         let result = PeerHostDoctor.classifyFailedRoute(
             details: details,
             message: "Socket is not connected",
-            macAppStatus: .init(installedVersion: "0.220.0", isRunning: false)
+            macAppStatus: .init(
+                isInstalled: true, installedVersion: "0.220.0", isRunning: false
+            )
         )
         XCTAssertEqual(
             result,
             .appNotRunning(details: details, installedVersion: "0.220.0")
+        )
+    }
+
+    func testFailedRouteWithoutInstalledMacAppRemainsHandshakeFailure() {
+        let details = failedRouteDetails()
+        XCTAssertEqual(
+            PeerHostDoctor.classifyFailedRoute(
+                details: details,
+                message: "Socket is not connected",
+                macAppStatus: .init(
+                    isInstalled: false, installedVersion: nil, isRunning: false
+                )
+            ),
+            .relayFailed(details: details, message: "Socket is not connected")
         )
     }
 
@@ -67,7 +85,9 @@ final class PeerDaemonVersionTests: XCTestCase {
             PeerHostDoctor.classifyFailedRoute(
                 details: details,
                 message: "protocol mismatch",
-                macAppStatus: .init(installedVersion: "0.220.0", isRunning: true)
+                macAppStatus: .init(
+                    isInstalled: true, installedVersion: "0.220.0", isRunning: true
+                )
             ),
             .relayFailed(details: details, message: "protocol mismatch")
         )

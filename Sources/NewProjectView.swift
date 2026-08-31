@@ -2399,9 +2399,16 @@ struct NewProjectView: View {
     }
 
     private func chooseSeparateProjectName() {
+        if Self.shouldRevealAdvancedOptionsForName(sourceKind: sourceKind) {
+            showsAdvancedOptions = true
+        }
         creationError = nil
         submissionConflict = nil
         focusedField = .name
+    }
+
+    static func shouldRevealAdvancedOptionsForName(sourceKind: ProjectSourceKind) -> Bool {
+        sourceKind == .clone
     }
 
     private func openExistingProject(

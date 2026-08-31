@@ -169,6 +169,24 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
         XCTAssertEqual(warnings, [], "\(warnings)")
     }
 
+    func testDifferentHomebrewVersionInLoginPathDoesNotReportMissingPath() {
+        let warnings = PeerHostDoctor.inventoryWarnings(
+            PeerHostDoctor.parseBinaryInventory("""
+            os=Darwin
+            app=0.220.0
+            home=/Users/jinwoo
+            login-shell=/bin/zsh
+            login-path=/opt/homebrew/bin:/usr/bin:/bin
+            tm-agent=/Applications/term-mesh.app/Contents/Resources/bin/tm-agent|tm-agent 0.220.0
+            tm-agent.shadowed=/opt/homebrew/bin/tm-agent|tm-agent 0.219.0
+            """)
+        )
+        XCTAssertFalse(warnings.contains {
+            $0.contains("Terminal panes cannot find tm-agent")
+        }, "\(warnings)")
+        XCTAssertTrue(warnings.contains { $0.contains("shadowed") }, "\(warnings)")
+    }
+
     /// The daemon prepends `~/.local/bin` to a pane's PATH itself, so naming
     /// it would report a gap that is already closed.
     func test_cliUnderHomeLocalBinStaysSilent() {

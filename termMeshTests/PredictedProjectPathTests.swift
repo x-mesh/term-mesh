@@ -432,6 +432,14 @@ final class PredictedProjectPathTests: XCTestCase {
         XCTAssertTrue(help.contains("not created or renamed"))
     }
 
+    func testCloneNameConflictRevealsAdvancedNameField() {
+        XCTAssertTrue(NewProjectView.shouldRevealAdvancedOptionsForName(sourceKind: .clone))
+        XCTAssertFalse(
+            NewProjectView.shouldRevealAdvancedOptionsForName(sourceKind: .existingFolder)
+        )
+        XCTAssertFalse(NewProjectView.shouldRevealAdvancedOptionsForName(sourceKind: .empty))
+    }
+
     func testExistingFolderSelectionNeverAppendsTheProjectName() {
         XCTAssertEqual(
             RemoteDirectoryLookup.selectedPath(
