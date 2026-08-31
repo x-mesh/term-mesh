@@ -858,6 +858,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
     private actor ResizeColsCollector {
         private var pending = Data()
         private var collected: [UInt32] = []
+        private var collectedRows: [UInt32] = []
         private var authorityClaims: [Bool] = []
 
         func add(_ data: Data) {
@@ -865,16 +866,18 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             while let env = try? decodeFrame(from: &pending) {
                 if case .resize(let r)? = env.payload {
                     collected.append(r.cols)
+                    collectedRows.append(r.rows)
                     authorityClaims.append(r.claimAuthority)
                 }
             }
         }
 
         func cols() -> [UInt32] { collected }
+        func rows() -> [UInt32] { collectedRows }
         func claims() -> [Bool] { authorityClaims }
     }
 
-    func testInitialResizeIsPassiveThenFocusedResizeClaimsAuthority() async throws {
+    func testFocusedInitialResizeClaimsAuthority() async throws {
         let collector = ResizeColsCollector()
         let session = makeSession(collector)
         let coalescer = RelayResizeCoalescer(
@@ -883,32 +886,21 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialCols: 80,
             initialRows: 24,
             authorityEligible: true,
-            delayMs: 1,
+            delayMs: 10_000,
             onHeal: { _ in }
         )
 
-        await coalescer.submit(cols: 80, rows: 24)
-        await coalescer.flushNow()
         await coalescer.submit(cols: 120, rows: 36)
         await coalescer.flushNow()
 
         let cols = await collector.cols()
         let claims = await collector.claims()
-        XCTAssertEqual(cols, [80, 120])
-        XCTAssertEqual(claims, [false, true])
+        XCTAssertEqual(cols, [120])
+        XCTAssertEqual(claims, [true])
         await coalescer.cancel()
     }
 
-    /// A resize held for the coalescing delay must not claim authority if
-    /// focus left the pane before it went out.
-    ///
-    /// The claim used to be decided in `submit` and carried in `pending`, so a
-    /// resize that started while focused still asserted authority ~24ms later
-    /// even though `setAuthorityEligible(false)` had run in between. The host
-    /// arbitrates PTY size by most recent activity, so that late claim landed
-    /// after the newly focused pane's own resize and took the size back — the
-    /// remote TUI ended up sized for the pane the person had just left.
-    func testAResizeDoesNotClaimAuthorityAfterFocusLeavesDuringTheDelay() async throws {
+    func testUnfocusedInitialResizeRemainsPassive() async throws {
         let collector = ResizeColsCollector()
         let session = makeSession(collector)
         let coalescer = RelayResizeCoalescer(
@@ -916,34 +908,22 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             surfaceID: Data(repeating: 0xC5, count: 16),
             initialCols: 80,
             initialRows: 24,
-            authorityEligible: true,
-            delayMs: 1,
+            authorityEligible: false,
+            delayMs: 10_000,
             onHeal: { _ in }
         )
 
-        // Get past the initial geometry reconcile, which is passive by design.
-        await coalescer.submit(cols: 80, rows: 24)
-        await coalescer.flushNow()
-
-        // A focused resize starts…
         await coalescer.submit(cols: 120, rows: 36)
-        // …focus moves away before it is written…
-        await coalescer.setAuthorityEligible(false)
-        // …and only then does it go out.
         await coalescer.flushNow()
 
-        let claims = await collector.claims()
-        XCTAssertEqual(claims, [false, false],
-                       "a resize flushed after focus left must not claim authority")
         let cols = await collector.cols()
-        XCTAssertEqual(cols, [80, 120], "the size itself is still sent")
+        let claims = await collector.claims()
+        XCTAssertEqual(cols, [120])
+        XCTAssertEqual(claims, [false])
         await coalescer.cancel()
     }
 
-    /// The mirror of the above: focus arriving during the delay should let the
-    /// resize claim authority. Deciding at flush has to work both ways, or the
-    /// fix would simply have moved the bug.
-    func testAResizeClaimsAuthorityWhenFocusArrivesDuringTheDelay() async throws {
+    func testFocusRegainReassertsLastHelperObservedSizeExactlyOnceWithoutSubmit() async throws {
         let collector = ResizeColsCollector()
         let session = makeSession(collector)
         let coalescer = RelayResizeCoalescer(
@@ -952,20 +932,54 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialCols: 80,
             initialRows: 24,
             authorityEligible: false,
-            delayMs: 1,
+            delayMs: 10_000,
             onHeal: { _ in }
         )
 
-        await coalescer.submit(cols: 80, rows: 24)
+        await coalescer.submit(cols: 120, rows: 36)
         await coalescer.flushNow()
 
-        await coalescer.submit(cols: 120, rows: 36)
+        await coalescer.setAuthorityEligible(true)
+        await coalescer.flushNow()
         await coalescer.setAuthorityEligible(true)
         await coalescer.flushNow()
 
+        let cols = await collector.cols()
+        let rows = await collector.rows()
         let claims = await collector.claims()
+        XCTAssertEqual(cols, [120, 120],
+                       "focus regain must resend the last helper-observed size exactly once")
+        XCTAssertEqual(rows, [36, 36],
+                       "focus regain must preserve the last helper-observed rows")
         XCTAssertEqual(claims, [false, true],
-                       "a resize flushed after focus arrived may claim authority")
+                       "the focus-regain resend must claim authority")
+        await coalescer.cancel()
+    }
+
+    /// A resize held for the coalescing delay must be passive if focus leaves
+    /// before it is written. Authority is deliberately evaluated at flush.
+    func testResizeFlushedAfterFocusLossRemainsPassive() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC7, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            authorityEligible: true,
+            delayMs: 10_000,
+            onHeal: { _ in }
+        )
+
+        await coalescer.submit(cols: 120, rows: 36)
+        await coalescer.setAuthorityEligible(false)
+        await coalescer.flushNow()
+
+        let cols = await collector.cols()
+        let claims = await collector.claims()
+        XCTAssertEqual(cols, [120], "the delayed size itself must still be sent")
+        XCTAssertEqual(claims, [false],
+                       "a resize flushed after focus left must not claim authority")
         await coalescer.cancel()
     }
 
