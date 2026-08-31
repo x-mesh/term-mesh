@@ -424,8 +424,8 @@ final class PredictedProjectPathTests: XCTestCase {
 
     func testExistingFolderConflictCopySeparatesProjectNameFromDirectory() {
         XCTAssertEqual(
-            NewProjectView.conflictRenameButtonTitle(suggestedName: "term-mesh 3"),
-            "Use Project name “term-mesh 3”"
+            NewProjectView.separateProjectButtonTitle(),
+            "Choose Another Project Name…"
         )
         let help = NewProjectView.existingFolderNameHelp()
         XCTAssertTrue(help.contains("name shown in term-mesh"))

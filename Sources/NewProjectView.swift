@@ -1835,8 +1835,8 @@ struct NewProjectView: View {
             || currentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    static func conflictRenameButtonTitle(suggestedName: String) -> String {
-        "Use Project name “\(suggestedName)”"
+    static func separateProjectButtonTitle() -> String {
+        "Choose Another Project Name…"
     }
 
     static func existingFolderNameHelp() -> String {
@@ -2247,15 +2247,15 @@ struct NewProjectView: View {
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.deleteOwnedRecord")
             }
-            Button(Self.conflictRenameButtonTitle(suggestedName: suggestedProjectName)) {
-                useSuggestedProjectName()
+            Button(Self.separateProjectButtonTitle()) {
+                chooseSeparateProjectName()
             }
                 .keyboardShortcut(record.canOpenRemoteProject ? nil : .defaultAction)
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.rename")
         case .localNameCollision, .reservedByAnotherRequest:
-            Button(Self.conflictRenameButtonTitle(suggestedName: suggestedProjectName)) {
-                useSuggestedProjectName()
+            Button(Self.separateProjectButtonTitle()) {
+                chooseSeparateProjectName()
             }
                 .keyboardShortcut(.defaultAction)
                 .disabled(isResolvingConflict)
@@ -2398,26 +2398,9 @@ struct NewProjectView: View {
         return ProjectCreationFlow.conflictDescription(conflict)
     }
 
-    private var suggestedProjectName: String {
-        let base = effectiveName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !base.isEmpty else { return "Project 2" }
-        let records = TeamOrchestrator.shared.projectConflictRecords(
-            currentTabManager: tabManager
-        )
-        var suffix = 2
-        while records.contains(where: {
-            TeamOrchestrator.normalizedProjectName($0.name)
-                == TeamOrchestrator.normalizedProjectName("\(base) \(suffix)")
-        }) {
-            suffix += 1
-        }
-        return "\(base) \(suffix)"
-    }
-
-    private func useSuggestedProjectName() {
-        name = suggestedProjectName
-        nameEdited = true
+    private func chooseSeparateProjectName() {
         creationError = nil
+        submissionConflict = nil
         focusedField = .name
     }
 
@@ -2484,9 +2467,10 @@ struct NewProjectView: View {
     }
 
     private func startCreation() {
+        let creationName = effectiveName
         if let problem = PeerProjectBootstrap.repositoryURLProblem(gitURL) {
             creationError = problem
-            RemoteWorkLog.error("Could not create \(effectiveName): \(problem)")
+            RemoteWorkLog.error("Could not create \(creationName): \(problem)")
             return
         }
         let localDirectory = runsOnHostKey == nil
@@ -2519,7 +2503,7 @@ struct NewProjectView: View {
         Task { @MainActor in
             do {
                 let result = try await onCreate(
-                    effectiveName,
+                    creationName,
                     localDirectory,
                     agents,
                     source,
@@ -2540,19 +2524,19 @@ struct NewProjectView: View {
                     showsFailureDetail = false
                     bootSteps = []
                     RemoteWorkLog.error(
-                        "Could not create \(effectiveName): \(error.localizedDescription)"
+                        "Could not create \(creationName): \(error.localizedDescription)"
                     )
                     return
                 }
                 let message = error.localizedDescription
                 creationError = message
                 failRunningBootStep(message: message)
-                RemoteWorkLog.error("Could not create \(effectiveName): \(message)")
+                RemoteWorkLog.error("Could not create \(creationName): \(message)")
             } catch {
                 let message = error.localizedDescription
                 creationError = message
                 failRunningBootStep(message: message)
-                RemoteWorkLog.error("Could not create \(effectiveName): \(message)")
+                RemoteWorkLog.error("Could not create \(creationName): \(message)")
             }
         }
     }
