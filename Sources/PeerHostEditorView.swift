@@ -42,6 +42,7 @@ struct PeerHostEditorView: View {
         case testing
         case ok(String)              // live socket path
         case daemonMissing           // SSH fine, no term-meshd → offer install
+        case appNotRunning(socket: String, version: String?)
         case relayFailed(socket: String, message: String)
         case sshFailed(String)
         case installing
@@ -737,7 +738,8 @@ struct PeerHostEditorView: View {
         case .ok, .okUpToDate, .okVersionUnknown, .updateAvailable,
              .legacyDaemon, .relayFailed, .installFailed, .diagnosed:
             return true
-        case .idle, .testing, .daemonMissing, .installing, .diagnosing, .sshFailed:
+        case .idle, .testing, .daemonMissing, .appNotRunning,
+             .installing, .diagnosing, .sshFailed:
             return false
         }
     }
@@ -760,6 +762,19 @@ struct PeerHostEditorView: View {
                       systemImage: "exclamationmark.triangle.fill")
                     .font(.caption).foregroundColor(.orange)
                 macManualUpdateHint
+            }
+        case .appNotRunning(let socket, let version):
+            VStack(alignment: .leading, spacing: 2) {
+                Label(
+                    "term-mesh\(version.map { " v\(displayVersion($0))" } ?? "") is installed but not running",
+                    systemImage: "power"
+                )
+                .font(.caption)
+                .foregroundColor(.orange)
+                Text("Launch term-mesh on this Mac. The socket at \(socket) is stale and has no listener.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         case .okUpToDate(_, let version):
             Label("\(serverLabel) v\(displayVersion(version)) — up to date", systemImage: "checkmark.seal")
@@ -1414,6 +1429,15 @@ struct PeerHostEditorView: View {
                 guard gen == doctorGeneration else { return }
                 doctorState = .relayFailed(socket: details.connectedSocket, message: message)
                 await refreshDaemonSnapshot(draft: draft, gen: gen)
+            case .appNotRunning(let details, let installedVersion):
+                relayTestDetails = details
+                testedHostKind = .app
+                doctorState = .appNotRunning(
+                    socket: details.connectedSocket,
+                    version: installedVersion
+                )
+                await refreshBinaryInventory(draft: draft, gen: gen)
+                await refreshDaemonSnapshot(draft: draft, gen: gen)
             case .sshFailed(let msg): doctorState = .sshFailed(msg)
             }
         }
@@ -1503,6 +1527,15 @@ struct PeerHostEditorView: View {
             case .relayFailed(let details, let message):
                 relayTestDetails = details
                 doctorState = .relayFailed(socket: details.connectedSocket, message: message)
+                await refreshDaemonSnapshot(draft: draft, gen: gen)
+            case .appNotRunning(let details, let installedVersion):
+                relayTestDetails = details
+                testedHostKind = .app
+                doctorState = .appNotRunning(
+                    socket: details.connectedSocket,
+                    version: installedVersion
+                )
+                await refreshBinaryInventory(draft: draft, gen: gen)
                 await refreshDaemonSnapshot(draft: draft, gen: gen)
             case .sshFailed(let msg):
                 doctorState = .sshFailed(msg)

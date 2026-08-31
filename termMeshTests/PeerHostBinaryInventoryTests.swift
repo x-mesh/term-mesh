@@ -137,6 +137,38 @@ final class PeerHostBinaryInventoryTests: XCTestCase {
         XCTAssertTrue(warnings[0].contains("Agents are unaffected"), warnings[0])
     }
 
+    func test_reportsHomebrewTmAgentHiddenFromMacSSHLoginPath() {
+        let warnings = PeerHostDoctor.inventoryWarnings(
+            PeerHostDoctor.parseBinaryInventory("""
+            os=Darwin
+            app=0.220.0
+            home=/Users/jinwoo
+            login-shell=/bin/zsh
+            login-path=/usr/bin:/bin:/usr/sbin:/sbin
+            tm-agent=/Applications/term-mesh.app/Contents/Resources/bin/tm-agent|tm-agent 0.220.0
+            tm-agent.shadowed=/opt/homebrew/bin/tm-agent|tm-agent 0.220.0
+            """)
+        )
+        XCTAssertEqual(warnings.count, 1, "\(warnings)")
+        XCTAssertTrue(warnings[0].contains("/opt/homebrew/bin"), warnings[0])
+        XCTAssertTrue(warnings[0].contains("Terminal panes cannot find tm-agent"), warnings[0])
+    }
+
+    func testHomebrewTmAgentVisibleToLoginShellStaysSilent() {
+        let warnings = PeerHostDoctor.inventoryWarnings(
+            PeerHostDoctor.parseBinaryInventory("""
+            os=Darwin
+            app=0.220.0
+            home=/Users/jinwoo
+            login-shell=/bin/zsh
+            login-path=/opt/homebrew/bin:/usr/bin:/bin
+            tm-agent=/Applications/term-mesh.app/Contents/Resources/bin/tm-agent|tm-agent 0.220.0
+            tm-agent.shadowed=/opt/homebrew/bin/tm-agent|tm-agent 0.220.0
+            """)
+        )
+        XCTAssertEqual(warnings, [], "\(warnings)")
+    }
+
     /// The daemon prepends `~/.local/bin` to a pane's PATH itself, so naming
     /// it would report a gap that is already closed.
     func test_cliUnderHomeLocalBinStaysSilent() {
