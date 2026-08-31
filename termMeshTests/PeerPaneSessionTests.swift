@@ -500,6 +500,10 @@ final class PeerPaneSessionTests: XCTestCase {
             TerminalController.debugProjectConflictLocation(.remoteNameCollision(remote)),
             "remote:mac-sub"
         )
+        XCTAssertEqual(
+            TerminalController.debugProjectConflictAction(.remoteNameCollision(remote)),
+            "open_existing"
+        )
     }
 
     @MainActor
