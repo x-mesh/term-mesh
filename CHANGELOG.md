@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.222.0] - 2026-08-31
+
+### Fixed
+
+- Keep macOS peer Projects visible after restart, and preserve their identity across session restoration.
+- Remove remote Project manifests, workspaces, panes, and checkouts before the same Project name is reused.
+- Keep mobile Chat and Terminal views connected to live transcript and screen data across view switches.
+- Fail socket E2E cleanup when its app or daemon process remains alive.
+
 ## [0.221.0] - 2026-08-31
 
 ### Added
