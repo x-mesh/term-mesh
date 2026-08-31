@@ -41,22 +41,32 @@ import Foundation
 /// symptom happens on the released app, so a DEBUG-only log would only ever
 /// watch a build where it does not occur.
 ///
-///     touch /tmp/term-mesh-input-debug.on     # then reproduce
-///     cat /tmp/term-mesh-input-debug.log
+///     mkdir -p ~/Library/Caches/term-mesh
+///     touch ~/Library/Caches/term-mesh/input-debug.on     # then reproduce
+///     cat ~/Library/Caches/term-mesh/input-debug.log
 enum InputInjectionLog {
     /// Presence enables recording. A file rather than an env var because the
     /// app under investigation is already running and cannot be relaunched
     /// without losing the state that produced the symptom.
-    static let markerPath = "/tmp/term-mesh-input-debug.on"
+    private static let directoryURL = FileManager.default.urls(
+        for: .cachesDirectory, in: .userDomainMask
+    )[0].appendingPathComponent("term-mesh", isDirectory: true)
+
+    static var markerPath: String {
+        directoryURL.appendingPathComponent("input-debug.on").path
+    }
 
     /// Tag-isolated like `RemoteWorkLog`, so a tagged debug build chasing this
     /// does not interleave with the production app's own recording.
     static var path: String {
         let tag = ProcessInfo.processInfo.environment["TERMMESH_TAG"]?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return tag.isEmpty
-            ? "/tmp/term-mesh-input-debug.log"
-            : "/tmp/term-mesh-input-debug-\(tag).log"
+        let safeTag = tag.unicodeScalars.map { scalar in
+            CharacterSet.alphanumerics.contains(scalar) || scalar == "-" || scalar == "_"
+                ? String(scalar) : "_"
+        }.joined()
+        let name = safeTag.isEmpty ? "input-debug.log" : "input-debug-\(safeTag).log"
+        return directoryURL.appendingPathComponent(name).path
     }
 
     // MARK: - Enablement
@@ -96,7 +106,55 @@ enum InputInjectionLog {
     /// byte that should not be there at all — a stray control or high byte,
     /// which is how `ÿ` came to sit in an idle prompt.
     static func isOrdinaryTypedText<S: Sequence>(_ bytes: S) -> Bool where S.Element == UInt8 {
-        bytes.allSatisfy { (0x20..<0x7F).contains($0) || $0 == 0x0A || $0 == 0x0D || $0 == 0x09 }
+        exceptionalBytes(in: Array(bytes)).isEmpty
+    }
+
+    /// Control bytes and malformed UTF-8 bytes, without retaining valid text
+    /// that happened to share their input chunk.
+    private static func exceptionalBytes(in bytes: [UInt8]) -> [(Int, UInt8)] {
+        var result: [(Int, UInt8)] = []
+        var index = 0
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte < 0x80 {
+                if (byte < 0x20 && byte != 0x09 && byte != 0x0A && byte != 0x0D)
+                    || byte == 0x7F
+                {
+                    result.append((index, byte))
+                }
+                index += 1
+                continue
+            }
+
+            let length: Int
+            switch byte {
+            case 0xC2...0xDF: length = 2
+            case 0xE0...0xEF: length = 3
+            case 0xF0...0xF4: length = 4
+            default:
+                result.append((index, byte))
+                index += 1
+                continue
+            }
+            guard index + length <= bytes.count else {
+                result.append((index, byte))
+                index += 1
+                continue
+            }
+            let continuation = bytes[(index + 1)..<(index + length)]
+            let hasValidContinuation = continuation.allSatisfy { (0x80...0xBF).contains($0) }
+            let hasValidBoundary = (byte != 0xE0 || bytes[index + 1] >= 0xA0)
+                && (byte != 0xED || bytes[index + 1] <= 0x9F)
+                && (byte != 0xF0 || bytes[index + 1] >= 0x90)
+                && (byte != 0xF4 || bytes[index + 1] <= 0x8F)
+            guard hasValidContinuation, hasValidBoundary else {
+                result.append((index, byte))
+                index += 1
+                continue
+            }
+            index += length
+        }
+        return result
     }
 
     // MARK: - Recording
@@ -161,7 +219,10 @@ enum InputInjectionLog {
         // The content rule. Length and site are always here; the bytes only
         // when they are not something a person could have typed.
         if !bytes.isEmpty, !isOrdinaryTypedText(bytes) {
-            line += " hex=[" + bytes.map { String(format: "%02x", $0) }.joined(separator: " ") + "]"
+            let exceptional = exceptionalBytes(in: bytes).map { offset, byte in
+                return "\(offset):" + String(format: "%02x", byte)
+            }.prefix(16)
+            line += " exceptional=[" + exceptional.joined(separator: " ") + "]"
         }
         write(line)
     }
@@ -171,8 +232,15 @@ enum InputInjectionLog {
         lock.lock()
         defer { lock.unlock() }
         guard let data = (line + "\n").data(using: .utf8) else { return }
+        try? FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
         if !FileManager.default.fileExists(atPath: path) {
-            FileManager.default.createFile(atPath: path, contents: nil)
+            FileManager.default.createFile(
+                atPath: path, contents: nil, attributes: [.posixPermissions: 0o600]
+            )
         }
         guard let handle = FileHandle(forWritingAtPath: path) else { return }
         defer { try? handle.close() }

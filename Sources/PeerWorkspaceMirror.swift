@@ -612,7 +612,7 @@ final class PeerWorkspaceMirrorController {
                 + ", watching \(split.watch.count) still reconnecting"
                 + ", respawning \(split.respawn.count)"
         )
-        watchRecoveringPanes(split.watch)
+        watchRecoveringPanes(split.watch, fallbackLayout: dropDiagnosticsBaseline)
     }
 
     /// What a reconnect owes each mirrored pane.
@@ -695,7 +695,10 @@ final class PeerWorkspaceMirrorController {
     /// was named on the path that used to be silent".
     var droppedPaneReportsFromReconnectBaseline = 0
 
-    private func watchRecoveringPanes(_ watched: [Data: UUID]) {
+    private func watchRecoveringPanes(
+        _ watched: [Data: UUID],
+        fallbackLayout: Termmesh_Peer_V1_WorkspaceLayout?
+    ) {
         recoveringPaneWatchdog?.cancel()
         recoveringPaneWatchdog = nil
         guard !watched.isEmpty else { return }
@@ -703,7 +706,7 @@ final class PeerWorkspaceMirrorController {
         recoveringPaneWatchdog = Task { [weak self] in
             try? await Task.sleep(nanoseconds: graceNs)
             guard let self, !Task.isCancelled, !self.isTornDown else { return }
-            self.respawnPanesThatNeverRecovered(watched)
+            self.respawnPanesThatNeverRecovered(watched, fallbackLayout: fallbackLayout)
         }
     }
 
@@ -713,8 +716,11 @@ final class PeerWorkspaceMirrorController {
     /// are touched: a later reconcile may have respawned or closed the panel
     /// already, and respawning against a stale mapping would close a pane that
     /// is now somebody else's.
-    private func respawnPanesThatNeverRecovered(_ watched: [Data: UUID]) {
-        guard let workspace, let layout = lastAppliedLayout else { return }
+    private func respawnPanesThatNeverRecovered(
+        _ watched: [Data: UUID],
+        fallbackLayout: Termmesh_Peer_V1_WorkspaceLayout?
+    ) {
+        guard let workspace, let layout = lastAppliedLayout ?? fallbackLayout else { return }
         var stranded: [Data: UUID] = [:]
         for (surfaceID, panelId) in watched where panelBySurfaceID[surfaceID] == panelId {
             guard let session = workspace.terminalPanel(for: panelId)?.peerPaneSession

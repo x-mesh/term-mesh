@@ -71,11 +71,11 @@ final class InputInjectionLogTests: XCTestCase {
         XCTAssertFalse(InputInjectionLog.isOrdinaryTypedText(Array("ok".utf8) + [0xFF]))
     }
 
-    func test_nonASCIITextIsRecorded() {
-        // Deliberate, and the cost is accepted: a chunk of Korean or emoji is
-        // written out. It is also how a UTF-8 fragment or a mis-encoded byte
-        // becomes visible, which is exactly the failure being chased.
-        XCTAssertFalse(ordinary("한글"))
+    func test_validNonASCIITextIsNotWrittenOut() {
+        // Valid user text is not diagnostic evidence. Recording it would leak
+        // pasted content while hiding invalid bytes among ordinary UTF-8.
+        XCTAssertTrue(ordinary("한글"))
+        XCTAssertTrue(ordinary("🙂"))
     }
 
     // MARK: - Enablement

@@ -1969,8 +1969,15 @@ extension TerminalController {
     /// `surface_id` is base64, matching `mirror_status`'s `panes[].surface_id`;
     /// omitted, the first mirrored surface in sorted order is used.
     func v2DebugPeerMirrorEndPaneRelay(params: [String: Any]) -> V2CallResult {
-        let requested = v2String(params, "surface_id")
-            .flatMap { Data(base64Encoded: $0) }
+        let requested: Data?
+        if let encoded = v2String(params, "surface_id") {
+            guard let decoded = Data(base64Encoded: encoded) else {
+                return .err(code: "invalid_params", message: "surface_id must be base64 encoded", data: nil)
+            }
+            requested = decoded
+        } else {
+            requested = nil
+        }
         var endedSurface: String?
         var failure: String?
         let ok = v2MainExec(timeout: 5) {
@@ -1994,8 +2001,15 @@ extension TerminalController {
     /// in the tree — what `relayStartupFailure` leaves behind, and the state in
     /// which unmapping alone strands the panel as a ghost tab.
     func v2DebugPeerMirrorTeardownPaneSession(params: [String: Any]) -> V2CallResult {
-        let requested = v2String(params, "surface_id")
-            .flatMap { Data(base64Encoded: $0) }
+        let requested: Data?
+        if let encoded = v2String(params, "surface_id") {
+            guard let decoded = Data(base64Encoded: encoded) else {
+                return .err(code: "invalid_params", message: "surface_id must be base64 encoded", data: nil)
+            }
+            requested = decoded
+        } else {
+            requested = nil
+        }
         var torndownSurface: String?
         var failure: String?
         let ok = v2MainExec(timeout: 5) {
@@ -2029,13 +2043,15 @@ extension TerminalController {
         guard let target = v2String(params, "target"), !target.isEmpty else {
             return .err(code: "invalid_params", message: "target is required", data: nil)
         }
-        let remoteSock = v2String(params, "remote_sock") ?? "/tmp/term-mesh-probe.sock"
+        let remoteSock = v2String(params, "remote_sock")
+            ?? "/tmp/term-mesh-probe-\(UUID().uuidString).sock"
         let semaphore = DispatchSemaphore(value: 0)
-        var payload: [String: Any] = [:]
+        nonisolated(unsafe) var payload: [String: Any] = [:]
         // Bounded above the tunnel's own deadline so a hung probe still
         // answers instead of wedging the socket command.
         let budget = PeerSSHTunnel.forwardSocketDeadlineSeconds + 20
-        Task.detached {
+        let task = Task.detached {
+            defer { semaphore.signal() }
             let tunnel = PeerSSHTunnel(sshTarget: target, remoteSockPath: remoteSock)
             let started = Date()
             var kind = "connected"
@@ -2064,9 +2080,9 @@ extension TerminalController {
                 "ssh_connect_timeout_s": PeerSSHTunnel.sshConnectTimeoutSeconds,
                 "forward_socket_deadline_s": Int(PeerSSHTunnel.forwardSocketDeadlineSeconds),
             ]
-            semaphore.signal()
         }
         guard semaphore.wait(timeout: .now() + budget) == .success else {
+            task.cancel()
             return .err(code: "internal_error", message: "tunnel probe timed out", data: nil)
         }
         return .ok(payload)
