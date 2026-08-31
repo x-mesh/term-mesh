@@ -6,6 +6,7 @@ import Foundation
 struct LeaderParticipationSettings: Equatable {
     enum Mode: String { case off, shadow, canary }
     enum Cohort: String { case staticPolicy = "static", shadow, canary, holdout }
+    enum HealthScope: String { case controlHost = "control_host", executionHost = "execution_host" }
     enum Resolution: Equatable { case staticPolicy(Cohort), shadow(Cohort), canary(Cohort) }
 
     static let modeKey = "leaderParticipation.mode"

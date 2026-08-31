@@ -2812,7 +2812,8 @@ extension TeamOrchestrator {
         let participationControlFile: String?
         if Self.supportsLeaderTurnMeasurement(cli: cli), turnHookFile != nil,
            let controlData = Self.leaderParticipationControlData(
-               teamName: teamName, sessionID: team.leaderSessionId, supportedLeader: true
+               teamName: teamName, sessionID: team.leaderSessionId, supportedLeader: true,
+               healthScope: .executionHost
            ) {
             participationControlFile = await Self.writeRemoteLeaderFileOverSSH(
                 host: host, data: controlData,
@@ -4266,7 +4267,8 @@ extension TeamOrchestrator {
         guard let host = await MainActor.run(body: {
             RemoteHostStore.shared.sortedHosts.first { $0.id == hostKey }
         }), let data = leaderParticipationControlData(
-            teamName: teamName, sessionID: sessionID, supportedLeader: supportedLeader
+            teamName: teamName, sessionID: sessionID, supportedLeader: supportedLeader,
+            healthScope: .executionHost
         ) else { return }
         _ = await writeRemoteLeaderFileOverSSH(
             host: host, data: data,
