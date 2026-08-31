@@ -93,6 +93,7 @@ final class PeerPaneSessionTests: XCTestCase {
             location: .remote(hostKey: "ssh:mac-sub", hostName: "mac-sub")
         )
         XCTAssertFalse(remote.canDeleteOwnedRemoteRecord, "foreign records need host-side cleanup")
+        XCTAssertTrue(remote.canOpenRemoteProject, "a remote manifest with an exact ID is adoptable")
 
         remote.presentationOwnedByRequester = true
         XCTAssertTrue(remote.canDeleteOwnedRemoteRecord)
@@ -106,13 +107,14 @@ final class PeerPaneSessionTests: XCTestCase {
 
         remote.identity = .init(hostKey: "ssh:mac-sub", workingDirectory: "/work/xm")
         XCTAssertFalse(remote.canDeleteOwnedRemoteRecord, "deletion needs an exact Project ID")
+        XCTAssertFalse(remote.canOpenRemoteProject, "opening needs an exact Project ID")
 
         var local = conflictRecord(location: .detached(workspaceID: UUID()))
         local.presentationOwnedByRequester = true
         XCTAssertFalse(local.canDeleteOwnedRemoteRecord, "local lifecycle uses normal teardown")
     }
 
-    func testProjectNameConflictDoesNotHideDifferentIdentityBehindExactMatch() {
+    func testProjectNameConflictPrefersExactProjectOverDifferentIdentity() {
         let requested = TeamOrchestrator.ProjectCreationIdentity(
             projectID: "team:one", hostKey: "ssh:mac-sub",
             workingDirectory: "/work/xm"
@@ -126,17 +128,17 @@ final class PeerPaneSessionTests: XCTestCase {
             location: .remote(hostKey: "ssh:mac-sub", hostName: "mac-sub")
         )
 
-        guard case .remoteNameCollision(let selected) =
+        guard case .exactLive(let selected) =
             TeamOrchestrator.classifyProjectNameConflict(
                 requestedName: "xm", requestedIdentity: requested,
                 candidates: [exact, duplicateRemote]
             )
         else {
             return XCTFail(
-                "a second UUID with the same name must not be hidden by Open Existing"
+                "an exact Project was hidden behind a same-name remote record"
             )
         }
-        XCTAssertEqual(selected.identity.projectID, "team:two")
+        XCTAssertEqual(selected.identity.projectID, "team:one")
     }
 
     // MARK: - Which owner a same-name collision reports
@@ -167,7 +169,7 @@ final class PeerPaneSessionTests: XCTestCase {
         .init(hostKey: hostKey, workingDirectory: path)
     }
 
-    func testProjectNameConflictReportsTheRemoteOwnerAheadOfALocalOne() {
+    func testProjectNameConflictOpensExactDetachedProjectAheadOfRemoteRecord() {
         // Candidate order as `projectConflictRecords` emits it.
         let localLeftover = conflictRecord(
             name: "eBPF", projectID: "team:local", hostKey: "ssh:builder",
@@ -180,7 +182,7 @@ final class PeerPaneSessionTests: XCTestCase {
             location: .remote(hostKey: "ssh:builder", hostName: "builder")
         )
 
-        guard case .remoteNameCollision(let selected) =
+        guard case .exactDetached(let selected) =
             TeamOrchestrator.classifyProjectNameConflict(
                 requestedName: "eBPF",
                 requestedIdentity: newProjectIdentity(),
@@ -188,13 +190,13 @@ final class PeerPaneSessionTests: XCTestCase {
             )
         else {
             return XCTFail(
-                "a remote manifest owning the name was hidden behind a local record"
+                "an exact detached Project was hidden behind a remote record"
             )
         }
-        XCTAssertEqual(selected.identity.projectID, "team:remote")
+        XCTAssertEqual(selected.identity.projectID, "team:local")
     }
 
-    func testProjectNameConflictReportsTheRemoteOwnerRegardlessOfCandidateOrder() {
+    func testProjectNameConflictOpensExactDetachedProjectRegardlessOfCandidateOrder() {
         // `teams` is a dictionary, so local records arrive in an unspecified
         // order; the answer must not depend on it.
         let local = conflictRecord(
@@ -207,22 +209,21 @@ final class PeerPaneSessionTests: XCTestCase {
             location: .remote(hostKey: "ssh:builder", hostName: "builder")
         )
         for candidates in [[local, remote], [remote, local]] {
-            guard case .remoteNameCollision(let selected) =
+            guard case .exactDetached(let selected) =
                 TeamOrchestrator.classifyProjectNameConflict(
                     requestedName: "eBPF",
                     requestedIdentity: newProjectIdentity(),
                     candidates: candidates
                 )
             else { return XCTFail("order changed the answer: \(candidates)") }
-            XCTAssertEqual(selected.identity.projectID, "team:remote")
+            XCTAssertEqual(selected.identity.projectID, "team:local")
         }
     }
 
-    func testProjectNameConflictReportsTheRemoteOwnerBehindAnExactMatch() {
-        // The Existing-folder shape: the requested host+path matches a record
-        // exactly, so Open Existing would normally be offered, but a second
-        // owner of the name takes precedence. That precedence is deliberate —
-        // this pins WHICH of several owners is named.
+    func testProjectNameConflictOpensExactProjectAheadOfRemoteLeftover() {
+        // The Existing-folder shape: the requested host+path matches a real
+        // Project exactly. A stale same-name record must not replace the only
+        // action that continues that Project with a rename suggestion.
         let exact = conflictRecord(
             name: "eBPF", projectID: "team:exact", hostKey: "ssh:builder",
             path: "/app/term-mesh/eBPF",
@@ -239,16 +240,16 @@ final class PeerPaneSessionTests: XCTestCase {
             location: .remote(hostKey: "ssh:builder", hostName: "builder")
         )
 
-        guard case .remoteNameCollision(let selected) =
+        guard case .exactLive(let selected) =
             TeamOrchestrator.classifyProjectNameConflict(
                 requestedName: "eBPF",
                 requestedIdentity: newProjectIdentity(),
                 candidates: [exact, localLeftover, remoteLeftover]
             )
         else {
-            return XCTFail("the remote owner was hidden behind a local leftover")
+            return XCTFail("the exact Project was hidden behind a remote leftover")
         }
-        XCTAssertEqual(selected.identity.projectID, "team:remote")
+        XCTAssertEqual(selected.identity.projectID, "team:exact")
     }
 
     func testProjectNameConflictTreatsOneProjectsTwoPresentationsAsOneOwner() {
@@ -481,7 +482,7 @@ final class PeerPaneSessionTests: XCTestCase {
         ).contains("mac-sub"))
         XCTAssertTrue(ProjectCreationFlow.conflictDescription(
             .remoteNameCollision(remote)
-        ).contains("Rename"))
+        ).contains("Open Existing"))
     }
 
     func testProjectConflictDebugLocationUsesProductionRecord() {
