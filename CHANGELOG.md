@@ -4,6 +4,23 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.219.0] - 2026-08-31
+
+피어 연결이 잠시 끊겨도 살아 있는 pane을 유지하고, 사라진 pane과 터널 실패 원인을 진단할 수 있습니다.
+
+### Added
+
+- 피어 레이아웃이 pane을 제거하면 호스트와 뷰어 양쪽에서 해당 pane 이름을 기록합니다. (Sources/PeerServerHost.swift, Sources/PeerWorkspaceMirror+Reconcile.swift)
+- 로컬 surface로 들어온 비정상 입력의 출처를 opt-in 진단 로그로 남깁니다. 일반 텍스트는 기록하지 않고 사용자 전용 cache 경로를 사용합니다. (Sources/InputInjectionLog.swift, Sources/GhosttyTerminalView.swift, Sources/GhosttyPaneSurfaceProvider.swift)
+
+### Fixed
+
+- workspace subscription이 재연결될 때 이미 복구된 pane은 유지하고, 계속 복구되지 않는 pane만 제한 시간 뒤 다시 만듭니다. (Sources/PeerWorkspaceMirror.swift, Sources/PeerRelaySession.swift)
+- SSH 연결 실패가 앱의 socket deadline에 먼저 잘리지 않고 OpenSSH의 원인을 남기도록 timeout 순서를 고쳤습니다. (Sources/PeerSSHTunnel.swift)
+- relay가 terminal window/title 응답을 host 입력으로 되돌려 보내던 경로를 차단했습니다. (daemon/term-mesh-peer-relay/src/main.rs)
+- 같은 이름의 Project가 여러 위치에 있을 때 실제 충돌 소유자와 정리 가능한 remote manifest를 우선 표시합니다. (Sources/TeamOrchestrator.swift)
+- 반복되는 remote 작업 로그가 파일을 무한히 키우지 않도록 보존과 중복 억제를 적용했습니다. (Sources/RemoteWorkLog.swift)
+
 ## [0.218.0] - 2026-08-30
 
 **자동화가 명령을 처리하는 동안 사용자가 연 창이 활성화되지 않던 문제를 고쳤습니다.**
