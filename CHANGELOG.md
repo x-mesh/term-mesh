@@ -4,6 +4,21 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.221.0] - 2026-08-31
+
+### Added
+
+- Detect stopped macOS term-mesh apps and explain when Homebrew-installed agent tools are hidden from terminal panes.
+- Evaluate remote leader participation health on the execution host and reject duplicate turn starts before promotion.
+
+### Changed
+
+- Clarify that existing-folder Project names are independent from their selected folders, and let users choose a different name when a collision occurs.
+
+### Fixed
+
+- Avoid reporting an uninstalled macOS app as merely stopped, distinguish PATH visibility from version shadowing, and reveal the clone Project name field when resolving a collision.
+
 ## [0.220.0] - 2026-08-31
 
 기존 remote Project와 이름이 겹칠 때 새 Project 이름을 만들도록 유도하지 않고, 현재 Project를 계속 열 수 있습니다.
