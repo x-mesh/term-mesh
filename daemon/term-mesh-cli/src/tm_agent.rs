@@ -16250,6 +16250,214 @@ struct LeaderParticipationCanaryConfig {
     session_id: String,
 }
 
+#[derive(Debug, Default, PartialEq)]
+struct LeaderParticipationHealth {
+    supported_turns: usize,
+    linked_turns: usize,
+    stated_turns: usize,
+    unstated_turns: usize,
+    observed_days: u64,
+    malformed_lines: usize,
+}
+
+impl LeaderParticipationHealth {
+    fn passes_promotion_gate(&self) -> bool {
+        if self.supported_turns == 0 || self.malformed_lines > 0 {
+            return false;
+        }
+        let supported = self.supported_turns as f64;
+        let coverage = (self.stated_turns + self.unstated_turns) as f64 / supported;
+        let linkage = self.linked_turns as f64 / supported;
+        let unknown_rate = (self.supported_turns - self.stated_turns) as f64 / supported;
+        (self.supported_turns >= 500 || self.observed_days >= 7)
+            && coverage >= 0.95
+            && linkage >= 0.95
+            && unknown_rate <= 0.02
+    }
+}
+
+fn leader_participation_health(
+    log_path: &Path,
+    project_id: &str,
+    pending_turn_id: Option<&str>,
+) -> LeaderParticipationHealth {
+    let rotated = log_path.with_extension("log.1");
+    let mut records = Vec::new();
+    let mut malformed_lines = 0;
+    for path in [&rotated, log_path] {
+        let Ok(data) = fs::read(path) else { continue };
+        let complete_len = data
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        if complete_len < data.len() {
+            malformed_lines += 1;
+        }
+        for line in data[..complete_len].split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_slice::<Value>(line) else {
+                malformed_lines += 1;
+                continue;
+            };
+            let valid = matches!(
+                record["event"].as_str(),
+                Some("turn_start" | "turn_route" | "turn_end")
+            ) && record["turn_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+                && record["ts"].as_str().and_then(iso8601_day_number).is_some()
+                && record["team"].as_str().is_some();
+            if !valid {
+                malformed_lines += 1;
+                continue;
+            }
+            if record["team"].as_str() == Some(project_id) {
+                records.push(record);
+            }
+        }
+    }
+
+    let absorbed: std::collections::HashSet<&str> = records
+        .iter()
+        .filter(|record| {
+            record["event"].as_str() == Some("turn_end")
+                && record["route_status"].as_str() == Some("absorbed")
+        })
+        .filter_map(|record| record["turn_id"].as_str())
+        .collect();
+    let routed: std::collections::HashSet<&str> = records
+        .iter()
+        .filter(|record| record["event"].as_str() == Some("turn_route"))
+        .filter_map(|record| record["turn_id"].as_str())
+        .collect();
+    let ended: std::collections::HashSet<&str> = records
+        .iter()
+        .filter(|record| record["event"].as_str() == Some("turn_end"))
+        .filter_map(|record| record["turn_id"].as_str())
+        .collect();
+    let mut start_ids = std::collections::HashSet::new();
+    let mut unique_starts = Vec::new();
+    for (record, turn_id) in records
+        .iter()
+        .filter(|record| record["event"].as_str() == Some("turn_start"))
+        .filter_map(|record| {
+            record["turn_id"].as_str().map(|turn_id| (record, turn_id))
+        })
+    {
+        if !start_ids.insert(turn_id) {
+            malformed_lines += 1;
+            continue;
+        }
+        unique_starts.push(record);
+    }
+    let starts: Vec<&Value> = unique_starts
+        .into_iter()
+        .filter(|record| {
+            record["turn_id"].as_str().is_some_and(|turn_id| {
+                !absorbed.contains(turn_id) && Some(turn_id) != pending_turn_id
+            })
+        })
+        .collect();
+    let mut stated_turns = 0;
+    let mut unstated_turns = 0;
+    let mut linked_turns = 0;
+    for start in &starts {
+        let Some(turn_id) = start["turn_id"].as_str() else {
+            continue;
+        };
+        let has_route = routed.contains(turn_id);
+        let has_end = ended.contains(turn_id);
+        if has_route {
+            stated_turns += 1;
+        } else if has_end {
+            unstated_turns += 1;
+        }
+        if turn_id != "unknown" && turn_id != "unstated" && has_route && has_end {
+            linked_turns += 1;
+        }
+    }
+    let mut days = starts
+        .iter()
+        .filter_map(|record| record["ts"].as_str())
+        .filter_map(iso8601_day_number)
+        .collect::<Vec<_>>();
+    days.sort_unstable();
+    let observed_days = days
+        .first()
+        .zip(days.last())
+        .map(|(first, last)| (last - first + 1) as u64)
+        .unwrap_or(0);
+    LeaderParticipationHealth {
+        supported_turns: starts.len(),
+        linked_turns,
+        stated_turns,
+        unstated_turns,
+        observed_days,
+        malformed_lines,
+    }
+}
+
+fn apply_participation_health_scope(
+    config: &mut LeaderParticipationCanaryConfig,
+    health_scope: Option<&str>,
+    log_path: Option<&Path>,
+    pending_turn_id: Option<&str>,
+) {
+    if health_scope == Some("execution_host") {
+        config.healthy = log_path
+            .map(|path| {
+                leader_participation_health(path, &config.project_id, pending_turn_id)
+            })
+            .is_some_and(|health| health.passes_promotion_gate());
+    }
+}
+
+fn iso8601_day_number(timestamp: &str) -> Option<i64> {
+    let bytes = timestamp.as_bytes();
+    if bytes.len() != 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || bytes.get(19) != Some(&b'Z')
+    {
+        return None;
+    }
+    let date = timestamp.get(..10)?;
+    let mut fields = date.split('-');
+    let year = fields.next()?.parse::<i64>().ok()?;
+    let month = fields.next()?.parse::<i64>().ok()?;
+    let day = fields.next()?.parse::<i64>().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if fields.next().is_some() || !(1..=days_in_month).contains(&day) {
+        return None;
+    }
+    let hour = timestamp.get(11..13)?.parse::<u8>().ok()?;
+    let minute = timestamp.get(14..16)?.parse::<u8>().ok()?;
+    let second = timestamp.get(17..19)?.parse::<u8>().ok()?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era)
+}
+
 fn parse_bool_env(name: &str) -> bool {
     matches!(
         env::var(name).ok().as_deref().map(str::trim),
@@ -16320,7 +16528,10 @@ fn resolve_participation(
     }
 }
 
-fn resolve_participation_from_env(known_input: bool) -> LeaderParticipationResolution {
+fn resolve_participation_from_env(
+    known_input: bool,
+    pending_turn_id: Option<&str>,
+) -> LeaderParticipationResolution {
     let mut config = LeaderParticipationCanaryConfig {
         mode: env::var("TERMMESH_LEADER_PARTICIPATION_MODE")
             .unwrap_or_else(|_| "shadow".to_string())
@@ -16338,6 +16549,7 @@ fn resolve_participation_from_env(known_input: bool) -> LeaderParticipationResol
         project_id: env::var("TERMMESH_LEADER_PARTICIPATION_PROJECT_ID").unwrap_or_default(),
         session_id: env::var("TERMMESH_LEADER_PARTICIPATION_SESSION_ID").unwrap_or_default(),
     };
+    let mut health_scope = None;
     // The app rewrites this owner-only file whenever controls or health
     // change. Reading it per route call makes a global kill switch affect the
     // next evaluated turn without restarting the leader. Missing, malformed,
@@ -16360,6 +16572,10 @@ fn resolve_participation_from_env(known_input: bool) -> LeaderParticipationResol
                 if let Some(flag) = value["healthy"].as_bool() {
                     config.healthy = flag;
                 }
+                health_scope = value["health_scope"].as_str().map(str::to_string);
+                if health_scope.as_deref() == Some("execution_host") {
+                    config.healthy = false;
+                }
                 if let Some(flag) = value["opt_in"].as_bool() {
                     config.opt_in = flag;
                 }
@@ -16372,6 +16588,13 @@ fn resolve_participation_from_env(known_input: bool) -> LeaderParticipationResol
             }
         }
     }
+    let log_path = turn_log_path().ok();
+    apply_participation_health_scope(
+        &mut config,
+        health_scope.as_deref(),
+        log_path.as_deref(),
+        pending_turn_id,
+    );
     resolve_participation(&config, known_input)
 }
 
@@ -16418,7 +16641,7 @@ fn turn_route_record_with_policy_input(
     }
     let suggestion =
         LeaderParticipationDirective::from_input(task_shape, risk_reasons, available_workers);
-    let resolution = resolve_participation_from_env(available_workers.is_some());
+    let resolution = resolve_participation_from_env(available_workers.is_some(), Some(turn_id));
     record["suggested_participation"] = json!(suggestion.participation);
     record["suggested_route"] = json!(suggestion.route);
     record["policy_reasons"] = json!(suggestion.reasons);
@@ -16713,6 +16936,188 @@ mod leader_turn_record_tests {
             );
         }
         assert!(!resolve_participation(&eligible, false).applied);
+    }
+
+    fn linked_turn(turn_id: &str, timestamp: &str) -> String {
+        [
+            json!({"event": "turn_start", "turn_id": turn_id, "ts": timestamp, "team": "p"}),
+            json!({"event": "turn_route", "turn_id": turn_id, "ts": timestamp, "team": "p"}),
+            json!({"event": "turn_end", "turn_id": turn_id, "ts": timestamp, "team": "p"}),
+        ]
+        .into_iter()
+        .map(|record| serde_json::to_string(&record).expect("serialize record"))
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n"
+    }
+
+    #[test]
+    fn execution_host_health_passes_with_seven_days_of_linked_turns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.supported_turns, 2);
+        assert_eq!(health.observed_days, 7);
+        assert!(health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
+    fn execution_host_health_includes_rotated_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        fs::write(
+            path.with_extension("log.1"),
+            linked_turn("first", "2026-08-18T23:59:00Z"),
+        )
+        .expect("write rotated turns");
+        fs::write(&path, linked_turn("last", "2026-08-24T00:01:00Z")).expect("write live turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.supported_turns, 2);
+        assert!(health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
+    fn execution_host_health_fails_closed_for_malformed_or_torn_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &linked_turn("last", "2026-08-24T00:01:00Z")
+            + "{not-json}\n"
+            + "{\"event\":\"turn_start\"";
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.malformed_lines, 2);
+        assert!(!health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
+    fn execution_host_health_is_scoped_to_the_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let other_team = linked_turn("first", "2026-08-18T23:59:00Z")
+            .replace("\"team\":\"p\"", "\"team\":\"other\"")
+            + &linked_turn("last", "2026-08-24T00:01:00Z")
+                .replace("\"team\":\"p\"", "\"team\":\"other\"");
+        fs::write(&path, other_team).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.supported_turns, 0);
+        assert!(!health.passes_promotion_gate());
+    }
+
+    #[test]
+    fn execution_host_health_excludes_the_pending_route_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &linked_turn("last", "2026-08-24T00:01:00Z")
+            + &serde_json::to_string(&json!({
+                "event": "turn_start",
+                "turn_id": "pending",
+                "ts": "2026-08-31T00:00:00Z",
+                "team": "p"
+            }))
+            .expect("serialize pending")
+            + "\n";
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", Some("pending"));
+        assert_eq!(health.supported_turns, 2);
+        assert!(health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
+    fn execution_host_health_fails_closed_for_duplicate_turn_starts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let duplicate_start = serde_json::to_string(&json!({
+            "event": "turn_start",
+            "turn_id": "first",
+            "ts": "2026-08-18T23:59:00Z",
+            "team": "p"
+        }))
+        .expect("serialize duplicate start");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &duplicate_start
+            + "\n"
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+
+        assert_eq!(health.supported_turns, 2);
+        assert_eq!(health.malformed_lines, 1);
+        assert!(!health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
+    fn execution_host_health_checks_duplicates_before_pending_exclusion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let duplicate_start = serde_json::to_string(&json!({
+            "event": "turn_start",
+            "turn_id": "pending",
+            "ts": "2026-08-24T00:00:00Z",
+            "team": "p"
+        }))
+        .expect("serialize duplicate start");
+        fs::write(&path, duplicate_start.clone() + "\n" + &duplicate_start + "\n")
+            .expect("write turns");
+
+        let health = leader_participation_health(&path, "p", Some("pending"));
+
+        assert_eq!(health.supported_turns, 0);
+        assert_eq!(health.malformed_lines, 1);
+        assert!(!health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
+    fn execution_host_scope_overrides_staged_owner_health() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        fs::write(
+            &path,
+            linked_turn("first", "2026-08-18T23:59:00Z")
+                + &linked_turn("last", "2026-08-24T00:01:00Z"),
+        )
+        .expect("write turns");
+        let mut config = canary_config(100);
+        config.project_id = "p".to_string();
+        config.healthy = false;
+
+        apply_participation_health_scope(
+            &mut config, Some("execution_host"), Some(&path), None,
+        );
+
+        assert!(config.healthy);
+        assert!(resolve_participation(&config, true).applied);
+    }
+
+    #[test]
+    fn execution_host_scope_fails_closed_when_local_log_is_missing() {
+        let mut config = canary_config(100);
+        config.healthy = true;
+
+        apply_participation_health_scope(&mut config, Some("execution_host"), None, None);
+
+        assert!(!config.healthy);
+        assert!(!resolve_participation(&config, true).applied);
+    }
+
+    #[test]
+    fn control_host_scope_preserves_staged_health() {
+        let mut config = canary_config(100);
+        config.healthy = true;
+
+        apply_participation_health_scope(&mut config, Some("control_host"), None, None);
+
+        assert!(config.healthy);
     }
 
     #[test]
