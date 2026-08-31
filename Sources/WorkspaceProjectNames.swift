@@ -86,8 +86,8 @@ final class WorkspaceProjectNames {
     /// Called once with the workspaces a restore produced. A team workspace
     /// created later this run declares itself as it is built, so pruning to the
     /// restored set cannot strand one that is still coming.
-    func retain(ids: Set<UUID>) {
-        let live = Set(ids.map(\.uuidString))
+    func retain(ids: Set<UUID>, protecting protectedIDs: Set<UUID> = []) {
+        let live = Set(ids.union(protectedIDs).map(\.uuidString))
         let pruned = names.filter { live.contains($0.key) }
         if pruned.count != names.count {
             names = pruned

@@ -1411,6 +1411,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugCommandPaletteRenameInputSelectAll(params: params))
         case "debug.sidebar.visible":
             return v2Result(id: id, self.v2DebugSidebarVisible(params: params))
+        case "debug.sidebar.projects":
+            return v2Result(id: id, self.v2DebugSidebarProjects(params: params))
         case "debug.terminal.is_focused":
             return v2Result(id: id, self.v2DebugIsTerminalFocused(params: params))
         case "debug.terminal.read_text":
@@ -1738,6 +1740,7 @@ class TerminalController {
             "debug.command_palette.rename_input.selection",
             "debug.command_palette.rename_input.select_all",
             "debug.sidebar.visible",
+            "debug.sidebar.projects",
             "debug.terminal.is_focused",
             "debug.terminal.read_text",
             "debug.terminal.render_stats",

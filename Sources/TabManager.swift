@@ -731,7 +731,10 @@ class TabManager {
         // Launch is the one moment the live workspaces are exactly the restored
         // ones, so it is the only place a declaration for a workspace that no
         // longer exists can be told apart from one still in use.
-        WorkspaceProjectNames.shared.retain(ids: Set(tabs.map(\.id)))
+        WorkspaceProjectNames.shared.retain(
+            ids: Set(tabs.map(\.id)),
+            protecting: Set(TeamOrchestrator.shared.teams.values.map(\.workspaceId))
+        )
         let version = session.version
         Logger.app.info("session-restore: restored \(self.tabs.count, privacy: .public) workspace(s) (v\(version, privacy: .public))")
     }

@@ -3178,6 +3178,25 @@ final class ProjectRemoteSurfaceDeletionTests: XCTestCase {
             "with no known surfaces nothing can prove ownership"
         )
     }
+
+    func test_layoutless_existing_workspaceStillDeletesThroughLifecycle() {
+        let workspaceID = Data(repeating: 0x33, count: 16)
+        let workspace = rosterWorkspace(id: 0x33, title: "project:demo", surface: nil)
+
+        XCTAssertEqual(
+            TeamOrchestrator.remoteWorkspaceSurfaceIDs(
+                workspaces: [workspace], workspaceID: workspaceID
+            ),
+            [],
+            "an existing layout-less workspace continues to DeleteWorkspace"
+        )
+        XCTAssertNil(
+            TeamOrchestrator.remoteWorkspaceSurfaceIDs(
+                workspaces: [], workspaceID: workspaceID
+            ),
+            "a missing workspace is distinct from an empty one"
+        )
+    }
 }
 
 /// Invariant harness over the peer-agent cleanup submachine — the first

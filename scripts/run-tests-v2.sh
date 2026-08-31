@@ -299,6 +299,11 @@ cleanup() {
       && break
     sleep 0.1
   done
+  if { [ -n "$E2E_APP_PID" ] && kill -0 "$E2E_APP_PID" 2>/dev/null; } \
+      || { [ -n "$E2E_DAEMON_PID" ] && kill -0 "$E2E_DAEMON_PID" 2>/dev/null; }; then
+    echo "ERROR: E2E app or daemon survived cleanup: app=${E2E_APP_PID:-none} daemon=${E2E_DAEMON_PID:-none}" >&2
+    return 1
+  fi
   # SSH relay helpers may daemonize/reparent while the app is terminating.
   # Reap only exact descendants captured before SIGTERM; unrelated developer
   # tunnels are never selected by a broad process-name match.

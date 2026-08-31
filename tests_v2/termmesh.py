@@ -1611,6 +1611,10 @@ class termmesh:
         result = dict(self._call("debug.project.remote_presentations", {"host": host}) or {})
         return list(result.get("projects") or [])
 
+    def debug_sidebar_projects(self, window_id: str) -> List[Dict[str, Any]]:
+        result = dict(self._call("debug.sidebar.projects", {"window_id": window_id}) or {})
+        return list(result.get("projects") or [])
+
     def debug_project_adopt_remote(self, host: str, project_id: str) -> dict:
         return dict(self._call("debug.project.adopt_remote", {
             "host": host,

@@ -683,6 +683,28 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
     ))
     if pending_team is None or not pending_team.get("workspace_id"):
         raise termmeshError("remote Project model was not restored after app restart")
+    window_id = next(
+        (window.get("id") for window in c.list_windows()
+         if any(workspace_id == pending_team["workspace_id"]
+                for _, workspace_id, _, _ in c.list_workspaces(window.get("id")))),
+        None,
+    )
+    if not window_id:
+        raise termmeshError("restored Project workspace has no owning window")
+    visible = _wait(lambda: next(
+        (row for row in c.debug_sidebar_projects(str(window_id))
+         if row.get("project_id") == state["project_id"]),
+        None,
+    ))
+    if visible is None:
+        raise termmeshError(
+            "authoritative remote Project is absent from the local Project list"
+        )
+    visibility_screenshot = c.screenshot("remote-project-visible-after-restart")
+    if not visibility_screenshot.get("path"):
+        raise termmeshError(
+            f"Project visibility screenshot was not captured: {visibility_screenshot!r}"
+        )
     _assert_background_project_waits_for_mount(c, team_name)
     c.select_workspace(pending_team["workspace_id"])
     remote_members = {
@@ -911,6 +933,7 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
                 "bytes_received": int(reconnect_io.get("bytes_received") or 0),
                 "leader_process_active": True,
                 "leader_process_active_known": True,
+                "project_visibility_screenshot": visibility_screenshot["path"],
                 "create_relay_io": state.get("create_relay_io") or {},
                 "restart_relay_io": restart_relay.get("io") or {},
                 "reconnect_relay_io": reconnect_io,
@@ -925,6 +948,46 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
 
     _wait_for_project_deletion(c, deletion_operation_id)
     if _wait(fully_deleted):
+        recreation_directory = Path(f"/tmp/{team_name}-recreate")
+        recreation_directory.mkdir(parents=True, exist_ok=True)
+        if not (recreation_directory / ".git").exists():
+            import subprocess
+            subprocess.run(["git", "init", "-q", str(recreation_directory)], check=True)
+            (recreation_directory / "README.md").write_text("same-name recreation\n")
+            subprocess.run(
+                ["git", "-C", str(recreation_directory), "add", "README.md"], check=True
+            )
+            subprocess.run([
+                "git", "-C", str(recreation_directory),
+                "-c", "user.name=term-mesh-e2e",
+                "-c", "user.email=e2e@invalid",
+                "commit", "-qm", "fixture",
+            ], check=True)
+        recreated = c.debug_project_creation_attempt(
+            name=team_name, directory=str(recreation_directory)
+        )
+        recreation_operation_id = str(recreated.get("operation_id") or "")
+        if not recreation_operation_id:
+            raise termmeshError(
+                f"same-name recreation returned no operation id: {recreated!r}"
+            )
+        recreation = _wait(lambda: (
+            status if (status := c.debug_project_creation_status(
+                recreation_operation_id
+            )).get("state") != "running" else None
+        ))
+        if recreation is None or recreation.get("state") != "created":
+            raise termmeshError(
+                "deleted remote Project name was not reusable: "
+                f"{recreation!r}"
+            )
+        cleanup = c.debug_project_delete(team_name)
+        cleanup_id = str(cleanup.get("operation_id") or "")
+        if not cleanup_id:
+            raise termmeshError(f"same-name recreation cleanup did not start: {cleanup!r}")
+        _wait_for_project_deletion(c, cleanup_id)
+        import shutil
+        shutil.rmtree(recreation_directory, ignore_errors=True)
         if receipt_path:
             receipt["result"] = "pass"
             receipt["phases"]["cleanup"] = "pass"

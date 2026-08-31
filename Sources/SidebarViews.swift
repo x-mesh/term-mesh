@@ -1828,10 +1828,18 @@ private struct SidebarPeerProjectsView: View {
             // A project that named itself is not up for reinterpretation. Only
             // workspaces nobody declared fall through to the path rule.
             let declared = WorkspaceProjectNames.shared.identity(for: workspace.id)
+            let runtimeTeamName = orchestrator.teams.values.first {
+                $0.workspaceId == workspace.id
+            }?.id
             return (
                 workspace,
-                declared
-                    ?? projectIdentity(forWorkingDirectories: localWorkingDirectories(workspace))
+                TeamOrchestrator.sidebarProjectIdentity(
+                    declared: declared,
+                    runtimeTeamName: runtimeTeamName,
+                    inferred: projectIdentity(
+                        forWorkingDirectories: localWorkingDirectories(workspace)
+                    )
+                )
             )
         }
     }

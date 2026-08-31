@@ -3981,7 +3981,7 @@ enum ProjectCreationFlow {
         case .remoteNameCollision(let record):
             if case let .remote(_, hostName) = record.location {
                 record.canOpenRemoteProject
-                    ? "A Project with this name already exists on \(hostName). Open it, or choose another Project name; the selected folder stays unchanged."
+                    ? "A Project with this name already exists on \(hostName). Choose Open Existing, or choose another Project name; the selected folder stays unchanged."
                     : "A different Project on \(hostName) already uses this name. Choose another Project name; the selected folder will not be created or renamed."
             } else {
                 "A different Project on a connected machine already uses this name. Choose another Project name; the selected folder will not be created or renamed."
