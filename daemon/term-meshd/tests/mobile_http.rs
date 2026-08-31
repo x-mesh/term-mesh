@@ -10,7 +10,8 @@ mod http_mobile;
 mod remote;
 
 use http_mobile::{
-    gui_key, parse_logins, styled_from_grid, AuthMode, GuiKey, MobileConfig, SAFE_KEYS,
+    embedded_page_js, gui_key, parse_logins, styled_from_grid, AuthMode, GuiKey, MobileConfig,
+    SAFE_KEYS,
 };
 use remote::{EnableSpec, KeysPolicy, SharedRegistry, TargetKind};
 use serde_json::{json, Value};
@@ -1050,6 +1051,27 @@ async fn agent_targets_take_turns_and_show_the_transcript() {
     let none = get(&h, "/api/targets/pane-1/transcript").await;
     assert_eq!(none.status, 409);
     assert_eq!(none.error_code(), "not_an_agent");
+}
+
+#[test]
+fn mobile_page_keeps_chat_and_terminal_wired_for_chat_capable_targets() {
+    let js = embedded_page_js();
+    assert!(
+        js.contains("function isChat(t) { return !!t && t.chat_capable && state.mode === 'chat'; }"),
+        "native agents must not be permanently locked to Chat"
+    );
+    assert!(
+        js.contains("el.viewSwitch.hidden = !has || !t.chat_capable;"),
+        "every chat-capable target must expose Chat and Terminal"
+    );
+    assert!(
+        js.contains("Promise.all([refreshScreen(), refreshChat(), refreshRequests()])"),
+        "both data sources must stay warm so switching views cannot show an empty pane"
+    );
+    assert!(
+        !js.contains("el.viewSwitch.hidden = !has || isAgent(t) || !t.chat_capable;"),
+        "the old native-agent terminal suppression must not return"
+    );
 }
 
 #[tokio::test]

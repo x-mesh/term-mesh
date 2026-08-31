@@ -63,6 +63,14 @@ def http(method: str, path: str, body=None, expect=None):
     return status, parsed
 
 
+def http_text(path: str) -> str:
+    url = f"http://{MOBILE_ADDR}{path}"
+    with urllib.request.urlopen(url, timeout=15) as res:
+        if res.status != 200:
+            raise termmeshError(f"GET {path}: expected HTTP 200, got {res.status}")
+        return res.read().decode("utf-8", "replace")
+
+
 def error_code(payload) -> str:
     return str(((payload or {}).get("error") or {}).get("code") or "")
 
@@ -273,6 +281,15 @@ def main() -> int:
     status, _ = http("GET", "/api/agents/spawn")
     if status != 404:
         raise termmeshError(f"dashboard routes must not exist on the mobile listener: {status}")
+    page_js = http_text("/app.js")
+    required_wiring = [
+        "el.viewSwitch.hidden = !has || !t.chat_capable;",
+        "Promise.all([refreshScreen(), refreshChat(), refreshRequests()])",
+    ]
+    if any(fragment not in page_js for fragment in required_wiring):
+        raise termmeshError(
+            "mobile page does not keep Chat and Terminal connected to both data sources"
+        )
 
     with termmesh() as c:
         check_pane_flow(c, cli)
