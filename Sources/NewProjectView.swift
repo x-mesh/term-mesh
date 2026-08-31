@@ -1035,15 +1035,24 @@ struct NewProjectView: View {
                     }
                 }
 
-                if sourceKind == .empty {
-                    GridRow {
+                if sourceKind == .empty || sourceKind == .existingFolder {
+                    GridRow(alignment: .top) {
                         Text("Project name")
-                        TextField("project-name", text: Binding(
-                            get: { name },
-                            set: { name = $0; nameEdited = true }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                        .focused($focusedField, equals: .name)
+                            .padding(.top, 5)
+                        VStack(alignment: .leading, spacing: 4) {
+                            TextField("project-name", text: Binding(
+                                get: { name },
+                                set: { name = $0; nameEdited = true }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .focused($focusedField, equals: .name)
+                            if sourceKind == .existingFolder {
+                                Text(Self.existingFolderNameHelp())
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
                     }
                 }
 
@@ -1826,6 +1835,14 @@ struct NewProjectView: View {
             || currentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    static func conflictRenameButtonTitle(suggestedName: String) -> String {
+        "Use Project name “\(suggestedName)”"
+    }
+
+    static func existingFolderNameHelp() -> String {
+        "This is the name shown in term-mesh. The selected folder is used as-is and is not created or renamed."
+    }
+
     private func applyDerivedDestination() {
         guard sourceKind != .existingFolder else { return }
         let projectName = effectiveName.isEmpty ? Self.placeholderProjectName : effectiveName
@@ -2230,12 +2247,16 @@ struct NewProjectView: View {
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.deleteOwnedRecord")
             }
-            Button("Use “\(suggestedProjectName)”") { useSuggestedProjectName() }
+            Button(Self.conflictRenameButtonTitle(suggestedName: suggestedProjectName)) {
+                useSuggestedProjectName()
+            }
                 .keyboardShortcut(record.canOpenRemoteProject ? nil : .defaultAction)
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.rename")
         case .localNameCollision, .reservedByAnotherRequest:
-            Button("Use “\(suggestedProjectName)”") { useSuggestedProjectName() }
+            Button(Self.conflictRenameButtonTitle(suggestedName: suggestedProjectName)) {
+                useSuggestedProjectName()
+            }
                 .keyboardShortcut(.defaultAction)
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.rename")
@@ -3965,14 +3986,14 @@ enum ProjectCreationFlow {
         case .incomplete(let record):
             record.failureDescription ?? "This Project setup is incomplete. Resume or discard it explicitly."
         case .localNameCollision:
-            "A different local Project already uses this name. Rename this Project before creating it."
+            "A different local Project already uses this name. Choose another Project name; the selected folder will not be created or renamed."
         case .remoteNameCollision(let record):
             if case let .remote(_, hostName) = record.location {
                 record.canOpenRemoteProject
-                    ? "A Project with this name already exists on \(hostName). Choose Open Existing to reuse it, or use another name for a separate Project."
-                    : "A different Project on \(hostName) already uses this name. Rename this Project before creating it."
+                    ? "A Project with this name already exists on \(hostName). Open it, or choose another Project name; the selected folder stays unchanged."
+                    : "A different Project on \(hostName) already uses this name. Choose another Project name; the selected folder will not be created or renamed."
             } else {
-                "A different Project on a connected machine already uses this name. Rename this Project before creating it."
+                "A different Project on a connected machine already uses this name. Choose another Project name; the selected folder will not be created or renamed."
             }
         case .reservedByAnotherRequest:
             "Another window is creating this Project name. Wait for it to finish, then refresh."

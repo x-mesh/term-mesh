@@ -422,6 +422,27 @@ final class PredictedProjectPathTests: XCTestCase {
         )
     }
 
+    func testExistingFolderConflictCopySeparatesProjectNameFromDirectory() {
+        XCTAssertEqual(
+            NewProjectView.conflictRenameButtonTitle(suggestedName: "term-mesh 3"),
+            "Use Project name “term-mesh 3”"
+        )
+        let help = NewProjectView.existingFolderNameHelp()
+        XCTAssertTrue(help.contains("name shown in term-mesh"))
+        XCTAssertTrue(help.contains("not created or renamed"))
+    }
+
+    func testExistingFolderSelectionNeverAppendsTheProjectName() {
+        XCTAssertEqual(
+            RemoteDirectoryLookup.selectedPath(
+                sourceKind: .existingFolder,
+                folder: "/Users/jinwoo/work/project/term-mesh",
+                projectName: "term-mesh 3"
+            ),
+            "/Users/jinwoo/work/project/term-mesh"
+        )
+    }
+
     func testAgentPlacementCanFollowTheLeader() {
         XCTAssertEqual(
             NewProjectView.resolvedAgentHostKey(
