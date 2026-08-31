@@ -2326,6 +2326,13 @@ extension TerminalController {
             )
         case .daemonMissing:
             return ["state": "failed", "message": "daemon missing"]
+        case .appNotRunning(let details, let installedVersion):
+            return debugPeerRouteDetailsPayload(
+                details,
+                state: "app_not_running",
+                message: installedVersion.map { "term-mesh v\($0) is installed but not running" }
+                    ?? "term-mesh is installed but not running"
+            )
         case .sshFailed(let message):
             return ["state": "failed", "message": message]
         }

@@ -1035,15 +1035,24 @@ struct NewProjectView: View {
                     }
                 }
 
-                if sourceKind == .empty {
-                    GridRow {
+                if sourceKind == .empty || sourceKind == .existingFolder {
+                    GridRow(alignment: .top) {
                         Text("Project name")
-                        TextField("project-name", text: Binding(
-                            get: { name },
-                            set: { name = $0; nameEdited = true }
-                        ))
-                        .textFieldStyle(.roundedBorder)
-                        .focused($focusedField, equals: .name)
+                            .padding(.top, 5)
+                        VStack(alignment: .leading, spacing: 4) {
+                            TextField("project-name", text: Binding(
+                                get: { name },
+                                set: { name = $0; nameEdited = true }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .focused($focusedField, equals: .name)
+                            if sourceKind == .existingFolder {
+                                Text(Self.existingFolderNameHelp())
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
                     }
                 }
 
@@ -1826,6 +1835,14 @@ struct NewProjectView: View {
             || currentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    static func separateProjectButtonTitle() -> String {
+        "Choose Another Project Name…"
+    }
+
+    static func existingFolderNameHelp() -> String {
+        "This is the name shown in term-mesh. The selected folder is used as-is and is not created or renamed."
+    }
+
     private func applyDerivedDestination() {
         guard sourceKind != .existingFolder else { return }
         let projectName = effectiveName.isEmpty ? Self.placeholderProjectName : effectiveName
@@ -2230,12 +2247,16 @@ struct NewProjectView: View {
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.deleteOwnedRecord")
             }
-            Button("Use “\(suggestedProjectName)”") { useSuggestedProjectName() }
+            Button(Self.separateProjectButtonTitle()) {
+                chooseSeparateProjectName()
+            }
                 .keyboardShortcut(record.canOpenRemoteProject ? nil : .defaultAction)
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.rename")
         case .localNameCollision, .reservedByAnotherRequest:
-            Button("Use “\(suggestedProjectName)”") { useSuggestedProjectName() }
+            Button(Self.separateProjectButtonTitle()) {
+                chooseSeparateProjectName()
+            }
                 .keyboardShortcut(.defaultAction)
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.rename")
@@ -2377,27 +2398,17 @@ struct NewProjectView: View {
         return ProjectCreationFlow.conflictDescription(conflict)
     }
 
-    private var suggestedProjectName: String {
-        let base = effectiveName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !base.isEmpty else { return "Project 2" }
-        let records = TeamOrchestrator.shared.projectConflictRecords(
-            currentTabManager: tabManager
-        )
-        var suffix = 2
-        while records.contains(where: {
-            TeamOrchestrator.normalizedProjectName($0.name)
-                == TeamOrchestrator.normalizedProjectName("\(base) \(suffix)")
-        }) {
-            suffix += 1
+    private func chooseSeparateProjectName() {
+        if Self.shouldRevealAdvancedOptionsForName(sourceKind: sourceKind) {
+            showsAdvancedOptions = true
         }
-        return "\(base) \(suffix)"
+        creationError = nil
+        submissionConflict = nil
+        focusedField = .name
     }
 
-    private func useSuggestedProjectName() {
-        name = suggestedProjectName
-        nameEdited = true
-        creationError = nil
-        focusedField = .name
+    static func shouldRevealAdvancedOptionsForName(sourceKind: ProjectSourceKind) -> Bool {
+        sourceKind == .clone
     }
 
     private func openExistingProject(
@@ -2463,9 +2474,10 @@ struct NewProjectView: View {
     }
 
     private func startCreation() {
+        let creationName = effectiveName
         if let problem = PeerProjectBootstrap.repositoryURLProblem(gitURL) {
             creationError = problem
-            RemoteWorkLog.error("Could not create \(effectiveName): \(problem)")
+            RemoteWorkLog.error("Could not create \(creationName): \(problem)")
             return
         }
         let localDirectory = runsOnHostKey == nil
@@ -2498,7 +2510,7 @@ struct NewProjectView: View {
         Task { @MainActor in
             do {
                 let result = try await onCreate(
-                    effectiveName,
+                    creationName,
                     localDirectory,
                     agents,
                     source,
@@ -2519,19 +2531,19 @@ struct NewProjectView: View {
                     showsFailureDetail = false
                     bootSteps = []
                     RemoteWorkLog.error(
-                        "Could not create \(effectiveName): \(error.localizedDescription)"
+                        "Could not create \(creationName): \(error.localizedDescription)"
                     )
                     return
                 }
                 let message = error.localizedDescription
                 creationError = message
                 failRunningBootStep(message: message)
-                RemoteWorkLog.error("Could not create \(effectiveName): \(message)")
+                RemoteWorkLog.error("Could not create \(creationName): \(message)")
             } catch {
                 let message = error.localizedDescription
                 creationError = message
                 failRunningBootStep(message: message)
-                RemoteWorkLog.error("Could not create \(effectiveName): \(message)")
+                RemoteWorkLog.error("Could not create \(creationName): \(message)")
             }
         }
     }
@@ -3965,14 +3977,14 @@ enum ProjectCreationFlow {
         case .incomplete(let record):
             record.failureDescription ?? "This Project setup is incomplete. Resume or discard it explicitly."
         case .localNameCollision:
-            "A different local Project already uses this name. Rename this Project before creating it."
+            "A different local Project already uses this name. Choose another Project name; the selected folder will not be created or renamed."
         case .remoteNameCollision(let record):
             if case let .remote(_, hostName) = record.location {
                 record.canOpenRemoteProject
-                    ? "A Project with this name already exists on \(hostName). Choose Open Existing to reuse it, or use another name for a separate Project."
-                    : "A different Project on \(hostName) already uses this name. Rename this Project before creating it."
+                    ? "A Project with this name already exists on \(hostName). Open it, or choose another Project name; the selected folder stays unchanged."
+                    : "A different Project on \(hostName) already uses this name. Choose another Project name; the selected folder will not be created or renamed."
             } else {
-                "A different Project on a connected machine already uses this name. Rename this Project before creating it."
+                "A different Project on a connected machine already uses this name. Choose another Project name; the selected folder will not be created or renamed."
             }
         case .reservedByAnotherRequest:
             "Another window is creating this Project name. Wait for it to finish, then refresh."

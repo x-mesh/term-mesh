@@ -8,6 +8,91 @@ import XCTest
 #endif
 
 final class PeerDaemonVersionTests: XCTestCase {
+    private func failedRouteDetails() -> PeerRelayTestDetails {
+        PeerRelayTestDetails(
+            configuredSocket: nil,
+            discoveredSocket: "/tmp/term-mesh-peer-501/peer.sock",
+            discoveredVerified: false,
+            connectedSocket: "/tmp/term-mesh-peer-501/peer.sock",
+            connectedVerified: false,
+            sessionOwnerSocket: nil,
+            sessionOwnerVerified: false,
+            hostDisplayName: "Handshake failed",
+            hostAppVersion: "unknown"
+        )
+    }
+
+    func testMacAppRuntimeProbeIsFixedAndChecksBundleAndProcess() {
+        let command = PeerHostDoctor.macAppRuntimeProbeCommand
+        XCTAssertTrue(command.hasPrefix("sh -c '"))
+        XCTAssertTrue(command.hasSuffix("'"))
+        let body = String(command.dropFirst("sh -c '".count).dropLast())
+        XCTAssertFalse(body.contains("'"))
+        XCTAssertTrue(body.contains("/Applications/term-mesh.app/Contents/Info.plist"))
+        XCTAssertTrue(body.contains("app-installed=0"))
+        XCTAssertTrue(body.contains("app-running=0"))
+        XCTAssertTrue(body.contains("pgrep"))
+    }
+
+    func testMacAppRuntimeParserSeparatesInstalledFromRunning() {
+        XCTAssertEqual(
+            PeerHostDoctor.parseMacAppRuntimeStatus("""
+            app-installed=1
+            app-version=0.220.0
+            app-running=0
+            """),
+            .init(isInstalled: true, installedVersion: "0.220.0", isRunning: false)
+        )
+        XCTAssertEqual(
+            PeerHostDoctor.parseMacAppRuntimeStatus("app-installed=1\napp-running=1\n"),
+            .init(isInstalled: true, installedVersion: nil, isRunning: true)
+        )
+        XCTAssertNil(PeerHostDoctor.parseMacAppRuntimeStatus("app-version=0.220.0\n"))
+    }
+
+    func testFailedStaleMacSocketReportsAppNotRunning() {
+        let details = failedRouteDetails()
+        let result = PeerHostDoctor.classifyFailedRoute(
+            details: details,
+            message: "Socket is not connected",
+            macAppStatus: .init(
+                isInstalled: true, installedVersion: "0.220.0", isRunning: false
+            )
+        )
+        XCTAssertEqual(
+            result,
+            .appNotRunning(details: details, installedVersion: "0.220.0")
+        )
+    }
+
+    func testFailedRouteWithoutInstalledMacAppRemainsHandshakeFailure() {
+        let details = failedRouteDetails()
+        XCTAssertEqual(
+            PeerHostDoctor.classifyFailedRoute(
+                details: details,
+                message: "Socket is not connected",
+                macAppStatus: .init(
+                    isInstalled: false, installedVersion: nil, isRunning: false
+                )
+            ),
+            .relayFailed(details: details, message: "Socket is not connected")
+        )
+    }
+
+    func testFailedLiveMacSocketRemainsHandshakeFailure() {
+        let details = failedRouteDetails()
+        XCTAssertEqual(
+            PeerHostDoctor.classifyFailedRoute(
+                details: details,
+                message: "protocol mismatch",
+                macAppStatus: .init(
+                    isInstalled: true, installedVersion: "0.220.0", isRunning: true
+                )
+            ),
+            .relayFailed(details: details, message: "protocol mismatch")
+        )
+    }
+
     func testCleanupAndDoctorActionsShareOneBusyGate() {
         for (daemonCleanup, binaryCleanup) in [(true, false), (false, true), (true, true)] {
             XCTAssertTrue(PeerHostEditorView.doctorActionsBusy(

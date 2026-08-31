@@ -15,6 +15,11 @@ enum PeerHostTestResult: Equatable {
     /// SSH reached the host but no live peer socket was found —
     /// term-meshd is likely not installed/running. Install is offered.
     case daemonMissing
+    /// A Mac app bundle is installed, but no production app process owns the
+    /// peer listener. A stale socket pathname often remains after an external
+    /// Homebrew upgrade, so reporting only "handshake failed" sends the user
+    /// toward network and protocol fixes when the remedy is to launch the app.
+    case appNotRunning(details: PeerRelayTestDetails, installedVersion: String?)
     /// A socket file exists, but the SSH forward or peer protocol handshake
     /// could not reach a live compatible server. Kept separate from
     /// `sshFailed` so a stale socket never produces a false-green result.
@@ -171,6 +176,70 @@ enum PeerHostDoctor {
     /// built from user input.
     static let installCommand =
         "curl -fsSL https://raw.githubusercontent.com/x-mesh/term-mesh/main/scripts/install-linux.sh | bash"
+
+    struct MacAppRuntimeStatus: Equatable {
+        var isInstalled: Bool
+        var installedVersion: String?
+        var isRunning: Bool
+    }
+
+    /// Distinguishes a dead/stale macOS app socket from a live server that
+    /// rejected the protocol. Fixed shell text; no user input enters syntax.
+    static let macAppRuntimeProbeCommand =
+        #"sh -c 'if [ "$(uname -s)" != Darwin ]; then exit 44; fi; if [ -d /Applications/term-mesh.app ]; then echo app-installed=1; else echo app-installed=0; fi; v=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null); [ -n "$v" ] && echo "app-version=$v"; if /usr/bin/pgrep -f "^/Applications/term-mesh[.]app/Contents/MacOS/term-mesh$" >/dev/null 2>&1; then echo app-running=1; else echo app-running=0; fi; exit 0'"#
+
+    static func parseMacAppRuntimeStatus(_ output: String) -> MacAppRuntimeStatus? {
+        var installed: Bool?
+        var version: String?
+        var running: Bool?
+        for rawLine in output.split(whereSeparator: { $0.isNewline }) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line == "app-installed=1" {
+                installed = true
+            } else if line == "app-installed=0" {
+                installed = false
+            } else if line.hasPrefix("app-version=") {
+                version = String(line.dropFirst("app-version=".count)).nonEmpty
+            } else if line == "app-running=1" {
+                running = true
+            } else if line == "app-running=0" {
+                running = false
+            }
+        }
+        guard let installed, let running else { return nil }
+        return MacAppRuntimeStatus(
+            isInstalled: installed, installedVersion: version, isRunning: running
+        )
+    }
+
+    private static func macAppRuntimeStatus(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?
+    ) async -> MacAppRuntimeStatus? {
+        guard let output = try? await runRemote(
+            sshTarget: sshTarget,
+            port: port,
+            identityFile: identityFile,
+            command: macAppRuntimeProbeCommand,
+            timeoutSeconds: 15
+        ) else { return nil }
+        return parseMacAppRuntimeStatus(output)
+    }
+
+    static func classifyFailedRoute(
+        details: PeerRelayTestDetails,
+        message: String,
+        macAppStatus: MacAppRuntimeStatus?
+    ) -> PeerHostTestResult {
+        if let macAppStatus, macAppStatus.isInstalled, !macAppStatus.isRunning {
+            return .appNotRunning(
+                details: details,
+                installedVersion: macAppStatus.installedVersion
+            )
+        }
+        return .relayFailed(details: details, message: message)
+    }
 
     /// Fixed diagnosis command: service state + recent journal lines.
     /// No single quotes in the body (same constraint as the prober's
@@ -1024,22 +1093,32 @@ enum PeerHostDoctor {
             } else {
                 discoveredVerified = discoveredSocket == nil ? nil : false
             }
+            let failedDetails = PeerRelayTestDetails(
+                configuredSocket: configuredSocket,
+                discoveredSocket: discoveredSocket,
+                discoveredVerified: discoveredVerified,
+                connectedSocket: socketPath,
+                connectedVerified: false,
+                sessionOwnerSocket: nil,
+                sessionOwnerVerified: false,
+                hostDisplayName: "Handshake failed",
+                hostAppVersion: "unknown"
+            )
+            let app = await macAppRuntimeStatus(
+                sshTarget: sshTarget,
+                port: port,
+                identityFile: identityFile
+            )
+            if let app, !app.isRunning {
+                RemoteWorkLog.infoOffMain(
+                    "Relay health check found installed macOS app but no running app on \(sshTarget)"
+                )
+            }
             RemoteWorkLog.infoOffMain(
                 "Relay health check failed for \(sshTarget) via \(socketPath): \(message)"
             )
-            return .relayFailed(
-                details: PeerRelayTestDetails(
-                    configuredSocket: configuredSocket,
-                    discoveredSocket: discoveredSocket,
-                    discoveredVerified: discoveredVerified,
-                    connectedSocket: socketPath,
-                    connectedVerified: false,
-                    sessionOwnerSocket: nil,
-                    sessionOwnerVerified: false,
-                    hostDisplayName: "Handshake failed",
-                    hostAppVersion: "unknown"
-                ),
-                message: message
+            return classifyFailedRoute(
+                details: failedDetails, message: message, macAppStatus: app
             )
         }
     }
@@ -1157,18 +1236,27 @@ enum PeerHostDoctor {
         // `~/.local/bin` is excluded: the daemon prepends that one itself, so
         // naming it here would report a gap that is already closed.
         if let loginPath = inventory.loginPath,
-           let cliPath = inventory.cli?.path, cliPath.hasPrefix("/") {
-            let directory = (cliPath as NSString).deletingLastPathComponent
+           let cli = inventory.cli, cli.path.hasPrefix("/") {
+            let searched = Set(loginPath.split(separator: ":").map(String.init))
+            let candidates = [cli] + inventory.cliShadowed
             let daemonPrepends = inventory.homeDirectory.map {
                 ($0 as NSString).appendingPathComponent(".local/bin")
             }
-            let searched = Set(loginPath.split(separator: ":").map(String.init))
-            if !directory.isEmpty,
-               !searched.contains(directory),
-               directory != daemonPrepends {
+            let matchingVisible = candidates.contains { candidate in
+                let directory = (candidate.path as NSString).deletingLastPathComponent
+                return searched.contains(directory) || directory == daemonPrepends
+            }
+            let homebrew = candidates.first { candidate in
+                candidate.path == "/opt/homebrew/bin/tm-agent"
+                    || candidate.path == "/usr/local/bin/tm-agent"
+            }
+            let reported = homebrew ?? cli
+            let directory = (reported.path as NSString).deletingLastPathComponent
+            if !matchingVisible,
+               !directory.isEmpty {
                 let shell = inventory.loginShell ?? "the login shell"
                 warnings.append(
-                    "Terminal panes cannot find tm-agent: it lives in \(directory), and "
+                    "Terminal panes cannot find tm-agent: it is installed in \(directory), and "
                         + "\(shell) builds a PATH without it. Agents are unaffected — they run "
                         + "with a fixed PATH. Add \(directory) to the profile that shell reads "
                         + "at login, or set PATH for this host explicitly (a literal list; "
