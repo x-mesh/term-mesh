@@ -16338,17 +16338,21 @@ fn leader_participation_health(
         .filter(|record| record["event"].as_str() == Some("turn_end"))
         .filter_map(|record| record["turn_id"].as_str())
         .collect();
-    let starts: Vec<&Value> = records
-        .iter()
-        .filter(|record| {
-            record["event"].as_str() == Some("turn_start")
-                && record["turn_id"]
-                    .as_str()
-                    .is_some_and(|turn_id| {
-                        !absorbed.contains(turn_id) && Some(turn_id) != pending_turn_id
-                    })
-        })
-        .collect();
+    let mut start_ids = std::collections::HashSet::new();
+    let mut starts = Vec::new();
+    for record in records.iter().filter(|record| {
+        record["event"].as_str() == Some("turn_start")
+            && record["turn_id"].as_str().is_some_and(|turn_id| {
+                !absorbed.contains(turn_id) && Some(turn_id) != pending_turn_id
+            })
+    }) {
+        let turn_id = record["turn_id"].as_str().expect("validated turn id");
+        if !start_ids.insert(turn_id) {
+            malformed_lines += 1;
+            continue;
+        }
+        starts.push(record);
+    }
     let mut stated_turns = 0;
     let mut unstated_turns = 0;
     let mut linked_turns = 0;
@@ -17018,6 +17022,30 @@ mod leader_turn_record_tests {
         let health = leader_participation_health(&path, "p", Some("pending"));
         assert_eq!(health.supported_turns, 2);
         assert!(health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
+    fn execution_host_health_fails_closed_for_duplicate_turn_starts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let duplicate_start = serde_json::to_string(&json!({
+            "event": "turn_start",
+            "turn_id": "first",
+            "ts": "2026-08-18T23:59:00Z",
+            "team": "p"
+        }))
+        .expect("serialize duplicate start");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &duplicate_start
+            + "\n"
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+
+        assert_eq!(health.supported_turns, 2);
+        assert_eq!(health.malformed_lines, 1);
+        assert!(!health.passes_promotion_gate(), "health was {health:?}");
     }
 
     #[test]
