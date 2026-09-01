@@ -18,8 +18,28 @@ final class AgentStartupPromptTests: XCTestCase {
      Enter to confirm · Esc to cancel
     """
 
+    private let codexTrustPrompt = """
+    Do you trust the contents of this directory?
+    › 1. Yes, continue
+      2. No, quit
+    Press enter to continue
+    """
+
     func test_detects_the_folder_trust_prompt() {
         XCTAssertEqual(AgentStartupPrompt.detect(in: trustPrompt), .claudeFolderTrust)
+    }
+
+    func test_detects_the_codex_directory_trust_prompt() {
+        XCTAssertEqual(
+            AgentStartupPrompt.detect(in: codexTrustPrompt), .codexDirectoryTrust
+        )
+    }
+
+    func test_leaves_codex_trust_alone_when_no_is_selected() {
+        let moved = codexTrustPrompt
+            .replacingOccurrences(of: "› 1. Yes", with: "  1. Yes")
+            .replacingOccurrences(of: "  2. No, quit", with: "› 2. No, quit")
+        XCTAssertNil(AgentStartupPrompt.detect(in: moved))
     }
 
     func test_leaves_it_alone_when_the_caret_is_on_no() {

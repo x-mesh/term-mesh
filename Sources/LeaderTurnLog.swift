@@ -37,12 +37,24 @@ enum LeaderTurnLog {
         let shadowTurns: Int
         let canaryTurns: Int
         let holdoutTurns: Int
+        let delegatedWaves: Int
+        let delegatedTasks: Int
+        let completedDelegatedTasks: Int
+        let delegationRate: Double
+        let delegationCompletionRate: Double
+        let delegatedRoutes: Int
+        let unlinkedDelegatedTasks: Int
+        let delegationRateByCohort: [String: Double]
+        /// Prevent a missing task stream from being reported as a measured 0%.
+        let delegationMeasurementStatus: String
     }
 
     enum Event: String, Codable, CaseIterable {
         case turnStart = "turn_start"
         case turnRoute = "turn_route"
         case turnEnd = "turn_end"
+        case taskDispatch = "task_dispatch"
+        case taskLifecycle = "task_lifecycle"
     }
 
     struct Record: Codable, Equatable {
@@ -66,6 +78,16 @@ enum LeaderTurnLog {
         let cohort: String?
         let policyReasons: [String]?
         let dispatchBounds: String?
+        let requestID: String?
+        let taskID: String?
+        let worker: String?
+        let workerInstanceID: String?
+        let taskStatus: String?
+        let taskRoute: String?
+        let taskWaveID: String?
+        /// The route record uses wave_id while task records use task_wave_id.
+        let waveID: String?
+        let taskDelivery: String?
 
         private enum CodingKeys: String, CodingKey {
             case event
@@ -85,6 +107,15 @@ enum LeaderTurnLog {
             case cohort
             case policyReasons = "policy_reasons"
             case dispatchBounds = "dispatch_bounds"
+            case requestID = "request_id"
+            case taskID = "task_id"
+            case worker
+            case workerInstanceID = "worker_instance_id"
+            case taskStatus = "task_status"
+            case taskRoute = "task_route"
+            case taskWaveID = "task_wave_id"
+            case waveID = "wave_id"
+            case taskDelivery = "task_delivery"
         }
 
         private init(
@@ -104,7 +135,16 @@ enum LeaderTurnLog {
             policyApplied: Bool? = nil,
             cohort: String? = nil,
             policyReasons: [String]? = nil,
-            dispatchBounds: String? = nil
+            dispatchBounds: String? = nil,
+            requestID: String? = nil,
+            taskID: String? = nil,
+            worker: String? = nil,
+            workerInstanceID: String? = nil,
+            taskStatus: String? = nil,
+            taskRoute: String? = nil,
+            taskWaveID: String? = nil,
+            waveID: String? = nil,
+            taskDelivery: String? = nil
         ) {
             self.event = event
             self.turnID = turnID
@@ -123,6 +163,15 @@ enum LeaderTurnLog {
             self.cohort = cohort
             self.policyReasons = policyReasons
             self.dispatchBounds = dispatchBounds
+            self.requestID = requestID
+            self.taskID = taskID
+            self.worker = worker
+            self.workerInstanceID = workerInstanceID
+            self.taskStatus = taskStatus
+            self.taskRoute = taskRoute
+            self.taskWaveID = taskWaveID
+            self.waveID = waveID
+            self.taskDelivery = taskDelivery
         }
 
         static func turnStart(
@@ -171,6 +220,66 @@ enum LeaderTurnLog {
             )
         }
 
+        static func taskDispatch(
+            team: String,
+            requestID: String?,
+            taskID: String,
+            worker: String?,
+            workerInstanceID: String?,
+            route: String?,
+            waveID: String?,
+            delivery: String,
+            timestamp: Date = Date()
+        ) -> Record {
+            Record(
+                event: .taskDispatch,
+                turnID: requestID ?? waveID ?? taskID,
+                timestamp: LeaderTurnLog.timestamp(timestamp),
+                team: team,
+                surfaceID: "",
+                promptBytes: nil,
+                promptSHA256: nil,
+                requestID: requestID,
+                taskID: taskID,
+                worker: worker,
+                workerInstanceID: workerInstanceID,
+                taskRoute: route,
+                taskWaveID: waveID,
+                taskDelivery: delivery
+            )
+        }
+
+        static func taskLifecycle(
+            team: String,
+            requestID: String?,
+            taskID: String,
+            worker: String?,
+            workerInstanceID: String?,
+            route: String?,
+            waveID: String?,
+            status: String,
+            delivery: String? = nil,
+            timestamp: Date = Date()
+        ) -> Record {
+            Record(
+                event: .taskLifecycle,
+                turnID: requestID ?? waveID ?? taskID,
+                timestamp: LeaderTurnLog.timestamp(timestamp),
+                team: team,
+                surfaceID: "",
+                promptBytes: nil,
+                promptSHA256: nil,
+                requestID: requestID,
+                taskID: taskID,
+                worker: worker,
+                workerInstanceID: workerInstanceID,
+                taskStatus: status,
+                taskRoute: route,
+                taskWaveID: waveID,
+                taskDelivery: delivery
+            )
+        }
+
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             event = try container.decode(Event.self, forKey: .event)
@@ -188,7 +297,7 @@ enum LeaderTurnLog {
             case .turnStart:
                 promptBytes = try container.decodeIfPresent(Int.self, forKey: .promptBytes)
                 promptSHA256 = try container.decodeIfPresent(String.self, forKey: .promptSHA256)
-            case .turnRoute, .turnEnd:
+            case .turnRoute, .turnEnd, .taskDispatch, .taskLifecycle:
                 promptBytes = nil
                 promptSHA256 = nil
             }
@@ -202,6 +311,15 @@ enum LeaderTurnLog {
             cohort = try container.decodeIfPresent(String.self, forKey: .cohort)
             policyReasons = try container.decodeIfPresent([String].self, forKey: .policyReasons)
             dispatchBounds = try container.decodeIfPresent(String.self, forKey: .dispatchBounds)
+            requestID = try container.decodeIfPresent(String.self, forKey: .requestID)
+            taskID = try container.decodeIfPresent(String.self, forKey: .taskID)
+            worker = try container.decodeIfPresent(String.self, forKey: .worker)
+            workerInstanceID = try container.decodeIfPresent(String.self, forKey: .workerInstanceID)
+            taskStatus = try container.decodeIfPresent(String.self, forKey: .taskStatus)
+            taskRoute = try container.decodeIfPresent(String.self, forKey: .taskRoute)
+            taskWaveID = try container.decodeIfPresent(String.self, forKey: .taskWaveID)
+            waveID = try container.decodeIfPresent(String.self, forKey: .waveID)
+            taskDelivery = try container.decodeIfPresent(String.self, forKey: .taskDelivery)
         }
 
         func encode(to encoder: Encoder) throws {
@@ -227,6 +345,17 @@ enum LeaderTurnLog {
             try container.encodeIfPresent(cohort, forKey: .cohort)
             try container.encodeIfPresent(policyReasons, forKey: .policyReasons)
             try container.encodeIfPresent(dispatchBounds, forKey: .dispatchBounds)
+            try container.encodeIfPresent(requestID, forKey: .requestID)
+            try container.encodeIfPresent(taskID, forKey: .taskID)
+            try container.encodeIfPresent(worker, forKey: .worker)
+            try container.encodeIfPresent(workerInstanceID, forKey: .workerInstanceID)
+            try container.encodeIfPresent(taskStatus, forKey: .taskStatus)
+            try container.encodeIfPresent(taskRoute, forKey: .taskRoute)
+            try container.encodeIfPresent(taskWaveID, forKey: .taskWaveID)
+            if event == .turnRoute {
+                try container.encodeIfPresent(waveID, forKey: .waveID)
+            }
+            try container.encodeIfPresent(taskDelivery, forKey: .taskDelivery)
         }
     }
 
@@ -298,6 +427,64 @@ enum LeaderTurnLog {
         }
         guard written == line.count else {
             throw AppendError.writeFailed(expected: line.count, actual: written, errno: errno)
+        }
+    }
+
+    @discardableResult
+    static func appendTaskDispatch(
+        team: String,
+        requestID: String?,
+        taskID: String,
+        worker: String?,
+        workerInstanceID: String?,
+        route: String?,
+        waveID: String?,
+        delivery: String,
+        to logFile: URL = logFile
+    ) -> Bool {
+        do {
+            try append(
+                .taskDispatch(
+                    team: team, requestID: requestID, taskID: taskID,
+                    worker: worker, workerInstanceID: workerInstanceID,
+                    route: route, waveID: waveID, delivery: delivery
+                ),
+                to: logFile
+            )
+            return true
+        } catch {
+            fputs("term-mesh: leader task dispatch log append failed: \(error)\\n", stderr)
+            return false
+        }
+    }
+
+    @discardableResult
+    static func appendTaskLifecycle(
+        team: String,
+        requestID: String?,
+        taskID: String,
+        worker: String?,
+        workerInstanceID: String?,
+        route: String?,
+        waveID: String?,
+        status: String,
+        delivery: String? = nil,
+        to logFile: URL = logFile
+    ) -> Bool {
+        do {
+            try append(
+                .taskLifecycle(
+                    team: team, requestID: requestID, taskID: taskID,
+                    worker: worker, workerInstanceID: workerInstanceID,
+                    route: route, waveID: waveID, status: status,
+                    delivery: delivery
+                ),
+                to: logFile
+            )
+            return true
+        } catch {
+            fputs("term-mesh: leader task lifecycle log append failed: \(error)\\n", stderr)
+            return false
         }
     }
 
@@ -396,10 +583,53 @@ enum LeaderTurnLog {
         Dictionary(grouping: readAll(from: logFile), by: \.event).mapValues(\.count)
     }
 
-    static func policyReport(from logFile: URL = logFile) -> PolicyReport {
-        let routes = readAll(from: logFile).filter { $0.event == .turnRoute }
+    static func policyReport(from logFile: URL = logFile, team: String? = nil) -> PolicyReport {
+        let records = readAll(from: logFile).filter { record in
+            guard let team else { return true }
+            return record.team == team
+        }
+        let routes = records.filter { $0.event == .turnRoute }
+        let dispatches = records.filter { $0.event == .taskDispatch }
+        let lifecycles = records.filter { $0.event == .taskLifecycle }
         let cohorts = Dictionary(grouping: routes.compactMap(\.cohort), by: { $0 })
             .mapValues(\.count)
+        // Only an explicit wave is a dispatch join key. Falling back to task_id
+        // made every single task look like a delegated wave and inflated rates.
+        let waves = Set(dispatches.compactMap(\.taskWaveID))
+        let taskIDs = Set(dispatches.compactMap(\.taskID))
+        let completedTaskIDs = Set(lifecycles.compactMap { record -> String? in
+            guard record.taskStatus == "completed" else { return nil }
+            return record.taskID
+        })
+        let routeCount = routes.count
+        let delegatedRoutes = routes.filter { route in
+            guard let wave = route.waveID else { return false }
+            return waves.contains(wave)
+        }.count
+        let unlinkedDelegatedTasks = dispatches.filter { dispatch in
+            guard let wave = dispatch.taskWaveID else { return true }
+            return !routes.contains { $0.waveID == wave }
+        }.count
+        let delegationRateByCohort = Dictionary(grouping: routes, by: { $0.cohort ?? "unknown" })
+            .mapValues { cohortRoutes in
+                let delegated = cohortRoutes.filter { route in
+                    guard let wave = route.waveID else { return false }
+                    return waves.contains(wave)
+                }.count
+                return cohortRoutes.isEmpty ? 0 : Double(delegated) / Double(cohortRoutes.count)
+            }
+        let unlinkedDelegatedRoutes = routes.contains { route in
+            guard let wave = route.waveID else { return false }
+            return !waves.contains(wave)
+        }
+        let delegationMeasurementStatus: String
+        if routes.isEmpty {
+            delegationMeasurementStatus = dispatches.isEmpty ? "no_turn_routes" : "dispatches_without_turn_routes"
+        } else if unlinkedDelegatedTasks > 0 || unlinkedDelegatedRoutes {
+            delegationMeasurementStatus = "incomplete_unlinked_tasks"
+        } else {
+            delegationMeasurementStatus = "measured"
+        }
         return PolicyReport(
             cohortCounts: cohorts,
             appliedTurns: routes.filter { $0.policyApplied == true }.count,
@@ -410,7 +640,17 @@ enum LeaderTurnLog {
             }.count,
             shadowTurns: routes.filter { $0.policyMode == "shadow" }.count,
             canaryTurns: cohorts["canary", default: 0],
-            holdoutTurns: cohorts["holdout", default: 0]
+            holdoutTurns: cohorts["holdout", default: 0],
+            delegatedWaves: waves.count,
+            delegatedTasks: taskIDs.count,
+            completedDelegatedTasks: completedTaskIDs.intersection(taskIDs).count,
+            delegationRate: routeCount == 0 ? 0 : Double(delegatedRoutes) / Double(routeCount),
+            delegationCompletionRate: taskIDs.isEmpty
+                ? 0 : Double(completedTaskIDs.intersection(taskIDs).count) / Double(taskIDs.count),
+            delegatedRoutes: delegatedRoutes,
+            unlinkedDelegatedTasks: unlinkedDelegatedTasks,
+            delegationRateByCohort: delegationRateByCohort,
+            delegationMeasurementStatus: delegationMeasurementStatus
         )
     }
 

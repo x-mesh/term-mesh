@@ -1525,6 +1525,53 @@ final class PeerPaneSessionTests: XCTestCase {
         ))
     }
 
+    // MARK: - Remote leader foreground confirmation
+
+    /// Gate policy: `repl`/`adopted` never launch a CLI on the remote-leader
+    /// attach path, so there is nothing for a foreground-busy signal to
+    /// confirm — gating on it there would fail every attach in those modes.
+    func testRemoteLeaderForegroundConfirmationIsSkippedForReplAndAdopted() {
+        XCTAssertFalse(TeamOrchestrator.remoteLeaderNeedsForegroundConfirmation(leaderMode: "repl"))
+        XCTAssertFalse(TeamOrchestrator.remoteLeaderNeedsForegroundConfirmation(leaderMode: "adopted"))
+        XCTAssertTrue(TeamOrchestrator.remoteLeaderNeedsForegroundConfirmation(leaderMode: "claude"))
+        XCTAssertTrue(TeamOrchestrator.remoteLeaderNeedsForegroundConfirmation(leaderMode: "codex"))
+    }
+
+    /// Regression for the bug this gate exists to close: a plain shell that
+    /// never execs the requested CLI must not read as confirmed, even though
+    /// its surface exists and is otherwise ordinary.
+    func testRemoteLeaderSurfaceConfirmsForegroundOnlyWhenKnownAndBusy() {
+        let surfaceID = Data(repeating: 0x7, count: 16)
+        func surface(known: Bool, busy: Bool, id: Data = surfaceID) -> Termmesh_Peer_V1_SurfaceInfo {
+            var info = Termmesh_Peer_V1_SurfaceInfo()
+            info.surfaceID = id
+            info.foregroundBusyKnown = known
+            info.foregroundBusy = busy
+            return info
+        }
+        XCTAssertTrue(TeamOrchestrator.remoteLeaderSurfaceConfirmsForeground(
+            surfaces: [surface(known: true, busy: true)], surfaceID: surfaceID
+        ))
+        // A plain shell: the surface exists, but nothing claimed the
+        // foreground — exactly the observed "plain shell accepted as leader"
+        // symptom this gate closes.
+        XCTAssertFalse(TeamOrchestrator.remoteLeaderSurfaceConfirmsForeground(
+            surfaces: [surface(known: true, busy: false)], surfaceID: surfaceID
+        ))
+        // A host that cannot answer the question at all must read as "not
+        // yet", never as a false confirmation.
+        XCTAssertFalse(TeamOrchestrator.remoteLeaderSurfaceConfirmsForeground(
+            surfaces: [surface(known: false, busy: false)], surfaceID: surfaceID
+        ))
+        XCTAssertFalse(TeamOrchestrator.remoteLeaderSurfaceConfirmsForeground(
+            surfaces: [surface(known: true, busy: true, id: Data(repeating: 0x9, count: 16))],
+            surfaceID: surfaceID
+        ))
+        XCTAssertFalse(TeamOrchestrator.remoteLeaderSurfaceConfirmsForeground(
+            surfaces: [], surfaceID: surfaceID
+        ))
+    }
+
     @MainActor
     func testRemoteManifestSignatureIgnoresTelemetryButTracksTopology() {
         var team = TeamOrchestrator.Team(
