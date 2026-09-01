@@ -4,6 +4,27 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.223.0] - 2026-09-01
+
+### Added
+
+- Add leader participation controls for Shadow, Canary, and kill-switch operation.
+- Record privacy-safe leader turn routes, delegation waves, task completion, and cohort metrics.
+- Inject one shared leader execution policy into local and remote Codex and Claude leaders.
+- Add remote leader readiness checks and live participation control refresh.
+
+### Changed
+
+- Route non-trivial leader requests through explicit direct, probe, or parallel decisions.
+- Require execution-host health evidence before Canary participation applies.
+- Preserve remote Project state across create, restart, adopt, reconnect, and cleanup phases.
+
+### Fixed
+
+- Preserve E2E state across viewer adoption and owner cleanup while changing only ephemeral viewer identity.
+- Keep runner pass, skip, and failure outcomes distinct.
+- Verify real Codex leader delegation with durable worker task evidence in remote E2E.
+
 ## [0.222.0] - 2026-08-31
 
 ### Fixed
