@@ -25,9 +25,23 @@ def main() -> int:
     if not os.access(cli, os.X_OK):
         raise termmeshError(f"bundled tm-agent is not executable: {cli}")
     with tempfile.TemporaryDirectory(prefix="leader-canary-e2e-") as home:
+        log = Path(home) / ".term-mesh/logs/turns.log"
+        log.parent.mkdir(parents=True)
+        linked = []
+        for turn, timestamp in (
+            ("first", "2026-08-26T00:00:00Z"),
+            ("last", "2026-09-01T00:00:00Z"),
+        ):
+            linked.extend([
+                {"event": "turn_start", "turn_id": turn, "ts": timestamp, "team": "p"},
+                {"event": "turn_route", "turn_id": turn, "ts": timestamp, "team": "p"},
+                {"event": "turn_end", "turn_id": turn, "ts": timestamp, "team": "p"},
+            ])
+        log.write_text("".join(json.dumps(record) + "\n" for record in linked))
         control = Path(home) / "control.json"
         config = {"mode": "canary", "percent": 100, "kill_switch": False,
-                  "supported": True, "healthy": True, "opt_in": True,
+                  "supported": True, "healthy": False, "opt_in": True,
+                  "health_scope": "execution_host",
                   "project_id": "p", "session_id": "s"}
         control.write_text(json.dumps(config))
         control.chmod(0o600)
@@ -38,6 +52,24 @@ def main() -> int:
         applied = route(cli, env, "turn-canary")
         if not applied.get("directive") or not applied["record"].get("policy_applied"):
             raise termmeshError(f"eligible canary did not apply: {applied}")
+
+        config["mode"] = "shadow"
+        control.write_text(json.dumps(config))
+        shadow = route(cli, env, "turn-shadow")
+        if shadow.get("directive") is not None \
+           or shadow["record"].get("policy_mode") != "shadow":
+            raise termmeshError(f"Shadow mode changed the live route: {shadow}")
+
+        config["mode"] = "canary"
+        config["project_id"] = "missing-project"
+        control.write_text(json.dumps(config))
+        unhealthy = route(cli, env, "turn-unhealthy")
+        if unhealthy.get("directive") is not None \
+           or unhealthy["record"].get("policy_applied"):
+            raise termmeshError(
+                f"missing execution-host health did not fail closed: {unhealthy}"
+            )
+        config["project_id"] = "p"
 
         config["kill_switch"] = True
         control.write_text(json.dumps(config))

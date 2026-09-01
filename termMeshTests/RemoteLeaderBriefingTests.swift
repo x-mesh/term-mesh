@@ -36,10 +36,22 @@ final class RemoteLeaderBriefingTests: XCTestCase {
             "Claude Code v2\nInitializing MCP servers…"
         ))
         XCTAssertTrue(TeamOrchestrator.localLeaderPaneLooksReady(
-            "Claude Code v2\n────────\n❯ \n────────"
+            "Claude Code v2\n────────\n❯ \n────────", leaderMode: "claude"
         ))
         XCTAssertTrue(TeamOrchestrator.localLeaderPaneLooksReady(
-            "Codex CLI\n› Ask anything"
+            "Codex CLI\n› Ask anything", leaderMode: "codex"
+        ))
+        XCTAssertTrue(TeamOrchestrator.localLeaderPaneLooksReady(
+            "Codex CLI\n› Type @ to mention files", leaderMode: "codex"
+        ))
+        XCTAssertFalse(TeamOrchestrator.localLeaderPaneLooksReady(
+            "Do you trust the contents of this directory?\n"
+                + "› 1. Yes, continue\n  2. No, quit\nPress enter to continue",
+            leaderMode: "codex"
+        ))
+        XCTAssertFalse(TeamOrchestrator.localLeaderPaneLooksReady(
+            "OpenAI Codex\n› New durable request req-1\n❯ ent/any",
+            leaderMode: "codex"
         ))
         XCTAssertFalse(TeamOrchestrator.localLeaderPaneLooksReady(
             "Starting tools\n> initialization detail"
@@ -410,6 +422,16 @@ final class RemoteLeaderAutonomyFlagsTests: XCTestCase {
         XCTAssertTrue(stage.contains("mv -f"))
     }
 
+    func test_remoteLeaderArtifactCleanupUsesServiceAccountCache() {
+        let command = TeamOrchestrator.remoteLeaderArtifactCleanupCommand(
+            teamUUID: "project-a"
+        )
+        XCTAssertTrue(command.contains("leader-turn-project-a.sh"))
+        XCTAssertTrue(command.contains("leader-participation-project-a.json"))
+        XCTAssertTrue(command.contains("XDG_CACHE_HOME"))
+        XCTAssertTrue(command.contains("rm -f --"))
+    }
+
     /// Claude carries its own equivalent and must keep it.
     func test_aClaudeLeaderKeepsItsPermissionBypass() {
         XCTAssertTrue(command(cli: "claude").contains("--dangerously-skip-permissions"))
@@ -433,6 +455,7 @@ final class RemoteLeaderAutonomyFlagsTests: XCTestCase {
             "a flag after the prompt argument is prompt text, not a flag: \(cmd)"
         )
     }
+
 }
 
 extension RemoteLeaderAutonomyFlagsTests {

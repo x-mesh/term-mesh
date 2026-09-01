@@ -1777,6 +1777,13 @@ extension TeamOrchestrator {
     /// stall, not to race a slow but working host.
     static let leaderAttachTimeout: TimeInterval = 180
 
+    /// How often to re-check whether the leader's surface has a busy
+    /// foreground process, after the launch command's keystrokes were
+    /// delivered. Unbounded on its own — `attachRemoteLeader` runs inside
+    /// `withLeaderAttachDeadline`, so `leaderAttachTimeout` above is what
+    /// stops the poll, the same way it already stops every other step here.
+    static let remoteLeaderForegroundPollInterval: TimeInterval = 0.5
+
     /// Settles on whichever of two outcomes arrives first and ignores the
     /// other. Deliberately not a task group: a group waits for every child
     /// before its scope may exit, so a child that ignores cancellation holds
@@ -2615,6 +2622,134 @@ extension TeamOrchestrator {
             + " (pid \(pids)); Edit Peer Host → Clean Up Daemons stops them"
     }
 
+    /// Whether a remote leader launch needs foreground confirmation at all.
+    /// `repl`/`adopted` never launch a CLI on this path — there is nothing
+    /// running for the peer to report as busy, so gating on it would fail
+    /// every attach in those modes.
+    nonisolated static func remoteLeaderNeedsForegroundConfirmation(leaderMode: String) -> Bool {
+        leaderMode != "repl" && leaderMode != "adopted"
+    }
+
+    /// Whether one `listSurfaces` snapshot already confirms the leader's
+    /// surface has a live foreground process. `foregroundBusyKnown` is
+    /// required, not just `foregroundBusy`, so a host that cannot answer the
+    /// question at all (older peer, capability gap) reads as "not yet",
+    /// never as a false confirmation.
+    nonisolated static func remoteLeaderSurfaceConfirmsForeground(
+        surfaces: [Termmesh_Peer_V1_SurfaceInfo],
+        surfaceID: Data
+    ) -> Bool {
+        guard let surface = surfaces.first(where: { $0.surfaceID == surfaceID }) else {
+            return false
+        }
+        return surface.foregroundBusyKnown && surface.foregroundBusy
+    }
+
+    /// Confirm the just-launched remote leader actually took over its
+    /// shell's foreground, instead of accepting a silently-failed launch
+    /// (missing binary, PATH, a permission error) as success.
+    /// `sendRemoteLeaderStage` only confirms the launch command's keystrokes
+    /// were delivered and the relay transport is up — neither says anything
+    /// about what is now running in the shell. This reuses the same
+    /// `foreground_busy`/`foreground_busy_known` peer signal the leader
+    /// restore path already reads off `listSurfaces` (no new protocol).
+    ///
+    /// Polls until confirmed with no budget of its own: `attachRemoteLeader`
+    /// runs inside `withLeaderAttachDeadline`, whose `leaderAttachTimeout`
+    /// already bounds this call the same way it bounds every other step in
+    /// that function. On timeout the deadline cancels the enclosing `Task`,
+    /// `Task.sleep` below throws `CancellationError` instead of swallowing
+    /// it, and that propagates out to the caller's existing
+    /// compensate-and-rethrow handling — settling as the deadline's own
+    /// `leaderAttachTimedOut`, not a second bespoke error.
+    private func confirmRemoteLeaderForeground(
+        host: HostEntry,
+        surfaceID: Data,
+        leaderMode: String
+    ) async throws {
+        guard Self.remoteLeaderNeedsForegroundConfirmation(leaderMode: leaderMode) else { return }
+        while true {
+            let lease = try? await PeerPaneHostRegistry.shared.acquire(
+                Self.requireTeamHostSpec(host)
+            )
+            if let lease {
+                let surfaces = try? await PeerPaneSession.listSurfaces(on: lease)
+                PeerPaneHostRegistry.shared.release(lease)
+                let confirmed = surfaces.map {
+                    Self.remoteLeaderSurfaceConfirmsForeground(surfaces: $0, surfaceID: surfaceID)
+                } ?? false
+                if confirmed { return }
+            }
+            try await Task.sleep(
+                nanoseconds: UInt64(Self.remoteLeaderForegroundPollInterval * 1_000_000_000)
+            )
+        }
+    }
+
+    private func confirmRemoteLeaderPrompt(
+        panel: TerminalPanel,
+        host: HostEntry,
+        surfaceID: Data,
+        leaderMode: String
+    ) async throws {
+        guard Self.remoteLeaderNeedsForegroundConfirmation(leaderMode: leaderMode) else { return }
+        var stableObservations = 0
+        var answeredStartupPrompt = false
+        while true {
+            try Task.checkCancellation()
+            let hostLease = try? await PeerPaneHostRegistry.shared.acquire(
+                Self.requireTeamHostSpec(host)
+            )
+            let foregroundConfirmed: Bool
+            if let hostLease {
+                let surfaces = try? await PeerPaneSession.listSurfaces(on: hostLease)
+                PeerPaneHostRegistry.shared.release(hostLease)
+                foregroundConfirmed = surfaces.map {
+                    Self.remoteLeaderSurfaceConfirmsForeground(
+                        surfaces: $0, surfaceID: surfaceID
+                    )
+                } ?? false
+            } else {
+                foregroundConfirmed = false
+            }
+            if foregroundConfirmed, let lease = panel.surface.beginReadLease() {
+                let text: String? = await withCheckedContinuation {
+                    (continuation: CheckedContinuation<String?, Never>) in
+                    Self.localLeaderReadinessQueue.async {
+                        let value = Self.readLocalLeaderPane(lease.surface)
+                        lease.release()
+                        continuation.resume(returning: value)
+                    }
+                }
+                if !answeredStartupPrompt,
+                   text.flatMap(AgentStartupPrompt.detect(in:)) == .codexDirectoryTrust {
+                    answeredStartupPrompt = true
+                    guard let peerSession = panel.peerPaneSession,
+                          try await peerSession.relaySession.sendRemoteKeys(Data([0x0D])) else {
+                        throw RemoteAgentError.paneCreationFailed
+                    }
+                    stableObservations = 0
+                    try await Task.sleep(
+                        nanoseconds: UInt64(
+                            Self.remoteLeaderForegroundPollInterval * 1_000_000_000
+                        )
+                    )
+                    continue
+                }
+                stableObservations = text.map {
+                    Self.localLeaderPaneLooksReady($0, leaderMode: leaderMode)
+                } == true
+                    ? stableObservations + 1 : 0
+                if stableObservations >= Self.localLeaderStablePromptObservations { return }
+            } else {
+                stableObservations = 0
+            }
+            try await Task.sleep(
+                nanoseconds: UInt64(Self.remoteLeaderForegroundPollInterval * 1_000_000_000)
+            )
+        }
+    }
+
     func attachRemoteLeader(
         teamName: String,
         hostKey: String,
@@ -2887,6 +3022,26 @@ extension TeamOrchestrator {
 #if DEBUG
         dlog("leader.attach.stage launch.sent host=\(hostKey)")
 #endif
+        guard let leaderSurfaceID = resources.surfaceID else {
+            _ = await sendRemoteLeaderStage(session: session, text: "stty echo")
+            await attempt.compensate()
+            throw RemoteAgentError.paneCreationFailed
+        }
+        do {
+            try await confirmRemoteLeaderForeground(
+                host: host, surfaceID: leaderSurfaceID, leaderMode: cli
+            )
+        } catch {
+            // Best-effort recovery for the only stage that can leave a shell
+            // with echo disabled, same as the send failure above.
+            _ = await sendRemoteLeaderStage(session: session, text: "stty echo")
+            await attempt.compensate()
+            throw error
+        }
+        try await attempt.ensureCurrent()
+#if DEBUG
+        dlog("leader.attach.stage foreground.confirmed host=\(hostKey)")
+#endif
 
         // No await between this generation check and the synchronous UI/team
         // commit: both run on MainActor, so a timeout generation cannot slip
@@ -2918,12 +3073,21 @@ extension TeamOrchestrator {
             throw RemoteAgentError.paneCreationFailed
         }
         resources.panelID = panel.id
-        replaceLeaderAnchorPanel(teamName: teamName, panelID: panel.id)
         panel.surface.resetTerminal()
         workspace.setPanelCustomTitle(
             panelId: panel.id,
             title: "👑 Leader (\(cli.capitalized)) @\(host.displayName)"
         )
+        do {
+            try await confirmRemoteLeaderPrompt(
+                panel: panel, host: host, surfaceID: leaderSurfaceID, leaderMode: cli
+            )
+        } catch {
+            await attempt.compensate()
+            throw error
+        }
+        try await attempt.ensureCurrent()
+        replaceLeaderAnchorPanel(teamName: teamName, panelID: panel.id)
         markLeaderPolicyState(teamName: teamName, state: "injected")
         setLeaderMeasurementCapability(
             teamName: teamName,
@@ -4243,6 +4407,32 @@ extension TeamOrchestrator {
             $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "." || $0 == "_" || $0 == "-")
         }
         return "leader-participation-\(safeID.isEmpty ? "unknown" : safeID).json"
+    }
+
+    static func remoteLeaderArtifactCleanupCommand(teamUUID: String) -> String {
+        let names = [
+            remoteLeaderTurnHookFileName(teamUUID: teamUUID),
+            remoteLeaderParticipationControlFileName(teamUUID: teamUUID),
+        ]
+        let paths = names.map { "\"$d\"/\(shellQuoted($0))" }.joined(separator: " ")
+        return RemotePasteTransfer.serviceAccountCommand(
+            "d=\"${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/leader-hooks\"; "
+                + "rm -f -- \(paths)"
+        )
+    }
+
+    private static func removeRemoteLeaderArtifacts(
+        host: HostEntry,
+        teamUUID: String
+    ) async throws {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return }
+        try await PeerHostReadinessChecker.runScript(
+            sshTarget: sshTarget,
+            port: host.sshPort,
+            identityFile: host.identityFile,
+            script: remoteLeaderArtifactCleanupCommand(teamUUID: teamUUID),
+            timeoutSeconds: 20
+        )
     }
 
     static func remoteLeaderFileSSHStageCommand(fileName: String, mode: String) -> String {
@@ -8432,6 +8622,18 @@ extension TeamOrchestrator {
                 remaining.append(contentsOf: grouped[hostKey, default: []].map {
                     "path \(hostKey):\($0.path)"
                 })
+            }
+        }
+
+        if case let .peer(hostKey) = team.leaderEndpoint,
+           let teamUUID = team.teamUuid,
+           let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) {
+            do {
+                try await Self.removeRemoteLeaderArtifacts(host: host, teamUUID: teamUUID)
+                deleted.append("leader artifacts \(hostKey):\(teamUUID)")
+            } catch {
+                failures.append("leader artifacts \(hostKey): \(error)")
+                remaining.append("leader artifacts \(hostKey):\(teamUUID)")
             }
         }
 

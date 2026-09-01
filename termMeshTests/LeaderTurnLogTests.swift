@@ -219,6 +219,79 @@ final class LeaderTurnLogTests: XCTestCase {
         XCTAssertEqual(report.routeDeviations, 2)
     }
 
+    func testPolicyReportJoinsRouteWaveToActualDispatchAndLifecycle() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let lines = [
+            #"{"event":"turn_route","turn_id":"direct","ts":"2026-08-24T00:00:00Z","team":"t","wave_id":"wave-1","cohort":"shadow"}"#,
+            #"{"event":"turn_route","turn_id":"none","ts":"2026-08-24T00:00:01Z","team":"t","cohort":"shadow"}"#,
+        ]
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: log)
+        LeaderTurnLog.appendTaskDispatch(
+            team: "t", requestID: "req-1", taskID: "task-1", worker: "executor",
+            workerInstanceID: "instance-1", route: "parallel", waveID: "wave-1",
+            delivery: "created", to: log
+        )
+        LeaderTurnLog.appendTaskLifecycle(
+            team: "t", requestID: "req-1", taskID: "task-1", worker: "executor",
+            workerInstanceID: "instance-1", route: "parallel", waveID: "wave-1",
+            status: "completed", to: log
+        )
+
+        let report = LeaderTurnLog.policyReport(from: log)
+        XCTAssertEqual(report.delegatedWaves, 1)
+        XCTAssertEqual(report.delegatedRoutes, 1)
+        XCTAssertEqual(report.delegationRate, 0.5)
+        XCTAssertEqual(report.delegatedTasks, 1)
+        XCTAssertEqual(report.completedDelegatedTasks, 1)
+        XCTAssertEqual(report.delegationCompletionRate, 1)
+        XCTAssertEqual(report.unlinkedDelegatedTasks, 0)
+        XCTAssertEqual(report.delegationRateByCohort["shadow"], 0.5)
+        XCTAssertEqual(report.delegationMeasurementStatus, "measured")
+    }
+
+    func testPolicyReportMarksMissingTaskStreamInsteadOfPretendingZeroIsMeasured() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data((String(#"{"event":"turn_route","turn_id":"t","ts":"2026-08-24T00:00:00Z","team":"t"}"#) + "\n").utf8)
+            .write(to: log)
+
+        let report = LeaderTurnLog.policyReport(from: log)
+        XCTAssertEqual(report.delegationRate, 0)
+        XCTAssertEqual(report.delegationMeasurementStatus, "measured")
+
+        LeaderTurnLog.appendTaskDispatch(
+            team: "t", requestID: nil, taskID: "task-1", worker: "executor",
+            workerInstanceID: nil, route: "parallel", waveID: "wave-orphan",
+            delivery: "created", to: log
+        )
+        let incomplete = LeaderTurnLog.policyReport(from: log)
+        XCTAssertEqual(incomplete.delegationMeasurementStatus, "incomplete_unlinked_tasks")
+        XCTAssertEqual(incomplete.unlinkedDelegatedTasks, 1)
+    }
+
+    func testTaskLogHelpersWriteDispatchAndLifecycleEvents() throws {
+        let log = try temporaryLog()
+        LeaderTurnLog.appendTaskDispatch(
+            team: "t", requestID: "req", taskID: "task", worker: "executor",
+            workerInstanceID: "instance", route: "parallel", waveID: "wave",
+            delivery: "created", to: log
+        )
+        LeaderTurnLog.appendTaskLifecycle(
+            team: "t", requestID: "req", taskID: "task", worker: "executor",
+            workerInstanceID: "instance", route: "parallel", waveID: "wave",
+            status: "delivered", delivery: "confirmed", to: log
+        )
+        let records = LeaderTurnLog.readAll(from: log)
+        XCTAssertEqual(records.map(\.event), [.taskDispatch, .taskLifecycle])
+        XCTAssertEqual(records.map(\.taskWaveID), ["wave", "wave"])
+        XCTAssertEqual(records.last?.taskDelivery, "confirmed")
+    }
+
     func testAppendCreatesMissingDirectory() throws {
         let log = try temporaryLog()
         XCTAssertFalse(FileManager.default.fileExists(atPath: log.deletingLastPathComponent().path))

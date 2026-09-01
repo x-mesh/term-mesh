@@ -4,6 +4,7 @@ import Foundation
 /// in shadow mode with a zero-percent canary, so changing this type never
 /// changes a leader's behavior by itself.
 struct LeaderParticipationSettings: Equatable {
+    static let e2eSuiteName = "com.termmesh.e2e"
     enum Mode: String { case off, shadow, canary }
     enum Cohort: String { case staticPolicy = "static", shadow, canary, holdout }
     enum HealthScope: String { case controlHost = "control_host", executionHost = "execution_host" }
@@ -21,6 +22,16 @@ struct LeaderParticipationSettings: Equatable {
     var optInProjects: Set<String>
 
     static let `default` = Self(mode: .shadow, canaryPercent: 0, killSwitch: false, optInProjects: [])
+
+    static func defaultsForCurrentProcess(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> UserDefaults {
+        if SessionRestoreSettings.stateDirectoryOverride(environment: environment) != nil,
+           let isolated = UserDefaults(suiteName: e2eSuiteName) {
+            return isolated
+        }
+        return .standard
+    }
 
     struct Health: Equatable {
         var supportedTurns: Int

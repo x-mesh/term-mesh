@@ -8,12 +8,12 @@ import os
 @MainActor
 final class TeamOrchestrator: ObservableObject {
     static let shared = TeamOrchestrator()
-    private static let localLeaderReadinessQueue = DispatchQueue(
+    static let localLeaderReadinessQueue = DispatchQueue(
         label: "term-mesh.leader-readiness", qos: .userInitiated
     )
     private static let localLeaderReadinessPollInterval: TimeInterval = 0.25
     private static let localLeaderReadinessTimeout: TimeInterval = 60
-    private static let localLeaderStablePromptObservations = 4
+    static let localLeaderStablePromptObservations = 4
 
     private init() {
         // Native turn state lives in the thread-safe data store rather than in
@@ -3860,7 +3860,7 @@ final class TeamOrchestrator: ObservableObject {
     static func writeLeaderParticipationControl(
         teamName: String, sessionID: String, supportedLeader: Bool,
         delegationState: ProjectDelegationState = .default,
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = LeaderParticipationSettings.defaultsForCurrentProcess()
     ) {
         guard let data = leaderParticipationControlData(
             teamName: teamName, sessionID: sessionID,
@@ -3875,7 +3875,7 @@ final class TeamOrchestrator: ObservableObject {
         teamName: String, sessionID: String, supportedLeader: Bool,
         delegationState: ProjectDelegationState = .default,
         healthScope: LeaderParticipationSettings.HealthScope = .controlHost,
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = LeaderParticipationSettings.defaultsForCurrentProcess()
     ) -> Data? {
         let settings = LeaderParticipationSettings.load(from: defaults)
         let measurement = LeaderTurnLog.health()
@@ -5126,20 +5126,36 @@ final class TeamOrchestrator: ObservableObject {
     /// composer; a wake pasted in that interval is acknowledged by Ghostty and
     /// discarded by the CLI. Keep `leader_ready` false until a real composer
     /// prompt is visible.
-    nonisolated static func localLeaderPaneLooksReady(_ text: String) -> Bool {
+    nonisolated static func localLeaderPaneLooksReady(
+        _ text: String,
+        leaderMode: String? = nil
+    ) -> Bool {
         let unavailable = ["Not logged in", "Login expired", "Please run /login"]
         guard !unavailable.contains(where: text.contains) else { return false }
+        guard AgentStartupPrompt.detect(in: text) == nil else { return false }
         // `>` is intentionally excluded. Startup banners and progress hints
         // contain ordinary greater-than characters before the TUI composer
         // exists, which recreated the very startup race this probe guards.
         let markers: Set<Character> = ["❯", "›", "»"]
-        return text.split(separator: "\n", omittingEmptySubsequences: false).contains { raw in
-            guard let first = raw.trimmingCharacters(in: .whitespaces).first else { return false }
-            return markers.contains(first)
+        let promptLines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { line in line.first.map(markers.contains) == true }
+        guard let prompt = promptLines.last, let marker = prompt.first else { return false }
+        let expectedMarkers: Set<Character> = switch leaderMode?.lowercased() {
+        case "codex": ["›"]
+        case "claude": ["❯"]
+        default: markers
         }
+        guard expectedMarkers.contains(marker) else { return false }
+        if leaderMode?.lowercased() == "codex" { return true }
+        let remainder = prompt.dropFirst().trimmingCharacters(in: .whitespaces)
+        return remainder.isEmpty
+            || remainder == "Ask anything"
+            || remainder == "Ask Codex"
+            || remainder.hasPrefix("Try \"")
     }
 
-    private nonisolated static func readLocalLeaderPane(
+    nonisolated static func readLocalLeaderPane(
         _ surface: ghostty_surface_t
     ) -> String? {
         let topLeft = ghostty_point_s(
@@ -5166,14 +5182,16 @@ final class TeamOrchestrator: ObservableObject {
             launchLeaderLocally: true, leaderMode: leaderMode
         ) else { return }
         pollLocalLeaderReadiness(
-            teamName: teamName, workspaceId: workspaceId, panelId: panelId,
+            teamName: teamName, leaderMode: leaderMode,
+            workspaceId: workspaceId, panelId: panelId,
             tabManager: tabManager, deadline: Date().addingTimeInterval(Self.localLeaderReadinessTimeout),
             readyObservations: 0
         )
     }
 
     private func pollLocalLeaderReadiness(
-        teamName: String, workspaceId: UUID, panelId: UUID, tabManager: TabManager,
+        teamName: String, leaderMode: String,
+        workspaceId: UUID, panelId: UUID, tabManager: TabManager,
         deadline: Date, readyObservations: Int
     ) {
         guard let team = teams[teamName], team.leaderPanelId == panelId, !team.leaderReady else { return }
@@ -5191,7 +5209,8 @@ final class TeamOrchestrator: ObservableObject {
         guard let lease = panel?.surface.beginReadLease() else {
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.localLeaderReadinessPollInterval) { [weak self] in
                 self?.pollLocalLeaderReadiness(
-                    teamName: teamName, workspaceId: workspaceId, panelId: panelId,
+                    teamName: teamName, leaderMode: leaderMode,
+                    workspaceId: workspaceId, panelId: panelId,
                     tabManager: tabManager, deadline: deadline, readyObservations: 0
                 )
             }
@@ -5203,7 +5222,9 @@ final class TeamOrchestrator: ObservableObject {
             DispatchQueue.main.async {
                 guard let self, var current = self.teams[teamName],
                       current.leaderPanelId == panelId, !current.leaderReady else { return }
-                let promptVisible = snapshot.map(Self.localLeaderPaneLooksReady) == true
+                let promptVisible = snapshot.map {
+                    Self.localLeaderPaneLooksReady($0, leaderMode: leaderMode)
+                } == true
                 let nextReadyObservations = promptVisible ? readyObservations + 1 : 0
                 if nextReadyObservations >= Self.localLeaderStablePromptObservations
                     && current.leaderPolicyState == "injected" {
@@ -5217,7 +5238,8 @@ final class TeamOrchestrator: ObservableObject {
                         deadline: .now() + Self.localLeaderReadinessPollInterval
                     ) { [weak self] in
                         self?.pollLocalLeaderReadiness(
-                            teamName: teamName, workspaceId: workspaceId, panelId: panelId,
+                            teamName: teamName, leaderMode: leaderMode,
+                            workspaceId: workspaceId, panelId: panelId,
                             tabManager: tabManager, deadline: deadline,
                             readyObservations: nextReadyObservations
                         )
@@ -5698,6 +5720,18 @@ final class TeamOrchestrator: ObservableObject {
             if landed {
                 TeamDataStore.shared.markTextDelivered(
                     teamName: teamName, taskId: taskId)
+            } else {
+                LeaderTurnLog.appendTaskLifecycle(
+                    team: teamName,
+                    requestID: task.request_id,
+                    taskID: task.id,
+                    worker: task.assignee,
+                    workerInstanceID: task.assigneeInstanceId,
+                    route: task.route,
+                    waveID: task.waveId,
+                    status: "delivery_failed",
+                    delivery: "failed"
+                )
             }
             completion?(landed)
         }
@@ -9109,6 +9143,15 @@ final class TeamOrchestrator: ObservableObject {
                 "shadow_turns": policy.shadowTurns,
                 "canary_turns": policy.canaryTurns,
                 "holdout_turns": policy.holdoutTurns,
+                "delegated_waves": policy.delegatedWaves,
+                "delegated_routes": policy.delegatedRoutes,
+                "delegated_tasks": policy.delegatedTasks,
+                "completed_delegated_tasks": policy.completedDelegatedTasks,
+                "delegation_rate": policy.delegationRate,
+                "delegation_completion_rate": policy.delegationCompletionRate,
+                "unlinked_delegated_tasks": policy.unlinkedDelegatedTasks,
+                "delegation_rate_by_cohort": policy.delegationRateByCohort,
+                "delegation_measurement_status": policy.delegationMeasurementStatus,
                 "outcome_metrics": [
                     "quality": "unavailable",
                     "failure_rework": "unavailable",
@@ -9314,6 +9357,18 @@ final class TeamOrchestrator: ObservableObject {
             lastProgressAt: nil
         )
         taskBoards[teamName, default: []].append(task)
+        if task.assignee != nil {
+            LeaderTurnLog.appendTaskDispatch(
+                team: teamName,
+                requestID: task.request_id,
+                taskID: task.id,
+                worker: task.assignee,
+                workerInstanceID: task.assigneeInstanceId,
+                route: task.route,
+                waveID: task.waveId,
+                delivery: "created"
+            )
+        }
         if let parentTaskId,
            var tasks = taskBoards[teamName],
            let parentIdx = tasks.firstIndex(where: { $0.id == parentTaskId }) {
@@ -9391,6 +9446,17 @@ final class TeamOrchestrator: ObservableObject {
         if let status {
             let normalizedStatus = normalizedTaskStatus(status)
             tasks[idx].status = normalizedStatus
+            let lifecycleTask = tasks[idx]
+            LeaderTurnLog.appendTaskLifecycle(
+                team: teamName,
+                requestID: lifecycleTask.request_id,
+                taskID: lifecycleTask.id,
+                worker: lifecycleTask.assignee,
+                workerInstanceID: lifecycleTask.assigneeInstanceId,
+                route: lifecycleTask.route,
+                waveID: lifecycleTask.waveId,
+                status: normalizedStatus
+            )
             switch normalizedStatus {
             case "in_progress":
                 tasks[idx].startedAt = tasks[idx].startedAt ?? now

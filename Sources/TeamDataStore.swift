@@ -1156,6 +1156,18 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         else { return false }
         guard taskBoards[teamName]![index].textDeliveredAt == nil else { return false }
         taskBoards[teamName]![index].textDeliveredAt = moment
+        let deliveredTask = taskBoards[teamName]![index]
+        LeaderTurnLog.appendTaskLifecycle(
+            team: teamName,
+            requestID: deliveredTask.request_id,
+            taskID: deliveredTask.id,
+            worker: deliveredTask.assignee,
+            workerInstanceID: deliveredTask.assigneeInstanceId,
+            route: deliveredTask.route,
+            waveID: deliveredTask.waveId,
+            status: "delivered",
+            delivery: "confirmed"
+        )
         // What a replay after a restart reads is the board snapshot on disk,
         // not this dictionary. Without the notify the mark lived only in
         // memory: quit the app after a delivery landed and the next retry saw
@@ -1282,6 +1294,18 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             lastProgressAt: nil
         )
         taskBoards[teamName, default: []].append(task)
+        if task.assignee != nil {
+            LeaderTurnLog.appendTaskDispatch(
+                team: teamName,
+                requestID: task.request_id,
+                taskID: task.id,
+                worker: task.assignee,
+                workerInstanceID: task.assigneeInstanceId,
+                route: task.route,
+                waveID: task.waveId,
+                delivery: "created"
+            )
+        }
         noteTasksChanged()
         if let parentTaskId,
            var tasks = taskBoards[teamName],
@@ -1420,6 +1444,17 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         if let status {
             let normalizedStatus = Self.normalizedTaskStatus(status)
             tasks[idx].status = normalizedStatus
+            let lifecycleTask = tasks[idx]
+            LeaderTurnLog.appendTaskLifecycle(
+                team: teamName,
+                requestID: lifecycleTask.request_id,
+                taskID: lifecycleTask.id,
+                worker: lifecycleTask.assignee,
+                workerInstanceID: lifecycleTask.assigneeInstanceId,
+                route: lifecycleTask.route,
+                waveID: lifecycleTask.waveId,
+                status: normalizedStatus
+            )
             switch normalizedStatus {
             case "in_progress":
                 tasks[idx].startedAt = tasks[idx].startedAt ?? now
@@ -1489,6 +1524,17 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         let previousAssigneeInstanceId = tasks[idx].assigneeInstanceId
         tasks[idx].assignee = resolvedAssignee.assignee
         tasks[idx].assigneeInstanceId = resolvedAssignee.instanceId
+        let reassignedTask = tasks[idx]
+        LeaderTurnLog.appendTaskDispatch(
+            team: teamName,
+            requestID: reassignedTask.request_id,
+            taskID: reassignedTask.id,
+            worker: reassignedTask.assignee,
+            workerInstanceID: reassignedTask.assigneeInstanceId,
+            route: reassignedTask.route,
+            waveID: reassignedTask.waveId,
+            delivery: "reassigned"
+        )
         tasks[idx].status = tasks[idx].assignee == nil ? "queued" : "assigned"
         tasks[idx].blockedReason = nil
         tasks[idx].reviewSummary = nil
@@ -1568,6 +1614,17 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         let now = Date()
         tasks[idx].assignee = agentName
         tasks[idx].assigneeInstanceId = resolvedInstanceId
+        let claimedTask = tasks[idx]
+        LeaderTurnLog.appendTaskDispatch(
+            team: teamName,
+            requestID: claimedTask.request_id,
+            taskID: claimedTask.id,
+            worker: claimedTask.assignee,
+            workerInstanceID: claimedTask.assigneeInstanceId,
+            route: claimedTask.route,
+            waveID: claimedTask.waveId,
+            delivery: "claimed"
+        )
         tasks[idx].status = "assigned"
         tasks[idx].updatedAt = now
         tasks[idx].lastProgressAt = now

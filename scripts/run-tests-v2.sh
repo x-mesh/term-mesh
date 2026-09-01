@@ -349,6 +349,7 @@ reset_e2e_state() {
 
 E2E_STATE_DIR="${TMPDIR:-/tmp}/termmesh-e2e-state.$$"
 export TERMMESH_E2E_STATE_DIR="$E2E_STATE_DIR"
+export TERMMESH_E2E_REATTACH_STATE="$E2E_STATE_DIR/remote-project-reattach.json"
 export TERMMESH_E2E_MOBILE_ADDR="$MOBILE_LISTENER_ADDR"
 # A test that relaunches the app respawns this exact binary with this exact env.
 export TERMMESH_APP_BIN="$APP/Contents/MacOS/term-mesh DEV"
@@ -570,14 +571,27 @@ run_test_with_retry() {
   local f="$1"
   local attempts=3
   local n=1
+  local output_file
+  output_file=$(mktemp "${TMPDIR:-/tmp}/term-mesh-e2e-output.XXXXXX")
 
   while [ "$n" -le "$attempts" ]; do
     echo "RUN  $f (attempt $n/$attempts)"
-    if "$PYTHON" "$f"; then
-      return 0
+    : > "$output_file"
+    set +e
+    "$PYTHON" "$f" 2>&1 | tee "$output_file"
+    local command_status=${PIPESTATUS[0]}
+    set -e
+    set +e
+    ./scripts/classify-test-result.sh "$command_status" "$output_file"
+    local classified=$?
+    set -e
+    if [ "$classified" -eq 0 ] || [ "$classified" -eq 2 ]; then
+      rm -f "$output_file"
+      return "$classified"
     fi
 
     if [ "$n" -ge "$attempts" ]; then
+      rm -f "$output_file"
       return 1
     fi
 
@@ -587,6 +601,7 @@ run_test_with_retry() {
     n=$((n + 1))
   done
 
+  rm -f "$output_file"
   return 1
 }
 
@@ -629,35 +644,105 @@ for f in "${test_files[@]}"; do
     skipped=$((skipped + 1))
     continue
   fi
+  if [ "$base" = "test_runner_skip_accounting.py" ]; then
+    echo "RUN  $f (host-safe; no app launch)"
+    if "$PYTHON" "$f"; then
+      passed=$((passed + 1))
+    else
+      fail=1
+      failed_tests[${#failed_tests[@]}]="$f"
+      [ "$KEEP_GOING" = "1" ] || break
+    fi
+    continue
+  fi
   if [ "$base" = "test_remote_project_restart_reattach.py" ] \
     && [ "${TERMMESH_E2E_REATTACH_PHASE:-}" = "full" ]; then
+    phase_result() {
+      local output_file="$1"
+      shift
+      set +e
+      "$@" 2>&1 | tee "$output_file"
+      local command_status=${PIPESTATUS[0]}
+      set -e
+      set +e
+      ./scripts/classify-test-result.sh "$command_status" "$output_file"
+      local classified=$?
+      set -e
+      return "$classified"
+    }
+    phase_failed=0
+    phase_skipped=0
+    phase_output=$(mktemp "${TMPDIR:-/tmp}/term-mesh-phase-output.XXXXXX")
     echo "== launch ($base create) =="
     launch_and_wait
     echo "RUN  $f (phase create)"
-    if ! TERMMESH_E2E_REATTACH_PHASE=create "$PYTHON" "$f"; then
+    set +e
+    phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=create "$PYTHON" "$f"
+    create_result=$?
+    set -e
+    if [ "$create_result" -eq 2 ]; then
+      phase_skipped=1
+    elif [ "$create_result" -ne 0 ]; then
       echo "FAIL $f (phase create)" >&2
-      fail=1
+      phase_failed=1
       failed_tests[${#failed_tests[@]}]="$f:create"
-      [ "$KEEP_GOING" = "1" ] || break
-      continue
     fi
-    echo "== relaunch ($base adopt; preserving app and test state) =="
-    launch_and_wait 1
-    echo "RUN  $f (phase adopt/reconnect)"
-    if ! TERMMESH_E2E_REATTACH_PHASE=adopt "$PYTHON" "$f"; then
-      echo "FAIL $f (phase adopt/reconnect)" >&2
+    if [ "$create_result" -eq 0 ]; then
+      echo "== relaunch ($base adopt; fresh viewer installation) =="
+      TERMMESH_PEER_IDENTITY_EPHEMERAL=1 launch_and_wait 1
+      echo "RUN  $f (phase adopt/reconnect)"
+      set +e
+      phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=adopt \
+        TERMMESH_E2E_CROSS_INSTALLATION_VIEWER=1 "$PYTHON" "$f"
+      adopt_result=$?
+      set -e
+      if [ "$adopt_result" -eq 2 ]; then
+        phase_skipped=1
+      elif [ "$adopt_result" -ne 0 ]; then
+        echo "FAIL $f (phase adopt/reconnect)" >&2
+        phase_failed=1
+        failed_tests[${#failed_tests[@]}]="$f:adopt"
+      fi
+
+      echo "== relaunch ($base cleanup; original owner identity) =="
+      launch_and_wait 1
+      echo "RUN  $f (phase owner cleanup)"
+      set +e
+      phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=cleanup "$PYTHON" "$f"
+      cleanup_result=$?
+      set -e
+      if [ "$cleanup_result" -eq 2 ]; then
+        phase_skipped=1
+      elif [ "$cleanup_result" -ne 0 ]; then
+        echo "FAIL $f (phase owner cleanup)" >&2
+        phase_failed=1
+        failed_tests[${#failed_tests[@]}]="$f:cleanup"
+      fi
+    fi
+    rm -f "$phase_output"
+    if [ "$phase_failed" -ne 0 ]; then
       fail=1
-      failed_tests[${#failed_tests[@]}]="$f:adopt"
       [ "$KEEP_GOING" = "1" ] || break
       continue
     fi
-    passed=$((passed + 1))
+    if [ "$phase_skipped" -ne 0 ]; then
+      skipped=$((skipped + 1))
+    else
+      passed=$((passed + 1))
+    fi
     continue
   fi
 
   echo "== launch ($base) =="
   launch_and_wait
-  if ! run_test_with_retry "$f"; then
+  if run_test_with_retry "$f"; then
+    test_result=0
+  else
+    test_result=$?
+  fi
+  if [ "$test_result" -eq 2 ]; then
+    skipped=$((skipped + 1))
+  elif [ "$test_result" -ne 0 ]; then
     echo "FAIL $f" >&2
     fail=1
     failed_tests[${#failed_tests[@]}]="$f"

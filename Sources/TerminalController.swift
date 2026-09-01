@@ -1448,6 +1448,10 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugProjectCreationAttempt(params: params))
         case "debug.project.creation_status":
             return v2Result(id: id, self.v2DebugProjectCreationStatus(params: params))
+        case "debug.leader_participation.configure":
+            return v2Result(id: id, self.v2DebugLeaderParticipationConfigure(params: params))
+        case "debug.leader_request.status":
+            return v2Result(id: id, self.v2DebugLeaderRequestStatus(params: params))
         case "debug.project.delete":
             return v2Result(id: id, self.v2DebugProjectDelete(params: params))
         case "debug.project.delete_status":

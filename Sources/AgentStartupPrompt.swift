@@ -21,6 +21,7 @@ import Foundation
 /// it does today, which is a visible failure rather than a wrong answer.
 enum AgentStartupPrompt: Equatable, CaseIterable {
     case claudeFolderTrust
+    case codexDirectoryTrust
 
     /// The key that commits the answer, in `sendNamedKey`'s vocabulary.
     var answerKey: String { "return" }
@@ -40,6 +41,17 @@ enum AgentStartupPrompt: Equatable, CaseIterable {
                 .contains { line in
                     let trimmed = line.trimmingCharacters(in: .whitespaces)
                     return trimmed.hasPrefix("❯") && trimmed.contains("Yes, I trust this folder")
+                }
+        case .codexDirectoryTrust:
+            guard text.contains("Do you trust the contents of this directory?") else {
+                return false
+            }
+            guard text.contains("Press enter to continue") else { return false }
+            return text
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .contains { line in
+                    line.trimmingCharacters(in: .whitespaces)
+                        .hasPrefix("› 1. Yes, continue")
                 }
         }
     }
