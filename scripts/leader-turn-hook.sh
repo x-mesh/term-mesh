@@ -61,6 +61,10 @@ LOG_FILE="$LOG_DIR/turns.log"
 STATE_KEY="$(printf '%s' "$SURFACE_ID" | tr -cd 'A-Za-z0-9._-' 2>/dev/null || true)"
 [ -n "$STATE_KEY" ] || STATE_KEY=unknown
 STATE_FILE="$LOG_DIR/.turn-current-$STATE_KEY"
+# Per-surface, not per-turn: the id a Stop hook resolves does not always match
+# the one Start wrote, and the floor only needs "did anything get dispatched
+# since this pane's last prompt".
+DISPATCH_BASELINE_FILE="$LOG_DIR/.turn-dispatch-$STATE_KEY"
 STATE_LOCK="$STATE_FILE.lock"
 STATE_LOCK_HELD=0
 
@@ -324,16 +328,16 @@ TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
 # leaves the field off entirely rather than guessing "met".
 DELEGATION_FLOOR=""
 if [ "$MODE" = --end ] \
-    && [ "$TURN_ID" != unknown ] \
     && [ -n "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
     && [ -r "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
     && [ -r "$LOG_FILE" ] \
+    && [ -r "$DISPATCH_BASELINE_FILE" ] \
     && command -v python3 >/dev/null 2>&1; then
-    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TURN_ID" <<'TURN_HOOK_MET' 2>/dev/null || true
+    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" <<'TURN_HOOK_MET' 2>/dev/null || true
 import json
 import sys
 
-control_path, log_path, turn_id = sys.argv[1], sys.argv[2], sys.argv[3]
+control_path, log_path, team, baseline_path = sys.argv[1:5]
 
 try:
     with open(control_path, "r", encoding="utf-8") as handle:
@@ -352,42 +356,64 @@ except (TypeError, ValueError):
 if level != "delegated" or workers <= 0:
     sys.exit(0)
 
-# task_dispatch carries a request/wave/task id, never this turn's id, so the
-# two streams cannot be joined by key. Walking back to this turn's own start is
-# the join: whatever dispatch records lie after it belong to this turn. Read a
-# bounded tail so a rotated-but-large log cannot stall a Stop hook.
+# Compare against the count this turn started with, rather than walking the log
+# back to this turn's own turn_start.
+#
+# That walk was wrong twice over. `task_dispatch` carries a request/wave/task
+# id and never this turn's id, so the streams cannot be joined by key — and the
+# id a leader states with `leader turn route` is not always the one the hook
+# recorded, so the walk could sail past every recent record and match a start
+# from hours earlier, counting some other turn's dispatches as this one's. It
+# also counted dispatches from every team on the host.
+#
+# A baseline has neither failure: it needs no id at all, and it is scoped to
+# this team.
 try:
-    with open(log_path, "r", encoding="utf-8") as handle:
-        lines = handle.readlines()[-4000:]
+    with open(baseline_path, "r", encoding="utf-8") as handle:
+        baseline = int(handle.read().strip())
 except Exception:
     sys.exit(0)
 
-dispatched = False
-for line in reversed(lines):
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        record = json.loads(line)
-    except Exception:
-        continue
-    if not isinstance(record, dict):
-        continue
-    event = record.get("event")
-    if event == "turn_start" and record.get("turn_id") == turn_id:
-        print("met" if dispatched else "unmet", end="")
-        sys.exit(0)
-    if event == "task_dispatch":
-        dispatched = True
 
-# No start found in the tail: say nothing rather than call an unbounded window
-# unmet.
+def dispatch_count():
+    try:
+        with open(log_path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()[-8000:]
+    except Exception:
+        return None
+    total = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        if (
+            isinstance(record, dict)
+            and record.get("event") == "task_dispatch"
+            and record.get("team") == team
+        ):
+            total += 1
+    return total
+
+
+current = dispatch_count()
+if current is None:
+    sys.exit(0)
+# A count below the baseline means the log rotated under us. Say nothing rather
+# than report a drop as "the leader delegated nothing".
+if current < baseline:
+    sys.exit(0)
+print("met" if current > baseline else "unmet", end="")
 TURN_HOOK_MET
 )"
     case "$DELEGATION_FLOOR" in
         met|unmet) ;;
         *) DELEGATION_FLOOR="" ;;
     esac
+    rm -f "$DISPATCH_BASELINE_FILE" 2>/dev/null || true
 fi
 
 # Entries newer than the routed turn were prompts absorbed into that running
@@ -417,6 +443,49 @@ fi
 # this FD: daemon GC rotates turns.log at startup and every six hours, and a
 # retained descriptor would keep writing to the renamed inode.
 { printf '%s\n' "$LINE" >> "$LOG_FILE"; } 2>/dev/null || true
+
+# Record how many tasks this team had dispatched before the turn runs, so Stop
+# can tell whether this turn added any. Independent of the injection below: the
+# floor may be switched off while measurement continues.
+if [ "$MODE" = --start ] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" <<'TURN_HOOK_BASELINE' 2>/dev/null || true
+import json
+import os
+import sys
+
+log_path, team, baseline_path = sys.argv[1:4]
+total = 0
+try:
+    with open(log_path, "r", encoding="utf-8") as handle:
+        lines = handle.readlines()[-8000:]
+except Exception:
+    lines = []
+for line in lines:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        record = json.loads(line)
+    except Exception:
+        continue
+    if (
+        isinstance(record, dict)
+        and record.get("event") == "task_dispatch"
+        and record.get("team") == team
+    ):
+        total += 1
+tmp = baseline_path + ".tmp"
+try:
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(str(total))
+    os.replace(tmp, baseline_path)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except Exception:
+        pass
+TURN_HOOK_BASELINE
+fi
 
 # The delegation floor. Everything above this line observes; this block is the
 # only part that speaks back, and stdout is the reason it can: Claude Code adds

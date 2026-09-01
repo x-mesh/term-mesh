@@ -446,4 +446,89 @@ PY
 
 printf '%s\n' 'PASS: leader turn hook logs private, correlated start/end boundaries'
 printf '%s\n' 'PASS: leader turn hook injects and measures the delegation floor'
+# Another team's dispatches are not this team's delegation.
+#
+# The first version of this verdict walked the log back to this turn's own
+# turn_start and counted every task_dispatch on the way. Two things broke it:
+# the id a leader states with `leader turn route` is not always the one the
+# hook recorded, so the walk could run past every recent record and match a
+# start from hours earlier — and it counted dispatches from every team on the
+# host. A live run reported "met" for a turn that dispatched nothing, on the
+# strength of another project's records from six hours before.
+STRAY_HOME="$TEST_TMP/stray"
+STRAY_CTL="$TEST_TMP/stray-ctl"
+mkdir -p "$STRAY_HOME/.term-mesh/logs" "$STRAY_CTL" || exit 1
+STRAY_LOG="$STRAY_HOME/.term-mesh/logs/turns.log"
+
+cat > "$STRAY_CTL/delegated.json" <<'JSON' || exit 1
+{"delegation_effective":"delegated","available_workers":2,
+ "worker_names":["a","b"],"kill_switch":false,"project_id":"mine"}
+JSON
+
+stray_hook() {
+    HOME="$STRAY_HOME" \
+        TERMMESH_TEAM=mine \
+        TERMMESH_SURFACE_ID=stray-surface \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$STRAY_CTL/delegated.json" \
+        "$HOOK" "$@"
+}
+
+# An old dispatch belonging to this team, before the turn begins: it is part of
+# the baseline, so it must not make the new turn look delegated.
+printf '%s\n' '{"event":"task_dispatch","turn_id":"old","ts":"2026-01-01T00:00:00Z","team":"mine","task_id":"t0","worker":"a","delivery":"created"}' \
+    >> "$STRAY_LOG" || exit 1
+
+stray_hook --start '{"prompt":"turn one","session_id":"stray-1"}' >/dev/null \
+    || fail "stray start returned nonzero"
+
+# ...and a different team dispatching while this turn runs.
+printf '%s\n' '{"event":"task_dispatch","turn_id":"other","ts":"2026-01-01T00:00:01Z","team":"someone-else","task_id":"t1","worker":"x","delivery":"created"}' \
+    >> "$STRAY_LOG" || exit 1
+
+stray_hook --end '{"session_id":"stray-1"}' >/dev/null \
+    || fail "stray end returned nonzero"
+
+python3 - "$STRAY_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+last_end = [r for r in records if r["event"] == "turn_end"][-1]
+if last_end.get("delegation_floor") != "unmet":
+    raise SystemExit(
+        "FAIL: a prior dispatch and another team's dispatch must not read as met, got "
+        + repr(last_end.get("delegation_floor"))
+    )
+PY
+
+# With no baseline — a Stop that never saw a Start — the verdict is withheld
+# rather than guessed.
+rm -f "$STRAY_HOME/.term-mesh/logs/.turn-dispatch-stray-surface" 2>/dev/null || true
+stray_hook --end '{"session_id":"stray-2"}' >/dev/null \
+    || fail "baseline-less end returned nonzero"
+python3 - "$STRAY_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+last_end = [r for r in records if r["event"] == "turn_end"][-1]
+if "delegation_floor" in last_end:
+    raise SystemExit(
+        "FAIL: without a baseline the floor must be withheld, got "
+        + repr(last_end.get("delegation_floor"))
+    )
+PY
+
 printf '%s\n' 'PASS: leader turn hook honours per-Project execution options'
+printf '%s\n' 'PASS: delegation floor counts only this team, only this turn'
