@@ -612,7 +612,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
 
     func enqueueLeaderRequest(
         teamName: String, content: String, requestId: String? = nil,
-        taskShape: ProjectTaskShape = .singleUnit,
+        taskShape: ProjectTaskShape? = nil,
         riskReasons: Set<ProjectRoutingRisk> = [], now: Date = Date()
     ) -> LeaderRequestEnqueueResult {
         let requestedId = requestId?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -651,7 +651,8 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         }
         let decision = ProjectRoutingDecision.decide(
             level: state.effective, taskShape: taskShape, risks: riskReasons,
-            availableWorkers: teamRegistry[teamName]?.count ?? 0
+            availableWorkers: teamRegistry[teamName]?.count ?? 0,
+            maxParallelWorkers: ProjectExecutionOptions.load(teamName: teamName).maxParallelWorkers
         )
         let request = LeaderRequest(
             id: id, content: content, contentSHA256: digest,

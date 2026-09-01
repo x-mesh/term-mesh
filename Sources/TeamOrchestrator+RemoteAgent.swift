@@ -1427,6 +1427,7 @@ extension TeamOrchestrator {
         case promptStagingFailed(String)
         case environmentStagingFailed(String)
         case hostUpdateRequired(host: String, version: String?)
+        case peerShellSweepTimedOut(host: String, seconds: Int)
         case durableAgentUnavailable(cli: String, host: String, reason: String)
         /// The peer never showed a pane in the workspace the leader was going to
         /// take. Everything after `host` is what the placement loop already knew
@@ -1449,6 +1450,15 @@ extension TeamOrchestrator {
             case .teamNotFound(let name): return "no team named \(name)"
             case .hostNotFound(let key): return "no host \(key)"
             case .hostNotConnected(let name): return "\(name) is not connected"
+            // Say what to do next. The likeliest cause is that every one of the
+            // host's connection slots is held by an attached pane, and the
+            // sweep needs one of its own — so the way out is to give one back,
+            // and both ways of doing that are in the same menu as this sheet.
+            case .peerShellSweepTimedOut(let name, let seconds):
+                return "\(name) did not answer within \(seconds)s. Some panes may have "
+                    + "closed — press Refresh to see. If it times out again, the host has "
+                    + "no free connection slot: close remote panes you are not using, or "
+                    + "use \"Close All Panes and Disconnect\" on the host, then try again."
             case .noAttachableSurface(let name): return "\(name) has no free surface to attach"
             case .noFreshSurface(let name):
                 // The split request is fire-and-forget, so this is a timeout
@@ -2257,10 +2267,47 @@ extension TeamOrchestrator {
     /// guard is worse than the send: `liveTeamSockPath` is empty until some
     /// pane has leased the team tunnel, so a perfectly connected GUI host would
     /// report itself disconnected before a single shell was tried.
+    /// How long a whole sweep may take before it reports back.
+    ///
+    /// Every step inside has its own read timeout, but the sweep as a whole had
+    /// none, so a dial that never answered left the sheet spinning with no
+    /// error and no end — the one outcome a person cannot act on.
+    static let peerShellSweepDeadlineSeconds: Double = 25
+
     func closePeerShells(
         host: HostEntry,
         surfaceIDs: Set<Data>,
         force: Bool = false
+    ) async throws -> Int {
+        let name = host.displayName
+        return try await withThrowingTaskGroup(of: Int.self) { group in
+            group.addTask { [self] in
+                try await performClosePeerShells(
+                    host: host, surfaceIDs: surfaceIDs, force: force
+                )
+            }
+            group.addTask {
+                try await Task.sleep(
+                    nanoseconds: UInt64(Self.peerShellSweepDeadlineSeconds * 1_000_000_000)
+                )
+                throw RemoteAgentError.peerShellSweepTimedOut(
+                    host: name, seconds: Int(Self.peerShellSweepDeadlineSeconds)
+                )
+            }
+            guard let first = try await group.next() else {
+                throw RemoteAgentError.peerShellSweepTimedOut(
+                    host: name, seconds: Int(Self.peerShellSweepDeadlineSeconds)
+                )
+            }
+            group.cancelAll()
+            return first
+        }
+    }
+
+    private func performClosePeerShells(
+        host: HostEntry,
+        surfaceIDs: Set<Data>,
+        force: Bool
     ) async throws -> Int {
         guard !host.activeSockPath.isEmpty else {
             throw RemoteAgentError.hostNotConnected(host.displayName)
@@ -2721,12 +2768,31 @@ extension TeamOrchestrator {
                         continuation.resume(returning: value)
                     }
                 }
+                // Every first-run prompt, not just codex's. Claude's folder
+                // trust used to be excluded here, and nothing else answers a
+                // leader: `AutoReplyPoller` only walks `team.agents`, which a
+                // leader is not in. So a Claude leader on a freshly cloned
+                // remote checkout sat on the trust screen until this loop timed
+                // out at 180s and the whole Project failed to start.
+                //
+                // The keys are a sequence, not one Return. Claude now defaults
+                // its selection to "No, exit", so committing without moving the
+                // caret first quits the CLI — the failure this is meant to
+                // prevent, delivered faster.
                 if !answeredStartupPrompt,
-                   text.flatMap(AgentStartupPrompt.detect(in:)) == .codexDirectoryTrust {
+                   let answer = text.flatMap(AgentStartupPrompt.answer(in:)) {
                     answeredStartupPrompt = true
-                    guard let peerSession = panel.peerPaneSession,
-                          try await peerSession.relaySession.sendRemoteKeys(Data([0x0D])) else {
+                    guard let peerSession = panel.peerPaneSession else {
                         throw RemoteAgentError.paneCreationFailed
+                    }
+                    for key in answer.keys {
+                        guard let bytes = AgentStartupPrompt.remoteBytes(forKey: key),
+                              try await peerSession.relaySession.sendRemoteKeys(bytes) else {
+                            throw RemoteAgentError.paneCreationFailed
+                        }
+                        // Let the TUI redraw its selection before the next key;
+                        // a commit that races the caret answers the wrong row.
+                        try await Task.sleep(nanoseconds: 150_000_000)
                     }
                     stableObservations = 0
                     try await Task.sleep(
@@ -2965,6 +3031,7 @@ extension TeamOrchestrator {
         if Self.supportsLeaderTurnMeasurement(cli: cli), turnHookFile != nil,
            let controlData = Self.leaderParticipationControlData(
                teamName: teamName, sessionID: team.leaderSessionId, supportedLeader: true,
+               delegationState: team.delegationState,
                healthScope: .executionHost
            ) {
             participationControlFile = await Self.writeRemoteLeaderFileOverSSH(
@@ -4409,6 +4476,43 @@ extension TeamOrchestrator {
         return "leader-participation-\(safeID.isEmpty ? "unknown" : safeID).json"
     }
 
+    /// End the host's daemon so the next connection starts a fresh one.
+    ///
+    /// This exists because a surface whose process is already gone cannot be
+    /// removed any other way: `TerminateSurface` only reaches the live PTY
+    /// registry, so a leftover record answers `NotFound` and the ClosePane
+    /// fallback never confirms. Restarting the daemon drops those records, and
+    /// until the daemon learns to clear them it is the only cure — so it
+    /// belongs in the host menu rather than in a maintainer's terminal.
+    ///
+    /// Scoped to this user's own daemon. `-x` matches the executable name
+    /// exactly so an unrelated process that merely mentions the name in its
+    /// arguments is not a target; the second form covers a daemon launched by
+    /// full path.
+    static func restartPeerHostDaemonCommand() -> String {
+        RemotePasteTransfer.serviceAccountCommand(
+            "u=\"$(id -u)\"; "
+                + "pkill -u \"$u\" -x term-meshd 2>/dev/null; "
+                + "pkill -u \"$u\" -f 'Resources/bin/term-meshd' 2>/dev/null; "
+                + "exit 0"
+        )
+    }
+
+    /// Restart `host`'s daemon. The app reconnects on its own afterwards and
+    /// the host starts a new daemon on that connection.
+    func restartPeerHostDaemon(host: HostEntry) async throws {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
+            throw RemoteAgentError.hostNotConnected(host.displayName)
+        }
+        _ = try await PeerHostReadinessChecker.runScript(
+            sshTarget: sshTarget,
+            port: host.sshPort,
+            identityFile: host.identityFile,
+            script: Self.restartPeerHostDaemonCommand(),
+            timeoutSeconds: 30
+        )
+    }
+
     static func remoteLeaderArtifactCleanupCommand(teamUUID: String) -> String {
         let names = [
             remoteLeaderTurnHookFileName(teamUUID: teamUUID),
@@ -4467,21 +4571,44 @@ extension TeamOrchestrator {
         }
     }
 
+    /// `delegationState` has to be passed explicitly. Omitting it silently wrote
+    /// `leaderFirst` into every peer leader's control file regardless of the
+    /// Project's configured level, so a peer leader could never observe the
+    /// setting the user chose.
     static func refreshRemoteLeaderParticipationControl(
         hostKey: String, teamUUID: String, teamName: String, sessionID: String,
-        supportedLeader: Bool
+        supportedLeader: Bool, delegationState: ProjectDelegationState
     ) async {
         guard let host = await MainActor.run(body: {
             RemoteHostStore.shared.sortedHosts.first { $0.id == hostKey }
-        }), let data = leaderParticipationControlData(
+        }) else {
+#if DEBUG
+            dlog("leaderControl.noHost team=\(teamName) hostKey=\(hostKey)")
+#endif
+            return
+        }
+        guard let data = leaderParticipationControlData(
             teamName: teamName, sessionID: sessionID, supportedLeader: supportedLeader,
+            delegationState: delegationState,
             healthScope: .executionHost
-        ) else { return }
-        _ = await writeRemoteLeaderFileOverSSH(
+        ) else {
+#if DEBUG
+            dlog("leaderControl.noPayload team=\(teamName)")
+#endif
+            return
+        }
+        // The write is over SSH and every failure inside it is swallowed, so
+        // say whether the file the leader reads was actually replaced.
+        let written = await writeRemoteLeaderFileOverSSH(
             host: host, data: data,
             fileName: remoteLeaderParticipationControlFileName(teamUUID: teamUUID),
             mode: "600"
         )
+#if DEBUG
+        dlog("leaderControl.result team=\(teamName) uuid=\(teamUUID) "
+            + (written.map { "wrote=\($0)" } ?? "FAILED"))
+#endif
+        _ = written
     }
 
     private static func writeRemoteLeaderTurnHookOverSSH(

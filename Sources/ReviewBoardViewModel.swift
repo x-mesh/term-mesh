@@ -42,6 +42,11 @@ final class ReviewBoardViewModel: ObservableObject {
     /// reads as though the fresh one failed.
     @Published private(set) var actionError: String?
 
+    /// The Project the board is pointed at, set from whichever workspace is on
+    /// screen. Nil means no team there, and the section hides itself.
+    @Published private(set) var activeTeamName: String?
+    @Published private(set) var delegation: DelegationPanel?
+
     /// The boundary, as configured. Read from settings so what the toggle
     /// shows and what the runner enforces cannot drift apart.
     @Published private(set) var autoPilot: AutoPilotPolicy
@@ -55,6 +60,7 @@ final class ReviewBoardViewModel: ObservableObject {
     @Published private(set) var undoMessage: String?
 
     private var snapshotProvider: @MainActor () -> ReviewBoardSnapshot
+    private var activeTeamProvider: @MainActor () -> String? = { nil }
     /// Where the auto pilot policy is read and written. Injected so a test can
     /// exercise the toggle without arming unattended merging for whoever is
     /// running the tests.
@@ -132,8 +138,16 @@ final class ReviewBoardViewModel: ObservableObject {
     }
 
     /// Idle boards cost nothing: with no tasks there is nothing to animate.
+    ///
+    /// The delegation panel is the exception and is refreshed either way. A
+    /// board with no tasks is precisely where someone sets the level for the
+    /// work they are about to start, and it also has to show a roster sitting
+    /// idle — which is a state with no tasks by definition.
     private func refreshWhileWorkIsRunning() {
-        guard !snapshot.tasks.isEmpty else { return }
+        guard !snapshot.tasks.isEmpty else {
+            refreshDelegationPanel()
+            return
+        }
         refresh()
     }
 
@@ -186,6 +200,10 @@ final class ReviewBoardViewModel: ObservableObject {
         // gated on inequality so an unchanged roster publishes nothing.
         let working = Self.runningAgentNames()
         if workingAssignees != working { workingAssignees = working }
+        // Same beat as the roster: the level can change from the sidebar sheet
+        // or a socket call, and whether a worker is idle changes with nothing
+        // published at all.
+        refreshDelegationPanel()
         keepSelectionValid()
     }
 
@@ -340,6 +358,95 @@ final class ReviewBoardViewModel: ObservableObject {
     private func dropLoadedReview() {
         review = nil
         reviewedTaskID = nil
+    }
+
+    // MARK: - Work distribution
+
+    /// How much of the Project in view its leader hands to workers, plus the
+    /// roster that decision is about.
+    ///
+    /// Keyed to the workspace on screen rather than to the task list. Auto
+    /// Pilot infers its team from `snapshot.tasks.first`, which is fine for a
+    /// control you reach for once work exists — but this is the setting you
+    /// want *before* the first task, and inferring it from tasks would leave it
+    /// unreachable on exactly the board that shows "Nothing assigned yet".
+    struct DelegationPanel: Equatable {
+        var teamName: String
+        var level: ProjectDelegationLevel
+        var pending: ProjectDelegationLevel?
+        var options: ProjectExecutionOptions
+        var workerCount: Int
+        var workingCount: Int
+
+        var idleCount: Int { max(0, workerCount - workingCount) }
+        /// The state this whole feature exists to make visible: a roster that
+        /// is present, and doing nothing.
+        var everyWorkerIdle: Bool { workerCount > 0 && workingCount == 0 }
+    }
+
+    /// Where the board's Project comes from, injected the way the snapshot is.
+    ///
+    /// A pushed value loses the race with workspace restore — at launch there
+    /// is no selection yet, and if it never changes afterwards nothing pushes
+    /// again and the section stays hidden all session. Pulling it on the same
+    /// beat as everything else cannot go stale that way.
+    func setActiveTeamProvider(_ provider: @escaping @MainActor () -> String?) {
+        activeTeamProvider = provider
+        refreshDelegationPanel()
+    }
+
+    func setActiveTeam(_ teamName: String?) {
+        guard activeTeamName != teamName else { return }
+        activeTeamName = teamName
+        refreshDelegationPanel()
+    }
+
+    func setDelegationLevel(_ level: ProjectDelegationLevel) {
+        guard let teamName = delegation?.teamName else { return }
+        _ = TeamOrchestrator.shared.setProjectDelegationLevel(teamName: teamName, level: level)
+        refreshDelegationPanel()
+    }
+
+    func setMaxParallelWorkers(_ count: Int) {
+        updateExecutionOptions { $0.maxParallelWorkers = count }
+    }
+
+    func setInjectDirective(_ enabled: Bool) {
+        updateExecutionOptions { $0.injectDirective = enabled }
+    }
+
+    /// Options live in defaults and reach the leader through its control file,
+    /// so a write is only half the change — the file has to be rewritten too,
+    /// or the hook keeps reading the values from before.
+    private func updateExecutionOptions(_ mutate: (inout ProjectExecutionOptions) -> Void) {
+        guard let teamName = delegation?.teamName else { return }
+        var options = ProjectExecutionOptions.load(teamName: teamName)
+        mutate(&options)
+        options.save(teamName: teamName)
+        TeamOrchestrator.shared.refreshLeaderParticipationControls()
+        refreshDelegationPanel()
+    }
+
+    private func refreshDelegationPanel() {
+        let resolved = activeTeamProvider() ?? activeTeamName
+        if activeTeamName != resolved { activeTeamName = resolved }
+        let next = Self.delegationPanel(for: resolved)
+        if delegation != next { delegation = next }
+    }
+
+    private static func delegationPanel(for teamName: String?) -> DelegationPanel? {
+        guard let teamName, !teamName.isEmpty,
+              let team = TeamOrchestrator.shared.teams[teamName] else { return nil }
+        let rosterNames = Set(team.agents.map(\.name))
+        let working = runningAgentNames().intersection(rosterNames)
+        return DelegationPanel(
+            teamName: teamName,
+            level: team.delegationState.effective,
+            pending: team.delegationState.pending,
+            options: ProjectExecutionOptions.load(teamName: teamName),
+            workerCount: team.agents.count,
+            workingCount: working.count
+        )
     }
 
     // MARK: - Auto pilot

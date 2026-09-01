@@ -115,6 +115,31 @@ final class LeaderParticipationPolicyTests: XCTestCase {
         XCTAssertEqual(payload["health_scope"] as? String, "execution_host")
     }
 
+    /// The turn hook runs on the execution host with no socket, so the roster
+    /// and the Project's level have to travel in this file or the hook cannot
+    /// state a floor at all.
+    func testControlDataCarriesRosterAndConfiguredLevelForTheHook() throws {
+        let team = "control-roster-\(UUID().uuidString)"
+        TeamDataStore.shared.registerTeam(team, agentNames: ["executor", "reviewer"])
+        addTeardownBlock { TeamDataStore.shared.unregisterTeam(team) }
+
+        let suite = "leader-roster-control.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+
+        let data = try XCTUnwrap(TeamOrchestrator.leaderParticipationControlData(
+            teamName: team, sessionID: "s", supportedLeader: true,
+            delegationState: ProjectDelegationState(configured: .delegated, effective: .delegated),
+            healthScope: .executionHost, defaults: defaults
+        ))
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(payload["available_workers"] as? Int, 2)
+        XCTAssertEqual(payload["worker_names"] as? [String], ["executor", "reviewer"])
+        XCTAssertEqual(payload["delegation_effective"] as? String, "delegated")
+    }
+
     func testUnsupportedLeaderControlPayloadCannotApplyCanary() {
         let settings = LeaderParticipationSettings(
             mode: .canary, canaryPercent: 100, killSwitch: false, optInProjects: ["p"]

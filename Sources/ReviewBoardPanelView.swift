@@ -15,11 +15,11 @@ struct ReviewBoardPanelView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            if viewModel.tasks.isEmpty && viewModel.pendingMergeQueue.isEmpty {
-                emptyState
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if viewModel.tasks.isEmpty && viewModel.pendingMergeQueue.isEmpty {
+                        emptyState
+                    } else {
                         // Above the tasks: the queue is what gates work
                         // actually landing, so it should not need scrolling
                         // past a long task list to find.
@@ -32,13 +32,18 @@ struct ReviewBoardPanelView: View {
                         if let task = viewModel.selectedTask {
                             taskDetails(task)
                         }
-                        // Last: it is a setting and a log, not the work. It
-                        // should be findable, not in the way of the row someone
-                        // opened the board to read.
-                        autoPilotSection
                     }
-                    .padding(12)
+                    // Settings live below the work, and this one stays visible
+                    // on an empty board on purpose: it is what you set before
+                    // handing out the first task, and an idle roster is a state
+                    // with no rows by definition.
+                    workDistributionSection
+                    // Last: it is a setting and a log, not the work. It should
+                    // be findable, not in the way of the row someone opened the
+                    // board to read.
+                    autoPilotSection
                 }
+                .padding(12)
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -490,6 +495,109 @@ extension ReviewBoardPanelView {
 
     /// The switch, the boundary it works inside, and what it has done.
     ///
+    /// How much of this Project the leader hands to workers.
+    ///
+    /// Same shape as Auto Pilot below, for the same reason: a control that
+    /// changes what an agent does unattended has to state what it will do, not
+    /// just offer a switch. So the level, the wave ceiling and the roster are
+    /// all on screen together — "delegated" means nothing without knowing how
+    /// many workers there are to delegate to.
+    @ViewBuilder
+    private var workDistributionSection: some View {
+        if let panel = viewModel.delegation {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    sectionTitle("Work Distribution")
+                    Spacer(minLength: 8)
+                    Text(panel.teamName)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+
+                Picker("", selection: Binding(
+                    get: { panel.level },
+                    set: { viewModel.setDelegationLevel($0) }
+                )) {
+                    ForEach(ProjectDelegationLevel.allCases, id: \.self) { level in
+                        Text(level.displayName).tag(level)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("reviewBoard.delegationLevel")
+
+                Text(panel.level.detail)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let pending = panel.pending {
+                    Text("Current: \(Text(panel.level.displayName)) · Next request: \(Text(pending.displayName))")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+
+                HStack(spacing: 8) {
+                    Text("Max parallel workers")
+                        .font(.system(size: 11))
+                    Spacer(minLength: 8)
+                    Stepper(
+                        value: Binding(
+                            get: { panel.options.maxParallelWorkers },
+                            set: { viewModel.setMaxParallelWorkers($0) }
+                        ),
+                        in: ProjectExecutionOptions.workerBounds
+                    ) {
+                        Text("\(panel.options.maxParallelWorkers)")
+                            .font(.system(size: 11, design: .monospaced))
+                    }
+                    .accessibilityIdentifier("reviewBoard.maxParallelWorkers")
+                }
+
+                Toggle(isOn: Binding(
+                    get: { panel.options.injectDirective },
+                    set: { viewModel.setInjectDirective($0) }
+                )) {
+                    Text("State the floor each turn")
+                        .font(.system(size: 11))
+                }
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .accessibilityIdentifier("reviewBoard.injectDirective")
+
+                rosterText(panel)
+                    .font(.system(size: 11))
+                    .foregroundColor(panel.everyWorkerIdle ? .orange : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04))
+            )
+            .accessibilityIdentifier("reviewBoard.workDistribution")
+        }
+    }
+
+    /// The roster, and whether any of it is doing anything.
+    ///
+    /// An idle roster is the symptom this whole control exists for — the
+    /// leader working alone while workers sit there — so it is stated in
+    /// words rather than left to be inferred from a count.
+    ///
+    /// Returns `Text`, not `String`: `Text(someString)` is the verbatim
+    /// initializer and never reaches the string catalog, which is how the rest
+    /// of this feature's UI stayed English in a Korean app.
+    private func rosterText(_ panel: ReviewBoardViewModel.DelegationPanel) -> Text {
+        guard panel.workerCount > 0 else {
+            return Text("No workers on this Project yet, so every route is direct.")
+        }
+        if panel.everyWorkerIdle {
+            return Text("\(panel.workerCount) workers, none working right now.")
+        }
+        return Text("\(panel.workerCount) workers · \(panel.workingCount) working, \(panel.idleCount) idle.")
+    }
+
     /// All three together on purpose. A toggle on its own asks someone to arm
     /// unattended merging without telling them how far it can go, and a log on
     /// its own leaves "why is this still sitting here" unanswered.

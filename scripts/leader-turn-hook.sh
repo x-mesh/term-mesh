@@ -317,6 +317,79 @@ fi
 TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
 [ -n "$TS" ] || TS=unknown
 
+# Did this turn meet the delegation floor? Only `delegated` states a floor that
+# a turn can measurably miss, and `task_dispatch` is written by the app rather
+# than claimed by the leader, so this is the one participation signal that does
+# not depend on the leader choosing to report anything. Anything unreadable
+# leaves the field off entirely rather than guessing "met".
+DELEGATION_FLOOR=""
+if [ "$MODE" = --end ] \
+    && [ "$TURN_ID" != unknown ] \
+    && [ -n "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
+    && [ -r "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
+    && [ -r "$LOG_FILE" ] \
+    && command -v python3 >/dev/null 2>&1; then
+    DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TURN_ID" <<'TURN_HOOK_MET' 2>/dev/null || true
+import json
+import sys
+
+control_path, log_path, turn_id = sys.argv[1], sys.argv[2], sys.argv[3]
+
+try:
+    with open(control_path, "r", encoding="utf-8") as handle:
+        control = json.load(handle)
+except Exception:
+    sys.exit(0)
+
+if not isinstance(control, dict) or control.get("kill_switch") is True:
+    sys.exit(0)
+
+level = control.get("delegation_effective") or control.get("delegation_configured")
+try:
+    workers = int(control.get("available_workers") or 0)
+except (TypeError, ValueError):
+    workers = 0
+if level != "delegated" or workers <= 0:
+    sys.exit(0)
+
+# task_dispatch carries a request/wave/task id, never this turn's id, so the
+# two streams cannot be joined by key. Walking back to this turn's own start is
+# the join: whatever dispatch records lie after it belong to this turn. Read a
+# bounded tail so a rotated-but-large log cannot stall a Stop hook.
+try:
+    with open(log_path, "r", encoding="utf-8") as handle:
+        lines = handle.readlines()[-4000:]
+except Exception:
+    sys.exit(0)
+
+dispatched = False
+for line in reversed(lines):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        record = json.loads(line)
+    except Exception:
+        continue
+    if not isinstance(record, dict):
+        continue
+    event = record.get("event")
+    if event == "turn_start" and record.get("turn_id") == turn_id:
+        print("met" if dispatched else "unmet", end="")
+        sys.exit(0)
+    if event == "task_dispatch":
+        dispatched = True
+
+# No start found in the tail: say nothing rather than call an unbounded window
+# unmet.
+TURN_HOOK_MET
+)"
+    case "$DELEGATION_FLOOR" in
+        met|unmet) ;;
+        *) DELEGATION_FLOOR="" ;;
+    esac
+fi
+
 # Entries newer than the routed turn were prompts absorbed into that running
 # turn. Record and remove them explicitly so health metrics do not count them
 # as independent turns that can never acquire a route or Stop.
@@ -333,11 +406,125 @@ fi
 if [ "$MODE" = --start ]; then
     LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"prompt_bytes\":$PROMPT_BYTES,\"prompt_sha256\":$(json_string "$PROMPT_SHA")}"
 else
-    LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":$(json_string "$ROUTE_STATUS")}"
+    FLOOR_FIELD=""
+    if [ -n "$DELEGATION_FLOOR" ]; then
+        FLOOR_FIELD=",\"delegation_floor\":$(json_string "$DELEGATION_FLOOR")"
+    fi
+    LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":$(json_string "$ROUTE_STATUS")$FLOOR_FIELD}"
 fi
 
 # Open the append once per invocation and emit one complete line. Do not retain
 # this FD: daemon GC rotates turns.log at startup and every six hours, and a
 # retained descriptor would keep writing to the renamed inode.
 { printf '%s\n' "$LINE" >> "$LOG_FILE"; } 2>/dev/null || true
+
+# The delegation floor. Everything above this line observes; this block is the
+# only part that speaks back, and stdout is the reason it can: Claude Code adds
+# a UserPromptSubmit hook's stdout to the turn's context, which makes this the
+# one request boundary that a directly typed prompt cannot bypass. It restates
+# the Project's own configured level and the roster the app already wrote into
+# the control file — it never decides anything the app did not already decide.
+#
+# Every failure is silent and empty. A missing, unreadable, or malformed control
+# file, absent python3, a zero roster, or an engaged kill switch all leave stdout
+# untouched, because a hook that garbles a leader turn costs more than a hook
+# that says nothing. Stop's stdout is not injected, so only --start emits.
+if [ "$MODE" = --start ] \
+    && [ -n "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
+    && [ -r "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
+    && command -v python3 >/dev/null 2>&1; then
+    python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" <<'TURN_HOOK_FLOOR' 2>/dev/null || true
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        control = json.load(handle)
+except Exception:
+    sys.exit(0)
+
+if not isinstance(control, dict) or control.get("kill_switch") is True:
+    sys.exit(0)
+
+# The per-Project switch for this whole block. Off restores the pre-existing
+# behavior — the leader decides unaided. Measurement is unaffected: observing
+# what a turn did is not the same as telling it what to do.
+if control.get("inject_directive") is False:
+    sys.exit(0)
+
+level = control.get("delegation_effective") or control.get("delegation_configured")
+if not isinstance(level, str):
+    sys.exit(0)
+
+try:
+    workers = int(control.get("available_workers") or 0)
+except (TypeError, ValueError):
+    workers = 0
+if workers <= 0:
+    sys.exit(0)
+
+try:
+    cap = int(control.get("max_parallel_workers") or 3)
+except (TypeError, ValueError):
+    cap = 3
+cap = max(1, cap)
+# What a wave can actually be here: never more than the roster, never more than
+# the Project allows. A cap of one means waves are off, not that they are small.
+wave = min(cap, workers)
+
+names = control.get("worker_names")
+names = [n for n in names if isinstance(n, str) and n] if isinstance(names, list) else []
+
+# leaderFirst only has something to say when a wave is possible at all: it
+# leaves serial work with the leader either way, so with no wave available the
+# floor would repeat the default every turn as noise.
+if level == "leaderFirst" and wave < 2:
+    sys.exit(0)
+
+if wave >= 2:
+    wave_clause = (
+        "Prefer a parallel wave of up to {} workers whenever at least two units are "
+        "dependency-ready, independently verifiable, and ownership-disjoint.".format(wave)
+    )
+else:
+    wave_clause = (
+        "Parallel waves are off for this Project, so keep the work in one lane."
+    )
+
+FLOORS = {
+    "leaderFirst": (
+        wave_clause
+        + " Direct execution stays available for trivial, same-file, or "
+        "dependency-serial work."
+    ),
+    "guarded": (
+        "Serial work stays in the leader lane, but a risk condition (cross-subsystem, "
+        "protocol or persistence, irreversible or release, unverified core assumption, "
+        "repeated failure) spends exactly one read-only worker probe first. "
+        + wave_clause
+    ),
+    "delegated": (
+        "Hand serial implementation to a worker and keep coordination, integration, and "
+        "review in the leader lane. Implementing it yourself requires a reason recorded "
+        "with `tm-agent leader turn route`. " + wave_clause
+    ),
+}
+floor = FLOORS.get(level)
+if floor is None:
+    sys.exit(0)
+
+project = control.get("project_id")
+project = project if isinstance(project, str) and project else "this Project"
+roster = " ({})".format(", ".join(names[:8])) if names else ""
+
+print(
+    "[term-mesh] Delegation floor for this turn — project: {}, level: {}, "
+    "workers available: {}{}, max parallel: {}".format(
+        project, level, workers, roster, cap
+    )
+)
+print(floor)
+TURN_HOOK_FLOOR
+fi
+
 exit 0

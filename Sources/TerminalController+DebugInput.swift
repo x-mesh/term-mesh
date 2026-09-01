@@ -245,6 +245,46 @@ extension TerminalController {
         }
     }
 
+    /// Send several named keys in order, each waiting on the one before it.
+    ///
+    /// A TUI selection list needs its caret moved before the commit key, and
+    /// the two are not interchangeable: committing early answers whatever row
+    /// the caret happens to be on. So a key that never lands stops the sequence
+    /// instead of pressing on, and `gap` gives the TUI time to redraw between
+    /// presses. `completion` reports the first failure, or success once every
+    /// key has landed.
+    func sendNamedKeysWithRetry(
+        on terminalSurface: TerminalSurface,
+        keyNames: [String],
+        gap: TimeInterval = 0.15,
+        completion: @escaping (Bool, String) -> Void = { _, _ in }
+    ) {
+        guard let key = keyNames.first else {
+            completion(true, "none")
+            return
+        }
+        let rest = Array(keyNames.dropFirst())
+        sendNamedKeyWithRetry(on: terminalSurface, keyName: key) { delivered, reason in
+            guard delivered else {
+                completion(false, reason)
+                return
+            }
+            guard !rest.isEmpty else {
+                completion(true, "none")
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + gap) { [weak self] in
+                guard let self else {
+                    completion(false, "controller_released")
+                    return
+                }
+                self.sendNamedKeysWithRetry(
+                    on: terminalSurface, keyNames: rest, gap: gap, completion: completion
+                )
+            }
+        }
+    }
+
     func sendNamedKeyWithRetry(
         on terminalSurface: TerminalSurface,
         keyName: String,

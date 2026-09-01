@@ -1307,7 +1307,7 @@ private struct SidebarProjectDelegationSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Delegation for \(target.projectLabel)")
+            Text("Work distribution for \(target.projectLabel)")
                 .font(.headline)
             Picker("Execution level", selection: $selection) {
                 ForEach(ProjectDelegationLevel.allCases, id: \.self) { level in
@@ -1320,7 +1320,10 @@ private struct SidebarProjectDelegationSheet: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if let pending = state.pending {
-                Text("Current: \(state.effective.displayName) · Next request: \(pending.displayName)")
+                // Interpolating `Text` rather than the keys themselves keeps
+                // this a catalog key ("Current: %@ · Next request: %@") while
+                // each level still translates on its own.
+                Text("Current: \(Text(state.effective.displayName)) · Next request: \(Text(pending.displayName))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -2090,7 +2093,10 @@ private struct SidebarPeerProjectsView: View {
         }
         .disabled(!canResetLayout(for: group))
         .accessibilityIdentifier("project.resetLayout")
-        Button("Delegation Settings…") {
+        // "Delegate Work to …" sits in this same menu and hands over one piece
+        // of work. This one sets the standing policy, so it must not read as a
+        // second way to do that.
+        Button("Work Distribution…") {
             guard let teamName = teamName(for: group) else { return }
             delegationTarget = SidebarProjectDelegationTarget(
                 teamName: teamName, projectLabel: group.identity.label
@@ -2615,7 +2621,10 @@ private struct PeerShellCleanupSheet: View {
                     }
                 }
                 .disabled(closeableIDs.isEmpty || isLoading)
-                Text("\(selection.count) of \(closeableCount) selected")
+                // Force widens what may be selected, so the denominator has
+                // to widen with it — otherwise selecting everything reads as
+                // "8 of 7 selected".
+                Text("\(selection.count) of \(force ? items.count : closeableCount) selected")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Spacer()
@@ -2732,6 +2741,8 @@ struct RemoteHostGroupView: View, Equatable {
     @State private var isExpanded: Bool
     @State private var showDeleteConfirm = false
     @State private var showForceDisconnectConfirm = false
+    @State private var showDaemonRestartConfirm = false
+    @State private var daemonRestartError: String?
     @State private var showNewWorkspaceAlert = false
     @State private var newWorkspaceTitle = ""
     @State private var showShellCleanup = false
@@ -3093,6 +3104,15 @@ struct RemoteHostGroupView: View, Equatable {
                         await loadShellCleanup()
                     }
                 }
+                // The cure for shells Clean Up Panes cannot remove. Kept next
+                // to it so the person who just hit that wall does not have to
+                // find a terminal.
+                Button("Restart Host Daemon…", role: .destructive) {
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        showDaemonRestartConfirm = true
+                    }
+                }
             case .connecting:
                 Button("Cancel Connection") { store.cancelConnectingHost(host) }
                 Button("Retry Connection") { store.retryConnectingHost(host) }
@@ -3255,6 +3275,30 @@ struct RemoteHostGroupView: View, Equatable {
         } message: {
             Text("Closes every pane, mirror, and relay window opened from this host. Processes running on the host continue.")
         }
+        .confirmationDialog(
+            "Restart the term-mesh daemon on \"\(host.displayName)\"?",
+            isPresented: $showDaemonRestartConfirm
+        ) {
+            Button("Restart Daemon", role: .destructive) {
+                Task { @MainActor in await restartHostDaemon() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            // Say what survives, because that is the question someone asks
+            // before pressing this: the agents keep running, only the
+            // bookkeeping is rebuilt.
+            Text("Panes disconnect and reattach. Agent and shell processes on the host keep running. "
+                 + "Shell records left behind by processes that already exited are cleared — "
+                 + "this is the way to remove the ones Clean Up Panes reports it cannot close.")
+        }
+        .alert("Restart failed", isPresented: Binding(
+            get: { daemonRestartError != nil },
+            set: { if !$0 { daemonRestartError = nil } }
+        )) {
+            Button("OK", role: .cancel) { daemonRestartError = nil }
+        } message: {
+            Text(daemonRestartError ?? "")
+        }
         .alert("New Workspace", isPresented: $showNewWorkspaceAlert) {
             TextField("Workspace name", text: $newWorkspaceTitle)
             Button("Create") {
@@ -3316,6 +3360,23 @@ struct RemoteHostGroupView: View, Equatable {
     }
 
     @MainActor
+    /// Restart the host's daemon, then let the app reconnect on its own.
+    private func restartHostDaemon() async {
+        daemonRestartError = nil
+        do {
+            let currentHost = RemoteHostStore.currentHostSnapshot(
+                for: host, in: store.hosts
+            )
+            try await TeamOrchestrator.shared.restartPeerHostDaemon(host: currentHost)
+            // Drop the transport rather than waiting for it to notice the
+            // daemon is gone: reconnecting starts a fresh daemon, so doing it
+            // here makes recovery immediate instead of a retry cycle.
+            store.disconnectSavedHost(currentHost)
+        } catch {
+            daemonRestartError = String(describing: error)
+        }
+    }
+
     private func closeSelectedShells(force: Bool) async {
         shellCleanupLoading = true
         shellCleanupError = nil

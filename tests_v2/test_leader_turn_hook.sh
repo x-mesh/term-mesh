@@ -280,4 +280,170 @@ PY
 # process can read a prompt out of `ps`. The hook copies it and clears argv.
 grep -q 'set --' "$HOOK" || fail "argv is not cleared after the payload is copied"
 
+# --- delegation floor -------------------------------------------------------
+# UserPromptSubmit stdout reaches the leader's context, so --start is the one
+# place the hook speaks rather than observes. Every unusable input must leave
+# stdout empty: a hook that garbles a turn costs more than one that says
+# nothing.
+FLOOR_HOME="$TEST_TMP/floor"
+FLOOR_CTL="$TEST_TMP/control"
+mkdir -p "$FLOOR_HOME" "$FLOOR_CTL" || exit 1
+FLOOR_LOG="$FLOOR_HOME/.term-mesh/logs/turns.log"
+
+floor_hook() {
+    _ctl="$1"
+    shift
+    HOME="$FLOOR_HOME" \
+        TERMMESH_TEAM=floor-test \
+        TERMMESH_SURFACE_ID=99999999-8888-7777-6666-555555555555 \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$_ctl" \
+        "$HOOK" "$@"
+}
+
+cat > "$FLOOR_CTL/delegated.json" <<'JSON' || exit 1
+{"delegation_effective":"delegated","available_workers":3,
+ "worker_names":["executor","architect","reviewer"],"kill_switch":false,
+ "project_id":"floor-test"}
+JSON
+cat > "$FLOOR_CTL/leader-first-solo.json" <<'JSON' || exit 1
+{"delegation_effective":"leaderFirst","available_workers":1,
+ "worker_names":["executor"],"kill_switch":false,"project_id":"floor-test"}
+JSON
+cat > "$FLOOR_CTL/killed.json" <<'JSON' || exit 1
+{"delegation_effective":"delegated","available_workers":3,"kill_switch":true,
+ "project_id":"floor-test"}
+JSON
+printf 'not json {{{' > "$FLOOR_CTL/broken.json" || exit 1
+
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"first","session_id":"floor-1"}') \
+    || fail "delegated start returned nonzero"
+case "$FLOOR_OUT" in
+    *"level: delegated"*) ;;
+    *) fail "delegated floor was not injected: $FLOOR_OUT" ;;
+esac
+case "$FLOOR_OUT" in
+    *executor*) ;;
+    *) fail "roster missing from injected floor: $FLOOR_OUT" ;;
+esac
+
+# Stop's stdout is not injected anywhere, so --end must stay silent.
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-1"}') \
+    || fail "delegated end returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "--end wrote to stdout: $FLOOR_OUT"
+
+for quiet in leader-first-solo killed broken missing; do
+    FLOOR_OUT=$(floor_hook "$FLOOR_CTL/$quiet.json" --start "{\"prompt\":\"$quiet\"}") \
+        || fail "$quiet start returned nonzero"
+    [ -z "$FLOOR_OUT" ] || fail "$quiet should inject nothing, got: $FLOOR_OUT"
+done
+FLOOR_OUT=$(env -u TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE HOME="$FLOOR_HOME" \
+    TERMMESH_TEAM=floor-test TERMMESH_SURFACE_ID=99999999-8888-7777-6666-555555555555 \
+    TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token "$HOOK" --start '{"prompt":"no control"}') \
+    || fail "unset control file returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "unset control file should inject nothing, got: $FLOOR_OUT"
+
+# task_dispatch is written by the app, never claimed by the leader, so whether
+# a delegated turn met its floor is the one participation signal that does not
+# depend on the leader reporting anything.
+floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"unmet turn","session_id":"floor-2"}' >/dev/null \
+    || fail "unmet start returned nonzero"
+floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-2"}' >/dev/null \
+    || fail "unmet end returned nonzero"
+
+floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"met turn","session_id":"floor-3"}' >/dev/null \
+    || fail "met start returned nonzero"
+printf '%s\n' '{"event":"task_dispatch","turn_id":"req-1","ts":"2026-01-01T00:00:00Z","team":"floor-test","task_id":"t1","worker":"executor","delivery":"created"}' \
+    >> "$FLOOR_LOG" || exit 1
+floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-3"}' >/dev/null \
+    || fail "met end returned nonzero"
+
+# leaderFirst states no floor a turn can miss, so the field must be absent.
+floor_hook "$FLOOR_CTL/leader-first-solo.json" --start '{"prompt":"lf turn","session_id":"floor-4"}' >/dev/null \
+    || fail "leader-first start returned nonzero"
+floor_hook "$FLOOR_CTL/leader-first-solo.json" --end '{"session_id":"floor-4"}' >/dev/null \
+    || fail "leader-first end returned nonzero"
+
+python3 - "$FLOOR_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = []
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if line:
+        records.append(json.loads(line))
+
+ends = [r for r in records if r["event"] == "turn_end"]
+# The last three ends are, in order: delegated with no dispatch, delegated with
+# one dispatch, then leaderFirst. Checking them positionally keeps this honest
+# about ordering instead of counting occurrences that earlier cases also add.
+expected = ["unmet", "met", None]
+actual = [r.get("delegation_floor") for r in ends[-3:]]
+if actual != expected:
+    raise SystemExit(f"FAIL: delegation floors were {actual}, expected {expected}")
+PY
+
+# The per-Project execution options, which only reach the hook through this
+# file: a cap of one means waves are off rather than small, and the injection
+# switch has to silence the floor without silencing measurement.
+cat > "$FLOOR_CTL/capped.json" <<'JSON' || exit 1
+{"delegation_effective":"delegated","available_workers":4,
+ "worker_names":["a","b","c","d"],"kill_switch":false,"project_id":"floor-test",
+ "max_parallel_workers":2}
+JSON
+cat > "$FLOOR_CTL/no-waves.json" <<'JSON' || exit 1
+{"delegation_effective":"leaderFirst","available_workers":4,
+ "worker_names":["a","b","c","d"],"kill_switch":false,"project_id":"floor-test",
+ "max_parallel_workers":1}
+JSON
+cat > "$FLOOR_CTL/injection-off.json" <<'JSON' || exit 1
+{"delegation_effective":"delegated","available_workers":3,"kill_switch":false,
+ "project_id":"floor-test","inject_directive":false}
+JSON
+
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/capped.json" --start '{"prompt":"capped"}') \
+    || fail "capped start returned nonzero"
+case "$FLOOR_OUT" in
+    *"up to 2 workers"*) ;;
+    *) fail "cap not reflected in the floor: $FLOOR_OUT" ;;
+esac
+case "$FLOOR_OUT" in
+    *"max parallel: 2"*) ;;
+    *) fail "cap missing from the header: $FLOOR_OUT" ;;
+esac
+
+# leaderFirst with waves capped off has nothing left to say beyond the default.
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/no-waves.json" --start '{"prompt":"no waves"}') \
+    || fail "no-waves start returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "leaderFirst with cap 1 should stay silent, got: $FLOOR_OUT"
+
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/injection-off.json" --start '{"prompt":"off","session_id":"floor-5"}') \
+    || fail "injection-off start returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "inject_directive=false must inject nothing, got: $FLOOR_OUT"
+
+# ...but turning injection off must not turn measurement off with it.
+floor_hook "$FLOOR_CTL/injection-off.json" --end '{"session_id":"floor-5"}' >/dev/null \
+    || fail "injection-off end returned nonzero"
+python3 - "$FLOOR_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+last_end = [r for r in records if r["event"] == "turn_end"][-1]
+if last_end.get("delegation_floor") != "unmet":
+    raise SystemExit(
+        "FAIL: injection off still has to measure the floor, got "
+        + repr(last_end.get("delegation_floor"))
+    )
+PY
+
 printf '%s\n' 'PASS: leader turn hook logs private, correlated start/end boundaries'
+printf '%s\n' 'PASS: leader turn hook injects and measures the delegation floor'
+printf '%s\n' 'PASS: leader turn hook honours per-Project execution options'

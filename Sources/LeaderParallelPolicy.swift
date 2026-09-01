@@ -1,12 +1,28 @@
 import CryptoKit
 import Foundation
+import SwiftUI
 
 enum ProjectDelegationLevel: String, CaseIterable, Codable, Sendable {
     case leaderFirst
     case guarded
     case delegated
 
-    var displayName: String {
+    /// App-wide starting level for newly created Projects. A Project keeps its
+    /// own level once created; this only decides where a new one begins, which
+    /// is why it lives in defaults rather than in `ProjectDelegationState`
+    /// — that type's `default` is also the decode fallback for stored state,
+    /// and a user preference must never rewrite what an old snapshot meant.
+    static let defaultLevelKey = "team.defaultDelegationLevel"
+
+    static func appDefault(from defaults: UserDefaults = .standard) -> ProjectDelegationLevel {
+        ProjectDelegationLevel(rawValue: defaults.string(forKey: defaultLevelKey) ?? "")
+            ?? .leaderFirst
+    }
+
+    /// `LocalizedStringKey`, not `String`: `Text(someString)` is the verbatim
+    /// initializer and never reaches the string catalog, which is why this
+    /// whole surface stayed English in a Korean app.
+    var displayName: LocalizedStringKey {
         switch self {
         case .leaderFirst: return "Leader first"
         case .guarded: return "Guarded"
@@ -14,7 +30,7 @@ enum ProjectDelegationLevel: String, CaseIterable, Codable, Sendable {
         }
     }
 
-    var detail: String {
+    var detail: LocalizedStringKey {
         switch self {
         case .leaderFirst:
             return "The leader handles serial work and delegates only independent parallel units."
@@ -23,6 +39,52 @@ enum ProjectDelegationLevel: String, CaseIterable, Codable, Sendable {
         case .delegated:
             return "Serial implementation goes to one worker; independent units still run in parallel."
         }
+    }
+}
+
+/// Per-Project execution options that only need to reach the turn hook.
+///
+/// Deliberately not fields on `ProjectDelegationState`. That type is wire
+/// format and rides eight persistence surfaces — team declaration, daemon
+/// sync, archive writer, live snapshot, pane restore, remote manifest payload
+/// *and* its signature, remote restore — so adding to it is a change to all
+/// eight or a value that silently fails to travel. These two only have to
+/// arrive in the control file the hook reads, so they live in defaults keyed by
+/// Project and are copied into that payload.
+struct ProjectExecutionOptions: Equatable, Sendable {
+    /// Upper bound on one parallel wave. The engine still cannot exceed the
+    /// number of workers actually on the roster.
+    var maxParallelWorkers: Int
+    /// Whether the turn hook states a delegation floor at all. Off leaves the
+    /// leader entirely to its own judgement, which is the pre-existing
+    /// behavior.
+    var injectDirective: Bool
+
+    static let `default` = Self(maxParallelWorkers: 3, injectDirective: true)
+    static let workerBounds = 1...5
+
+    private static func key(_ suffix: String, teamName: String) -> String {
+        let safe = teamName.filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
+        return "team.\(safe.isEmpty ? "unknown" : safe).\(suffix)"
+    }
+
+    static func load(teamName: String, from defaults: UserDefaults = .standard) -> Self {
+        let workersKey = key("maxParallelWorkers", teamName: teamName)
+        let injectKey = key("injectDelegationDirective", teamName: teamName)
+        let workers = defaults.object(forKey: workersKey) as? Int ?? `default`.maxParallelWorkers
+        let inject = defaults.object(forKey: injectKey) as? Bool ?? `default`.injectDirective
+        return Self(
+            maxParallelWorkers: min(workerBounds.upperBound, max(workerBounds.lowerBound, workers)),
+            injectDirective: inject
+        )
+    }
+
+    func save(teamName: String, to defaults: UserDefaults = .standard) {
+        defaults.set(
+            min(Self.workerBounds.upperBound, max(Self.workerBounds.lowerBound, maxParallelWorkers)),
+            forKey: Self.key("maxParallelWorkers", teamName: teamName)
+        )
+        defaults.set(injectDirective, forKey: Self.key("injectDelegationDirective", teamName: teamName))
     }
 }
 
@@ -84,29 +146,44 @@ struct ProjectRoutingDecision: Codable, Equatable, Sendable {
     let reasons: [String]
     let workerCount: Int
 
+    /// `taskShape` is optional because the only request boundary a directly
+    /// typed prompt crosses is the turn hook, which sees the prompt before any
+    /// classification exists. A nil shape must not silently read as
+    /// `single_unit`: that value closes the parallel gate outright, which is
+    /// how an unstated shape used to pin every such turn to `direct`.
     static func decide(
         level: ProjectDelegationLevel,
-        taskShape: ProjectTaskShape,
+        taskShape: ProjectTaskShape?,
         risks: Set<ProjectRoutingRisk>,
-        availableWorkers: Int
+        availableWorkers: Int,
+        maxParallelWorkers: Int = ProjectExecutionOptions.default.maxParallelWorkers
     ) -> Self {
         let workers = max(0, availableWorkers)
         guard workers > 0 else {
             return Self(route: .direct, reasons: ["no_available_workers"], workerCount: 0)
         }
-        if taskShape.supportsParallelWave, workers >= 2 {
+        // A cap of one is a deliberate "never fan out", not a small wave: two
+        // is the smallest wave the policy recognises, so a cap below it has to
+        // close the gate rather than emit a one-worker "parallel" run.
+        let cap = max(1, maxParallelWorkers)
+        if let taskShape, taskShape.supportsParallelWave, workers >= 2, cap >= 2 {
             return Self(
                 route: .parallel, reasons: ["parallel_ready"],
-                workerCount: min(3, workers)
+                workerCount: min(cap, workers)
             )
         }
         switch level {
         case .leaderFirst:
-            return Self(
-                route: .direct,
-                reasons: [taskShape.supportsParallelWave ? "limited_capacity" : "leader_first"],
-                workerCount: 0
-            )
+            // An unstated shape with a usable roster is not evidence that the
+            // work is serial. Say so in the reason rather than claiming the
+            // leader hit a capacity limit it never reported.
+            let reason: String
+            if let taskShape {
+                reason = taskShape.supportsParallelWave ? "limited_capacity" : "leader_first"
+            } else {
+                reason = workers >= 2 ? "shape_unstated" : "leader_first"
+            }
+            return Self(route: .direct, reasons: [reason], workerCount: 0)
         case .guarded:
             guard !risks.isEmpty else {
                 return Self(route: .direct, reasons: ["guard_not_required"], workerCount: 0)
