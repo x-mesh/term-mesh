@@ -107,6 +107,7 @@ actor MockTransport {
 /// handshake defined in `docs/peer-federation-protocol.md`, then answers
 /// ListSurfaces with a canned surface list.
 actor MockHost {
+    enum FinalRequest { case listSurfaces, terminateWithoutResponse }
     let transport: MockTransport
     var pendingInbound = Data()
     var seq: UInt64 = 0
@@ -115,6 +116,7 @@ actor MockHost {
     let protocolVersion: String
     let capabilities: [String]
     let cliBinDirs: [String]
+    let finalRequest: FinalRequest
 
     init(
         transport: MockTransport,
@@ -122,7 +124,8 @@ actor MockHost {
         pushWorkspaceUpdateBeforeSurfaceList: Bool = false,
         protocolVersion: String = "1.0.0",
         capabilities: [String] = [],
-        cliBinDirs: [String] = []
+        cliBinDirs: [String] = [],
+        finalRequest: FinalRequest = .listSurfaces
     ) {
         self.transport = transport
         self.surfaces = surfaces
@@ -130,6 +133,7 @@ actor MockHost {
         self.protocolVersion = protocolVersion
         self.capabilities = capabilities
         self.cliBinDirs = cliBinDirs
+        self.finalRequest = finalRequest
     }
 
     func run() async throws {
@@ -164,6 +168,13 @@ actor MockHost {
         result.accepted = true
         result.sessionID = Data(count: 16)
         try await sendEnvelope { $0.authResult = result }
+
+        if finalRequest == .terminateWithoutResponse {
+            _ = try await readExpecting { env in
+                if case .terminateSurfaceRequest = env.payload { return true } else { return false }
+            }
+            return
+        }
 
         // 6. Handle ListSurfaces
         _ = try await readExpecting { env in
@@ -763,6 +774,40 @@ final class PeerSessionTests: XCTestCase {
             XCTAssertEqual(operation, "createWorkspace")
         }
         try await hostTask.value
+    }
+
+    func testAdvertisedTerminateThatNeverRepliesTimesOutAndClosesTransport() async throws {
+        let transport = MockTransport()
+        let closed = Counter()
+        let host = MockHost(
+            transport: transport,
+            surfaces: [],
+            capabilities: [PeerCapability.surfaceTerminateV1],
+            finalRequest: .terminateWithoutResponse
+        )
+        let hostTask = Task { try await host.run() }
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) },
+            close: {
+                await closed.increment()
+                await transport.closeClientRead()
+            }
+        )
+        _ = try await session.handshake()
+
+        do {
+            _ = try await session.terminateSurface(
+                surfaceID: Data(repeating: 0xA1, count: 16),
+                timeoutSeconds: 0.05
+            )
+            XCTFail("silent terminate host must time out")
+        } catch PeerSessionError.rpcTimedOut(let operation) {
+            XCTAssertEqual(operation, "terminateSurface")
+        }
+        try await hostTask.value
+        let closeCount = await closed.value
+        XCTAssertEqual(closeCount, 1)
     }
 
     func testTeamRPCsRequireNegotiatedCapabilitiesBeforeWriting() async throws {

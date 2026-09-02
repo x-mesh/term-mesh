@@ -117,7 +117,8 @@ E2E_APP_PID_FILE="${TMPDIR:-/tmp}/term-mesh-e2e-app-${E2E_RUN_ID}.pid"
 REMOTE_FIXTURE_SSH_TARGET=""
 REMOTE_FIXTURE_ROOT=""
 # Where the peer's agent CLI symlink pointed before this run, when it resolved.
-REMOTE_AGENT_CLI_LINK=""
+REMOTE_AGENT_CLI_BACKUP=""
+REMOTE_AGENT_CLI_PRESENT=0
 PYTHON_VENV="$DERIVED_DATA_PATH/python-venv"
 PYTHON="$PYTHON_VENV/bin/python3"
 SYSTEM_PYTHON="/usr/bin/python3"
@@ -153,14 +154,14 @@ stage_remote_relay_fixture() {
   # CLI installs a copy of itself there and repoints ~/.local/bin/claude at it.
   # The fixture is deleted on exit, which left that link dangling and the next
   # run could not start a leader at all: "claude is not installed". Remember
-  # where it pointed so cleanup can put it back. Only a link that resolves is
-  # worth restoring — an already-broken one is not this run's to repair.
-  REMOTE_AGENT_CLI_LINK="$(ssh "$REMOTE_FIXTURE_SSH_TARGET" \
-    'if [ -e "$HOME/.local/bin/claude" ]; then readlink "$HOME/.local/bin/claude"; fi' \
-    2>/dev/null || true)"
-
   fixture_id="${candidate_sha:0:12}-$E2E_RUN_ID"
   REMOTE_FIXTURE_ROOT="/tmp/term-mesh-release-relay-$fixture_id"
+  REMOTE_AGENT_CLI_BACKUP="/tmp/term-mesh-release-relay-cli-$fixture_id"
+  if ssh "$REMOTE_FIXTURE_SSH_TARGET" 'test -e "$HOME/.local/bin/claude" || test -L "$HOME/.local/bin/claude"'; then
+    REMOTE_AGENT_CLI_PRESENT=1
+    ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+      "rm -rf '$REMOTE_AGENT_CLI_BACKUP'; mkdir -p '$REMOTE_AGENT_CLI_BACKUP'; cp -a \"\$HOME/.local/bin/claude\" '$REMOTE_AGENT_CLI_BACKUP/claude'"
+  fi
   remote_socket="$REMOTE_FIXTURE_ROOT/peer.sock"
   remote_dir="$REMOTE_FIXTURE_ROOT/src"
   echo "== stage remote candidate fixture ($REMOTE_FIXTURE_SSH_TARGET) =="
@@ -211,19 +212,22 @@ stage_remote_relay_fixture() {
 cleanup_remote_relay_fixture() {
   [ -n "$REMOTE_FIXTURE_SSH_TARGET" ] || return 0
   [ -n "$REMOTE_FIXTURE_ROOT" ] || return 0
-  # Put the agent CLI link back before the directory it points into is removed,
-  # and only when this run is what moved it.
-  if [ -n "$REMOTE_AGENT_CLI_LINK" ]; then
+  # Restore the exact original entry before deleting the fixture, but only
+  # when this run still owns the current fixture-target symlink.
+  if [ -n "$REMOTE_AGENT_CLI_BACKUP" ]; then
     ssh "$REMOTE_FIXTURE_SSH_TARGET" \
       "current=\$(readlink \"\$HOME/.local/bin/claude\" 2>/dev/null || true); \
        case \"\$current\" in \
          '$REMOTE_FIXTURE_ROOT'/*) \
-           ln -sfn '$REMOTE_AGENT_CLI_LINK' \"\$HOME/.local/bin/claude\";; \
+           rm -f \"\$HOME/.local/bin/claude\"; \
+           if [ '$REMOTE_AGENT_CLI_PRESENT' = '1' ]; then \
+             cp -a '$REMOTE_AGENT_CLI_BACKUP/claude' \"\$HOME/.local/bin/claude\"; \
+           fi;; \
        esac" \
       >/dev/null 2>&1 || true
   fi
   ssh "$REMOTE_FIXTURE_SSH_TARGET" \
-    "if test -f '$REMOTE_FIXTURE_ROOT/pid'; then kill \$(cat '$REMOTE_FIXTURE_ROOT/pid') 2>/dev/null || true; fi; rm -rf '$REMOTE_FIXTURE_ROOT'" \
+    "if test -f '$REMOTE_FIXTURE_ROOT/pid'; then kill \$(cat '$REMOTE_FIXTURE_ROOT/pid') 2>/dev/null || true; fi; rm -rf '$REMOTE_FIXTURE_ROOT' '$REMOTE_AGENT_CLI_BACKUP'" \
     >/dev/null 2>&1 || true
 }
 

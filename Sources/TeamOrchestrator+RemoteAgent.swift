@@ -2810,7 +2810,9 @@ extension TeamOrchestrator {
             guard let session = opened?.session else {
                 throw RemoteAgentError.hostNotConnected(host.displayName)
             }
-            return try await session.terminateSurface(surfaceID: paneID)
+            return try await session.terminateSurface(
+                surfaceID: paneID, timeoutSeconds: 5
+            )
         }
         func applyAuthoritativeAbsence() {
             guard let rosterCheckpoint else { return }
