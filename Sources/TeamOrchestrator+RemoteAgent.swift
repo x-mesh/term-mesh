@@ -2729,6 +2729,10 @@ extension TeamOrchestrator {
         )
         guard !targets.isEmpty else { return 0 }
         if force { closeLocalPeerPanes(surfaceIDs: targets) }
+        let rosterCheckpoint = RemoteHostStore.shared.peerShellCleanupCheckpoint(
+            hostID: host.id, expectedSockPath: host.activeSockPath
+        )
+        var confirmedAbsent = Set<Data>()
 
         // Prefer a connection the host has already granted. Opening one here
         // is what made this sweep unusable: the host allows a fixed number of
@@ -2779,24 +2783,28 @@ extension TeamOrchestrator {
             // pump is active. Keep one dedicated connection for the whole
             // sweep instead of consuming a new host permit for every target.
             if opened == nil {
-                guard !dialFailed else {
-                    throw RemoteAgentError.hostNotConnected(host.displayName)
-                }
-                do {
-                    opened = try await PeerRelaySession.connect(
-                        hostSockPath: host.activeSockPath
-                    )
-                } catch {
-                    dialFailed = true
-                    // A saturated host rejects new peer connections. Submit
-                    // termination over an already-admitted relay instead; the
-                    // fallback path below confirms removal from the live
-                    // roster before it can count as success.
-                    if let borrowed,
-                       try await borrowed.requestTerminateSurface(paneID) {
-                        return .notFound
+                let route = Self.peerShellTerminateRoute(
+                    hasOpenedSession: false,
+                    dialFailed: dialFailed,
+                    hasBorrowedSession: borrowed != nil
+                )
+                if route == .dial {
+                    do {
+                        opened = try await PeerRelaySession.connect(
+                            hostSockPath: host.activeSockPath
+                        )
+                    } catch {
+                        // Disable future dials, but keep using the admitted
+                        // borrowed session for every remaining target.
+                        dialFailed = true
                     }
-                    throw error
+                }
+                if opened == nil, let borrowed,
+                   let result = try await borrowed.requestTerminateSurface(paneID) {
+                    return result
+                }
+                if opened == nil {
+                    throw RemoteAgentError.hostNotConnected(host.displayName)
                 }
             }
             guard let session = opened?.session else {
@@ -2804,27 +2812,62 @@ extension TeamOrchestrator {
             }
             return try await session.terminateSurface(surfaceID: paneID)
         }
-        return try await Self.sweepClose(targets: targets, send: { surfaceID in
-            try await Self.closePeerShellConfirmed(
-                surfaceID: surfaceID,
-                force: force,
-                terminate: { try await terminateSurface(surfaceID) },
-                closePane: { try await sendClosePane(surfaceID) },
-                confirmRemoved: {
-                    if RemoteHostStore.shared.hosts[host.id] != nil {
-                        return try await self.waitForStoredPeerShellRemoval(
-                            hostID: host.id, surfaceID: surfaceID
+        func applyAuthoritativeAbsence() {
+            guard let rosterCheckpoint else { return }
+            _ = RemoteHostStore.shared.removeAuthoritativelyAbsentPeerShells(
+                confirmedAbsent, checkpoint: rosterCheckpoint
+            )
+        }
+        do {
+            let closed = try await Self.sweepClose(targets: targets, send: { surfaceID in
+                let confirmed = try await Self.closePeerShellConfirmed(
+                    surfaceID: surfaceID,
+                    force: force,
+                    terminate: { try await terminateSurface(surfaceID) },
+                    closePane: { try await sendClosePane(surfaceID) },
+                    confirmRemoved: {
+                        if let session = opened?.session {
+                            return try await self.waitForPeerShellRemoval(
+                                session: session, surfaceID: surfaceID
+                            )
+                        }
+                        if RemoteHostStore.shared.hosts[host.id] != nil {
+                            // A borrowed session on an older host cannot
+                            // produce an authoritative roster response. Fail
+                            // immediately instead of polling the same stale
+                            // cache for 25 seconds.
+                            return false
+                        }
+                        return try await self.waitForRemoteRemoval(
+                            hostSockPath: host.activeSockPath,
+                            surfaceID: surfaceID
                         )
                     }
-                    return try await self.waitForRemoteRemoval(
-                        hostSockPath: host.activeSockPath,
-                        surfaceID: surfaceID
-                    )
-                }
-            )
-        }) { surfaceID in
-            ManagedPeerSurfaceStore.shared.forget(hostKey: host.id, surfaceID: surfaceID)
+                )
+                if confirmed { confirmedAbsent.insert(surfaceID) }
+            }) { surfaceID in
+                ManagedPeerSurfaceStore.shared.forget(hostKey: host.id, surfaceID: surfaceID)
+            }
+            applyAuthoritativeAbsence()
+            return closed
+        } catch {
+            applyAuthoritativeAbsence()
+            throw error
         }
+    }
+
+    enum PeerShellTerminateRoute: Equatable {
+        case opened, dial, borrowed, unavailable
+    }
+
+    nonisolated static func peerShellTerminateRoute(
+        hasOpenedSession: Bool,
+        dialFailed: Bool,
+        hasBorrowedSession: Bool
+    ) -> PeerShellTerminateRoute {
+        if hasOpenedSession { return .opened }
+        if !dialFailed { return .dial }
+        return hasBorrowedSession ? .borrowed : .unavailable
     }
 
     @MainActor
@@ -2847,21 +2890,45 @@ extension TeamOrchestrator {
         return false
     }
 
+    /// Confirm on the same direct-response connection that carried ClosePane.
+    /// Older GUI hosts do not advertise TerminateSurface, but they do process
+    /// envelopes serially, so this full roster is ordered after the close and
+    /// cannot race a snapshot from another connection.
+    private func waitForPeerShellRemoval(
+        session: PeerSession,
+        surfaceID: Data
+    ) async throws -> Bool {
+        for attempt in 0..<15 {
+            let workspaces = try await session.listWorkspaces(timeoutSeconds: 2)
+            let stillExists = workspaces.contains { workspace in
+                workspace.hasLayout && peerSurfaceIDs(workspace.layout).contains(surfaceID)
+            }
+            if !stillExists { return true }
+            if attempt < 14 {
+                try await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+        return false
+    }
+
     /// Close one cleanup target only after the host has authoritatively removed
     /// it. `ClosePane` is fire-and-forget and deliberately ignores the final
     /// pane in a workspace, so successful frame delivery is not successful
     /// cleanup. Force mode first uses `TerminateSurface`, whose response is
     /// authoritative and can remove the final pane; older hosts that return
     /// `.notFound` fall back to ClosePane plus roster polling.
+    /// Returns true when a correlated terminate response or an ordered roster
+    /// read authoritatively proved the exact surface absent.
     static func closePeerShellConfirmed(
         surfaceID: Data,
         force: Bool,
         terminate: () async throws -> Termmesh_Peer_V1_TerminateSurfaceResult,
         closePane: () async throws -> Void,
         confirmRemoved: () async throws -> Bool
-    ) async throws {
-        if force, let result = try? await terminate(), result == .terminated {
-            return
+    ) async throws -> Bool {
+        if force, let result = try? await terminate(),
+           result == .terminated || result == .notFound {
+            return true
         }
         try await closePane()
         guard try await confirmRemoved() else {
@@ -2870,6 +2937,7 @@ extension TeamOrchestrator {
                     + surfaceID.prefix(4).map { String(format: "%02x", $0) }.joined()
             )
         }
+        return true
     }
 
     /// Close local viewers before force-ending their remote surfaces. Leaving

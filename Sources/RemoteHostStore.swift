@@ -859,6 +859,149 @@ final class RemoteHostStore: ObservableObject {
 
     @Published private(set) var hosts: [String: HostEntry] = [:]
     @Published private(set) var expandSignal = ExpandSignal()
+    private var workspaceRosterGenerations: [String: UInt64] = [:]
+
+    struct WorkspaceRosterCheckpoint: Equatable {
+        let hostID: String
+        let activeSockPath: String
+        let generation: UInt64
+    }
+
+    private func replaceWorkspaceRoster(_ workspaces: [WorkspaceSummary], for key: String) {
+        guard hosts[key] != nil else { return }
+        hosts[key]?.workspaces = workspaces
+        workspaceRosterGenerations[key, default: 0] &+= 1
+    }
+
+    func peerShellCleanupCheckpoint(
+        hostID: String, expectedSockPath: String
+    ) -> WorkspaceRosterCheckpoint? {
+        guard let host = hosts[hostID],
+              host.activeSockPath == expectedSockPath,
+              host.isConnected
+        else { return nil }
+        return WorkspaceRosterCheckpoint(
+            hostID: hostID, activeSockPath: expectedSockPath,
+            generation: workspaceRosterGenerations[hostID, default: 0]
+        )
+    }
+
+    /// Drop only stale presentation rows whose exact surfaces the serving
+    /// endpoint authoritatively reported absent. A roster push or reconnect
+    /// after the checkpoint wins; its newer snapshot must never be edited.
+    @discardableResult
+    func removeAuthoritativelyAbsentPeerShells(
+        _ surfaceIDs: Set<Data>, checkpoint: WorkspaceRosterCheckpoint
+    ) -> Bool {
+        guard !surfaceIDs.isEmpty,
+              let host = hosts[checkpoint.hostID],
+              host.activeSockPath == checkpoint.activeSockPath,
+              workspaceRosterGenerations[checkpoint.hostID, default: 0] == checkpoint.generation
+        else { return false }
+        let updated = Self.removingPeerShells(surfaceIDs, from: host.workspaces)
+        guard updated != host.workspaces else { return false }
+        replaceWorkspaceRoster(updated, for: checkpoint.hostID)
+        return true
+    }
+
+    nonisolated static func removingPeerShells(
+        _ surfaceIDs: Set<Data>, from workspaces: [WorkspaceSummary]
+    ) -> [WorkspaceSummary] {
+        workspaces.map { workspace in
+            // A row identifies only the active surface of a bonsplit leaf.
+            // Sibling tabs have their own surface IDs but are flattened into
+            // this row's tabCount, so never erase the whole row unless it is a
+            // single-tab pane. A later authoritative roster rebuilds a
+            // multi-tab row around whichever sibling became active.
+            let panes = workspace.panes.filter {
+                !surfaceIDs.contains($0.id) || $0.tabCount > 1
+            }
+            guard panes.count != workspace.panes.count else { return workspace }
+            return WorkspaceSummary(
+                id: workspace.id, title: workspace.title,
+                hostSockPath: workspace.hostSockPath, windowID: workspace.windowID,
+                windowTitle: workspace.windowTitle, isDefault: workspace.isDefault,
+                paneCount: panes.count,
+                surfaceCount: panes.reduce(0) { $0 + $1.tabCount },
+                busyCount: panes.count(where: \.isBusy), panes: panes
+            )
+        }
+    }
+
+    #if DEBUG
+    func installPeerShellCleanupCacheForTesting(
+        hostID: String, sockPath: String, workspaces: [WorkspaceSummary]
+    ) {
+        hosts[hostID] = HostEntry(
+            id: hostID, displayName: hostID, connectionState: .connected,
+            workspaces: workspaces, activeSockPath: sockPath,
+            sshTarget: nil, remoteSockPath: sockPath
+        )
+        workspaceRosterGenerations[hostID, default: 0] &+= 1
+    }
+
+    func removePeerShellCleanupCacheForTesting(hostID: String) {
+        hosts[hostID] = nil
+        workspaceRosterGenerations[hostID] = nil
+    }
+
+    /// Install a sidebar roster whose stale rows never existed on the serving
+    /// peer. Socket E2E uses the real loopback peer response while keeping
+    /// production hosts and their durable state out of the test.
+    func installPeerShellCleanupFixture(
+        hostID: String, sockPath: String, staleCount: Int
+    ) async throws -> (stale: [Data], survivor: Data) {
+        let connection = try await PeerRelaySession.connect(hostSockPath: sockPath)
+        let remote = try await connection.session.listWorkspaces(timeoutSeconds: 10)
+        await connection.cancel()
+        let summaries = remote.map { workspace -> WorkspaceSummary in
+            let layout = workspace.hasLayout ? workspace.layout : nil
+            let counts = peerLayoutCounts(layout)
+            return WorkspaceSummary(
+                id: workspace.workspaceID,
+                title: workspace.title.isEmpty ? "<workspace>" : workspace.title,
+                hostSockPath: sockPath, windowID: workspace.windowID,
+                windowTitle: workspace.windowTitle, isDefault: workspace.isDefault,
+                paneCount: counts.panes, surfaceCount: counts.surfaces,
+                busyCount: counts.busy, panes: peerPaneSummaries(layout)
+            )
+        }
+        guard let survivor = summaries.flatMap(\.panes).first else {
+            throw NSError(
+                domain: "PeerShellCleanupFixture", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "loopback peer has no pane"]
+            )
+        }
+        let stale = (0..<staleCount).map { index in
+            var bytes = UUID().uuid
+            return withUnsafeBytes(of: &bytes) { Data($0) }
+        }
+        let stalePanes = stale.enumerated().map { index, id in
+            RemotePaneSummary(
+                id: id, title: "stale-\(index)", workingDirectoryPath: "/tmp",
+                workingDirectoryName: "tmp", projectRootPath: nil, tabCount: 1,
+                columns: 80, rows: 24, isBusy: false
+            )
+        }
+        var fixture = summaries
+        if let index = fixture.firstIndex(where: { $0.panes.contains(survivor) }) {
+            let workspace = fixture[index]
+            let panes = workspace.panes + stalePanes
+            fixture[index] = WorkspaceSummary(
+                id: workspace.id, title: workspace.title,
+                hostSockPath: workspace.hostSockPath, windowID: workspace.windowID,
+                windowTitle: workspace.windowTitle, isDefault: workspace.isDefault,
+                paneCount: panes.count,
+                surfaceCount: panes.reduce(0) { $0 + $1.tabCount },
+                busyCount: panes.count(where: \.isBusy), panes: panes
+            )
+        }
+        installPeerShellCleanupCacheForTesting(
+            hostID: hostID, sockPath: sockPath, workspaces: fixture
+        )
+        return (stale, survivor.id)
+    }
+    #endif
 
     /// Connected (or connecting) first, then saved/failed; name-sorted
     /// within each band so entries don't shuffle on reconnect.
@@ -1150,7 +1293,7 @@ final class RemoteHostStore: ObservableObject {
                     // below re-answers it.
                     hosts[key]?.clearServingMetadata()
                     hosts[key]?.activeSockPath = conn.hostSockPath
-                    hosts[key]?.workspaces = []
+                    replaceWorkspaceRoster([], for: key)
                     fetchWorkspaces(for: conn.hostSockPath, key: key, provenance: nil)
                 }
             }
@@ -1363,7 +1506,7 @@ final class RemoteHostStore: ObservableObject {
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
         stopWorkspaceSubscription(for: key)
-        hosts[key]?.workspaces = []
+        replaceWorkspaceRoster([], for: key)
         hosts[key]?.activeSockPath = ""
         hosts[key]?.clearServingMetadata()
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
@@ -1403,7 +1546,7 @@ final class RemoteHostStore: ObservableObject {
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
         stopWorkspaceSubscription(for: key)
-        hosts[key]?.workspaces = []
+        replaceWorkspaceRoster([], for: key)
         hosts[key]?.activeSockPath = ""
         hosts[key]?.clearServingMetadata()
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
@@ -1534,7 +1677,7 @@ final class RemoteHostStore: ObservableObject {
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
         stopWorkspaceSubscription(for: key)
-        hosts[key]?.workspaces = []
+        replaceWorkspaceRoster([], for: key)
         hosts[key]?.activeSockPath = ""
         hosts[key]?.clearServingMetadata()
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
@@ -1593,7 +1736,7 @@ final class RemoteHostStore: ObservableObject {
         PeerPaneHostRegistry.shared.release(lease)
         fetchTasks[key]?.cancel()
         stopWorkspaceSubscription(for: key)
-        hosts[key]?.workspaces = []
+        replaceWorkspaceRoster([], for: key)
         hosts[key]?.activeSockPath = ""
         hosts[key]?.clearServingMetadata()
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
@@ -1644,7 +1787,7 @@ final class RemoteHostStore: ObservableObject {
         fetchTasks[key]?.cancel()
         fetchTasks[key] = nil
         stopWorkspaceSubscription(for: key)
-        hosts[key]?.workspaces = []
+        replaceWorkspaceRoster([], for: key)
         hosts[key]?.activeSockPath = ""
         hosts[key]?.clearServingMetadata()
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
@@ -1775,7 +1918,7 @@ final class RemoteHostStore: ObservableObject {
                         panes: peerPaneSummaries(layout)
                     )
                 }
-                self.hosts[key]?.workspaces = summaries
+                self.replaceWorkspaceRoster(summaries, for: key)
                 // Project discovery follows independently. An unresolved or
                 // slow session owner must not hold the serving GUI's roster
                 // hostage for the whole startup retry budget.
@@ -1807,7 +1950,7 @@ final class RemoteHostStore: ObservableObject {
                    self.hosts[key]?.activeSockPath == path,
                    self.hosts[key]?.isConnected == true {
                     self.hosts[key]?.connectionState = .failed(Self.unreachableReason)
-                    self.hosts[key]?.workspaces = []
+                    self.replaceWorkspaceRoster([], for: key)
                     self.hosts[key]?.teams = []
                     self.hosts[key]?.clearAuthenticatedHostCLIBinDirs()
                     TeamOrchestrator.shared.markRemoteAgentsUnreachable(
@@ -1975,7 +2118,7 @@ final class RemoteHostStore: ObservableObject {
         hostSockPath: String,
         key: String
     ) {
-        hosts[key]?.workspaces = workspaces.map { ws in
+        let summaries = workspaces.map { ws in
             let layout = ws.hasLayout ? ws.layout : nil
             let counts = peerLayoutCounts(layout)
             return WorkspaceSummary(
@@ -1991,6 +2134,7 @@ final class RemoteHostStore: ObservableObject {
                 panes: peerPaneSummaries(layout)
             )
         }
+        replaceWorkspaceRoster(summaries, for: key)
         scheduleTeamRosterRefresh(for: hostSockPath, key: key)
     }
 
@@ -2297,7 +2441,8 @@ final class RemoteHostStore: ObservableObject {
         else { return }
 
         let counts = peerLayoutCounts(layout)
-        hosts[hostID]?.workspaces[index] = WorkspaceSummary(
+        var workspaces = hosts[hostID]?.workspaces ?? []
+        workspaces[index] = WorkspaceSummary(
             id: current.id,
             title: current.title,
             hostSockPath: current.hostSockPath,
@@ -2309,6 +2454,7 @@ final class RemoteHostStore: ObservableObject {
             busyCount: counts.busy,
             panes: peerPaneSummaries(layout)
         )
+        replaceWorkspaceRoster(workspaces, for: hostID)
     }
 
     /// `host` is the sidebar group the row was rendered under — used for

@@ -775,6 +775,12 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         await MainActor.run { applyWorkspaceControl(control) }
     }
 
+    func terminateSurface(
+        surfaceID: Data
+    ) async -> Termmesh_Peer_V1_TerminateSurfaceResult {
+        await MainActor.run { performTerminate(surfaceIDBytes: surfaceID) }
+    }
+
     func createWorkspace(title: String) async -> Data? {
         await MainActor.run { performCreateWorkspace(title: title) }
     }
@@ -1275,14 +1281,20 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     }
 
     private func performClose(paneIDBytes: Data) {
-        guard let panelUUID = uuidFromSurfaceID(paneIDBytes),
+        _ = performTerminate(surfaceIDBytes: paneIDBytes)
+    }
+
+    private func performTerminate(
+        surfaceIDBytes: Data
+    ) -> Termmesh_Peer_V1_TerminateSurfaceResult {
+        guard let panelUUID = uuidFromSurfaceID(surfaceIDBytes),
               let workspace = workspaceContaining(panelUUID: panelUUID),
               workspace.panels[panelUUID] != nil
-        else { return }
+        else { return .notFound }
         // `bonsplitController.closeTab` only updates the split tree. It skips
         // Workspace's panel teardown, leaving the Ghostty surface and its PTY
         // child alive after the peer roster says the pane is gone.
-        _ = workspace.closePanel(panelUUID, force: true)
+        return workspace.closePanel(panelUUID, force: true) ? .terminated : .failed
     }
 
     /// Create in the window the host already considers current, but do not

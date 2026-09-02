@@ -57,6 +57,13 @@ public actor PeerSessionDemux {
     /// daemon may complete them out of order.  Keep their continuations here
     /// rather than coupling completion order to wire order.
     private var ensureWaiters: [Data: AsyncThrowingStream<Termmesh_Peer_V1_EnsureSurfaceResponse, Error>.Continuation] = [:]
+    private struct TerminateWaiter {
+        let expectedSurfaceID: Data
+        let continuation: AsyncThrowingStream<
+            Termmesh_Peer_V1_TerminateSurfaceResponse, Error
+        >.Continuation
+    }
+    private var terminateWaiters: [Data: TerminateWaiter] = [:]
 
     /// Per-surface count of chunks dropped by the `bufferingNewest` policy
     /// (a slow pane whose relay is backed up). This is an app-side
@@ -120,6 +127,83 @@ public actor PeerSessionDemux {
 
     func cancelEnsure(requestID: Data) {
         ensureWaiters.removeValue(forKey: requestID)?.finish(throwing: CancellationError())
+    }
+
+    func registerTerminate(
+        requestID: Data,
+        expectedSurfaceID: Data
+    ) throws -> AsyncThrowingStream<Termmesh_Peer_V1_TerminateSurfaceResponse, Error> {
+        guard terminateWaiters[requestID] == nil else {
+            throw PeerSessionError.duplicateEnsureRequestID
+        }
+        var captured: AsyncThrowingStream<Termmesh_Peer_V1_TerminateSurfaceResponse, Error>.Continuation!
+        let stream = AsyncThrowingStream<Termmesh_Peer_V1_TerminateSurfaceResponse, Error> {
+            captured = $0
+        }
+        terminateWaiters[requestID] = TerminateWaiter(
+            expectedSurfaceID: expectedSurfaceID, continuation: captured
+        )
+        return stream
+    }
+
+    func routeTerminateResponse(_ response: Termmesh_Peer_V1_TerminateSurfaceResponse) {
+        guard response.requestID.count == 16 else {
+            failAllTerminates(
+                error: PeerSessionError.malformedEnsureResponse("request_id must be 16 bytes")
+            )
+            return
+        }
+        guard let waiter = terminateWaiters.removeValue(forKey: response.requestID) else {
+            return
+        }
+        if let error = Self.terminateResponseValidationError(
+            response, expectedSurfaceID: waiter.expectedSurfaceID
+        ) {
+            waiter.continuation.finish(
+                throwing: PeerSessionError.malformedEnsureResponse(error)
+            )
+            return
+        }
+        waiter.continuation.yield(response)
+        waiter.continuation.finish()
+    }
+
+    func failTerminate(requestID: Data, error: Error) {
+        terminateWaiters.removeValue(forKey: requestID)?.continuation.finish(throwing: error)
+    }
+
+    func cancelTerminate(requestID: Data) {
+        terminateWaiters.removeValue(forKey: requestID)?.continuation.finish(
+            throwing: CancellationError()
+        )
+    }
+
+    func failAllTerminates(error: Error) {
+        let waiters = terminateWaiters.values
+        terminateWaiters.removeAll()
+        for waiter in waiters { waiter.continuation.finish(throwing: error) }
+    }
+
+    var pendingTerminateCount: Int { terminateWaiters.count }
+
+    static func terminateResponseValidationError(
+        _ response: Termmesh_Peer_V1_TerminateSurfaceResponse,
+        expectedSurfaceID: Data
+    ) -> String? {
+        guard response.surfaceID == expectedSurfaceID else {
+            return "surface_id does not echo the terminate request"
+        }
+        switch response.result {
+        case .terminated, .notFound:
+            return response.hasError ? "successful terminate response must not contain error" : nil
+        case .failed:
+            guard response.hasError else { return "failed terminate response must contain error" }
+            return response.error.code == .unspecified
+                ? "failed terminate response error code must be specified"
+                : nil
+        case .unspecified, .UNRECOGNIZED:
+            return "terminate result must be recognized and specified"
+        }
     }
 
     private static func ensureResponseValidationError(

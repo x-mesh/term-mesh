@@ -73,6 +73,16 @@ final class Workspace: Identifiable {
 
     /// The bonsplit controller managing the split panes for this workspace
     let bonsplitController: BonsplitController
+    /// Read by the pane header on every draw, so it is a plain reference to the
+    /// one app-wide mirror rather than per-workspace state to keep in sync.
+    private var remoteExposureStore: RemoteExposureStore { .shared }
+    /// Which of this workspace's panels the header last drew as exposed.
+    ///
+    /// Kept so a registry change redraws only the headers whose answer moved.
+    /// Without it the choice is between redrawing every pane on any change and
+    /// not redrawing at all.
+    private var drawnExposedPanelIds: Set<UUID> = []
+    private var exposureObserver: AnyCancellable?
 
     /// Mapping from bonsplit TabID to our Panel instances
     var panels: [UUID: any Panel] = [:] {
@@ -430,6 +440,7 @@ final class Workspace: Identifiable {
             self?.handleExternalTabDrop(request) ?? false
         }
         configurePaneHeaderActions()
+        observeRemoteExposures()
 
         // Ensure bonsplit has a focused pane and our didSelectTab handler runs for the
         // initial terminal. bonsplit's createTab selects internally but does not emit
@@ -451,63 +462,228 @@ final class Workspace: Identifiable {
         }
     }
 
+    /// Keep the header in step with a registry this app did not change.
+    ///
+    /// `/rc on` in a pane, an exposure that reached its TTL, another window's
+    /// toggle: all of them move the registry without going through this
+    /// workspace. The refresh is coalesced in the store and runs on app
+    /// activation rather than on a timer, because the registry only changes
+    /// when someone does something.
+    private func observeRemoteExposures() {
+        exposureObserver = remoteExposureStore.$exposures
+            .sink { [weak self] exposures in
+                guard let self else { return }
+                let exposed = Set(
+                    exposures.values
+                        .compactMap { UUID(uuidString: $0.surfaceID) }
+                        .filter { self.panels[$0] != nil }
+                )
+                let changed = exposed.symmetricDifference(self.drawnExposedPanelIds)
+                guard !changed.isEmpty else { return }
+                self.drawnExposedPanelIds = exposed
+                for panelId in changed {
+                    guard let tabId = self.surfaceIdFromPanelId(panelId) else { continue }
+                    self.bonsplitController.invalidatePaneHeaderActions(forTab: tabId)
+                }
+            }
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { RemoteExposureStore.shared.refresh() }
+        }
+        remoteExposureStore.refresh()
+    }
+
     private func configurePaneHeaderActions() {
+        // Runs inside a SwiftUI view body, once per header draw. Everything
+        // here is a dictionary lookup or a walk of one team's agents; nothing
+        // does I/O, allocates a spec, or touches the daemon. The exposure
+        // action reads a cached map and never asks the registry.
         bonsplitController.paneHeaderActions = { [weak self] _, selectedTabId in
             guard let self,
                   let selectedTabId,
                   let panelId = self.panelIdFromSurfaceId(selectedTabId),
-                  let panel = self.panels[panelId],
-                  let agent = TeamOrchestrator.shared.agentIdentity(forPanelId: panelId),
-                  let presentation = Self.agentRestartPresentation(
-                      panelType: panel.panelType,
-                      agentName: agent.agentName
-                  ) else {
+                  let panel = self.panels[panelId] else {
                 return []
             }
+            var actions: [BonsplitController.PaneHeaderAction] = []
+            if let exposure = self.mobileExposureAction(
+                panelId: panelId, panel: panel, tabId: selectedTabId
+            ) {
+                actions.append(exposure)
+            }
+            actions.append(contentsOf: self.agentRestartActions(panelId: panelId, panel: panel))
+            return actions
+        }
+    }
 
-            // Click = hard restart (close + respawn); Option-click = soft (ETX +
-            // retype). Interactive CLIs (claude/codex/gemini) swallow Ctrl-C so
-            // soft restart is effectively useless against the stuck-pane scenario
-            // that drives almost every ↻ press — hard is the safer default.
-            //
-            // Modifier read via NSEvent.currentEvent (the actual mouse-down event)
-            // rather than NSEvent.modifierFlags (process-global, can be stale by
-            // the time the SwiftUI Button closure fires).
-            return [
-                BonsplitController.PaneHeaderAction(
-                    id: "agent-restart-\(panelId.uuidString)",
-                    systemImage: "arrow.clockwise",
-                    help: presentation.help,
-                    accessibilityLabel: presentation.accessibilityLabel,
-                    action: {
-                        let optionHeld =
-                            NSApp.currentEvent?.modifierFlags.contains(.option)
-                            ?? NSEvent.modifierFlags.contains(.option)
-                        let useSoftRestart = optionHeld && presentation.allowsSoftRestart
-                        #if DEBUG
-                        dlog("[team.restart] header.click team=\(agent.teamName) agent=\(agent.agentName) panelType=\(panel.panelType.rawValue) optionHeld=\(optionHeld) mode=\(useSoftRestart ? "soft" : "hard")")
-                        #endif
-                        if useSoftRestart {
-                            TeamOrchestrator.shared.restartAgentPane(panelId: panelId)
-                        } else {
-                            // panelId-keyed so duplicate-named agents (e.g. two
-                            // `executor` panes) resolve to the exact pane the
-                            // user clicked rather than the first by name.
-                            Task { @MainActor in
-                                let result = await TeamOrchestrator.shared.restartAgentPaneHard(
-                                    panelId: panelId
+    /// The restart button, unchanged; it stays specific to team agents.
+    private func agentRestartActions(
+        panelId: UUID,
+        panel: Panel
+    ) -> [BonsplitController.PaneHeaderAction] {
+        guard let agent = TeamOrchestrator.shared.agentIdentity(forPanelId: panelId),
+              let presentation = Self.agentRestartPresentation(
+                  panelType: panel.panelType,
+                  agentName: agent.agentName
+              ) else {
+            return []
+        }
+
+        // Click = hard restart (close + respawn); Option-click = soft (ETX +
+        // retype). Interactive CLIs (claude/codex/gemini) swallow Ctrl-C so
+        // soft restart is effectively useless against the stuck-pane scenario
+        // that drives almost every ↻ press — hard is the safer default.
+        //
+        // Modifier read via NSEvent.currentEvent (the actual mouse-down event)
+        // rather than NSEvent.modifierFlags (process-global, can be stale by
+        // the time the SwiftUI Button closure fires).
+        return [
+            BonsplitController.PaneHeaderAction(
+                id: "agent-restart-\(panelId.uuidString)",
+                systemImage: "arrow.clockwise",
+                help: presentation.help,
+                accessibilityLabel: presentation.accessibilityLabel,
+                action: {
+                    let optionHeld =
+                        NSApp.currentEvent?.modifierFlags.contains(.option)
+                        ?? NSEvent.modifierFlags.contains(.option)
+                    let useSoftRestart = optionHeld && presentation.allowsSoftRestart
+                    #if DEBUG
+                    dlog("[team.restart] header.click team=\(agent.teamName) agent=\(agent.agentName) panelType=\(panel.panelType.rawValue) optionHeld=\(optionHeld) mode=\(useSoftRestart ? "soft" : "hard")")
+                    #endif
+                    if useSoftRestart {
+                        TeamOrchestrator.shared.restartAgentPane(panelId: panelId)
+                    } else {
+                        // panelId-keyed so duplicate-named agents (e.g. two
+                        // `executor` panes) resolve to the exact pane the
+                        // user clicked rather than the first by name.
+                        Task { @MainActor in
+                            let result = await TeamOrchestrator.shared.restartAgentPaneHard(
+                                panelId: panelId
+                            )
+                            if case .failure(let error) = result {
+                                RemoteWorkLog.error(
+                                    "Could not restart \(agent.agentName): \(error.message)"
                                 )
-                                if case .failure(let error) = result {
-                                    RemoteWorkLog.error(
-                                        "Could not restart \(agent.agentName): \(error.message)"
-                                    )
-                                }
                             }
                         }
                     }
-                )
-            ]
+                }
+            )
+        ]
+    }
+
+    /// The mobile exposure toggle, or nil for a pane that cannot be exposed.
+    ///
+    /// Cheap by construction: one dictionary lookup in the store plus the same
+    /// team walk the restart action already does. The `EnableSpec` is built in
+    /// the action, not here, so a pane that is never clicked never pays for it.
+    private func mobileExposureAction(
+        panelId: UUID,
+        panel: Panel,
+        tabId: TabID
+    ) -> BonsplitController.PaneHeaderAction? {
+        guard panel.panelType != .browser else { return nil }
+        let surfaceID = panelId.uuidString
+        let isExposed = remoteExposureStore.isExposed(surfaceID)
+        let title = bonsplitController.tab(tabId)?.title ?? ""
+        return BonsplitController.PaneHeaderAction(
+            id: "mobile-exposure-\(panelId.uuidString)",
+            systemImage: isExposed
+                ? "iphone.radiowaves.left.and.right"
+                : "iphone",
+            help: isExposed
+                ? "Stop showing this pane on the mobile page"
+                : "Show this pane on the mobile page",
+            accessibilityLabel: isExposed
+                ? "Stop mobile remote control for this pane"
+                : "Start mobile remote control for this pane",
+            action: { [weak self] in
+                guard let self else { return }
+                Task { @MainActor in
+                    await self.toggleMobileExposure(
+                        panelId: panelId, panel: panel, tabId: tabId, title: title
+                    )
+                }
+            }
+        )
+    }
+
+    private func toggleMobileExposure(
+        panelId: UUID,
+        panel: Panel,
+        tabId: TabID,
+        title: String
+    ) async {
+        let surfaceID = panelId.uuidString
+        defer { bonsplitController.invalidatePaneHeaderActions(forTab: tabId) }
+
+        if remoteExposureStore.isExposed(surfaceID) {
+            if case .failure(let error) = await remoteExposureStore.unexpose(surfaceID) {
+                RemoteWorkLog.error("Could not stop mobile remote control: \(error)")
+            }
+            return
         }
+        guard let spec = RemoteExposureStore.enableSpec(
+            for: mobilePaneIdentity(panelId: panelId, panel: panel, title: title),
+            appSocket: TerminalController.shared.socketPath,
+            keys: MobileRemoteControlSettings.keysPolicy(),
+            ttlSeconds: MobileRemoteControlSettings.ttlSeconds(),
+            owner: NSUserName(),
+            leaderRequestToken: TeamOrchestrator.shared
+                .teamName(containingPanelId: panelId)
+                .flatMap { team in
+                    TeamOrchestrator.shared.teams[team]?.leaderPanelId == panelId
+                        ? TeamDataStore.shared.prepareLeaderRequestToken(teamName: team)
+                        : nil
+                }
+        ) else { return }
+
+        switch await remoteExposureStore.expose(spec) {
+        case .success(let result):
+            // Registered and reachable are different outcomes, and the daemon
+            // is the one that knows which happened.
+            if let url = result.url, result.isReachable {
+                RemoteWorkLog.info("Mobile remote control: \(url)")
+            } else {
+                RemoteWorkLog.error(
+                    "Mobile remote control registered but unreachable"
+                        + (result.listenerError.map { ": \($0)" } ?? "")
+                        + " — enable the listener in Settings > Mobile Remote Control."
+                )
+            }
+        case .failure(let error):
+            RemoteWorkLog.error("Could not start mobile remote control: \(error)")
+        }
+    }
+
+    /// What the app knows about this pane, for the daemon's `EnableSpec`.
+    private func mobilePaneIdentity(
+        panelId: UUID,
+        panel: Panel,
+        title: String
+    ) -> RemoteExposureStore.PaneIdentity {
+        var identity = RemoteExposureStore.PaneIdentity(
+            surfaceID: panelId.uuidString,
+            panelType: panel.panelType,
+            title: title,
+            cwd: FileManager.default.currentDirectoryPath
+        )
+        if let teamName = TeamOrchestrator.shared.teamName(containingPanelId: panelId),
+           let team = TeamOrchestrator.shared.teams[teamName] {
+            if team.leaderPanelId == panelId {
+                identity.leaderTeamName = teamName
+            }
+            if let agent = team.agents.first(where: { $0.panelId == panelId }) {
+                identity.agentTeamName = teamName
+                identity.agentName = agent.name
+                identity.agentCLI = agent.cli
+            }
+        }
+        return identity
     }
 
     struct AgentRestartPresentation: Equatable {

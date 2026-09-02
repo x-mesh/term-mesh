@@ -152,6 +152,12 @@ public protocol PeerSurfaceProvider: AnyObject, Sendable {
     /// them in the same arrangement locally.
     func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace]
 
+    /// Remove one exact surface and distinguish terminated, already absent,
+    /// and provider refusal without collapsing them into one boolean.
+    func terminateSurface(
+        surfaceID: Data
+    ) async -> Termmesh_Peer_V1_TerminateSurfaceResult
+
     /// Fire-and-forget workspace mutation requests (split, close).
     /// Default no-op; providers that own a real workspace tree
     /// (`GhosttyPaneSurfaceProvider`) override to drive bonsplit. The
@@ -229,6 +235,11 @@ public struct PeerTeamCallFailure: Error, Sendable, Equatable {
 
 public extension PeerSurfaceProvider {
     func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace] { [] }
+    func terminateSurface(
+        surfaceID: Data
+    ) async -> Termmesh_Peer_V1_TerminateSurfaceResult {
+        await listSurfaces().contains { $0.surfaceID == surfaceID } ? .failed : .notFound
+    }
     func createWorkspace(title: String) async -> Data? { nil }
     func renameWorkspace(id workspaceID: Data, title: String) async -> Bool { false }
     func deleteWorkspace(id workspaceID: Data) async -> Bool { false }
@@ -1311,6 +1322,9 @@ public actor PtyDataCoalescer {
 /// in daemon/term-meshd/src/peer/connection.rs.
 actor PeerServerSession {
     private enum State { case initial, authSent, ready }
+    private enum LifecycleRequestAdmission {
+        case accepted, invalid, duplicate, exhausted
+    }
 
     private let connection: AcceptedUnixConnection
     private let config: PeerServerConfig
@@ -1326,6 +1340,10 @@ actor PeerServerSession {
     /// workspace, and an attached mirror must not be required merely to keep
     /// its host row fresh.
     private var workspaceListSubscribed = false
+    /// One-shot IDs shared by lifecycle mutations on this authenticated
+    /// connection. Keep the same 65,536 budget as the Rust host.
+    private var lifecycleRequestIDs = Set<Data>()
+    private static let lifecycleRequestIDBudget = 65_536
     /// Parsed once out of the client's Hello and kept for the life of the
     /// session — plumbing only for now (see P3, docs/peer-perf-proposal.md):
     /// nothing branches on it yet, but future wire changes (P8 and later)
@@ -1342,6 +1360,14 @@ actor PeerServerSession {
     /// Whether the connected client advertised `capability` in its Hello.
     func hasClientCapability(_ capability: String) -> Bool {
         clientCapabilities.has(capability)
+    }
+
+    private func admitLifecycleRequestID(_ requestID: Data) -> LifecycleRequestAdmission {
+        guard requestID.count == 16 else { return .invalid }
+        guard !lifecycleRequestIDs.contains(requestID) else { return .duplicate }
+        guard lifecycleRequestIDs.count < Self.lifecycleRequestIDBudget else { return .exhausted }
+        lifecycleRequestIDs.insert(requestID)
+        return .accepted
     }
 
     init(
@@ -1589,7 +1615,7 @@ actor PeerServerSession {
             // list them as attachable. It must not ride this host-direction
             // Hello: a Swift GUI host publishes TerminalPanels only
             // (`GhosttyPaneSurfaceProvider.collectSurfaces`) and implements
-            // no agent-kind EnsureSurface, so advertising would invite
+            // no agent-kind EnsureSurface, so advertising agent hosting would invite
             // `kind = "agent"` ensure/attach traffic that can only fail —
             // the familiar "the Rust host has the contract, the Swift host
             // doesn't" drift (#218/#219/#220). Same filter pattern as
@@ -1597,7 +1623,6 @@ actor PeerServerSession {
             // filter once the Mac host can actually host agent surfaces.
             advertisedCapabilities.removeAll {
                 $0 == PeerCapability.surfaceAgentV1
-                    || $0 == PeerCapability.surfaceTerminateV1
             }
             // Project manifests promise that the named surfaces outlive this
             // viewer. A GUI host owns no such lifecycle; only term-meshd may
@@ -1826,26 +1851,72 @@ actor PeerServerSession {
             // completes — see GhosttyPaneSurfaceProvider.deleteWorkspace.
             _ = await provider.deleteWorkspace(id: req.workspaceID)
 
-        case (.ready, .ensureSurfaceRequest(let req)) where req.kind == "agent":
+        case (.ready, .ensureSurfaceRequest(let req)):
             // Second layer under the Hello filter above (see
             // `advertisedCapabilities`): this direct GUI host cannot own a
-            // non-PTY bridge child, so an agent-kind ensure is refused
+            // durable ensured surface, so every ensure kind is refused
             // loudly, echoing the request_id the client's demux keys on.
             // Never silently create a terminal instead — kind is part of
-            // the surface spec (`EnsureSurfaceRequest.kind`), and a silent
-            // conversion is exactly the SPEC_CONFLICT contract the proto
-            // forbids. Non-agent ensures keep falling to the silent-drop
-            // default below, unchanged.
+            // the surface spec (`EnsureSurfaceRequest.kind`), and the request
+            // id is still consumed before this host returns the refusal.
+            let admission = admitLifecycleRequestID(req.requestID)
             try await sendEnvelopeWithCorrelation(env.seq) { inner in
                 var response = Termmesh_Peer_V1_EnsureSurfaceResponse()
                 response.requestID = req.requestID
                 response.result = .failed
                 var failure = Termmesh_Peer_V1_EnsureSurfaceError()
-                failure.code = .invalidRequest
+                switch admission {
+                case .accepted:
+                    failure.code = .invalidRequest
+                    failure.safeContext = "ensured surfaces are not hosted by this app"
+                case .invalid:
+                    failure.code = .invalidRequest
+                    failure.safeContext = "request_id must be exactly 16 bytes"
+                case .duplicate:
+                    failure.code = .duplicateRequestID
+                    failure.safeContext = "request_id already consumed"
+                case .exhausted:
+                    failure.code = .requestTooLarge
+                    failure.safeContext = "connection request_id budget exhausted"
+                }
                 failure.stage = "validate"
-                failure.safeContext = "agent surfaces are not hosted by this app"
                 response.error = failure
                 inner.ensureSurfaceResponse = response
+            }
+
+        case (.ready, .terminateSurfaceRequest(let req)):
+            let failure: (Termmesh_Peer_V1_TerminateSurfaceErrorCode, String, String)?
+            switch admitLifecycleRequestID(req.requestID) {
+            case .invalid:
+                failure = (.invalidRequest, "validate", "request_id must be exactly 16 bytes")
+            case .duplicate:
+                failure = (.duplicateRequestID, "validate", "request_id already consumed")
+            case .exhausted:
+                failure = (.internal, "internal", "connection request_id budget exhausted")
+            case .accepted:
+                failure = req.surfaceID.count == 16
+                    ? nil
+                    : (.invalidRequest, "validate", "surface_id must be exactly 16 bytes")
+            }
+            let result = failure == nil
+                ? await provider.terminateSurface(surfaceID: req.surfaceID)
+                : .failed
+            let responseFailure = failure ?? (result == .failed
+                ? (.internal, "terminate", "provider could not terminate exact surface")
+                : nil)
+            try await sendEnvelopeWithCorrelation(env.seq) { inner in
+                var response = Termmesh_Peer_V1_TerminateSurfaceResponse()
+                response.requestID = req.requestID
+                response.surfaceID = req.surfaceID
+                response.result = result
+                if let failure = responseFailure {
+                    var error = Termmesh_Peer_V1_TerminateSurfaceError()
+                    error.code = failure.0
+                    error.stage = failure.1
+                    error.safeContext = failure.2
+                    response.error = error
+                }
+                inner.terminateSurfaceResponse = response
             }
 
         case (.ready, .attachSurface(let req)):
