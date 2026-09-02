@@ -28,13 +28,30 @@ final class ReviewBoardViewModelTests: XCTestCase {
             ))
         }
 
-        XCTAssertEqual(panel(.healthy).title, "Healthy collaboration")
-        XCTAssertEqual(panel(.leaderOnly).title, "Leader only · no dispatch")
+        XCTAssertEqual(panel(.healthy).title, "Latest evidence: dispatched")
+        XCTAssertEqual(panel(.leaderOnly).title, "Latest evidence: no dispatch")
         XCTAssertEqual(panel(.identityMismatch).title, "Identity mismatch")
-        XCTAssertEqual(panel(.routeFailure).title, "Route failure")
+        XCTAssertEqual(panel(.routeFailure).title, "Latest evidence: route failure")
         XCTAssertEqual(panel(.unmeasured).title, "Collaboration unmeasured")
         XCTAssertEqual(panel(.healthy).dispatchCount, 2)
         XCTAssertNotEqual(panel(.healthy).symbolName, panel(.leaderOnly).symbolName)
+    }
+
+    /// The headline judges the newest record; the counts total the window.
+    /// A Project whose newest turn delegated nothing still shows the earlier
+    /// dispatches, and the two must not read as one contradictory claim.
+    @MainActor
+    func testCollaborationHeadlineNamesItsScopeWhenCountsDisagree() {
+        let panel = ReviewBoardViewModel.collaborationPanel(summary: .init(
+            state: .leaderOnly, routeCount: 6, dispatchCount: 4,
+            completionCount: 5, workerCount: 4, unmetFloorCount: 1,
+            lastActivity: "2026-09-02T03:02:00Z", legacyRecordCount: 0
+        ))
+        XCTAssertTrue(panel.title.hasPrefix("Latest evidence:"), panel.title)
+        XCTAssertTrue(panel.detail.contains("newest record"), panel.detail)
+        // The window totals survive a leader-only headline.
+        XCTAssertEqual(panel.dispatchCount, 4)
+        XCTAssertEqual(panel.completionCount, 5)
     }
 
     @MainActor

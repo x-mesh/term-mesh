@@ -508,12 +508,19 @@ extension ReviewBoardPanelView {
                 Text(panel.detail)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
-                Text("\(panel.workerCount) workers · \(panel.dispatchCount) dispatches · \(panel.completionCount) completed")
+                // Three numbers on one line read as one fact, and they are
+                // not: the roster is what exists now, the other two total a
+                // bounded history. Separating them is what stops "no dispatch"
+                // and "4 dispatches" from looking like a contradiction.
+                Text("Roster now · \(panel.workerCount) workers")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+                Text("Recent history · \(panel.dispatchCount) dispatches · \(panel.completionCount) completed")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(.secondary)
                 if let lastActivity = panel.lastActivity {
                     Text(
-                        "Last evidence "
+                        "Newest record "
                             + (ReviewBoardText.clockTime(lastActivity) ?? lastActivity)
                     )
                         .font(.system(size: 10))

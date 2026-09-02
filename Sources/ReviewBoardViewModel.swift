@@ -550,22 +550,27 @@ final class ReviewBoardViewModel: ObservableObject {
         let title: String
         let detail: String
         let symbol: String
+        // The state is decided by the newest decisive record in the window,
+        // while the counts below it total the whole window. Read as one claim
+        // they contradict each other: a Project can show "no dispatch" over
+        // four dispatches, because the newest record is a turn that delegated
+        // nothing. Every string here names which of the two it speaks for.
         switch summary.state {
         case .healthy:
-            title = "Healthy collaboration"
-            detail = "Workers received tasks."
+            title = "Latest evidence: dispatched"
+            detail = "Workers received tasks, and nothing since then failed."
             symbol = "checkmark.circle.fill"
         case .leaderOnly:
-            title = "Leader only · no dispatch"
-            detail = "A route was stated, but no worker task was recorded."
+            title = "Latest evidence: no dispatch"
+            detail = "The newest record is a stated route with no worker task after it."
             symbol = "person.crop.circle.badge.exclamationmark"
         case .identityMismatch:
             title = "Identity mismatch"
             detail = "Recent evidence belongs to another Project viewer."
             symbol = "person.crop.circle.badge.xmark"
         case .routeFailure:
-            title = "Route failure"
-            detail = "A worker delivery or route failed."
+            title = "Latest evidence: route failure"
+            detail = "A worker delivery or route failed after the last dispatch."
             symbol = "exclamationmark.triangle.fill"
         case .unmeasured:
             title = "Collaboration unmeasured"
