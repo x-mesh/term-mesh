@@ -46,6 +46,9 @@ final class ReviewBoardViewModel: ObservableObject {
     /// screen. Nil means no team there, and the section hides itself.
     @Published private(set) var activeTeamName: String?
     @Published private(set) var delegation: DelegationPanel?
+    @Published private(set) var collaboration: CollaborationPanel?
+    @Published private(set) var collaborationRepairInFlight = false
+    @Published private(set) var collaborationRepairMessage: String?
 
     /// The boundary, as configured. Read from settings so what the toggle
     /// shows and what the runner enforces cannot drift apart.
@@ -78,6 +81,9 @@ final class ReviewBoardViewModel: ObservableObject {
     private var decisionInFlight = false
     private var teamCancellable: AnyCancellable?
     private var activityTicker: Timer?
+    private var remoteCollaborationRecords: [String: [LeaderTurnLog.Record]] = [:]
+    private var remoteCollaborationFetches: [String: Task<Void, Never>] = [:]
+    private var remoteCollaborationFetchedAt: [String: Date] = [:]
 
     init(
         initialSnapshot: ReviewBoardSnapshot = .empty,
@@ -384,6 +390,17 @@ final class ReviewBoardViewModel: ObservableObject {
         var everyWorkerIdle: Bool { workerCount > 0 && workingCount == 0 }
     }
 
+    struct CollaborationPanel: Equatable {
+        let state: LeaderTurnLog.CollaborationState
+        let title: String
+        let detail: String
+        let symbolName: String
+        let workerCount: Int
+        let dispatchCount: Int
+        let completionCount: Int
+        let lastActivity: String?
+    }
+
     /// Where the board's Project comes from, injected the way the snapshot is.
     ///
     /// A pushed value loses the race with workspace restore — at launch there
@@ -432,6 +449,12 @@ final class ReviewBoardViewModel: ObservableObject {
         if activeTeamName != resolved { activeTeamName = resolved }
         let next = Self.delegationPanel(for: resolved)
         if delegation != next { delegation = next }
+        let nextCollaboration = Self.collaborationPanel(
+            for: resolved,
+            remoteRecords: resolved.flatMap { remoteCollaborationRecords[$0] } ?? []
+        )
+        if collaboration != nextCollaboration { collaboration = nextCollaboration }
+        refreshRemoteCollaborationIfNeeded(for: resolved)
     }
 
     private static func delegationPanel(for teamName: String?) -> DelegationPanel? {
@@ -447,6 +470,128 @@ final class ReviewBoardViewModel: ObservableObject {
             workerCount: team.agents.count,
             workingCount: working.count
         )
+    }
+
+    private static func collaborationPanel(
+        for teamName: String?, remoteRecords: [LeaderTurnLog.Record]
+    ) -> CollaborationPanel? {
+        guard let teamName, !teamName.isEmpty,
+              let team = TeamOrchestrator.shared.teams[teamName] else { return nil }
+        let records = LeaderTurnLog.readRecent(team: teamName) + remoteRecords
+        let leaderSurfaceID = team.remoteLeaderSurfaceID?.map {
+            String(format: "%02x", $0)
+        }.joined()
+        return collaborationPanel(summary: LeaderTurnLog.collaborationSummary(
+            records: records, team: teamName, teamUUID: team.teamUuid,
+            leaderSessionID: team.leaderSessionId, leaderSurfaceID: leaderSurfaceID,
+            workerCount: team.agents.count
+        ))
+    }
+
+    /// Peer leader turns are written on the execution host while task events
+    /// are written on this control host. Read only the bounded remote tail and
+    /// combine both streams before deriving collaboration health.
+    private func refreshRemoteCollaborationIfNeeded(for teamName: String?) {
+        guard let teamName, let team = TeamOrchestrator.shared.teams[teamName],
+              case let .peer(hostKey) = team.leaderEndpoint,
+              remoteCollaborationFetches[teamName] == nil,
+              ReviewBoardSettings.isVisible,
+              Date().timeIntervalSince(remoteCollaborationFetchedAt[teamName] ?? .distantPast) >= 10,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return }
+        let expectedUUID = team.teamUuid
+        remoteCollaborationFetchedAt[teamName] = Date()
+        remoteCollaborationFetches[teamName] = Task { [weak self] in
+            let loop = "for line in f:\n"
+                + " try:\n  row=json.loads(line)\n except Exception:\n  continue\n"
+                + " if isinstance(row,dict) and row.get('team')==team:\n  q.append(line)\n"
+            let filter = "import collections,json,sys; q=collections.deque(maxlen=200); "
+                + "f=open(sys.argv[1],encoding='utf-8'); team=sys.argv[2]; "
+                + "exec(" + String(reflecting: loop) + "); sys.stdout.writelines(q)"
+            let body = "f=\"$HOME/.term-mesh/logs/turns.log\"; "
+                + "if [ -r \"$f\" ]; then python3 -c "
+                + TeamOrchestrator.shellQuoted(filter) + " \"$f\" "
+                + TeamOrchestrator.shellQuoted(teamName) + "; fi"
+            let output = try? await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget, port: host.sshPort, identityFile: host.identityFile,
+                script: RemotePasteTransfer.serviceAccountCommand(body), timeoutSeconds: 10
+            )
+            guard let self else { return }
+            self.remoteCollaborationFetches[teamName] = nil
+            guard TeamOrchestrator.shared.teams[teamName]?.teamUuid == expectedUUID,
+                  let output else {
+                self.remoteCollaborationFetchedAt[teamName] = .distantPast
+                return
+            }
+            self.remoteCollaborationRecords[teamName] = LeaderTurnLog.readAll(from: output)
+            guard Self.shouldPublishRemoteCollaboration(
+                fetchedTeam: teamName,
+                activeTeam: self.activeTeamProvider() ?? self.activeTeamName
+            ) else {
+                return
+            }
+            let next = Self.collaborationPanel(
+                for: teamName, remoteRecords: self.remoteCollaborationRecords[teamName] ?? []
+            )
+            if self.collaboration != next { self.collaboration = next }
+        }
+    }
+
+    static func shouldPublishRemoteCollaboration(
+        fetchedTeam: String,
+        activeTeam: String?
+    ) -> Bool {
+        fetchedTeam == activeTeam
+    }
+
+    static func collaborationPanel(
+        summary: LeaderTurnLog.CollaborationSummary
+    ) -> CollaborationPanel {
+        let title: String
+        let detail: String
+        let symbol: String
+        switch summary.state {
+        case .healthy:
+            title = "Healthy collaboration"
+            detail = "Workers received tasks."
+            symbol = "checkmark.circle.fill"
+        case .leaderOnly:
+            title = "Leader only · no dispatch"
+            detail = "A route was stated, but no worker task was recorded."
+            symbol = "person.crop.circle.badge.exclamationmark"
+        case .identityMismatch:
+            title = "Identity mismatch"
+            detail = "Recent evidence belongs to another Project viewer."
+            symbol = "person.crop.circle.badge.xmark"
+        case .routeFailure:
+            title = "Route failure"
+            detail = "A worker delivery or route failed."
+            symbol = "exclamationmark.triangle.fill"
+        case .unmeasured:
+            title = "Collaboration unmeasured"
+            detail = summary.legacyRecordCount > 0
+                ? "Only legacy name-scoped records are available."
+                : "No identity-scoped task evidence is available."
+            symbol = "questionmark.circle"
+        }
+        return CollaborationPanel(
+            state: summary.state, title: title, detail: detail, symbolName: symbol,
+            workerCount: summary.workerCount, dispatchCount: summary.dispatchCount,
+            completionCount: summary.completionCount, lastActivity: summary.lastActivity
+        )
+    }
+
+    func repairCollaboration() async {
+        guard !collaborationRepairInFlight, let teamName = activeTeamName else { return }
+        collaborationRepairInFlight = true
+        collaborationRepairMessage = nil
+        let report = await TeamOrchestrator.shared.repairCollaboration(teamName: teamName)
+        collaborationRepairInFlight = false
+        if (activeTeamProvider() ?? activeTeamName) == teamName {
+            collaborationRepairMessage = report.message
+        }
+        remoteCollaborationFetchedAt[teamName] = .distantPast
+        refreshDelegationPanel()
     }
 
     // MARK: - Auto pilot

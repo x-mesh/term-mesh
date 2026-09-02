@@ -53,6 +53,29 @@ fi
 
 TEAM="${TERMMESH_TEAM:-}"
 SURFACE_ID="${TERMMESH_SURFACE_ID:-unknown}"
+TEAM_UUID="${TERMMESH_LEADER_TEAM_UUID:-}"
+LEADER_SESSION_ID="${TERMMESH_LEADER_SESSION_ID:-}"
+# Adoption rewrites this file while the leader process keeps its launch env.
+# Prefer its current viewer session so turn and task evidence share a scope.
+if [ -n "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
+    && [ -r "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
+    && command -v python3 >/dev/null 2>&1; then
+    _turn_control_session="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" <<'TURN_HOOK_IDENTITY' 2>/dev/null || true
+import json
+import os
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        value = json.load(handle).get("session_id")
+except Exception:
+    value = None
+if isinstance(value, str) and value:
+    print(value, end="")
+TURN_HOOK_IDENTITY
+)"
+    [ -z "$_turn_control_session" ] || LEADER_SESSION_ID=$_turn_control_session
+fi
 LOG_DIR="${HOME:-}/.term-mesh/logs"
 LOG_FILE="$LOG_DIR/turns.log"
 
@@ -320,6 +343,13 @@ fi
 
 TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
 [ -n "$TS" ] || TS=unknown
+IDENTITY_FIELDS=""
+if [ -n "$TEAM_UUID" ]; then
+    IDENTITY_FIELDS="$IDENTITY_FIELDS,\"team_uuid\":$(json_string "$TEAM_UUID")"
+fi
+if [ -n "$LEADER_SESSION_ID" ]; then
+    IDENTITY_FIELDS="$IDENTITY_FIELDS,\"leader_session_id\":$(json_string "$LEADER_SESSION_ID")"
+fi
 
 # Did this turn meet the delegation floor? Only `delegated` states a floor that
 # a turn can measurably miss, and `task_dispatch` is written by the app rather
@@ -335,6 +365,7 @@ if [ "$MODE" = --end ] \
     && command -v python3 >/dev/null 2>&1; then
     DELEGATION_FLOOR="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" <<'TURN_HOOK_MET' 2>/dev/null || true
 import json
+import os
 import sys
 
 control_path, log_path, team, baseline_path = sys.argv[1:5]
@@ -356,8 +387,8 @@ except (TypeError, ValueError):
 if level != "delegated" or workers <= 0:
     sys.exit(0)
 
-# Compare against the count this turn started with, rather than walking the log
-# back to this turn's own turn_start.
+# Read the bytes this turn appended, rather than walking the log back to this
+# turn's own turn_start.
 #
 # That walk was wrong twice over. `task_dispatch` carries a request/wave/task
 # id and never this turn's id, so the streams cannot be joined by key — and the
@@ -366,47 +397,52 @@ if level != "delegated" or workers <= 0:
 # from hours earlier, counting some other turn's dispatches as this one's. It
 # also counted dispatches from every team on the host.
 #
-# A baseline has neither failure: it needs no id at all, and it is scoped to
-# this team.
+# The baseline is a byte offset, not a count. Counting a fixed tail at both
+# ends compared two different windows: once the log outgrew that tail during a
+# turn, the dispatches that slid out of it cancelled the ones the turn added,
+# and a turn that did delegate was recorded as unmet. An offset needs no window
+# and no id, and the scan below is still scoped to this team.
 try:
     with open(baseline_path, "r", encoding="utf-8") as handle:
         baseline = int(handle.read().strip())
 except Exception:
     sys.exit(0)
+if baseline < 0:
+    sys.exit(0)
 
+try:
+    size = os.path.getsize(log_path)
+except Exception:
+    sys.exit(0)
+# A file shorter than the offset means the log rotated under us. Say nothing
+# rather than report a truncation as "the leader delegated nothing".
+if size < baseline:
+    sys.exit(0)
 
-def dispatch_count():
+try:
+    # Binary, because a text-mode seek only accepts offsets tell() produced.
+    with open(log_path, "rb") as handle:
+        handle.seek(baseline)
+        appended = handle.read().split(b"\n")
+except Exception:
+    sys.exit(0)
+
+dispatched = 0
+for raw in appended:
+    raw = raw.strip()
+    if not raw:
+        continue
     try:
-        with open(log_path, "r", encoding="utf-8") as handle:
-            lines = handle.readlines()[-8000:]
+        record = json.loads(raw)
     except Exception:
-        return None
-    total = 0
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except Exception:
-            continue
-        if (
-            isinstance(record, dict)
-            and record.get("event") == "task_dispatch"
-            and record.get("team") == team
-        ):
-            total += 1
-    return total
-
-
-current = dispatch_count()
-if current is None:
-    sys.exit(0)
-# A count below the baseline means the log rotated under us. Say nothing rather
-# than report a drop as "the leader delegated nothing".
-if current < baseline:
-    sys.exit(0)
-print("met" if current > baseline else "unmet", end="")
+        continue
+    if (
+        isinstance(record, dict)
+        and record.get("event") == "task_dispatch"
+        and record.get("team") == team
+    ):
+        dispatched += 1
+print("met" if dispatched > 0 else "unmet", end="")
 TURN_HOOK_MET
 )"
     case "$DELEGATION_FLOOR" in
@@ -422,7 +458,7 @@ fi
 if [ "$MODE" = --end ] && [ -n "${_turn_absorbed:-}" ]; then
     while IFS= read -r _turn_absorbed_id; do
         [ -n "$_turn_absorbed_id" ] || continue
-        _turn_absorbed_line="{\"event\":\"turn_end\",\"turn_id\":$(json_string "$_turn_absorbed_id"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":\"absorbed\"}"
+        _turn_absorbed_line="{\"event\":\"turn_end\",\"turn_id\":$(json_string "$_turn_absorbed_id"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":\"absorbed\"$IDENTITY_FIELDS}"
         { printf '%s\n' "$_turn_absorbed_line" >> "$LOG_FILE"; } 2>/dev/null || true
     done <<EOF
 $_turn_absorbed
@@ -430,13 +466,13 @@ EOF
 fi
 
 if [ "$MODE" = --start ]; then
-    LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"prompt_bytes\":$PROMPT_BYTES,\"prompt_sha256\":$(json_string "$PROMPT_SHA")}"
+    LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"prompt_bytes\":$PROMPT_BYTES,\"prompt_sha256\":$(json_string "$PROMPT_SHA")$IDENTITY_FIELDS}"
 else
     FLOOR_FIELD=""
     if [ -n "$DELEGATION_FLOOR" ]; then
         FLOOR_FIELD=",\"delegation_floor\":$(json_string "$DELEGATION_FLOOR")"
     fi
-    LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":$(json_string "$ROUTE_STATUS")$FLOOR_FIELD}"
+    LINE="{\"event\":$(json_string "$EVENT"),\"turn_id\":$(json_string "$TURN_ID"),\"ts\":$(json_string "$TS"),\"team\":$(json_string "$TEAM"),\"surface_id\":$(json_string "$SURFACE_ID"),\"route_status\":$(json_string "$ROUTE_STATUS")$FLOOR_FIELD$IDENTITY_FIELDS}"
 fi
 
 # Open the append once per invocation and emit one complete line. Do not retain
@@ -444,40 +480,34 @@ fi
 # retained descriptor would keep writing to the renamed inode.
 { printf '%s\n' "$LINE" >> "$LOG_FILE"; } 2>/dev/null || true
 
-# Record how many tasks this team had dispatched before the turn runs, so Stop
-# can tell whether this turn added any. Independent of the injection below: the
-# floor may be switched off while measurement continues.
+# Record where the log ends before the turn runs, so Stop can tell whether this
+# turn appended any dispatch of its own. Independent of the injection below:
+# the floor may be switched off while measurement continues.
 if [ "$MODE" = --start ] && command -v python3 >/dev/null 2>&1; then
-    python3 - "$LOG_FILE" "$TEAM" "$DISPATCH_BASELINE_FILE" <<'TURN_HOOK_BASELINE' 2>/dev/null || true
-import json
+    python3 - "$LOG_FILE" "$DISPATCH_BASELINE_FILE" <<'TURN_HOOK_BASELINE' 2>/dev/null || true
 import os
 import sys
 
-log_path, team, baseline_path = sys.argv[1:4]
-total = 0
+log_path, baseline_path = sys.argv[1:3]
 try:
-    with open(log_path, "r", encoding="utf-8") as handle:
-        lines = handle.readlines()[-8000:]
+    offset = os.path.getsize(log_path)
+except FileNotFoundError:
+    # No log yet. Every record Stop finds was appended after this point.
+    offset = 0
 except Exception:
-    lines = []
-for line in lines:
-    line = line.strip()
-    if not line:
-        continue
+    # The log exists but its size is unknowable, so this turn has no start
+    # marker. Leave no baseline rather than a wrong one: Stop withholds the
+    # verdict without it, and a stale baseline from an earlier turn would
+    # otherwise be read as this turn's.
     try:
-        record = json.loads(line)
+        os.unlink(baseline_path)
     except Exception:
-        continue
-    if (
-        isinstance(record, dict)
-        and record.get("event") == "task_dispatch"
-        and record.get("team") == team
-    ):
-        total += 1
+        pass
+    sys.exit(0)
 tmp = baseline_path + ".tmp"
 try:
     with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(str(total))
+        handle.write(str(offset))
     os.replace(tmp, baseline_path)
 except Exception:
     try:
@@ -504,6 +534,7 @@ if [ "$MODE" = --start ] \
     && command -v python3 >/dev/null 2>&1; then
     python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" <<'TURN_HOOK_FLOOR' 2>/dev/null || true
 import json
+import os
 import sys
 
 try:
@@ -543,6 +574,14 @@ wave = min(cap, workers)
 
 names = control.get("worker_names")
 names = [n for n in names if isinstance(n, str) and n] if isinstance(names, list) else []
+team_uuid = os.environ.get("TERMMESH_LEADER_TEAM_UUID", "")
+route_file = ""
+if team_uuid:
+    safe = "".join(
+        c for c in ("leader-" + team_uuid).lower()
+        if c.isascii() and (c.isalnum() or c == "-")
+    )[:48]
+    route_file = os.path.expanduser("~/.term-mesh/agent-routes/" + safe + ".json")
 
 # leaderFirst only has something to say when a wave is possible at all: it
 # leaves serial work with the leader either way, so with no wave available the
@@ -592,6 +631,11 @@ print(
         project, level, workers, roster, cap
     )
 )
+if route_file:
+    print(
+        "Use the current Project route for every tm-agent command in this turn: "
+        "prefix it with TERMMESH_LEADER_ROUTE_FILE={}.".format(route_file)
+    )
 print(floor)
 TURN_HOOK_FLOOR
 fi

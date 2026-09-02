@@ -4875,6 +4875,13 @@ class TerminalController {
                 id: id, code: "internal_error",
                 message: "Task creation failed for agent '\(agentName)'"
             )
+        case .presentationUnavailable(let presentation):
+            return v2Error(
+                id: id,
+                code: "presentation_unavailable",
+                message: "Project presentation is unavailable "
+                    + "(\(presentation.failureCode ?? "unknown")); run Repair collaboration"
+            )
         case nil:
             // The 12s dead-man switch fired before the main-actor block ran.
             return v2Error(

@@ -8,6 +8,36 @@ import XCTest
 
 final class ReviewBoardViewModelTests: XCTestCase {
     @MainActor
+    func testRemoteCollaborationPublishesOnlyForTheActiveTeam() {
+        XCTAssertTrue(ReviewBoardViewModel.shouldPublishRemoteCollaboration(
+            fetchedTeam: "aic", activeTeam: "aic"
+        ))
+        XCTAssertFalse(ReviewBoardViewModel.shouldPublishRemoteCollaboration(
+            fetchedTeam: "aic", activeTeam: "other"
+        ))
+    }
+    @MainActor
+    func testCollaborationPanelsDistinguishMeasuredStates() {
+        func panel(_ state: LeaderTurnLog.CollaborationState) -> ReviewBoardViewModel.CollaborationPanel {
+            ReviewBoardViewModel.collaborationPanel(summary: .init(
+                state: state, routeCount: 1, dispatchCount: state == .healthy ? 2 : 0,
+                completionCount: state == .healthy ? 1 : 0, workerCount: 3,
+                unmetFloorCount: state == .leaderOnly ? 1 : 0,
+                lastActivity: "2026-09-02T00:00:00Z",
+                legacyRecordCount: state == .unmeasured ? 1 : 0
+            ))
+        }
+
+        XCTAssertEqual(panel(.healthy).title, "Healthy collaboration")
+        XCTAssertEqual(panel(.leaderOnly).title, "Leader only · no dispatch")
+        XCTAssertEqual(panel(.identityMismatch).title, "Identity mismatch")
+        XCTAssertEqual(panel(.routeFailure).title, "Route failure")
+        XCTAssertEqual(panel(.unmeasured).title, "Collaboration unmeasured")
+        XCTAssertEqual(panel(.healthy).dispatchCount, 2)
+        XCTAssertNotEqual(panel(.healthy).symbolName, panel(.leaderOnly).symbolName)
+    }
+
+    @MainActor
     func testStatusBadgesCoverRequiredReviewStates() {
         let task = ReviewBoardTask(
             id: "1234567890abcdef",

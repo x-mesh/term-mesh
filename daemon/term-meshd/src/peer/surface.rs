@@ -618,7 +618,32 @@ fn process_start_time(pid: libc::pid_t) -> Option<u64> {
     after_name.split_whitespace().nth(19)?.parse().ok()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn process_start_time(pid: libc::pid_t) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if written != size || info.pbi_start_tvsec == 0 {
+        return None;
+    }
+    // Seconds alone can collide for two short-lived processes. Keep the
+    // kernel's full timeval identity in one stable integer.
+    Some(
+        info.pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_start_time(_pid: libc::pid_t) -> Option<u64> {
     None
 }
@@ -4988,7 +5013,7 @@ mod tests {
         manager.remove(&outcome.surface_id);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn echild_preserves_the_same_live_process_identity() {
         let pid = std::process::id() as libc::pid_t;
@@ -5003,7 +5028,7 @@ mod tests {
         assert!(same_process_is_live(&child));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn echild_rejects_a_recycled_process_identity() {
         let pid = std::process::id() as libc::pid_t;

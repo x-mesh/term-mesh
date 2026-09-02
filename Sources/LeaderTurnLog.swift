@@ -4,6 +4,9 @@ import Foundation
 
 /// Append-only leader turn measurements shared by the app and CLI.
 enum LeaderTurnLog {
+    private static let identityLock = NSLock()
+    private static var knownIdentities: [String: (teamUUID: String, leaderSessionID: String?)] = [:]
+
     enum MeasurementCapability: String, Codable, CaseIterable {
         case supported
         case unsupported
@@ -49,6 +52,34 @@ enum LeaderTurnLog {
         let delegationMeasurementStatus: String
     }
 
+    enum CollaborationState: String, Equatable {
+        case healthy
+        case leaderOnly
+        case identityMismatch
+        case routeFailure
+        case unmeasured
+    }
+
+    /// A bounded, identity-scoped view of recent collaboration evidence.
+    struct CollaborationSummary: Equatable {
+        let state: CollaborationState
+        let routeCount: Int
+        let dispatchCount: Int
+        let completionCount: Int
+        let workerCount: Int
+        let unmetFloorCount: Int
+        let lastActivity: String?
+        let legacyRecordCount: Int
+
+        static func empty(workerCount: Int) -> CollaborationSummary {
+            CollaborationSummary(
+                state: .unmeasured, routeCount: 0, dispatchCount: 0, completionCount: 0,
+                workerCount: workerCount, unmetFloorCount: 0, lastActivity: nil,
+                legacyRecordCount: 0
+            )
+        }
+    }
+
     enum Event: String, Codable, CaseIterable {
         case turnStart = "turn_start"
         case turnRoute = "turn_route"
@@ -88,6 +119,9 @@ enum LeaderTurnLog {
         /// The route record uses wave_id while task records use task_wave_id.
         let waveID: String?
         let taskDelivery: String?
+        let teamUUID: String?
+        let leaderSessionID: String?
+        let delegationFloor: String?
 
         private enum CodingKeys: String, CodingKey {
             case event
@@ -116,6 +150,9 @@ enum LeaderTurnLog {
             case taskWaveID = "task_wave_id"
             case waveID = "wave_id"
             case taskDelivery = "task_delivery"
+            case teamUUID = "team_uuid"
+            case leaderSessionID = "leader_session_id"
+            case delegationFloor = "delegation_floor"
         }
 
         private init(
@@ -144,7 +181,10 @@ enum LeaderTurnLog {
             taskRoute: String? = nil,
             taskWaveID: String? = nil,
             waveID: String? = nil,
-            taskDelivery: String? = nil
+            taskDelivery: String? = nil,
+            teamUUID: String? = nil,
+            leaderSessionID: String? = nil,
+            delegationFloor: String? = nil
         ) {
             self.event = event
             self.turnID = turnID
@@ -172,6 +212,9 @@ enum LeaderTurnLog {
             self.taskWaveID = taskWaveID
             self.waveID = waveID
             self.taskDelivery = taskDelivery
+            self.teamUUID = teamUUID
+            self.leaderSessionID = leaderSessionID
+            self.delegationFloor = delegationFloor
         }
 
         static func turnStart(
@@ -179,6 +222,8 @@ enum LeaderTurnLog {
             surfaceID: String,
             prompt: String,
             sessionID: String? = nil,
+            teamUUID: String? = nil,
+            leaderSessionID: String? = nil,
             timestamp: Date = Date()
         ) -> Record {
             let promptHash = LeaderTurnLog.promptSHA256(prompt)
@@ -193,7 +238,8 @@ enum LeaderTurnLog {
                 team: team,
                 surfaceID: surfaceID,
                 promptBytes: prompt.utf8.count,
-                promptSHA256: promptHash
+                promptSHA256: promptHash,
+                teamUUID: teamUUID, leaderSessionID: leaderSessionID
             )
         }
 
@@ -202,6 +248,8 @@ enum LeaderTurnLog {
             surfaceID: String,
             prompt: String,
             sessionID: String? = nil,
+            teamUUID: String? = nil,
+            leaderSessionID: String? = nil,
             timestamp: Date = Date()
         ) -> Record {
             let promptHash = LeaderTurnLog.promptSHA256(prompt)
@@ -216,7 +264,8 @@ enum LeaderTurnLog {
                 team: team,
                 surfaceID: surfaceID,
                 promptBytes: nil,
-                promptSHA256: nil
+                promptSHA256: nil,
+                teamUUID: teamUUID, leaderSessionID: leaderSessionID
             )
         }
 
@@ -229,6 +278,8 @@ enum LeaderTurnLog {
             route: String?,
             waveID: String?,
             delivery: String,
+            teamUUID: String? = nil,
+            leaderSessionID: String? = nil,
             timestamp: Date = Date()
         ) -> Record {
             Record(
@@ -245,7 +296,8 @@ enum LeaderTurnLog {
                 workerInstanceID: workerInstanceID,
                 taskRoute: route,
                 taskWaveID: waveID,
-                taskDelivery: delivery
+                taskDelivery: delivery,
+                teamUUID: teamUUID, leaderSessionID: leaderSessionID
             )
         }
 
@@ -259,6 +311,8 @@ enum LeaderTurnLog {
             waveID: String?,
             status: String,
             delivery: String? = nil,
+            teamUUID: String? = nil,
+            leaderSessionID: String? = nil,
             timestamp: Date = Date()
         ) -> Record {
             Record(
@@ -276,7 +330,8 @@ enum LeaderTurnLog {
                 taskStatus: status,
                 taskRoute: route,
                 taskWaveID: waveID,
-                taskDelivery: delivery
+                taskDelivery: delivery,
+                teamUUID: teamUUID, leaderSessionID: leaderSessionID
             )
         }
 
@@ -320,6 +375,9 @@ enum LeaderTurnLog {
             taskWaveID = try container.decodeIfPresent(String.self, forKey: .taskWaveID)
             waveID = try container.decodeIfPresent(String.self, forKey: .waveID)
             taskDelivery = try container.decodeIfPresent(String.self, forKey: .taskDelivery)
+            teamUUID = try container.decodeIfPresent(String.self, forKey: .teamUUID)
+            leaderSessionID = try container.decodeIfPresent(String.self, forKey: .leaderSessionID)
+            delegationFloor = try container.decodeIfPresent(String.self, forKey: .delegationFloor)
         }
 
         func encode(to encoder: Encoder) throws {
@@ -356,6 +414,9 @@ enum LeaderTurnLog {
                 try container.encodeIfPresent(waveID, forKey: .waveID)
             }
             try container.encodeIfPresent(taskDelivery, forKey: .taskDelivery)
+            try container.encodeIfPresent(teamUUID, forKey: .teamUUID)
+            try container.encodeIfPresent(leaderSessionID, forKey: .leaderSessionID)
+            try container.encodeIfPresent(delegationFloor, forKey: .delegationFloor)
         }
     }
 
@@ -440,14 +501,20 @@ enum LeaderTurnLog {
         route: String?,
         waveID: String?,
         delivery: String,
+        teamUUID: String? = nil,
+        leaderSessionID: String? = nil,
         to logFile: URL = logFile
     ) -> Bool {
+        let identity = recordIdentity(
+            team: team, teamUUID: teamUUID, leaderSessionID: leaderSessionID
+        )
         do {
             try append(
                 .taskDispatch(
                     team: team, requestID: requestID, taskID: taskID,
                     worker: worker, workerInstanceID: workerInstanceID,
-                    route: route, waveID: waveID, delivery: delivery
+                    route: route, waveID: waveID, delivery: delivery,
+                    teamUUID: identity.teamUUID, leaderSessionID: identity.leaderSessionID
                 ),
                 to: logFile
             )
@@ -469,15 +536,21 @@ enum LeaderTurnLog {
         waveID: String?,
         status: String,
         delivery: String? = nil,
+        teamUUID: String? = nil,
+        leaderSessionID: String? = nil,
         to logFile: URL = logFile
     ) -> Bool {
+        let identity = recordIdentity(
+            team: team, teamUUID: teamUUID, leaderSessionID: leaderSessionID
+        )
         do {
             try append(
                 .taskLifecycle(
                     team: team, requestID: requestID, taskID: taskID,
                     worker: worker, workerInstanceID: workerInstanceID,
                     route: route, waveID: waveID, status: status,
-                    delivery: delivery
+                    delivery: delivery, teamUUID: identity.teamUUID,
+                    leaderSessionID: identity.leaderSessionID
                 ),
                 to: logFile
             )
@@ -500,6 +573,73 @@ enum LeaderTurnLog {
         return lines.compactMap { line in
             try? decoder.decode(Record.self, from: Data(line))
         }
+    }
+
+    static func readAll(from text: String) -> [Record] {
+        let decoder = JSONDecoder()
+        return text.split(separator: "\n").compactMap { line in
+            try? decoder.decode(Record.self, from: Data(line.utf8))
+        }
+    }
+
+    /// Decode only the newest records for one Project. The file is shared by
+    /// every team, so callers that draw one card must not decode and sort the
+    /// entire append-only history on the main actor.
+    static func readRecent(
+        from logFile: URL = logFile,
+        team: String,
+        limit: Int = 200
+    ) -> [Record] {
+        guard let data = try? Data(contentsOf: logFile), !data.isEmpty else { return [] }
+        var lines = data.split(separator: 0x0A)
+        if data.last != 0x0A { lines.removeLast() }
+        let decoder = JSONDecoder()
+        var records: [Record] = []
+        records.reserveCapacity(max(1, limit))
+        for line in lines.reversed() {
+            guard let record = try? decoder.decode(Record.self, from: Data(line)),
+                  record.team == team else { continue }
+            records.append(record)
+            if records.count >= max(1, limit) { break }
+        }
+        return records.reversed()
+    }
+
+    /// Use live identity only when the caller already runs on the main thread.
+    /// Socket telemetry stays off-main and must never block it with main.sync.
+    private static func recordIdentity(
+        team: String, teamUUID: String?, leaderSessionID: String?
+    ) -> (teamUUID: String?, leaderSessionID: String?) {
+        if teamUUID != nil || leaderSessionID != nil {
+            return (teamUUID, leaderSessionID)
+        }
+        identityLock.lock()
+        let remembered = knownIdentities[team]
+        identityLock.unlock()
+        if let remembered { return remembered }
+        if Thread.isMainThread {
+            return MainActor.assumeIsolated {
+                guard let live = TeamOrchestrator.shared.teams[team] else {
+                    return (nil, nil)
+                }
+                return (live.teamUuid, live.leaderSessionId)
+            }
+        }
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["TERMMESH_TEAM"] == team else { return (nil, nil) }
+        return (
+            environment["TERMMESH_LEADER_TEAM_UUID"],
+            environment["TERMMESH_LEADER_SESSION_ID"]
+        )
+    }
+
+    static func rememberIdentity(
+        team: String, teamUUID: String, leaderSessionID: String?
+    ) {
+        guard !team.isEmpty, !teamUUID.isEmpty else { return }
+        identityLock.lock()
+        knownIdentities[team] = (teamUUID, leaderSessionID?.isEmpty == false ? leaderSessionID : nil)
+        identityLock.unlock()
     }
 
     /// One immutable measurement snapshot. Supported-turn denominator comes
@@ -581,6 +721,122 @@ enum LeaderTurnLog {
 
     static func countsByEvent(from logFile: URL = logFile) -> [Event: Int] {
         Dictionary(grouping: readAll(from: logFile), by: \.event).mapValues(\.count)
+    }
+
+    /// Read only a recent tail and require exact Project identity. Name-only
+    /// legacy rows remain readable, but never establish current health.
+    static func collaborationSummary(
+        from logFile: URL = logFile,
+        team: String,
+        teamUUID: String?,
+        leaderSessionID: String?,
+        leaderSurfaceID: String? = nil,
+        workerCount: Int,
+        limit: Int = 200
+    ) -> CollaborationSummary {
+        collaborationSummary(
+            records: readAll(from: logFile), team: team, teamUUID: teamUUID,
+            leaderSessionID: leaderSessionID, leaderSurfaceID: leaderSurfaceID,
+            workerCount: workerCount, limit: limit
+        )
+    }
+
+    static func collaborationSummary(
+        records: [Record],
+        team: String,
+        teamUUID: String?,
+        leaderSessionID: String?,
+        leaderSurfaceID: String? = nil,
+        workerCount: Int,
+        limit: Int = 200
+    ) -> CollaborationSummary {
+        // Bound this Project's history, not the shared log's history. Applying
+        // the window first lets a noisy sibling Project evict every current
+        // record and makes healthy collaboration appear unmeasured.
+        let ordered = records.enumerated().filter { $0.element.team == team }.sorted { lhs, rhs in
+            if lhs.element.timestamp != rhs.element.timestamp {
+                return lhs.element.timestamp < rhs.element.timestamp
+            }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+        let recent = Array(ordered.suffix(max(1, limit)))
+        let requiresSession = leaderSessionID?.isEmpty == false
+        let legacy = recent.filter { record in
+            record.teamUUID == nil || (requiresSession && record.leaderSessionID == nil)
+        }
+        guard let teamUUID, !teamUUID.isEmpty else {
+            var summary = CollaborationSummary.empty(workerCount: workerCount)
+            summary = CollaborationSummary(
+                state: summary.state, routeCount: 0, dispatchCount: 0,
+                completionCount: 0, workerCount: workerCount, unmetFloorCount: 0,
+                lastActivity: nil, legacyRecordCount: legacy.count
+            )
+            return summary
+        }
+        let scoped = recent.filter { record in
+            if record.teamUUID == nil,
+               let leaderSurfaceID, !leaderSurfaceID.isEmpty,
+               !record.surfaceID.isEmpty {
+                return Self.normalizedSurfaceID(record.surfaceID)
+                    == Self.normalizedSurfaceID(leaderSurfaceID)
+            }
+            guard record.teamUUID == teamUUID else { return false }
+            guard let leaderSessionID, !leaderSessionID.isEmpty else { return true }
+            return record.leaderSessionID == leaderSessionID
+        }
+        let mismatched = recent.contains { record in
+            guard let recordUUID = record.teamUUID else { return false }
+            if recordUUID != teamUUID { return true }
+            guard let leaderSessionID, !leaderSessionID.isEmpty else { return false }
+            guard let recordSession = record.leaderSessionID else { return false }
+            return recordSession != leaderSessionID
+        }
+        let routes = scoped.filter { $0.event == .turnRoute }
+        let dispatches = scoped.filter { $0.event == .taskDispatch }
+        let lifecycles = scoped.filter { $0.event == .taskLifecycle }
+        let completions = lifecycles.filter { $0.taskStatus == "completed" }
+        let unmet = scoped.filter { $0.delegationFloor == "unmet" }
+        let failures = scoped.filter { record in
+            guard record.event == .taskLifecycle else { return false }
+            let status = record.taskStatus ?? ""
+            let delivery = record.taskDelivery ?? ""
+            return delivery == "failed"
+                || status == "delivery_failed"
+                || status == "route_failed"
+                || status == "timeout"
+        }
+        let lastDispatch = scoped.lastIndex { $0.event == .taskDispatch }
+        let lastFailure = scoped.lastIndex { failures.contains($0) }
+        let lastUnmet = scoped.lastIndex { $0.delegationFloor == "unmet" }
+        func isLater(_ lhs: Int?, than rhs: Int?) -> Bool {
+            guard let lhs else { return false }
+            guard let rhs else { return true }
+            return lhs > rhs
+        }
+        let state: CollaborationState
+        if isLater(lastFailure, than: lastDispatch) {
+            state = .routeFailure
+        } else if scoped.isEmpty, mismatched {
+            state = .identityMismatch
+        } else if isLater(lastUnmet, than: lastDispatch) {
+            state = .leaderOnly
+        } else if !dispatches.isEmpty {
+            state = .healthy
+        } else if workerCount > 0 && (!routes.isEmpty || !unmet.isEmpty) {
+            state = .leaderOnly
+        } else {
+            state = .unmeasured
+        }
+        return CollaborationSummary(
+            state: state, routeCount: routes.count, dispatchCount: dispatches.count,
+            completionCount: completions.count, workerCount: workerCount,
+            unmetFloorCount: unmet.count, lastActivity: scoped.last?.timestamp,
+            legacyRecordCount: legacy.count
+        )
+    }
+
+    private static func normalizedSurfaceID(_ value: String) -> String {
+        value.lowercased().filter { $0.isASCII && $0.isHexDigit }
     }
 
     static func policyReport(from logFile: URL = logFile, team: String? = nil) -> PolicyReport {

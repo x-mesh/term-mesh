@@ -292,6 +292,171 @@ final class LeaderTurnLogTests: XCTestCase {
         XCTAssertEqual(records.last?.taskDelivery, "confirmed")
     }
 
+    func testIdentityFieldsRoundTripAndLegacyRecordsRemainReadable() throws {
+        let log = try temporaryLog()
+        LeaderTurnLog.appendTaskDispatch(
+            team: "aic", requestID: "req", taskID: "task", worker: "executor",
+            workerInstanceID: "worker", route: "parallel", waveID: "wave",
+            delivery: "created", teamUUID: "05AC84AA",
+            leaderSessionID: "leader-session", to: log
+        )
+        let legacy = """
+        {"event":"task_dispatch","turn_id":"old","ts":"2026-09-02T00:00:00Z","team":"aic","task_id":"old"}
+        """ + "\n"
+        let handle = try FileHandle(forWritingTo: log)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(legacy.utf8))
+        try handle.close()
+
+        let records = LeaderTurnLog.readAll(from: log)
+        XCTAssertEqual(records.count, 2)
+        XCTAssertEqual(records.first?.teamUUID, "05AC84AA")
+        XCTAssertEqual(records.first?.leaderSessionID, "leader-session")
+        XCTAssertNil(records.last?.teamUUID)
+        XCTAssertNil(records.last?.leaderSessionID)
+    }
+
+    func testCollaborationSummaryRequiresTaskEvidenceForHealthyState() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let records = [
+            #"{"event":"turn_route","turn_id":"r","ts":"2026-09-02T00:00:00Z","team":"aic","team_uuid":"05AC84AA","leader_session_id":"leader"}"#,
+            #"{"event":"turn_end","turn_id":"r","ts":"2026-09-02T00:00:01Z","team":"aic","team_uuid":"05AC84AA","leader_session_id":"leader","delegation_floor":"unmet"}"#,
+        ]
+        try Data((records.joined(separator: "\n") + "\n").utf8).write(to: log)
+
+        let summary = LeaderTurnLog.collaborationSummary(
+            from: log, team: "aic", teamUUID: "05AC84AA",
+            leaderSessionID: "leader", workerCount: 3
+        )
+        XCTAssertEqual(summary.state, .leaderOnly)
+        XCTAssertEqual(summary.routeCount, 1)
+        XCTAssertEqual(summary.dispatchCount, 0)
+        XCTAssertEqual(summary.unmetFloorCount, 1)
+    }
+
+    func testCollaborationSummaryScopesIdentityAndBoundsRecentRecords() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let records = [
+            #"{"event":"task_dispatch","turn_id":"old","ts":"2026-09-01T00:00:00Z","team":"aic","team_uuid":"05AC84AA","leader_session_id":"leader","task_id":"old"}"#,
+            #"{"event":"turn_route","turn_id":"new","ts":"2026-09-02T00:00:00Z","team":"aic","team_uuid":"OTHER","leader_session_id":"other"}"#,
+        ]
+        try Data((records.joined(separator: "\n") + "\n").utf8).write(to: log)
+        let summary = LeaderTurnLog.collaborationSummary(
+            from: log, team: "aic", teamUUID: "05AC84AA",
+            leaderSessionID: "leader", workerCount: 2, limit: 1
+        )
+        XCTAssertEqual(summary.state, .identityMismatch)
+        XCTAssertEqual(summary.dispatchCount, 0, "evidence outside the tail is not counted")
+    }
+
+    func testCollaborationSummaryAppliesLimitAfterTeamFilter() throws {
+        let records = LeaderTurnLog.readAll(from: """
+        {"event":"task_dispatch","turn_id":"aic-dispatch","ts":"2026-09-02T00:00:00Z","team":"aic","team_uuid":"05AC84AA","leader_session_id":"leader","task_id":"task"}
+        {"event":"task_dispatch","turn_id":"noise-1","ts":"2026-09-02T00:00:01Z","team":"noise","team_uuid":"OTHER","task_id":"noise-1"}
+        {"event":"task_dispatch","turn_id":"noise-2","ts":"2026-09-02T00:00:02Z","team":"noise","team_uuid":"OTHER","task_id":"noise-2"}
+        {"event":"task_lifecycle","turn_id":"aic-done","ts":"2026-09-02T00:00:03Z","team":"aic","team_uuid":"05AC84AA","leader_session_id":"leader","task_id":"task","task_status":"completed"}
+        """)
+        let summary = LeaderTurnLog.collaborationSummary(
+            records: records,
+            team: "aic",
+            teamUUID: "05AC84AA",
+            leaderSessionID: "leader",
+            workerCount: 1,
+            limit: 2
+        )
+        XCTAssertEqual(summary.state, .healthy)
+        XCTAssertEqual(summary.dispatchCount, 1)
+        XCTAssertEqual(summary.completionCount, 1)
+    }
+
+    func testCollaborationSummaryReportsEvidencedRouteFailure() throws {
+        let log = try temporaryLog()
+        LeaderTurnLog.appendTaskDispatch(
+            team: "aic", requestID: "req", taskID: "task", worker: "executor",
+            workerInstanceID: "worker", route: "parallel", waveID: "wave",
+            delivery: "created", teamUUID: "05AC84AA", leaderSessionID: "leader",
+            to: log
+        )
+        LeaderTurnLog.appendTaskLifecycle(
+            team: "aic", requestID: "req", taskID: "task", worker: "executor",
+            workerInstanceID: "worker", route: "parallel", waveID: "wave",
+            status: "delivery_failed", delivery: "failed", teamUUID: "05AC84AA",
+            leaderSessionID: "leader", to: log
+        )
+        let summary = LeaderTurnLog.collaborationSummary(
+            from: log, team: "aic", teamUUID: "05AC84AA",
+            leaderSessionID: "leader", workerCount: 1
+        )
+        XCTAssertEqual(summary.state, .routeFailure)
+        XCTAssertEqual(summary.dispatchCount, 1)
+    }
+
+    func testCollaborationSummaryCombinesControlAndExecutionHostRecords() throws {
+        let control = try temporaryLog()
+        LeaderTurnLog.appendTaskDispatch(
+            team: "aic", requestID: "req", taskID: "task", worker: "executor",
+            workerInstanceID: "worker", route: "parallel", waveID: "wave",
+            delivery: "created", teamUUID: "05AC84AA", leaderSessionID: "leader",
+            to: control
+        )
+        let remote = LeaderTurnLog.readAll(from: """
+        {"event":"turn_route","turn_id":"r","ts":"2026-09-02T00:00:00Z","team":"aic","team_uuid":"05AC84AA","leader_session_id":"leader"}
+        """)
+        let summary = LeaderTurnLog.collaborationSummary(
+            records: LeaderTurnLog.readAll(from: control) + remote, team: "aic",
+            teamUUID: "05AC84AA", leaderSessionID: "leader", workerCount: 1
+        )
+        XCTAssertEqual(summary.state, .healthy)
+        XCTAssertEqual(summary.routeCount, 1)
+        XCTAssertEqual(summary.dispatchCount, 1)
+    }
+
+    func testCollaborationSummaryScopesLegacyLeaderTurnsByCanonicalSurface() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let records = [
+            #"{"event":"turn_route","turn_id":"current","ts":"2026-09-02T00:00:00Z","team":"aic","surface_id":"516d3820-8571-5794-a710-5cb5a72dcd6e"}"#,
+            #"{"event":"turn_route","turn_id":"other","ts":"2026-09-02T00:00:01Z","team":"aic","surface_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#,
+        ]
+        try Data((records.joined(separator: "\n") + "\n").utf8).write(to: log)
+        let summary = LeaderTurnLog.collaborationSummary(
+            from: log, team: "aic", teamUUID: "05AC84AA",
+            leaderSessionID: "leader", leaderSurfaceID: "516d382085715794a7105cb5a72dcd6e",
+            workerCount: 4
+        )
+        XCTAssertEqual(summary.state, .leaderOnly)
+        XCTAssertEqual(summary.routeCount, 1)
+        XCTAssertEqual(summary.dispatchCount, 0)
+    }
+
+    func testCollaborationSummaryLetsANewerUnmetTurnOverrideOldDispatchHistory() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let records = [
+            #"{"event":"task_dispatch","turn_id":"old","ts":"2026-09-02T00:00:00Z","team":"aic","team_uuid":"05AC84AA","leader_session_id":"leader","task_id":"old"}"#,
+            #"{"event":"turn_route","turn_id":"new","ts":"2026-09-02T00:01:00Z","team":"aic","team_uuid":"05AC84AA","leader_session_id":"leader"}"#,
+            #"{"event":"turn_end","turn_id":"new","ts":"2026-09-02T00:01:01Z","team":"aic","team_uuid":"05AC84AA","leader_session_id":"leader","delegation_floor":"unmet"}"#,
+        ]
+        try Data((records.joined(separator: "\n") + "\n").utf8).write(to: log)
+        let summary = LeaderTurnLog.collaborationSummary(
+            from: log, team: "aic", teamUUID: "05AC84AA",
+            leaderSessionID: "leader", workerCount: 4
+        )
+        XCTAssertEqual(summary.state, .leaderOnly)
+        XCTAssertEqual(summary.dispatchCount, 1)
+        XCTAssertEqual(summary.unmetFloorCount, 1)
+    }
+
     func testAppendCreatesMissingDirectory() throws {
         let log = try temporaryLog()
         XCTAssertFalse(FileManager.default.fileExists(atPath: log.deletingLastPathComponent().path))

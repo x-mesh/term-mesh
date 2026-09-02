@@ -37,6 +37,7 @@ struct ReviewBoardPanelView: View {
                     // on an empty board on purpose: it is what you set before
                     // handing out the first task, and an idle roster is a state
                     // with no rows by definition.
+                    collaborationSection
                     workDistributionSection
                     // Last: it is a setting and a log, not the work. It should
                     // be findable, not in the way of the row someone opened the
@@ -491,7 +492,61 @@ extension ReviewBoardPanelView {
             .accessibilityAddTraits(.isHeader)
     }
 
-    // MARK: - Auto pilot
+    // MARK: - Collaboration
+
+    @ViewBuilder
+    private var collaborationSection: some View {
+        if let panel = viewModel.collaboration {
+            VStack(alignment: .leading, spacing: 7) {
+                sectionTitle("Collaboration")
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Image(systemName: panel.symbolName)
+                        .accessibilityHidden(true)
+                    Text(panel.title)
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                Text(panel.detail)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Text("\(panel.workerCount) workers · \(panel.dispatchCount) dispatches · \(panel.completionCount) completed")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+                if let lastActivity = panel.lastActivity {
+                    Text(
+                        "Last evidence "
+                            + (ReviewBoardText.clockTime(lastActivity) ?? lastActivity)
+                    )
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+                if panel.state != .healthy && panel.workerCount > 0 {
+                    Button {
+                        Task { await viewModel.repairCollaboration() }
+                    } label: {
+                        if viewModel.collaborationRepairInFlight {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Repair collaboration")
+                        }
+                    }
+                    .disabled(viewModel.collaborationRepairInFlight)
+                    .accessibilityIdentifier("reviewBoard.repairCollaboration")
+                }
+                if let message = viewModel.collaborationRepairMessage {
+                    Text(message)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04))
+            )
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("reviewBoard.collaboration")
+        }
+    }
 
     /// The switch, the boundary it works inside, and what it has done.
     ///

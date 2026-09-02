@@ -1751,6 +1751,22 @@ final class Workspace: Identifiable {
         panels[panelId] as? AgentPanel
     }
 
+    /// Whether a peer-owned AgentPanel can accept a turn right now.
+    ///
+    /// A roster entry and an AgentPanel are not enough: after a viewer swap the
+    /// pane can remain in the workspace while its peer transport has ended.
+    /// Keep the session lookup here because this workspace owns that binding.
+    func peerAgentPanelIsLive(_ panelId: UUID) -> Bool {
+        guard agentPanel(for: panelId) != nil,
+              let session = remoteAgentPaneSessions[panelId]
+        else { return false }
+        // Native AgentPanels call PeerPaneSession.start() directly because no
+        // Ghostty relay helper exists to drive startRelayIfNeeded(). Their
+        // relayStartupState therefore remains pending by design; the live
+        // transport is the authoritative state for this rendering path.
+        return !session.isTorndown && session.relayLiveness == .live
+    }
+
     /// Create a new browser surface in the specified pane.
     /// - Parameter focus: nil = focus only if the target pane is already focused (default UI behavior),
     ///                    true = force focus/selection of the new surface,
@@ -3670,6 +3686,25 @@ final class Workspace: Identifiable {
                 surfaceID: surfaceID
             )
         }
+    }
+
+    /// Explicit Repair counterpart to the automatic drop path. It removes the
+    /// unusable local consumer without recording a user dismissal, then waits
+    /// for the team-scoped peer recovery to bind a fresh AgentPanel to the
+    /// same durable surface.
+    func repairRemoteAgentPane(panelId: UUID) async -> Bool {
+        guard let session = remoteAgentPaneSessions.removeValue(forKey: panelId) else {
+            return false
+        }
+        session.relaySession.onPtyData = nil
+        (panels[panelId] as? AgentPanel)?.session.stop()
+        session.teardown()
+        let surfaceID = session.originSurface.surfaceID
+        _ = closePanel(panelId, force: true)
+        return await TeamOrchestrator.shared.recoverPeerOwnedAgentPane(
+            closedPanelID: panelId,
+            surfaceID: surfaceID
+        )
     }
 
     /// Close a pane whose host has confirmed the process is gone. Remove the

@@ -64,8 +64,19 @@ struct ProjectExecutionOptions: Equatable, Sendable {
     static let workerBounds = 1...5
 
     private static func key(_ suffix: String, teamName: String) -> String {
+        guard !teamName.isEmpty else { return "team.unknown.\(suffix)" }
         let safe = teamName.filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
-        return "team.\(safe.isEmpty ? "unknown" : safe).\(suffix)"
+        // A name the filter leaves untouched keeps the key it already stored,
+        // so existing preferences survive. Anything the filter changed needs
+        // the discarded characters back in some form: a fully Korean name
+        // collapses to nothing, and every such Project used to share
+        // `team.unknown.*` and overwrite the others' settings.
+        guard safe != teamName else { return "team.\(safe).\(suffix)" }
+        let digest = SHA256.hash(data: Data(teamName.utf8))
+            .prefix(8)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "team.\(safe.isEmpty ? "unknown" : safe).\(digest).\(suffix)"
     }
 
     static func load(teamName: String, from defaults: UserDefaults = .standard) -> Self {

@@ -253,33 +253,41 @@ extension TerminalController {
     /// instead of pressing on, and `gap` gives the TUI time to redraw between
     /// presses. `completion` reports the first failure, or success once every
     /// key has landed.
+    /// Send a key sequence, reporting how many keys of it actually landed.
+    ///
+    /// The count matters to any caller that would retry: these sequences drive
+    /// TUI selection lists, so re-sending one after a partial delivery moves
+    /// the selection a second time. Only a zero count is safe to repeat.
     func sendNamedKeysWithRetry(
         on terminalSurface: TerminalSurface,
         keyNames: [String],
         gap: TimeInterval = 0.15,
-        completion: @escaping (Bool, String) -> Void = { _, _ in }
+        alreadyDelivered: Int = 0,
+        completion: @escaping (Bool, Int, String) -> Void = { _, _, _ in }
     ) {
         guard let key = keyNames.first else {
-            completion(true, "none")
+            completion(true, alreadyDelivered, "none")
             return
         }
         let rest = Array(keyNames.dropFirst())
         sendNamedKeyWithRetry(on: terminalSurface, keyName: key) { delivered, reason in
             guard delivered else {
-                completion(false, reason)
+                completion(false, alreadyDelivered, reason)
                 return
             }
+            let landed = alreadyDelivered + 1
             guard !rest.isEmpty else {
-                completion(true, "none")
+                completion(true, landed, "none")
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + gap) { [weak self] in
                 guard let self else {
-                    completion(false, "controller_released")
+                    completion(false, landed, "controller_released")
                     return
                 }
                 self.sendNamedKeysWithRetry(
-                    on: terminalSurface, keyNames: rest, gap: gap, completion: completion
+                    on: terminalSurface, keyNames: rest, gap: gap,
+                    alreadyDelivered: landed, completion: completion
                 )
             }
         }

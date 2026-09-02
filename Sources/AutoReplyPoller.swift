@@ -542,9 +542,16 @@ final class AutoReplyPoller {
         TerminalController.shared.sendNamedKeysWithRetry(
             on: panel.surface,
             keyNames: answer.keys
-        ) { delivered, reason in
+        ) { delivered, landed, reason in
             guard !delivered else { return }
             NSLog("[auto-reply] startup prompt answer not delivered: %@", reason)
+            // The latch exists so a repeated prompt reaches a person, not so an
+            // undelivered answer silences the pane forever. Release it only
+            // when no key landed at all: after a partial sequence the selection
+            // has already moved, and repeating it would answer a question the
+            // pane is no longer asking.
+            guard landed == 0 else { return }
+            state.answeredStartupPrompt = false
         }
     }
 

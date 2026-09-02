@@ -297,6 +297,7 @@ floor_hook() {
         TERMMESH_TEAM=floor-test \
         TERMMESH_SURFACE_ID=99999999-8888-7777-6666-555555555555 \
         TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_TEAM_UUID=05AC84AA-1E7C-4B21-86CE-77239B138078 \
         TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$_ctl" \
         "$HOOK" "$@"
 }
@@ -412,6 +413,10 @@ esac
 case "$FLOOR_OUT" in
     *"max parallel: 2"*) ;;
     *) fail "cap missing from the header: $FLOOR_OUT" ;;
+esac
+case "$FLOOR_OUT" in
+    *"TERMMESH_LEADER_ROUTE_FILE="*) ;;
+    *) fail "current Project route missing from the floor: $FLOOR_OUT" ;;
 esac
 
 # leaderFirst with waves capped off has nothing left to say beyond the default.
@@ -530,5 +535,116 @@ if "delegation_floor" in last_end:
     )
 PY
 
+# A long turn on a busy log must still read as delegated.
+#
+# The verdict used to count a fixed tail of the log at both ends and compare
+# the two numbers. Once the log outgrew that tail during a turn, the old
+# dispatches that slid out of it cancelled the ones the turn added, and a turn
+# that delegated three tasks reported exactly the same number as it started
+# with — "unmet". The baseline is a byte offset now, so nothing that scrolls
+# out of view can cancel a real dispatch.
+WINDOW_HOME="$TEST_TMP/window"
+WINDOW_CTL="$TEST_TMP/window-ctl"
+mkdir -p "$WINDOW_HOME/.term-mesh/logs" "$WINDOW_CTL" || exit 1
+WINDOW_LOG="$WINDOW_HOME/.term-mesh/logs/turns.log"
+
+cat > "$WINDOW_CTL/delegated.json" <<'JSON' || exit 1
+{"delegation_effective":"delegated","available_workers":2,
+ "worker_names":["a","b"],"kill_switch":false,"project_id":"mine"}
+JSON
+
+window_hook() {
+    HOME="$WINDOW_HOME" \
+        TERMMESH_TEAM=mine \
+        TERMMESH_SURFACE_ID=window-surface \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$WINDOW_CTL/delegated.json" \
+        "$HOOK" "$@"
+}
+
+# Same shape as the live failure: three of this team's dispatches already in
+# the log, then enough traffic that they fall out of any fixed tail.
+window_fill() {
+    python3 - "$WINDOW_LOG" "$1" "$2" <<'PY' || exit 1
+import sys
+
+log_path, dispatches, filler = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(log_path, "a", encoding="utf-8") as handle:
+    for index in range(dispatches):
+        handle.write(
+            '{"event":"task_dispatch","turn_id":"w%d","ts":"2026-01-01T00:00:00Z",'
+            '"team":"mine","task_id":"w%d","worker":"a","delivery":"created"}\n'
+            % (index, index)
+        )
+    for index in range(filler):
+        handle.write(
+            '{"event":"task_lifecycle","turn_id":"f%d","ts":"2026-01-01T00:00:00Z",'
+            '"team":"noise","task_status":"running"}\n' % index
+        )
+PY
+}
+
+window_fill 3 7000
+window_hook --start '{"prompt":"long turn","session_id":"window-1"}' >/dev/null \
+    || fail "window start returned nonzero"
+window_fill 3 7000
+window_hook --end '{"session_id":"window-1"}' >/dev/null \
+    || fail "window end returned nonzero"
+
+python3 - "$WINDOW_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+last_end = [r for r in records if r["event"] == "turn_end"][-1]
+if last_end.get("delegation_floor") != "met":
+    raise SystemExit(
+        "FAIL: dispatches during a long turn must read as met, got "
+        + repr(last_end.get("delegation_floor"))
+    )
+PY
+
+# New hook records carry Project identity when the leader launch provides it.
+IDENTITY_HOME="$TEST_TMP/identity"
+mkdir -p "$IDENTITY_HOME/.term-mesh/logs" || exit 1
+IDENTITY_CONTROL="$IDENTITY_HOME/control.json"
+printf '%s\n' '{"session_id":"adopted-session"}' > "$IDENTITY_CONTROL" || exit 1
+HOME="$IDENTITY_HOME" \
+    TERMMESH_TEAM=aic \
+    TERMMESH_SURFACE_ID=identity-surface \
+    TERMMESH_LEADER_REQUEST_TOKEN=leader-token \
+    TERMMESH_LEADER_TEAM_UUID=05AC84AA \
+    TERMMESH_LEADER_SESSION_ID=leader-session \
+    TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$IDENTITY_CONTROL" \
+    "$HOOK" --start '{"prompt":"identity","session_id":"hook-session"}' >/dev/null \
+    || fail "identity start returned nonzero"
+HOME="$IDENTITY_HOME" \
+    TERMMESH_TEAM=aic \
+    TERMMESH_SURFACE_ID=identity-surface \
+    TERMMESH_LEADER_REQUEST_TOKEN=leader-token \
+    TERMMESH_LEADER_TEAM_UUID=05AC84AA \
+    TERMMESH_LEADER_SESSION_ID=leader-session \
+    TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$IDENTITY_CONTROL" \
+    "$HOOK" --end '{"session_id":"hook-session"}' >/dev/null \
+    || fail "identity end returned nonzero"
+python3 - "$IDENTITY_HOME/.term-mesh/logs/turns.log" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+if not records or any(record.get("team_uuid") != "05AC84AA" for record in records):
+    raise SystemExit("FAIL: hook records did not preserve team_uuid")
+if any(record.get("leader_session_id") != "adopted-session" for record in records):
+    raise SystemExit("FAIL: hook records did not refresh leader_session_id")
+PY
+
 printf '%s\n' 'PASS: leader turn hook honours per-Project execution options'
 printf '%s\n' 'PASS: delegation floor counts only this team, only this turn'
+printf '%s\n' 'PASS: delegation floor survives a log that outgrows any fixed tail'
+printf '%s\n' 'PASS: leader turn hook records scoped Project identity'

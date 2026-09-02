@@ -26,6 +26,30 @@ final class LeaderParticipationPolicyTests: XCTestCase {
         XCTAssertEqual(parallel.route, .parallel)
     }
 
+    /// Per-Project execution options are keyed by name, and the key used to
+    /// drop every character it could not spell. A fully Korean name left
+    /// nothing behind, so every such Project shared one entry and overwrote
+    /// the others' settings.
+    func testExecutionOptionsDoNotShareStorageBetweenNonASCIIProjectNames() {
+        let defaults = UserDefaults(suiteName: "execution-options.\(UUID().uuidString)")!
+        ProjectExecutionOptions(maxParallelWorkers: 2, injectDirective: false)
+            .save(teamName: "번역팀", to: defaults)
+        ProjectExecutionOptions(maxParallelWorkers: 5, injectDirective: true)
+            .save(teamName: "검수팀", to: defaults)
+
+        let first = ProjectExecutionOptions.load(teamName: "번역팀", from: defaults)
+        let second = ProjectExecutionOptions.load(teamName: "검수팀", from: defaults)
+        XCTAssertEqual(first.maxParallelWorkers, 2)
+        XCTAssertFalse(first.injectDirective)
+        XCTAssertEqual(second.maxParallelWorkers, 5)
+        XCTAssertTrue(second.injectDirective)
+        // A name the sanitizer never touched must keep the key it already
+        // stored, or every existing preference silently reverts to the default.
+        ProjectExecutionOptions(maxParallelWorkers: 4, injectDirective: false)
+            .save(teamName: "aic", to: defaults)
+        XCTAssertEqual(defaults.object(forKey: "team.aic.maxParallelWorkers") as? Int, 4)
+    }
+
     func testFreshSettingsAreShadowWithNoCanaryAndRoundTripAdditively() {
         let defaults = UserDefaults(suiteName: "leader-participation.\(UUID().uuidString)")!
         XCTAssertEqual(LeaderParticipationSettings.load(from: defaults), .default)
