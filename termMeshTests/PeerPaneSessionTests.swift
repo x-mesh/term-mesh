@@ -5077,6 +5077,100 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func test_collaborationControlSocketUsesMeasuredOrSiblingPathOnly() {
+        var measured = PeerHostHealthBaseline()
+        measured.controlPath = "/srv/term-mesh/control.sock"
+        measured.controlPathPresent = true
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationControlSocketPath(
+                peerSocketPath: "/run/term-mesh/tm-peer.sock", health: measured
+            ),
+            "/srv/term-mesh/control.sock"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationControlSocketPath(
+                peerSocketPath: "/private/tmp/term-meshd-peer.sock", health: nil
+            ),
+            "/private/tmp/term-meshd.sock"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationControlSocketPath(
+                peerSocketPath: "/run/term-mesh/tm-peer.sock", health: nil
+            ),
+            "/run/term-mesh/term-meshd.sock"
+        )
+        XCTAssertNil(
+            TeamOrchestrator.collaborationControlSocketPath(
+                peerSocketPath: "/tmp/unrelated.sock", health: nil
+            )
+        )
+    }
+
+    @MainActor
+    func test_collaborationRouteVerificationScriptUsesRouteFileWithoutBearer() {
+        let script = TeamOrchestrator.remoteCollaborationRouteVerificationScript(
+            teamName: "xm",
+            teamUUID: "A70D3DBC-8167-4112-88DD-FFAEFF54DCC6",
+            controlSocketPath: "/private/tmp/term-meshd.sock",
+            hostBinDirs: ["/Applications/term-mesh.app/Contents/Resources/bin"]
+        )
+        XCTAssertTrue(script.contains("leader-a70d3dbc-8167-4112-88dd-ffaeff54dcc6.json"))
+        XCTAssertTrue(script.contains("TERMMESH_LEADER_ROUTE_FILE="))
+        XCTAssertTrue(script.contains("TERMMESH_RPC_TIMEOUT=20"))
+        XCTAssertTrue(script.contains("--team 'xm' status"))
+        XCTAssertTrue(script.contains("__TERMMESH_COLLABORATION_ROUTE_RESULT__="))
+        XCTAssertFalse(script.contains("grant_id_hex"), "the bearer stays in the route file")
+    }
+
+    @MainActor
+    func test_collaborationRouteVerificationParserRequiresExactProxiedTeam() throws {
+        func output(team: String = "xm", proxied: Bool = true) throws -> String {
+            let value: [String: Any] = [
+                "ok": true,
+                "remote_leader_proxy": proxied,
+                "result": [
+                    "team_name": team,
+                ],
+            ]
+            let data = try JSONSerialization.data(withJSONObject: value)
+            return "noise\n" + TeamOrchestrator.collaborationRouteVerificationMarker
+                + data.base64EncodedString() + "\n"
+        }
+
+        XCTAssertTrue(TeamOrchestrator.parseRemoteCollaborationRouteVerification(
+            try output(), expectedTeamName: "xm"
+        ))
+        XCTAssertFalse(TeamOrchestrator.parseRemoteCollaborationRouteVerification(
+            try output(team: "other"), expectedTeamName: "xm"
+        ))
+        XCTAssertFalse(TeamOrchestrator.parseRemoteCollaborationRouteVerification(
+            try output(proxied: false), expectedTeamName: "xm"
+        ))
+        XCTAssertFalse(TeamOrchestrator.parseRemoteCollaborationRouteVerification(
+            "not a marker", expectedTeamName: "xm"
+        ))
+    }
+
+    @MainActor
+    func test_collaborationRecoveryReportClaimsSuccessOnlyAfterRouteVerification() {
+        let unverified = TeamOrchestrator.CollaborationRecoveryReport(
+            routeRepaired: true, leaderLive: true, liveAgents: 4,
+            replacedAgents: [], failedAgents: [],
+            verificationFailure: "peer leader command timed out"
+        )
+        XCTAssertFalse(unverified.succeeded)
+        XCTAssertTrue(unverified.message.contains("verification failed"))
+
+        let verified = TeamOrchestrator.CollaborationRecoveryReport(
+            routeRepaired: true, routeVerified: true,
+            leaderLive: true, liveAgents: 4,
+            replacedAgents: [], failedAgents: []
+        )
+        XCTAssertTrue(verified.succeeded)
+        XCTAssertTrue(verified.message.contains("Collaboration verified"))
+    }
+
+    @MainActor
     func test_remoteLeaderLaunchExportsRefreshableRouteAndScopedIdentity() {
         var grant = Termmesh_Peer_V1_TeamLeaderGrant()
         grant.grantID = Data(repeating: 0xab, count: PeerTeamLeader.grantIDBytes)

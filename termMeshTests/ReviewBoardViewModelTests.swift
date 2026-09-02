@@ -16,6 +16,49 @@ final class ReviewBoardViewModelTests: XCTestCase {
             fetchedTeam: "aic", activeTeam: "other"
         ))
     }
+
+    @MainActor
+    func testCollaborationRepairOutcomeUsesTheVerifiedReportBit() {
+        XCTAssertEqual(
+            ReviewBoardViewModel.collaborationRepairOutcome(
+                succeeded: true, message: "Leader control verified."
+            ),
+            .verified("Leader control verified.")
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.collaborationRepairOutcome(
+                succeeded: false, message: "Leader control timed out."
+            ),
+            .failed("Leader control timed out.")
+        )
+    }
+
+    @MainActor
+    func testCollaborationRepairPublishesOnlyForTheTeamThatWasRepaired() {
+        XCTAssertTrue(ReviewBoardViewModel.shouldPublishCollaborationRepair(
+            repairedTeam: "aic", activeTeam: "aic"
+        ))
+        XCTAssertFalse(ReviewBoardViewModel.shouldPublishCollaborationRepair(
+            repairedTeam: "aic", activeTeam: "other"
+        ))
+        XCTAssertFalse(ReviewBoardViewModel.shouldPublishCollaborationRepair(
+            repairedTeam: "aic", activeTeam: nil
+        ))
+    }
+
+    @MainActor
+    func testCollaborationRepairStartsOnlyOnceForAnActiveTeam() {
+        XCTAssertTrue(ReviewBoardViewModel.shouldStartCollaborationRepair(
+            isRunning: false, teamName: "aic"
+        ))
+        XCTAssertFalse(ReviewBoardViewModel.shouldStartCollaborationRepair(
+            isRunning: true, teamName: "aic"
+        ))
+        XCTAssertFalse(ReviewBoardViewModel.shouldStartCollaborationRepair(
+            isRunning: false, teamName: nil
+        ))
+    }
+
     @MainActor
     func testCollaborationPanelsDistinguishMeasuredStates() {
         func panel(_ state: LeaderTurnLog.CollaborationState) -> ReviewBoardViewModel.CollaborationPanel {

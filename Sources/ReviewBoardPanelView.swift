@@ -584,12 +584,18 @@ extension ReviewBoardPanelView {
                 // report lived in the body meant a failed repair said nothing
                 // at all: the spinner stopped, the state stayed broken, and
                 // the reason was behind a disclosure.
-                if let message = viewModel.collaborationRepairMessage {
-                    Text(message)
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityIdentifier("reviewBoard.repairMessage")
+                if let repairResult = collaborationRepairResult {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: repairResult.symbolName)
+                            .accessibilityHidden(true)
+                        Text(repairResult.message)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(repairResult.title + ". " + repairResult.message)
+                    .accessibilityIdentifier("reviewBoard.repairMessage")
                 }
 
                 if delegationExpanded {
@@ -630,21 +636,43 @@ extension ReviewBoardPanelView {
         return panel.state != .healthy && panel.workerCount > 0
     }
 
+    private var collaborationRepairResult: (title: String, message: String, symbolName: String)? {
+        switch viewModel.collaborationRepairOutcome {
+        case .verified(let message):
+            return ("Verified", message, "checkmark.circle.fill")
+        case .failed(let message):
+            return ("Failed", message, "exclamationmark.triangle.fill")
+        case .idle, .running:
+            return nil
+        }
+    }
+
     private var repairButton: some View {
         Button {
             Task { await viewModel.repairCollaboration() }
         } label: {
             if viewModel.collaborationRepairInFlight {
-                ProgressView().controlSize(.small)
+                HStack(spacing: 5) {
+                    ProgressView().controlSize(.small)
+                    Text("Repairing…")
+                }
             } else {
-                Text("Repair")
+                Text("Repair collaboration")
             }
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
         .disabled(viewModel.collaborationRepairInFlight)
-        .help("Rebuild this Project's routes and replace dead agent panes")
+        .help(collaborationRepairHelp)
+        .accessibilityLabel(
+            viewModel.collaborationRepairInFlight ? "Repairing collaboration" : "Repair collaboration"
+        )
+        .accessibilityHint(collaborationRepairHelp)
         .accessibilityIdentifier("reviewBoard.repairCollaboration")
+    }
+
+    private var collaborationRepairHelp: String {
+        "Refreshes routes, preserves live processes, repairs dead panes, and verifies leader control."
     }
 
     /// How much of this Project the leader hands to workers.

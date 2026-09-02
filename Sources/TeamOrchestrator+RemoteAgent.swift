@@ -610,11 +610,28 @@ extension TeamOrchestrator {
         }
         refreshLeaderParticipationControls()
 
+        // Replacing route files is only a prerequisite. The production
+        // failure that led here had a live leader, live workers, and a fresh
+        // route while every reverse team call still timed out. Exercise the
+        // exact leader-side path before touching workers or claiming success.
+        if let verificationFailure = await Self.verifyRemoteCollaborationRoute(
+            host: host, teamName: teamName, teamUUID: teamUUID
+        ) {
+            return CollaborationRecoveryReport(
+                routeRepaired: true, routeVerified: false,
+                leaderLive: initialPlan.leaderLive,
+                liveAgents: initialPlan.liveAgentCount,
+                replacedAgents: [], failedAgents: [],
+                verificationFailure: verificationFailure
+            )
+        }
+
         guard let refreshedLease = try? await PeerPaneHostRegistry.shared.acquire(
             Self.requireTeamHostSpec(host)
         ) else {
             return CollaborationRecoveryReport(
-                routeRepaired: true, leaderLive: false, liveAgents: 0,
+                routeRepaired: true, routeVerified: true,
+                leaderLive: false, liveAgents: 0,
                 replacedAgents: [], failedAgents: ["Host roster unavailable"]
             )
         }
@@ -622,7 +639,8 @@ extension TeamOrchestrator {
         PeerPaneHostRegistry.shared.release(refreshedLease)
         guard let refreshedSurfaces else {
             return CollaborationRecoveryReport(
-                routeRepaired: true, leaderLive: false, liveAgents: 0,
+                routeRepaired: true, routeVerified: true,
+                leaderLive: false, liveAgents: 0,
                 replacedAgents: [], failedAgents: ["Host roster unavailable"]
             )
         }
@@ -637,7 +655,8 @@ extension TeamOrchestrator {
         )
         guard plan.leaderLive else {
             return CollaborationRecoveryReport(
-                routeRepaired: true, leaderLive: false, liveAgents: plan.liveAgentCount,
+                routeRepaired: true, routeVerified: true,
+                leaderLive: false, liveAgents: plan.liveAgentCount,
                 replacedAgents: [], failedAgents: []
             )
         }
@@ -692,7 +711,7 @@ extension TeamOrchestrator {
             }
         }
         return CollaborationRecoveryReport(
-            routeRepaired: true, leaderLive: true,
+            routeRepaired: true, routeVerified: true, leaderLive: true,
             liveAgents: plan.liveAgentCount + replaced.count,
             replacedAgents: replaced, failedAgents: failed
         )
@@ -700,31 +719,163 @@ extension TeamOrchestrator {
 
     struct CollaborationRecoveryReport: Equatable {
         let routeRepaired: Bool
+        let routeVerified: Bool
         let leaderLive: Bool
         let liveAgents: Int
         let replacedAgents: [String]
         let failedAgents: [String]
+        let verificationFailure: String?
+
+        init(
+            routeRepaired: Bool, routeVerified: Bool = false,
+            leaderLive: Bool, liveAgents: Int,
+            replacedAgents: [String], failedAgents: [String],
+            verificationFailure: String? = nil
+        ) {
+            self.routeRepaired = routeRepaired
+            self.routeVerified = routeVerified
+            self.leaderLive = leaderLive
+            self.liveAgents = liveAgents
+            self.replacedAgents = replacedAgents
+            self.failedAgents = failedAgents
+            self.verificationFailure = verificationFailure
+        }
+
+        var succeeded: Bool {
+            routeRepaired && routeVerified && leaderLive && failedAgents.isEmpty
+        }
 
         var message: String {
             if !routeRepaired {
                 return failedAgents.first.map { "Collaboration repair failed: \($0)." }
                     ?? "Collaboration repair failed."
             }
+            if !routeVerified {
+                return verificationFailure.map {
+                    "Routes were refreshed, but leader control verification failed: \($0)."
+                } ?? "Routes were refreshed, but leader control could not be verified."
+            }
             if !failedAgents.isEmpty, !leaderLive {
-                return "Route repaired, but \(failedAgents.joined(separator: ", "))."
+                return "Leader control verified, but \(failedAgents.joined(separator: ", "))."
             }
             if !leaderLive {
-                return "The leader is not live. Worker replacement was withheld until the leader recovers."
+                return "Leader control verified, but the leader process is not live. Worker replacement was withheld."
             }
             if !failedAgents.isEmpty {
-                return "Route repaired. Replaced \(replacedAgents.count) agent(s); \(failedAgents.count) replacement(s) failed."
+                return "Leader control verified. Replaced \(replacedAgents.count) agent(s); \(failedAgents.count) replacement(s) failed."
             }
             if !replacedAgents.isEmpty {
-                return "Route repaired. Replaced \(replacedAgents.count) dead agent(s)."
+                return "Collaboration verified. Replaced \(replacedAgents.count) dead agent(s)."
             }
-            return "Route repaired. Leader and \(liveAgents) agent(s) are live; nothing was replaced."
+            return "Collaboration verified. Leader and \(liveAgents) agent(s) are live; nothing was replaced."
         }
     }
+
+    static let collaborationRouteVerificationMarker =
+        "__TERMMESH_COLLABORATION_ROUTE_RESULT__="
+
+    /// Resolve only a control socket that belongs to the authenticated peer
+    /// endpoint. Linux custom installs use Host Doctor's measured path; the
+    /// filename substitutions cover the bundled macOS daemon and the standard
+    /// Linux install. No global app socket or last-used socket participates.
+    static func collaborationControlSocketPath(
+        peerSocketPath: String,
+        health: PeerHostHealthBaseline?
+    ) -> String? {
+        if let health, health.controlPathPresent, !health.controlPath.isEmpty {
+            return health.controlPath
+        }
+        if peerSocketPath.hasSuffix("/term-meshd-peer.sock") {
+            return String(peerSocketPath.dropLast("term-meshd-peer.sock".count))
+                + "term-meshd.sock"
+        }
+        if peerSocketPath.hasSuffix("/tm-peer.sock") {
+            return String(peerSocketPath.dropLast("tm-peer.sock".count))
+                + "term-meshd.sock"
+        }
+        return nil
+    }
+
+    /// Run `tm-agent status` in the same service account and with the same
+    /// route file as the long-lived leader. The command and its output are
+    /// secret-free; the bearer never leaves the 0600 file.
+    static func remoteCollaborationRouteVerificationScript(
+        teamName: String,
+        teamUUID: String,
+        controlSocketPath: String,
+        hostBinDirs: [String]
+    ) -> String {
+        let routeName = remoteLeaderRouteFileName(teamUUID: teamUUID)
+        let body = "set -e; " + RemoteShellPath.prologue(hostBinDirs: hostBinDirs)
+            + "route=\"$HOME/.term-mesh/agent-routes/\(routeName)\"; "
+            + "[ -r \"$route\" ] || exit 70; "
+            + "control=\(shellQuoted(controlSocketPath)); "
+            + "[ -S \"$control\" ] || exit 71; "
+            + "cli=$(command -v tm-agent 2>/dev/null || true); "
+            + "[ -x \"$cli\" ] || cli=\"$HOME/.local/bin/tm-agent\"; "
+            + "[ -x \"$cli\" ] || exit 72; "
+            + "result=$(TERMMESH_SOCKET=\"$control\" "
+            + "TERMMESH_TEAM=\(shellQuoted(teamName)) "
+            + "TERMMESH_LEADER_ROUTE_FILE=\"$route\" TERMMESH_RPC_TIMEOUT=20 "
+            + "\"$cli\" --team \(shellQuoted(teamName)) status) || exit 73; "
+            + "encoded=$(printf %s \"$result\" | base64 | tr -d '\\n'); "
+            + "printf '%s%s\\n' \(shellQuoted(collaborationRouteVerificationMarker)) "
+            + "\"$encoded\""
+        return RemotePasteTransfer.serviceAccountCommand(body)
+    }
+
+    static func parseRemoteCollaborationRouteVerification(
+        _ output: String, expectedTeamName: String
+    ) -> Bool {
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false).reversed() {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            guard let range = text.range(of: collaborationRouteVerificationMarker),
+                  let data = Data(base64Encoded: String(text[range.upperBound...])),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  object["ok"] as? Bool == true,
+                  object["remote_leader_proxy"] as? Bool == true,
+                  let result = object["result"] as? [String: Any],
+                  result["team_name"] as? String == expectedTeamName
+            else { continue }
+            return true
+        }
+        return false
+    }
+
+    private static func verifyRemoteCollaborationRoute(
+        host: HostEntry, teamName: String, teamUUID: String
+    ) async -> String? {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
+            return "the host has no SSH verification route"
+        }
+        let health = await PeerHostDoctor.healthBaseline(
+            sshTarget: sshTarget, port: host.sshPort, identityFile: host.identityFile
+        )
+        guard let controlSocketPath = collaborationControlSocketPath(
+            peerSocketPath: host.remoteSockPath ?? "", health: health
+        ) else {
+            return "the host control socket could not be resolved"
+        }
+        do {
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget,
+                port: host.sshPort,
+                identityFile: host.identityFile,
+                script: remoteCollaborationRouteVerificationScript(
+                    teamName: teamName, teamUUID: teamUUID,
+                    controlSocketPath: controlSocketPath,
+                    hostBinDirs: host.hostCLIBinDirs
+                ),
+                timeoutSeconds: 30
+            )
+            return parseRemoteCollaborationRouteVerification(
+                output, expectedTeamName: teamName
+            ) ? nil : "the leader route returned an invalid response"
+        } catch {
+            return String(describing: error)
+        }
+    }
+
     /// Capture every namespace owner relevant to New Project. The snapshot is
     /// read-only and spans all windows, preserved/detached viewers and live
     /// remote manifests, so callers do not grow subtly different preflight
