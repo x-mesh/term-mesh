@@ -37,6 +37,7 @@
 		TTPI00000000000000003 /* TeamTemplatePlacementInheritanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = TTPI00000000000000006 /* TeamTemplatePlacementInheritanceTests.swift */; };
 		A17000000000000000000001 /* ReviewBoardModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000005 /* ReviewBoardModels.swift */; };
 		A17000000000000000000101 /* RemoteExposureStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000105 /* RemoteExposureStore.swift */; };
+		A17000000000000000000102 /* MobileRemoteControlSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000106 /* MobileRemoteControlSettings.swift */; };
 		A17000000000000000000009 /* ReviewBoardEvidence.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1700000000000000000000A /* ReviewBoardEvidence.swift */; };
 		A1720000000000000000000B /* AutoPilotPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1720000000000000000000C /* AutoPilotPolicy.swift */; };
 		A1770000000000000000000B /* AutoPilotRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1770000000000000000000C /* AutoPilotRunner.swift */; };
@@ -408,6 +409,7 @@
 			TTPI00000000000000006 /* TeamTemplatePlacementInheritanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamTemplatePlacementInheritanceTests.swift; sourceTree = "<group>"; };
 			A17000000000000000000005 /* ReviewBoardModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardModels.swift; sourceTree = "<group>"; };
 			A17000000000000000000105 /* RemoteExposureStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteExposureStore.swift; sourceTree = "<group>"; };
+			A17000000000000000000106 /* MobileRemoteControlSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileRemoteControlSettings.swift; sourceTree = "<group>"; };
 			A1700000000000000000000A /* ReviewBoardEvidence.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardEvidence.swift; sourceTree = "<group>"; };
 			A1720000000000000000000C /* AutoPilotPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoPilotPolicy.swift; sourceTree = "<group>"; };
 			A1770000000000000000000C /* AutoPilotRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutoPilotRunner.swift; sourceTree = "<group>"; };
@@ -829,6 +831,7 @@
 					A14000000000000000000005 /* ProjectSyncPanelView.swift */,
 					A17000000000000000000005 /* ReviewBoardModels.swift */,
 					A17000000000000000000105 /* RemoteExposureStore.swift */,
+					A17000000000000000000106 /* MobileRemoteControlSettings.swift */,
 					A1700000000000000000000A /* ReviewBoardEvidence.swift */,
 A1720000000000000000000C /* AutoPilotPolicy.swift */,
 A1770000000000000000000C /* AutoPilotRunner.swift */,
@@ -1311,6 +1314,7 @@ A1760000000000000000000C /* ReviewBoardMergeRunnerTests.swift */,
 					A14000000000000000000002 /* ProjectSyncPanelView.swift in Sources */,
 					A17000000000000000000001 /* ReviewBoardModels.swift in Sources */,
 					A17000000000000000000101 /* RemoteExposureStore.swift in Sources */,
+					A17000000000000000000102 /* MobileRemoteControlSettings.swift in Sources */,
 					A17000000000000000000009 /* ReviewBoardEvidence.swift in Sources */,
 A1720000000000000000000B /* AutoPilotPolicy.swift in Sources */,
 A1770000000000000000000B /* AutoPilotRunner.swift in Sources */,

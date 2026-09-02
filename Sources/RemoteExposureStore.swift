@@ -50,6 +50,10 @@ final class RemoteExposureStore: ObservableObject {
     /// dictionary itself still has one value to depend on.
     @Published private(set) var revision: Int = 0
 
+    /// The registry is one per daemon, so mirroring it once per app keeps
+    /// every workspace's headers agreeing without N copies polling it.
+    static let shared = RemoteExposureStore(daemon: TermMeshDaemon.shared)
+
     private let daemon: any DaemonService
     private let now: () -> Date
     private var refreshTask: Task<Void, Never>?

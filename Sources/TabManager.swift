@@ -1304,6 +1304,11 @@ class TabManager {
 
     func selectWorkspace(_ workspace: Workspace) {
         selectedTabId = workspace.id
+        // The headers about to be drawn may have been exposed or unexposed by
+        // something outside this app — `/rc on` in a pane, another window, a
+        // TTL that ran out. Coalesced in the store, so switching quickly
+        // between workspaces still costs one read.
+        RemoteExposureStore.shared.refresh()
     }
 
     // Keep selectTab as convenience alias

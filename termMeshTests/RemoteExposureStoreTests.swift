@@ -1,4 +1,5 @@
 import XCTest
+import Bonsplit
 
 #if canImport(term_mesh_DEV)
 @testable import term_mesh_DEV
@@ -306,6 +307,59 @@ final class RemoteExposureSpecTests: XCTestCase {
         XCTAssertNil(restricted?["owner"])
         XCTAssertEqual(restricted?["app_socket"] as? String, "/tmp/app.sock")
         XCTAssertEqual(spec(pane(.terminal))?["ttl_secs"] as? Int, 86_400)
+    }
+}
+
+// MARK: - Render cost
+
+@MainActor
+final class PaneHeaderInvalidationTests: XCTestCase {
+    /// One pane's exposure change must redraw one header.
+    ///
+    /// The signal lives on PaneState rather than on the controller precisely
+    /// so this holds: a controller-wide revision would be read by every
+    /// TabBarView, and toggling one pane would redraw every open tab bar.
+    func testInvalidatingOnePaneLeavesTheOthersUntouched() {
+        let controller = BonsplitController()
+        guard let first = controller.allPaneIds.first else {
+            return XCTFail("expected a root pane")
+        }
+        guard let second = controller.splitPane(first, orientation: .horizontal) else {
+            return XCTFail("expected a second pane")
+        }
+
+        let before = (controller.headerActionsRevision(inPane: first) ?? -1,
+                      controller.headerActionsRevision(inPane: second) ?? -1)
+        controller.invalidatePaneHeaderActions(inPane: first)
+
+        XCTAssertEqual(controller.headerActionsRevision(inPane: first), before.0 + 1)
+        XCTAssertEqual(
+            controller.headerActionsRevision(inPane: second), before.1,
+            "the pane nobody touched must not redraw"
+        )
+    }
+
+    /// The store is the only thing the header reads, and reading it is a
+    /// dictionary lookup — no daemon call on the draw path.
+    func testReadingExposureStateNeverCallsTheDaemon() async {
+        let daemon = ScriptedDaemon()
+        let store = RemoteExposureStore(daemon: daemon, now: { Date(timeIntervalSince1970: 1_000) })
+        daemon.replies["remote.list"] = """
+        {"status":"ok","entries":[{"surface_id":"A","kind":"pane","title":"t",        "expires_at":9999}],"pruned":0,"now":0}
+        """
+        store.refresh()
+        await store.settle()
+        let afterRefresh = daemon.calls.count
+
+        for _ in 0..<500 {
+            _ = store.isExposed("A")
+            _ = store.isExposed("B")
+            _ = store.exposure("A")
+        }
+        XCTAssertEqual(
+            daemon.calls.count, afterRefresh,
+            "1500 header reads must cost zero RPCs"
+        )
     }
 }
 
