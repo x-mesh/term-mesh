@@ -156,10 +156,86 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertEqual(group.updatedAt, "2026-09-02T03:02:02Z")
     }
 
-    /// The wave has to survive the producers, not just the model: the team
-    /// board writes `wave_id`, and a coordinator row that carries none must
-    /// not erase it on merge.
-    func testWaveSurvivesDecodingAndTheCoordinatorMerge() {
+    /// A long instruction must not be grouped on its clipped display copy.
+    ///
+    /// `title` is scrubbed and clipped to 120 characters, and delegated
+    /// instructions open with a shared preamble, so two different asks agree
+    /// for the first 119 characters and then differ. Grouping reads
+    /// `rawTitle` for exactly this case.
+    func testTwoLongInstructionsSharingAPrefixAreNotOneDispatch() {
+        // Short words on purpose: a 32-character run of word characters is
+        // rewritten to `<token>` by the scrubber before the clip, which would
+        // make the two display titles differ for the wrong reason.
+        let preamble = Array(repeating: "read only check and report", count: 6)
+            .joined(separator: " ")
+        func longTask(_ id: String, tail: String, at iso: String) -> ReviewBoardTask {
+            ReviewBoardTask(
+                id: id, teamName: "aic", title: preamble + " " + tail,
+                status: "completed", assignee: id, isStale: false, updatedAt: iso
+            )
+        }
+        let tasks = [
+            longTask("1", tail: "look at branch A", at: "2026-09-02T03:02:00Z"),
+            longTask("2", tail: "look at branch B", at: "2026-09-02T03:02:10Z"),
+        ]
+        // The clipped copies are identical, so grouping on `title` would merge.
+        XCTAssertEqual(tasks[0].title, tasks[1].title)
+        XCTAssertNotEqual(tasks[0].rawTitle, tasks[1].rawTitle)
+        XCTAssertEqual(ReviewBoardTask.grouped(tasks).count, 2)
+    }
+
+    /// The window bounds a group's whole span, not the gap to its nearest
+    /// member.
+    ///
+    /// Four arrivals 110 seconds apart used to chain into one group spanning
+    /// 5m30s, because each new task only had to be near *some* member. The
+    /// contract is now the span itself, so a repeated instruction can never
+    /// present minutes of separate asks as one dispatch.
+    func testNoDerivedGroupSpansMoreThanTheWindow() {
+        let window = ReviewBoardTask.derivedGroupWindow
+        let stamps = [
+            "2026-09-02T03:00:00Z", "2026-09-02T03:01:50Z",
+            "2026-09-02T03:03:40Z", "2026-09-02T03:05:30Z",
+        ]
+        let tasks = stamps.enumerated().map { index, iso in
+            groupTask(id: "\(index)", title: "Poll the host", assignee: "a", at: iso)
+        }
+        let groups = ReviewBoardTask.grouped(tasks)
+        XCTAssertGreaterThan(groups.count, 1, "5m30s of arrivals is not one dispatch")
+        for group in groups {
+            let instants = group.members
+                .compactMap { $0.updatedAt.flatMap(ReviewBoardText.date) }
+            guard let first = instants.min(), let last = instants.max() else {
+                return XCTFail("every member in this fixture has a timestamp")
+            }
+            XCTAssertLessThanOrEqual(last.timeIntervalSince(first), window)
+        }
+    }
+
+    /// The same board data must produce the same cards however the view model
+    /// sorted it, and it sorts by urgency rather than by time.
+    func testGroupingIsIndependentOfInputOrder() {
+        let stamps = [
+            "2026-09-02T03:00:00Z", "2026-09-02T03:00:30Z",
+            "2026-09-02T03:10:00Z", "2026-09-02T03:10:30Z",
+        ]
+        let tasks = stamps.enumerated().map { index, iso in
+            groupTask(id: "\(index)", title: "Same ask", assignee: "a", at: iso)
+        }
+        let forward = ReviewBoardTask.grouped(tasks)
+        let reversed = ReviewBoardTask.grouped(tasks.reversed())
+        XCTAssertEqual(forward.count, 2)
+        XCTAssertEqual(reversed.count, forward.count)
+        XCTAssertEqual(
+            Set(forward.map { Set($0.members.map(\.id)) }),
+            Set(reversed.map { Set($0.members.map(\.id)) })
+        )
+    }
+
+    /// The wave has to survive the producer, not just the model: both task
+    /// serializers must keep emitting `wave_id`, and a coordinator row that
+    /// carries none must not erase it on merge.
+    func testWaveSurvivesTheProducerDictionaryAndTheCoordinatorMerge() {
         let decoded = ReviewBoardTask(dictionary: [
             "id": "t1", "title": "t", "team_name": "aic",
             "status": "completed", "wave_id": "wave-9",

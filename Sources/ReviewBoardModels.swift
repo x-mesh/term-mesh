@@ -201,6 +201,13 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
     let worktreePath: String?
     let worktreeFinishMode: String?
     let worktreeRemoved: Bool?
+    /// The instruction as the producer wrote it. `title` is scrubbed and
+    /// clipped to 120 characters for display, which is right for a row and
+    /// wrong for deciding whether two tasks are the same instruction: a
+    /// delegated instruction opens with a shared preamble, so two different
+    /// asks routinely agree for the first 119 characters and then differ.
+    /// Same reasoning as `rawID` and `rawResult`.
+    let rawTitle: String
     let isStale: Bool
     let staleSeconds: Int?
     let updatedAt: String?
@@ -248,6 +255,7 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         // `merging(coordinator:)`. Every parser hands the producer's own
         // string to `result` and gets this filled in from it.
         rawResult: String? = nil,
+        rawTitle: String? = nil,
         resultPath: String? = nil,
         worktreeBranch: String? = nil,
         worktreeParent: String? = nil,
@@ -266,6 +274,7 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         self.rawID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         self.teamName = ReviewBoardText.safeLabel(teamName)
         self.title = ReviewBoardText.safeLabel(title)
+        self.rawTitle = rawTitle ?? title
         self.status = status
         self.assignee = assignee.map(ReviewBoardText.safeLabel)
         self.priority = priority
@@ -534,7 +543,12 @@ struct ReviewBoardTaskGroup: Identifiable, Equatable, Sendable {
     /// whole last moved.
     var updatedAt: String? { members.compactMap(\.updatedAt).max() }
 
-    /// Statuses in a stable, most-alarming-first order, deduplicated.
+    /// Statuses in first-seen member order, deduplicated, with their counts.
+    ///
+    /// First-seen, not severity-ranked: the board already hands members over
+    /// in its own sort order, and re-ranking here would quietly disagree with
+    /// the rows beside it. A view that wants to lead with the worst status
+    /// ranks this list itself.
     ///
     /// Not a sentence: a group's rollup is rendered differently at different
     /// widths, and building the prose here would decide that for the view.
@@ -575,69 +589,108 @@ extension ReviewBoardTask {
         _ tasks: [ReviewBoardTask],
         window: TimeInterval = derivedGroupWindow
     ) -> [ReviewBoardTaskGroup] {
-        var groups: [ReviewBoardTaskGroup] = []
-        // Position by first member, so grouping never reorders the board.
+        /// A group under construction, with the two values the scan would
+        /// otherwise recompute for every candidate: the normalized
+        /// instruction, and the anchor the window is measured from.
+        struct Building {
+            let id: String
+            let teamName: String
+            let title: String
+            let normalizedTitle: String
+            /// The earliest and latest member instants, so the window bounds
+            /// the group's whole span rather than its last arrival.
+            var earliest: Date?
+            var latest: Date?
+            var priority: Int
+            var members: [ReviewBoardTask]
+            let isDerived: Bool
+        }
+
+        var building: [Building] = []
         var indexByKey: [String: Int] = [:]
 
         for task in tasks {
+            let moment = task.updatedAt.flatMap(ReviewBoardText.date)
             let key: String
             let derived: Bool
             if let waveID = task.waveID {
                 key = "wave:\(task.teamName)\u{1F}\(waveID)"
                 derived = false
             } else {
-                key = Self.derivedKey(for: task, against: groups, window: window)
+                key = Self.derivedKey(
+                    for: task, moment: moment, against: building.map {
+                        (id: $0.id, teamName: $0.teamName,
+                         normalizedTitle: $0.normalizedTitle,
+                         earliest: $0.earliest, latest: $0.latest,
+                         isDerived: $0.isDerived)
+                    },
+                    window: window
+                )
                 derived = true
             }
             if let index = indexByKey[key] {
-                let existing = groups[index]
-                groups[index] = ReviewBoardTaskGroup(
-                    id: existing.id, teamName: existing.teamName,
-                    title: existing.title,
-                    // The board sorts by urgency, so a group is as urgent as
-                    // its most urgent member.
-                    priority: min(existing.priority, task.priority),
-                    members: existing.members + [task],
-                    isDerived: existing.isDerived
-                )
+                building[index].members.append(task)
+                // The board sorts by urgency, so a group is as urgent as its
+                // most urgent member.
+                building[index].priority = min(building[index].priority, task.priority)
+                if let moment {
+                    building[index].earliest = min(building[index].earliest ?? moment, moment)
+                    building[index].latest = max(building[index].latest ?? moment, moment)
+                }
                 continue
             }
-            indexByKey[key] = groups.count
-            groups.append(ReviewBoardTaskGroup(
+            indexByKey[key] = building.count
+            building.append(Building(
                 id: key, teamName: task.teamName, title: task.title,
+                normalizedTitle: ReviewBoardText.normalizedGroupTitle(task.rawTitle),
+                earliest: moment, latest: moment,
                 priority: task.priority, members: [task], isDerived: derived
             ))
         }
-        return groups
+
+        return building.map {
+            ReviewBoardTaskGroup(
+                id: $0.id, teamName: $0.teamName, title: $0.title,
+                priority: $0.priority, members: $0.members, isDerived: $0.isDerived
+            )
+        }
     }
+
+    /// A candidate group, reduced to what the derived match actually reads.
+    typealias DerivedCandidate = (
+        id: String, teamName: String, normalizedTitle: String,
+        earliest: Date?, latest: Date?, isDerived: Bool
+    )
 
     /// The key of an existing derived group this task belongs to, or a new one.
     ///
-    /// Matching against the groups already built — rather than bucketing by
-    /// title alone — is what keeps the window meaningful: two dispatches of
-    /// the same instruction hours apart share a title and must not share a
-    /// group.
+    /// The window bounds the group's whole span, not the distance to its
+    /// nearest member. Measuring against any member made membership
+    /// transitive: arrivals 110 seconds apart chained into one group of
+    /// unbounded width, so a poll repeating the same instruction folded into a
+    /// single card claiming one dispatch. It also made the result depend on
+    /// input order, and the board hands these over sorted by urgency rather
+    /// than by time.
     private static func derivedKey(
         for task: ReviewBoardTask,
-        against groups: [ReviewBoardTaskGroup],
+        moment: Date?,
+        against candidates: [DerivedCandidate],
         window: TimeInterval
     ) -> String {
-        let normalized = ReviewBoardText.normalizedGroupTitle(task.title)
-        guard let moment = task.updatedAt.flatMap(ReviewBoardText.date) else {
+        let normalized = ReviewBoardText.normalizedGroupTitle(task.rawTitle)
+        guard let moment else {
             // No clock means no evidence of a wave. Stand alone rather than
-            // join a group on the title by itself.
+            // join a group on the instruction by itself.
             return "solo:\(task.id)"
         }
-        for group in groups where group.isDerived
-            && group.teamName == task.teamName
-            && ReviewBoardText.normalizedGroupTitle(group.title) == normalized {
-            let near = group.members.contains { member in
-                guard let other = member.updatedAt.flatMap(ReviewBoardText.date) else {
-                    return false
-                }
-                return abs(other.timeIntervalSince(moment)) <= window
+        for candidate in candidates where candidate.isDerived
+            && candidate.teamName == task.teamName
+            && candidate.normalizedTitle == normalized {
+            guard let earliest = candidate.earliest, let latest = candidate.latest else {
+                continue
             }
-            if near { return group.id }
+            let span = max(latest, moment).timeIntervalSince(min(earliest, moment))
+            if span <= window { return candidate.id }
         }
         return "derived:\(task.teamName)\u{1F}\(normalized)\u{1F}\(task.id)"
     }
@@ -986,12 +1039,6 @@ enum ReviewBoardText {
         return formatter
     }()
 
-    /// A wall-clock reading of a stamp, for a row a person is looking at.
-    ///
-    /// The board carried these as raw `2026-07-28T08:32:11Z` strings, which is
-    /// the machine's form: it answers "when" only after the reader has done
-    /// timezone arithmetic. Today's times drop the date — a review board is
-    /// read while the work is happening.
     /// The instant an ISO timestamp names, for arithmetic rather than display.
     static func date(_ iso: String) -> Date? {
         for parser in timestampParsers {
@@ -1006,12 +1053,22 @@ enum ReviewBoardText {
     /// reflows the same paragraph for two agents has still asked one question.
     /// Nothing else is normalised: rewording is a different instruction, and
     /// collapsing those would merge dispatches that are genuinely separate.
+    ///
+    /// Callers pass `rawTitle`. The display `title` is clipped at 120
+    /// characters, and delegated instructions share a preamble, so comparing
+    /// the clipped copy merged asks that differ only past the cut.
     static func normalizedGroupTitle(_ title: String) -> String {
         title.lowercased()
             .split(whereSeparator: { $0.isWhitespace })
             .joined(separator: " ")
     }
 
+    /// A wall-clock reading of a stamp, for a row a person is looking at.
+    ///
+    /// The board carried these as raw `2026-07-28T08:32:11Z` strings, which is
+    /// the machine's form: it answers "when" only after the reader has done
+    /// timezone arithmetic. Today's times drop the date — a review board is
+    /// read while the work is happening.
     static func clockTime(_ iso: String) -> String? {
         for parser in timestampParsers {
             guard let date = parser.date(from: iso) else { continue }
