@@ -348,7 +348,9 @@ dmg-package:
 			--app-drop-link 450 185 \
 			--no-internet-enable \
 			"$(DMG_NAME)" "$$STAGING"; \
+		status=$$?; \
 		rm -rf "$$STAGING"; \
+		exit $$status; \
 	else \
 		echo "==> create-dmg not found, using hdiutil fallback..."; \
 		STAGING=$$(mktemp -d) && \
@@ -364,8 +366,17 @@ dmg-package:
 		"$(PROJECT_DIR)/scripts/check-bundle-binaries.sh" "$$STAGING/term-mesh.app" && \
 		ln -s /Applications "$$STAGING/Applications" && \
 		hdiutil create -volname "term-mesh" -srcfolder "$$STAGING" -ov -format UDZO "$(DMG_NAME)"; \
+		status=$$?; \
 		rm -rf "$$STAGING"; \
+		exit $$status; \
 	fi
+	@# The staging cleanup above used to be the last command in each branch, so
+	@# the recipe reported `rm -rf`'s status and a failed create-dmg exited 0.
+	@# A release then failed one step later with only "DMG missing" and none of
+	@# the packaging output that said why. Both branches propagate their own
+	@# status now, and this proves the artifact exists before the banner claims
+	@# it does.
+	@test -f "$(DMG_NAME)" || { echo "ERROR: $(DMG_NAME) was not created" >&2; exit 1; }
 	@# create-dmg occasionally leaves the read-write intermediate behind when
 	@# Finder detach is slow; clean it up so only the final UDZO remains.
 	@rm -f rw.*.$(DMG_NAME)

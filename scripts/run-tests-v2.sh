@@ -116,6 +116,8 @@ E2E_DAEMON_PID=""
 E2E_APP_PID_FILE="${TMPDIR:-/tmp}/term-mesh-e2e-app-${E2E_RUN_ID}.pid"
 REMOTE_FIXTURE_SSH_TARGET=""
 REMOTE_FIXTURE_ROOT=""
+# Where the peer's agent CLI symlink pointed before this run, when it resolved.
+REMOTE_AGENT_CLI_LINK=""
 PYTHON_VENV="$DERIVED_DATA_PATH/python-venv"
 PYTHON="$PYTHON_VENV/bin/python3"
 SYSTEM_PYTHON="/usr/bin/python3"
@@ -146,6 +148,16 @@ stage_remote_relay_fixture() {
     echo "ERROR: daemon/proto must be clean so the remote fixture proves candidate_sha" >&2
     exit 1
   fi
+
+  # The staged daemon runs with XDG_DATA_HOME inside the fixture, so the agent
+  # CLI installs a copy of itself there and repoints ~/.local/bin/claude at it.
+  # The fixture is deleted on exit, which left that link dangling and the next
+  # run could not start a leader at all: "claude is not installed". Remember
+  # where it pointed so cleanup can put it back. Only a link that resolves is
+  # worth restoring — an already-broken one is not this run's to repair.
+  REMOTE_AGENT_CLI_LINK="$(ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+    'if [ -e "$HOME/.local/bin/claude" ]; then readlink "$HOME/.local/bin/claude"; fi' \
+    2>/dev/null || true)"
 
   fixture_id="${candidate_sha:0:12}-$E2E_RUN_ID"
   REMOTE_FIXTURE_ROOT="/tmp/term-mesh-release-relay-$fixture_id"
@@ -199,6 +211,17 @@ stage_remote_relay_fixture() {
 cleanup_remote_relay_fixture() {
   [ -n "$REMOTE_FIXTURE_SSH_TARGET" ] || return 0
   [ -n "$REMOTE_FIXTURE_ROOT" ] || return 0
+  # Put the agent CLI link back before the directory it points into is removed,
+  # and only when this run is what moved it.
+  if [ -n "$REMOTE_AGENT_CLI_LINK" ]; then
+    ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+      "current=\$(readlink \"\$HOME/.local/bin/claude\" 2>/dev/null || true); \
+       case \"\$current\" in \
+         '$REMOTE_FIXTURE_ROOT'/*) \
+           ln -sfn '$REMOTE_AGENT_CLI_LINK' \"\$HOME/.local/bin/claude\";; \
+       esac" \
+      >/dev/null 2>&1 || true
+  fi
   ssh "$REMOTE_FIXTURE_SSH_TARGET" \
     "if test -f '$REMOTE_FIXTURE_ROOT/pid'; then kill \$(cat '$REMOTE_FIXTURE_ROOT/pid') 2>/dev/null || true; fi; rm -rf '$REMOTE_FIXTURE_ROOT'" \
     >/dev/null 2>&1 || true
