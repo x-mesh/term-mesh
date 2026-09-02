@@ -202,6 +202,113 @@ final class RemoteExposureStoreTests: XCTestCase {
     }
 }
 
+// MARK: - EnableSpec
+
+@MainActor
+final class RemoteExposureSpecTests: XCTestCase {
+    private let surface = "27C5ACD0-0719-463F-9B8B-DDC6287B0903"
+
+    private func pane(
+        _ type: PanelType,
+        leader: String? = nil,
+        agentTeam: String? = nil,
+        agent: String? = nil,
+        cli: String = ""
+    ) -> RemoteExposureStore.PaneIdentity {
+        RemoteExposureStore.PaneIdentity(
+            surfaceID: surface, panelType: type, title: "t", cwd: "/tmp",
+            leaderTeamName: leader, agentTeamName: agentTeam,
+            agentName: agent, agentCLI: cli
+        )
+    }
+
+    private func spec(_ identity: RemoteExposureStore.PaneIdentity) -> [String: Any]? {
+        RemoteExposureStore.enableSpec(
+            for: identity, appSocket: "/tmp/app.sock", keys: .safe,
+            ttlSeconds: 86_400, owner: "jinwoo",
+            leaderRequestToken: "tok"
+        )
+    }
+
+    /// A native agent pane is the one case the page shows as a chat without
+    /// needing a session id, which is the daemon's own rule.
+    func testANativeAgentPaneIsAChatTarget() {
+        let s = spec(pane(.agent, agentTeam: "aic", agent: "executor", cli: "claude"))
+        XCTAssertEqual(s?["kind"] as? String, "agent")
+        XCTAssertEqual(s?["chat_capable"] as? Bool, true)
+        XCTAssertEqual(s?["team_name"] as? String, "aic")
+        XCTAssertEqual(s?["agent_name"] as? String, "executor")
+        XCTAssertNil(s?["leader_request_token"], "only a leader can spend it")
+    }
+
+    /// The leader routes through the durable request board, so it carries the
+    /// team and the capability token. The app knows both; `tm-agent` needs
+    /// `--leader --team ws-<hex>` spelled out for an adopted leader.
+    func testALeaderPaneCarriesItsTeamAndToken() {
+        let s = spec(pane(.terminal, leader: "aic"))
+        XCTAssertEqual(s?["kind"] as? String, "leader")
+        XCTAssertEqual(s?["chat_capable"] as? Bool, true)
+        XCTAssertEqual(s?["team_name"] as? String, "aic")
+        XCTAssertEqual(s?["leader_request_token"] as? String, "tok")
+    }
+
+    /// Leader wins over agent: a pane can be both in the roster's eyes, and
+    /// the request board is the one that must receive the text.
+    func testLeaderWinsWhenAPaneIsBoth() {
+        let s = spec(pane(.agent, leader: "aic", agentTeam: "aic", agent: "executor"))
+        XCTAssertEqual(s?["kind"] as? String, "leader")
+        XCTAssertEqual(s?["team_name"] as? String, "aic")
+    }
+
+    /// The app clears CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID when it builds a
+    /// pane, so a hand-run CLI's session is not the app's to know. Claiming
+    /// chat here would show the phone an empty transcript; a terminal mirror is
+    /// what the app can actually back.
+    func testATerminalBackedAgentIsAMirrorNotAChat() {
+        let s = spec(pane(.terminal, agentTeam: "aic", agent: "reviewer", cli: "claude"))
+        XCTAssertEqual(s?["kind"] as? String, "pane")
+        XCTAssertEqual(s?["chat_capable"] as? Bool, false)
+        XCTAssertEqual(s?["agent_name"] as? String, "reviewer", "it still names itself")
+    }
+
+    func testAPlainShellIsAPlainPane() {
+        let s = spec(pane(.terminal))
+        XCTAssertEqual(s?["kind"] as? String, "pane")
+        XCTAssertEqual(s?["chat_capable"] as? Bool, false)
+        XCTAssertNil(s?["team_name"])
+        XCTAssertNil(s?["agent_name"])
+    }
+
+    /// No surface to mirror and no transcript to follow.
+    func testABrowserPaneYieldsNoSpec() {
+        XCTAssertNil(spec(pane(.browser)))
+        XCTAssertNil(spec(pane(.browser, agentTeam: "aic", agent: "executor")))
+    }
+
+    func testAPaneWithNoSurfaceIdYieldsNoSpec() {
+        var identity = pane(.terminal)
+        identity = RemoteExposureStore.PaneIdentity(
+            surfaceID: "", panelType: identity.panelType, title: identity.title,
+            cwd: identity.cwd
+        )
+        XCTAssertNil(spec(identity))
+    }
+
+    /// The keys policy and TTL travel as the daemon spells them, and an absent
+    /// TTL leaves the daemon's own default alone rather than inventing one.
+    func testKeysAndTTLTravelInTheDaemonsSpelling() {
+        let restricted = RemoteExposureStore.enableSpec(
+            for: pane(.terminal), appSocket: "/tmp/app.sock", keys: .none,
+            ttlSeconds: nil, owner: nil
+        )
+        XCTAssertEqual(restricted?["keys"] as? String, "none")
+        XCTAssertNil(restricted?["ttl_secs"])
+        XCTAssertNil(restricted?["owner"])
+        XCTAssertEqual(restricted?["app_socket"] as? String, "/tmp/app.sock")
+        XCTAssertEqual(spec(pane(.terminal))?["ttl_secs"] as? Int, 86_400)
+    }
+}
+
 private extension RemoteExposureStore {
     /// Let the in-flight refresh finish. `refresh()` is fire-and-forget by
     /// design — the header never awaits it — so tests need a join point.

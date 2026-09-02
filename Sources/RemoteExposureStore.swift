@@ -175,3 +175,106 @@ final class RemoteExposureStore: ObservableObject {
         )
     }
 }
+
+// MARK: - Building the daemon's EnableSpec
+
+extension RemoteExposureStore {
+    /// What the app knows about a pane, reduced to what `EnableSpec` needs.
+    ///
+    /// A value type on purpose: building the spec is the part worth testing,
+    /// and it should not need a Workspace, a TeamOrchestrator or a window.
+    struct PaneIdentity: Equatable {
+        let surfaceID: String
+        let panelType: PanelType
+        let title: String
+        let cwd: String
+        /// Set when this pane is a team's leader pane.
+        var leaderTeamName: String?
+        /// Set when this pane holds a team agent, native or terminal-backed.
+        var agentTeamName: String?
+        var agentName: String?
+        var agentCLI: String = ""
+    }
+
+    /// How much the phone may send back to a terminal-backed pane.
+    enum KeysPolicy: String, CaseIterable, Sendable {
+        /// The fixed allowlist in docs/mobile-remote-control.md §6.
+        case safe
+        /// Read the screen, send nothing.
+        case none
+    }
+
+    /// The daemon's `remote.on` parameters for this pane, or nil when the pane
+    /// cannot be exposed at all.
+    ///
+    /// The kind comes from what the app holds — panel type and team membership
+    /// — rather than from the environment variables `tm-agent` has to read,
+    /// which is why an adopted leader needs no `--leader --team ws-<hex>` here.
+    ///
+    /// `chat_capable` is narrower from the app than from the CLI, and that is
+    /// not an oversight. The CLI reads `CLAUDE_CODE_SESSION_ID` /
+    /// `CODEX_THREAD_ID` out of its own process environment; the app clears
+    /// exactly those variables when it builds a pane
+    /// (`GhosttyTerminalView.removingInheritedCLISessionIdentity`) so each CLI
+    /// starts its own session. A hand-run CLI's session id is therefore not
+    /// the app's to know, and claiming chat for a pane whose transcript cannot
+    /// be followed would show the phone an empty conversation. Such a pane is
+    /// exposed as a terminal mirror; `/rc on` from inside it still offers Chat.
+    static func enableSpec(
+        for pane: PaneIdentity,
+        appSocket: String,
+        keys: KeysPolicy,
+        ttlSeconds: Int?,
+        owner: String?,
+        leaderRequestToken: String? = nil
+    ) -> [String: Any]? {
+        guard !pane.surfaceID.isEmpty else { return nil }
+        // A browser pane has no surface to mirror and no transcript to follow.
+        guard pane.panelType != .browser else { return nil }
+
+        let kind: String
+        let chatCapable: Bool
+        if pane.leaderTeamName != nil {
+            kind = "leader"
+            chatCapable = true
+        } else if pane.panelType == .agent, pane.agentName != nil {
+            kind = "agent"
+            chatCapable = true
+        } else {
+            kind = "pane"
+            chatCapable = false
+        }
+
+        var spec: [String: Any] = [
+            "surface_id": pane.surfaceID,
+            "kind": kind,
+            "chat_capable": chatCapable,
+            "agent_cli": pane.agentCLI,
+            "title": pane.title,
+            "cwd": pane.cwd,
+            "app_socket": appSocket,
+            "keys": keys.rawValue,
+        ]
+        // `kind = leader` needs the team whose request board receives the text,
+        // and `kind = agent` needs team plus member. Carried whenever known, as
+        // the CLI does, so a terminal-backed agent still names itself.
+        if let team = pane.leaderTeamName ?? pane.agentTeamName {
+            spec["team_name"] = team
+        }
+        if let agentName = pane.agentName {
+            spec["agent_name"] = agentName
+        }
+        if let owner, !owner.isEmpty {
+            spec["owner"] = owner
+        }
+        if let ttlSeconds {
+            spec["ttl_secs"] = ttlSeconds
+        }
+        // Only a leader pane can spend it, and the daemon rejects a leader
+        // target that cannot reach the request board.
+        if kind == "leader", let leaderRequestToken, !leaderRequestToken.isEmpty {
+            spec["leader_request_token"] = leaderRequestToken
+        }
+        return spec
+    }
+}
