@@ -280,4 +280,371 @@ PY
 # process can read a prompt out of `ps`. The hook copies it and clears argv.
 grep -q 'set --' "$HOOK" || fail "argv is not cleared after the payload is copied"
 
+# --- delegation floor -------------------------------------------------------
+# UserPromptSubmit stdout reaches the leader's context, so --start is the one
+# place the hook speaks rather than observes. Every unusable input must leave
+# stdout empty: a hook that garbles a turn costs more than one that says
+# nothing.
+FLOOR_HOME="$TEST_TMP/floor"
+FLOOR_CTL="$TEST_TMP/control"
+mkdir -p "$FLOOR_HOME" "$FLOOR_CTL" || exit 1
+FLOOR_LOG="$FLOOR_HOME/.term-mesh/logs/turns.log"
+
+floor_hook() {
+    _ctl="$1"
+    shift
+    HOME="$FLOOR_HOME" \
+        TERMMESH_TEAM=floor-test \
+        TERMMESH_SURFACE_ID=99999999-8888-7777-6666-555555555555 \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_TEAM_UUID=05AC84AA-1E7C-4B21-86CE-77239B138078 \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$_ctl" \
+        "$HOOK" "$@"
+}
+
+cat > "$FLOOR_CTL/delegated.json" <<'JSON' || exit 1
+{"delegation_effective":"delegated","available_workers":3,
+ "worker_names":["executor","architect","reviewer"],"kill_switch":false,
+ "project_id":"floor-test"}
+JSON
+cat > "$FLOOR_CTL/leader-first-solo.json" <<'JSON' || exit 1
+{"delegation_effective":"leaderFirst","available_workers":1,
+ "worker_names":["executor"],"kill_switch":false,"project_id":"floor-test"}
+JSON
+cat > "$FLOOR_CTL/killed.json" <<'JSON' || exit 1
+{"delegation_effective":"delegated","available_workers":3,"kill_switch":true,
+ "project_id":"floor-test"}
+JSON
+printf 'not json {{{' > "$FLOOR_CTL/broken.json" || exit 1
+
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"first","session_id":"floor-1"}') \
+    || fail "delegated start returned nonzero"
+case "$FLOOR_OUT" in
+    *"level: delegated"*) ;;
+    *) fail "delegated floor was not injected: $FLOOR_OUT" ;;
+esac
+case "$FLOOR_OUT" in
+    *executor*) ;;
+    *) fail "roster missing from injected floor: $FLOOR_OUT" ;;
+esac
+
+# Stop's stdout is not injected anywhere, so --end must stay silent.
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-1"}') \
+    || fail "delegated end returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "--end wrote to stdout: $FLOOR_OUT"
+
+for quiet in leader-first-solo killed broken missing; do
+    FLOOR_OUT=$(floor_hook "$FLOOR_CTL/$quiet.json" --start "{\"prompt\":\"$quiet\"}") \
+        || fail "$quiet start returned nonzero"
+    [ -z "$FLOOR_OUT" ] || fail "$quiet should inject nothing, got: $FLOOR_OUT"
+done
+FLOOR_OUT=$(env -u TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE HOME="$FLOOR_HOME" \
+    TERMMESH_TEAM=floor-test TERMMESH_SURFACE_ID=99999999-8888-7777-6666-555555555555 \
+    TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token "$HOOK" --start '{"prompt":"no control"}') \
+    || fail "unset control file returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "unset control file should inject nothing, got: $FLOOR_OUT"
+
+# task_dispatch is written by the app, never claimed by the leader, so whether
+# a delegated turn met its floor is the one participation signal that does not
+# depend on the leader reporting anything.
+floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"unmet turn","session_id":"floor-2"}' >/dev/null \
+    || fail "unmet start returned nonzero"
+floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-2"}' >/dev/null \
+    || fail "unmet end returned nonzero"
+
+floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"met turn","session_id":"floor-3"}' >/dev/null \
+    || fail "met start returned nonzero"
+printf '%s\n' '{"event":"task_dispatch","turn_id":"req-1","ts":"2026-01-01T00:00:00Z","team":"floor-test","task_id":"t1","worker":"executor","delivery":"created"}' \
+    >> "$FLOOR_LOG" || exit 1
+floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-3"}' >/dev/null \
+    || fail "met end returned nonzero"
+
+# leaderFirst states no floor a turn can miss, so the field must be absent.
+floor_hook "$FLOOR_CTL/leader-first-solo.json" --start '{"prompt":"lf turn","session_id":"floor-4"}' >/dev/null \
+    || fail "leader-first start returned nonzero"
+floor_hook "$FLOOR_CTL/leader-first-solo.json" --end '{"session_id":"floor-4"}' >/dev/null \
+    || fail "leader-first end returned nonzero"
+
+python3 - "$FLOOR_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = []
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if line:
+        records.append(json.loads(line))
+
+ends = [r for r in records if r["event"] == "turn_end"]
+# The last three ends are, in order: delegated with no dispatch, delegated with
+# one dispatch, then leaderFirst. Checking them positionally keeps this honest
+# about ordering instead of counting occurrences that earlier cases also add.
+expected = ["unmet", "met", None]
+actual = [r.get("delegation_floor") for r in ends[-3:]]
+if actual != expected:
+    raise SystemExit(f"FAIL: delegation floors were {actual}, expected {expected}")
+PY
+
+# The per-Project execution options, which only reach the hook through this
+# file: a cap of one means waves are off rather than small, and the injection
+# switch has to silence the floor without silencing measurement.
+cat > "$FLOOR_CTL/capped.json" <<'JSON' || exit 1
+{"delegation_effective":"delegated","available_workers":4,
+ "worker_names":["a","b","c","d"],"kill_switch":false,"project_id":"floor-test",
+ "max_parallel_workers":2}
+JSON
+cat > "$FLOOR_CTL/no-waves.json" <<'JSON' || exit 1
+{"delegation_effective":"leaderFirst","available_workers":4,
+ "worker_names":["a","b","c","d"],"kill_switch":false,"project_id":"floor-test",
+ "max_parallel_workers":1}
+JSON
+cat > "$FLOOR_CTL/injection-off.json" <<'JSON' || exit 1
+{"delegation_effective":"delegated","available_workers":3,"kill_switch":false,
+ "project_id":"floor-test","inject_directive":false}
+JSON
+
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/capped.json" --start '{"prompt":"capped"}') \
+    || fail "capped start returned nonzero"
+case "$FLOOR_OUT" in
+    *"up to 2 workers"*) ;;
+    *) fail "cap not reflected in the floor: $FLOOR_OUT" ;;
+esac
+case "$FLOOR_OUT" in
+    *"max parallel: 2"*) ;;
+    *) fail "cap missing from the header: $FLOOR_OUT" ;;
+esac
+case "$FLOOR_OUT" in
+    *"TERMMESH_LEADER_ROUTE_FILE="*) ;;
+    *) fail "current Project route missing from the floor: $FLOOR_OUT" ;;
+esac
+
+# leaderFirst with waves capped off has nothing left to say beyond the default.
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/no-waves.json" --start '{"prompt":"no waves"}') \
+    || fail "no-waves start returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "leaderFirst with cap 1 should stay silent, got: $FLOOR_OUT"
+
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/injection-off.json" --start '{"prompt":"off","session_id":"floor-5"}') \
+    || fail "injection-off start returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "inject_directive=false must inject nothing, got: $FLOOR_OUT"
+
+# ...but turning injection off must not turn measurement off with it.
+floor_hook "$FLOOR_CTL/injection-off.json" --end '{"session_id":"floor-5"}' >/dev/null \
+    || fail "injection-off end returned nonzero"
+python3 - "$FLOOR_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+last_end = [r for r in records if r["event"] == "turn_end"][-1]
+if last_end.get("delegation_floor") != "unmet":
+    raise SystemExit(
+        "FAIL: injection off still has to measure the floor, got "
+        + repr(last_end.get("delegation_floor"))
+    )
+PY
+
 printf '%s\n' 'PASS: leader turn hook logs private, correlated start/end boundaries'
+printf '%s\n' 'PASS: leader turn hook injects and measures the delegation floor'
+# Another team's dispatches are not this team's delegation.
+#
+# The first version of this verdict walked the log back to this turn's own
+# turn_start and counted every task_dispatch on the way. Two things broke it:
+# the id a leader states with `leader turn route` is not always the one the
+# hook recorded, so the walk could run past every recent record and match a
+# start from hours earlier — and it counted dispatches from every team on the
+# host. A live run reported "met" for a turn that dispatched nothing, on the
+# strength of another project's records from six hours before.
+STRAY_HOME="$TEST_TMP/stray"
+STRAY_CTL="$TEST_TMP/stray-ctl"
+mkdir -p "$STRAY_HOME/.term-mesh/logs" "$STRAY_CTL" || exit 1
+STRAY_LOG="$STRAY_HOME/.term-mesh/logs/turns.log"
+
+cat > "$STRAY_CTL/delegated.json" <<'JSON' || exit 1
+{"delegation_effective":"delegated","available_workers":2,
+ "worker_names":["a","b"],"kill_switch":false,"project_id":"mine"}
+JSON
+
+stray_hook() {
+    HOME="$STRAY_HOME" \
+        TERMMESH_TEAM=mine \
+        TERMMESH_SURFACE_ID=stray-surface \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$STRAY_CTL/delegated.json" \
+        "$HOOK" "$@"
+}
+
+# An old dispatch belonging to this team, before the turn begins: it is part of
+# the baseline, so it must not make the new turn look delegated.
+printf '%s\n' '{"event":"task_dispatch","turn_id":"old","ts":"2026-01-01T00:00:00Z","team":"mine","task_id":"t0","worker":"a","delivery":"created"}' \
+    >> "$STRAY_LOG" || exit 1
+
+stray_hook --start '{"prompt":"turn one","session_id":"stray-1"}' >/dev/null \
+    || fail "stray start returned nonzero"
+
+# ...and a different team dispatching while this turn runs.
+printf '%s\n' '{"event":"task_dispatch","turn_id":"other","ts":"2026-01-01T00:00:01Z","team":"someone-else","task_id":"t1","worker":"x","delivery":"created"}' \
+    >> "$STRAY_LOG" || exit 1
+
+stray_hook --end '{"session_id":"stray-1"}' >/dev/null \
+    || fail "stray end returned nonzero"
+
+python3 - "$STRAY_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+last_end = [r for r in records if r["event"] == "turn_end"][-1]
+if last_end.get("delegation_floor") != "unmet":
+    raise SystemExit(
+        "FAIL: a prior dispatch and another team's dispatch must not read as met, got "
+        + repr(last_end.get("delegation_floor"))
+    )
+PY
+
+# With no baseline — a Stop that never saw a Start — the verdict is withheld
+# rather than guessed.
+rm -f "$STRAY_HOME/.term-mesh/logs/.turn-dispatch-stray-surface" 2>/dev/null || true
+stray_hook --end '{"session_id":"stray-2"}' >/dev/null \
+    || fail "baseline-less end returned nonzero"
+python3 - "$STRAY_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+last_end = [r for r in records if r["event"] == "turn_end"][-1]
+if "delegation_floor" in last_end:
+    raise SystemExit(
+        "FAIL: without a baseline the floor must be withheld, got "
+        + repr(last_end.get("delegation_floor"))
+    )
+PY
+
+# A long turn on a busy log must still read as delegated.
+#
+# The verdict used to count a fixed tail of the log at both ends and compare
+# the two numbers. Once the log outgrew that tail during a turn, the old
+# dispatches that slid out of it cancelled the ones the turn added, and a turn
+# that delegated three tasks reported exactly the same number as it started
+# with — "unmet". The baseline is a byte offset now, so nothing that scrolls
+# out of view can cancel a real dispatch.
+WINDOW_HOME="$TEST_TMP/window"
+WINDOW_CTL="$TEST_TMP/window-ctl"
+mkdir -p "$WINDOW_HOME/.term-mesh/logs" "$WINDOW_CTL" || exit 1
+WINDOW_LOG="$WINDOW_HOME/.term-mesh/logs/turns.log"
+
+cat > "$WINDOW_CTL/delegated.json" <<'JSON' || exit 1
+{"delegation_effective":"delegated","available_workers":2,
+ "worker_names":["a","b"],"kill_switch":false,"project_id":"mine"}
+JSON
+
+window_hook() {
+    HOME="$WINDOW_HOME" \
+        TERMMESH_TEAM=mine \
+        TERMMESH_SURFACE_ID=window-surface \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$WINDOW_CTL/delegated.json" \
+        "$HOOK" "$@"
+}
+
+# Same shape as the live failure: three of this team's dispatches already in
+# the log, then enough traffic that they fall out of any fixed tail.
+window_fill() {
+    python3 - "$WINDOW_LOG" "$1" "$2" <<'PY' || exit 1
+import sys
+
+log_path, dispatches, filler = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(log_path, "a", encoding="utf-8") as handle:
+    for index in range(dispatches):
+        handle.write(
+            '{"event":"task_dispatch","turn_id":"w%d","ts":"2026-01-01T00:00:00Z",'
+            '"team":"mine","task_id":"w%d","worker":"a","delivery":"created"}\n'
+            % (index, index)
+        )
+    for index in range(filler):
+        handle.write(
+            '{"event":"task_lifecycle","turn_id":"f%d","ts":"2026-01-01T00:00:00Z",'
+            '"team":"noise","task_status":"running"}\n' % index
+        )
+PY
+}
+
+window_fill 3 7000
+window_hook --start '{"prompt":"long turn","session_id":"window-1"}' >/dev/null \
+    || fail "window start returned nonzero"
+window_fill 3 7000
+window_hook --end '{"session_id":"window-1"}' >/dev/null \
+    || fail "window end returned nonzero"
+
+python3 - "$WINDOW_LOG" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+last_end = [r for r in records if r["event"] == "turn_end"][-1]
+if last_end.get("delegation_floor") != "met":
+    raise SystemExit(
+        "FAIL: dispatches during a long turn must read as met, got "
+        + repr(last_end.get("delegation_floor"))
+    )
+PY
+
+# New hook records carry Project identity when the leader launch provides it.
+IDENTITY_HOME="$TEST_TMP/identity"
+mkdir -p "$IDENTITY_HOME/.term-mesh/logs" || exit 1
+IDENTITY_CONTROL="$IDENTITY_HOME/control.json"
+printf '%s\n' '{"session_id":"adopted-session"}' > "$IDENTITY_CONTROL" || exit 1
+HOME="$IDENTITY_HOME" \
+    TERMMESH_TEAM=aic \
+    TERMMESH_SURFACE_ID=identity-surface \
+    TERMMESH_LEADER_REQUEST_TOKEN=leader-token \
+    TERMMESH_LEADER_TEAM_UUID=05AC84AA \
+    TERMMESH_LEADER_SESSION_ID=leader-session \
+    TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$IDENTITY_CONTROL" \
+    "$HOOK" --start '{"prompt":"identity","session_id":"hook-session"}' >/dev/null \
+    || fail "identity start returned nonzero"
+HOME="$IDENTITY_HOME" \
+    TERMMESH_TEAM=aic \
+    TERMMESH_SURFACE_ID=identity-surface \
+    TERMMESH_LEADER_REQUEST_TOKEN=leader-token \
+    TERMMESH_LEADER_TEAM_UUID=05AC84AA \
+    TERMMESH_LEADER_SESSION_ID=leader-session \
+    TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$IDENTITY_CONTROL" \
+    "$HOOK" --end '{"session_id":"hook-session"}' >/dev/null \
+    || fail "identity end returned nonzero"
+python3 - "$IDENTITY_HOME/.term-mesh/logs/turns.log" <<'PY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+if not records or any(record.get("team_uuid") != "05AC84AA" for record in records):
+    raise SystemExit("FAIL: hook records did not preserve team_uuid")
+if any(record.get("leader_session_id") != "adopted-session" for record in records):
+    raise SystemExit("FAIL: hook records did not refresh leader_session_id")
+PY
+
+printf '%s\n' 'PASS: leader turn hook honours per-Project execution options'
+printf '%s\n' 'PASS: delegation floor counts only this team, only this turn'
+printf '%s\n' 'PASS: delegation floor survives a log that outgrows any fixed tail'
+printf '%s\n' 'PASS: leader turn hook records scoped Project identity'

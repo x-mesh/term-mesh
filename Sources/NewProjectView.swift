@@ -83,7 +83,7 @@ struct NewProjectView: View {
     @State private var knownAgentIDs: Set<UUID> = []
     @State private var inheritedAgentIDs: Set<UUID> = []
     @State private var agents: [TeamAgentRow] = []
-    @State private var delegationLevel: ProjectDelegationLevel = .leaderFirst
+    @State private var delegationLevel: ProjectDelegationLevel = .appDefault()
     /// The machine the leader and primary checkout live on.
     ///
     /// Asked first because everything after it depends on the answer. A folder

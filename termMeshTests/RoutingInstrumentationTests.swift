@@ -62,6 +62,121 @@ final class RoutingInstrumentationTests: XCTestCase {
         )
     }
 
+    /// The turn hook is the only request boundary a directly typed prompt
+    /// crosses, and it sees the prompt before any classification exists. An
+    /// unstated shape used to arrive as `single_unit`, which closes the
+    /// parallel gate and pinned those turns to `direct` no matter what the
+    /// Project was configured to do.
+    func testUnstatedTaskShapeDoesNotReadAsSingleUnit() {
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .leaderFirst, taskShape: nil, risks: [], availableWorkers: 3
+            ),
+            .init(route: .direct, reasons: ["shape_unstated"], workerCount: 0),
+            "a roster of three with no stated shape is not evidence of serial work"
+        )
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .leaderFirst, taskShape: nil, risks: [], availableWorkers: 1
+            ),
+            .init(route: .direct, reasons: ["leader_first"], workerCount: 0),
+            "one worker cannot form a wave, so leader-first is the honest reason"
+        )
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .delegated, taskShape: nil, risks: [], availableWorkers: 1
+            ),
+            .init(route: .delegated, reasons: ["delegated_serial_work"], workerCount: 1),
+            "delegated must not need a stated shape to hand work over"
+        )
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .guarded, taskShape: nil,
+                risks: [.repeatedFailure], availableWorkers: 2
+            ),
+            .init(route: .probe, reasons: ["repeated_failure"], workerCount: 1)
+        )
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .delegated, taskShape: nil, risks: [], availableWorkers: 0
+            ),
+            .init(route: .direct, reasons: ["no_available_workers"], workerCount: 0),
+            "an empty roster still outranks every level"
+        )
+    }
+
+    /// A cap of one is "never fan out", not "fan out to one": two is the
+    /// smallest wave the policy recognises, so the gate has to close rather
+    /// than emit a one-worker parallel run.
+    func testParallelCapClosesTheGateRatherThanShrinkingTheWave() {
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .leaderFirst, taskShape: .multiUnit, risks: [],
+                availableWorkers: 4, maxParallelWorkers: 1
+            ),
+            .init(route: .direct, reasons: ["limited_capacity"], workerCount: 0)
+        )
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .leaderFirst, taskShape: .multiUnit, risks: [],
+                availableWorkers: 4, maxParallelWorkers: 2
+            ),
+            .init(route: .parallel, reasons: ["parallel_ready"], workerCount: 2)
+        )
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .leaderFirst, taskShape: .multiUnit, risks: [],
+                availableWorkers: 2, maxParallelWorkers: 5
+            ),
+            .init(route: .parallel, reasons: ["parallel_ready"], workerCount: 2),
+            "the roster still bounds the wave when the cap is higher"
+        )
+    }
+
+    func testExecutionOptionsRoundTripAndClampOutOfRangeValues() throws {
+        let suite = "exec-options.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertEqual(
+            ProjectExecutionOptions.load(teamName: "fresh", from: defaults),
+            .default,
+            "an unset Project has to read as the shipped default, not as zero"
+        )
+
+        ProjectExecutionOptions(maxParallelWorkers: 99, injectDirective: false)
+            .save(teamName: "capped", to: defaults)
+        let loaded = ProjectExecutionOptions.load(teamName: "capped", from: defaults)
+        XCTAssertEqual(loaded.maxParallelWorkers, ProjectExecutionOptions.workerBounds.upperBound)
+        XCTAssertFalse(loaded.injectDirective)
+
+        ProjectExecutionOptions(maxParallelWorkers: 0, injectDirective: true)
+            .save(teamName: "floored", to: defaults)
+        XCTAssertEqual(
+            ProjectExecutionOptions.load(teamName: "floored", from: defaults).maxParallelWorkers,
+            ProjectExecutionOptions.workerBounds.lowerBound
+        )
+
+        // Two Projects must not share one setting.
+        XCTAssertEqual(
+            ProjectExecutionOptions.load(teamName: "capped", from: defaults).maxParallelWorkers,
+            ProjectExecutionOptions.workerBounds.upperBound
+        )
+    }
+
+    func testEnqueueWithoutTaskShapeStoresNilRatherThanSingleUnit() throws {
+        let team = registerTeam()
+        _ = store.configureProjectDelegation(teamName: team, level: .delegated)
+        guard case .created(let request, _) = store.enqueueLeaderRequest(
+            teamName: team, content: "unclassified request", requestId: "shape-unstated"
+        ) else {
+            return XCTFail("expected the request to be created")
+        }
+        XCTAssertNil(request.taskShape, "an omitted shape must stay unstated")
+        XCTAssertEqual(request.selectedRoute, .delegated)
+        XCTAssertEqual(request.selectedWorkerCount, 1)
+    }
+
     func testLeaderRequestSnapshotsEffectiveDelegationAndEngineRoute() throws {
         let team = registerTeam()
         _ = store.configureProjectDelegation(teamName: team, level: .guarded)

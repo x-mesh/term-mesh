@@ -352,6 +352,379 @@ final class PeerAgentPaneRecoveryCoordinator {
 }
 
 extension TeamOrchestrator {
+    struct CollaborationRecoveryPlan: Equatable {
+        let leaderLive: Bool
+        let deadAgentInstanceIDs: [String]
+        let liveAgentCount: Int
+    }
+
+    struct CollaborationRouteGeneration: Equatable {
+        let teamUUID: String?
+        let workspaceID: UUID
+        let leaderPanelID: UUID
+        let agents: [String]
+    }
+
+    static func collaborationRouteGeneration(_ team: Team) -> CollaborationRouteGeneration {
+        CollaborationRouteGeneration(
+            teamUUID: team.teamUuid,
+            workspaceID: team.workspaceId,
+            leaderPanelID: team.leaderPanelId,
+            agents: team.agents.map { agent in
+                let panel = agent.panelId?.uuidString ?? "-"
+                let surface = agent.remoteSurfaceID?.map {
+                    String(format: "%02x", $0)
+                }.joined() ?? "-"
+                return "\(agent.agentInstanceId)|\(panel)|\(surface)"
+            }.sorted()
+        )
+    }
+
+    nonisolated static func collaborationRecoveryPlan(
+        leaderSurfaceID: Data?,
+        agents: [AgentMember],
+        surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+    ) -> CollaborationRecoveryPlan {
+        // The roster is remote input. Two rows sharing a surface id — the
+        // protobuf default empty Data included — would trap
+        // `Dictionary(uniqueKeysWithValues:)` and take the app down inside a
+        // recovery path. Keep the first row and carry on.
+        let byID = Dictionary(surfaces.map { ($0.surfaceID, $0) }) { first, _ in first }
+        let leaderLive = leaderSurfaceID.flatMap { byID[$0] }.map {
+            $0.attachable && (!$0.foregroundBusyKnown || $0.foregroundBusy)
+        } == true
+        let remoteAgents = agents.filter { $0.remoteAgentSurface }
+        let dead = remoteAgents.compactMap { agent -> String? in
+            guard let surfaceID = agent.remoteSurfaceID,
+                  byID[surfaceID]?.attachable == true else {
+                return agent.agentInstanceId
+            }
+            return nil
+        }
+        return CollaborationRecoveryPlan(
+            leaderLive: leaderLive,
+            deadAgentInstanceIDs: dead,
+            liveAgentCount: remoteAgents.count - dead.count
+        )
+    }
+
+    /// Restore the local viewer shape before changing any grants. A route-only
+    /// repair makes roster calls work while native delivery still has nowhere
+    /// to land, which is the split-brain this action exists to remove.
+    @MainActor
+    private func ensureCollaborationPresentation(
+        teamName: String,
+        repairableMissingAgentIDs: Set<String>
+    ) async -> Bool {
+        if collaborationPresentationState(
+            teamName: teamName,
+            requireLiveSessions: false,
+            repairableMissingAgentIDs: repairableMissingAgentIDs
+        ) == .ready {
+            return true
+        }
+        guard let tabManager = AppDelegate.shared?.tabManager else { return false }
+        _ = await restoreDetachedProjectPresentation(
+            teamName: teamName,
+            tabManager: tabManager
+        )
+        return collaborationPresentationState(
+            teamName: teamName,
+            requireLiveSessions: false,
+            repairableMissingAgentIDs: repairableMissingAgentIDs
+        ) == .ready
+    }
+
+    /// Respawn a peer-owned member whose durable roster entry survived but
+    /// whose local pane did not. The leader pane is the stable insertion
+    /// anchor; unlike the ordinary hard-restart path there is no old local tab
+    /// to close after the replacement commits.
+    @MainActor
+    private func replaceMissingPeerOwnedAgentPane(
+        teamName: String,
+        agentInstanceID: String
+    ) async -> Bool {
+        guard let team = teams[teamName],
+              let agent = team.agents.first(where: {
+                  $0.agentInstanceId == agentInstanceID && $0.remoteAgentSurface
+              }),
+              let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
+              let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }),
+              workspace.panels[team.leaderPanelId] != nil
+        else { return false }
+
+        let result = await restartPeerOwnedAgentPaneHard(
+            team: team,
+            agent: agent,
+            workspace: workspace,
+            splitFrom: (team.leaderPanelId, .horizontal, false)
+        )
+        guard case .success(let replacement) = result else { return false }
+        guard commitPeerOwnedAgentReplacement(
+                  teamName: teamName,
+                  expected: agent,
+                  replacement: replacement.member
+              ) else {
+            discardPeerOwnedAgentRestart(replacement, workspace: workspace)
+            return false
+        }
+        await activatePeerOwnedAgentRestart(
+            replacement,
+            teamName: teamName,
+            agentInstanceID: agent.agentInstanceId
+        )
+        Self.releasePeerOwnedAgentSurface(agent)
+        scheduleAgentGridEqualization(workspace: workspace)
+        return true
+    }
+
+    @MainActor
+    func repairCollaboration(teamName: String) async -> CollaborationRecoveryReport {
+        guard let initial = teams[teamName],
+              let teamUUID = initial.teamUuid,
+              case let .peer(hostKey) = initial.leaderEndpoint,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey })
+        else {
+            return CollaborationRecoveryReport(
+                routeRepaired: false, leaderLive: false, liveAgents: 0,
+                replacedAgents: [], failedAgents: ["Project route unavailable"]
+            )
+        }
+
+        guard let rosterLease = try? await PeerPaneHostRegistry.shared.acquire(
+            Self.requireTeamHostSpec(host)
+        ) else {
+            return CollaborationRecoveryReport(
+                routeRepaired: false, leaderLive: false, liveAgents: 0,
+                replacedAgents: [], failedAgents: ["Host roster unavailable"]
+            )
+        }
+        let surfaces = try? await PeerPaneSession.listSurfaces(on: rosterLease)
+        PeerPaneHostRegistry.shared.release(rosterLease)
+        guard let surfaces else {
+            return CollaborationRecoveryReport(
+                routeRepaired: false, leaderLive: false, liveAgents: 0,
+                replacedAgents: [], failedAgents: ["Host roster unavailable"]
+            )
+        }
+        let initialLeaderSurfaceID = initial.remoteLeaderSurfaceID
+            ?? ManagedPeerSurfaceStore.shared.leaderRecord(
+                hostKey: hostKey, teamName: teamName
+            )?.surfaceID
+        let initialPlan = Self.collaborationRecoveryPlan(
+            leaderSurfaceID: initialLeaderSurfaceID,
+            agents: initial.agents,
+            surfaces: surfaces
+        )
+#if DEBUG
+        let surfaceState = surfaces.map {
+            let id = $0.surfaceID.map { String(format: "%02x", $0) }
+                .joined().prefix(8)
+            return "\(id):" + ($0.attachable ? "live" : "dead")
+        }.joined(separator: ",")
+        let deadIDSummary = initialPlan.deadAgentInstanceIDs.joined(separator: ",")
+        dlog(
+            "collaboration.repair.roster team=\(teamName) leader=\(initialPlan.leaderLive) "
+                + "dead=\(deadIDSummary) "
+                + "surfaces=[\(surfaceState)]"
+        )
+#endif
+        guard await ensureCollaborationPresentation(
+            teamName: teamName,
+            repairableMissingAgentIDs: Set(initialPlan.deadAgentInstanceIDs)
+        ) else {
+            return CollaborationRecoveryReport(
+                routeRepaired: false, leaderLive: initialPlan.leaderLive,
+                liveAgents: initialPlan.liveAgentCount,
+                replacedAgents: [], failedAgents: ["presentation_missing"]
+            )
+        }
+
+        guard let routeTeam = teams[teamName], routeTeam.teamUuid == teamUUID else {
+            return CollaborationRecoveryReport(
+                routeRepaired: false, leaderLive: false, liveAgents: 0,
+                replacedAgents: [], failedAgents: ["Project changed during repair"]
+            )
+        }
+        let routeGeneration = Self.collaborationRouteGeneration(routeTeam)
+        guard let routes = await mintAdoptedRemoteAgentRoutes(
+            teamName: teamName, teamUUID: teamUUID, host: host, members: routeTeam.agents
+        ) else {
+            return CollaborationRecoveryReport(
+                routeRepaired: false, leaderLive: initial.leaderReady, liveAgents: 0,
+                replacedAgents: [], failedAgents: ["Route refresh failed"]
+            )
+        }
+        let grantIDs = [routes.leaderGrantID] + Array(routes.workerGrants.values)
+        guard teams[teamName].map(Self.collaborationRouteGeneration) == routeGeneration else {
+            Self.rollbackRemoteAgentRoutesPreservingGrants(
+                host: host, transaction: routes.transaction, grantIDs: grantIDs
+            )
+            return CollaborationRecoveryReport(
+                routeRepaired: false, leaderLive: false, liveAgents: 0,
+                replacedAgents: [], failedAgents: ["Project changed during repair"]
+            )
+        }
+        guard await Self.finishAdoptedRemoteAgentRoutes(
+            host: host, transaction: routes.transaction, commit: true
+        ) else {
+            Self.rollbackRemoteAgentRoutesPreservingGrants(
+                host: host, transaction: routes.transaction, grantIDs: grantIDs
+            )
+            return CollaborationRecoveryReport(
+                routeRepaired: false, leaderLive: initial.leaderReady, liveAgents: 0,
+                replacedAgents: [], failedAgents: ["Route commit failed"]
+            )
+        }
+        guard let current = teams[teamName],
+              Self.collaborationRouteGeneration(current) == routeGeneration else {
+            Self.rollbackRemoteAgentRoutesPreservingGrants(
+                host: host, transaction: routes.transaction, grantIDs: grantIDs
+            )
+            return CollaborationRecoveryReport(
+                routeRepaired: false, leaderLive: false, liveAgents: 0,
+                replacedAgents: [], failedAgents: ["Project changed during repair"]
+            )
+        }
+        if !(await Self.finalizeAdoptedRemoteAgentRoutes(
+            host: host, transaction: routes.transaction
+        )) {
+            // Commit already succeeded. A lost finalize response cannot make
+            // the live route unsafe; keep the grants and finish housekeeping
+            // in the background rather than rolling back a working repair.
+            Self.scheduleAdoptedRemoteAgentRouteFinalize(
+                host: host, transaction: routes.transaction
+            )
+        }
+        startRemoteLeaderGrantKeepalive(teamName: teamName, grantID: routes.leaderGrantID)
+        for (instanceID, grantID) in routes.workerGrants {
+            startRemoteAgentRouteKeepalive(
+                teamName: teamName, agentInstanceID: instanceID, grantID: grantID
+            )
+        }
+        var hookRefreshFailed = false
+        if let hookData = Self.localLeaderTurnHookData() {
+            hookRefreshFailed = await Self.writeRemoteLeaderTurnHookOverSSH(
+                host: host, hookData: hookData, teamUUID: teamUUID
+            ) == nil
+        }
+        refreshLeaderParticipationControls()
+
+        guard let refreshedLease = try? await PeerPaneHostRegistry.shared.acquire(
+            Self.requireTeamHostSpec(host)
+        ) else {
+            return CollaborationRecoveryReport(
+                routeRepaired: true, leaderLive: false, liveAgents: 0,
+                replacedAgents: [], failedAgents: ["Host roster unavailable"]
+            )
+        }
+        let refreshedSurfaces = try? await PeerPaneSession.listSurfaces(on: refreshedLease)
+        PeerPaneHostRegistry.shared.release(refreshedLease)
+        guard let refreshedSurfaces else {
+            return CollaborationRecoveryReport(
+                routeRepaired: true, leaderLive: false, liveAgents: 0,
+                replacedAgents: [], failedAgents: ["Host roster unavailable"]
+            )
+        }
+        let leaderSurfaceID = current.remoteLeaderSurfaceID
+            ?? ManagedPeerSurfaceStore.shared.leaderRecord(
+                hostKey: hostKey, teamName: teamName
+            )?.surfaceID
+        let plan = Self.collaborationRecoveryPlan(
+            leaderSurfaceID: leaderSurfaceID,
+            agents: current.agents,
+            surfaces: refreshedSurfaces
+        )
+        guard plan.leaderLive else {
+            return CollaborationRecoveryReport(
+                routeRepaired: true, leaderLive: false, liveAgents: plan.liveAgentCount,
+                replacedAgents: [], failedAgents: []
+            )
+        }
+
+        var replaced: [String] = []
+        var failed: [String] = hookRefreshFailed ? ["Turn hook refresh failed"] : []
+        let deadIDs = Set(plan.deadAgentInstanceIDs)
+        for agent in current.agents where agent.remoteAgentSurface
+            && !deadIDs.contains(agent.agentInstanceId) {
+            guard let panelID = agent.panelId,
+                  let manager = AppDelegate.shared?.tabManagerFor(tabId: agent.workspaceId),
+                  let workspace = manager.tabs.first(where: { $0.id == agent.workspaceId })
+            else {
+                failed.append(agent.name)
+                continue
+            }
+            if !workspace.peerAgentPanelIsLive(panelID) {
+                if await workspace.repairRemoteAgentPane(panelId: panelID) {
+                    replaced.append(agent.name)
+                } else {
+                    failed.append(agent.name)
+                }
+            }
+        }
+        for instanceID in plan.deadAgentInstanceIDs {
+            guard let liveTeam = teams[teamName],
+                  let agent = liveTeam.agents.first(where: {
+                      $0.agentInstanceId == instanceID
+                  }) else {
+                failed.append(instanceID)
+                continue
+            }
+            guard let panelID = agent.panelId,
+                  let manager = AppDelegate.shared?.tabManagerFor(tabId: agent.workspaceId),
+                  let workspace = manager.tabs.first(where: { $0.id == agent.workspaceId }),
+                  workspace.panels[panelID] != nil else {
+                if await replaceMissingPeerOwnedAgentPane(
+                    teamName: teamName,
+                    agentInstanceID: instanceID
+                ) {
+                    replaced.append(agent.name)
+                } else {
+                    failed.append(agent.name)
+                }
+                continue
+            }
+            switch await restartAgentPaneHard(panelId: panelID) {
+            case .success:
+                replaced.append(agent.name)
+            case .failure:
+                failed.append(agent.name)
+            }
+        }
+        return CollaborationRecoveryReport(
+            routeRepaired: true, leaderLive: true,
+            liveAgents: plan.liveAgentCount + replaced.count,
+            replacedAgents: replaced, failedAgents: failed
+        )
+    }
+
+    struct CollaborationRecoveryReport: Equatable {
+        let routeRepaired: Bool
+        let leaderLive: Bool
+        let liveAgents: Int
+        let replacedAgents: [String]
+        let failedAgents: [String]
+
+        var message: String {
+            if !routeRepaired {
+                return failedAgents.first.map { "Collaboration repair failed: \($0)." }
+                    ?? "Collaboration repair failed."
+            }
+            if !failedAgents.isEmpty, !leaderLive {
+                return "Route repaired, but \(failedAgents.joined(separator: ", "))."
+            }
+            if !leaderLive {
+                return "The leader is not live. Worker replacement was withheld until the leader recovers."
+            }
+            if !failedAgents.isEmpty {
+                return "Route repaired. Replaced \(replacedAgents.count) agent(s); \(failedAgents.count) replacement(s) failed."
+            }
+            if !replacedAgents.isEmpty {
+                return "Route repaired. Replaced \(replacedAgents.count) dead agent(s)."
+            }
+            return "Route repaired. Leader and \(liveAgents) agent(s) are live; nothing was replaced."
+        }
+    }
     /// Capture every namespace owner relevant to New Project. The snapshot is
     /// read-only and spans all windows, preserved/detached viewers and live
     /// remote manifests, so callers do not grow subtly different preflight
@@ -1263,7 +1636,8 @@ extension TeamOrchestrator {
             tabManager.closeWorkspace(workspace)
             return false
         }
-        let mintedRoutes = routeTransfer.grants
+        let mintedRoutes = routeTransfer.workerGrants
+        let mintedGrantIDs = [routeTransfer.leaderGrantID] + Array(mintedRoutes.values)
 
         var team = Team(
             id: remote.name,
@@ -1308,7 +1682,7 @@ extension TeamOrchestrator {
             _ = await Self.finishAdoptedRemoteAgentRoutes(
                 host: host, transaction: routeTransfer.transaction, commit: false
             )
-            await Self.revokeGrants(Array(mintedRoutes.values))
+            await Self.revokeGrants(mintedGrantIDs)
             tabManager.closeWorkspace(workspace)
             return false
         }
@@ -1316,16 +1690,27 @@ extension TeamOrchestrator {
             let oldTabManager = AppDelegate.shared?.tabManagerFor(
                 tabId: updateTarget.workspaceId
             )
+            let replacementPresentationReady = tabManager.tabs.contains(where: {
+                $0 === workspace
+            }) && workspace.terminalPanel(for: leaderPanelID) != nil
+                && members.allSatisfy { member in
+                    guard member.workspaceId == workspace.id,
+                          let panelID = member.panelId else { return false }
+                    return member.remoteAgentSurface
+                        ? workspace.agentPanel(for: panelID) != nil
+                        : workspace.panels[panelID] != nil
+                }
             let replacement = replaceAdoptedRemoteProject(
                 team,
                 expectedWorkspaceID: updateTarget.workspaceId,
-                expectedRevision: updateTarget.remotePresentationRevision
+                expectedRevision: updateTarget.remotePresentationRevision,
+                replacementPresentationReady: replacementPresentationReady
             )
             guard replacement.replaced else {
                 _ = await Self.finishAdoptedRemoteAgentRoutes(
                     host: host, transaction: routeTransfer.transaction, commit: false
                 )
-                await Self.revokeGrants(Array(mintedRoutes.values))
+                await Self.revokeGrants(mintedGrantIDs)
                 tabManager.closeWorkspace(workspace)
                 return false
             }
@@ -1343,7 +1728,7 @@ extension TeamOrchestrator {
                 _ = await Self.finishAdoptedRemoteAgentRoutes(
                     host: host, transaction: routeTransfer.transaction, commit: false
                 )
-                await Self.revokeGrants(Array(mintedRoutes.values))
+                await Self.revokeGrants(mintedGrantIDs)
                 tabManager.closeWorkspace(workspace)
                 return false
             }
@@ -1351,8 +1736,26 @@ extension TeamOrchestrator {
         await Self.commitRemoteAgentRoutesPreservingGrants(
             host: host,
             transaction: routeTransfer.transaction,
-            grantIDs: Array(mintedRoutes.values)
+            grantIDs: mintedGrantIDs
         )
+        // The running leader's hook command points at a deterministic path.
+        // Replacing that file upgrades identity logging on its next turn,
+        // without restarting the CLI or losing its conversation.
+        if let hookData = Self.localLeaderTurnHookData() {
+            if await Self.writeRemoteLeaderTurnHookOverSSH(
+                host: host, hookData: hookData, teamUUID: remote.teamUUID
+            ) == nil {
+                recordRemoteAttachFailure(
+                    teamName: remote.name,
+                    description: "Turn hook refresh failed"
+                )
+            }
+        }
+        LeaderTurnLog.rememberIdentity(
+            team: remote.name, teamUUID: remote.teamUUID,
+            leaderSessionID: team.leaderSessionId
+        )
+        refreshLeaderParticipationControls()
         let adoptedSignature = Self.remoteProjectManifestSignature(
             team, hostKey: host.id
         )
@@ -1363,6 +1766,10 @@ extension TeamOrchestrator {
         // Only now that the roster is real: the keepalive loop retires itself
         // when the team or the member is missing, so starting it any earlier
         // would have cancelled every lease on its first tick.
+        startRemoteLeaderGrantKeepalive(
+            teamName: remote.name,
+            grantID: routeTransfer.leaderGrantID
+        )
         for (agentInstanceID, grantID) in mintedRoutes {
             startRemoteAgentRouteKeepalive(
                 teamName: remote.name,
@@ -1427,6 +1834,7 @@ extension TeamOrchestrator {
         case promptStagingFailed(String)
         case environmentStagingFailed(String)
         case hostUpdateRequired(host: String, version: String?)
+        case peerShellSweepTimedOut(host: String, seconds: Int)
         case durableAgentUnavailable(cli: String, host: String, reason: String)
         /// The peer never showed a pane in the workspace the leader was going to
         /// take. Everything after `host` is what the placement loop already knew
@@ -1449,6 +1857,15 @@ extension TeamOrchestrator {
             case .teamNotFound(let name): return "no team named \(name)"
             case .hostNotFound(let key): return "no host \(key)"
             case .hostNotConnected(let name): return "\(name) is not connected"
+            // Say what to do next. The likeliest cause is that every one of the
+            // host's connection slots is held by an attached pane, and the
+            // sweep needs one of its own — so the way out is to give one back,
+            // and both ways of doing that are in the same menu as this sheet.
+            case .peerShellSweepTimedOut(let name, let seconds):
+                return "\(name) did not answer within \(seconds)s. Some panes may have "
+                    + "closed — press Refresh to see. If it times out again, the host has "
+                    + "no free connection slot: close remote panes you are not using, or "
+                    + "use \"Close All Panes and Disconnect\" on the host, then try again."
             case .noAttachableSurface(let name): return "\(name) has no free surface to attach"
             case .noFreshSurface(let name):
                 // The split request is fire-and-forget, so this is a timeout
@@ -1675,6 +2092,7 @@ extension TeamOrchestrator {
         var launchFile: String?
         var turnHookFile: String?
         var participationControlFile: String?
+        var routeFilePath: String?
         var hostSockPath: String
         var surfaceID: Data?
         var session: PeerPaneSession?
@@ -1729,6 +2147,9 @@ extension TeamOrchestrator {
                 await TeamOrchestrator.removeRemoteLeaderFile(
                     host: host, path: participationControlFile
                 )
+            }
+            if let routeFilePath {
+                await TeamOrchestrator.removeRemoteLeaderFile(host: host, path: routeFilePath)
             }
         }
     }
@@ -2257,10 +2678,47 @@ extension TeamOrchestrator {
     /// guard is worse than the send: `liveTeamSockPath` is empty until some
     /// pane has leased the team tunnel, so a perfectly connected GUI host would
     /// report itself disconnected before a single shell was tried.
+    /// How long a whole sweep may take before it reports back.
+    ///
+    /// Every step inside has its own read timeout, but the sweep as a whole had
+    /// none, so a dial that never answered left the sheet spinning with no
+    /// error and no end — the one outcome a person cannot act on.
+    static let peerShellSweepDeadlineSeconds: Double = 25
+
     func closePeerShells(
         host: HostEntry,
         surfaceIDs: Set<Data>,
         force: Bool = false
+    ) async throws -> Int {
+        let name = host.displayName
+        return try await withThrowingTaskGroup(of: Int.self) { group in
+            group.addTask { [self] in
+                try await performClosePeerShells(
+                    host: host, surfaceIDs: surfaceIDs, force: force
+                )
+            }
+            group.addTask {
+                try await Task.sleep(
+                    nanoseconds: UInt64(Self.peerShellSweepDeadlineSeconds * 1_000_000_000)
+                )
+                throw RemoteAgentError.peerShellSweepTimedOut(
+                    host: name, seconds: Int(Self.peerShellSweepDeadlineSeconds)
+                )
+            }
+            guard let first = try await group.next() else {
+                throw RemoteAgentError.peerShellSweepTimedOut(
+                    host: name, seconds: Int(Self.peerShellSweepDeadlineSeconds)
+                )
+            }
+            group.cancelAll()
+            return first
+        }
+    }
+
+    private func performClosePeerShells(
+        host: HostEntry,
+        surfaceIDs: Set<Data>,
+        force: Bool
     ) async throws -> Int {
         guard !host.activeSockPath.isEmpty else {
             throw RemoteAgentError.hostNotConnected(host.displayName)
@@ -2721,12 +3179,31 @@ extension TeamOrchestrator {
                         continuation.resume(returning: value)
                     }
                 }
+                // Every first-run prompt, not just codex's. Claude's folder
+                // trust used to be excluded here, and nothing else answers a
+                // leader: `AutoReplyPoller` only walks `team.agents`, which a
+                // leader is not in. So a Claude leader on a freshly cloned
+                // remote checkout sat on the trust screen until this loop timed
+                // out at 180s and the whole Project failed to start.
+                //
+                // The keys are a sequence, not one Return. Claude now defaults
+                // its selection to "No, exit", so committing without moving the
+                // caret first quits the CLI — the failure this is meant to
+                // prevent, delivered faster.
                 if !answeredStartupPrompt,
-                   text.flatMap(AgentStartupPrompt.detect(in:)) == .codexDirectoryTrust {
+                   let answer = text.flatMap(AgentStartupPrompt.answer(in:)) {
                     answeredStartupPrompt = true
-                    guard let peerSession = panel.peerPaneSession,
-                          try await peerSession.relaySession.sendRemoteKeys(Data([0x0D])) else {
+                    guard let peerSession = panel.peerPaneSession else {
                         throw RemoteAgentError.paneCreationFailed
+                    }
+                    for key in answer.keys {
+                        guard let bytes = AgentStartupPrompt.remoteBytes(forKey: key),
+                              try await peerSession.relaySession.sendRemoteKeys(bytes) else {
+                            throw RemoteAgentError.paneCreationFailed
+                        }
+                        // Let the TUI redraw its selection before the next key;
+                        // a commit that races the caret answers the wrong row.
+                        try await Task.sleep(nanoseconds: 150_000_000)
                     }
                     stableObservations = 0
                     try await Task.sleep(
@@ -2913,6 +3390,20 @@ extension TeamOrchestrator {
         dlog("leader.attach.stage bootstrap.ok host=\(hostKey)")
 #endif
 
+        // The leader must read the same replaceable route as its workers. A
+        // frozen launch grant keeps targeting the viewer that created this
+        // pane after another viewer adopts the durable Project.
+        guard let routeFilePath = await Self.stageRemoteAgentRouteFile(
+            host: host,
+            agentInstanceID: Self.remoteLeaderRouteIdentity(teamUUID: teamUUID),
+            grant: grantResponse.grant
+        ) else {
+            await attempt.compensate()
+            throw RemoteAgentError.environmentStagingFailed(host.displayName)
+        }
+        resources.routeFilePath = routeFilePath
+        try await attempt.ensureCurrent()
+
         await Self.waitForRemoteShell(session: session)
         try await attempt.ensureCurrent()
 #if DEBUG
@@ -2965,6 +3456,7 @@ extension TeamOrchestrator {
         if Self.supportsLeaderTurnMeasurement(cli: cli), turnHookFile != nil,
            let controlData = Self.leaderParticipationControlData(
                teamName: teamName, sessionID: team.leaderSessionId, supportedLeader: true,
+               delegationState: team.delegationState,
                healthScope: .executionHost
            ) {
             participationControlFile = await Self.writeRemoteLeaderFileOverSSH(
@@ -2988,7 +3480,9 @@ extension TeamOrchestrator {
             environment: remoteEnvironment,
             hostBinDirs: host.hostCLIBinDirs,
             turnHookFile: turnHookFile,
-            participationControlFile: participationControlFile
+            participationControlFile: participationControlFile,
+            routeFilePath: routeFilePath,
+            leaderSessionID: team.leaderSessionId
         )
         var command = Self.remoteLeaderCommandCheckingPrompt(
             launch: launch,
@@ -3101,6 +3595,9 @@ extension TeamOrchestrator {
             endpoint: .peer(hostKey: hostKey)
         )
         attempt.commit()
+        LeaderTurnLog.rememberIdentity(
+            team: teamName, teamUUID: teamUUID, leaderSessionID: team.leaderSessionId
+        )
         startRemoteLeaderGrantKeepalive(
             teamName: teamName,
             grantID: grantResponse.grant.grantID
@@ -4409,6 +4906,43 @@ extension TeamOrchestrator {
         return "leader-participation-\(safeID.isEmpty ? "unknown" : safeID).json"
     }
 
+    /// End the host's daemon so the next connection starts a fresh one.
+    ///
+    /// This exists because a surface whose process is already gone cannot be
+    /// removed any other way: `TerminateSurface` only reaches the live PTY
+    /// registry, so a leftover record answers `NotFound` and the ClosePane
+    /// fallback never confirms. Restarting the daemon drops those records, and
+    /// until the daemon learns to clear them it is the only cure — so it
+    /// belongs in the host menu rather than in a maintainer's terminal.
+    ///
+    /// Scoped to this user's own daemon. `-x` matches the executable name
+    /// exactly so an unrelated process that merely mentions the name in its
+    /// arguments is not a target; the second form covers a daemon launched by
+    /// full path.
+    static func restartPeerHostDaemonCommand() -> String {
+        RemotePasteTransfer.serviceAccountCommand(
+            "u=\"$(id -u)\"; "
+                + "pkill -u \"$u\" -x term-meshd 2>/dev/null; "
+                + "pkill -u \"$u\" -f 'Resources/bin/term-meshd' 2>/dev/null; "
+                + "exit 0"
+        )
+    }
+
+    /// Restart `host`'s daemon. The app reconnects on its own afterwards and
+    /// the host starts a new daemon on that connection.
+    func restartPeerHostDaemon(host: HostEntry) async throws {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
+            throw RemoteAgentError.hostNotConnected(host.displayName)
+        }
+        _ = try await PeerHostReadinessChecker.runScript(
+            sshTarget: sshTarget,
+            port: host.sshPort,
+            identityFile: host.identityFile,
+            script: Self.restartPeerHostDaemonCommand(),
+            timeoutSeconds: 30
+        )
+    }
+
     static func remoteLeaderArtifactCleanupCommand(teamUUID: String) -> String {
         let names = [
             remoteLeaderTurnHookFileName(teamUUID: teamUUID),
@@ -4467,21 +5001,40 @@ extension TeamOrchestrator {
         }
     }
 
+    /// `delegationState` has to be passed explicitly. Omitting it silently wrote
+    /// `leaderFirst` into every peer leader's control file regardless of the
+    /// Project's configured level, so a peer leader could never observe the
+    /// setting the user chose.
+    /// - Returns: whether the file the leader reads was actually replaced.
+    ///   The caller uses this to decide if the payload may be remembered as
+    ///   delivered; a swallowed SSH failure must not look like a write.
+    @discardableResult
     static func refreshRemoteLeaderParticipationControl(
-        hostKey: String, teamUUID: String, teamName: String, sessionID: String,
-        supportedLeader: Bool
-    ) async {
+        hostKey: String, teamUUID: String, teamName: String, payload data: Data
+    ) async -> Bool {
         guard let host = await MainActor.run(body: {
             RemoteHostStore.shared.sortedHosts.first { $0.id == hostKey }
-        }), let data = leaderParticipationControlData(
-            teamName: teamName, sessionID: sessionID, supportedLeader: supportedLeader,
-            healthScope: .executionHost
-        ) else { return }
-        _ = await writeRemoteLeaderFileOverSSH(
+        }) else {
+#if DEBUG
+            dlog("leaderControl.noHost team=\(teamName) hostKey=\(hostKey)")
+#endif
+            return false
+        }
+        // The caller's exact bytes, not a fresh snapshot: it records these as
+        // delivered, and recomputing here would let the two disagree.
+        //
+        // The write is over SSH and every failure inside it is swallowed, so
+        // say whether the file the leader reads was actually replaced.
+        let written = await writeRemoteLeaderFileOverSSH(
             host: host, data: data,
             fileName: remoteLeaderParticipationControlFileName(teamUUID: teamUUID),
             mode: "600"
         )
+#if DEBUG
+        dlog("leaderControl.result team=\(teamName) uuid=\(teamUUID) "
+            + (written.map { "wrote=\($0)" } ?? "FAILED"))
+#endif
+        return written != nil
     }
 
     private static func writeRemoteLeaderTurnHookOverSSH(
@@ -6216,6 +6769,7 @@ extension TeamOrchestrator {
         guard let team = teams[request.teamName],
               let agent = team.agents.first(where: {
                   $0.agentInstanceId == request.agentInstanceID
+                      && $0.panelId == request.closedPanelID
                       && $0.remoteSurfaceID == request.surfaceID
               })
         else {
@@ -6281,6 +6835,7 @@ extension TeamOrchestrator {
             teamName: request.teamName,
             agentInstanceID: request.agentInstanceID,
             surfaceID: request.surfaceID,
+            panelID: request.closedPanelID,
             onMismatch: { session.teardown() }
         ) else { return .authoritativeMissing }
 
@@ -6317,12 +6872,14 @@ extension TeamOrchestrator {
     func ownsPeerAgentSurface(
         teamName: String,
         agentInstanceID: String,
-        surfaceID: Data
+        surfaceID: Data,
+        panelID: UUID? = nil
     ) -> Bool {
         teams[teamName]?.agents.contains(where: {
             $0.agentInstanceId == agentInstanceID
                 && $0.remoteAgentSurface
                 && $0.remoteSurfaceID == surfaceID
+                && (panelID == nil || $0.panelId == panelID)
         }) == true
     }
 
@@ -6331,12 +6888,14 @@ extension TeamOrchestrator {
         teamName: String,
         agentInstanceID: String,
         surfaceID: Data,
+        panelID: UUID? = nil,
         onMismatch: () -> Void
     ) -> Bool {
         guard ownsPeerAgentSurface(
             teamName: teamName,
             agentInstanceID: agentInstanceID,
-            surfaceID: surfaceID
+            surfaceID: surfaceID,
+            panelID: panelID
         ) else {
             onMismatch()
             return false
@@ -6356,8 +6915,14 @@ extension TeamOrchestrator {
     ) -> (teamName: String, agent: AgentMember)? {
         for (teamName, team) in teams {
             for agent in team.agents where agent.remoteAgentSurface {
-                if !surfaceID.isEmpty, agent.remoteSurfaceID == surfaceID {
-                    return (teamName, agent)
+                if !surfaceID.isEmpty {
+                    // A viewer replacement reuses the durable peer surface but
+                    // mints a new local panel. A delayed callback from the old
+                    // pane must not recover or retire the new presentation.
+                    if agent.remoteSurfaceID == surfaceID, agent.panelId == panelID {
+                        return (teamName, agent)
+                    }
+                    continue
                 }
                 if agent.panelId == panelID { return (teamName, agent) }
             }
@@ -7222,6 +7787,17 @@ extension TeamOrchestrator {
         return String(safeID.prefix(48)) + ".json"
     }
 
+    /// Stable across viewers, unlike a local leader session or pane id.
+    static func remoteLeaderRouteIdentity(teamUUID: String) -> String {
+        "leader-" + teamUUID
+    }
+
+    static func remoteLeaderRouteFileName(teamUUID: String) -> String {
+        remoteAgentRouteFileName(
+            agentInstanceID: remoteLeaderRouteIdentity(teamUUID: teamUUID)
+        )
+    }
+
     /// The exact bytes `tm-agent`'s `remote_leader_route_from_file` parses.
     static func remoteAgentRouteFilePayload(
         _ grant: Termmesh_Peer_V1_TeamLeaderGrant
@@ -7316,7 +7892,8 @@ extension TeamOrchestrator {
     /// files are decoded before the first live path changes; the trap restores
     /// backups (or removes newly-created paths) if any later rename fails.
     struct AdoptedRemoteAgentRouteTransfer {
-        let grants: [String: Data]
+        let leaderGrantID: Data
+        let workerGrants: [String: Data]
         let transaction: String
     }
 
@@ -7377,7 +7954,8 @@ extension TeamOrchestrator {
     static func adoptedRemoteAgentRouteTransactionScript() -> String {
         "set -e; umask 077; "
             + "dir=\"$HOME/.term-mesh/agent-routes\"; mkdir -p \"$dir\"; chmod 700 \"$dir\"; "
-            + "tx=\"$dir/.tx.$$\"; mkdir \"$tx\"; : > \"$tx/committed\"; "
+            + "find \"$dir\" -type f -name '.tx*.done' -mtime +1 -delete 2>/dev/null || true; "
+            + "stamp=$(date +%s 2>/dev/null || printf 0); tx=\"$dir/.tx.$$${stamp}\"; mkdir \"$tx\"; : > \"$tx/committed\"; "
             + "rollback() { while IFS= read -r n; do [ -n \"$n\" ] || continue; if [ -f \"$tx/$n.old\" ]; then mv -f \"$tx/$n.old\" \"$dir/$n\"; else rm -f \"$dir/$n\"; fi; done < \"$tx/committed\"; rm -rf \"$tx\"; }; "
             + "trap rollback EXIT HUP INT TERM; tab=$(printf '\\t'); "
             + "while IFS=\"$tab\" read -r n b; do [ -n \"$n\" ] || continue; "
@@ -7432,11 +8010,22 @@ extension TeamOrchestrator {
         let safeTransaction = transaction
         let rollback = "while IFS= read -r n; do [ -n \"$n\" ] || continue; if [ -f \"$tx/$n.old\" ]; then mv -f \"$tx/$n.old\" \"$dir/$n\"; else rm -f \"$dir/$n\"; fi; done < \"$tx/committed\"; rm -rf \"$tx\""
         let action = commit
-            ? "[ -f \"$tx.done\" ] && exit 0; [ -d \"$tx\" ] || exit 67; rollback() { " + rollback + "; }; trap rollback EXIT HUP INT TERM; for p in \"$tx\"/*.new; do [ -f \"$p\" ] || continue; n=${p##*/}; n=${n%.new}; [ ! -e \"$dir/$n\" ] || cp -p \"$dir/$n\" \"$tx/$n.old\"; mv -f \"$p\" \"$dir/$n\"; printf '%s\\n' \"$n\" >> \"$tx/committed\"; done; : > \"$tx.done\"; trap - EXIT HUP INT TERM; rm -rf \"$tx\""
+            ? "[ -f \"$tx/committed.done\" ] && exit 0; [ -d \"$tx\" ] || exit 67; rollback() { " + rollback + "; }; trap rollback EXIT HUP INT TERM; for p in \"$tx\"/*.new; do [ -f \"$p\" ] || continue; n=${p##*/}; n=${n%.new}; [ ! -e \"$dir/$n\" ] || cp -p \"$dir/$n\" \"$tx/$n.old\"; mv -f \"$p\" \"$dir/$n\"; printf '%s\\n' \"$n\" >> \"$tx/committed\"; done; : > \"$tx/committed.done\"; trap - EXIT HUP INT TERM"
             : rollback
-        let guardTransaction = commit ? "" : "[ -d \"$tx\" ] || exit 0; "
+        let guardTransaction = commit
+            ? ""
+            : "[ -f \"$tx.done\" ] && exit 69; [ -d \"$tx\" ] || exit 0; "
         return "set -e; dir=\"$HOME/.term-mesh/agent-routes\"; tx=\"$dir/"
             + safeTransaction + "\"; " + guardTransaction + action
+    }
+
+    static func adoptedRemoteAgentRouteFinalizeScript(transaction: String) -> String? {
+        guard transaction.hasPrefix(".tx."),
+              transaction.dropFirst(4).allSatisfy(\.isNumber) else { return nil }
+        return "set -e; dir=\"$HOME/.term-mesh/agent-routes\"; tx=\"$dir/"
+            + transaction
+            + "\"; [ -f \"$tx.done\" ] && exit 0; [ -d \"$tx\" ] || exit 68; "
+            + "[ -f \"$tx/committed.done\" ] || exit 68; : > \"$tx.done\"; rm -rf \"$tx\""
     }
 
     static func finishAdoptedRemoteAgentRoutes(
@@ -7456,6 +8045,35 @@ extension TeamOrchestrator {
         }
     }
 
+    static func finalizeAdoptedRemoteAgentRoutes(
+        host: HostEntry, transaction: String
+    ) async -> Bool {
+        guard let body = adoptedRemoteAgentRouteFinalizeScript(transaction: transaction),
+              let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return false }
+        do {
+            _ = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget, port: host.sshPort, identityFile: host.identityFile,
+                script: RemotePasteTransfer.serviceAccountCommand(body), timeoutSeconds: 20
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    static func scheduleAdoptedRemoteAgentRouteFinalize(
+        host: HostEntry,
+        transaction: String
+    ) {
+        Task {
+            while !(await finalizeAdoptedRemoteAgentRoutes(
+                host: host, transaction: transaction
+            )) {
+                try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+            }
+        }
+    }
+
     /// Retry the commit after the local roster owns the worker. Staging never
     /// touches the live route, so a failed local operation can simply discard
     /// its prepared transaction and revoke the unused grants.
@@ -7466,6 +8084,14 @@ extension TeamOrchestrator {
             if await finishAdoptedRemoteAgentRoutes(
                 host: host, transaction: transaction, commit: true
             ) {
+                while !(await finalizeAdoptedRemoteAgentRoutes(
+                    host: host, transaction: transaction
+                )) {
+                    for grantID in grantIDs {
+                        _ = await PeerTeamLeaderControlPlane.shared.keepAliveGrant(id: grantID)
+                    }
+                    try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+                }
                 return
             }
             for grantID in grantIDs {
@@ -7475,7 +8101,31 @@ extension TeamOrchestrator {
         }
     }
 
-    /// Hand every adopted worker a grant this app owns.
+    /// A committed route keeps its grants until the previous files are
+    /// restored. Revoking first leaves every worker reading a dead bearer when
+    /// SSH is unavailable for the rollback itself.
+    static func rollbackRemoteAgentRoutesPreservingGrants(
+        host: HostEntry,
+        transaction: String,
+        grantIDs: [Data]
+    ) {
+        Task {
+            while true {
+                if await finishAdoptedRemoteAgentRoutes(
+                    host: host, transaction: transaction, commit: false
+                ) {
+                    await revokeGrants(grantIDs)
+                    return
+                }
+                for grantID in grantIDs {
+                    _ = await PeerTeamLeaderControlPlane.shared.keepAliveGrant(id: grantID)
+                }
+                try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+            }
+        }
+    }
+
+    /// Hand the adopted leader and every worker grants this app owns.
     ///
     /// Adoption used to attach the surfaces and stop there, which left each
     /// worker addressing the bearer of whichever viewer created it. While that
@@ -7494,16 +8144,26 @@ extension TeamOrchestrator {
         host: HostEntry,
         members: [AgentMember]
     ) async -> AdoptedRemoteAgentRouteTransfer? {
-        guard !members.isEmpty else {
-            return AdoptedRemoteAgentRouteTransfer(grants: [:], transaction: "")
-        }
         guard host.sshTarget?.isEmpty == false else { return nil }
         var minted: [String: Data] = [:]
         var routes: [(agentInstanceID: String, grant: Termmesh_Peer_V1_TeamLeaderGrant)] = []
+        let leaderRouteID = Self.remoteLeaderRouteIdentity(teamUUID: teamUUID)
 
         func abandon() async {
             await Self.revokeGrants(Array(minted.values))
         }
+
+        guard let leaderGrant = try? await bootstrapRemoteAgentRoute(
+            teamName: teamName, teamUUID: teamUUID
+        ) else {
+            RemoteWorkLog.info(
+                "Could not mint a leader route on \(host.displayName); "
+                    + "leaving the existing project untouched"
+            )
+            return nil
+        }
+        minted[leaderRouteID] = leaderGrant.grantID
+        routes.append((leaderRouteID, leaderGrant))
 
         for member in members {
             guard let grant = try? await bootstrapRemoteAgentRoute(
@@ -7531,7 +8191,9 @@ extension TeamOrchestrator {
             return nil
         }
         return AdoptedRemoteAgentRouteTransfer(
-            grants: minted, transaction: transaction
+            leaderGrantID: leaderGrant.grantID,
+            workerGrants: minted.filter { $0.key != leaderRouteID },
+            transaction: transaction
         )
     }
 
@@ -8972,7 +9634,9 @@ extension TeamOrchestrator {
         environment: [String: String] = [:],
         hostBinDirs: [String] = [],
         turnHookFile: String? = nil,
-        participationControlFile: String? = nil
+        participationControlFile: String? = nil,
+        routeFilePath: String? = nil,
+        leaderSessionID: String? = nil
     ) -> String {
         let hexGrant = grant.grantID.map { String(format: "%02x", $0) }.joined()
         let protectedValues = [
@@ -8983,6 +9647,8 @@ extension TeamOrchestrator {
             ("TERMMESH_LEADER_PEER_ID", PeerIdentity.hexString(PeerIdentity.defaultPeerID())),
             ("TERMMESH_LEADER_REQUEST_TOKEN", leaderRequestToken),
             ("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE", participationControlFile ?? ""),
+            (remoteTeamRouteFileEnvName, routeFilePath ?? ""),
+            ("TERMMESH_LEADER_SESSION_ID", leaderSessionID ?? ""),
             ("TERMMESH_TEAM", teamName),
         ]
         let savedPrefix = "TERMMESH_SAVED_"

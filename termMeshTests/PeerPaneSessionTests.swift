@@ -4839,6 +4839,144 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func test_remoteLeaderRouteFileNameIsDeterministicAndDistinctFromWorkers() {
+        let first = TeamOrchestrator.remoteLeaderRouteFileName(
+            teamUUID: "05AC84AA-0000-0000-0000-000000000000"
+        )
+        let second = TeamOrchestrator.remoteLeaderRouteFileName(
+            teamUUID: "05AC84AA-0000-0000-0000-000000000000"
+        )
+        XCTAssertEqual(first, second)
+        XCTAssertTrue(first.hasPrefix("leader-05ac84aa"))
+        XCTAssertNotEqual(
+            first,
+            TeamOrchestrator.remoteAgentRouteFileName(agentInstanceID: "worker-1")
+        )
+    }
+
+    @MainActor
+    func test_collaborationRecoveryPlanReplacesOnlyDeadWorkersWhenLeaderIsLive() {
+        let workspaceID = UUID()
+        let leaderID = Data(repeating: 0x01, count: 16)
+        let liveID = Data(repeating: 0x02, count: 16)
+        let deadID = Data(repeating: 0x03, count: 16)
+        func agent(_ name: String, _ instance: String, _ surface: Data) -> TeamOrchestrator.AgentMember {
+            TeamOrchestrator.AgentMember(
+                id: "\(name)@aic", agentInstanceId: instance, name: name,
+                teamName: "aic", cli: "codex", launchCommand: "codex",
+                model: "gpt-5.6-sol", agentType: name, color: "blue",
+                instructions: "", workspaceId: workspaceID, panelId: UUID(),
+                createdAt: Date(), remoteSurfaceID: surface,
+                remoteSurfaceSpawned: true, remoteAgentSurface: true,
+                hostKey: "ssh:mac-sub"
+            )
+        }
+        var leader = Termmesh_Peer_V1_SurfaceInfo()
+        leader.surfaceID = leaderID
+        leader.attachable = true
+        leader.foregroundBusyKnown = true
+        leader.foregroundBusy = true
+        var live = Termmesh_Peer_V1_SurfaceInfo()
+        live.surfaceID = liveID
+        live.surfaceType = "agent"
+        live.attachable = true
+        var dead = Termmesh_Peer_V1_SurfaceInfo()
+        dead.surfaceID = deadID
+        dead.surfaceType = "agent"
+        dead.attachable = false
+
+        let plan = TeamOrchestrator.collaborationRecoveryPlan(
+            leaderSurfaceID: leaderID,
+            agents: [agent("executor", "live", liveID), agent("reviewer", "dead", deadID)],
+            surfaces: [leader, live, dead]
+        )
+        XCTAssertTrue(plan.leaderLive)
+        XCTAssertEqual(plan.liveAgentCount, 1)
+        XCTAssertEqual(plan.deadAgentInstanceIDs, ["dead"])
+    }
+
+    /// The roster is remote input, so two rows can share a surface id — the
+    /// protobuf default empty Data included. Building the lookup with
+    /// `Dictionary(uniqueKeysWithValues:)` trapped on that and took the app
+    /// down inside the recovery path it was supposed to run.
+    func test_collaborationRecoveryPlanSurvivesDuplicateSurfaceIDs() {
+        let workspaceID = UUID()
+        let leaderID = Data(repeating: 0x01, count: 16)
+        let sharedID = Data(repeating: 0x02, count: 16)
+        func agent(_ name: String, _ instance: String, _ surface: Data) -> TeamOrchestrator.AgentMember {
+            TeamOrchestrator.AgentMember(
+                id: "\(name)@aic", agentInstanceId: instance, name: name,
+                teamName: "aic", cli: "codex", launchCommand: "codex",
+                model: "gpt-5.6-sol", agentType: name, color: "blue",
+                instructions: "", workspaceId: workspaceID, panelId: UUID(),
+                createdAt: Date(), remoteSurfaceID: surface,
+                remoteSurfaceSpawned: true, remoteAgentSurface: true,
+                hostKey: "ssh:mac-sub"
+            )
+        }
+        var leader = Termmesh_Peer_V1_SurfaceInfo()
+        leader.surfaceID = leaderID
+        leader.attachable = true
+        leader.foregroundBusyKnown = true
+        leader.foregroundBusy = true
+        var first = Termmesh_Peer_V1_SurfaceInfo()
+        first.surfaceID = sharedID
+        first.surfaceType = "agent"
+        first.attachable = true
+        var duplicate = Termmesh_Peer_V1_SurfaceInfo()
+        duplicate.surfaceID = sharedID
+        duplicate.surfaceType = "agent"
+        duplicate.attachable = false
+        var empty = Termmesh_Peer_V1_SurfaceInfo()
+        empty.surfaceType = "agent"
+        var alsoEmpty = Termmesh_Peer_V1_SurfaceInfo()
+        alsoEmpty.surfaceType = "agent"
+
+        let plan = TeamOrchestrator.collaborationRecoveryPlan(
+            leaderSurfaceID: leaderID,
+            agents: [agent("executor", "shared", sharedID)],
+            surfaces: [leader, first, duplicate, empty, alsoEmpty]
+        )
+        // First row wins, so the attachable one still counts as live.
+        XCTAssertTrue(plan.leaderLive)
+        XCTAssertEqual(plan.liveAgentCount, 1)
+        XCTAssertEqual(plan.deadAgentInstanceIDs, [])
+    }
+
+    @MainActor
+    func test_collaborationRecoveryPlanWithholdsWorkerReplacementWhenLeaderIsDead() {
+        var leader = Termmesh_Peer_V1_SurfaceInfo()
+        leader.surfaceID = Data(repeating: 0x01, count: 16)
+        leader.attachable = true
+        leader.foregroundBusyKnown = true
+        leader.foregroundBusy = false
+        let plan = TeamOrchestrator.collaborationRecoveryPlan(
+            leaderSurfaceID: leader.surfaceID, agents: [], surfaces: [leader]
+        )
+        XCTAssertFalse(plan.leaderLive)
+    }
+
+    @MainActor
+    func test_remoteLeaderLaunchExportsRefreshableRouteAndScopedIdentity() {
+        var grant = Termmesh_Peer_V1_TeamLeaderGrant()
+        grant.grantID = Data(repeating: 0xab, count: PeerTeamLeader.grantIDBytes)
+        grant.projectID = "team:05AC84AA"
+        grant.teamUuid = "05AC84AA"
+        grant.expiresAtUnixSecs = 4_102_444_800
+        let command = TeamOrchestrator.remoteLeaderCommand(
+            cli: "codex", model: "", teamName: "aic",
+            workingDirectory: "/tmp/aic", grant: grant,
+            leaderRequestToken: "request-token",
+            routeFilePath: "/srv/agent/.term-mesh/agent-routes/leader-05ac84aa.json",
+            leaderSessionID: "leader-session"
+        )
+        XCTAssertTrue(command.contains("TERMMESH_LEADER_ROUTE_FILE"))
+        XCTAssertTrue(command.contains("leader-05ac84aa.json"))
+        XCTAssertTrue(command.contains("TERMMESH_LEADER_SESSION_ID"))
+        XCTAssertTrue(command.contains("leader-session"))
+    }
+
+    @MainActor
     func test_remoteRouteFileEnvironmentIsOmittedWhenNothingWasStaged() {
         var grant = Termmesh_Peer_V1_TeamLeaderGrant()
         grant.grantID = Data(repeating: 0xab, count: PeerTeamLeader.grantIDBytes)
@@ -4953,6 +5091,55 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func test_adoptedRouteTransactionCommitsLeaderAndWorkersAsOneBatch() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-route-all-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c", TeamOrchestrator.adoptedRemoteAgentRouteTransactionScript(),
+        ]
+        process.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+        let input = Pipe()
+        let output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        try process.run()
+        input.fileHandleForWriting.write(
+            Data("leader-team.json\tbGVhZGVy\nworker.json\td29ya2Vy\n".utf8)
+        )
+        try input.fileHandleForWriting.close()
+        let stagedOutput = String(
+            decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self
+        )
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        let transaction = try XCTUnwrap(
+            TeamOrchestrator.parseAdoptedRouteTransaction(stagedOutput)
+        )
+        let commit = Process()
+        commit.executableURL = URL(fileURLWithPath: "/bin/sh")
+        commit.arguments = [
+            "-c", try XCTUnwrap(TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transaction, commit: true
+            )),
+        ]
+        commit.environment = process.environment
+        try commit.run()
+        commit.waitUntilExit()
+        let directory = home.appendingPathComponent(".term-mesh/agent-routes")
+        XCTAssertEqual(
+            try String(contentsOf: directory.appendingPathComponent("leader-team.json")),
+            "leader"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: directory.appendingPathComponent("worker.json")),
+            "worker"
+        )
+    }
+
+    @MainActor
     func test_adoptedRouteFinishTargetsTheValidatedTransactionDirectory() {
         let rollback = TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
             transaction: ".tx.1234", commit: false
@@ -4966,8 +5153,13 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             rollback?.contains("mv -f \"$tx/$n.old\" \"$dir/$n\"") == true
         )
         XCTAssertTrue(commit?.contains("mv -f \"$p\" \"$dir/$n\"") == true)
-        XCTAssertTrue(commit?.contains("[ -f \"$tx.done\" ] && exit 0") == true)
+        XCTAssertTrue(commit?.contains("[ -f \"$tx/committed.done\" ] && exit 0") == true)
         XCTAssertTrue(commit?.contains("[ -d \"$tx\" ] || exit 67") == true)
+        XCTAssertTrue(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinalizeScript(
+                transaction: ".tx.1234"
+            )?.contains(": > \"$tx.done\"; rm -rf \"$tx\"") == true
+        )
         XCTAssertNil(
             TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
                 transaction: "../routes", commit: false
@@ -5096,14 +5288,9 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         commit.waitUntilExit()
         XCTAssertEqual(commit.terminationStatus, 0)
         XCTAssertEqual(try Data(contentsOf: live), Data("test".utf8))
-        XCTAssertFalse(
-            FileManager.default.fileExists(
-                atPath: directory.appendingPathComponent(transaction).path
-            )
-        )
         XCTAssertTrue(
             FileManager.default.fileExists(
-                atPath: directory.appendingPathComponent(transaction + ".done").path
+                atPath: directory.appendingPathComponent(transaction).path
             )
         )
 
@@ -5122,6 +5309,79 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         retry.waitUntilExit()
         XCTAssertEqual(retry.terminationStatus, 0)
         XCTAssertEqual(try Data(contentsOf: live), Data("test".utf8))
+
+        let rollback = Process()
+        rollback.executableURL = URL(fileURLWithPath: "/bin/sh")
+        rollback.arguments = [
+            "-c",
+            try XCTUnwrap(TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transaction, commit: false
+            )),
+        ]
+        rollback.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+        try rollback.run()
+        rollback.waitUntilExit()
+        XCTAssertEqual(rollback.terminationStatus, 0)
+        XCTAssertEqual(try Data(contentsOf: live), Data("old".utf8))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(transaction).path
+            )
+        )
+    }
+
+    @MainActor
+    func test_adoptedRouteFinalizeDiscardsRollbackStateAfterCommit() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-route-finalize-\(UUID().uuidString)")
+        let directory = home.appendingPathComponent(".term-mesh/agent-routes")
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: home) }
+        let live = directory.appendingPathComponent("worker.json")
+        try Data("old".utf8).write(to: live)
+
+        let staged = Process()
+        staged.executableURL = URL(fileURLWithPath: "/bin/sh")
+        staged.arguments = ["-c", TeamOrchestrator.adoptedRemoteAgentRouteTransactionScript()]
+        staged.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+        let input = Pipe()
+        let output = Pipe()
+        staged.standardInput = input
+        staged.standardOutput = output
+        try staged.run()
+        input.fileHandleForWriting.write(Data("worker.json\tdGVzdA==\n".utf8))
+        try input.fileHandleForWriting.close()
+        let stagedOutput = String(
+            decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self
+        )
+        staged.waitUntilExit()
+        let transaction = try XCTUnwrap(
+            TeamOrchestrator.parseAdoptedRouteTransaction(stagedOutput)
+        )
+        for script in [
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transaction, commit: true
+            ),
+            TeamOrchestrator.adoptedRemoteAgentRouteFinalizeScript(
+                transaction: transaction
+            ),
+        ] {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", try XCTUnwrap(script)]
+            process.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0)
+        }
+        XCTAssertEqual(try Data(contentsOf: live), Data("test".utf8))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent(transaction).path
+            )
+        )
     }
 
     @MainActor
@@ -6651,6 +6911,18 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             agentInstanceID: member.agentInstanceId,
             surfaceID: surfaceID
         ))
+        XCTAssertTrue(orchestrator.ownsPeerAgentSurface(
+            teamName: teamName,
+            agentInstanceID: member.agentInstanceId,
+            surfaceID: surfaceID,
+            panelID: member.panelId
+        ))
+        XCTAssertFalse(orchestrator.ownsPeerAgentSurface(
+            teamName: teamName,
+            agentInstanceID: member.agentInstanceId,
+            surfaceID: surfaceID,
+            panelID: UUID()
+        ), "a callback from an older local pane must not own the replacement")
         XCTAssertFalse(orchestrator.ownsPeerAgentSurface(
             teamName: teamName,
             agentInstanceID: member.agentInstanceId,
@@ -6666,6 +6938,83 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             onMismatch: { teardownCount += 1 }
         ))
         XCTAssertEqual(teardownCount, 1, "a stale attached session must be torn down")
+    }
+
+    @MainActor
+    func testPeerAgentMemberLookupRequiresPanelGenerationWhenSurfaceIsReused() {
+        let orchestrator = TeamOrchestrator.shared
+        let teamName = "peer-member-generation-\(UUID().uuidString.prefix(8))"
+        let surfaceID = Data(repeating: 0x72, count: 16)
+        let currentPanelID = UUID()
+        let member = TeamOrchestrator.AgentMember(
+            id: "executor@\(teamName)", agentInstanceId: "executor-instance",
+            name: "executor", teamName: teamName, cli: "codex",
+            launchCommand: "codex", model: "sonnet", agentType: "executor",
+            color: "green", instructions: "", workspaceId: UUID(),
+            panelId: currentPanelID, createdAt: Date(), remoteSurfaceID: surfaceID,
+            remoteSurfaceSpawned: true, remoteAgentSurface: true, hostKey: "ssh:peer"
+        )
+        defer { orchestrator.forgetTeamForTests(teamName) }
+        orchestrator.installTeamForTests(name: teamName, agents: [member])
+
+        XCTAssertNil(orchestrator.peerOwnedAgentMember(
+            panelID: UUID(), surfaceID: surfaceID
+        ))
+        XCTAssertEqual(orchestrator.peerOwnedAgentMember(
+            panelID: currentPanelID, surfaceID: surfaceID
+        )?.agent.agentInstanceId, member.agentInstanceId)
+    }
+
+    @MainActor
+    func testCollaborationPresentationStateNamesTheFirstBrokenInvariant() {
+        typealias Probe = TeamOrchestrator.AgentPresentationProbe
+        XCTAssertEqual(TeamOrchestrator.collaborationPresentationState(
+            teamExists: true, workspaceExists: false,
+            leaderPanelExists: false, leaderSessionReady: false,
+            agents: [], requireLiveSessions: true
+        ), .workspaceMissing)
+        XCTAssertEqual(TeamOrchestrator.collaborationPresentationState(
+            teamExists: true, workspaceExists: true,
+            leaderPanelExists: true, leaderSessionReady: true,
+            agents: [Probe(instanceID: "worker", panelPresent: true, sessionReady: false)],
+            requireLiveSessions: true
+        ), .agentSessionUnavailable("worker"))
+        XCTAssertEqual(TeamOrchestrator.collaborationPresentationState(
+            teamExists: true, workspaceExists: true,
+            leaderPanelExists: true, leaderSessionReady: false,
+            agents: [Probe(instanceID: "worker", panelPresent: true, sessionReady: false)],
+            requireLiveSessions: false
+        ), .ready, "Repair can refresh existing panels before their relays settle")
+        XCTAssertEqual(TeamOrchestrator.collaborationPresentationState(
+            teamExists: true, workspaceExists: true,
+            leaderPanelExists: true, leaderSessionReady: true,
+            agents: [Probe(instanceID: "dead", panelPresent: false, sessionReady: false)],
+            requireLiveSessions: false,
+            repairableMissingAgentIDs: ["dead"]
+        ), .ready, "an authoritative dead worker can be respawned from its durable member")
+    }
+
+    @MainActor
+    func testAdoptedReplacementRefusesAnUnreadyPresentation() {
+        let orchestrator = TeamOrchestrator.shared
+        let teamName = "replace-unready-\(UUID().uuidString.prefix(8))"
+        defer { orchestrator.forgetTeamForTests(teamName) }
+        orchestrator.installTeamForTests(name: teamName, agents: [])
+        guard let replacement = orchestrator.teams[teamName] else {
+            return XCTFail("team fixture missing")
+        }
+
+        let result = orchestrator.replaceAdoptedRemoteProject(
+            replacement,
+            expectedWorkspaceID: replacement.workspaceId,
+            expectedRevision: 0,
+            replacementPresentationReady: false
+        )
+        XCTAssertFalse(result.replaced)
+        XCTAssertEqual(
+            orchestrator.teams[teamName]?.leaderSessionId,
+            replacement.leaderSessionId
+        )
     }
 
     /// The field the three cleanup paths read. Defaulting it to false is what

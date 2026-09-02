@@ -11,15 +11,31 @@ struct ReviewBoardPanelView: View {
     @State private var rejectReason = ""
     @State private var isRejecting = false
 
+    /// Folded state for the two settings sections below the work.
+    ///
+    /// `@AppStorage`, not `@State` seeded from defaults: the board is mounted
+    /// once per window, and a `@State` seed is read only when a view identity
+    /// first appears. Two open windows would drift apart and never resync,
+    /// with the last writer deciding what a third window sees.
+    ///
+    /// The defaults differ on purpose. Delegation is what someone sets before
+    /// handing out the first task, so a Project that has never been configured
+    /// must not hide it. Auto Pilot starts folded — see its own header, which
+    /// keeps the boundary sentence visible either way.
+    @AppStorage(ReviewBoardSettings.delegationExpandedKey)
+    private var delegationExpanded = true
+    @AppStorage(ReviewBoardSettings.autoPilotExpandedKey)
+    private var autoPilotExpanded = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            if viewModel.tasks.isEmpty && viewModel.pendingMergeQueue.isEmpty {
-                emptyState
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if viewModel.tasks.isEmpty && viewModel.pendingMergeQueue.isEmpty {
+                        emptyState
+                    } else {
                         // Above the tasks: the queue is what gates work
                         // actually landing, so it should not need scrolling
                         // past a long task list to find.
@@ -32,13 +48,24 @@ struct ReviewBoardPanelView: View {
                         if let task = viewModel.selectedTask {
                             taskDetails(task)
                         }
-                        // Last: it is a setting and a log, not the work. It
-                        // should be findable, not in the way of the row someone
-                        // opened the board to read.
-                        autoPilotSection
                     }
-                    .padding(12)
+                    // Settings live below the work, and this one stays visible
+                    // on an empty board on purpose: it is what you set before
+                    // handing out the first task, and an idle roster is a state
+                    // with no rows by definition.
+                    //
+                    // The level and the evidence for it are one section, not
+                    // two. "Delegated" is a claim; "4 workers, none working" is
+                    // whether it is happening, and separating them put the
+                    // reason to change a setting on a different card from the
+                    // setting.
+                    delegationSection
+                    // Last: it is a setting and a log, not the work. It should
+                    // be findable, not in the way of the row someone opened the
+                    // board to read.
+                    autoPilotSection
                 }
+                .padding(12)
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -486,18 +513,291 @@ extension ReviewBoardPanelView {
             .accessibilityAddTraits(.isHeader)
     }
 
-    // MARK: - Auto pilot
+    // MARK: - Delegation
 
-    /// The switch, the boundary it works inside, and what it has done.
+    /// A folding header whose collapsed line carries the summary.
     ///
+    /// Tabs were the other candidate and they hide the wrong half. The level
+    /// is a claim ("delegate serial work") and the evidence is whether it is
+    /// happening ("4 workers, none working"); a tab puts the reason to change
+    /// a setting behind a control you have to find first. Folding keeps the
+    /// verdict on the header instead, so collapsing costs nothing but height.
+    private func foldHeader<Trailing: View>(
+        _ title: String,
+        isExpanded: Bool,
+        summary: Text?,
+        toggle: @escaping () -> Void,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        HStack(spacing: 6) {
+            Button(action: toggle) {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .accessibilityHidden(true)
+                    sectionTitle(title)
+                    if !isExpanded, let summary {
+                        summary
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    Spacer(minLength: 4)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "Collapse \(title)" : "Expand \(title)")
+            trailing()
+        }
+    }
+
+    /// The switch, the boundary it works inside, and what it has done —
+    /// one section, because none of the three answers anything alone.
+    @ViewBuilder
+    private var delegationSection: some View {
+        if viewModel.delegation != nil || viewModel.collaboration != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                foldHeader(
+                    "Delegation",
+                    isExpanded: delegationExpanded,
+                    summary: delegationSummary,
+                    toggle: { delegationExpanded.toggle() }
+                ) {
+                    // Folding must never hide the only way out of a broken
+                    // state, so the repair rides the header at every size.
+                    if needsCollaborationRepair {
+                        repairButton
+                    } else if delegationExpanded, let panel = viewModel.delegation {
+                        Text(panel.teamName)
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+
+                // Outside the fold, next to the button that produces it.
+                // Keeping the Repair button on the header while its only
+                // report lived in the body meant a failed repair said nothing
+                // at all: the spinner stopped, the state stayed broken, and
+                // the reason was behind a disclosure.
+                if let message = viewModel.collaborationRepairMessage {
+                    Text(message)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("reviewBoard.repairMessage")
+                }
+
+                if delegationExpanded {
+                    delegationControls
+                    collaborationEvidence
+                }
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04))
+            )
+            .accessibilityIdentifier("reviewBoard.delegation")
+        }
+    }
+
+    /// What the folded header has to say on one line.
+    ///
+    /// The verdict leads. At the board's default width the line truncates
+    /// after roughly two clauses, and putting the level first meant the tail
+    /// that got cut was "no dispatch" — the one clause that decides whether
+    /// this section is worth opening.
+    private var delegationSummary: Text? {
+        let collaboration = viewModel.collaboration
+        guard let panel = viewModel.delegation else {
+            return collaboration.map { Text($0.shortState) }
+        }
+        var text = Text("")
+        if let collaboration {
+            text = Text(collaboration.shortState) + Text(" · ")
+        }
+        text = text + Text(panel.level.displayName)
+            + Text(" · \(panel.workerCount) workers")
+        return text
+    }
+
+    private var needsCollaborationRepair: Bool {
+        guard let panel = viewModel.collaboration else { return false }
+        return panel.state != .healthy && panel.workerCount > 0
+    }
+
+    private var repairButton: some View {
+        Button {
+            Task { await viewModel.repairCollaboration() }
+        } label: {
+            if viewModel.collaborationRepairInFlight {
+                ProgressView().controlSize(.small)
+            } else {
+                Text("Repair")
+            }
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .disabled(viewModel.collaborationRepairInFlight)
+        .help("Rebuild this Project's routes and replace dead agent panes")
+        .accessibilityIdentifier("reviewBoard.repairCollaboration")
+    }
+
+    /// How much of this Project the leader hands to workers.
+    ///
+    /// Same shape as Auto Pilot below, for the same reason: a control that
+    /// changes what an agent does unattended has to state what it will do, not
+    /// just offer a switch. So the level, the wave ceiling and the roster are
+    /// all on screen together — "delegated" means nothing without knowing how
+    /// many workers there are to delegate to.
+    @ViewBuilder
+    private var delegationControls: some View {
+        if let panel = viewModel.delegation {
+            VStack(alignment: .leading, spacing: 8) {
+                Picker("", selection: Binding(
+                    get: { panel.level },
+                    set: { viewModel.setDelegationLevel($0) }
+                )) {
+                    ForEach(ProjectDelegationLevel.allCases, id: \.self) { level in
+                        Text(level.displayName).tag(level)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("reviewBoard.delegationLevel")
+
+                Text(panel.level.detail)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let pending = panel.pending {
+                    Text("Current: \(Text(panel.level.displayName)) · Next request: \(Text(pending.displayName))")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+
+                HStack(spacing: 8) {
+                    Text("Max parallel workers")
+                        .font(.system(size: 11))
+                    Spacer(minLength: 8)
+                    Stepper(
+                        value: Binding(
+                            get: { panel.options.maxParallelWorkers },
+                            set: { viewModel.setMaxParallelWorkers($0) }
+                        ),
+                        in: ProjectExecutionOptions.workerBounds
+                    ) {
+                        Text("\(panel.options.maxParallelWorkers)")
+                            .font(.system(size: 11, design: .monospaced))
+                    }
+                    .accessibilityIdentifier("reviewBoard.maxParallelWorkers")
+                }
+
+                Toggle(isOn: Binding(
+                    get: { panel.options.injectDirective },
+                    set: { viewModel.setInjectDirective($0) }
+                )) {
+                    Text("State the floor each turn")
+                        .font(.system(size: 11))
+                }
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .accessibilityIdentifier("reviewBoard.injectDirective")
+
+                rosterText(panel)
+                    .font(.system(size: 11))
+                    .foregroundColor(panel.everyWorkerIdle ? .orange : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityIdentifier("reviewBoard.workDistribution")
+        }
+    }
+
+    /// Whether the level above is actually happening, as the turn log recorded
+    /// it. Subordinate to the control on purpose: it is the reason to change
+    /// the setting, not a second thing to configure.
+    @ViewBuilder
+    private var collaborationEvidence: some View {
+        if let panel = viewModel.collaboration {
+            VStack(alignment: .leading, spacing: 5) {
+                Divider()
+                    .padding(.vertical, 1)
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Image(systemName: panel.symbolName)
+                        .accessibilityHidden(true)
+                    Text(panel.title)
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                Text(panel.detail)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                // Three numbers on one line read as one fact, and they are
+                // not: the roster is what exists now, the other two total a
+                // bounded history. Separating them is what stops "no dispatch"
+                // and "4 dispatches" from looking like a contradiction.
+                Text("Roster now · \(panel.workerCount) workers")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+                Text("Recent history · \(panel.dispatchCount) dispatches · \(panel.completionCount) completed")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+                if let lastActivity = panel.lastActivity {
+                    Text(
+                        "Newest record "
+                            + (ReviewBoardText.clockTime(lastActivity) ?? lastActivity)
+                    )
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .accessibilityIdentifier("reviewBoard.collaboration")
+        }
+    }
+
+    /// The roster, and whether any of it is doing anything.
+    ///
+    /// An idle roster is the symptom this whole control exists for — the
+    /// leader working alone while workers sit there — so it is stated in
+    /// words rather than left to be inferred from a count.
+    ///
+    /// Returns `Text`, not `String`: `Text(someString)` is the verbatim
+    /// initializer and never reaches the string catalog, which is how the rest
+    /// of this feature's UI stayed English in a Korean app.
+    private func rosterText(_ panel: ReviewBoardViewModel.DelegationPanel) -> Text {
+        guard panel.workerCount > 0 else {
+            return Text("No workers on this Project yet, so every route is direct.")
+        }
+        if panel.everyWorkerIdle {
+            return Text("\(panel.workerCount) workers, none working right now.")
+        }
+        return Text("\(panel.workerCount) workers · \(panel.workingCount) working, \(panel.idleCount) idle.")
+    }
+
     /// All three together on purpose. A toggle on its own asks someone to arm
     /// unattended merging without telling them how far it can go, and a log on
     /// its own leaves "why is this still sitting here" unanswered.
     private var autoPilotSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                sectionTitle("Auto Pilot")
-                Spacer(minLength: 8)
+            foldHeader(
+                "Auto Pilot",
+                isExpanded: autoPilotExpanded,
+                // The boundary, not just the state. This section folds by
+                // default and its switch stays on the header, so wording the
+                // summary "off" would have put arming unattended merging one
+                // click away with the ceiling branch and the per-session cap
+                // never on screen.
+                summary: Text(boundarySentence),
+                toggle: { autoPilotExpanded.toggle() }
+            ) {
+                // The switch stays reachable folded. Arming unattended merging
+                // is the one thing here worth a click without reading first;
+                // the boundary it works inside is one disclosure away.
                 Toggle("", isOn: Binding(
                     get: { viewModel.autoPilot.isEnabled },
                     set: { viewModel.setAutoPilotEnabled($0) }
@@ -508,24 +808,25 @@ extension ReviewBoardPanelView {
                 .accessibilityLabel("Auto Pilot")
             }
 
-            // The boundary is stated whether it is on or off. Someone deciding
-            // whether to turn it on is exactly who needs to read it.
-            Text(boundarySentence)
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if !viewModel.autoPilotUndoPoints.isEmpty {
-                undoList
-            }
-            if let message = viewModel.undoMessage {
-                Text(message)
+            if autoPilotExpanded {
+                // The same sentence the folded header truncates, in full.
+                Text(boundarySentence)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-            }
-            if !viewModel.autoPilotAudit.isEmpty {
-                auditList
+
+                if !viewModel.autoPilotUndoPoints.isEmpty {
+                    undoList
+                }
+                if let message = viewModel.undoMessage {
+                    Text(message)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !viewModel.autoPilotAudit.isEmpty {
+                    auditList
+                }
             }
         }
         .padding(10)

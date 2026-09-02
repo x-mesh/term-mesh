@@ -87,9 +87,16 @@ struct LeaderParticipationSettings: Equatable {
         }
     }
 
+    /// `availableWorkers` and `workerNames` exist so the turn hook can state a
+    /// delegation floor without asking the leader what the roster looks like.
+    /// The hook runs on the execution host with no socket, so anything it needs
+    /// has to arrive in this file.
     func controlPayload(
         projectID: String, sessionID: String, supportedLeader: Bool, health: Health,
-        delegationState: ProjectDelegationState = .default
+        delegationState: ProjectDelegationState = .default,
+        availableWorkers: Int = 0,
+        workerNames: [String] = [],
+        executionOptions: ProjectExecutionOptions = .default
     ) -> [String: Any] {
         [
             "schema_version": 1,
@@ -104,6 +111,10 @@ struct LeaderParticipationSettings: Equatable {
             "delegation_configured": delegationState.configured.rawValue,
             "delegation_effective": delegationState.effective.rawValue,
             "delegation_pending": delegationState.pending?.rawValue as Any? ?? NSNull(),
+            "available_workers": max(0, availableWorkers),
+            "worker_names": workerNames,
+            "max_parallel_workers": executionOptions.maxParallelWorkers,
+            "inject_directive": executionOptions.injectDirective,
         ]
     }
 }

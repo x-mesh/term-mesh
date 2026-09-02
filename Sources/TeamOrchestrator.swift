@@ -34,6 +34,26 @@ final class TeamOrchestrator: ObservableObject {
     /// teardown remains the operation that ends those processes.
     private var detachedProjectWorkspaces: [String: Workspace] = [:]
     private var projectCreationReservations: [String: UUID] = [:]
+    /// Last control-file payload written per team, so a daemon sync that
+    /// changed nothing does not re-send a peer's file over SSH.
+    private var leaderParticipationControlPayloads: [String: Data] = [:]
+    /// Teams with a writer draining `leaderParticipationControlPending`.
+    /// Daemon syncs are far more frequent than an SSH write, so without this
+    /// every sync would open another write for the same payload.
+    private var leaderParticipationControlWritesInFlight: Set<String> = []
+    /// The newest payload each team still needs written.
+    ///
+    /// Coalesced, not dropped. Skipping a sync outright while a write was in
+    /// flight lost whatever that sync wanted written: a settings change lands
+    /// through one `refreshLeaderParticipationControls()` call, so if that one
+    /// call was the skipped one, nothing retried and the leader never saw it.
+    private var leaderParticipationControlPending: [String: RemoteLeaderControlWrite] = [:]
+
+    struct RemoteLeaderControlWrite {
+        let hostKey: String
+        let teamUUID: String
+        let payload: Data
+    }
 
     /// Stable identity used to decide whether a same-named Project is the
     /// exact existing Project or a namespace collision. The display name is
@@ -1010,9 +1030,11 @@ final class TeamOrchestrator: ObservableObject {
     func replaceAdoptedRemoteProject(
         _ team: Team,
         expectedWorkspaceID: UUID,
-        expectedRevision: UInt64
+        expectedRevision: UInt64,
+        replacementPresentationReady: Bool = true
     ) -> (replaced: Bool, detachedWorkspace: Workspace?) {
-        guard let current = teams[team.id],
+        guard replacementPresentationReady,
+              let current = teams[team.id],
               !current.ownsRemotePresentation,
               current.workspaceId == expectedWorkspaceID,
               current.remotePresentationRevision == expectedRevision
@@ -1043,6 +1065,32 @@ final class TeamOrchestrator: ObservableObject {
         team.agents[index].panelId = panelID
         teams[teamName] = team
         syncTeamStateToDaemon()
+    }
+
+    /// Publish a replacement only if the same local pane generation still
+    /// owns the roster slot. Extensions use this instead of reaching through
+    /// the private daemon-sync funnel.
+    func commitPeerOwnedAgentReplacement(
+        teamName: String,
+        expected: AgentMember,
+        replacement: AgentMember
+    ) -> Bool {
+        guard let current = teams[teamName],
+              let updated = Self.teamByReplacingPeerOwnedAgent(
+                  current: current,
+                  expected: expected,
+                  replacement: replacement
+              )
+        else { return false }
+        teams[teamName] = updated
+        TeamDataStore.shared.registerTeam(
+            teamName,
+            agents: updated.agents.map {
+                .init(name: $0.name, instanceId: $0.agentInstanceId)
+            }
+        )
+        syncTeamStateToDaemon()
+        return true
     }
 
     @discardableResult
@@ -1175,6 +1223,197 @@ final class TeamOrchestrator: ObservableObject {
             }
         }
         return nil
+    }
+
+    struct AgentPresentationProbe: Equatable {
+        let instanceID: String
+        let panelPresent: Bool
+        let sessionReady: Bool
+    }
+
+    enum CollaborationPresentationState: Equatable {
+        case ready
+        case teamMissing
+        case workspaceMissing
+        case leaderPanelMissing
+        case leaderSessionUnavailable
+        case agentPanelMissing(String)
+        case agentSessionUnavailable(String)
+
+        var failureCode: String? {
+            switch self {
+            case .ready: return nil
+            case .teamMissing: return "team_missing"
+            case .workspaceMissing: return "workspace_missing"
+            case .leaderPanelMissing: return "leader_panel_missing"
+            case .leaderSessionUnavailable: return "leader_session_unavailable"
+            case .agentPanelMissing: return "agent_panel_missing"
+            case .agentSessionUnavailable: return "agent_session_unavailable"
+            }
+        }
+    }
+
+    /// Pure presentation contract shared by Repair and socket delegation.
+    static func collaborationPresentationState(
+        teamExists: Bool,
+        workspaceExists: Bool,
+        leaderPanelExists: Bool,
+        leaderSessionReady: Bool,
+        agents: [AgentPresentationProbe],
+        requireLiveSessions: Bool,
+        repairableMissingAgentIDs: Set<String> = []
+    ) -> CollaborationPresentationState {
+        guard teamExists else { return .teamMissing }
+        guard workspaceExists else { return .workspaceMissing }
+        guard leaderPanelExists else { return .leaderPanelMissing }
+        if requireLiveSessions, !leaderSessionReady {
+            return .leaderSessionUnavailable
+        }
+        for agent in agents {
+            if repairableMissingAgentIDs.contains(agent.instanceID) { continue }
+            guard agent.panelPresent else {
+                return .agentPanelMissing(agent.instanceID)
+            }
+            if requireLiveSessions, !agent.sessionReady {
+                return .agentSessionUnavailable(agent.instanceID)
+            }
+        }
+        return .ready
+    }
+
+    /// Read the exact local presentation that a peer-backed Project needs.
+    /// Local teams do not use a replaceable viewer route and remain unchanged.
+    func collaborationPresentationState(
+        teamName: String,
+        requireLiveSessions: Bool,
+        repairableMissingAgentIDs: Set<String> = []
+    ) -> CollaborationPresentationState {
+        guard let team = teams[teamName] else { return .teamMissing }
+        guard case .peer = team.leaderEndpoint else { return .ready }
+        guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
+              let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId })
+        else { return .workspaceMissing }
+
+        let leaderPanel = workspace.terminalPanel(for: team.leaderPanelId)
+        let leaderSessionReady = leaderPanel?.peerPaneSession?.isRelayLive == true
+        let probes = team.agents.sorted { $0.agentInstanceId < $1.agentInstanceId }.map { agent in
+            guard agent.workspaceId == team.workspaceId, let panelID = agent.panelId else {
+                return AgentPresentationProbe(
+                    instanceID: agent.agentInstanceId,
+                    panelPresent: false,
+                    sessionReady: false
+                )
+            }
+            if agent.remoteAgentSurface {
+                return AgentPresentationProbe(
+                    instanceID: agent.agentInstanceId,
+                    panelPresent: workspace.agentPanel(for: panelID) != nil,
+                    sessionReady: workspace.peerAgentPanelIsLive(panelID)
+                )
+            }
+            if agent.hostKey != nil {
+                let panel = workspace.terminalPanel(for: panelID)
+                return AgentPresentationProbe(
+                    instanceID: agent.agentInstanceId,
+                    panelPresent: panel != nil,
+                    sessionReady: panel?.peerPaneSession?.isRelayLive == true
+                )
+            }
+            return AgentPresentationProbe(
+                instanceID: agent.agentInstanceId,
+                panelPresent: workspace.panels[panelID] != nil,
+                sessionReady: true
+            )
+        }
+        return Self.collaborationPresentationState(
+            teamExists: true,
+            workspaceExists: true,
+            leaderPanelExists: leaderPanel != nil,
+            leaderSessionReady: leaderSessionReady,
+            agents: probes,
+            requireLiveSessions: requireLiveSessions,
+            repairableMissingAgentIDs: repairableMissingAgentIDs
+        )
+    }
+
+    /// Delegate needs one exact deliverable target, not a perfect whole
+    /// roster. Repair uses the stricter all-member contract above.
+    func delegationPresentationState(
+        teamName: String,
+        agentName: String,
+        agentInstanceID: String?
+    ) -> CollaborationPresentationState {
+        guard let team = teams[teamName] else { return .teamMissing }
+        guard case .peer = team.leaderEndpoint else { return .ready }
+        guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
+              let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId })
+        else { return .workspaceMissing }
+        guard let leader = workspace.terminalPanel(for: team.leaderPanelId) else {
+            return .leaderPanelMissing
+        }
+        guard leader.peerPaneSession?.isRelayLive == true else {
+            return .leaderSessionUnavailable
+        }
+
+        let candidates = team.agents.filter { agent in
+            guard agent.name == agentName else { return false }
+            guard let agentInstanceID, !agentInstanceID.isEmpty else { return true }
+            return agent.agentInstanceId == agentInstanceID
+        }
+        guard !candidates.isEmpty else { return .agentPanelMissing(agentName) }
+        var firstMissing: CollaborationPresentationState?
+        for agent in candidates {
+            guard agent.workspaceId == team.workspaceId, let panelID = agent.panelId else {
+                firstMissing = firstMissing ?? .agentPanelMissing(agent.agentInstanceId)
+                continue
+            }
+            if agent.remoteAgentSurface {
+                guard workspace.agentPanel(for: panelID) != nil else {
+                    firstMissing = firstMissing ?? .agentPanelMissing(agent.agentInstanceId)
+                    continue
+                }
+                if !workspace.peerAgentPanelIsLive(panelID) {
+                    firstMissing = firstMissing ?? .agentSessionUnavailable(agent.agentInstanceId)
+                    continue
+                }
+                return .ready
+            }
+            if agent.hostKey != nil {
+                guard let panel = workspace.terminalPanel(for: panelID) else {
+                    firstMissing = firstMissing ?? .agentPanelMissing(agent.agentInstanceId)
+                    continue
+                }
+                if panel.peerPaneSession?.isRelayLive != true {
+                    firstMissing = firstMissing ?? .agentSessionUnavailable(agent.agentInstanceId)
+                    continue
+                }
+                return .ready
+            }
+            if workspace.panels[panelID] == nil {
+                firstMissing = firstMissing ?? .agentPanelMissing(agent.agentInstanceId)
+                continue
+            }
+            return .ready
+        }
+        // Only report the first failure once no candidate turned out to be
+        // deliverable. Reporting it while a live sibling exists is what the
+        // "one exact deliverable target" contract above rules out.
+        return firstMissing ?? .ready
+    }
+
+    /// Generation guard for callbacks captured by an older viewer.
+    func ownsPeerAgentPresentation(
+        teamName: String,
+        agentInstanceID: String,
+        panelID: UUID,
+        surfaceID: Data
+    ) -> Bool {
+        teams[teamName]?.agents.contains(where: {
+            $0.agentInstanceId == agentInstanceID
+                && $0.panelId == panelID
+                && $0.remoteAgentSurface
+                && $0.remoteSurfaceID == surfaceID
+        }) == true
     }
 
     /// When true, agent terminal surfaces are occluded; a periodic timer triggers a single
@@ -3886,10 +4125,18 @@ final class TeamOrchestrator: ObservableObject {
             unknownRate: measurement.supportedTurns == 0 ? 1
                 : Double(unknown) / Double(measurement.supportedTurns)
         )
+        // Read the roster here rather than at each call site: every writer of
+        // this file needs the same count, and `agentNames(for:)` already takes
+        // the store's lock. A team with no registered roster yields zero, which
+        // the hook reads as "no floor to state".
+        let workerNames = TeamDataStore.shared.agentNames(for: teamName)
         let payload = settings.controlPayload(
             projectID: teamName, sessionID: sessionID,
             supportedLeader: supportedLeader, health: health,
-            delegationState: delegationState
+            delegationState: delegationState,
+            availableWorkers: workerNames.count,
+            workerNames: workerNames,
+            executionOptions: ProjectExecutionOptions.load(teamName: teamName)
         )
         var scopedPayload = payload
         scopedPayload["health_scope"] = healthScope.rawValue
@@ -3918,25 +4165,99 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
+    /// Rewrite each leader's control file when its contents would change.
+    ///
+    /// The roster is part of that file now, and a Project's leader attaches
+    /// before its workers do — so the file written at attach time says zero
+    /// workers, and the turn hook reads "no floor to state" for the rest of the
+    /// session unless something rewrites it. Every roster change already ends
+    /// in `syncTeamStateToDaemon`, which is why this hangs off there rather
+    /// than off each of the six `registerTeam` call sites.
+    ///
+    /// Payload-compared rather than rewritten every time: a peer's file goes
+    /// over SSH, and daemon syncs are far more frequent than roster changes.
     func refreshLeaderParticipationControls() {
         for team in teams.values {
             let supported = leaderMeasurementCapability(for: team) == .supported
             switch team.leaderEndpoint {
             case .local:
+                guard let data = Self.leaderParticipationControlData(
+                    teamName: team.id, sessionID: team.leaderSessionId,
+                    supportedLeader: supported, delegationState: team.delegationState
+                ), leaderParticipationControlPayloads[team.id] != data else { continue }
+                leaderParticipationControlPayloads[team.id] = data
                 Self.writeLeaderParticipationControl(
                     teamName: team.id, sessionID: team.leaderSessionId,
                     supportedLeader: supported, delegationState: team.delegationState
                 )
             case .peer(let hostKey):
-                guard Self.supportsLeaderTurnMeasurement(cli: team.leaderMode),
-                      let teamUUID = team.teamUuid else { continue }
-                Task {
-                    await Self.refreshRemoteLeaderParticipationControl(
-                        hostKey: hostKey, teamUUID: teamUUID, teamName: team.id,
-                        sessionID: team.leaderSessionId, supportedLeader: supported
-                    )
+                // Both of these used to `continue` in silence, which is how a
+                // Project could show a four-worker roster on screen while the
+                // file its leader actually reads still said zero.
+                //
+                // `leaderMode` answers "who owns the leader pane", and for an
+                // adopted Project that answer — "adopted" — overwrites the one
+                // thing asked here: which CLI is running. The remote manifest
+                // carries no CLI either, so for an adopted leader this is
+                // genuinely unknown. Write the file anyway: a leader with the
+                // turn hook reads it, one without never opens it, and refusing
+                // to write is the only outcome that is certainly wrong.
+                let resolvedCli = team.leaderCli ?? team.leaderMode
+                guard Self.supportsLeaderTurnMeasurement(cli: resolvedCli)
+                        || resolvedCli == "adopted" else {
+#if DEBUG
+                    dlog("leaderControl.skip team=\(team.id) reason=unsupported_cli cli=\(resolvedCli)")
+#endif
+                    continue
                 }
+                guard let teamUUID = team.teamUuid else {
+#if DEBUG
+                    dlog("leaderControl.skip team=\(team.id) reason=no_team_uuid")
+#endif
+                    continue
+                }
+                let delegationState = team.delegationState
+                guard let data = Self.leaderParticipationControlData(
+                    teamName: team.id, sessionID: team.leaderSessionId,
+                    supportedLeader: supported, delegationState: delegationState,
+                    healthScope: .executionHost
+                ), leaderParticipationControlPayloads[team.id] != data else { continue }
+                let teamID = team.id
+                // Queue the newest payload, then start a writer only if none is
+                // running. A writer already draining picks this up on its next
+                // turn, so a settings change made during an SSH write is
+                // delayed rather than lost.
+                leaderParticipationControlPending[teamID] = RemoteLeaderControlWrite(
+                    hostKey: hostKey, teamUUID: teamUUID, payload: data
+                )
+#if DEBUG
+                dlog("leaderControl.send team=\(teamID) uuid=\(teamUUID) bytes=\(data.count)")
+#endif
+                guard leaderParticipationControlWritesInFlight.insert(teamID).inserted
+                else { continue }
+                Task { await self.drainLeaderParticipationControl(teamID) }
             }
+        }
+    }
+
+    /// Write this team's queued control payloads until none is left.
+    ///
+    /// One writer per team, so writes cannot land out of order, and the queue
+    /// is re-read after every write so a payload queued mid-flight is written
+    /// rather than waiting for some later sync to notice.
+    private func drainLeaderParticipationControl(_ teamID: String) async {
+        defer { leaderParticipationControlWritesInFlight.remove(teamID) }
+        while let job = leaderParticipationControlPending.removeValue(forKey: teamID) {
+            // Record the payload only after the write lands. Caching it before
+            // the SSH attempt made a single failure permanent: the identical
+            // payload compared equal on every later sync, so the leader kept
+            // reading the stale control file for the rest of the session.
+            // Leaving the cache untouched lets the next sync re-queue.
+            let written = await Self.refreshRemoteLeaderParticipationControl(
+                hostKey: job.hostKey, teamUUID: job.teamUUID, teamName: teamID,
+                payload: job.payload
+            )
+            if written { leaderParticipationControlPayloads[teamID] = job.payload }
         }
     }
 
@@ -5192,7 +5513,8 @@ final class TeamOrchestrator: ObservableObject {
     private func pollLocalLeaderReadiness(
         teamName: String, leaderMode: String,
         workspaceId: UUID, panelId: UUID, tabManager: TabManager,
-        deadline: Date, readyObservations: Int
+        deadline: Date, readyObservations: Int,
+        answeredStartupPrompt: Bool = false
     ) {
         guard let team = teams[teamName], team.leaderPanelId == panelId, !team.leaderReady else { return }
         guard Date() < deadline else {
@@ -5211,7 +5533,8 @@ final class TeamOrchestrator: ObservableObject {
                 self?.pollLocalLeaderReadiness(
                     teamName: teamName, leaderMode: leaderMode,
                     workspaceId: workspaceId, panelId: panelId,
-                    tabManager: tabManager, deadline: deadline, readyObservations: 0
+                    tabManager: tabManager, deadline: deadline, readyObservations: 0,
+                    answeredStartupPrompt: answeredStartupPrompt
                 )
             }
             return
@@ -5222,6 +5545,31 @@ final class TeamOrchestrator: ObservableObject {
             DispatchQueue.main.async {
                 guard let self, var current = self.teams[teamName],
                       current.leaderPanelId == panelId, !current.leaderReady else { return }
+                // A leader is not in `team.agents`, so `AutoReplyPoller` never
+                // sees this pane. Without answering here, a first-run trust
+                // prompt just reads as "not ready" until the deadline and the
+                // Project fails to start with no idea why.
+                if !answeredStartupPrompt, let snap = snapshot,
+                   let answer = AgentStartupPrompt.answer(in: snap),
+                   let leaderPanel = panel {
+                    NSLog("[leader] answered startup prompt team=%@ prompt=%@ keys=%@",
+                          teamName, String(describing: answer.prompt),
+                          answer.keys.joined(separator: ","))
+                    TerminalController.shared.sendNamedKeysWithRetry(
+                        on: leaderPanel.surface, keyNames: answer.keys
+                    )
+                    DispatchQueue.main.asyncAfter(
+                        deadline: .now() + Self.localLeaderReadinessPollInterval
+                    ) { [weak self] in
+                        self?.pollLocalLeaderReadiness(
+                            teamName: teamName, leaderMode: leaderMode,
+                            workspaceId: workspaceId, panelId: panelId,
+                            tabManager: tabManager, deadline: deadline,
+                            readyObservations: 0, answeredStartupPrompt: true
+                        )
+                    }
+                    return
+                }
                 let promptVisible = snapshot.map {
                     Self.localLeaderPaneLooksReady($0, leaderMode: leaderMode)
                 } == true
@@ -5241,7 +5589,8 @@ final class TeamOrchestrator: ObservableObject {
                             teamName: teamName, leaderMode: leaderMode,
                             workspaceId: workspaceId, panelId: panelId,
                             tabManager: tabManager, deadline: deadline,
-                            readyObservations: nextReadyObservations
+                            readyObservations: nextReadyObservations,
+                            answeredStartupPrompt: answeredStartupPrompt
                         )
                     }
                 }
@@ -5270,11 +5619,6 @@ final class TeamOrchestrator: ObservableObject {
         return leaderRequestWake(requestId: request.id, tmAgent: tmAgent)
             + " Engine decision: delegation=\(level), route=\(route), reasons=\(reasons). "
             + "Execute this route; any override must be explicit in the turn route record."
-    }
-
-    static func projectDelegationDirective(_ level: ProjectDelegationLevel) -> String {
-        "Project delegation level: \(level.rawValue). Durable requests carry an "
-            + "engine-selected route; execute that route rather than reclassifying it."
     }
 
     func leaderRequestWake(teamName: String, requestId: String) -> String {
@@ -5469,6 +5813,7 @@ final class TeamOrchestrator: ObservableObject {
         case allInstancesBusy(blockers: [DelegateBlocker])
         /// The store genuinely refused to create the task.
         case taskCreateFailed
+        case presentationUnavailable(CollaborationPresentationState)
     }
 
     /// Whether an already-existing task may be acknowledged without pasting
@@ -5643,6 +5988,14 @@ final class TeamOrchestrator: ObservableObject {
                 agentInstanceIds: named.map(\.agentInstanceId)
             )
             return .allInstancesBusy(blockers: blockers)
+        }
+        let presentation = delegationPresentationState(
+            teamName: teamName,
+            agentName: agentName,
+            agentInstanceID: target.agentInstanceId
+        )
+        guard presentation == .ready else {
+            return .presentationUnavailable(presentation)
         }
         guard let creation = TeamDataStore.shared.createTaskWithDisposition(
             teamName: teamName,
@@ -7613,6 +7966,17 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     private func syncTeamStateToDaemon() {
+        for team in teams.values {
+            if let teamUUID = team.teamUuid?.nilIfBlank {
+                LeaderTurnLog.rememberIdentity(
+                    team: team.id, teamUUID: teamUUID,
+                    leaderSessionID: team.leaderSessionId
+                )
+            }
+        }
+        // Roster changes all funnel through here, and the leader's control file
+        // carries the roster. The call is a no-op unless the payload changed.
+        refreshLeaderParticipationControls()
         let payload = daemonPayload()
         DispatchQueue.global(qos: .utility).async {
             self.daemon.syncTeams(payload)

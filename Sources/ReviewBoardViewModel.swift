@@ -42,6 +42,14 @@ final class ReviewBoardViewModel: ObservableObject {
     /// reads as though the fresh one failed.
     @Published private(set) var actionError: String?
 
+    /// The Project the board is pointed at, set from whichever workspace is on
+    /// screen. Nil means no team there, and the section hides itself.
+    @Published private(set) var activeTeamName: String?
+    @Published private(set) var delegation: DelegationPanel?
+    @Published private(set) var collaboration: CollaborationPanel?
+    @Published private(set) var collaborationRepairInFlight = false
+    @Published private(set) var collaborationRepairMessage: String?
+
     /// The boundary, as configured. Read from settings so what the toggle
     /// shows and what the runner enforces cannot drift apart.
     @Published private(set) var autoPilot: AutoPilotPolicy
@@ -55,6 +63,7 @@ final class ReviewBoardViewModel: ObservableObject {
     @Published private(set) var undoMessage: String?
 
     private var snapshotProvider: @MainActor () -> ReviewBoardSnapshot
+    private var activeTeamProvider: @MainActor () -> String? = { nil }
     /// Where the auto pilot policy is read and written. Injected so a test can
     /// exercise the toggle without arming unattended merging for whoever is
     /// running the tests.
@@ -72,6 +81,9 @@ final class ReviewBoardViewModel: ObservableObject {
     private var decisionInFlight = false
     private var teamCancellable: AnyCancellable?
     private var activityTicker: Timer?
+    private var remoteCollaborationRecords: [String: [LeaderTurnLog.Record]] = [:]
+    private var remoteCollaborationFetches: [String: Task<Void, Never>] = [:]
+    private var remoteCollaborationFetchedAt: [String: Date] = [:]
 
     init(
         initialSnapshot: ReviewBoardSnapshot = .empty,
@@ -132,8 +144,16 @@ final class ReviewBoardViewModel: ObservableObject {
     }
 
     /// Idle boards cost nothing: with no tasks there is nothing to animate.
+    ///
+    /// The delegation panel is the exception and is refreshed either way. A
+    /// board with no tasks is precisely where someone sets the level for the
+    /// work they are about to start, and it also has to show a roster sitting
+    /// idle — which is a state with no tasks by definition.
     private func refreshWhileWorkIsRunning() {
-        guard !snapshot.tasks.isEmpty else { return }
+        guard !snapshot.tasks.isEmpty else {
+            refreshDelegationPanel()
+            return
+        }
         refresh()
     }
 
@@ -186,6 +206,10 @@ final class ReviewBoardViewModel: ObservableObject {
         // gated on inequality so an unchanged roster publishes nothing.
         let working = Self.runningAgentNames()
         if workingAssignees != working { workingAssignees = working }
+        // Same beat as the roster: the level can change from the sidebar sheet
+        // or a socket call, and whether a worker is idle changes with nothing
+        // published at all.
+        refreshDelegationPanel()
         keepSelectionValid()
     }
 
@@ -340,6 +364,249 @@ final class ReviewBoardViewModel: ObservableObject {
     private func dropLoadedReview() {
         review = nil
         reviewedTaskID = nil
+    }
+
+    // MARK: - Work distribution
+
+    /// How much of the Project in view its leader hands to workers, plus the
+    /// roster that decision is about.
+    ///
+    /// Keyed to the workspace on screen rather than to the task list. Auto
+    /// Pilot infers its team from `snapshot.tasks.first`, which is fine for a
+    /// control you reach for once work exists — but this is the setting you
+    /// want *before* the first task, and inferring it from tasks would leave it
+    /// unreachable on exactly the board that shows "Nothing assigned yet".
+    struct DelegationPanel: Equatable {
+        var teamName: String
+        var level: ProjectDelegationLevel
+        var pending: ProjectDelegationLevel?
+        var options: ProjectExecutionOptions
+        var workerCount: Int
+        var workingCount: Int
+
+        var idleCount: Int { max(0, workerCount - workingCount) }
+        /// The state this whole feature exists to make visible: a roster that
+        /// is present, and doing nothing.
+        var everyWorkerIdle: Bool { workerCount > 0 && workingCount == 0 }
+    }
+
+    struct CollaborationPanel: Equatable {
+        let state: LeaderTurnLog.CollaborationState
+        let title: String
+        let detail: String
+        /// The headline compressed to fit a folded section header, where the
+        /// full title would crowd out the level and the roster beside it.
+        let shortState: String
+        let symbolName: String
+        let workerCount: Int
+        let dispatchCount: Int
+        let completionCount: Int
+        let lastActivity: String?
+    }
+
+    /// Where the board's Project comes from, injected the way the snapshot is.
+    ///
+    /// A pushed value loses the race with workspace restore — at launch there
+    /// is no selection yet, and if it never changes afterwards nothing pushes
+    /// again and the section stays hidden all session. Pulling it on the same
+    /// beat as everything else cannot go stale that way.
+    func setActiveTeamProvider(_ provider: @escaping @MainActor () -> String?) {
+        activeTeamProvider = provider
+        refreshDelegationPanel()
+    }
+
+    func setActiveTeam(_ teamName: String?) {
+        guard activeTeamName != teamName else { return }
+        activeTeamName = teamName
+        refreshDelegationPanel()
+    }
+
+    func setDelegationLevel(_ level: ProjectDelegationLevel) {
+        guard let teamName = delegation?.teamName else { return }
+        _ = TeamOrchestrator.shared.setProjectDelegationLevel(teamName: teamName, level: level)
+        refreshDelegationPanel()
+    }
+
+    func setMaxParallelWorkers(_ count: Int) {
+        updateExecutionOptions { $0.maxParallelWorkers = count }
+    }
+
+    func setInjectDirective(_ enabled: Bool) {
+        updateExecutionOptions { $0.injectDirective = enabled }
+    }
+
+    /// Options live in defaults and reach the leader through its control file,
+    /// so a write is only half the change — the file has to be rewritten too,
+    /// or the hook keeps reading the values from before.
+    private func updateExecutionOptions(_ mutate: (inout ProjectExecutionOptions) -> Void) {
+        guard let teamName = delegation?.teamName else { return }
+        var options = ProjectExecutionOptions.load(teamName: teamName)
+        mutate(&options)
+        options.save(teamName: teamName)
+        TeamOrchestrator.shared.refreshLeaderParticipationControls()
+        refreshDelegationPanel()
+    }
+
+    private func refreshDelegationPanel() {
+        let resolved = activeTeamProvider() ?? activeTeamName
+        if activeTeamName != resolved { activeTeamName = resolved }
+        let next = Self.delegationPanel(for: resolved)
+        if delegation != next { delegation = next }
+        let nextCollaboration = Self.collaborationPanel(
+            for: resolved,
+            remoteRecords: resolved.flatMap { remoteCollaborationRecords[$0] } ?? []
+        )
+        if collaboration != nextCollaboration { collaboration = nextCollaboration }
+        refreshRemoteCollaborationIfNeeded(for: resolved)
+    }
+
+    private static func delegationPanel(for teamName: String?) -> DelegationPanel? {
+        guard let teamName, !teamName.isEmpty,
+              let team = TeamOrchestrator.shared.teams[teamName] else { return nil }
+        let rosterNames = Set(team.agents.map(\.name))
+        let working = runningAgentNames().intersection(rosterNames)
+        return DelegationPanel(
+            teamName: teamName,
+            level: team.delegationState.effective,
+            pending: team.delegationState.pending,
+            options: ProjectExecutionOptions.load(teamName: teamName),
+            workerCount: team.agents.count,
+            workingCount: working.count
+        )
+    }
+
+    private static func collaborationPanel(
+        for teamName: String?, remoteRecords: [LeaderTurnLog.Record]
+    ) -> CollaborationPanel? {
+        guard let teamName, !teamName.isEmpty,
+              let team = TeamOrchestrator.shared.teams[teamName] else { return nil }
+        let records = LeaderTurnLog.readRecent(team: teamName) + remoteRecords
+        let leaderSurfaceID = team.remoteLeaderSurfaceID?.map {
+            String(format: "%02x", $0)
+        }.joined()
+        return collaborationPanel(summary: LeaderTurnLog.collaborationSummary(
+            records: records, team: teamName, teamUUID: team.teamUuid,
+            leaderSessionID: team.leaderSessionId, leaderSurfaceID: leaderSurfaceID,
+            workerCount: team.agents.count
+        ))
+    }
+
+    /// Peer leader turns are written on the execution host while task events
+    /// are written on this control host. Read only the bounded remote tail and
+    /// combine both streams before deriving collaboration health.
+    private func refreshRemoteCollaborationIfNeeded(for teamName: String?) {
+        guard let teamName, let team = TeamOrchestrator.shared.teams[teamName],
+              case let .peer(hostKey) = team.leaderEndpoint,
+              remoteCollaborationFetches[teamName] == nil,
+              ReviewBoardSettings.isVisible,
+              Date().timeIntervalSince(remoteCollaborationFetchedAt[teamName] ?? .distantPast) >= 10,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return }
+        let expectedUUID = team.teamUuid
+        remoteCollaborationFetchedAt[teamName] = Date()
+        remoteCollaborationFetches[teamName] = Task { [weak self] in
+            let loop = "for line in f:\n"
+                + " try:\n  row=json.loads(line)\n except Exception:\n  continue\n"
+                + " if isinstance(row,dict) and row.get('team')==team:\n  q.append(line)\n"
+            let filter = "import collections,json,sys; q=collections.deque(maxlen=200); "
+                + "f=open(sys.argv[1],encoding='utf-8'); team=sys.argv[2]; "
+                + "exec(" + String(reflecting: loop) + "); sys.stdout.writelines(q)"
+            let body = "f=\"$HOME/.term-mesh/logs/turns.log\"; "
+                + "if [ -r \"$f\" ]; then python3 -c "
+                + TeamOrchestrator.shellQuoted(filter) + " \"$f\" "
+                + TeamOrchestrator.shellQuoted(teamName) + "; fi"
+            let output = try? await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget, port: host.sshPort, identityFile: host.identityFile,
+                script: RemotePasteTransfer.serviceAccountCommand(body), timeoutSeconds: 10
+            )
+            guard let self else { return }
+            self.remoteCollaborationFetches[teamName] = nil
+            guard TeamOrchestrator.shared.teams[teamName]?.teamUuid == expectedUUID,
+                  let output else {
+                self.remoteCollaborationFetchedAt[teamName] = .distantPast
+                return
+            }
+            self.remoteCollaborationRecords[teamName] = LeaderTurnLog.readAll(from: output)
+            guard Self.shouldPublishRemoteCollaboration(
+                fetchedTeam: teamName,
+                activeTeam: self.activeTeamProvider() ?? self.activeTeamName
+            ) else {
+                return
+            }
+            let next = Self.collaborationPanel(
+                for: teamName, remoteRecords: self.remoteCollaborationRecords[teamName] ?? []
+            )
+            if self.collaboration != next { self.collaboration = next }
+        }
+    }
+
+    static func shouldPublishRemoteCollaboration(
+        fetchedTeam: String,
+        activeTeam: String?
+    ) -> Bool {
+        fetchedTeam == activeTeam
+    }
+
+    static func collaborationPanel(
+        summary: LeaderTurnLog.CollaborationSummary
+    ) -> CollaborationPanel {
+        let title: String
+        let detail: String
+        let short: String
+        let symbol: String
+        // The state is decided by the newest decisive record in the window,
+        // while the counts below it total the whole window. Read as one claim
+        // they contradict each other: a Project can show "no dispatch" over
+        // four dispatches, because the newest record is a turn that delegated
+        // nothing. Every string here names which of the two it speaks for.
+        switch summary.state {
+        case .healthy:
+            title = "Latest evidence: dispatched"
+            detail = "Workers received tasks, and nothing since then failed."
+            short = "dispatching"
+            symbol = "checkmark.circle.fill"
+        case .leaderOnly:
+            title = "Latest evidence: no dispatch"
+            detail = "The newest record is a stated route with no worker task after it."
+            short = "no dispatch"
+            symbol = "person.crop.circle.badge.exclamationmark"
+        case .identityMismatch:
+            title = "Identity mismatch"
+            detail = "Recent evidence belongs to another Project viewer."
+            short = "identity mismatch"
+            symbol = "person.crop.circle.badge.xmark"
+        case .routeFailure:
+            title = "Latest evidence: route failure"
+            detail = "A worker delivery or route failed after the last dispatch."
+            short = "route failure"
+            symbol = "exclamationmark.triangle.fill"
+        case .unmeasured:
+            title = "Collaboration unmeasured"
+            detail = summary.legacyRecordCount > 0
+                ? "Only legacy name-scoped records are available."
+                : "No identity-scoped task evidence is available."
+            short = "unmeasured"
+            symbol = "questionmark.circle"
+        }
+        return CollaborationPanel(
+            state: summary.state, title: title, detail: detail, shortState: short,
+            symbolName: symbol,
+            workerCount: summary.workerCount, dispatchCount: summary.dispatchCount,
+            completionCount: summary.completionCount, lastActivity: summary.lastActivity
+        )
+    }
+
+    func repairCollaboration() async {
+        guard !collaborationRepairInFlight, let teamName = activeTeamName else { return }
+        collaborationRepairInFlight = true
+        collaborationRepairMessage = nil
+        let report = await TeamOrchestrator.shared.repairCollaboration(teamName: teamName)
+        collaborationRepairInFlight = false
+        if (activeTeamProvider() ?? activeTeamName) == teamName {
+            collaborationRepairMessage = report.message
+        }
+        remoteCollaborationFetchedAt[teamName] = .distantPast
+        refreshDelegationPanel()
     }
 
     // MARK: - Auto pilot

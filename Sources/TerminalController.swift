@@ -3525,9 +3525,13 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_params", message: "Missing text")
         }
         let requestId = params["request_id"] as? String
+        // An absent or unrecognized task_shape stays nil. Defaulting it to
+        // single_unit made "the caller said nothing" indistinguishable from
+        // "the caller said this work cannot be split", and only the second is
+        // a reason to close the parallel gate.
         let taskShape = ProjectTaskShape(
             rawValue: (params["task_shape"] as? String) ?? ""
-        ) ?? .singleUnit
+        )
         let riskReasons = Set(
             (params["risk_reasons"] as? [String] ?? []).compactMap(ProjectRoutingRisk.init(rawValue:))
         )
@@ -4870,6 +4874,13 @@ class TerminalController {
             return v2Error(
                 id: id, code: "internal_error",
                 message: "Task creation failed for agent '\(agentName)'"
+            )
+        case .presentationUnavailable(let presentation):
+            return v2Error(
+                id: id,
+                code: "presentation_unavailable",
+                message: "Project presentation is unavailable "
+                    + "(\(presentation.failureCode ?? "unknown")); run Repair collaboration"
             )
         case nil:
             // The 12s dead-man switch fired before the main-actor block ran.
@@ -6392,9 +6403,13 @@ class TerminalController {
         }
 
         let stored: (request: TeamDataStore.LeaderRequest, replayed: Bool, persisted: Bool)
+        // An absent or unrecognized task_shape stays nil. Defaulting it to
+        // single_unit made "the caller said nothing" indistinguishable from
+        // "the caller said this work cannot be split", and only the second is
+        // a reason to close the parallel gate.
         let taskShape = ProjectTaskShape(
             rawValue: (params["task_shape"] as? String) ?? ""
-        ) ?? .singleUnit
+        )
         let riskReasons = Set(
             (params["risk_reasons"] as? [String] ?? []).compactMap(ProjectRoutingRisk.init(rawValue:))
         )
