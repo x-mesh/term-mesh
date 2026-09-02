@@ -4,6 +4,17 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.225.0] - 2026-09-02
+
+### Added
+
+- Add a pane-header control that exposes or hides a terminal, agent, or Project leader on the mobile remote page without requiring the rc command in the pane.
+
+### Fixed
+
+- Keep the pane-header mobile state synchronized with command-line changes, TTL expiry, and pane closure, while preserving the pane's own working directory and the user's start/stop intent.
+- Make peer pane cleanup remove stale and orphaned panes reliably, including force cleanup on a crowded host, instead of timing out after 25 seconds and showing the same dead panes again.
+
 ## [0.224.0] - 2026-09-02
 
 ### Added
