@@ -11,6 +11,17 @@ struct ReviewBoardPanelView: View {
     @State private var rejectReason = ""
     @State private var isRejecting = false
 
+    /// Folded state for the two settings sections below the work. Seeded from
+    /// defaults so a collapse survives closing the board, and written back on
+    /// every toggle rather than on disappear — the panel is dismissed by the
+    /// window closing as often as by the button.
+    @State private var delegationExpanded = ReviewBoardSettings.isSectionExpanded(
+        ReviewBoardSettings.delegationExpandedKey, default: true
+    )
+    @State private var autoPilotExpanded = ReviewBoardSettings.isSectionExpanded(
+        ReviewBoardSettings.autoPilotExpandedKey, default: false
+    )
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
@@ -37,8 +48,13 @@ struct ReviewBoardPanelView: View {
                     // on an empty board on purpose: it is what you set before
                     // handing out the first task, and an idle roster is a state
                     // with no rows by definition.
-                    collaborationSection
-                    workDistributionSection
+                    //
+                    // The level and the evidence for it are one section, not
+                    // two. "Delegated" is a claim; "4 workers, none working" is
+                    // whether it is happening, and separating them put the
+                    // reason to change a setting on a different card from the
+                    // setting.
+                    delegationSection
                     // Last: it is a setting and a log, not the work. It should
                     // be findable, not in the way of the row someone opened the
                     // board to read.
@@ -492,71 +508,132 @@ extension ReviewBoardPanelView {
             .accessibilityAddTraits(.isHeader)
     }
 
-    // MARK: - Collaboration
+    // MARK: - Delegation
 
-    @ViewBuilder
-    private var collaborationSection: some View {
-        if let panel = viewModel.collaboration {
-            VStack(alignment: .leading, spacing: 7) {
-                sectionTitle("Collaboration")
-                HStack(alignment: .firstTextBaseline, spacing: 7) {
-                    Image(systemName: panel.symbolName)
+    /// A folding header whose collapsed line carries the summary.
+    ///
+    /// Tabs were the other candidate and they hide the wrong half. The level
+    /// is a claim ("delegate serial work") and the evidence is whether it is
+    /// happening ("4 workers, none working"); a tab puts the reason to change
+    /// a setting behind a control you have to find first. Folding keeps the
+    /// verdict on the header instead, so collapsing costs nothing but height.
+    private func foldHeader<Trailing: View>(
+        _ title: String,
+        isExpanded: Bool,
+        summary: Text?,
+        toggle: @escaping () -> Void,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        HStack(spacing: 6) {
+            Button(action: toggle) {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .accessibilityHidden(true)
-                    Text(panel.title)
-                        .font(.system(size: 11, weight: .semibold))
-                }
-                Text(panel.detail)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                // Three numbers on one line read as one fact, and they are
-                // not: the roster is what exists now, the other two total a
-                // bounded history. Separating them is what stops "no dispatch"
-                // and "4 dispatches" from looking like a contradiction.
-                Text("Roster now · \(panel.workerCount) workers")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(.secondary)
-                Text("Recent history · \(panel.dispatchCount) dispatches · \(panel.completionCount) completed")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(.secondary)
-                if let lastActivity = panel.lastActivity {
-                    Text(
-                        "Newest record "
-                            + (ReviewBoardText.clockTime(lastActivity) ?? lastActivity)
-                    )
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                }
-                if panel.state != .healthy && panel.workerCount > 0 {
-                    Button {
-                        Task { await viewModel.repairCollaboration() }
-                    } label: {
-                        if viewModel.collaborationRepairInFlight {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Text("Repair collaboration")
-                        }
+                    sectionTitle(title)
+                    if !isExpanded, let summary {
+                        summary
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
-                    .disabled(viewModel.collaborationRepairInFlight)
-                    .accessibilityIdentifier("reviewBoard.repairCollaboration")
+                    Spacer(minLength: 4)
                 }
-                if let message = viewModel.collaborationRepairMessage {
-                    Text(message)
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "Collapse \(title)" : "Expand \(title)")
+            trailing()
+        }
+    }
+
+    /// The switch, the boundary it works inside, and what it has done —
+    /// one section, because none of the three answers anything alone.
+    @ViewBuilder
+    private var delegationSection: some View {
+        if viewModel.delegation != nil || viewModel.collaboration != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                foldHeader(
+                    "Delegation",
+                    isExpanded: delegationExpanded,
+                    summary: delegationSummary,
+                    toggle: {
+                        delegationExpanded.toggle()
+                        ReviewBoardSettings.setSectionExpanded(
+                            ReviewBoardSettings.delegationExpandedKey, delegationExpanded
+                        )
+                    }
+                ) {
+                    // Folding must never hide the only way out of a broken
+                    // state, so the repair rides the header at every size.
+                    if needsCollaborationRepair {
+                        repairButton
+                    } else if delegationExpanded, let panel = viewModel.delegation {
+                        Text(panel.teamName)
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+
+                if delegationExpanded {
+                    delegationControls
+                    collaborationEvidence
                 }
             }
             .padding(10)
             .background(
                 RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04))
             )
-            .accessibilityElement(children: .combine)
-            .accessibilityIdentifier("reviewBoard.collaboration")
+            .accessibilityIdentifier("reviewBoard.delegation")
         }
     }
 
-    /// The switch, the boundary it works inside, and what it has done.
+    /// What the folded header has to say on one line.
     ///
+    /// The verdict leads. At the board's default width the line truncates
+    /// after roughly two clauses, and putting the level first meant the tail
+    /// that got cut was "no dispatch" — the one clause that decides whether
+    /// this section is worth opening.
+    private var delegationSummary: Text? {
+        let collaboration = viewModel.collaboration
+        guard let panel = viewModel.delegation else {
+            return collaboration.map { Text($0.shortState) }
+        }
+        var text = Text("")
+        if let collaboration {
+            text = Text(collaboration.shortState) + Text(" · ")
+        }
+        text = text + Text(panel.level.displayName)
+            + Text(" · \(panel.workerCount) workers")
+        return text
+    }
+
+    private var needsCollaborationRepair: Bool {
+        guard let panel = viewModel.collaboration else { return false }
+        return panel.state != .healthy && panel.workerCount > 0
+    }
+
+    private var repairButton: some View {
+        Button {
+            Task { await viewModel.repairCollaboration() }
+        } label: {
+            if viewModel.collaborationRepairInFlight {
+                ProgressView().controlSize(.small)
+            } else {
+                Text("Repair")
+            }
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .disabled(viewModel.collaborationRepairInFlight)
+        .help("Rebuild this Project's routes and replace dead agent panes")
+        .accessibilityIdentifier("reviewBoard.repairCollaboration")
+    }
+
     /// How much of this Project the leader hands to workers.
     ///
     /// Same shape as Auto Pilot below, for the same reason: a control that
@@ -565,18 +642,9 @@ extension ReviewBoardPanelView {
     /// all on screen together — "delegated" means nothing without knowing how
     /// many workers there are to delegate to.
     @ViewBuilder
-    private var workDistributionSection: some View {
+    private var delegationControls: some View {
         if let panel = viewModel.delegation {
             VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    sectionTitle("Work Distribution")
-                    Spacer(minLength: 8)
-                    Text(panel.teamName)
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                }
-
                 Picker("", selection: Binding(
                     get: { panel.level },
                     set: { viewModel.setDelegationLevel($0) }
@@ -633,11 +701,55 @@ extension ReviewBoardPanelView {
                     .foregroundColor(panel.everyWorkerIdle ? .orange : .secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(10)
-            .background(
-                RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.04))
-            )
             .accessibilityIdentifier("reviewBoard.workDistribution")
+        }
+    }
+
+    /// Whether the level above is actually happening, as the turn log recorded
+    /// it. Subordinate to the control on purpose: it is the reason to change
+    /// the setting, not a second thing to configure.
+    @ViewBuilder
+    private var collaborationEvidence: some View {
+        if let panel = viewModel.collaboration {
+            VStack(alignment: .leading, spacing: 5) {
+                Divider()
+                    .padding(.vertical, 1)
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Image(systemName: panel.symbolName)
+                        .accessibilityHidden(true)
+                    Text(panel.title)
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                Text(panel.detail)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                // Three numbers on one line read as one fact, and they are
+                // not: the roster is what exists now, the other two total a
+                // bounded history. Separating them is what stops "no dispatch"
+                // and "4 dispatches" from looking like a contradiction.
+                Text("Roster now · \(panel.workerCount) workers")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+                Text("Recent history · \(panel.dispatchCount) dispatches · \(panel.completionCount) completed")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+                if let lastActivity = panel.lastActivity {
+                    Text(
+                        "Newest record "
+                            + (ReviewBoardText.clockTime(lastActivity) ?? lastActivity)
+                    )
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+                if let message = viewModel.collaborationRepairMessage {
+                    Text(message)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .accessibilityIdentifier("reviewBoard.collaboration")
         }
     }
 
@@ -665,9 +777,20 @@ extension ReviewBoardPanelView {
     /// its own leaves "why is this still sitting here" unanswered.
     private var autoPilotSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                sectionTitle("Auto Pilot")
-                Spacer(minLength: 8)
+            foldHeader(
+                "Auto Pilot",
+                isExpanded: autoPilotExpanded,
+                summary: Text(viewModel.autoPilot.isEnabled ? "on" : "off"),
+                toggle: {
+                    autoPilotExpanded.toggle()
+                    ReviewBoardSettings.setSectionExpanded(
+                        ReviewBoardSettings.autoPilotExpandedKey, autoPilotExpanded
+                    )
+                }
+            ) {
+                // The switch stays reachable folded. Arming unattended merging
+                // is the one thing here worth a click without reading first;
+                // the boundary it works inside is one disclosure away.
                 Toggle("", isOn: Binding(
                     get: { viewModel.autoPilot.isEnabled },
                     set: { viewModel.setAutoPilotEnabled($0) }
@@ -678,24 +801,27 @@ extension ReviewBoardPanelView {
                 .accessibilityLabel("Auto Pilot")
             }
 
-            // The boundary is stated whether it is on or off. Someone deciding
-            // whether to turn it on is exactly who needs to read it.
-            Text(boundarySentence)
-                .font(.system(size: 11))
-                .foregroundColor(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if !viewModel.autoPilotUndoPoints.isEmpty {
-                undoList
-            }
-            if let message = viewModel.undoMessage {
-                Text(message)
+            if autoPilotExpanded {
+                // The boundary is stated whether it is on or off. Someone
+                // deciding whether to turn it on is exactly who needs to read
+                // it, which is why expanding is what the summary invites.
+                Text(boundarySentence)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-            }
-            if !viewModel.autoPilotAudit.isEmpty {
-                auditList
+
+                if !viewModel.autoPilotUndoPoints.isEmpty {
+                    undoList
+                }
+                if let message = viewModel.undoMessage {
+                    Text(message)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !viewModel.autoPilotAudit.isEmpty {
+                    auditList
+                }
             }
         }
         .padding(10)

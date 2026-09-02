@@ -394,6 +394,9 @@ final class ReviewBoardViewModel: ObservableObject {
         let state: LeaderTurnLog.CollaborationState
         let title: String
         let detail: String
+        /// The headline compressed to fit a folded section header, where the
+        /// full title would crowd out the level and the roster beside it.
+        let shortState: String
         let symbolName: String
         let workerCount: Int
         let dispatchCount: Int
@@ -549,6 +552,7 @@ final class ReviewBoardViewModel: ObservableObject {
     ) -> CollaborationPanel {
         let title: String
         let detail: String
+        let short: String
         let symbol: String
         // The state is decided by the newest decisive record in the window,
         // while the counts below it total the whole window. Read as one claim
@@ -559,28 +563,34 @@ final class ReviewBoardViewModel: ObservableObject {
         case .healthy:
             title = "Latest evidence: dispatched"
             detail = "Workers received tasks, and nothing since then failed."
+            short = "dispatching"
             symbol = "checkmark.circle.fill"
         case .leaderOnly:
             title = "Latest evidence: no dispatch"
             detail = "The newest record is a stated route with no worker task after it."
+            short = "no dispatch"
             symbol = "person.crop.circle.badge.exclamationmark"
         case .identityMismatch:
             title = "Identity mismatch"
             detail = "Recent evidence belongs to another Project viewer."
+            short = "identity mismatch"
             symbol = "person.crop.circle.badge.xmark"
         case .routeFailure:
             title = "Latest evidence: route failure"
             detail = "A worker delivery or route failed after the last dispatch."
+            short = "route failure"
             symbol = "exclamationmark.triangle.fill"
         case .unmeasured:
             title = "Collaboration unmeasured"
             detail = summary.legacyRecordCount > 0
                 ? "Only legacy name-scoped records are available."
                 : "No identity-scoped task evidence is available."
+            short = "unmeasured"
             symbol = "questionmark.circle"
         }
         return CollaborationPanel(
-            state: summary.state, title: title, detail: detail, symbolName: symbol,
+            state: summary.state, title: title, detail: detail, shortState: short,
+            symbolName: symbol,
             workerCount: summary.workerCount, dispatchCount: summary.dispatchCount,
             completionCount: summary.completionCount, lastActivity: summary.lastActivity
         )

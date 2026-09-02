@@ -54,6 +54,47 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertEqual(panel.completionCount, 5)
     }
 
+    /// The folded header has to state the level, the roster and the newest
+    /// verdict on one line, or collapsing the section hides the reason to
+    /// open it.
+    @MainActor
+    func testCollaborationPanelCarriesAShortStateForTheFoldedHeader() {
+        func short(_ state: LeaderTurnLog.CollaborationState) -> String {
+            ReviewBoardViewModel.collaborationPanel(summary: .init(
+                state: state, routeCount: 1, dispatchCount: 0, completionCount: 0,
+                workerCount: 3, unmetFloorCount: 0, lastActivity: nil,
+                legacyRecordCount: 0
+            )).shortState
+        }
+        let all = LeaderTurnLog.CollaborationState.allCases.map(short)
+        XCTAssertEqual(Set(all).count, all.count, "short states must stay distinguishable")
+        for phrase in all {
+            XCTAssertFalse(phrase.isEmpty)
+            XCTAssertLessThanOrEqual(phrase.count, 20, phrase)
+        }
+        XCTAssertEqual(short(.leaderOnly), "no dispatch")
+    }
+
+    /// Folding is remembered, and the two sections start differently on
+    /// purpose: Delegation is what you set before the first task, Auto Pilot
+    /// is a switch and a log.
+    func testSectionFoldStateDefaultsPerSectionAndRoundTrips() {
+        let defaults = UserDefaults(suiteName: "review-board-fold.\(UUID().uuidString)")!
+        XCTAssertTrue(ReviewBoardSettings.isSectionExpanded(
+            ReviewBoardSettings.delegationExpandedKey, default: true, defaults: defaults
+        ))
+        XCTAssertFalse(ReviewBoardSettings.isSectionExpanded(
+            ReviewBoardSettings.autoPilotExpandedKey, default: false, defaults: defaults
+        ))
+        ReviewBoardSettings.setSectionExpanded(
+            ReviewBoardSettings.delegationExpandedKey, false, defaults: defaults
+        )
+        // A stored false must beat the default, or collapsing never sticks.
+        XCTAssertFalse(ReviewBoardSettings.isSectionExpanded(
+            ReviewBoardSettings.delegationExpandedKey, default: true, defaults: defaults
+        ))
+    }
+
     @MainActor
     func testStatusBadgesCoverRequiredReviewStates() {
         let task = ReviewBoardTask(

@@ -52,7 +52,7 @@ enum LeaderTurnLog {
         let delegationMeasurementStatus: String
     }
 
-    enum CollaborationState: String, Equatable {
+    enum CollaborationState: String, Equatable, CaseIterable {
         case healthy
         case leaderOnly
         case identityMismatch

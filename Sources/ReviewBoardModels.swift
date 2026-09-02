@@ -64,6 +64,26 @@ enum ReviewBoardSettings {
     static func saveWidth(_ width: CGFloat, defaults: UserDefaults = .standard) {
         defaults.set(Double(clampedWidth(width)), forKey: widthKey)
     }
+
+    static let delegationExpandedKey = "reviewBoard.delegationExpanded"
+    static let autoPilotExpandedKey = "reviewBoard.autoPilotExpanded"
+
+    /// Defaults differ on purpose. Delegation is what someone sets before
+    /// handing out the first task, so a Project that has never been configured
+    /// must not hide it. Auto Pilot is a switch plus a log — findable, not in
+    /// the way of the row someone opened the board to read.
+    static func isSectionExpanded(
+        _ key: String, default fallback: Bool, defaults: UserDefaults = .standard
+    ) -> Bool {
+        guard defaults.object(forKey: key) != nil else { return fallback }
+        return defaults.bool(forKey: key)
+    }
+
+    static func setSectionExpanded(
+        _ key: String, _ expanded: Bool, defaults: UserDefaults = .standard
+    ) {
+        defaults.set(expanded, forKey: key)
+    }
 }
 
 extension Notification.Name {
