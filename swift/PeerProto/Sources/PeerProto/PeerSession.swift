@@ -1213,7 +1213,8 @@ public actor PeerSession {
     @discardableResult
     public func terminateSurface(
         requestID suppliedRequestID: Data? = nil,
-        surfaceID: Data
+        surfaceID: Data,
+        timeoutSeconds: TimeInterval = 5
     ) async throws -> Termmesh_Peer_V1_TerminateSurfaceResult {
         try requireHostCapability(PeerCapability.surfaceTerminateV1)
         let requestID = suppliedRequestID ?? Self.makeEnsureRequestID()
@@ -1235,7 +1236,16 @@ public actor PeerSession {
             request.surfaceID = surfaceID
             env.terminateSurfaceRequest = request
         }
-        let reply = try await readFrame()
+        let reply: Termmesh_Peer_V1_Envelope
+        do {
+            reply = try await readFrame(
+                timeoutSeconds: timeoutSeconds,
+                operation: "terminateSurface"
+            )
+        } catch {
+            await close(reason: "terminateSurface failed: \(error)")
+            throw error
+        }
         guard case .terminateSurfaceResponse(let response) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(
                 "expected TerminateSurfaceResponse, got \(String(describing: reply.payload))"

@@ -372,6 +372,7 @@ extension Workspace: BonsplitDelegate {
             if let closedBrowserRestoreSnapshot {
                 onClosedBrowserPanel?(closedBrowserRestoreSnapshot)
             }
+            unexposeForClosingPanel(panelId)
             panel?.close()
             AutoReplyPoller.shared.forget(panelId: panelId)
             PeerHostCoordinator.shared.invalidateTapHub(forSurfaceId: panelId)
@@ -505,6 +506,7 @@ extension Workspace: BonsplitDelegate {
 
         if !closedPanelIds.isEmpty {
             for panelId in closedPanelIds {
+                unexposeForClosingPanel(panelId)
                 panels[panelId]?.close()
                 // Mirror the cleanup applied in didCloseTab (non-detach) and
                 // TabManager.closeWorkspace so a single-pane Bonsplit close

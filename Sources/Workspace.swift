@@ -75,7 +75,7 @@ final class Workspace: Identifiable {
     let bonsplitController: BonsplitController
     /// Read by the pane header on every draw, so it is a plain reference to the
     /// one app-wide mirror rather than per-workspace state to keep in sync.
-    private var remoteExposureStore: RemoteExposureStore { .shared }
+    @ObservationIgnored var remoteExposureStore: RemoteExposureStore = .shared
     /// Which of this workspace's panels the header last drew as exposed.
     ///
     /// Kept so a registry change redraws only the headers whose answer moved.
@@ -475,6 +475,7 @@ final class Workspace: Identifiable {
                 guard let self else { return }
                 let exposed = Set(
                     exposures.values
+                        .filter { $0.expiresAt > Date().timeIntervalSince1970 }
                         .compactMap { UUID(uuidString: $0.surfaceID) }
                         .filter { self.panels[$0] != nil }
                 )
@@ -486,14 +487,7 @@ final class Workspace: Identifiable {
                     self.bonsplitController.invalidatePaneHeaderActions(forTab: tabId)
                 }
             }
-        NotificationCenter.default.addObserver(
-            forName: NSApplication.didBecomeActiveNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            MainActor.assumeIsolated { RemoteExposureStore.shared.refresh() }
-        }
-        remoteExposureStore.refresh()
+        remoteExposureStore.startMonitoring()
     }
 
     private func configurePaneHeaderActions() {
@@ -588,40 +582,68 @@ final class Workspace: Identifiable {
     ) -> BonsplitController.PaneHeaderAction? {
         guard panel.panelType != .browser else { return nil }
         let surfaceID = panelId.uuidString
-        let isExposed = remoteExposureStore.isExposed(surfaceID)
+        let presentation = Self.mobileExposurePresentation(
+            isExposed: remoteExposureStore.isExposed(surfaceID)
+        )
         let title = bonsplitController.tab(tabId)?.title ?? ""
         return BonsplitController.PaneHeaderAction(
             id: "mobile-exposure-\(panelId.uuidString)",
-            systemImage: isExposed
-                ? "iphone.radiowaves.left.and.right"
-                : "iphone",
-            help: isExposed
-                ? "Stop showing this pane on the mobile page"
-                : "Show this pane on the mobile page",
-            accessibilityLabel: isExposed
-                ? "Stop mobile remote control for this pane"
-                : "Start mobile remote control for this pane",
+            systemImage: presentation.systemImage,
+            help: presentation.help,
+            accessibilityLabel: presentation.accessibilityLabel,
             action: { [weak self] in
                 guard let self else { return }
                 Task { @MainActor in
                     await self.toggleMobileExposure(
-                        panelId: panelId, panel: panel, tabId: tabId, title: title
+                        panelId: panelId, panel: panel, tabId: tabId, title: title,
+                        shouldExpose: presentation.shouldExpose
                     )
                 }
             }
         )
     }
 
+    struct MobileExposurePresentation: Equatable {
+        let shouldExpose: Bool
+        let systemImage: String
+        let help: String
+        let accessibilityLabel: String
+    }
+
+    nonisolated static func mobileExposurePresentation(
+        isExposed: Bool
+    ) -> MobileExposurePresentation {
+        MobileExposurePresentation(
+            shouldExpose: !isExposed,
+            systemImage: isExposed ? "iphone.radiowaves.left.and.right" : "iphone",
+            help: isExposed
+                ? "Stop showing this pane on the mobile page"
+                : "Show this pane on the mobile page",
+            accessibilityLabel: isExposed
+                ? "Stop mobile remote control for this pane"
+                : "Start mobile remote control for this pane"
+        )
+    }
+
+    nonisolated static func mobileExposureCWD(
+        panelDirectory: String?,
+        workspaceDirectory: String
+    ) -> String {
+        guard let panelDirectory, !panelDirectory.isEmpty else { return workspaceDirectory }
+        return panelDirectory
+    }
+
     private func toggleMobileExposure(
         panelId: UUID,
         panel: Panel,
         tabId: TabID,
-        title: String
+        title: String,
+        shouldExpose: Bool
     ) async {
         let surfaceID = panelId.uuidString
         defer { bonsplitController.invalidatePaneHeaderActions(forTab: tabId) }
 
-        if remoteExposureStore.isExposed(surfaceID) {
+        if !shouldExpose {
             if case .failure(let error) = await remoteExposureStore.unexpose(surfaceID) {
                 RemoteWorkLog.error("Could not stop mobile remote control: \(error)")
             }
@@ -670,7 +692,10 @@ final class Workspace: Identifiable {
             surfaceID: panelId.uuidString,
             panelType: panel.panelType,
             title: title,
-            cwd: FileManager.default.currentDirectoryPath
+            cwd: Self.mobileExposureCWD(
+                panelDirectory: panelDirectories[panelId],
+                workspaceDirectory: currentDirectory
+            )
         )
         if let teamName = TeamOrchestrator.shared.teamName(containingPanelId: panelId),
            let team = TeamOrchestrator.shared.teams[teamName] {
@@ -684,6 +709,15 @@ final class Workspace: Identifiable {
             }
         }
         return identity
+    }
+
+    /// Closing a local pane must remove its mobile target while the app socket
+    /// is still alive. Best effort and non-blocking: panel teardown never waits
+    /// for the daemon.
+    func unexposeForClosingPanel(_ panelId: UUID) {
+        Task { @MainActor [remoteExposureStore] in
+            _ = await remoteExposureStore.unexpose(panelId.uuidString)
+        }
     }
 
     struct AgentRestartPresentation: Equatable {

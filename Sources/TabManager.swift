@@ -1144,6 +1144,7 @@ class TabManager {
                 TerminalController.shared.v2CleanupSurface(tabId.uuid)
             }
             TerminalController.shared.v2CleanupSurface(panelId)
+            workspace.unexposeForClosingPanel(panelId)
             panel.close()
             AutoReplyPoller.shared.forget(panelId: panelId)
             PeerHostCoordinator.shared.invalidateTapHub(forSurfaceId: panelId)

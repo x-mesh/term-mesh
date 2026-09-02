@@ -14,11 +14,23 @@ import Bonsplit
 /// daemon and it uses exactly one call.
 private final class ScriptedDaemon: DaemonService, @unchecked Sendable {
     var replies: [String: String] = [:]
-    private(set) var calls: [(method: String, params: [String: Any])] = []
+    var handlers: [String: @Sendable ([String: Any]) -> String?] = [:]
+    private let lock = NSLock()
+    private var recordedCalls: [(method: String, params: [String: Any])] = []
+
+    var calls: [(method: String, params: [String: Any])] {
+        lock.lock(); defer { lock.unlock() }
+        return recordedCalls
+    }
 
     func rpcCallRaw(method: String, params: [String: Any]) -> String? {
-        calls.append((method, params))
-        return replies[method]
+        lock.lock()
+        recordedCalls.append((method, params))
+        let handler = handlers[method]
+        let reply = replies[method]
+        lock.unlock()
+        if let handler { return handler(params) }
+        return reply
     }
 
     // MARK: - Unused protocol surface
@@ -95,6 +107,79 @@ final class RemoteExposureStoreTests: XCTestCase {
         clock = Date(timeIntervalSince1970: 1_101)
         XCTAssertFalse(store.isExposed(surface), "past expires_at the cache is stale, not authoritative")
         XCTAssertNil(store.exposure(surface))
+    }
+
+    func testPruningExpiryPublishesRemovalForHeaderInvalidation() async {
+        let daemon = ScriptedDaemon()
+        var clock = Date(timeIntervalSince1970: 1_000)
+        let store = RemoteExposureStore(daemon: daemon, now: { clock })
+        daemon.replies["remote.list"] = entry(surface, expiresAt: 1_100)
+        store.refresh()
+        await store.settle()
+        let before = store.revision
+
+        clock = Date(timeIntervalSince1970: 1_101)
+        store.pruneExpired()
+
+        XCTAssertNil(store.exposures[surface])
+        XCTAssertEqual(store.revision, before + 1)
+    }
+
+    func testStaleRefreshCannotOverwriteNewerExposeMutation() async {
+        let daemon = ScriptedDaemon()
+        let releaseRefresh = DispatchSemaphore(value: 0)
+        daemon.handlers["remote.list"] = { _ in
+            releaseRefresh.wait()
+            return "{\"status\":\"ok\",\"entries\":[],\"pruned\":0,\"now\":0}"
+        }
+        daemon.replies["remote.on"] = """
+        {"status":"ok","entry":{"surface_id":"\(surface)","kind":"pane",\
+        "title":"executor","expires_at":1600},"listener_enabled":true}
+        """
+        let store = RemoteExposureStore(
+            daemon: daemon, now: { Date(timeIntervalSince1970: 1_000) }
+        )
+
+        store.refresh()
+        for _ in 0..<200 where !daemon.calls.contains(where: { $0.method == "remote.list" }) {
+            await Task.yield()
+        }
+        XCTAssertTrue(daemon.calls.contains(where: { $0.method == "remote.list" }))
+        _ = await store.expose(["surface_id": surface])
+        releaseRefresh.signal()
+        await store.settle()
+
+        XCTAssertTrue(store.isExposed(surface), "older list result must not erase newer on")
+    }
+
+    func testMonitoringStartsOnlyOneAppWidePoller() {
+        let daemon = ScriptedDaemon()
+        let store = RemoteExposureStore(daemon: daemon)
+        store.startMonitoring()
+        store.startMonitoring()
+        XCTAssertTrue(store.monitoringForTesting)
+        store.stopMonitoringForTesting()
+        XCTAssertFalse(store.monitoringForTesting)
+    }
+
+    func testMonitoringObservesExternalCurrentPaneChangesWithoutRefocus() async {
+        let daemon = ScriptedDaemon()
+        daemon.replies["remote.list"] = "{\"status\":\"ok\",\"entries\":[]}"
+        let store = RemoteExposureStore(
+            daemon: daemon,
+            now: { Date(timeIntervalSince1970: 1_000) },
+            pollNanoseconds: 10_000_000
+        )
+        store.startMonitoring()
+        await store.settle()
+        daemon.replies["remote.list"] = entry(surface, expiresAt: 1_100)
+
+        for _ in 0..<200 where !store.isExposed(surface) {
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+
+        XCTAssertTrue(store.isExposed(surface))
+        store.stopMonitoringForTesting()
     }
 
     /// The reply is what gets stored. Deriving the expiry from the requested
@@ -314,6 +399,45 @@ final class RemoteExposureSpecTests: XCTestCase {
 
 @MainActor
 final class PaneHeaderInvalidationTests: XCTestCase {
+    func testStopPresentationKeepsStopIntentWhenClockLaterExpires() {
+        let presentation = Workspace.mobileExposurePresentation(isExposed: true)
+        XCTAssertFalse(presentation.shouldExpose)
+        XCTAssertEqual(presentation.systemImage, "iphone.radiowaves.left.and.right")
+        XCTAssertTrue(presentation.help.hasPrefix("Stop"))
+    }
+
+    func testPaneDirectoryWinsOverWorkspaceDirectoryForExposure() {
+        XCTAssertEqual(
+            Workspace.mobileExposureCWD(
+                panelDirectory: "/repo/pane", workspaceDirectory: "/repo/workspace"
+            ),
+            "/repo/pane"
+        )
+        XCTAssertEqual(
+            Workspace.mobileExposureCWD(
+                panelDirectory: nil, workspaceDirectory: "/repo/workspace"
+            ),
+            "/repo/workspace"
+        )
+    }
+
+    func testClosingPaneRequestsBestEffortUnexpose() async {
+        let daemon = ScriptedDaemon()
+        daemon.replies["remote.off"] = "{\"status\":\"ok\",\"removed\":true}"
+        let store = RemoteExposureStore(daemon: daemon)
+        let workspace = Workspace(title: "close-unexpose")
+        workspace.remoteExposureStore = store
+        let panelID = try! XCTUnwrap(workspace.panels.keys.first)
+
+        workspace.unexposeForClosingPanel(panelID)
+        for _ in 0..<200 where !daemon.calls.contains(where: { $0.method == "remote.off" }) {
+            await Task.yield()
+        }
+
+        let call = daemon.calls.first(where: { $0.method == "remote.off" })
+        XCTAssertEqual(call?.params["surface_id"] as? String, panelID.uuidString)
+    }
+
     /// One pane's exposure change must redraw one header.
     ///
     /// The signal lives on PaneState rather than on the controller precisely

@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 /// The app's view of the daemon's mobile exposure registry.
 ///
@@ -57,10 +58,20 @@ final class RemoteExposureStore: ObservableObject {
     private let daemon: any DaemonService
     private let now: () -> Date
     private var refreshTask: Task<Void, Never>?
+    private var expiryTask: Task<Void, Never>?
+    private var pollingTask: Task<Void, Never>?
+    private var activationObserver: NSObjectProtocol?
+    private var mutationGeneration: UInt64 = 0
+    private let pollNanoseconds: UInt64
 
-    init(daemon: any DaemonService, now: @escaping () -> Date = Date.init) {
+    init(
+        daemon: any DaemonService,
+        now: @escaping () -> Date = Date.init,
+        pollNanoseconds: UInt64 = 2_000_000_000
+    ) {
         self.daemon = daemon
         self.now = now
+        self.pollNanoseconds = pollNanoseconds
     }
 
     // MARK: - Reading
@@ -82,6 +93,28 @@ final class RemoteExposureStore: ObservableObject {
 
     // MARK: - Refreshing
 
+    /// Start the one app-wide monitor used by every Workspace header.
+    /// Idempotent: workspace churn never adds another observer or poller.
+    func startMonitoring() {
+        guard pollingTask == nil else { return }
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+        let pollNanoseconds = self.pollNanoseconds
+        pollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: pollNanoseconds)
+                guard !Task.isCancelled, let self else { return }
+                self.refresh()
+            }
+        }
+        refresh()
+    }
+
     /// Re-read the registry.
     ///
     /// Coalesced: a refresh already running is left to finish rather than
@@ -89,11 +122,13 @@ final class RemoteExposureStore: ObservableObject {
     /// focus and after a toggle, not on a tight timer.
     func refresh() {
         guard refreshTask == nil else { return }
+        let generation = mutationGeneration
         refreshTask = Task { [weak self] in
             guard let self else { return }
             let entries = await Self.list(daemon: self.daemon)
             self.refreshTask = nil
             guard let entries else { return }
+            guard self.mutationGeneration == generation else { return }
             self.publish(entries)
         }
     }
@@ -114,9 +149,11 @@ final class RemoteExposureStore: ObservableObject {
         }.value
         guard let object = Self.decode(raw) else { return .failure(.unavailable) }
         if let error = object["error"] as? String { return .failure(.rejected(error)) }
+        mutationGeneration &+= 1
         if let entry = (object["entry"] as? [String: Any]).flatMap(Self.exposure(from:)) {
             exposures[entry.surfaceID] = entry
             revision &+= 1
+            scheduleExpiry()
         }
         return .success(ExposureResult(
             surfaceID: surfaceID,
@@ -136,18 +173,66 @@ final class RemoteExposureStore: ObservableObject {
         if let error = object["error"] as? String { return .failure(.rejected(error)) }
         // Drop it locally whether or not the daemon had it: `removed: false`
         // means it was already gone, which is the state being asked for.
+        mutationGeneration &+= 1
         if exposures.removeValue(forKey: surfaceID) != nil { revision &+= 1 }
+        scheduleExpiry()
         return .success(())
     }
 
     // MARK: - Internals
 
     private func publish(_ entries: [Exposure]) {
-        let next = Dictionary(entries.map { ($0.surfaceID, $0) }) { first, _ in first }
+        let cutoff = now().timeIntervalSince1970
+        let live = entries.filter { $0.expiresAt > cutoff }
+        let next = Dictionary(live.map { ($0.surfaceID, $0) }) { first, _ in first }
         guard next != exposures else { return }
         exposures = next
         revision &+= 1
+        scheduleExpiry()
     }
+
+    private func scheduleExpiry() {
+        expiryTask?.cancel()
+        guard let earliest = exposures.values.map(\.expiresAt).min() else {
+            expiryTask = nil
+            return
+        }
+        let delay = max(earliest - now().timeIntervalSince1970, 0)
+        expiryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            self.expiryTask = nil
+            self.pruneExpired()
+        }
+    }
+
+    /// Internal seam used by the expiry task and deterministic tests.
+    func pruneExpired() {
+        let cutoff = now().timeIntervalSince1970
+        let next = exposures.filter { $0.value.expiresAt > cutoff }
+        guard next != exposures else {
+            scheduleExpiry()
+            return
+        }
+        exposures = next
+        revision &+= 1
+        scheduleExpiry()
+    }
+
+    #if DEBUG
+    func stopMonitoringForTesting() {
+        pollingTask?.cancel()
+        pollingTask = nil
+        expiryTask?.cancel()
+        expiryTask = nil
+        if let activationObserver {
+            NotificationCenter.default.removeObserver(activationObserver)
+            self.activationObserver = nil
+        }
+    }
+
+    var monitoringForTesting: Bool { pollingTask != nil }
+    #endif
 
     private static func list(daemon: any DaemonService) async -> [Exposure]? {
         // `rpcCallRaw` blocks for up to its timeout. Off-main, always.
