@@ -4,6 +4,12 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.226.0] - 2026-09-03
+
+### Fixed
+
+- Restored reliable remote Project leader control when several viewer connections are open, and added a deterministic **Repair collaboration** action that refreshes routes, verifies the leader control path, and preserves live agent sessions.
+
 ## [0.225.0] - 2026-09-02
 
 ### Added
