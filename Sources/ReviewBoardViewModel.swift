@@ -47,8 +47,9 @@ final class ReviewBoardViewModel: ObservableObject {
     @Published private(set) var activeTeamName: String?
     @Published private(set) var delegation: DelegationPanel?
     @Published private(set) var collaboration: CollaborationPanel?
-    @Published private(set) var collaborationRepairInFlight = false
-    @Published private(set) var collaborationRepairMessage: String?
+    @Published private(set) var collaborationRepairOutcome: CollaborationRepairOutcome = .idle
+
+    var collaborationRepairInFlight: Bool { collaborationRepairOutcome.isRunning }
 
     /// The boundary, as configured. Read from settings so what the toggle
     /// shows and what the runner enforces cannot drift apart.
@@ -404,6 +405,15 @@ final class ReviewBoardViewModel: ObservableObject {
         let lastActivity: String?
     }
 
+    enum CollaborationRepairOutcome: Equatable {
+        case idle
+        case running
+        case verified(String)
+        case failed(String)
+
+        var isRunning: Bool { self == .running }
+    }
+
     /// Where the board's Project comes from, injected the way the snapshot is.
     ///
     /// A pushed value loses the race with workspace restore — at launch there
@@ -418,6 +428,7 @@ final class ReviewBoardViewModel: ObservableObject {
     func setActiveTeam(_ teamName: String?) {
         guard activeTeamName != teamName else { return }
         activeTeamName = teamName
+        if !collaborationRepairInFlight { collaborationRepairOutcome = .idle }
         refreshDelegationPanel()
     }
 
@@ -449,7 +460,10 @@ final class ReviewBoardViewModel: ObservableObject {
 
     private func refreshDelegationPanel() {
         let resolved = activeTeamProvider() ?? activeTeamName
-        if activeTeamName != resolved { activeTeamName = resolved }
+        if activeTeamName != resolved {
+            activeTeamName = resolved
+            if !collaborationRepairInFlight { collaborationRepairOutcome = .idle }
+        }
         let next = Self.delegationPanel(for: resolved)
         if delegation != next { delegation = next }
         let nextCollaboration = Self.collaborationPanel(
@@ -547,6 +561,27 @@ final class ReviewBoardViewModel: ObservableObject {
         fetchedTeam == activeTeam
     }
 
+    static func shouldStartCollaborationRepair(
+        isRunning: Bool,
+        teamName: String?
+    ) -> Bool {
+        !isRunning && teamName != nil
+    }
+
+    static func shouldPublishCollaborationRepair(
+        repairedTeam: String,
+        activeTeam: String?
+    ) -> Bool {
+        repairedTeam == activeTeam
+    }
+
+    static func collaborationRepairOutcome(
+        succeeded: Bool,
+        message: String
+    ) -> CollaborationRepairOutcome {
+        succeeded ? .verified(message) : .failed(message)
+    }
+
     static func collaborationPanel(
         summary: LeaderTurnLog.CollaborationSummary
     ) -> CollaborationPanel {
@@ -597,13 +632,22 @@ final class ReviewBoardViewModel: ObservableObject {
     }
 
     func repairCollaboration() async {
-        guard !collaborationRepairInFlight, let teamName = activeTeamName else { return }
-        collaborationRepairInFlight = true
-        collaborationRepairMessage = nil
+        guard Self.shouldStartCollaborationRepair(
+            isRunning: collaborationRepairInFlight,
+            teamName: activeTeamName
+        ), let teamName = activeTeamName else { return }
+        collaborationRepairOutcome = .running
         let report = await TeamOrchestrator.shared.repairCollaboration(teamName: teamName)
-        collaborationRepairInFlight = false
-        if (activeTeamProvider() ?? activeTeamName) == teamName {
-            collaborationRepairMessage = report.message
+        if Self.shouldPublishCollaborationRepair(
+            repairedTeam: teamName,
+            activeTeam: activeTeamProvider() ?? activeTeamName
+        ) {
+            collaborationRepairOutcome = Self.collaborationRepairOutcome(
+                succeeded: report.succeeded,
+                message: report.message
+            )
+        } else {
+            collaborationRepairOutcome = .idle
         }
         remoteCollaborationFetchedAt[teamName] = .distantPast
         refreshDelegationPanel()
