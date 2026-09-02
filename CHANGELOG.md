@@ -4,6 +4,32 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.224.0] - 2026-09-02
+
+### Added
+
+- Add Work Distribution controls to the Review Board: pick how much of a Project the leader hands to workers, cap a parallel wave, and choose whether each turn states the floor.
+- Show collaboration health for a Project beside those controls, with a Repair action that rebuilds its routes and replaces dead agent panes.
+- Answer a remote agent's first-run trust prompt during startup so an adopted Project does not stall on it.
+- Add a Restart Host Daemon action for a peer host.
+- Recover a leader that launched before the route-file contract by discovering the adopted viewer's route file, so its running agent commands keep working without a restart.
+
+### Changed
+
+- Fold the Review Board's settings into two sections that remember whether they are open, and merge the delegation level and its evidence into one card. The folded header keeps the verdict, the Repair action, and Auto Pilot's limits on screen.
+- State which scope each collaboration figure describes. The headline judges the newest record and the counts total recent history, so a Project can show "no dispatch" over four earlier dispatches without contradicting itself.
+- Treat an unstated task shape as unstated rather than as work that cannot be split, so an unclassified turn no longer closes the parallel gate.
+
+### Fixed
+
+- Keep per-Project execution settings separate for Projects whose names hold no ASCII. Every such Project shared one entry and overwrote the others.
+- Deliver a leader's participation settings reliably. A failed write used to leave the leader reading a stale file for the rest of the session, and a change made while a write was in flight could be dropped.
+- Deliver a task to a named agent when a live one exists, instead of reporting the first unhealthy agent that shares its name.
+- Retry an undelivered first-run prompt answer instead of leaving the pane waiting forever, and never repeat a partly delivered key sequence.
+- Record delegation for a turn on a busy host. Turns that did delegate were reported as leader-only once the log outgrew the window the check read.
+- Survive a peer host that reports two panes with the same surface id, which could end the app during recovery.
+- Identify macOS processes by start time as well as pid, so a recycled pid is no longer mistaken for a live pane.
+
 ## [0.223.0] - 2026-09-01
 
 ### Added
