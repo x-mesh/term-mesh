@@ -37,10 +37,23 @@ final class TeamOrchestrator: ObservableObject {
     /// Last control-file payload written per team, so a daemon sync that
     /// changed nothing does not re-send a peer's file over SSH.
     private var leaderParticipationControlPayloads: [String: Data] = [:]
-    /// Teams whose remote control-file write has been dispatched and not yet
-    /// answered. Daemon syncs are far more frequent than the write, so without
-    /// this every sync would open another SSH write for the same payload.
+    /// Teams with a writer draining `leaderParticipationControlPending`.
+    /// Daemon syncs are far more frequent than an SSH write, so without this
+    /// every sync would open another write for the same payload.
     private var leaderParticipationControlWritesInFlight: Set<String> = []
+    /// The newest payload each team still needs written.
+    ///
+    /// Coalesced, not dropped. Skipping a sync outright while a write was in
+    /// flight lost whatever that sync wanted written: a settings change lands
+    /// through one `refreshLeaderParticipationControls()` call, so if that one
+    /// call was the skipped one, nothing retried and the leader never saw it.
+    private var leaderParticipationControlPending: [String: RemoteLeaderControlWrite] = [:]
+
+    struct RemoteLeaderControlWrite {
+        let hostKey: String
+        let teamUUID: String
+        let payload: Data
+    }
 
     /// Stable identity used to decide whether a same-named Project is the
     /// exact existing Project or a namespace collision. The display name is
@@ -4209,28 +4222,42 @@ final class TeamOrchestrator: ObservableObject {
                     supportedLeader: supported, delegationState: delegationState,
                     healthScope: .executionHost
                 ), leaderParticipationControlPayloads[team.id] != data else { continue }
-                guard leaderParticipationControlWritesInFlight.insert(team.id).inserted
-                else { continue }
-#if DEBUG
-                dlog("leaderControl.send team=\(team.id) uuid=\(teamUUID) bytes=\(data.count)")
-#endif
                 let teamID = team.id
-                Task {
-                    // Record the payload only after the write lands. Caching it
-                    // before the SSH attempt made a single failure permanent:
-                    // the identical payload compared equal on every later sync,
-                    // so the leader kept reading the stale control file for the
-                    // rest of the session. Leaving the cache untouched lets the
-                    // next sync retry.
-                    let written = await Self.refreshRemoteLeaderParticipationControl(
-                        hostKey: hostKey, teamUUID: teamUUID, teamName: teamID,
-                        sessionID: team.leaderSessionId, supportedLeader: supported,
-                        delegationState: delegationState
-                    )
-                    self.leaderParticipationControlWritesInFlight.remove(teamID)
-                    if written { self.leaderParticipationControlPayloads[teamID] = data }
-                }
+                // Queue the newest payload, then start a writer only if none is
+                // running. A writer already draining picks this up on its next
+                // turn, so a settings change made during an SSH write is
+                // delayed rather than lost.
+                leaderParticipationControlPending[teamID] = RemoteLeaderControlWrite(
+                    hostKey: hostKey, teamUUID: teamUUID, payload: data
+                )
+#if DEBUG
+                dlog("leaderControl.send team=\(teamID) uuid=\(teamUUID) bytes=\(data.count)")
+#endif
+                guard leaderParticipationControlWritesInFlight.insert(teamID).inserted
+                else { continue }
+                Task { await self.drainLeaderParticipationControl(teamID) }
             }
+        }
+    }
+
+    /// Write this team's queued control payloads until none is left.
+    ///
+    /// One writer per team, so writes cannot land out of order, and the queue
+    /// is re-read after every write so a payload queued mid-flight is written
+    /// rather than waiting for some later sync to notice.
+    private func drainLeaderParticipationControl(_ teamID: String) async {
+        defer { leaderParticipationControlWritesInFlight.remove(teamID) }
+        while let job = leaderParticipationControlPending.removeValue(forKey: teamID) {
+            // Record the payload only after the write lands. Caching it before
+            // the SSH attempt made a single failure permanent: the identical
+            // payload compared equal on every later sync, so the leader kept
+            // reading the stale control file for the rest of the session.
+            // Leaving the cache untouched lets the next sync re-queue.
+            let written = await Self.refreshRemoteLeaderParticipationControl(
+                hostKey: job.hostKey, teamUUID: job.teamUUID, teamName: teamID,
+                payload: job.payload
+            )
+            if written { leaderParticipationControlPayloads[teamID] = job.payload }
         }
     }
 

@@ -5010,8 +5010,7 @@ extension TeamOrchestrator {
     ///   delivered; a swallowed SSH failure must not look like a write.
     @discardableResult
     static func refreshRemoteLeaderParticipationControl(
-        hostKey: String, teamUUID: String, teamName: String, sessionID: String,
-        supportedLeader: Bool, delegationState: ProjectDelegationState
+        hostKey: String, teamUUID: String, teamName: String, payload data: Data
     ) async -> Bool {
         guard let host = await MainActor.run(body: {
             RemoteHostStore.shared.sortedHosts.first { $0.id == hostKey }
@@ -5021,16 +5020,9 @@ extension TeamOrchestrator {
 #endif
             return false
         }
-        guard let data = leaderParticipationControlData(
-            teamName: teamName, sessionID: sessionID, supportedLeader: supportedLeader,
-            delegationState: delegationState,
-            healthScope: .executionHost
-        ) else {
-#if DEBUG
-            dlog("leaderControl.noPayload team=\(teamName)")
-#endif
-            return false
-        }
+        // The caller's exact bytes, not a fresh snapshot: it records these as
+        // delivered, and recomputing here would let the two disagree.
+        //
         // The write is over SSH and every failure inside it is swallowed, so
         // say whether the file the leader reads was actually replaced.
         let written = await writeRemoteLeaderFileOverSSH(
