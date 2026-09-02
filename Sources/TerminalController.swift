@@ -1470,6 +1470,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPeerShellInspect(params: params))
         case "debug.peer.shells.close":
             return v2Result(id: id, self.v2DebugPeerShellClose(params: params))
+        case "debug.peer.shells.fixture":
+            return v2Result(id: id, self.v2DebugPeerShellFixture(params: params))
         case "debug.peer.shells.status":
             return v2Result(id: id, self.v2DebugPeerShellStatus())
         case "debug.reviewboard.delegate":

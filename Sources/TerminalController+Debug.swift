@@ -1646,11 +1646,13 @@ extension TerminalController {
             )
         }
         debugPeerShellInspection = nil
+        let force = (params["force"] as? Bool) ?? false
         Task { @MainActor in
             do {
                 let closed = try await TeamOrchestrator.shared.closePeerShells(
                     host: host,
-                    surfaceIDs: surfaceIDs
+                    surfaceIDs: surfaceIDs,
+                    force: force
                 )
                 debugPeerShellInspection = ["ok": true, "closed": closed]
             } catch {
@@ -1658,6 +1660,30 @@ extension TerminalController {
                     "ok": false,
                     "error": String(describing: error),
                 ]
+            }
+        }
+        return .ok(["started": true])
+    }
+
+    func v2DebugPeerShellFixture(params: [String: Any]) -> V2CallResult {
+        let staleCount = max(1, min((params["stale_count"] as? Int) ?? 7, 32))
+        debugPeerShellInspection = nil
+        Task { @MainActor in
+            do {
+                guard await PeerHostCoordinator.shared.setRunning(true),
+                      let sockPath = PeerHostCoordinator.shared.currentSocketPath
+                else { throw NSError(domain: "PeerShellCleanupFixture", code: 1) }
+                let hostID = "cleanup-force-fixture"
+                let fixture = try await RemoteHostStore.shared.installPeerShellCleanupFixture(
+                    hostID: hostID, sockPath: sockPath, staleCount: staleCount
+                )
+                debugPeerShellInspection = [
+                    "ok": true, "host": hostID,
+                    "surface_ids": fixture.stale.map { $0.base64EncodedString() },
+                    "survivor_id": fixture.survivor.base64EncodedString(),
+                ]
+            } catch {
+                debugPeerShellInspection = ["ok": false, "error": String(describing: error)]
             }
         }
         return .ok(["started": true])

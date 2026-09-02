@@ -1,7 +1,193 @@
 import XCTest
 @testable import PeerProto
 
+private actor RecordingTerminateProvider: PeerSurfaceProvider {
+    private(set) var calls = 0
+    private let result: Termmesh_Peer_V1_TerminateSurfaceResult
+
+    init(result: Termmesh_Peer_V1_TerminateSurfaceResult = .terminated) {
+        self.result = result
+    }
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] { [] }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
+    ) async -> PeerSurfaceAttachment? { nil }
+
+    func terminateSurface(
+        surfaceID: Data
+    ) async -> Termmesh_Peer_V1_TerminateSurfaceResult {
+        calls += 1
+        return result
+    }
+}
+
 final class PeerServerTests: XCTestCase {
+    func testTerminateMissingSurfaceReturnsCorrelatedIdempotentNotFound() async throws {
+        let sockPath = "/tmp/tm-peer-terminate-missing-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: [])
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+
+        let result = try await session.terminateSurface(
+            requestID: Data(repeating: 0x31, count: 16),
+            surfaceID: Data(repeating: 0x41, count: 16)
+        )
+        XCTAssertEqual(result, .notFound)
+        try await session.sendGoodbye(reason: "terminate missing test done")
+        await transport.close()
+    }
+
+    func testTerminateRejectsMalformedAndDuplicateRequestsBeforeProviderMutation() async throws {
+        let sockPath = "/tmp/tm-peer-terminate-validate-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let provider = RecordingTerminateProvider()
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+        var responseBytes = Data()
+
+        func terminate(
+            seq: UInt64, requestID: Data, surfaceID: Data
+        ) async throws -> Termmesh_Peer_V1_TerminateSurfaceResponse {
+            var request = Termmesh_Peer_V1_TerminateSurfaceRequest()
+            request.requestID = requestID
+            request.surfaceID = surfaceID
+            var envelope = Termmesh_Peer_V1_Envelope()
+            envelope.seq = seq
+            envelope.terminateSurfaceRequest = request
+            try await transport.write(encodeFrame(envelope))
+            while true {
+                if let decoded = try decodeFrame(from: &responseBytes),
+                   case .terminateSurfaceResponse(let response) = decoded.payload {
+                    return response
+                }
+                responseBytes.append(try await transport.read())
+            }
+        }
+
+        let surfaceID = Data(repeating: 0x61, count: 16)
+        let malformed = try await terminate(
+            seq: 901, requestID: Data(repeating: 0x62, count: 15), surfaceID: surfaceID
+        )
+        XCTAssertEqual(malformed.result, .failed)
+        XCTAssertEqual(malformed.error.code, .invalidRequest)
+        let callsAfterMalformed = await provider.calls
+        XCTAssertEqual(callsAfterMalformed, 0)
+
+        let requestID = Data(repeating: 0x63, count: 16)
+        let first = try await terminate(seq: 902, requestID: requestID, surfaceID: surfaceID)
+        XCTAssertEqual(first.result, .terminated)
+        let callsAfterFirst = await provider.calls
+        XCTAssertEqual(callsAfterFirst, 1)
+
+        let duplicate = try await terminate(
+            seq: 903, requestID: requestID,
+            surfaceID: Data(repeating: 0x64, count: 16)
+        )
+        XCTAssertEqual(duplicate.result, .failed)
+        XCTAssertEqual(duplicate.error.code, .duplicateRequestID)
+        let callsAfterDuplicate = await provider.calls
+        XCTAssertEqual(callsAfterDuplicate, 1, "duplicate must never replay provider mutation")
+
+        var ensure = Termmesh_Peer_V1_EnsureSurfaceRequest()
+        ensure.requestID = requestID
+        ensure.key = "cross-type"
+        ensure.cwd = "/tmp"
+        ensure.executable = "/usr/bin/true"
+        var ensureEnvelope = Termmesh_Peer_V1_Envelope()
+        ensureEnvelope.seq = 904
+        ensureEnvelope.ensureSurfaceRequest = ensure
+        try await transport.write(encodeFrame(ensureEnvelope))
+        var ensureResponse: Termmesh_Peer_V1_EnsureSurfaceResponse?
+        while ensureResponse == nil {
+            if let decoded = try decodeFrame(from: &responseBytes),
+               case .ensureSurfaceResponse(let response) = decoded.payload {
+                ensureResponse = response
+            } else {
+                responseBytes.append(try await transport.read())
+            }
+        }
+        XCTAssertEqual(ensureResponse?.error.code, .duplicateRequestID)
+
+        let ensureFirstID = Data(repeating: 0x65, count: 16)
+        ensure.requestID = ensureFirstID
+        ensureEnvelope.seq = 905
+        ensureEnvelope.ensureSurfaceRequest = ensure
+        try await transport.write(encodeFrame(ensureEnvelope))
+        var firstEnsure: Termmesh_Peer_V1_EnsureSurfaceResponse?
+        while firstEnsure == nil {
+            if let decoded = try decodeFrame(from: &responseBytes),
+               case .ensureSurfaceResponse(let response) = decoded.payload {
+                firstEnsure = response
+            } else {
+                responseBytes.append(try await transport.read())
+            }
+        }
+        XCTAssertEqual(firstEnsure?.error.code, .invalidRequest)
+        let crossTypeTerminate = try await terminate(
+            seq: 906, requestID: ensureFirstID, surfaceID: surfaceID
+        )
+        XCTAssertEqual(crossTypeTerminate.error.code, .duplicateRequestID)
+        let callsAfterCrossType = await provider.calls
+        XCTAssertEqual(callsAfterCrossType, 1)
+        try await session.sendGoodbye(reason: "terminate validation test done")
+        await transport.close()
+    }
+
+    func testTerminateProviderFailureUsesTerminateStage() async throws {
+        let sockPath = "/tmp/tm-peer-terminate-failed-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: RecordingTerminateProvider(result: .failed)
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+
+        var request = Termmesh_Peer_V1_TerminateSurfaceRequest()
+        request.requestID = Data(repeating: 0x71, count: 16)
+        request.surfaceID = Data(repeating: 0x72, count: 16)
+        var envelope = Termmesh_Peer_V1_Envelope()
+        envelope.seq = 904
+        envelope.terminateSurfaceRequest = request
+        try await transport.write(encodeFrame(envelope))
+        var bytes = Data()
+        var response: Termmesh_Peer_V1_TerminateSurfaceResponse?
+        while response == nil {
+            bytes.append(try await transport.read())
+            if let decoded = try decodeFrame(from: &bytes),
+               case .terminateSurfaceResponse(let value) = decoded.payload {
+                response = value
+            }
+        }
+        let value = try XCTUnwrap(response)
+        XCTAssertEqual(value.result, .failed)
+        XCTAssertEqual(value.error.code, .internal)
+        XCTAssertEqual(value.error.stage, "terminate")
+        try await session.sendGoodbye(reason: "terminate provider failure test done")
+        await transport.close()
+    }
+
     func testHostStatsCapabilityTracksConfiguredProvider() async throws {
         func handshake(config: PeerServerConfig, suffix: String) async throws -> PeerSessionInfo {
             let sockPath = "/tmp/tm-peer-stats-cap-\(suffix)-\(UUID().uuidString.prefix(8)).sock"
@@ -298,10 +484,9 @@ final class PeerServerTests: XCTestCase {
         // publishes terminal panes only and cannot host an agent surface,
         // so PeerServer filters the string out of its own Hello.
         XCTAssertFalse(info.hasHostCapability(PeerCapability.surfaceAgentV1))
-        // The GUI host also has no TerminateSurface handler. Advertising the
-        // daemon-only direct-response RPC would make cleanup wait for a reply
-        // that can never arrive instead of using ClosePane + roster checking.
-        XCTAssertFalse(info.hasHostCapability(PeerCapability.surfaceTerminateV1))
+        // The GUI host owns terminal panes and implements exact, idempotent
+        // termination for them even though it still cannot host agent kinds.
+        XCTAssertTrue(info.hasHostCapability(PeerCapability.surfaceTerminateV1))
         XCTAssertFalse(info.hasHostCapability("totally.unknown.v1"))
 
         let activeSessions = await server.activeSessions

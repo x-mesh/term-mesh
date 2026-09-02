@@ -1673,14 +1673,14 @@ final class PeerRelaySession {
         return true
     }
 
-    /// Submit authoritative termination over this already-admitted relay
-    /// connection. The relay pump consumes the response; cleanup confirms the
-    /// result through the host roster before counting success.
-    @discardableResult
-    func requestTerminateSurface(_ surfaceID: Data) async throws -> Bool {
-        guard let session else { return false }
-        try await session.requestTerminateSurface(surfaceID: surfaceID)
-        return true
+    /// Submit authoritative termination over this already-admitted relay.
+    /// PeerSession's single inbound pump demuxes the correlated response by
+    /// request id, so a saturated host needs no extra connection slot.
+    func requestTerminateSurface(
+        _ surfaceID: Data
+    ) async throws -> Termmesh_Peer_V1_TerminateSurfaceResult? {
+        guard let session else { return nil }
+        return try await session.requestTerminateSurface(surfaceID: surfaceID)
     }
 
     /// Send bytes straight to this attached remote PTY.

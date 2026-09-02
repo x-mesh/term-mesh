@@ -3000,43 +3000,77 @@ final class PeerShellSweepTests: XCTestCase {
         )
     }
 
+    func test_saturated_sweep_keeps_borrowing_after_first_dial_failure() {
+        XCTAssertEqual(TeamOrchestrator.peerShellTerminateRoute(
+            hasOpenedSession: false, dialFailed: false, hasBorrowedSession: true
+        ), .dial)
+        for _ in 0..<7 {
+            XCTAssertEqual(TeamOrchestrator.peerShellTerminateRoute(
+                hasOpenedSession: false, dialFailed: true, hasBorrowedSession: true
+            ), .borrowed)
+        }
+        XCTAssertEqual(TeamOrchestrator.peerShellTerminateRoute(
+            hasOpenedSession: false, dialFailed: true, hasBorrowedSession: false
+        ), .unavailable)
+    }
+
     @MainActor
     func test_force_uses_authoritative_termination_for_the_last_pane() async throws {
         var closeSent = false
         var confirmationRead = false
-        try await TeamOrchestrator.closePeerShellConfirmed(
+        let authoritative = try await TeamOrchestrator.closePeerShellConfirmed(
             surfaceID: Data(repeating: 0x41, count: 16),
             force: true,
             terminate: { .terminated },
             closePane: { closeSent = true },
             confirmRemoved: { confirmationRead = true; return false }
         )
+        XCTAssertTrue(authoritative)
         XCTAssertFalse(closeSent)
         XCTAssertFalse(confirmationRead)
     }
 
     @MainActor
-    func test_force_falls_back_for_an_older_host_and_confirms_removal() async throws {
+    func test_force_authoritative_notFound_is_idempotent_success() async throws {
         var closeSent = false
-        try await TeamOrchestrator.closePeerShellConfirmed(
+        var confirmationRead = false
+        let authoritative = try await TeamOrchestrator.closePeerShellConfirmed(
             surfaceID: Data(repeating: 0x42, count: 16),
             force: true,
             terminate: { .notFound },
             closePane: { closeSent = true },
-            confirmRemoved: { true }
+            confirmRemoved: { confirmationRead = true; return false }
         )
-        XCTAssertTrue(closeSent)
+        XCTAssertTrue(authoritative)
+        XCTAssertFalse(closeSent)
+        XCTAssertFalse(confirmationRead)
     }
 
     @MainActor
-    func test_force_borrowed_termination_still_requires_roster_confirmation() async throws {
+    func test_older_host_close_with_roster_confirmation_is_cache_safe_success() async throws {
+        var closeSent = false
+        var confirmationRead = false
+        let confirmed = try await TeamOrchestrator.closePeerShellConfirmed(
+            surfaceID: Data(repeating: 0x45, count: 16),
+            force: true,
+            terminate: { throw PeerSessionError.capabilityNotNegotiated("surface.terminate.v1") },
+            closePane: { closeSent = true },
+            confirmRemoved: { confirmationRead = true; return true }
+        )
+        XCTAssertTrue(confirmed)
+        XCTAssertTrue(closeSent)
+        XCTAssertTrue(confirmationRead)
+    }
+
+    @MainActor
+    func test_force_failed_termination_still_requires_roster_confirmation() async throws {
         var closeSent = false
         var confirmationRead = false
         do {
             try await TeamOrchestrator.closePeerShellConfirmed(
                 surfaceID: Data(repeating: 0x44, count: 16),
                 force: true,
-                terminate: { .notFound },
+                terminate: { .failed },
                 closePane: { closeSent = true },
                 confirmRemoved: { confirmationRead = true; return false }
             )
@@ -3053,7 +3087,7 @@ final class PeerShellSweepTests: XCTestCase {
             _ = try await TeamOrchestrator.sweepClose(
                 targets: [Data(repeating: 0x43, count: 16)],
                 send: { surfaceID in
-                    try await TeamOrchestrator.closePeerShellConfirmed(
+                    _ = try await TeamOrchestrator.closePeerShellConfirmed(
                         surfaceID: surfaceID,
                         force: false,
                         terminate: { .notFound },
@@ -3070,6 +3104,92 @@ final class PeerShellSweepTests: XCTestCase {
             XCTAssertEqual(closed, 0)
             XCTAssertEqual(failed, 1)
         }
+    }
+
+    func test_authoritative_absence_removes_exact_rows_and_recomputes_counts() {
+        func pane(_ id: UInt8, tabs: Int, busy: Bool) -> RemotePaneSummary {
+            RemotePaneSummary(
+                id: Data([id]), title: "pane-\(id)",
+                workingDirectoryPath: "/tmp", workingDirectoryName: "tmp",
+                projectRootPath: nil, tabCount: tabs, columns: 80, rows: 24,
+                isBusy: busy
+            )
+        }
+        func workspace(_ id: UInt8, panes: [RemotePaneSummary]) -> WorkspaceSummary {
+            WorkspaceSummary(
+                id: Data([id]), title: "workspace-\(id)", hostSockPath: "/tmp/peer.sock",
+                windowID: Data(), windowTitle: "", isDefault: false,
+                paneCount: panes.count,
+                surfaceCount: panes.reduce(0) { $0 + $1.tabCount },
+                busyCount: panes.count(where: \.isBusy), panes: panes
+            )
+        }
+        let multiTab = pane(1, tabs: 2, busy: true)
+        let survivor = pane(2, tabs: 3, busy: false)
+        let removed = pane(3, tabs: 1, busy: true)
+
+        let result = RemoteHostStore.removingPeerShells(
+            [multiTab.id, removed.id],
+            from: [
+                workspace(10, panes: [multiTab, survivor]),
+                workspace(11, panes: [removed]),
+            ]
+        )
+
+        XCTAssertEqual(
+            result[0].panes.map(\.id), [multiTab.id, survivor.id],
+            "an active tab disappearing must not hide its live sibling tabs"
+        )
+        XCTAssertEqual(result[0].paneCount, 2)
+        XCTAssertEqual(result[0].surfaceCount, 5)
+        XCTAssertEqual(result[0].busyCount, 1)
+        XCTAssertTrue(result[1].panes.isEmpty)
+        XCTAssertEqual(result[1].paneCount, 0)
+        XCTAssertEqual(result[1].surfaceCount, 0)
+        XCTAssertEqual(result[1].busyCount, 0)
+        XCTAssertEqual(result[1].id, Data([11]), "empty named workspace must be preserved")
+    }
+
+    @MainActor
+    func test_newer_live_mirror_roster_invalidates_cleanup_checkpoint() throws {
+        let store = RemoteHostStore.shared
+        let hostID = "cleanup-generation-\(UUID().uuidString)"
+        let sockPath = "/tmp/cleanup-generation.sock"
+        let surfaceID = Data(repeating: 0x51, count: 16)
+        var pane = Termmesh_Peer_V1_WorkspacePane()
+        pane.surfaceID = surfaceID
+        pane.title = "newer"
+        pane.tabs = []
+        var layout = Termmesh_Peer_V1_WorkspaceLayout()
+        layout.pane = pane
+        let summaryPane = RemotePaneSummary(
+            id: surfaceID, title: "old", workingDirectoryPath: "/tmp",
+            workingDirectoryName: "tmp", projectRootPath: nil, tabCount: 1,
+            columns: 80, rows: 24, isBusy: false
+        )
+        let workspaceID = Data(repeating: 0x52, count: 16)
+        let workspace = WorkspaceSummary(
+            id: workspaceID, title: "workspace", hostSockPath: sockPath,
+            windowID: Data(), windowTitle: "", isDefault: false,
+            paneCount: 1, surfaceCount: 1, busyCount: 0, panes: [summaryPane]
+        )
+        store.installPeerShellCleanupCacheForTesting(
+            hostID: hostID, sockPath: sockPath, workspaces: [workspace]
+        )
+        defer { store.removePeerShellCleanupCacheForTesting(hostID: hostID) }
+        let checkpoint = try XCTUnwrap(store.peerShellCleanupCheckpoint(
+            hostID: hostID, expectedSockPath: sockPath
+        ))
+
+        store.recordLiveMirrorLayout(
+            layout, hostKey: store.hosts[hostID]!.paneHostSpec.hostKey,
+            workspaceIDs: [workspaceID]
+        )
+
+        XCTAssertFalse(store.removeAuthoritativelyAbsentPeerShells(
+            [surfaceID], checkpoint: checkpoint
+        ))
+        XCTAssertEqual(store.hosts[hostID]?.workspaces[0].panes.first?.title, "newer")
     }
 
     @MainActor
