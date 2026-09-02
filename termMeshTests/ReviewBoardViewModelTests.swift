@@ -37,6 +37,146 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertNotEqual(panel(.healthy).symbolName, panel(.leaderOnly).symbolName)
     }
 
+    // MARK: - Dispatch grouping
+
+    private func groupTask(
+        id: String, title: String, assignee: String, at iso: String,
+        wave: String? = nil, status: String = "completed", team: String = "aic"
+    ) -> ReviewBoardTask {
+        ReviewBoardTask(
+            id: id, teamName: team, title: title, status: status,
+            assignee: assignee, isStale: false, updatedAt: iso, waveID: wave
+        )
+    }
+
+    /// A stated wave is the whole answer: one card, every agent inside it.
+    func testAStatedWaveGroupsEveryAgentIntoOneDispatch() {
+        let tasks = [
+            groupTask(id: "1", title: "Check the round trip", assignee: "executor",
+                      at: "2026-09-02T03:02:00Z", wave: "wave-1"),
+            groupTask(id: "2", title: "Check the round trip", assignee: "architect",
+                      at: "2026-09-02T03:02:04Z", wave: "wave-1"),
+            groupTask(id: "3", title: "Check the round trip", assignee: "reviewer",
+                      at: "2026-09-02T03:02:09Z", wave: "wave-1"),
+        ]
+        let groups = ReviewBoardTask.grouped(tasks)
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups[0].members.map(\.assignee), ["executor", "architect", "reviewer"])
+        XCTAssertFalse(groups[0].isDerived)
+        XCTAssertEqual(groups[0].uniformStatus, "completed")
+    }
+
+    /// The live board this came from: three rows at 12:02 and one at 11:49,
+    /// and the 12:02 rows do not all share an instruction. Grouping by title
+    /// alone would merge the two 11:49/12:02 rows that do; grouping by clock
+    /// alone would merge two different instructions. Neither is acceptable, so
+    /// without a wave id both pieces of evidence have to agree.
+    func testWithoutAWaveTheFallbackNeedsBothTheInstructionAndTheClock() {
+        let tasks = [
+            groupTask(id: "1", title: "Report only these three things",
+                      assignee: "executor", at: "2026-09-02T03:02:00Z"),
+            groupTask(id: "2", title: "Report only these three things",
+                      assignee: "architect", at: "2026-09-02T03:02:03Z"),
+            groupTask(id: "3", title: "Report only these three lines",
+                      assignee: "reviewer", at: "2026-09-02T03:02:05Z"),
+            groupTask(id: "4", title: "Report only these three lines",
+                      assignee: "reviewer", at: "2026-09-02T02:49:00Z"),
+        ]
+        let groups = ReviewBoardTask.grouped(tasks)
+        XCTAssertEqual(groups.count, 3)
+        XCTAssertEqual(groups[0].members.map(\.id), ["1", "2"])
+        XCTAssertEqual(groups[1].members.map(\.id), ["3"])
+        // 13 minutes later is a second ask, not a straggler of the first.
+        XCTAssertEqual(groups[2].members.map(\.id), ["4"])
+        XCTAssertTrue(groups.allSatisfy(\.isDerived))
+    }
+
+    /// A guess is labelled as one. "3 agents" means something different when
+    /// the wave was stated than when it was inferred from prose and a clock.
+    func testDerivedGroupsAreMarkedAndStatedOnesAreNot() {
+        let derived = ReviewBoardTask.grouped([
+            groupTask(id: "1", title: "Same ask", assignee: "a", at: "2026-09-02T03:02:00Z"),
+            groupTask(id: "2", title: "Same ask", assignee: "b", at: "2026-09-02T03:02:01Z"),
+        ])
+        XCTAssertEqual(derived.count, 1)
+        XCTAssertTrue(derived[0].isDerived)
+        XCTAssertFalse(derived[0].isSingle)
+
+        let stated = ReviewBoardTask.grouped([
+            groupTask(id: "1", title: "Same ask", assignee: "a",
+                      at: "2026-09-02T03:02:00Z", wave: "w"),
+            groupTask(id: "2", title: "Same ask", assignee: "b",
+                      at: "2026-09-02T03:02:01Z", wave: "w"),
+        ])
+        XCTAssertFalse(stated[0].isDerived)
+    }
+
+    /// Two Projects can run the same instruction at the same moment. The
+    /// fallback must not put them in one card.
+    func testTheFallbackNeverGroupsAcrossProjects() {
+        let groups = ReviewBoardTask.grouped([
+            groupTask(id: "1", title: "Same ask", assignee: "a",
+                      at: "2026-09-02T03:02:00Z", team: "aic"),
+            groupTask(id: "2", title: "Same ask", assignee: "b",
+                      at: "2026-09-02T03:02:01Z", team: "other"),
+        ])
+        XCTAssertEqual(groups.count, 2)
+    }
+
+    /// A task with no clock has no evidence of belonging to a wave, so it
+    /// stands alone rather than joining one on its title.
+    func testATaskWithNoTimestampStandsAlone() {
+        let groups = ReviewBoardTask.grouped([
+            groupTask(id: "1", title: "Same ask", assignee: "a", at: "2026-09-02T03:02:00Z"),
+            ReviewBoardTask(id: "2", teamName: "aic", title: "Same ask",
+                            status: "completed", assignee: "b", isStale: false),
+        ])
+        XCTAssertEqual(groups.count, 2)
+    }
+
+    /// Grouping reports what the members are doing without deciding how the
+    /// board words it, and a group is as urgent as its most urgent member.
+    func testGroupRollupKeepsMixedStatusesAndTheStrongestPriority() {
+        let tasks = [
+            ReviewBoardTask(id: "1", teamName: "aic", title: "t", status: "completed",
+                            assignee: "a", priority: 2, isStale: false,
+                            updatedAt: "2026-09-02T03:02:00Z", waveID: "w"),
+            ReviewBoardTask(id: "2", teamName: "aic", title: "t", status: "failed",
+                            assignee: "b", priority: 0, isStale: false,
+                            updatedAt: "2026-09-02T03:02:01Z", waveID: "w"),
+            ReviewBoardTask(id: "3", teamName: "aic", title: "t", status: "completed",
+                            assignee: "c", priority: 2, isStale: false,
+                            updatedAt: "2026-09-02T03:02:02Z", waveID: "w"),
+        ]
+        let group = ReviewBoardTask.grouped(tasks)[0]
+        XCTAssertNil(group.uniformStatus)
+        XCTAssertEqual(group.statusCounts.map(\.status), ["completed", "failed"])
+        XCTAssertEqual(group.statusCounts.map(\.count), [2, 1])
+        XCTAssertEqual(group.priority, 0)
+        XCTAssertEqual(group.updatedAt, "2026-09-02T03:02:02Z")
+    }
+
+    /// The wave has to survive the producers, not just the model: the team
+    /// board writes `wave_id`, and a coordinator row that carries none must
+    /// not erase it on merge.
+    func testWaveSurvivesDecodingAndTheCoordinatorMerge() {
+        let decoded = ReviewBoardTask(dictionary: [
+            "id": "t1", "title": "t", "team_name": "aic",
+            "status": "completed", "wave_id": "wave-9",
+        ])
+        XCTAssertEqual(decoded?.waveID, "wave-9")
+
+        let blank = ReviewBoardTask(dictionary: [
+            "id": "t2", "title": "t", "team_name": "aic", "wave_id": "  ",
+        ])
+        XCTAssertNil(blank?.waveID, "a blank wave id groups nothing")
+
+        let coordinator = ReviewBoardTask(
+            id: "t1", teamName: "aic", title: "t", status: "placed", isStale: false
+        )
+        XCTAssertEqual(decoded?.merging(coordinator: coordinator).waveID, "wave-9")
+    }
+
     @MainActor
     func testStatusBadgesCoverRequiredReviewStates() {
         let task = ReviewBoardTask(

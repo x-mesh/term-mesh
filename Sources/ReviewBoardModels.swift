@@ -204,6 +204,15 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
     let isStale: Bool
     let staleSeconds: Int?
     let updatedAt: String?
+    /// The wave this task was dispatched in, when the leader stated one.
+    ///
+    /// Both task serializers already emit `wave_id`; the board simply never
+    /// read it, which is why one fan-out to four agents arrived as four
+    /// unrelated rows repeating the same instruction. Optional because a
+    /// directly created task belongs to no wave, and because a leader may
+    /// dispatch without stating one — those cases are grouped by evidence
+    /// rather than by claim, and marked as derived.
+    let waveID: String?
 
     /// Statuses that mean the agent is done with it — `review_ready` included,
     /// because the work finished even though the review has not.
@@ -250,7 +259,8 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         worktreeRemoved: Bool? = nil,
         isStale: Bool = false,
         staleSeconds: Int? = nil,
-        updatedAt: String? = nil
+        updatedAt: String? = nil,
+        waveID: String? = nil
     ) {
         self.id = ReviewBoardText.safeIdentifier(id)
         self.rawID = id.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -285,6 +295,11 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
         self.isStale = isStale
         self.staleSeconds = staleSeconds
         self.updatedAt = updatedAt
+        // A wave id identifies a dispatch, so a blank one identifies nothing:
+        // every task with an empty string would otherwise land in one group.
+        self.waveID = waveID
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
     }
 
     init?(dictionary: [String: Any]) {
@@ -312,7 +327,8 @@ struct ReviewBoardTask: Identifiable, Equatable, Sendable {
             worktreeRemoved: dictionary["worktree_removed"] as? Bool,
             isStale: dictionary["is_stale"] as? Bool ?? false,
             staleSeconds: dictionary["stale_seconds"] as? Int,
-            updatedAt: dictionary["updated_at"] as? String
+            updatedAt: dictionary["updated_at"] as? String,
+            waveID: dictionary["wave_id"] as? String
         )
     }
 
@@ -477,8 +493,153 @@ extension ReviewBoardTask {
             worktreeRemoved: worktreeRemoved,
             isStale: isStale,
             staleSeconds: staleSeconds,
-            updatedAt: [updatedAt, other.updatedAt].compactMap { $0 }.max()
+            updatedAt: [updatedAt, other.updatedAt].compactMap { $0 }.max(),
+            // Only the team board records a wave; a coordinator row carries
+            // none. Taking whichever side has one keeps a merged row inside
+            // the dispatch it came from instead of falling back to the
+            // title-and-time guess.
+            waveID: waveID ?? other.waveID
         )
+    }
+}
+
+/// One dispatch: the instruction as it was given once, and every agent it
+/// went to.
+///
+/// The board drew one card per task, so a leader fanning one question out to
+/// four agents produced four cards repeating the same two lines of
+/// instruction, distinguished only by an agent name and a clock time. The
+/// question was asked once; it should be read once.
+struct ReviewBoardTaskGroup: Identifiable, Equatable, Sendable {
+    let id: String
+    let teamName: String
+    let title: String
+    let priority: Int
+    /// Members in the order the board received them, so a group's rows do not
+    /// reshuffle on a status tick.
+    let members: [ReviewBoardTask]
+    /// Whether `id` is a wave the leader actually stated, or one derived from
+    /// the instruction text and the clock.
+    ///
+    /// The distinction is shown, not hidden. A derived group can be wrong in
+    /// both directions — a leader that reworded one agent's copy of the same
+    /// instruction splits, and two unrelated dispatches of an identical
+    /// instruction inside the window merge — and a reader deciding whether
+    /// "3 agents" means anything has to know which kind of group it is.
+    let isDerived: Bool
+
+    var isSingle: Bool { members.count == 1 }
+
+    /// The clock face of the newest member, which is when the dispatch as a
+    /// whole last moved.
+    var updatedAt: String? { members.compactMap(\.updatedAt).max() }
+
+    /// Statuses in a stable, most-alarming-first order, deduplicated.
+    ///
+    /// Not a sentence: a group's rollup is rendered differently at different
+    /// widths, and building the prose here would decide that for the view.
+    var statusCounts: [(status: String, count: Int)] {
+        var order: [String] = []
+        var counts: [String: Int] = [:]
+        for member in members {
+            if counts[member.status] == nil { order.append(member.status) }
+            counts[member.status, default: 0] += 1
+        }
+        return order.map { ($0, counts[$0] ?? 0) }
+    }
+
+    /// Whether every member reached the same status, which is the common case
+    /// and the one worth stating as one phrase.
+    var uniformStatus: String? {
+        let statuses = Set(members.map(\.status))
+        return statuses.count == 1 ? statuses.first : nil
+    }
+}
+
+extension ReviewBoardTask {
+    /// How far apart two members of the same derived group may be.
+    ///
+    /// A fan-out is dispatched in one motion, and its members finish within a
+    /// wave of each other. Two minutes is wide enough to hold a wave whose
+    /// agents answered at different speeds and narrow enough to keep a
+    /// re-ask of the same question, minutes later, as its own dispatch.
+    static let derivedGroupWindow: TimeInterval = 120
+
+    /// Group tasks into the dispatches they were made in.
+    ///
+    /// A stated wave id wins outright. Without one the fallback is evidence
+    /// rather than claim — same Project, same instruction, finished close
+    /// together — and every group it forms is marked `isDerived`, because it
+    /// is a guess and the board must not present a guess as a wave.
+    static func grouped(
+        _ tasks: [ReviewBoardTask],
+        window: TimeInterval = derivedGroupWindow
+    ) -> [ReviewBoardTaskGroup] {
+        var groups: [ReviewBoardTaskGroup] = []
+        // Position by first member, so grouping never reorders the board.
+        var indexByKey: [String: Int] = [:]
+
+        for task in tasks {
+            let key: String
+            let derived: Bool
+            if let waveID = task.waveID {
+                key = "wave:\(task.teamName)\u{1F}\(waveID)"
+                derived = false
+            } else {
+                key = Self.derivedKey(for: task, against: groups, window: window)
+                derived = true
+            }
+            if let index = indexByKey[key] {
+                let existing = groups[index]
+                groups[index] = ReviewBoardTaskGroup(
+                    id: existing.id, teamName: existing.teamName,
+                    title: existing.title,
+                    // The board sorts by urgency, so a group is as urgent as
+                    // its most urgent member.
+                    priority: min(existing.priority, task.priority),
+                    members: existing.members + [task],
+                    isDerived: existing.isDerived
+                )
+                continue
+            }
+            indexByKey[key] = groups.count
+            groups.append(ReviewBoardTaskGroup(
+                id: key, teamName: task.teamName, title: task.title,
+                priority: task.priority, members: [task], isDerived: derived
+            ))
+        }
+        return groups
+    }
+
+    /// The key of an existing derived group this task belongs to, or a new one.
+    ///
+    /// Matching against the groups already built — rather than bucketing by
+    /// title alone — is what keeps the window meaningful: two dispatches of
+    /// the same instruction hours apart share a title and must not share a
+    /// group.
+    private static func derivedKey(
+        for task: ReviewBoardTask,
+        against groups: [ReviewBoardTaskGroup],
+        window: TimeInterval
+    ) -> String {
+        let normalized = ReviewBoardText.normalizedGroupTitle(task.title)
+        guard let moment = task.updatedAt.flatMap(ReviewBoardText.date) else {
+            // No clock means no evidence of a wave. Stand alone rather than
+            // join a group on the title by itself.
+            return "solo:\(task.id)"
+        }
+        for group in groups where group.isDerived
+            && group.teamName == task.teamName
+            && ReviewBoardText.normalizedGroupTitle(group.title) == normalized {
+            let near = group.members.contains { member in
+                guard let other = member.updatedAt.flatMap(ReviewBoardText.date) else {
+                    return false
+                }
+                return abs(other.timeIntervalSince(moment)) <= window
+            }
+            if near { return group.id }
+        }
+        return "derived:\(task.teamName)\u{1F}\(normalized)\u{1F}\(task.id)"
     }
 }
 
@@ -831,6 +992,26 @@ enum ReviewBoardText {
     /// the machine's form: it answers "when" only after the reader has done
     /// timezone arithmetic. Today's times drop the date — a review board is
     /// read while the work is happening.
+    /// The instant an ISO timestamp names, for arithmetic rather than display.
+    static func date(_ iso: String) -> Date? {
+        for parser in timestampParsers {
+            if let date = parser.date(from: iso) { return date }
+        }
+        return nil
+    }
+
+    /// Two copies of one instruction, compared the way a reader would.
+    ///
+    /// Whitespace and case carry no dispatch meaning, and a leader that
+    /// reflows the same paragraph for two agents has still asked one question.
+    /// Nothing else is normalised: rewording is a different instruction, and
+    /// collapsing those would merge dispatches that are genuinely separate.
+    static func normalizedGroupTitle(_ title: String) -> String {
+        title.lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+    }
+
     static func clockTime(_ iso: String) -> String? {
         for parser in timestampParsers {
             guard let date = parser.date(from: iso) else { continue }
