@@ -11,16 +11,21 @@ struct ReviewBoardPanelView: View {
     @State private var rejectReason = ""
     @State private var isRejecting = false
 
-    /// Folded state for the two settings sections below the work. Seeded from
-    /// defaults so a collapse survives closing the board, and written back on
-    /// every toggle rather than on disappear — the panel is dismissed by the
-    /// window closing as often as by the button.
-    @State private var delegationExpanded = ReviewBoardSettings.isSectionExpanded(
-        ReviewBoardSettings.delegationExpandedKey, default: true
-    )
-    @State private var autoPilotExpanded = ReviewBoardSettings.isSectionExpanded(
-        ReviewBoardSettings.autoPilotExpandedKey, default: false
-    )
+    /// Folded state for the two settings sections below the work.
+    ///
+    /// `@AppStorage`, not `@State` seeded from defaults: the board is mounted
+    /// once per window, and a `@State` seed is read only when a view identity
+    /// first appears. Two open windows would drift apart and never resync,
+    /// with the last writer deciding what a third window sees.
+    ///
+    /// The defaults differ on purpose. Delegation is what someone sets before
+    /// handing out the first task, so a Project that has never been configured
+    /// must not hide it. Auto Pilot starts folded — see its own header, which
+    /// keeps the boundary sentence visible either way.
+    @AppStorage(ReviewBoardSettings.delegationExpandedKey)
+    private var delegationExpanded = true
+    @AppStorage(ReviewBoardSettings.autoPilotExpandedKey)
+    private var autoPilotExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -560,12 +565,7 @@ extension ReviewBoardPanelView {
                     "Delegation",
                     isExpanded: delegationExpanded,
                     summary: delegationSummary,
-                    toggle: {
-                        delegationExpanded.toggle()
-                        ReviewBoardSettings.setSectionExpanded(
-                            ReviewBoardSettings.delegationExpandedKey, delegationExpanded
-                        )
-                    }
+                    toggle: { delegationExpanded.toggle() }
                 ) {
                     // Folding must never hide the only way out of a broken
                     // state, so the repair rides the header at every size.
@@ -577,6 +577,19 @@ extension ReviewBoardPanelView {
                             .foregroundColor(.secondary)
                             .lineLimit(1)
                     }
+                }
+
+                // Outside the fold, next to the button that produces it.
+                // Keeping the Repair button on the header while its only
+                // report lived in the body meant a failed repair said nothing
+                // at all: the spinner stopped, the state stayed broken, and
+                // the reason was behind a disclosure.
+                if let message = viewModel.collaborationRepairMessage {
+                    Text(message)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("reviewBoard.repairMessage")
                 }
 
                 if delegationExpanded {
@@ -742,12 +755,6 @@ extension ReviewBoardPanelView {
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
                 }
-                if let message = viewModel.collaborationRepairMessage {
-                    Text(message)
-                        .font(.system(size: 10))
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
             }
             .accessibilityIdentifier("reviewBoard.collaboration")
         }
@@ -780,13 +787,13 @@ extension ReviewBoardPanelView {
             foldHeader(
                 "Auto Pilot",
                 isExpanded: autoPilotExpanded,
-                summary: Text(viewModel.autoPilot.isEnabled ? "on" : "off"),
-                toggle: {
-                    autoPilotExpanded.toggle()
-                    ReviewBoardSettings.setSectionExpanded(
-                        ReviewBoardSettings.autoPilotExpandedKey, autoPilotExpanded
-                    )
-                }
+                // The boundary, not just the state. This section folds by
+                // default and its switch stays on the header, so wording the
+                // summary "off" would have put arming unattended merging one
+                // click away with the ceiling branch and the per-session cap
+                // never on screen.
+                summary: Text(boundarySentence),
+                toggle: { autoPilotExpanded.toggle() }
             ) {
                 // The switch stays reachable folded. Arming unattended merging
                 // is the one thing here worth a click without reading first;
@@ -802,9 +809,7 @@ extension ReviewBoardPanelView {
             }
 
             if autoPilotExpanded {
-                // The boundary is stated whether it is on or off. Someone
-                // deciding whether to turn it on is exactly who needs to read
-                // it, which is why expanding is what the summary invites.
+                // The same sentence the folded header truncates, in full.
                 Text(boundarySentence)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)

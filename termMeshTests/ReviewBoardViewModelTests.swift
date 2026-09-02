@@ -75,26 +75,6 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertEqual(short(.leaderOnly), "no dispatch")
     }
 
-    /// Folding is remembered, and the two sections start differently on
-    /// purpose: Delegation is what you set before the first task, Auto Pilot
-    /// is a switch and a log.
-    func testSectionFoldStateDefaultsPerSectionAndRoundTrips() {
-        let defaults = UserDefaults(suiteName: "review-board-fold.\(UUID().uuidString)")!
-        XCTAssertTrue(ReviewBoardSettings.isSectionExpanded(
-            ReviewBoardSettings.delegationExpandedKey, default: true, defaults: defaults
-        ))
-        XCTAssertFalse(ReviewBoardSettings.isSectionExpanded(
-            ReviewBoardSettings.autoPilotExpandedKey, default: false, defaults: defaults
-        ))
-        ReviewBoardSettings.setSectionExpanded(
-            ReviewBoardSettings.delegationExpandedKey, false, defaults: defaults
-        )
-        // A stored false must beat the default, or collapsing never sticks.
-        XCTAssertFalse(ReviewBoardSettings.isSectionExpanded(
-            ReviewBoardSettings.delegationExpandedKey, default: true, defaults: defaults
-        ))
-    }
-
     @MainActor
     func testStatusBadgesCoverRequiredReviewStates() {
         let task = ReviewBoardTask(
