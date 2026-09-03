@@ -4,6 +4,21 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.227.0] - 2026-09-04
+
+### Fixed
+- Recover a mirrored pane whose remote output stopped after a reconnect or resume handoff, instead of leaving an attached pane that renders nothing. Pane health now reports output progress and startup state rather than calling an attached but unmounted pane healthy.
+- Retry a partial workspace mirror spawn on its own after 0.5s, 1s, and 2s, and report the mirror as opening, degraded, ready, or failed instead of leaving pending panes unattached and unreported.
+- Always resolve that mirror recovery. A layout update that failed used to leave the relay workspace window under a blocking "Opening mirror" overlay with no retry armed, and a failed resync left a permanent "Opening panes" title on the workspace.
+- Stop showing the "Opening mirror" overlay over a working mirror on every incremental layout update from the host, including each tick of a host divider drag.
+- Keep the focused relay pane's grid size authoritative, so a remote surface no longer stays a row or column behind and no longer redraws long wrapped prompts at a different width.
+- Replace a same-name, provably inert remote repair placeholder only when the supplied host, team, and project identity match exactly. Corrupt boards, unsaved board changes, live routes, live panes, and focus-affecting state now fail closed and leave the displaced Project untouched.
+- Keep `~/...` expandable in a launch command preview while quoting the rest of the path.
+- Offer the Claude 1M context models. `sonnet[1m]`, `opus[1m]`, and `fable[1m]` now appear beside their tiers for agent panes and the leader, a stored `opus-1m` upgrades to `opus[1m]` instead of dropping to the standard context window, and headless agents follow the current model in each tier instead of a pinned older Opus.
+- Quote a model alias in the launch command preview, so `opus[1m]` no longer fails the pasted line in zsh.
+- Require explicit confirmation before a force disconnect closes every local pane, mirror, and relay window from a host. The CLI rejects a missing `--confirm` locally, before the request is sent.
+- Make an unmounted screen read retryable instead of reporting it as an outright failure.
+
 ## [0.226.4] - 2026-09-03
 
 ### Fixed
