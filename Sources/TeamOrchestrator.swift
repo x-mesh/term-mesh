@@ -9163,13 +9163,15 @@ final class TeamOrchestrator: ObservableObject {
     /// pin kept working, so nothing surfaced the staleness. Resolving the tier
     /// is the CLI's job, and it does it at launch rather than at build time.
     ///
-    /// The `[1m]` suffix is not carried over either. It asked for a 1M context
-    /// window on a model whose default was smaller; the models the tiers now
-    /// resolve to are natively 1M.
+    /// A `[1m]` alias passes through as itself. It is a distinct entry in that
+    /// same alias list, not a decoration on the tier: a bare tier gets the
+    /// standard context window, and the CLI's own picker lists "Opus 5 (1M
+    /// context)" separately. Stripping the suffix was measured moving an agent
+    /// that had asked for 1M onto the standard window without saying so.
     static func resolveClaudeModelArg(_ model: String) -> String {
         switch model {
-        // Stored before the tier list settled; `opus` is what it meant.
-        case "opus-1m": return "opus"
+        // Stored before the tier list settled; it asked for the 1M window.
+        case "opus-1m": return "opus[1m]"
         default:        return model
         }
     }

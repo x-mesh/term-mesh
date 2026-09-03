@@ -24,6 +24,15 @@ final class PredictedProjectPathTests: XCTestCase {
         )
     }
 
+    func testLaunchPreviewQuotesClaudeOneMillionContextAlias() {
+        XCTAssertEqual(
+            ProjectCreationFlow.launchCommandPreview(
+                cli: "claude", model: "opus[1m]", directory: "/tmp/demo"
+            ),
+            "cd /tmp/demo && claude --model 'opus[1m]'"
+        )
+    }
+
     private func profile(root: String?) -> PeerHostProfile {
         var p = PeerHostProfile(sshTarget: "root@example")
         p.projectRootPath = root

@@ -2943,9 +2943,37 @@ final class AgentSessionTests: XCTestCase {
         for model in AgentRolePreset.models(for: "claude") {
             XCTAssertFalse(model.hasPrefix("claude-"), model)
         }
-        // Stored before the tier list settled.
-        XCTAssertEqual(TeamOrchestrator.resolveClaudeModelArg("opus-1m"), "opus")
-        XCTAssertEqual(AgentRolePreset.normalizeModel("opus-1m", for: "claude"), "opus")
+        // Stored before the tier list settled. It asked for the 1M window, so
+        // it upgrades to the 1M alias rather than to the bare tier — the two
+        // are different models to the CLI.
+        XCTAssertEqual(TeamOrchestrator.resolveClaudeModelArg("opus-1m"), "opus[1m]")
+        XCTAssertEqual(AgentRolePreset.normalizeModel("opus-1m", for: "claude"), "opus[1m]")
+    }
+
+    /// `opus` and `opus[1m]` are separate entries in the CLI's alias list, and
+    /// a bare tier gets the standard context window. Offering only the tiers
+    /// left "Opus 5 (1M context)" — which the CLI's own picker lists —
+    /// unreachable from an agent pane or from the leader.
+    func testTheOneMillionContextAliasesAreOfferedAndPassedThrough() {
+        let models = AgentRolePreset.models(for: "claude")
+        for alias in ["sonnet[1m]", "opus[1m]", "fable[1m]"] {
+            XCTAssertTrue(models.contains(alias), "\(alias) must be offered by the picker")
+            // Passed to the CLI as itself; stripping the suffix silently
+            // downgrades the window the user asked for.
+            XCTAssertEqual(TeamOrchestrator.resolveClaudeModelArg(alias), alias)
+            XCTAssertEqual(AgentRolePreset.normalizeModel(alias, for: "claude"), alias)
+        }
+        // haiku has no 1M form in the CLI's alias list.
+        XCTAssertFalse(models.contains("haiku[1m]"))
+        // The picker labels them apart from the plain tiers.
+        XCTAssertEqual(
+            AgentRolePreset.modelDisplayLabel("opus[1m]", for: "claude"),
+            "Opus 5 (1M context)"
+        )
+        XCTAssertNotEqual(
+            AgentRolePreset.modelDisplayLabel("opus[1m]", for: "claude"),
+            AgentRolePreset.modelDisplayLabel("opus", for: "claude")
+        )
     }
 
     /// Codex takes exact ids, so the list has to match its own catalog —

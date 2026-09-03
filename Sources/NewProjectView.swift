@@ -4665,8 +4665,16 @@ enum ProjectCreationFlow {
         return components.string ?? raw
     }
 
+    /// Quote a value for a command line the reader may paste into a shell.
+    ///
+    /// Whitespace is not the only thing that needs quoting: a model alias like
+    /// `opus[1m]` is a glob pattern, and zsh fails the whole line with "no
+    /// matches found" rather than passing it through. Anything outside the
+    /// characters that are safe bare gets quoted.
     private static func shellDisplayQuote(_ value: String) -> String {
-        guard value.contains(where: { $0.isWhitespace || $0 == "'" }) else { return value }
+        let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-+=/:@,"))
+        let needsQuote = value.isEmpty || value.unicodeScalars.contains { !safe.contains($0) }
+        guard needsQuote else { return value }
         return "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
