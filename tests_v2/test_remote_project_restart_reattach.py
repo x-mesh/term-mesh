@@ -1268,6 +1268,8 @@ def _phase_repair(c, host: str, remote_dir: str, state_path: Path) -> None:
         row for row in c.peer_host_list()
         if row.get("id") == host and row.get("state") == "connected"
         and row.get("team_host_readiness") == "ready"
+        and "session_host_socket" in row
+        and row.get("launchable") is True
     ), None), timeout_s=45)
     repair = c.team_repair_collaboration(team_name)
     if not repair.get("succeeded") or not repair.get("route_verified"):
