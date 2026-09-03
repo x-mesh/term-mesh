@@ -463,6 +463,17 @@ private final class RelayFrameReader: @unchecked Sendable {
 // heal logic directly — the trailing-debounce/throttle timing is impractical
 // to verify through the flaky live workspace-mirror path.
 actor RelayResizeCoalescer {
+    private enum ResizeReason {
+        case helper(pastInitialResize: Bool)
+        case focusReassert
+    }
+
+    private struct PendingResize {
+        let cols: UInt32
+        let rows: UInt32
+        let reason: ResizeReason
+    }
+
     // `var`, not `let`: a successful R3 resume-heal reconnect (see
     // `PeerRelaySession.performResumeHeal`) hands this actor the new
     // session via `adopt(session:)` so an ordinary resize sent right after
@@ -470,11 +481,16 @@ actor RelayResizeCoalescer {
     private var session: PeerSession
     private let surfaceID: Data
     private let delayNs: UInt64
-    /// The coalesced helper-observed resize waiting to go out. Authority is
-    /// read at flush because focus can move during the coalescing delay.
-    private var pending: (cols: UInt32, rows: UInt32)?
+    /// The coalesced resize waiting to go out. Helper geometry and an explicit
+    /// focus reassert are different events: the helper's first observation is
+    /// always a passive initial reconcile, while focus regain may explicitly
+    /// reclaim authority using the last helper-observed geometry.
+    private var pending: PendingResize?
     private var flushTask: Task<Void, Never>?
     private var authorityEligible: Bool
+    private var hasObservedInitialResize = false
+    private var reassertAfterInitialResize = false
+    private var isCancelled = false
     /// Unlike `lastSize`, this is not seeded from attach geometry. Focus regain
     /// may reassert only a size the helper actually observed.
     private var lastHelperObservedSize: (cols: UInt32, rows: UInt32)?
@@ -536,6 +552,7 @@ actor RelayResizeCoalescer {
     /// R3: re-target this actor's normal (non-heal) resize forwarding at a
     /// session that replaced a retired one via a resume-heal reconnect.
     func adopt(session: PeerSession) {
+        guard !isCancelled else { return }
         self.session = session
     }
 
@@ -547,10 +564,31 @@ actor RelayResizeCoalescer {
     }
 
     func setAuthorityEligible(_ eligible: Bool) {
+        guard !isCancelled else { return }
         let becameEligible = eligible && !authorityEligible
         authorityEligible = eligible
+        guard eligible else {
+            reassertAfterInitialResize = false
+            if case .focusReassert? = pending?.reason {
+                pending = nil
+                flushTask?.cancel()
+                flushTask = nil
+            }
+            return
+        }
         guard becameEligible, let size = lastHelperObservedSize else { return }
-        pending = size
+        if let pending {
+            // Never overwrite a newer helper resize with stale geometry. A
+            // post-initial helper resize will claim at flush; an initial one
+            // stays passive and is followed by one explicit reassert.
+            if case .helper(let pastInitialResize) = pending.reason {
+                reassertAfterInitialResize = !pastInitialResize
+            }
+            return
+        }
+        pending = PendingResize(
+            cols: size.cols, rows: size.rows, reason: .focusReassert
+        )
         scheduleFlushIfNeeded()
     }
 
@@ -565,44 +603,69 @@ actor RelayResizeCoalescer {
     /// back — the remote TUI ends up sized for the pane the person just left.
     /// This actor serialises its state, so the value read at flush is the
     /// eligibility as of the moment the write actually happens.
-    private func claimAuthorityNow() -> Bool {
-        authorityEligible
+    private func claimAuthorityNow(_ resize: PendingResize) -> Bool {
+        guard authorityEligible else { return false }
+        switch resize.reason {
+        case .helper(let pastInitialResize):
+            return pastInitialResize
+        case .focusReassert:
+            return true
+        }
     }
 
     func submit(cols: UInt32, rows: UInt32) {
+        guard !isCancelled else { return }
         let size = (cols, rows)
-        pending = size
+        let pastInitialResize = hasObservedInitialResize
+        hasObservedInitialResize = true
+        pending = PendingResize(
+            cols: cols, rows: rows,
+            reason: .helper(pastInitialResize: pastInitialResize)
+        )
+        // A helper resize supersedes any queued focus reassert. If it is past
+        // the initial reconcile it can make the one authoritative claim itself.
+        reassertAfterInitialResize = false
         lastSize = size
         lastHelperObservedSize = size
         scheduleFlushIfNeeded()
     }
 
     private func scheduleFlushIfNeeded() {
-        guard flushTask == nil else { return }
+        guard !isCancelled, pending != nil, flushTask == nil else { return }
         let delayNs = self.delayNs
         flushTask = Task { [weak self] in
             guard let self else { return }
             try? await Task.sleep(nanoseconds: delayNs)
+            guard !Task.isCancelled else { return }
             await self.flushPending()
         }
     }
 
     func flushNow() async {
+        guard !isCancelled else { return }
         flushTask?.cancel()
         flushTask = nil
         await flushPending()
     }
 
     func cancel() {
+        guard !isCancelled else { return }
+        isCancelled = true
         flushTask?.cancel()
         flushTask = nil
         healTask?.cancel()
         healTask = nil
         gapEpisodeStart = nil
         pending = nil
+        reassertAfterInitialResize = false
     }
 
     private func flushPending() async {
+        guard !isCancelled else {
+            flushTask = nil
+            pending = nil
+            return
+        }
         guard let size = pending else {
             flushTask = nil
             return
@@ -614,22 +677,30 @@ actor RelayResizeCoalescer {
                 surfaceID: surfaceID,
                 cols: size.cols,
                 rows: size.rows,
-                claimAuthority: claimAuthorityNow()
+                claimAuthority: claimAuthorityNow(size)
             )
+            scheduleDeferredFocusReassert(after: size)
         } catch {
             NSLog("[peer-relay] resize send failed; retrying latest size once: %@", String(describing: error))
+            guard !isCancelled else { return }
             // Preserve a newer resize that arrived while the failed write was
             // suspended. Otherwise retry this size once after a short backoff.
             if pending == nil { pending = size }
             guard flushTask == nil else { return }
             flushTask = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 50_000_000)
+                guard !Task.isCancelled else { return }
                 await self?.flushPendingWithoutRetry()
             }
         }
     }
 
     private func flushPendingWithoutRetry() async {
+        guard !isCancelled else {
+            flushTask = nil
+            pending = nil
+            return
+        }
         guard let size = pending else {
             flushTask = nil
             return
@@ -641,11 +712,25 @@ actor RelayResizeCoalescer {
                 surfaceID: surfaceID,
                 cols: size.cols,
                 rows: size.rows,
-                claimAuthority: claimAuthorityNow()
+                claimAuthority: claimAuthorityNow(size)
             )
+            scheduleDeferredFocusReassert(after: size)
         } catch {
             NSLog("[peer-relay] resize retry failed: %@", String(describing: error))
         }
+    }
+
+    private func scheduleDeferredFocusReassert(after resize: PendingResize) {
+        guard !isCancelled, authorityEligible, reassertAfterInitialResize,
+              case nil = pending,
+              case .helper(let pastInitialResize) = resize.reason,
+              !pastInitialResize, let size = lastHelperObservedSize
+        else { return }
+        reassertAfterInitialResize = false
+        pending = PendingResize(
+            cols: size.cols, rows: size.rows, reason: .focusReassert
+        )
+        scheduleFlushIfNeeded()
     }
 
     // ── P9.2 gap heal ────────────────────────────────────────────────
@@ -666,6 +751,7 @@ actor RelayResizeCoalescer {
     // once output settles (no point healing mid-flood).
 
     func noteGapForHeal() {
+        guard !isCancelled else { return }
         let now = Date()
         lastGapAt = now
         if gapEpisodeStart == nil { gapEpisodeStart = now }
@@ -710,6 +796,7 @@ actor RelayResizeCoalescer {
     }
 
     private func performGapHeal(reason: String) async {
+        guard !isCancelled else { return }
         // Update first so the throttle window advances even when there is no
         // size to heal with yet (avoids a tight retry loop before the first
         // resize/attach establishes one).
