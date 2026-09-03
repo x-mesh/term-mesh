@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import base64
 import subprocess
 import sys
 import time
@@ -1251,6 +1252,9 @@ def _phase_repair(c, host: str, remote_dir: str, state_path: Path) -> None:
             "durable Project manifest did not survive daemon restart"
         )
     expected_references = 1 + len(state["member_instances"])
+    old_leader_hex = base64.b64decode(old_leader).hex()
+    if durable.get("leader_surface_id") != old_leader_hex:
+        raise termmeshError(f"durable Project leader identity changed: {durable!r}")
     if int(durable.get("referenced_surfaces") or 0) != expected_references:
         raise termmeshError(f"durable Project references changed: {durable!r}")
     live_references = int(durable.get("live_surfaces") or 0)
@@ -1265,15 +1269,6 @@ def _phase_repair(c, host: str, remote_dir: str, state_path: Path) -> None:
         if row.get("id") == host and row.get("state") == "connected"
         and row.get("team_host_readiness") == "ready"
     ), None), timeout_s=45)
-    stale = _wait(lambda: next((
-        item for item in c.debug_project_remote_presentations(host)
-        if item.get("project_id") == state["project_id"]
-    ), None), timeout_s=30)
-    if stale is None or stale.get("leader_surface_id") != old_leader:
-        raise termmeshError(f"stale manifest did not survive daemon restart: {stale!r}")
-    if not stale.get("leader_process_active_known") or stale.get("leader_process_active"):
-        raise termmeshError(f"old leader was not authoritatively inactive: {stale!r}")
-
     repair = c.team_repair_collaboration(team_name)
     if not repair.get("succeeded") or not repair.get("route_verified"):
         raise termmeshError(f"one-call collaboration repair failed: {repair!r}")

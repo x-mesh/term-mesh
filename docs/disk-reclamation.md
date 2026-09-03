@@ -96,8 +96,9 @@ tm-agent daemon project-presentations prune --apply
 tm-agent daemon project-presentations prune --project-id team:<uuid> --apply
 ```
 
-- `list` shows every record with its live/referenced surface counts, owner and
-  whether the recorded directory still exists.
+- `list` shows every record with its persisted leader surface ID,
+  live/referenced surface counts, owner, and whether the recorded directory
+  still exists.
 - `prune` without `--project-id` considers only records whose directory is gone
   and whose surfaces are all dead. Named records are removed even if their
   directory exists. A record with any live surface is never removed, whichever
