@@ -1301,6 +1301,11 @@ extension TeamOrchestrator {
               !leaderSurfaceID.isEmpty,
               let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey })
         else { return true }
+        let projectID = Self.remoteProjectPresentationID(teamUUID: rawTeamUUID)
+        let suppression = Self.projectDeletionSuppressionKey(
+            hostID: hostKey, projectID: projectID
+        )
+        guard !projectDeletionSuppressions.contains(suppression) else { return true }
         guard host.isConnected, !Self.liveTeamSockPath(for: host).isEmpty else { return false }
         let teamUUID = rawTeamUUID
 
@@ -1331,7 +1336,7 @@ extension TeamOrchestrator {
         project.leaderSurfaceID = leaderSurfaceID
         project.leaderCli = team.leaderCli ?? team.leaderMode
         project.leaderModel = team.leaderModel
-        project.projectID = Self.remoteProjectPresentationID(teamUUID: teamUUID)
+        project.projectID = projectID
         project.delegationConfigured = team.delegationState.configured.rawValue
         project.delegationEffective = team.delegationState.effective.rawValue
         project.delegationPending = team.delegationState.pending?.rawValue ?? ""
@@ -1358,6 +1363,13 @@ extension TeamOrchestrator {
             return true
         }
         do {
+            // Delete may begin while the network connection above is opening.
+            // Re-check at the mutation boundary so a delayed publisher cannot
+            // resurrect a manifest after its tombstone was committed.
+            guard !projectDeletionSuppressions.contains(suppression) else {
+                await connection.cancel()
+                return true
+            }
             let response = try await connection.session.upsertProjectPresentation(project)
             await connection.cancel()
             if !response.ok {
