@@ -1202,6 +1202,21 @@ def _phase_repair(c, host: str, remote_dir: str, state_path: Path) -> None:
     state = json.loads(state_path.read_text())
     team_name = state["team_name"]
     old_leader = state["leader_surface_id"]
+    project = _wait(lambda: next((
+        item for item in c.debug_project_remote_presentations(host)
+        if item.get("project_id") == state["project_id"]
+    ), None), timeout_s=30)
+    if project is None:
+        raise termmeshError("original owner could not rediscover Project before repair repro")
+    if not any(item.get("team_name") == team_name for item in c.team_list()):
+        c.debug_project_adopt_remote(host, state["project_id"])
+    pending = _wait(lambda: next((
+        item for item in c.team_list()
+        if item.get("team_name") == team_name and item.get("workspace_id")
+    ), None), timeout_s=45)
+    if pending is None:
+        raise termmeshError("original owner did not create Project model before repair repro")
+    c.select_workspace(pending["workspace_id"])
     owner_team = _wait(lambda: next((
         item for item in c.team_list()
         if item.get("team_name") == team_name
