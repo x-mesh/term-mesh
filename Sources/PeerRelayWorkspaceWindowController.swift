@@ -1307,7 +1307,18 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             incompleteLayoutRetryTask = nil
             layoutRecoveryGeneration &+= 1
             generation = layoutRecoveryGeneration
-            setLayoutRecoveryState(.opening, force: true)
+            // `.opening` shows a full-window blocking overlay here, unlike the
+            // embedded mirror where it is only a title suffix. Forcing it on
+            // every push covered a working mirror with "Opening mirror" for
+            // each incremental delta — a host divider drag flashes one per
+            // tick. Only a pass that actually has panes to attach earns it.
+            let alreadyShowingEveryTargetPane = layoutRecoveryState.presentsAsReady
+                && PeerMirrorLayoutRecoveryPolicy.missingSurfaceIDs(
+                    required: collectSurfaceIDs(layout), spawned: Set(panesBySurfaceID.keys)
+                ).isEmpty
+            if !alreadyShowingEveryTargetPane {
+                setLayoutRecoveryState(.opening, force: true)
+            }
         }
         let previous = applyLayoutTask
         let myTask = Task<Void, Error> { [weak self] in
@@ -1326,6 +1337,22 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             // ref is cleared either way (a newer task may already
             // have replaced it, in which case we leave that alone).
             if applyLayoutTask == myTask { applyLayoutTask = nil }
+            // Settle the recovery state the `.opening` above opened. Without
+            // this a thrown pass left the blocking overlay latched with no
+            // retry armed: the subscription's layout-changed handler only
+            // logs, so an idle host sent nothing further and the overlay
+            // covered a live mirror indefinitely.
+            //
+            // Scoped to a mirror that already has panes. The first attach owns
+            // no content yet and its caller replaces the overlay with an
+            // actionable "Attach failed"; arming a retry under that would
+            // swap the user's Close button for a Retry a few seconds later.
+            if !(error is CancellationError), !panesBySurfaceID.isEmpty {
+                updateIncompleteLayoutRecovery(
+                    layout: layout, generation: generation,
+                    completedAttempts: completedAttempts, passFailed: true
+                )
+            }
             throw error
         }
         if applyLayoutTask == myTask { applyLayoutTask = nil }
@@ -1370,6 +1397,11 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
             surfaceInfoByID = try await fetchSurfaceInfoByIDIfNeeded(
                 for: Array(missingSurfaceIDs)
             )
+        } catch is CancellationError {
+            // Cancellation is not a metadata failure: a newer apply replaced
+            // this one. Falling through would spawn panes for a superseded
+            // layout after the supersession was already decided.
+            throw CancellationError()
         } catch {
             // Pane metadata is an optimization. The layout carries enough to
             // attach through `makeFallbackSurfaceInfo`, and letting this abort
@@ -1444,7 +1476,8 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
     private func updateIncompleteLayoutRecovery(
         layout: Termmesh_Peer_V1_WorkspaceLayout,
         generation: UInt64,
-        completedAttempts: Int
+        completedAttempts: Int,
+        passFailed: Bool = false
     ) {
         guard PeerMirrorLayoutRecoveryPolicy.mayContinue(
             expectedGeneration: generation, currentGeneration: layoutRecoveryGeneration,
@@ -1456,7 +1489,8 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
         switch PeerMirrorLayoutRecoveryPolicy.action(
             missingPaneCount: missing.count,
             completedAttempts: completedAttempts,
-            isCancelled: Task.isCancelled
+            isCancelled: Task.isCancelled,
+            passFailed: passFailed
         ) {
         case .ready:
             incompleteLayoutRetryTask?.cancel()
@@ -1482,11 +1516,11 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 } catch is CancellationError {
                     return
                 } catch {
+                    // `applyLayout` settles this generation in its own catch,
+                    // so re-settling here would arm a second retry task for
+                    // the same attempt and could overrule that outcome with a
+                    // pane-map-only `.ready`.
                     NSLog("[peer-ws] autonomous layout retry failed: %@", String(describing: error))
-                    self.updateIncompleteLayoutRecovery(
-                        layout: layout, generation: generation,
-                        completedAttempts: completedAttempts + 1
-                    )
                 }
             }
         case .failed:

@@ -55,13 +55,20 @@ enum PeerMirrorLayoutRecoveryPolicy {
         2_000_000_000,
     ]
 
+    /// `passFailed` is the outcome of the apply that just ran, not a state.
+    /// A thrown pass stopped somewhere inside itself, so the pane map it
+    /// left behind proves nothing: keys are inserted as leaves spawn, and a
+    /// throw after the last insert looks exactly like a complete layout.
+    /// Judging that as `.ready` retires the recovery loop on the one path it
+    /// exists for, so a failed pass always owes at least one bounded retry.
     static func action(
         missingPaneCount: Int,
         completedAttempts: Int,
-        isCancelled: Bool
+        isCancelled: Bool,
+        passFailed: Bool = false
     ) -> PeerMirrorLayoutRecoveryAction {
         if isCancelled { return .abandon }
-        if missingPaneCount == 0 { return .ready }
+        if missingPaneCount == 0, !passFailed { return .ready }
         guard completedAttempts < retryDelaysNanoseconds.count else { return .failed }
         return .retry(afterNanoseconds: retryDelaysNanoseconds[completedAttempts])
     }
@@ -160,23 +167,6 @@ final class PeerWorkspaceMirrorController {
             targetTitle: hostWorkspaceTitle.isEmpty ? "<workspace>" : hostWorkspaceTitle,
             connectedAt: connectedAt
         )
-    }
-
-    var layoutRecoveryStatusFields: [String: Any] {
-        switch layoutRecoveryState {
-        case .opening:
-            return ["state": "opening"]
-        case .degraded(let missingPaneCount, let attempt):
-            return [
-                "state": "degraded",
-                "missing_panes": missingPaneCount,
-                "retry_attempt": attempt,
-            ]
-        case .ready:
-            return ["state": "ready"]
-        case .failed(let missingPaneCount):
-            return ["state": "failed", "missing_panes": missingPaneCount]
-        }
     }
 
     init(
@@ -439,7 +429,8 @@ final class PeerWorkspaceMirrorController {
                 guard generation == self.layoutRecoveryGeneration, !Task.isCancelled else { return }
                 self.updateIncompleteLayoutRecovery(
                     target: layout, generation: generation,
-                    completedAttempts: completedAttempts
+                    completedAttempts: completedAttempts,
+                    passFailed: true
                 )
             }
         }
@@ -457,7 +448,8 @@ final class PeerWorkspaceMirrorController {
     private func updateIncompleteLayoutRecovery(
         target: Termmesh_Peer_V1_WorkspaceLayout,
         generation: UInt64,
-        completedAttempts: Int
+        completedAttempts: Int,
+        passFailed: Bool = false
     ) {
         guard PeerMirrorLayoutRecoveryPolicy.mayContinue(
             expectedGeneration: generation, currentGeneration: layoutRecoveryGeneration,
@@ -470,7 +462,8 @@ final class PeerWorkspaceMirrorController {
         switch PeerMirrorLayoutRecoveryPolicy.action(
             missingPaneCount: missing.count,
             completedAttempts: completedAttempts,
-            isCancelled: Task.isCancelled
+            isCancelled: Task.isCancelled,
+            passFailed: passFailed
         ) {
         case .ready:
             incompleteLayoutRetryTask?.cancel()
@@ -635,6 +628,9 @@ final class PeerWorkspaceMirrorController {
     /// receive loop of its own.
     func forceResync() async {
         guard !isTornDown, subscriptionSession != nil else { return }
+        // Set once the recovery generation is open, so the catch below knows
+        // whether there is a latched `.opening` it still owes an outcome to.
+        var startedRecovery: (layout: Termmesh_Peer_V1_WorkspaceLayout, generation: UInt64)?
         do {
             let transport = try await UnixSocketTransport.connect(socketPath: lease.hostSockPath)
             let oneShot = PeerSession(
@@ -652,6 +648,7 @@ final class PeerWorkspaceMirrorController {
             }
             markAllPanesStale()
             let recoveryGeneration = beginLayoutRecoveryGeneration()
+            startedRecovery = (target.layout, recoveryGeneration)
             try await reconcile(target: target.layout)
             guard PeerMirrorLayoutRecoveryPolicy.mayContinue(
                 expectedGeneration: recoveryGeneration,
@@ -665,6 +662,16 @@ final class PeerWorkspaceMirrorController {
         } catch {
             NSLog("[peer-mirror] forceResync failed: %@", String(describing: error))
             RemoteWorkLog.infoOffMain("Workspace resync failed: \(error.localizedDescription)")
+            // `beginLayoutRecoveryGeneration` already put the mirror in
+            // `.opening`. Swallowing the error here without settling left
+            // that state latched with no retry armed, so the resync the user
+            // asked for ended as a permanent "Opening panes" title.
+            if let started = startedRecovery {
+                updateIncompleteLayoutRecovery(
+                    target: started.layout, generation: started.generation,
+                    completedAttempts: 0, passFailed: true
+                )
+            }
         }
     }
 

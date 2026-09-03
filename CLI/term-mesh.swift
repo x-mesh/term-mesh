@@ -719,7 +719,17 @@ struct TermMeshCLI {
                 }
             }()
             var peerParams: [String: Any] = ["host": hostArg]
-            if command == "peer-force-disconnect", commandArgs.contains("--confirm") {
+            if command == "peer-force-disconnect" {
+                // Usage documents --confirm as required. Omitting it used to
+                // reach the daemon and come back as a remote
+                // `confirmation_required`, which spends a round trip to
+                // restate what the local usage line already says.
+                guard hasFlag(commandArgs, name: "--confirm") else {
+                    throw CLIError(
+                        message: "--confirm is required: peer-force-disconnect closes every "
+                            + "local pane, mirror, and relay window opened from this host"
+                    )
+                }
                 peerParams["confirm"] = true
             }
             if command == "peer-open-mirror", let ws = optionValue(commandArgs, name: "--workspace") {
