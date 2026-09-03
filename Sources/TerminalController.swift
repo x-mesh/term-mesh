@@ -2508,11 +2508,15 @@ class TerminalController {
             response = await self.processTeamUICommandAsync(method: method, params: params, id: id)
         }
 
-        // Dynamic timeout: scale with team size for fan-out scenarios.
-        // Base 5s + 0.5s per agent beyond 1, so 10 agents → 9.5s timeout.
+        // Dynamic timeout: scale ordinary fan-out scenarios with team size.
+        // Collaboration repair is a bounded lifecycle operation of its own:
+        // it may reconnect a host, bootstrap a leader (180s ceiling), restore
+        // workers and verify the exact reverse route before answering.
         let teamName = (params["team"] ?? params["team_name"]) as? String
         let agentCount = teamName.flatMap { TeamOrchestrator.shared.teams[$0]?.agents.count } ?? 1
-        let timeoutSec = max(5.0, 5.0 + Double(agentCount - 1) * 0.5)
+        let timeoutSec = Self.teamCommandTimeoutSeconds(
+            method: method, agentCount: agentCount
+        )
         if semaphore.wait(timeout: .now() + timeoutSec) == .timedOut {
             // Cancel the still-running Task so delayed retries inside
             // asyncTeamSend/asyncTeamDelegate don't fire after we've already
@@ -2524,9 +2528,19 @@ class TerminalController {
             #if DEBUG
             dlog("[dispatchTeamCommandAsync] TIMEOUT: cancelling stale task method=\(method) timeout=\(timeoutSec)s agents=\(agentCount)")
             #endif
-            return "{\"ok\":false,\"error\":{\"code\":\"timeout\",\"message\":\"team command timed out\"}}"
+            return v2Error(
+                id: id, code: "timeout",
+                message: "team command timed out after \(timeoutSec)s"
+            )
         }
         return response
+    }
+
+    nonisolated static func teamCommandTimeoutSeconds(
+        method: String, agentCount: Int
+    ) -> TimeInterval {
+        if method == "team.repair_collaboration" { return 240 }
+        return max(5.0, 5.0 + Double(max(0, agentCount - 1)) * 0.5)
     }
 
     /// Direct dispatch for data-only team commands (called within teamDataQueue).
@@ -2635,6 +2649,8 @@ class TerminalController {
             return await asyncTeamAgentStatus(params: params, id: id)
         case "team.delegation.configure":
             return await asyncTeamDelegationConfigure(params: params, id: id)
+        case "team.repair_collaboration":
+            return await asyncTeamRepairCollaboration(params: params, id: id)
         case "team.task.start":
             return await asyncTeamTaskStart(params: params, id: id)
         case "team.task.block":
@@ -4057,6 +4073,29 @@ class TerminalController {
             TeamOrchestrator.shared.inboxItems(teamName: teamName, agentName: agentName, topOnly: topOnly)
         }
         return v2Ok(id: id, result: ["team_name": teamName, "items": items, "count": items.count])
+    }
+
+    /// Production socket twin of Review Board's Repair collaboration button.
+    /// It deliberately stays out of the remote-leader peer allow-list: only
+    /// the owning app may rebuild leader/worker processes and routes.
+    private func asyncTeamRepairCollaboration(
+        params: [String: Any], id: Any?
+    ) async -> String {
+        guard let teamName = params["team_name"] as? String, !teamName.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        let report = await TeamOrchestrator.shared.repairCollaboration(teamName: teamName)
+        return v2Ok(id: id, result: [
+            "team_name": teamName,
+            "succeeded": report.succeeded,
+            "route_repaired": report.routeRepaired,
+            "route_verified": report.routeVerified,
+            "leader_live": report.leaderLive,
+            "live_agents": report.liveAgents,
+            "replaced_agents": report.replacedAgents,
+            "failed_agents": report.failedAgents,
+            "message": report.message,
+        ])
     }
 
     /// Peer-path twin of `v2TeamDelegationConfigure`.

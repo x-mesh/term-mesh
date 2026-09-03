@@ -1095,6 +1095,7 @@ pub struct ProjectPresentationStatus {
     pub team_name: String,
     pub working_directory: String,
     pub owner_peer_id: String,
+    pub leader_surface_id: String,
     pub revision: u64,
     pub referenced_surfaces: usize,
     pub live_surfaces: usize,
@@ -1414,6 +1415,7 @@ impl PeerHost {
             team_name: record.team_name.clone(),
             working_directory: record.working_directory.clone(),
             owner_peer_id: record.owner_peer_id.clone(),
+            leader_surface_id: record.leader_surface_id.clone(),
             revision: record.revision,
             referenced_surfaces: ids.len(),
             live_surfaces: ids.iter().filter(|id| live.contains(*id)).count(),
@@ -1740,6 +1742,8 @@ impl PeerHost {
             || project.team_uuid.len() > 128
             || project.working_directory.len() > 4096
             || project.project_root.len() > 4096
+            || project.leader_cli.len() > 128
+            || project.leader_model.len() > 256
             || project.leader_surface_id.len() != 16
             || project.members.len() > 64
         {
@@ -1834,6 +1838,8 @@ impl PeerHost {
             team_uuid: project.team_uuid.clone(),
             working_directory: project.working_directory.clone(),
             project_root: project.project_root.clone(),
+            leader_cli: project.leader_cli.clone(),
+            leader_model: project.leader_model.clone(),
             delegation_configured: project.delegation_configured.clone(),
             delegation_effective: project.delegation_effective.clone(),
             delegation_pending: project.delegation_pending.clone(),

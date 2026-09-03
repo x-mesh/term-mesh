@@ -970,6 +970,10 @@ message Team {
   string delegation_configured = 14;
   string delegation_effective = 15;
   string delegation_pending = 16;
+  // Exact leader launch identity used for deterministic replacement. Empty
+  // for manifests written by hosts that predate durable leader recovery.
+  string leader_cli = 17;
+  string leader_model = 18;
 }
 
 message TeamMember {

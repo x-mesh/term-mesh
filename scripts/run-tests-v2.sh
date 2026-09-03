@@ -162,7 +162,7 @@ stage_remote_relay_fixture() {
     ssh "$REMOTE_FIXTURE_SSH_TARGET" \
       "rm -rf '$REMOTE_AGENT_CLI_BACKUP'; mkdir -p '$REMOTE_AGENT_CLI_BACKUP'; cp -a \"\$HOME/.local/bin/claude\" '$REMOTE_AGENT_CLI_BACKUP/claude'"
   fi
-  remote_socket="$REMOTE_FIXTURE_ROOT/peer.sock"
+  remote_socket="$REMOTE_FIXTURE_ROOT/term-meshd-peer.sock"
   remote_dir="$REMOTE_FIXTURE_ROOT/src"
   echo "== stage remote candidate fixture ($REMOTE_FIXTURE_SSH_TARGET) =="
   ssh "$REMOTE_FIXTURE_SSH_TARGET" "mkdir -p '$remote_dir'"
@@ -188,7 +188,7 @@ stage_remote_relay_fixture() {
      env XDG_DATA_HOME='$REMOTE_FIXTURE_ROOT/state' XDG_RUNTIME_DIR='$REMOTE_FIXTURE_ROOT/runtime' \
        PATH=/tmp/term-mesh-release-relay-target/release:\$HOME/.cargo/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:\$PATH \
        TERMMESH_PEER_SOCKET='$remote_socket' \
-       TERMMESH_DAEMON_UNIX_PATH='$REMOTE_FIXTURE_ROOT/control.sock' \
+       TERMMESH_DAEMON_UNIX_PATH='$REMOTE_FIXTURE_ROOT/term-meshd.sock' \
        nohup /tmp/term-mesh-release-relay-target/release/term-meshd \
        >'$REMOTE_FIXTURE_ROOT/daemon.log' 2>&1 & echo \$! >'$REMOTE_FIXTURE_ROOT/pid'"
   for _ in {1..120}; do
@@ -731,8 +731,23 @@ for f in "${test_files[@]}"; do
         failed_tests[${#failed_tests[@]}]="$f:adopt"
       fi
 
-      echo "== relaunch ($base cleanup; original owner identity) =="
-      launch_and_wait 1
+      if [ "$adopt_result" -eq 0 ]; then
+        echo "== relaunch ($base repair; original owner identity) =="
+        launch_and_wait 1
+        echo "RUN  $f (phase missing-surface repair)"
+        set +e
+        phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=repair "$PYTHON" "$f"
+        repair_result=$?
+        set -e
+        if [ "$repair_result" -eq 2 ]; then
+          phase_skipped=1
+        elif [ "$repair_result" -ne 0 ]; then
+          echo "FAIL $f (phase missing-surface repair)" >&2
+          phase_failed=1
+          failed_tests[${#failed_tests[@]}]="$f:repair"
+        fi
+      fi
+
       echo "RUN  $f (phase owner cleanup)"
       set +e
       phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=cleanup "$PYTHON" "$f"

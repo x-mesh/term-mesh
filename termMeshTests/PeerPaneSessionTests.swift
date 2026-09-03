@@ -18,6 +18,21 @@ private actor AsyncFlag {
 }
 
 final class PeerPaneSessionTests: XCTestCase {
+    func testCollaborationRepairUsesLifecycleTimeoutWithoutChangingOrdinaryCommands() {
+        XCTAssertEqual(
+            TerminalController.teamCommandTimeoutSeconds(
+                method: "team.repair_collaboration", agentCount: 4
+            ),
+            240
+        )
+        XCTAssertEqual(
+            TerminalController.teamCommandTimeoutSeconds(
+                method: "team.send", agentCount: 4
+            ),
+            6.5
+        )
+    }
+
     private func conflictRecord(
         name: String = "xm",
         projectID: String = "team:one",
@@ -817,6 +832,37 @@ final class PeerPaneSessionTests: XCTestCase {
             localTeamForName: { localTeams[$0] }
         )
         XCTAssertEqual(sorted.map(\.name), ["Alpha", "term-mesh3"])
+    }
+
+    func testKnownInactiveRemoteManifestIsNeitherOfferedNorAdoptable() {
+        func manifest(
+            name: String, active: Bool, activeKnown: Bool
+        ) -> RemoteTeamSummary {
+            RemoteTeamSummary(
+                name: name, teamUUID: name, workingDirectory: "/work/\(name)",
+                projectRootPath: nil, agentNames: [], projectID: "team:\(name)",
+                leaderSurfaceID: Data(repeating: 0x44, count: 16),
+                leaderProcessActive: active, leaderProcessActiveKnown: activeKnown
+            )
+        }
+
+        let inactive = manifest(name: "inactive", active: false, activeKnown: true)
+        let live = manifest(name: "live", active: true, activeKnown: true)
+        let unknown = manifest(name: "unknown", active: false, activeKnown: false)
+
+        XCTAssertFalse(TeamOrchestrator.remoteManifestLeaderIsAdoptable(inactive))
+        XCTAssertTrue(TeamOrchestrator.remoteManifestLeaderIsAdoptable(live))
+        XCTAssertTrue(
+            TeamOrchestrator.remoteManifestLeaderIsAdoptable(unknown),
+            "legacy/unknown state preserves the existing conservative offer policy"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.hostAxisOfferedManifests(
+                isConnected: true, teams: [unknown, inactive, live],
+                hostKey: "ssh:mac-sub", localTeamForName: { _ in nil }
+            ).map(\.name),
+            ["live", "unknown"]
+        )
     }
 
     func testRemoteManifestUIKeySeparatesHostsAndProjects() {
@@ -5076,16 +5122,190 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         XCTAssertFalse(plan.leaderLive)
     }
 
+    func test_collaborationLeaderRepairKeepsAuthoritativelyLiveLeader() {
+        let leaderID = Data(repeating: 0x41, count: 16)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = leaderID
+        surface.foregroundBusyKnown = true
+        surface.foregroundBusy = true
+        let remote = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: [], projectID: "team:uuid",
+            leaderSurfaceID: leaderID, leaderCLI: "codex",
+            leaderModel: "gpt-5.6-sol", leaderProcessActive: true,
+            leaderProcessActiveKnown: true
+        )
+
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationLeaderRepairDecision(
+                remoteTeam: remote, surfaces: [surface]
+            ),
+            .keepExisting
+        )
+    }
+
+    func test_collaborationLeaderRepairBootstrapsMissingOrInactiveLeader() {
+        let leaderID = Data(repeating: 0x42, count: 16)
+        var inactiveSurface = Termmesh_Peer_V1_SurfaceInfo()
+        inactiveSurface.surfaceID = leaderID
+        inactiveSurface.foregroundBusyKnown = true
+        inactiveSurface.foregroundBusy = false
+        let inactive = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: [], projectID: "team:uuid",
+            leaderSurfaceID: leaderID, leaderProcessActive: false,
+            leaderProcessActiveKnown: true
+        )
+
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationLeaderRepairDecision(
+                remoteTeam: inactive, surfaces: [inactiveSurface]
+            ),
+            .bootstrapReplacement
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationLeaderRepairDecision(
+                remoteTeam: inactive, surfaces: []
+            ),
+            .bootstrapReplacement
+        )
+    }
+
+    func test_collaborationLeaderRepairNeverBootstrapsUnknownRoster() {
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationLeaderRepairDecision(
+                remoteTeam: nil, surfaces: []
+            ),
+            .deferUntilAuthoritative
+        )
+
+        let leaderID = Data(repeating: 0x43, count: 16)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = leaderID
+        let unknown = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: [], projectID: "team:uuid",
+            leaderSurfaceID: leaderID
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationLeaderRepairDecision(
+                remoteTeam: unknown, surfaces: [surface]
+            ),
+            .deferUntilAuthoritative
+        )
+    }
+
+    func test_collaborationLeaderRepairRequiresOneExactRemoteProject() {
+        let first = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: [], projectID: "team:uuid"
+        )
+        let duplicate = RemoteTeamSummary(
+            name: "xm copy", teamUUID: "uuid", workingDirectory: "/other",
+            projectRootPath: nil, agentNames: [], projectID: "team:uuid"
+        )
+        XCTAssertNil(TeamOrchestrator.exactCollaborationRemoteTeam(
+            in: [], teamUUID: "uuid", projectID: "team:uuid"
+        ))
+        XCTAssertEqual(
+            TeamOrchestrator.exactCollaborationRemoteTeam(
+                in: [first], teamUUID: "uuid", projectID: "team:uuid"
+            ),
+            first
+        )
+        XCTAssertNil(TeamOrchestrator.exactCollaborationRemoteTeam(
+            in: [first, duplicate], teamUUID: "uuid", projectID: "team:uuid"
+        ))
+    }
+
+    func test_collaborationLeaderRepairIgnoresStaleLocalRelayState() {
+        let leaderID = Data(repeating: 0x44, count: 16)
+        let missing = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: [], projectID: "team:uuid",
+            leaderSurfaceID: leaderID, leaderProcessActive: false,
+            leaderProcessActiveKnown: true
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationLeaderRepairDecision(
+                remoteTeam: missing, surfaces: [], localLeaderRelayStarted: true
+            ),
+            .bootstrapReplacement
+        )
+    }
+
+    func test_collaborationLeaderLaunchMetadataUsesRosterAndLegacyFallback() {
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationLeaderLaunchMetadata(
+                remoteCLI: "codex", remoteModel: "gpt-5.6-sol"
+            ),
+            .init(cli: "codex", model: "gpt-5.6-sol")
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationLeaderLaunchMetadata(
+                remoteCLI: "", remoteModel: ""
+            ),
+            .init(cli: "claude", model: "opus")
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationLeaderLaunchMetadata(
+                remoteCLI: "adopted", remoteModel: ""
+            ),
+            .init(cli: "claude", model: "opus")
+        )
+    }
+
+    func test_remoteTeamSummaryPreservesLeaderLaunchMetadata() {
+        var proto = Termmesh_Peer_V1_Team()
+        proto.name = "xm"
+        proto.teamUuid = "uuid"
+        proto.leaderCli = "codex"
+        proto.leaderModel = "gpt-5.6-sol"
+        let summary = RemoteHostStore.remoteTeamSummary(proto)
+        XCTAssertEqual(summary.leaderCLI, "codex")
+        XCTAssertEqual(summary.leaderModel, "gpt-5.6-sol")
+    }
+
+    func test_collaborationReplacementConfirmationUsesNewManagedSurfaceDuringManifestLag() {
+        let staleManifestID = Data(repeating: 0x45, count: 16)
+        let replacementID = Data(repeating: 0x46, count: 16)
+        var replacement = Termmesh_Peer_V1_SurfaceInfo()
+        replacement.surfaceID = replacementID
+        replacement.attachable = true
+        replacement.foregroundBusyKnown = true
+        replacement.foregroundBusy = true
+
+        let confirmed = TeamOrchestrator.confirmedReplacementLeaderSurfaceID(
+                manifestLeaderSurfaceID: staleManifestID,
+                managedLeaderSurfaceID: replacementID,
+                surfaces: [replacement]
+        )
+        XCTAssertEqual(confirmed, replacementID)
+        XCTAssertTrue(TeamOrchestrator.collaborationRecoveryPlan(
+            leaderSurfaceID: confirmed, agents: [], surfaces: [replacement]
+        ).leaderLive)
+    }
+
     @MainActor
     func test_collaborationControlSocketUsesMeasuredOrSiblingPathOnly() {
         var measured = PeerHostHealthBaseline()
         measured.controlPath = "/srv/term-mesh/control.sock"
         measured.controlPathPresent = true
+        measured.peerPath = "/run/term-mesh/tm-peer.sock"
+        measured.peerPathPresent = true
         XCTAssertEqual(
             TeamOrchestrator.collaborationControlSocketPath(
                 peerSocketPath: "/run/term-mesh/tm-peer.sock", health: measured
             ),
             "/srv/term-mesh/control.sock"
+        )
+        measured.peerPath = "/run/term-mesh/other-peer.sock"
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationControlSocketPath(
+                peerSocketPath: "/run/term-mesh/tm-peer.sock", health: measured
+            ),
+            "/run/term-mesh/term-meshd.sock",
+            "health from another daemon must not redirect verification"
         )
         XCTAssertEqual(
             TeamOrchestrator.collaborationControlSocketPath(
@@ -5117,8 +5337,13 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         XCTAssertTrue(script.contains("leader-a70d3dbc-8167-4112-88dd-ffaeff54dcc6.json"))
         XCTAssertTrue(script.contains("TERMMESH_LEADER_ROUTE_FILE="))
         XCTAssertTrue(script.contains("TERMMESH_RPC_TIMEOUT=20"))
-        XCTAssertTrue(script.contains("--team 'xm' status"))
+        // `serviceAccountCommand` re-quotes the inner shell, so the exact
+        // apostrophe spelling is intentionally not part of this contract.
+        XCTAssertTrue(script.contains("--team"))
+        XCTAssertTrue(script.contains("xm"))
+        XCTAssertTrue(script.contains("status"))
         XCTAssertTrue(script.contains("__TERMMESH_COLLABORATION_ROUTE_RESULT__="))
+        XCTAssertTrue(script.contains("__TERMMESH_COLLABORATION_ROUTE_EXIT__="))
         XCTAssertFalse(script.contains("grant_id_hex"), "the bearer stays in the route file")
     }
 
@@ -5152,6 +5377,17 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func test_collaborationRouteVerificationFailurePreservesExitAndBoundedDetail() {
+        let detail = Data("peer leader command timed out".utf8).base64EncodedString()
+        let output = TeamOrchestrator.collaborationRouteVerificationMarker + detail + "\n"
+            + TeamOrchestrator.collaborationRouteVerificationExitMarker + "1\n"
+        XCTAssertEqual(
+            TeamOrchestrator.remoteCollaborationRouteVerificationFailure(output),
+            "leader route exited 1: peer leader command timed out"
+        )
+    }
+
+    @MainActor
     func test_collaborationRecoveryReportClaimsSuccessOnlyAfterRouteVerification() {
         let unverified = TeamOrchestrator.CollaborationRecoveryReport(
             routeRepaired: true, leaderLive: true, liveAgents: 4,
@@ -5160,6 +5396,14 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         )
         XCTAssertFalse(unverified.succeeded)
         XCTAssertTrue(unverified.message.contains("verification failed"))
+
+        let rolledBack = TeamOrchestrator.CollaborationRecoveryReport(
+            routeRepaired: false, leaderLive: true, liveAgents: 4,
+            replacedAgents: [], failedAgents: [],
+            verificationFailure: "wrong daemon"
+        )
+        XCTAssertFalse(rolledBack.succeeded)
+        XCTAssertTrue(rolledBack.message.contains("rolled back"))
 
         let verified = TeamOrchestrator.CollaborationRecoveryReport(
             routeRepaired: true, routeVerified: true,

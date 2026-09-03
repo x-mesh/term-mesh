@@ -352,10 +352,152 @@ final class PeerAgentPaneRecoveryCoordinator {
 }
 
 extension TeamOrchestrator {
+    enum CollaborationLeaderRepairDecision: Equatable {
+        case keepExisting
+        case bootstrapReplacement
+        case deferUntilAuthoritative
+    }
+
+    struct CollaborationLeaderLaunchMetadata: Equatable {
+        let cli: String
+        let model: String
+    }
+
     struct CollaborationRecoveryPlan: Equatable {
         let leaderLive: Bool
         let deadAgentInstanceIDs: [String]
         let liveAgentCount: Int
+    }
+
+    /// Decide from one authoritative host snapshot, never from the local pane.
+    /// A pane can retain `relayStarted` after its remote process has exited, so
+    /// using it here would make Repair preserve exactly the stale leader it is
+    /// meant to replace. Unknown process state remains conservative: creating
+    /// a second leader is worse than asking the user to retry the read.
+    nonisolated static func collaborationLeaderRepairDecision(
+        remoteTeam: RemoteTeamSummary?,
+        surfaces: [Termmesh_Peer_V1_SurfaceInfo],
+        localLeaderRelayStarted _: Bool = false
+    ) -> CollaborationLeaderRepairDecision {
+        guard let remoteTeam else { return .deferUntilAuthoritative }
+        let surfaceID = remoteTeam.leaderSurfaceID
+        guard !surfaceID.isEmpty,
+              let surface = surfaces.first(where: { $0.surfaceID == surfaceID }) else {
+            return .bootstrapReplacement
+        }
+        if remoteTeam.leaderProcessActiveKnown {
+            return remoteTeam.leaderProcessActive
+                ? .keepExisting : .bootstrapReplacement
+        }
+        if surface.foregroundBusyKnown {
+            return surface.foregroundBusy
+                ? .keepExisting : .bootstrapReplacement
+        }
+        return .deferUntilAuthoritative
+    }
+
+    /// Adopted is a local presentation state, not an executable. New protocol
+    /// fields preserve the owner's actual launch choice. Legacy manifests have
+    /// no such metadata, so use the explicit New Project default rather than
+    /// ever trying to execute `adopted`.
+    nonisolated static func collaborationLeaderLaunchMetadata(
+        remoteCLI: String,
+        remoteModel: String
+    ) -> CollaborationLeaderLaunchMetadata {
+        let cli = remoteCLI.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = remoteModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cli.isEmpty, cli.lowercased() != "adopted", !model.isEmpty else {
+            return CollaborationLeaderLaunchMetadata(cli: "claude", model: "opus")
+        }
+        return CollaborationLeaderLaunchMetadata(cli: cli, model: model)
+    }
+
+    /// After a replacement starts, the durable manifest may still name the
+    /// old leader until its debounced publication lands. Confirm the newly
+    /// managed identity directly against the fresh surface roster instead of
+    /// falsely failing on that expected persistence lag.
+    nonisolated static func confirmedReplacementLeaderSurfaceID(
+        manifestLeaderSurfaceID _: Data,
+        managedLeaderSurfaceID: Data?,
+        surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+    ) -> Data? {
+        guard let managedLeaderSurfaceID, !managedLeaderSurfaceID.isEmpty,
+              let surface = surfaces.first(where: {
+                  $0.surfaceID == managedLeaderSurfaceID
+              }),
+              surface.foregroundBusyKnown, surface.foregroundBusy else {
+            return nil
+        }
+        return managedLeaderSurfaceID
+    }
+
+    nonisolated static func exactCollaborationRemoteTeam(
+        in teams: [RemoteTeamSummary],
+        teamUUID: String,
+        projectID: String?
+    ) -> RemoteTeamSummary? {
+        let matches = teams.filter { remote in
+            guard remote.teamUUID == teamUUID else { return false }
+            guard let projectID, !projectID.isEmpty else { return true }
+            return remote.projectID == projectID
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    private typealias AuthoritativeCollaborationSnapshot = (
+        surfaces: [Termmesh_Peer_V1_SurfaceInfo], team: RemoteTeamSummary
+    )
+
+    private enum AuthoritativeCollaborationSnapshotResult {
+        case success(AuthoritativeCollaborationSnapshot)
+        case failure(String)
+    }
+
+    @MainActor
+    private func authoritativeCollaborationSnapshot(
+        host: HostEntry,
+        teamUUID: String,
+        projectID: String?
+    ) async -> AuthoritativeCollaborationSnapshotResult {
+        let lease: PeerPaneHostLease
+        do {
+            if let current = RemoteHostStore.shared.sortedHosts.first(where: {
+                $0.id == host.id
+            }), !Self.teamHostCanLaunch(current) {
+                // A daemon restart can let the retired connection's failure
+                // callback land after a fresh row briefly reported ready.
+                // Repair owns route recovery, so start one fresh generation
+                // before waiting on the ordinary bounded readiness funnel.
+                _ = RemoteHostStore.shared.retryConnectingHost(current)
+            }
+            let readyHost = try await Self.waitForTeamHostLaunchReadiness(
+                hostKey: host.id
+            )
+            let spec = try Self.requireTeamHostSpec(readyHost)
+            lease = try await PeerPaneHostRegistry.shared.acquire(spec)
+        } catch {
+            return .failure("Host connection unavailable: \(error.localizedDescription)")
+        }
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+        let snapshot: (
+            surfaces: [Termmesh_Peer_V1_SurfaceInfo],
+            teams: [Termmesh_Peer_V1_Team]
+        )
+        do {
+            snapshot = try await PeerPaneSession.listSessionHostSnapshot(on: lease)
+        } catch {
+            return .failure("Host roster request failed: \(error.localizedDescription)")
+        }
+        let teams = snapshot.teams.map(RemoteHostStore.remoteTeamSummary)
+        guard let team = Self.exactCollaborationRemoteTeam(
+            in: teams, teamUUID: teamUUID, projectID: projectID
+        ) else {
+            return .failure(
+                "Exact Project roster unavailable: expected team \(teamUUID) "
+                    + "project \(projectID ?? "<legacy>"); received \(teams.count) Project(s)"
+            )
+        }
+        return .success((snapshot.surfaces, team))
     }
 
     struct CollaborationRouteGeneration: Equatable {
@@ -491,33 +633,86 @@ extension TeamOrchestrator {
             )
         }
 
-        guard let rosterLease = try? await PeerPaneHostRegistry.shared.acquire(
-            Self.requireTeamHostSpec(host)
-        ) else {
+        var snapshotResult = await authoritativeCollaborationSnapshot(
+            host: host,
+            teamUUID: teamUUID,
+            projectID: initial.remotePresentationProjectID
+        )
+        guard case .success(let firstSnapshot) = snapshotResult else {
+            let reason: String
+            if case .failure(let message) = snapshotResult { reason = message }
+            else { reason = "Host roster unavailable" }
             return CollaborationRecoveryReport(
                 routeRepaired: false, leaderLive: false, liveAgents: 0,
-                replacedAgents: [], failedAgents: ["Host roster unavailable"]
+                replacedAgents: [], failedAgents: [reason]
             )
         }
-        let surfaces = try? await PeerPaneSession.listSurfaces(on: rosterLease)
-        PeerPaneHostRegistry.shared.release(rosterLease)
-        guard let surfaces else {
+        var authoritative = firstSnapshot
+        let leaderDecision = Self.collaborationLeaderRepairDecision(
+            remoteTeam: authoritative.team,
+            surfaces: authoritative.surfaces,
+            localLeaderRelayStarted: initial.leaderReady
+        )
+        switch leaderDecision {
+        case .keepExisting:
+            break
+        case .deferUntilAuthoritative:
             return CollaborationRecoveryReport(
                 routeRepaired: false, leaderLive: false, liveAgents: 0,
-                replacedAgents: [], failedAgents: ["Host roster unavailable"]
+                replacedAgents: [], failedAgents: ["Leader state unavailable"]
             )
-        }
-        let initialLeaderSurfaceID = initial.remoteLeaderSurfaceID
-            ?? ManagedPeerSurfaceStore.shared.leaderRecord(
+        case .bootstrapReplacement:
+            let launch = Self.collaborationLeaderLaunchMetadata(
+                remoteCLI: authoritative.team.leaderCLI,
+                remoteModel: authoritative.team.leaderModel
+            )
+            guard await recoverRemoteLeaderAfterRuntimeClose(
+                teamName: teamName,
+                closedPanelID: initial.leaderPanelId,
+                authoritativeReplacementRequired: true,
+                replacementLaunchMetadata: launch
+            ) else {
+                return CollaborationRecoveryReport(
+                    routeRepaired: false, leaderLive: false, liveAgents: 0,
+                    replacedAgents: [], failedAgents: ["Leader replacement failed"]
+                )
+            }
+            snapshotResult = await authoritativeCollaborationSnapshot(
+                host: host,
+                teamUUID: teamUUID,
+                projectID: initial.remotePresentationProjectID
+            )
+            let managedLeaderSurfaceID = ManagedPeerSurfaceStore.shared.leaderRecord(
                 hostKey: hostKey, teamName: teamName
             )?.surfaceID
+            guard case .success(let refreshed) = snapshotResult,
+                  let replacementSurfaceID = Self.confirmedReplacementLeaderSurfaceID(
+                    manifestLeaderSurfaceID: refreshed.team.leaderSurfaceID,
+                    managedLeaderSurfaceID: managedLeaderSurfaceID,
+                    surfaces: refreshed.surfaces
+                  ) else {
+                return CollaborationRecoveryReport(
+                    routeRepaired: false, leaderLive: false, liveAgents: 0,
+                    replacedAgents: [], failedAgents: ["Replacement leader not confirmed"]
+                )
+            }
+            recordRecoveredRemoteLeaderSurface(
+                teamName: teamName, surfaceID: replacementSurfaceID,
+                leaderCLI: launch.cli, leaderModel: launch.model
+            )
+            scheduleRemoteProjectManifestPublication(forHostKey: hostKey)
+            authoritative = refreshed
+        }
+
+        let initialLeaderSurfaceID = teams[teamName]?.remoteLeaderSurfaceID
+            ?? authoritative.team.leaderSurfaceID
         let initialPlan = Self.collaborationRecoveryPlan(
             leaderSurfaceID: initialLeaderSurfaceID,
             agents: initial.agents,
-            surfaces: surfaces
+            surfaces: authoritative.surfaces
         )
 #if DEBUG
-        let surfaceState = surfaces.map {
+        let surfaceState = authoritative.surfaces.map {
             let id = $0.surfaceID.map { String(format: "%02x", $0) }
                 .joined().prefix(8)
             return "\(id):" + ($0.attachable ? "live" : "dead")
@@ -586,12 +781,36 @@ extension TeamOrchestrator {
                 replacedAgents: [], failedAgents: ["Project changed during repair"]
             )
         }
+        // Replacing route files is only a prerequisite. The production
+        // failure that led here had a live leader, live workers, and a fresh
+        // route while every reverse team call still timed out. Exercise the
+        // exact leader-side path before touching workers or claiming success.
+        if let verificationFailure = await Self.verifyRemoteCollaborationRoute(
+            host: host, teamName: teamName, teamUUID: teamUUID
+        ) {
+            if await Self.finishAdoptedRemoteAgentRoutes(
+                host: host, transaction: routes.transaction, commit: false
+            ) {
+                await Self.revokeGrants(grantIDs)
+            } else {
+                Self.rollbackRemoteAgentRoutesPreservingGrants(
+                    host: host, transaction: routes.transaction, grantIDs: grantIDs
+                )
+            }
+            return CollaborationRecoveryReport(
+                routeRepaired: false, routeVerified: false,
+                leaderLive: initialPlan.leaderLive,
+                liveAgents: initialPlan.liveAgentCount,
+                replacedAgents: [], failedAgents: [],
+                verificationFailure: verificationFailure
+            )
+        }
+
         if !(await Self.finalizeAdoptedRemoteAgentRoutes(
             host: host, transaction: routes.transaction
         )) {
-            // Commit already succeeded. A lost finalize response cannot make
-            // the live route unsafe; keep the grants and finish housekeeping
-            // in the background rather than rolling back a working repair.
+            // The exact route is already verified. Keep the grants and finish
+            // deleting transaction backups in the background.
             Self.scheduleAdoptedRemoteAgentRouteFinalize(
                 host: host, transaction: routes.transaction
             )
@@ -610,40 +829,22 @@ extension TeamOrchestrator {
         }
         refreshLeaderParticipationControls()
 
-        // Replacing route files is only a prerequisite. The production
-        // failure that led here had a live leader, live workers, and a fresh
-        // route while every reverse team call still timed out. Exercise the
-        // exact leader-side path before touching workers or claiming success.
-        if let verificationFailure = await Self.verifyRemoteCollaborationRoute(
-            host: host, teamName: teamName, teamUUID: teamUUID
-        ) {
-            return CollaborationRecoveryReport(
-                routeRepaired: true, routeVerified: false,
-                leaderLive: initialPlan.leaderLive,
-                liveAgents: initialPlan.liveAgentCount,
-                replacedAgents: [], failedAgents: [],
-                verificationFailure: verificationFailure
-            )
-        }
-
-        guard let refreshedLease = try? await PeerPaneHostRegistry.shared.acquire(
-            Self.requireTeamHostSpec(host)
-        ) else {
+        let postVerificationSnapshot = await authoritativeCollaborationSnapshot(
+            host: host,
+            teamUUID: teamUUID,
+            projectID: initial.remotePresentationProjectID
+        )
+        guard case .success(let postVerification) = postVerificationSnapshot else {
+            let reason: String
+            if case .failure(let message) = postVerificationSnapshot { reason = message }
+            else { reason = "Host roster unavailable" }
             return CollaborationRecoveryReport(
                 routeRepaired: true, routeVerified: true,
                 leaderLive: false, liveAgents: 0,
-                replacedAgents: [], failedAgents: ["Host roster unavailable"]
+                replacedAgents: [], failedAgents: [reason]
             )
         }
-        let refreshedSurfaces = try? await PeerPaneSession.listSurfaces(on: refreshedLease)
-        PeerPaneHostRegistry.shared.release(refreshedLease)
-        guard let refreshedSurfaces else {
-            return CollaborationRecoveryReport(
-                routeRepaired: true, routeVerified: true,
-                leaderLive: false, liveAgents: 0,
-                replacedAgents: [], failedAgents: ["Host roster unavailable"]
-            )
-        }
+        let refreshedSurfaces = postVerification.surfaces
         let leaderSurfaceID = current.remoteLeaderSurfaceID
             ?? ManagedPeerSurfaceStore.shared.leaderRecord(
                 hostKey: hostKey, teamName: teamName
@@ -746,15 +947,16 @@ extension TeamOrchestrator {
         }
 
         var message: String {
+            if let verificationFailure, !routeVerified {
+                return routeRepaired
+                    ? "Routes were refreshed, but leader control verification failed: \(verificationFailure)."
+                    : "Leader control verification failed and the route update was rolled back: \(verificationFailure)."
+            }
             if !routeRepaired {
                 return failedAgents.first.map { "Collaboration repair failed: \($0)." }
                     ?? "Collaboration repair failed."
             }
-            if !routeVerified {
-                return verificationFailure.map {
-                    "Routes were refreshed, but leader control verification failed: \($0)."
-                } ?? "Routes were refreshed, but leader control could not be verified."
-            }
+            if !routeVerified { return "Routes were refreshed, but leader control could not be verified." }
             if !failedAgents.isEmpty, !leaderLive {
                 return "Leader control verified, but \(failedAgents.joined(separator: ", "))."
             }
@@ -773,6 +975,8 @@ extension TeamOrchestrator {
 
     static let collaborationRouteVerificationMarker =
         "__TERMMESH_COLLABORATION_ROUTE_RESULT__="
+    static let collaborationRouteVerificationExitMarker =
+        "__TERMMESH_COLLABORATION_ROUTE_EXIT__="
 
     /// Resolve only a control socket that belongs to the authenticated peer
     /// endpoint. Linux custom installs use Host Doctor's measured path; the
@@ -782,7 +986,9 @@ extension TeamOrchestrator {
         peerSocketPath: String,
         health: PeerHostHealthBaseline?
     ) -> String? {
-        if let health, health.controlPathPresent, !health.controlPath.isEmpty {
+        if let health,
+           health.peerPathPresent, health.peerPath == peerSocketPath,
+           health.controlPathPresent, !health.controlPath.isEmpty {
             return health.controlPath
         }
         if peerSocketPath.hasSuffix("/term-meshd-peer.sock") {
@@ -814,13 +1020,14 @@ extension TeamOrchestrator {
             + "cli=$(command -v tm-agent 2>/dev/null || true); "
             + "[ -x \"$cli\" ] || cli=\"$HOME/.local/bin/tm-agent\"; "
             + "[ -x \"$cli\" ] || exit 72; "
-            + "result=$(TERMMESH_SOCKET=\"$control\" "
+            + "set +e; result=$(TERMMESH_SOCKET=\"$control\" "
             + "TERMMESH_TEAM=\(shellQuoted(teamName)) "
             + "TERMMESH_LEADER_ROUTE_FILE=\"$route\" TERMMESH_RPC_TIMEOUT=20 "
-            + "\"$cli\" --team \(shellQuoted(teamName)) status) || exit 73; "
+            + "\"$cli\" --team \(shellQuoted(teamName)) status 2>&1); status=$?; set -e; "
             + "encoded=$(printf %s \"$result\" | base64 | tr -d '\\n'); "
             + "printf '%s%s\\n' \(shellQuoted(collaborationRouteVerificationMarker)) "
-            + "\"$encoded\""
+            + "\"$encoded\"; printf '%s%s\\n' "
+            + "\(shellQuoted(collaborationRouteVerificationExitMarker)) \"$status\""
         return RemotePasteTransfer.serviceAccountCommand(body)
     }
 
@@ -840,6 +1047,23 @@ extension TeamOrchestrator {
             return true
         }
         return false
+    }
+
+    static func remoteCollaborationRouteVerificationFailure(_ output: String) -> String {
+        var status = "unknown"
+        var detail = "no diagnostic output"
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            if let range = text.range(of: collaborationRouteVerificationExitMarker) {
+                status = String(text[range.upperBound...])
+            }
+            if let range = text.range(of: collaborationRouteVerificationMarker),
+               let data = Data(base64Encoded: String(text[range.upperBound...])),
+               let decoded = String(data: data, encoding: .utf8), !decoded.isEmpty {
+                detail = String(decoded.prefix(512))
+            }
+        }
+        return "leader route exited \(status): \(detail)"
     }
 
     private static func verifyRemoteCollaborationRoute(
@@ -870,7 +1094,7 @@ extension TeamOrchestrator {
             )
             return parseRemoteCollaborationRouteVerification(
                 output, expectedTeamName: teamName
-            ) ? nil : "the leader route returned an invalid response"
+            ) ? nil : remoteCollaborationRouteVerificationFailure(output)
         } catch {
             return String(describing: error)
         }
@@ -1035,6 +1259,8 @@ extension TeamOrchestrator {
             team.gitRepoRoot ?? "",
             hostKey,
             leaderID,
+            team.leaderCli ?? team.leaderMode,
+            team.leaderModel,
             team.delegationState.configured.rawValue,
             team.delegationState.effective.rawValue,
             team.delegationState.pending?.rawValue ?? "",
@@ -1075,6 +1301,11 @@ extension TeamOrchestrator {
               !leaderSurfaceID.isEmpty,
               let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey })
         else { return true }
+        let projectID = Self.remoteProjectPresentationID(teamUUID: rawTeamUUID)
+        let suppression = Self.projectDeletionSuppressionKey(
+            hostID: hostKey, projectID: projectID
+        )
+        guard !projectDeletionSuppressions.contains(suppression) else { return true }
         guard host.isConnected, !Self.liveTeamSockPath(for: host).isEmpty else { return false }
         let teamUUID = rawTeamUUID
 
@@ -1103,7 +1334,9 @@ extension TeamOrchestrator {
         project.agentNames = team.agents.map(\.name)
         project.createdAtUnixSecs = UInt64(max(0, team.createdAt.timeIntervalSince1970))
         project.leaderSurfaceID = leaderSurfaceID
-        project.projectID = Self.remoteProjectPresentationID(teamUUID: teamUUID)
+        project.leaderCli = team.leaderCli ?? team.leaderMode
+        project.leaderModel = team.leaderModel
+        project.projectID = projectID
         project.delegationConfigured = team.delegationState.configured.rawValue
         project.delegationEffective = team.delegationState.effective.rawValue
         project.delegationPending = team.delegationState.pending?.rawValue ?? ""
@@ -1130,6 +1363,13 @@ extension TeamOrchestrator {
             return true
         }
         do {
+            // Delete may begin while the network connection above is opening.
+            // Re-check at the mutation boundary so a delayed publisher cannot
+            // resurrect a manifest after its tombstone was committed.
+            guard !projectDeletionSuppressions.contains(suppression) else {
+                await connection.cancel()
+                return true
+            }
             let response = try await connection.session.upsertProjectPresentation(project)
             await connection.cancel()
             if !response.ok {
@@ -1214,6 +1454,16 @@ extension TeamOrchestrator {
             && hasResolvedTeamRoute
     }
 
+    /// A durable manifest remains authoritative repair input even after its
+    /// leader exits, but it must not be presented or adopted as live work.
+    /// Legacy manifests have no process probe, so preserve their existing
+    /// conservative attach policy until the host reports an exact state.
+    nonisolated static func remoteManifestLeaderIsAdoptable(
+        _ remote: RemoteTeamSummary
+    ) -> Bool {
+        !remote.leaderProcessActiveKnown || remote.leaderProcessActive
+    }
+
     nonisolated static func shouldOfferRemoteManifest(
         hasLocalTeam: Bool,
         localPresentationOwnedByRequester: Bool,
@@ -1267,8 +1517,9 @@ extension TeamOrchestrator {
     /// projects appearing in one view and not the other is what made a Project
     /// on a Mac peer look deleted: workspaces come from the serving GUI socket,
     /// which publishes no manifest, so the Host axis had nothing to show and
-    /// said nothing about it. A manifest with no leader surface is skipped for
-    /// the same reason the Project axis skips it — there is nothing to attach.
+    /// said nothing about it. A manifest with no leader surface or a known-dead
+    /// leader is skipped because neither can be attached as live work. The raw
+    /// host roster remains intact so its owner can still repair that Project.
     nonisolated static func hostAxisOfferedManifests(
         isConnected: Bool,
         teams: [RemoteTeamSummary],
@@ -1277,7 +1528,8 @@ extension TeamOrchestrator {
     ) -> [RemoteTeamSummary] {
         guard isConnected else { return [] }
         return teams.filter { team in
-            guard !team.leaderSurfaceID.isEmpty else { return false }
+            guard !team.leaderSurfaceID.isEmpty,
+                  remoteManifestLeaderIsAdoptable(team) else { return false }
             return sidebarRemoteManifestState(
                 localTeam: localTeamForName(team.name),
                 remote: team,
@@ -1655,7 +1907,7 @@ extension TeamOrchestrator {
     ) async -> Bool {
         guard !projectDeletionSuppressions.contains(
             Self.projectDeletionSuppressionKey(hostID: host.id, projectID: remote.projectID)
-        ) else { return false }
+        ), Self.remoteManifestLeaderIsAdoptable(remote) else { return false }
         let namedTeam = teams[remote.name]
         let matchingTeam = namedTeam.flatMap {
             Self.remotePresentationIdentityMatches(
@@ -1790,12 +2042,15 @@ extension TeamOrchestrator {
         let mintedRoutes = routeTransfer.workerGrants
         let mintedGrantIDs = [routeTransfer.leaderGrantID] + Array(mintedRoutes.values)
 
+        let leaderLaunch = Self.collaborationLeaderLaunchMetadata(
+            remoteCLI: remote.leaderCLI, remoteModel: remote.leaderModel
+        )
         var team = Team(
             id: remote.name,
             leaderSessionId: UUID().uuidString,
             leaderMode: "adopted",
-            leaderModel: "",
-            leaderCli: nil,
+            leaderModel: leaderLaunch.model,
+            leaderCli: leaderLaunch.cli,
             leaderPanelId: leaderPanelID,
             leaderEndpoint: .peer(hostKey: host.id),
             workingDirectory: remote.workingDirectory,
@@ -4192,7 +4447,9 @@ extension TeamOrchestrator {
     @discardableResult
     func recoverRemoteLeaderAfterRuntimeClose(
         teamName: String,
-        closedPanelID: UUID
+        closedPanelID: UUID,
+        authoritativeReplacementRequired: Bool = false,
+        replacementLaunchMetadata: CollaborationLeaderLaunchMetadata? = nil
     ) async -> Bool {
         guard let original = teams[teamName],
               original.leaderPanelId == closedPanelID,
@@ -4211,16 +4468,20 @@ extension TeamOrchestrator {
         // merely could not reach the host is retried instead: the remote
         // leader is most likely still running, and replacing it there leaves
         // two on one team.
-        var outcome = await reattachRemoteLeaderIfNeeded(teamName: teamName)
-        for delay in Self.remoteLeaderReattachBackoffSeconds {
-            if case .attached = outcome { return true }
-            if outcome.permitsReplacementBootstrap { break }
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            if Task.isCancelled { return false }
-            outcome = await reattachRemoteLeaderIfNeeded(teamName: teamName)
+        var outcome: RemoteLeaderReattachOutcome = authoritativeReplacementRequired
+            ? .confirmedMissing
+            : await reattachRemoteLeaderIfNeeded(teamName: teamName)
+        if !authoritativeReplacementRequired {
+            for delay in Self.remoteLeaderReattachBackoffSeconds {
+                if case .attached = outcome { return true }
+                if outcome.permitsReplacementBootstrap { break }
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                if Task.isCancelled { return false }
+                outcome = await reattachRemoteLeaderIfNeeded(teamName: teamName)
+            }
         }
         if case .attached = outcome { return true }
-        guard outcome.permitsReplacementBootstrap else {
+        guard authoritativeReplacementRequired || outcome.permitsReplacementBootstrap else {
             // Deliberately not a bootstrap. The stored surface and grant are
             // left as they are, so `recoverRemoteLeaderIfNeeded` can pick this
             // up again once the host answers.
@@ -4252,8 +4513,13 @@ extension TeamOrchestrator {
             )?.workingDirectory
             ?? team.remoteProjectLocations.first(where: { $0.hostKey == hostKey })?.path
             ?? team.workingDirectory
+        let launchMetadata = replacementLaunchMetadata
+            ?? Self.collaborationLeaderLaunchMetadata(
+                remoteCLI: team.leaderCli ?? team.leaderMode,
+                remoteModel: team.leaderModel
+            )
         let systemPrompt: String?
-        if team.leaderMode.lowercased() == "claude" {
+        if launchMetadata.cli.lowercased() == "claude" {
             systemPrompt = Self.remoteLeaderClaudeRecoverySystemPrompt(
                 teamName: teamName,
                 agents: team.agents,
@@ -4282,8 +4548,8 @@ extension TeamOrchestrator {
                     teamName: teamName,
                     hostKey: hostKey,
                     workingDirectory: workingDirectory,
-                    cli: team.leaderMode,
-                    model: team.leaderModel,
+                    cli: launchMetadata.cli,
+                    model: launchMetadata.model,
                     attempt: attempt,
                     systemPrompt: systemPrompt
                 )
