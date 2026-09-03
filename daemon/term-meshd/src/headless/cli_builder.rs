@@ -616,6 +616,37 @@ mod tests {
     }
 
     #[test]
+    fn claude_model_aliases_preserve_context_window_intent() {
+        let model_arg = |model: &str| {
+            let cmd = build_claude_command(
+                "explorer",
+                "my-team",
+                model,
+                "/proj",
+                "/tmp/term-meshd.sock",
+                None,
+                None,
+                None,
+                ClaudeSpawnMode::Fresh {
+                    session_id: "11111111-2222-3333-4444-555555555555".into(),
+                },
+                &[],
+                &std::collections::HashMap::new(),
+            );
+            let index = cmd
+                .args
+                .iter()
+                .position(|arg| arg == &OsString::from("--model"))
+                .expect("--model");
+            cmd.args[index + 1].clone()
+        };
+
+        assert_eq!(model_arg("opus"), OsString::from("opus"));
+        assert_eq!(model_arg("opus[1m]"), OsString::from("opus[1m]"));
+        assert_eq!(model_arg("opus-1m"), OsString::from("opus[1m]"));
+    }
+
+    #[test]
     fn claude_resume_argv_uses_resume_flag() {
         let cmd = build_claude_command(
             "explorer",
