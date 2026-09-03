@@ -756,6 +756,22 @@ final class RelayResumeTransitionGateTests: XCTestCase {
         )
     }
 
+    func testStaleHealFailureCannotAbortNewGenerationGapCapture() {
+        let gate = RelayResumeTransitionGate()
+        let retired = gate.currentGeneration()
+        let winner = gate.replaceSession(expectedGeneration: retired)!
+        gate.beginGapCapture(generation: winner)
+
+        XCTAssertNil(
+            gate.activeGapCapture(generation: retired),
+            "stale cleanup must not manufacture a token for the winner's capture"
+        )
+        let current = gate.activeGapCapture(generation: winner)
+        XCTAssertNotNil(current)
+        XCTAssertEqual(current?.generation, winner)
+        XCTAssertEqual(gate.snapshot().phase, "gap-capture")
+    }
+
     func testDebouncedHealFromRetiredGenerationIsDiscarded() async throws {
         let gate = RelayResumeTransitionGate()
         let retired = gate.currentGeneration()

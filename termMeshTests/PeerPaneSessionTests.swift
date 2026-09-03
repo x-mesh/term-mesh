@@ -18,6 +18,21 @@ private actor AsyncFlag {
 }
 
 final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
+    func testOnlyReadyRecoveryMayClearTheDegradedOverlay() {
+        XCTAssertTrue(PeerMirrorLayoutRecoveryState.ready.presentsAsReady)
+        XCTAssertFalse(PeerMirrorLayoutRecoveryState.opening.presentsAsReady)
+        XCTAssertFalse(
+            PeerMirrorLayoutRecoveryState.degraded(
+                missingPaneCount: 1, attempt: 1
+            ).presentsAsReady
+        )
+        XCTAssertFalse(
+            PeerMirrorLayoutRecoveryState.failed(
+                missingPaneCount: 1
+            ).presentsAsReady
+        )
+    }
+
     func test_missingLeavesRetryWithBoundedBackoffThenFail() {
         XCTAssertEqual(
             PeerMirrorLayoutRecoveryPolicy.action(
@@ -121,6 +136,23 @@ final class PeerPaneSessionTests: XCTestCase {
                 startupState: .pending, relayLiveness: .live, isTorndown: true
             ),
             .ended
+        )
+    }
+
+    func testCallbackPaneHealthUsesTransportInsteadOfHelperStartupLatch() {
+        XCTAssertEqual(
+            PeerPaneSession.derivePaneHealth(
+                startupState: .pending, relayLiveness: .live, isTorndown: false,
+                requiresRelayStartup: false
+            ),
+            .live
+        )
+        XCTAssertEqual(
+            PeerPaneSession.derivePaneHealth(
+                startupState: .pending, relayLiveness: .reconnecting, isTorndown: false,
+                requiresRelayStartup: false
+            ),
+            .reconnecting
         )
     }
 

@@ -595,7 +595,8 @@ final class PeerPaneSession {
         Self.derivePaneHealth(
             startupState: relayStartupState,
             relayLiveness: relayLiveness,
-            isTorndown: isTorndown
+            isTorndown: isTorndown,
+            requiresRelayStartup: relaySession.usesRelayHelper
         )
     }
 
@@ -605,9 +606,17 @@ final class PeerPaneSession {
     nonisolated static func derivePaneHealth(
         startupState: RelayStartupState,
         relayLiveness: PeerRelaySession.TransportLiveness,
-        isTorndown: Bool
+        isTorndown: Bool,
+        requiresRelayStartup: Bool = true
     ) -> PaneHealth {
         if isTorndown { return .ended }
+        if !requiresRelayStartup {
+            switch relayLiveness {
+            case .live: return .live
+            case .reconnecting: return .reconnecting
+            case .ended: return .ended
+            }
+        }
         switch startupState {
         case .pending: return .pending
         case .starting: return .starting

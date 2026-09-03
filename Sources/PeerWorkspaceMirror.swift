@@ -31,6 +31,11 @@ enum PeerMirrorLayoutRecoveryState: Equatable {
     case degraded(missingPaneCount: Int, attempt: Int)
     case ready
     case failed(missingPaneCount: Int)
+
+    var presentsAsReady: Bool {
+        if case .ready = self { return true }
+        return false
+    }
 }
 
 enum PeerMirrorLayoutRecoveryAction: Equatable {

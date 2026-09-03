@@ -622,8 +622,11 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                     try await self.applyLayout(latest.layout)
                     await self.startSubscription()
                     await MainActor.run { [weak self] in
-                        self?.hideRelayOverlay()
-                        self?.bannerPresenter?.showReconnected()
+                        guard let self, self.layoutRecoveryState.presentsAsReady else {
+                            return
+                        }
+                        self.hideRelayOverlay()
+                        self.bannerPresenter?.showReconnected()
                     }
                 } catch {
                     let detail = String(describing: error)
@@ -1784,7 +1787,11 @@ final class PeerRelayWorkspaceWindowController: NSWindowController, NSWindowDele
                 }
                 try await self.applyLayout(latest.layout)
                 await self.startSubscription()
-                await MainActor.run { self.hideRelayOverlay() }
+                await MainActor.run {
+                    if self.layoutRecoveryState.presentsAsReady {
+                        self.hideRelayOverlay()
+                    }
+                }
             } catch {
                 let detail = String(describing: error)
                 await MainActor.run { [weak self] in

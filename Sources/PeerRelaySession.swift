@@ -1147,6 +1147,15 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
         return Transition(id: id, resumeWireSeq: resumeSeq, generation: generation)
     }
 
+    func activeGapCapture(generation expectedGeneration: UInt64) -> Transition? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == expectedGeneration,
+              case .buffering(let id, let resumeSeq, true, _) = phase
+        else { return nil }
+        return Transition(id: id, resumeWireSeq: resumeSeq, generation: generation)
+    }
+
     func route(endWireSeq: UInt64, data: Data) -> Route {
         lock.lock()
         defer { lock.unlock() }
@@ -1766,6 +1775,10 @@ final class PeerRelaySession {
     /// the relay-only fixtures either exist for the whole session or never
     /// exist at all, so the mode cannot flip midway.
     let ptyDelivery: PtyDelivery
+    var usesRelayHelper: Bool {
+        if case .relaySocket = ptyDelivery { return true }
+        return false
+    }
 
     private var listenerFd: Int32 = -1
     private var relaySocket: RelaySocket?
@@ -3527,7 +3540,9 @@ final class PeerRelaySession {
             // flush the capture back out — a transient connect failure must
             // not leave the pane suppressed forever. The gap stays lost,
             // which is where every path started.
-            if let capture = resumeTransitionGate.activeGapCapture() {
+            if let capture = resumeTransitionGate.activeGapCapture(
+                generation: oldGeneration
+            ) {
                 await abortResumeTransition(capture)
             }
             return

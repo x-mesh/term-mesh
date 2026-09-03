@@ -3437,7 +3437,7 @@ struct TermMeshCLI {
             Example:
               term-mesh peer-hosts
               term-mesh peer-connect --host jw-server
-              term-mesh --json peer-force-disconnect --host ssh:root@jw-server
+              term-mesh --json peer-force-disconnect --host ssh:root@jw-server --confirm
             """
         case "new-workspace":
             return """
@@ -5115,7 +5115,7 @@ struct TermMeshCLI {
           peer-hosts
           peer-connect --host <id|name>
           peer-disconnect --host <id|name>
-          peer-force-disconnect --host <id|name>
+          peer-force-disconnect --host <id|name> --confirm
           peer-retry --host <id|name>
           peer-cancel --host <id|name>
           peer-open-pane --host <id|name>
