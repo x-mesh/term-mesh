@@ -4,6 +4,13 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.226.4] - 2026-09-03
+
+### Fixed
+- Allow one exact owner-socket repair call to reconstruct and recover a specific cold Project even when multiple inactive manifests make automatic name-based restoration ambiguous.
+- Reject partial, malformed, or mismatched repair identities without changing local or remote Project state; existing in-app Repair actions remain compatible.
+- Extend the release lifecycle test to prove `team.list=[]` → exact one-call repair → verified leader route and restored workers.
+
 ## [0.226.3] - 2026-09-03
 
 ### Fixed
