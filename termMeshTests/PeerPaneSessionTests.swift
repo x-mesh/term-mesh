@@ -1151,6 +1151,617 @@ final class PeerPaneSessionTests: XCTestCase {
         )
     }
 
+    func testRemoteRepairPlaceholderGenerationRejectsMaterializedState() throws {
+        let remote = RemoteTeamSummary(
+            name: "guard-\(UUID().uuidString)", teamUUID: "old-team",
+            workingDirectory: "/work/old", projectRootPath: nil,
+            agentNames: ["executor"], projectID: "team:old",
+            leaderSurfaceID: Data(repeating: 0x77, count: 16),
+            members: [.init(
+                name: "executor", agentInstanceID: "old-worker",
+                cli: "claude", model: "sonnet", agentType: "executor",
+                color: "blue", workingDirectory: "/work/old",
+                surfaceID: Data(repeating: 0x78, count: 16), surfaceType: "agent"
+            )],
+            presentationOwnedByRequester: true,
+            leaderProcessActive: false, leaderProcessActiveKnown: true
+        )
+        var placeholder = try XCTUnwrap(
+            TeamOrchestrator.remoteProjectRepairPlaceholder(
+                remote: remote, hostKey: "ssh:old"
+            )
+        )
+        XCTAssertNotNil(
+            TeamOrchestrator.remoteRepairPlaceholderGeneration(team: placeholder)
+        )
+
+        placeholder.leaderReady = true
+        XCTAssertNil(
+            TeamOrchestrator.remoteRepairPlaceholderGeneration(team: placeholder)
+        )
+        placeholder.leaderReady = false
+        placeholder.pairPanelId = UUID()
+        XCTAssertNil(
+            TeamOrchestrator.remoteRepairPlaceholderGeneration(team: placeholder)
+        )
+        placeholder.pairPanelId = nil
+        placeholder.agents[0].panelId = UUID()
+        XCTAssertNil(
+            TeamOrchestrator.remoteRepairPlaceholderGeneration(team: placeholder)
+        )
+        placeholder.agents[0].panelId = nil
+        placeholder.agents[0].remoteSurfaceOwnerRemoteSockPath = "/tmp/owner.sock"
+        XCTAssertNil(
+            TeamOrchestrator.remoteRepairPlaceholderGeneration(team: placeholder)
+        )
+        placeholder.agents[0].remoteSurfaceOwnerRemoteSockPath = nil
+        placeholder.remoteProjectLocations = [
+            .init(hostKey: "ssh:old", path: "/work/old")
+        ]
+        XCTAssertNil(
+            TeamOrchestrator.remoteRepairPlaceholderGeneration(team: placeholder)
+        )
+    }
+
+    @MainActor
+    func testExactRepairCanCASReplaceOnlyPristineInertPlaceholder() throws {
+        let teamName = "exact-cas-\(UUID().uuidString)"
+        defer {
+            TeamOrchestrator.shared.teams.removeValue(forKey: teamName)
+            TeamDataStore.shared.unregisterTeam(teamName)
+        }
+        func placeholder(
+            host: String, uuid: String, project: String, worker: String,
+            delegation: String
+        ) throws -> TeamOrchestrator.Team {
+            let remote = RemoteTeamSummary(
+                name: teamName, teamUUID: uuid, workingDirectory: "/work/\(uuid)",
+                projectRootPath: nil, agentNames: ["executor"], projectID: project,
+                leaderSurfaceID: Data(repeating: UInt8(uuid.count), count: 16),
+                members: [.init(
+                    name: "executor", agentInstanceID: worker, cli: "claude",
+                    model: "sonnet", agentType: "executor", color: "blue",
+                    workingDirectory: "/work/\(uuid)",
+                    surfaceID: Data(repeating: UInt8(worker.count), count: 16),
+                    surfaceType: "agent"
+                )],
+                presentationOwnedByRequester: true,
+                leaderProcessActive: false, leaderProcessActiveKnown: true,
+                delegationState: .init(
+                    configuredRaw: delegation, effectiveRaw: delegation, pendingRaw: ""
+                )
+            )
+            return try XCTUnwrap(TeamOrchestrator.remoteProjectRepairPlaceholder(
+                remote: remote, hostKey: host
+            ))
+        }
+
+        let old = try placeholder(
+            host: "ssh:old", uuid: "old-team", project: "team:old",
+            worker: "old-worker", delegation: "leaderFirst"
+        )
+        let replacement = try placeholder(
+            host: "ssh:new", uuid: "new-team", project: "team:new",
+            worker: "new-worker", delegation: "parallel"
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(old)
+        )
+        let expected = try XCTUnwrap(
+            TeamOrchestrator.shared.inertRemoteRepairPlaceholderGeneration(
+                teamName: teamName
+            )
+        )
+        let selectedBefore = AppDelegate.shared?.tabManager?.selectedTabId
+
+        XCTAssertTrue(
+            TeamOrchestrator.shared.replaceInertRemoteProjectRepairPlaceholder(
+                expected: expected, replacement: replacement
+            )
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.shared.teams[teamName]?.teamUuid, "new-team"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.shared.teams[teamName]?.remotePresentationProjectID,
+            "team:new"
+        )
+        XCTAssertEqual(
+            TeamDataStore.shared.agentInstanceId(
+                teamName: teamName, agentName: "executor"
+            ),
+            "new-worker"
+        )
+        XCTAssertEqual(
+            TeamDataStore.shared.projectDelegationState(teamName: teamName),
+            replacement.delegationState
+        )
+        XCTAssertEqual(AppDelegate.shared?.tabManager?.selectedTabId, selectedBefore)
+        XCTAssertFalse(
+            TeamOrchestrator.shared.replaceInertRemoteProjectRepairPlaceholder(
+                expected: expected, replacement: old
+            ),
+            "a consumed placeholder generation must never win a second CAS"
+        )
+    }
+
+    @MainActor
+    func testExactRepairRefusesPlaceholderWithNameKeyedWork() throws {
+        let teamName = "exact-busy-\(UUID().uuidString)"
+        defer {
+            TeamOrchestrator.shared.teams.removeValue(forKey: teamName)
+            TeamDataStore.shared.unregisterTeam(teamName)
+        }
+        func placeholder(uuid: String, worker: String) throws -> TeamOrchestrator.Team {
+            let remote = RemoteTeamSummary(
+                name: teamName, teamUUID: uuid, workingDirectory: "/work/\(uuid)",
+                projectRootPath: nil, agentNames: ["executor"],
+                projectID: "team:\(uuid)",
+                leaderSurfaceID: Data(repeating: 0x79, count: 16),
+                members: [.init(
+                    name: "executor", agentInstanceID: worker, cli: "claude",
+                    model: "sonnet", agentType: "executor", color: "blue",
+                    workingDirectory: "/work/\(uuid)",
+                    surfaceID: Data(repeating: 0x7a, count: 16), surfaceType: "agent"
+                )],
+                presentationOwnedByRequester: true,
+                leaderProcessActive: false, leaderProcessActiveKnown: true
+            )
+            return try XCTUnwrap(TeamOrchestrator.remoteProjectRepairPlaceholder(
+                remote: remote, hostKey: "ssh:\(uuid)"
+            ))
+        }
+
+        let old = try placeholder(uuid: "old", worker: "old-worker")
+        let replacement = try placeholder(uuid: "new", worker: "new-worker")
+        XCTAssertTrue(
+            TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(old)
+        )
+        let expected = try XCTUnwrap(
+            TeamOrchestrator.shared.inertRemoteRepairPlaceholderGeneration(
+                teamName: teamName
+            )
+        )
+        XCTAssertNotNil(TeamDataStore.shared.createTask(
+            teamName: teamName, title: "preserve me", assignee: "executor",
+            assigneeInstanceId: "old-worker"
+        ))
+
+        XCTAssertFalse(
+            TeamOrchestrator.shared.replaceInertRemoteProjectRepairPlaceholder(
+                expected: expected, replacement: replacement
+            )
+        )
+        XCTAssertEqual(TeamOrchestrator.shared.teams[teamName]?.teamUuid, "old")
+        XCTAssertEqual(TeamDataStore.shared.listTasks(teamName: teamName).count, 1)
+    }
+
+    @MainActor
+    func testExactRepairAtomicallySwapsDurableBoardsWithoutRewritingEitherFile() throws {
+        let teamName = "exact-board-swap-\(UUID().uuidString)"
+        let oldUUID = UUID().uuidString
+        let newUUID = UUID().uuidString
+        let oldURL = TeamDataStore.boardFileURL(teamUuid: oldUUID)
+        let newURL = TeamDataStore.boardFileURL(teamUuid: newUUID)
+        defer {
+            TeamOrchestrator.shared.teams.removeValue(forKey: teamName)
+            TeamDataStore.shared.unregisterTeam(teamName)
+            try? FileManager.default.removeItem(
+                at: oldURL.deletingLastPathComponent()
+            )
+            try? FileManager.default.removeItem(
+                at: newURL.deletingLastPathComponent()
+            )
+        }
+        func writeBoard(uuid: String, url: URL, key: String, value: String) throws {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            let moment = Date(timeIntervalSince1970: 1_700_000_000)
+            let board = TeamDataStore.PersistedBoard(
+                schema: TeamDataStore.boardSchemaVersion, teamUuid: uuid,
+                teamName: teamName, savedAt: moment, tasks: [],
+                context: [key: .init(value: value, setBy: "test", updatedAt: moment)],
+                leaderRequests: [], leaderRequestToken: nil
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            encoder.outputFormatting = [.sortedKeys]
+            try encoder.encode(board).write(to: url, options: .atomic)
+        }
+        func placeholder(uuid: String, host: String, worker: String) throws
+            -> TeamOrchestrator.Team {
+            let remote = RemoteTeamSummary(
+                name: teamName, teamUUID: uuid, workingDirectory: "/work/\(uuid)",
+                projectRootPath: nil, agentNames: ["executor"],
+                projectID: "team:\(uuid)",
+                leaderSurfaceID: Data(repeating: UInt8(worker.count), count: 16),
+                members: [.init(
+                    name: "executor", agentInstanceID: worker, cli: "claude",
+                    model: "sonnet", agentType: "executor", color: "blue",
+                    workingDirectory: "/work/\(uuid)",
+                    surfaceID: Data(repeating: UInt8(uuid.count), count: 16),
+                    surfaceType: "agent"
+                )],
+                presentationOwnedByRequester: true,
+                leaderProcessActive: false, leaderProcessActiveKnown: true
+            )
+            return try XCTUnwrap(TeamOrchestrator.remoteProjectRepairPlaceholder(
+                remote: remote, hostKey: host
+            ))
+        }
+
+        try writeBoard(uuid: oldUUID, url: oldURL, key: "old", value: "preserve-a")
+        try writeBoard(uuid: newUUID, url: newURL, key: "new", value: "restore-b")
+        let oldBytes = try Data(contentsOf: oldURL)
+        let newBytes = try Data(contentsOf: newURL)
+        let old = try placeholder(uuid: oldUUID, host: "ssh:old", worker: "old-worker")
+        let replacement = try placeholder(
+            uuid: newUUID, host: "ssh:new", worker: "new-worker"
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(old)
+        )
+        XCTAssertEqual(
+            TeamDataStore.shared.contextGet(teamName: teamName, key: "old")?[
+                "value"
+            ] as? String,
+            "preserve-a"
+        )
+        let expected = try XCTUnwrap(
+            TeamOrchestrator.shared.inertRemoteRepairPlaceholderGeneration(
+                teamName: teamName
+            )
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.shared.replaceInertRemoteProjectRepairPlaceholder(
+                expected: expected, replacement: replacement
+            )
+        )
+        XCTAssertNil(
+            TeamDataStore.shared.contextGet(teamName: teamName, key: "old")
+        )
+        XCTAssertEqual(
+            TeamDataStore.shared.contextGet(teamName: teamName, key: "new")?[
+                "value"
+            ] as? String,
+            "restore-b"
+        )
+        let pendingSaveSettled = expectation(description: "pending old save settled")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            pendingSaveSettled.fulfill()
+        }
+        wait(for: [pendingSaveSettled], timeout: 2)
+        XCTAssertEqual(try Data(contentsOf: oldURL), oldBytes)
+        XCTAssertEqual(try Data(contentsOf: newURL), newBytes)
+    }
+
+    @MainActor
+    func testExactRepairImmediatelySwapsAnInProgressRestoredBoard() throws {
+        let teamName = "exact-in-progress-\(UUID().uuidString)"
+        let oldUUID = UUID().uuidString
+        let newUUID = UUID().uuidString
+        let oldURL = TeamDataStore.boardFileURL(teamUuid: oldUUID)
+        let newURL = TeamDataStore.boardFileURL(teamUuid: newUUID)
+        defer {
+            TeamOrchestrator.shared.teams.removeValue(forKey: teamName)
+            TeamDataStore.shared.unregisterTeam(teamName)
+            try? FileManager.default.removeItem(
+                at: oldURL.deletingLastPathComponent()
+            )
+        }
+        try FileManager.default.createDirectory(
+            at: oldURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let savedAt = Date(timeIntervalSince1970: 1_700_000_123)
+        let task = TeamOrchestrator.TeamTask(
+            id: "in-flight", title: "preserve", details: nil,
+            acceptanceCriteria: [], labels: [], estimatedSize: nil,
+            assignee: "executor", assigneeInstanceId: "old-worker",
+            status: "in_progress", priority: 2, dependsOn: [],
+            parentTaskId: nil, childTaskIds: [], reassignmentCount: 0,
+            createdBy: "leader", result: nil, createdAt: savedAt,
+            updatedAt: savedAt.addingTimeInterval(-10), startedAt: savedAt
+        )
+        func write(_ board: TeamDataStore.PersistedBoard, to url: URL) throws {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            encoder.outputFormatting = [.sortedKeys]
+            try encoder.encode(board).write(to: url, options: .atomic)
+        }
+        try write(.init(
+            schema: TeamDataStore.boardSchemaVersion, teamUuid: oldUUID,
+            teamName: teamName, savedAt: savedAt, tasks: [task], context: [:],
+            leaderRequests: [], leaderRequestToken: nil
+        ), to: oldURL)
+        try write(.init(
+            schema: TeamDataStore.boardSchemaVersion, teamUuid: newUUID,
+            teamName: teamName, savedAt: savedAt, tasks: [],
+            context: ["new": .init(
+                value: "target", setBy: "test", updatedAt: savedAt
+            )], leaderRequests: [], leaderRequestToken: nil
+        ), to: newURL)
+        let oldBytes = try Data(contentsOf: oldURL)
+        let newBytes = try Data(contentsOf: newURL)
+        func placeholder(uuid: String, host: String, worker: String) throws
+            -> TeamOrchestrator.Team {
+            let remote = RemoteTeamSummary(
+                name: teamName, teamUUID: uuid, workingDirectory: "/work/\(uuid)",
+                projectRootPath: nil, agentNames: ["executor"],
+                projectID: "team:\(uuid)",
+                leaderSurfaceID: Data(repeating: 0x61, count: 16),
+                members: [.init(
+                    name: "executor", agentInstanceID: worker, cli: "claude",
+                    model: "sonnet", agentType: "executor", color: "blue",
+                    workingDirectory: "/work/\(uuid)",
+                    surfaceID: Data(repeating: 0x62, count: 16), surfaceType: "agent"
+                )], presentationOwnedByRequester: true,
+                leaderProcessActive: false, leaderProcessActiveKnown: true
+            )
+            return try XCTUnwrap(TeamOrchestrator.remoteProjectRepairPlaceholder(
+                remote: remote, hostKey: host
+            ))
+        }
+        let old = try placeholder(uuid: oldUUID, host: "ssh:old", worker: "old-worker")
+        let replacement = try placeholder(
+            uuid: newUUID, host: "ssh:new", worker: "new-worker"
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(old)
+        )
+        XCTAssertEqual(
+            TeamDataStore.shared.listTasks(teamName: teamName).first?.status, "assigned"
+        )
+        let expected = try XCTUnwrap(
+            TeamOrchestrator.shared.inertRemoteRepairPlaceholderGeneration(
+                teamName: teamName
+            )
+        )
+        // Do not wait for the 0.5s normalization save. Re-decoding A must
+        // produce the same restored bytes immediately.
+        XCTAssertTrue(
+            TeamOrchestrator.shared.replaceInertRemoteProjectRepairPlaceholder(
+                expected: expected, replacement: replacement
+            )
+        )
+        XCTAssertTrue(TeamDataStore.shared.listTasks(teamName: teamName).isEmpty)
+        XCTAssertEqual(
+            TeamDataStore.shared.contextGet(teamName: teamName, key: "new")?[
+                "value"
+            ] as? String, "target"
+        )
+        XCTAssertEqual(try Data(contentsOf: oldURL), oldBytes)
+        XCTAssertEqual(try Data(contentsOf: newURL), newBytes)
+    }
+
+    @MainActor
+    func testRepairPlaceholderNeverOverwritesCorruptDurableBoards() throws {
+        let teamName = "exact-corrupt-\(UUID().uuidString)"
+        let oldUUID = UUID().uuidString
+        let newUUID = UUID().uuidString
+        let oldURL = TeamDataStore.boardFileURL(teamUuid: oldUUID)
+        let newURL = TeamDataStore.boardFileURL(teamUuid: newUUID)
+        defer {
+            TeamOrchestrator.shared.teams.removeValue(forKey: teamName)
+            TeamDataStore.shared.unregisterTeam(teamName)
+            try? FileManager.default.removeItem(
+                at: oldURL.deletingLastPathComponent()
+            )
+        }
+        try FileManager.default.createDirectory(
+            at: oldURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let corruptA = Data("{not-json-a".utf8)
+        try corruptA.write(to: oldURL, options: .atomic)
+        func placeholder(uuid: String, host: String) throws -> TeamOrchestrator.Team {
+            let remote = RemoteTeamSummary(
+                name: teamName, teamUUID: uuid, workingDirectory: "/work/\(uuid)",
+                projectRootPath: nil, agentNames: [], projectID: "team:\(uuid)",
+                leaderSurfaceID: Data(repeating: 0x63, count: 16),
+                presentationOwnedByRequester: true,
+                leaderProcessActive: false, leaderProcessActiveKnown: true
+            )
+            return try XCTUnwrap(TeamOrchestrator.remoteProjectRepairPlaceholder(
+                remote: remote, hostKey: host
+            ))
+        }
+        XCTAssertFalse(TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(
+            try placeholder(uuid: oldUUID, host: "ssh:old")
+        ))
+        XCTAssertNil(TeamOrchestrator.shared.teams[teamName])
+        XCTAssertEqual(try Data(contentsOf: oldURL), corruptA)
+
+        // A valid empty board may install, but a corrupt B must make the CAS
+        // fail before either the local model or either file changes.
+        let validA = TeamDataStore.PersistedBoard(
+            schema: TeamDataStore.boardSchemaVersion, teamUuid: oldUUID,
+            teamName: teamName, savedAt: Date(), tasks: [], context: [:],
+            leaderRequests: [], leaderRequestToken: nil
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(validA).write(to: oldURL, options: .atomic)
+        let validABytes = try Data(contentsOf: oldURL)
+        let corruptB = Data("{not-json-b".utf8)
+        try FileManager.default.createDirectory(
+            at: newURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try corruptB.write(to: newURL, options: .atomic)
+        XCTAssertTrue(TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(
+            try placeholder(uuid: oldUUID, host: "ssh:old")
+        ))
+        let expected = try XCTUnwrap(
+            TeamOrchestrator.shared.inertRemoteRepairPlaceholderGeneration(
+                teamName: teamName
+            )
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.shared.replaceInertRemoteProjectRepairPlaceholder(
+                expected: expected,
+                replacement: try placeholder(uuid: newUUID, host: "ssh:new")
+            )
+        )
+        XCTAssertEqual(TeamOrchestrator.shared.teams[teamName]?.teamUuid, oldUUID)
+        XCTAssertEqual(try Data(contentsOf: oldURL), validABytes)
+        XCTAssertEqual(try Data(contentsOf: newURL), corruptB)
+    }
+
+    @MainActor
+    func testInertPlaceholderGuardRejectsStaleRoutesAndPendingRecovery() throws {
+        let teamName = "exact-runtime-guard-\(UUID().uuidString)"
+        let staleID = "stale-worker-\(UUID().uuidString)"
+        defer {
+            TeamOrchestrator.shared.remoteAgentRouteLeases.removeValue(forKey: staleID)
+            TeamOrchestrator.shared.remoteAgentRouteKeepalives
+                .removeValue(forKey: staleID)?.task.cancel()
+            TeamOrchestrator.shared.teams.removeValue(forKey: teamName)
+            TeamDataStore.shared.unregisterTeam(teamName)
+        }
+        let remote = RemoteTeamSummary(
+            name: teamName, teamUUID: "old", workingDirectory: "/work/old",
+            projectRootPath: nil, agentNames: [], projectID: "team:old",
+            leaderSurfaceID: Data(repeating: 0x7c, count: 16),
+            presentationOwnedByRequester: true,
+            leaderProcessActive: false, leaderProcessActiveKnown: true
+        )
+        let placeholder = try XCTUnwrap(
+            TeamOrchestrator.remoteProjectRepairPlaceholder(
+                remote: remote, hostKey: "ssh:old"
+            )
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(placeholder)
+        )
+        XCTAssertNotNil(
+            TeamOrchestrator.shared.inertRemoteRepairPlaceholderGeneration(
+                teamName: teamName
+            )
+        )
+
+        TeamOrchestrator.shared.remoteAgentRouteLeases[staleID] = .init(
+            teamName: teamName, grantID: Data(repeating: 0x7d, count: 16)
+        )
+        XCTAssertNil(
+            TeamOrchestrator.shared.inertRemoteRepairPlaceholderGeneration(
+                teamName: teamName
+            )
+        )
+        TeamOrchestrator.shared.remoteAgentRouteLeases.removeValue(forKey: staleID)
+        TeamOrchestrator.shared.remoteAgentRouteKeepalives[staleID] = .init(
+            teamName: teamName, task: Task {}
+        )
+        XCTAssertNil(
+            TeamOrchestrator.shared.inertRemoteRepairPlaceholderGeneration(
+                teamName: teamName
+            )
+        )
+        TeamOrchestrator.shared.remoteAgentRouteKeepalives
+            .removeValue(forKey: staleID)?.task.cancel()
+
+        let pending = PeerAgentPaneRecoveryCoordinator.Request(
+            teamName: teamName, agentInstanceID: staleID, closedPanelID: UUID(),
+            surfaceID: Data(repeating: 0x7e, count: 16)
+        )
+        PeerAgentPaneRecoveryCoordinator.shared.remember(pending)
+        defer { PeerAgentPaneRecoveryCoordinator.shared.forget(pending) }
+        XCTAssertNil(
+            TeamOrchestrator.shared.inertRemoteRepairPlaceholderGeneration(
+                teamName: teamName
+            )
+        )
+    }
+
+    @MainActor
+    func testFinishedRepairPlaceholderReschedulesManifestPublication() throws {
+        let teamName = "repair-publish-\(UUID().uuidString)"
+        defer {
+            TeamOrchestrator.shared.remoteProjectManifestTasks
+                .removeValue(forKey: teamName)?.cancel()
+            TeamOrchestrator.shared.remoteProjectManifestSignatures
+                .removeValue(forKey: teamName)
+            TeamOrchestrator.shared.teams.removeValue(forKey: teamName)
+            TeamDataStore.shared.unregisterTeam(teamName)
+        }
+        let remote = RemoteTeamSummary(
+            name: teamName, teamUUID: "publish-team",
+            workingDirectory: "/work/publish", projectRootPath: nil,
+            agentNames: [], projectID: "team:publish-team",
+            leaderSurfaceID: Data(repeating: 0x7f, count: 16),
+            presentationOwnedByRequester: true,
+            leaderProcessActive: false, leaderProcessActiveKnown: true
+        )
+        let placeholder = try XCTUnwrap(
+            TeamOrchestrator.remoteProjectRepairPlaceholder(
+                remote: remote, hostKey: "ssh:publish"
+            )
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(placeholder)
+        )
+        XCTAssertNil(TeamOrchestrator.shared.remoteProjectManifestTasks[teamName])
+
+        TeamOrchestrator.shared.finishRemoteRepairPlaceholderMaterialization(
+            teamName: teamName
+        )
+        XCTAssertFalse(
+            try XCTUnwrap(TeamOrchestrator.shared.teams[teamName])
+                .isRemoteRepairPlaceholder
+        )
+        XCTAssertNotNil(TeamOrchestrator.shared.remoteProjectManifestTasks[teamName])
+    }
+
+    @MainActor
+    func testInstallingRepairPlaceholderLoadsDurableBoardBeforeRegistration() throws {
+        let teamName = "repair-board-\(UUID().uuidString)"
+        let teamUUID = UUID().uuidString
+        let url = TeamDataStore.boardFileURL(teamUuid: teamUUID)
+        defer {
+            TeamOrchestrator.shared.teams.removeValue(forKey: teamName)
+            TeamDataStore.shared.unregisterTeam(teamName)
+        }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let board = TeamDataStore.PersistedBoard(
+            schema: TeamDataStore.boardSchemaVersion, teamUuid: teamUUID,
+            teamName: teamName, savedAt: Date(), tasks: [],
+            context: ["durable": .init(
+                value: "preserved", setBy: "test", updatedAt: Date()
+            )],
+            leaderRequests: [], leaderRequestToken: nil
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder.encode(board).write(to: url, options: .atomic)
+
+        let remote = RemoteTeamSummary(
+            name: teamName, teamUUID: teamUUID, workingDirectory: "/work/board",
+            projectRootPath: nil, agentNames: [], projectID: "team:\(teamUUID)",
+            leaderSurfaceID: Data(repeating: 0x7b, count: 16),
+            presentationOwnedByRequester: true,
+            leaderProcessActive: false, leaderProcessActiveKnown: true
+        )
+        let placeholder = try XCTUnwrap(
+            TeamOrchestrator.remoteProjectRepairPlaceholder(
+                remote: remote, hostKey: "ssh:board"
+            )
+        )
+        XCTAssertTrue(
+            TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(placeholder)
+        )
+        XCTAssertEqual(
+            TeamDataStore.shared.contextGet(teamName: teamName, key: "durable")?[
+                "value"
+            ] as? String,
+            "preserved"
+        )
+    }
+
     func testAutomaticRestoreFailureKeyChangesWithSocketOrRevision() {
         let base = TeamOrchestrator.automaticProjectRestoreFailureKey(
             hostID: "host", activeSockPath: "/tmp/one.sock",

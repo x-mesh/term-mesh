@@ -367,6 +367,18 @@ extension TeamOrchestrator {
         let projectID: String
     }
 
+    struct RemoteRepairPlaceholderGeneration: Equatable {
+        let hostKey: String
+        let teamUUID: String
+        let projectID: String
+        let workspaceID: UUID
+        let leaderPanelID: UUID
+        let revision: UInt64
+        let createdAt: Date
+        let memberInstanceIDs: [String]
+        let memberSurfaceIDs: [Data?]
+    }
+
     enum ExactRepairInput: Equatable {
         case omitted
         case valid(ExactRepairIdentity)
@@ -760,9 +772,23 @@ extension TeamOrchestrator {
                 owningEndpoint.remoteSockPath
             teams[teamName] = current
         }
-        if var current = teams[teamName] {
-            current.isRemoteRepairPlaceholder = false
-            teams[teamName] = current
+        finishRemoteRepairPlaceholderMaterialization(teamName: teamName)
+    }
+
+    /// The inert-install publication guard must end at the same boundary as
+    /// materialization. Leader recovery can request publication earlier while
+    /// the flag is still true; explicitly rescheduling here ensures the new
+    /// leader and worker topology becomes the durable remote manifest.
+    @MainActor
+    func finishRemoteRepairPlaceholderMaterialization(teamName: String) {
+        guard var current = teams[teamName], current.isRemoteRepairPlaceholder else {
+            return
+        }
+        current.isRemoteRepairPlaceholder = false
+        teams[teamName] = current
+        syncTeamStateToDaemon()
+        if case .peer(let hostKey) = current.leaderEndpoint {
+            scheduleRemoteProjectManifestPublication(forHostKey: hostKey)
         }
     }
 
@@ -878,17 +904,32 @@ extension TeamOrchestrator {
         defer { collaborationRepairInFlight.remove(teamName) }
         if let exactIdentity {
             if let localTeam = teams[teamName] {
-                guard Self.exactRepairIdentityMatches(
+                if !Self.exactRepairIdentityMatches(
                     team: localTeam, hostKey: exactIdentity.hostKey,
                     teamUUID: exactIdentity.teamUUID,
                     projectID: exactIdentity.projectID
-                ) else {
-                    return CollaborationRecoveryReport(
-                        routeRepaired: false, leaderLive: false, liveAgents: 0,
-                        replacedAgents: [], failedAgents: [
-                            "Local Project does not match the exact repair identity"
-                        ]
-                    )
+                ) {
+                    guard let expected = inertRemoteRepairPlaceholderGeneration(
+                        teamName: teamName
+                    ) else {
+                        return CollaborationRecoveryReport(
+                            routeRepaired: false, leaderLive: false, liveAgents: 0,
+                            replacedAgents: [], failedAgents: [
+                                "Local Project does not match the exact repair identity"
+                            ]
+                        )
+                    }
+                    if let failure = await installExactRemoteProjectRepairPlaceholder(
+                        teamName: teamName, hostKey: exactIdentity.hostKey,
+                        teamUUID: exactIdentity.teamUUID,
+                        projectID: exactIdentity.projectID,
+                        replacing: expected
+                    ) {
+                        return CollaborationRecoveryReport(
+                            routeRepaired: false, leaderLive: false, liveAgents: 0,
+                            replacedAgents: [], failedAgents: [failure]
+                        )
+                    }
                 }
             } else if let failure = await installExactRemoteProjectRepairPlaceholder(
                 teamName: teamName, hostKey: exactIdentity.hostKey,
@@ -1696,7 +1737,8 @@ extension TeamOrchestrator {
         for team in teams.values {
             guard case let .peer(hostKey) = team.leaderEndpoint,
                   requestedHostKey == nil || requestedHostKey == hostKey,
-                  team.ownsRemotePresentation
+                  team.ownsRemotePresentation,
+                  !team.isRemoteRepairPlaceholder
             else { continue }
             let signature = Self.remoteProjectManifestSignature(team, hostKey: hostKey)
             // Ordinary team syncs include high-frequency task/message state.
@@ -2161,7 +2203,14 @@ extension TeamOrchestrator {
     @MainActor
     func installRemoteProjectRepairPlaceholder(_ team: Team) -> Bool {
         guard team.isRemoteRepairPlaceholder, team.ownsRemotePresentation,
-              teams[team.id] == nil else { return false }
+              teams[team.id] == nil,
+              let teamUUID = team.teamUuid?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ), !teamUUID.isEmpty,
+              TeamDataStore.shared.preparePlaceholderBoardRegistration(
+                teamName: team.id, teamUUID: teamUUID
+              )
+        else { return false }
         teams[team.id] = team
         TeamDataStore.shared.registerTeam(
             team.id,
@@ -2180,10 +2229,11 @@ extension TeamOrchestrator {
     /// state; the caller's immediately-following Repair owns materialization.
     @MainActor
     func installExactRemoteProjectRepairPlaceholder(
-        teamName: String, hostKey: String, teamUUID: String, projectID: String
+        teamName: String, hostKey: String, teamUUID: String, projectID: String,
+        replacing expected: RemoteRepairPlaceholderGeneration? = nil
     ) async -> String? {
-        guard teams[teamName] == nil, !hostKey.isEmpty, !teamUUID.isEmpty,
-              !projectID.isEmpty,
+        guard !hostKey.isEmpty, !teamUUID.isEmpty, !projectID.isEmpty,
+              (expected == nil ? teams[teamName] == nil : true),
               let host = RemoteHostStore.shared.sortedHosts.first(where: {
                   $0.id == hostKey && $0.isConnected && $0.teamHostSpec != nil
               }) else {
@@ -2199,11 +2249,129 @@ extension TeamOrchestrator {
               !authoritative.team.leaderProcessActive,
               let placeholder = Self.remoteProjectRepairPlaceholder(
                   remote: authoritative.team, hostKey: hostKey
-              ),
-              installRemoteProjectRepairPlaceholder(placeholder) else {
+              ) else {
             return "Exact owned inactive Project could not be reconstructed"
         }
+        let installed: Bool
+        if let expected {
+            installed = replaceInertRemoteProjectRepairPlaceholder(
+                expected: expected, replacement: placeholder
+            )
+        } else {
+            installed = installRemoteProjectRepairPlaceholder(placeholder)
+        }
+        guard installed else {
+            return "Exact Project identity changed before repair"
+        }
         return nil
+    }
+
+    nonisolated static func remoteRepairPlaceholderGeneration(
+        team: Team
+    ) -> RemoteRepairPlaceholderGeneration? {
+        guard team.isRemoteRepairPlaceholder, team.ownsRemotePresentation,
+              !team.leaderReady, team.pairPanelId == nil,
+              team.remoteWorkspaceIDs.isEmpty, team.remoteProjectLocations.isEmpty,
+              let teamUUID = team.teamUuid?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              ), !teamUUID.isEmpty,
+              let projectID = team.remotePresentationProjectID?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              ), !projectID.isEmpty,
+              case .peer(let hostKey) = team.leaderEndpoint,
+              !hostKey.isEmpty,
+              team.agents.allSatisfy({
+                  $0.panelId == nil
+                      && $0.remoteSurfaceOwnerRemoteSockPath == nil
+                      && $0.workspaceId == team.workspaceId
+              })
+        else { return nil }
+        return RemoteRepairPlaceholderGeneration(
+            hostKey: hostKey, teamUUID: teamUUID, projectID: projectID,
+            workspaceID: team.workspaceId, leaderPanelID: team.leaderPanelId,
+            revision: team.remotePresentationRevision, createdAt: team.createdAt,
+            memberInstanceIDs: team.agents.map(\.agentInstanceId),
+            memberSurfaceIDs: team.agents.map(\.remoteSurfaceID)
+        )
+    }
+
+    @MainActor
+    func inertRemoteRepairPlaceholderGeneration(
+        teamName: String
+    ) -> RemoteRepairPlaceholderGeneration? {
+        guard let team = teams[teamName],
+              let generation = Self.remoteRepairPlaceholderGeneration(team: team),
+              AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId) == nil,
+              AppDelegate.shared?.locateSurface(surfaceId: team.leaderPanelId) == nil,
+              team.agents.allSatisfy({ agent in
+                  AppDelegate.shared?.tabManagerFor(tabId: agent.workspaceId) == nil
+                      && (agent.panelId.flatMap {
+                          AppDelegate.shared?.locateSurface(surfaceId: $0)
+                      }) == nil
+              }),
+              !hasPreservedProjectPresentation(teamName: teamName),
+              WorkspaceProjectNames.shared.projectName(for: team.workspaceId) == nil,
+              WorkspaceProjectNames.shared.projectID(for: team.workspaceId) == nil,
+              remoteLeaderGrantIDs[teamName] == nil,
+              remoteLeaderGrants[teamName] == nil,
+              remoteLeaderGrantKeepalives[teamName] == nil,
+              !remoteAgentRouteLeases.values.contains(where: {
+                  $0.teamName == teamName
+              }),
+              !remoteAgentRouteKeepalives.values.contains(where: {
+                  $0.teamName == teamName
+              }),
+              !remoteLeaderReattachInFlight.contains(teamName),
+              !remoteLeaderRecoveryInFlight.contains(teamName),
+              !projectRestoreInFlight.contains(teamName),
+              remoteLeaderReconnectTasks[teamName] == nil,
+              remoteProjectManifestTasks[teamName] == nil,
+              remoteProjectManifestSignatures[teamName] == nil,
+              publishedRemoteProjectAgentSurfaceIDs[teamName] == nil,
+              !automaticProjectRestoreRetryTasks.keys.contains(where: { key in
+                  key.hasPrefix(generation.hostKey + "\u{1f}")
+                      && key.contains("\u{1f}" + generation.projectID + "\u{1f}")
+              }),
+              !peerAgentRecoveryInFlight.contains(where: {
+                  $0.hasPrefix(teamName + "/")
+              }),
+              !PeerAgentPaneRecoveryCoordinator.shared.pending.contains(where: {
+                  $0.teamName == teamName
+              }),
+              !projectDeletionSuppressions.contains(
+                  Self.projectDeletionSuppressionKey(
+                      hostID: generation.hostKey, projectID: generation.projectID
+                  )
+              )
+        else { return nil }
+        return generation
+    }
+
+    @MainActor
+    func replaceInertRemoteProjectRepairPlaceholder(
+        expected: RemoteRepairPlaceholderGeneration, replacement: Team
+    ) -> Bool {
+        guard let current = teams[replacement.id],
+              inertRemoteRepairPlaceholderGeneration(teamName: replacement.id) == expected,
+              let oldTeamUUID = current.teamUuid,
+              let newTeamUUID = replacement.teamUuid,
+              TeamDataStore.shared.replacePristinePlaceholderRegistration(
+                  teamName: replacement.id,
+                  expectedAgents: current.agents.map {
+                      .init(name: $0.name, instanceId: $0.agentInstanceId)
+                  },
+                  expectedDelegationState: current.delegationState,
+                  expectedTeamUUID: oldTeamUUID,
+                  replacementAgents: replacement.agents.map {
+                      .init(name: $0.name, instanceId: $0.agentInstanceId)
+                  },
+                  replacementDelegationState: replacement.delegationState,
+                  replacementTeamUUID: newTeamUUID
+              )
+        else { return false }
+        teams[replacement.id] = replacement
+        syncTeamStateToDaemon()
+        return true
     }
 
     nonisolated static func exactRemoteRepairPlaceholderCandidate(
@@ -4988,7 +5156,7 @@ extension TeamOrchestrator {
             grantID: grantID
         )
         installRemoteLeaderWakeObserver()
-        remoteAgentRouteKeepalives[agentInstanceID] = Task { [weak self] in
+        let keepalive = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
                 guard !Task.isCancelled,
@@ -5015,6 +5183,9 @@ extension TeamOrchestrator {
                 }
             }
         }
+        remoteAgentRouteKeepalives[agentInstanceID] = .init(
+            teamName: teamName, task: keepalive
+        )
     }
 
     /// Renew every live grant as soon as the machine wakes.
@@ -5101,7 +5272,7 @@ extension TeamOrchestrator {
         agentInstanceID: String,
         revoke: Bool
     ) {
-        remoteAgentRouteKeepalives.removeValue(forKey: agentInstanceID)?.cancel()
+        remoteAgentRouteKeepalives.removeValue(forKey: agentInstanceID)?.task.cancel()
         guard let lease = remoteAgentRouteLeases.removeValue(forKey: agentInstanceID),
               revoke else { return }
         Task { await PeerTeamLeaderControlPlane.shared.revokeGrant(id: lease.grantID) }
