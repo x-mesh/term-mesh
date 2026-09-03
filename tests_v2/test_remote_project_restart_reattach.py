@@ -1355,10 +1355,9 @@ def _phase_cleanup(c, host: str, state_path: Path) -> None:
         f'test ! -e "$d/leader-participation-{state["team_uuid"]}.json"'
     )
     _remote_stdout(host, artifact_check)
-    if any(
-        item.get("project_id") == state["project_id"]
-        for item in c.debug_project_remote_presentations(host)
-    ):
+    if _remote_project_manifest_status(
+        host, state["source_directory"], state["project_id"]
+    ) is not None:
         raise termmeshError("owner cleanup left the manifest behind")
     receipt_path = os.environ.get(RECEIPT_ENV, "").strip()
     if receipt_path:
