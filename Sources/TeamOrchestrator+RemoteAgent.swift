@@ -461,7 +461,10 @@ extension TeamOrchestrator {
     ) async -> AuthoritativeCollaborationSnapshotResult {
         let lease: PeerPaneHostLease
         do {
-            let spec = try Self.requireTeamHostSpec(host)
+            let readyHost = try await Self.waitForTeamHostLaunchReadiness(
+                hostKey: host.id
+            )
+            let spec = try Self.requireTeamHostSpec(readyHost)
             lease = try await PeerPaneHostRegistry.shared.acquire(spec)
         } catch {
             return .failure("Host connection unavailable: \(error.localizedDescription)")
