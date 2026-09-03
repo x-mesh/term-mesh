@@ -461,6 +461,15 @@ extension TeamOrchestrator {
     ) async -> AuthoritativeCollaborationSnapshotResult {
         let lease: PeerPaneHostLease
         do {
+            if let current = RemoteHostStore.shared.sortedHosts.first(where: {
+                $0.id == host.id
+            }), !Self.teamHostCanLaunch(current) {
+                // A daemon restart can let the retired connection's failure
+                // callback land after a fresh row briefly reported ready.
+                // Repair owns route recovery, so start one fresh generation
+                // before waiting on the ordinary bounded readiness funnel.
+                _ = RemoteHostStore.shared.retryConnectingHost(current)
+            }
             let readyHost = try await Self.waitForTeamHostLaunchReadiness(
                 hostKey: host.id
             )
