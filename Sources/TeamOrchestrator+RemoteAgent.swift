@@ -968,6 +968,8 @@ extension TeamOrchestrator {
 
     static let collaborationRouteVerificationMarker =
         "__TERMMESH_COLLABORATION_ROUTE_RESULT__="
+    static let collaborationRouteVerificationExitMarker =
+        "__TERMMESH_COLLABORATION_ROUTE_EXIT__="
 
     /// Resolve only a control socket that belongs to the authenticated peer
     /// endpoint. Linux custom installs use Host Doctor's measured path; the
@@ -1009,13 +1011,14 @@ extension TeamOrchestrator {
             + "cli=$(command -v tm-agent 2>/dev/null || true); "
             + "[ -x \"$cli\" ] || cli=\"$HOME/.local/bin/tm-agent\"; "
             + "[ -x \"$cli\" ] || exit 72; "
-            + "result=$(TERMMESH_SOCKET=\"$control\" "
+            + "set +e; result=$(TERMMESH_SOCKET=\"$control\" "
             + "TERMMESH_TEAM=\(shellQuoted(teamName)) "
             + "TERMMESH_LEADER_ROUTE_FILE=\"$route\" TERMMESH_RPC_TIMEOUT=20 "
-            + "\"$cli\" --team \(shellQuoted(teamName)) status) || exit 73; "
+            + "\"$cli\" --team \(shellQuoted(teamName)) status 2>&1); status=$?; set -e; "
             + "encoded=$(printf %s \"$result\" | base64 | tr -d '\\n'); "
             + "printf '%s%s\\n' \(shellQuoted(collaborationRouteVerificationMarker)) "
-            + "\"$encoded\""
+            + "\"$encoded\"; printf '%s%s\\n' "
+            + "\(shellQuoted(collaborationRouteVerificationExitMarker)) \"$status\""
         return RemotePasteTransfer.serviceAccountCommand(body)
     }
 
@@ -1035,6 +1038,23 @@ extension TeamOrchestrator {
             return true
         }
         return false
+    }
+
+    static func remoteCollaborationRouteVerificationFailure(_ output: String) -> String {
+        var status = "unknown"
+        var detail = "no diagnostic output"
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let text = line.trimmingCharacters(in: .whitespaces)
+            if let range = text.range(of: collaborationRouteVerificationExitMarker) {
+                status = String(text[range.upperBound...])
+            }
+            if let range = text.range(of: collaborationRouteVerificationMarker),
+               let data = Data(base64Encoded: String(text[range.upperBound...])),
+               let decoded = String(data: data, encoding: .utf8), !decoded.isEmpty {
+                detail = String(decoded.prefix(512))
+            }
+        }
+        return "leader route exited \(status): \(detail)"
     }
 
     private static func verifyRemoteCollaborationRoute(
@@ -1065,7 +1085,7 @@ extension TeamOrchestrator {
             )
             return parseRemoteCollaborationRouteVerification(
                 output, expectedTeamName: teamName
-            ) ? nil : "the leader route returned an invalid response"
+            ) ? nil : remoteCollaborationRouteVerificationFailure(output)
         } catch {
             return String(describing: error)
         }

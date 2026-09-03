@@ -5333,6 +5333,7 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         XCTAssertTrue(script.contains("xm"))
         XCTAssertTrue(script.contains("status"))
         XCTAssertTrue(script.contains("__TERMMESH_COLLABORATION_ROUTE_RESULT__="))
+        XCTAssertTrue(script.contains("__TERMMESH_COLLABORATION_ROUTE_EXIT__="))
         XCTAssertFalse(script.contains("grant_id_hex"), "the bearer stays in the route file")
     }
 
@@ -5363,6 +5364,17 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         XCTAssertFalse(TeamOrchestrator.parseRemoteCollaborationRouteVerification(
             "not a marker", expectedTeamName: "xm"
         ))
+    }
+
+    @MainActor
+    func test_collaborationRouteVerificationFailurePreservesExitAndBoundedDetail() {
+        let detail = Data("peer leader command timed out".utf8).base64EncodedString()
+        let output = TeamOrchestrator.collaborationRouteVerificationMarker + detail + "\n"
+            + TeamOrchestrator.collaborationRouteVerificationExitMarker + "1\n"
+        XCTAssertEqual(
+            TeamOrchestrator.remoteCollaborationRouteVerificationFailure(output),
+            "leader route exited 1: peer leader command timed out"
+        )
     }
 
     @MainActor
