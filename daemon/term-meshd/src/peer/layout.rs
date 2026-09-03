@@ -690,6 +690,7 @@ pub const DAEMON_WORKSPACE: &str = "term-meshd";
 pub struct Broadcaster {
     clients: Mutex<HashMap<u64, RegisteredClient>>,
     next_id: AtomicU64,
+    next_leader_generation: AtomicU64,
     leader_pending: Mutex<HashMap<Vec<u8>, PendingLeaderResponse>>,
 }
 
@@ -711,27 +712,70 @@ struct RegisteredClient {
 }
 
 struct PendingLeaderResponse {
-    connection_id: u64,
-    correlation_id: u64,
+    generation: u64,
+    routes: Vec<PendingLeaderRoute>,
     target_peer_id: Vec<u8>,
     request: TeamLeaderCommandRequest,
     senders: Vec<oneshot::Sender<Result<TeamLeaderCommandResponse, String>>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingLeaderRoute {
+    connection_id: u64,
+    correlation_id: u64,
+}
+
 impl Broadcaster {
-    fn fail_pending_leader_if_matches(
+    fn fail_pending_leader_generation_if_matches(
         &self,
         request_id: &[u8],
-        connection_id: u64,
-        correlation_id: u64,
+        generation: u64,
         message: &str,
     ) -> bool {
         let entry = {
             let mut pending = self.leader_pending.lock().unwrap();
-            let matches = pending.get(request_id).is_some_and(|entry| {
-                entry.connection_id == connection_id && entry.correlation_id == correlation_id
-            });
+            let matches = pending
+                .get(request_id)
+                .is_some_and(|entry| entry.generation == generation);
             matches.then(|| pending.remove(request_id)).flatten()
+        };
+        let Some(entry) = entry else { return false };
+        for sender in entry.senders {
+            let _ = sender.send(Err(message.to_string()));
+        }
+        true
+    }
+
+    /// Retire one unusable connection route. The command remains pending as
+    /// long as another connection for the same peer can still answer it.
+    fn remove_pending_leader_route(
+        &self,
+        request_id: &[u8],
+        generation: u64,
+        route: PendingLeaderRoute,
+        message: &str,
+    ) -> bool {
+        let entry = {
+            let mut pending = self.leader_pending.lock().unwrap();
+            let Some(entry) = pending.get_mut(request_id) else {
+                return false;
+            };
+            if entry.generation != generation {
+                return false;
+            }
+            let Some(index) = entry
+                .routes
+                .iter()
+                .position(|candidate| *candidate == route)
+            else {
+                return false;
+            };
+            entry.routes.swap_remove(index);
+            entry
+                .routes
+                .is_empty()
+                .then(|| pending.remove(request_id))
+                .flatten()
         };
         let Some(entry) = entry else { return false };
         for sender in entry.senders {
@@ -744,6 +788,7 @@ impl Broadcaster {
         Self {
             clients: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            next_leader_generation: AtomicU64::new(1),
             leader_pending: Mutex::new(HashMap::new()),
         }
     }
@@ -842,18 +887,21 @@ impl Broadcaster {
         if request.request_id.len() != peer_proto::team_leader::REQUEST_ID_BYTES {
             return Err("invalid request_id".into());
         }
-        let target = self
+        let targets = self
             .clients
             .lock()
             .unwrap()
             .iter()
             .filter(|(_, client)| client.peer_id == target_peer_id)
-            .max_by_key(|(id, _)| *id)
             .map(|(id, client)| (*id, client.clone()))
-            .ok_or_else(|| "authorized peer viewer is not connected".to_string())?;
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Err("authorized peer viewer is not connected".to_string());
+        }
         let (tx, rx) = oneshot::channel();
         let mut joined = false;
-        let correlation_id;
+        let generation;
+        let routes;
         {
             let mut pending = self.leader_pending.lock().unwrap();
             if let Some(existing) = pending.get_mut(&request.request_id) {
@@ -861,15 +909,23 @@ impl Broadcaster {
                     return Err("request_id conflicts with an in-flight request".into());
                 }
                 existing.senders.push(tx);
-                correlation_id = existing.correlation_id;
+                generation = existing.generation;
+                routes = Vec::new();
                 joined = true;
             } else {
-                correlation_id = target.1.seq.fetch_add(1, Ordering::Relaxed) + 1;
+                generation = self.next_leader_generation.fetch_add(1, Ordering::Relaxed);
+                routes = targets
+                    .iter()
+                    .map(|(connection_id, client)| PendingLeaderRoute {
+                        connection_id: *connection_id,
+                        correlation_id: client.seq.fetch_add(1, Ordering::Relaxed) + 1,
+                    })
+                    .collect::<Vec<_>>();
                 pending.insert(
                     request.request_id.clone(),
                     PendingLeaderResponse {
-                        connection_id: target.0,
-                        correlation_id,
+                        generation,
+                        routes: routes.clone(),
                         target_peer_id: target_peer_id.to_vec(),
                         request: request.clone(),
                         senders: vec![tx],
@@ -889,33 +945,33 @@ impl Broadcaster {
                 Err(_) => Err("peer leader command timed out".into()),
             };
         }
-        // The target can disconnect after it was selected but before the
-        // pending entry above was installed. Its BroadcastGuard then had no
-        // entry to remove. Re-check registration after insertion: if it is
-        // already gone, remove the orphan now. If it drops after this check,
-        // BroadcastGuard::drop performs the same cleanup.
-        if !self.clients.lock().unwrap().contains_key(&target.0) {
-            self.fail_pending_leader_if_matches(
-                &request.request_id,
-                target.0,
-                correlation_id,
-                "authorized peer viewer is unavailable",
-            );
-            return Err("authorized peer viewer is unavailable".into());
-        }
-        let envelope = Envelope {
-            seq: correlation_id,
-            correlation_id: 0,
-            payload: Some(Payload::TeamLeaderCommandRequest(request.clone())),
-        };
-        if target.1.tx.try_send(envelope).is_err() {
-            self.fail_pending_leader_if_matches(
-                &request.request_id,
-                target.0,
-                correlation_id,
-                "authorized peer viewer is unavailable",
-            );
-            return Err("authorized peer viewer is unavailable".into());
+        // Re-check every selected connection after installing the pending
+        // entry. Disconnects and channel backpressure retire only that route;
+        // another connection for the same peer may still answer.
+        {
+            let registered = self.clients.lock().unwrap();
+            for ((_, client), route) in targets.into_iter().zip(routes.iter().copied()) {
+                let still_registered = registered
+                    .get(&route.connection_id)
+                    .is_some_and(|candidate| candidate.peer_id == target_peer_id);
+                let sent = still_registered
+                    && client
+                        .tx
+                        .try_send(Envelope {
+                            seq: route.correlation_id,
+                            correlation_id: 0,
+                            payload: Some(Payload::TeamLeaderCommandRequest(request.clone())),
+                        })
+                        .is_ok();
+                if !sent {
+                    self.remove_pending_leader_route(
+                        &request.request_id,
+                        generation,
+                        route,
+                        "authorized peer viewer is unavailable",
+                    );
+                }
+            }
         }
         match tokio::time::timeout(
             Duration::from_secs(peer_proto::team_leader::COMMAND_PENDING_TIMEOUT_SECS),
@@ -926,10 +982,9 @@ impl Broadcaster {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("peer viewer dropped the command response".into()),
             Err(_) => {
-                self.fail_pending_leader_if_matches(
+                self.fail_pending_leader_generation_if_matches(
                     &request.request_id,
-                    target.0,
-                    correlation_id,
+                    generation,
                     "peer leader command timed out",
                 );
                 Err("peer leader command timed out".into())
@@ -951,7 +1006,9 @@ impl Broadcaster {
         let Some(expected) = pending.get(&response.request_id) else {
             return false;
         };
-        if expected.connection_id != connection_id || expected.correlation_id != correlation_id {
+        if !expected.routes.iter().any(|route| {
+            route.connection_id == connection_id && route.correlation_id == correlation_id
+        }) {
             return false;
         }
         let Some(expected) = pending.remove(&response.request_id) else {
@@ -978,17 +1035,17 @@ impl BroadcastGuard {
 impl Drop for BroadcastGuard {
     fn drop(&mut self) {
         self.broadcaster.clients.lock().unwrap().remove(&self.id);
-        // A reverse leader request is scoped to this exact connection. Once
-        // the connection is gone no response can legitimately satisfy it, so
-        // remove it now and drop its oneshot sender. Besides waking the caller
-        // immediately, this lets an idempotent retry reuse the request_id
-        // instead of failing with `request_id already in flight` until timeout.
+        // A reverse leader request may be in flight on several connections
+        // for the same peer. Retire only this connection's route and fail the
+        // callers immediately only when no route remains.
         let removed = {
             let mut pending = self.broadcaster.leader_pending.lock().unwrap();
             let request_ids = pending
-                .iter()
-                .filter(|(_, entry)| entry.connection_id == self.id)
-                .map(|(request_id, _)| request_id.clone())
+                .iter_mut()
+                .filter_map(|(request_id, entry)| {
+                    entry.routes.retain(|route| route.connection_id != self.id);
+                    entry.routes.is_empty().then(|| request_id.clone())
+                })
                 .collect::<Vec<_>>();
             request_ids
                 .into_iter()
@@ -1038,6 +1095,7 @@ pub struct ProjectPresentationStatus {
     pub team_name: String,
     pub working_directory: String,
     pub owner_peer_id: String,
+    pub leader_surface_id: String,
     pub revision: u64,
     pub referenced_surfaces: usize,
     pub live_surfaces: usize,
@@ -1357,6 +1415,7 @@ impl PeerHost {
             team_name: record.team_name.clone(),
             working_directory: record.working_directory.clone(),
             owner_peer_id: record.owner_peer_id.clone(),
+            leader_surface_id: record.leader_surface_id.clone(),
             revision: record.revision,
             referenced_surfaces: ids.len(),
             live_surfaces: ids.iter().filter(|id| live.contains(*id)).count(),
@@ -1683,6 +1742,8 @@ impl PeerHost {
             || project.team_uuid.len() > 128
             || project.working_directory.len() > 4096
             || project.project_root.len() > 4096
+            || project.leader_cli.len() > 128
+            || project.leader_model.len() > 256
             || project.leader_surface_id.len() != 16
             || project.members.len() > 64
         {
@@ -1777,6 +1838,8 @@ impl PeerHost {
             team_uuid: project.team_uuid.clone(),
             working_directory: project.working_directory.clone(),
             project_root: project.project_root.clone(),
+            leader_cli: project.leader_cli.clone(),
+            leader_model: project.leader_model.clone(),
             delegation_configured: project.delegation_configured.clone(),
             delegation_effective: project.delegation_effective.clone(),
             delegation_pending: project.delegation_pending.clone(),
@@ -2700,12 +2763,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leader_reverse_route_targets_one_peer_and_rejects_spoofed_response() {
+    async fn leader_reverse_route_fans_out_and_first_exact_response_wins() {
         let router = Arc::new(Broadcaster::new());
-        let (authorized_tx, mut authorized_rx) = mpsc::channel(4);
+        let (older_tx, mut older_rx) = mpsc::channel(4);
+        let (newest_tx, mut newest_rx) = mpsc::channel(4);
         let (attacker_tx, mut attacker_rx) = mpsc::channel(4);
-        let authorized =
-            router.register(authorized_tx, Arc::new(AtomicU64::new(10)), vec![0xA1; 16]);
+        let older = router.register(older_tx, Arc::new(AtomicU64::new(10)), vec![0xA1; 16]);
+        let newest = router.register(newest_tx, Arc::new(AtomicU64::new(20)), vec![0xA1; 16]);
         let attacker = router.register(attacker_tx, Arc::new(AtomicU64::new(20)), vec![0xB1; 16]);
         let request = TeamLeaderCommandRequest {
             request_id: vec![0x41; peer_proto::team_leader::REQUEST_ID_BYTES],
@@ -2722,12 +2786,12 @@ mod tests {
                 .await
         });
 
-        let envelope = authorized_rx.recv().await.expect("targeted request");
+        let older_envelope = older_rx.recv().await.expect("older connection request");
+        let newest_envelope = newest_rx.recv().await.expect("newest connection request");
         assert!(
             attacker_rx.try_recv().is_err(),
             "non-target peer must not receive the scoped grant"
         );
-        let correlation_id = envelope.seq;
         let response = TeamLeaderCommandResponse {
             request_id: request.request_id,
             ok: true,
@@ -2736,18 +2800,155 @@ mod tests {
         };
 
         assert!(
-            !router.resolve_team_leader(attacker.connection_id(), correlation_id, response.clone()),
+            !router.resolve_team_leader(
+                attacker.connection_id(),
+                older_envelope.seq,
+                response.clone()
+            ),
             "another connection cannot win the response race"
         );
         assert!(
             !router.resolve_team_leader(
-                authorized.connection_id(),
-                correlation_id + 1,
+                older.connection_id(),
+                older_envelope.seq + 1,
                 response.clone()
             ),
             "the target must echo the exact request correlation"
         );
-        assert!(router.resolve_team_leader(authorized.connection_id(), correlation_id, response));
+        assert!(router.resolve_team_leader(
+            older.connection_id(),
+            older_envelope.seq,
+            response.clone()
+        ));
+        assert!(
+            !router.resolve_team_leader(
+                newest.connection_id(),
+                newest_envelope.seq,
+                response.clone()
+            ),
+            "a later response from another fanned-out route is stale"
+        );
+        assert!(
+            !router.resolve_team_leader(older.connection_id(), older_envelope.seq, response),
+            "a duplicate response cannot complete the request again"
+        );
+        assert!(call.await.unwrap().unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn leader_reverse_route_survives_one_connection_drop() {
+        let router = Arc::new(Broadcaster::new());
+        let peer_id = vec![0xA1; 16];
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        let (second_tx, mut second_rx) = mpsc::channel(4);
+        let first = router.register(first_tx, Arc::new(AtomicU64::new(10)), peer_id.clone());
+        let second = router.register(second_tx, Arc::new(AtomicU64::new(20)), peer_id.clone());
+        let request = TeamLeaderCommandRequest {
+            request_id: vec![0x46; peer_proto::team_leader::REQUEST_ID_BYTES],
+            method: "team.status".into(),
+            params_json: "{}".into(),
+            ..Default::default()
+        };
+
+        let pending_router = Arc::clone(&router);
+        let pending_request = request.clone();
+        let call = tokio::spawn(async move {
+            pending_router
+                .call_team_leader(pending_request, &[0xA1; 16])
+                .await
+        });
+        let first_envelope = first_rx.recv().await.expect("first route");
+        let second_envelope = second_rx.recv().await.expect("second route");
+        let second_connection_id = second.connection_id();
+        drop(second);
+
+        let response = TeamLeaderCommandResponse {
+            request_id: request.request_id,
+            ok: true,
+            result_json: "{}".into(),
+            ..Default::default()
+        };
+        assert!(
+            !router.resolve_team_leader(
+                second_connection_id,
+                second_envelope.seq,
+                response.clone()
+            ),
+            "a disconnected route cannot answer while another route remains"
+        );
+        assert!(router.resolve_team_leader(first.connection_id(), first_envelope.seq, response));
+        assert!(call.await.unwrap().unwrap().ok);
+    }
+
+    #[tokio::test]
+    async fn leader_reverse_route_fails_immediately_when_all_connections_drop() {
+        let router = Arc::new(Broadcaster::new());
+        let peer_id = vec![0xA1; 16];
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        let (second_tx, mut second_rx) = mpsc::channel(4);
+        let first = router.register(first_tx, Arc::new(AtomicU64::new(10)), peer_id.clone());
+        let second = router.register(second_tx, Arc::new(AtomicU64::new(20)), peer_id.clone());
+        let request = TeamLeaderCommandRequest {
+            request_id: vec![0x47; peer_proto::team_leader::REQUEST_ID_BYTES],
+            method: "team.status".into(),
+            params_json: "{}".into(),
+            ..Default::default()
+        };
+
+        let pending_router = Arc::clone(&router);
+        let call =
+            tokio::spawn(
+                async move { pending_router.call_team_leader(request, &[0xA1; 16]).await },
+            );
+        first_rx.recv().await.expect("first route");
+        second_rx.recv().await.expect("second route");
+        drop(first);
+        assert!(
+            !call.is_finished(),
+            "one live route must keep the call pending"
+        );
+        drop(second);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("all-route disconnect should not wait for command timeout")
+            .unwrap();
+        assert_eq!(result.unwrap_err(), "authorized peer viewer is unavailable");
+    }
+
+    #[tokio::test]
+    async fn leader_reverse_route_ignores_backpressured_connection() {
+        let router = Arc::new(Broadcaster::new());
+        let peer_id = vec![0xA1; 16];
+        let (blocked_tx, _blocked_rx) = mpsc::channel(1);
+        blocked_tx
+            .try_send(Envelope::default())
+            .expect("fill blocked connection channel");
+        let _blocked = router.register(blocked_tx, Arc::new(AtomicU64::new(10)), peer_id.clone());
+        let (healthy_tx, mut healthy_rx) = mpsc::channel(4);
+        let healthy = router.register(healthy_tx, Arc::new(AtomicU64::new(20)), peer_id.clone());
+        let request = TeamLeaderCommandRequest {
+            request_id: vec![0x48; peer_proto::team_leader::REQUEST_ID_BYTES],
+            method: "team.status".into(),
+            params_json: "{}".into(),
+            ..Default::default()
+        };
+
+        let pending_router = Arc::clone(&router);
+        let pending_request = request.clone();
+        let call = tokio::spawn(async move {
+            pending_router
+                .call_team_leader(pending_request, &[0xA1; 16])
+                .await
+        });
+        let envelope = healthy_rx.recv().await.expect("healthy route request");
+        let response = TeamLeaderCommandResponse {
+            request_id: request.request_id,
+            ok: true,
+            result_json: "{}".into(),
+            ..Default::default()
+        };
+        assert!(router.resolve_team_leader(healthy.connection_id(), envelope.seq, response));
         assert!(call.await.unwrap().unwrap().ok);
     }
 
@@ -2903,8 +3104,11 @@ mod tests {
         router.leader_pending.lock().unwrap().insert(
             request_id.clone(),
             PendingLeaderResponse {
-                connection_id: 10,
-                correlation_id: 11,
+                generation: 1,
+                routes: vec![PendingLeaderRoute {
+                    connection_id: 10,
+                    correlation_id: 11,
+                }],
                 target_peer_id: vec![0xA1; 16],
                 request: TeamLeaderCommandRequest {
                     request_id: request_id.clone(),
@@ -2927,10 +3131,9 @@ mod tests {
         let stale_cleanup = thread::spawn(move || {
             cleanup_retry_registered.wait();
             cleanup_allowed.wait();
-            cleanup_router.fail_pending_leader_if_matches(
+            cleanup_router.fail_pending_leader_generation_if_matches(
                 &cleanup_request_id,
-                10,
-                11,
+                1,
                 "stale cleanup",
             )
         });
@@ -2939,8 +3142,11 @@ mod tests {
         router.leader_pending.lock().unwrap().insert(
             request_id.clone(),
             PendingLeaderResponse {
-                connection_id: 20,
-                correlation_id: 21,
+                generation: 2,
+                routes: vec![PendingLeaderRoute {
+                    connection_id: 20,
+                    correlation_id: 21,
+                }],
                 target_peer_id: vec![0xA1; 16],
                 request: TeamLeaderCommandRequest {
                     request_id: request_id.clone(),
@@ -2957,8 +3163,14 @@ mod tests {
         let retry = pending
             .get(&request_id)
             .expect("retry must survive stale cleanup");
-        assert_eq!(retry.connection_id, 20);
-        assert_eq!(retry.correlation_id, 21);
+        assert_eq!(retry.generation, 2);
+        assert_eq!(
+            retry.routes,
+            vec![PendingLeaderRoute {
+                connection_id: 20,
+                correlation_id: 21,
+            }]
+        );
     }
 
     #[test]

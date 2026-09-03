@@ -4,6 +4,7 @@ import Foundation
 /// in shadow mode with a zero-percent canary, so changing this type never
 /// changes a leader's behavior by itself.
 struct LeaderParticipationSettings: Equatable {
+    static let e2eSuiteName = "com.termmesh.e2e"
     enum Mode: String { case off, shadow, canary }
     enum Cohort: String { case staticPolicy = "static", shadow, canary, holdout }
     enum HealthScope: String { case controlHost = "control_host", executionHost = "execution_host" }
@@ -21,6 +22,16 @@ struct LeaderParticipationSettings: Equatable {
     var optInProjects: Set<String>
 
     static let `default` = Self(mode: .shadow, canaryPercent: 0, killSwitch: false, optInProjects: [])
+
+    static func defaultsForCurrentProcess(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> UserDefaults {
+        if SessionRestoreSettings.stateDirectoryOverride(environment: environment) != nil,
+           let isolated = UserDefaults(suiteName: e2eSuiteName) {
+            return isolated
+        }
+        return .standard
+    }
 
     struct Health: Equatable {
         var supportedTurns: Int
@@ -76,9 +87,16 @@ struct LeaderParticipationSettings: Equatable {
         }
     }
 
+    /// `availableWorkers` and `workerNames` exist so the turn hook can state a
+    /// delegation floor without asking the leader what the roster looks like.
+    /// The hook runs on the execution host with no socket, so anything it needs
+    /// has to arrive in this file.
     func controlPayload(
         projectID: String, sessionID: String, supportedLeader: Bool, health: Health,
-        delegationState: ProjectDelegationState = .default
+        delegationState: ProjectDelegationState = .default,
+        availableWorkers: Int = 0,
+        workerNames: [String] = [],
+        executionOptions: ProjectExecutionOptions = .default
     ) -> [String: Any] {
         [
             "schema_version": 1,
@@ -93,6 +111,10 @@ struct LeaderParticipationSettings: Equatable {
             "delegation_configured": delegationState.configured.rawValue,
             "delegation_effective": delegationState.effective.rawValue,
             "delegation_pending": delegationState.pending?.rawValue as Any? ?? NSNull(),
+            "available_workers": max(0, availableWorkers),
+            "worker_names": workerNames,
+            "max_parallel_workers": executionOptions.maxParallelWorkers,
+            "inject_directive": executionOptions.injectDirective,
         ]
     }
 }

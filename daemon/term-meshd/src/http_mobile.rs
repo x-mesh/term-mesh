@@ -76,6 +76,11 @@ const PAGE_HTML: &str = include_str!("../../../Resources/mobile/index.html");
 const PAGE_JS: &str = include_str!("../../../Resources/mobile/app.js");
 const PAGE_CSS: &str = include_str!("../../../Resources/mobile/app.css");
 
+#[cfg(test)]
+pub(crate) fn embedded_page_js() -> &'static str {
+    PAGE_JS
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
     /// Development only: any loopback peer passes. Logged loudly at startup.

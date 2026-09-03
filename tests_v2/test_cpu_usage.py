@@ -18,6 +18,7 @@ import sys
 import time
 import re
 import statistics
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -50,15 +51,23 @@ SUSPICIOUS_PATTERNS = [
 
 def get_termmesh_pid() -> Optional[int]:
     """Get the PID of the running termmesh process."""
+    pid_file = os.environ.get("TERMMESH_E2E_APP_PID_FILE")
+    if pid_file:
+        try:
+            pid = int(Path(pid_file).read_text().strip())
+            if pid > 0:
+                return pid
+        except (OSError, ValueError):
+            pass
     result = subprocess.run(
-        ["pgrep", "-f", r"termmesh\.app/Contents/MacOS/termmesh$"],
+        ["pgrep", "-f", r"term-mesh\.app/Contents/MacOS/term-mesh$"],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         # Try DEV build
         result = subprocess.run(
-            ["pgrep", "-f", r"termmesh DEV\.app/Contents/MacOS/termmesh"],
+            ["pgrep", "-f", r"term-mesh DEV.*\.app/Contents/MacOS/term-mesh DEV"],
             capture_output=True,
             text=True,
         )

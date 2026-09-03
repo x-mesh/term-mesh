@@ -87,7 +87,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .terminal: return ["terminal", "font", "size", "theme", "monospace", "family"]
         case .workspaceColors: return ["workspace", "color", "indicator", "palette", "custom"]
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
-        case .agentTeams: return ["agent", "team", "leader", "model", "directory", "rendering", "interval", "refresh", "recycle", "auto"]
+        case .agentTeams: return ["agent", "team", "leader", "model", "directory", "rendering", "interval", "refresh", "recycle", "auto", "delegation", "distribution", "worker"]
         case .agentRunbooks: return ["agent", "runbook", "skill", "claude", "codex", "opencode", "install", "role"]
         case .agentCLIPaths: return ["cli", "path", "binary", "agent"] + AgentRolePreset.knownCLIs
         case .agentModels: return ["model", "custom", "version", "gemini", "codex", "kiro", "claude", "preview"]
@@ -157,14 +157,13 @@ struct SettingsView: View {
     @AppStorage(ReviewBoardSettings.enabledKey)
     private var reviewBoardEnabled = ReviewBoardSettings.defaultEnabled
     @AppStorage("teamDefaultLeaderMode") private var teamDefaultLeaderMode = "claude"
-    @AppStorage(LeaderParticipationSettings.modeKey)
-    private var leaderParticipationMode = LeaderParticipationSettings.Mode.shadow.rawValue
-    @AppStorage(LeaderParticipationSettings.canaryPercentKey)
-    private var leaderParticipationCanaryPercent = 0
-    @AppStorage(LeaderParticipationSettings.killSwitchKey)
-    private var leaderParticipationKillSwitch = false
-    @AppStorage(LeaderParticipationSettings.optInProjectsCSVKey)
-    private var leaderParticipationOptInProjects = ""
+    /// The shadow/canary rollout controls that used to sit here were a
+    /// measurement experiment, not a participation dial, and reading them as
+    /// one is what made the settings page misleading. They keep their defaults
+    /// keys and their `debug.leader_participation.configure` RPC, which the E2E
+    /// suite drives; only the user-facing cards are gone.
+    @AppStorage(ProjectDelegationLevel.defaultLevelKey)
+    private var teamDefaultDelegationLevel = ProjectDelegationLevel.leaderFirst.rawValue
 
     /// Whether agents get a pane the app draws instead of a terminal.
     ///
@@ -1481,68 +1480,28 @@ struct SettingsView: View {
                             .pickerStyle(.menu)
                         }
 
-                        if settingsMatch("leader", "participation", "shadow", "canary", "kill switch",
-                                         "리더", "참여", "관찰", "시험 적용", "긴급 중지") {
+                        }
+
+                        // Its own `if`, not nested inside the model card's.
+                        // Nesting made every keyword below dead: searching
+                        // "위임" matched nothing because the outer condition
+                        // was false.
+                        if settingsMatch("delegation", "distribution", "work", "leader", "worker",
+                                         "agent", "team", "위임", "분배", "리더", "작업") {
                         SettingsCardDivider()
 
                         SettingsCardRow(
-                            "Leader Participation",
-                            subtitle: "Shadow only records suggestions. Canary applies observable tm-agent dispatch bounds only after health gates pass.",
+                            "Default Work Distribution",
+                            subtitle: "How much of a new Project's work its leader hands to workers. Each Project can override this from its sidebar menu.",
                             controlWidth: pickerColumnWidth
                         ) {
-                            Picker("", selection: $leaderParticipationMode) {
-                                Text("Off").tag(LeaderParticipationSettings.Mode.off.rawValue)
-                                Text("Shadow").tag(LeaderParticipationSettings.Mode.shadow.rawValue)
-                                Text("Canary").tag(LeaderParticipationSettings.Mode.canary.rawValue)
+                            Picker("", selection: $teamDefaultDelegationLevel) {
+                                ForEach(ProjectDelegationLevel.allCases, id: \.self) { level in
+                                    Text(level.displayName).tag(level.rawValue)
+                                }
                             }
                             .labelsHidden()
                             .pickerStyle(.segmented)
-                        }
-                        .onChange(of: leaderParticipationMode) { _, _ in
-                            TeamOrchestrator.shared.refreshLeaderParticipationControls()
-                        }
-
-                        SettingsCardDivider()
-
-                        SettingsCardRow(
-                            "Canary Percentage",
-                            subtitle: "Deterministic Project/session cohort. The shipped default is 0%.",
-                            controlWidth: pickerColumnWidth
-                        ) {
-                            Stepper(value: $leaderParticipationCanaryPercent, in: 0...100) {
-                                Text("\(leaderParticipationCanaryPercent)%")
-                                    .font(.system(.body, design: .monospaced))
-                            }
-                        }
-                        .onChange(of: leaderParticipationCanaryPercent) { _, _ in
-                            TeamOrchestrator.shared.refreshLeaderParticipationControls()
-                        }
-
-                        SettingsCardDivider()
-
-                        SettingsCardRow(
-                            "Canary Projects",
-                            subtitle: "Explicit Project names, comma-separated. No Project is opted in by default."
-                        ) {
-                            TextField(LocalizedStringKey("project-a, project-b"), text: $leaderParticipationOptInProjects)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 240)
-                        }
-                        .onChange(of: leaderParticipationOptInProjects) { _, _ in
-                            TeamOrchestrator.shared.refreshLeaderParticipationControls()
-                        }
-
-                        SettingsCardDivider()
-
-                        SettingsCardRow(
-                            "Kill Switch",
-                            subtitle: "Returns every existing local leader to static behavior on its next route evaluation."
-                        ) {
-                            Toggle("", isOn: $leaderParticipationKillSwitch).labelsHidden()
-                        }
-                        .onChange(of: leaderParticipationKillSwitch) { _, _ in
-                            TeamOrchestrator.shared.refreshLeaderParticipationControls()
-                        }
                         }
                         }
 

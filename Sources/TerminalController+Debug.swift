@@ -157,6 +157,43 @@ extension TerminalController {
         return result
     }
 
+    func v2DebugSidebarProjects(params: [String: Any]) -> V2CallResult {
+        guard let windowID = v2UUID(params, "window_id") else {
+            return .err(code: "invalid_params", message: "Missing window_id", data: nil)
+        }
+        var result: V2CallResult = .err(code: "not_found", message: "Window not found", data: nil)
+        _ = v2MainExec(timeout: 5) {
+            guard let manager = AppDelegate.shared?.tabManagerFor(windowId: windowID) else { return }
+            let rows = manager.tabs.compactMap { workspace -> [String: Any]? in
+                guard !workspace.isPeerMirror else { return nil }
+                let declared = WorkspaceProjectNames.shared.identity(for: workspace.id)
+                let runtimeTeam = TeamOrchestrator.shared.teams.values.first {
+                    $0.workspaceId == workspace.id
+                }
+                let panelPaths = workspace.panelDirectories.values.filter { !$0.isEmpty }
+                let directories = panelPaths.isEmpty
+                    ? (workspace.currentDirectory.isEmpty ? [] : [workspace.currentDirectory])
+                    : Array(panelPaths)
+                let identity = TeamOrchestrator.sidebarProjectIdentity(
+                    declared: declared,
+                    runtimeTeamName: runtimeTeam?.id,
+                    inferred: projectIdentity(forWorkingDirectories: directories)
+                )
+                guard !identity.isUnknown else { return nil }
+                return [
+                    "workspace_id": workspace.id.uuidString,
+                    "project_name": identity.label,
+                    "project_key": identity.key,
+                    "project_id": WorkspaceProjectNames.shared.projectID(for: workspace.id)
+                        ?? runtimeTeam?.remotePresentationProjectID
+                        ?? NSNull(),
+                ]
+            }
+            result = .ok(["window_id": windowID.uuidString, "projects": rows])
+        }
+        return result
+    }
+
     func v2DebugShortcutSet(params: [String: Any]) -> V2CallResult {
         guard let name = v2String(params, "name"),
               let combo = v2String(params, "combo") else {
@@ -1163,19 +1200,69 @@ extension TerminalController {
             "before_process_count": beforeProcesses,
             "sheet_was_open": sheetWasOpen,
         ]
+        let roles = params["roles"] as? [String] ?? []
+        let hostKey = (params["host"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let leaderMode = params["leader_cli"] as? String
+            ?? (hostKey == nil ? "repl" : "claude")
+        let leaderModel = params["leader_model"] as? String
+            ?? AgentRolePreset.defaultModel(for: leaderMode)
+        let workerCLI = params["worker_cli"] as? String
+        let workerModel = params["worker_model"] as? String
+        let isolate = params["isolate"] as? Bool ?? true
+        let gitURL = params["git_url"] as? String ?? ""
+        let presets = AgentRolePresetManager.shared.presets
+        let missingRoles = roles.filter {
+            Self.debugProjectPreset(named: $0, presets: presets) == nil
+        }
+        guard missingRoles.isEmpty else {
+            return .err(
+                code: "invalid_params",
+                message: "unknown agent role(s): \(missingRoles.joined(separator: ", "))",
+                data: nil
+            )
+        }
+        let rows = roles.compactMap { roleName -> TeamAgentRow? in
+            guard var preset = Self.debugProjectPreset(named: roleName, presets: presets)
+            else { return nil }
+            if let workerCLI, !workerCLI.isEmpty {
+                preset.cli = workerCLI
+                preset.model = AgentRolePreset.defaultModel(for: workerCLI)
+            }
+            if let workerModel, !workerModel.isEmpty {
+                preset.model = workerModel
+            }
+            var row = TeamAgentRow(preset: preset, customInstructions: "")
+            row.hostKey = hostKey
+            return row
+        }
+        precondition(rows.count == roles.count)
         Task { @MainActor in
             let source = ProjectSource(
-                hostKey: nil, projectPath: directory, gitURL: "",
-                isolateAgents: false, kind: .existingFolder
+                hostKey: hostKey, projectPath: directory, gitURL: gitURL,
+                isolateAgents: isolate, kind: gitURL.isEmpty ? .existingFolder : .clone
             )
-            let leader = ProjectLeader(mode: "repl", model: "", endpoint: .local)
+            let leader = ProjectLeader(
+                mode: leaderMode, model: leaderModel,
+                endpoint: hostKey.map { .peer(hostKey: $0) } ?? .local
+            )
+            let formDirectory = hostKey == nil
+                ? directory : FileManager.default.homeDirectoryForCurrentUser.path
             do {
-                _ = try await ProjectCreationFlow.create(
-                    name: name, directory: directory, rows: [], source: source,
+                let created = try await ProjectCreationFlow.create(
+                    name: name, directory: formDirectory, rows: rows, source: source,
                     leader: leader, tabManager: tabManager
                 )
+                let createdTeam = TeamOrchestrator.shared.teams[name]
+                let checkouts = createdTeam?.agents.compactMap { agent -> [String: Any]? in
+                    guard let path = agent.originalAgentWorkDir, !path.isEmpty else { return nil }
+                    return ["agent": agent.name, "path": path]
+                } ?? []
                 self.debugProjectCreationStatus[operationID] = [
                     "state": "created", "name": name,
+                    "working_directory": createdTeam?.workingDirectory ?? NSNull(),
+                    "agent_count": createdTeam?.agents.count ?? 0,
+                    "checkouts": checkouts,
+                    "creation_result": String(describing: created),
                     "before_team_count": beforeTeams,
                     "before_workspace_count": beforeWorkspaces,
                     "after_team_count": TeamOrchestrator.shared.teams.count,
@@ -1239,6 +1326,49 @@ extension TerminalController {
             }
         }
         return .ok(["started": true, "operation_id": operationID])
+    }
+
+    func v2DebugLeaderParticipationConfigure(params: [String: Any]) -> V2CallResult {
+        guard let modeRaw = params["mode"] as? String,
+              LeaderParticipationSettings.Mode(rawValue: modeRaw) != nil else {
+            return .err(
+                code: "invalid_params", message: "mode must be off, shadow, or canary", data: nil
+            )
+        }
+        let percent = min(100, max(0, params["percent"] as? Int ?? 0))
+        let killSwitch = params["kill_switch"] as? Bool ?? false
+        let projects = (params["projects"] as? [String] ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let defaults = LeaderParticipationSettings.defaultsForCurrentProcess()
+        defaults.set(modeRaw, forKey: LeaderParticipationSettings.modeKey)
+        defaults.set(percent, forKey: LeaderParticipationSettings.canaryPercentKey)
+        defaults.set(killSwitch, forKey: LeaderParticipationSettings.killSwitchKey)
+        defaults.set(projects, forKey: LeaderParticipationSettings.optInProjectsKey)
+        defaults.set(
+            projects.joined(separator: ", "),
+            forKey: LeaderParticipationSettings.optInProjectsCSVKey
+        )
+        TeamOrchestrator.shared.refreshLeaderParticipationControls()
+        return .ok([
+            "mode": modeRaw, "percent": percent,
+            "kill_switch": killSwitch, "projects": projects,
+        ])
+    }
+
+    func v2DebugLeaderRequestStatus(params: [String: Any]) -> V2CallResult {
+        guard let team = params["team"] as? String, !team.isEmpty,
+              let requestID = params["request_id"] as? String, !requestID.isEmpty else {
+            return .err(
+                code: "invalid_params", message: "team and request_id are required", data: nil
+            )
+        }
+        guard let request = TeamDataStore.shared.listLeaderRequests(
+            teamName: team, includeCompleted: true
+        )?.first(where: { $0.id == requestID }) else {
+            return .err(code: "not_found", message: "leader request not found", data: nil)
+        }
+        return .ok(TeamDataStore.shared.leaderRequestDictionary(request, includeContent: false))
     }
 
     nonisolated static func debugProjectConflictLocation(
@@ -1516,11 +1646,13 @@ extension TerminalController {
             )
         }
         debugPeerShellInspection = nil
+        let force = (params["force"] as? Bool) ?? false
         Task { @MainActor in
             do {
                 let closed = try await TeamOrchestrator.shared.closePeerShells(
                     host: host,
-                    surfaceIDs: surfaceIDs
+                    surfaceIDs: surfaceIDs,
+                    force: force
                 )
                 debugPeerShellInspection = ["ok": true, "closed": closed]
             } catch {
@@ -1528,6 +1660,30 @@ extension TerminalController {
                     "ok": false,
                     "error": String(describing: error),
                 ]
+            }
+        }
+        return .ok(["started": true])
+    }
+
+    func v2DebugPeerShellFixture(params: [String: Any]) -> V2CallResult {
+        let staleCount = max(1, min((params["stale_count"] as? Int) ?? 7, 32))
+        debugPeerShellInspection = nil
+        Task { @MainActor in
+            do {
+                guard await PeerHostCoordinator.shared.setRunning(true),
+                      let sockPath = PeerHostCoordinator.shared.currentSocketPath
+                else { throw NSError(domain: "PeerShellCleanupFixture", code: 1) }
+                let hostID = "cleanup-force-fixture"
+                let fixture = try await RemoteHostStore.shared.installPeerShellCleanupFixture(
+                    hostID: hostID, sockPath: sockPath, staleCount: staleCount
+                )
+                debugPeerShellInspection = [
+                    "ok": true, "host": hostID,
+                    "surface_ids": fixture.stale.map { $0.base64EncodedString() },
+                    "survivor_id": fixture.survivor.base64EncodedString(),
+                ]
+            } catch {
+                debugPeerShellInspection = ["ok": false, "error": String(describing: error)]
             }
         }
         return .ok(["started": true])

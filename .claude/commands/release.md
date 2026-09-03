@@ -22,7 +22,27 @@ Accepted forms:
 
 2. Use `latest_tag` and `git log <latest-tag>..origin/develop --no-merges` to draft one changelog section. Include only user-visible changes and contributor credits. The section must start with `## [X.Y.Z] - YYYY-MM-DD`. Write it to a temporary file.
 
-3. Run the required mac-sub relay Project E2E against the pinned develop SHA. It must run create → app restart/adopt → host disconnect/reconnect with `TERMMESH_E2E_REQUIRE_REMOTE_PROJECT=1`, `TERMMESH_E2E_REATTACH_PHASE=full`, `TERMMESH_E2E_CANDIDATE_SHA=<pinned-sha>`, and `TERMMESH_E2E_RELAY_RECEIPT=<receipt-path>` through `./scripts/run-tests-v2.sh tests_v2/test_remote_project_restart_reattach.py`. A SKIP is a failure. The test holds exact leader attachment and nonzero relay bytes for 15 seconds past each recovery boundary.
+3. Run the required mac-sub relay Project E2E against the pinned develop SHA. It must run create → app restart/adopt → host disconnect/reconnect. A SKIP is a failure. The test holds exact leader attachment and nonzero relay bytes for 15 seconds past each recovery boundary.
+
+   ```bash
+   ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && \
+     TERMMESH_E2E_REQUIRE_REMOTE_PROJECT=1 \
+     TERMMESH_E2E_REATTACH_PHASE=full \
+     TERMMESH_E2E_STAGE_REMOTE_FIXTURE=1 \
+     TERMMESH_E2E_REMOTE_FIXTURE_SSH_TARGET=root@jw-server \
+     TERMMESH_E2E_CANDIDATE_SHA=<pinned-sha> \
+     TERMMESH_E2E_RELAY_RECEIPT=<receipt-path> \
+     ./scripts/run-tests-v2.sh tests_v2/test_remote_project_restart_reattach.py'
+   ```
+
+   All six are required. `STAGE_REMOTE_FIXTURE` and `REMOTE_FIXTURE_SSH_TARGET` are what
+   make the run prove the candidate: the runner stages that SHA's daemon on the peer and
+   refuses to start without them, so a stale production daemon cannot be mistaken for the
+   candidate. `TERMMESH_E2E_REMOTE_LEADER_HOST`, `_DIR` and `_HOST_PROFILE_JSON` are derived
+   by the runner once the fixture is up — do not set them by hand.
+
+   The runner's checkout must be detached at the pinned SHA with `daemon` and `Proto` clean,
+   or the fixture refuses to stage. The peer host needs the agent CLI already installed.
 
 4. Show the version, pinned develop SHA, changelog, relay receipt, and prepare effects: merge `develop→main`, create/push the release branch, and open the release PR. Ask one explicit confirmation. On approval:
 

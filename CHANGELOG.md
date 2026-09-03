@@ -4,6 +4,100 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.226.3] - 2026-09-03
+
+### Fixed
+- Verify repaired Project leader control through the authenticated session-owner endpoint, even when a saved Mac host profile still names an older serving socket.
+- Safely reuse an exact, app-managed leader process left by an interrupted repair instead of spawning a duplicate, with strict Project identity and process-environment proof for legacy records.
+- Terminate failed remote leader surfaces on their owning endpoint before local teardown, retaining an owner-aware durable cleanup record until the host confirms removal.
+
+## [0.226.2] - 2026-09-03
+
+### Fixed
+- Restore an owned remote Project after both the owner app and session-host daemon restart, without automatically opening panes, changing focus, or duplicating the leader. One explicit **Repair collaboration** action now rebuilds the leader and restores the durable worker roster with the original agent identities.
+- Keep collaboration route handovers transactional: verify the exact staged leader control route before replacing live route files, preserve old grants until commit, and roll back safely across concurrent viewers or interrupted repairs.
+
+## [0.226.1] - 2026-09-03
+
+### Fixed
+
+- Made **Repair collaboration** recover a remote Project whose durable manifest survived but leader and worker surfaces disappeared, while preserving live processes and durable worker identities.
+- Made repair reconnect the authoritative host route, verify the exact leader-side `team.status` proxy before reporting success, and roll back unverified route changes safely.
+- Prevented delayed Project publication from resurrecting a manifest after successful deletion.
+
+## [0.226.0] - 2026-09-03
+
+### Fixed
+
+- Restored reliable remote Project leader control when several viewer connections are open, and added a deterministic **Repair collaboration** action that refreshes routes, verifies the leader control path, and preserves live agent sessions.
+
+## [0.225.0] - 2026-09-02
+
+### Added
+
+- Add a pane-header control that exposes or hides a terminal, agent, or Project leader on the mobile remote page without requiring the rc command in the pane.
+
+### Fixed
+
+- Keep the pane-header mobile state synchronized with command-line changes, TTL expiry, and pane closure, while preserving the pane's own working directory and the user's start/stop intent.
+- Make peer pane cleanup remove stale and orphaned panes reliably, including force cleanup on a crowded host, instead of timing out after 25 seconds and showing the same dead panes again.
+
+## [0.224.0] - 2026-09-02
+
+### Added
+
+- Add Work Distribution controls to the Review Board: pick how much of a Project the leader hands to workers, cap a parallel wave, and choose whether each turn states the floor.
+- Show collaboration health for a Project beside those controls, with a Repair action that rebuilds its routes and replaces dead agent panes.
+- Answer a remote agent's first-run trust prompt during startup so an adopted Project does not stall on it.
+- Add a Restart Host Daemon action for a peer host.
+- Recover a leader that launched before the route-file contract by discovering the adopted viewer's route file, so its running agent commands keep working without a restart.
+
+### Changed
+
+- Fold the Review Board's settings into two sections that remember whether they are open, and merge the delegation level and its evidence into one card. The folded header keeps the verdict, the Repair action, and Auto Pilot's limits on screen.
+- State which scope each collaboration figure describes. The headline judges the newest record and the counts total recent history, so a Project can show "no dispatch" over four earlier dispatches without contradicting itself.
+- Treat an unstated task shape as unstated rather than as work that cannot be split, so an unclassified turn no longer closes the parallel gate.
+
+### Fixed
+
+- Keep per-Project execution settings separate for Projects whose names hold no ASCII. Every such Project shared one entry and overwrote the others.
+- Deliver a leader's participation settings reliably. A failed write used to leave the leader reading a stale file for the rest of the session, and a change made while a write was in flight could be dropped.
+- Deliver a task to a named agent when a live one exists, instead of reporting the first unhealthy agent that shares its name.
+- Retry an undelivered first-run prompt answer instead of leaving the pane waiting forever, and never repeat a partly delivered key sequence.
+- Record delegation for a turn on a busy host. Turns that did delegate were reported as leader-only once the log outgrew the window the check read.
+- Survive a peer host that reports two panes with the same surface id, which could end the app during recovery.
+- Identify macOS processes by start time as well as pid, so a recycled pid is no longer mistaken for a live pane.
+
+## [0.223.0] - 2026-09-01
+
+### Added
+
+- Add leader participation controls for Shadow, Canary, and kill-switch operation.
+- Record privacy-safe leader turn routes, delegation waves, task completion, and cohort metrics.
+- Inject one shared leader execution policy into local and remote Codex and Claude leaders.
+- Add remote leader readiness checks and live participation control refresh.
+
+### Changed
+
+- Route non-trivial leader requests through explicit direct, probe, or parallel decisions.
+- Require execution-host health evidence before Canary participation applies.
+- Preserve remote Project state across create, restart, adopt, reconnect, and cleanup phases.
+
+### Fixed
+
+- Preserve E2E state across viewer adoption and owner cleanup while changing only ephemeral viewer identity.
+- Keep runner pass, skip, and failure outcomes distinct.
+- Verify real Codex leader delegation with durable worker task evidence in remote E2E.
+
+## [0.222.0] - 2026-08-31
+
+### Fixed
+
+- Keep macOS peer Projects visible after restart, and preserve their identity across session restoration.
+- Remove remote Project manifests, workspaces, panes, and checkouts before the same Project name is reused.
+- Keep mobile Chat and Terminal views connected to live transcript and screen data across view switches.
+- Fail socket E2E cleanup when its app or daemon process remains alive.
+
 ## [0.221.0] - 2026-08-31
 
 ### Added

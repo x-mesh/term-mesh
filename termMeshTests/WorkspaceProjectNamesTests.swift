@@ -102,4 +102,31 @@ final class WorkspaceProjectNamesTests: XCTestCase {
             "another-project"
         )
     }
+
+    func testRestoreCleanupProtectsAConcurrentRemoteProjectDeclaration() {
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: workspace,
+            projectName: "term-mesh",
+            projectID: "team:remote"
+        )
+
+        WorkspaceProjectNames.shared.retain(ids: [], protecting: [workspace])
+
+        XCTAssertEqual(
+            WorkspaceProjectNames.shared.projectID(for: workspace),
+            "team:remote"
+        )
+    }
+
+    func testRuntimeTeamIdentityRescuesAWorkspaceAfterDeclarationLoss() {
+        let identity = TeamOrchestrator.sidebarProjectIdentity(
+            declared: nil,
+            runtimeTeamName: "term-mesh",
+            inferred: projectIdentity(forWorkingDirectories: ["/Users/jinwoo"])
+        )
+
+        XCTAssertEqual(identity.key, "name:term-mesh")
+        XCTAssertEqual(identity.label, "term-mesh")
+        XCTAssertFalse(identity.isUnknown)
+    }
 }

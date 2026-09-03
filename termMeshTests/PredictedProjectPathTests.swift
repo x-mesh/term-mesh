@@ -556,6 +556,56 @@ final class PredictedProjectPathTests: XCTestCase {
         )
     }
 
+    /// Regression: a fully-remote placement has no local checkout, so
+    /// `localProjectPath` is nil and the old fallback landed straight on the
+    /// caller's raw `directory` — which `NewProjectView.startCreation`
+    /// substitutes with this Mac's own home directory for any remote-host
+    /// request, not the folder the user actually typed. The resolved leader
+    /// path must win whenever the placement produced one and there is no
+    /// local checkout. When a local checkout does exist (local or mixed
+    /// placement), `localProjectPath` must keep winning — that is the
+    /// pre-existing, still-required behavior.
+    func testResolvedTeamWorkingDirectoryPrefersLocalOverLeaderWhenBothExist() {
+        XCTAssertEqual(
+            ProjectCreationFlow.resolvedTeamWorkingDirectory(
+                leaderProjectPath: "/srv/remote/tm-projects/term-mesh",
+                localProjectPath: "/Users/jinwoo/work/tm-projects/term-mesh",
+                requestedDirectory: "/Users/jinwoo"
+            ),
+            "/Users/jinwoo/work/tm-projects/term-mesh"
+        )
+    }
+
+    func testResolvedTeamWorkingDirectoryPrefersTheLeaderPathOnAFullyRemotePlacement() {
+        XCTAssertEqual(
+            ProjectCreationFlow.resolvedTeamWorkingDirectory(
+                leaderProjectPath: "/srv/remote/tm-projects/term-mesh",
+                localProjectPath: nil,
+                requestedDirectory: "/Users/jinwoo"
+            ),
+            "/srv/remote/tm-projects/term-mesh"
+        )
+        // Local (or mixed, with a local checkout) placement is unaffected:
+        // localProjectPath still wins over the raw requested directory.
+        XCTAssertEqual(
+            ProjectCreationFlow.resolvedTeamWorkingDirectory(
+                leaderProjectPath: nil,
+                localProjectPath: "/Users/jinwoo/work/tm-projects/term-mesh",
+                requestedDirectory: "/Users/jinwoo"
+            ),
+            "/Users/jinwoo/work/tm-projects/term-mesh"
+        )
+        // Neither resolved: the raw requested directory is the last resort.
+        XCTAssertEqual(
+            ProjectCreationFlow.resolvedTeamWorkingDirectory(
+                leaderProjectPath: nil,
+                localProjectPath: nil,
+                requestedDirectory: "/Users/jinwoo/work/tm-projects/term-mesh"
+            ),
+            "/Users/jinwoo/work/tm-projects/term-mesh"
+        )
+    }
+
     func testRemoteDirectoryCompletionUsesTheTypedParentAndLeafPrefix() {
         XCTAssertEqual(
             RemoteDirectoryLookup.completionQuery(for: "/app/tm-pro"),

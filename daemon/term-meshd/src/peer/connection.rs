@@ -385,51 +385,65 @@ async fn reader_loop(
                 let project_owner_hex: HashSet<String> =
                     project_owner_peer_ids.iter().map(hex::encode).collect();
                 for manifest in host.project_presentations() {
-                    let Some(leader_surface_id) = hex::decode(&manifest.leader_surface_id)
-                        .ok()
-                        .filter(|id| live_surfaces.contains_key(id))
-                    else {
+                    let Ok(leader_surface_id) = hex::decode(&manifest.leader_surface_id) else {
                         continue;
                     };
+                    // `members` is the durable desired roster. Keep it intact
+                    // even when a daemon restart or process exit leaves a
+                    // persisted surface absent. `agent_names` remains the
+                    // live roster so existing clients retain their liveness
+                    // signal while owners can reconstruct missing members.
                     let members = manifest
                         .members
                         .iter()
                         .filter_map(|member| {
                             let surface_id = hex::decode(&member.surface_id).ok()?;
-                            live_surfaces
-                                .contains_key(&surface_id)
-                                .then_some(TeamMember {
-                                    name: member.name.clone(),
-                                    agent_instance_id: member.agent_instance_id.clone(),
-                                    cli: member.cli.clone(),
-                                    model: member.model.clone(),
-                                    agent_type: member.agent_type.clone(),
-                                    color: member.color.clone(),
-                                    working_directory: member.working_directory.clone(),
-                                    surface_id,
-                                    surface_type: member.surface_type.clone(),
-                                })
+                            Some(TeamMember {
+                                name: member.name.clone(),
+                                agent_instance_id: member.agent_instance_id.clone(),
+                                cli: member.cli.clone(),
+                                model: member.model.clone(),
+                                agent_type: member.agent_type.clone(),
+                                color: member.color.clone(),
+                                working_directory: member.working_directory.clone(),
+                                surface_id,
+                                surface_type: member.surface_type.clone(),
+                            })
                         })
                         .collect::<Vec<TeamMember>>();
+                    let live_agent_names = members
+                        .iter()
+                        .filter(|member| live_surfaces.contains_key(&member.surface_id))
+                        .map(|member| member.name.clone())
+                        .collect::<Vec<String>>();
                     if let Some(team) = teams
                         .iter_mut()
                         .find(|team| team.team_uuid == manifest.team_uuid)
                     {
                         team.project_id = manifest.project_id;
                         team.leader_surface_id = leader_surface_id;
-                        team.agent_names =
-                            members.iter().map(|member| member.name.clone()).collect();
+                        team.agent_names = live_agent_names;
                         team.members = members;
                         team.presentation_revision = manifest.revision;
                         team.delegation_configured = manifest.delegation_configured;
                         team.delegation_effective = manifest.delegation_effective;
                         team.delegation_pending = manifest.delegation_pending;
+                        team.leader_cli = manifest.leader_cli;
+                        team.leader_model = manifest.leader_model;
                         team.created_at_unix_secs = manifest.created_at_unix_secs;
                         team.presentation_owned_by_requester =
                             project_owner_hex.contains(&manifest.owner_peer_id);
                         if let Some(info) = live_surfaces.get(&team.leader_surface_id) {
                             team.leader_process_active = info.foreground_busy;
                             team.leader_process_active_known = info.foreground_busy_known;
+                        } else {
+                            // The surface roster is authoritative: a durable
+                            // manifest may outlive its processes across a
+                            // daemon restart, and that absence is itself a
+                            // known inactive state. Keep the persisted leader
+                            // id so the owner can classify and bootstrap it.
+                            team.leader_process_active = false;
+                            team.leader_process_active_known = true;
                         }
                         if team.project_root.is_empty() {
                             team.project_root = manifest.project_root;
@@ -441,7 +455,7 @@ async fn reader_loop(
                             team_uuid: manifest.team_uuid,
                             working_directory: manifest.working_directory,
                             project_root: manifest.project_root,
-                            agent_names: members.iter().map(|member| member.name.clone()).collect(),
+                            agent_names: live_agent_names,
                             created_at_unix_secs: manifest.created_at_unix_secs,
                             leader_surface_id,
                             members,
@@ -452,10 +466,12 @@ async fn reader_loop(
                             leader_process_active: leader_info
                                 .is_some_and(|info| info.foreground_busy),
                             leader_process_active_known: leader_info
-                                .is_some_and(|info| info.foreground_busy_known),
+                                .map_or(true, |info| info.foreground_busy_known),
                             delegation_configured: manifest.delegation_configured,
                             delegation_effective: manifest.delegation_effective,
                             delegation_pending: manifest.delegation_pending,
+                            leader_cli: manifest.leader_cli,
+                            leader_model: manifest.leader_model,
                         });
                     }
                 }
@@ -4486,7 +4502,7 @@ mod agent_surface_tests {
             .expect("ensure agent")
             .surface_id;
 
-        let host = Arc::new(PeerHost::new(manager));
+        let host = Arc::new(PeerHost::new(manager.clone()));
         host.set_persist_path(tmp.path().join("peer-workspaces.json"));
 
         let (mut owner_reader, mut owner_writer) =
@@ -4522,11 +4538,16 @@ mod agent_surface_tests {
                             working_directory: "/tmp".into(),
                             project_root: "/tmp".into(),
                             agent_names: vec!["worker".into()],
+                            leader_cli: "codex".into(),
+                            leader_model: "gpt-5.6-sol".into(),
                             leader_surface_id: leader_id.clone(),
                             members: vec![TeamMember {
                                 name: "worker".into(),
                                 agent_instance_id: "worker-instance".into(),
                                 cli: "codex".into(),
+                                model: "gpt-5.6-sol".into(),
+                                agent_type: "reviewer".into(),
+                                color: "blue".into(),
                                 working_directory: "/tmp".into(),
                                 surface_id: member_id.clone(),
                                 surface_type: "agent".into(),
@@ -4558,8 +4579,14 @@ mod agent_surface_tests {
         drop(owner_reader);
         drop(owner_writer);
 
-        let (mut viewer_reader, mut viewer_writer) =
-            handshake_as(host.clone(), capability::supported_vec(), vec![0x43; 16]).await;
+        let reloaded_host = Arc::new(PeerHost::new(manager));
+        reloaded_host.set_persist_path(tmp.path().join("peer-workspaces.json"));
+        let (mut viewer_reader, mut viewer_writer) = handshake_as(
+            reloaded_host.clone(),
+            capability::supported_vec(),
+            vec![0x43; 16],
+        )
+        .await;
         write_envelope(
             &mut viewer_writer,
             &Envelope {
@@ -4578,6 +4605,8 @@ mod agent_surface_tests {
             other => panic!("expected team list, got {other:?}"),
         };
         assert_eq!(project.name, "durable-demo");
+        assert_eq!(project.leader_cli, "codex");
+        assert_eq!(project.leader_model, "gpt-5.6-sol");
         assert_eq!(project.leader_surface_id, leader_id);
         assert_eq!(project.members.len(), 1);
         assert_eq!(project.members[0].surface_id, member_id);
@@ -4652,15 +4681,36 @@ mod agent_surface_tests {
                 other => panic!("expected team list, got {other:?}"),
             }
         };
-        assert_eq!(list.teams.len(), 1, "a live leader keeps the project discoverable");
+        assert_eq!(
+            list.teams.len(),
+            1,
+            "a live leader keeps the project discoverable"
+        );
         assert_eq!(list.teams[0].leader_surface_id, leader_id);
         assert!(
-            list.teams[0].members.is_empty(),
-            "dead members must be omitted instead of respawned by discovery"
+            list.teams[0].agent_names.is_empty(),
+            "dead members must be omitted from the live roster"
         );
+        assert_eq!(
+            list.teams[0].members.len(),
+            1,
+            "the desired roster must retain dead members for deterministic repair"
+        );
+        assert_eq!(list.teams[0].members[0].name, "worker");
+        assert_eq!(
+            list.teams[0].members[0].agent_instance_id,
+            "worker-instance"
+        );
+        assert_eq!(list.teams[0].members[0].cli, "codex");
+        assert_eq!(list.teams[0].members[0].model, "gpt-5.6-sol");
+        assert_eq!(list.teams[0].members[0].agent_type, "reviewer");
+        assert_eq!(list.teams[0].members[0].color, "blue");
+        assert_eq!(list.teams[0].members[0].working_directory, "/tmp");
+        assert_eq!(list.teams[0].members[0].surface_id, member_id);
+        assert_eq!(list.teams[0].members[0].surface_type, "agent");
 
         let (mut owner_reader, mut owner_writer) = handshake_as_with_owner_aliases(
-            host.clone(),
+            reloaded_host,
             capability::supported_vec(),
             vec![0x45; 16],
             vec![vec![0x42; 16]],
@@ -4694,6 +4744,146 @@ mod agent_surface_tests {
             )
         )
         .is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_manifest_without_live_surfaces_remains_discoverable() {
+        let tmp = TempDir::new().expect("temp dir");
+        let manager = Arc::new(PtyManager::new());
+        let leader = PtySurface::spawn(
+            surface_id_from_name("manifest-only-project-leader"),
+            "manifest-only-project-leader".into(),
+            "/bin/cat",
+            &[],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn leader");
+        let leader_id = leader.surface_id.clone();
+        manager.insert_surface(leader);
+        let member_id = manager
+            .ensure("manifest-only-project-member", &cat_agent_spec())
+            .expect("ensure member")
+            .surface_id;
+        let persist_path = tmp.path().join("peer-workspaces.json");
+        let host = Arc::new(PeerHost::new(manager));
+        host.set_persist_path(persist_path.clone());
+
+        let owner_id = vec![0x52; 16];
+        let (mut owner_reader, mut owner_writer) =
+            handshake_as(host, capability::supported_vec(), owner_id.clone()).await;
+        write_envelope(
+            &mut owner_writer,
+            &Envelope {
+                seq: 10,
+                correlation_id: 0,
+                payload: Some(Payload::UpsertProjectPresentationRequest(
+                    UpsertProjectPresentationRequest {
+                        request_id: vec![0x20; 16],
+                        delete_project_id: String::new(),
+                        project: Some(Team {
+                            name: "manifest-only-demo".into(),
+                            team_uuid: "uuid-manifest-only-demo".into(),
+                            working_directory: "/tmp/manifest-only".into(),
+                            project_root: "/tmp".into(),
+                            agent_names: vec!["worker".into()],
+                            created_at_unix_secs: 1234,
+                            leader_surface_id: leader_id.clone(),
+                            members: vec![TeamMember {
+                                name: "worker".into(),
+                                agent_instance_id: "worker-instance".into(),
+                                cli: "claude".into(),
+                                model: "claude-sonnet-5".into(),
+                                agent_type: "executor".into(),
+                                color: "green".into(),
+                                working_directory: "/tmp/manifest-only".into(),
+                                surface_id: member_id.clone(),
+                                surface_type: "agent".into(),
+                                ..Default::default()
+                            }],
+                            project_id: "team:uuid-manifest-only-demo".into(),
+                            delegation_configured: "guarded".into(),
+                            delegation_effective: "leader-first".into(),
+                            delegation_pending: "delegated".into(),
+                            leader_cli: "codex".into(),
+                            leader_model: "gpt-5.6-sol".into(),
+                            ..Default::default()
+                        }),
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("publish manifest");
+        match recv(&mut owner_reader).await.payload {
+            Some(Payload::UpsertProjectPresentationResponse(response)) => {
+                assert!(response.ok, "{}", response.error_code);
+                assert_eq!(response.revision, 1);
+            }
+            other => panic!("expected upsert response, got {other:?}"),
+        }
+        drop(owner_reader);
+        drop(owner_writer);
+
+        // Model a daemon restart where durable presentation state reloads
+        // before any of its old surfaces have been restored.
+        let reloaded_host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        reloaded_host.set_persist_path(persist_path);
+        let (mut reloaded_reader, mut reloaded_writer) =
+            handshake_as(reloaded_host, capability::supported_vec(), owner_id).await;
+        write_envelope(
+            &mut reloaded_writer,
+            &Envelope {
+                seq: 20,
+                correlation_id: 0,
+                payload: Some(Payload::ListTeams(ListTeams {})),
+            },
+        )
+        .await
+        .expect("list manifest-only project");
+        let project = match recv(&mut reloaded_reader).await.payload {
+            Some(Payload::TeamList(list)) => {
+                assert_eq!(
+                    list.teams.len(),
+                    1,
+                    "manifest must not be skipped or duplicated"
+                );
+                list.teams
+                    .into_iter()
+                    .next()
+                    .expect("manifest-only project")
+            }
+            other => panic!("expected team list, got {other:?}"),
+        };
+
+        assert_eq!(project.name, "manifest-only-demo");
+        assert_eq!(project.team_uuid, "uuid-manifest-only-demo");
+        assert_eq!(project.project_id, "team:uuid-manifest-only-demo");
+        assert_eq!(project.working_directory, "/tmp/manifest-only");
+        assert_eq!(project.project_root, "/tmp");
+        assert_eq!(project.created_at_unix_secs, 1234);
+        assert_eq!(project.presentation_revision, 1);
+        assert!(project.presentation_owned_by_requester);
+        assert_eq!(project.leader_surface_id, leader_id);
+        assert_eq!(project.leader_cli, "codex");
+        assert_eq!(project.leader_model, "gpt-5.6-sol");
+        assert_eq!(project.delegation_configured, "guarded");
+        assert_eq!(project.delegation_effective, "leader-first");
+        assert_eq!(project.delegation_pending, "delegated");
+        assert!(project.agent_names.is_empty());
+        assert_eq!(project.members.len(), 1);
+        assert_eq!(project.members[0].name, "worker");
+        assert_eq!(project.members[0].agent_instance_id, "worker-instance");
+        assert_eq!(project.members[0].cli, "claude");
+        assert_eq!(project.members[0].model, "claude-sonnet-5");
+        assert_eq!(project.members[0].agent_type, "executor");
+        assert_eq!(project.members[0].color, "green");
+        assert_eq!(project.members[0].working_directory, "/tmp/manifest-only");
+        assert_eq!(project.members[0].surface_id, member_id);
+        assert_eq!(project.members[0].surface_type, "agent");
+        assert!(project.leader_process_active_known);
+        assert!(!project.leader_process_active);
     }
 
     async fn recv(reader: &mut OwnedReadHalf) -> Envelope {

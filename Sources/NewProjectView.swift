@@ -83,7 +83,7 @@ struct NewProjectView: View {
     @State private var knownAgentIDs: Set<UUID> = []
     @State private var inheritedAgentIDs: Set<UUID> = []
     @State private var agents: [TeamAgentRow] = []
-    @State private var delegationLevel: ProjectDelegationLevel = .leaderFirst
+    @State private var delegationLevel: ProjectDelegationLevel = .appDefault()
     /// The machine the leader and primary checkout live on.
     ///
     /// Asked first because everything after it depends on the answer. A folder
@@ -3981,7 +3981,7 @@ enum ProjectCreationFlow {
         case .remoteNameCollision(let record):
             if case let .remote(_, hostName) = record.location {
                 record.canOpenRemoteProject
-                    ? "A Project with this name already exists on \(hostName). Open it, or choose another Project name; the selected folder stays unchanged."
+                    ? "A Project with this name already exists on \(hostName). Choose Open Existing, or choose another Project name; the selected folder stays unchanged."
                     : "A different Project on \(hostName) already uses this name. Choose another Project name; the selected folder will not be created or renamed."
             } else {
                 "A different Project on a connected machine already uses this name. Choose another Project name; the selected folder will not be created or renamed."
@@ -4042,6 +4042,26 @@ enum ProjectCreationFlow {
                 continuation.resume(returning: true)
             }
         }
+    }
+
+    /// The directory to record as this team's `workingDirectory` — which,
+    /// for a peer leader, is also what gets published in its durable project
+    /// manifest. `localProjectPath` keeps its existing priority: whenever a
+    /// local checkout exists (local or mixed placement), it is what the
+    /// local team engine actually uses, and must keep winning. A
+    /// fully-remote placement produces no local checkout (`localProjectPath`
+    /// stays nil), so falling straight back to the caller's
+    /// `requestedDirectory` used to record whatever `startCreation` passed
+    /// as `directory` — this Mac's own home directory for any remote-host
+    /// request (`NewProjectView.startCreation`), not the folder the user
+    /// actually typed. The leader's own resolved path is correct whenever
+    /// one exists, so it is the fallback before `requestedDirectory`.
+    nonisolated static func resolvedTeamWorkingDirectory(
+        leaderProjectPath: String?,
+        localProjectPath: String?,
+        requestedDirectory: String
+    ) -> String {
+        localProjectPath ?? leaderProjectPath ?? requestedDirectory
     }
 
     /// The whole of what "Create" means: the checkouts, the team, the board.
@@ -4162,7 +4182,11 @@ enum ProjectCreationFlow {
         guard let createdTeam = orchestrator.createTeam(
             named: name,
             rows: prepared.rows,
-            workingDirectory: prepared.localProjectPath ?? directory,
+            workingDirectory: Self.resolvedTeamWorkingDirectory(
+                leaderProjectPath: prepared.leaderProjectPath,
+                localProjectPath: prepared.localProjectPath,
+                requestedDirectory: directory
+            ),
             leaderMode: leader.mode,
             leaderModel: leader.model,
             leaderEndpoint: leader.endpoint,

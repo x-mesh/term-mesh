@@ -1555,6 +1555,18 @@ class termmesh:
     def team_status(self, team_name: str) -> Dict[str, Any]:
         return dict(self._call("team.status", {"team_name": team_name}) or {})
 
+    def team_repair_collaboration(
+        self, team_name: str, *, host_key: Optional[str] = None,
+        team_uuid: Optional[str] = None, project_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"team_name": team_name}
+        if host_key is not None: params["host_key"] = host_key
+        if team_uuid is not None: params["team_uuid"] = team_uuid
+        if project_id is not None: params["project_id"] = project_id
+        return dict(self._call(
+            "team.repair_collaboration", params, timeout_s=300
+        ) or {})
+
     def debug_project_create(self, directory: str, roles: List[str],
                              leader_cli: str = "claude",
                              leader_model: str = "sonnet",
@@ -1584,9 +1596,54 @@ class termmesh:
             params["preset_id"] = preset_id
         return dict(self._call("debug.project.create", params) or {})
 
-    def debug_project_creation_attempt(self, name: str, directory: str) -> dict:
-        return dict(self._call("debug.project.creation_attempt", {
+    def debug_project_creation_attempt(
+        self, name: str, directory: str, roles: Optional[List[str]] = None,
+        host: Optional[str] = None, leader_cli: Optional[str] = None,
+        leader_model: Optional[str] = None, worker_cli: Optional[str] = None,
+        worker_model: Optional[str] = None,
+        isolate: bool = True, git_url: str = "",
+    ) -> dict:
+        params: Dict[str, Any] = {
             "name": name, "directory": directory,
+            "roles": roles or [], "isolate": isolate, "git_url": git_url,
+        }
+        if host:
+            params["host"] = host
+        if leader_cli:
+            params["leader_cli"] = leader_cli
+        if leader_model:
+            params["leader_model"] = leader_model
+        if worker_cli:
+            params["worker_cli"] = worker_cli
+        if worker_model:
+            params["worker_model"] = worker_model
+        return dict(self._call("debug.project.creation_attempt", params) or {})
+
+    def debug_leader_participation_configure(
+        self, mode: str, percent: int, projects: List[str],
+        kill_switch: bool = False,
+    ) -> dict:
+        return dict(self._call("debug.leader_participation.configure", {
+            "mode": mode, "percent": percent,
+            "projects": projects, "kill_switch": kill_switch,
+        }) or {})
+
+    def team_leader_send(
+        self, team: str, text: str, request_id: str,
+        task_shape: str = "single_unit", risk_reasons: Optional[List[str]] = None,
+    ) -> dict:
+        return dict(self._call("team.leader.send", {
+            "team_name": team, "text": text, "request_id": request_id,
+            "task_shape": task_shape, "risk_reasons": risk_reasons or [],
+        }) or {})
+
+    def team_task_list(self, team: str) -> List[Dict[str, Any]]:
+        result = dict(self._call("team.task.list", {"team_name": team}) or {})
+        return list(result.get("tasks") or [])
+
+    def debug_leader_request_status(self, team: str, request_id: str) -> dict:
+        return dict(self._call("debug.leader_request.status", {
+            "team": team, "request_id": request_id,
         }) or {})
 
     def debug_project_create_status(self, operation_id: str) -> dict:
@@ -1609,6 +1666,10 @@ class termmesh:
 
     def debug_project_remote_presentations(self, host: str) -> List[Dict[str, Any]]:
         result = dict(self._call("debug.project.remote_presentations", {"host": host}) or {})
+        return list(result.get("projects") or [])
+
+    def debug_sidebar_projects(self, window_id: str) -> List[Dict[str, Any]]:
+        result = dict(self._call("debug.sidebar.projects", {"window_id": window_id}) or {})
         return list(result.get("projects") or [])
 
     def debug_project_adopt_remote(self, host: str, project_id: str) -> dict:

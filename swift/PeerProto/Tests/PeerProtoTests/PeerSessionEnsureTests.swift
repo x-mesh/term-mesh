@@ -60,6 +60,58 @@ private actor TestGate {
     }
 }
 
+private actor SilentTerminateHost {
+    private let transport: MockTransport
+    let entered: TestGate
+    let release: TestGate
+    private var pendingInbound = Data()
+    private var seq: UInt64 = 0
+
+    init(transport: MockTransport, entered: TestGate, release: TestGate) {
+        self.transport = transport
+        self.entered = entered
+        self.release = release
+    }
+
+    func run() async throws {
+        _ = try await readFrame() // client Hello
+        var hello = Termmesh_Peer_V1_Hello()
+        hello.protocolVersion = "1.0.0"
+        hello.peerID = Data(repeating: 0x41, count: 16)
+        hello.capabilities = [PeerCapability.surfaceTerminateV1]
+        try await send { $0.hello = hello }
+        var challenge = Termmesh_Peer_V1_AuthChallenge()
+        challenge.nonce = Data(repeating: 0x42, count: 32)
+        challenge.supportedMethods = ["ssh-passthrough"]
+        try await send { $0.authChallenge = challenge }
+        _ = try await readFrame() // client Auth
+        var auth = Termmesh_Peer_V1_AuthResult()
+        auth.accepted = true
+        auth.sessionID = Data(repeating: 0x43, count: 16)
+        try await send { $0.authResult = auth }
+        _ = try await readFrame() // TerminateSurfaceRequest; intentionally no reply
+        await entered.open()
+        await release.wait()
+    }
+
+    private func readFrame() async throws -> Termmesh_Peer_V1_Envelope {
+        while true {
+            if let envelope = try decodeFrame(from: &pendingInbound) { return envelope }
+            pendingInbound.append(await transport.serverRead())
+        }
+    }
+
+    private func send(
+        _ configure: (inout Termmesh_Peer_V1_Envelope) -> Void
+    ) async throws {
+        seq &+= 1
+        var envelope = Termmesh_Peer_V1_Envelope()
+        envelope.seq = seq
+        configure(&envelope)
+        await transport.serverWrite(try encodeFrame(envelope))
+    }
+}
+
 private actor CloseCounter {
     private(set) var value = 0
     func increment() { value += 1 }
@@ -449,6 +501,135 @@ final class PeerSessionEnsureTests: XCTestCase {
         XCTAssertEqual(surfaceID, pty.surfaceID)
         XCTAssertEqual(byteSeq, 7)
         XCTAssertEqual(payload, Data("kept".utf8))
+    }
+
+    func testTerminateResponseIsDemuxedWhileInboundPumpOwnsReads() async throws {
+        let sockPath = "/tmp/tm-peer-terminate-demux-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let server = PeerServer(
+            socketPath: sockPath,
+            provider: StaticSurfaceProvider(surfaces: [])
+        )
+        try await server.start()
+        defer { Task { await server.stop() } }
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+        await session.startHeartbeat(intervalSeconds: 10, deadAfterSeconds: 30) {}
+
+        let result = try await session.requestTerminateSurface(
+            requestID: Data(repeating: 0x23, count: 16),
+            surfaceID: Data(repeating: 0x24, count: 16)
+        )
+        XCTAssertEqual(result, .notFound)
+        do {
+            _ = try await session.ensureSurface(
+                requestID: Data(repeating: 0x23, count: 16),
+                key: "cross-type", cwd: "/tmp", executable: "/usr/bin/true"
+            )
+            XCTFail("terminate request id must not be reusable by ensure")
+        } catch PeerSessionError.duplicateEnsureRequestID {}
+
+        let ensureID = Data(repeating: 0x2A, count: 16)
+        let rejectedEnsure = try await session.ensureSurface(
+            requestID: ensureID,
+            key: "unsupported", cwd: "/tmp", executable: "/usr/bin/true"
+        )
+        XCTAssertEqual(rejectedEnsure.result, .failed)
+        do {
+            _ = try await session.requestTerminateSurface(
+                requestID: ensureID,
+                surfaceID: Data(repeating: 0x2B, count: 16)
+            )
+            XCTFail("ensure request id must not be reusable by terminate")
+        } catch PeerSessionError.duplicateEnsureRequestID {}
+        let second = try await session.requestTerminateSurface(
+            requestID: Data(repeating: 0x25, count: 16),
+            surfaceID: Data(repeating: 0x26, count: 16)
+        )
+        XCTAssertEqual(second, .notFound, "borrowed demux must work for every sweep target")
+        await session.stopHeartbeat()
+        await session.close(reason: "terminate demux test done")
+    }
+
+    func testTerminateValidationRejectsMismatchedSurfaceForDirectAndPumpedPaths() {
+        var response = Termmesh_Peer_V1_TerminateSurfaceResponse()
+        response.requestID = Data(repeating: 0x27, count: 16)
+        response.surfaceID = Data(repeating: 0x28, count: 16)
+        response.result = .notFound
+        XCTAssertEqual(
+            PeerSessionDemux.terminateResponseValidationError(
+                response, expectedSurfaceID: Data(repeating: 0x29, count: 16)
+            ),
+            "surface_id does not echo the terminate request"
+        )
+    }
+
+    func testMalformedResponseClassDoesNotEraseOppositeDemuxWaiter() async throws {
+        let demux = PeerSessionDemux()
+        let ensureID = Data(repeating: 0x31, count: 16)
+        let terminateID = Data(repeating: 0x32, count: 16)
+        _ = try await demux.registerEnsure(requestID: ensureID)
+        _ = try await demux.registerTerminate(
+            requestID: terminateID,
+            expectedSurfaceID: Data(repeating: 0x33, count: 16)
+        )
+
+        var wrongType = Termmesh_Peer_V1_EnsureSurfaceResponse()
+        wrongType.requestID = terminateID
+        wrongType.result = .failed
+        var error = Termmesh_Peer_V1_EnsureSurfaceError()
+        error.code = .invalidRequest
+        wrongType.error = error
+        await demux.routeEnsureResponse(wrongType)
+
+        let ensureCount = await demux.pendingEnsureCount
+        let terminateCount = await demux.pendingTerminateCount
+        XCTAssertEqual(ensureCount, 1)
+        XCTAssertEqual(terminateCount, 1)
+        await demux.failAllEnsures(error: CancellationError())
+        await demux.failAllTerminates(error: CancellationError())
+    }
+
+    func testCancellingPumpedTerminateClosesBlockedReader() async throws {
+        let transport = MockTransport()
+        let entered = TestGate()
+        let release = TestGate()
+        let host = SilentTerminateHost(
+            transport: transport, entered: entered, release: release
+        )
+        let hostTask = Task { try await host.run() }
+        let session = PeerSession(
+            read: { await transport.clientRead() },
+            write: { await transport.clientWrite($0) },
+            close: { await transport.closeClientRead() }
+        )
+        _ = try await session.handshake()
+        await session.startHeartbeat(intervalSeconds: 10, deadAfterSeconds: 30) {}
+        let request = Task {
+            try await session.requestTerminateSurface(
+                requestID: Data(repeating: 0x34, count: 16),
+                surfaceID: Data(repeating: 0x35, count: 16)
+            )
+        }
+        await entered.wait()
+        request.cancel()
+        do {
+            _ = try await request.value
+            XCTFail("cancelled terminate must not return success")
+        } catch is CancellationError {}
+
+        do {
+            _ = try await session.listWorkspaces()
+            XCTFail("cancelled pumped RPC must close the blocked single reader")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("cancelled")
+                    || String(describing: error).contains("closed")
+            )
+        }
+        await release.open()
+        try await hostTask.value
     }
 
     func testSendFailureRemovesPendingWaiter() async throws {

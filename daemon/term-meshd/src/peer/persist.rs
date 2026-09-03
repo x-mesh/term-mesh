@@ -119,6 +119,10 @@ pub struct PersistedProjectPresentation {
     pub created_at_unix_secs: u64,
     pub leader_surface_id: String,
     #[serde(default)]
+    pub leader_cli: String,
+    #[serde(default)]
+    pub leader_model: String,
+    #[serde(default)]
     pub delegation_configured: String,
     #[serde(default)]
     pub delegation_effective: String,
@@ -518,6 +522,8 @@ mod tests {
             project_root: "/srv/demo".into(),
             created_at_unix_secs: 1_700_000_000,
             leader_surface_id: hex::encode([8u8; 16]),
+            leader_cli: "codex".into(),
+            leader_model: "gpt-5.6-sol".into(),
             delegation_configured: String::new(),
             delegation_effective: String::new(),
             delegation_pending: String::new(),
@@ -537,6 +543,26 @@ mod tests {
 
         save_project_presentations(&path, std::slice::from_ref(&record)).unwrap();
         assert_eq!(load_project_presentations(&path), vec![record]);
+    }
+
+    #[test]
+    fn legacy_project_presentation_defaults_missing_leader_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer-project-presentations.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"records":[{{"owner_peer_id":"{}","project_id":"name:legacy","team_name":"legacy","team_uuid":"legacy-uuid","working_directory":"/srv/legacy","project_root":"/srv/legacy","created_at_unix_secs":1700000000,"leader_surface_id":"{}","members":[],"revision":1}}]}}"#,
+                hex::encode([7u8; 16]),
+                hex::encode([8u8; 16]),
+            ),
+        )
+        .unwrap();
+
+        let loaded = load_project_presentations(&path);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].leader_cli.is_empty());
+        assert!(loaded[0].leader_model.is_empty());
     }
 
     #[test]

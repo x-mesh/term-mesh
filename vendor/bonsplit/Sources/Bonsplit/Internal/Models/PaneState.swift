@@ -7,6 +7,14 @@ final class PaneState: Identifiable {
     let id: PaneID
     var tabs: [TabItem]
     var selectedTabId: UUID?
+    /// Bumped by the host when the actions its `paneHeaderActions` closure
+    /// would return for this pane have changed.
+    ///
+    /// `paneHeaderActions` is a plain closure on the controller and is not
+    /// observation-tracked, so host-side state can change with nothing to tell
+    /// SwiftUI. This lives on the pane rather than the controller so one
+    /// pane's change redraws one header instead of every open pane's.
+    var headerActionsRevision: Int = 0
 
     init(
         id: PaneID = PaneID(),

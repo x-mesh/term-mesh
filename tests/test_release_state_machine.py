@@ -70,6 +70,7 @@ class ReleaseStateMachineTests(unittest.TestCase):
             ("leader_relay_stability_seconds", 10),
             ("bytes_received", 0),
             ("leader_process_active", False),
+            ("background_restore_hold_seconds", 10),
         ):
             invalid = dict(receipt)
             invalid[key] = value

@@ -114,6 +114,19 @@ final class WorkspaceSurfaceRealizationPinTests: XCTestCase {
         XCTAssertTrue(mounted.contains(selected))
     }
 
+    @MainActor
+    func test_independentPinOwnersCannotReleaseEachOthersMount() {
+        let manager = TabManager(persistsSessionState: false)
+        let workspaceID = manager.tabs[0].id
+        manager.pinWorkspaceForSurfaceRealization(workspaceID)
+        manager.pinWorkspaceForSurfaceRealization(workspaceID)
+
+        manager.unpinWorkspaceForSurfaceRealization(workspaceID)
+        XCTAssertTrue(manager.surfaceRealizationPins.contains(workspaceID))
+        manager.unpinWorkspaceForSurfaceRealization(workspaceID)
+        XCTAssertFalse(manager.surfaceRealizationPins.contains(workspaceID))
+    }
+
     // MARK: - Timeout
 
     /// The pin is bounded because an unresolved one keeps an invisible

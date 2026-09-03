@@ -116,6 +116,9 @@ E2E_DAEMON_PID=""
 E2E_APP_PID_FILE="${TMPDIR:-/tmp}/term-mesh-e2e-app-${E2E_RUN_ID}.pid"
 REMOTE_FIXTURE_SSH_TARGET=""
 REMOTE_FIXTURE_ROOT=""
+# Where the peer's agent CLI symlink pointed before this run, when it resolved.
+REMOTE_AGENT_CLI_BACKUP=""
+REMOTE_AGENT_CLI_PRESENT=0
 PYTHON_VENV="$DERIVED_DATA_PATH/python-venv"
 PYTHON="$PYTHON_VENV/bin/python3"
 SYSTEM_PYTHON="/usr/bin/python3"
@@ -147,9 +150,19 @@ stage_remote_relay_fixture() {
     exit 1
   fi
 
+  # The staged daemon runs with XDG_DATA_HOME inside the fixture, so the agent
+  # CLI installs a copy of itself there and repoints ~/.local/bin/claude at it.
+  # The fixture is deleted on exit, which left that link dangling and the next
+  # run could not start a leader at all: "claude is not installed". Remember
   fixture_id="${candidate_sha:0:12}-$E2E_RUN_ID"
   REMOTE_FIXTURE_ROOT="/tmp/term-mesh-release-relay-$fixture_id"
-  remote_socket="$REMOTE_FIXTURE_ROOT/peer.sock"
+  REMOTE_AGENT_CLI_BACKUP="/tmp/term-mesh-release-relay-cli-$fixture_id"
+  if ssh "$REMOTE_FIXTURE_SSH_TARGET" 'test -e "$HOME/.local/bin/claude" || test -L "$HOME/.local/bin/claude"'; then
+    REMOTE_AGENT_CLI_PRESENT=1
+    ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+      "rm -rf '$REMOTE_AGENT_CLI_BACKUP'; mkdir -p '$REMOTE_AGENT_CLI_BACKUP'; cp -a \"\$HOME/.local/bin/claude\" '$REMOTE_AGENT_CLI_BACKUP/claude'"
+  fi
+  remote_socket="$REMOTE_FIXTURE_ROOT/term-meshd-peer.sock"
   remote_dir="$REMOTE_FIXTURE_ROOT/src"
   echo "== stage remote candidate fixture ($REMOTE_FIXTURE_SSH_TARGET) =="
   ssh "$REMOTE_FIXTURE_SSH_TARGET" "mkdir -p '$remote_dir'"
@@ -175,7 +188,7 @@ stage_remote_relay_fixture() {
      env XDG_DATA_HOME='$REMOTE_FIXTURE_ROOT/state' XDG_RUNTIME_DIR='$REMOTE_FIXTURE_ROOT/runtime' \
        PATH=/tmp/term-mesh-release-relay-target/release:\$HOME/.cargo/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:\$PATH \
        TERMMESH_PEER_SOCKET='$remote_socket' \
-       TERMMESH_DAEMON_UNIX_PATH='$REMOTE_FIXTURE_ROOT/control.sock' \
+       TERMMESH_DAEMON_UNIX_PATH='$REMOTE_FIXTURE_ROOT/term-meshd.sock' \
        nohup /tmp/term-mesh-release-relay-target/release/term-meshd \
        >'$REMOTE_FIXTURE_ROOT/daemon.log' 2>&1 & echo \$! >'$REMOTE_FIXTURE_ROOT/pid'"
   for _ in {1..120}; do
@@ -199,9 +212,41 @@ stage_remote_relay_fixture() {
 cleanup_remote_relay_fixture() {
   [ -n "$REMOTE_FIXTURE_SSH_TARGET" ] || return 0
   [ -n "$REMOTE_FIXTURE_ROOT" ] || return 0
+  # Restore the exact original entry before deleting the fixture, but only
+  # when this run still owns the current fixture-target symlink.
+  if [ -n "$REMOTE_AGENT_CLI_BACKUP" ]; then
+    ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+      "current=\$(readlink \"\$HOME/.local/bin/claude\" 2>/dev/null || true); \
+       case \"\$current\" in \
+         '$REMOTE_FIXTURE_ROOT'/*) \
+           rm -f \"\$HOME/.local/bin/claude\"; \
+           if [ '$REMOTE_AGENT_CLI_PRESENT' = '1' ]; then \
+             cp -a '$REMOTE_AGENT_CLI_BACKUP/claude' \"\$HOME/.local/bin/claude\"; \
+           fi;; \
+       esac" \
+      >/dev/null 2>&1 || true
+  fi
   ssh "$REMOTE_FIXTURE_SSH_TARGET" \
-    "if test -f '$REMOTE_FIXTURE_ROOT/pid'; then kill \$(cat '$REMOTE_FIXTURE_ROOT/pid') 2>/dev/null || true; fi; rm -rf '$REMOTE_FIXTURE_ROOT'" \
+    "if test -f '$REMOTE_FIXTURE_ROOT/pid'; then kill \$(cat '$REMOTE_FIXTURE_ROOT/pid') 2>/dev/null || true; fi; rm -rf '$REMOTE_FIXTURE_ROOT' '$REMOTE_AGENT_CLI_BACKUP'" \
     >/dev/null 2>&1 || true
+}
+
+restart_remote_relay_fixture_for_repair() {
+  [ -n "$REMOTE_FIXTURE_SSH_TARGET" ] || return 1
+  [ -n "$REMOTE_FIXTURE_ROOT" ] || return 1
+  ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+    "root='$REMOTE_FIXTURE_ROOT'; \
+     old=\$(cat \"\$root/pid\"); kill \"\$old\" 2>/dev/null || true; \
+     for _ in \$(seq 1 80); do kill -0 \"\$old\" 2>/dev/null || break; sleep .1; done; \
+     rm -f \"\$root/term-meshd-peer.sock\" \"\$root/term-meshd.sock\"; \
+     env XDG_DATA_HOME=\"\$root/state\" XDG_RUNTIME_DIR=\"\$root/runtime\" \
+       PATH=/tmp/term-mesh-release-relay-target/release:\$HOME/.cargo/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:\$PATH \
+       TERMMESH_PEER_SOCKET=\"\$root/term-meshd-peer.sock\" \
+       TERMMESH_DAEMON_UNIX_PATH=\"\$root/term-meshd.sock\" \
+       nohup /tmp/term-mesh-release-relay-target/release/term-meshd \
+       >\"\$root/daemon.log\" 2>&1 & echo \$! >\"\$root/pid\"; \
+     for _ in \$(seq 1 120); do [ -S \"\$root/term-meshd-peer.sock\" ] && exit 0; sleep .25; done; \
+     tail -100 \"\$root/daemon.log\" >&2; exit 1"
 }
 
 trap 'cleanup_remote_relay_fixture' EXIT
@@ -299,6 +344,11 @@ cleanup() {
       && break
     sleep 0.1
   done
+  if { [ -n "$E2E_APP_PID" ] && kill -0 "$E2E_APP_PID" 2>/dev/null; } \
+      || { [ -n "$E2E_DAEMON_PID" ] && kill -0 "$E2E_DAEMON_PID" 2>/dev/null; }; then
+    echo "ERROR: E2E app or daemon survived cleanup: app=${E2E_APP_PID:-none} daemon=${E2E_DAEMON_PID:-none}" >&2
+    return 1
+  fi
   # SSH relay helpers may daemonize/reparent while the app is terminating.
   # Reap only exact descendants captured before SIGTERM; unrelated developer
   # tunnels are never selected by a broad process-name match.
@@ -344,6 +394,7 @@ reset_e2e_state() {
 
 E2E_STATE_DIR="${TMPDIR:-/tmp}/termmesh-e2e-state.$$"
 export TERMMESH_E2E_STATE_DIR="$E2E_STATE_DIR"
+export TERMMESH_E2E_REATTACH_STATE="$E2E_STATE_DIR/remote-project-reattach.json"
 export TERMMESH_E2E_MOBILE_ADDR="$MOBILE_LISTENER_ADDR"
 # A test that relaunches the app respawns this exact binary with this exact env.
 export TERMMESH_APP_BIN="$APP/Contents/MacOS/term-mesh DEV"
@@ -381,6 +432,7 @@ launch_and_wait() {
   TERMMESH_SOCKET_PATH="$APP_SOCK_PATH" \
   TERMMESH_ALLOW_SOCKET_OVERRIDE=1 \
   TERMMESH_UI_TEST_MODE=1 \
+  TERMMESH_E2E_DISABLE_AUTO_REPAIR_PLACEHOLDERS="${TERMMESH_E2E_DISABLE_AUTO_REPAIR_PLACEHOLDERS:-0}" \
   "$APP/Contents/MacOS/term-mesh DEV" >/dev/null 2>&1 &
   E2E_APP_PID=$!
   printf '%s\n' "$E2E_APP_PID" > "$E2E_APP_PID_FILE"
@@ -565,14 +617,27 @@ run_test_with_retry() {
   local f="$1"
   local attempts=3
   local n=1
+  local output_file
+  output_file=$(mktemp "${TMPDIR:-/tmp}/term-mesh-e2e-output.XXXXXX")
 
   while [ "$n" -le "$attempts" ]; do
     echo "RUN  $f (attempt $n/$attempts)"
-    if "$PYTHON" "$f"; then
-      return 0
+    : > "$output_file"
+    set +e
+    "$PYTHON" "$f" 2>&1 | tee "$output_file"
+    local command_status=${PIPESTATUS[0]}
+    set -e
+    set +e
+    ./scripts/classify-test-result.sh "$command_status" "$output_file"
+    local classified=$?
+    set -e
+    if [ "$classified" -eq 0 ] || [ "$classified" -eq 2 ]; then
+      rm -f "$output_file"
+      return "$classified"
     fi
 
     if [ "$n" -ge "$attempts" ]; then
+      rm -f "$output_file"
       return 1
     fi
 
@@ -582,6 +647,7 @@ run_test_with_retry() {
     n=$((n + 1))
   done
 
+  rm -f "$output_file"
   return 1
 }
 
@@ -624,35 +690,125 @@ for f in "${test_files[@]}"; do
     skipped=$((skipped + 1))
     continue
   fi
+  if [ "$base" = "test_runner_skip_accounting.py" ]; then
+    echo "RUN  $f (host-safe; no app launch)"
+    if "$PYTHON" "$f"; then
+      passed=$((passed + 1))
+    else
+      fail=1
+      failed_tests[${#failed_tests[@]}]="$f"
+      [ "$KEEP_GOING" = "1" ] || break
+    fi
+    continue
+  fi
   if [ "$base" = "test_remote_project_restart_reattach.py" ] \
     && [ "${TERMMESH_E2E_REATTACH_PHASE:-}" = "full" ]; then
+    phase_result() {
+      local output_file="$1"
+      shift
+      set +e
+      "$@" 2>&1 | tee "$output_file"
+      local command_status=${PIPESTATUS[0]}
+      set -e
+      set +e
+      ./scripts/classify-test-result.sh "$command_status" "$output_file"
+      local classified=$?
+      set -e
+      return "$classified"
+    }
+    phase_failed=0
+    phase_skipped=0
+    phase_output=$(mktemp "${TMPDIR:-/tmp}/term-mesh-phase-output.XXXXXX")
     echo "== launch ($base create) =="
     launch_and_wait
     echo "RUN  $f (phase create)"
-    if ! TERMMESH_E2E_REATTACH_PHASE=create "$PYTHON" "$f"; then
+    set +e
+    phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=create "$PYTHON" "$f"
+    create_result=$?
+    set -e
+    if [ "$create_result" -eq 2 ]; then
+      phase_skipped=1
+    elif [ "$create_result" -ne 0 ]; then
       echo "FAIL $f (phase create)" >&2
-      fail=1
+      phase_failed=1
       failed_tests[${#failed_tests[@]}]="$f:create"
-      [ "$KEEP_GOING" = "1" ] || break
-      continue
     fi
-    echo "== relaunch ($base adopt; preserving app and test state) =="
-    launch_and_wait 1
-    echo "RUN  $f (phase adopt/reconnect)"
-    if ! TERMMESH_E2E_REATTACH_PHASE=adopt "$PYTHON" "$f"; then
-      echo "FAIL $f (phase adopt/reconnect)" >&2
+    if [ "$create_result" -eq 0 ]; then
+      echo "== relaunch ($base adopt; fresh viewer installation) =="
+      TERMMESH_PEER_IDENTITY_EPHEMERAL=1 launch_and_wait 1
+      echo "RUN  $f (phase adopt/reconnect)"
+      set +e
+      phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=adopt \
+        TERMMESH_E2E_CROSS_INSTALLATION_VIEWER=1 "$PYTHON" "$f"
+      adopt_result=$?
+      set -e
+      if [ "$adopt_result" -eq 2 ]; then
+        phase_skipped=1
+      elif [ "$adopt_result" -ne 0 ]; then
+        echo "FAIL $f (phase adopt/reconnect)" >&2
+        phase_failed=1
+        failed_tests[${#failed_tests[@]}]="$f:adopt"
+      fi
+
+      if [ "$adopt_result" -eq 0 ]; then
+        echo "== relaunch ($base repair; original owner identity) =="
+        # Reproduce the production boundary: the owner app is down while the
+        # remote daemon restarts, so its first roster already has a durable
+        # manifest with missing processes/surfaces.
+        cleanup
+        restart_remote_relay_fixture_for_repair
+        TERMMESH_E2E_DISABLE_AUTO_REPAIR_PLACEHOLDERS=1 launch_and_wait 1
+        echo "RUN  $f (phase missing-surface repair)"
+        set +e
+        phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=repair "$PYTHON" "$f"
+        repair_result=$?
+        set -e
+        if [ "$repair_result" -eq 2 ]; then
+          phase_skipped=1
+        elif [ "$repair_result" -ne 0 ]; then
+          echo "FAIL $f (phase missing-surface repair)" >&2
+          phase_failed=1
+          failed_tests[${#failed_tests[@]}]="$f:repair"
+        fi
+      fi
+
+      echo "RUN  $f (phase owner cleanup)"
+      set +e
+      phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=cleanup "$PYTHON" "$f"
+      cleanup_result=$?
+      set -e
+      if [ "$cleanup_result" -eq 2 ]; then
+        phase_skipped=1
+      elif [ "$cleanup_result" -ne 0 ]; then
+        echo "FAIL $f (phase owner cleanup)" >&2
+        phase_failed=1
+        failed_tests[${#failed_tests[@]}]="$f:cleanup"
+      fi
+    fi
+    rm -f "$phase_output"
+    if [ "$phase_failed" -ne 0 ]; then
       fail=1
-      failed_tests[${#failed_tests[@]}]="$f:adopt"
       [ "$KEEP_GOING" = "1" ] || break
       continue
     fi
-    passed=$((passed + 1))
+    if [ "$phase_skipped" -ne 0 ]; then
+      skipped=$((skipped + 1))
+    else
+      passed=$((passed + 1))
+    fi
     continue
   fi
 
   echo "== launch ($base) =="
   launch_and_wait
-  if ! run_test_with_retry "$f"; then
+  if run_test_with_retry "$f"; then
+    test_result=0
+  else
+    test_result=$?
+  fi
+  if [ "$test_result" -eq 2 ]; then
+    skipped=$((skipped + 1))
+  elif [ "$test_result" -ne 0 ]; then
     echo "FAIL $f" >&2
     fail=1
     failed_tests[${#failed_tests[@]}]="$f"
