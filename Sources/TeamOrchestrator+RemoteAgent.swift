@@ -1839,6 +1839,7 @@ extension TeamOrchestrator {
     ) async {
         for host in hosts where host.isConnected && host.teamHostSpec != nil {
             let leaderRecoveryNames = teams.values.compactMap { team -> String? in
+                guard !team.isRemoteRepairPlaceholder else { return nil }
                 let teamHostKey: String? = {
                     guard case let .peer(key) = team.leaderEndpoint else { return nil }
                     return key
