@@ -38,7 +38,17 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
             // sonnet → claude-sonnet-5, haiku → claude-haiku-4-5.
             // Listing tiers rather than pinned ids is what keeps this from
             // going stale on every model release.
-            return ["sonnet", "opus", "fable", "haiku"]
+            //
+            // The `[1m]` forms are separate aliases, not a spelling of the same
+            // thing: the CLI's alias list is `sonnet, opus, haiku, fable, best,
+            // sonnet[1m], opus[1m], fable[1m], opusplan`, and a bare tier gets
+            // the standard context window. Dropping them left "Opus 5 (1M
+            // context)" — an entry the CLI's own `/model` picker offers —
+            // unreachable from a pane or a leader. haiku has no 1M form.
+            // 1M access is per account; the CLI reports it at launch when the
+            // account lacks it.
+            return ["sonnet", "sonnet[1m]", "opus", "opus[1m]",
+                    "fable", "fable[1m]", "haiku"]
         case "kiro":
             // Tiers first (they are what the rest of the app stores), then the
             // newest of each family kiro actually lists. `auto` is its own
@@ -96,6 +106,9 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
         case ("claude", "opus"):   return "Opus 5"
         case ("claude", "sonnet"): return "Sonnet 5"
         case ("claude", "haiku"):  return "Haiku 4.5"
+        case ("claude", "fable[1m]"):  return "Fable 5 (1M context)"
+        case ("claude", "opus[1m]"):   return "Opus 5 (1M context)"
+        case ("claude", "sonnet[1m]"): return "Sonnet 5 (1M context)"
         case ("codex", "opus"):   return "gpt-5.6-sol (high)"
         case ("codex", "sonnet"): return "gpt-5.6-sol (medium)"
         case ("codex", "haiku"):  return "gpt-5.6-sol (low)"
@@ -130,10 +143,15 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     }
 
     /// Normalize legacy stored model aliases to the current canonical tier name.
-    /// Must run before picker validation so "opus-1m" upgrages to "opus" rather than
-    /// falling through to the default sonnet tier.
+    /// Must run before picker validation so "opus-1m" upgrades to "opus[1m]"
+    /// rather than falling through to the default sonnet tier.
+    ///
+    /// It maps to `opus[1m]`, not to `opus`: the stored value asked for the 1M
+    /// window, and the two are still different models to the CLI. Rewriting it
+    /// to the bare tier silently moved every agent that had picked 1M onto the
+    /// standard context window.
     static func normalizeModel(_ model: String, for cli: String) -> String {
-        if cli == "claude" && model == "opus-1m" { return "opus" }
+        if cli == "claude" && model == "opus-1m" { return "opus[1m]" }
         return model
     }
 
