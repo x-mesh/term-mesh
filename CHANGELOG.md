@@ -4,6 +4,13 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.226.3] - 2026-09-03
+
+### Fixed
+- Verify repaired Project leader control through the authenticated session-owner endpoint, even when a saved Mac host profile still names an older serving socket.
+- Safely reuse an exact, app-managed leader process left by an interrupted repair instead of spawning a duplicate, with strict Project identity and process-environment proof for legacy records.
+- Terminate failed remote leader surfaces on their owning endpoint before local teardown, retaining an owner-aware durable cleanup record until the host confirms removal.
+
 ## [0.226.2] - 2026-09-03
 
 ### Fixed
