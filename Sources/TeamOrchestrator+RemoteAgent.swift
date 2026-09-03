@@ -64,6 +64,7 @@ final class PendingPeerAgentSurfaceCleanupStore {
     /// retry forever against a host that keeps answering "not mine" while the
     /// `tm-agent-bridge` it was meant to kill stays up.
     typealias Terminator = @MainActor (String, String, Data, String?) async -> Bool
+    typealias Confirmation = @MainActor (String, Data) -> Void
     struct Record: Codable, Equatable, Identifiable {
         let hostKey: String
         let surfaceIDBase64: String
@@ -100,6 +101,7 @@ final class PendingPeerAgentSurfaceCleanupStore {
     private let automaticRetryDelay: TimeInterval
     private let hostSockPathProvider: HostSockPath
     private let terminator: Terminator
+    private let onConfirmed: Confirmation
 
     /// Cleanup only needs the authenticated transport that already backs the
     /// connected host row. CLI launch metadata is resolved by a later RPC and
@@ -133,12 +135,18 @@ final class PendingPeerAgentSurfaceCleanupStore {
                 surfaceID: surfaceID,
                 owningRemoteSockPath: owningRemoteSockPath
             )
+        },
+        onConfirmed: @escaping Confirmation = { hostKey, surfaceID in
+            ManagedPeerSurfaceStore.shared.forget(
+                hostKey: hostKey, surfaceID: surfaceID
+            )
         }
     ) {
         self.defaults = defaults
         self.automaticRetryDelay = automaticRetryDelay
         self.hostSockPathProvider = hostSockPathProvider
         self.terminator = terminator
+        self.onConfirmed = onConfirmed
         if let data = defaults.data(forKey: Self.storageKey),
            let decoded = try? JSONDecoder().decode([Record].self, from: data) {
             records = decoded
@@ -253,6 +261,7 @@ final class PendingPeerAgentSurfaceCleanupStore {
                 $0.id == record.id
                     && $0.owningRemoteSockPath == record.owningRemoteSockPath
             }
+            onConfirmed(record.hostKey, surfaceID)
             persist()
         }
     }
@@ -429,6 +438,104 @@ extension TeamOrchestrator {
             return nil
         }
         return managedLeaderSurfaceID
+    }
+
+    nonisolated static func recoverableManagedLeaderSurfaceID(
+        manifestLeaderSurfaceID: Data,
+        managedRecords: [ManagedPeerSurfaceStore.Record],
+        teamName: String,
+        teamUUID: String,
+        projectID: String?,
+        workingDirectory: String,
+        surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+    ) -> Data? {
+        let live = managedRecords.compactMap { record -> Data? in
+            guard record.teamName == teamName, record.role == "leader",
+                  record.workingDirectory == workingDirectory,
+                  record.teamUUID == teamUUID,
+                  record.projectID == projectID,
+                  let surfaceID = record.surfaceID,
+                  surfaceID != manifestLeaderSurfaceID,
+                  let surface = surfaces.first(where: { $0.surfaceID == surfaceID }),
+                  surface.attachable, surface.foregroundBusyKnown, surface.foregroundBusy
+            else { return nil }
+            return surfaceID
+        }
+        let unique = Set(live)
+        return unique.count == 1 ? unique.first : nil
+    }
+
+    nonisolated static func legacyManagedLeaderCandidateSurfaceID(
+        manifestLeaderSurfaceID: Data,
+        managedRecords: [ManagedPeerSurfaceStore.Record],
+        teamName: String,
+        workingDirectory: String,
+        surfaces: [Termmesh_Peer_V1_SurfaceInfo]
+    ) -> Data? {
+        let live = managedRecords.compactMap { record -> Data? in
+            guard record.teamName == teamName, record.role == "leader",
+                  record.workingDirectory == workingDirectory,
+                  record.teamUUID == nil, record.projectID == nil,
+                  let surfaceID = record.surfaceID, surfaceID != manifestLeaderSurfaceID,
+                  let surface = surfaces.first(where: { $0.surfaceID == surfaceID }),
+                  surface.attachable, surface.foregroundBusyKnown, surface.foregroundBusy
+            else { return nil }
+            return surfaceID
+        }
+        let unique = Set(live)
+        return unique.count == 1 ? unique.first : nil
+    }
+
+    static func legacyManagedLeaderIdentityProofScript() -> String {
+        // Snapshot before reading the identity tokens or spawning any matcher.
+        // Therefore neither this verifier nor its later ps/grep children can
+        // appear in the candidate PID set.
+        let body = "self=$$; snapshot=$(ps -axo pid=,ppid=,pgid= 2>/dev/null) || exit 75; "
+            + "IFS= read -r surface || exit 76; IFS= read -r team || exit 76; "
+            + "ancestors=\" $self \"; current=$self; "
+            + "while :; do parent=$(printf '%s\\n' \"$snapshot\" | awk -v p=\"$current\" '$1 == p { print $2; exit }'); "
+            + "case \"$parent\" in ''|0|1) break;; esac; ancestors=\"$ancestors$parent \"; current=$parent; done; "
+            + "groups=' '; for pid in $(printf '%s\\n' \"$snapshot\" | awk '{ print $1 }'); do "
+            + "case \"$ancestors\" in *\" $pid \"*) continue;; esac; "
+            + "pgid=$(printf '%s\\n' \"$snapshot\" | awk -v p=\"$pid\" '$1 == p { print $3; exit }'); [ -n \"$pgid\" ] || continue; "
+            + "matched=0; if [ -r \"/proc/$pid/environ\" ]; then "
+            + "envlines=$(tr '\\000' '\\n' < \"/proc/$pid/environ\" 2>/dev/null || true); "
+            + "printf '%s\\n' \"$envlines\" | grep -Fqx -- \"$surface\" && printf '%s\\n' \"$envlines\" | grep -Fqx -- \"$team\" && matched=1; "
+            + "else line=$(ps eww -p \"$pid\" -o command= 2>/dev/null || true); "
+            + "case \" $line \" in *\" $surface \"*) case \" $line \" in *\" $team \"*) matched=1;; esac;; esac; fi; "
+            + "[ \"$matched\" -eq 1 ] || continue; case \"$groups\" in *\" $pgid \"*) ;; *) groups=\"$groups$pgid \";; esac; done; "
+            + "count=$(printf '%s\\n' \"$groups\" | awk '{ print NF }'); [ \"$count\" -eq 1 ] && printf '1\\n' || printf '0\\n'"
+        return RemotePasteTransfer.serviceAccountCommand(body)
+    }
+
+    nonisolated static func legacyManagedLeaderIdentityProofInput(
+        surfaceID: Data, teamUUID: String
+    ) -> Data {
+        let surfaceHex = surfaceID.map { String(format: "%02x", $0) }.joined()
+        return Data(
+            "TERMMESH_SURFACE_ID=\(surfaceHex)\n"
+                .appending("TERMMESH_LEADER_TEAM_UUID=\(teamUUID)\n").utf8
+        )
+    }
+
+    static func verifyLegacyManagedLeaderIdentity(
+        host: HostEntry, surfaceID: Data, teamUUID: String
+    ) async -> Bool {
+        guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else { return false }
+        do {
+            let output = try await PeerHostReadinessChecker.runScript(
+                sshTarget: sshTarget, port: host.sshPort,
+                identityFile: host.identityFile,
+                script: legacyManagedLeaderIdentityProofScript(),
+                standardInput: legacyManagedLeaderIdentityProofInput(
+                    surfaceID: surfaceID, teamUUID: teamUUID
+                ),
+                timeoutSeconds: 20
+            )
+            return output.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+        } catch {
+            return false
+        }
     }
 
     nonisolated static func exactCollaborationRemoteTeam(
@@ -772,7 +879,107 @@ extension TeamOrchestrator {
             surfaces: authoritative.surfaces,
             localLeaderRelayStarted: initial.leaderReady
         )
-        switch leaderDecision {
+        var recoverableManagedLeaderSurfaceID: Data? = leaderDecision == .bootstrapReplacement
+            ? Self.recoverableManagedLeaderSurfaceID(
+                manifestLeaderSurfaceID: authoritative.team.leaderSurfaceID,
+                managedRecords: ManagedPeerSurfaceStore.shared.records(hostKey: hostKey),
+                teamName: teamName, teamUUID: teamUUID,
+                projectID: initial.remotePresentationProjectID,
+                workingDirectory: authoritative.team.workingDirectory,
+                surfaces: authoritative.surfaces
+            ) : nil
+        if recoverableManagedLeaderSurfaceID == nil,
+           leaderDecision == .bootstrapReplacement,
+           let projectID = initial.remotePresentationProjectID,
+           let legacySurfaceID = Self.legacyManagedLeaderCandidateSurfaceID(
+               manifestLeaderSurfaceID: authoritative.team.leaderSurfaceID,
+               managedRecords: ManagedPeerSurfaceStore.shared.records(hostKey: hostKey),
+               teamName: teamName,
+               workingDirectory: authoritative.team.workingDirectory,
+               surfaces: authoritative.surfaces
+           ),
+           await Self.verifyLegacyManagedLeaderIdentity(
+               host: host, surfaceID: legacySurfaceID, teamUUID: teamUUID
+           ) {
+            ManagedPeerSurfaceStore.shared.remember(
+                hostKey: hostKey, surfaceID: legacySurfaceID,
+                teamName: teamName, role: "leader",
+                workingDirectory: authoritative.team.workingDirectory,
+                teamUUID: teamUUID, projectID: projectID
+            )
+            recoverableManagedLeaderSurfaceID = legacySurfaceID
+        }
+        if let recoverableManagedLeaderSurfaceID {
+            let launch = Self.collaborationLeaderLaunchMetadata(
+                remoteCLI: authoritative.team.leaderCLI,
+                remoteModel: authoritative.team.leaderModel
+            )
+            guard materializeRemoteRepairPlaceholder(teamName: teamName),
+                  let repairTeam = teams[teamName],
+                  let repairTabManager = AppDelegate.shared?.tabManagerFor(
+                      tabId: repairTeam.workspaceId
+                  ) else {
+                return CollaborationRecoveryReport(
+                    routeRepaired: false, leaderLive: false, liveAgents: 0,
+                    replacedAgents: [], failedAgents: ["Repair presentation unavailable"]
+                )
+            }
+            repairTabManager.pinWorkspaceForSurfaceRealization(repairTeam.workspaceId)
+            defer {
+                repairTabManager.unpinWorkspaceForSurfaceRealization(repairTeam.workspaceId)
+            }
+            guard case .attached = await reattachRemoteLeaderIfNeeded(
+                teamName: teamName, expectedSurfaceID: recoverableManagedLeaderSurfaceID
+            ) else {
+                return CollaborationRecoveryReport(
+                    routeRepaired: false, leaderLive: false, liveAgents: 0,
+                    replacedAgents: [],
+                    failedAgents: ["Managed replacement leader could not be reattached"]
+                )
+            }
+            let relayDeadline = Date().addingTimeInterval(30)
+            while Date() < relayDeadline {
+                let panelID = teams[teamName]?.leaderPanelId
+                let started = panelID.flatMap { panelID in
+                    repairTabManager.tabs.first(where: {
+                        $0.id == repairTeam.workspaceId
+                    })?.terminalPanel(for: panelID)?.peerPaneSession?.isRelayStarted
+                } == true
+                if started { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            guard let repairedPanelID = teams[teamName]?.leaderPanelId,
+                  let repairedWorkspace = repairTabManager.tabs.first(where: {
+                      $0.id == repairTeam.workspaceId
+                  }),
+                  let repairedSession = repairedWorkspace.terminalPanel(
+                      for: repairedPanelID
+                  )?.peerPaneSession,
+                  repairedSession.isRelayStarted,
+                  repairedSession.originSurface.surfaceID
+                    == recoverableManagedLeaderSurfaceID else {
+                return CollaborationRecoveryReport(
+                    routeRepaired: false, leaderLive: false, liveAgents: 0,
+                    replacedAgents: [], failedAgents: ["Managed leader relay did not start"]
+                )
+            }
+            recordRecoveredRemoteLeaderSurface(
+                teamName: teamName, surfaceID: recoverableManagedLeaderSurfaceID,
+                leaderCLI: launch.cli, leaderModel: launch.model
+            )
+            scheduleRemoteProjectManifestPublication(forHostKey: hostKey)
+            snapshotResult = await authoritativeCollaborationSnapshot(
+                host: host, teamUUID: teamUUID,
+                projectID: initial.remotePresentationProjectID
+            )
+            guard case .success(let refreshed) = snapshotResult else {
+                return CollaborationRecoveryReport(
+                    routeRepaired: false, leaderLive: false, liveAgents: 0,
+                    replacedAgents: [], failedAgents: ["Managed leader refresh failed"]
+                )
+            }
+            authoritative = refreshed
+        } else { switch leaderDecision {
         case .keepExisting:
             break
         case .deferUntilAuthoritative:
@@ -877,7 +1084,7 @@ extension TeamOrchestrator {
             )
             scheduleRemoteProjectManifestPublication(forHostKey: hostKey)
             authoritative = refreshed
-        }
+        }}
 
         let initialLeaderSurfaceID = teams[teamName]?.remoteLeaderSurfaceID
             ?? authoritative.team.leaderSurfaceID
@@ -1189,6 +1396,24 @@ extension TeamOrchestrator {
         return nil
     }
 
+    /// Verification must measure the same authenticated endpoint that supplied
+    /// the Team and surface roster. A saved Mac profile can still name its old
+    /// GUI/legacy peer socket while Hello redirects durable team work to the
+    /// daemon's session-owner socket.
+    nonisolated static func collaborationPeerSocketPath(
+        teamHostKey: PeerPaneHostKey?
+    ) -> String? {
+        if let teamHostKey {
+            let path: String
+            switch teamHostKey {
+            case .direct(let sockPath): path = sockPath
+            case .ssh(_, let remoteSockPath, _): path = remoteSockPath
+            }
+            if !path.isEmpty { return path }
+        }
+        return nil
+    }
+
     /// Run `tm-agent status` in the same service account and with the same
     /// route file as the long-lived leader. The command and its output are
     /// secret-free; the bearer never leaves the 0600 file.
@@ -1267,11 +1492,16 @@ extension TeamOrchestrator {
         guard let sshTarget = host.sshTarget, !sshTarget.isEmpty else {
             return "the host has no SSH verification route"
         }
+        guard let peerSocketPath = collaborationPeerSocketPath(
+            teamHostKey: host.teamHostSpec?.hostKey
+        ) else {
+            return "the authenticated team peer socket could not be resolved"
+        }
         let health = await PeerHostDoctor.healthBaseline(
             sshTarget: sshTarget, port: host.sshPort, identityFile: host.identityFile
         )
         guard let controlSocketPath = collaborationControlSocketPath(
-            peerSocketPath: host.remoteSockPath ?? "", health: health
+            peerSocketPath: peerSocketPath, health: health
         ) else {
             return "the host control socket could not be resolved"
         }
@@ -2277,7 +2507,9 @@ extension TeamOrchestrator {
                 surfaceID: remote.leaderSurfaceID,
                 teamName: remote.name,
                 role: "leader",
-                workingDirectory: remote.workingDirectory
+                workingDirectory: remote.workingDirectory,
+                teamUUID: remote.teamUUID,
+                projectID: remote.projectID
             )
         }
 
@@ -2649,6 +2881,68 @@ extension TeamOrchestrator {
         var errorDescription: String? { description }
     }
 
+    typealias FailedLeaderSurfaceTerminator = @MainActor (
+        PeerPaneHostSpec, Data
+    ) async -> Bool
+    typealias FailedLeaderSurfaceForgetter = @MainActor (String, Data) -> Void
+    typealias FailedLeaderSurfaceEnqueuer = @MainActor (
+        String, Data, String?
+    ) -> Void
+
+    /// Reap a leader surface created by an attach that never committed. The
+    /// captured creation endpoint wins over the host's current route, and local
+    /// teardown happens only after confirmation or a durable owner-aware
+    /// tombstone exists.
+    @MainActor
+    static func compensateFailedLeaderSurface(
+        hostKey: String,
+        surfaceID: Data?,
+        owningHostSpec: PeerPaneHostSpec?,
+        terminate: FailedLeaderSurfaceTerminator,
+        forgetManaged: FailedLeaderSurfaceForgetter,
+        enqueueCleanup: FailedLeaderSurfaceEnqueuer,
+        teardownLocal: @MainActor () -> Void
+    ) async {
+        defer { teardownLocal() }
+        guard let surfaceID, !surfaceID.isEmpty else { return }
+        let terminated = if let owningHostSpec {
+            await terminate(owningHostSpec, surfaceID)
+        } else {
+            false
+        }
+        if terminated {
+            forgetManaged(hostKey, surfaceID)
+        } else {
+            enqueueCleanup(
+                hostKey, surfaceID,
+                owningHostSpec.flatMap(failedLeaderOwningSocketPath)
+            )
+        }
+    }
+
+    nonisolated static func failedLeaderOwningSocketPath(
+        _ spec: PeerPaneHostSpec
+    ) -> String? {
+        let path: String
+        switch spec {
+        case .direct(let sockPath): path = sockPath
+        case .ssh(_, let remoteSockPath, _, _): path = remoteSockPath
+        }
+        return path.isEmpty ? nil : path
+    }
+
+    @MainActor
+    private static func terminateFailedLeaderSurface(
+        owningHostSpec: PeerPaneHostSpec, surfaceID: Data
+    ) async -> Bool {
+        guard let lease = try? await PeerPaneHostRegistry.shared.acquire(owningHostSpec)
+        else { return false }
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+        return await terminatePeerAgentSurfaceConfirmed(
+            hostSockPath: lease.hostSockPath, surfaceID: surfaceID
+        )
+    }
+
     /// What happened to each participant that had to be attached over a peer,
     /// reported as it happens.
     ///
@@ -2820,6 +3114,7 @@ extension TeamOrchestrator {
         var participationControlFile: String?
         var routeFilePath: String?
         var routeTransaction: String?
+        var owningHostSpec: PeerPaneHostSpec?
         var hostSockPath: String
         var surfaceID: Data?
         var session: PeerPaneSession?
@@ -2840,11 +3135,6 @@ extension TeamOrchestrator {
         }
 
         func cleanup() async {
-            if let panelID {
-                _ = workspace.closePanel(panelID, force: true)
-            } else {
-                session?.teardown()
-            }
             // Restore the previous canonical route before revoking the new
             // bearer. Reversing these two steps leaves a live route file that
             // points at a dead grant while rollback SSH is still in flight.
@@ -2865,13 +3155,34 @@ extension TeamOrchestrator {
             if let grantID, !grantRevocationDeferred {
                 await PeerTeamLeaderControlPlane.shared.revokeGrant(id: grantID)
             }
-            if let surfaceID {
-                await TeamOrchestrator.closeManagedRemoteSurface(
-                    hostSockPath: hostSockPath,
-                    hostKey: hostKey,
-                    surfaceID: surfaceID
-                )
-            }
+            await TeamOrchestrator.compensateFailedLeaderSurface(
+                hostKey: hostKey, surfaceID: surfaceID,
+                owningHostSpec: owningHostSpec,
+                terminate: { spec, surfaceID in
+                    await TeamOrchestrator.terminateFailedLeaderSurface(
+                        owningHostSpec: spec, surfaceID: surfaceID
+                    )
+                },
+                forgetManaged: { hostKey, surfaceID in
+                    ManagedPeerSurfaceStore.shared.forget(
+                        hostKey: hostKey, surfaceID: surfaceID
+                    )
+                },
+                enqueueCleanup: { hostKey, surfaceID, owningRemoteSockPath in
+                    TeamOrchestrator.enqueuePendingPeerAgentSurfaceCleanup(
+                        hostKey: hostKey, surfaceID: surfaceID,
+                        owningRemoteSockPath: owningRemoteSockPath
+                    )
+                },
+                teardownLocal: { [weak self] in
+                    guard let self else { return }
+                    if let panelID = self.panelID {
+                        _ = self.workspace.closePanel(panelID, force: true)
+                    } else {
+                        self.session?.teardown()
+                    }
+                }
+            )
             if let promptFile {
                 await TeamOrchestrator.removeRemoteLeaderPrompt(
                     host: host,
@@ -4066,7 +4377,9 @@ extension TeamOrchestrator {
         attempt.installCleanup { await resources.cleanup() }
         try await attempt.ensureCurrent()
 
-        let lease = try await PeerPaneHostRegistry.shared.acquire(Self.requireTeamHostSpec(host))
+        let owningHostSpec = try Self.requireTeamHostSpec(host)
+        resources.owningHostSpec = owningHostSpec
+        let lease = try await PeerPaneHostRegistry.shared.acquire(owningHostSpec)
         resources.hostSockPath = lease.hostSockPath
         try await attempt.ensureCurrent()
 #if DEBUG
@@ -4124,7 +4437,12 @@ extension TeamOrchestrator {
                 surfaceID: chosen.surfaceID,
                 teamName: teamName,
                 role: "leader",
-                workingDirectory: workingDirectory
+                workingDirectory: workingDirectory,
+                teamUUID: teamUUID,
+                projectID: team.remotePresentationProjectID
+                    ?? PeerTeamLeader.projectID(
+                        teamName: teamName, teamUUID: teamUUID
+                    )
             )
             session = try await PeerPaneSession.attach(
                 lease: lease,
@@ -4695,21 +5013,35 @@ extension TeamOrchestrator {
     /// record and its grant untouched, because the remote leader may well still
     /// be running behind it.
     @discardableResult
-    func reattachRemoteLeaderIfNeeded(teamName: String) async -> RemoteLeaderReattachOutcome {
+    func reattachRemoteLeaderIfNeeded(
+        teamName: String, expectedSurfaceID: Data? = nil
+    ) async -> RemoteLeaderReattachOutcome {
         guard let team = teams[teamName],
               case let .peer(hostKey) = team.leaderEndpoint
         else { return .temporarilyUnavailable }
-        if isLeaderPaneAttached(teamName: teamName) { return .attached }
+        if isLeaderPaneAttached(teamName: teamName) {
+            guard let expectedSurfaceID,
+                  let located = AppDelegate.shared?.locateSurface(
+                      surfaceId: team.leaderPanelId
+                  ),
+                  let workspace = located.tabManager.tabs.first(where: {
+                      $0.id == located.workspaceId
+                  }),
+                  workspace.terminalPanel(for: team.leaderPanelId)?
+                    .peerPaneSession?.originSurface.surfaceID == expectedSurfaceID else {
+                return expectedSurfaceID == nil ? .attached : .temporarilyUnavailable
+            }
+            return .attached
+        }
         guard !remoteLeaderReattachInFlight.contains(teamName) else {
             return .temporarilyUnavailable
         }
         remoteLeaderReattachInFlight.insert(teamName)
         defer { remoteLeaderReattachInFlight.remove(teamName) }
 
-        guard let record = ManagedPeerSurfaceStore.shared.leaderRecord(
-            hostKey: hostKey,
-            teamName: teamName
-        ), let surfaceID = record.surfaceID else {
+        let surfaceID: Data? = expectedSurfaceID ?? ManagedPeerSurfaceStore.shared
+            .leaderRecord(hostKey: hostKey, teamName: teamName)?.surfaceID
+        guard let surfaceID else {
             // No surface was ever recorded, so there is none to duplicate. This
             // is the initial-attach-failed case `recoverRemoteLeaderIfNeeded`
             // documents, and bootstrapping is its intended repair.
@@ -4787,11 +5119,14 @@ extension TeamOrchestrator {
         }
         PeerPaneHostRegistry.shared.release(lease)
 
-        guard let panel = workspace.openRemotePane(
-            session: session,
-            focus: false,
-            lifetime: .keepAlive
-        ) else {
+        let panel = team.isRemoteRepairPlaceholder
+            ? workspace.replaceTerminalPaneWithRemote(
+                panelId: team.leaderPanelId, session: session, lifetime: .keepAlive
+            )
+            : workspace.openRemotePane(
+                session: session, focus: false, lifetime: .keepAlive
+            )
+        guard let panel else {
             session.teardown()
             RemoteWorkLog.info("Cannot restore \(teamName) leader: no local pane can host it")
             return .temporarilyUnavailable
