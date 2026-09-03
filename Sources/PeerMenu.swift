@@ -20,6 +20,34 @@ import Bonsplit
 import Darwin
 import PeerProto
 
+/// Resources a Force Disconnect asked to close. Pane sessions, live mirrors,
+/// and standalone relay/console windows have different recovery costs, so a
+/// destructive socket response must not collapse them into one opaque count.
+struct PeerForceDisconnectCounts: Equatable, Sendable {
+    let total: Int
+    let panes: Int
+    let mirrors: Int
+    let relayWindows: Int
+    let other: Int
+
+    nonisolated static func classify(
+        targetIDs: Set<ObjectIdentifier>,
+        paneIDs: Set<ObjectIdentifier>,
+        mirrorIDs: Set<ObjectIdentifier>,
+        relayWindowIDs: Set<ObjectIdentifier>
+    ) -> Self {
+        let panes = targetIDs.intersection(paneIDs).count
+        let mirrors = targetIDs.intersection(mirrorIDs).count
+        let relayWindows = targetIDs.intersection(relayWindowIDs).count
+        let classified = paneIDs.union(mirrorIDs).union(relayWindowIDs)
+        return Self(
+            total: targetIDs.count, panes: panes, mirrors: mirrors,
+            relayWindows: relayWindows,
+            other: targetIDs.subtracting(classified).count
+        )
+    }
+}
+
 @MainActor
 enum PeerMenu {
     static func item() -> NSMenuItem {
@@ -129,6 +157,25 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         }
 #endif
         return infos
+    }
+
+    /// Classify a frozen connection roster before asynchronous close requests
+    /// start removing controllers from the coordinator. This distinguishes a
+    /// live mirror from a workspace relay window even though both render as
+    /// `PeerRelayConnectionInfo.Kind.workspace`.
+    func forceDisconnectCounts(
+        for ids: Set<ObjectIdentifier>
+    ) -> PeerForceDisconnectCounts {
+        PeerForceDisconnectCounts.classify(
+            targetIDs: ids,
+            paneIDs: Set(openPaneSessions.map { ObjectIdentifier($0) }),
+            mirrorIDs: Set(openWorkspaceMirrors.map { ObjectIdentifier($0) }),
+            relayWindowIDs: Set(
+                openConsoles.map { ObjectIdentifier($0) }
+                    + openRelays.map { ObjectIdentifier($0) }
+                    + openWorkspaceRelays.map { ObjectIdentifier($0) }
+            )
+        )
     }
 
     /// Disconnect (close) the relay window matching `id`. No-op when
@@ -1754,6 +1801,27 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 if let workspaceId = mirror.workspace?.id.uuidString {
                     entry["workspace_id"] = workspaceId
                 }
+                switch mirror.layoutRecoveryState {
+                case .opening:
+                    entry["layout_recovery"] = [
+                        "state": "opening", "missing_pane_count": 0,
+                    ]
+                case .degraded(let missingPaneCount, let attempt):
+                    entry["layout_recovery"] = [
+                        "state": "degraded",
+                        "missing_pane_count": missingPaneCount,
+                        "attempt": attempt,
+                    ]
+                case .ready:
+                    entry["layout_recovery"] = [
+                        "state": "ready", "missing_pane_count": 0,
+                    ]
+                case .failed(let missingPaneCount):
+                    entry["layout_recovery"] = [
+                        "state": "failed",
+                        "missing_pane_count": missingPaneCount,
+                    ]
+                }
                 // How the last resync classified what it found. Leaf counts
                 // cannot witness this: keeping four live panes and respawning
                 // four dead ones both settle at four leaves, and the whole
@@ -1776,14 +1844,17 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                     .map { surfaceID, panelId -> [String: Any] in
                         let session = mirror.workspace?
                             .terminalPanel(for: panelId)?.peerPaneSession
-                        return [
+                        var row: [String: Any] = [
                             "surface_id": surfaceID.base64EncodedString(),
                             "panel_id": panelId.uuidString,
-                            "relay_startup_state": session
-                                .map { String(describing: $0.relayStartupState) } ?? "none",
+                            "relay_startup_state": session?.relayStartupState.rawValue ?? "none",
                             "relay_liveness": session?.relayLiveness.rawValue ?? "none",
+                            "pane_health": session?.paneHealth.rawValue ?? "none",
+                            "healthy": session?.paneHealth == .live,
                             "pane_torn_down": session?.isTorndown ?? true,
                         ]
+                        row["io"] = session?.relaySession.ioSnapshot ?? [:]
+                        return row
                     }
                 return entry
             }
@@ -1798,6 +1869,21 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         guard let mirror = openWorkspaceMirrors.first else { return false }
         mirror.debugDropSubscription(holdReconnectSeconds: holdReconnectSeconds)
         return true
+    }
+
+    func debugDropMirrorPaneTransport(
+        surfaceID: Data?
+    ) -> (surface: String?, error: String?) {
+        guard let mirror = openWorkspaceMirrors.first else {
+            return (nil, "no live workspace mirror")
+        }
+        guard let target = surfaceID ?? mirror.debugMirroredSurfaceIDs().first else {
+            return (nil, "mirror has no mapped surface")
+        }
+        guard mirror.debugDropPaneTransport(surfaceID: target) else {
+            return (nil, "surface has no live owned pane transport")
+        }
+        return (target.base64EncodedString(), nil)
     }
 
     /// Tear down one mirrored pane's session, leaving its panel in the tree.
@@ -1840,6 +1926,10 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                     "title": session.surfaceTitle,
                     "surface_id": session.originSurface.surfaceID.base64EncodedString(),
                     "torn_down": session.isTorndown,
+                    "relay_startup_state": session.relayStartupState.rawValue,
+                    "relay_liveness": session.relayLiveness.rawValue,
+                    "pane_health": session.paneHealth.rawValue,
+                    "healthy": session.paneHealth == .live,
                 ]
                 // Byte counters, so a blank pane can be adjudicated live
                 // instead of by scraping logs after the fact: received==0

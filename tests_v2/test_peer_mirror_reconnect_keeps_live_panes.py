@@ -43,6 +43,17 @@ def _panes_by_surface(mirror: dict) -> dict:
     return {p["surface_id"]: p for p in (mirror.get("panes") or [])}
 
 
+def _io_progressed(before: dict, after: dict) -> bool:
+    """Require real host-to-viewer delivery, not only a live transport flag."""
+    old = before.get("io") or {}
+    new = after.get("io") or {}
+    return (
+        int(new.get("bytes_received") or 0) > int(old.get("bytes_received") or 0)
+        and int(new.get("bytes_enqueued") or 0) > int(old.get("bytes_enqueued") or 0)
+        and int(new.get("chunks") or 0) > int(old.get("chunks") or 0)
+    )
+
+
 def main() -> int:
     with termmesh() as c:
         # ── seed a 2-leaf host workspace and mirror it
@@ -124,6 +135,68 @@ def main() -> int:
                 )
         if mirror.get("leaf_count") != base:
             raise termmeshError(f"leaf count drifted after resync: {mirror!r}")
+
+        # A half-alive pane reports every transport/startup flag as healthy
+        # while host-to-relay delivery is permanently frozen. Make every
+        # remote shell redraw and require its actual counters to advance.
+        progress_before = _panes_by_surface(c.peer_mirror_status())
+        for surface in sorted(progress_before):
+            c.send_surface(
+                progress_before[surface]["panel_id"], "printf issue455-progress\n"
+            )
+
+        def _all_progressed() -> bool:
+            current = _panes_by_surface(c.peer_mirror_status())
+            return set(current) == set(progress_before) and all(
+                _io_progressed(progress_before[surface], current[surface])
+                for surface in progress_before
+            )
+
+        if not _wait(_all_progressed, timeout_s=30):
+            raise termmeshError(
+                "mirror panes stayed transport-live but host output did not advance "
+                f"after reconnect: before={progress_before!r} "
+                f"after={_panes_by_surface(c.peer_mirror_status())!r}"
+            )
+
+        # ── 1b. Drop one pane's OWNED host transport. This is issue #455's
+        # exact primary path: panel/helper stay alive, receive gets EOF, the
+        # same pane reconnects, and output must resume under a new generation.
+        transport_victim = sorted(progress_before)[0]
+        transport_before = _panes_by_surface(c.peer_mirror_status())[transport_victim]
+        old_generation = int((transport_before.get("io") or {}).get("session_generation") or 0)
+        dropped_transport = c.peer_mirror_drop_pane_transport(transport_victim)
+        if not dropped_transport.get("ok"):
+            raise termmeshError(f"pane transport drop refused: {dropped_transport!r}")
+
+        def _owned_reconnected() -> bool:
+            row = _panes_by_surface(c.peer_mirror_status()).get(transport_victim) or {}
+            io = row.get("io") or {}
+            return (
+                row.get("pane_health") == "live"
+                and int(io.get("session_generation") or 0) > old_generation
+                and io.get("resume_gate_phase") == "idle"
+            )
+
+        if not _wait(_owned_reconnected, timeout_s=60):
+            raise termmeshError(
+                "owned pane transport did not reconnect under a fresh idle generation: "
+                f"{_panes_by_surface(c.peer_mirror_status()).get(transport_victim)!r}"
+            )
+        reconnected_before = _panes_by_surface(c.peer_mirror_status())[transport_victim]
+        c.send_surface(reconnected_before["panel_id"], "printf issue455-owned-reconnect\n")
+        if not _wait(
+            lambda: _io_progressed(
+                reconnected_before,
+                _panes_by_surface(c.peer_mirror_status()).get(transport_victim) or {},
+            ),
+            timeout_s=30,
+        ):
+            raise termmeshError(
+                "owned pane transport reconnected but host output stayed frozen: "
+                f"before={reconnected_before!r} "
+                f"after={_panes_by_surface(c.peer_mirror_status()).get(transport_victim)!r}"
+            )
 
         # ── 2. end one pane's relay, leaving its pane session alone.
         victim = sorted(after)[0]

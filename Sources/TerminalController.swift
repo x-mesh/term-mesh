@@ -1514,6 +1514,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPeerHostStatus(params: params))
         case "debug.peer.mirror_drop_subscription":
             return v2Result(id: id, self.v2DebugPeerMirrorDropSubscription(params: params))
+        case "debug.peer.mirror_drop_pane_transport":
+            return v2Result(id: id, self.v2DebugPeerMirrorDropPaneTransport(params: params))
         case "debug.peer.mirror_end_pane_relay":
             return v2Result(id: id, self.v2DebugPeerMirrorEndPaneRelay(params: params))
         case "debug.peer.mirror_teardown_pane_session":

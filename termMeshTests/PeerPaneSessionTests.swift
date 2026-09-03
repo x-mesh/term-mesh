@@ -17,7 +17,166 @@ private actor AsyncFlag {
     func read() -> Bool { value }
 }
 
+final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
+    func testOnlyReadyRecoveryMayClearTheDegradedOverlay() {
+        XCTAssertTrue(PeerMirrorLayoutRecoveryState.ready.presentsAsReady)
+        XCTAssertFalse(PeerMirrorLayoutRecoveryState.opening.presentsAsReady)
+        XCTAssertFalse(
+            PeerMirrorLayoutRecoveryState.degraded(
+                missingPaneCount: 1, attempt: 1
+            ).presentsAsReady
+        )
+        XCTAssertFalse(
+            PeerMirrorLayoutRecoveryState.failed(
+                missingPaneCount: 1
+            ).presentsAsReady
+        )
+    }
+
+    func test_missingLeavesRetryWithBoundedBackoffThenFail() {
+        XCTAssertEqual(
+            PeerMirrorLayoutRecoveryPolicy.action(
+                missingPaneCount: 2, completedAttempts: 0, isCancelled: false
+            ),
+            .retry(afterNanoseconds: 500_000_000)
+        )
+        XCTAssertEqual(
+            PeerMirrorLayoutRecoveryPolicy.action(
+                missingPaneCount: 1, completedAttempts: 2, isCancelled: false
+            ),
+            .retry(afterNanoseconds: 2_000_000_000)
+        )
+        XCTAssertEqual(
+            PeerMirrorLayoutRecoveryPolicy.action(
+                missingPaneCount: 1, completedAttempts: 3, isCancelled: false
+            ),
+            .failed
+        )
+    }
+
+    func test_completeOrCancelledRecoveryDoesNotScheduleRetry() {
+        XCTAssertEqual(
+            PeerMirrorLayoutRecoveryPolicy.action(
+                missingPaneCount: 0, completedAttempts: 0, isCancelled: false
+            ),
+            .ready
+        )
+        XCTAssertEqual(
+            PeerMirrorLayoutRecoveryPolicy.action(
+                missingPaneCount: 1, completedAttempts: 0, isCancelled: true
+            ),
+            .abandon
+        )
+    }
+
+    func test_missingSurfaceIDsPreservesSuccessfulPanes() {
+        let present = Data([0x01])
+        let missing = Data([0x02])
+        XCTAssertEqual(
+            PeerMirrorLayoutRecoveryPolicy.missingSurfaceIDs(
+                required: [present, missing], spawned: [present]
+            ),
+            [missing]
+        )
+    }
+
+    func test_staleOrTornDownGenerationCannotResurrectRetry() {
+        XCTAssertTrue(PeerMirrorLayoutRecoveryPolicy.mayContinue(
+            expectedGeneration: 7, currentGeneration: 7,
+            isCancelled: false, isTornDown: false
+        ))
+        XCTAssertFalse(PeerMirrorLayoutRecoveryPolicy.mayContinue(
+            expectedGeneration: 7, currentGeneration: 8,
+            isCancelled: false, isTornDown: false
+        ))
+        XCTAssertFalse(PeerMirrorLayoutRecoveryPolicy.mayContinue(
+            expectedGeneration: 7, currentGeneration: 7,
+            isCancelled: false, isTornDown: true
+        ))
+    }
+}
+
 final class PeerPaneSessionTests: XCTestCase {
+    func testPaneHealthRequiresStartupBeforeTransportCanBeLive() {
+        XCTAssertEqual(
+            PeerPaneSession.derivePaneHealth(
+                startupState: .pending, relayLiveness: .live, isTorndown: false
+            ),
+            .pending
+        )
+        XCTAssertEqual(
+            PeerPaneSession.derivePaneHealth(
+                startupState: .starting, relayLiveness: .live, isTorndown: false
+            ),
+            .starting
+        )
+        XCTAssertEqual(
+            PeerPaneSession.derivePaneHealth(
+                startupState: .started, relayLiveness: .live, isTorndown: false
+            ),
+            .live
+        )
+    }
+
+    func testPaneHealthPreservesReconnectFailureAndTeardownStates() {
+        XCTAssertEqual(
+            PeerPaneSession.derivePaneHealth(
+                startupState: .started, relayLiveness: .reconnecting, isTorndown: false
+            ),
+            .reconnecting
+        )
+        XCTAssertEqual(
+            PeerPaneSession.derivePaneHealth(
+                startupState: .failed, relayLiveness: .live, isTorndown: false
+            ),
+            .failed
+        )
+        XCTAssertEqual(
+            PeerPaneSession.derivePaneHealth(
+                startupState: .pending, relayLiveness: .live, isTorndown: true
+            ),
+            .ended
+        )
+    }
+
+    func testCallbackPaneHealthUsesTransportInsteadOfHelperStartupLatch() {
+        XCTAssertEqual(
+            PeerPaneSession.derivePaneHealth(
+                startupState: .pending, relayLiveness: .live, isTorndown: false,
+                requiresRelayStartup: false
+            ),
+            .live
+        )
+        XCTAssertEqual(
+            PeerPaneSession.derivePaneHealth(
+                startupState: .pending, relayLiveness: .reconnecting, isTorndown: false,
+                requiresRelayStartup: false
+            ),
+            .reconnecting
+        )
+    }
+
+    func testUnmountedTerminalIsRetryableUnavailableForRemoteAndLocalPendingStates() {
+        XCTAssertEqual(
+            TerminalController.terminalSurfaceUnavailablePolicy(relayStartupState: .pending),
+            TerminalController.TerminalSurfaceUnavailablePolicy(
+                code: "unavailable", retryable: true, startupState: "pending"
+            )
+        )
+        XCTAssertEqual(
+            TerminalController.terminalSurfaceUnavailablePolicy(relayStartupState: nil),
+            TerminalController.TerminalSurfaceUnavailablePolicy(
+                code: "unavailable", retryable: true, startupState: "mounting"
+            )
+        )
+    }
+
+    func testForceDisconnectRequiresLiteralTrueConfirmation() {
+        XCTAssertFalse(TerminalController.peerForceDisconnectConfirmed(nil))
+        XCTAssertFalse(TerminalController.peerForceDisconnectConfirmed(false))
+        XCTAssertTrue(TerminalController.peerForceDisconnectConfirmed(true))
+    }
+
     @MainActor
     private func cleanupRepairFixture(
         teamName: String, teamUUIDs: [String]
@@ -3948,6 +4107,29 @@ final class PeerPaneSessionTests: XCTestCase {
 /// flips that predicate off before any pane is asked to close.
 @MainActor
 final class RemoteHostForceDisconnectOrderTests: XCTestCase {
+    func test_forceDisconnectCounts_distinguishMirrorsPanesAndRelayWindows() {
+        let paneObject = NSObject()
+        let mirrorObject = NSObject()
+        let windowObject = NSObject()
+        let otherObject = NSObject()
+        let pane = ObjectIdentifier(paneObject)
+        let mirror = ObjectIdentifier(mirrorObject)
+        let window = ObjectIdentifier(windowObject)
+        let other = ObjectIdentifier(otherObject)
+
+        let counts = PeerForceDisconnectCounts.classify(
+            targetIDs: [pane, mirror, window, other],
+            paneIDs: [pane], mirrorIDs: [mirror], relayWindowIDs: [window]
+        )
+
+        XCTAssertEqual(
+            counts,
+            PeerForceDisconnectCounts(
+                total: 4, panes: 1, mirrors: 1, relayWindows: 1, other: 1
+            )
+        )
+    }
+
 
     private func connection(
         _ kind: PeerRelayConnectionInfo.Kind,

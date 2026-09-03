@@ -1652,12 +1652,12 @@ final class RemoteHostStore: ObservableObject {
         rows.filter { $0.kind != .pane } + rows.filter { $0.kind == .pane }
     }
 
-    /// Returns how many connections were asked to close. Counting rows here is
+    /// Returns which connections were asked to close. Counting rows here is
     /// the only accurate measure: window closes land asynchronously, so
     /// comparing `activeConnections().count` before and after reports 0, and it
     /// would also fold in unrelated hosts' connections.
     @discardableResult
-    func forceDisconnectSavedHost(_ host: HostEntry) -> Int {
+    func forceDisconnectSavedHost(_ host: HostEntry) -> PeerForceDisconnectCounts {
         let key = host.id
         let coordinator = PeerClientCoordinator.shared
         // Resolve rows before clearing activeSockPath: stableKey folds
@@ -1665,6 +1665,7 @@ final class RemoteHostStore: ObservableObject {
         let rows = coordinator.activeConnections()
             .filter { stableKey(for: $0) == key }
         let ordered = Self.forceDisconnectOrder(rows)
+        let counts = coordinator.forceDisconnectCounts(for: Set(ordered.map(\.id)))
         for row in ordered {
             coordinator.disconnect(id: row.id)
         }
@@ -1699,7 +1700,7 @@ final class RemoteHostStore: ObservableObject {
         RemoteWorkLog.info(
             "Force-disconnected \(host.displayName) — closed \(ids.count) connection(s)"
         )
-        return ids.count
+        return counts
     }
 
     /// Delete the backing profile. Releases the sidebar lease first so
