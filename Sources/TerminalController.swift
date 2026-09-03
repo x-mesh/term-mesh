@@ -2508,11 +2508,15 @@ class TerminalController {
             response = await self.processTeamUICommandAsync(method: method, params: params, id: id)
         }
 
-        // Dynamic timeout: scale with team size for fan-out scenarios.
-        // Base 5s + 0.5s per agent beyond 1, so 10 agents → 9.5s timeout.
+        // Dynamic timeout: scale ordinary fan-out scenarios with team size.
+        // Collaboration repair is a bounded lifecycle operation of its own:
+        // it may reconnect a host, bootstrap a leader (180s ceiling), restore
+        // workers and verify the exact reverse route before answering.
         let teamName = (params["team"] ?? params["team_name"]) as? String
         let agentCount = teamName.flatMap { TeamOrchestrator.shared.teams[$0]?.agents.count } ?? 1
-        let timeoutSec = max(5.0, 5.0 + Double(agentCount - 1) * 0.5)
+        let timeoutSec = Self.teamCommandTimeoutSeconds(
+            method: method, agentCount: agentCount
+        )
         if semaphore.wait(timeout: .now() + timeoutSec) == .timedOut {
             // Cancel the still-running Task so delayed retries inside
             // asyncTeamSend/asyncTeamDelegate don't fire after we've already
@@ -2524,9 +2528,19 @@ class TerminalController {
             #if DEBUG
             dlog("[dispatchTeamCommandAsync] TIMEOUT: cancelling stale task method=\(method) timeout=\(timeoutSec)s agents=\(agentCount)")
             #endif
-            return "{\"ok\":false,\"error\":{\"code\":\"timeout\",\"message\":\"team command timed out\"}}"
+            return v2Error(
+                id: id, code: "timeout",
+                message: "team command timed out after \(timeoutSec)s"
+            )
         }
         return response
+    }
+
+    nonisolated static func teamCommandTimeoutSeconds(
+        method: String, agentCount: Int
+    ) -> TimeInterval {
+        if method == "team.repair_collaboration" { return 240 }
+        return max(5.0, 5.0 + Double(max(0, agentCount - 1)) * 0.5)
     }
 
     /// Direct dispatch for data-only team commands (called within teamDataQueue).

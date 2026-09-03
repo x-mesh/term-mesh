@@ -18,6 +18,21 @@ private actor AsyncFlag {
 }
 
 final class PeerPaneSessionTests: XCTestCase {
+    func testCollaborationRepairUsesLifecycleTimeoutWithoutChangingOrdinaryCommands() {
+        XCTAssertEqual(
+            TerminalController.teamCommandTimeoutSeconds(
+                method: "team.repair_collaboration", agentCount: 4
+            ),
+            240
+        )
+        XCTAssertEqual(
+            TerminalController.teamCommandTimeoutSeconds(
+                method: "team.send", agentCount: 4
+            ),
+            6.5
+        )
+    }
+
     private func conflictRecord(
         name: String = "xm",
         projectID: String = "team:one",
