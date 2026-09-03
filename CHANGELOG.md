@@ -4,6 +4,12 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.226.2] - 2026-09-03
+
+### Fixed
+- Restore an owned remote Project after both the owner app and session-host daemon restart, without automatically opening panes, changing focus, or duplicating the leader. One explicit **Repair collaboration** action now rebuilds the leader and restores the durable worker roster with the original agent identities.
+- Keep collaboration route handovers transactional: verify the exact staged leader control route before replacing live route files, preserve old grants until commit, and roll back safely across concurrent viewers or interrupted repairs.
+
 ## [0.226.1] - 2026-09-03
 
 ### Fixed
