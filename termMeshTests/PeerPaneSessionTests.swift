@@ -986,6 +986,67 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertNil(TeamOrchestrator.automaticRemoteProjectRepairPlaceholderCandidate(
             in: [unknown], leaderRecord: nil
         ))
+        XCTAssertEqual(
+            TeamOrchestrator.exactRemoteRepairPlaceholderCandidate(
+                in: [live, dead], teamName: "xm",
+                teamUUID: "uuid", projectID: "team:uuid"
+            ),
+            dead
+        )
+        XCTAssertNil(TeamOrchestrator.exactRemoteRepairPlaceholderCandidate(
+            in: [dead, dead], teamName: "xm",
+            teamUUID: "uuid", projectID: "team:uuid"
+        ))
+        var local = TeamOrchestrator.Team(
+            id: "xm", leaderSessionId: "leader", leaderMode: "claude",
+            leaderModel: "opus", leaderCli: "claude",
+            leaderPanelId: UUID(),
+            leaderEndpoint: .peer(hostKey: "ssh:mac-sub"),
+            workingDirectory: "/work/xm", workspaceId: UUID(),
+            agents: [], createdAt: Date(), worktreeMode: "off",
+            teamUuid: "uuid", remotePresentationProjectID: "team:uuid"
+        )
+        XCTAssertTrue(TeamOrchestrator.exactRepairIdentityMatches(
+            team: local, hostKey: "ssh:mac-sub",
+            teamUUID: "uuid", projectID: "team:uuid"
+        ))
+        XCTAssertFalse(TeamOrchestrator.exactRepairIdentityMatches(
+            team: local, hostKey: "ssh:other",
+            teamUUID: "uuid", projectID: "team:uuid"
+        ))
+        XCTAssertEqual(
+            TeamOrchestrator.exactRepairInput(params: ["team_name": "xm"]),
+            .omitted
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.exactRepairInput(params: [
+                "team_name": "xm", "host_key": 123,
+            ]),
+            .invalid
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.exactRepairInput(params: [
+                "team_name": "xm", "host_key": "ssh:mac-sub",
+                "team_uuid": "uuid", "project_id": "team:uuid",
+            ]),
+            .valid(.init(
+                hostKey: "ssh:mac-sub", teamUUID: "uuid",
+                projectID: "team:uuid"
+            ))
+        )
+        local.teamUuid = "other"
+        XCTAssertFalse(TeamOrchestrator.exactRepairIdentityMatches(
+            team: local, hostKey: "ssh:mac-sub",
+            teamUUID: "uuid", projectID: "team:uuid"
+        ))
+        XCTAssertNil(TeamOrchestrator.exactRemoteRepairPlaceholderCandidate(
+            in: [unknown], teamName: "xm",
+            teamUUID: "uuid", projectID: "team:uuid"
+        ))
+        XCTAssertNil(TeamOrchestrator.exactRemoteRepairPlaceholderCandidate(
+            in: [dead], teamName: "xm",
+            teamUUID: "wrong", projectID: "team:uuid"
+        ))
         XCTAssertNil(TeamOrchestrator.automaticRemoteProjectRepairPlaceholderCandidate(
             in: [live], leaderRecord: nil
         ))

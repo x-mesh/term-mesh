@@ -432,6 +432,7 @@ launch_and_wait() {
   TERMMESH_SOCKET_PATH="$APP_SOCK_PATH" \
   TERMMESH_ALLOW_SOCKET_OVERRIDE=1 \
   TERMMESH_UI_TEST_MODE=1 \
+  TERMMESH_E2E_DISABLE_AUTO_REPAIR_PLACEHOLDERS="${TERMMESH_E2E_DISABLE_AUTO_REPAIR_PLACEHOLDERS:-0}" \
   "$APP/Contents/MacOS/term-mesh DEV" >/dev/null 2>&1 &
   E2E_APP_PID=$!
   printf '%s\n' "$E2E_APP_PID" > "$E2E_APP_PID_FILE"
@@ -756,7 +757,7 @@ for f in "${test_files[@]}"; do
         # manifest with missing processes/surfaces.
         cleanup
         restart_remote_relay_fixture_for_repair
-        launch_and_wait 1
+        TERMMESH_E2E_DISABLE_AUTO_REPAIR_PLACEHOLDERS=1 launch_and_wait 1
         echo "RUN  $f (phase missing-surface repair)"
         set +e
         phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=repair "$PYTHON" "$f"

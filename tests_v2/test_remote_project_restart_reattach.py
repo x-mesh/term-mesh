@@ -1196,15 +1196,9 @@ def _phase_repair(c, host: str, remote_dir: str, state_path: Path) -> None:
     state = json.loads(state_path.read_text())
     team_name = state["team_name"]
     old_leader = state["leader_surface_id"]
-    owner_team = _wait(lambda: next((
-        item for item in c.team_list()
-        if item.get("team_name") == team_name
-        and not item.get("leader_pane_attached")
-        and len(item.get("agents") or []) == len(state["member_instances"])
-    ), None), timeout_s=45)
-    if owner_team is None:
+    if any(item.get("team_name") == team_name for item in c.team_list()):
         raise termmeshError(
-            "original owner did not restore the known-dead Project repair model"
+            "cold exact-repair fixture unexpectedly installed a local placeholder"
         )
     durable = _remote_project_manifest_status(host, remote_dir, state["project_id"])
     if durable is None:
@@ -1231,7 +1225,10 @@ def _phase_repair(c, host: str, remote_dir: str, state_path: Path) -> None:
         and "session_host_socket" in row
         and row.get("launchable") is True
     ), None), timeout_s=45)
-    repair = c.team_repair_collaboration(team_name)
+    repair = c.team_repair_collaboration(
+        team_name, host_key=host, team_uuid=state["team_uuid"],
+        project_id=state["project_id"]
+    )
     if not repair.get("succeeded") or not repair.get("route_verified"):
         raise termmeshError(f"one-call collaboration repair failed: {repair!r}")
     if int(repair.get("live_agents") or 0) != len(state["member_instances"]):
