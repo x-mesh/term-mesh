@@ -651,6 +651,21 @@ struct ContentView: View {
             }
     }
 
+    /// The team whose Project owns `workspaceId`, when exactly one does.
+    ///
+    /// Ambiguity resolves to nil rather than to a guess. The board's
+    /// work-distribution section writes to whatever team this returns, and
+    /// silently editing the wrong Project's execution level is worse than
+    /// showing no section at all.
+    @MainActor
+    static func reviewBoardTeamName(forWorkspace workspaceId: UUID?) -> String? {
+        guard let workspaceId else { return nil }
+        let candidates = TeamOrchestrator.shared.teams.values.filter {
+            $0.workspaceId == workspaceId || $0.leaderWorkspaceId == workspaceId
+        }
+        return candidates.count == 1 ? candidates[0].id : nil
+    }
+
     private var terminalContentWithReviewBoard: some View {
         HStack(spacing: 0) {
             terminalContentWithSidebarDropOverlay
@@ -1780,6 +1795,11 @@ struct ContentView: View {
                 approve: { try await coordinator.approve($0, reviewer: reviewer) },
                 reject: { try await coordinator.reject($0, reviewer: reviewer, reason: $1) }
             ))
+            let manager = tabManager
+            reviewBoardViewModel.setActiveTeamProvider { [weak manager] in
+                guard let manager else { return nil }
+                return Self.reviewBoardTeamName(forWorkspace: manager.selectedTabId)
+            }
             reviewBoardViewModel.refresh()
         })
 
@@ -1797,6 +1817,10 @@ struct ContentView: View {
             tabManager.applyWindowBackgroundForSelectedTab()
             startWorkspaceHandoffIfNeeded(newSelectedId: newValue)
             reconcileMountedWorkspaceIds(selectedId: newValue)
+            // The board's work-distribution section edits one Project, so it
+            // follows the workspace on screen rather than guessing from a task
+            // list that is empty exactly when the setting matters most.
+            reviewBoardViewModel.setActiveTeam(Self.reviewBoardTeamName(forWorkspace: newValue))
             guard let newValue else { return }
             if selectedTabIds.count <= 1 {
                 selectedTabIds = [newValue]

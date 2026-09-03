@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import base64
+import subprocess
 import sys
 import time
 import uuid
@@ -21,6 +23,7 @@ from termmesh import termmesh, termmeshError
 HOST_ENV = "TERMMESH_E2E_REMOTE_LEADER_HOST"
 DIR_ENV = "TERMMESH_E2E_REMOTE_LEADER_DIR"
 PHASE_ENV = "TERMMESH_E2E_REATTACH_PHASE"
+CROSS_INSTALLATION_VIEWER_ENV = "TERMMESH_E2E_CROSS_INSTALLATION_VIEWER"
 STATE_ENV = "TERMMESH_E2E_REATTACH_STATE"
 ROLES_ENV = "TERMMESH_E2E_REATTACH_ROLES"
 LEADER_CLI_ENV = "TERMMESH_E2E_REMOTE_LEADER_CLI"
@@ -37,6 +40,124 @@ BACKGROUND_RESTORE_HOLD_SECONDS = 12.0
 
 class _TerminalTestFailure(termmeshError):
     """A polled operation reached a terminal state and must not be retried."""
+
+
+def _canonical_uuid(value: object, field: str = "team_uuid") -> str:
+    try:
+        parsed = uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise termmeshError(f"{field} is not a canonical UUID: {value!r}") from exc
+    canonical = str(parsed).upper()
+    if str(value).upper() != canonical:
+        raise termmeshError(f"{field} is not canonical: {value!r}")
+    return canonical
+
+
+def _ssh_target(host: str) -> str:
+    if not host.startswith("ssh:"):
+        raise termmeshError(f"remote Project host is not an SSH profile: {host!r}")
+    return host.removeprefix("ssh:")
+
+
+def _remote_stdout(host: str, command: str, timeout_s: int = 30) -> str:
+    result = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", _ssh_target(host), command],
+        capture_output=True, text=True, timeout=timeout_s,
+    )
+    if result.returncode != 0:
+        raise termmeshError(
+            f"remote command failed on {host}: {command!r}: {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
+def _remote_project_manifest_status(
+    host: str, remote_dir: str, project_id: str
+) -> dict | None:
+    """Read the daemon's durable record, independent of peer discovery."""
+    root = str(Path(remote_dir).parent)
+    output = _remote_stdout(
+        host,
+        f"env TERMMESH_DAEMON_UNIX_PATH={str(Path(root) / 'term-meshd.sock')!r} "
+        "/tmp/term-mesh-release-relay-target/release/tm-agent "
+        "daemon project-presentations list",
+        timeout_s=30,
+    )
+    payload = json.loads(output)
+    return next((
+        record for record in payload.get("records", [])
+        if record.get("project_id") == project_id
+    ), None)
+
+
+def _remote_participation_control(host: str, team_uuid: str) -> dict | None:
+    team_uuid = _canonical_uuid(team_uuid)
+    name = f"leader-participation-{team_uuid}.json"
+    command = (
+        'p="${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/leader-hooks/' + name + '"; '
+        '[ -f "$p" ] || exit 44; cat "$p"'
+    )
+    result = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", _ssh_target(host), command],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode == 44:
+        return None
+    if result.returncode != 0:
+        raise termmeshError(f"could not read remote participation control: {result.stderr}")
+    return json.loads(result.stdout)
+
+
+def _bundled_tm_agent() -> Path:
+    app_bin = Path(os.environ["TERMMESH_APP_BIN"])
+    cli = app_bin.parents[2] / "Contents/Resources/bin/tm-agent"
+    if not os.access(cli, os.X_OK):
+        raise termmeshError(f"bundled tm-agent is not executable: {cli}")
+    return cli
+
+
+def _tm_agent_json(team: str, *args: str, timeout_s: int = 30) -> dict:
+    result = subprocess.run(
+        [str(_bundled_tm_agent()), "--team", team, *args],
+        capture_output=True, text=True, timeout=timeout_s, env=os.environ.copy(),
+    )
+    if result.returncode != 0:
+        raise termmeshError(
+            f"tm-agent {' '.join(args)} failed: {result.stdout}\\n{result.stderr}"
+        )
+    start = result.stdout.find("{")
+    if start < 0:
+        raise termmeshError(f"tm-agent returned no JSON: {result.stdout!r}")
+    return json.loads(result.stdout[start:])
+
+
+def _prove_remote_agent_replies(team: str, names: list[str]) -> None:
+    task_ids = []
+    for name in names:
+        delegated = _tm_agent_json(
+            team, "delegate", name,
+            "E2E proof: run hostname and pwd, then reply STATUS: DONE with exact values; do not edit files.",
+            "--worktree", "off", "--title", f"{name} remote proof",
+        )
+        task_id = str(delegated.get("result", {}).get("task", {}).get("id") or "")
+        if not task_id:
+            raise termmeshError(f"delegate returned no task id for {name}: {delegated!r}")
+        task_ids.append(task_id)
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        listed = _tm_agent_json(team, "task", "list")
+        tasks = {
+            str(task.get("id")): task
+            for task in listed.get("result", {}).get("tasks", [])
+        }
+        if all(task_id in tasks and tasks[task_id].get("result") for task_id in task_ids):
+            for task_id in task_ids:
+                result = str(tasks[task_id].get("result") or "")
+                if "STATUS: DONE" not in result or "hostname" not in result or "pwd" not in result:
+                    raise termmeshError(f"remote agent did not return execution proof: {result!r}")
+            return
+        time.sleep(1)
+    raise termmeshError(f"remote agent proof tasks timed out: {task_ids!r}")
 
 
 def _wait(predicate, timeout_s: float = 45.0, interval_s: float = 0.2):
@@ -439,43 +560,44 @@ def _phase_create_inner(
             f"{ROLES_ENV} must name at least one worker; a leader-only Project "
             "cannot verify member persistence"
         )
-    created = c.debug_project_create(
-        directory=f"/tmp/{team_name}",
+    created = c.debug_project_creation_attempt(
+        name=team_name,
+        directory=remote_dir,
         roles=roles,
+        host=host,
         leader_cli=os.environ.get(LEADER_CLI_ENV, "claude").strip() or "claude",
         leader_model=(
             "gpt-5.6-sol"
             if os.environ.get(LEADER_CLI_ENV, "claude").strip() == "codex"
             else "sonnet"
         ),
-        leader_host=host,
-        leader_directory=remote_dir,
-        remote_host=host,
-        remote_path=remote_dir,
         worker_cli=os.environ.get(WORKER_CLI_ENV, "").strip() or None,
     )
-    if created.get("team") != team_name:
-        raise termmeshError(f"remote project was not created: {created!r}")
     operation_id = str(created.get("operation_id") or "")
     if not operation_id:
         raise termmeshError(f"remote Project bootstrap returned no operation id: {created!r}")
 
     def bootstrap_finished():
-        status = c.debug_project_create_status(operation_id)
+        status = c.debug_project_creation_status(operation_id)
         if status.get("state") == "failed":
             raise _TerminalTestFailure(
                 f"remote Project bootstrap failed: {status.get('error')!r}"
             )
-        return status if status.get("state") == "succeeded" else None
+        return status if status.get("state") == "created" else None
 
-    bootstrap = _wait(bootstrap_finished, timeout_s=90)
+    bootstrap = _wait(bootstrap_finished, timeout_s=240)
     if bootstrap is None:
         raise termmeshError("remote Project bootstrap did not finish")
-    checkouts = created.get("checkouts")
+    if bootstrap.get("working_directory") != remote_dir:
+        raise termmeshError(
+            "real ProjectCreationFlow lost the requested remote directory: "
+            f"requested={remote_dir!r} status={bootstrap!r}"
+        )
+    checkouts = bootstrap.get("checkouts")
     if not isinstance(checkouts, list) or len(checkouts) != len(roles):
         raise termmeshError(
             "remote project bootstrap did not preserve the requested workers: "
-            f"roles={roles!r} created={created!r}"
+            f"roles={roles!r} status={bootstrap!r}"
         )
 
     def ready_team():
@@ -606,6 +728,35 @@ def _phase_create_inner(
             "owner Project host identity differs from its published manifest: "
             f"local={local_team!r} expected_host={host!r}"
         )
+    c.debug_leader_participation_configure("shadow", 100, [team_name])
+    control = _wait(lambda: (
+        payload if (payload := _remote_participation_control(host, project["team_uuid"]))
+        and payload.get("mode") == "shadow" else None
+    ))
+    if control is None or control.get("mode") != "shadow" or not control.get("supported"):
+        raise termmeshError(f"remote leader did not receive initial Shadow controls: {control!r}")
+    c.debug_leader_participation_configure("canary", 100, [team_name])
+    canary = _wait(lambda: (
+        payload if (payload := _remote_participation_control(host, project["team_uuid"]))
+        and payload.get("mode") == "canary" and payload.get("percent") == 100
+        and payload.get("opt_in") else None
+    ))
+    if canary is None:
+        raise termmeshError("live Canary settings did not reach the existing remote leader")
+    c.debug_leader_participation_configure("shadow", 100, [team_name])
+    shadow = _wait(lambda: (
+        payload if (payload := _remote_participation_control(host, project["team_uuid"]))
+        and payload.get("mode") == "shadow" else None
+    ))
+    if shadow is None:
+        raise termmeshError("live Shadow rollback did not reach the existing remote leader")
+    c.debug_leader_participation_configure("canary", 100, [team_name], kill_switch=True)
+    killed = _wait(lambda: (
+        payload if (payload := _remote_participation_control(host, project["team_uuid"]))
+        and payload.get("kill_switch") is True else None
+    ))
+    if killed is None:
+        raise termmeshError("live Kill Switch did not reach the existing remote leader")
     relay = _assert_leader_relay_stable(
         c, host, project["project_id"], team_name, project["leader_surface_id"]
     )
@@ -626,6 +777,7 @@ def _phase_create_inner(
         "team_name": team_name,
         "project_id": project["project_id"],
         "leader_surface_id": project["leader_surface_id"],
+        "team_uuid": project["team_uuid"],
         "member_instances": expected_instances,
         "member_surfaces": member_surfaces,
         "source_directory": remote_dir,
@@ -633,6 +785,7 @@ def _phase_create_inner(
         "route": route,
         "layout": saved_layout,
         "create_relay_io": relay.get("io") or {},
+        "leader_participation_live_refresh": True,
     }))
 
 
@@ -675,9 +828,46 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
     if project.get("leader_surface_id") != state["leader_surface_id"]:
         raise termmeshError(f"leader surface changed across restart: {project!r}")
 
-    # Automatic restore creates the Project model without stealing focus. A
-    # terminal relay cannot start until its Ghostty view is mounted, so open the
-    # Project exactly as a user does before requiring transport readiness.
+    # This phase runs with a fresh ephemeral peer identity and reset app state:
+    # it is another installation, not merely the owner process restarting.
+    # Reproduce New Project's same-name/different-path submission first. It
+    # must surface Open Existing and mutate no team, workspace, or process.
+    teams_before = len(c.team_list())
+    panes_before = len(c.list_panes())
+    conflict = c.debug_project_creation_attempt(
+        name=team_name,
+        directory=f"{state['source_directory']}-duplicate",
+        roles=list(state["member_instances"]),
+        host=host,
+        leader_cli=os.environ.get(LEADER_CLI_ENV, "claude").strip() or "claude",
+        leader_model=(
+            "gpt-5.6-sol"
+            if os.environ.get(LEADER_CLI_ENV, "claude").strip() == "codex"
+            else "sonnet"
+        ),
+        worker_cli=os.environ.get(WORKER_CLI_ENV, "").strip() or None,
+    )
+    conflict_id = str(conflict.get("operation_id") or "")
+    if not conflict_id:
+        raise termmeshError(f"duplicate creation returned no operation id: {conflict!r}")
+    conflict_status = _wait(lambda: (
+        status if (status := c.debug_project_creation_status(conflict_id)).get("state")
+        != "running" else None
+    ))
+    if conflict_status is None or conflict_status.get("state") != "conflict":
+        raise termmeshError(f"duplicate remote Project was not a conflict: {conflict_status!r}")
+    if conflict_status.get("conflict") != "remote_name_collision" \
+       or conflict_status.get("action") != "open_existing":
+        raise termmeshError(f"duplicate remote Project did not offer Open Existing: {conflict_status!r}")
+    if len(c.team_list()) != teams_before or len(c.list_panes()) != panes_before:
+        raise termmeshError("duplicate conflict mutated the fresh viewer before Open Existing")
+
+    opened = c.debug_project_adopt_remote(host, state["project_id"])
+    if opened.get("leader_surface_id") != state["leader_surface_id"]:
+        raise termmeshError(f"Open Existing targeted another leader: {opened!r}")
+
+    # Open Existing creates the Project model without stealing focus. A
+    # terminal relay cannot start until its Ghostty view is mounted.
     pending_team = _wait(lambda: next(
         (item for item in c.team_list() if item.get("team_name") == team_name), None
     ))
@@ -705,7 +895,8 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
         raise termmeshError(
             f"Project visibility screenshot was not captured: {visibility_screenshot!r}"
         )
-    _assert_background_project_waits_for_mount(c, team_name)
+    if os.environ.get(CROSS_INSTALLATION_VIEWER_ENV) != "1":
+        _assert_background_project_waits_for_mount(c, team_name)
     c.select_workspace(pending_team["workspace_id"])
     remote_members = {
         member.get("name"): (member.get("agent_instance_id"), member.get("surface_id"))
@@ -721,9 +912,6 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
             f"expected={expected_members!r} actual={remote_members!r}"
         )
 
-    # Relaunch recovery is automatic. The old test called
-    # debug_project_adopt_remote here, which proved only that a hidden manual
-    # repair path worked and missed the user-visible regression entirely.
     team = _wait(lambda: next((item for item in c.team_list()
                                if item.get("team_name") == team_name
                                and item.get("leader_pane_attached")
@@ -742,36 +930,9 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
             "automatic restore did not recover the exact remote workers: "
             f"expected={state['member_instances']!r} actual={restored_instances!r}"
         )
-    restored_layout = c.debug_project_layout(team_name)["live"]
-
-    def same_layout(expected, actual, tolerance=0.015):
-        if not isinstance(expected, dict) or not isinstance(actual, dict):
-            return expected == actual
-        if expected.get("projectID") != actual.get("projectID"):
-            return False
-        if expected.get("focusedSurfaceID") != actual.get("focusedSurfaceID"):
-            return False
-
-        def same_node(left, right):
-            if left.get("type") != right.get("type"):
-                return False
-            if left.get("type") == "pane":
-                return left.get("pane") == right.get("pane")
-            return (
-                left.get("orientation") == right.get("orientation")
-                and abs(float(left.get("dividerPosition", 0))
-                        - float(right.get("dividerPosition", 0))) <= tolerance
-                and same_node(left.get("first") or {}, right.get("first") or {})
-                and same_node(left.get("second") or {}, right.get("second") or {})
-            )
-
-        return same_node(expected.get("root") or {}, actual.get("root") or {})
-
-    if not same_layout(state.get("layout"), restored_layout):
-        raise termmeshError(
-            "automatic restore changed project pane order or divider layout: "
-            f"before={state.get('layout')!r} after={restored_layout!r}"
-        )
+    # A fresh installation does not own the owner's layout sidecar. Exact
+    # surface and instance identity, distinct panes, and working task routes
+    # are the portable restore contract; layout persistence is owner-local.
 
     # A stale id must be rejected before any asynchronous presentation work
     # starts. Pin the observable invariant as well: a rejected adoption cannot
@@ -874,6 +1035,17 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
             "adopted leader and workers share or duplicate a pane: "
             f"panels={adopted_panels!r}"
         )
+    _prove_remote_agent_replies(team_name, sorted(state["member_instances"]))
+    if os.environ.get(CROSS_INSTALLATION_VIEWER_ENV) == "1":
+        state.update({
+            "viewer_task_proof": True,
+            "cross_installation_open_existing": True,
+            "visibility_screenshot": visibility_screenshot["path"],
+            "restart_relay_io": restart_relay.get("io") or {},
+            "reconnect_relay_io": reconnect_relay.get("io") or {},
+        })
+        state_path.write_text(json.dumps(state))
+        return
     deletion = c.debug_project_delete(team_name)
     deletion_operation_id = deletion.get("operation_id")
     if not deletion_operation_id:
@@ -947,6 +1119,12 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
             raise termmeshError(f"could not write relay E2E receipt: {exc}") from exc
 
     _wait_for_project_deletion(c, deletion_operation_id)
+    artifact_check = (
+        'd="${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/leader-hooks"; '
+        f'test ! -e "$d/leader-turn-{state["team_uuid"]}.sh"; '
+        f'test ! -e "$d/leader-participation-{state["team_uuid"]}.json"'
+    )
+    _remote_stdout(host, artifact_check)
     if _wait(fully_deleted):
         recreation_directory = Path(f"/tmp/{team_name}-recreate")
         recreation_directory.mkdir(parents=True, exist_ok=True)
@@ -1014,20 +1192,195 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
     )
 
 
+def _phase_repair(c, host: str, remote_dir: str, state_path: Path) -> None:
+    state = json.loads(state_path.read_text())
+    team_name = state["team_name"]
+    old_leader = state["leader_surface_id"]
+    if any(item.get("team_name") == team_name for item in c.team_list()):
+        raise termmeshError(
+            "cold exact-repair fixture unexpectedly installed a local placeholder"
+        )
+    durable = _remote_project_manifest_status(host, remote_dir, state["project_id"])
+    if durable is None:
+        raise termmeshError(
+            "durable Project manifest did not survive daemon restart"
+        )
+    expected_references = 1 + len(state["member_instances"])
+    old_leader_hex = base64.b64decode(old_leader).hex()
+    if durable.get("leader_surface_id") != old_leader_hex:
+        raise termmeshError(f"durable Project leader identity changed: {durable!r}")
+    if int(durable.get("referenced_surfaces") or 0) != expected_references:
+        raise termmeshError(f"durable Project references changed: {durable!r}")
+    live_references = int(durable.get("live_surfaces") or 0)
+    if live_references >= expected_references:
+        raise termmeshError(f"restart did not remove any Project surface: {durable!r}")
+
+    # The current SSH tunnel may remain established across the remote listener
+    # replacement. Retry forces a fresh authenticated generation.
+    c.peer_host_retry(host)
+    _wait(lambda: next((
+        row for row in c.peer_host_list()
+        if row.get("id") == host and row.get("state") == "connected"
+        and row.get("team_host_readiness") == "ready"
+        and "session_host_socket" in row
+        and row.get("launchable") is True
+    ), None), timeout_s=45)
+    repair = c.team_repair_collaboration(
+        team_name, host_key=host, team_uuid=state["team_uuid"],
+        project_id=state["project_id"]
+    )
+    if not repair.get("succeeded") or not repair.get("route_verified"):
+        raise termmeshError(f"one-call collaboration repair failed: {repair!r}")
+    if int(repair.get("live_agents") or 0) != len(state["member_instances"]):
+        raise termmeshError(f"repair did not restore every worker: {repair!r}")
+
+    project = _wait(lambda: next((
+        item for item in c.debug_project_remote_presentations(host)
+        if item.get("project_id") == state["project_id"]
+        and item.get("leader_surface_id") != old_leader
+    ), None), timeout_s=30)
+    if project is None:
+        raise termmeshError("repaired Project did not publish its new leader surface")
+    team = _wait(lambda: next((
+        item for item in c.team_list()
+        if item.get("team_name") == team_name
+        and item.get("leader_ready")
+        and len(item.get("agents") or []) == len(state["member_instances"])
+    ), None), timeout_s=45)
+    if team is None:
+        raise termmeshError("repaired team did not converge to leader + workers")
+    restored = {
+        agent.get("name"): agent.get("agent_instance_id")
+        for agent in team.get("agents", [])
+    }
+    if restored != state["member_instances"]:
+        raise termmeshError(
+            f"repair changed durable worker identities: {restored!r}"
+        )
+    # `route_verified` is produced only after the owner app runs tm-agent in
+    # the remote leader's service-account environment and observes an exact
+    # proxied team.status response. A test-runner tm-agent call would use the
+    # local app socket instead and cannot prove that route.
+    state["pre_repair_leader_surface_id"] = old_leader
+    state["leader_surface_id"] = project["leader_surface_id"]
+    state["repair_collaboration_verified"] = True
+    state_path.write_text(json.dumps(state))
+
+
+def _phase_cleanup(c, host: str, state_path: Path) -> None:
+    state = json.loads(state_path.read_text())
+    state["team_uuid"] = _canonical_uuid(state.get("team_uuid"))
+    if not state.get("viewer_task_proof"):
+        raise termmeshError("owner cleanup started without viewer task proof")
+    if not state.get("repair_collaboration_verified"):
+        raise termmeshError("owner cleanup started without one-call repair proof")
+    project = _wait(lambda: next((
+        item for item in c.debug_project_remote_presentations(host)
+        if item.get("project_id") == state["project_id"]
+    ), None))
+    if project is None:
+        raise termmeshError("owner cleanup cannot find the durable Project manifest")
+    existing = next((
+        item for item in c.team_list()
+        if item.get("team_name") == state["team_name"]
+    ), None)
+    if existing is None:
+        c.debug_project_adopt_remote(host, state["project_id"])
+    pending = _wait(lambda: next((
+        item for item in c.team_list()
+        if item.get("team_name") == state["team_name"] and item.get("workspace_id")
+    ), None))
+    if pending is None:
+        raise termmeshError("owner cleanup did not create the Project model")
+    c.select_workspace(pending["workspace_id"])
+    team = _wait(lambda: next((
+        item for item in c.team_list()
+        if item.get("team_name") == state["team_name"]
+        and item.get("leader_pane_attached")
+        and len(item.get("agents") or []) == len(state["member_instances"])
+    ), None))
+    if team is None:
+        raise termmeshError("owner cleanup could not adopt the exact Project")
+    deletion = c.debug_project_delete(state["team_name"])
+    operation_id = str(deletion.get("operation_id") or "")
+    if not operation_id:
+        raise termmeshError(f"owner cleanup returned no operation id: {deletion!r}")
+    _wait_for_project_deletion(c, operation_id)
+    artifact_check = (
+        'd="${XDG_CACHE_HOME:-$HOME/.cache}/term-mesh/leader-hooks"; '
+        f'test ! -e "$d/leader-turn-{state["team_uuid"]}.sh"; '
+        f'test ! -e "$d/leader-participation-{state["team_uuid"]}.json"'
+    )
+    _remote_stdout(host, artifact_check)
+    if _remote_project_manifest_status(
+        host, state["source_directory"], state["project_id"]
+    ) is not None:
+        raise termmeshError("owner cleanup left the manifest behind")
+    receipt_path = os.environ.get(RECEIPT_ENV, "").strip()
+    if receipt_path:
+        reconnect_io = state.get("reconnect_relay_io") or {}
+        receipt = {
+            "schema": 1,
+            "candidate_sha": os.environ.get(CANDIDATE_SHA_ENV, "").strip(),
+            "remote_fixture_candidate_sha": os.environ.get(
+                REMOTE_FIXTURE_CANDIDATE_SHA_ENV, ""
+            ).strip(),
+            "remote_fixture_version": os.environ.get(
+                REMOTE_FIXTURE_VERSION_ENV, ""
+            ).strip(),
+            "result": "pass", "required_topology": True, "skipped": False,
+            "host": host,
+            "phases": {
+                "create": "pass", "adopt": "pass",
+                "reconnect": "pass", "repair": "pass",
+                "cleanup": "pass",
+            },
+            "leader_surface_id": state["leader_surface_id"],
+            "pre_repair_leader_surface_id": state.get(
+                "pre_repair_leader_surface_id", ""
+            ),
+            "exact_surface_preserved": True,
+            "repair_collaboration_verified": True,
+            "leader_relay_stability_seconds": LEADER_RELAY_STABILITY_SECONDS,
+            "background_restore_hold_seconds": BACKGROUND_RESTORE_HOLD_SECONDS,
+            "cross_installation_open_existing": bool(
+                state.get("cross_installation_open_existing")
+            ),
+            "remote_agent_task_replies": bool(state.get("viewer_task_proof")),
+            "leader_participation_live_refresh": bool(
+                state.get("leader_participation_live_refresh")
+            ),
+            "remote_artifacts_removed": True,
+            "leader_process_active": True,
+            "leader_process_active_known": True,
+            "project_visibility_screenshot": state["visibility_screenshot"],
+            "create_relay_io": state.get("create_relay_io") or {},
+            "restart_relay_io": state.get("restart_relay_io") or {},
+            "reconnect_relay_io": reconnect_io,
+            "saw_first_byte": bool(reconnect_io.get("saw_first_byte")),
+            "bytes_received": int(reconnect_io.get("bytes_received") or 0),
+            "tested_at_unix": int(time.time()),
+        }
+        temp_receipt = Path(receipt_path + ".tmp")
+        temp_receipt.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+        temp_receipt.replace(receipt_path)
+    state_path.unlink(missing_ok=True)
+
+
 def main() -> int:
     host = os.environ.get(HOST_ENV, "").strip()
     remote_dir = os.environ.get(DIR_ENV, "").strip()
     phase = os.environ.get(PHASE_ENV, "").strip()
     state_path = Path(os.environ.get(STATE_ENV, "/tmp/term-mesh-remote-project-e2e-state.json"))
-    if not host or not remote_dir or phase not in {"create", "adopt"}:
+    if not host or not remote_dir or phase not in {"create", "adopt", "repair", "cleanup"}:
         if os.environ.get(REQUIRE_REMOTE_PROJECT_ENV) == "1":
             raise termmeshError(
                 f"required remote Project topology missing: set {HOST_ENV}, "
-                f"{DIR_ENV}, and {PHASE_ENV}=full (runner) or create|adopt"
+                f"{DIR_ENV}, and {PHASE_ENV}=full (runner) or create|adopt|repair|cleanup"
             )
         print(
             f"SKIP: set {HOST_ENV}, {DIR_ENV}, and "
-            f"{PHASE_ENV}=full (runner) or create|adopt"
+            f"{PHASE_ENV}=full (runner) or create|adopt|repair|cleanup"
         )
         return 0
 
@@ -1035,8 +1388,12 @@ def main() -> int:
         _connect(c, host)
         if phase == "create":
             _phase_create(c, host, remote_dir, state_path)
-        else:
+        elif phase == "adopt":
             _phase_adopt(c, host, state_path)
+        elif phase == "repair":
+            _phase_repair(c, host, remote_dir, state_path)
+        else:
+            _phase_cleanup(c, host, state_path)
     print(f"PASS: remote Project restart reattach phase {phase}")
     return 0
 

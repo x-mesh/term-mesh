@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import os
+from pathlib import Path
 from typing import List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,15 +42,23 @@ MONITOR_DURATION = 3.0
 
 def get_termmesh_pid() -> Optional[int]:
     """Get the PID of the running termmesh process."""
+    pid_file = os.environ.get("TERMMESH_E2E_APP_PID_FILE")
+    if pid_file:
+        try:
+            pid = int(Path(pid_file).read_text().strip())
+            if pid > 0:
+                return pid
+        except (OSError, ValueError):
+            pass
     result = subprocess.run(
-        ["pgrep", "-f", r"termmesh\.app/Contents/MacOS/termmesh$"],
+        ["pgrep", "-f", r"term-mesh\.app/Contents/MacOS/term-mesh$"],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         # Try DEV build
         result = subprocess.run(
-            ["pgrep", "-f", r"termmesh DEV\.app/Contents/MacOS/termmesh"],
+            ["pgrep", "-f", r"term-mesh DEV.*\.app/Contents/MacOS/term-mesh DEV"],
             capture_output=True,
             text=True,
         )
@@ -227,9 +236,12 @@ def main():
     print(f"\nFound termmesh process: PID {pid}")
 
     # Try to connect to the socket
-    socket_paths = ["/tmp/term-mesh.sock", "/tmp/term-mesh-debug.sock"]
+    socket_paths = [
+        os.environ.get("TERMMESH_SOCKET_PATH") or os.environ.get("TERMMESH_SOCKET"),
+        "/tmp/term-mesh.sock", "/tmp/term-mesh-debug.sock",
+    ]
     client = None
-    for socket_path in socket_paths:
+    for socket_path in filter(None, socket_paths):
         if os.path.exists(socket_path):
             try:
                 client = termmesh(socket_path)

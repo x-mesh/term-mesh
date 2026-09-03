@@ -234,7 +234,12 @@ public actor PeerSession {
     private let closeTransport: PeerCloseFn?
     private var pendingInbound = Data()
     private let demux = PeerSessionDemux()
+    /// One used namespace is shared for connection-lifetime one-shot IDs.
+    /// Active ownership stays split so one malformed response class cannot
+    /// erase the other class's reason for keeping the single reader alive.
+    private var usedLifecycleRequestIDs: Set<Data> = []
     private var activeEnsureRequestIDs: Set<Data> = []
+    private var activeTerminateRequestIDs: Set<Data> = []
     private var inboundPumpTask: Task<Void, Never>?
     private var bufferedIncomingMessages: [PeerIncomingMessage] = []
     /// Keep the transport reader independent from a slow downstream consumer.
@@ -922,9 +927,10 @@ public actor PeerSession {
         kind: String,
         environment: [String: String]
     ) async throws -> PeerEnsureSurfaceOutcome {
-        guard activeEnsureRequestIDs.insert(requestID).inserted else {
+        guard usedLifecycleRequestIDs.insert(requestID).inserted else {
             throw PeerSessionError.duplicateEnsureRequestID
         }
+        activeEnsureRequestIDs.insert(requestID)
         let responses: AsyncThrowingStream<Termmesh_Peer_V1_EnsureSurfaceResponse, Error>
         do {
             responses = try await demux.registerEnsure(requestID: requestID)
@@ -940,6 +946,7 @@ public actor PeerSession {
             )
         } catch {
             activeEnsureRequestIDs.remove(requestID)
+            usedLifecycleRequestIDs.remove(requestID)
             await demux.failEnsure(requestID: requestID, error: error)
             if Task.isCancelled { throw CancellationError() }
             throw error
@@ -993,6 +1000,7 @@ public actor PeerSession {
         while !Task.isCancelled {
             guard heartbeatTask != nil
                     || !activeEnsureRequestIDs.isEmpty
+                    || !activeTerminateRequestIDs.isEmpty
                     || !incomingWaiters.isEmpty else {
                 inboundPumpTask = nil
                 return
@@ -1022,6 +1030,15 @@ public actor PeerSession {
                     activeEnsureRequestIDs.removeAll()
                 }
                 await demux.routeEnsureResponse(response)
+                continue
+            }
+            if case .terminateSurfaceResponse(let response) = envelope.payload {
+                if response.requestID.count == 16 {
+                    activeTerminateRequestIDs.remove(response.requestID)
+                } else {
+                    activeTerminateRequestIDs.removeAll()
+                }
+                await demux.routeTerminateResponse(response)
                 continue
             }
 
@@ -1096,7 +1113,9 @@ public actor PeerSession {
         inboundPumpTask = nil
         inboundTerminalError = error
         activeEnsureRequestIDs.removeAll()
+        activeTerminateRequestIDs.removeAll()
         await demux.failAllEnsures(error: error)
+        await demux.failAllTerminates(error: error)
         let waiters = incomingWaiters.values
         incomingWaiters.removeAll()
         for continuation in waiters {
@@ -1194,7 +1213,8 @@ public actor PeerSession {
     @discardableResult
     public func terminateSurface(
         requestID suppliedRequestID: Data? = nil,
-        surfaceID: Data
+        surfaceID: Data,
+        timeoutSeconds: TimeInterval = 5
     ) async throws -> Termmesh_Peer_V1_TerminateSurfaceResult {
         try requireHostCapability(PeerCapability.surfaceTerminateV1)
         let requestID = suppliedRequestID ?? Self.makeEnsureRequestID()
@@ -1205,6 +1225,10 @@ public actor PeerSession {
             throw PeerSessionError.invalidEnsureRequest("surface_id must be 16 bytes")
         }
         try beginDirectResponseRPC()
+        guard usedLifecycleRequestIDs.insert(requestID).inserted else {
+            directResponseRPCInFlight = false
+            throw PeerSessionError.duplicateEnsureRequestID
+        }
         defer { directResponseRPCInFlight = false }
         try await sendEnvelope { env in
             var request = Termmesh_Peer_V1_TerminateSurfaceRequest()
@@ -1212,7 +1236,16 @@ public actor PeerSession {
             request.surfaceID = surfaceID
             env.terminateSurfaceRequest = request
         }
-        let reply = try await readFrame()
+        let reply: Termmesh_Peer_V1_Envelope
+        do {
+            reply = try await readFrame(
+                timeoutSeconds: timeoutSeconds,
+                operation: "terminateSurface"
+            )
+        } catch {
+            await close(reason: "terminateSurface failed: \(error)")
+            throw error
+        }
         guard case .terminateSurfaceResponse(let response) = reply.payload else {
             throw PeerSessionError.unexpectedMessage(
                 "expected TerminateSurfaceResponse, got \(String(describing: reply.payload))"
@@ -1221,17 +1254,20 @@ public actor PeerSession {
         guard response.requestID == requestID else {
             throw PeerSessionError.malformedEnsureResponse("request_id does not echo the request")
         }
+        if let error = PeerSessionDemux.terminateResponseValidationError(
+            response, expectedSurfaceID: surfaceID
+        ) {
+            throw PeerSessionError.malformedEnsureResponse(error)
+        }
         return response.result
     }
 
-    /// Submit explicit termination over an attached session whose inbound
-    /// pump already owns reads. The matching response is consumed as other;
-    /// callers must confirm removal from an authoritative roster before
-    /// reporting success.
+    /// Submit explicit termination over an attached session and await the
+    /// correlated response through the single inbound pump.
     public func requestTerminateSurface(
         requestID suppliedRequestID: Data? = nil,
         surfaceID: Data
-    ) async throws {
+    ) async throws -> Termmesh_Peer_V1_TerminateSurfaceResult {
         try requireHostCapability(PeerCapability.surfaceTerminateV1)
         let requestID = suppliedRequestID ?? Self.makeEnsureRequestID()
         guard requestID.count == 16 else {
@@ -1240,12 +1276,54 @@ public actor PeerSession {
         guard surfaceID.count == 16 else {
             throw PeerSessionError.invalidEnsureRequest("surface_id must be 16 bytes")
         }
-        try await sendEnvelope { env in
-            var request = Termmesh_Peer_V1_TerminateSurfaceRequest()
-            request.requestID = requestID
-            request.surfaceID = surfaceID
-            env.terminateSurfaceRequest = request
+        guard usedLifecycleRequestIDs.insert(requestID).inserted else {
+            throw PeerSessionError.duplicateEnsureRequestID
         }
+        activeTerminateRequestIDs.insert(requestID)
+        let responses: AsyncThrowingStream<Termmesh_Peer_V1_TerminateSurfaceResponse, Error>
+        do {
+            responses = try await demux.registerTerminate(
+                requestID: requestID, expectedSurfaceID: surfaceID
+            )
+            try await sendEnvelope { env in
+                var request = Termmesh_Peer_V1_TerminateSurfaceRequest()
+                request.requestID = requestID
+                request.surfaceID = surfaceID
+                env.terminateSurfaceRequest = request
+            }
+        } catch {
+            activeTerminateRequestIDs.remove(requestID)
+            usedLifecycleRequestIDs.remove(requestID)
+            await demux.failTerminate(requestID: requestID, error: error)
+            throw error
+        }
+        startInboundPumpIfNeeded()
+        return try await withTaskCancellationHandler {
+            do {
+                var iterator = responses.makeAsyncIterator()
+                guard let response = try await iterator.next() else {
+                    throw CancellationError()
+                }
+                return response.result
+            } catch {
+                if Task.isCancelled {
+                    await cancelTerminate(requestID: requestID)
+                    throw CancellationError()
+                }
+                throw error
+            }
+        } onCancel: {
+            Task { await self.cancelTerminate(requestID: requestID) }
+        }
+    }
+
+    private func cancelTerminate(requestID: Data) async {
+        activeTerminateRequestIDs.remove(requestID)
+        await demux.cancelTerminate(requestID: requestID)
+        // The single reader may already be blocked in readAnyFrame. Closing
+        // the session is the only deterministic cancellation barrier; it also
+        // fails sibling waiters instead of leaving hidden work behind.
+        await terminateInbound(with: PeerSessionError.sessionClosed(reason: "request cancelled"))
     }
 
     public func attachSurface(
@@ -1311,7 +1389,8 @@ public actor PeerSession {
     private func cancelIncomingWaiter(_ waiterID: UUID) async {
         let continuation = incomingWaiters.removeValue(forKey: waiterID)
         continuation?.resume(throwing: CancellationError())
-        if continuation != nil, incomingWaiters.isEmpty, activeEnsureRequestIDs.isEmpty {
+        if continuation != nil, incomingWaiters.isEmpty,
+           activeEnsureRequestIDs.isEmpty, activeTerminateRequestIDs.isEmpty {
             await terminateInbound(with: PeerSessionError.sessionClosed(reason: "receive cancelled"))
         }
     }
@@ -1477,6 +1556,7 @@ public actor PeerSession {
         if let inboundTerminalError { throw inboundTerminalError }
         guard !directResponseRPCInFlight,
               activeEnsureRequestIDs.isEmpty,
+              activeTerminateRequestIDs.isEmpty,
               incomingWaiters.isEmpty,
               !inboundReadInProgress else {
             throw PeerSessionError.concurrentReceiveOperation

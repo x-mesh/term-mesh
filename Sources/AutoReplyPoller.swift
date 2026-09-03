@@ -525,26 +525,33 @@ final class AutoReplyPoller {
         agentName: String
     ) {
         guard !state.answeredStartupPrompt else { return }
-        guard let prompt = AgentStartupPrompt.detect(in: text) else { return }
+        guard let answer = AgentStartupPrompt.answer(in: text) else { return }
         guard let located = AppDelegate.shared?.locateSurface(surfaceId: panelId),
               let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
               let panel = workspace.terminalPanel(for: panelId) else { return }
         state.answeredStartupPrompt = true
-        NSLog("[auto-reply] answered startup prompt agent=%@ prompt=%@",
-              agentName, String(describing: prompt))
+        NSLog("[auto-reply] answered startup prompt agent=%@ prompt=%@ keys=%@",
+              agentName, String(describing: answer.prompt), answer.keys.joined(separator: ","))
 #if DEBUG
-        dlog("startupPrompt.answered agent=\(agentName) panel=\(panelId.uuidString.prefix(8)) prompt=\(prompt)")
+        dlog("startupPrompt.answered agent=\(agentName) panel=\(panelId.uuidString.prefix(8)) prompt=\(answer.prompt) keys=\(answer.keys.joined(separator: ","))")
 #endif
-        // A key event, not text. The prompt is a TUI selection list waiting on
-        // Return; writing a carriage return into the composer looks like
-        // typing and does not commit it. This is the same retrying path the
-        // socket's `surface.send_key` uses.
-        TerminalController.shared.sendNamedKeyWithRetry(
+        // Key events, not text. The prompt is a TUI selection list waiting on
+        // Return; writing a carriage return into the composer looks like typing
+        // and does not commit it. This is the same retrying path the socket's
+        // `surface.send_key` uses.
+        TerminalController.shared.sendNamedKeysWithRetry(
             on: panel.surface,
-            keyName: prompt.answerKey
-        ) { delivered, reason in
+            keyNames: answer.keys
+        ) { delivered, landed, reason in
             guard !delivered else { return }
             NSLog("[auto-reply] startup prompt answer not delivered: %@", reason)
+            // The latch exists so a repeated prompt reaches a person, not so an
+            // undelivered answer silences the pane forever. Release it only
+            // when no key landed at all: after a partial sequence the selection
+            // has already moved, and repeating it would answer a question the
+            // pane is no longer asking.
+            guard landed == 0 else { return }
+            state.answeredStartupPrompt = false
         }
     }
 

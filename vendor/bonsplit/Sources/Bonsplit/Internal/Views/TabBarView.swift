@@ -453,6 +453,10 @@ struct TabBarView: View {
     @ViewBuilder
     private var splitButtons: some View {
         let tooltips = controller.configuration.appearance.splitButtonTooltips
+        // Read it so this header observes its own pane's revision. Without the
+        // read there is no dependency, and a host that changes what its
+        // closure returns has no way to say so.
+        let _ = pane.headerActionsRevision
         let headerActions = controller.paneHeaderActions?(
             pane.id,
             pane.selectedTabId.map { TabID(id: $0) }

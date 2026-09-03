@@ -2506,6 +2506,12 @@ public nonisolated struct Termmesh_Peer_V1_Team: Sendable {
 
   public var delegationPending: String = String()
 
+  /// Exact leader launch identity used for deterministic replacement. Empty
+  /// for manifests written by hosts that predate durable leader recovery.
+  public var leaderCli: String = String()
+
+  public var leaderModel: String = String()
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -6480,7 +6486,7 @@ nonisolated extension Termmesh_Peer_V1_TeamList: SwiftProtobuf.Message, SwiftPro
 
 nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Team"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}name\0\u{3}team_uuid\0\u{3}working_directory\0\u{3}project_root\0\u{3}agent_names\0\u{3}created_at_unix_secs\0\u{3}leader_surface_id\0\u{1}members\0\u{3}project_id\0\u{3}presentation_revision\0\u{3}presentation_owned_by_requester\0\u{3}leader_process_active\0\u{3}leader_process_active_known\0\u{3}delegation_configured\0\u{3}delegation_effective\0\u{3}delegation_pending\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}name\0\u{3}team_uuid\0\u{3}working_directory\0\u{3}project_root\0\u{3}agent_names\0\u{3}created_at_unix_secs\0\u{3}leader_surface_id\0\u{1}members\0\u{3}project_id\0\u{3}presentation_revision\0\u{3}presentation_owned_by_requester\0\u{3}leader_process_active\0\u{3}leader_process_active_known\0\u{3}delegation_configured\0\u{3}delegation_effective\0\u{3}delegation_pending\0\u{3}leader_cli\0\u{3}leader_model\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6504,6 +6510,8 @@ nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobu
       case 14: try { try decoder.decodeSingularStringField(value: &self.delegationConfigured) }()
       case 15: try { try decoder.decodeSingularStringField(value: &self.delegationEffective) }()
       case 16: try { try decoder.decodeSingularStringField(value: &self.delegationPending) }()
+      case 17: try { try decoder.decodeSingularStringField(value: &self.leaderCli) }()
+      case 18: try { try decoder.decodeSingularStringField(value: &self.leaderModel) }()
       default: break
       }
     }
@@ -6558,6 +6566,12 @@ nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobu
     if !self.delegationPending.isEmpty {
       try visitor.visitSingularStringField(value: self.delegationPending, fieldNumber: 16)
     }
+    if !self.leaderCli.isEmpty {
+      try visitor.visitSingularStringField(value: self.leaderCli, fieldNumber: 17)
+    }
+    if !self.leaderModel.isEmpty {
+      try visitor.visitSingularStringField(value: self.leaderModel, fieldNumber: 18)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -6578,6 +6592,8 @@ nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobu
     if lhs.delegationConfigured != rhs.delegationConfigured {return false}
     if lhs.delegationEffective != rhs.delegationEffective {return false}
     if lhs.delegationPending != rhs.delegationPending {return false}
+    if lhs.leaderCli != rhs.leaderCli {return false}
+    if lhs.leaderModel != rhs.leaderModel {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

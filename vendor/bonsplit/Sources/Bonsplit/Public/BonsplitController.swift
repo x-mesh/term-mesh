@@ -939,6 +939,32 @@ public final class BonsplitController {
 
     // MARK: - Private Helpers
 
+    /// Redraw one pane's header because the host's `paneHeaderActions` would
+    /// now return something different for it.
+    ///
+    /// Scoped to a pane on purpose: exposure, readiness and similar host state
+    /// belong to one pane at a time, and invalidating every header for one of
+    /// them would redraw tab bars that did not change.
+    public func invalidatePaneHeaderActions(inPane paneId: PaneID) {
+        guard let pane = internalController.rootNode.allPanes.first(where: { $0.id == paneId })
+        else { return }
+        pane.headerActionsRevision &+= 1
+    }
+
+    /// How many times this pane's header has been invalidated. Exposed so a
+    /// host can assert that one pane's change did not redraw its neighbours.
+    public func headerActionsRevision(inPane paneId: PaneID) -> Int? {
+        internalController.rootNode.allPanes
+            .first { $0.id == paneId }?
+            .headerActionsRevision
+    }
+
+    /// The same, addressed by a tab the host knows about.
+    public func invalidatePaneHeaderActions(forTab tabId: TabID) {
+        guard let (pane, _) = findTabInternal(tabId) else { return }
+        pane.headerActionsRevision &+= 1
+    }
+
     private func findTabInternal(_ tabId: TabID) -> (PaneState, Int)? {
         for pane in internalController.rootNode.allPanes {
             if let index = pane.tabs.firstIndex(where: { $0.id == tabId.id }) {

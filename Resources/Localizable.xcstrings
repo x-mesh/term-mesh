@@ -131,6 +131,16 @@
         }
       }
     },
+    "%lld workers · %lld working, %lld idle.": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "워커 %lld명 · %lld명 작업 중, %lld명 대기." } }
+      }
+    },
+    "%lld workers, none working right now.": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "워커 %lld명, 지금 일하는 워커는 없습니다." } }
+      }
+    },
     "(no profiles)": {
       "localizations": {
         "ko": {
@@ -449,6 +459,11 @@
             "value": "터미널 링크와 `open https://...` 호출 중 목록에 있는 주소만 term-mesh에서 열고, 나머지는 기본 브라우저에서 엽니다. 한 줄에 주소나 와일드카드를 하나씩 적습니다(예: example.com, *.internal.example). 비워 두면 모든 주소를 term-mesh에서 엽니다."
           }
         }
+      }
+    },
+    "Apply": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "적용" } }
       }
     },
     "Apply to Active Pane (Restart)": {
@@ -1121,6 +1136,11 @@
         }
       }
     },
+    "Current: %@ · Next request: %@": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "현재: %@ · 다음 요청: %@" } }
+      }
+    },
     "Cursor Color": {
       "localizations": {
         "ko": {
@@ -1211,6 +1231,46 @@
         }
       }
     },
+    "Delegation": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "분배" } }
+      }
+    },
+    "Execution level": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "실행 수준" } }
+      }
+    },
+    "Delegated": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "위임 우선" } }
+      }
+    },
+    "Guarded": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "신중" } }
+      }
+    },
+    "Leader first": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "리더 우선" } }
+      }
+    },
+    "How much of a new Project's work its leader hands to workers. Each Project can override this from its sidebar menu.": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "새 프로젝트에서 리더가 워커에게 넘기는 작업의 정도입니다. 프로젝트마다 사이드바 메뉴에서 따로 지정할 수 있습니다." } }
+      }
+    },
+    "Default Work Distribution": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "기본 작업 분배" } }
+      }
+    },
+    "Max parallel workers": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "최대 병렬 워커" } }
+      }
+    },
     "Mobile Remote Control": {
       "localizations": {
         "ko": {
@@ -1281,6 +1341,36 @@
         }
       }
     },
+    "No workers on this Project yet, so every route is direct.": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "이 프로젝트에는 아직 워커가 없어서 모든 작업을 리더가 직접 처리합니다." } }
+      }
+    },
+    "Panes disconnect and reattach. Agent and shell processes on the host keep running. Shell records left behind by processes that already exited are cleared — this is the way to remove the ones Clean Up Panes reports it cannot close.": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "pane이 끊겼다가 다시 붙습니다. 호스트에서 실행 중인 에이전트와 셸 프로세스는 그대로 유지됩니다. 이미 종료된 프로세스가 남긴 셸 기록은 지워집니다 — Clean Up Panes가 닫지 못한다고 표시하는 항목을 없애는 방법입니다." } }
+      }
+    },
+    "Restart failed": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "재시작 실패" } }
+      }
+    },
+    "Restart the term-mesh daemon on \"%@\"?": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "\"%@\"의 term-mesh 데몬을 재시작할까요?" } }
+      }
+    },
+    "Restart Daemon": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "데몬 재시작" } }
+      }
+    },
+    "Restart Host Daemon…": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "호스트 데몬 재시작…" } }
+      }
+    },
     "Scanning %@…": {
       "localizations": {
         "ko": {
@@ -1289,6 +1379,26 @@
             "value": "검색 중: %@…"
           }
         }
+      }
+    },
+    "Serial implementation goes to one worker; independent units still run in parallel.": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "직렬 구현을 워커 한 명에게 맡기고, 독립 단위는 그대로 병렬로 실행합니다." } }
+      }
+    },
+    "Serial work stays with the leader; risk conditions add one read-only probe.": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "직렬 작업은 리더가 맡고, 위험 조건이 있으면 읽기 전용 조사를 한 번 추가합니다." } }
+      }
+    },
+    "State the floor each turn": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "매 턴 하한선 알리기" } }
+      }
+    },
+    "The leader handles serial work and delegates only independent parallel units.": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "리더가 직렬 작업을 맡고, 서로 독립적인 병렬 단위만 위임합니다." } }
       }
     },
     "This removes the worktree and its git registration:\n%@\n\nA worktree with uncommitted changes is kept — you will be asked again before anything is discarded.": {
@@ -2789,6 +2899,21 @@
     "Shadow only records suggestions. Canary applies observable tm-agent dispatch bounds only after health gates pass.": {
       "localizations": {
         "ko": { "stringUnit": { "state": "translated", "value": "관찰만 모드에서는 제안만 기록합니다. 시험 적용은 상태 기준을 통과한 뒤 tm-agent로 확인 가능한 작업 분배 범위에만 반영됩니다." } }
+      }
+    },
+    "Work Distribution": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "작업 분배" } }
+      }
+    },
+    "Work distribution for %@": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "%@의 작업 분배" } }
+      }
+    },
+    "Work Distribution…": {
+      "localizations": {
+        "ko": { "stringUnit": { "state": "translated", "value": "작업 분배…" } }
       }
     },
     "project-a, project-b": {

@@ -4897,7 +4897,37 @@ fn remote_leader_route() -> Option<RemoteLeaderRoute> {
             return Some(route);
         }
     }
+    // Leaders launched before the route-file contract cannot gain a new
+    // environment variable after another viewer adopts their Project. The
+    // adopted viewer still stages the deterministic leader file, so discover
+    // that path from the frozen team UUID before falling back to the frozen
+    // bearer. This upgrades the next tm-agent invocation without restarting
+    // the long-lived leader process.
+    if let (Some(home), Some(team_uuid)) = (
+        env::var("HOME").ok().filter(|value| !value.is_empty()),
+        env::var("TERMMESH_LEADER_TEAM_UUID")
+            .ok()
+            .filter(|value| !value.is_empty()),
+    ) {
+        let path = default_remote_leader_route_file(Path::new(&home), &team_uuid);
+        if let Some(route) = remote_leader_route_from_file(&path) {
+            return Some(route);
+        }
+    }
     remote_leader_route_from_env()
+}
+
+fn default_remote_leader_route_file(home: &Path, team_uuid: &str) -> PathBuf {
+    let identity = format!("leader-{team_uuid}");
+    let safe: String = identity
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric() || *value == '-')
+        .take(48)
+        .collect();
+    home.join(".term-mesh")
+        .join("agent-routes")
+        .join(format!("{safe}.json"))
 }
 
 fn remote_leader_route_from_env() -> Option<RemoteLeaderRoute> {
@@ -4970,7 +5000,8 @@ mod remote_leader_route_file_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    const ROUTE_ENV: [&str; 5] = [
+    const ROUTE_ENV: [&str; 6] = [
+        "HOME",
         "TERMMESH_LEADER_GRANT_ID",
         "TERMMESH_LEADER_PROJECT_ID",
         "TERMMESH_LEADER_TEAM_UUID",
@@ -5136,6 +5167,26 @@ mod remote_leader_route_file_tests {
     }
 
     #[test]
+    fn leader_without_route_env_discovers_the_adopted_viewers_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guard = RouteEnv::new();
+        guard.set_env_route(&"11".repeat(32));
+        env::set_var("TERMMESH_LEADER_TEAM_UUID", "05AC84AA-A_B");
+        env::set_var("HOME", dir.path());
+        let path = default_remote_leader_route_file(dir.path(), "05AC84AA-A_B");
+        fs::create_dir_all(path.parent().expect("route parent")).expect("mkdir route parent");
+        fs::write(&path, route_json(&"99".repeat(32))).expect("write adopted route");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod route");
+
+        let route = remote_leader_route().expect("adopted route");
+        assert_eq!(route.grant_id_hex, "99".repeat(32));
+        assert_eq!(
+            path.file_name().and_then(|value| value.to_str()),
+            Some("leader-05ac84aa-ab.json")
+        );
+    }
+
+    #[test]
     fn replacing_the_file_moves_a_live_worker_to_the_new_grant() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = stage(&dir, "route.json", &route_json(&"cd".repeat(32)), 0o600);
@@ -5263,9 +5314,19 @@ fn remote_leader_rpc_call(
     let first = rpc_call_timeout(sock, "peer.leader.call", proxy_params.clone(), timeout);
     let outer = match first {
         Ok(value) => value,
-        Err(_) => rpc_call_timeout(sock, "peer.leader.call", proxy_params, timeout)?,
+        Err(_) => match rpc_call_timeout(sock, "peer.leader.call", proxy_params, timeout) {
+            Ok(value) => value,
+            Err(error) => {
+                append_remote_leader_route_failure(&route, method, &request_id_hex);
+                return Err(error);
+            }
+        },
     };
-    remote_leader_proxy_result(decode_daemon_response(outer)?)
+    let result = decode_daemon_response(outer).and_then(remote_leader_proxy_result);
+    if result.is_err() {
+        append_remote_leader_route_failure(&route, method, &request_id_hex);
+    }
+    result
 }
 
 fn remote_leader_rpc_call_duration(
@@ -5284,12 +5345,69 @@ fn remote_leader_rpc_call_duration(
         Err(first_error) => {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                append_remote_leader_route_failure(&route, method, &request_id_hex);
                 return Err(first_error);
             }
-            rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining)?
+            match rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining) {
+                Ok(value) => value,
+                Err(error) => {
+                    append_remote_leader_route_failure(&route, method, &request_id_hex);
+                    return Err(error);
+                }
+            }
         }
     };
-    remote_leader_proxy_result(decode_daemon_response(outer)?)
+    let result = decode_daemon_response(outer).and_then(remote_leader_proxy_result);
+    if result.is_err() {
+        append_remote_leader_route_failure(&route, method, &request_id_hex);
+    }
+    result
+}
+
+fn append_remote_leader_route_failure(
+    route: &RemoteLeaderRoute,
+    method: &str,
+    request_id_hex: &str,
+) {
+    let Ok(path) = turn_log_path() else { return };
+    let team = env::var("TERMMESH_TEAM").unwrap_or_else(|_| route.project_id.clone());
+    let mut record = json!({
+        "event": "task_lifecycle",
+        "turn_id": request_id_hex,
+        "ts": iso8601_utc_now(),
+        "team": team,
+        "team_uuid": route.team_uuid,
+        "task_status": "route_failed",
+        "task_delivery": "failed",
+        "task_route": method,
+    });
+    if let Some(session) = current_leader_session_id() {
+        record["leader_session_id"] = json!(session);
+    }
+    let _ = append_turn_record(&path, &record);
+}
+
+fn current_leader_session_id() -> Option<String> {
+    if let Some(path) = env::var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        if let Ok(data) = fs::read(Path::new(&path)) {
+            if data.len() <= 64 * 1024 {
+                if let Ok(value) = serde_json::from_slice::<Value>(&data) {
+                    if let Some(session) = value["session_id"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                    {
+                        return Some(session.to_string());
+                    }
+                }
+            }
+        }
+    }
+    env::var("TERMMESH_LEADER_SESSION_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 fn remote_leader_proxy_result(proxied: Value) -> Result<Value, String> {
@@ -16818,7 +16936,7 @@ fn run_leader_turn_route(
         );
     }
     let path = turn_log_path()?;
-    let record = turn_route_record_with_policy_input(
+    let mut record = turn_route_record_with_policy_input(
         turn_id,
         route,
         task_shape,
@@ -16829,6 +16947,12 @@ fn run_leader_turn_route(
         env::var("TERMMESH_SURFACE_ID").ok().as_deref(),
         &iso8601_utc_now(),
     );
+    if let Some(route) = remote_leader_route() {
+        record["team_uuid"] = json!(route.team_uuid);
+    }
+    if let Some(session) = current_leader_session_id() {
+        record["leader_session_id"] = json!(session);
+    }
     mark_turn_route_stated(&path, turn_id)?;
     // The marker and the log line are a small two-phase local transaction. A
     // failed append must not let Stop report a route that never reached the
