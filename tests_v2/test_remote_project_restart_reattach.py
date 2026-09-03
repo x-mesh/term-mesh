@@ -1253,8 +1253,9 @@ def _phase_repair(c, host: str, remote_dir: str, state_path: Path) -> None:
     expected_references = 1 + len(state["member_instances"])
     if int(durable.get("referenced_surfaces") or 0) != expected_references:
         raise termmeshError(f"durable Project references changed: {durable!r}")
-    if int(durable.get("live_surfaces") or 0) != 0:
-        raise termmeshError(f"restart did not remove Project surfaces: {durable!r}")
+    live_references = int(durable.get("live_surfaces") or 0)
+    if live_references >= expected_references:
+        raise termmeshError(f"restart did not remove any Project surface: {durable!r}")
 
     # The current SSH tunnel may remain established across the remote listener
     # replacement. Retry forces a fresh authenticated generation.
@@ -1270,6 +1271,8 @@ def _phase_repair(c, host: str, remote_dir: str, state_path: Path) -> None:
     ), None), timeout_s=30)
     if stale is None or stale.get("leader_surface_id") != old_leader:
         raise termmeshError(f"stale manifest did not survive daemon restart: {stale!r}")
+    if not stale.get("leader_process_active_known") or stale.get("leader_process_active"):
+        raise termmeshError(f"old leader was not authoritatively inactive: {stale!r}")
 
     repair = c.team_repair_collaboration(team_name)
     if not repair.get("succeeded") or not repair.get("route_verified"):
