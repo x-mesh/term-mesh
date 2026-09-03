@@ -5291,11 +5291,21 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         var measured = PeerHostHealthBaseline()
         measured.controlPath = "/srv/term-mesh/control.sock"
         measured.controlPathPresent = true
+        measured.peerPath = "/run/term-mesh/tm-peer.sock"
+        measured.peerPathPresent = true
         XCTAssertEqual(
             TeamOrchestrator.collaborationControlSocketPath(
                 peerSocketPath: "/run/term-mesh/tm-peer.sock", health: measured
             ),
             "/srv/term-mesh/control.sock"
+        )
+        measured.peerPath = "/run/term-mesh/other-peer.sock"
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationControlSocketPath(
+                peerSocketPath: "/run/term-mesh/tm-peer.sock", health: measured
+            ),
+            "/run/term-mesh/term-meshd.sock",
+            "health from another daemon must not redirect verification"
         )
         XCTAssertEqual(
             TeamOrchestrator.collaborationControlSocketPath(
@@ -5386,6 +5396,14 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         )
         XCTAssertFalse(unverified.succeeded)
         XCTAssertTrue(unverified.message.contains("verification failed"))
+
+        let rolledBack = TeamOrchestrator.CollaborationRecoveryReport(
+            routeRepaired: false, leaderLive: true, liveAgents: 4,
+            replacedAgents: [], failedAgents: [],
+            verificationFailure: "wrong daemon"
+        )
+        XCTAssertFalse(rolledBack.succeeded)
+        XCTAssertTrue(rolledBack.message.contains("rolled back"))
 
         let verified = TeamOrchestrator.CollaborationRecoveryReport(
             routeRepaired: true, routeVerified: true,

@@ -781,12 +781,36 @@ extension TeamOrchestrator {
                 replacedAgents: [], failedAgents: ["Project changed during repair"]
             )
         }
+        // Replacing route files is only a prerequisite. The production
+        // failure that led here had a live leader, live workers, and a fresh
+        // route while every reverse team call still timed out. Exercise the
+        // exact leader-side path before touching workers or claiming success.
+        if let verificationFailure = await Self.verifyRemoteCollaborationRoute(
+            host: host, teamName: teamName, teamUUID: teamUUID
+        ) {
+            if await Self.finishAdoptedRemoteAgentRoutes(
+                host: host, transaction: routes.transaction, commit: false
+            ) {
+                await Self.revokeGrants(grantIDs)
+            } else {
+                Self.rollbackRemoteAgentRoutesPreservingGrants(
+                    host: host, transaction: routes.transaction, grantIDs: grantIDs
+                )
+            }
+            return CollaborationRecoveryReport(
+                routeRepaired: false, routeVerified: false,
+                leaderLive: initialPlan.leaderLive,
+                liveAgents: initialPlan.liveAgentCount,
+                replacedAgents: [], failedAgents: [],
+                verificationFailure: verificationFailure
+            )
+        }
+
         if !(await Self.finalizeAdoptedRemoteAgentRoutes(
             host: host, transaction: routes.transaction
         )) {
-            // Commit already succeeded. A lost finalize response cannot make
-            // the live route unsafe; keep the grants and finish housekeeping
-            // in the background rather than rolling back a working repair.
+            // The exact route is already verified. Keep the grants and finish
+            // deleting transaction backups in the background.
             Self.scheduleAdoptedRemoteAgentRouteFinalize(
                 host: host, transaction: routes.transaction
             )
@@ -804,22 +828,6 @@ extension TeamOrchestrator {
             ) == nil
         }
         refreshLeaderParticipationControls()
-
-        // Replacing route files is only a prerequisite. The production
-        // failure that led here had a live leader, live workers, and a fresh
-        // route while every reverse team call still timed out. Exercise the
-        // exact leader-side path before touching workers or claiming success.
-        if let verificationFailure = await Self.verifyRemoteCollaborationRoute(
-            host: host, teamName: teamName, teamUUID: teamUUID
-        ) {
-            return CollaborationRecoveryReport(
-                routeRepaired: true, routeVerified: false,
-                leaderLive: initialPlan.leaderLive,
-                liveAgents: initialPlan.liveAgentCount,
-                replacedAgents: [], failedAgents: [],
-                verificationFailure: verificationFailure
-            )
-        }
 
         guard let refreshedLease = try? await PeerPaneHostRegistry.shared.acquire(
             Self.requireTeamHostSpec(host)
@@ -941,15 +949,16 @@ extension TeamOrchestrator {
         }
 
         var message: String {
+            if let verificationFailure, !routeVerified {
+                return routeRepaired
+                    ? "Routes were refreshed, but leader control verification failed: \(verificationFailure)."
+                    : "Leader control verification failed and the route update was rolled back: \(verificationFailure)."
+            }
             if !routeRepaired {
                 return failedAgents.first.map { "Collaboration repair failed: \($0)." }
                     ?? "Collaboration repair failed."
             }
-            if !routeVerified {
-                return verificationFailure.map {
-                    "Routes were refreshed, but leader control verification failed: \($0)."
-                } ?? "Routes were refreshed, but leader control could not be verified."
-            }
+            if !routeVerified { return "Routes were refreshed, but leader control could not be verified." }
             if !failedAgents.isEmpty, !leaderLive {
                 return "Leader control verified, but \(failedAgents.joined(separator: ", "))."
             }
@@ -979,7 +988,9 @@ extension TeamOrchestrator {
         peerSocketPath: String,
         health: PeerHostHealthBaseline?
     ) -> String? {
-        if let health, health.controlPathPresent, !health.controlPath.isEmpty {
+        if let health,
+           health.peerPathPresent, health.peerPath == peerSocketPath,
+           health.controlPathPresent, !health.controlPath.isEmpty {
             return health.controlPath
         }
         if peerSocketPath.hasSuffix("/term-meshd-peer.sock") {

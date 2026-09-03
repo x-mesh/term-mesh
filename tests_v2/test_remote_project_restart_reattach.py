@@ -83,15 +83,15 @@ def _restart_remote_fixture_daemon(host: str, remote_dir: str) -> None:
         f"root={root!r}; "
         'old=$(cat "$root/pid"); kill "$old" 2>/dev/null || true; '
         'for _ in $(seq 1 80); do kill -0 "$old" 2>/dev/null || break; sleep .1; done; '
-        'rm -f "$root/peer.sock" "$root/control.sock"; '
+        'rm -f "$root/term-meshd-peer.sock" "$root/term-meshd.sock"; '
         'env XDG_DATA_HOME="$root/state" XDG_RUNTIME_DIR="$root/runtime" '
         'PATH=/tmp/term-mesh-release-relay-target/release:$HOME/.cargo/bin:'
         '$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH '
-        'TERMMESH_PEER_SOCKET="$root/peer.sock" '
-        'TERMMESH_DAEMON_UNIX_PATH="$root/control.sock" '
+        'TERMMESH_PEER_SOCKET="$root/term-meshd-peer.sock" '
+        'TERMMESH_DAEMON_UNIX_PATH="$root/term-meshd.sock" '
         'nohup /tmp/term-mesh-release-relay-target/release/term-meshd '
         '>"$root/daemon.log" 2>&1 & echo $! >"$root/pid"; '
-        'for _ in $(seq 1 120); do [ -S "$root/peer.sock" ] && exit 0; sleep .25; done; '
+        'for _ in $(seq 1 120); do [ -S "$root/term-meshd-peer.sock" ] && exit 0; sleep .25; done; '
         'tail -100 "$root/daemon.log" >&2; exit 1'
     )
     _remote_stdout(host, command, timeout_s=45)
@@ -104,7 +104,7 @@ def _remote_project_manifest_status(
     root = str(Path(remote_dir).parent)
     output = _remote_stdout(
         host,
-        f"env TERMMESH_DAEMON_UNIX_PATH={str(Path(root) / 'control.sock')!r} "
+        f"env TERMMESH_DAEMON_UNIX_PATH={str(Path(root) / 'term-meshd.sock')!r} "
         "/tmp/term-mesh-release-relay-target/release/tm-agent "
         "daemon project-presentations list",
         timeout_s=30,
