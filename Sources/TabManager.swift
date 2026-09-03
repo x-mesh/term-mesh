@@ -34,6 +34,7 @@ class TabManager {
     /// mount — only `panel.close()` frees it — so the pin is released as soon
     /// as it has done its job.
     private(set) var surfaceRealizationPins: Set<UUID> = []
+    @ObservationIgnored private var surfaceRealizationPinCounts: [UUID: Int] = [:]
 
     /// Titlebar progress bar state. Set to non-nil to show, nil to hide.
     var titlebarProgress: TitlebarProgress?
@@ -356,19 +357,24 @@ class TabManager {
 
     /// Hold `id` in the mounted set until its panes have surfaces.
     ///
-    /// See `surfaceRealizationPins`. Idempotent: pinning a workspace that is
-    /// already pinned changes nothing, so a repeated peer request cannot leak
-    /// a second pin that the release path then fails to clear.
+    /// See `surfaceRealizationPins`. Each call acquires one lease; callers must
+    /// release exactly the lease they acquired.
     func pinWorkspaceForSurfaceRealization(_ id: UUID) {
-        guard !surfaceRealizationPins.contains(id) else { return }
-        surfaceRealizationPins.insert(id)
+        let count = surfaceRealizationPinCounts[id, default: 0]
+        surfaceRealizationPinCounts[id] = count + 1
+        if count == 0 { surfaceRealizationPins.insert(id) }
     }
 
     /// Release a realization pin. Safe to call for an id that was never
     /// pinned — the caller's timeout and its success path both end here.
     func unpinWorkspaceForSurfaceRealization(_ id: UUID) {
-        guard surfaceRealizationPins.contains(id) else { return }
-        surfaceRealizationPins.remove(id)
+        guard let count = surfaceRealizationPinCounts[id] else { return }
+        if count > 1 {
+            surfaceRealizationPinCounts[id] = count - 1
+        } else {
+            surfaceRealizationPinCounts.removeValue(forKey: id)
+            surfaceRealizationPins.remove(id)
+        }
     }
 
     /// Whether `id` now holds a pane the peer protocol would actually report.

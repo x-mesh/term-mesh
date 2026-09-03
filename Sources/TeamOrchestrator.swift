@@ -2,6 +2,7 @@ import AppKit
 import Bonsplit
 import Foundation
 import os
+import PeerProto
 
 /// Manages multi-agent Claude teams where a leader orchestrates N agent instances,
 /// each running in split panes within a single workspace.
@@ -591,6 +592,10 @@ final class TeamOrchestrator: ObservableObject {
     /// second reattach/bootstrap against the same team. Runtime EOF can also
     /// arrive more than once while Ghostty and the peer relay unwind.
     var remoteLeaderRecoveryInFlight: Set<String> = []
+    /// The operator repair is one route transaction per Project. Review Board
+    /// and the owner socket can invoke it concurrently, so MainActor alone is
+    /// not a lock once the first call suspends for remote I/O.
+    var collaborationRepairInFlight: Set<String> = []
 
     func beginRemoteLeaderAttach(teamName: String) -> Bool {
         remoteLeaderRecoveryInFlight.insert(teamName).inserted
@@ -604,6 +609,10 @@ final class TeamOrchestrator: ObservableObject {
     /// which minted the grant and owns the project, may extend its server lease.
     var remoteLeaderGrantKeepalives: [String: Task<Void, Never>] = [:]
     var remoteLeaderGrantIDs: [String: Data] = [:]
+    /// Full leader grants retained so an immediately-following repair can
+    /// stage and verify the grant that actually launched the leader instead of
+    /// minting a second bearer for the same deterministic route file.
+    var remoteLeaderGrants: [String: Termmesh_Peer_V1_TeamLeaderGrant] = [:]
     /// A remote worker cannot use this Mac's Unix app socket. Give each one a
     /// separate scoped reverse-route grant so `tm-agent send/inbox/reply`
     /// reaches the team that owns it without exposing that socket remotely.

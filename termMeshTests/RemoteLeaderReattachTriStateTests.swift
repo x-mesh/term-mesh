@@ -23,6 +23,30 @@ import XCTest
 /// roster to nil and hands it here — so pinning it pins the real path.
 @MainActor
 final class RemoteLeaderReattachTriStateTests: XCTestCase {
+    func testRepairUnpinsOnlyAfterTheExactReplacementRelayStarts() {
+        let replacement = UUID()
+        XCTAssertTrue(TeamOrchestrator.remoteRepairLeaderIsReadyToUnpin(
+            teamLeaderPanelID: replacement,
+            inspectedPanelID: replacement,
+            relayStarted: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.remoteRepairLeaderIsReadyToUnpin(
+            teamLeaderPanelID: replacement,
+            inspectedPanelID: UUID(),
+            relayStarted: true
+        ))
+        XCTAssertFalse(TeamOrchestrator.remoteRepairLeaderIsReadyToUnpin(
+            teamLeaderPanelID: replacement,
+            inspectedPanelID: replacement,
+            relayStarted: false
+        ))
+        XCTAssertFalse(TeamOrchestrator.remoteRepairLeaderIsReadyToUnpin(
+            teamLeaderPanelID: nil,
+            inspectedPanelID: replacement,
+            relayStarted: true
+        ))
+    }
+
     func testOnlyOwnerDeletionCreatesAReadoptionTombstone() {
         XCTAssertTrue(TeamOrchestrator.shouldTombstoneDeletedProject(
             ownsRemotePresentation: true

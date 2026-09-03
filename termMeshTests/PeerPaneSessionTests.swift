@@ -5481,6 +5481,24 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func test_collaborationRouteVerificationCanProbeStagedCandidateBeforeCommit() {
+        let candidate =
+            "/srv/agent/.term-mesh/agent-routes/.tx.42/leader-team-uuid.json.new"
+        let script = TeamOrchestrator.remoteCollaborationRouteVerificationScript(
+            teamName: "xm",
+            teamUUID: "team-uuid",
+            controlSocketPath: "/run/term-mesh/term-meshd.sock",
+            hostBinDirs: [],
+            routeFilePath: candidate
+        )
+        XCTAssertTrue(script.contains(candidate))
+        XCTAssertFalse(
+            script.contains("$HOME/.term-mesh/agent-routes/leader-team-uuid.json"),
+            "candidate verification must not read or replace the canonical route"
+        )
+    }
+
+    @MainActor
     func test_collaborationRouteVerificationParserRequiresExactProxiedTeam() throws {
         func output(team: String = "xm", proxied: Bool = true) throws -> String {
             let value: [String: Any] = [
@@ -5676,8 +5694,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         let decode = body.range(of: "base64 $flag >")
         XCTAssertNotNil(decode)
         XCTAssertFalse(body.contains("mv -f \"$p\" \"$dir/$n\""))
-        XCTAssertTrue(body.contains("trap rollback EXIT HUP INT TERM"))
-        XCTAssertTrue(body.contains("mv -f \"$tx/$n.old\" \"$dir/$n\""))
+        XCTAssertTrue(body.contains("trap cleanup EXIT HUP INT TERM"))
+        XCTAssertTrue(body.contains("$tx/$n.base"))
         XCTAssertTrue(body.contains("__TERMMESH_ROUTE_DIR__="))
     }
 
@@ -5744,6 +5762,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             rollback?.contains("mv -f \"$tx/$n.old\" \"$dir/$n\"") == true
         )
         XCTAssertTrue(commit?.contains("mv -f \"$p\" \"$dir/$n\"") == true)
+        XCTAssertTrue(commit?.contains("cmp -s \"$tx/$n.base\" \"$dir/$n\"") == true)
+        XCTAssertTrue(commit?.contains("$tx/$n.installed") == true)
         XCTAssertTrue(commit?.contains("[ -f \"$tx/committed.done\" ] && exit 0") == true)
         XCTAssertTrue(commit?.contains("[ -d \"$tx\" ] || exit 67") == true)
         XCTAssertTrue(
@@ -5864,6 +5884,14 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         let transaction = try XCTUnwrap(
             TeamOrchestrator.parseAdoptedRouteTransaction(stagedOutput)
         )
+        let stagedCandidate = directory
+            .appendingPathComponent(transaction)
+            .appendingPathComponent("worker.json.new")
+        XCTAssertEqual(try Data(contentsOf: stagedCandidate), Data("test".utf8))
+        XCTAssertEqual(
+            try Data(contentsOf: live), Data("old".utf8),
+            "candidate verification must happen while the canonical route remains old"
+        )
         let commit = Process()
         commit.executableURL = URL(fileURLWithPath: "/bin/sh")
         commit.arguments = [
@@ -5972,6 +6000,188 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             FileManager.default.fileExists(
                 atPath: directory.appendingPathComponent(transaction).path
             )
+        )
+    }
+
+    @MainActor
+    func test_adoptedRouteCASRejectsStaleCommitAndRollbackCannotClobberNewerWriter() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-route-cas-\(UUID().uuidString)")
+        let directory = home.appendingPathComponent(".term-mesh/agent-routes")
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: home) }
+        let live = directory.appendingPathComponent("worker.json")
+        try Data("old".utf8).write(to: live)
+        let environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+
+        func run(_ script: String, input: String? = nil) throws -> (Int32, String) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", script]
+            process.environment = environment
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = Pipe()
+            if let input {
+                let pipe = Pipe()
+                process.standardInput = pipe
+                try process.run()
+                pipe.fileHandleForWriting.write(Data(input.utf8))
+                try pipe.fileHandleForWriting.close()
+            } else {
+                try process.run()
+            }
+            let text = String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self
+            )
+            process.waitUntilExit()
+            return (process.terminationStatus, text)
+        }
+
+        func stage(_ bytes: String) throws -> String {
+            let encoded = Data(bytes.utf8).base64EncodedString()
+            let result = try run(
+                TeamOrchestrator.adoptedRemoteAgentRouteTransactionScript(),
+                input: "worker.json\t\(encoded)\n"
+            )
+            XCTAssertEqual(result.0, 0)
+            return try XCTUnwrap(
+                TeamOrchestrator.parseAdoptedRouteTransaction(result.1)
+            )
+        }
+
+        let transactionA = try stage("candidate-a")
+        let transactionB = try stage("candidate-b")
+        let commitB = try run(try XCTUnwrap(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transactionB, commit: true
+            )
+        ))
+        XCTAssertEqual(commitB.0, 0)
+        XCTAssertEqual(try Data(contentsOf: live), Data("candidate-b".utf8))
+        let staleCommitA = try run(try XCTUnwrap(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transactionA, commit: true
+            )
+        ))
+        XCTAssertNotEqual(staleCommitA.0, 0)
+        XCTAssertEqual(
+            try Data(contentsOf: live), Data("candidate-b".utf8),
+            "only one concurrent snapshot may replace the canonical route"
+        )
+        XCTAssertEqual(try run(try XCTUnwrap(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transactionA, commit: false
+            )
+        )).0, 0)
+        XCTAssertEqual(try run(try XCTUnwrap(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transactionB, commit: false
+            )
+        )).0, 0)
+        let transactionC = try stage("candidate-c")
+        XCTAssertEqual(try run(try XCTUnwrap(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transactionC, commit: true
+            )
+        )).0, 0)
+        XCTAssertEqual(try Data(contentsOf: live), Data("candidate-c".utf8))
+        try Data("later-writer".utf8).write(to: live)
+        XCTAssertEqual(try run(try XCTUnwrap(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transactionC, commit: false
+            )
+        )).0, 0)
+        XCTAssertEqual(
+            try Data(contentsOf: live), Data("later-writer".utf8),
+            "a stale rollback must not overwrite another transaction's installed bytes"
+        )
+    }
+
+    @MainActor
+    func test_adoptedRouteCommitMutexPublishesOneWholeBatch() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-route-race-\(UUID().uuidString)")
+        let directory = home.appendingPathComponent(".term-mesh/agent-routes")
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: home) }
+        for name in ["leader.json", "worker.json"] {
+            try Data("old".utf8).write(to: directory.appendingPathComponent(name))
+        }
+        let environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+
+        func stage(_ generation: String) throws -> String {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = [
+                "-c", TeamOrchestrator.adoptedRemoteAgentRouteTransactionScript(),
+            ]
+            process.environment = environment
+            let input = Pipe()
+            let output = Pipe()
+            process.standardInput = input
+            process.standardOutput = output
+            process.standardError = Pipe()
+            try process.run()
+            let leader = Data("\(generation)-leader".utf8).base64EncodedString()
+            let worker = Data("\(generation)-worker".utf8).base64EncodedString()
+            input.fileHandleForWriting.write(
+                Data("leader.json\t\(leader)\nworker.json\t\(worker)\n".utf8)
+            )
+            try input.fileHandleForWriting.close()
+            let text = String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self
+            )
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0)
+            return try XCTUnwrap(TeamOrchestrator.parseAdoptedRouteTransaction(text))
+        }
+
+        let transactionA = try stage("a")
+        let transactionB = try stage("b")
+        let gate = home.appendingPathComponent("gate")
+        try FileManager.default.createDirectory(at: gate, withIntermediateDirectories: true)
+
+        func commit(_ transaction: String, marker: String, other: String) throws -> Process {
+            let body = try XCTUnwrap(
+                TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                    transaction: transaction, commit: true
+                )
+            )
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = [
+                "-c",
+                "touch \(gate.appendingPathComponent(marker).path); "
+                    + "while [ ! -f \(gate.appendingPathComponent(other).path) ]; do sleep 0.01; done; "
+                    + body,
+            ]
+            process.environment = environment
+            process.standardOutput = Pipe()
+            process.standardError = Pipe()
+            try process.run()
+            return process
+        }
+
+        let commitA = try commit(transactionA, marker: "a", other: "b")
+        let commitB = try commit(transactionB, marker: "b", other: "a")
+        commitA.waitUntilExit()
+        commitB.waitUntilExit()
+        XCTAssertEqual(
+            [commitA.terminationStatus, commitB.terminationStatus].filter { $0 == 0 }.count,
+            1,
+            "the short commit mutex must choose exactly one batch winner"
+        )
+        let leader = try String(contentsOf: directory.appendingPathComponent("leader.json"))
+        let worker = try String(contentsOf: directory.appendingPathComponent("worker.json"))
+        XCTAssertTrue(
+            (leader == "a-leader" && worker == "a-worker")
+                || (leader == "b-leader" && worker == "b-worker"),
+            "canonical routes must never contain a mixed transaction generation"
         )
     }
 
