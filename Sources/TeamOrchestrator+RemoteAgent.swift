@@ -368,6 +368,37 @@ extension TeamOrchestrator {
     }
 
     struct RemoteRepairPlaceholderGeneration: Equatable {
+        struct AgentRoutingGeneration: Equatable {
+            let id: String
+            let agentInstanceID: String
+            let name: String
+            let teamName: String
+            let cli: String
+            let launchCommand: String
+            let model: String
+            let agentType: String
+            let color: String
+            let instructions: String
+            let workspaceID: UUID
+            let panelID: UUID?
+            let parentSessionID: String?
+            let claudeSessionID: String?
+            let claudeSessionIDCapturedAt: Date?
+            let createdAt: Date
+            let remoteSurfaceID: Data?
+            let remoteSurfaceSpawned: Bool
+            let remoteAgentSurface: Bool
+            let remoteSurfaceOwnerRemoteSockPath: String?
+            let hostKey: String?
+            let originalSpawnCommand: String?
+            let originalAgentWorkDir: String?
+            let worktreeName: String?
+            let worktreePath: String?
+            let worktreeBranch: String?
+            let autoRecycleEvery: Int?
+            let completedTaskCount: Int
+        }
+
         let hostKey: String
         let teamUUID: String
         let projectID: String
@@ -375,8 +406,16 @@ extension TeamOrchestrator {
         let leaderPanelID: UUID
         let revision: UInt64
         let createdAt: Date
-        let memberInstanceIDs: [String]
-        let memberSurfaceIDs: [Data?]
+        let delegationState: ProjectDelegationState
+        let leaderSessionID: String
+        let leaderMode: String
+        let leaderModel: String
+        let leaderCLI: String?
+        let leaderEndpoint: LeaderEndpoint
+        let leaderFailureDescription: String?
+        let remotePresentationHostKey: String?
+        let remoteLeaderSurfaceID: Data?
+        let agents: [AgentRoutingGeneration]
     }
 
     enum ExactRepairInput: Equatable {
@@ -2290,8 +2329,38 @@ extension TeamOrchestrator {
             hostKey: hostKey, teamUUID: teamUUID, projectID: projectID,
             workspaceID: team.workspaceId, leaderPanelID: team.leaderPanelId,
             revision: team.remotePresentationRevision, createdAt: team.createdAt,
-            memberInstanceIDs: team.agents.map(\.agentInstanceId),
-            memberSurfaceIDs: team.agents.map(\.remoteSurfaceID)
+            delegationState: team.delegationState,
+            leaderSessionID: team.leaderSessionId, leaderMode: team.leaderMode,
+            leaderModel: team.leaderModel, leaderCLI: team.leaderCli,
+            leaderEndpoint: team.leaderEndpoint,
+            leaderFailureDescription: team.leaderFailureDescription,
+            remotePresentationHostKey: team.remotePresentationHostKey,
+            remoteLeaderSurfaceID: team.remoteLeaderSurfaceID,
+            agents: team.agents.map { agent in
+                .init(
+                    id: agent.id, agentInstanceID: agent.agentInstanceId,
+                    name: agent.name, teamName: agent.teamName, cli: agent.cli,
+                    launchCommand: agent.launchCommand, model: agent.model,
+                    agentType: agent.agentType, color: agent.color,
+                    instructions: agent.instructions, workspaceID: agent.workspaceId,
+                    panelID: agent.panelId, parentSessionID: agent.parentSessionId,
+                    claudeSessionID: agent.claudeSessionId,
+                    claudeSessionIDCapturedAt: agent.claudeSessionIdCapturedAt,
+                    createdAt: agent.createdAt,
+                    remoteSurfaceID: agent.remoteSurfaceID,
+                    remoteSurfaceSpawned: agent.remoteSurfaceSpawned,
+                    remoteAgentSurface: agent.remoteAgentSurface,
+                    remoteSurfaceOwnerRemoteSockPath:
+                        agent.remoteSurfaceOwnerRemoteSockPath,
+                    hostKey: agent.hostKey,
+                    originalSpawnCommand: agent.originalSpawnCommand,
+                    originalAgentWorkDir: agent.originalAgentWorkDir,
+                    worktreeName: agent.worktreeName, worktreePath: agent.worktreePath,
+                    worktreeBranch: agent.worktreeBranch,
+                    autoRecycleEvery: agent.autoRecycleEvery,
+                    completedTaskCount: agent.completedTaskCount
+                )
+            }
         )
     }
 
