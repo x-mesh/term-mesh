@@ -767,9 +767,11 @@ extension TeamOrchestrator {
                 authoritativeReplacementRequired: true,
                 replacementLaunchMetadata: launch
             ) else {
+                let detail = teams[teamName]?.leaderFailureDescription
+                    ?? "Leader replacement failed"
                 return CollaborationRecoveryReport(
                     routeRepaired: false, leaderLive: false, liveAgents: 0,
-                    replacedAgents: [], failedAgents: ["Leader replacement failed"]
+                    replacedAgents: [], failedAgents: [detail]
                 )
             }
             snapshotResult = await authoritativeCollaborationSnapshot(
