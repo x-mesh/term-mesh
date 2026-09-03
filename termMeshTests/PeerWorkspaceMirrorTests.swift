@@ -877,7 +877,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         func claims() -> [Bool] { authorityClaims }
     }
 
-    func testFocusedInitialResizeClaimsAuthority() async throws {
+    func testFocusedInitialResizeRemainsPassiveForExistingAuthority() async throws {
         let collector = ResizeColsCollector()
         let session = makeSession(collector)
         let coalescer = RelayResizeCoalescer(
@@ -896,7 +896,8 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         let cols = await collector.cols()
         let claims = await collector.claims()
         XCTAssertEqual(cols, [120])
-        XCTAssertEqual(claims, [true])
+        XCTAssertEqual(claims, [false],
+                       "the helper's initial reconcile must not steal authority from another viewer")
         await coalescer.cancel()
     }
 
@@ -954,6 +955,88 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         XCTAssertEqual(claims, [false, true],
                        "the focus-regain resend must claim authority")
         await coalescer.cancel()
+    }
+
+    func testPendingResizeClaimsWhenFocusArrivesDuringDelayWithoutDuplicateReassert() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC8, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            authorityEligible: false,
+            delayMs: 10_000,
+            onHeal: { _ in }
+        )
+
+        await coalescer.submit(cols: 80, rows: 24)
+        await coalescer.flushNow()
+        await coalescer.submit(cols: 130, rows: 42)
+        await coalescer.setAuthorityEligible(true)
+        await coalescer.flushNow()
+        await coalescer.flushNow()
+
+        let cols = await collector.cols()
+        let rows = await collector.rows()
+        let claims = await collector.claims()
+        XCTAssertEqual(cols, [80, 130])
+        XCTAssertEqual(rows, [24, 42])
+        XCTAssertEqual(claims, [false, true],
+                       "the pending helper resize should claim once at flush, without a stale duplicate")
+        await coalescer.cancel()
+    }
+
+    func testFocusLossBeforeReassertFlushDropsStaleAuthorityClaim() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC9, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            authorityEligible: false,
+            delayMs: 10_000,
+            onHeal: { _ in }
+        )
+
+        await coalescer.submit(cols: 120, rows: 36)
+        await coalescer.flushNow()
+        await coalescer.setAuthorityEligible(true)
+        await coalescer.setAuthorityEligible(false)
+        await coalescer.flushNow()
+
+        let cols = await collector.cols()
+        let claims = await collector.claims()
+        XCTAssertEqual(cols, [120])
+        XCTAssertEqual(claims, [false],
+                       "focus loss must remove a queued focus-only reassert before it can flush")
+        await coalescer.cancel()
+    }
+
+    func testCancelIsTerminalForFocusAndResizeScheduling() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xCA, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            authorityEligible: false,
+            delayMs: 1,
+            onHeal: { _ in }
+        )
+
+        await coalescer.submit(cols: 120, rows: 36)
+        await coalescer.cancel()
+        await coalescer.setAuthorityEligible(true)
+        await coalescer.submit(cols: 140, rows: 48)
+        await coalescer.flushNow()
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        let cols = await collector.cols()
+        XCTAssertTrue(cols.isEmpty,
+                      "cancel must prevent focus and resize events from recreating flush tasks")
     }
 
     /// A resize held for the coalescing delay must be passive if focus leaves
