@@ -1527,19 +1527,23 @@ final class PeerPaneSessionTests: XCTestCase {
                 teamName: teamName, teamUUIDs: [oldUUID, newUUID, thirdUUID]
             )
         }
+        // `surfaceByte` is passed, not derived. Deriving it from `uuid.count`
+        // gave every placeholder the same 16 bytes — a UUID string is always
+        // 36 characters — so a swap that kept the consumed placeholder's
+        // surfaces produced identical routing and no assertion could see it.
         func placeholder(
             host: String, uuid: String, project: String, worker: String,
-            delegation: String
+            delegation: String, surfaceByte: UInt8
         ) throws -> TeamOrchestrator.Team {
             let remote = RemoteTeamSummary(
                 name: teamName, teamUUID: uuid, workingDirectory: "/work/\(uuid)",
                 projectRootPath: nil, agentNames: ["executor"], projectID: project,
-                leaderSurfaceID: Data(repeating: UInt8(uuid.count), count: 16),
+                leaderSurfaceID: Data(repeating: surfaceByte, count: 16),
                 members: [.init(
                     name: "executor", agentInstanceID: worker, cli: "claude",
                     model: "sonnet", agentType: "executor", color: "blue",
                     workingDirectory: "/work/\(uuid)",
-                    surfaceID: Data(repeating: UInt8(worker.count), count: 16),
+                    surfaceID: Data(repeating: surfaceByte &+ 1, count: 16),
                     surfaceType: "agent"
                 )],
                 presentationOwnedByRequester: true,
@@ -1555,11 +1559,11 @@ final class PeerPaneSessionTests: XCTestCase {
 
         let old = try placeholder(
             host: "ssh:old", uuid: oldUUID, project: "team:\(oldUUID)",
-            worker: "old-worker", delegation: "leaderFirst"
+            worker: "old-worker", delegation: "leaderFirst", surfaceByte: 0x10
         )
         let replacement = try placeholder(
             host: "ssh:new", uuid: newUUID, project: "team:\(newUUID)",
-            worker: "new-worker", delegation: "parallel"
+            worker: "new-worker", delegation: "parallel", surfaceByte: 0x20
         )
         XCTAssertTrue(
             TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(old)
@@ -1591,6 +1595,17 @@ final class PeerPaneSessionTests: XCTestCase {
             TeamDataStore.shared.projectDelegationState(teamName: teamName),
             replacement.delegationState
         )
+        XCTAssertEqual(
+            TeamOrchestrator.shared.teams[teamName]?.remoteLeaderSurfaceID,
+            Data(repeating: 0x20, count: 16),
+            "the swap must route the leader to B's surface, not keep A's"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.shared.teams[teamName]?.agents
+                .first { $0.name == "executor" }?.remoteSurfaceID,
+            Data(repeating: 0x21, count: 16),
+            "the swap must route the worker to B's surface, not keep A's"
+        )
         XCTAssertFalse(
             TeamOrchestrator.shared.replaceInertRemoteProjectRepairPlaceholder(
                 expected: expected, replacement: old
@@ -1604,7 +1619,7 @@ final class PeerPaneSessionTests: XCTestCase {
         )
         let third = try placeholder(
             host: "ssh:third", uuid: thirdUUID, project: "team:\(thirdUUID)",
-            worker: "third-worker", delegation: "guarded"
+            worker: "third-worker", delegation: "guarded", surfaceByte: 0x30
         )
         XCTAssertTrue(
             TeamOrchestrator.shared.replaceInertRemoteProjectRepairPlaceholder(
@@ -1926,6 +1941,11 @@ final class PeerPaneSessionTests: XCTestCase {
                 "value"
             ] as? String, "target"
         )
+        // Install schedules a normalization save 0.5s out. Comparing the files
+        // straight after the CAS only proved the assertion outran that timer,
+        // so it could not fail whatever the swap did to the pending save.
+        // Draining first makes it prove the swap cancelled or redirected it.
+        TeamDataStore.shared.drainBoardIOForTests()
         XCTAssertEqual(try Data(contentsOf: oldURL), oldBytes)
         XCTAssertEqual(try Data(contentsOf: newURL), newBytes)
     }
