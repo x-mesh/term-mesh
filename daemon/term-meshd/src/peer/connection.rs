@@ -388,34 +388,41 @@ async fn reader_loop(
                     let Ok(leader_surface_id) = hex::decode(&manifest.leader_surface_id) else {
                         continue;
                     };
+                    // `members` is the durable desired roster. Keep it intact
+                    // even when a daemon restart or process exit leaves a
+                    // persisted surface absent. `agent_names` remains the
+                    // live roster so existing clients retain their liveness
+                    // signal while owners can reconstruct missing members.
                     let members = manifest
                         .members
                         .iter()
                         .filter_map(|member| {
                             let surface_id = hex::decode(&member.surface_id).ok()?;
-                            live_surfaces
-                                .contains_key(&surface_id)
-                                .then_some(TeamMember {
-                                    name: member.name.clone(),
-                                    agent_instance_id: member.agent_instance_id.clone(),
-                                    cli: member.cli.clone(),
-                                    model: member.model.clone(),
-                                    agent_type: member.agent_type.clone(),
-                                    color: member.color.clone(),
-                                    working_directory: member.working_directory.clone(),
-                                    surface_id,
-                                    surface_type: member.surface_type.clone(),
-                                })
+                            Some(TeamMember {
+                                name: member.name.clone(),
+                                agent_instance_id: member.agent_instance_id.clone(),
+                                cli: member.cli.clone(),
+                                model: member.model.clone(),
+                                agent_type: member.agent_type.clone(),
+                                color: member.color.clone(),
+                                working_directory: member.working_directory.clone(),
+                                surface_id,
+                                surface_type: member.surface_type.clone(),
+                            })
                         })
                         .collect::<Vec<TeamMember>>();
+                    let live_agent_names = members
+                        .iter()
+                        .filter(|member| live_surfaces.contains_key(&member.surface_id))
+                        .map(|member| member.name.clone())
+                        .collect::<Vec<String>>();
                     if let Some(team) = teams
                         .iter_mut()
                         .find(|team| team.team_uuid == manifest.team_uuid)
                     {
                         team.project_id = manifest.project_id;
                         team.leader_surface_id = leader_surface_id;
-                        team.agent_names =
-                            members.iter().map(|member| member.name.clone()).collect();
+                        team.agent_names = live_agent_names;
                         team.members = members;
                         team.presentation_revision = manifest.revision;
                         team.delegation_configured = manifest.delegation_configured;
@@ -448,7 +455,7 @@ async fn reader_loop(
                             team_uuid: manifest.team_uuid,
                             working_directory: manifest.working_directory,
                             project_root: manifest.project_root,
-                            agent_names: members.iter().map(|member| member.name.clone()).collect(),
+                            agent_names: live_agent_names,
                             created_at_unix_secs: manifest.created_at_unix_secs,
                             leader_surface_id,
                             members,
@@ -4538,6 +4545,9 @@ mod agent_surface_tests {
                                 name: "worker".into(),
                                 agent_instance_id: "worker-instance".into(),
                                 cli: "codex".into(),
+                                model: "gpt-5.6-sol".into(),
+                                agent_type: "reviewer".into(),
+                                color: "blue".into(),
                                 working_directory: "/tmp".into(),
                                 surface_id: member_id.clone(),
                                 surface_type: "agent".into(),
@@ -4671,12 +4681,33 @@ mod agent_surface_tests {
                 other => panic!("expected team list, got {other:?}"),
             }
         };
-        assert_eq!(list.teams.len(), 1, "a live leader keeps the project discoverable");
+        assert_eq!(
+            list.teams.len(),
+            1,
+            "a live leader keeps the project discoverable"
+        );
         assert_eq!(list.teams[0].leader_surface_id, leader_id);
         assert!(
-            list.teams[0].members.is_empty(),
-            "dead members must be omitted instead of respawned by discovery"
+            list.teams[0].agent_names.is_empty(),
+            "dead members must be omitted from the live roster"
         );
+        assert_eq!(
+            list.teams[0].members.len(),
+            1,
+            "the desired roster must retain dead members for deterministic repair"
+        );
+        assert_eq!(list.teams[0].members[0].name, "worker");
+        assert_eq!(
+            list.teams[0].members[0].agent_instance_id,
+            "worker-instance"
+        );
+        assert_eq!(list.teams[0].members[0].cli, "codex");
+        assert_eq!(list.teams[0].members[0].model, "gpt-5.6-sol");
+        assert_eq!(list.teams[0].members[0].agent_type, "reviewer");
+        assert_eq!(list.teams[0].members[0].color, "blue");
+        assert_eq!(list.teams[0].members[0].working_directory, "/tmp");
+        assert_eq!(list.teams[0].members[0].surface_id, member_id);
+        assert_eq!(list.teams[0].members[0].surface_type, "agent");
 
         let (mut owner_reader, mut owner_writer) = handshake_as_with_owner_aliases(
             reloaded_host,
@@ -4764,8 +4795,10 @@ mod agent_surface_tests {
                                 agent_instance_id: "worker-instance".into(),
                                 cli: "claude".into(),
                                 model: "claude-sonnet-5".into(),
+                                agent_type: "executor".into(),
+                                color: "green".into(),
                                 working_directory: "/tmp/manifest-only".into(),
-                                surface_id: member_id,
+                                surface_id: member_id.clone(),
                                 surface_type: "agent".into(),
                                 ..Default::default()
                             }],
@@ -4839,7 +4872,16 @@ mod agent_surface_tests {
         assert_eq!(project.delegation_effective, "leader-first");
         assert_eq!(project.delegation_pending, "delegated");
         assert!(project.agent_names.is_empty());
-        assert!(project.members.is_empty());
+        assert_eq!(project.members.len(), 1);
+        assert_eq!(project.members[0].name, "worker");
+        assert_eq!(project.members[0].agent_instance_id, "worker-instance");
+        assert_eq!(project.members[0].cli, "claude");
+        assert_eq!(project.members[0].model, "claude-sonnet-5");
+        assert_eq!(project.members[0].agent_type, "executor");
+        assert_eq!(project.members[0].color, "green");
+        assert_eq!(project.members[0].working_directory, "/tmp/manifest-only");
+        assert_eq!(project.members[0].surface_id, member_id);
+        assert_eq!(project.members[0].surface_type, "agent");
         assert!(project.leader_process_active_known);
         assert!(!project.leader_process_active);
     }

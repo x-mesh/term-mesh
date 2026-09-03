@@ -957,6 +957,139 @@ final class PeerPaneSessionTests: XCTestCase {
         ))
     }
 
+    func testAutomaticRemoteRepairPlaceholderRequiresExactOwnedKnownDeadManifest() {
+        let leaderID = Data(repeating: 0x71, count: 16)
+        let dead = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: ["executor"],
+            projectID: "team:uuid", leaderSurfaceID: leaderID,
+            presentationOwnedByRequester: true,
+            leaderProcessActive: false, leaderProcessActiveKnown: true
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.automaticRemoteProjectRepairPlaceholderCandidate(
+                in: [dead], leaderRecord: nil
+            ), dead
+        )
+
+        let unknown = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: [], projectID: "team:uuid",
+            leaderSurfaceID: leaderID, presentationOwnedByRequester: true
+        )
+        let live = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: [], projectID: "team:uuid",
+            leaderSurfaceID: leaderID, presentationOwnedByRequester: true,
+            leaderProcessActive: true, leaderProcessActiveKnown: true
+        )
+        XCTAssertNil(TeamOrchestrator.automaticRemoteProjectRepairPlaceholderCandidate(
+            in: [unknown], leaderRecord: nil
+        ))
+        XCTAssertNil(TeamOrchestrator.automaticRemoteProjectRepairPlaceholderCandidate(
+            in: [live], leaderRecord: nil
+        ))
+        XCTAssertNil(TeamOrchestrator.automaticRemoteProjectRepairPlaceholderCandidate(
+            in: [dead, RemoteTeamSummary(
+                name: "xm", teamUUID: "other", workingDirectory: "/other",
+                projectRootPath: nil, agentNames: [], projectID: "team:other",
+                leaderSurfaceID: Data(repeating: 0x72, count: 16),
+                presentationOwnedByRequester: true,
+                leaderProcessActiveKnown: true
+            )], leaderRecord: nil
+        ))
+    }
+
+    func testRemoteRepairPlaceholderPreservesDurableTopologyWithoutPanels() throws {
+        let leaderID = Data(repeating: 0x73, count: 16)
+        let workerID = Data(repeating: 0x74, count: 16)
+        let delegation = ProjectDelegationState(
+            configuredRaw: "parallel", effectiveRaw: "parallel", pendingRaw: ""
+        )
+        let remote = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: "/work/xm", agentNames: ["executor"],
+            projectID: "team:uuid", leaderSurfaceID: leaderID,
+            leaderCLI: "codex", leaderModel: "gpt-5.6-sol",
+            members: [.init(
+                name: "executor", agentInstanceID: "worker-instance",
+                cli: "claude", model: "sonnet", agentType: "executor",
+                color: "blue", workingDirectory: "/work/xm-agent",
+                surfaceID: workerID, surfaceType: "agent"
+            )],
+            presentationRevision: 17, presentationOwnedByRequester: true,
+            leaderProcessActive: false, leaderProcessActiveKnown: true,
+            delegationState: delegation
+        )
+
+        let team = try XCTUnwrap(TeamOrchestrator.remoteProjectRepairPlaceholder(
+            remote: remote, hostKey: "ssh:mac-sub"
+        ))
+        XCTAssertTrue(team.isRemoteRepairPlaceholder)
+        XCTAssertTrue(team.ownsRemotePresentation)
+        XCTAssertFalse(team.leaderReady)
+        XCTAssertEqual(team.teamUuid, "uuid")
+        XCTAssertEqual(team.remotePresentationProjectID, "team:uuid")
+        XCTAssertEqual(team.remotePresentationHostKey, "ssh:mac-sub")
+        XCTAssertEqual(team.remoteLeaderSurfaceID, leaderID)
+        XCTAssertEqual(team.leaderCli, "codex")
+        XCTAssertEqual(team.leaderModel, "gpt-5.6-sol")
+        XCTAssertEqual(team.delegationState, delegation)
+        XCTAssertEqual(team.agents.count, 1)
+        XCTAssertEqual(team.agents[0].agentInstanceId, "worker-instance")
+        XCTAssertEqual(team.agents[0].remoteSurfaceID, workerID)
+        XCTAssertEqual(team.agents[0].hostKey, "ssh:mac-sub")
+        XCTAssertNil(team.agents[0].panelId)
+    }
+
+    @MainActor
+    func testInstallingRemoteRepairPlaceholderRegistersDurableRoutingState() throws {
+        let teamName = "repair-placeholder-\(UUID().uuidString)"
+        defer {
+            TeamOrchestrator.shared.teams.removeValue(forKey: teamName)
+            TeamDataStore.shared.unregisterTeam(teamName)
+        }
+        let remote = RemoteTeamSummary(
+            name: teamName, teamUUID: "durable-team", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: ["executor"],
+            projectID: "team:durable-team",
+            leaderSurfaceID: Data(repeating: 0x75, count: 16),
+            members: [.init(
+                name: "executor", agentInstanceID: "durable-worker",
+                cli: "claude", model: "sonnet", agentType: "executor",
+                color: "blue", workingDirectory: "/work/xm",
+                surfaceID: Data(repeating: 0x76, count: 16), surfaceType: "agent"
+            )],
+            presentationOwnedByRequester: true,
+            leaderProcessActiveKnown: true,
+            delegationState: .init(
+                configuredRaw: "parallel", effectiveRaw: "parallel", pendingRaw: ""
+            )
+        )
+        let placeholder = try XCTUnwrap(
+            TeamOrchestrator.remoteProjectRepairPlaceholder(
+                remote: remote, hostKey: "ssh:mac-sub"
+            )
+        )
+
+        XCTAssertTrue(
+            TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(placeholder)
+        )
+        XCTAssertEqual(
+            TeamDataStore.shared.agentInstanceId(
+                teamName: teamName, agentName: "executor"
+            ),
+            "durable-worker"
+        )
+        XCTAssertEqual(
+            TeamDataStore.shared.projectDelegationState(teamName: teamName),
+            remote.delegationState
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(placeholder)
+        )
+    }
+
     func testAutomaticRestoreFailureKeyChangesWithSocketOrRevision() {
         let base = TeamOrchestrator.automaticProjectRestoreFailureKey(
             hostID: "host", activeSockPath: "/tmp/one.sock",

@@ -555,6 +555,11 @@ final class TeamOrchestrator: ObservableObject {
         /// viewers keep this only in team state so the shell cleanup registry
         /// never mistakes somebody else's process for a managed orphan.
         var remoteLeaderSurfaceID: Data? = nil
+        /// Owner-only, non-presenting reconstruction state installed from one
+        /// exact durable manifest whose leader is authoritatively inactive.
+        /// It deliberately owns no workspace or panel until the user invokes
+        /// Repair collaboration.
+        var isRemoteRepairPlaceholder: Bool = false
     }
 
     struct AgentPaneIdentity: Equatable {
@@ -7982,7 +7987,7 @@ final class TeamOrchestrator: ObservableObject {
         return payload
     }
 
-    private func syncTeamStateToDaemon() {
+    func syncTeamStateToDaemon() {
         for team in teams.values {
             if let teamUUID = team.teamUuid?.nilIfBlank {
                 LeaderTurnLog.rememberIdentity(

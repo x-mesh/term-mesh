@@ -558,6 +558,12 @@ extension TeamOrchestrator {
         teamName: String,
         repairableMissingAgentIDs: Set<String>
     ) async -> Bool {
+        if teams[teamName]?.isRemoteRepairPlaceholder == true {
+            await attachRemoteRepairPlaceholderWorkers(
+                teamName: teamName,
+                repairableMissingAgentIDs: repairableMissingAgentIDs
+            )
+        }
         if collaborationPresentationState(
             teamName: teamName,
             requireLiveSessions: false,
@@ -575,6 +581,56 @@ extension TeamOrchestrator {
             requireLiveSessions: false,
             repairableMissingAgentIDs: repairableMissingAgentIDs
         ) == .ready
+    }
+
+    /// Explicit Repair has already replaced the dead leader. Reattach each
+    /// surviving persisted worker into that new workspace before refreshing
+    /// routes; known-dead workers stay panel-less for the replacement phase.
+    @MainActor
+    private func attachRemoteRepairPlaceholderWorkers(
+        teamName: String,
+        repairableMissingAgentIDs: Set<String>
+    ) async {
+        guard let team = teams[teamName], team.isRemoteRepairPlaceholder,
+              let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId),
+              let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId })
+        else { return }
+        for agent in team.agents where agent.panelId == nil
+            && !repairableMissingAgentIDs.contains(agent.agentInstanceId) {
+            guard let hostKey = agent.hostKey, let surfaceID = agent.remoteSurfaceID else { continue }
+            let owningEndpoint = RestoredSurfaceEndpoint()
+            guard let panelID = await attachRestoredRemoteSurface(
+                hostKey: hostKey,
+                surfaceID: surfaceID,
+                title: agent.name,
+                panelTitle: "\(Self.colorEmoji(agent.color)) \(agent.name)",
+                workspace: workspace,
+                owningRemoteSockPath: owningEndpoint,
+                onAgentPanel: { panel, host in
+                    Self.bindPeerOwnedAgentPanel(
+                        panel: panel,
+                        workspace: workspace,
+                        teamName: teamName,
+                        agentName: agent.name,
+                        agentInstanceId: agent.agentInstanceId,
+                        color: agent.color,
+                        hostDisplayName: host.displayName
+                    )
+                }
+            ) else { continue }
+            guard var current = teams[teamName],
+                  let index = current.agents.firstIndex(where: {
+                      $0.agentInstanceId == agent.agentInstanceId
+                  }) else { continue }
+            current.agents[index].panelId = panelID
+            current.agents[index].remoteSurfaceOwnerRemoteSockPath =
+                owningEndpoint.remoteSockPath
+            teams[teamName] = current
+        }
+        if var current = teams[teamName] {
+            current.isRemoteRepairPlaceholder = false
+            teams[teamName] = current
+        }
     }
 
     /// Respawn a peer-owned member whose durable roster entry survived but
@@ -617,6 +673,38 @@ extension TeamOrchestrator {
         )
         Self.releasePeerOwnedAgentSurface(agent)
         scheduleAgentGridEqualization(workspace: workspace)
+        return true
+    }
+
+    /// Materialize the inert owner placeholder only after an explicit Repair
+    /// action and an authoritative dead-leader decision. Automatic restore
+    /// itself never spawns, attaches, or focuses a surface.
+    @MainActor
+    private func materializeRemoteRepairPlaceholder(teamName: String) -> Bool {
+        guard var team = teams[teamName], team.isRemoteRepairPlaceholder,
+              let tabManager = AppDelegate.shared?.tabManager
+        else { return teams[teamName]?.isRemoteRepairPlaceholder == false }
+        let workspace = tabManager.addWorkspace(
+            workingDirectory: team.workingDirectory,
+            select: false
+        )
+        workspace.customTitle = "[\(teamName)]"
+        workspace.title = "[\(teamName)]"
+        team.workspaceId = workspace.id
+        guard let anchorPanelID = workspace.focusedPanelId else {
+            tabManager.closeWorkspace(workspace)
+            return false
+        }
+        team.leaderPanelId = anchorPanelID
+        for index in team.agents.indices {
+            team.agents[index].workspaceId = workspace.id
+        }
+        teams[teamName] = team
+        WorkspaceProjectNames.shared.declare(
+            workspaceId: workspace.id,
+            projectName: teamName,
+            projectID: team.remotePresentationProjectID
+        )
         return true
     }
 
@@ -666,9 +754,16 @@ extension TeamOrchestrator {
                 remoteCLI: authoritative.team.leaderCLI,
                 remoteModel: authoritative.team.leaderModel
             )
+            guard materializeRemoteRepairPlaceholder(teamName: teamName),
+                  let repairAnchor = teams[teamName]?.leaderPanelId else {
+                return CollaborationRecoveryReport(
+                    routeRepaired: false, leaderLive: false, liveAgents: 0,
+                    replacedAgents: [], failedAgents: ["Repair presentation unavailable"]
+                )
+            }
             guard await recoverRemoteLeaderAfterRuntimeClose(
                 teamName: teamName,
-                closedPanelID: initial.leaderPanelId,
+                closedPanelID: repairAnchor,
                 authoritativeReplacementRequired: true,
                 replacementLaunchMetadata: launch
             ) else {
@@ -1579,6 +1674,110 @@ extension TeamOrchestrator {
         return candidates.max { $0.presentationRevision < $1.presentationRevision }
     }
 
+    /// A dead owner manifest cannot be adopted, but it still contains the
+    /// deterministic input for Repair collaboration. Unknown liveness and
+    /// ambiguous owner identity remain fail-closed.
+    nonisolated static func automaticRemoteProjectRepairPlaceholderCandidate(
+        in remotes: [RemoteTeamSummary],
+        leaderRecord: ManagedPeerSurfaceStore.Record?
+    ) -> RemoteTeamSummary? {
+        guard let remote = automaticRemoteProjectRestoreCandidate(
+            in: remotes, leaderRecord: leaderRecord
+        ), remote.presentationOwnedByRequester,
+           remote.leaderProcessActiveKnown, !remote.leaderProcessActive,
+           !remote.teamUUID.isEmpty, !remote.projectID.isEmpty,
+           !remote.leaderSurfaceID.isEmpty
+        else { return nil }
+        return remote
+    }
+
+    /// Reconstruct owner repair state without attaching, spawning, focusing,
+    /// or registering any surface. The local UUIDs are inert sentinels; Repair
+    /// uses the exact durable project/team and surface identities below.
+    nonisolated static func remoteProjectRepairPlaceholder(
+        remote: RemoteTeamSummary,
+        hostKey: String
+    ) -> Team? {
+        guard remote.presentationOwnedByRequester,
+              remote.leaderProcessActiveKnown, !remote.leaderProcessActive,
+              !remote.teamUUID.isEmpty, !remote.projectID.isEmpty,
+              !remote.leaderSurfaceID.isEmpty, !hostKey.isEmpty
+        else { return nil }
+        let workspaceID = UUID()
+        let launch = collaborationLeaderLaunchMetadata(
+            remoteCLI: remote.leaderCLI, remoteModel: remote.leaderModel
+        )
+        let members = remote.members.map { descriptor in
+            AgentMember(
+                id: "\(descriptor.name)@\(remote.name)",
+                agentInstanceId: descriptor.agentInstanceID,
+                name: descriptor.name,
+                teamName: remote.name,
+                cli: descriptor.cli,
+                launchCommand: descriptor.cli,
+                model: descriptor.model,
+                agentType: descriptor.agentType,
+                color: descriptor.color,
+                instructions: "",
+                workspaceId: workspaceID,
+                panelId: nil,
+                createdAt: Date(),
+                remoteSurfaceID: descriptor.surfaceID,
+                remoteSurfaceSpawned: descriptor.surfaceType == "agent",
+                remoteAgentSurface: descriptor.surfaceType == "agent",
+                hostKey: hostKey,
+                originalAgentWorkDir: descriptor.workingDirectory
+            )
+        }
+        var team = Team(
+            id: remote.name,
+            leaderSessionId: UUID().uuidString,
+            leaderMode: "adopted",
+            leaderModel: launch.model,
+            leaderCli: launch.cli,
+            leaderPanelId: UUID(),
+            leaderEndpoint: .peer(hostKey: hostKey),
+            leaderReady: false,
+            leaderFailureDescription:
+                "Remote leader process is inactive; Repair collaboration can restore it",
+            workingDirectory: remote.workingDirectory,
+            workspaceId: workspaceID,
+            agents: members,
+            createdAt: Date(),
+            gitRepoRoot: remote.projectRootPath,
+            worktreeMode: "off",
+            teamUuid: remote.teamUUID,
+            usesDedicatedRemoteWorkspaces: true,
+            ownsRemotePresentation: true,
+            remotePresentationRevision: remote.presentationRevision,
+            remotePresentationProjectID: remote.projectID,
+            remotePresentationHostKey: hostKey,
+            remoteLeaderSurfaceID: remote.leaderSurfaceID,
+            isRemoteRepairPlaceholder: true
+        )
+        team.delegationState = remote.delegationState
+        return team
+    }
+
+    /// Commit the placeholder to every local routing surface as one logical
+    /// install. The published assignment emits the UI change; the registry
+    /// receives the same durable ids and delegation before daemon sync.
+    @MainActor
+    func installRemoteProjectRepairPlaceholder(_ team: Team) -> Bool {
+        guard team.isRemoteRepairPlaceholder, team.ownsRemotePresentation,
+              teams[team.id] == nil else { return false }
+        teams[team.id] = team
+        TeamDataStore.shared.registerTeam(
+            team.id,
+            agents: team.agents.map {
+                .init(name: $0.name, instanceId: $0.agentInstanceId)
+            },
+            delegationState: team.delegationState
+        )
+        syncTeamStateToDaemon()
+        return true
+    }
+
     nonisolated static func shouldReleaseRemoteAgentsOnQuit(
         ownsRemotePresentation: Bool,
         hasPeerLeader: Bool,
@@ -1667,6 +1866,15 @@ extension TeamOrchestrator {
                     in: host.teams.filter { $0.name == teamName },
                     leaderRecord: leaderRecord
                 ) else { continue }
+                if let dead = Self.automaticRemoteProjectRepairPlaceholderCandidate(
+                    in: host.teams.filter { $0.name == teamName },
+                    leaderRecord: leaderRecord
+                ), let placeholder = Self.remoteProjectRepairPlaceholder(
+                    remote: dead, hostKey: host.id
+                ) {
+                    _ = installRemoteProjectRepairPlaceholder(placeholder)
+                    continue
+                }
                 let failureKey = Self.automaticProjectRestoreFailureKey(
                     hostID: host.id,
                     activeSockPath: host.activeSockPath,

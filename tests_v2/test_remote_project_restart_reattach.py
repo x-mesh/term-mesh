@@ -71,32 +71,6 @@ def _remote_stdout(host: str, command: str, timeout_s: int = 30) -> str:
     return result.stdout.strip()
 
 
-def _restart_remote_fixture_daemon(host: str, remote_dir: str) -> None:
-    """Restart the staged daemon with its persisted state but no surfaces.
-
-    Daemon-owned leader/worker surfaces use restartPolicy=never, so this is the
-    exact production failure: the Project manifest survives while every
-    process and surface it names disappears.
-    """
-    root = str(Path(remote_dir).parent)
-    command = (
-        f"root={root!r}; "
-        'old=$(cat "$root/pid"); kill "$old" 2>/dev/null || true; '
-        'for _ in $(seq 1 80); do kill -0 "$old" 2>/dev/null || break; sleep .1; done; '
-        'rm -f "$root/term-meshd-peer.sock" "$root/term-meshd.sock"; '
-        'env XDG_DATA_HOME="$root/state" XDG_RUNTIME_DIR="$root/runtime" '
-        'PATH=/tmp/term-mesh-release-relay-target/release:$HOME/.cargo/bin:'
-        '$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH '
-        'TERMMESH_PEER_SOCKET="$root/term-meshd-peer.sock" '
-        'TERMMESH_DAEMON_UNIX_PATH="$root/term-meshd.sock" '
-        'nohup /tmp/term-mesh-release-relay-target/release/term-meshd '
-        '>"$root/daemon.log" 2>&1 & echo $! >"$root/pid"; '
-        'for _ in $(seq 1 120); do [ -S "$root/term-meshd-peer.sock" ] && exit 0; sleep .25; done; '
-        'tail -100 "$root/daemon.log" >&2; exit 1'
-    )
-    _remote_stdout(host, command, timeout_s=45)
-
-
 def _remote_project_manifest_status(
     host: str, remote_dir: str, project_id: str
 ) -> dict | None:
@@ -1222,30 +1196,16 @@ def _phase_repair(c, host: str, remote_dir: str, state_path: Path) -> None:
     state = json.loads(state_path.read_text())
     team_name = state["team_name"]
     old_leader = state["leader_surface_id"]
-    project = _wait(lambda: next((
-        item for item in c.debug_project_remote_presentations(host)
-        if item.get("project_id") == state["project_id"]
-    ), None), timeout_s=30)
-    if project is None:
-        raise termmeshError("original owner could not rediscover Project before repair repro")
-    if not any(item.get("team_name") == team_name for item in c.team_list()):
-        c.debug_project_adopt_remote(host, state["project_id"])
-    pending = _wait(lambda: next((
-        item for item in c.team_list()
-        if item.get("team_name") == team_name and item.get("workspace_id")
-    ), None), timeout_s=45)
-    if pending is None:
-        raise termmeshError("original owner did not create Project model before repair repro")
-    c.select_workspace(pending["workspace_id"])
     owner_team = _wait(lambda: next((
         item for item in c.team_list()
         if item.get("team_name") == team_name
-        and item.get("leader_pane_attached")
+        and not item.get("leader_pane_attached")
         and len(item.get("agents") or []) == len(state["member_instances"])
     ), None), timeout_s=45)
     if owner_team is None:
-        raise termmeshError("original owner did not restore Project before repair repro")
-    _restart_remote_fixture_daemon(host, remote_dir)
+        raise termmeshError(
+            "original owner did not restore the known-dead Project repair model"
+        )
     durable = _remote_project_manifest_status(host, remote_dir, state["project_id"])
     if durable is None:
         raise termmeshError(
