@@ -620,8 +620,12 @@ final class TeamOrchestrator: ObservableObject {
         let teamName: String
         let grantID: Data
     }
+    struct RemoteAgentRouteKeepalive {
+        let teamName: String
+        let task: Task<Void, Never>
+    }
     var remoteAgentRouteLeases: [String: RemoteAgentRouteLease] = [:]
-    var remoteAgentRouteKeepalives: [String: Task<Void, Never>] = [:]
+    var remoteAgentRouteKeepalives: [String: RemoteAgentRouteKeepalive] = [:]
     /// Wake observer for the keepalives above, installed once and kept for the
     /// app's life. `Task.sleep` does not advance while the Mac is asleep, so
     /// the interval alone cannot cover a closed lid — see

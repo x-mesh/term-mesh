@@ -289,6 +289,118 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         notifyChanged()
     }
 
+    /// Exchange the routing registration for a same-named repair placeholder
+    /// only while that name still contains registration metadata and nothing
+    /// else. A normal unregister is deliberately forbidden here: it deletes
+    /// tasks, requests, messages, and the durable board, while exact repair is
+    /// only changing which inert remote manifest the local name represents.
+    @MainActor
+    func replacePristinePlaceholderRegistration(
+        teamName: String,
+        expectedAgents: [AgentRegistration],
+        expectedDelegationState: ProjectDelegationState,
+        expectedTeamUUID: String,
+        replacementAgents: [AgentRegistration],
+        replacementDelegationState: ProjectDelegationState,
+        replacementTeamUUID: String
+    ) -> Bool {
+        guard agentUsage[teamName]?.isEmpty != false else { return false }
+        let replaced = boardIOQueue.sync {
+            let expectedBoard: DecodedBoard?
+            switch decodeBoard(teamName: teamName, teamUuid: expectedTeamUUID) {
+            case .missing:
+                expectedBoard = nil
+            case .invalid:
+                return false
+            case .loaded(let board):
+                expectedBoard = board
+            }
+            let replacementBoard: DecodedBoard?
+            switch decodeBoard(teamName: teamName, teamUuid: replacementTeamUUID) {
+            case .missing:
+                replacementBoard = nil
+            case .invalid:
+                return false
+            case .loaded(let board):
+                replacementBoard = board
+            }
+
+            lock.lock()
+            guard teamRegistry[teamName] == expectedAgents,
+                  projectDelegationStates[teamName] == expectedDelegationState,
+                  boardUuids[teamName] == expectedTeamUUID,
+                  messages[teamName, default: []].isEmpty,
+                  correlationMailboxes[teamName, default: [:]].isEmpty,
+                  heartbeats[teamName, default: [:]].isEmpty,
+                  leaderRequestTokens[teamName] == nil,
+                  parkedAgents[teamName, default: []].isEmpty,
+                  busyAgents[teamName, default: []].isEmpty,
+                  watchDrifts[teamName, default: [:]].isEmpty,
+                  let currentContentBytes = boardContentBytesLocked(teamName: teamName),
+                  currentContentBytes == (
+                    expectedBoard?.restoredContentBytes
+                        ?? Self.emptyBoardContentBytes
+                  )
+            else {
+                lock.unlock()
+                return false
+            }
+            teamRegistry[teamName] = replacementAgents
+            projectDelegationStates[teamName] = replacementDelegationState
+            boardUuids[teamName] = replacementTeamUUID
+            installDecodedBoardLocked(replacementBoard, teamName: teamName)
+            lock.unlock()
+
+            if let replacementBoard {
+                lastBoardContentBytes[replacementTeamUUID] =
+                    replacementBoard.persistedContentBytes
+            } else {
+                lastBoardContentBytes.removeValue(forKey: replacementTeamUUID)
+            }
+            return true
+        }
+        guard replaced else { return false }
+        noteTasksChanged()
+        notifyChanged()
+        return true
+    }
+
+    /// Prepare the UUID-scoped durable board before an inert placeholder is
+    /// visible to any registry or daemon sync. Missing means a genuinely new
+    /// empty board; unreadable/corrupt means fail closed without changing the
+    /// name mapping, so a later debounce cannot overwrite the bad file with
+    /// an empty snapshot.
+    @MainActor
+    func preparePlaceholderBoardRegistration(
+        teamName: String, teamUUID: String
+    ) -> Bool {
+        let prepared = boardIOQueue.sync {
+            let board: DecodedBoard?
+            switch decodeBoard(teamName: teamName, teamUuid: teamUUID) {
+            case .missing:
+                board = nil
+            case .invalid:
+                return false
+            case .loaded(let decoded):
+                board = decoded
+            }
+            lock.lock()
+            installDecodedBoardLocked(board, teamName: teamName)
+            boardUuids[teamName] = teamUUID
+            lock.unlock()
+            if let board {
+                lastBoardContentBytes[teamUUID] = board.persistedContentBytes
+            } else {
+                lastBoardContentBytes.removeValue(forKey: teamUUID)
+            }
+            return true
+        }
+        guard prepared else { return false }
+        noteTasksChanged()
+        notifyChanged()
+        return true
+    }
+
     func projectDelegationState(teamName: String) -> ProjectDelegationState? {
         lock.lock()
         defer { lock.unlock() }
@@ -421,6 +533,26 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         var leaderRequests: [LeaderRequest]
     }
 
+    private struct DecodedBoard {
+        var tasks: [TeamOrchestrator.TeamTask]
+        var context: [String: ContextEntry]
+        var leaderRequests: [LeaderRequest]
+        /// Encoding of the bytes currently on disk, excluding `savedAt`. If
+        /// task normalization changed the in-memory state, the next save sees
+        /// a different encoding and persists that normalized state.
+        var persistedContentBytes: Data
+        /// Encoding after restore normalization. Exact-placeholder CAS compares
+        /// this with current memory so UUID-scoped durable work is preserved,
+        /// while any unsaved mutation still fails closed.
+        var restoredContentBytes: Data
+    }
+
+    private enum BoardDecodeResult {
+        case missing
+        case invalid
+        case loaded(DecodedBoard)
+    }
+
     static let boardSchemaVersion = 1
 
     /// Serial queue owning all board file IO plus `boardSavePending` /
@@ -428,6 +560,15 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     private let boardIOQueue = DispatchQueue(label: "team.board.persist", qos: .utility)
     private var boardSavePending = false
     private var lastBoardContentBytes: [String: Data] = [:]
+
+    private static let emptyBoardContentBytes: Data = {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(BoardContent(
+            tasks: [], context: [:], leaderRequests: []
+        ))) ?? Data()
+    }()
 
     /// team_name → team_uuid. Refreshed by `TeamOrchestrator` on every state
     /// sync (uuid is the on-disk identity; teams without one predate D3-A
@@ -559,8 +700,35 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// Returns the number of restored tasks (0 when no/invalid board file).
     @discardableResult
     func loadBoard(teamName: String, teamUuid: String) -> Int {
+        let loaded: Int? = boardIOQueue.sync {
+            guard case .loaded(let board) = decodeBoard(
+                teamName: teamName, teamUuid: teamUuid
+            ) else { return nil }
+            lock.lock()
+            installDecodedBoardLocked(board, teamName: teamName)
+            boardUuids[teamName] = teamUuid
+            lock.unlock()
+            lastBoardContentBytes[teamUuid] = board.persistedContentBytes
+            return board.tasks.count
+        }
+        guard let loaded else { return 0 }
+        noteTasksChanged()
+        notifyChanged()
+        Logger.team.info(
+            "[board.persist] restored \(loaded) task(s) for team=\(teamName, privacy: .public)"
+        )
+        return loaded
+    }
+
+    /// Decode while serialized with every board writer. Callers may then
+    /// change `boardUuids` and install the decoded state under `lock` without
+    /// exposing an intermediate UUID→old-content mapping to a pending save.
+    private func decodeBoard(
+        teamName: String, teamUuid: String
+    ) -> BoardDecodeResult {
         let url = Self.boardFileURL(teamUuid: teamUuid)
-        guard let data = try? Data(contentsOf: url) else { return 0 }
+        guard FileManager.default.fileExists(atPath: url.path) else { return .missing }
+        guard let data = try? Data(contentsOf: url) else { return .invalid }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         guard let board = try? decoder.decode(PersistedBoard.self, from: data),
@@ -569,14 +737,17 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             Logger.team.warning(
                 "[board.persist] load skipped team=\(teamName, privacy: .public): schema/uuid mismatch or corrupt file"
             )
-            return 0
+            return .invalid
         }
 
         var restored = board.tasks
-        let now = Date()
         for i in restored.indices where restored[i].status == "in_progress" {
             restored[i].status = "assigned"
-            restored[i].updatedAt = now
+            // Deterministic across repeated decodes of the same bytes. Exact
+            // placeholder CAS may decode A once at install and again before
+            // swapping to B; Date() made those equivalent restores compare
+            // different until a delayed normalization save happened to win.
+            restored[i].updatedAt = board.savedAt
         }
         let context = board.context.reduce(into: [String: ContextEntry]()) { acc, kv in
             acc[kv.key] = ContextEntry(
@@ -585,23 +756,56 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             )
         }
         let restoredRequests = board.leaderRequests ?? []
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        guard let persistedContentBytes = try? encoder.encode(BoardContent(
+            tasks: board.tasks, context: board.context,
+            leaderRequests: restoredRequests
+        )), let restoredContentBytes = try? encoder.encode(BoardContent(
+            tasks: restored, context: board.context,
+            leaderRequests: restoredRequests
+        )) else { return .invalid }
+        return .loaded(DecodedBoard(
+            tasks: restored, context: context, leaderRequests: restoredRequests,
+            persistedContentBytes: persistedContentBytes,
+            restoredContentBytes: restoredContentBytes
+        ))
+    }
 
-        lock.lock()
-        taskBoards[teamName] = restored
-        noteTasksChanged()
-        if !context.isEmpty {
+    /// `lock` must be held. This is the exact in-memory payload a board save
+    /// would encode, without the volatile `savedAt` field.
+    private func boardContentBytesLocked(teamName: String) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        let context = contextStore[teamName, default: [:]].mapValues {
+            PersistedContextEntry(
+                value: $0.value, setBy: $0.setBy, updatedAt: $0.updatedAt
+            )
+        }
+        return try? encoder.encode(BoardContent(
+            tasks: taskBoards[teamName, default: []], context: context,
+            leaderRequests: leaderRequests[teamName, default: []]
+        ))
+    }
+
+    /// `lock` must be held. Nil means a legitimately absent target board and
+    /// therefore an empty target state, not "keep the old name's content".
+    private func installDecodedBoardLocked(
+        _ board: DecodedBoard?, teamName: String
+    ) {
+        taskBoards[teamName] = board?.tasks ?? []
+        if let context = board?.context, !context.isEmpty {
             contextStore[teamName] = context
+        } else {
+            contextStore.removeValue(forKey: teamName)
         }
-        if !restoredRequests.isEmpty {
-            leaderRequests[teamName] = restoredRequests
+        if let requests = board?.leaderRequests, !requests.isEmpty {
+            leaderRequests[teamName] = requests
+        } else {
+            leaderRequests.removeValue(forKey: teamName)
         }
-        boardUuids[teamName] = teamUuid
-        lock.unlock()
-        notifyChanged()
-        Logger.team.info(
-            "[board.persist] restored \(restored.count) task(s) for team=\(teamName, privacy: .public)"
-        )
-        return restored.count
     }
 
     // MARK: - Durable Leader Requests
