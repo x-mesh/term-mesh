@@ -444,24 +444,48 @@ extension TeamOrchestrator {
         return matches.count == 1 ? matches[0] : nil
     }
 
+    private typealias AuthoritativeCollaborationSnapshot = (
+        surfaces: [Termmesh_Peer_V1_SurfaceInfo], team: RemoteTeamSummary
+    )
+
+    private enum AuthoritativeCollaborationSnapshotResult {
+        case success(AuthoritativeCollaborationSnapshot)
+        case failure(String)
+    }
+
     @MainActor
     private func authoritativeCollaborationSnapshot(
         host: HostEntry,
         teamUUID: String,
         projectID: String?
-    ) async -> (surfaces: [Termmesh_Peer_V1_SurfaceInfo], team: RemoteTeamSummary)? {
-        guard let lease = try? await PeerPaneHostRegistry.shared.acquire(
-            Self.requireTeamHostSpec(host)
-        ) else { return nil }
+    ) async -> AuthoritativeCollaborationSnapshotResult {
+        let lease: PeerPaneHostLease
+        do {
+            let spec = try Self.requireTeamHostSpec(host)
+            lease = try await PeerPaneHostRegistry.shared.acquire(spec)
+        } catch {
+            return .failure("Host connection unavailable: \(error.localizedDescription)")
+        }
         defer { PeerPaneHostRegistry.shared.release(lease) }
-        guard let snapshot = try? await PeerPaneSession.listSessionHostSnapshot(on: lease) else {
-            return nil
+        let snapshot: (
+            surfaces: [Termmesh_Peer_V1_SurfaceInfo],
+            teams: [Termmesh_Peer_V1_Team]
+        )
+        do {
+            snapshot = try await PeerPaneSession.listSessionHostSnapshot(on: lease)
+        } catch {
+            return .failure("Host roster request failed: \(error.localizedDescription)")
         }
         let teams = snapshot.teams.map(RemoteHostStore.remoteTeamSummary)
         guard let team = Self.exactCollaborationRemoteTeam(
             in: teams, teamUUID: teamUUID, projectID: projectID
-        ) else { return nil }
-        return (snapshot.surfaces, team)
+        ) else {
+            return .failure(
+                "Exact Project roster unavailable: expected team \(teamUUID) "
+                    + "project \(projectID ?? "<legacy>"); received \(teams.count) Project(s)"
+            )
+        }
+        return .success((snapshot.surfaces, team))
     }
 
     struct CollaborationRouteGeneration: Equatable {
@@ -597,17 +621,21 @@ extension TeamOrchestrator {
             )
         }
 
-        var snapshot = await authoritativeCollaborationSnapshot(
+        var snapshotResult = await authoritativeCollaborationSnapshot(
             host: host,
             teamUUID: teamUUID,
             projectID: initial.remotePresentationProjectID
         )
-        guard var authoritative = snapshot else {
+        guard case .success(let firstSnapshot) = snapshotResult else {
+            let reason: String
+            if case .failure(let message) = snapshotResult { reason = message }
+            else { reason = "Host roster unavailable" }
             return CollaborationRecoveryReport(
                 routeRepaired: false, leaderLive: false, liveAgents: 0,
-                replacedAgents: [], failedAgents: ["Host roster unavailable"]
+                replacedAgents: [], failedAgents: [reason]
             )
         }
+        var authoritative = firstSnapshot
         let leaderDecision = Self.collaborationLeaderRepairDecision(
             remoteTeam: authoritative.team,
             surfaces: authoritative.surfaces,
@@ -637,7 +665,7 @@ extension TeamOrchestrator {
                     replacedAgents: [], failedAgents: ["Leader replacement failed"]
                 )
             }
-            snapshot = await authoritativeCollaborationSnapshot(
+            snapshotResult = await authoritativeCollaborationSnapshot(
                 host: host,
                 teamUUID: teamUUID,
                 projectID: initial.remotePresentationProjectID
@@ -645,7 +673,7 @@ extension TeamOrchestrator {
             let managedLeaderSurfaceID = ManagedPeerSurfaceStore.shared.leaderRecord(
                 hostKey: hostKey, teamName: teamName
             )?.surfaceID
-            guard let refreshed = snapshot,
+            guard case .success(let refreshed) = snapshotResult,
                   let replacementSurfaceID = Self.confirmedReplacementLeaderSurfaceID(
                     manifestLeaderSurfaceID: refreshed.team.leaderSurfaceID,
                     managedLeaderSurfaceID: managedLeaderSurfaceID,
