@@ -829,24 +829,22 @@ extension TeamOrchestrator {
         }
         refreshLeaderParticipationControls()
 
-        guard let refreshedLease = try? await PeerPaneHostRegistry.shared.acquire(
-            Self.requireTeamHostSpec(host)
-        ) else {
+        let postVerificationSnapshot = await authoritativeCollaborationSnapshot(
+            host: host,
+            teamUUID: teamUUID,
+            projectID: initial.remotePresentationProjectID
+        )
+        guard case .success(let postVerification) = postVerificationSnapshot else {
+            let reason: String
+            if case .failure(let message) = postVerificationSnapshot { reason = message }
+            else { reason = "Host roster unavailable" }
             return CollaborationRecoveryReport(
                 routeRepaired: true, routeVerified: true,
                 leaderLive: false, liveAgents: 0,
-                replacedAgents: [], failedAgents: ["Host roster unavailable"]
+                replacedAgents: [], failedAgents: [reason]
             )
         }
-        let refreshedSurfaces = try? await PeerPaneSession.listSurfaces(on: refreshedLease)
-        PeerPaneHostRegistry.shared.release(refreshedLease)
-        guard let refreshedSurfaces else {
-            return CollaborationRecoveryReport(
-                routeRepaired: true, routeVerified: true,
-                leaderLive: false, liveAgents: 0,
-                replacedAgents: [], failedAgents: ["Host roster unavailable"]
-            )
-        }
+        let refreshedSurfaces = postVerification.surfaces
         let leaderSurfaceID = current.remoteLeaderSurfaceID
             ?? ManagedPeerSurfaceStore.shared.leaderRecord(
                 hostKey: hostKey, teamName: teamName
