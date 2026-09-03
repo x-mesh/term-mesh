@@ -1378,13 +1378,16 @@ class termmesh:
         reports the state after the fact rather than assuming."""
         return dict(self._call("peer.host.disconnect", {"host": host}) or {})
 
-    def peer_host_force_disconnect(self, host: str) -> dict:
+    def peer_host_force_disconnect(self, host: str, *, confirm: bool = False) -> dict:
         """Close every pane, mirror and relay window opened from the host,
         then release the lease (`peer.host.force_disconnect`). Reports
-        {closed: N, state, has_sidebar_lease}, where `closed` counts the rows
-        asked to close — window closes land asynchronously, so poll
-        `peer_pane_status()` to observe them actually gone."""
-        return dict(self._call("peer.host.force_disconnect", {"host": host}) or {})
+        Requires `confirm=True`. Reports {closed: N, closed_by_type, warning,
+        state, has_sidebar_lease}, where `closed` counts the rows asked to close
+        — window closes land asynchronously, so poll `peer_pane_status()` to
+        observe them actually gone."""
+        return dict(self._call(
+            "peer.host.force_disconnect", {"host": host, "confirm": confirm}
+        ) or {})
 
     def peer_open_pane(self, host: str) -> dict:
         """Attach the host's first attachable surface as a pane in the current
@@ -1451,6 +1454,12 @@ class termmesh:
         if hold_reconnect_s:
             params["hold_reconnect_s"] = hold_reconnect_s
         return dict(self._call("debug.peer.mirror_drop_subscription", params) or {})
+
+    def peer_mirror_drop_pane_transport(self, surface_id: Optional[str] = None) -> dict:
+        """Close one mirrored pane's owned transport without closing its
+        panel/helper, forcing the production unexpected-EOF reconnect path."""
+        params = {"surface_id": surface_id} if surface_id else {}
+        return dict(self._call("debug.peer.mirror_drop_pane_transport", params) or {})
 
     def peer_mirror_end_pane_relay(self, surface_id: Optional[str] = None) -> dict:
         """End one mirrored pane's relay WITHOUT tearing down its pane session

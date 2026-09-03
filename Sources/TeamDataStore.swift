@@ -42,7 +42,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// `updateUsage(teamName:agents:)` which the daemon notify handler calls.
     /// Observers should `.objectWillChange` via the data store, and read this
     /// map under the assumption it changes on the main thread.
-    @Published var agentUsage: [String: [String: AgentUsageSnapshot]] = [:]
+    @MainActor @Published var agentUsage: [String: [String: AgentUsageSnapshot]] = [:]
 
     /// Bumped whenever a team's task board changes. The board views read the
     /// tasks through `listTasks`, which is lock-guarded and therefore cannot
@@ -96,6 +96,18 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// Mirrors the Project's execution setting off-main. Requests snapshot the
     /// effective value here so a later UI change cannot rewrite history.
     private var projectDelegationStates: [String: ProjectDelegationState] = [:]
+    private struct PlaceholderBoardGeneration {
+        let teamUUID: String
+        let contentBytes: Data
+        /// Exact durable BoardContent observed for this UUID. Nil means the
+        /// board file did not exist when the placeholder was installed.
+        let diskContentBytes: Data?
+    }
+    /// Exact in-memory board committed when an inert placeholder is installed.
+    /// Disk bytes are still validated separately, but CAS uses this token so a
+    /// real post-restore mutation — including `updatedAt` alone — cannot hide
+    /// behind restore normalization. Guarded by `lock`.
+    private var placeholderBoardGenerations: [String: PlaceholderBoardGeneration] = [:]
 
     /// The one gate `writeResult` and `AutoReplyEmit.emit` both call before
     /// attributing a report to a task, so the two paths cannot drift apart
@@ -289,6 +301,137 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         notifyChanged()
     }
 
+    /// Exchange the routing registration for a same-named repair placeholder
+    /// only while that name still contains registration metadata and nothing
+    /// else. A normal unregister is deliberately forbidden here: it deletes
+    /// tasks, requests, messages, and the durable board, while exact repair is
+    /// only changing which inert remote manifest the local name represents.
+    @MainActor
+    func replacePristinePlaceholderRegistration(
+        teamName: String,
+        expectedAgents: [AgentRegistration],
+        expectedDelegationState: ProjectDelegationState,
+        expectedTeamUUID: String,
+        replacementAgents: [AgentRegistration],
+        replacementDelegationState: ProjectDelegationState,
+        replacementTeamUUID: String
+    ) -> Bool {
+        guard agentUsage[teamName]?.isEmpty != false else { return false }
+        let replaced = boardIOQueue.sync {
+            let expectedDiskContentBytes: Data?
+            switch decodeBoard(teamName: teamName, teamUuid: expectedTeamUUID) {
+            case .missing: expectedDiskContentBytes = nil
+            case .loaded(let board): expectedDiskContentBytes = board.persistedContentBytes
+            case .invalid: return false
+            }
+            let replacementBoard: DecodedBoard?
+            switch decodeBoard(teamName: teamName, teamUuid: replacementTeamUUID) {
+            case .missing:
+                replacementBoard = nil
+            case .invalid:
+                return false
+            case .loaded(let board):
+                replacementBoard = board
+            }
+            let replacementContentBytes = replacementBoard?.restoredGenerationBytes
+                ?? Self.emptyBoardGenerationBytes
+
+            lock.lock()
+            guard teamRegistry[teamName] == expectedAgents,
+                  projectDelegationStates[teamName] == expectedDelegationState,
+                  boardUuids[teamName] == expectedTeamUUID,
+                  messages[teamName, default: []].isEmpty,
+                  correlationMailboxes[teamName, default: [:]].isEmpty,
+                  heartbeats[teamName, default: [:]].isEmpty,
+                  leaderRequestTokens[teamName] == nil,
+                  parkedAgents[teamName, default: []].isEmpty,
+                  busyAgents[teamName, default: []].isEmpty,
+                  watchDrifts[teamName, default: [:]].isEmpty,
+                  let generation = placeholderBoardGenerations[teamName],
+                  generation.teamUUID == expectedTeamUUID,
+                  generation.diskContentBytes == expectedDiskContentBytes,
+                  let currentContentBytes = boardContentBytesLocked(teamName: teamName),
+                  currentContentBytes == generation.contentBytes
+            else {
+                lock.unlock()
+                return false
+            }
+            teamRegistry[teamName] = replacementAgents
+            projectDelegationStates[teamName] = replacementDelegationState
+            boardUuids[teamName] = replacementTeamUUID
+            installDecodedBoardLocked(
+                replacementBoard, teamName: teamName, replaceEmptyCollections: true
+            )
+            placeholderBoardGenerations[teamName] = .init(
+                teamUUID: replacementTeamUUID,
+                contentBytes: replacementContentBytes,
+                diskContentBytes: replacementBoard?.persistedContentBytes
+            )
+            lock.unlock()
+
+            if let replacementBoard {
+                lastBoardContentBytes[replacementTeamUUID] =
+                    replacementBoard.persistedContentBytes
+            } else {
+                lastBoardContentBytes.removeValue(forKey: replacementTeamUUID)
+            }
+            return true
+        }
+        guard replaced else { return false }
+        noteTasksChanged()
+        notifyChanged()
+        return true
+    }
+
+    /// Prepare the UUID-scoped durable board before an inert placeholder is
+    /// visible to any registry or daemon sync. Missing means a genuinely new
+    /// empty board; unreadable/corrupt means fail closed without changing the
+    /// name mapping, so a later debounce cannot overwrite the bad file with
+    /// an empty snapshot.
+    @MainActor
+    func preparePlaceholderBoardRegistration(
+        teamName: String, teamUUID: String
+    ) -> Bool {
+        guard agentUsage[teamName] == nil else { return false }
+        let prepared = boardIOQueue.sync {
+            let board: DecodedBoard?
+            switch decodeBoard(teamName: teamName, teamUuid: teamUUID) {
+            case .missing:
+                board = nil
+            case .invalid:
+                return false
+            case .loaded(let decoded):
+                board = decoded
+            }
+            lock.lock()
+            guard !hasAnyNameStateLocked(teamName: teamName) else {
+                lock.unlock()
+                return false
+            }
+            installDecodedBoardLocked(
+                board, teamName: teamName, replaceEmptyCollections: true
+            )
+            boardUuids[teamName] = teamUUID
+            let contentBytes = board?.restoredGenerationBytes
+                ?? Self.emptyBoardGenerationBytes
+            placeholderBoardGenerations[teamName] = .init(
+                teamUUID: teamUUID, contentBytes: contentBytes,
+                diskContentBytes: board?.persistedContentBytes
+            )
+            lock.unlock()
+            if let board {
+                lastBoardContentBytes[teamUUID] = board.persistedContentBytes
+            } else {
+                lastBoardContentBytes.removeValue(forKey: teamUUID)
+            }
+            return true
+        }
+        guard prepared else { return false }
+        noteTasksChanged()
+        notifyChanged()
+        return true
+    }
+
     func projectDelegationState(teamName: String) -> ProjectDelegationState? {
         lock.lock()
         defer { lock.unlock() }
@@ -363,6 +506,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         leaderRequests.removeValue(forKey: name)
         leaderRequestTokens.removeValue(forKey: name)
         projectDelegationStates.removeValue(forKey: name)
+        placeholderBoardGenerations.removeValue(forKey: name)
         parkedAgents.removeValue(forKey: name)
         watchDrifts.removeValue(forKey: name)
         let boardUuid = boardUuids.removeValue(forKey: name)
@@ -421,12 +565,36 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         var leaderRequests: [LeaderRequest]
     }
 
+    private struct DecodedBoard {
+        var tasks: [TeamOrchestrator.TeamTask]
+        var context: [String: ContextEntry]
+        var leaderRequests: [LeaderRequest]
+        /// Encoding of the bytes currently on disk, excluding `savedAt`. If
+        /// task normalization changed the in-memory state, the next save sees
+        /// a different encoding and persists that normalized state.
+        var persistedContentBytes: Data
+        /// Lossless in-memory generation after restore normalization. Built
+        /// before a CAS mutates any registration or board mapping.
+        var restoredGenerationBytes: Data
+    }
+
+    private static let emptyBoardGenerationBytes = boardGenerationContentBytes(
+        tasks: [], context: [:], leaderRequests: []
+    ) ?? Data()
+
+    private enum BoardDecodeResult {
+        case missing
+        case invalid
+        case loaded(DecodedBoard)
+    }
+
     static let boardSchemaVersion = 1
 
     /// Serial queue owning all board file IO plus `boardSavePending` /
     /// `lastBoardContentBytes` below.
     private let boardIOQueue = DispatchQueue(label: "team.board.persist", qos: .utility)
     private var boardSavePending = false
+    private var boardSaveGeneration: UInt64 = 0
     private var lastBoardContentBytes: [String: Data] = [:]
 
     /// team_name → team_uuid. Refreshed by `TeamOrchestrator` on every state
@@ -462,12 +630,50 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         boardIOQueue.async { [weak self] in
             guard let self, !self.boardSavePending else { return }
             self.boardSavePending = true
+            self.boardSaveGeneration &+= 1
+            let generation = self.boardSaveGeneration
             self.boardIOQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 guard let self else { return }
+                guard self.boardSavePending, self.boardSaveGeneration == generation else {
+                    return
+                }
                 self.boardSavePending = false
                 self.saveAllBoardsNow()
             }
         }
+    }
+
+    /// Deterministic unit-test seam. Flushes the current debounced generation
+    /// without sleeping; the already-scheduled delayed closure observes the
+    /// cleared flag and becomes a no-op.
+    func drainBoardIOForTests() {
+        boardIOQueue.sync {
+            guard boardSavePending else { return }
+            boardSavePending = false
+            boardSaveGeneration &+= 1
+            saveAllBoardsNow()
+        }
+    }
+
+    /// Deterministic test seam for the placeholder generation contract. This
+    /// changes no task field except `updatedAt`, so a failed CAS proves the full
+    /// in-memory token observes timestamp-only mutations.
+    @discardableResult
+    func setTaskUpdatedAtForTests(
+        teamName: String, taskID: String, updatedAt: Date
+    ) -> Bool {
+        lock.lock()
+        guard var tasks = taskBoards[teamName],
+              let index = tasks.firstIndex(where: { $0.id == taskID }) else {
+            lock.unlock()
+            return false
+        }
+        tasks[index].updatedAt = updatedAt
+        taskBoards[teamName] = tasks
+        lock.unlock()
+        noteTasksChanged()
+        notifyChanged()
+        return true
     }
 
     /// boardIOQueue only.
@@ -530,6 +736,26 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             let data = try encoder.encode(board)
             try data.write(to: url, options: .atomic)
             lastBoardContentBytes[teamUuid] = contentBytes
+            if let generationContentBytes = Self.boardGenerationContentBytes(
+                tasks: tasks, context: context, leaderRequests: requests
+            ) {
+                lock.lock()
+                if let generation = placeholderBoardGenerations[teamName],
+                   generation.teamUUID == teamUuid,
+                   generation.contentBytes == generationContentBytes {
+                    // A normalization-only save may move the durable bytes
+                    // (in_progress -> assigned) without moving the immutable
+                    // install-time in-memory CAS boundary. Any real mutation
+                    // leaves contentBytes unequal, so neither token advances
+                    // and exact replacement remains fail-closed after drain.
+                    placeholderBoardGenerations[teamName] = .init(
+                        teamUUID: teamUuid,
+                        contentBytes: generation.contentBytes,
+                        diskContentBytes: contentBytes
+                    )
+                }
+                lock.unlock()
+            }
             return true
         } catch {
             Logger.team.warning(
@@ -559,8 +785,37 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// Returns the number of restored tasks (0 when no/invalid board file).
     @discardableResult
     func loadBoard(teamName: String, teamUuid: String) -> Int {
+        let loaded: Int? = boardIOQueue.sync {
+            guard case .loaded(let board) = decodeBoard(
+                teamName: teamName, teamUuid: teamUuid
+            ) else { return nil }
+            lock.lock()
+            installDecodedBoardLocked(
+                board, teamName: teamName, replaceEmptyCollections: false
+            )
+            boardUuids[teamName] = teamUuid
+            lock.unlock()
+            lastBoardContentBytes[teamUuid] = board.persistedContentBytes
+            return board.tasks.count
+        }
+        guard let loaded else { return 0 }
+        noteTasksChanged()
+        notifyChanged()
+        Logger.team.info(
+            "[board.persist] restored \(loaded) task(s) for team=\(teamName, privacy: .public)"
+        )
+        return loaded
+    }
+
+    /// Decode while serialized with every board writer. Callers may then
+    /// change `boardUuids` and install the decoded state under `lock` without
+    /// exposing an intermediate UUID→old-content mapping to a pending save.
+    private func decodeBoard(
+        teamName: String, teamUuid: String
+    ) -> BoardDecodeResult {
         let url = Self.boardFileURL(teamUuid: teamUuid)
-        guard let data = try? Data(contentsOf: url) else { return 0 }
+        guard FileManager.default.fileExists(atPath: url.path) else { return .missing }
+        guard let data = try? Data(contentsOf: url) else { return .invalid }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         guard let board = try? decoder.decode(PersistedBoard.self, from: data),
@@ -569,14 +824,14 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             Logger.team.warning(
                 "[board.persist] load skipped team=\(teamName, privacy: .public): schema/uuid mismatch or corrupt file"
             )
-            return 0
+            return .invalid
         }
 
         var restored = board.tasks
-        let now = Date()
+        let restoredAt = Date()
         for i in restored.indices where restored[i].status == "in_progress" {
             restored[i].status = "assigned"
-            restored[i].updatedAt = now
+            restored[i].updatedAt = restoredAt
         }
         let context = board.context.reduce(into: [String: ContextEntry]()) { acc, kv in
             acc[kv.key] = ContextEntry(
@@ -585,23 +840,89 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             )
         }
         let restoredRequests = board.leaderRequests ?? []
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        guard let persistedContentBytes = try? encoder.encode(BoardContent(
+            tasks: board.tasks, context: board.context,
+            leaderRequests: restoredRequests
+        )), let restoredGenerationBytes = Self.boardGenerationContentBytes(
+            tasks: restored, context: board.context, leaderRequests: restoredRequests
+        ) else { return .invalid }
+        return .loaded(DecodedBoard(
+            tasks: restored, context: context, leaderRequests: restoredRequests,
+            persistedContentBytes: persistedContentBytes,
+            restoredGenerationBytes: restoredGenerationBytes
+        ))
+    }
 
-        lock.lock()
-        taskBoards[teamName] = restored
-        noteTasksChanged()
-        if !context.isEmpty {
-            contextStore[teamName] = context
+    /// `lock` must be held. Exact bytes of the current in-memory domain state.
+    /// Date is encoded by its raw Double bit pattern so same-second mutations
+    /// cannot collapse the way ISO-8601 string encoding does.
+    private func boardContentBytesLocked(teamName: String) -> Data? {
+        let context = contextStore[teamName, default: [:]].mapValues {
+            PersistedContextEntry(
+                value: $0.value, setBy: $0.setBy, updatedAt: $0.updatedAt
+            )
         }
-        if !restoredRequests.isEmpty {
-            leaderRequests[teamName] = restoredRequests
-        }
-        boardUuids[teamName] = teamUuid
-        lock.unlock()
-        notifyChanged()
-        Logger.team.info(
-            "[board.persist] restored \(restored.count) task(s) for team=\(teamName, privacy: .public)"
+        return Self.boardGenerationContentBytes(
+            tasks: taskBoards[teamName, default: []], context: context,
+            leaderRequests: leaderRequests[teamName, default: []]
         )
-        return restored.count
+    }
+
+    private static func boardGenerationContentBytes(
+        tasks: [TeamOrchestrator.TeamTask],
+        context: [String: PersistedContextEntry],
+        leaderRequests: [LeaderRequest]
+    ) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            var container = encoder.singleValueContainer()
+            try container.encode(date.timeIntervalSinceReferenceDate.bitPattern)
+        }
+        return try? encoder.encode(BoardContent(
+            tasks: tasks, context: context, leaderRequests: leaderRequests
+        ))
+    }
+
+    /// `lock` must be held. Ordinary resume keeps legacy merge semantics for
+    /// empty context/request collections; exact placeholder replacement opts
+    /// into clearing them so the old UUID cannot leak into the new Project.
+    private func installDecodedBoardLocked(
+        _ board: DecodedBoard?, teamName: String, replaceEmptyCollections: Bool
+    ) {
+        taskBoards[teamName] = board?.tasks ?? []
+        if let context = board?.context, !context.isEmpty {
+            contextStore[teamName] = context
+        } else if replaceEmptyCollections {
+            contextStore.removeValue(forKey: teamName)
+        }
+        if let requests = board?.leaderRequests, !requests.isEmpty {
+            leaderRequests[teamName] = requests
+        } else if replaceEmptyCollections {
+            leaderRequests.removeValue(forKey: teamName)
+        }
+    }
+
+    /// `lock` must be held. Key presence is intentional: an empty registration
+    /// or empty activity bucket is still state owned by another lifecycle.
+    private func hasAnyNameStateLocked(teamName: String) -> Bool {
+        teamRegistry[teamName] != nil
+            || projectDelegationStates[teamName] != nil
+            || messages[teamName] != nil
+            || correlationMailboxes[teamName] != nil
+            || taskBoards[teamName] != nil
+            || heartbeats[teamName] != nil
+            || contextStore[teamName] != nil
+            || leaderRequests[teamName] != nil
+            || leaderRequestTokens[teamName] != nil
+            || parkedAgents[teamName] != nil
+            || busyAgents[teamName] != nil
+            || watchDrifts[teamName] != nil
+            || boardUuids[teamName] != nil
+            || placeholderBoardGenerations[teamName] != nil
     }
 
     // MARK: - Durable Leader Requests
@@ -882,6 +1203,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// the existing entry; agents absent from the payload are left untouched
     /// (the daemon emits per-agent tick events, so partial updates are normal).
     /// MUST be called on the main thread — `agentUsage` is `@Published`.
+    @MainActor
     func updateUsage(teamName: String, agents: [(name: String, snapshot: AgentUsageSnapshot)]) {
         var bucket = agentUsage[teamName] ?? [:]
         for entry in agents {
@@ -893,14 +1215,14 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// Convenience accessor — returns `.empty` placeholder snapshot when no
     /// data has arrived yet. Callers can check `updatedAt == .distantPast`
     /// to render an em-dash.
+    @MainActor
     func usage(teamName: String, agentName: String) -> AgentUsageSnapshot? {
         agentUsage[teamName]?[agentName]
     }
 
     /// Drop all usage data for a team (called from `unregisterTeam`).
     private func clearUsageUnsafe(teamName: String) {
-        // We can't mutate @Published from off-main, so dispatch.
-        DispatchQueue.main.async { [weak self] in
+        Task { @MainActor [weak self] in
             self?.agentUsage.removeValue(forKey: teamName)
         }
     }

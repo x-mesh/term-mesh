@@ -463,6 +463,17 @@ private final class RelayFrameReader: @unchecked Sendable {
 // heal logic directly — the trailing-debounce/throttle timing is impractical
 // to verify through the flaky live workspace-mirror path.
 actor RelayResizeCoalescer {
+    private enum ResizeReason {
+        case helper(pastInitialResize: Bool)
+        case focusReassert
+    }
+
+    private struct PendingResize {
+        let cols: UInt32
+        let rows: UInt32
+        let reason: ResizeReason
+    }
+
     // `var`, not `let`: a successful R3 resume-heal reconnect (see
     // `PeerRelaySession.performResumeHeal`) hands this actor the new
     // session via `adopt(session:)` so an ordinary resize sent right after
@@ -470,22 +481,30 @@ actor RelayResizeCoalescer {
     private var session: PeerSession
     private let surfaceID: Data
     private let delayNs: UInt64
-    /// The coalesced resize waiting to go out. The third field is *not* the
-    /// authority claim — it records only that this resize came after the
-    /// helper's initial geometry reconcile. The claim itself is read at flush,
-    /// because focus can move during the coalescing delay.
-    private var pending: (cols: UInt32, rows: UInt32, pastInitialResize: Bool)?
+    /// The coalesced resize waiting to go out. Helper geometry and an explicit
+    /// focus reassert are different events: the helper's first observation is
+    /// always a passive initial reconcile, while focus regain may explicitly
+    /// reclaim authority using the last helper-observed geometry.
+    private var pending: PendingResize?
     private var flushTask: Task<Void, Never>?
     private var authorityEligible: Bool
-    /// The helper's first resize only reconciles Ghostty's initial geometry.
-    /// It is not a divider/window interaction and must not steal authority.
     private var hasObservedInitialResize = false
+    private var reassertAfterInitialResize = false
+    private var isCancelled = false
+    /// Unlike `lastSize`, this is not seeded from attach geometry. Focus regain
+    /// may reassert only a size the helper actually observed.
+    private var lastHelperObservedSize: (cols: UInt32, rows: UInt32)?
     /// The heal action itself. Owned by `PeerRelaySession`, not this actor:
     /// R3 replaced the old in-place resize nudge with a resume re-attach,
     /// which needs `PeerRelaySession`'s session/transport/seq-tracking state
     /// this actor doesn't (and shouldn't) hold. This actor keeps owning only
     /// the debounce/throttle *timing* — see the class doc comment.
-    private let onHeal: @Sendable (String) async -> Void
+    private let onHeal: @Sendable (String, UInt64) async -> Void
+    /// A debounce task belongs to the session generation that observed its
+    /// gap. If that session was replaced before the task fires, the heal is
+    /// stale and must not start work against the replacement.
+    private let generationIsCurrent: @Sendable (UInt64) -> Bool
+    private var gapGeneration: UInt64 = 0
     /// Most recent size seen — the baseline for a P9.2 heal nudge.
     private var lastSize: (cols: UInt32, rows: UInt32)?
     /// The single trailing-debounce task for the current gap episode. Started
@@ -517,7 +536,8 @@ actor RelayResizeCoalescer {
         delayMs: UInt64 = 24,
         healDebounceMs: UInt64 = 400,
         healMaxWaitSeconds: TimeInterval = 2.0,
-        onHeal: @escaping @Sendable (String) async -> Void
+        generationIsCurrent: @escaping @Sendable (UInt64) -> Bool = { _ in true },
+        onHeal: @escaping @Sendable (String, UInt64) async -> Void
     ) {
         self.session = session
         self.surfaceID = surfaceID
@@ -525,6 +545,7 @@ actor RelayResizeCoalescer {
         self.authorityEligible = authorityEligible
         self.healDebounceSeconds = TimeInterval(healDebounceMs) / 1000.0
         self.healMaxWait = healMaxWaitSeconds
+        self.generationIsCurrent = generationIsCurrent
         self.onHeal = onHeal
         // Seed so a gap heal always has a size to nudge, even before the
         // relay's first resize frame reaches `submit` — for some mirror panes
@@ -538,6 +559,7 @@ actor RelayResizeCoalescer {
     /// R3: re-target this actor's normal (non-heal) resize forwarding at a
     /// session that replaced a retired one via a resume-heal reconnect.
     func adopt(session: PeerSession) {
+        guard !isCancelled else { return }
         self.session = session
     }
 
@@ -549,7 +571,32 @@ actor RelayResizeCoalescer {
     }
 
     func setAuthorityEligible(_ eligible: Bool) {
+        guard !isCancelled else { return }
+        let becameEligible = eligible && !authorityEligible
         authorityEligible = eligible
+        guard eligible else {
+            reassertAfterInitialResize = false
+            if case .focusReassert? = pending?.reason {
+                pending = nil
+                flushTask?.cancel()
+                flushTask = nil
+            }
+            return
+        }
+        guard becameEligible, let size = lastHelperObservedSize else { return }
+        if let pending {
+            // Never overwrite a newer helper resize with stale geometry. A
+            // post-initial helper resize will claim at flush; an initial one
+            // stays passive and is followed by one explicit reassert.
+            if case .helper(let pastInitialResize) = pending.reason {
+                reassertAfterInitialResize = !pastInitialResize
+            }
+            return
+        }
+        pending = PendingResize(
+            cols: size.cols, rows: size.rows, reason: .focusReassert
+        )
+        scheduleFlushIfNeeded()
     }
 
     /// Whether the resize about to be written may claim size authority.
@@ -563,42 +610,69 @@ actor RelayResizeCoalescer {
     /// back — the remote TUI ends up sized for the pane the person just left.
     /// This actor serialises its state, so the value read at flush is the
     /// eligibility as of the moment the write actually happens.
-    private func claimAuthorityNow(_ size: (cols: UInt32, rows: UInt32, pastInitialResize: Bool)) -> Bool {
-        authorityEligible && size.pastInitialResize
+    private func claimAuthorityNow(_ resize: PendingResize) -> Bool {
+        guard authorityEligible else { return false }
+        switch resize.reason {
+        case .helper(let pastInitialResize):
+            return pastInitialResize
+        case .focusReassert:
+            return true
+        }
     }
 
     func submit(cols: UInt32, rows: UInt32) {
-        // Only "is this past the initial resize" is decided here. Whether the
-        // pane may claim authority is decided at flush — see `claimAuthorityNow`.
+        guard !isCancelled else { return }
+        let size = (cols, rows)
         let pastInitialResize = hasObservedInitialResize
         hasObservedInitialResize = true
-        pending = (cols, rows, pastInitialResize)
-        lastSize = (cols, rows)
-        guard flushTask == nil else { return }
+        pending = PendingResize(
+            cols: cols, rows: rows,
+            reason: .helper(pastInitialResize: pastInitialResize)
+        )
+        // A helper resize supersedes any queued focus reassert. If it is past
+        // the initial reconcile it can make the one authoritative claim itself.
+        reassertAfterInitialResize = false
+        lastSize = size
+        lastHelperObservedSize = size
+        scheduleFlushIfNeeded()
+    }
+
+    private func scheduleFlushIfNeeded() {
+        guard !isCancelled, pending != nil, flushTask == nil else { return }
         let delayNs = self.delayNs
         flushTask = Task { [weak self] in
             guard let self else { return }
             try? await Task.sleep(nanoseconds: delayNs)
+            guard !Task.isCancelled else { return }
             await self.flushPending()
         }
     }
 
     func flushNow() async {
+        guard !isCancelled else { return }
         flushTask?.cancel()
         flushTask = nil
         await flushPending()
     }
 
     func cancel() {
+        guard !isCancelled else { return }
+        isCancelled = true
         flushTask?.cancel()
         flushTask = nil
         healTask?.cancel()
         healTask = nil
         gapEpisodeStart = nil
         pending = nil
+        reassertAfterInitialResize = false
     }
 
     private func flushPending() async {
+        guard !isCancelled else {
+            flushTask = nil
+            pending = nil
+            return
+        }
         guard let size = pending else {
             flushTask = nil
             return
@@ -612,20 +686,28 @@ actor RelayResizeCoalescer {
                 rows: size.rows,
                 claimAuthority: claimAuthorityNow(size)
             )
+            scheduleDeferredFocusReassert(after: size)
         } catch {
             NSLog("[peer-relay] resize send failed; retrying latest size once: %@", String(describing: error))
+            guard !isCancelled else { return }
             // Preserve a newer resize that arrived while the failed write was
             // suspended. Otherwise retry this size once after a short backoff.
             if pending == nil { pending = size }
             guard flushTask == nil else { return }
             flushTask = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 50_000_000)
+                guard !Task.isCancelled else { return }
                 await self?.flushPendingWithoutRetry()
             }
         }
     }
 
     private func flushPendingWithoutRetry() async {
+        guard !isCancelled else {
+            flushTask = nil
+            pending = nil
+            return
+        }
         guard let size = pending else {
             flushTask = nil
             return
@@ -639,9 +721,23 @@ actor RelayResizeCoalescer {
                 rows: size.rows,
                 claimAuthority: claimAuthorityNow(size)
             )
+            scheduleDeferredFocusReassert(after: size)
         } catch {
             NSLog("[peer-relay] resize retry failed: %@", String(describing: error))
         }
+    }
+
+    private func scheduleDeferredFocusReassert(after resize: PendingResize) {
+        guard !isCancelled, authorityEligible, reassertAfterInitialResize,
+              case nil = pending,
+              case .helper(let pastInitialResize) = resize.reason,
+              !pastInitialResize, let size = lastHelperObservedSize
+        else { return }
+        reassertAfterInitialResize = false
+        pending = PendingResize(
+            cols: size.cols, rows: size.rows, reason: .focusReassert
+        )
+        scheduleFlushIfNeeded()
     }
 
     // ── P9.2 gap heal ────────────────────────────────────────────────
@@ -661,7 +757,9 @@ actor RelayResizeCoalescer {
     // Debounced so a burst of thousands of gaps triggers exactly one heal,
     // once output settles (no point healing mid-flood).
 
-    func noteGapForHeal() {
+    func noteGapForHeal(generation: UInt64 = 0) {
+        guard !isCancelled else { return }
+        gapGeneration = generation
         let now = Date()
         lastGapAt = now
         if gapEpisodeStart == nil { gapEpisodeStart = now }
@@ -706,6 +804,11 @@ actor RelayResizeCoalescer {
     }
 
     private func performGapHeal(reason: String) async {
+        guard !isCancelled else { return }
+        guard generationIsCurrent(gapGeneration) else {
+            endGapEpisode()
+            return
+        }
         // Update first so the throttle window advances even when there is no
         // size to heal with yet (avoids a tight retry loop before the first
         // resize/attach establishes one).
@@ -717,7 +820,7 @@ actor RelayResizeCoalescer {
         #if DEBUG
         dlog("peer.relay.gap.heal reason=\(reason) cols=\(size.cols) rows=\(size.rows)")
         #endif
-        await onHeal(reason)
+        await onHeal(reason, gapGeneration)
     }
 }
 
@@ -736,7 +839,9 @@ actor RelayResizeCoalescer {
 actor RelayGapHealScheduler {
     private let healDebounceSeconds: TimeInterval
     private let healMaxWait: TimeInterval
-    private let onHeal: @Sendable (String) async -> Void
+    private let onHeal: @Sendable (String, UInt64) async -> Void
+    private let generationIsCurrent: @Sendable (UInt64) -> Bool
+    private var gapGeneration: UInt64 = 0
     /// The single trailing-debounce task for the current gap episode —
     /// started once per episode and self-rescheduled off `lastGapAt`, the
     /// same no-Task-churn shape as `RelayResizeCoalescer` (the hot pump
@@ -749,14 +854,17 @@ actor RelayGapHealScheduler {
     init(
         healDebounceMs: UInt64 = 400,
         healMaxWaitSeconds: TimeInterval = 2.0,
-        onHeal: @escaping @Sendable (String) async -> Void
+        generationIsCurrent: @escaping @Sendable (UInt64) -> Bool = { _ in true },
+        onHeal: @escaping @Sendable (String, UInt64) async -> Void
     ) {
         self.healDebounceSeconds = TimeInterval(healDebounceMs) / 1000.0
         self.healMaxWait = healMaxWaitSeconds
+        self.generationIsCurrent = generationIsCurrent
         self.onHeal = onHeal
     }
 
-    func noteGap() {
+    func noteGap(generation: UInt64 = 0) {
+        gapGeneration = generation
         let now = Date()
         lastGapAt = now
         if gapEpisodeStart == nil { gapEpisodeStart = now }
@@ -794,11 +902,15 @@ actor RelayGapHealScheduler {
     }
 
     private func performHeal(reason: String) async {
+        guard generationIsCurrent(gapGeneration) else {
+            gapEpisodeStart = nil
+            return
+        }
         lastHealAt = Date()
         #if DEBUG
         dlog("peer.relay.gap.heal reason=\(reason) delivery=callback")
         #endif
-        await onHeal(reason)
+        await onHeal(reason, gapGeneration)
     }
 }
 
@@ -827,11 +939,15 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
     struct Transition: Equatable {
         let id: UInt64
         let resumeWireSeq: UInt64
+        let generation: UInt64
     }
 
     enum Route: Equatable {
         case forward(Data)
         case suppress
+        /// A chunk read by a retired session after a replacement committed.
+        /// It must neither paint nor mutate the replacement's wire position.
+        case staleGeneration
         /// The bounded transition buffer filled up. The pump that observed
         /// the overflow owns this combined, ordered flush; the in-flight
         /// attach will see its transition token invalidated and be discarded.
@@ -854,6 +970,7 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
     private let maxBufferedBytes: Int
     private var wireSeq: UInt64 = 0
     private var nextID: UInt64 = 0
+    private var generation: UInt64 = 1
     private var phase: Phase = .idle
 
     init(maxBufferedBytes: Int = 1_048_576) {
@@ -866,6 +983,15 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
         lock.unlock()
     }
 
+    @discardableResult
+    func resetWireSeq(generation expectedGeneration: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == expectedGeneration else { return false }
+        wireSeq = 0
+        return true
+    }
+
     /// The last processed wire position, without opening a transition.
     /// `begin()` also reports it, but only as the side effect of starting to
     /// buffer — reconnect needs the value alone.
@@ -873,6 +999,44 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return wireSeq
+    }
+
+    func currentGeneration() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return generation
+    }
+
+    struct Snapshot: Equatable {
+        let generation: UInt64
+        let phase: String
+        let wireSeq: UInt64
+        let bufferedBytes: Int
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        let phaseName: String
+        let bufferedBytes: Int
+        switch phase {
+        case .idle:
+            phaseName = "idle"
+            bufferedBytes = 0
+        case .buffering(_, _, let isGapCapture, let buffer):
+            phaseName = isGapCapture ? "gap-capture" : "buffering"
+            bufferedBytes = buffer.count
+        case .committed:
+            phaseName = "committed"
+            bufferedBytes = 0
+        case .draining(_, let buffer):
+            phaseName = "draining"
+            bufferedBytes = buffer.count
+        }
+        return Snapshot(
+            generation: generation, phase: phaseName, wireSeq: wireSeq,
+            bufferedBytes: bufferedBytes
+        )
     }
 
     /// Drop any in-flight transition and restart sequence accounting.
@@ -888,6 +1052,25 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Atomically retires one owned-session generation and opens the next.
+    ///
+    /// The generation check is the commit CAS for both reconnect paths. A
+    /// resume-heal or reconnect that completed after another replacement may
+    /// close its newly-dialed connection, but it cannot reset the winner's gate
+    /// or install itself over the winner. Resetting the phase in the same lock
+    /// means the first new-session PtyData can never inherit `.buffering` or
+    /// `.committed` from the dead stream.
+    func replaceSession(expectedGeneration: UInt64) -> UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == expectedGeneration else { return nil }
+        generation &+= 1
+        if generation == 0 { generation = 1 }
+        phase = .idle
+        wireSeq = 0
+        return generation
+    }
+
     func begin() -> Transition {
         lock.lock()
         defer { lock.unlock() }
@@ -899,11 +1082,30 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
         // here on: same commit/abort/overflow rules.
         if case .buffering(let id, let resumeSeq, true, let buffer) = phase {
             phase = .buffering(id: id, resumeSeq: resumeSeq, isGapCapture: false, buffer: buffer)
-            return Transition(id: id, resumeWireSeq: resumeSeq)
+            return Transition(id: id, resumeWireSeq: resumeSeq, generation: generation)
         }
         nextID &+= 1
         phase = .buffering(id: nextID, resumeSeq: wireSeq, isGapCapture: false, buffer: Buffer())
-        return Transition(id: nextID, resumeWireSeq: wireSeq)
+        return Transition(id: nextID, resumeWireSeq: wireSeq, generation: generation)
+    }
+
+    /// Generation-checked form for async reconnect work. A stale heal must not
+    /// open a transition on the session that already replaced it.
+    func begin(generation expectedGeneration: UInt64) -> Transition? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == expectedGeneration else { return nil }
+        if case .buffering(let id, let resumeSeq, true, let buffer) = phase {
+            phase = .buffering(
+                id: id, resumeSeq: resumeSeq, isGapCapture: false, buffer: buffer
+            )
+            return Transition(id: id, resumeWireSeq: resumeSeq, generation: generation)
+        }
+        nextID &+= 1
+        phase = .buffering(
+            id: nextID, resumeSeq: wireSeq, isGapCapture: false, buffer: Buffer()
+        )
+        return Transition(id: nextID, resumeWireSeq: wireSeq, generation: generation)
     }
 
     /// Callback-delivery gap repair (host broadcast Lag): open a buffering
@@ -927,6 +1129,14 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
         phase = .buffering(id: nextID, resumeSeq: wireSeq, isGapCapture: true, buffer: Buffer())
     }
 
+    func beginGapCapture(generation expectedGeneration: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == expectedGeneration, case .idle = phase else { return }
+        nextID &+= 1
+        phase = .buffering(id: nextID, resumeSeq: wireSeq, isGapCapture: true, buffer: Buffer())
+    }
+
     /// The pump-opened gap capture still waiting for a heal, if any. A heal
     /// that cannot proceed (connect failure) must abort exactly this
     /// transition, or the capture keeps suppressing a live stream forever.
@@ -934,7 +1144,16 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard case .buffering(let id, let resumeSeq, true, _) = phase else { return nil }
-        return Transition(id: id, resumeWireSeq: resumeSeq)
+        return Transition(id: id, resumeWireSeq: resumeSeq, generation: generation)
+    }
+
+    func activeGapCapture(generation expectedGeneration: UInt64) -> Transition? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == expectedGeneration,
+              case .buffering(let id, let resumeSeq, true, _) = phase
+        else { return nil }
+        return Transition(id: id, resumeWireSeq: resumeSeq, generation: generation)
     }
 
     func route(endWireSeq: UInt64, data: Data) -> Route {
@@ -977,10 +1196,45 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
         }
     }
 
+    func route(
+        generation expectedGeneration: UInt64,
+        endWireSeq: UInt64,
+        data: Data
+    ) -> Route {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == expectedGeneration else { return .staleGeneration }
+        wireSeq = endWireSeq
+        switch phase {
+        case .idle:
+            return .forward(data)
+        case .buffering(_, _, _, let buffer):
+            guard buffer.count + data.count <= maxBufferedBytes else {
+                buffer.append(data)
+                phase = .idle
+                return .overflowFlush(buffer.take())
+            }
+            buffer.append(data)
+            return .suppress
+        case .committed:
+            return .suppress
+        case .draining(_, let buffer):
+            guard buffer.count + data.count <= maxBufferedBytes else {
+                buffer.append(data)
+                phase = .idle
+                return .overflowFlush(buffer.take())
+            }
+            buffer.append(data)
+            return .suppress
+        }
+    }
+
     func commit(_ transition: Transition) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard case .buffering(let id, _, _, _) = phase, id == transition.id else { return false }
+        guard generation == transition.generation,
+              case .buffering(let id, _, _, _) = phase, id == transition.id
+        else { return false }
         phase = .committed(id: id)
         return true
     }
@@ -999,7 +1253,9 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
     func abort(_ transition: Transition) -> Data? {
         lock.lock()
         defer { lock.unlock() }
-        guard case .buffering(let id, _, _, let buffer) = phase, id == transition.id else { return nil }
+        guard generation == transition.generation,
+              case .buffering(let id, _, _, let buffer) = phase, id == transition.id
+        else { return nil }
         phase = .draining(id: id, buffer: buffer)
         return buffer.take()
     }
@@ -1007,7 +1263,9 @@ final class RelayResumeTransitionGate: @unchecked Sendable {
     func finishDrain(_ transition: Transition) -> Data? {
         lock.lock()
         defer { lock.unlock() }
-        guard case .draining(let id, let buffer) = phase, id == transition.id else { return nil }
+        guard generation == transition.generation,
+              case .draining(let id, let buffer) = phase, id == transition.id
+        else { return nil }
         guard buffer.count > 0 else {
             phase = .idle
             return nil
@@ -1163,6 +1421,8 @@ private final class RelayIOStats: @unchecked Sendable {
     private var dropped: UInt64 = 0
     private var chunks: UInt64 = 0
     private var sawFirst = false
+    private var lastHostByteUptimeNs: UInt64 = 0
+    private var lastDeliveredByteUptimeNs: UInt64 = 0
 
     /// Returns true only for the first chunk, so the caller logs `firstByte`
     /// exactly once without keeping a second flag. No timestamp is kept here:
@@ -1173,6 +1433,7 @@ private final class RelayIOStats: @unchecked Sendable {
         defer { lock.unlock() }
         received += UInt64(count)
         chunks += 1
+        lastHostByteUptimeNs = DispatchTime.now().uptimeNanoseconds
         guard !sawFirst else { return false }
         sawFirst = true
         return true
@@ -1181,6 +1442,7 @@ private final class RelayIOStats: @unchecked Sendable {
     func noteEnqueued(_ count: Int) {
         lock.lock()
         enqueued += UInt64(count)
+        lastDeliveredByteUptimeNs = DispatchTime.now().uptimeNanoseconds
         lock.unlock()
     }
 
@@ -1196,10 +1458,16 @@ private final class RelayIOStats: @unchecked Sendable {
         return sawFirst
     }
 
-    func read() -> (received: UInt64, enqueued: UInt64, dropped: UInt64, chunks: UInt64) {
+    func read() -> (
+        received: UInt64, enqueued: UInt64, dropped: UInt64, chunks: UInt64,
+        lastHostByteUptimeNs: UInt64, lastDeliveredByteUptimeNs: UInt64
+    ) {
         lock.lock()
         defer { lock.unlock() }
-        return (received, enqueued, dropped, chunks)
+        return (
+            received, enqueued, dropped, chunks,
+            lastHostByteUptimeNs, lastDeliveredByteUptimeNs
+        )
     }
 }
 
@@ -1397,6 +1665,36 @@ final class PeerRelaySession {
         case ended
     }
 
+    struct OutputHealthSnapshot: Equatable {
+        let sessionGeneration: UInt64
+        let resumeGatePhase: String
+        let resumeGateWireSeq: UInt64
+        let resumeGateBufferedBytes: Int
+        let bytesReceived: UInt64
+        let bytesDelivered: UInt64
+        let bytesDropped: UInt64
+        let chunksReceived: UInt64
+        let lastHostByteUptimeNs: UInt64
+        let lastDeliveredByteUptimeNs: UInt64
+    }
+
+    var outputHealthSnapshot: OutputHealthSnapshot {
+        let gate = resumeTransitionGate.snapshot()
+        let io = ioStats.read()
+        return OutputHealthSnapshot(
+            sessionGeneration: gate.generation,
+            resumeGatePhase: gate.phase,
+            resumeGateWireSeq: gate.wireSeq,
+            resumeGateBufferedBytes: gate.bufferedBytes,
+            bytesReceived: io.received,
+            bytesDelivered: io.enqueued,
+            bytesDropped: io.dropped,
+            chunksReceived: io.chunks,
+            lastHostByteUptimeNs: io.lastHostByteUptimeNs,
+            lastDeliveredByteUptimeNs: io.lastDeliveredByteUptimeNs
+        )
+    }
+
     /// Deliberately derived, never stored: a stored copy would need writing
     /// on every teardown path (`disconnect` funnels three of them) and the
     /// one that got missed would report a dead pane as live — the exact
@@ -1407,20 +1705,26 @@ final class PeerRelaySession {
     }
 
     var ioSnapshot: [String: Any] {
-        let c = ioStats.read()
+        let c = outputHealthSnapshot
         return [
-            "bytes_received": c.received,
-            "bytes_enqueued": c.enqueued,
-            "bytes_dropped": c.dropped,
-            "chunks": c.chunks,
+            "bytes_received": c.bytesReceived,
+            "bytes_enqueued": c.bytesDelivered,
+            "bytes_dropped": c.bytesDropped,
+            "chunks": c.chunksReceived,
             "saw_first_byte": ioStats.sawFirstByte,
+            "session_generation": c.sessionGeneration,
+            "resume_gate_phase": c.resumeGatePhase,
+            "resume_gate_wire_seq": c.resumeGateWireSeq,
+            "resume_gate_buffered_bytes": c.resumeGateBufferedBytes,
+            "last_host_byte_uptime_ns": c.lastHostByteUptimeNs,
+            "last_delivered_byte_uptime_ns": c.lastDeliveredByteUptimeNs,
         ]
     }
 
     /// One-line counter summary for the disconnect / watchdog log lines.
     var ioSummary: String {
-        let c = ioStats.read()
-        return "received=\(c.received) enqueued=\(c.enqueued) dropped=\(c.dropped) chunks=\(c.chunks)"
+        let c = outputHealthSnapshot
+        return "generation=\(c.sessionGeneration) gate=\(c.resumeGatePhase) received=\(c.bytesReceived) enqueued=\(c.bytesDelivered) dropped=\(c.bytesDropped) chunks=\(c.chunksReceived) lastHostNs=\(c.lastHostByteUptimeNs) lastDeliveredNs=\(c.lastDeliveredByteUptimeNs)"
     }
 
     // Path the relay binary should connect to.
@@ -1471,6 +1775,10 @@ final class PeerRelaySession {
     /// the relay-only fixtures either exist for the whole session or never
     /// exist at all, so the mode cannot flip midway.
     let ptyDelivery: PtyDelivery
+    var usesRelayHelper: Bool {
+        if case .relaySocket = ptyDelivery { return true }
+        return false
+    }
 
     private var listenerFd: Int32 = -1
     private var relaySocket: RelaySocket?
@@ -2484,13 +2792,16 @@ final class PeerRelaySession {
             writer = nil
             reader = nil
         }
+        // Captured by the heal schedulers and both detached pumps below. It
+        // must be bound before those closures are created.
+        let resumeTransitionGate = self.resumeTransitionGate
         // Gap-heal timing. The relay path hangs it off the resize coalescer
         // (which also owns resize forwarding and so needs the session);
         // callback delivery has no resize traffic, so a dedicated scheduler
         // carries the same debounce/throttle contract on its own.
         let resizeCoalescer: RelayResizeCoalescer?
         let gapHealScheduler: RelayGapHealScheduler?
-        let noteGapForHeal: @Sendable () async -> Void
+        let noteGapForHeal: @Sendable (UInt64) async -> Void
         if relay != nil {
             let coalescer = RelayResizeCoalescer(
                 session: session,
@@ -2498,8 +2809,13 @@ final class PeerRelaySession {
                 initialCols: remoteCols,
                 initialRows: remoteRows,
                 authorityEligible: resizeAuthorityEligible,
-                onHeal: { [weak self] reason in
-                    await self?.performResumeHeal(reason: reason)
+                generationIsCurrent: { generation in
+                    resumeTransitionGate.currentGeneration() == generation
+                },
+                onHeal: { [weak self] reason, generation in
+                    await self?.performResumeHeal(
+                        reason: reason, generation: generation
+                    )
                 }
             )
             // Stored so `performResumeHeal` (an instance method outside this
@@ -2508,17 +2824,26 @@ final class PeerRelaySession {
             self.resizeCoalescer = coalescer
             resizeCoalescer = coalescer
             gapHealScheduler = nil
-            noteGapForHeal = { await coalescer.noteGapForHeal() }
+            noteGapForHeal = { generation in
+                await coalescer.noteGapForHeal(generation: generation)
+            }
         } else {
             let scheduler = RelayGapHealScheduler(
-                onHeal: { [weak self] reason in
-                    await self?.performResumeHeal(reason: reason)
+                generationIsCurrent: { generation in
+                    resumeTransitionGate.currentGeneration() == generation
+                },
+                onHeal: { [weak self] reason, generation in
+                    await self?.performResumeHeal(
+                        reason: reason, generation: generation
+                    )
                 }
             )
             self.gapHealScheduler = scheduler
             resizeCoalescer = nil
             gapHealScheduler = scheduler
-            noteGapForHeal = { await scheduler.noteGap() }
+            noteGapForHeal = { generation in
+                await scheduler.noteGap(generation: generation)
+            }
         }
         // One delivery function for every PtyData exit point, so callback
         // delivery rides the exact live/replay/abort ordering the relay
@@ -2554,9 +2879,6 @@ final class PeerRelaySession {
         let ptyStream = self.ptyStream
         let ownsSession = self.ownsSession
         let mySurfaceID = surfaceID
-        // R3: plain Sendable reference, captured like `writer`/`reader` above
-        // rather than read via `self.` inside the detached closures below.
-        let resumeTransitionGate = self.resumeTransitionGate
         let scrollbackBrowse = self.scrollbackBrowse
 
         pumpTask = Task.detached(priority: .userInitiated) {
@@ -2603,7 +2925,9 @@ final class PeerRelaySession {
                                     "Output dropped on the shared path — \(gap) bytes (\(gapBytesTotal) total over \(gapCount) gaps); the pane is missing content"
                                 )
                             }
-                            await noteGapForHeal()
+                            await noteGapForHeal(
+                                resumeTransitionGate.currentGeneration()
+                            )
                         }
                         expectedByteSeq = chunk.byteSeq + UInt64(chunk.payload.count)
                         if self.ioStats.noteReceived(chunk.payload.count) {
@@ -2646,6 +2970,7 @@ final class PeerRelaySession {
                 // `self.session`, so a receive error here can mean either a
                 // real disconnect or a deliberate swap to pump up next.
                 var currentSession = session
+                var currentGeneration = resumeTransitionGate.currentGeneration()
                 pumpLoop: while !Task.isCancelled {
                     let msg: PeerIncomingMessage
                     do {
@@ -2667,19 +2992,22 @@ final class PeerRelaySession {
                             // reads as a spurious gap against the old session's
                             // trailing byte_seq.
                             currentSession = swapped
+                            currentGeneration = resumeTransitionGate.currentGeneration()
                             expectedByteSeq = nil
                             gapBytesTotal = 0
                             gapCount = 0
-                            resumeTransitionGate.adoptCommittedSession()
                             continue pumpLoop
                         }
                         if ownsSession,
-                           await self.reconnectOwnedSession(afterLosing: currentSession),
+                           await self.reconnectOwnedSession(
+                               afterLosing: currentSession, generation: currentGeneration
+                           ),
                            let swapped = await self.session, swapped !== currentSession {
                             #if DEBUG
                             dlog("peer.relay.receive.reconnected failed=\(failedTag) adopted=\(Self.sessionTag(swapped))")
                             #endif
                             currentSession = swapped
+                            currentGeneration = resumeTransitionGate.currentGeneration()
                             expectedByteSeq = nil
                             gapBytesTotal = 0
                             gapCount = 0
@@ -2788,11 +3116,13 @@ final class PeerRelaySession {
                             // GridSnapshot to fall back on. Terminal (relay)
                             // delivery keeps its post-gap anchor unchanged.
                             if writer == nil {
-                                resumeTransitionGate.beginGapCapture()
+                                resumeTransitionGate.beginGapCapture(
+                                    generation: currentGeneration
+                                )
                             }
                             // P9.2: schedule a debounced redraw heal so a TUI
                             // corrupted by the drop recovers once output settles.
-                            await noteGapForHeal()
+                            await noteGapForHeal(currentGeneration)
                         }
                         expectedByteSeq = byteSeq + UInt64(data.count)
                         // R3: `expectedByteSeq` IS "last processed wire seq" —
@@ -2801,11 +3131,18 @@ final class PeerRelaySession {
                         // lock-protected box rather than a MainActor hop.
                         let isBrowsingScrollback = scrollbackBrowse.isBrowsing
                         let route = resumeTransitionGate.route(
+                            generation: currentGeneration,
                             endWireSeq: expectedByteSeq!,
                             // Browsing intentionally drops live display bytes;
                             // do not resurrect them if a resume attempt fails.
                             data: isBrowsingScrollback ? Data() : data
                         )
+                        // A retired pump may already have decoded one last
+                        // frame when another task commits the replacement. It
+                        // is not output from the current session, so do not let
+                        // it advance current-generation health counters or the
+                        // last-host-byte timestamp.
+                        if case .staleGeneration = route { break }
                         if self.ioStats.noteReceived(data.count) {
                             #if DEBUG
                             dlog("peer.relay.firstByte path=owned bytes=\(data.count)")
@@ -2829,6 +3166,10 @@ final class PeerRelaySession {
                                 break pumpLoop
                             }
                         case .suppress:
+                            break
+                        case .staleGeneration:
+                            // Handled before accounting above. Kept exhaustive
+                            // in case the routing code moves independently.
                             break
                         }
                     case .surfaceExited(let sid, let exitCode, let signal, let reason)
@@ -2866,7 +3207,9 @@ final class PeerRelaySession {
                             // the reset would misread the next live chunk as a
                             // gap and schedule a needless heal.
                             expectedByteSeq = 0
-                            resumeTransitionGate.resetWireSeq()
+                            _ = resumeTransitionGate.resetWireSeq(
+                                generation: currentGeneration
+                            )
                             #if DEBUG
                             dlog("peer.relay.callback.gridSnapshot.ignored bytes=\(ansi.count)")
                             #endif
@@ -2894,7 +3237,9 @@ final class PeerRelaySession {
                         // would read as a jump, fire a spurious gap log, and
                         // schedule a needless redraw heal.
                         expectedByteSeq = 0
-                        resumeTransitionGate.resetWireSeq()
+                        _ = resumeTransitionGate.resetWireSeq(
+                            generation: currentGeneration
+                        )
                         if self.ioStats.noteReceived(payload.count) {
                             #if DEBUG
                             dlog("peer.relay.firstByte path=owned-snapshot bytes=\(payload.count)")
@@ -3131,8 +3476,10 @@ final class PeerRelaySession {
     // per surface, so a second connection attaching the same surface_id
     // never collides with the still-live one — it simply gets its own
     // subscriber + replay snapshot.
-    private func performResumeHeal(reason: String) async {
-        guard !isTorndown, !resumeInFlight else { return }
+    private func performResumeHeal(reason: String, generation: UInt64) async {
+        guard !isTorndown, !resumeInFlight,
+              resumeTransitionGate.currentGeneration() == generation
+        else { return }
         resumeInFlight = true
         defer { resumeInFlight = false }
 
@@ -3141,16 +3488,24 @@ final class PeerRelaySession {
         // and keep exclusive ownership until the replacement is committed and
         // the old transport is retired. This closes #292's lag/heal/RPC race.
         guard await leaderSessionGate.acquireHeal() else { return }
-        guard !Task.isCancelled, !isTorndown else {
+        guard !Task.isCancelled, !isTorndown,
+              resumeTransitionGate.currentGeneration() == generation
+        else {
             await leaderSessionGate.releaseHeal()
             return
         }
-        await performResumeHealExclusively(reason: reason)
+        await performResumeHealExclusively(
+            reason: reason, generation: generation
+        )
         await leaderSessionGate.releaseHeal()
     }
 
-    private func performResumeHealExclusively(reason: String) async {
-        guard !isTorndown, let oldSession = session else { return }
+    private func performResumeHealExclusively(
+        reason: String, generation oldGeneration: UInt64
+    ) async {
+        guard !isTorndown, let oldSession = session,
+              resumeTransitionGate.currentGeneration() == oldGeneration
+        else { return }
 
         guard ownsSession else {
             // Shared (workspace-mirror) session: this pane doesn't own the
@@ -3185,7 +3540,9 @@ final class PeerRelaySession {
             // flush the capture back out — a transient connect failure must
             // not leave the pane suppressed forever. The gap stays lost,
             // which is where every path started.
-            if let capture = resumeTransitionGate.activeGapCapture() {
+            if let capture = resumeTransitionGate.activeGapCapture(
+                generation: oldGeneration
+            ) {
                 await abortResumeTransition(capture)
             }
             return
@@ -3221,7 +3578,12 @@ final class PeerRelaySession {
         // DELIVERED byte, so the resume below asks the ring for the dropped
         // bytes too. Without one it anchors at the current position — the
         // unchanged terminal behavior.
-        let transition = resumeTransitionGate.begin()
+        guard let transition = resumeTransitionGate.begin(
+            generation: oldGeneration
+        ) else {
+            await newConnection.cancel()
+            return
+        }
         let resumeFromSeq: UInt64 = hostSupportsReplayRing
             ? (attachInitialSeq &+ transition.resumeWireSeq)
             : 0
@@ -3271,7 +3633,11 @@ final class PeerRelaySession {
         // have run and torn everything down while this was suspended. Without
         // this the mutations below would revive session/transport state right
         // after teardown nilled them.
-        guard !isTorndown else {
+        guard !isTorndown, session === oldSession,
+              let newGeneration = resumeTransitionGate.replaceSession(
+                  expectedGeneration: transition.generation
+              )
+        else {
             await newConnection.cancel()
             return
         }
@@ -3299,7 +3665,7 @@ final class PeerRelaySession {
         await oldTransport.close()
 
         #if DEBUG
-        dlog("peer.relay.gap.heal.resume.swapped heal#\(resumeHealCount) retired=\(retiredTag) adopted=\(Self.sessionTag(newConnection.session)) newInitialSeq=\(outcome.initialByteSeq)")
+        dlog("peer.relay.gap.heal.resume.swapped heal#\(resumeHealCount) generation=\(newGeneration) retired=\(retiredTag) adopted=\(Self.sessionTag(newConnection.session)) newInitialSeq=\(outcome.initialByteSeq)")
         #endif
     }
 
@@ -3307,13 +3673,19 @@ final class PeerRelaySession {
     /// relay helper and Ghostty surface remain alive while this retries, so
     /// the same pane resumes once the same remote surface is reachable.
     /// Workspace-mirror panes use their controller's shared reconnect loop.
-    private func reconnectOwnedSession(afterLosing failedSession: PeerSession) async -> Bool {
+    private func reconnectOwnedSession(
+        afterLosing failedSession: PeerSession,
+        generation failedGeneration: UInt64
+    ) async -> Bool {
         guard Self.shouldReconnectOwnedSession(
             ownsSession: ownsSession,
             isTorndown: isTorndown,
             isCurrentSession: session === failedSession,
             hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
         ) else {
+            return session !== failedSession
+        }
+        guard resumeTransitionGate.currentGeneration() == failedGeneration else {
             return session !== failedSession
         }
         // From here to the return, this pane is RECONNECTING rather than
@@ -3329,6 +3701,9 @@ final class PeerRelaySession {
             isCurrentSession: session === failedSession,
             hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
         ) else {
+            return session !== failedSession
+        }
+        guard resumeTransitionGate.currentGeneration() == failedGeneration else {
             return session !== failedSession
         }
         var attempt = 0
@@ -3353,7 +3728,9 @@ final class PeerRelaySession {
             dlog("peer.relay.reconnect.attempt n=\(attempt) delay=\(delay)")
             #endif
             onReconnecting?(attempt)
-            if await attemptOwnedSessionReconnect(from: failedSession) {
+            if await attemptOwnedSessionReconnect(
+                from: failedSession, generation: failedGeneration
+            ) {
                 onReconnected?()
                 RemoteWorkLog.infoOffMain("Remote pane reconnected on attempt \(attempt)")
                 return true
@@ -3376,7 +3753,10 @@ final class PeerRelaySession {
 
     /// One reconnect attempt after the old receive loop has already failed.
     /// Unlike gap healing, no old-session bytes can race this attach boundary.
-    private func attemptOwnedSessionReconnect(from failedSession: PeerSession) async -> Bool {
+    private func attemptOwnedSessionReconnect(
+        from failedSession: PeerSession,
+        generation failedGeneration: UInt64
+    ) async -> Bool {
         // The outer loop's predicate, re-checked at every await boundary
         // INSIDE the attempt. `connect` and `attachSurface` are exactly
         // where a Disconnect Host lands mid-flight; the original guards
@@ -3390,7 +3770,7 @@ final class PeerRelaySession {
                 isTorndown: isTorndown,
                 isCurrentSession: session === failedSession,
                 hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
-            )
+            ) && resumeTransitionGate.currentGeneration() == failedGeneration
         }
         guard stillEligible() else { return false }
         let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
@@ -3435,15 +3815,19 @@ final class PeerRelaySession {
             return false
         }
 
+        guard let newGeneration = resumeTransitionGate.replaceSession(
+            expectedGeneration: failedGeneration
+        ) else {
+            await connection.cancel()
+            return false
+        }
+        // The generation CAS and gate reset above happen before installation.
+        // Old-session chunks already read by the detached pump carry the retired
+        // generation and are rejected; the first new-session chunk carries this
+        // generation and sees an idle gate.
         session = connection.session
         transport = connection.transport
         attachInitialSeq = outcome.initialByteSeq
-        // Full reset, not just the wire position: a resume-heal transition may
-        // have been mid-flight when the transport died, and this replaces the
-        // session wholesale. Leaving the gate in `buffering`/`committed` would
-        // suppress the reconnected session's output forever — the old bytes it
-        // was holding for can no longer arrive.
-        resumeTransitionGate.reset()
         hostSupportsReplayRing = connection.hostCapabilities.has(PeerCapability.replayRingV1)
         await resizeCoalescer?.adopt(session: connection.session)
         await startHeartbeatMonitoring(session: connection.session, transport: connection.transport)
@@ -3453,6 +3837,9 @@ final class PeerRelaySession {
         if outcome.initialByteSeq != resumeFromSeq {
             onPtyDeliveryRestart?()
         }
+        #if DEBUG
+        dlog("peer.relay.reconnect.committed generation=\(newGeneration) session=\(Self.sessionTag(connection.session))")
+        #endif
         return true
     }
 
@@ -3511,6 +3898,16 @@ final class PeerRelaySession {
 
     func beginResumeTransitionForTesting() -> RelayResumeTransitionGate.Transition {
         resumeTransitionGate.begin()
+    }
+
+    /// Reproduce an unexpected owned transport EOF without tearing down the
+    /// pane, relay helper, or host surface. The ordinary pump must reconnect
+    /// this exact session and advance its generation.
+    @discardableResult
+    func debugDropOwnedTransport() -> Bool {
+        guard ownsSession, !isTorndown, let transport else { return false }
+        Task { await transport.close() }
+        return true
     }
 
     func commitResumeTransitionForTesting(_ transition: RelayResumeTransitionGate.Transition) -> Bool {

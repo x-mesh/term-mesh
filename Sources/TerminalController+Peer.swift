@@ -203,7 +203,14 @@ extension TerminalController {
     /// release the sidebar lease. `closed` counts the connections that were
     /// asked to close, which is what a test asserts against.
     func v2PeerHostForceDisconnect(params: [String: Any]) -> V2CallResult {
-        peerDispatchHostAction(params: params, action: "force_disconnect") { store, host in
+        let confirmed = Self.peerForceDisconnectConfirmed(v2Bool(params, "confirm"))
+        return peerDispatchHostAction(params: params, action: "force_disconnect") { store, host in
+            guard confirmed else {
+                throw PeerCommandFailure(
+                    code: "confirmation_required",
+                    message: "Force Disconnect closes every local pane, mirror, and relay window from this host. Retry with confirm=true."
+                )
+            }
             // The store reports the rows it closed. Diffing activeConnections()
             // around the call would be wrong twice over: window closes land
             // asynchronously, and the count includes other hosts.
@@ -211,11 +218,23 @@ extension TerminalController {
             let row = store.sortedHosts.first { $0.id == host.id }
             return [
                 "ok": true,
-                "closed": closed,
+                "closed": closed.total,
+                "closed_by_type": [
+                    "panes": closed.panes,
+                    "mirrors": closed.mirrors,
+                    "relay_windows": closed.relayWindows,
+                    "other": closed.other,
+                ],
+                "destructive": true,
+                "warning": "Closed local panes, mirrors, and relay windows. Processes running on the host continue.",
                 "state": row.map { Self.peerStateString($0.connectionState) } ?? "saved",
                 "has_sidebar_lease": store.hasSidebarLease(for: host.id),
             ]
         }
+    }
+
+    nonisolated static func peerForceDisconnectConfirmed(_ value: Bool?) -> Bool {
+        value == true
     }
 
     /// Open one of the host's remote surfaces as a pane in the current

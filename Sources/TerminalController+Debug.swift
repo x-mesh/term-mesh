@@ -2138,6 +2138,41 @@ extension TerminalController {
         return .ok(["ok": true, "dropped": true, "hold_reconnect_s": hold])
     }
 
+    /// Test-only: close one mirror pane's owned host transport while keeping
+    /// its panel/helper alive. This drives the production unexpected-EOF
+    /// reconnect path rather than the layout-subscription-only path.
+    func v2DebugPeerMirrorDropPaneTransport(params: [String: Any]) -> V2CallResult {
+        let requested: Data?
+        if let encoded = v2String(params, "surface_id") {
+            guard let decoded = Data(base64Encoded: encoded) else {
+                return .err(
+                    code: "invalid_params", message: "surface_id must be base64 encoded",
+                    data: nil
+                )
+            }
+            requested = decoded
+        } else {
+            requested = nil
+        }
+        var droppedSurface: String?
+        var failure: String?
+        let ok = v2MainExec(timeout: 5) {
+            MainActor.assumeIsolated {
+                let outcome = PeerClientCoordinator.shared
+                    .debugDropMirrorPaneTransport(surfaceID: requested)
+                droppedSurface = outcome.surface
+                failure = outcome.error
+            }
+        }
+        guard ok else {
+            return .err(code: "internal_error", message: "drop pane transport timed out", data: nil)
+        }
+        if let failure {
+            return .err(code: "not_found", message: failure, data: nil)
+        }
+        return .ok(["ok": true, "surface_id": droppedSurface ?? ""])
+    }
+
     /// Test-only: end one mirrored pane's relay without tearing down its pane
     /// session — the state a heartbeat death leaves, and the one in which
     /// `relay_startup_state` still reads `started`.

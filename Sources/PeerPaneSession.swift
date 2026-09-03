@@ -504,10 +504,24 @@ final class PeerPaneHostRegistry {
 /// relay session plus the host lease it holds a ref on.
 @MainActor
 final class PeerPaneSession {
-    enum RelayStartupState: Equatable {
+    enum RelayStartupState: String, Equatable, Sendable {
         case pending
         case starting
         case started
+        case failed
+    }
+
+    /// User-facing aggregate state for a pane. `relayLiveness` deliberately
+    /// describes only the attached transport and therefore reads `.live`
+    /// before the local relay helper has even been requested. Keep that
+    /// transport contract intact, but never expose it as the pane's overall
+    /// health without folding in startup and teardown.
+    enum PaneHealth: String, Equatable, Sendable {
+        case pending
+        case starting
+        case live
+        case reconnecting
+        case ended
         case failed
     }
 
@@ -575,6 +589,45 @@ final class PeerPaneSession {
     /// recovered" cannot be spelled with it.
     var relayLiveness: PeerRelaySession.TransportLiveness {
         isTorndown ? .ended : relaySession.transportLiveness
+    }
+
+    var paneHealth: PaneHealth {
+        Self.derivePaneHealth(
+            startupState: relayStartupState,
+            relayLiveness: relayLiveness,
+            isTorndown: isTorndown,
+            requiresRelayStartup: relaySession.usesRelayHelper
+        )
+    }
+
+    /// Pure form used by status surfaces and regression tests. Teardown wins
+    /// over every latched state; otherwise startup must complete before the
+    /// transport is allowed to call the whole pane live.
+    nonisolated static func derivePaneHealth(
+        startupState: RelayStartupState,
+        relayLiveness: PeerRelaySession.TransportLiveness,
+        isTorndown: Bool,
+        requiresRelayStartup: Bool = true
+    ) -> PaneHealth {
+        if isTorndown { return .ended }
+        if !requiresRelayStartup {
+            switch relayLiveness {
+            case .live: return .live
+            case .reconnecting: return .reconnecting
+            case .ended: return .ended
+            }
+        }
+        switch startupState {
+        case .pending: return .pending
+        case .starting: return .starting
+        case .failed: return .failed
+        case .started:
+            switch relayLiveness {
+            case .live: return .live
+            case .reconnecting: return .reconnecting
+            case .ended: return .ended
+            }
+        }
     }
 
     /// Started, and its transport is up. The only state in which a mirrored

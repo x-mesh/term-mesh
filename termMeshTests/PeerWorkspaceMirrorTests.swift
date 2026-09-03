@@ -628,6 +628,12 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
 /// path, so it's exercised directly here via the `onHeal` callback rather
 /// than by counting `Resize` frames.
 final class RelayResumeTransitionGateTests: XCTestCase {
+    private actor GenerationHealRecorder {
+        private var reasons: [String] = []
+
+        func record(_ reason: String) { reasons.append(reason) }
+        func all() -> [String] { reasons }
+    }
 
     /// Reconnect replaces the session wholesale, so a transition that was in
     /// flight when the transport died must not keep suppressing output — the
@@ -654,6 +660,140 @@ final class RelayResumeTransitionGateTests: XCTestCase {
         gate.reset()
 
         XCTAssertEqual(gate.route(endWireSeq: 3, data: Data("y".utf8)), .forward(Data("y".utf8)))
+    }
+
+    func testOwnedReconnectFromBufferingRejectsOldGenerationAndForwardsFirstNewChunk() {
+        let gate = RelayResumeTransitionGate()
+        let oldGeneration = gate.currentGeneration()
+        let transition = gate.begin()
+        XCTAssertEqual(transition.generation, oldGeneration)
+        XCTAssertEqual(
+            gate.route(
+                generation: oldGeneration, endWireSeq: 4, data: Data("held".utf8)
+            ),
+            .suppress
+        )
+
+        let newGeneration = gate.replaceSession(expectedGeneration: oldGeneration)
+        XCTAssertNotNil(newGeneration)
+        XCTAssertEqual(
+            gate.route(
+                generation: oldGeneration, endWireSeq: 8, data: Data("stale".utf8)
+            ),
+            .staleGeneration,
+            "a retired pump must not paint or advance the replacement gate"
+        )
+        XCTAssertEqual(gate.snapshot().wireSeq, 0)
+        XCTAssertEqual(
+            gate.route(
+                generation: newGeneration!, endWireSeq: 3, data: Data("new".utf8)
+            ),
+            .forward(Data("new".utf8)),
+            "the replacement's first PtyData must see an idle gate"
+        )
+        XCTAssertEqual(gate.snapshot().wireSeq, 3)
+        XCTAssertEqual(gate.snapshot().phase, "idle")
+    }
+
+    func testOwnedReconnectFromCommittedRejectsOldGenerationAndForwardsFirstNewChunk() {
+        let gate = RelayResumeTransitionGate()
+        let oldGeneration = gate.currentGeneration()
+        let transition = gate.begin()
+        XCTAssertTrue(gate.commit(transition))
+        XCTAssertEqual(
+            gate.route(
+                generation: oldGeneration, endWireSeq: 4, data: Data("old".utf8)
+            ),
+            .suppress
+        )
+
+        let newGeneration = gate.replaceSession(expectedGeneration: oldGeneration)!
+        XCTAssertEqual(gate.snapshot().phase, "idle")
+        XCTAssertEqual(
+            gate.route(
+                generation: newGeneration, endWireSeq: 5, data: Data("first".utf8)
+            ),
+            .forward(Data("first".utf8))
+        )
+        XCTAssertFalse(gate.commit(transition), "the retired transition cannot recommit")
+        XCTAssertNil(gate.abort(transition), "the retired transition cannot drain into the new stream")
+    }
+
+    func testStaleReconnectCommitCannotReplaceOrResetWinningGeneration() {
+        let gate = RelayResumeTransitionGate()
+        let original = gate.currentGeneration()
+        let winner = gate.replaceSession(expectedGeneration: original)!
+        XCTAssertEqual(
+            gate.route(generation: winner, endWireSeq: 3, data: Data("one".utf8)),
+            .forward(Data("one".utf8))
+        )
+
+        XCTAssertNil(
+            gate.replaceSession(expectedGeneration: original),
+            "late async work from the retired generation must lose the commit CAS"
+        )
+        let snapshot = gate.snapshot()
+        XCTAssertEqual(snapshot.generation, winner)
+        XCTAssertEqual(snapshot.wireSeq, 3, "a stale commit must not reset the winner's progress")
+        XCTAssertEqual(snapshot.phase, "idle")
+        XCTAssertEqual(
+            gate.route(generation: winner, endWireSeq: 6, data: Data("two".utf8)),
+            .forward(Data("two".utf8))
+        )
+    }
+
+    func testStaleHealCannotOpenBufferingOnWinningGeneration() {
+        let gate = RelayResumeTransitionGate()
+        let retired = gate.currentGeneration()
+        let winner = gate.replaceSession(expectedGeneration: retired)!
+
+        XCTAssertNil(gate.begin(generation: retired))
+        XCTAssertEqual(gate.snapshot().phase, "idle")
+        XCTAssertEqual(
+            gate.route(generation: winner, endWireSeq: 5, data: Data("live".utf8)),
+            .forward(Data("live".utf8)),
+            "stale heal setup must not suppress the winning session"
+        )
+    }
+
+    func testStaleHealFailureCannotAbortNewGenerationGapCapture() {
+        let gate = RelayResumeTransitionGate()
+        let retired = gate.currentGeneration()
+        let winner = gate.replaceSession(expectedGeneration: retired)!
+        gate.beginGapCapture(generation: winner)
+
+        XCTAssertNil(
+            gate.activeGapCapture(generation: retired),
+            "stale cleanup must not manufacture a token for the winner's capture"
+        )
+        let current = gate.activeGapCapture(generation: winner)
+        XCTAssertNotNil(current)
+        XCTAssertEqual(current?.generation, winner)
+        XCTAssertEqual(gate.snapshot().phase, "gap-capture")
+    }
+
+    func testDebouncedHealFromRetiredGenerationIsDiscarded() async throws {
+        let gate = RelayResumeTransitionGate()
+        let retired = gate.currentGeneration()
+        let healed = GenerationHealRecorder()
+        let scheduler = RelayGapHealScheduler(
+            healDebounceMs: 20,
+            generationIsCurrent: { generation in
+                gate.currentGeneration() == generation
+            },
+            onHeal: { reason, _ in await healed.record(reason) }
+        )
+
+        await scheduler.noteGap(generation: retired)
+        _ = gate.replaceSession(expectedGeneration: retired)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        let reasons = await healed.all()
+        XCTAssertTrue(
+            reasons.isEmpty,
+            "a debounce scheduled by the dead stream must not heal its replacement"
+        )
+        await scheduler.cancel()
     }
 
     /// `begin()` reports the wire position as a side effect of starting to
@@ -858,6 +998,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
     private actor ResizeColsCollector {
         private var pending = Data()
         private var collected: [UInt32] = []
+        private var collectedRows: [UInt32] = []
         private var authorityClaims: [Bool] = []
 
         func add(_ data: Data) {
@@ -865,16 +1006,18 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             while let env = try? decodeFrame(from: &pending) {
                 if case .resize(let r)? = env.payload {
                     collected.append(r.cols)
+                    collectedRows.append(r.rows)
                     authorityClaims.append(r.claimAuthority)
                 }
             }
         }
 
         func cols() -> [UInt32] { collected }
+        func rows() -> [UInt32] { collectedRows }
         func claims() -> [Bool] { authorityClaims }
     }
 
-    func testInitialResizeIsPassiveThenFocusedResizeClaimsAuthority() async throws {
+    func testFocusedInitialResizeRemainsPassiveForExistingAuthority() async throws {
         let collector = ResizeColsCollector()
         let session = makeSession(collector)
         let coalescer = RelayResizeCoalescer(
@@ -883,32 +1026,22 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialCols: 80,
             initialRows: 24,
             authorityEligible: true,
-            delayMs: 1,
-            onHeal: { _ in }
+            delayMs: 10_000,
+            onHeal: { _, _ in }
         )
 
-        await coalescer.submit(cols: 80, rows: 24)
-        await coalescer.flushNow()
         await coalescer.submit(cols: 120, rows: 36)
         await coalescer.flushNow()
 
         let cols = await collector.cols()
         let claims = await collector.claims()
-        XCTAssertEqual(cols, [80, 120])
-        XCTAssertEqual(claims, [false, true])
+        XCTAssertEqual(cols, [120])
+        XCTAssertEqual(claims, [false],
+                       "the helper's initial reconcile must not steal authority from another viewer")
         await coalescer.cancel()
     }
 
-    /// A resize held for the coalescing delay must not claim authority if
-    /// focus left the pane before it went out.
-    ///
-    /// The claim used to be decided in `submit` and carried in `pending`, so a
-    /// resize that started while focused still asserted authority ~24ms later
-    /// even though `setAuthorityEligible(false)` had run in between. The host
-    /// arbitrates PTY size by most recent activity, so that late claim landed
-    /// after the newly focused pane's own resize and took the size back — the
-    /// remote TUI ended up sized for the pane the person had just left.
-    func testAResizeDoesNotClaimAuthorityAfterFocusLeavesDuringTheDelay() async throws {
+    func testUnfocusedInitialResizeRemainsPassive() async throws {
         let collector = ResizeColsCollector()
         let session = makeSession(collector)
         let coalescer = RelayResizeCoalescer(
@@ -916,34 +1049,22 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             surfaceID: Data(repeating: 0xC5, count: 16),
             initialCols: 80,
             initialRows: 24,
-            authorityEligible: true,
-            delayMs: 1,
-            onHeal: { _ in }
+            authorityEligible: false,
+            delayMs: 10_000,
+            onHeal: { _, _ in }
         )
 
-        // Get past the initial geometry reconcile, which is passive by design.
-        await coalescer.submit(cols: 80, rows: 24)
-        await coalescer.flushNow()
-
-        // A focused resize starts…
         await coalescer.submit(cols: 120, rows: 36)
-        // …focus moves away before it is written…
-        await coalescer.setAuthorityEligible(false)
-        // …and only then does it go out.
         await coalescer.flushNow()
 
-        let claims = await collector.claims()
-        XCTAssertEqual(claims, [false, false],
-                       "a resize flushed after focus left must not claim authority")
         let cols = await collector.cols()
-        XCTAssertEqual(cols, [80, 120], "the size itself is still sent")
+        let claims = await collector.claims()
+        XCTAssertEqual(cols, [120])
+        XCTAssertEqual(claims, [false])
         await coalescer.cancel()
     }
 
-    /// The mirror of the above: focus arriving during the delay should let the
-    /// resize claim authority. Deciding at flush has to work both ways, or the
-    /// fix would simply have moved the bug.
-    func testAResizeClaimsAuthorityWhenFocusArrivesDuringTheDelay() async throws {
+    func testFocusRegainReassertsLastHelperObservedSizeExactlyOnceWithoutSubmit() async throws {
         let collector = ResizeColsCollector()
         let session = makeSession(collector)
         let coalescer = RelayResizeCoalescer(
@@ -952,20 +1073,136 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialCols: 80,
             initialRows: 24,
             authorityEligible: false,
-            delayMs: 1,
-            onHeal: { _ in }
+            delayMs: 10_000,
+            onHeal: { _, _ in }
+        )
+
+        await coalescer.submit(cols: 120, rows: 36)
+        await coalescer.flushNow()
+
+        await coalescer.setAuthorityEligible(true)
+        await coalescer.flushNow()
+        await coalescer.setAuthorityEligible(true)
+        await coalescer.flushNow()
+
+        let cols = await collector.cols()
+        let rows = await collector.rows()
+        let claims = await collector.claims()
+        XCTAssertEqual(cols, [120, 120],
+                       "focus regain must resend the last helper-observed size exactly once")
+        XCTAssertEqual(rows, [36, 36],
+                       "focus regain must preserve the last helper-observed rows")
+        XCTAssertEqual(claims, [false, true],
+                       "the focus-regain resend must claim authority")
+        await coalescer.cancel()
+    }
+
+    func testPendingResizeClaimsWhenFocusArrivesDuringDelayWithoutDuplicateReassert() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC8, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            authorityEligible: false,
+            delayMs: 10_000,
+            onHeal: { _, _ in }
         )
 
         await coalescer.submit(cols: 80, rows: 24)
         await coalescer.flushNow()
-
-        await coalescer.submit(cols: 120, rows: 36)
+        await coalescer.submit(cols: 130, rows: 42)
         await coalescer.setAuthorityEligible(true)
         await coalescer.flushNow()
+        await coalescer.flushNow()
 
+        let cols = await collector.cols()
+        let rows = await collector.rows()
         let claims = await collector.claims()
+        XCTAssertEqual(cols, [80, 130])
+        XCTAssertEqual(rows, [24, 42])
         XCTAssertEqual(claims, [false, true],
-                       "a resize flushed after focus arrived may claim authority")
+                       "the pending helper resize should claim once at flush, without a stale duplicate")
+        await coalescer.cancel()
+    }
+
+    func testFocusLossBeforeReassertFlushDropsStaleAuthorityClaim() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC9, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            authorityEligible: false,
+            delayMs: 10_000,
+            onHeal: { _, _ in }
+        )
+
+        await coalescer.submit(cols: 120, rows: 36)
+        await coalescer.flushNow()
+        await coalescer.setAuthorityEligible(true)
+        await coalescer.setAuthorityEligible(false)
+        await coalescer.flushNow()
+
+        let cols = await collector.cols()
+        let claims = await collector.claims()
+        XCTAssertEqual(cols, [120])
+        XCTAssertEqual(claims, [false],
+                       "focus loss must remove a queued focus-only reassert before it can flush")
+        await coalescer.cancel()
+    }
+
+    func testCancelIsTerminalForFocusAndResizeScheduling() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xCA, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            authorityEligible: false,
+            delayMs: 1,
+            onHeal: { _, _ in }
+        )
+
+        await coalescer.submit(cols: 120, rows: 36)
+        await coalescer.cancel()
+        await coalescer.setAuthorityEligible(true)
+        await coalescer.submit(cols: 140, rows: 48)
+        await coalescer.flushNow()
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        let cols = await collector.cols()
+        XCTAssertTrue(cols.isEmpty,
+                      "cancel must prevent focus and resize events from recreating flush tasks")
+    }
+
+    /// A resize held for the coalescing delay must be passive if focus leaves
+    /// before it is written. Authority is deliberately evaluated at flush.
+    func testResizeFlushedAfterFocusLossRemainsPassive() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC7, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            authorityEligible: true,
+            delayMs: 10_000,
+            onHeal: { _, _ in }
+        )
+
+        await coalescer.submit(cols: 120, rows: 36)
+        await coalescer.setAuthorityEligible(false)
+        await coalescer.flushNow()
+
+        let cols = await collector.cols()
+        let claims = await collector.claims()
+        XCTAssertEqual(cols, [120], "the delayed size itself must still be sent")
+        XCTAssertEqual(claims, [false],
+                       "a resize flushed after focus left must not claim authority")
         await coalescer.cancel()
     }
 
@@ -1004,7 +1241,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             healDebounceMs: 40,
             healMaxWaitSeconds: 1000,
-            onHeal: { reason in await healed.record(reason) }
+            onHeal: { reason, _ in await healed.record(reason) }
         )
 
         await coalescer.noteGapForHeal()
@@ -1031,7 +1268,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             healDebounceMs: 1_000_000,
             healMaxWaitSeconds: 0.1,
-            onHeal: { reason in await healed.record(reason) }
+            onHeal: { reason, _ in await healed.record(reason) }
         )
 
         // Stream gaps every ~15ms for ~0.5s — never a 100ms lull.
@@ -1065,7 +1302,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 0,
             healDebounceMs: 40,
             healMaxWaitSeconds: 1000,
-            onHeal: { reason in await healed.record(reason) }
+            onHeal: { reason, _ in await healed.record(reason) }
         )
 
         await coalescer.noteGapForHeal()
@@ -1090,7 +1327,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             healDebounceMs: 40,
             healMaxWaitSeconds: 1000,
-            onHeal: { reason in await healed.record(reason) }
+            onHeal: { reason, _ in await healed.record(reason) }
         )
         await coalescer.submit(cols: 0, rows: 24)  // 0-col size — must not fire the heal
         await coalescer.noteGapForHeal()

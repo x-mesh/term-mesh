@@ -194,9 +194,14 @@ pub fn build_claude_command(
     ] {
         args.push(OsString::from(s));
     }
-    // "opus" and legacy "opus-1m" both resolve to claude-opus-4-8[1m].
+    // Tiers and the `[1m]` aliases are the CLI's own; it resolves each to the
+    // current model in that family at launch. Pinning "opus" to
+    // claude-opus-4-8[1m] here held every headless agent on the previous Opus
+    // after Opus 5 shipped, and the pin kept launching, so nothing surfaced it.
+    // Only the legacy "opus-1m" spelling still needs a rewrite, and it maps to
+    // the 1M alias it asked for rather than to the bare tier.
     let resolved_model = match model {
-        "opus" | "opus-1m" => "claude-opus-4-8[1m]",
+        "opus-1m" => "opus[1m]",
         other => other,
     };
     args.push(OsString::from(resolved_model));
@@ -608,6 +613,37 @@ mod tests {
                 "sonnet",
             ]
         );
+    }
+
+    #[test]
+    fn claude_model_aliases_preserve_context_window_intent() {
+        let model_arg = |model: &str| {
+            let cmd = build_claude_command(
+                "explorer",
+                "my-team",
+                model,
+                "/proj",
+                "/tmp/term-meshd.sock",
+                None,
+                None,
+                None,
+                ClaudeSpawnMode::Fresh {
+                    session_id: "11111111-2222-3333-4444-555555555555".into(),
+                },
+                &[],
+                &std::collections::HashMap::new(),
+            );
+            let index = cmd
+                .args
+                .iter()
+                .position(|arg| arg == &OsString::from("--model"))
+                .expect("--model");
+            cmd.args[index + 1].clone()
+        };
+
+        assert_eq!(model_arg("opus"), OsString::from("opus"));
+        assert_eq!(model_arg("opus[1m]"), OsString::from("opus[1m]"));
+        assert_eq!(model_arg("opus-1m"), OsString::from("opus[1m]"));
     }
 
     #[test]
