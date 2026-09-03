@@ -957,6 +957,139 @@ final class PeerPaneSessionTests: XCTestCase {
         ))
     }
 
+    func testAutomaticRemoteRepairPlaceholderRequiresExactOwnedKnownDeadManifest() {
+        let leaderID = Data(repeating: 0x71, count: 16)
+        let dead = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: ["executor"],
+            projectID: "team:uuid", leaderSurfaceID: leaderID,
+            presentationOwnedByRequester: true,
+            leaderProcessActive: false, leaderProcessActiveKnown: true
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.automaticRemoteProjectRepairPlaceholderCandidate(
+                in: [dead], leaderRecord: nil
+            ), dead
+        )
+
+        let unknown = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: [], projectID: "team:uuid",
+            leaderSurfaceID: leaderID, presentationOwnedByRequester: true
+        )
+        let live = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: [], projectID: "team:uuid",
+            leaderSurfaceID: leaderID, presentationOwnedByRequester: true,
+            leaderProcessActive: true, leaderProcessActiveKnown: true
+        )
+        XCTAssertNil(TeamOrchestrator.automaticRemoteProjectRepairPlaceholderCandidate(
+            in: [unknown], leaderRecord: nil
+        ))
+        XCTAssertNil(TeamOrchestrator.automaticRemoteProjectRepairPlaceholderCandidate(
+            in: [live], leaderRecord: nil
+        ))
+        XCTAssertNil(TeamOrchestrator.automaticRemoteProjectRepairPlaceholderCandidate(
+            in: [dead, RemoteTeamSummary(
+                name: "xm", teamUUID: "other", workingDirectory: "/other",
+                projectRootPath: nil, agentNames: [], projectID: "team:other",
+                leaderSurfaceID: Data(repeating: 0x72, count: 16),
+                presentationOwnedByRequester: true,
+                leaderProcessActiveKnown: true
+            )], leaderRecord: nil
+        ))
+    }
+
+    func testRemoteRepairPlaceholderPreservesDurableTopologyWithoutPanels() throws {
+        let leaderID = Data(repeating: 0x73, count: 16)
+        let workerID = Data(repeating: 0x74, count: 16)
+        let delegation = ProjectDelegationState(
+            configuredRaw: "parallel", effectiveRaw: "parallel", pendingRaw: ""
+        )
+        let remote = RemoteTeamSummary(
+            name: "xm", teamUUID: "uuid", workingDirectory: "/work/xm",
+            projectRootPath: "/work/xm", agentNames: ["executor"],
+            projectID: "team:uuid", leaderSurfaceID: leaderID,
+            leaderCLI: "codex", leaderModel: "gpt-5.6-sol",
+            members: [.init(
+                name: "executor", agentInstanceID: "worker-instance",
+                cli: "claude", model: "sonnet", agentType: "executor",
+                color: "blue", workingDirectory: "/work/xm-agent",
+                surfaceID: workerID, surfaceType: "agent"
+            )],
+            presentationRevision: 17, presentationOwnedByRequester: true,
+            leaderProcessActive: false, leaderProcessActiveKnown: true,
+            delegationState: delegation
+        )
+
+        let team = try XCTUnwrap(TeamOrchestrator.remoteProjectRepairPlaceholder(
+            remote: remote, hostKey: "ssh:mac-sub"
+        ))
+        XCTAssertTrue(team.isRemoteRepairPlaceholder)
+        XCTAssertTrue(team.ownsRemotePresentation)
+        XCTAssertFalse(team.leaderReady)
+        XCTAssertEqual(team.teamUuid, "uuid")
+        XCTAssertEqual(team.remotePresentationProjectID, "team:uuid")
+        XCTAssertEqual(team.remotePresentationHostKey, "ssh:mac-sub")
+        XCTAssertEqual(team.remoteLeaderSurfaceID, leaderID)
+        XCTAssertEqual(team.leaderCli, "codex")
+        XCTAssertEqual(team.leaderModel, "gpt-5.6-sol")
+        XCTAssertEqual(team.delegationState, delegation)
+        XCTAssertEqual(team.agents.count, 1)
+        XCTAssertEqual(team.agents[0].agentInstanceId, "worker-instance")
+        XCTAssertEqual(team.agents[0].remoteSurfaceID, workerID)
+        XCTAssertEqual(team.agents[0].hostKey, "ssh:mac-sub")
+        XCTAssertNil(team.agents[0].panelId)
+    }
+
+    @MainActor
+    func testInstallingRemoteRepairPlaceholderRegistersDurableRoutingState() throws {
+        let teamName = "repair-placeholder-\(UUID().uuidString)"
+        defer {
+            TeamOrchestrator.shared.teams.removeValue(forKey: teamName)
+            TeamDataStore.shared.unregisterTeam(teamName)
+        }
+        let remote = RemoteTeamSummary(
+            name: teamName, teamUUID: "durable-team", workingDirectory: "/work/xm",
+            projectRootPath: nil, agentNames: ["executor"],
+            projectID: "team:durable-team",
+            leaderSurfaceID: Data(repeating: 0x75, count: 16),
+            members: [.init(
+                name: "executor", agentInstanceID: "durable-worker",
+                cli: "claude", model: "sonnet", agentType: "executor",
+                color: "blue", workingDirectory: "/work/xm",
+                surfaceID: Data(repeating: 0x76, count: 16), surfaceType: "agent"
+            )],
+            presentationOwnedByRequester: true,
+            leaderProcessActiveKnown: true,
+            delegationState: .init(
+                configuredRaw: "parallel", effectiveRaw: "parallel", pendingRaw: ""
+            )
+        )
+        let placeholder = try XCTUnwrap(
+            TeamOrchestrator.remoteProjectRepairPlaceholder(
+                remote: remote, hostKey: "ssh:mac-sub"
+            )
+        )
+
+        XCTAssertTrue(
+            TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(placeholder)
+        )
+        XCTAssertEqual(
+            TeamDataStore.shared.agentInstanceId(
+                teamName: teamName, agentName: "executor"
+            ),
+            "durable-worker"
+        )
+        XCTAssertEqual(
+            TeamDataStore.shared.projectDelegationState(teamName: teamName),
+            remote.delegationState
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.shared.installRemoteProjectRepairPlaceholder(placeholder)
+        )
+    }
+
     func testAutomaticRestoreFailureKeyChangesWithSocketOrRevision() {
         let base = TeamOrchestrator.automaticProjectRestoreFailureKey(
             hostID: "host", activeSockPath: "/tmp/one.sock",
@@ -5348,6 +5481,24 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
     }
 
     @MainActor
+    func test_collaborationRouteVerificationCanProbeStagedCandidateBeforeCommit() {
+        let candidate =
+            "/srv/agent/.term-mesh/agent-routes/.tx.42/leader-team-uuid.json.new"
+        let script = TeamOrchestrator.remoteCollaborationRouteVerificationScript(
+            teamName: "xm",
+            teamUUID: "team-uuid",
+            controlSocketPath: "/run/term-mesh/term-meshd.sock",
+            hostBinDirs: [],
+            routeFilePath: candidate
+        )
+        XCTAssertTrue(script.contains(candidate))
+        XCTAssertFalse(
+            script.contains("$HOME/.term-mesh/agent-routes/leader-team-uuid.json"),
+            "candidate verification must not read or replace the canonical route"
+        )
+    }
+
+    @MainActor
     func test_collaborationRouteVerificationParserRequiresExactProxiedTeam() throws {
         func output(team: String = "xm", proxied: Bool = true) throws -> String {
             let value: [String: Any] = [
@@ -5543,8 +5694,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         let decode = body.range(of: "base64 $flag >")
         XCTAssertNotNil(decode)
         XCTAssertFalse(body.contains("mv -f \"$p\" \"$dir/$n\""))
-        XCTAssertTrue(body.contains("trap rollback EXIT HUP INT TERM"))
-        XCTAssertTrue(body.contains("mv -f \"$tx/$n.old\" \"$dir/$n\""))
+        XCTAssertTrue(body.contains("trap cleanup EXIT HUP INT TERM"))
+        XCTAssertTrue(body.contains("$tx/$n.base"))
         XCTAssertTrue(body.contains("__TERMMESH_ROUTE_DIR__="))
     }
 
@@ -5611,6 +5762,8 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             rollback?.contains("mv -f \"$tx/$n.old\" \"$dir/$n\"") == true
         )
         XCTAssertTrue(commit?.contains("mv -f \"$p\" \"$dir/$n\"") == true)
+        XCTAssertTrue(commit?.contains("cmp -s \"$tx/$n.base\" \"$dir/$n\"") == true)
+        XCTAssertTrue(commit?.contains("$tx/$n.installed") == true)
         XCTAssertTrue(commit?.contains("[ -f \"$tx/committed.done\" ] && exit 0") == true)
         XCTAssertTrue(commit?.contains("[ -d \"$tx\" ] || exit 67") == true)
         XCTAssertTrue(
@@ -5731,6 +5884,14 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         let transaction = try XCTUnwrap(
             TeamOrchestrator.parseAdoptedRouteTransaction(stagedOutput)
         )
+        let stagedCandidate = directory
+            .appendingPathComponent(transaction)
+            .appendingPathComponent("worker.json.new")
+        XCTAssertEqual(try Data(contentsOf: stagedCandidate), Data("test".utf8))
+        XCTAssertEqual(
+            try Data(contentsOf: live), Data("old".utf8),
+            "candidate verification must happen while the canonical route remains old"
+        )
         let commit = Process()
         commit.executableURL = URL(fileURLWithPath: "/bin/sh")
         commit.arguments = [
@@ -5839,6 +6000,188 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
             FileManager.default.fileExists(
                 atPath: directory.appendingPathComponent(transaction).path
             )
+        )
+    }
+
+    @MainActor
+    func test_adoptedRouteCASRejectsStaleCommitAndRollbackCannotClobberNewerWriter() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-route-cas-\(UUID().uuidString)")
+        let directory = home.appendingPathComponent(".term-mesh/agent-routes")
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: home) }
+        let live = directory.appendingPathComponent("worker.json")
+        try Data("old".utf8).write(to: live)
+        let environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+
+        func run(_ script: String, input: String? = nil) throws -> (Int32, String) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", script]
+            process.environment = environment
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = Pipe()
+            if let input {
+                let pipe = Pipe()
+                process.standardInput = pipe
+                try process.run()
+                pipe.fileHandleForWriting.write(Data(input.utf8))
+                try pipe.fileHandleForWriting.close()
+            } else {
+                try process.run()
+            }
+            let text = String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self
+            )
+            process.waitUntilExit()
+            return (process.terminationStatus, text)
+        }
+
+        func stage(_ bytes: String) throws -> String {
+            let encoded = Data(bytes.utf8).base64EncodedString()
+            let result = try run(
+                TeamOrchestrator.adoptedRemoteAgentRouteTransactionScript(),
+                input: "worker.json\t\(encoded)\n"
+            )
+            XCTAssertEqual(result.0, 0)
+            return try XCTUnwrap(
+                TeamOrchestrator.parseAdoptedRouteTransaction(result.1)
+            )
+        }
+
+        let transactionA = try stage("candidate-a")
+        let transactionB = try stage("candidate-b")
+        let commitB = try run(try XCTUnwrap(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transactionB, commit: true
+            )
+        ))
+        XCTAssertEqual(commitB.0, 0)
+        XCTAssertEqual(try Data(contentsOf: live), Data("candidate-b".utf8))
+        let staleCommitA = try run(try XCTUnwrap(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transactionA, commit: true
+            )
+        ))
+        XCTAssertNotEqual(staleCommitA.0, 0)
+        XCTAssertEqual(
+            try Data(contentsOf: live), Data("candidate-b".utf8),
+            "only one concurrent snapshot may replace the canonical route"
+        )
+        XCTAssertEqual(try run(try XCTUnwrap(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transactionA, commit: false
+            )
+        )).0, 0)
+        XCTAssertEqual(try run(try XCTUnwrap(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transactionB, commit: false
+            )
+        )).0, 0)
+        let transactionC = try stage("candidate-c")
+        XCTAssertEqual(try run(try XCTUnwrap(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transactionC, commit: true
+            )
+        )).0, 0)
+        XCTAssertEqual(try Data(contentsOf: live), Data("candidate-c".utf8))
+        try Data("later-writer".utf8).write(to: live)
+        XCTAssertEqual(try run(try XCTUnwrap(
+            TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                transaction: transactionC, commit: false
+            )
+        )).0, 0)
+        XCTAssertEqual(
+            try Data(contentsOf: live), Data("later-writer".utf8),
+            "a stale rollback must not overwrite another transaction's installed bytes"
+        )
+    }
+
+    @MainActor
+    func test_adoptedRouteCommitMutexPublishesOneWholeBatch() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-route-race-\(UUID().uuidString)")
+        let directory = home.appendingPathComponent(".term-mesh/agent-routes")
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: home) }
+        for name in ["leader.json", "worker.json"] {
+            try Data("old".utf8).write(to: directory.appendingPathComponent(name))
+        }
+        let environment = ["HOME": home.path, "PATH": "/usr/bin:/bin"]
+
+        func stage(_ generation: String) throws -> String {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = [
+                "-c", TeamOrchestrator.adoptedRemoteAgentRouteTransactionScript(),
+            ]
+            process.environment = environment
+            let input = Pipe()
+            let output = Pipe()
+            process.standardInput = input
+            process.standardOutput = output
+            process.standardError = Pipe()
+            try process.run()
+            let leader = Data("\(generation)-leader".utf8).base64EncodedString()
+            let worker = Data("\(generation)-worker".utf8).base64EncodedString()
+            input.fileHandleForWriting.write(
+                Data("leader.json\t\(leader)\nworker.json\t\(worker)\n".utf8)
+            )
+            try input.fileHandleForWriting.close()
+            let text = String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self
+            )
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0)
+            return try XCTUnwrap(TeamOrchestrator.parseAdoptedRouteTransaction(text))
+        }
+
+        let transactionA = try stage("a")
+        let transactionB = try stage("b")
+        let gate = home.appendingPathComponent("gate")
+        try FileManager.default.createDirectory(at: gate, withIntermediateDirectories: true)
+
+        func commit(_ transaction: String, marker: String, other: String) throws -> Process {
+            let body = try XCTUnwrap(
+                TeamOrchestrator.adoptedRemoteAgentRouteFinishScript(
+                    transaction: transaction, commit: true
+                )
+            )
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = [
+                "-c",
+                "touch \(gate.appendingPathComponent(marker).path); "
+                    + "while [ ! -f \(gate.appendingPathComponent(other).path) ]; do sleep 0.01; done; "
+                    + body,
+            ]
+            process.environment = environment
+            process.standardOutput = Pipe()
+            process.standardError = Pipe()
+            try process.run()
+            return process
+        }
+
+        let commitA = try commit(transactionA, marker: "a", other: "b")
+        let commitB = try commit(transactionB, marker: "b", other: "a")
+        commitA.waitUntilExit()
+        commitB.waitUntilExit()
+        XCTAssertEqual(
+            [commitA.terminationStatus, commitB.terminationStatus].filter { $0 == 0 }.count,
+            1,
+            "the short commit mutex must choose exactly one batch winner"
+        )
+        let leader = try String(contentsOf: directory.appendingPathComponent("leader.json"))
+        let worker = try String(contentsOf: directory.appendingPathComponent("worker.json"))
+        XCTAssertTrue(
+            (leader == "a-leader" && worker == "a-worker")
+                || (leader == "b-leader" && worker == "b-worker"),
+            "canonical routes must never contain a mixed transaction generation"
         )
     }
 

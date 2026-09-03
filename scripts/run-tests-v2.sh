@@ -231,6 +231,24 @@ cleanup_remote_relay_fixture() {
     >/dev/null 2>&1 || true
 }
 
+restart_remote_relay_fixture_for_repair() {
+  [ -n "$REMOTE_FIXTURE_SSH_TARGET" ] || return 1
+  [ -n "$REMOTE_FIXTURE_ROOT" ] || return 1
+  ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+    "root='$REMOTE_FIXTURE_ROOT'; \
+     old=\$(cat \"\$root/pid\"); kill \"\$old\" 2>/dev/null || true; \
+     for _ in \$(seq 1 80); do kill -0 \"\$old\" 2>/dev/null || break; sleep .1; done; \
+     rm -f \"\$root/term-meshd-peer.sock\" \"\$root/term-meshd.sock\"; \
+     env XDG_DATA_HOME=\"\$root/state\" XDG_RUNTIME_DIR=\"\$root/runtime\" \
+       PATH=/tmp/term-mesh-release-relay-target/release:\$HOME/.cargo/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:\$PATH \
+       TERMMESH_PEER_SOCKET=\"\$root/term-meshd-peer.sock\" \
+       TERMMESH_DAEMON_UNIX_PATH=\"\$root/term-meshd.sock\" \
+       nohup /tmp/term-mesh-release-relay-target/release/term-meshd \
+       >\"\$root/daemon.log\" 2>&1 & echo \$! >\"\$root/pid\"; \
+     for _ in \$(seq 1 120); do [ -S \"\$root/term-meshd-peer.sock\" ] && exit 0; sleep .25; done; \
+     tail -100 \"\$root/daemon.log\" >&2; exit 1"
+}
+
 trap 'cleanup_remote_relay_fixture' EXIT
 stage_remote_relay_fixture
 preflight_remote_project_fixture
@@ -733,6 +751,11 @@ for f in "${test_files[@]}"; do
 
       if [ "$adopt_result" -eq 0 ]; then
         echo "== relaunch ($base repair; original owner identity) =="
+        # Reproduce the production boundary: the owner app is down while the
+        # remote daemon restarts, so its first roster already has a durable
+        # manifest with missing processes/surfaces.
+        cleanup
+        restart_remote_relay_fixture_for_repair
         launch_and_wait 1
         echo "RUN  $f (phase missing-surface repair)"
         set +e
