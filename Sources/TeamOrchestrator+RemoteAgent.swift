@@ -361,6 +361,32 @@ final class PeerAgentPaneRecoveryCoordinator {
 }
 
 extension TeamOrchestrator {
+    struct ExactRepairIdentity: Equatable {
+        let hostKey: String
+        let teamUUID: String
+        let projectID: String
+    }
+
+    enum ExactRepairInput: Equatable {
+        case omitted
+        case valid(ExactRepairIdentity)
+        case invalid
+    }
+
+    nonisolated static func exactRepairInput(
+        params: [String: Any]
+    ) -> ExactRepairInput {
+        let keys = ["host_key", "team_uuid", "project_id"]
+        guard keys.contains(where: params.keys.contains) else { return .omitted }
+        guard let hostKey = params["host_key"] as? String, !hostKey.isEmpty,
+              let teamUUID = params["team_uuid"] as? String, !teamUUID.isEmpty,
+              let projectID = params["project_id"] as? String, !projectID.isEmpty
+        else { return .invalid }
+        return .valid(.init(
+            hostKey: hostKey, teamUUID: teamUUID, projectID: projectID
+        ))
+    }
+
     enum CollaborationLeaderRepairDecision: Equatable {
         case keepExisting
         case bootstrapReplacement
@@ -840,7 +866,9 @@ extension TeamOrchestrator {
     }
 
     @MainActor
-    func repairCollaboration(teamName: String) async -> CollaborationRecoveryReport {
+    func repairCollaboration(
+        teamName: String, exactIdentity: ExactRepairIdentity? = nil
+    ) async -> CollaborationRecoveryReport {
         guard collaborationRepairInFlight.insert(teamName).inserted else {
             return CollaborationRecoveryReport(
                 routeRepaired: false, leaderLive: false, liveAgents: 0,
@@ -848,6 +876,43 @@ extension TeamOrchestrator {
             )
         }
         defer { collaborationRepairInFlight.remove(teamName) }
+        if let exactIdentity {
+            if let localTeam = teams[teamName] {
+                guard Self.exactRepairIdentityMatches(
+                    team: localTeam, hostKey: exactIdentity.hostKey,
+                    teamUUID: exactIdentity.teamUUID,
+                    projectID: exactIdentity.projectID
+                ) else {
+                    return CollaborationRecoveryReport(
+                        routeRepaired: false, leaderLive: false, liveAgents: 0,
+                        replacedAgents: [], failedAgents: [
+                            "Local Project does not match the exact repair identity"
+                        ]
+                    )
+                }
+            } else if let failure = await installExactRemoteProjectRepairPlaceholder(
+                teamName: teamName, hostKey: exactIdentity.hostKey,
+                teamUUID: exactIdentity.teamUUID, projectID: exactIdentity.projectID
+            ) {
+                return CollaborationRecoveryReport(
+                    routeRepaired: false, leaderLive: false, liveAgents: 0,
+                    replacedAgents: [], failedAgents: [failure]
+                )
+            }
+            guard let installed = teams[teamName],
+                  Self.exactRepairIdentityMatches(
+                    team: installed, hostKey: exactIdentity.hostKey,
+                    teamUUID: exactIdentity.teamUUID,
+                    projectID: exactIdentity.projectID
+                  ) else {
+                return CollaborationRecoveryReport(
+                    routeRepaired: false, leaderLive: false, liveAgents: 0,
+                    replacedAgents: [], failedAgents: [
+                        "Exact Project identity changed before repair"
+                    ]
+                )
+            }
+        }
         guard let initial = teams[teamName],
               let teamUUID = initial.teamUuid,
               case let .peer(hostKey) = initial.leaderEndpoint,
@@ -2109,6 +2174,63 @@ extension TeamOrchestrator {
         return true
     }
 
+    /// Explicit owner-RPC counterpart to automatic cold reconstruction. Unlike
+    /// the name-based startup scan, exact durable identity makes multiple
+    /// same-owner manifests unambiguous. It still installs only inert repair
+    /// state; the caller's immediately-following Repair owns materialization.
+    @MainActor
+    func installExactRemoteProjectRepairPlaceholder(
+        teamName: String, hostKey: String, teamUUID: String, projectID: String
+    ) async -> String? {
+        guard teams[teamName] == nil, !hostKey.isEmpty, !teamUUID.isEmpty,
+              !projectID.isEmpty,
+              let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                  $0.id == hostKey && $0.isConnected && $0.teamHostSpec != nil
+              }) else {
+            return "Exact Project host or local name is unavailable"
+        }
+        let snapshot = await authoritativeCollaborationSnapshot(
+            host: host, teamUUID: teamUUID, projectID: projectID
+        )
+        guard case .success(let authoritative) = snapshot,
+              authoritative.team.name == teamName,
+              authoritative.team.presentationOwnedByRequester,
+              authoritative.team.leaderProcessActiveKnown,
+              !authoritative.team.leaderProcessActive,
+              let placeholder = Self.remoteProjectRepairPlaceholder(
+                  remote: authoritative.team, hostKey: hostKey
+              ),
+              installRemoteProjectRepairPlaceholder(placeholder) else {
+            return "Exact owned inactive Project could not be reconstructed"
+        }
+        return nil
+    }
+
+    nonisolated static func exactRemoteRepairPlaceholderCandidate(
+        in remotes: [RemoteTeamSummary], teamName: String,
+        teamUUID: String, projectID: String
+    ) -> RemoteTeamSummary? {
+        let matches = remotes.filter { remote in
+            remote.name == teamName
+                && remote.teamUUID == teamUUID
+                && remote.projectID == projectID
+                && remote.presentationOwnedByRequester
+                && remote.leaderProcessActiveKnown
+                && !remote.leaderProcessActive
+                && !remote.leaderSurfaceID.isEmpty
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    nonisolated static func exactRepairIdentityMatches(
+        team: Team, hostKey: String, teamUUID: String, projectID: String
+    ) -> Bool {
+        guard case .peer(let actualHost) = team.leaderEndpoint else { return false }
+        return actualHost == hostKey
+            && team.teamUuid == teamUUID
+            && team.remotePresentationProjectID == projectID
+    }
+
     nonisolated static func shouldReleaseRemoteAgentsOnQuit(
         ownsRemotePresentation: Bool,
         hasPeerLeader: Bool,
@@ -2204,6 +2326,13 @@ extension TeamOrchestrator {
                 ), let placeholder = Self.remoteProjectRepairPlaceholder(
                     remote: dead, hostKey: host.id
                 ) {
+                    #if DEBUG
+                    if ProcessInfo.processInfo.environment[
+                        "TERMMESH_E2E_DISABLE_AUTO_REPAIR_PLACEHOLDERS"
+                    ] == "1" {
+                        continue
+                    }
+                    #endif
                     _ = installRemoteProjectRepairPlaceholder(placeholder)
                     continue
                 }

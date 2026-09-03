@@ -1555,10 +1555,17 @@ class termmesh:
     def team_status(self, team_name: str) -> Dict[str, Any]:
         return dict(self._call("team.status", {"team_name": team_name}) or {})
 
-    def team_repair_collaboration(self, team_name: str) -> Dict[str, Any]:
-        return dict(self._call("team.repair_collaboration", {
-            "team_name": team_name,
-        }, timeout_s=300) or {})
+    def team_repair_collaboration(
+        self, team_name: str, *, host_key: Optional[str] = None,
+        team_uuid: Optional[str] = None, project_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"team_name": team_name}
+        if host_key is not None: params["host_key"] = host_key
+        if team_uuid is not None: params["team_uuid"] = team_uuid
+        if project_id is not None: params["project_id"] = project_id
+        return dict(self._call(
+            "team.repair_collaboration", params, timeout_s=300
+        ) or {})
 
     def debug_project_create(self, directory: str, roles: List[str],
                              leader_cli: str = "claude",

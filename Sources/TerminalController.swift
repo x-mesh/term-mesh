@@ -4084,7 +4084,21 @@ class TerminalController {
         guard let teamName = params["team_name"] as? String, !teamName.isEmpty else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
-        let report = await TeamOrchestrator.shared.repairCollaboration(teamName: teamName)
+        let exactIdentity: TeamOrchestrator.ExactRepairIdentity?
+        switch TeamOrchestrator.exactRepairInput(params: params) {
+        case .omitted:
+            exactIdentity = nil
+        case .invalid:
+            return v2Error(
+                id: id, code: "invalid_params",
+                message: "Exact repair requires non-empty host_key, team_uuid, and project_id"
+            )
+        case .valid(let identity):
+            exactIdentity = identity
+        }
+        let report = await TeamOrchestrator.shared.repairCollaboration(
+            teamName: teamName, exactIdentity: exactIdentity
+        )
         return v2Ok(id: id, result: [
             "team_name": teamName,
             "succeeded": report.succeeded,
