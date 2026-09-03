@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.226.1] - 2026-09-03
+
+### Fixed
+
+- Made **Repair collaboration** recover a remote Project whose durable manifest survived but leader and worker surfaces disappeared, while preserving live processes and durable worker identities.
+- Made repair reconnect the authoritative host route, verify the exact leader-side `team.status` proxy before reporting success, and roll back unverified route changes safely.
+- Prevented delayed Project publication from resurrecting a manifest after successful deletion.
+
 ## [0.226.0] - 2026-09-03
 
 ### Fixed
