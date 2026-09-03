@@ -239,7 +239,7 @@ def _run_case(c: termmesh, case: dict) -> dict:
             agent["panel_id"] for agent in team.get("agents", [])
         }
 
-        disconnected = c.peer_host_force_disconnect(host)
+        disconnected = c.peer_host_force_disconnect(host, confirm=True)
         if not disconnected.get("ok"):
             raise termmeshError(f"{platform} force disconnect failed: {disconnected!r}")
         row = _wait(lambda: next((

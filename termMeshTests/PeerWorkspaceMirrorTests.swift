@@ -628,6 +628,12 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
 /// path, so it's exercised directly here via the `onHeal` callback rather
 /// than by counting `Resize` frames.
 final class RelayResumeTransitionGateTests: XCTestCase {
+    private actor GenerationHealRecorder {
+        private var reasons: [String] = []
+
+        func record(_ reason: String) { reasons.append(reason) }
+        func all() -> [String] { reasons }
+    }
 
     /// Reconnect replaces the session wholesale, so a transition that was in
     /// flight when the transport died must not keep suppressing output — the
@@ -654,6 +660,124 @@ final class RelayResumeTransitionGateTests: XCTestCase {
         gate.reset()
 
         XCTAssertEqual(gate.route(endWireSeq: 3, data: Data("y".utf8)), .forward(Data("y".utf8)))
+    }
+
+    func testOwnedReconnectFromBufferingRejectsOldGenerationAndForwardsFirstNewChunk() {
+        let gate = RelayResumeTransitionGate()
+        let oldGeneration = gate.currentGeneration()
+        let transition = gate.begin()
+        XCTAssertEqual(transition.generation, oldGeneration)
+        XCTAssertEqual(
+            gate.route(
+                generation: oldGeneration, endWireSeq: 4, data: Data("held".utf8)
+            ),
+            .suppress
+        )
+
+        let newGeneration = gate.replaceSession(expectedGeneration: oldGeneration)
+        XCTAssertNotNil(newGeneration)
+        XCTAssertEqual(
+            gate.route(
+                generation: oldGeneration, endWireSeq: 8, data: Data("stale".utf8)
+            ),
+            .staleGeneration,
+            "a retired pump must not paint or advance the replacement gate"
+        )
+        XCTAssertEqual(gate.snapshot().wireSeq, 0)
+        XCTAssertEqual(
+            gate.route(
+                generation: newGeneration!, endWireSeq: 3, data: Data("new".utf8)
+            ),
+            .forward(Data("new".utf8)),
+            "the replacement's first PtyData must see an idle gate"
+        )
+        XCTAssertEqual(gate.snapshot().wireSeq, 3)
+        XCTAssertEqual(gate.snapshot().phase, "idle")
+    }
+
+    func testOwnedReconnectFromCommittedRejectsOldGenerationAndForwardsFirstNewChunk() {
+        let gate = RelayResumeTransitionGate()
+        let oldGeneration = gate.currentGeneration()
+        let transition = gate.begin()
+        XCTAssertTrue(gate.commit(transition))
+        XCTAssertEqual(
+            gate.route(
+                generation: oldGeneration, endWireSeq: 4, data: Data("old".utf8)
+            ),
+            .suppress
+        )
+
+        let newGeneration = gate.replaceSession(expectedGeneration: oldGeneration)!
+        XCTAssertEqual(gate.snapshot().phase, "idle")
+        XCTAssertEqual(
+            gate.route(
+                generation: newGeneration, endWireSeq: 5, data: Data("first".utf8)
+            ),
+            .forward(Data("first".utf8))
+        )
+        XCTAssertFalse(gate.commit(transition), "the retired transition cannot recommit")
+        XCTAssertNil(gate.abort(transition), "the retired transition cannot drain into the new stream")
+    }
+
+    func testStaleReconnectCommitCannotReplaceOrResetWinningGeneration() {
+        let gate = RelayResumeTransitionGate()
+        let original = gate.currentGeneration()
+        let winner = gate.replaceSession(expectedGeneration: original)!
+        XCTAssertEqual(
+            gate.route(generation: winner, endWireSeq: 3, data: Data("one".utf8)),
+            .forward(Data("one".utf8))
+        )
+
+        XCTAssertNil(
+            gate.replaceSession(expectedGeneration: original),
+            "late async work from the retired generation must lose the commit CAS"
+        )
+        let snapshot = gate.snapshot()
+        XCTAssertEqual(snapshot.generation, winner)
+        XCTAssertEqual(snapshot.wireSeq, 3, "a stale commit must not reset the winner's progress")
+        XCTAssertEqual(snapshot.phase, "idle")
+        XCTAssertEqual(
+            gate.route(generation: winner, endWireSeq: 6, data: Data("two".utf8)),
+            .forward(Data("two".utf8))
+        )
+    }
+
+    func testStaleHealCannotOpenBufferingOnWinningGeneration() {
+        let gate = RelayResumeTransitionGate()
+        let retired = gate.currentGeneration()
+        let winner = gate.replaceSession(expectedGeneration: retired)!
+
+        XCTAssertNil(gate.begin(generation: retired))
+        XCTAssertEqual(gate.snapshot().phase, "idle")
+        XCTAssertEqual(
+            gate.route(generation: winner, endWireSeq: 5, data: Data("live".utf8)),
+            .forward(Data("live".utf8)),
+            "stale heal setup must not suppress the winning session"
+        )
+    }
+
+    func testDebouncedHealFromRetiredGenerationIsDiscarded() async throws {
+        let gate = RelayResumeTransitionGate()
+        let retired = gate.currentGeneration()
+        let healed = GenerationHealRecorder()
+        let scheduler = RelayGapHealScheduler(
+            healDebounceMs: 20,
+            generationIsCurrent: { generation in
+                gate.currentGeneration() == generation
+            },
+            onHeal: { reason, _ in await healed.record(reason) }
+        )
+
+        await scheduler.noteGap(generation: retired)
+        _ = gate.replaceSession(expectedGeneration: retired)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        let reasons = await healed.all()
+        XCTAssertTrue(
+            reasons.isEmpty,
+            "a debounce scheduled by the dead stream must not heal its replacement"
+        )
+        await scheduler.cancel()
     }
 
     /// `begin()` reports the wire position as a side effect of starting to
@@ -887,7 +1011,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             authorityEligible: true,
             delayMs: 10_000,
-            onHeal: { _ in }
+            onHeal: { _, _ in }
         )
 
         await coalescer.submit(cols: 120, rows: 36)
@@ -911,7 +1035,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             authorityEligible: false,
             delayMs: 10_000,
-            onHeal: { _ in }
+            onHeal: { _, _ in }
         )
 
         await coalescer.submit(cols: 120, rows: 36)
@@ -934,7 +1058,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             authorityEligible: false,
             delayMs: 10_000,
-            onHeal: { _ in }
+            onHeal: { _, _ in }
         )
 
         await coalescer.submit(cols: 120, rows: 36)
@@ -967,7 +1091,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             authorityEligible: false,
             delayMs: 10_000,
-            onHeal: { _ in }
+            onHeal: { _, _ in }
         )
 
         await coalescer.submit(cols: 80, rows: 24)
@@ -997,7 +1121,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             authorityEligible: false,
             delayMs: 10_000,
-            onHeal: { _ in }
+            onHeal: { _, _ in }
         )
 
         await coalescer.submit(cols: 120, rows: 36)
@@ -1024,7 +1148,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             authorityEligible: false,
             delayMs: 1,
-            onHeal: { _ in }
+            onHeal: { _, _ in }
         )
 
         await coalescer.submit(cols: 120, rows: 36)
@@ -1051,7 +1175,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             authorityEligible: true,
             delayMs: 10_000,
-            onHeal: { _ in }
+            onHeal: { _, _ in }
         )
 
         await coalescer.submit(cols: 120, rows: 36)
@@ -1101,7 +1225,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             healDebounceMs: 40,
             healMaxWaitSeconds: 1000,
-            onHeal: { reason in await healed.record(reason) }
+            onHeal: { reason, _ in await healed.record(reason) }
         )
 
         await coalescer.noteGapForHeal()
@@ -1128,7 +1252,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             healDebounceMs: 1_000_000,
             healMaxWaitSeconds: 0.1,
-            onHeal: { reason in await healed.record(reason) }
+            onHeal: { reason, _ in await healed.record(reason) }
         )
 
         // Stream gaps every ~15ms for ~0.5s — never a 100ms lull.
@@ -1162,7 +1286,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 0,
             healDebounceMs: 40,
             healMaxWaitSeconds: 1000,
-            onHeal: { reason in await healed.record(reason) }
+            onHeal: { reason, _ in await healed.record(reason) }
         )
 
         await coalescer.noteGapForHeal()
@@ -1187,7 +1311,7 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             initialRows: 24,
             healDebounceMs: 40,
             healMaxWaitSeconds: 1000,
-            onHeal: { reason in await healed.record(reason) }
+            onHeal: { reason, _ in await healed.record(reason) }
         )
         await coalescer.submit(cols: 0, rows: 24)  // 0-col size — must not fire the heal
         await coalescer.noteGapForHeal()

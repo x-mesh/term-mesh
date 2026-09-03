@@ -172,7 +172,7 @@ extension PeerWorkspaceMirrorController {
                 )
                 newSessions[leaf.surfaceID] = session
             } catch {
-                NSLog("[peer-mirror] leaf attach failed (skipping until next push): %@",
+                NSLog("[peer-mirror] leaf attach failed (bounded autonomous retry armed): %@",
                       String(describing: error))
             }
         }

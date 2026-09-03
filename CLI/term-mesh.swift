@@ -719,6 +719,9 @@ struct TermMeshCLI {
                 }
             }()
             var peerParams: [String: Any] = ["host": hostArg]
+            if command == "peer-force-disconnect", commandArgs.contains("--confirm") {
+                peerParams["confirm"] = true
+            }
             if command == "peer-open-mirror", let ws = optionValue(commandArgs, name: "--workspace") {
                 peerParams["workspace"] = ws
             }
@@ -3402,7 +3405,7 @@ struct TermMeshCLI {
             Usage: term-mesh peer-hosts
                    term-mesh peer-connect --host <id|name>
                    term-mesh peer-disconnect --host <id|name>
-                   term-mesh peer-force-disconnect --host <id|name>
+                   term-mesh peer-force-disconnect --host <id|name> --confirm
                    term-mesh peer-retry --host <id|name>
                    term-mesh peer-cancel --host <id|name>
                    term-mesh peer-open-pane --host <id|name>
@@ -3423,8 +3426,9 @@ struct TermMeshCLI {
             design, which can leave the row back at "connected".
 
             force-disconnect closes every pane, mirror and relay window opened
-            from the host, then releases the lease. Reports how many
-            connections it closed.
+            from the host, then releases the lease. It is destructive to local
+            presentation state and therefore requires the explicit --confirm
+            flag. Reports typed pane/mirror/window close counts.
 
             open-pane attaches the host's first attachable surface as a pane in
             the current workspace (no picker). Asynchronous like connect: poll

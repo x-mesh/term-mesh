@@ -914,6 +914,12 @@ extension TerminalController {
                 result = .err(code: "invalid_params", message: "Surface is not a terminal", data: ["surface_id": surfaceId.uuidString])
                 return
             }
+            guard terminalPanel.surface.surface != nil else {
+                result = self.v2TerminalSurfaceUnavailable(
+                    terminalPanel: terminalPanel, surfaceId: surfaceId
+                )
+                return
+            }
 
             let response = self.readTerminalTextBase64(
                 terminalPanel: terminalPanel,
@@ -981,7 +987,9 @@ extension TerminalController {
                 return
             }
             guard let surface = terminalPanel.surface.surface else {
-                result = .err(code: "internal_error", message: "Terminal surface not found", data: nil)
+                result = self.v2TerminalSurfaceUnavailable(
+                    terminalPanel: terminalPanel, surfaceId: surfaceId
+                )
                 return
             }
             let idString = surfaceId.uuidString
@@ -1012,6 +1020,47 @@ extension TerminalController {
             return .err(code: "timeout", message: "Main thread busy (IME or modal UI active)", data: nil)
         }
         return result
+    }
+
+    /// Nil here is a normal lifecycle state: SwiftUI may have created a panel
+    /// model before Ghostty mounts it, and a remote pane may still be waiting
+    /// for its relay helper. Callers can retry; reporting `internal_error` made
+    /// an expected pending state look like a server defect.
+    private func v2TerminalSurfaceUnavailable(
+        terminalPanel: TerminalPanel, surfaceId: UUID
+    ) -> V2CallResult {
+        let policy = Self.terminalSurfaceUnavailablePolicy(
+            relayStartupState: terminalPanel.peerPaneSession?.relayStartupState
+        )
+        var data: [String: Any] = [
+            "surface_id": surfaceId.uuidString,
+            "retryable": policy.retryable,
+            "startup_state": policy.startupState,
+        ]
+        if let session = terminalPanel.peerPaneSession {
+            data["relay_startup_state"] = session.relayStartupState.rawValue
+            data["pane_health"] = session.paneHealth.rawValue
+        }
+        return .err(
+            code: policy.code,
+            message: "Terminal surface is not mounted yet",
+            data: data
+        )
+    }
+
+    struct TerminalSurfaceUnavailablePolicy: Equatable, Sendable {
+        let code: String
+        let retryable: Bool
+        let startupState: String
+    }
+
+    nonisolated static func terminalSurfaceUnavailablePolicy(
+        relayStartupState: PeerPaneSession.RelayStartupState?
+    ) -> TerminalSurfaceUnavailablePolicy {
+        TerminalSurfaceUnavailablePolicy(
+            code: "unavailable", retryable: true,
+            startupState: relayStartupState?.rawValue ?? "mounting"
+        )
     }
 
     func readTerminalTextBase64(terminalPanel: TerminalPanel, includeScrollback: Bool = false, lineLimit: Int? = nil) -> String {

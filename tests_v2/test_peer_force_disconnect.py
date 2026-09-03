@@ -111,14 +111,33 @@ def main() -> int:
                 f"got {connected[0]!r}"
             )
 
-        # --- 3. force disconnect closes everything
-        result = c.peer_host_force_disconnect(host_id)
+        # --- 3. force disconnect is gated because it destroys local mirrors
+        # and panes, unlike the transport-only disconnect command.
+        try:
+            c.peer_host_force_disconnect(host_id)
+        except termmeshError as exc:
+            if "confirmation_required" not in str(exc):
+                raise termmeshError(f"expected confirmation_required, got {exc}")
+        else:
+            raise termmeshError("force_disconnect without confirm unexpectedly succeeded")
+        if _live_pane_count(c) != opened:
+            raise termmeshError("unconfirmed force_disconnect changed pane state")
+
+        result = c.peer_host_force_disconnect(host_id, confirm=True)
         if not result.get("ok"):
             raise termmeshError(f"force_disconnect failed: {result!r}")
         if result.get("closed") != opened:
             raise termmeshError(
                 f"expected closed={opened}, got {result.get('closed')} ({result!r})"
             )
+        counts = result.get("closed_by_type") or {}
+        expected_counts = {
+            "panes": opened, "mirrors": 0, "relay_windows": 0, "other": 0
+        }
+        if counts != expected_counts:
+            raise termmeshError(f"unexpected typed close counts: {counts!r}")
+        if not result.get("destructive") or "mirrors" not in result.get("warning", ""):
+            raise termmeshError(f"destructive warning missing: {result!r}")
 
         if not _wait(lambda: _live_pane_count(c) == 0, timeout_s=20):
             raise termmeshError(
@@ -146,7 +165,7 @@ def main() -> int:
 
         # --- 5. unknown host is a clean error
         try:
-            c.peer_host_force_disconnect("definitely-not-a-host")
+            c.peer_host_force_disconnect("definitely-not-a-host", confirm=True)
         except termmeshError as exc:
             if "not_found" not in str(exc):
                 raise termmeshError(f"expected not_found for unknown host, got {exc}")
