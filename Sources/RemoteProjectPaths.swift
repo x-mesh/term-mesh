@@ -170,9 +170,43 @@ final class ManagedPeerSurfaceStore {
         let role: String
         let workingDirectory: String
         let createdAt: Date
+        var teamUUID: String? = nil
+        var projectID: String? = nil
 
         var id: String { "\(hostKey)\u{0000}\(surfaceIDBase64)" }
         var surfaceID: Data? { Data(base64Encoded: surfaceIDBase64) }
+
+        private enum CodingKeys: String, CodingKey {
+            case hostKey, surfaceIDBase64, teamName, role, workingDirectory
+            case createdAt, teamUUID, projectID
+        }
+
+        init(
+            hostKey: String, surfaceIDBase64: String, teamName: String,
+            role: String, workingDirectory: String, createdAt: Date,
+            teamUUID: String? = nil, projectID: String? = nil
+        ) {
+            self.hostKey = hostKey
+            self.surfaceIDBase64 = surfaceIDBase64
+            self.teamName = teamName
+            self.role = role
+            self.workingDirectory = workingDirectory
+            self.createdAt = createdAt
+            self.teamUUID = teamUUID
+            self.projectID = projectID
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            hostKey = try values.decode(String.self, forKey: .hostKey)
+            surfaceIDBase64 = try values.decode(String.self, forKey: .surfaceIDBase64)
+            teamName = try values.decode(String.self, forKey: .teamName)
+            role = try values.decode(String.self, forKey: .role)
+            workingDirectory = try values.decode(String.self, forKey: .workingDirectory)
+            createdAt = try values.decode(Date.self, forKey: .createdAt)
+            teamUUID = try values.decodeIfPresent(String.self, forKey: .teamUUID)
+            projectID = try values.decodeIfPresent(String.self, forKey: .projectID)
+        }
     }
 
     static let shared = ManagedPeerSurfaceStore()
@@ -194,7 +228,9 @@ final class ManagedPeerSurfaceStore {
         surfaceID: Data,
         teamName: String,
         role: String,
-        workingDirectory: String
+        workingDirectory: String,
+        teamUUID: String? = nil,
+        projectID: String? = nil
     ) {
         let encoded = surfaceID.base64EncodedString()
         records.removeAll {
@@ -206,7 +242,9 @@ final class ManagedPeerSurfaceStore {
             teamName: teamName,
             role: role,
             workingDirectory: workingDirectory,
-            createdAt: Date()
+            createdAt: Date(),
+            teamUUID: teamUUID,
+            projectID: projectID
         ))
         persist()
     }

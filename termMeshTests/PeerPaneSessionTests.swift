@@ -5419,6 +5419,120 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         ).leaderLive)
     }
 
+    func test_collaborationReusesOnlyExactLiveManagedReplacement() {
+        let manifestID = Data(repeating: 0x61, count: 16)
+        let managedID = Data(repeating: 0x62, count: 16)
+        let record = ManagedPeerSurfaceStore.Record(
+            hostKey: "ssh:mac-sub",
+            surfaceIDBase64: managedID.base64EncodedString(),
+            teamName: "xm", role: "leader",
+            workingDirectory: "/work/xm", createdAt: Date(),
+            teamUUID: "uuid", projectID: "team:uuid"
+        )
+        var managed = Termmesh_Peer_V1_SurfaceInfo()
+        managed.surfaceID = managedID
+        managed.attachable = true
+        managed.foregroundBusyKnown = true
+        managed.foregroundBusy = true
+        XCTAssertEqual(
+            TeamOrchestrator.recoverableManagedLeaderSurfaceID(
+                manifestLeaderSurfaceID: manifestID,
+                managedRecords: [record], teamName: "xm", teamUUID: "uuid",
+                projectID: "team:uuid", workingDirectory: "/work/xm",
+                surfaces: [managed]
+            ),
+            managedID
+        )
+        XCTAssertNil(TeamOrchestrator.recoverableManagedLeaderSurfaceID(
+            manifestLeaderSurfaceID: managedID,
+            managedRecords: [record], teamName: "xm", teamUUID: "uuid",
+            projectID: "team:uuid", workingDirectory: "/work/xm",
+            surfaces: [managed]
+        ))
+        managed.foregroundBusy = false
+        XCTAssertNil(TeamOrchestrator.recoverableManagedLeaderSurfaceID(
+            manifestLeaderSurfaceID: manifestID,
+            managedRecords: [record], teamName: "xm", teamUUID: "uuid",
+            projectID: "team:uuid", workingDirectory: "/work/xm",
+            surfaces: [managed]
+        ))
+        managed.foregroundBusy = true
+        let otherID = Data(repeating: 0x63, count: 16)
+        var other = Termmesh_Peer_V1_SurfaceInfo()
+        other.surfaceID = otherID
+        other.attachable = true
+        other.foregroundBusyKnown = true
+        other.foregroundBusy = true
+        let otherRecord = ManagedPeerSurfaceStore.Record(
+            hostKey: "ssh:mac-sub", surfaceIDBase64: otherID.base64EncodedString(),
+            teamName: "xm", role: "leader", workingDirectory: "/work/xm",
+            createdAt: Date(), teamUUID: "uuid", projectID: "team:uuid"
+        )
+        XCTAssertNil(TeamOrchestrator.recoverableManagedLeaderSurfaceID(
+            manifestLeaderSurfaceID: manifestID,
+            managedRecords: [record, otherRecord], teamName: "xm", teamUUID: "uuid",
+            projectID: "team:uuid", workingDirectory: "/work/xm",
+            surfaces: [managed, other]
+        ))
+    }
+
+    @MainActor
+    func test_managedLeaderRecordDecodesLegacyIdentityAsUnknown() throws {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "hostKey": "ssh:mac-sub",
+            "surfaceIDBase64": Data(repeating: 0x64, count: 16).base64EncodedString(),
+            "teamName": "xm", "role": "leader",
+            "workingDirectory": "/work/xm",
+            "createdAt": 0.0,
+        ])
+        let record = try JSONDecoder().decode(
+            ManagedPeerSurfaceStore.Record.self, from: data
+        )
+        XCTAssertNil(record.teamUUID)
+        XCTAssertNil(record.projectID)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = try XCTUnwrap(record.surfaceID)
+        surface.attachable = true
+        surface.foregroundBusyKnown = true
+        surface.foregroundBusy = true
+        XCTAssertNil(TeamOrchestrator.recoverableManagedLeaderSurfaceID(
+            manifestLeaderSurfaceID: Data(repeating: 0x65, count: 16),
+            managedRecords: [record], teamName: "xm", teamUUID: "uuid",
+            projectID: "team:uuid", workingDirectory: "/work/xm",
+            surfaces: [surface]
+        ))
+        XCTAssertEqual(TeamOrchestrator.legacyManagedLeaderCandidateSurfaceID(
+            manifestLeaderSurfaceID: Data(repeating: 0x65, count: 16),
+            managedRecords: [record], teamName: "xm",
+            workingDirectory: "/work/xm", surfaces: [surface]
+        ), record.surfaceID)
+        let script = TeamOrchestrator.legacyManagedLeaderIdentityProofScript()
+        XCTAssertFalse(script.contains("TERMMESH_SURFACE_ID="))
+        XCTAssertFalse(script.contains("TERMMESH_LEADER_TEAM_UUID=uuid"))
+        XCTAssertFalse(script.contains("TERMMESH_LEADER_GRANT_ID"))
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", script]
+        let input = Pipe()
+        let output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = Pipe()
+        try process.run()
+        input.fileHandleForWriting.write(
+            TeamOrchestrator.legacyManagedLeaderIdentityProofInput(
+                surfaceID: try XCTUnwrap(record.surfaceID), teamUUID: "uuid"
+            )
+        )
+        try input.fileHandleForWriting.close()
+        let result = String(
+            decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertEqual(result, "0", "the verifier must not match its own command")
+    }
+
     @MainActor
     func test_collaborationControlSocketUsesMeasuredOrSiblingPathOnly() {
         var measured = PeerHostHealthBaseline()
@@ -5457,6 +5571,29 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
                 peerSocketPath: "/tmp/unrelated.sock", health: nil
             )
         )
+    }
+
+    func test_collaborationPeerSocketUsesOnlyAuthenticatedTeamEndpoint() {
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationPeerSocketPath(
+                teamHostKey: .direct(sockPath: "/owner/term-meshd-peer.sock")
+            ),
+            "/owner/term-meshd-peer.sock"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.collaborationPeerSocketPath(
+                teamHostKey: .ssh(
+                    target: "mac-sub",
+                    remoteSockPath: "/var/folders/owner/term-meshd-peer.sock",
+                    port: nil
+                )
+            ),
+            "/var/folders/owner/term-meshd-peer.sock"
+        )
+        XCTAssertNil(TeamOrchestrator.collaborationPeerSocketPath(teamHostKey: nil))
+        XCTAssertNil(TeamOrchestrator.collaborationPeerSocketPath(
+            teamHostKey: .ssh(target: "mac-sub", remoteSockPath: "", port: nil)
+        ))
     }
 
     @MainActor
@@ -6731,6 +6868,63 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         await TeamOrchestrator.terminatePeerAgentSurface(
             hostSockPath: "/tmp/does-not-exist-\(getpid()).sock",
             surfaceID: Data(repeating: 1, count: 16)
+        )
+    }
+
+    @MainActor
+    func test_failedLeaderCompensationTerminatesOwnerBeforeForgettingAndTeardown() async {
+        let surfaceID = Data(repeating: 0x7a, count: 16)
+        let owner = PeerPaneHostSpec.ssh(
+            target: "mac-sub", remoteSockPath: "/owner/term-meshd-peer.sock",
+            port: nil, identityFile: nil
+        )
+        var events: [String] = []
+        await TeamOrchestrator.compensateFailedLeaderSurface(
+            hostKey: "ssh:mac-sub", surfaceID: surfaceID, owningHostSpec: owner,
+            terminate: { spec, actual in
+                XCTAssertEqual(spec.hostKey.remoteSockPath, "/owner/term-meshd-peer.sock")
+                XCTAssertEqual(actual, surfaceID)
+                events.append("terminate")
+                return true
+            },
+            forgetManaged: { _, actual in
+                XCTAssertEqual(actual, surfaceID)
+                events.append("forget")
+            },
+            enqueueCleanup: { _, _, _ in events.append("enqueue") },
+            teardownLocal: { events.append("teardown") }
+        )
+        XCTAssertEqual(events, ["terminate", "forget", "teardown"])
+    }
+
+    @MainActor
+    func test_failedLeaderCompensationPersistsOwnerTombstoneBeforeTeardown() async {
+        let surfaceID = Data(repeating: 0x7b, count: 16)
+        let owner = PeerPaneHostSpec.ssh(
+            target: "mac-sub", remoteSockPath: "/owner/term-meshd-peer.sock",
+            port: nil, identityFile: nil
+        )
+        var events: [String] = []
+        var tombstone: (String, Data, String?)?
+        await TeamOrchestrator.compensateFailedLeaderSurface(
+            hostKey: "ssh:mac-sub", surfaceID: surfaceID, owningHostSpec: owner,
+            terminate: { _, _ in events.append("terminate"); return false },
+            forgetManaged: { _, _ in events.append("forget") },
+            enqueueCleanup: { host, actual, endpoint in
+                tombstone = (host, actual, endpoint)
+                events.append("enqueue")
+            },
+            teardownLocal: { events.append("teardown") }
+        )
+        XCTAssertEqual(events, ["terminate", "enqueue", "teardown"])
+        XCTAssertEqual(tombstone?.0, "ssh:mac-sub")
+        XCTAssertEqual(tombstone?.1, surfaceID)
+        XCTAssertEqual(tombstone?.2, "/owner/term-meshd-peer.sock")
+        XCTAssertEqual(
+            TeamOrchestrator.failedLeaderOwningSocketPath(
+                .direct(sockPath: "/direct/term-meshd-peer.sock")
+            ),
+            "/direct/term-meshd-peer.sock"
         )
     }
 
