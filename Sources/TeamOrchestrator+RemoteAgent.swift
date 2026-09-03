@@ -1373,6 +1373,16 @@ extension TeamOrchestrator {
             && hasResolvedTeamRoute
     }
 
+    /// A durable manifest remains authoritative repair input even after its
+    /// leader exits, but it must not be presented or adopted as live work.
+    /// Legacy manifests have no process probe, so preserve their existing
+    /// conservative attach policy until the host reports an exact state.
+    nonisolated static func remoteManifestLeaderIsAdoptable(
+        _ remote: RemoteTeamSummary
+    ) -> Bool {
+        !remote.leaderProcessActiveKnown || remote.leaderProcessActive
+    }
+
     nonisolated static func shouldOfferRemoteManifest(
         hasLocalTeam: Bool,
         localPresentationOwnedByRequester: Bool,
@@ -1426,8 +1436,9 @@ extension TeamOrchestrator {
     /// projects appearing in one view and not the other is what made a Project
     /// on a Mac peer look deleted: workspaces come from the serving GUI socket,
     /// which publishes no manifest, so the Host axis had nothing to show and
-    /// said nothing about it. A manifest with no leader surface is skipped for
-    /// the same reason the Project axis skips it — there is nothing to attach.
+    /// said nothing about it. A manifest with no leader surface or a known-dead
+    /// leader is skipped because neither can be attached as live work. The raw
+    /// host roster remains intact so its owner can still repair that Project.
     nonisolated static func hostAxisOfferedManifests(
         isConnected: Bool,
         teams: [RemoteTeamSummary],
@@ -1436,7 +1447,8 @@ extension TeamOrchestrator {
     ) -> [RemoteTeamSummary] {
         guard isConnected else { return [] }
         return teams.filter { team in
-            guard !team.leaderSurfaceID.isEmpty else { return false }
+            guard !team.leaderSurfaceID.isEmpty,
+                  remoteManifestLeaderIsAdoptable(team) else { return false }
             return sidebarRemoteManifestState(
                 localTeam: localTeamForName(team.name),
                 remote: team,
@@ -1814,7 +1826,7 @@ extension TeamOrchestrator {
     ) async -> Bool {
         guard !projectDeletionSuppressions.contains(
             Self.projectDeletionSuppressionKey(hostID: host.id, projectID: remote.projectID)
-        ) else { return false }
+        ), Self.remoteManifestLeaderIsAdoptable(remote) else { return false }
         let namedTeam = teams[remote.name]
         let matchingTeam = namedTeam.flatMap {
             Self.remotePresentationIdentityMatches(

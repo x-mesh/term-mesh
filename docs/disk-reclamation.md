@@ -81,11 +81,13 @@ rebuild that failed while the previous build is live.
 ## Stale Project manifests on a host (`tm-agent daemon project-presentations`)
 
 A daemon keeps one durable record per published Project in
-`peer-project-presentations.json`. Records whose surfaces are gone are hidden
-from the roster, so they cause no collisions, but they stay on disk and only
-the installation that published them may delete them over the peer protocol
-(`not_owner` otherwise). The host-side command is the path for everything the
-protocol refuses:
+`peer-project-presentations.json`. A record remains in the peer roster when its
+surfaces are gone so the owning installation can identify the exact Project and
+repair its leader. Normal attach UI does not offer a record whose leader is
+authoritatively inactive; the raw roster entry is recovery state, not evidence
+of an attachable pane. Only the installation that published a record may delete
+it over the peer protocol (`not_owner` otherwise). The host-side command is the
+path for everything the protocol refuses:
 
 ```bash
 tm-agent daemon project-presentations list
@@ -115,5 +117,6 @@ records and running leaders point here or to the sidebar respectively.
 VERIFY:
 
 ```bash
-(cd daemon && cargo test -p term-meshd prune_removes_only_dead_records)
+(cd daemon && cargo test -p term-meshd prune_removes_only_dead_records \
+  && cargo test -p term-meshd project_manifest_without_live_surfaces_remains_discoverable)
 ```

@@ -96,6 +96,25 @@ def _restart_remote_fixture_daemon(host: str, remote_dir: str) -> None:
     _remote_stdout(host, command, timeout_s=45)
 
 
+def _remote_project_manifest_status(
+    host: str, remote_dir: str, project_id: str
+) -> dict | None:
+    """Read the daemon's durable record, independent of peer discovery."""
+    root = str(Path(remote_dir).parent)
+    output = _remote_stdout(
+        host,
+        f"env TERMMESH_DAEMON_UNIX_PATH={str(Path(root) / 'control.sock')!r} "
+        "/tmp/term-mesh-release-relay-target/release/tm-agent "
+        "daemon project-presentations list",
+        timeout_s=30,
+    )
+    payload = json.loads(output)
+    return next((
+        record for record in payload.get("records", [])
+        if record.get("project_id") == project_id
+    ), None)
+
+
 def _remote_participation_control(host: str, team_uuid: str) -> dict | None:
     team_uuid = _canonical_uuid(team_uuid)
     name = f"leader-participation-{team_uuid}.json"
@@ -1226,6 +1245,16 @@ def _phase_repair(c, host: str, remote_dir: str, state_path: Path) -> None:
     if owner_team is None:
         raise termmeshError("original owner did not restore Project before repair repro")
     _restart_remote_fixture_daemon(host, remote_dir)
+    durable = _remote_project_manifest_status(host, remote_dir, state["project_id"])
+    if durable is None:
+        raise termmeshError(
+            "durable Project manifest did not survive daemon restart"
+        )
+    expected_references = 1 + len(state["member_instances"])
+    if int(durable.get("referenced_surfaces") or 0) != expected_references:
+        raise termmeshError(f"durable Project references changed: {durable!r}")
+    if int(durable.get("live_surfaces") or 0) != 0:
+        raise termmeshError(f"restart did not remove Project surfaces: {durable!r}")
 
     # The current SSH tunnel may remain established across the remote listener
     # replacement. Retry forces a fresh authenticated generation.

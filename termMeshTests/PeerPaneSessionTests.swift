@@ -819,6 +819,37 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertEqual(sorted.map(\.name), ["Alpha", "term-mesh3"])
     }
 
+    func testKnownInactiveRemoteManifestIsNeitherOfferedNorAdoptable() {
+        func manifest(
+            name: String, active: Bool, activeKnown: Bool
+        ) -> RemoteTeamSummary {
+            RemoteTeamSummary(
+                name: name, teamUUID: name, workingDirectory: "/work/\(name)",
+                projectRootPath: nil, agentNames: [], projectID: "team:\(name)",
+                leaderSurfaceID: Data(repeating: 0x44, count: 16),
+                leaderProcessActive: active, leaderProcessActiveKnown: activeKnown
+            )
+        }
+
+        let inactive = manifest(name: "inactive", active: false, activeKnown: true)
+        let live = manifest(name: "live", active: true, activeKnown: true)
+        let unknown = manifest(name: "unknown", active: false, activeKnown: false)
+
+        XCTAssertFalse(TeamOrchestrator.remoteManifestLeaderIsAdoptable(inactive))
+        XCTAssertTrue(TeamOrchestrator.remoteManifestLeaderIsAdoptable(live))
+        XCTAssertTrue(
+            TeamOrchestrator.remoteManifestLeaderIsAdoptable(unknown),
+            "legacy/unknown state preserves the existing conservative offer policy"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.hostAxisOfferedManifests(
+                isConnected: true, teams: [unknown, inactive, live],
+                hostKey: "ssh:mac-sub", localTeamForName: { _ in nil }
+            ).map(\.name),
+            ["live", "unknown"]
+        )
+    }
+
     func testRemoteManifestUIKeySeparatesHostsAndProjects() {
         let first = RemoteTeamSummary(
             name: "same-name", teamUUID: "one", workingDirectory: "/work",
