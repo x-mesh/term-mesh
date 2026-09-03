@@ -466,8 +466,8 @@ final class TeamOrchestrator: ObservableObject {
         let id: String            // team name
         let leaderSessionId: String
         let leaderMode: String    // "repl", "claude", "kiro", "codex", "gemini", "adopted"
-        let leaderModel: String   // e.g. "sonnet", "opus", "haiku"
-        let leaderCli: String?    // detected CLI for adopted leader; nil otherwise
+        var leaderModel: String   // e.g. "sonnet", "opus", "haiku"
+        var leaderCli: String?    // actual CLI for adopted/recovered leaders
         var leaderPanelId: UUID   // leader pane for sending instructions
         var leaderWorkspaceId: UUID?  // only set in "adopted" mode (leader lives in a separate workspace)
         /// The leader's host namespace.  Older teams did not carry this
@@ -821,6 +821,23 @@ final class TeamOrchestrator: ObservableObject {
         guard var team = teams[teamName] else { return }
         team.leaderPanelId = panelID
         team.leaderWorkspaceId = nil
+        teams[teamName] = team
+        syncTeamStateToDaemon()
+    }
+
+    /// Commit the host-confirmed replacement identity before the durable
+    /// Project manifest publisher runs. Adopted presentations otherwise retain
+    /// their old manifest id in memory during the publication debounce.
+    func recordRecoveredRemoteLeaderSurface(
+        teamName: String,
+        surfaceID: Data,
+        leaderCLI: String,
+        leaderModel: String
+    ) {
+        guard var team = teams[teamName] else { return }
+        team.remoteLeaderSurfaceID = surfaceID
+        team.leaderCli = leaderCLI
+        team.leaderModel = leaderModel
         teams[teamName] = team
         syncTeamStateToDaemon()
     }

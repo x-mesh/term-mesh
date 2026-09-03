@@ -424,6 +424,8 @@ async fn reader_loop(
                         team.delegation_configured = manifest.delegation_configured;
                         team.delegation_effective = manifest.delegation_effective;
                         team.delegation_pending = manifest.delegation_pending;
+                        team.leader_cli = manifest.leader_cli;
+                        team.leader_model = manifest.leader_model;
                         team.created_at_unix_secs = manifest.created_at_unix_secs;
                         team.presentation_owned_by_requester =
                             project_owner_hex.contains(&manifest.owner_peer_id);
@@ -456,6 +458,8 @@ async fn reader_loop(
                             delegation_configured: manifest.delegation_configured,
                             delegation_effective: manifest.delegation_effective,
                             delegation_pending: manifest.delegation_pending,
+                            leader_cli: manifest.leader_cli,
+                            leader_model: manifest.leader_model,
                         });
                     }
                 }
@@ -4486,7 +4490,7 @@ mod agent_surface_tests {
             .expect("ensure agent")
             .surface_id;
 
-        let host = Arc::new(PeerHost::new(manager));
+        let host = Arc::new(PeerHost::new(manager.clone()));
         host.set_persist_path(tmp.path().join("peer-workspaces.json"));
 
         let (mut owner_reader, mut owner_writer) =
@@ -4522,6 +4526,8 @@ mod agent_surface_tests {
                             working_directory: "/tmp".into(),
                             project_root: "/tmp".into(),
                             agent_names: vec!["worker".into()],
+                            leader_cli: "codex".into(),
+                            leader_model: "gpt-5.6-sol".into(),
                             leader_surface_id: leader_id.clone(),
                             members: vec![TeamMember {
                                 name: "worker".into(),
@@ -4558,8 +4564,14 @@ mod agent_surface_tests {
         drop(owner_reader);
         drop(owner_writer);
 
-        let (mut viewer_reader, mut viewer_writer) =
-            handshake_as(host.clone(), capability::supported_vec(), vec![0x43; 16]).await;
+        let reloaded_host = Arc::new(PeerHost::new(manager));
+        reloaded_host.set_persist_path(tmp.path().join("peer-workspaces.json"));
+        let (mut viewer_reader, mut viewer_writer) = handshake_as(
+            reloaded_host.clone(),
+            capability::supported_vec(),
+            vec![0x43; 16],
+        )
+        .await;
         write_envelope(
             &mut viewer_writer,
             &Envelope {
@@ -4578,6 +4590,8 @@ mod agent_surface_tests {
             other => panic!("expected team list, got {other:?}"),
         };
         assert_eq!(project.name, "durable-demo");
+        assert_eq!(project.leader_cli, "codex");
+        assert_eq!(project.leader_model, "gpt-5.6-sol");
         assert_eq!(project.leader_surface_id, leader_id);
         assert_eq!(project.members.len(), 1);
         assert_eq!(project.members[0].surface_id, member_id);
@@ -4660,7 +4674,7 @@ mod agent_surface_tests {
         );
 
         let (mut owner_reader, mut owner_writer) = handshake_as_with_owner_aliases(
-            host.clone(),
+            reloaded_host,
             capability::supported_vec(),
             vec![0x45; 16],
             vec![vec![0x42; 16]],

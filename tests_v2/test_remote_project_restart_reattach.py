@@ -70,6 +70,32 @@ def _remote_stdout(host: str, command: str, timeout_s: int = 30) -> str:
     return result.stdout.strip()
 
 
+def _restart_remote_fixture_daemon(host: str, remote_dir: str) -> None:
+    """Restart the staged daemon with its persisted state but no surfaces.
+
+    Daemon-owned leader/worker surfaces use restartPolicy=never, so this is the
+    exact production failure: the Project manifest survives while every
+    process and surface it names disappears.
+    """
+    root = str(Path(remote_dir).parent)
+    command = (
+        f"root={root!r}; "
+        'old=$(cat "$root/pid"); kill "$old" 2>/dev/null || true; '
+        'for _ in $(seq 1 80); do kill -0 "$old" 2>/dev/null || break; sleep .1; done; '
+        'rm -f "$root/peer.sock" "$root/control.sock"; '
+        'env XDG_DATA_HOME="$root/state" XDG_RUNTIME_DIR="$root/runtime" '
+        'PATH=/tmp/term-mesh-release-relay-target/release:$HOME/.cargo/bin:'
+        '$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH '
+        'TERMMESH_PEER_SOCKET="$root/peer.sock" '
+        'TERMMESH_DAEMON_UNIX_PATH="$root/control.sock" '
+        'nohup /tmp/term-mesh-release-relay-target/release/term-meshd '
+        '>"$root/daemon.log" 2>&1 & echo $! >"$root/pid"; '
+        'for _ in $(seq 1 120); do [ -S "$root/peer.sock" ] && exit 0; sleep .25; done; '
+        'tail -100 "$root/daemon.log" >&2; exit 1'
+    )
+    _remote_stdout(host, command, timeout_s=45)
+
+
 def _remote_participation_control(host: str, team_uuid: str) -> dict | None:
     team_uuid = _canonical_uuid(team_uuid)
     name = f"leader-participation-{team_uuid}.json"
@@ -1172,18 +1198,93 @@ def _phase_adopt(c, host: str, state_path: Path) -> None:
     )
 
 
+def _phase_repair(c, host: str, remote_dir: str, state_path: Path) -> None:
+    state = json.loads(state_path.read_text())
+    team_name = state["team_name"]
+    old_leader = state["leader_surface_id"]
+    owner_team = _wait(lambda: next((
+        item for item in c.team_list()
+        if item.get("team_name") == team_name
+        and item.get("leader_pane_attached")
+        and len(item.get("agents") or []) == len(state["member_instances"])
+    ), None), timeout_s=45)
+    if owner_team is None:
+        raise termmeshError("original owner did not restore Project before repair repro")
+    _restart_remote_fixture_daemon(host, remote_dir)
+
+    # The current SSH tunnel may remain established across the remote listener
+    # replacement. Retry forces a fresh authenticated generation.
+    c.peer_host_retry(host)
+    _wait(lambda: next((
+        row for row in c.peer_host_list()
+        if row.get("id") == host and row.get("state") == "connected"
+        and row.get("team_host_readiness") == "ready"
+    ), None), timeout_s=45)
+    stale = _wait(lambda: next((
+        item for item in c.debug_project_remote_presentations(host)
+        if item.get("project_id") == state["project_id"]
+    ), None), timeout_s=30)
+    if stale is None or stale.get("leader_surface_id") != old_leader:
+        raise termmeshError(f"stale manifest did not survive daemon restart: {stale!r}")
+
+    repair = c.team_repair_collaboration(team_name)
+    if not repair.get("succeeded") or not repair.get("route_verified"):
+        raise termmeshError(f"one-call collaboration repair failed: {repair!r}")
+    if int(repair.get("live_agents") or 0) != len(state["member_instances"]):
+        raise termmeshError(f"repair did not restore every worker: {repair!r}")
+
+    project = _wait(lambda: next((
+        item for item in c.debug_project_remote_presentations(host)
+        if item.get("project_id") == state["project_id"]
+        and item.get("leader_surface_id") != old_leader
+    ), None), timeout_s=30)
+    if project is None:
+        raise termmeshError("repaired Project did not publish its new leader surface")
+    team = _wait(lambda: next((
+        item for item in c.team_list()
+        if item.get("team_name") == team_name
+        and item.get("leader_ready")
+        and len(item.get("agents") or []) == len(state["member_instances"])
+    ), None), timeout_s=45)
+    if team is None:
+        raise termmeshError("repaired team did not converge to leader + workers")
+    restored = {
+        agent.get("name"): agent.get("agent_instance_id")
+        for agent in team.get("agents", [])
+    }
+    if restored != state["member_instances"]:
+        raise termmeshError(
+            f"repair changed durable worker identities: {restored!r}"
+        )
+    # `route_verified` is produced only after the owner app runs tm-agent in
+    # the remote leader's service-account environment and observes an exact
+    # proxied team.status response. A test-runner tm-agent call would use the
+    # local app socket instead and cannot prove that route.
+    state["pre_repair_leader_surface_id"] = old_leader
+    state["leader_surface_id"] = project["leader_surface_id"]
+    state["repair_collaboration_verified"] = True
+    state_path.write_text(json.dumps(state))
+
+
 def _phase_cleanup(c, host: str, state_path: Path) -> None:
     state = json.loads(state_path.read_text())
     state["team_uuid"] = _canonical_uuid(state.get("team_uuid"))
     if not state.get("viewer_task_proof"):
         raise termmeshError("owner cleanup started without viewer task proof")
+    if not state.get("repair_collaboration_verified"):
+        raise termmeshError("owner cleanup started without one-call repair proof")
     project = _wait(lambda: next((
         item for item in c.debug_project_remote_presentations(host)
         if item.get("project_id") == state["project_id"]
     ), None))
     if project is None:
         raise termmeshError("owner cleanup cannot find the durable Project manifest")
-    c.debug_project_adopt_remote(host, state["project_id"])
+    existing = next((
+        item for item in c.team_list()
+        if item.get("team_name") == state["team_name"]
+    ), None)
+    if existing is None:
+        c.debug_project_adopt_remote(host, state["project_id"])
     pending = _wait(lambda: next((
         item for item in c.team_list()
         if item.get("team_name") == state["team_name"] and item.get("workspace_id")
@@ -1231,10 +1332,15 @@ def _phase_cleanup(c, host: str, state_path: Path) -> None:
             "host": host,
             "phases": {
                 "create": "pass", "adopt": "pass",
-                "reconnect": "pass", "cleanup": "pass",
+                "reconnect": "pass", "repair": "pass",
+                "cleanup": "pass",
             },
             "leader_surface_id": state["leader_surface_id"],
+            "pre_repair_leader_surface_id": state.get(
+                "pre_repair_leader_surface_id", ""
+            ),
             "exact_surface_preserved": True,
+            "repair_collaboration_verified": True,
             "leader_relay_stability_seconds": LEADER_RELAY_STABILITY_SECONDS,
             "background_restore_hold_seconds": BACKGROUND_RESTORE_HOLD_SECONDS,
             "cross_installation_open_existing": bool(
@@ -1266,15 +1372,15 @@ def main() -> int:
     remote_dir = os.environ.get(DIR_ENV, "").strip()
     phase = os.environ.get(PHASE_ENV, "").strip()
     state_path = Path(os.environ.get(STATE_ENV, "/tmp/term-mesh-remote-project-e2e-state.json"))
-    if not host or not remote_dir or phase not in {"create", "adopt", "cleanup"}:
+    if not host or not remote_dir or phase not in {"create", "adopt", "repair", "cleanup"}:
         if os.environ.get(REQUIRE_REMOTE_PROJECT_ENV) == "1":
             raise termmeshError(
                 f"required remote Project topology missing: set {HOST_ENV}, "
-                f"{DIR_ENV}, and {PHASE_ENV}=full (runner) or create|adopt|cleanup"
+                f"{DIR_ENV}, and {PHASE_ENV}=full (runner) or create|adopt|repair|cleanup"
             )
         print(
             f"SKIP: set {HOST_ENV}, {DIR_ENV}, and "
-            f"{PHASE_ENV}=full (runner) or create|adopt|cleanup"
+            f"{PHASE_ENV}=full (runner) or create|adopt|repair|cleanup"
         )
         return 0
 
@@ -1284,6 +1390,8 @@ def main() -> int:
             _phase_create(c, host, remote_dir, state_path)
         elif phase == "adopt":
             _phase_adopt(c, host, state_path)
+        elif phase == "repair":
+            _phase_repair(c, host, remote_dir, state_path)
         else:
             _phase_cleanup(c, host, state_path)
     print(f"PASS: remote Project restart reattach phase {phase}")

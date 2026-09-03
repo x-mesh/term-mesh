@@ -731,8 +731,23 @@ for f in "${test_files[@]}"; do
         failed_tests[${#failed_tests[@]}]="$f:adopt"
       fi
 
-      echo "== relaunch ($base cleanup; original owner identity) =="
-      launch_and_wait 1
+      if [ "$adopt_result" -eq 0 ]; then
+        echo "== relaunch ($base repair; original owner identity) =="
+        launch_and_wait 1
+        echo "RUN  $f (phase missing-surface repair)"
+        set +e
+        phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=repair "$PYTHON" "$f"
+        repair_result=$?
+        set -e
+        if [ "$repair_result" -eq 2 ]; then
+          phase_skipped=1
+        elif [ "$repair_result" -ne 0 ]; then
+          echo "FAIL $f (phase missing-surface repair)" >&2
+          phase_failed=1
+          failed_tests[${#failed_tests[@]}]="$f:repair"
+        fi
+      fi
+
       echo "RUN  $f (phase owner cleanup)"
       set +e
       phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=cleanup "$PYTHON" "$f"

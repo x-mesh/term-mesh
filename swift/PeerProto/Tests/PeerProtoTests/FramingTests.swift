@@ -82,6 +82,18 @@ final class FramingTests: XCTestCase {
         XCTAssertEqual(decMeta.cwd, "/tmp/x")
     }
 
+    func testTeamLeaderIdentityRoundTrip() throws {
+        var team = Termmesh_Peer_V1_Team()
+        team.name = "demo"
+        team.leaderCli = "codex"
+        team.leaderModel = "gpt-5.6-sol"
+
+        let encoded: Data = try team.serializedBytes()
+        let decoded = try Termmesh_Peer_V1_Team(serializedBytes: encoded)
+        XCTAssertEqual(decoded.leaderCli, "codex")
+        XCTAssertEqual(decoded.leaderModel, "gpt-5.6-sol")
+    }
+
     func testPartialFrameReturnsNil() throws {
         // Only 2 bytes of the 4-byte length prefix available.
         var partial = Data([0x05, 0x00])

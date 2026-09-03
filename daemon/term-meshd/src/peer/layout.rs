@@ -1740,6 +1740,8 @@ impl PeerHost {
             || project.team_uuid.len() > 128
             || project.working_directory.len() > 4096
             || project.project_root.len() > 4096
+            || project.leader_cli.len() > 128
+            || project.leader_model.len() > 256
             || project.leader_surface_id.len() != 16
             || project.members.len() > 64
         {
@@ -1834,6 +1836,8 @@ impl PeerHost {
             team_uuid: project.team_uuid.clone(),
             working_directory: project.working_directory.clone(),
             project_root: project.project_root.clone(),
+            leader_cli: project.leader_cli.clone(),
+            leader_model: project.leader_model.clone(),
             delegation_configured: project.delegation_configured.clone(),
             delegation_effective: project.delegation_effective.clone(),
             delegation_pending: project.delegation_pending.clone(),

@@ -2635,6 +2635,8 @@ class TerminalController {
             return await asyncTeamAgentStatus(params: params, id: id)
         case "team.delegation.configure":
             return await asyncTeamDelegationConfigure(params: params, id: id)
+        case "team.repair_collaboration":
+            return await asyncTeamRepairCollaboration(params: params, id: id)
         case "team.task.start":
             return await asyncTeamTaskStart(params: params, id: id)
         case "team.task.block":
@@ -4057,6 +4059,29 @@ class TerminalController {
             TeamOrchestrator.shared.inboxItems(teamName: teamName, agentName: agentName, topOnly: topOnly)
         }
         return v2Ok(id: id, result: ["team_name": teamName, "items": items, "count": items.count])
+    }
+
+    /// Production socket twin of Review Board's Repair collaboration button.
+    /// It deliberately stays out of the remote-leader peer allow-list: only
+    /// the owning app may rebuild leader/worker processes and routes.
+    private func asyncTeamRepairCollaboration(
+        params: [String: Any], id: Any?
+    ) async -> String {
+        guard let teamName = params["team_name"] as? String, !teamName.isEmpty else {
+            return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
+        }
+        let report = await TeamOrchestrator.shared.repairCollaboration(teamName: teamName)
+        return v2Ok(id: id, result: [
+            "team_name": teamName,
+            "succeeded": report.succeeded,
+            "route_repaired": report.routeRepaired,
+            "route_verified": report.routeVerified,
+            "leader_live": report.leaderLive,
+            "live_agents": report.liveAgents,
+            "replaced_agents": report.replacedAgents,
+            "failed_agents": report.failedAgents,
+            "message": report.message,
+        ])
     }
 
     /// Peer-path twin of `v2TeamDelegationConfigure`.

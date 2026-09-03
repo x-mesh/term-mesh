@@ -57,6 +57,12 @@ struct RemoteTeamSummary: Identifiable, Equatable {
     let agentNames: [String]
     let projectID: String
     let leaderSurfaceID: Data
+    /// CLI/model recorded by the Project owner for deterministic leader
+    /// replacement. Empty on legacy hosts; callers must use an explicit safe
+    /// fallback instead of treating the local `adopted` presentation marker as
+    /// an executable CLI.
+    let leaderCLI: String
+    let leaderModel: String
     let members: [Member]
     let presentationRevision: UInt64
     let presentationOwnedByRequester: Bool
@@ -74,6 +80,8 @@ struct RemoteTeamSummary: Identifiable, Equatable {
         agentNames: [String],
         projectID: String = "",
         leaderSurfaceID: Data = Data(),
+        leaderCLI: String = "",
+        leaderModel: String = "",
         members: [Member] = [],
         presentationRevision: UInt64 = 0,
         presentationOwnedByRequester: Bool = false,
@@ -88,6 +96,8 @@ struct RemoteTeamSummary: Identifiable, Equatable {
         self.agentNames = agentNames
         self.projectID = projectID
         self.leaderSurfaceID = leaderSurfaceID
+        self.leaderCLI = leaderCLI
+        self.leaderModel = leaderModel
         self.members = members
         self.presentationRevision = presentationRevision
         self.presentationOwnedByRequester = presentationOwnedByRequester
@@ -2338,7 +2348,7 @@ final class RemoteHostStore: ObservableObject {
         }
     }
 
-    private nonisolated static func remoteTeamSummary(
+    nonisolated static func remoteTeamSummary(
         _ team: Termmesh_Peer_V1_Team
     ) -> RemoteTeamSummary {
         RemoteTeamSummary(
@@ -2349,6 +2359,8 @@ final class RemoteHostStore: ObservableObject {
             agentNames: team.agentNames,
             projectID: team.projectID,
             leaderSurfaceID: team.leaderSurfaceID,
+            leaderCLI: team.leaderCli,
+            leaderModel: team.leaderModel,
             members: team.members.map { member in
                 RemoteTeamSummary.Member(
                     name: member.name,
