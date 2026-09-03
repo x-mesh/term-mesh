@@ -69,6 +69,53 @@ final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
         )
     }
 
+    /// A pass that threw stopped part-way, so a complete-looking pane map is
+    /// not proof of readiness: the leaf keys are inserted as panes spawn, and
+    /// a throw after the last insert is indistinguishable from success.
+    /// Reporting `.ready` there retired the recovery loop on the one path it
+    /// exists for and latched the mirror's overlay with nothing armed.
+    func test_failedPassOwesARetryEvenWithNoMissingPanes() {
+        XCTAssertEqual(
+            PeerMirrorLayoutRecoveryPolicy.action(
+                missingPaneCount: 0, completedAttempts: 0,
+                isCancelled: false, passFailed: true
+            ),
+            .retry(afterNanoseconds: 500_000_000)
+        )
+        XCTAssertEqual(
+            PeerMirrorLayoutRecoveryPolicy.action(
+                missingPaneCount: 0, completedAttempts: 1,
+                isCancelled: false, passFailed: true
+            ),
+            .retry(afterNanoseconds: 1_000_000_000)
+        )
+    }
+
+    /// The failed-pass allowance stays bounded by the same backoff table, so
+    /// a permanently failing apply ends in `.failed` rather than retrying for
+    /// the life of the window.
+    func test_failedPassStillStopsAtTheRetryBudget() {
+        XCTAssertEqual(
+            PeerMirrorLayoutRecoveryPolicy.action(
+                missingPaneCount: 0, completedAttempts: 3,
+                isCancelled: false, passFailed: true
+            ),
+            .failed
+        )
+    }
+
+    /// Cancellation outranks a failed pass: a superseded apply must not arm a
+    /// retry for a generation that no longer owns the mirror.
+    func test_cancellationOutranksAFailedPass() {
+        XCTAssertEqual(
+            PeerMirrorLayoutRecoveryPolicy.action(
+                missingPaneCount: 0, completedAttempts: 0,
+                isCancelled: true, passFailed: true
+            ),
+            .abandon
+        )
+    }
+
     func test_missingSurfaceIDsPreservesSuccessfulPanes() {
         let present = Data([0x01])
         let missing = Data([0x02])
