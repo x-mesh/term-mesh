@@ -14073,10 +14073,24 @@ fn cmd_doctor(verbose: bool, json_output: bool) {
         .as_ref()
         .and_then(|sock| rpc_call(sock, "daemon.status", json!({})).ok());
 
-    let live_sockets = sockets
+    // `discover_term_mesh_sockets` globs /tmp, which is where a Mac keeps its
+    // sockets. A Linux peer host puts them under the systemd RuntimeDirectory
+    // (/run/term-mesh), so counting only the glob's hits reports zero owners on
+    // exactly the hosts this reset targets. Fold in the two resolved paths.
+    let mut owner_paths: std::collections::BTreeSet<String> = sockets
         .iter()
         .filter(|socket| socket["alive"].as_bool().unwrap_or(false))
-        .count();
+        .filter_map(|socket| socket["path"].as_str().map(str::to_string))
+        .collect();
+    for candidate in [daemon_socket.as_ref(), app_socket.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if is_socket_alive(candidate) {
+            owner_paths.insert(candidate.to_string_lossy().to_string());
+        }
+    }
+    let live_sockets = owner_paths.len();
     // Same fallback `daemon project-presentations` uses: the peer host answers
     // on whichever of the two sockets this machine actually exposes.
     let peer_rpc_socket = daemon_socket.as_ref().or(app_socket.as_ref());
