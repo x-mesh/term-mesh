@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-const FORCED_EXIT_CODE: i32 = 2;
+pub(crate) const FORCED_EXIT_CODE: i32 = 2;
 
 /// Teardown steps, in the order `main` runs them. `STEP_NAMES` is indexed by
 /// the values below, so the two must stay in sync.
