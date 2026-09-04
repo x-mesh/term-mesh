@@ -89,6 +89,19 @@ pub async fn serve(
     let manager = Arc::new(PtyManager::new());
     manager.spawn_from_config();
     let workspaces_path = persist::default_workspaces_path();
+    // Held until this listener returns, so an offline repair tool can tell the
+    // state directory is still owned. Not fatal when it fails: the lock gates
+    // repair, never this daemon's own writes.
+    let _state_lock = match persist::acquire_state_lock_shared(&workspaces_path) {
+        Ok(file) => Some(file),
+        Err(error) => {
+            tracing::warn!(
+                "peer state lock {} unavailable: {error}",
+                persist::state_lock_path(&workspaces_path).display()
+            );
+            None
+        }
+    };
     let default_name_fallback = connection::hostname_or(DAEMON_WORKSPACE);
     let entries = persist::boot(&workspaces_path, &default_name_fallback);
     let host = Arc::new(PeerHost::with_workspaces(manager, entries));
