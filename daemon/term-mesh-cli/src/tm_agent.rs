@@ -1904,6 +1904,24 @@ enum DaemonCommand {
     /// owns cannot be deleted over the peer protocol; this is the
     /// host-side path for them.
     ProjectPresentations(ProjectPresentationsCommands),
+    /// Clear durable peer state so names a dead leader still holds stop
+    /// blocking new Projects. Unlike `project-presentations prune` this does
+    /// not require the record to be unresumable — a project folder does not
+    /// vanish when its leader dies, so an ordinary prune skips it forever.
+    ///
+    /// Reports only unless --apply. Each file is backed up next to itself
+    /// first. With the daemon up, live surfaces and the default workspace are
+    /// refused and reported; with the daemon down there is nothing to ask
+    /// about liveness, so the whole file goes.
+    Reset {
+        /// projects = Project manifests, workspaces = named workspaces
+        /// (removing one kills that workspace's shells), all = both.
+        #[arg(long, default_value = "all", value_parser = ["projects", "workspaces", "all"])]
+        scope: String,
+        /// Perform the reset instead of previewing it.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -7694,6 +7712,57 @@ fn main() {
                 cmd_daemon_replay_capacity(&sock, set.as_deref());
                 return;
             }
+            DaemonCommand::Reset { scope, apply } => {
+                // With the daemon up, go through it: clearing the files alone
+                // would be undone by its next save, which writes a full
+                // in-memory snapshot. Without one, fall back to the files.
+                let Some(sock) = detect_daemon_socket().or_else(detect_socket) else {
+                    cmd_daemon_reset_offline(scope, *apply);
+                };
+                let result = match cmd_daemon_rpc(
+                    &sock,
+                    "peer.state.reset",
+                    json!({ "scope": scope, "apply": apply }),
+                ) {
+                    Ok(result) => {
+                        println!("{}", pretty(&result));
+                        result
+                    }
+                    // A daemon older than this command answers this way. Say
+                    // what to do instead of leaving a bare protocol error:
+                    // clearing the files under a live daemon does nothing,
+                    // because its next save writes the old snapshot back.
+                    Err(msg) if msg.contains("unknown method") => {
+                        eprintln!(
+                            "Error: the running term-meshd does not know `peer.state.reset`.\n\
+                             It predates this command, so upgrade and restart it — or stop it\n\
+                             and run this again to clear the files directly."
+                        );
+                        process::exit(3);
+                    }
+                    Err(msg) => {
+                        eprintln!("Error: {msg}");
+                        process::exit(1);
+                    }
+                };
+                if !apply {
+                    let projects = result["projects"]["removed"]
+                        .as_array()
+                        .map(|r| r.len())
+                        .unwrap_or(0);
+                    let workspaces = result["workspaces_removed"]
+                        .as_array()
+                        .map(|r| r.len())
+                        .unwrap_or(0);
+                    if projects > 0 || workspaces > 0 {
+                        println!(
+                            "(dry-run — pass --apply to clear {projects} manifest(s) \
+                             and {workspaces} workspace(s))"
+                        );
+                    }
+                }
+                return;
+            }
             DaemonCommand::ProjectPresentations(cmd) => {
                 let sock = detect_daemon_socket()
                     .or_else(detect_socket)
@@ -10527,6 +10596,169 @@ fn cmd_daemon_rpc_print(sock: &PathBuf, method: &str, params: serde_json::Value)
             process::exit(1);
         }
     }
+}
+
+/// The peer state directory term-meshd writes.
+///
+/// Mirrors `peer::persist::default_workspaces_path`'s base deliberately: that
+/// function reads no environment variable, so every daemon on this machine —
+/// tagged dev builds included — shares one directory, and an offline reset has
+/// exactly one place to look.
+fn peer_state_dir() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("term-meshd")
+}
+
+/// Which files a scope covers. Ensured-surface records are never included:
+/// losing those costs runner identity, not a stale name.
+fn peer_state_files(scope: &str) -> Vec<(&'static str, std::path::PathBuf)> {
+    let dir = peer_state_dir();
+    let mut out = Vec::new();
+    if scope == "projects" || scope == "all" {
+        out.push((
+            "projects",
+            dir.join("peer-project-presentations.json"),
+        ));
+    }
+    if scope == "workspaces" || scope == "all" {
+        out.push(("workspaces", dir.join("peer-workspaces.json")));
+    }
+    out
+}
+
+/// Take `.peer-state.lock` exclusively. Failing is the answer to "is a daemon
+/// still running": one holds this shared for the life of its listener, and
+/// rewriting these files under it would just be saved over by its next write.
+fn try_lock_peer_state_dir(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+
+    std::fs::create_dir_all(dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(".peer-state.lock"))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// Copy `path` next to itself before removing it, matching the daemon's
+/// `persist::backup_state_file` naming so both paths leave the same trail.
+fn backup_peer_state_file(path: &std::path::Path) -> Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| format!("cannot derive a backup name for {}", path.display()))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let mut candidate = path.with_file_name(format!("{stem}.{stamp}.bak.json"));
+    let mut suffix = 1;
+    while candidate.exists() {
+        if suffix > 1000 {
+            return Err(format!("too many backups beside {}", path.display()));
+        }
+        candidate = path.with_file_name(format!("{stem}.{stamp}-{suffix}.bak.json"));
+        suffix += 1;
+    }
+    std::fs::copy(path, &candidate).map_err(|e| format!("backup failed: {e}"))?;
+    Ok(Some(candidate.display().to_string()))
+}
+
+/// Reset with no daemon to ask.
+///
+/// This cannot tell a live surface from a dead one, so it does not try to be
+/// selective: it backs each file up and removes it, which the loaders treat
+/// exactly like an empty file. The daemon path (`peer.state.reset`) is the one
+/// that refuses live work — prefer it whenever the daemon is up.
+fn cmd_daemon_reset_offline(scope: &str, apply: bool) -> ! {
+    let dir = peer_state_dir();
+    let files = peer_state_files(scope);
+
+    let lock = match try_lock_peer_state_dir(&dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!(
+                "Error: {} is still owned by a running term-meshd ({error}).\n\
+                 Stop it first (systemctl stop term-meshd, or quit the app), or run this\n\
+                 with the daemon up so it can clear its in-memory copy too.",
+                dir.display()
+            );
+            // Same class as `watch doctor`'s \"tried and it is still wrong\".
+            process::exit(3);
+        }
+    };
+
+    let mut entries = Vec::new();
+    for (scope_name, path) in &files {
+        entries.push(json!({
+            "scope": scope_name,
+            "path": path.display().to_string(),
+            "present": path.exists(),
+        }));
+    }
+
+    if !apply {
+        let present = files.iter().filter(|(_, path)| path.exists()).count();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "applied": false,
+                "daemon": "not running",
+                "files": entries,
+            }))
+            .unwrap_or_default()
+        );
+        if present > 0 {
+            println!("(dry-run — pass --apply to clear {present} file(s))");
+        }
+        drop(lock);
+        process::exit(0);
+    }
+
+    let mut cleared = Vec::new();
+    for (scope_name, path) in &files {
+        if !path.exists() {
+            continue;
+        }
+        let backup = match backup_peer_state_file(path) {
+            Ok(backup) => backup,
+            Err(error) => {
+                eprintln!("Error: {error}");
+                process::exit(1);
+            }
+        };
+        if let Err(error) = std::fs::remove_file(path) {
+            eprintln!("Error: could not remove {}: {error}", path.display());
+            process::exit(1);
+        }
+        cleared.push(json!({
+            "scope": scope_name,
+            "path": path.display().to_string(),
+            "backup_path": backup,
+        }));
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "applied": true,
+            "daemon": "not running",
+            "cleared": cleared,
+        }))
+        .unwrap_or_default()
+    );
+    drop(lock);
+    process::exit(0);
 }
 
 /// `tm-agent daemon replay-capacity [--set <value>]` — get or set the peer
@@ -13705,6 +13937,128 @@ fn discover_term_mesh_sockets() -> Vec<Value> {
     sockets
 }
 
+/// What the peer state directory holds, read straight off disk.
+///
+/// Read from the files rather than asked of the daemon, because the moment
+/// someone runs doctor is often the moment no daemon is up. The one fact only
+/// a daemon knows is how many of a manifest's surfaces are alive, so that
+/// field stays null without one.
+fn peer_state_report(daemon_socket: Option<&PathBuf>, live_sockets: usize) -> Value {
+    let dir = peer_state_dir();
+
+    // Asking the daemon costs nothing when it is down and gives the liveness
+    // column when it is up.
+    let live_by_project: std::collections::HashMap<String, u64> = daemon_socket
+        // `cmd_daemon_rpc`, not `rpc_call`: this is a daemon-local query with
+        // no team context, and `rpc_call` would route it through the remote
+        // leader policy and fail.
+        .and_then(|sock| cmd_daemon_rpc(sock, "peer.project_presentations.list", json!({})).ok())
+        .and_then(|value| value["records"].as_array().cloned())
+        .map(|records| {
+            records
+                .iter()
+                .filter_map(|record| {
+                    Some((
+                        record["project_id"].as_str()?.to_string(),
+                        record["live_surfaces"].as_u64().unwrap_or(0),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut files = Vec::new();
+    let mut projects = Vec::new();
+    let mut workspaces = Vec::new();
+
+    for (scope, path) in peer_state_files("all") {
+        let present = path.exists();
+        let bytes = std::fs::metadata(&path).map(|meta| meta.len()).ok();
+        let parsed: Option<Value> = std::fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice(&raw).ok());
+        let records = match (scope, &parsed) {
+            ("projects", Some(value)) => value["records"].as_array().map(|r| r.len()),
+            ("workspaces", Some(value)) => value.as_array().map(|r| r.len()),
+            _ => None,
+        };
+        files.push(json!({
+            "scope": scope,
+            "path": path.display().to_string(),
+            "present": present,
+            "bytes": bytes,
+            // Distinguishes "no file" from "a file that will not load" — the
+            // loaders treat both as empty, so only this tells them apart.
+            "parsed": if present { Some(parsed.is_some()) } else { None },
+            "records": records,
+        }));
+
+        match (scope, parsed) {
+            ("projects", Some(value)) => {
+                for record in value["records"].as_array().cloned().unwrap_or_default() {
+                    let project_id = record["project_id"].as_str().unwrap_or_default().to_string();
+                    let working_directory = record["working_directory"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    projects.push(json!({
+                        "team_name": record["team_name"],
+                        "project_id": project_id.clone(),
+                        "working_directory": working_directory.clone(),
+                        "leader_surface_id": record["leader_surface_id"],
+                        "directory_present": !working_directory.is_empty()
+                            && std::path::Path::new(&working_directory).is_dir(),
+                        "live_surfaces": live_by_project.get(&project_id),
+                    }));
+                }
+            }
+            ("workspaces", Some(value)) => {
+                for entry in value.as_array().cloned().unwrap_or_default() {
+                    workspaces.push(json!({
+                        "id": entry["id"],
+                        "name": entry["name"],
+                        "is_default": entry["is_default"],
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Taking it exclusively for an instant is the only way to learn whether a
+    // daemon holds it shared. Dropped immediately; a daemon that boots while
+    // we hold it logs a warning and carries on.
+    let lock_error = match try_lock_peer_state_dir(&dir) {
+        Ok(lock) => {
+            drop(lock);
+            None
+        }
+        Err(error) => Some(error),
+    };
+    // The lock alone is not enough. A daemon built before the lock existed
+    // never takes it, yet still saves a full snapshot over anything written
+    // here — so a live socket has to count as ownership too.
+    let reset_blocked_by = match (lock_error, live_sockets) {
+        (Some(error), _) => Some(format!(
+            "a running term-meshd holds the state lock ({error})"
+        )),
+        (None, 0) => None,
+        (None, count) => Some(format!(
+            "{count} live term-mesh socket(s): a daemon that predates the state \
+             lock does not take it and would save over this"
+        )),
+    };
+
+    json!({
+        "directory": dir.display().to_string(),
+        "reset_safe": reset_blocked_by.is_none(),
+        "reset_blocked_by": reset_blocked_by,
+        "files": files,
+        "projects": projects,
+        "workspaces": workspaces,
+    })
+}
+
 fn cmd_doctor(verbose: bool, json_output: bool) {
     let app_socket = detect_socket();
     let daemon_socket = detect_daemon_socket();
@@ -13719,6 +14073,15 @@ fn cmd_doctor(verbose: bool, json_output: bool) {
         .as_ref()
         .and_then(|sock| rpc_call(sock, "daemon.status", json!({})).ok());
 
+    let live_sockets = sockets
+        .iter()
+        .filter(|socket| socket["alive"].as_bool().unwrap_or(false))
+        .count();
+    // Same fallback `daemon project-presentations` uses: the peer host answers
+    // on whichever of the two sockets this machine actually exposes.
+    let peer_rpc_socket = daemon_socket.as_ref().or(app_socket.as_ref());
+    let peer_state = peer_state_report(peer_rpc_socket, live_sockets);
+
     let result = json!({
         "ok": app_socket.is_some() || daemon_socket.is_some(),
         "team": team,
@@ -13728,6 +14091,7 @@ fn cmd_doctor(verbose: bool, json_output: bool) {
         "app_status": app_status,
         "daemon_status": daemon_status,
         "sockets": if verbose { Value::Array(sockets.clone()) } else { json!(sockets.iter().filter(|s| s["alive"].as_bool().unwrap_or(false)).count()) },
+        "peer_state": peer_state,
     });
 
     if json_output {
@@ -13762,6 +14126,58 @@ fn cmd_doctor(verbose: bool, json_output: bool) {
     } else {
         println!("alive sockets: {}", result["sockets"].as_u64().unwrap_or(0));
     }
+
+    println!("peer state: {}", peer_state["directory"].as_str().unwrap_or("?"));
+    for file in peer_state["files"].as_array().cloned().unwrap_or_default() {
+        let scope = file["scope"].as_str().unwrap_or("?");
+        if !file["present"].as_bool().unwrap_or(false) {
+            println!("  {scope}: absent");
+            continue;
+        }
+        // A file that will not parse loads as empty, silently. Say so.
+        if file["parsed"].as_bool() == Some(false) {
+            println!("  {scope}: UNREADABLE (loads as empty)");
+            continue;
+        }
+        println!(
+            "  {scope}: {} record(s)",
+            file["records"].as_u64().unwrap_or(0)
+        );
+    }
+    for project in peer_state["projects"].as_array().cloned().unwrap_or_default() {
+        let live = match project["live_surfaces"].as_u64() {
+            Some(count) => format!("{count} live surface(s)"),
+            None => "liveness unknown (no daemon)".to_string(),
+        };
+        println!(
+            "    project {} [{}] dir={} {}{}",
+            project["team_name"].as_str().unwrap_or("?"),
+            project["project_id"].as_str().unwrap_or("?"),
+            project["working_directory"].as_str().unwrap_or("?"),
+            live,
+            if project["directory_present"].as_bool().unwrap_or(false) {
+                ""
+            } else {
+                " (directory gone)"
+            }
+        );
+    }
+    for workspace in peer_state["workspaces"].as_array().cloned().unwrap_or_default() {
+        println!(
+            "    workspace {}{}",
+            workspace["name"].as_str().unwrap_or("?"),
+            if workspace["is_default"].as_bool().unwrap_or(false) {
+                " (default)"
+            } else {
+                ""
+            }
+        );
+    }
+    match peer_state["reset_blocked_by"].as_str() {
+        Some(reason) => println!("  reset: unsafe — {reason}"),
+        None => println!("  reset: safe (no daemon holds this directory)"),
+    }
+
     println!(
         "status: {}",
         if result["ok"].as_bool().unwrap_or(false) {

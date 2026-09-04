@@ -449,6 +449,35 @@ pub fn boot(path: &Path, default_name_fallback: &str) -> Vec<PersistedWorkspace>
     entries
 }
 
+/// Copy `path` next to itself as `<stem>.<unix-secs>[-<n>].bak.json` before a
+/// destructive rewrite. Every loader in this module reads only its own exact
+/// primary path, so a backup is never mistaken for state. `Ok(None)` when
+/// there was nothing persisted to copy.
+pub fn backup_state_file(path: &Path) -> Result<Option<String>, &'static str> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or("backup_failed")?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let mut candidate = path.with_file_name(format!("{stem}.{stamp}.bak.json"));
+    let mut suffix = 1;
+    while candidate.exists() {
+        if suffix > 1000 {
+            return Err("backup_failed");
+        }
+        candidate = path.with_file_name(format!("{stem}.{stamp}-{suffix}.bak.json"));
+        suffix += 1;
+    }
+    std::fs::copy(path, &candidate).map_err(|_| "backup_failed")?;
+    Ok(Some(candidate.display().to_string()))
+}
+
 /// Advisory lock guarding this state directory, held for a daemon's whole
 /// lifetime.
 ///
