@@ -10725,7 +10725,12 @@ fn cmd_daemon_reset_offline(scope: &str, apply: bool) -> ! {
         process::exit(0);
     }
 
+    // `scope=all` clears two files, so a failure on the second one leaves the
+    // first already gone. Exiting inside the loop would take the `cleared`
+    // list with it — including the backup path that is the only way back — so
+    // failures are collected and reported next to what did get removed.
     let mut cleared = Vec::new();
+    let mut failed = Vec::new();
     for (scope_name, path) in &files {
         if !path.exists() {
             continue;
@@ -10733,13 +10738,22 @@ fn cmd_daemon_reset_offline(scope: &str, apply: bool) -> ! {
         let backup = match backup_peer_state_file(path) {
             Ok(backup) => backup,
             Err(error) => {
-                eprintln!("Error: {error}");
-                process::exit(1);
+                failed.push(json!({
+                    "scope": scope_name,
+                    "path": path.display().to_string(),
+                    "error": error,
+                }));
+                continue;
             }
         };
         if let Err(error) = std::fs::remove_file(path) {
-            eprintln!("Error: could not remove {}: {error}", path.display());
-            process::exit(1);
+            failed.push(json!({
+                "scope": scope_name,
+                "path": path.display().to_string(),
+                "backup_path": backup,
+                "error": format!("could not remove: {error}"),
+            }));
+            continue;
         }
         cleared.push(json!({
             "scope": scope_name,
@@ -10751,14 +10765,26 @@ fn cmd_daemon_reset_offline(scope: &str, apply: bool) -> ! {
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
+            // What ran, not what qualified: an --apply that found nothing to
+            // clear still ran, and `cleared` says it removed nothing.
             "applied": true,
             "daemon": "not running",
+            "directory": dir.display().to_string(),
             "cleared": cleared,
+            "failed": failed,
         }))
         .unwrap_or_default()
     );
+    for failure in &failed {
+        eprintln!(
+            "Error: {} — {}",
+            failure["path"].as_str().unwrap_or("?"),
+            failure["error"].as_str().unwrap_or("?")
+        );
+    }
+    let exit_code = if failed.is_empty() { 0 } else { 1 };
     drop(lock);
-    process::exit(0);
+    process::exit(exit_code);
 }
 
 /// `tm-agent daemon replay-capacity [--set <value>]` — get or set the peer
