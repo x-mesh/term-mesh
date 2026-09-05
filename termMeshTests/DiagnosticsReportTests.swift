@@ -84,6 +84,109 @@ final class DiagnosticsReportTests: XCTestCase {
         XCTAssertTrue(output.contains("Peer Hosts:"))
     }
 
+    // MARK: - Project manifests behind the team count
+
+    private func projectRecord(
+        name: String = "eBPF",
+        projectID: String = "proj-ebpf-1",
+        directory: String = "/root/eBPF",
+        revision: UInt64 = 4,
+        owned: Bool = false,
+        surfacePresent: Bool = false,
+        processActive: Bool = false,
+        processKnown: Bool = true,
+        agents: Int = 0
+    ) -> ProjectRecordSnapshot {
+        ProjectRecordSnapshot(
+            name: name,
+            projectID: projectID,
+            workingDirectory: directory,
+            revision: revision,
+            ownedByRequester: owned,
+            leaderSurfacePresent: surfacePresent,
+            leaderProcessActive: processActive,
+            leaderProcessActiveKnown: processKnown,
+            agentCount: agents
+        )
+    }
+
+    private func render(records: [ProjectRecordSnapshot]) -> String {
+        var subject = host()
+        subject.projectRecords = records
+        subject.teamCount = records.count
+        return render([subject])
+    }
+
+    /// #462: `teams: 3` cannot tell three running Projects from three records a
+    /// departed installation left holding their names, and that is the whole
+    /// question a "cannot create this Project" report asks. The facts behind
+    /// the count have to reach the bundle.
+    func test_projectRecordsNameWhatHoldsEachProjectName() {
+        let output = render(records: [projectRecord()])
+        XCTAssertTrue(output.contains("project records:"))
+        XCTAssertTrue(output.contains("eBPF (proj-ebpf-1) revision=4"))
+        XCTAssertTrue(output.contains("owner=other-installation"))
+        XCTAssertTrue(output.contains("agents=0"))
+        XCTAssertTrue(output.contains("dir=/root/eBPF"))
+        XCTAssertTrue(output.contains("leader-surface=absent"))
+        XCTAssertTrue(output.contains("leader-process=inactive"))
+    }
+
+    /// The recorded path is what separates two same-named records from one, so
+    /// it is printed as recorded rather than masked.
+    func test_recordedDirectoryIsPrintedAsRecorded() {
+        let output = render(records: [
+            projectRecord(projectID: "proj-a", directory: "/root/eBPF"),
+            projectRecord(projectID: "proj-b", directory: "/srv/work/eBPF"),
+        ])
+        XCTAssertTrue(output.contains("dir=/root/eBPF"))
+        XCTAssertTrue(output.contains("dir=/srv/work/eBPF"))
+    }
+
+    /// "The host never probed the leader" is a different claim from "the leader
+    /// is stopped". A record with an idle shell can be reclaimed; one whose
+    /// process the host confirms is running is work to open.
+    func test_unprobedLeaderIsReportedAsUnknownNotAsStopped() {
+        let output = render(records: [projectRecord(surfacePresent: true, processKnown: false)])
+        XCTAssertTrue(output.contains("leader-surface=present"))
+        XCTAssertTrue(output.contains("leader-process=unknown"))
+        XCTAssertFalse(output.contains("leader-process=inactive"))
+    }
+
+    func test_ownedRecordSaysSoAndActiveLeaderIsNotHiddenBehindTheCount() {
+        let output = render(records: [
+            projectRecord(name: "aurora27", projectID: "proj-a27", directory: "/root/aurora27",
+                          owned: true, surfacePresent: true, processActive: true, agents: 4)
+        ])
+        XCTAssertTrue(output.contains("owner=this-installation"))
+        XCTAssertTrue(output.contains("leader-process=active"))
+        XCTAssertTrue(output.contains("agents=4"))
+    }
+
+    /// A record with nothing recorded still has to appear: an empty project id
+    /// is why the app can offer no exact action for it.
+    func test_aRecordWithNoIdentityStillAppears() {
+        let output = render(records: [projectRecord(name: "", projectID: "", directory: "")])
+        XCTAssertTrue(output.contains("(unnamed) ((no project id))"))
+        XCTAssertTrue(output.contains("dir=(not recorded)"))
+    }
+
+    /// The bundle rides a URL-length budget. A truncated list must not read as
+    /// a complete one.
+    func test_alongListIsCappedAndSaysHowManyItLeftOut() {
+        let records = (0..<15).map { projectRecord(name: "p\($0)", projectID: "id-\($0)") }
+        let output = render(records: records)
+        XCTAssertTrue(output.contains("… and 3 more"))
+        XCTAssertTrue(output.contains("p0 (id-0)"))
+        XCTAssertFalse(output.contains("p14 (id-14)"))
+    }
+
+    func test_hostWithNoManifestsOmitsTheSection() {
+        let output = render(records: [])
+        XCTAssertFalse(output.contains("project records:"))
+        XCTAssertTrue(output.contains("Peer Hosts:"))
+    }
+
     // MARK: - Peer host section
 
     func test_failedHostCarriesItsReason() {

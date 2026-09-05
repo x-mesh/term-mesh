@@ -266,6 +266,26 @@ final class DiagnosticsRedactor {
 /// hosts involved without an SSH round trip. `healthBaseline` is the
 /// exception: it comes from a probe, so it is nil unless a caller that had
 /// one — the host editor, or the failure-detection capture — supplies it.
+/// One durable Project manifest the host still holds.
+///
+/// The host used to appear as `teams: 3`, and that number cannot tell three
+/// running Projects from three records a departed installation left behind —
+/// which is exactly the question a "cannot create this Project" report asks
+/// (#462). These are the facts behind the count, not a verdict about them: a
+/// reader derives "this record could be removed" from ownership and leader
+/// state, and the two come apart precisely when the app's own rule is wrong.
+struct ProjectRecordSnapshot {
+    var name: String
+    var projectID: String
+    var workingDirectory: String
+    var revision: UInt64
+    var ownedByRequester: Bool
+    var leaderSurfacePresent: Bool
+    var leaderProcessActive: Bool
+    var leaderProcessActiveKnown: Bool
+    var agentCount: Int
+}
+
 struct PeerHostSnapshot {
     var id: String
     var displayName: String
@@ -276,6 +296,9 @@ struct PeerHostSnapshot {
     var servingAppVersion: String?
     var workspaceCount: Int
     var teamCount: Int
+    /// The manifests behind `teamCount`. Defaulted so a caller that only
+    /// reports connectivity does not have to invent them.
+    var projectRecords: [ProjectRecordSnapshot] = []
     var isLaunchable: Bool
     /// Rendered readiness rather than a yes/no. The host store distinguishes
     /// never-probed, probing, unreachable, and ready-but-without-the-route,
@@ -358,6 +381,8 @@ enum DiagnosticsReport {
     /// URL-length budget.
     static let activityTailLines = 80
     static let daemonLogTailLines = 40
+    /// Project manifests listed per host before the rest are counted instead.
+    static let projectRecordLimit = 12
 
     /// Build the redacted bundle. This is the only way text leaves this type.
     ///
@@ -444,6 +469,21 @@ enum DiagnosticsReport {
                 servingAppVersion: host.servingAppVersion,
                 workspaceCount: host.workspaces.count,
                 teamCount: host.teams.count,
+                projectRecords: host.teams
+                    .map { team in
+                        ProjectRecordSnapshot(
+                            name: team.name,
+                            projectID: team.projectID,
+                            workingDirectory: team.workingDirectory,
+                            revision: team.presentationRevision,
+                            ownedByRequester: team.presentationOwnedByRequester,
+                            leaderSurfacePresent: !team.leaderSurfaceID.isEmpty,
+                            leaderProcessActive: team.leaderProcessActive,
+                            leaderProcessActiveKnown: team.leaderProcessActiveKnown,
+                            agentCount: team.members.count
+                        )
+                    }
+                    .sorted { ($0.name, $0.projectID) < ($1.name, $1.projectID) },
                 isLaunchable: host.isLaunchable,
                 teamHostReadiness: describe(host.teamHostReadiness),
                 failureReason: failureReason,
@@ -570,8 +610,47 @@ enum DiagnosticsReport {
                 lines.append("    active sock: \(host.activeSockPath)")
             }
             lines.append("    workspaces: \(host.workspaceCount), teams: \(host.teamCount)")
+            appendProjectRecords(host.projectRecords, to: &lines)
             lines.append("    launchable: \(host.isLaunchable), team host: \(host.teamHostReadiness)")
             appendHealthBaseline(host.healthBaseline, to: &lines)
+        }
+    }
+
+    /// Name the manifests the host holds, so a report can say which record
+    /// took a Project name and whether anything behind it is still running.
+    ///
+    /// The working directory is printed as recorded. It is the field that
+    /// separates two same-named records from one, and a masked path cannot do
+    /// that. Hostnames inside it are still aliased by the redactor, like every
+    /// other line.
+    private static func appendProjectRecords(
+        _ records: [ProjectRecordSnapshot],
+        to lines: inout [String]
+    ) {
+        guard !records.isEmpty else { return }
+        lines.append("    project records:")
+        // The bundle rides a URL-length budget, and a host can hold far more
+        // records than a reader needs. Naming the overflow keeps a truncated
+        // list from reading as a complete one.
+        for record in records.prefix(projectRecordLimit) {
+            let name = record.name.isEmpty ? "(unnamed)" : record.name
+            let id = record.projectID.isEmpty ? "(no project id)" : record.projectID
+            lines.append(
+                "      \(name) (\(id)) revision=\(record.revision) "
+                    + "owner=\(record.ownedByRequester ? "this-installation" : "other-installation") "
+                    + "agents=\(record.agentCount)"
+            )
+            let leaderProcess = record.leaderProcessActiveKnown
+                ? (record.leaderProcessActive ? "active" : "inactive")
+                : "unknown"
+            lines.append(
+                "        dir=\(record.workingDirectory.isEmpty ? "(not recorded)" : record.workingDirectory) "
+                    + "leader-surface=\(record.leaderSurfacePresent ? "present" : "absent") "
+                    + "leader-process=\(leaderProcess)"
+            )
+        }
+        if records.count > projectRecordLimit {
+            lines.append("      … and \(records.count - projectRecordLimit) more")
         }
     }
 
