@@ -96,6 +96,9 @@ grep -qx 'CapabilityBoundingSet=' /etc/systemd/system/term-meshd.service
 grep -qx 'ProtectSystem=full' /etc/systemd/system/term-meshd.service
 grep -qx 'ProtectHome=false' /etc/systemd/system/term-meshd.service
 grep -qx 'RuntimeDirectory=term-mesh' /etc/systemd/system/term-meshd.service
+# Without this the unit inherits the 90s default, which is how one stuck
+# teardown step cost 90 seconds of relay downtime (#403).
+grep -qx 'TimeoutStopSec=45' /etc/systemd/system/term-meshd.service
 grep -qx 'TERMMESH_PEER_SOCKET=/run/term-mesh/tm-peer.sock' /etc/term-mesh/peer.env
 grep -qx 'TERMMESH_DAEMON_UNIX_PATH=/run/term-mesh/term-meshd.sock' /etc/term-mesh/peer.env
 if grep -q '^sudo ' "$CALLS"; then

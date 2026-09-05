@@ -58,6 +58,58 @@ static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 /// the runtime never delivers the signal to its own listener.
 static SIGNALLED: AtomicBool = AtomicBool::new(false);
 static EXITING: AtomicBool = AtomicBool::new(false);
+/// Teardown fault injection, read once at `install`.
+static STALL: OnceLock<Option<Stall>> = OnceLock::new();
+
+/// What `TERMMESH_SHUTDOWN_STALL` wedges.
+///
+/// A teardown bound is only worth what it does when a step stops returning,
+/// and no ordinary daemon state produces that. This names the two shapes the
+/// production hangs took, so a test can reproduce each one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stall {
+    /// The named step's future never completes. The step's own limit ends it
+    /// and teardown carries on, which is the 2026-08-25 shape: the log stopped
+    /// after one step and the rest never ran.
+    Step(usize),
+    /// The thread running teardown blocks past the budget, so no timer on that
+    /// runtime can fire. This is the 2026-08-27 shape, where not even the
+    /// SIGTERM receipt was logged: only an off-runtime bound can end it.
+    Teardown,
+}
+
+/// Read `TERMMESH_SHUTDOWN_STALL`. An unrecognized value injects nothing, so a
+/// typo cannot silently wedge a production daemon.
+fn parse_stall(value: &str) -> Option<Stall> {
+    match value.trim() {
+        "" | "0" | "off" => None,
+        "teardown" | "runtime" => Some(Stall::Teardown),
+        "headless" => Some(Stall::Step(STEP_HEADLESS)),
+        "agents" => Some(Stall::Step(STEP_AGENTS)),
+        "resume" => Some(Stall::Step(STEP_RESUME)),
+        "servers" => Some(Stall::Step(STEP_SERVERS)),
+        _ => None,
+    }
+}
+
+/// The injected stall, or None. Always None unless the environment asked.
+pub fn stall() -> Option<Stall> {
+    STALL.get().copied().flatten()
+}
+
+/// Block the thread running teardown past `budget`.
+///
+/// Reproduces a teardown that makes no progress at all: every bound that lives
+/// on this runtime is now unreachable, so the process may only end through the
+/// off-runtime hard-exit thread.
+pub fn wedge_teardown(budget: Duration) {
+    let hold = budget.saturating_mul(3);
+    tracing::warn!(
+        "teardown wedged for {}s by TERMMESH_SHUTDOWN_STALL",
+        hold.as_secs()
+    );
+    std::thread::sleep(hold);
+}
 
 fn now_ms() -> u64 {
     BASE.get()
@@ -77,6 +129,16 @@ fn now_ms() -> u64 {
 pub fn install(budget: Duration, stall_threshold: Duration) -> bool {
     let base = *BASE.get_or_init(Instant::now);
     HEARTBEAT.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
+
+    STALL.get_or_init(|| {
+        std::env::var("TERMMESH_SHUTDOWN_STALL")
+            .ok()
+            .as_deref()
+            .and_then(parse_stall)
+    });
+    if let Some(injected) = stall() {
+        tracing::warn!("teardown fault injection active: {injected:?}");
+    }
 
     let signals_installed = observe_stop_signals();
     spawn_heartbeat();
@@ -275,7 +337,14 @@ where
     tracing::info!("shutdown step '{name}' started");
 
     let began = Instant::now();
-    match tokio::time::timeout(limit, work).await {
+    let bounded = async move {
+        if stall() == Some(Stall::Step(index)) {
+            tracing::warn!("shutdown step '{name}' stalled by TERMMESH_SHUTDOWN_STALL");
+            std::future::pending::<()>().await;
+        }
+        work.await
+    };
+    match tokio::time::timeout(limit, bounded).await {
         Ok(value) => {
             tracing::info!(
                 "shutdown step '{name}' finished in {}ms",
@@ -336,6 +405,21 @@ mod tests {
             .await
             .expect("latched signal was not observed");
         SIGNALLED.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn only_a_named_shape_injects_a_stall() {
+        assert_eq!(parse_stall("agents"), Some(Stall::Step(STEP_AGENTS)));
+        assert_eq!(parse_stall(" servers "), Some(Stall::Step(STEP_SERVERS)));
+        assert_eq!(parse_stall("teardown"), Some(Stall::Teardown));
+        assert_eq!(parse_stall("runtime"), Some(Stall::Teardown));
+    }
+
+    #[test]
+    fn an_unrecognized_stall_wedges_nothing() {
+        for value in ["", "0", "off", "agent", "yes", "1", "STEP_AGENTS"] {
+            assert_eq!(parse_stall(value), None, "{value:?} must not inject");
+        }
     }
 
     #[test]

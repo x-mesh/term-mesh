@@ -633,6 +633,13 @@ async fn main() -> anyhow::Result<()> {
         }
         }
     };
+    // Injected before the receipt below on purpose: the 2026-08-27 hang logged
+    // no SIGTERM receipt at all, so the wedge has to sit where nothing on this
+    // runtime has run yet. Only the hard-exit thread can end the process from
+    // here, which is the property under test.
+    if shutdown::stall() == Some(shutdown::Stall::Teardown) {
+        shutdown::wedge_teardown(SHUTDOWN_BUDGET);
+    }
     shutdown::begin();
     tracing::info!("received {shutdown_reason}, initiating graceful shutdown...");
 

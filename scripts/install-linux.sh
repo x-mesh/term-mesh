@@ -419,6 +419,11 @@ ProtectSystem=full
 ProtectHome=${PROTECT_HOME}
 Restart=always
 RestartSec=2
+# The daemon bounds its own teardown (SHUTDOWN_BUDGET in term-meshd) and exits
+# once that budget is spent. This backstop only has to sit above it. Leaving it
+# at the distro default of 90s is what made one stuck step cost 90 seconds of
+# relay downtime.
+TimeoutStopSec=45
 
 [Install]
 WantedBy=${WANTED_BY}
@@ -434,6 +439,9 @@ EnvironmentFile=-${ENV_FILE}
 ExecStart=${PREFIX}/${BIN_NAME}
 Restart=always
 RestartSec=2
+# See the system unit above: the daemon owns the teardown bound, this is only
+# the backstop above it.
+TimeoutStopSec=45
 
 [Install]
 WantedBy=${WANTED_BY}
