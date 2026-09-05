@@ -1116,6 +1116,65 @@ pub struct ProjectPresentationPruneReport {
     pub skipped: Vec<ProjectPresentationPruneSkip>,
 }
 
+
+/// What a peer state reset is allowed to touch. Deliberately not "everything
+/// under the state directory": ensured-surface records, the agent session DB
+/// and the sync stores are out of scope, because losing those costs task
+/// history and device trust rather than a stale name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerStateResetScope {
+    Projects,
+    Workspaces,
+    All,
+}
+
+impl PeerStateResetScope {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "projects" => Some(Self::Projects),
+            "workspaces" => Some(Self::Workspaces),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    fn covers_projects(self) -> bool {
+        matches!(self, Self::Projects | Self::All)
+    }
+
+    fn covers_workspaces(self) -> bool {
+        matches!(self, Self::Workspaces | Self::All)
+    }
+}
+
+/// One workspace a reset removed, or would remove on `--apply`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorkspaceResetEntry {
+    pub workspace_id: String,
+    pub name: String,
+    /// Host processes this removal kills. A reset is not a tidy-up when this
+    /// is non-zero, which is why the dry-run reports it before anything runs.
+    pub surfaces: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorkspaceResetSkip {
+    pub workspace_id: String,
+    pub name: String,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PeerStateResetReport {
+    pub applied: bool,
+    /// Present when the scope covered manifests. Carries its own backup path
+    /// and per-record skip reasons.
+    pub projects: Option<ProjectPresentationPruneReport>,
+    pub workspaces_backup_path: Option<String>,
+    pub workspaces_removed: Vec<WorkspaceResetEntry>,
+    pub workspaces_skipped: Vec<WorkspaceResetSkip>,
+}
+
 /// Shared state of one daemon peer host: the PTYs, the workspaces they are
 /// arranged into, and the connections to push layout changes to. This is
 /// what `connection::run` receives instead of a bare `PtyManager`.
@@ -1525,7 +1584,7 @@ impl PeerHost {
         }
         let path = self.project_presentations_path.lock().unwrap().clone();
         let backup_path = match &path {
-            Some(path) => Self::backup_project_presentations_file(path)?,
+            Some(path) => super::persist::backup_state_file(path)?,
             None => None,
         };
         let previous: Vec<_> = removed
@@ -1549,31 +1608,143 @@ impl PeerHost {
         })
     }
 
-    /// Copy the persisted manifest file next to itself as
-    /// `peer-project-presentations.<unix-secs>[-<n>].bak.json`. The loader
-    /// reads only the exact primary path, so backups are never mistaken for
-    /// state. `Ok(None)` when nothing was persisted yet.
-    fn backup_project_presentations_file(path: &Path) -> Result<Option<String>, &'static str> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or(0);
-        let mut candidate = path.with_file_name(format!("peer-project-presentations.{stamp}.bak.json"));
-        let mut suffix = 1;
-        while candidate.exists() {
-            if suffix > 1000 {
-                return Err("backup_failed");
+
+    /// Empty this host's durable peer state so a name it still holds stops
+    /// blocking a new Project.
+    ///
+    /// Distinct from `prune_stale_project_presentations`, which only reclaims
+    /// what nothing could resume: an idle manifest whose working directory
+    /// still exists is skipped there, and a project folder does not disappear,
+    /// so a leader that died leaves a record that never becomes a candidate.
+    /// A reset is the operator saying "remove it anyway".
+    ///
+    /// What it still refuses is live work. A manifest with a live surface, and
+    /// the default workspace, are reported as skipped rather than removed —
+    /// the point is to clear names, not to kill sessions the user can see.
+    /// Removing a non-default workspace does kill that workspace's processes
+    /// (`remove_workspace`), so the dry-run names the surface count first.
+    ///
+    /// Workspaces go first, and under `All` that ordering is the whole point.
+    /// A manifest whose leader lives in a named workspace is live right up
+    /// until that workspace is removed, so pruning first would skip it as
+    /// `live`, kill its leader moments later, and leave the operator holding
+    /// the name they asked to have cleared — the exact failure this command
+    /// exists to end. Running the removal first means the prune sees the
+    /// post-removal surface set: `remove_workspace` drops each surface from
+    /// the registry synchronously, so `live_surface_ids` is already current.
+    ///
+    /// It also puts every failure that can abort the call before the first
+    /// manifest is deleted. The workspace backup is the one step here that
+    /// returns `Err`, and returning it early costs nothing, where returning
+    /// it after the prune would discard the report carrying that prune's own
+    /// backup path.
+    pub fn reset_peer_state(
+        &self,
+        scope: PeerStateResetScope,
+        apply: bool,
+    ) -> Result<PeerStateResetReport, &'static str> {
+        let mut removed = Vec::new();
+        let mut skipped = Vec::new();
+        let mut workspaces_backup_path = None;
+
+        if scope.covers_workspaces() {
+            let default_id = self.default_id();
+            let inventory: Vec<(Vec<u8>, String, bool, usize)> = {
+                let workspaces = self.workspaces.lock().unwrap();
+                workspaces
+                    .iter()
+                    .map(|(id, entry)| {
+                        (
+                            id.clone(),
+                            entry.name.clone(),
+                            entry.is_default,
+                            entry.store.surface_ids().len(),
+                        )
+                    })
+                    .collect()
+            };
+
+            let mut candidates = Vec::new();
+            for (id, name, is_default, surfaces) in inventory {
+                if is_default || id == default_id {
+                    skipped.push(WorkspaceResetSkip {
+                        workspace_id: hex::encode(&id),
+                        name,
+                        reason: "default",
+                    });
+                    continue;
+                }
+                candidates.push((id, name, surfaces));
             }
-            candidate = path.with_file_name(format!(
-                "peer-project-presentations.{stamp}-{suffix}.bak.json"
-            ));
-            suffix += 1;
+            candidates.sort_by(|a, b| a.1.cmp(&b.1));
+
+            if !apply {
+                removed = candidates
+                    .into_iter()
+                    .map(|(id, name, surfaces)| WorkspaceResetEntry {
+                        workspace_id: hex::encode(&id),
+                        name,
+                        surfaces,
+                    })
+                    .collect();
+            } else if !candidates.is_empty() {
+                let path = self.persist_path.lock().unwrap().clone();
+                if let Some(path) = &path {
+                    workspaces_backup_path = super::persist::backup_state_file(path)?;
+                }
+                for (id, name, surfaces) in candidates {
+                    // `remove_workspace` persists and broadcasts on its own,
+                    // and refuses to leave the host with no workspace at all.
+                    match self.remove_workspace(&id) {
+                        Ok(()) => removed.push(WorkspaceResetEntry {
+                            workspace_id: hex::encode(&id),
+                            name,
+                            surfaces,
+                        }),
+                        Err(RemoveWorkspaceError::LastWorkspace) => {
+                            skipped.push(WorkspaceResetSkip {
+                                workspace_id: hex::encode(&id),
+                                name,
+                                reason: "last_workspace",
+                            })
+                        }
+                        Err(RemoveWorkspaceError::NotFound) => {
+                            skipped.push(WorkspaceResetSkip {
+                                workspace_id: hex::encode(&id),
+                                name,
+                                reason: "not_found",
+                            })
+                        }
+                    }
+                }
+            }
         }
-        std::fs::copy(path, &candidate).map_err(|_| "backup_failed")?;
-        Ok(Some(candidate.display().to_string()))
+
+        let projects = if scope.covers_projects() {
+            // Every id named explicitly: that is what makes the prune ignore
+            // `directory_present`, which is the whole reason a dead leader's
+            // record survives an ordinary prune.
+            let ids: Vec<String> = self
+                .project_presentations
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            Some(self.prune_stale_project_presentations(&ids, apply)?)
+        } else {
+            None
+        };
+
+        let applied = apply
+            && (projects.as_ref().is_some_and(|report| report.applied) || !removed.is_empty());
+        Ok(PeerStateResetReport {
+            applied,
+            projects,
+            workspaces_backup_path,
+            workspaces_removed: removed,
+            workspaces_skipped: skipped,
+        })
     }
 
     /// Every surface id a stored manifest names, leader first.
@@ -4846,6 +5017,273 @@ mod tests {
         host.terminate_surface(&replacement_leader.surface_id)
             .unwrap();
         host.terminate_surface(&member.surface_id).unwrap();
+    }
+
+    /// The gap `prune` leaves open: a leader that died still holds its Project
+    /// name, because an implicit prune skips any record whose working
+    /// directory exists — and a project folder does not disappear when its
+    /// leader does. Reset is the operator saying "take the name anyway", and
+    /// it still has to refuse a Project someone is looking at.
+    #[tokio::test]
+    async fn reset_clears_a_dead_leaders_name_that_prune_keeps_forever() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces_path = tmp.path().join("peer-workspaces.json");
+        let presentations_path =
+            crate::peer::persist::project_presentations_path(&workspaces_path);
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(workspaces_path.clone());
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let foreign_owner = vec![vec![9; 16]];
+        let publish = |key: &str, project_id: &str| {
+            let leader = host.ensure_surface(key, &spec).unwrap();
+            let team = peer_proto::v1::Team {
+                name: project_id.to_string(),
+                team_uuid: format!("uuid-{project_id}"),
+                // Both records point at a directory that exists — that is
+                // exactly the shape an implicit prune refuses to touch.
+                working_directory: "/tmp".to_string(),
+                leader_surface_id: leader.surface_id.clone(),
+                project_id: project_id.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(
+                host.upsert_project_presentation(&foreign_owner, &team),
+                Ok((1, true))
+            );
+            leader
+        };
+        let watched = publish("watched-leader", "watched");
+        let abandoned = publish("abandoned-leader", "abandoned");
+        host.terminate_surface(&abandoned.surface_id).unwrap();
+        for _ in 0..50 {
+            if !host.live_surface_ids().contains(&abandoned.surface_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+
+        // Baseline: an implicit prune finds nothing, which is the bug.
+        let prune = host.prune_stale_project_presentations(&[], true).unwrap();
+        assert!(prune.removed.is_empty());
+        assert!(prune
+            .skipped
+            .iter()
+            .any(|skip| skip.project_id == "abandoned" && skip.reason == "directory_present"));
+
+        // Dry run changes nothing on disk.
+        let before = std::fs::read(&presentations_path).expect("persisted file");
+        let preview = host
+            .reset_peer_state(PeerStateResetScope::Projects, false)
+            .unwrap();
+        assert!(!preview.applied);
+        let preview_projects = preview.projects.expect("projects scope reports");
+        assert_eq!(
+            preview_projects
+                .removed
+                .iter()
+                .map(|status| status.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["abandoned"]
+        );
+        assert_eq!(std::fs::read(&presentations_path).unwrap(), before);
+
+        let report = host
+            .reset_peer_state(PeerStateResetScope::Projects, true)
+            .unwrap();
+        assert!(report.applied);
+        let projects = report.projects.expect("projects scope reports");
+        assert_eq!(
+            projects
+                .removed
+                .iter()
+                .map(|status| status.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["abandoned"]
+        );
+        // The one still being watched is refused, by liveness and nothing else.
+        assert!(projects
+            .skipped
+            .iter()
+            .any(|skip| skip.project_id == "watched" && skip.reason == "live"));
+        assert!(projects.backup_path.is_some());
+
+        let surviving: Vec<String> = host
+            .project_presentation_statuses()
+            .into_iter()
+            .map(|status| status.project_id)
+            .collect();
+        assert_eq!(surviving, vec!["watched".to_string()]);
+        // And the removal is durable, not just in memory.
+        assert!(!String::from_utf8_lossy(&std::fs::read(&presentations_path).unwrap())
+            .contains("abandoned"));
+        drop(watched);
+    }
+
+    /// Clearing names must not leave the host without a workspace to resolve
+    /// un-namespaced control to, so the default one is reported rather than
+    /// removed. Everything else goes — and takes its shells with it, which is
+    /// why the dry-run has to say how many first.
+    #[tokio::test]
+    async fn reset_removes_named_workspaces_but_never_the_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces_path = tmp.path().join("peer-workspaces.json");
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(workspaces_path.clone());
+        let default_id = host.default_id();
+        let named = host.create_workspace("Project · aic".to_string());
+        let also_named = host.create_workspace("newnew".to_string());
+
+        let preview = host
+            .reset_peer_state(PeerStateResetScope::Workspaces, false)
+            .unwrap();
+        assert!(!preview.applied);
+        assert!(preview.projects.is_none());
+        let previewed: Vec<&str> = preview
+            .workspaces_removed
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(previewed, vec!["Project · aic", "newnew"]);
+        assert!(preview
+            .workspaces_skipped
+            .iter()
+            .any(|skip| skip.reason == "default"));
+        // Nothing removed yet.
+        assert_eq!(host.list_workspaces().len(), 3);
+
+        let report = host
+            .reset_peer_state(PeerStateResetScope::Workspaces, true)
+            .unwrap();
+        assert!(report.applied);
+        assert_eq!(report.workspaces_removed.len(), 2);
+        assert!(report.workspaces_backup_path.is_some());
+
+        let remaining = host.list_workspaces();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, default_id);
+        // Durable, and the removed names are gone from the file too.
+        let persisted = String::from_utf8_lossy(&std::fs::read(&workspaces_path).unwrap()).to_string();
+        assert!(!persisted.contains("newnew"));
+        assert!(!persisted.contains("Project · aic"));
+        drop((named, also_named));
+    }
+
+    /// `all` has to finish the job in one call. A manifest whose leader lives
+    /// in a named workspace is live until that workspace goes, so pruning
+    /// manifests first skipped it as `live`, killed the leader moments later,
+    /// and handed back a report claiming success while the name it was asked
+    /// to clear was still held. Removing workspaces first means the prune
+    /// reads the surface set this same call already emptied.
+    #[tokio::test]
+    async fn all_scope_clears_a_manifest_whose_leader_dies_with_its_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces_path = tmp.path().join("peer-workspaces.json");
+        let manager = Arc::new(PtyManager::new());
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        host.set_persist_path(workspaces_path.clone());
+
+        // Named workspace built directly, holding the leader surface — the
+        // same manual-construction pattern as
+        // `remove_workspace_tears_down_surfaces_and_broadcasts_removal`,
+        // because `ensure_surface` always lands in the default workspace.
+        let leader = sid("aic-leader");
+        let surface = PtySurface::spawn(leader.clone(), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(surface);
+        let named_id = sid("aic-workspace");
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            let mut store = LayoutStore {
+                root: None,
+                next_split_id: 1,
+            };
+            store.seed_first_pane(leader.clone());
+            workspaces.insert(
+                named_id.clone(),
+                WorkspaceEntry {
+                    id: named_id.clone(),
+                    name: "Project · aic".into(),
+                    is_default: false,
+                    store,
+                },
+            );
+        }
+        host.surface_workspace
+            .lock()
+            .unwrap()
+            .insert(leader.clone(), named_id.clone());
+
+        let team = peer_proto::v1::Team {
+            name: "aic".to_string(),
+            team_uuid: "uuid-aic".to_string(),
+            // The directory exists, so an ordinary prune would never take it.
+            working_directory: "/tmp".to_string(),
+            leader_surface_id: leader.clone(),
+            project_id: "aic".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            host.upsert_project_presentation(&[vec![9; 16]], &team),
+            Ok((1, true))
+        );
+
+        // The dry-run has to name the shells the apply will kill, or the
+        // surface count is a field nothing ever exercises.
+        let preview = host
+            .reset_peer_state(PeerStateResetScope::All, false)
+            .unwrap();
+        let previewed = preview
+            .workspaces_removed
+            .iter()
+            .find(|entry| entry.name == "Project · aic")
+            .expect("named workspace previewed");
+        assert_eq!(previewed.surfaces, 1, "dry-run must warn about the shell");
+        // Before the workspace goes, the manifest is genuinely live.
+        assert!(preview
+            .projects
+            .expect("projects scope reports")
+            .skipped
+            .iter()
+            .any(|skip| skip.project_id == "aic" && skip.reason == "live"));
+
+        let report = host.reset_peer_state(PeerStateResetScope::All, true).unwrap();
+        assert!(report.applied);
+        assert_eq!(report.workspaces_removed.len(), 1);
+        // One call, both halves: the workspace went and the name came free.
+        let projects = report.projects.expect("projects scope reports");
+        assert_eq!(
+            projects
+                .removed
+                .iter()
+                .map(|status| status.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aic"],
+            "the manifest must not survive the call that killed its leader"
+        );
+        assert!(host.project_presentation_statuses().is_empty());
+    }
+
+    /// `all` is the two scopes together, not a third behaviour.
+    #[test]
+    fn reset_scope_parses_exactly_the_three_documented_values() {
+        assert_eq!(
+            PeerStateResetScope::parse("projects"),
+            Some(PeerStateResetScope::Projects)
+        );
+        assert_eq!(
+            PeerStateResetScope::parse("workspaces"),
+            Some(PeerStateResetScope::Workspaces)
+        );
+        assert_eq!(PeerStateResetScope::parse("all"), Some(PeerStateResetScope::All));
+        assert_eq!(PeerStateResetScope::parse("everything"), None);
+        assert_eq!(PeerStateResetScope::parse(""), None);
     }
 
     /// Operator prune for issue #389: records another installation owns

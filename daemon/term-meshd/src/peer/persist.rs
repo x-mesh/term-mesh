@@ -449,6 +449,138 @@ pub fn boot(path: &Path, default_name_fallback: &str) -> Vec<PersistedWorkspace>
     entries
 }
 
+/// Copy `path` next to itself as `<stem>.<unix-secs>[-<n>].bak.json` before a
+/// destructive rewrite. Every loader in this module reads only its own exact
+/// primary path, so a backup is never mistaken for state. `Ok(None)` when
+/// there was nothing persisted to copy.
+pub fn backup_state_file(path: &Path) -> Result<Option<String>, &'static str> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or("backup_failed")?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let mut candidate = path.with_file_name(format!("{stem}.{stamp}.bak.json"));
+    let mut suffix = 1;
+    while candidate.exists() {
+        if suffix > 1000 {
+            return Err("backup_failed");
+        }
+        candidate = path.with_file_name(format!("{stem}.{stamp}-{suffix}.bak.json"));
+        suffix += 1;
+    }
+    std::fs::copy(path, &candidate).map_err(|_| "backup_failed")?;
+    Ok(Some(candidate.display().to_string()))
+}
+
+/// Advisory lock guarding this state directory, held for a daemon's whole
+/// lifetime.
+///
+/// The peer socket lock in `server.rs` is keyed on the socket path, so two
+/// daemons started with different socket paths hold different locks. But
+/// `default_workspaces_path` has no env override, so both of them write the
+/// same three state files, and every writer here saves a *full snapshot* —
+/// the last one to finish silently drops whatever the other had recorded.
+///
+/// This lock does not fix that. It exists so a repair tool can tell whether
+/// any daemon still owns this directory before rewriting the files: a daemon
+/// that is up would just save its own in-memory snapshot over the repair.
+/// Daemons take it shared, repair tools take it exclusive.
+pub fn state_lock_path(workspaces_path: &Path) -> PathBuf {
+    workspaces_path.with_file_name(".peer-state.lock")
+}
+
+/// Open the lock file with the same ownership contract as the peer socket
+/// lock: a single-link regular file owned by this uid, mode 0600.
+#[cfg(unix)]
+fn open_state_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(lock_path)?;
+    let metadata = file.metadata()?;
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_file() || metadata.uid() != uid || metadata.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "peer state lock {} is not a single-link regular file owned by uid {uid}",
+                lock_path.display()
+            ),
+        ));
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn flock_nonblocking(file: &std::fs::File, operation: libc::c_int) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let rc = unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Shared lock: several daemons can hold it at once. Its only job is to make
+/// an exclusive acquisition fail while any of them is alive.
+#[cfg(unix)]
+pub fn acquire_state_lock_shared(workspaces_path: &Path) -> std::io::Result<std::fs::File> {
+    let file = open_state_lock_file(&state_lock_path(workspaces_path))?;
+    flock_nonblocking(&file, libc::LOCK_SH)?;
+    Ok(file)
+}
+
+/// Exclusive lock. An error means a daemon still owns this state directory,
+/// so rewriting its files would be undone by that daemon's next save.
+#[cfg(unix)]
+pub fn try_acquire_state_lock_exclusive(
+    workspaces_path: &Path,
+) -> std::io::Result<std::fs::File> {
+    let file = open_state_lock_file(&state_lock_path(workspaces_path))?;
+    flock_nonblocking(&file, libc::LOCK_EX)?;
+    Ok(file)
+}
+
+/// Without `flock` there is no way to tell a live daemon from a dead one, so
+/// both acquisitions succeed and a repair tool falls back to its own checks.
+#[cfg(not(unix))]
+pub fn acquire_state_lock_shared(workspaces_path: &Path) -> std::io::Result<std::fs::File> {
+    let path = state_lock_path(workspaces_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+pub fn try_acquire_state_lock_exclusive(
+    workspaces_path: &Path,
+) -> std::io::Result<std::fs::File> {
+    acquire_state_lock_shared(workspaces_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,5 +1034,51 @@ mod tests {
 
         assert!(load_ensured_surfaces(&ensured_path).is_empty());
         assert_eq!(load(&workspace_path)[0].name, "kept");
+    }
+
+    #[test]
+    fn state_lock_sits_next_to_the_workspaces_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspaces = dir.path().join("peer-workspaces.json");
+        assert_eq!(
+            state_lock_path(&workspaces),
+            dir.path().join(".peer-state.lock")
+        );
+    }
+
+    /// The whole point of the lock: while any daemon holds it shared, a repair
+    /// tool must not conclude the state directory is free to rewrite.
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_state_lock_blocks_exclusive_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspaces = dir.path().join("peer-workspaces.json");
+
+        let daemon = acquire_state_lock_shared(&workspaces).expect("daemon takes shared lock");
+        assert!(try_acquire_state_lock_exclusive(&workspaces).is_err());
+
+        // A second daemon on the same directory is allowed — shared locks do
+        // not exclude each other, and it is the exclusive side that must fail.
+        let second = acquire_state_lock_shared(&workspaces).expect("second daemon");
+        assert!(try_acquire_state_lock_exclusive(&workspaces).is_err());
+
+        drop(second);
+        drop(daemon);
+        assert!(try_acquire_state_lock_exclusive(&workspaces).is_ok());
+    }
+
+    /// Boot must not depend on the lock, so a directory that already has one
+    /// still reconciles normally.
+    #[cfg(unix)]
+    #[test]
+    fn state_lock_file_is_not_mistaken_for_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspaces = dir.path().join("peer-workspaces.json");
+        let _held = acquire_state_lock_shared(&workspaces).expect("shared lock");
+
+        save(&workspaces, &[sample("kept", true)]).unwrap();
+        let loaded = load(&workspaces);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "kept");
     }
 }
