@@ -1483,6 +1483,23 @@ impl PeerHost {
         }
     }
 
+    /// One durable manifest's facts, or None when nothing holds that id.
+    ///
+    /// Reads the whole liveness set for a single record on purpose: a repair
+    /// must judge the record against the same snapshot a prune would, not
+    /// against a cheaper per-surface probe that could disagree with it.
+    pub fn project_presentation_status(
+        &self,
+        project_id: &str,
+    ) -> Option<ProjectPresentationStatus> {
+        let live = self.live_surface_ids();
+        self.project_presentations
+            .lock()
+            .unwrap()
+            .get(project_id)
+            .map(|record| Self::presentation_status(record, &live))
+    }
+
     /// Every durable manifest with the facts an operator needs to judge it:
     /// how many of its surfaces are live and whether its directory exists.
     pub fn project_presentation_statuses(&self) -> Vec<ProjectPresentationStatus> {

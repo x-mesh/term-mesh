@@ -163,6 +163,7 @@ struct NewProjectView: View {
     @State private var isResolvingConflict = false
     @State private var pendingConflictDiscardTeamName: String?
     @State private var pendingOwnedRecordRemoval: TeamOrchestrator.ProjectConflictRecord?
+    @State private var pendingStaleRecordRepair: TeamOrchestrator.ProjectConflictRecord?
     /// A conflict discovered after Create began (for example another window's
     /// reservation) is not necessarily visible in the advisory snapshot yet.
     /// Keep that typed result until the user changes the Project identity.
@@ -396,6 +397,35 @@ struct NewProjectView: View {
                         + "and stops the panes only it referenced: its leader shell and any agent panes. "
                         + "The Project can no longer be opened from this record. The daemon workspace, "
                         + "its own shell and all files stay in place."
+                )
+            }
+        }
+        .confirmationDialog(
+            "Reclaim this Project name?",
+            isPresented: Binding(
+                get: { pendingStaleRecordRepair != nil },
+                set: { if !$0 { pendingStaleRecordRepair = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Reclaim Name", role: .destructive) {
+                guard let record = pendingStaleRecordRepair else { return }
+                pendingStaleRecordRepair = nil
+                repairStaleProjectRecord(record)
+            }
+            Button("Keep record", role: .cancel) {
+                pendingStaleRecordRepair = nil
+            }
+        } message: {
+            if let record = pendingStaleRecordRepair,
+               case let .remote(_, hostName) = record.location {
+                Text(
+                    "Another installation published the Project record "
+                        + "\(record.identity.projectID ?? "unknown") at "
+                        + "\(record.identity.workingDirectory ?? "an unrecorded path") on \(hostName). "
+                        + "The host checks it twice before removing it and refuses while anything "
+                        + "behind it is still running, so this takes a few seconds. It keeps a backup, "
+                        + "and the workspace, its shell, every other Project and all files stay in place."
                 )
             }
         }
@@ -2247,6 +2277,13 @@ struct NewProjectView: View {
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.deleteOwnedRecord")
             }
+            if record.canRepairStaleRemoteRecord {
+                Button("Reclaim Name…", role: .destructive) {
+                    pendingStaleRecordRepair = record
+                }
+                .disabled(isResolvingConflict)
+                .accessibilityIdentifier("newProject.conflict.repairStaleRecord")
+            }
             Button(Self.separateProjectButtonTitle()) {
                 chooseSeparateProjectName()
             }
@@ -2301,7 +2338,9 @@ struct NewProjectView: View {
                         ? "Open Existing to reuse this Project. Delete the record only if this Project is gone; files and the workspace stay."
                         : (record.presentationOwnedByRequester
                             ? "Open Existing to reuse this Project. Its leader is running, so the record cannot be deleted."
-                            : "Open Existing to reuse this Project. Only the owning installation can delete its record.")
+                            : (record.canRepairStaleRemoteRecord
+                                ? "Open Existing to reuse this Project. Another installation owns this record, so only Reclaim Name can free it — and only while nothing behind it is running."
+                                : "Open Existing to reuse this Project. Another installation owns this record and its leader is running."))
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -2345,6 +2384,23 @@ struct NewProjectView: View {
                 RemoteWorkLog.info("Deleted remote Project record \(projectID) from New Project")
             } catch {
                 creationError = "Could not delete the Project record: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func repairStaleProjectRecord(_ record: TeamOrchestrator.ProjectConflictRecord) {
+        guard case let .remote(hostKey, _) = record.location,
+              let projectID = record.identity.projectID else { return }
+        isResolvingConflict = true
+        Task { @MainActor in
+            defer { isResolvingConflict = false }
+            do {
+                try await hostStore.repairStaleProjectRecord(hostKey: hostKey, projectID: projectID)
+                submissionConflict = nil
+                creationError = nil
+                RemoteWorkLog.info("Reclaimed Project name from \(projectID) in New Project")
+            } catch {
+                creationError = "Could not reclaim the name: \(error.localizedDescription)"
             }
         }
     }

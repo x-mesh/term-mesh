@@ -111,6 +111,23 @@ final class TeamOrchestrator: ObservableObject {
             return !(leaderProcessActiveKnown && leaderReady)
         }
 
+        /// A remote record another installation published can have its name
+        /// reclaimed from the collision UI.
+        ///
+        /// The owner-authorized delete refuses it forever, so a record left by
+        /// an installation that is gone — a rotated peer identity, a
+        /// reinstalled app — holds the name and the only escape offered was a
+        /// different name (#389, #462). Offered under the same liveness rule as
+        /// the owned delete: a leader whose process is known to be running is
+        /// live work to be opened, never reclaimed. The host re-checks all of
+        /// this itself and requires a second look before it removes anything,
+        /// so this only decides whether to show the way in.
+        var canRepairStaleRemoteRecord: Bool {
+            guard case .remote = location else { return false }
+            guard !presentationOwnedByRequester, identity.projectID != nil else { return false }
+            return !(leaderProcessActiveKnown && leaderReady)
+        }
+
         /// A discovered manifest with an exact Project ID can be adopted into
         /// this window even when the folder currently entered in New Project
         /// differs. The name collision still blocks creating a second Project;

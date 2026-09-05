@@ -121,6 +121,11 @@ pub mod capability {
     /// ids, allowing a different authenticated viewer to discover and attach
     /// the already-running presentation without spawning replacement work.
     pub const PROJECT_PRESENTATION_V1: &str = "project.presentation.v1";
+    /// Operator removal of a manifest the requesting peer does not own.
+    /// Separate from [`PROJECT_PRESENTATION_V1`] because that capability is
+    /// owner-authorized by design: a host may serve durable manifests without
+    /// ever accepting a removal from a peer that is not their owner.
+    pub const PROJECT_PRESENTATION_REPAIR_V1: &str = "project.presentation.repair.v1";
     /// Daemon-owned workers read a transferable scoped team route from an
     /// owner-only file on every tm-agent invocation. Required before a viewer
     /// may promise that an adopted worker keeps team RPCs after handoff.
@@ -148,6 +153,7 @@ pub mod capability {
         TEAM_CALL_V1,
         TEAM_LEADER_V1,
         PROJECT_PRESENTATION_V1,
+        PROJECT_PRESENTATION_REPAIR_V1,
         TEAM_ROUTE_FILE_V1,
     ];
 
