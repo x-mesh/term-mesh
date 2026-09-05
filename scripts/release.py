@@ -275,8 +275,18 @@ def gh_json_optional(*args: str) -> tuple[Any, str | None]:
 
 
 def release_assets(tag: str) -> list[str]:
-    """Asset names currently attached to a tag's GitHub Release."""
-    release, _ = gh_json_optional("release", "view", tag, "--repo", REPO, "--json", "assets")
+    """Asset names currently attached to a tag's GitHub Release.
+
+    A read that fails is raised, never returned as an empty list. This feeds
+    the retention check either side of the DMG upload, and an empty list there
+    is wrong in both directions: before the upload it leaves nothing to retain,
+    so a real asset loss passes; after it, every asset reads as dropped and a
+    release that succeeded fails on an invented loss. A tag with no release at
+    all still answers honestly with an empty list.
+    """
+    release, error = gh_json_optional("release", "view", tag, "--repo", REPO, "--json", "assets")
+    if error:
+        raise ReleaseError(f"could not read the assets on {tag}: {error}")
     return [item["name"] for item in (release or {}).get("assets", [])]
 
 

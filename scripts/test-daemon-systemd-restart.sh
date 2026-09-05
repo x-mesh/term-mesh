@@ -91,8 +91,19 @@ if [[ -n "$STALL" ]]; then
   echo "stall:       $STALL (drop-in at $DROPIN_DIR)"
   # Leave no injected fault behind, whichever way this exits.
   trap 'rm -f "$DROPIN_DIR/99-shutdown-stall.conf"; systemctl_scoped daemon-reload; systemctl_scoped restart "$UNIT" || true' EXIT
+  STALL_SINCE=$(date '+%Y-%m-%d %H:%M:%S')
   systemctl_scoped restart "$UNIT"
   until relay_accepts; do sleep 0.1; done
+  # A release build compiles the injection out, so the drop-in above would be
+  # a silent no-op and every measurement below would read as "the bound works".
+  # Make that a failure instead.
+  if ! journal_scoped -u "$UNIT" --since "$STALL_SINCE" --no-pager \
+      | grep -q "teardown fault injection active"; then
+    echo "FAIL: --stall $STALL had no effect. This daemon build injects no" >&2
+    echo "      teardown fault (release builds never do). Measure without" >&2
+    echo "      --stall, or install a debug build to exercise the bound." >&2
+    exit 1
+  fi
 fi
 
 WORST=0

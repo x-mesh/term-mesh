@@ -318,6 +318,23 @@ class ReleaseStateMachineTests(unittest.TestCase):
         self.assertIsNone(value)
         self.assertIn("could not connect", error)
 
+    def test_an_unreadable_asset_list_is_raised_not_read_as_empty(self):
+        """An unreadable asset list must stop the publish, not read as "no assets".
+
+        Before the upload that would wave a real loss through; after it every
+        asset reads as dropped and a release that succeeded fails on a loss
+        that never happened.
+        """
+        with unittest.mock.patch.object(
+            release, "gh_json_optional", return_value=(None, "could not connect to api.github.com")
+        ):
+            with self.assertRaisesRegex(release.ReleaseError, "could not read the assets"):
+                release.release_assets("v0.226.4")
+
+        # A tag with no release is absence, not failure, and still answers.
+        with unittest.mock.patch.object(release, "gh_json_optional", return_value=(None, None)):
+            self.assertEqual(release.release_assets("v9.9.9"), [])
+
     def test_publishing_the_dmg_keeps_the_linux_assets(self):
         dmg = "term-mesh-macos-0.226.4.dmg"
         before = list(self.LINUX_ASSETS)
