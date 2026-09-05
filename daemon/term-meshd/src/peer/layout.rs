@@ -1265,6 +1265,16 @@ pub struct PeerHost {
     project_presentations_persistence: Mutex<()>,
     /// How many times each project id's manifest has been written or removed.
     ///
+    /// Locking: take `project_presentations` first and this second, always.
+    /// The counter is only meaningful paired with the record it counts, so a
+    /// read or a write that does not hold both can hand out a stale count for
+    /// a fresh record — which is the whole defect it exists to prevent.
+    ///
+    /// Entries outlive their records on purpose. Dropping one when its record
+    /// is deleted would restart the count at zero for that project id, and a
+    /// republished manifest would again be indistinguishable from the one it
+    /// replaced.
+    ///
     /// `revision` cannot identify a manifest instance: it restarts at 1
     /// whenever a project id has no record, so a delete followed by a
     /// republish produces a second instance that reads as the first. A repair
@@ -1530,10 +1540,11 @@ impl PeerHost {
         project_id: &str,
     ) -> Option<ProjectPresentationStatus> {
         let live = self.live_surface_ids();
+        let records = self.project_presentations.lock().unwrap();
+        // Read inside the map lock. Taken before it, the count could be the one
+        // a delete had already published for a record this then reads fresh.
         let instance = self.presentation_instance(project_id);
-        self.project_presentations
-            .lock()
-            .unwrap()
+        records
             .get(project_id)
             .map(|record| Self::presentation_status(record, &live, instance))
     }
@@ -1658,7 +1669,8 @@ impl PeerHost {
             records
                 .get(&status.project_id)
                 .map(|record| {
-                    Self::presentation_status(record, &live_now, status.instance).live_surfaces == 0
+                    let instance = self.presentation_instance(&status.project_id);
+                    Self::presentation_status(record, &live_now, instance).live_surfaces == 0
                 })
                 .unwrap_or(false)
         });
@@ -1711,11 +1723,14 @@ impl PeerHost {
                 })
             })
             .collect();
-        drop(records);
-        drop(_persist_guard);
+        // Under the map lock, with the removal: a counter bumped after the
+        // records lock is released leaves a window where a republished
+        // manifest reads with the count of the record it replaced.
         for status in &removed {
             self.bump_presentation_instance(&status.project_id);
         }
+        drop(records);
+        drop(_persist_guard);
         // Same shape as the owner-side delete: take each surface's lifecycle
         // lock and re-check the reference under it, so a manifest published
         // between the snapshot above and here keeps its pane.
@@ -1954,12 +1969,13 @@ impl PeerHost {
                     || record.members.iter().any(|member| member.surface_id == encoded)
             })
         }).cloned().collect::<Vec<_>>();
-        drop(records);
-        drop(_persist_guard);
         // Whatever replaces this project id next is a different manifest, and
         // `revision` will not say so: it restarts at 1 for an id with no
-        // record. Counting the removal is what keeps the two apart.
+        // record. Counting the removal is what keeps the two apart, and it has
+        // to happen under the map lock that removed it.
         self.bump_presentation_instance(project_id);
+        drop(records);
+        drop(_persist_guard);
         for surface_id in unreferenced {
             let lifecycle = self.surface_lifecycle_lock(&surface_id);
             let _lifecycle_guard = lifecycle.lock().map_err(|_| "surface_lifecycle_poisoned")?;
@@ -2196,8 +2212,10 @@ impl PeerHost {
             )
             .filter_map(|surface_id| surfaces.get(surface_id).cloned())
             .collect::<Vec<_>>();
-        drop(records);
+        // Under the map lock, with the write, for the same reason the removal
+        // paths count under theirs.
         self.bump_presentation_instance(&project.project_id);
+        drop(records);
         for surface in watched {
             self.watch_presentation_surface(surface);
         }
@@ -5497,6 +5515,62 @@ mod tests {
         assert_eq!(host.project_presentations()[0].project_id, "keeper");
         assert_eq!(host.list_workspaces().len(), workspace_count);
         host.terminate_surface(&shared).ok();
+    }
+
+    /// The counter must never hand a project id a number it has already used.
+    ///
+    /// Reclaiming an entry when its record is deleted looks like tidy
+    /// housekeeping and would restart the count at zero, which is exactly the
+    /// state a republished manifest was indistinguishable in before this
+    /// existed. This holds that door shut.
+    #[tokio::test]
+    async fn a_project_id_never_reuses_an_instance_it_has_already_held() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(tmp.path().join("peer-workspaces.json"));
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let owner = vec![vec![9; 16]];
+        let publish = |key: &str| {
+            let leader = host.ensure_surface(key, &spec).expect("surface").surface_id;
+            host.upsert_project_presentation(
+                &owner,
+                &peer_proto::v1::Team {
+                    name: "x".into(),
+                    team_uuid: "uuid-x".into(),
+                    working_directory: "/tmp".into(),
+                    leader_surface_id: leader.clone(),
+                    project_id: "x".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("publish");
+            leader
+        };
+
+        let first = publish("one");
+        let first_instance = host.project_presentation_status("x").expect("status").instance;
+        host.delete_project_presentation(&owner, "x").expect("delete");
+        let second = publish("two");
+        let second_instance = host.project_presentation_status("x").expect("status").instance;
+
+        assert_eq!(
+            host.project_presentation_status("x").expect("status").revision,
+            1,
+            "the premise: the revision restarts, which is why the count exists"
+        );
+        assert!(
+            second_instance > first_instance,
+            "a republished manifest reused instance {first_instance}"
+        );
+        host.terminate_surface(&first).ok();
+        host.terminate_surface(&second).ok();
     }
 
     /// The repair path's expectation is checked where the record leaves the

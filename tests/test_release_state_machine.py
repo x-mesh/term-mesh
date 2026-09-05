@@ -118,19 +118,53 @@ class ReleaseStateMachineTests(unittest.TestCase):
         self.assertIsNone(reading)
         self.assertIn("Bad credentials", error)
 
-    def test_a_not_found_about_the_repository_is_not_absence(self):
-        """A revoked token answers "repository not found" for a private repo.
-        Reading that as "this release does not exist" is how an auth failure
-        turns into a wrong reconciliation."""
-        self.assertIsNone(release.gh_failure_reason("release not found"))
-        self.assertIsNone(release.gh_failure_reason("gh: HTTP 404"))
-        for detail in (
-            "repository not found",
-            "GraphQL: Could not resolve to a Repository",
-            "HTTP 401: Bad credentials",
-            "HTTP 403: rate limit exceeded",
-        ):
-            self.assertEqual(release.gh_failure_reason(detail), detail, detail)
+    def test_absence_is_believed_only_when_the_repository_still_reads(self):
+        """The message alone cannot decide this.
+
+        Measured against the live `gh`: a missing release prints exactly
+        `release not found`, and a repository the token cannot see prints the
+        same, because GitHub answers 404 for both. Matching on the text was the
+        bug; the repository has to be asked.
+        """
+        with unittest.mock.patch.object(release, "repo_is_readable", return_value=True) as probe:
+            self.assertIsNone(release.gh_failure_reason("release not found", release.REPO))
+            self.assertIsNone(release.gh_failure_reason("gh: Not Found (HTTP 404)", release.REPO))
+        self.assertEqual(probe.call_count, 2)
+
+        # Same message, but the repository does not read: access, not absence.
+        with unittest.mock.patch.object(release, "repo_is_readable", return_value=False):
+            reason = release.gh_failure_reason("release not found", release.REPO)
+        self.assertIsNotNone(reason)
+        self.assertIn("access, not absence", reason)
+
+        # A failure that never claimed absence needs no probe at all.
+        with unittest.mock.patch.object(release, "repo_is_readable") as probe:
+            self.assertEqual(
+                release.gh_failure_reason("HTTP 403: rate limit exceeded", release.REPO),
+                "HTTP 403: rate limit exceeded",
+            )
+        probe.assert_not_called()
+
+    def test_a_failure_with_no_output_is_still_a_failure(self):
+        """An empty message is falsy, so returning it would put the caller
+        back where `if error:` reads a failed call as absence."""
+        self.assertEqual(release.gh_failure_reason("", release.REPO), "gh failed without output")
+
+    def test_emit_survives_a_receipt_written_before_mismatches_carried_a_stage(self):
+        import contextlib, io
+        state = {
+            "schema": 1, "version": "0.226.4", "candidate_develop_sha": "a" * 40,
+            "candidate_main_sha": "a" * 40, "latest_tag": "v0.226.3",
+            "steps": {name: {"status": "completed"} for name in release.STEP_ORDER},
+            "observation": {"mismatched": ["a plain string from an older receipt"]},
+        }
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            release.emit(state, command="status")
+        self.assertEqual(
+            json.loads(buffer.getvalue())["mismatched"],
+            ["a plain string from an older receipt"],
+        )
 
     def test_state_dir_can_be_isolated(self):
         with tempfile.TemporaryDirectory() as directory, unittest.mock.patch.dict(
@@ -341,7 +375,8 @@ class ReleaseStateMachineTests(unittest.TestCase):
         broken = subprocess.CompletedProcess(
             args=("gh",), returncode=1, stdout="", stderr="could not connect to api.github.com",
         )
-        with unittest.mock.patch.object(release.subprocess, "run", return_value=absent):
+        with unittest.mock.patch.object(release.subprocess, "run", return_value=absent), \
+                unittest.mock.patch.object(release, "repo_is_readable", return_value=True):
             self.assertEqual(release.gh_json_optional("release", "view", "v9.9.9"), (None, None))
         with unittest.mock.patch.object(release.subprocess, "run", return_value=broken):
             value, error = release.gh_json_optional("release", "view", "v9.9.9")
