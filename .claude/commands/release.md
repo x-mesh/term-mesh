@@ -78,4 +78,18 @@ Accepted forms:
 python3 scripts/release.py status <version> --json
 ```
 
+`status`, `publish`, and `resume` read the remote before they read the receipt.
+A stage the remote already finished is adopted with its evidence and listed in
+`reconciled`. A stage that stopped mid-run is listed in `interrupted`; it is not
+work in flight. Read these four fields before you act:
+
+- `reconciled`: stages adopted from remote state, with the fact that proved each
+- `interrupted`: stages that stopped mid-run and will start again
+- `mismatched`: remote state that contradicts the receipt. Resolve each one before resume.
+- `unread_remote_facts`: facts `gh` or `git` could not read. Reconciliation skipped them, so a stage can look pending when it is not.
+
+Reconciliation never adopts `release_build`, `dsym`, or `dmg`. Homebrew
+publishes the DMG checksum, so a DMG with no local receipt is rebuilt from the
+pinned release commit and replaces the published asset.
+
 Never edit receipts manually. Use `plan <version> --reset` only before remote mutation when the pinned candidate must intentionally be replaced, and explain why first.
