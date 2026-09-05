@@ -153,12 +153,22 @@ pub fn install(budget: Duration, stall_threshold: Duration) -> bool {
     });
     match stall() {
         Some(injected) => tracing::warn!("teardown fault injection active: {injected:?}"),
-        // Say so rather than ignoring it: a release build cannot inject, and a
-        // caller that set the variable is about to conclude the bound it was
-        // testing does not work.
-        None if std::env::var_os("TERMMESH_SHUTDOWN_STALL").is_some() => tracing::warn!(
-            "TERMMESH_SHUTDOWN_STALL is set but this build injects no teardown fault"
-        ),
+        // Say so rather than ignoring it: a caller that set the variable is
+        // about to conclude the bound it was testing does not work. Name which
+        // of the two reasons applies — blaming the build for a misspelt value
+        // sends them to rebuild something that was never the problem.
+        None if std::env::var_os("TERMMESH_SHUTDOWN_STALL").is_some() => {
+            if cfg!(debug_assertions) {
+                tracing::warn!(
+                    "TERMMESH_SHUTDOWN_STALL names no known fault; expected one of \
+                     headless, agents, resume, servers, teardown"
+                );
+            } else {
+                tracing::warn!(
+                    "TERMMESH_SHUTDOWN_STALL is set but a release build injects no teardown fault"
+                );
+            }
+        }
         None => {}
     }
 

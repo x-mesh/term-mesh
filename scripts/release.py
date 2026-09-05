@@ -257,47 +257,67 @@ def emit(state: dict[str, Any], *, command: str) -> None:
         "mismatched": [
             entry["detail"]
             for entry in state.get("observation", {}).get("mismatched", [])
-            if not completed(state, entry["step"])
+            # A receipt written before mismatches carried their stage holds
+            # plain strings. Reporting one is right; crashing on it is not.
+            if isinstance(entry, dict) and not completed(state, entry["step"])
+        ] + [
+            entry
+            for entry in state.get("observation", {}).get("mismatched", [])
+            if isinstance(entry, str)
         ],
         "unread_remote_facts": state.get("observation", {}).get("unreadable", {}),
         "receipts": state["steps"],
     }, indent=2, ensure_ascii=False))
 
 
-# Failures that say "not found" about something other than the resource asked
-# for. A revoked token answers "repository not found" for a private repo, and
-# reading that as "this release does not exist yet" is how an auth failure turns
-# into a wrong reconciliation. Checked before the absence patterns below.
-GH_NOT_ABSENT = (
-    "repository not found",
-    "could not resolve",
-    "bad credentials",
-    "authentication",
-    "http 401",
-    "http 403",
-)
-GH_ABSENT = ("release not found", "http 404")
+# What `gh` prints when the thing asked for is not there. Measured, not
+# assumed: a missing release prints `release not found`, and `gh api` prints
+# `Not Found (HTTP 404)`.
+GH_ABSENT = ("not found", "http 404")
 
 
-def gh_failure_reason(detail: str) -> str | None:
-    """None when a `gh` failure means the resource is absent, else the message."""
-    lowered = detail.lower()
-    if any(pattern in lowered for pattern in GH_NOT_ABSENT):
+def gh_failure_reason(detail: str, repo: str) -> str | None:
+    """None when a `gh` failure means the resource is absent, else the message.
+
+    The text alone cannot decide this. GitHub answers 404 for a repository the
+    token cannot see, so a revoked or scope-reduced token prints exactly what a
+    missing release prints — matching on the message was the whole bug. A
+    not-found answer is only credible as absence when the repository itself
+    still reads, so that is asked, once, on that path only.
+    """
+    if not detail:
+        # An empty message is still a failure, and an empty string is falsy —
+        # the absence/failure collapse this function exists to remove.
+        return "gh failed without output"
+    if not any(pattern in detail.lower() for pattern in GH_ABSENT):
         return detail
-    if any(pattern in lowered for pattern in GH_ABSENT):
+    if repo_is_readable(repo):
         return None
-    return detail
+    return f"{detail} (and {repo} does not read, so this is access, not absence)"
 
 
-def gh_text_optional(*args: str) -> tuple[str | None, str | None]:
-    """Read a plain-text `gh` fact, splitting absence from failure."""
+def repo_is_readable(repo: str) -> bool:
+    """Whether this token can see `repo` at all."""
+    proc = subprocess.run(
+        ("gh", "api", f"repos/{repo}", "--jq", ".name"),
+        cwd=ROOT, text=True, capture_output=True, check=False,
+    )
+    return proc.returncode == 0
+
+
+def gh_text_optional(*args: str, repo: str = REPO) -> tuple[str | None, str | None]:
+    """Read a plain-text `gh` fact, splitting absence from failure.
+
+    `repo` names the repository the call reads, which is what a not-found
+    answer is checked against.
+    """
     proc = subprocess.run(("gh", *args), cwd=ROOT, text=True, capture_output=True, check=False)
     if proc.returncode == 0:
         return proc.stdout.strip(), None
-    return None, gh_failure_reason((proc.stderr or proc.stdout).strip())
+    return None, gh_failure_reason((proc.stderr or proc.stdout).strip(), repo)
 
 
-def gh_json_optional(*args: str) -> tuple[Any, str | None]:
+def gh_json_optional(*args: str, repo: str = REPO) -> tuple[Any, str | None]:
     """Read a `gh` fact that may legitimately not exist yet.
 
     Returns `(value, error)`. A resource that is absent yields `(None, None)`,
@@ -305,7 +325,7 @@ def gh_json_optional(*args: str) -> tuple[Any, str | None]:
     `(None, message)`, so an unreachable `gh` is reported as an unread fact
     instead of being mistaken for absence.
     """
-    raw, error = gh_text_optional(*args)
+    raw, error = gh_text_optional(*args, repo=repo)
     if error or not raw:
         return None, error
     return json.loads(raw), None
@@ -428,7 +448,11 @@ def reconcile(state: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
                           f"not the release commit {merge_sha[:12]}",
             })
 
-    release = facts["release"]
+    # `release` stays None when the read failed, and the reconciliation below
+    # cannot tell that from "no release yet" — so it does not try. The failure
+    # is already reported under `unreadable`, and adopting nothing is the safe
+    # direction: the stage runs again rather than being skipped on a guess.
+    release = facts["release"] if "release" not in facts["unreadable"] else None
     dmg_asset = f"term-mesh-macos-{version}.dmg"
     if release and not completed(state, "github_release"):
         assets = [item["name"] for item in release.get("assets", [])]
@@ -508,7 +532,8 @@ def homebrew_cask_reading() -> tuple[tuple[str, str] | None, str | None]:
     by answering None for both.
     """
     content, error = gh_text_optional(
-        "api", "repos/x-mesh/homebrew-tap/contents/Casks/term-mesh.rb?ref=main", "--jq", ".content"
+        "api", "repos/x-mesh/homebrew-tap/contents/Casks/term-mesh.rb?ref=main", "--jq", ".content",
+        repo="x-mesh/homebrew-tap",
     )
     if error:
         return None, error
