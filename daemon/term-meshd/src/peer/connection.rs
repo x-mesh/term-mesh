@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use peer_proto::v1::envelope::Payload;
 use peer_proto::v1::{
@@ -21,7 +21,8 @@ use peer_proto::v1::{
     GridSnapshot, Hello, HostStats, Pong, PtyData, ScrollbackChunk, SurfaceExited, SurfaceList,
     Team, TeamCallResponse, TeamList, TeamMember, TerminateSurfaceError as WireTerminateError,
     TerminateSurfaceErrorCode, TerminateSurfaceRequest, TerminateSurfaceResponse,
-    TerminateSurfaceResult, UpsertProjectPresentationResponse, Workspace, WorkspaceList,
+    RepairStaleProjectPresentationResponse, StaleProjectObservation, TerminateSurfaceResult,
+    UpsertProjectPresentationResponse, Workspace, WorkspaceList,
     WorkspaceListChanged, WorkspaceMeta, WorkspaceUpdate,
 };
 use peer_proto::{capability, PeerCapabilities};
@@ -54,6 +55,189 @@ struct AttachEntry {
     surface: Arc<PtySurface>,
     task: JoinHandle<()>,
     cancel: Arc<Notify>,
+}
+
+/// How long an observation must age before a repair may act on it.
+///
+/// A surface can be missing for an instant while it respawns, so one look is
+/// not evidence that a manifest is dead. Two looks this far apart, at an
+/// unchanged revision, are the bounded recheck a removal is worth.
+const STALE_RECHECK: Duration = Duration::from_secs(5);
+
+/// One connection's look at a manifest it may want removed.
+struct StaleObservation {
+    revision: u64,
+    at: Instant,
+}
+
+/// Remove a manifest the requesting peer does not own, once it has proved
+/// stale twice.
+///
+/// Ownership is what the ordinary delete enforces, and it must stay enforced:
+/// it is how one installation cannot silently retire another's live work. But
+/// an owner that no longer exists — a rotated peer identity, a reinstalled app
+/// — leaves a record nothing can retire, holding a name forever. This is the
+/// operator saying "that owner is gone", and it buys that only with evidence:
+/// an exact project id, no live surface, and the same revision seen stale
+/// `STALE_RECHECK` ago on this connection.
+fn repair_stale_project_presentation(
+    host: &Arc<PeerHost>,
+    peer_capabilities: &PeerCapabilities,
+    owner_peer_ids: &[Vec<u8>],
+    lifecycle_request_ids: &mut HashSet<Vec<u8>>,
+    observations: &mut HashMap<String, StaleObservation>,
+    request: peer_proto::v1::RepairStaleProjectPresentationRequest,
+) -> (RepairStaleProjectPresentationResponse, bool) {
+    let refused = |code: &str, message: &str| RepairStaleProjectPresentationResponse {
+        request_id: request.request_id.clone(),
+        ok: false,
+        error_code: code.into(),
+        error_message: message.into(),
+        min_recheck_secs: STALE_RECHECK.as_secs() as u32,
+        ..Default::default()
+    };
+
+    if !peer_capabilities.has(capability::PROJECT_PRESENTATION_REPAIR_V1) {
+        return (
+            refused(
+                "capability_unavailable",
+                "project.presentation.repair.v1 was not negotiated",
+            ),
+            false,
+        );
+    }
+    if request.request_id.len() != 16 {
+        return (refused("invalid_request", "request_id must be 16 bytes"), false);
+    }
+    if !lifecycle_request_ids.insert(request.request_id.clone()) {
+        return (
+            refused(
+                "duplicate_request_id",
+                "request_id was already used on this connection",
+            ),
+            false,
+        );
+    }
+    if request.project_id.is_empty() {
+        return (
+            refused("invalid_request", "project_id is required; a name is not accepted"),
+            false,
+        );
+    }
+
+    let Some(status) = host.project_presentation_status(&request.project_id) else {
+        observations.remove(&request.project_id);
+        return (refused("not_found", "no manifest holds that project id"), false);
+    };
+    let observed = StaleProjectObservation {
+        project_id: status.project_id.clone(),
+        revision: status.revision,
+        referenced_surfaces: status.referenced_surfaces as u32,
+        live_surfaces: status.live_surfaces as u32,
+        directory_present: status.directory_present,
+        owned_by_requester: owner_peer_ids
+            .iter()
+            .any(|id| status.owner_peer_id == hex::encode(id)),
+        working_directory: status.working_directory.clone(),
+    };
+    let answer = |code: &str, message: &str| RepairStaleProjectPresentationResponse {
+        request_id: request.request_id.clone(),
+        ok: false,
+        error_code: code.into(),
+        error_message: message.into(),
+        observed: Some(observed.clone()),
+        min_recheck_secs: STALE_RECHECK.as_secs() as u32,
+        ..Default::default()
+    };
+
+    // A record with a live surface is running work, whichever way it was
+    // reached. Forget any earlier observation of it: what was seen stale is
+    // no longer what is there.
+    if status.live_surfaces > 0 {
+        observations.remove(&request.project_id);
+        return (
+            answer("live", "the manifest still names a live surface"),
+            false,
+        );
+    }
+
+    if !request.apply {
+        observations.insert(
+            request.project_id.clone(),
+            StaleObservation { revision: status.revision, at: Instant::now() },
+        );
+        return (
+            RepairStaleProjectPresentationResponse {
+                request_id: request.request_id,
+                ok: true,
+                observed: Some(observed),
+                min_recheck_secs: STALE_RECHECK.as_secs() as u32,
+                ..Default::default()
+            },
+            false,
+        );
+    }
+
+    let Some(earlier) = observations.get(&request.project_id) else {
+        observations.insert(
+            request.project_id.clone(),
+            StaleObservation { revision: status.revision, at: Instant::now() },
+        );
+        return (
+            answer(
+                "recheck_required",
+                "observe this manifest first, then repair after the recheck interval",
+            ),
+            false,
+        );
+    };
+    if earlier.revision != status.revision {
+        // A rewritten manifest is a different claim about the project. Start
+        // the evidence over rather than removing what was never observed.
+        observations.insert(
+            request.project_id.clone(),
+            StaleObservation { revision: status.revision, at: Instant::now() },
+        );
+        return (
+            answer("revision_changed", "the manifest changed since it was observed"),
+            false,
+        );
+    }
+    if earlier.at.elapsed() < STALE_RECHECK {
+        return (
+            answer("recheck_too_soon", "the observation is not old enough to act on"),
+            false,
+        );
+    }
+
+    match host.prune_stale_project_presentations(std::slice::from_ref(&request.project_id), true) {
+        // Every surface this record named is already dead, so nothing is
+        // released for the abandoned-surface reap the owner delete performs.
+        Ok(report) if report.applied && !report.removed.is_empty() => {
+            observations.remove(&request.project_id);
+            (
+                RepairStaleProjectPresentationResponse {
+                    request_id: request.request_id,
+                    ok: true,
+                    removed: true,
+                    observed: Some(observed),
+                    min_recheck_secs: STALE_RECHECK.as_secs() as u32,
+                    backup_path: report.backup_path.unwrap_or_default(),
+                    ..Default::default()
+                },
+                true,
+            )
+        }
+        Ok(report) => {
+            let reason = report
+                .skipped
+                .first()
+                .map(|skip| skip.reason)
+                .unwrap_or("not_removed");
+            (answer(reason, "the host refused to remove that manifest"), false)
+        }
+        Err(code) => (answer(code, "the repair could not be written"), false),
+    }
 }
 
 pub async fn run(stream: UnixStream, host: Arc<PeerHost>) -> anyhow::Result<()> {
@@ -96,6 +280,11 @@ async fn reader_loop(
     // Request ids are one-shot for the authenticated connection. Insert before
     // starting work so two back-to-back frames cannot race through ensure.
     let mut lifecycle_request_ids: HashSet<Vec<u8>> = HashSet::new();
+    // What this connection has already seen stale, so a repair can require a
+    // second look rather than acting on one transient missing surface. Kept
+    // per connection and never persisted: evidence a client could carry across
+    // reconnects would defeat the recheck it exists to enforce.
+    let mut stale_observations: HashMap<String, StaleObservation> = HashMap::new();
     // Acquired by the reader before an ensure task is spawned. Waiting here
     // applies socket backpressure instead of accumulating unbounded queued
     // tasks while keeping up to this many independent keys concurrent.
@@ -625,6 +814,29 @@ async fn reader_loop(
                     // invalidation signal for the team roster. Its payload is
                     // already understood by connected clients, which then
                     // perform a debounced ListTeams refresh.
+                    host.broadcast_workspace_roster();
+                }
+            }
+
+            (HandshakeState::Ready, Payload::RepairStaleProjectPresentationRequest(request)) => {
+                let (response, presentation_changed) = repair_stale_project_presentation(
+                    &host,
+                    &peer_capabilities,
+                    &project_owner_peer_ids,
+                    &mut lifecycle_request_ids,
+                    &mut stale_observations,
+                    request,
+                );
+                send(
+                    &outgoing_tx,
+                    Envelope {
+                        seq: next_seq(&seq_counter),
+                        correlation_id: env.seq,
+                        payload: Some(Payload::RepairStaleProjectPresentationResponse(response)),
+                    },
+                )
+                .await?;
+                if presentation_changed {
                     host.broadcast_workspace_roster();
                 }
             }
@@ -5532,5 +5744,311 @@ mod agent_surface_tests {
         assert_eq!(replayed, expected, "fallback must resend the whole ring");
 
         manager.remove(&agent_id);
+    }
+}
+
+#[cfg(test)]
+mod stale_repair_tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use peer_proto::v1::RepairStaleProjectPresentationRequest;
+    use peer_proto::{capability, PeerCapabilities};
+
+    use super::super::layout::PeerHost;
+    use super::super::surface::{EnsureRestartPolicy, PtyManager, SurfaceKind, SurfaceSpec};
+    use super::{repair_stale_project_presentation, StaleObservation, STALE_RECHECK};
+
+    /// Owned by a peer id this host never sees again — the shape the ordinary
+    /// delete answers `not_owner` for, forever.
+    const GONE_OWNER: [u8; 16] = [9; 16];
+    /// The connection's own identity, which owns nothing here.
+    const REQUESTER: [u8; 16] = [7; 16];
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        host: Arc<PeerHost>,
+        seen: HashSet<Vec<u8>>,
+        observations: HashMap<String, StaleObservation>,
+        next_request_id: u8,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+            host.set_persist_path(tmp.path().join("peer-workspaces.json"));
+            Self {
+                _tmp: tmp,
+                host,
+                seen: HashSet::new(),
+                observations: HashMap::new(),
+                next_request_id: 1,
+            }
+        }
+
+        /// Publish a manifest owned by an installation that is gone, and hand
+        /// back its leader surface id.
+        fn publish(&self, project_id: &str) -> Vec<u8> {
+            self.publish_keyed(project_id, project_id)
+        }
+
+        /// Same, with an explicit surface key, so one project can be
+        /// republished behind a different leader.
+        fn publish_keyed(&self, key: &str, project_id: &str) -> Vec<u8> {
+            let spec = SurfaceSpec {
+                cwd: "/tmp".into(),
+                executable: "/bin/cat".into(),
+                args: Vec::new(),
+                restart_policy: EnsureRestartPolicy::Never,
+                kind: SurfaceKind::Pty,
+                agent_cli: String::new(),
+            };
+            let leader = self.host.ensure_surface(key, &spec).expect("leader surface");
+            let team = peer_proto::v1::Team {
+                name: project_id.to_string(),
+                team_uuid: format!("uuid-{project_id}"),
+                working_directory: "/tmp".to_string(),
+                leader_surface_id: leader.surface_id.clone(),
+                project_id: project_id.to_string(),
+                ..Default::default()
+            };
+            let (_revision, changed) = self
+                .host
+                .upsert_project_presentation(&[GONE_OWNER.to_vec()], &team)
+                .expect("publish manifest");
+            assert!(changed, "publishing {project_id} must change the manifest");
+            leader.surface_id
+        }
+
+        /// Stop a project's leader and wait until the host stops counting it
+        /// live, so staleness is judged against a settled liveness set. Asks
+        /// through the same status the repair reads, not a private one.
+        async fn kill(&self, project_id: &str, surface_id: &[u8]) {
+            self.host.terminate_surface(surface_id).unwrap();
+            for _ in 0..50 {
+                if self.live_surfaces(project_id) == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            panic!("{project_id} never stopped being live");
+        }
+
+        fn live_surfaces(&self, project_id: &str) -> u32 {
+            self.host
+                .project_presentation_status(project_id)
+                .map(|status| status.live_surfaces as u32)
+                .unwrap_or(0)
+        }
+
+        fn call(
+            &mut self,
+            project_id: &str,
+            apply: bool,
+        ) -> peer_proto::v1::RepairStaleProjectPresentationResponse {
+            self.call_with(project_id, apply, capabilities())
+        }
+
+        fn call_with(
+            &mut self,
+            project_id: &str,
+            apply: bool,
+            capabilities: PeerCapabilities,
+        ) -> peer_proto::v1::RepairStaleProjectPresentationResponse {
+            let request_id = vec![self.next_request_id; 16];
+            self.next_request_id += 1;
+            let (response, _) = repair_stale_project_presentation(
+                &self.host,
+                &capabilities,
+                &[REQUESTER.to_vec()],
+                &mut self.seen,
+                &mut self.observations,
+                RepairStaleProjectPresentationRequest {
+                    request_id,
+                    project_id: project_id.to_string(),
+                    apply,
+                },
+            );
+            response
+        }
+
+        /// Backdate the stored observation so an aged one can be tested
+        /// without spending the recheck interval in the test.
+        fn age_observation(&mut self, project_id: &str) {
+            let entry = self.observations.get_mut(project_id).expect("observation");
+            entry.at = Instant::now() - STALE_RECHECK - Duration::from_secs(1);
+        }
+    }
+
+    fn capabilities() -> PeerCapabilities {
+        PeerCapabilities::from_hello(vec![
+            capability::PROJECT_PRESENTATION_REPAIR_V1.to_string(),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_host_that_did_not_negotiate_repair_refuses_it() {
+        let mut fixture = Fixture::new();
+        let leader = fixture.publish("gone");
+        fixture.kill("gone", &leader).await;
+
+        let response = fixture.call_with(
+            "gone",
+            true,
+            PeerCapabilities::from_hello(vec![capability::PROJECT_PRESENTATION_V1.to_string()]),
+        );
+
+        assert!(!response.ok);
+        assert_eq!(response.error_code, "capability_unavailable");
+        assert_eq!(fixture.host.project_presentations().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_repair_names_one_exact_record_or_nothing() {
+        let mut fixture = Fixture::new();
+
+        let empty = fixture.call("", true);
+        assert_eq!(empty.error_code, "invalid_request");
+        let unknown = fixture.call("never-existed", true);
+        assert_eq!(unknown.error_code, "not_found");
+        assert!(unknown.observed.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_repair_refuses_a_record_that_still_has_a_live_surface() {
+        let mut fixture = Fixture::new();
+        let leader = fixture.publish("running");
+
+        // Observe first, so the refusal cannot be mistaken for "no evidence".
+        let observed = fixture.call("running", false);
+        assert!(!observed.ok);
+        assert_eq!(observed.error_code, "live");
+        assert_eq!(observed.observed.expect("evidence").live_surfaces, 1);
+
+        let applied = fixture.call("running", true);
+        assert_eq!(applied.error_code, "live");
+        assert_eq!(fixture.host.project_presentations().len(), 1);
+        fixture.kill("running", &leader).await;
+    }
+
+    #[tokio::test]
+    async fn a_repair_will_not_act_on_a_single_look() {
+        let mut fixture = Fixture::new();
+        let leader = fixture.publish("gone");
+        fixture.kill("gone", &leader).await;
+
+        let straight_to_apply = fixture.call("gone", true);
+        assert!(!straight_to_apply.ok);
+        assert_eq!(straight_to_apply.error_code, "recheck_required");
+        assert_eq!(straight_to_apply.min_recheck_secs, STALE_RECHECK.as_secs() as u32);
+
+        // The refusal recorded the first look, but it is not old enough yet.
+        let too_soon = fixture.call("gone", true);
+        assert_eq!(too_soon.error_code, "recheck_too_soon");
+        assert_eq!(fixture.host.project_presentations().len(), 1);
+    }
+
+    /// A record republished behind different surfaces is a different claim
+    /// about the project, even when those surfaces are dead again by the time
+    /// the repair lands. The evidence has to start over.
+    #[tokio::test]
+    async fn a_manifest_rewritten_since_it_was_observed_starts_the_evidence_over() {
+        let mut fixture = Fixture::new();
+        let first = fixture.publish("gone");
+        fixture.kill("gone", &first).await;
+
+        let observed = fixture.call("gone", false);
+        assert!(observed.ok);
+        let evidence = observed.observed.expect("evidence");
+        assert_eq!(evidence.revision, 1);
+        assert!(!evidence.owned_by_requester);
+        fixture.age_observation("gone");
+
+        // A manifest can only be written behind a live leader, so a rewrite
+        // means a second leader came and went.
+        let second = fixture.publish_keyed("gone-again", "gone");
+        assert_eq!(fixture.host.project_presentation_status("gone").unwrap().revision, 2);
+        fixture.kill("gone", &second).await;
+
+        let response = fixture.call("gone", true);
+
+        assert_eq!(response.error_code, "revision_changed");
+        assert_eq!(response.observed.expect("evidence").revision, 2);
+        assert_eq!(fixture.host.project_presentations().len(), 1);
+
+        // The refusal recorded the new revision, so the next aged look works.
+        fixture.age_observation("gone");
+        let retried = fixture.call("gone", true);
+        assert!(retried.ok, "{retried:?}");
+        assert!(retried.removed);
+    }
+
+    /// Issue #389/#462: a name held by an installation that is gone can be
+    /// reclaimed, and nothing else moves.
+    #[tokio::test]
+    async fn an_aged_observation_removes_that_record_and_leaves_everything_else() {
+        let mut fixture = Fixture::new();
+        let workspaces_before = fixture.host.list_workspaces().len();
+        let stale = fixture.publish("stale");
+        let keep = fixture.publish("keep");
+        fixture.kill("stale", &stale).await;
+
+        let observed = fixture.call("stale", false);
+        assert!(observed.ok, "{observed:?}");
+        let evidence = observed.observed.expect("evidence");
+        assert_eq!((evidence.live_surfaces, evidence.directory_present), (0, true));
+        assert!(!evidence.owned_by_requester, "the requester must not own this record");
+        fixture.age_observation("stale");
+
+        let response = fixture.call("stale", true);
+
+        assert!(response.ok, "{response:?}");
+        assert!(response.removed);
+        assert!(!response.backup_path.is_empty(), "a repair must leave a way back");
+        assert_eq!(std::fs::metadata(&response.backup_path).is_ok(), true);
+
+        let remaining: Vec<String> = fixture
+            .host
+            .project_presentations()
+            .into_iter()
+            .map(|record| record.project_id)
+            .collect();
+        assert_eq!(remaining, vec!["keep".to_string()]);
+        assert_eq!(fixture.host.list_workspaces().len(), workspaces_before);
+        assert_eq!(fixture.live_surfaces("keep"), 1, "an unrelated record must stay live");
+        fixture.kill("keep", &keep).await;
+    }
+
+    #[tokio::test]
+    async fn a_request_id_cannot_be_replayed_on_one_connection() {
+        let mut fixture = Fixture::new();
+        let leader = fixture.publish("gone");
+        fixture.kill("gone", &leader).await;
+
+        let request = RepairStaleProjectPresentationRequest {
+            request_id: vec![42; 16],
+            project_id: "gone".into(),
+            apply: false,
+        };
+        let (first, _) = repair_stale_project_presentation(
+            &fixture.host,
+            &capabilities(),
+            &[REQUESTER.to_vec()],
+            &mut fixture.seen,
+            &mut fixture.observations,
+            request.clone(),
+        );
+        assert!(first.ok);
+        let (second, _) = repair_stale_project_presentation(
+            &fixture.host,
+            &capabilities(),
+            &[REQUESTER.to_vec()],
+            &mut fixture.seen,
+            &mut fixture.observations,
+            request,
+        );
+        assert_eq!(second.error_code, "duplicate_request_id");
     }
 }

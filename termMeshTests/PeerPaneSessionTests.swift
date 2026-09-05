@@ -256,7 +256,7 @@ final class PeerPaneSessionTests: XCTestCase {
 
     private func conflictRecord(
         name: String = "xm",
-        projectID: String = "team:one",
+        projectID: String? = "team:one",
         hostKey: String? = "ssh:mac-sub",
         path: String = "/work/xm",
         location: TeamOrchestrator.ProjectConflictLocation,
@@ -270,6 +270,41 @@ final class PeerPaneSessionTests: XCTestCase {
             location: location, teamName: name, leaderReady: leaderReady,
             failureDescription: leaderReady ? nil : "leader failed"
         )
+    }
+
+    /// #389/#462: a name held by a record another installation published must
+    /// have a way out of New Project, and only while nothing behind it runs.
+    func testStaleRemoteRecordRepairIsOfferedOnlyForAnotherOwnersDeadRecord() {
+        let remote = TeamOrchestrator.ProjectConflictLocation.remote(
+            hostKey: "ssh:mac-sub", hostName: "mac-sub"
+        )
+        func record(
+            owned: Bool, leaderReady: Bool, leaderKnown: Bool, projectID: String? = "team:one"
+        ) -> TeamOrchestrator.ProjectConflictRecord {
+            var candidate = conflictRecord(projectID: projectID, location: remote, leaderReady: leaderReady)
+            candidate.presentationOwnedByRequester = owned
+            candidate.leaderProcessActiveKnown = leaderKnown
+            return candidate
+        }
+
+        // The case the issue is about: another owner, leader long gone.
+        XCTAssertTrue(record(owned: false, leaderReady: false, leaderKnown: true).canRepairStaleRemoteRecord)
+        // A surface with no foreground probe is not proof of live work.
+        XCTAssertTrue(record(owned: false, leaderReady: true, leaderKnown: false).canRepairStaleRemoteRecord)
+        // A leader the host confirms is running is work to open, not to reclaim.
+        XCTAssertFalse(record(owned: false, leaderReady: true, leaderKnown: true).canRepairStaleRemoteRecord)
+        // Our own record has the owner-authorized delete instead.
+        XCTAssertFalse(record(owned: true, leaderReady: false, leaderKnown: true).canRepairStaleRemoteRecord)
+        XCTAssertTrue(record(owned: true, leaderReady: false, leaderKnown: true).canDeleteOwnedRemoteRecord)
+        // Without an exact Project ID there is nothing exact to remove.
+        XCTAssertFalse(
+            record(owned: false, leaderReady: false, leaderKnown: true, projectID: nil)
+                .canRepairStaleRemoteRecord
+        )
+        // Local collisions are a different lifecycle entirely.
+        var local = conflictRecord(location: .detached(workspaceID: UUID()), leaderReady: false)
+        local.leaderProcessActiveKnown = true
+        XCTAssertFalse(local.canRepairStaleRemoteRecord)
     }
 
     func testProjectNameConflictClassifiesExactLiveAndDetached() {
