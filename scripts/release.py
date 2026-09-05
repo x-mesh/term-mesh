@@ -241,8 +241,185 @@ def emit(state: dict[str, Any], *, command: str) -> None:
         "pending": pending,
         "next_action": pending[0] if pending else None,
         "resume_command": None if not pending else f"python3 scripts/release.py resume {state['version']} --yes --json",
+        "reconciled": {
+            name: state["steps"][name]["reconciled_from"]
+            for name in STEP_ORDER
+            if "reconciled_from" in state["steps"][name]
+        },
+        "interrupted": [
+            name for name in STEP_ORDER
+            if state["steps"][name].get("status") == "interrupted"
+        ],
+        "mismatched": state.get("observation", {}).get("mismatched", []),
+        "unread_remote_facts": state.get("observation", {}).get("unreadable", {}),
         "receipts": state["steps"],
     }, indent=2, ensure_ascii=False))
+
+
+def gh_json_optional(*args: str) -> tuple[Any, str | None]:
+    """Read a `gh` fact that may legitimately not exist yet.
+
+    Returns `(value, error)`. A resource that is absent yields `(None, None)`,
+    because "no release for this tag" is a fact. Anything else yields
+    `(None, message)`, so an unreachable `gh` is reported as an unread fact
+    instead of being mistaken for absence.
+    """
+    proc = subprocess.run(("gh", *args), cwd=ROOT, text=True, capture_output=True, check=False)
+    if proc.returncode == 0:
+        raw = proc.stdout.strip()
+        return (json.loads(raw) if raw else None), None
+    detail = (proc.stderr or proc.stdout).strip()
+    if "not found" in detail.lower():
+        return None, None
+    return None, detail
+
+
+def release_assets(tag: str) -> list[str]:
+    """Asset names currently attached to a tag's GitHub Release."""
+    release, _ = gh_json_optional("release", "view", tag, "--repo", REPO, "--json", "assets")
+    return [item["name"] for item in (release or {}).get("assets", [])]
+
+
+def upload_release_dmg(version: str, tag: str, dmg: str, cwd: Path) -> tuple[list[str], list[str]]:
+    """Attach the DMG to a tag's release without losing what is already there.
+
+    The Linux workflow publishes from the tag push, so its archives can already
+    be attached when the macOS stages run. Uploading the DMG must add to that
+    release. Returns the published and the pre-existing asset names.
+    """
+    retained = {name for name in release_assets(tag) if not name.endswith(".dmg")}
+    run("./scripts/publish-github-release.sh", version, dmg, cwd=cwd)
+    published = set(release_assets(tag))
+    lost = sorted(retained - published)
+    if lost:
+        raise ReleaseError(f"publishing the DMG dropped existing release assets: {lost}")
+    return sorted(published), sorted(retained)
+
+
+def observe(state: dict[str, Any]) -> dict[str, Any]:
+    """Read the remote facts this release's receipt can be checked against.
+
+    A release can stop between a remote mutation and the receipt that records
+    it, so resume has to ask the remote what already happened. Every read here
+    is idempotent, and no read may fail the command: a release must stay
+    inspectable when `gh` is unreachable, so an unread fact stays None and is
+    reported.
+    """
+    tag = f"v{state['version']}"
+    facts: dict[str, Any] = {
+        "tag": tag,
+        "tag_commit": None,
+        "release": None,
+        "homebrew": None,
+        "mismatched": [],
+        "unreadable": {},
+    }
+    try:
+        line = git("ls-remote", "origin", f"refs/tags/{tag}^{{}}")
+        facts["tag_commit"] = line.split()[0] if line else None
+    except ReleaseError as exc:
+        facts["unreadable"]["tag_commit"] = str(exc)
+    release, error = gh_json_optional(
+        "release", "view", tag, "--repo", REPO, "--json", "url,isDraft,isPrerelease,assets"
+    )
+    if error:
+        facts["unreadable"]["release"] = error
+    else:
+        facts["release"] = release
+    facts["homebrew"] = homebrew_cask()
+    return facts
+
+
+def reconcile(state: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
+    """Fold observed remote state into a receipt that fell behind it.
+
+    v0.226.4 stopped with `release_build` still marked `running` while its tag
+    and its Linux assets were already public. Resuming that receipt would have
+    re-run stages the remote had already finished, and reading it gave no sign
+    that the remote had moved on. A stage is adopted here only when a remote
+    fact proves it, and the proof goes into the receipt.
+
+    Local artifact stages (`release_build`, `dsym`, `dmg`) are never adopted
+    from the remote: the DMG's checksum is what Homebrew publishes, so a stage
+    that produced it must have a local receipt or run again.
+    """
+    version = state["version"]
+    tag = facts["tag"]
+
+    # main() holds this version's exclusive lock, so no other release process
+    # owns this receipt. A stage still marked `running` was interrupted, and
+    # saying so is what separates "in flight" from "abandoned".
+    for name in STEP_ORDER:
+        if state["steps"][name].get("status") == "running":
+            state["steps"][name] = {
+                **state["steps"][name],
+                "status": "interrupted",
+                "interrupted_at": utc_now(),
+            }
+            save_state(state)
+
+    if completed(state, "release_pr") and not completed(state, "release_merge"):
+        pr = state["steps"]["release_pr"]["pr"]
+        info, error = gh_json_optional("api", f"repos/{REPO}/pulls/{pr}")
+        if error:
+            facts["unreadable"]["release_pr"] = error
+        elif info and info.get("merged"):
+            mark(state, "release_merge", merge_sha=info["merge_commit_sha"],
+                 reconciled_from=f"pull {pr} is already merged")
+
+    merge_sha = state["steps"]["release_merge"].get("merge_sha")
+    if merge_sha and facts["tag_commit"] and not completed(state, "tag"):
+        if facts["tag_commit"] == merge_sha:
+            mark(state, "tag", tag=tag, commit=merge_sha,
+                 reconciled_from=f"origin already holds {tag}")
+        else:
+            facts["mismatched"].append(
+                f"origin {tag} points at {facts['tag_commit'][:12]}, "
+                f"not the release commit {merge_sha[:12]}"
+            )
+
+    release = facts["release"]
+    dmg_asset = f"term-mesh-macos-{version}.dmg"
+    if release and not completed(state, "github_release"):
+        assets = [item["name"] for item in release.get("assets", [])]
+        # The Linux workflow publishes from the tag push, so a release can be
+        # public with only its Linux assets. That is not this stage: adopt it
+        # only once the macOS DMG this release built is the one attached.
+        if dmg_asset in assets and completed(state, "dmg"):
+            mark(state, "github_release", url=release["url"], assets=sorted(assets),
+                 reconciled_from=f"{dmg_asset} is already published")
+        elif dmg_asset in assets:
+            facts["mismatched"].append(
+                f"{dmg_asset} is published on {release['url']} but no local dmg "
+                "receipt records its checksum; the stage runs again and replaces "
+                "that asset from the pinned release commit"
+            )
+
+    if completed(state, "dmg") and not completed(state, "homebrew"):
+        expected = (version, state["steps"]["dmg"]["sha256"])
+        if facts["homebrew"] is not None and tuple(facts["homebrew"]) == expected:
+            mark(state, "homebrew", version=version, sha256=expected[1],
+                 reconciled_from="the cask already points at the published DMG")
+
+    state["observation"] = {
+        "observed_at": utc_now(),
+        "tag_commit": facts["tag_commit"],
+        "release_assets": sorted(
+            item["name"] for item in (facts["release"] or {}).get("assets", [])
+        ),
+        "homebrew": list(facts["homebrew"]) if facts["homebrew"] else None,
+        "mismatched": facts["mismatched"],
+        "unreadable": facts["unreadable"],
+    }
+    save_state(state)
+    return facts
+
+
+def load_reconciled(version: str) -> dict[str, Any]:
+    """Load a receipt and bring it up to date with what the remote already has."""
+    state = load_state(version)
+    reconcile(state, observe(state))
+    return state
 
 
 def remote_sha(branch: str) -> str:
@@ -763,7 +940,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
 
 def publish(args: argparse.Namespace) -> dict[str, Any]:
     ensure_approved(args)
-    state = load_state(normalize_version(args.version))
+    state = load_reconciled(normalize_version(args.version))
     if not completed(state, "release_pr"):
         raise ReleaseError("release is not prepared; run prepare first")
     pr = state["steps"]["release_pr"]["pr"]
@@ -824,8 +1001,9 @@ def publish(args: argparse.Namespace) -> dict[str, Any]:
     dmg = state["steps"]["dmg"]["path"]
     if not completed(state, "github_release"):
         begin(state, "github_release")
-        run("./scripts/publish-github-release.sh", state["version"], dmg, cwd=artifact_wt)
-        mark(state, "github_release", url=f"https://github.com/{REPO}/releases/tag/{tag}")
+        published, retained = upload_release_dmg(state["version"], tag, dmg, artifact_wt)
+        mark(state, "github_release", url=f"https://github.com/{REPO}/releases/tag/{tag}",
+             assets=published, retained=retained)
     if not completed(state, "homebrew"):
         begin(state, "homebrew")
         expected_sha = state["steps"]["dmg"]["sha256"]
@@ -892,7 +1070,7 @@ def publish(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def resume(args: argparse.Namespace) -> dict[str, Any]:
-    state = load_state(normalize_version(args.version))
+    state = load_reconciled(normalize_version(args.version))
     if any(not completed(state, name) for name in ("develop_to_main", "release_metadata", "release_pr")):
         return prepare(args)
     if any(not completed(state, name) for name in STEP_ORDER[3:]):
@@ -943,7 +1121,7 @@ def main() -> int:
             elif args.command == "resume":
                 state = resume(args)
             else:
-                state = load_state(normalize_version(args.version))
+                state = load_reconciled(normalize_version(args.version))
         emit(state, command=args.command)
         return 0
     except ReleaseError as exc:
