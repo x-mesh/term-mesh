@@ -80,6 +80,18 @@ pub enum Stall {
 
 /// Read `TERMMESH_SHUTDOWN_STALL`. An unrecognized value injects nothing, so a
 /// typo cannot silently wedge a production daemon.
+///
+/// A release build never injects at all, whatever the variable says. Rejecting
+/// typos is not enough protection for a correctly spelled one: the daemon
+/// inherits its GUI owner's environment, so a variable left over from a test
+/// run would make every later shutdown spend the whole budget and exit with a
+/// failure status, and nothing in normal operation would explain why.
+#[cfg(not(debug_assertions))]
+fn parse_stall(_value: &str) -> Option<Stall> {
+    None
+}
+
+#[cfg(debug_assertions)]
 fn parse_stall(value: &str) -> Option<Stall> {
     match value.trim() {
         "" | "0" | "off" => None,
@@ -136,8 +148,15 @@ pub fn install(budget: Duration, stall_threshold: Duration) -> bool {
             .as_deref()
             .and_then(parse_stall)
     });
-    if let Some(injected) = stall() {
-        tracing::warn!("teardown fault injection active: {injected:?}");
+    match stall() {
+        Some(injected) => tracing::warn!("teardown fault injection active: {injected:?}"),
+        // Say so rather than ignoring it: a release build cannot inject, and a
+        // caller that set the variable is about to conclude the bound it was
+        // testing does not work.
+        None if std::env::var_os("TERMMESH_SHUTDOWN_STALL").is_some() => tracing::warn!(
+            "TERMMESH_SHUTDOWN_STALL is set but this build injects no teardown fault"
+        ),
+        None => {}
     }
 
     let signals_installed = observe_stop_signals();
@@ -407,6 +426,9 @@ mod tests {
         SIGNALLED.store(false, Ordering::SeqCst);
     }
 
+    // Both parser tests describe the debug-build parser. A release build has
+    // no injection to describe.
+    #[cfg(debug_assertions)]
     #[test]
     fn only_a_named_shape_injects_a_stall() {
         assert_eq!(parse_stall("agents"), Some(Stall::Step(STEP_AGENTS)));
@@ -415,6 +437,7 @@ mod tests {
         assert_eq!(parse_stall("runtime"), Some(Stall::Teardown));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn an_unrecognized_stall_wedges_nothing() {
         for value in ["", "0", "off", "agent", "yes", "1", "STEP_AGENTS"] {

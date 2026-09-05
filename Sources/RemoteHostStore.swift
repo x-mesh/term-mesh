@@ -2275,8 +2275,18 @@ final class RemoteHostStore: ObservableObject {
         let observed = try await repairStep(connection, projectID: projectID, apply: false)
         // The recheck must span both looks, so wait on the same connection the
         // host recorded the first one against.
+        //
+        // The wait is cancellable and the step after it is destructive, so the
+        // cancellation has to be honoured rather than swallowed: `try?` here
+        // woke the moment the task was cancelled and then removed the record
+        // anyway, which is the opposite of what cancelling asked for.
         let recheck = max(1, min(30, Int(observed.minRecheckSecs)))
-        try? await Task.sleep(for: .seconds(recheck))
+        do {
+            try await Task.sleep(for: .seconds(recheck))
+        } catch {
+            throw StaleProjectRecordRepairError.cancelled
+        }
+        guard !Task.isCancelled else { throw StaleProjectRecordRepairError.cancelled }
         let applied = try await repairStep(connection, projectID: projectID, apply: true)
         guard applied.removed else {
             throw StaleProjectRecordRepairError.rejected(
@@ -2768,6 +2778,7 @@ enum StaleProjectRecordRepairError: LocalizedError {
     case notFound
     case live
     case changed
+    case cancelled
     case rejected(String)
 
     var errorDescription: String? {
@@ -2783,6 +2794,8 @@ enum StaleProjectRecordRepairError: LocalizedError {
             "That Project is running on the host. Open it instead of removing its record."
         case .changed:
             "The Project record changed while it was being checked. Try again."
+        case .cancelled:
+            "The name reclaim was cancelled before the host was asked to remove anything."
         case .rejected(let detail):
             "The host refused to remove the Project record: \(detail)"
         }
