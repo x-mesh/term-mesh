@@ -1739,7 +1739,7 @@ impl PeerHost {
             let lifecycle = self.surface_lifecycle_lock(&surface_id);
             let Ok(_lifecycle_guard) = lifecycle.lock() else { continue };
             if !self.presentation_references_surface(&surface_id)
-                && self.terminate_surface_locked(&surface_id).unwrap_or(false)
+                && self.retire_surface_locked(&surface_id).unwrap_or(false)
             {
                 terminated_surfaces += 1;
             }
@@ -1980,6 +1980,12 @@ impl PeerHost {
             let lifecycle = self.surface_lifecycle_lock(&surface_id);
             let _lifecycle_guard = lifecycle.lock().map_err(|_| "surface_lifecycle_poisoned")?;
             if !self.presentation_references_surface(&surface_id) {
+                // Unconditional on purpose, and covered by
+                // `explicit_delete_terminates_a_project_surface_even_while_attached`:
+                // the owner asked for this Project to be retired, so its panes
+                // go with it whether or not a viewer is looking at one. The
+                // prune path cannot claim that authority — see
+                // `retire_surface_locked`.
                 let _ = self.terminate_surface_locked(&surface_id);
             }
         }
@@ -2315,6 +2321,37 @@ impl PeerHost {
             .lock()
             .map_err(|_| EnsureError::Internal("host surface lifecycle lock poisoned"))?;
         self.terminate_surface_locked(surface_id)
+    }
+
+    /// Drop a surface a prune orphaned, unless it came back to life while
+    /// that was being decided.
+    ///
+    /// The authority is what separates this from the owner-side delete. There,
+    /// the owner asked for the Project to be retired and its panes go with it,
+    /// attached or not. A prune asks nobody: it reclaims a name from an
+    /// installation that is gone, on the strength of having found nothing
+    /// live. Acting on that finding after it stopped being true would take a
+    /// pane on no authority at all.
+    ///
+    /// The lifecycle lock held by the callers does not make that safe on its
+    /// own: a peer attach reaches `PtyManager::get_or_respawn` directly and
+    /// takes only that manager's reservation, which is a different mutex. The
+    /// liveness re-check therefore lives inside `terminate_if_dead`, under
+    /// the lock a respawn also needs. `Ok(false)` means nothing changed.
+    fn retire_surface_locked(self: &Arc<Self>, surface_id: &[u8]) -> Result<bool, EnsureError> {
+        let workspace_id = self.workspace_id_for_surface(surface_id);
+        if !self.pty.terminate_if_dead(surface_id)? {
+            return Ok(false);
+        }
+        let layout_removed = workspace_id.as_ref().is_some_and(|workspace_id| {
+            self.with_store(workspace_id, |store| store.remove_surface_allow_empty(surface_id))
+                .unwrap_or(false)
+        });
+        self.surface_workspace.lock().unwrap().remove(surface_id);
+        if layout_removed {
+            self.schedule_layout_push(workspace_id.expect("checked above"));
+        }
+        Ok(true)
     }
 
     fn terminate_surface_locked(self: &Arc<Self>, surface_id: &[u8]) -> Result<bool, EnsureError> {
@@ -5515,6 +5552,104 @@ mod tests {
         assert_eq!(host.project_presentations()[0].project_id, "keeper");
         assert_eq!(host.list_workspaces().len(), workspace_count);
         host.terminate_surface(&shared).ok();
+    }
+
+    /// The implicit removal must not take a pane that came back to life.
+    ///
+    /// The callers decide to retire a surface because no manifest names it,
+    /// and between that decision and this call there is a manifest write and
+    /// a file save. A peer attach reaching `get_or_respawn` in that window
+    /// revives the surface, and the lifecycle lock the callers hold does not
+    /// exclude it — that path takes the PtyManager's own reservation, an
+    /// unrelated mutex. Only a re-check under the reservation can refuse.
+    #[tokio::test]
+    async fn an_implicit_retirement_refuses_a_surface_that_came_back_to_life() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(tmp.path().join("peer-workspaces.json"));
+        // A declared surface, not an ensured one. Only a declared surface
+        // keeps a respawn spec, so only it can be revived by an attach — an
+        // ensured surface has no spec and `get_or_respawn` answers None for
+        // it. That is the real reach of this race, and a manifest may name
+        // either kind.
+        let surface = super::super::surface::surface_id_from_name("revived").to_vec();
+        host.pty.register_and_spawn(
+            surface.clone(),
+            super::super::surface::SpawnSpec {
+                title: "revived".into(),
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 0.3".into()],
+                cols: 80,
+                rows: 24,
+                cwd: Some("/tmp".into()),
+                kind: super::super::surface::SurfaceKind::Pty,
+                agent_cli: String::new(),
+            },
+        );
+        for _ in 0..100 {
+            if !host.live_surface_ids().contains(&surface) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert!(!host.live_surface_ids().contains(&surface), "the leader must have exited");
+        assert!(
+            host.pty.list().iter().any(|s| s.surface_id == surface),
+            "a declared surface keeps its dead pane"
+        );
+
+        // The window: an attach revives the dead pane after the caller judged
+        // it dead and before the retirement lands.
+        assert!(host.pty.get_or_respawn(&surface).is_some(), "attach revives it");
+        assert!(host.live_surface_ids().contains(&surface));
+
+        let retired = host.retire_surface_locked(&surface).expect("retire");
+
+        assert!(!retired, "a revived pane must survive an implicit retirement");
+        assert!(
+            host.pty.list().iter().any(|s| s.surface_id == surface),
+            "the pane must still be registered"
+        );
+        assert!(host.live_surface_ids().contains(&surface));
+
+        // Explicit termination is a different verb and stays unconditional.
+        assert!(host.terminate_surface(&surface).expect("terminate"));
+        assert!(!host.pty.list().iter().any(|s| s.surface_id == surface));
+    }
+
+    /// The same guard at the layer that owns it: a caller cannot get this
+    /// right from outside, because the respawn it races takes only this lock.
+    #[tokio::test]
+    async fn terminate_if_dead_refuses_a_live_surface_and_takes_a_dead_one() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 0.3".into()],
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let surface_id = host.ensure_surface("live-one", &spec).expect("surface").surface_id;
+
+        assert!(host.live_surface_ids().contains(&surface_id));
+        assert!(
+            !host.pty.terminate_if_dead(&surface_id).expect("refuse"),
+            "a live surface must not be retired"
+        );
+        assert!(host.pty.list().iter().any(|s| s.surface_id == surface_id));
+
+        for _ in 0..100 {
+            if !host.live_surface_ids().contains(&surface_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert!(
+            host.pty.terminate_if_dead(&surface_id).expect("retire"),
+            "a dead surface is what this is for"
+        );
+        assert!(!host.pty.list().iter().any(|s| s.surface_id == surface_id));
     }
 
     /// The counter must never hand a project id a number it has already used.
