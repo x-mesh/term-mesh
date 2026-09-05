@@ -50,6 +50,12 @@ impl Host {
     /// a term-mesh pane, which exports the production socket paths, and an
     /// inherited one would point this daemon at the running installation.
     fn start(&self, stall: Option<&str>, log: &str) -> Daemon {
+        self.start_owned_by(stall, log, None)
+    }
+
+    /// `owner_pid` makes the daemon a GUI child: it stops when that process
+    /// does, which is a shutdown reason no signal accompanies.
+    fn start_owned_by(&self, stall: Option<&str>, log: &str, owner_pid: Option<u32>) -> Daemon {
         let log_path = self.root.join(log);
         // `tracing_subscriber::fmt()` writes to stdout; keep stderr with it so a
         // panic on the way down lands in the same journal.
@@ -69,6 +75,9 @@ impl Host {
             .stderr(Stdio::from(journal_errors));
         if let Some(shape) = stall {
             command.env("TERMMESH_SHUTDOWN_STALL", shape);
+        }
+        if let Some(pid) = owner_pid {
+            command.env("TERMMESH_OWNER_PID", pid.to_string());
         }
         let child = command.spawn().expect("term-meshd did not start");
         Daemon { child: Some(child), log: log_path }
@@ -245,6 +254,45 @@ fn a_wedged_teardown_is_ended_by_the_bound_that_lives_off_the_runtime() {
     assert!(
         teardown > SHUTDOWN_BUDGET / 2,
         "the daemon stopped in {teardown:?}, too early for the wedge to have applied"
+    );
+}
+
+/// The budget has to start for every shutdown reason, not only for a signal.
+///
+/// A daemon launched by the app stops when its owner does, and that path sets
+/// no signal. With the teardown mark taken after the wedge instead of before
+/// it, the hard-exit thread had no start time on this path and simply waited
+/// out the wedge — the one shape the earlier test could not see, because it
+/// always sent SIGTERM.
+#[test]
+fn a_wedged_teardown_is_bounded_when_no_signal_started_it() {
+    let host = Host::new();
+    let mut owner = Command::new("/bin/sh")
+        .args(["-c", "sleep 300"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("owner process");
+    let mut daemon = host.start_owned_by(Some("teardown"), "wedged-owner.log", Some(owner.id()));
+    host.await_ready(&daemon);
+
+    let began = Instant::now();
+    owner.kill().expect("stop the owner");
+    owner.wait().expect("reap the owner");
+    let mut child = daemon.child.take().expect("daemon is running");
+    let status = child.wait().expect("waiting on term-meshd");
+    let teardown = began.elapsed();
+
+    assert_eq!(status.code(), Some(2), "the hard-exit status changed");
+    assert!(
+        teardown < SHUTDOWN_BUDGET + SLACK,
+        "the daemon took {teardown:?} to notice its owner was gone, over its own {SHUTDOWN_BUDGET:?} budget"
+    );
+    let journal = daemon.journal();
+    assert!(
+        !journal.contains("initiating graceful shutdown"),
+        "the wedge must sit ahead of the receipt, as the reported hang did:\n{journal}"
     );
 }
 

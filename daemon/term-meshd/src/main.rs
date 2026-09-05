@@ -633,14 +633,19 @@ async fn main() -> anyhow::Result<()> {
         }
         }
     };
+    // Before the wedge, not after: the hard-exit thread starts its budget from
+    // either the raw signal or this mark, and only a signal sets the first.
+    // Shutting down because the GUI owner exited or a required socket closed
+    // sets no signal, so a wedge placed ahead of this had no deadline at all
+    // on those paths and simply slept.
+    shutdown::begin();
     // Injected before the receipt below on purpose: the 2026-08-27 hang logged
-    // no SIGTERM receipt at all, so the wedge has to sit where nothing on this
-    // runtime has run yet. Only the hard-exit thread can end the process from
-    // here, which is the property under test.
+    // no SIGTERM receipt at all, so the wedge has to sit where nothing else on
+    // this path has run yet. Only the hard-exit thread can end the process
+    // from here, which is the property under test.
     if shutdown::stall() == Some(shutdown::Stall::Teardown) {
         shutdown::wedge_teardown(SHUTDOWN_BUDGET);
     }
-    shutdown::begin();
     tracing::info!("received {shutdown_reason}, initiating graceful shutdown...");
 
     // 7. Shutdown sequence

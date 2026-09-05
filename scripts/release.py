@@ -250,10 +250,51 @@ def emit(state: dict[str, Any], *, command: str) -> None:
             name for name in STEP_ORDER
             if state["steps"][name].get("status") == "interrupted"
         ],
-        "mismatched": state.get("observation", {}).get("mismatched", []),
+        # Only for stages still outstanding. The observation is taken once, at
+        # load; a stage that has completed since has resolved whatever its
+        # mismatch was, and printing it beside "state": "complete" reads as an
+        # unresolved problem.
+        "mismatched": [
+            entry["detail"]
+            for entry in state.get("observation", {}).get("mismatched", [])
+            if not completed(state, entry["step"])
+        ],
         "unread_remote_facts": state.get("observation", {}).get("unreadable", {}),
         "receipts": state["steps"],
     }, indent=2, ensure_ascii=False))
+
+
+# Failures that say "not found" about something other than the resource asked
+# for. A revoked token answers "repository not found" for a private repo, and
+# reading that as "this release does not exist yet" is how an auth failure turns
+# into a wrong reconciliation. Checked before the absence patterns below.
+GH_NOT_ABSENT = (
+    "repository not found",
+    "could not resolve",
+    "bad credentials",
+    "authentication",
+    "http 401",
+    "http 403",
+)
+GH_ABSENT = ("release not found", "http 404")
+
+
+def gh_failure_reason(detail: str) -> str | None:
+    """None when a `gh` failure means the resource is absent, else the message."""
+    lowered = detail.lower()
+    if any(pattern in lowered for pattern in GH_NOT_ABSENT):
+        return detail
+    if any(pattern in lowered for pattern in GH_ABSENT):
+        return None
+    return detail
+
+
+def gh_text_optional(*args: str) -> tuple[str | None, str | None]:
+    """Read a plain-text `gh` fact, splitting absence from failure."""
+    proc = subprocess.run(("gh", *args), cwd=ROOT, text=True, capture_output=True, check=False)
+    if proc.returncode == 0:
+        return proc.stdout.strip(), None
+    return None, gh_failure_reason((proc.stderr or proc.stdout).strip())
 
 
 def gh_json_optional(*args: str) -> tuple[Any, str | None]:
@@ -264,14 +305,10 @@ def gh_json_optional(*args: str) -> tuple[Any, str | None]:
     `(None, message)`, so an unreachable `gh` is reported as an unread fact
     instead of being mistaken for absence.
     """
-    proc = subprocess.run(("gh", *args), cwd=ROOT, text=True, capture_output=True, check=False)
-    if proc.returncode == 0:
-        raw = proc.stdout.strip()
-        return (json.loads(raw) if raw else None), None
-    detail = (proc.stderr or proc.stdout).strip()
-    if "not found" in detail.lower():
-        return None, None
-    return None, detail
+    raw, error = gh_text_optional(*args)
+    if error or not raw:
+        return None, error
+    return json.loads(raw), None
 
 
 def release_assets(tag: str) -> list[str]:
@@ -336,7 +373,9 @@ def observe(state: dict[str, Any]) -> dict[str, Any]:
         facts["unreadable"]["release"] = error
     else:
         facts["release"] = release
-    facts["homebrew"] = homebrew_cask()
+    facts["homebrew"], homebrew_error = homebrew_cask_reading()
+    if homebrew_error:
+        facts["unreadable"]["homebrew"] = homebrew_error
     return facts
 
 
@@ -383,10 +422,11 @@ def reconcile(state: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
             mark(state, "tag", tag=tag, commit=merge_sha,
                  reconciled_from=f"origin already holds {tag}")
         else:
-            facts["mismatched"].append(
-                f"origin {tag} points at {facts['tag_commit'][:12]}, "
-                f"not the release commit {merge_sha[:12]}"
-            )
+            facts["mismatched"].append({
+                "step": "tag",
+                "detail": f"origin {tag} points at {facts['tag_commit'][:12]}, "
+                          f"not the release commit {merge_sha[:12]}",
+            })
 
     release = facts["release"]
     dmg_asset = f"term-mesh-macos-{version}.dmg"
@@ -399,11 +439,12 @@ def reconcile(state: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any]:
             mark(state, "github_release", url=release["url"], assets=sorted(assets),
                  reconciled_from=f"{dmg_asset} is already published")
         elif dmg_asset in assets:
-            facts["mismatched"].append(
-                f"{dmg_asset} is published on {release['url']} but no local dmg "
-                "receipt records its checksum; the stage runs again and replaces "
-                "that asset from the pinned release commit"
-            )
+            facts["mismatched"].append({
+                "step": "github_release",
+                "detail": f"{dmg_asset} is published on {release['url']} but no local "
+                          "dmg receipt records its checksum; the stage runs again and "
+                          "replaces that asset from the pinned release commit",
+            })
 
     if completed(state, "dmg") and not completed(state, "homebrew"):
         expected = (version, state["steps"]["dmg"]["sha256"])
@@ -458,18 +499,37 @@ def valid_release_product(product: Path, dsym: Path, version: str, commit: str) 
     )
 
 
-def homebrew_cask() -> tuple[str, str] | None:
-    raw = run("gh", "api", "repos/x-mesh/homebrew-tap/contents/Casks/term-mesh.rb?ref=main",
-              "--jq", ".content", check=False)
-    if not raw:
-        return None
+def homebrew_cask_reading() -> tuple[tuple[str, str] | None, str | None]:
+    """The cask's `(version, sha256)`, and why it could not be read.
+
+    Kept apart from `homebrew_cask` because `observe` has to tell "the cask
+    says 0.226.3" from "nobody could read the cask" — the same distinction
+    every other read there makes, and the one this function used to collapse
+    by answering None for both.
+    """
+    content, error = gh_text_optional(
+        "api", "repos/x-mesh/homebrew-tap/contents/Casks/term-mesh.rb?ref=main", "--jq", ".content"
+    )
+    if error:
+        return None, error
+    if not content:
+        return None, None
     try:
-        body = base64.b64decode(raw).decode()
-    except (ValueError, UnicodeDecodeError):
-        return None
+        body = base64.b64decode(content).decode()
+    except (ValueError, UnicodeDecodeError) as exc:
+        return None, f"cask content is not readable: {exc}"
     version = re.search(r'^  version "([^"]+)"$', body, re.M)
     sha = re.search(r'^  sha256 "([0-9a-f]{64})"$', body, re.M)
-    return (version.group(1), sha.group(1)) if version and sha else None
+    if not (version and sha):
+        return None, "cask has no version/sha256 pair"
+    return (version.group(1), sha.group(1)), None
+
+
+def homebrew_cask() -> tuple[str, str] | None:
+    """The published cask, or None. Callers that only compare it for equality
+    fail their own step with a clear message, so they do not need the reason."""
+    reading, _ = homebrew_cask_reading()
+    return reading
 
 
 def fetch() -> None:
@@ -948,9 +1008,12 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     return state
 
 
-def publish(args: argparse.Namespace) -> dict[str, Any]:
+def publish(args: argparse.Namespace, state: dict[str, Any] | None = None) -> dict[str, Any]:
     ensure_approved(args)
-    state = load_reconciled(normalize_version(args.version))
+    # `state` lets resume hand over the receipt it already reconciled. Each
+    # reconcile is four remote reads and a write, and running them again would
+    # only re-derive what the caller is holding.
+    state = load_reconciled(normalize_version(args.version)) if state is None else state
     if not completed(state, "release_pr"):
         raise ReleaseError("release is not prepared; run prepare first")
     pr = state["steps"]["release_pr"]["pr"]
@@ -1084,7 +1147,7 @@ def resume(args: argparse.Namespace) -> dict[str, Any]:
     if any(not completed(state, name) for name in ("develop_to_main", "release_metadata", "release_pr")):
         return prepare(args)
     if any(not completed(state, name) for name in STEP_ORDER[3:]):
-        state = publish(args)
+        state = publish(args, state)
     return state
 
 

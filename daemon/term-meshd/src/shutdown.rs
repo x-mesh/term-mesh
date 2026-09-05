@@ -72,9 +72,11 @@ pub enum Stall {
     /// and teardown carries on, which is the 2026-08-25 shape: the log stopped
     /// after one step and the rest never ran.
     Step(usize),
-    /// The thread running teardown blocks past the budget, so no timer on that
-    /// runtime can fire. This is the 2026-08-27 shape, where not even the
-    /// SIGTERM receipt was logged: only an off-runtime bound can end it.
+    /// The thread running teardown blocks past the budget. Other workers keep
+    /// polling — the runtime is multi-threaded, so timers elsewhere still fire
+    /// — but nothing advances teardown itself, so none of its own per-step
+    /// bounds is ever reached. This is the 2026-08-27 shape, where not even
+    /// the SIGTERM receipt was logged: only an off-runtime bound can end it.
     Teardown,
 }
 
@@ -111,9 +113,10 @@ pub fn stall() -> Option<Stall> {
 
 /// Block the thread running teardown past `budget`.
 ///
-/// Reproduces a teardown that makes no progress at all: every bound that lives
-/// on this runtime is now unreachable, so the process may only end through the
-/// off-runtime hard-exit thread.
+/// Reproduces a teardown that makes no progress at all. It does not stop the
+/// runtime — other workers keep polling, and the heartbeat keeps ticking — it
+/// stops the one path that would reach a per-step bound, so the process may
+/// only end through the off-runtime hard-exit thread.
 pub fn wedge_teardown(budget: Duration) {
     let hold = budget.saturating_mul(3);
     tracing::warn!(

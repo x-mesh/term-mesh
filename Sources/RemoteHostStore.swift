@@ -2237,6 +2237,11 @@ final class RemoteHostStore: ObservableObject {
         refreshTeamRoster(forHostKey: hostKey)
     }
 
+    /// Longest recheck interval this app will sit through before it tells the
+    /// user to do the removal on the host. The host names the interval; this
+    /// only bounds how long a window the app will hold a connection open for.
+    static let maximumRepairRecheckSeconds: UInt32 = 120
+
     /// Reclaim a name held by a Project record another installation published.
     ///
     /// The owner-authorized delete answers `notOwner` by design, so a record
@@ -2280,7 +2285,13 @@ final class RemoteHostStore: ObservableObject {
         // cancellation has to be honoured rather than swallowed: `try?` here
         // woke the moment the task was cancelled and then removed the record
         // anyway, which is the opposite of what cancelling asked for.
-        let recheck = max(1, min(30, Int(observed.minRecheckSecs)))
+        // Waiting less than the host asked for only earns a refusal from it,
+        // with nothing to say why, so a request beyond what this app serves is
+        // reported instead of quietly shortened.
+        guard observed.minRecheckSecs <= Self.maximumRepairRecheckSeconds else {
+            throw StaleProjectRecordRepairError.tooLongToWait(observed.minRecheckSecs)
+        }
+        let recheck = max(1, Int(observed.minRecheckSecs))
         do {
             try await Task.sleep(for: .seconds(recheck))
         } catch {
@@ -2315,7 +2326,11 @@ final class RemoteHostStore: ObservableObject {
                 projectID: projectID, apply: apply
             )
         } catch {
-            throw StaleProjectRecordRepairError.rejected(error.localizedDescription)
+            // A refusal comes back as a response with `ok == false`. Reaching
+            // here means the call never got an answer — the relay dropped
+            // during the recheck wait, most often — and reporting that as
+            // "the host refused" sends the user after the wrong thing.
+            throw StaleProjectRecordRepairError.transport(error.localizedDescription)
         }
         guard response.ok else {
             switch response.errorCode {
@@ -2779,6 +2794,8 @@ enum StaleProjectRecordRepairError: LocalizedError {
     case live
     case changed
     case cancelled
+    case transport(String)
+    case tooLongToWait(UInt32)
     case rejected(String)
 
     var errorDescription: String? {
@@ -2796,6 +2813,11 @@ enum StaleProjectRecordRepairError: LocalizedError {
             "The Project record changed while it was being checked. Try again."
         case .cancelled:
             "The name reclaim was cancelled before the host was asked to remove anything."
+        case .transport(let detail):
+            "Lost the connection to the host while reclaiming the name: \(detail)"
+        case .tooLongToWait(let seconds):
+            "The host wants \(seconds)s between its two checks, longer than this app waits. "
+                + "Remove the record on the host instead."
         case .rejected(let detail):
             "The host refused to remove the Project record: \(detail)"
         }
