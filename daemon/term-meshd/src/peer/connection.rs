@@ -65,8 +65,13 @@ struct AttachEntry {
 const STALE_RECHECK: Duration = Duration::from_secs(5);
 
 /// One connection's look at a manifest it may want removed.
+///
+/// Keyed on the host's instance counter, not on `revision`. A revision
+/// restarts at 1 whenever a project id has no record, so a delete and a
+/// republish produce a second manifest that reads as the one observed — and
+/// removing that one is exactly what this evidence exists to prevent.
 struct StaleObservation {
-    revision: u64,
+    instance: u64,
     at: Instant,
 }
 
@@ -78,8 +83,8 @@ struct StaleObservation {
 /// an owner that no longer exists — a rotated peer identity, a reinstalled app
 /// — leaves a record nothing can retire, holding a name forever. This is the
 /// operator saying "that owner is gone", and it buys that only with evidence:
-/// an exact project id, no live surface, and the same revision seen stale
-/// `STALE_RECHECK` ago on this connection.
+/// an exact project id, no live surface, and the same manifest instance seen
+/// stale `STALE_RECHECK` ago on this connection.
 fn repair_stale_project_presentation(
     host: &Arc<PeerHost>,
     peer_capabilities: &PeerCapabilities,
@@ -164,7 +169,7 @@ fn repair_stale_project_presentation(
     if !request.apply {
         observations.insert(
             request.project_id.clone(),
-            StaleObservation { revision: status.revision, at: Instant::now() },
+            StaleObservation { instance: status.instance, at: Instant::now() },
         );
         return (
             RepairStaleProjectPresentationResponse {
@@ -181,7 +186,7 @@ fn repair_stale_project_presentation(
     let Some(earlier) = observations.get(&request.project_id) else {
         observations.insert(
             request.project_id.clone(),
-            StaleObservation { revision: status.revision, at: Instant::now() },
+            StaleObservation { instance: status.instance, at: Instant::now() },
         );
         return (
             answer(
@@ -191,15 +196,16 @@ fn repair_stale_project_presentation(
             false,
         );
     };
-    if earlier.revision != status.revision {
-        // A rewritten manifest is a different claim about the project. Start
-        // the evidence over rather than removing what was never observed.
+    if earlier.instance != status.instance {
+        // A rewritten — or a deleted and republished — manifest is a different
+        // claim about the project. Start the evidence over rather than
+        // removing what was never observed.
         observations.insert(
             request.project_id.clone(),
-            StaleObservation { revision: status.revision, at: Instant::now() },
+            StaleObservation { instance: status.instance, at: Instant::now() },
         );
         return (
-            answer("revision_changed", "the manifest changed since it was observed"),
+            answer("record_changed", "the manifest changed since it was observed"),
             false,
         );
     }
@@ -210,9 +216,15 @@ fn repair_stale_project_presentation(
         );
     }
 
-    match host.prune_stale_project_presentations(std::slice::from_ref(&request.project_id), true) {
-        // Every surface this record named is already dead, so nothing is
-        // released for the abandoned-surface reap the owner delete performs.
+    // The check above ran outside the lock that removes, so it is a filter,
+    // not the decision. The expectation goes down with the call and is
+    // verified where the record leaves the map: a republish landing in between
+    // is refused there rather than removed unseen.
+    match host.prune_stale_project_presentations_expecting(
+        std::slice::from_ref(&request.project_id),
+        true,
+        Some((request.project_id.as_str(), earlier.instance)),
+    ) {
         Ok(report) if report.applied && !report.removed.is_empty() => {
             observations.remove(&request.project_id);
             (
@@ -5974,7 +5986,7 @@ mod stale_repair_tests {
 
         let response = fixture.call("gone", true);
 
-        assert_eq!(response.error_code, "revision_changed");
+        assert_eq!(response.error_code, "record_changed");
         assert_eq!(response.observed.expect("evidence").revision, 2);
         assert_eq!(fixture.host.project_presentations().len(), 1);
 
@@ -6019,6 +6031,43 @@ mod stale_repair_tests {
         assert_eq!(fixture.host.list_workspaces().len(), workspaces_before);
         assert_eq!(fixture.live_surfaces("keep"), 1, "an unrelated record must stay live");
         fixture.kill("keep", &keep).await;
+    }
+
+    /// The defect a revision check cannot see: `revision` restarts at 1 for a
+    /// project id with no record, so a manifest deleted and republished
+    /// repeats the revision of the record it replaced. An observation of the
+    /// record that is gone must not authorize removing its successor.
+    #[tokio::test]
+    async fn a_republished_manifest_is_not_the_one_that_was_observed() {
+        let mut fixture = Fixture::new();
+        let first = fixture.publish("gone");
+        fixture.kill("gone", &first).await;
+
+        let observed = fixture.call("gone", false);
+        assert!(observed.ok, "{observed:?}");
+        assert_eq!(observed.observed.expect("evidence").revision, 1);
+        fixture.age_observation("gone");
+
+        // The owner retires the record and publishes a new Project under the
+        // same id. Nothing about the revision distinguishes the two.
+        fixture
+            .host
+            .delete_project_presentation(&[GONE_OWNER.to_vec()], "gone")
+            .expect("owner delete");
+        let second = fixture.publish_keyed("gone-again", "gone");
+        let republished = fixture.host.project_presentation_status("gone").expect("republished");
+        assert_eq!(republished.revision, 1, "the premise: the revision repeats");
+        fixture.kill("gone", &second).await;
+
+        let response = fixture.call("gone", true);
+
+        assert_eq!(response.error_code, "record_changed");
+        assert!(!response.removed);
+        assert_eq!(
+            fixture.host.project_presentations().len(),
+            1,
+            "a Project nobody observed must survive"
+        );
     }
 
     #[tokio::test]

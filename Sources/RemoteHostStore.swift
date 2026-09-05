@@ -2311,7 +2311,7 @@ final class RemoteHostStore: ObservableObject {
             switch response.errorCode {
             case "not_found": throw StaleProjectRecordRepairError.notFound
             case "live": throw StaleProjectRecordRepairError.live
-            case "revision_changed": throw StaleProjectRecordRepairError.changed
+            case "record_changed": throw StaleProjectRecordRepairError.changed
             case "capability_unavailable": throw StaleProjectRecordRepairError.unsupported
             default:
                 throw StaleProjectRecordRepairError.rejected(
