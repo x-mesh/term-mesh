@@ -2699,8 +2699,11 @@ public nonisolated struct Termmesh_Peer_V1_StaleProjectObservation: Sendable {
 /// — holds its name for good, and the only escape the UI offered was a different
 /// name. This is deliberately narrow: an exact project id, never a name; a
 /// refusal while any surface it names is alive; and a removal only after the
-/// host has seen the same record stale twice, `min_recheck_secs` apart, at an
-/// unchanged revision. One transient missing surface is not evidence.
+/// host has seen the same record stale twice, `min_recheck_secs` apart, and
+/// still the same manifest instance. One transient missing surface is not
+/// evidence, and neither is a same-named record published since: `revision`
+/// restarts at 1 for a project id with no record, so it cannot tell a manifest
+/// apart from its replacement.
 ///
 /// Workspaces, other manifests, and files are untouched. The host copies the
 /// manifest file before it writes.
