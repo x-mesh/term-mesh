@@ -1623,27 +1623,26 @@ impl PeerHost {
     /// the point is to clear names, not to kill sessions the user can see.
     /// Removing a non-default workspace does kill that workspace's processes
     /// (`remove_workspace`), so the dry-run names the surface count first.
+    ///
+    /// Workspaces go first, and under `All` that ordering is the whole point.
+    /// A manifest whose leader lives in a named workspace is live right up
+    /// until that workspace is removed, so pruning first would skip it as
+    /// `live`, kill its leader moments later, and leave the operator holding
+    /// the name they asked to have cleared — the exact failure this command
+    /// exists to end. Running the removal first means the prune sees the
+    /// post-removal surface set: `remove_workspace` drops each surface from
+    /// the registry synchronously, so `live_surface_ids` is already current.
+    ///
+    /// It also puts every failure that can abort the call before the first
+    /// manifest is deleted. The workspace backup is the one step here that
+    /// returns `Err`, and returning it early costs nothing, where returning
+    /// it after the prune would discard the report carrying that prune's own
+    /// backup path.
     pub fn reset_peer_state(
         &self,
         scope: PeerStateResetScope,
         apply: bool,
     ) -> Result<PeerStateResetReport, &'static str> {
-        let projects = if scope.covers_projects() {
-            // Every id named explicitly: that is what makes the prune ignore
-            // `directory_present`, which is the whole reason a dead leader's
-            // record survives an ordinary prune.
-            let ids: Vec<String> = self
-                .project_presentations
-                .lock()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect();
-            Some(self.prune_stale_project_presentations(&ids, apply)?)
-        } else {
-            None
-        };
-
         let mut removed = Vec::new();
         let mut skipped = Vec::new();
         let mut workspaces_backup_path = None;
@@ -1720,6 +1719,22 @@ impl PeerHost {
                 }
             }
         }
+
+        let projects = if scope.covers_projects() {
+            // Every id named explicitly: that is what makes the prune ignore
+            // `directory_present`, which is the whole reason a dead leader's
+            // record survives an ordinary prune.
+            let ids: Vec<String> = self
+                .project_presentations
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            Some(self.prune_stale_project_presentations(&ids, apply)?)
+        } else {
+            None
+        };
 
         let applied = apply
             && (projects.as_ref().is_some_and(|report| report.applied) || !removed.is_empty());
@@ -5158,6 +5173,101 @@ mod tests {
         assert!(!persisted.contains("newnew"));
         assert!(!persisted.contains("Project · aic"));
         drop((named, also_named));
+    }
+
+    /// `all` has to finish the job in one call. A manifest whose leader lives
+    /// in a named workspace is live until that workspace goes, so pruning
+    /// manifests first skipped it as `live`, killed the leader moments later,
+    /// and handed back a report claiming success while the name it was asked
+    /// to clear was still held. Removing workspaces first means the prune
+    /// reads the surface set this same call already emptied.
+    #[tokio::test]
+    async fn all_scope_clears_a_manifest_whose_leader_dies_with_its_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces_path = tmp.path().join("peer-workspaces.json");
+        let manager = Arc::new(PtyManager::new());
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        host.set_persist_path(workspaces_path.clone());
+
+        // Named workspace built directly, holding the leader surface — the
+        // same manual-construction pattern as
+        // `remove_workspace_tears_down_surfaces_and_broadcasts_removal`,
+        // because `ensure_surface` always lands in the default workspace.
+        let leader = sid("aic-leader");
+        let surface = PtySurface::spawn(leader.clone(), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(surface);
+        let named_id = sid("aic-workspace");
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            let mut store = LayoutStore {
+                root: None,
+                next_split_id: 1,
+            };
+            store.seed_first_pane(leader.clone());
+            workspaces.insert(
+                named_id.clone(),
+                WorkspaceEntry {
+                    id: named_id.clone(),
+                    name: "Project · aic".into(),
+                    is_default: false,
+                    store,
+                },
+            );
+        }
+        host.surface_workspace
+            .lock()
+            .unwrap()
+            .insert(leader.clone(), named_id.clone());
+
+        let team = peer_proto::v1::Team {
+            name: "aic".to_string(),
+            team_uuid: "uuid-aic".to_string(),
+            // The directory exists, so an ordinary prune would never take it.
+            working_directory: "/tmp".to_string(),
+            leader_surface_id: leader.clone(),
+            project_id: "aic".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            host.upsert_project_presentation(&[vec![9; 16]], &team),
+            Ok((1, true))
+        );
+
+        // The dry-run has to name the shells the apply will kill, or the
+        // surface count is a field nothing ever exercises.
+        let preview = host
+            .reset_peer_state(PeerStateResetScope::All, false)
+            .unwrap();
+        let previewed = preview
+            .workspaces_removed
+            .iter()
+            .find(|entry| entry.name == "Project · aic")
+            .expect("named workspace previewed");
+        assert_eq!(previewed.surfaces, 1, "dry-run must warn about the shell");
+        // Before the workspace goes, the manifest is genuinely live.
+        assert!(preview
+            .projects
+            .expect("projects scope reports")
+            .skipped
+            .iter()
+            .any(|skip| skip.project_id == "aic" && skip.reason == "live"));
+
+        let report = host.reset_peer_state(PeerStateResetScope::All, true).unwrap();
+        assert!(report.applied);
+        assert_eq!(report.workspaces_removed.len(), 1);
+        // One call, both halves: the workspace went and the name came free.
+        let projects = report.projects.expect("projects scope reports");
+        assert_eq!(
+            projects
+                .removed
+                .iter()
+                .map(|status| status.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aic"],
+            "the manifest must not survive the call that killed its leader"
+        );
+        assert!(host.project_presentation_statuses().is_empty());
     }
 
     /// `all` is the two scopes together, not a third behaviour.
