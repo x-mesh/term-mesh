@@ -1662,24 +1662,43 @@ impl PeerHost {
 
         // The liveness set above is a snapshot: an attach can respawn a dead
         // surface (`get_or_respawn`) between it and the removal below. Look
-        // again right before committing so a record that just came back to
-        // life is reported as live instead of removed.
-        let live_now = self.live_surface_ids();
-        let (removed, revived): (Vec<_>, Vec<_>) = removed.into_iter().partition(|status| {
-            records
-                .get(&status.project_id)
-                .map(|record| {
-                    let instance = self.presentation_instance(&status.project_id);
-                    Self::presentation_status(record, &live_now, instance).live_surfaces == 0
-                })
-                .unwrap_or(false)
-        });
-        for status in revived {
-            skipped.push(ProjectPresentationPruneSkip {
-                project_id: status.project_id,
-                reason: "live",
+        // again before committing so a record that just came back to life is
+        // reported as live instead of removed.
+        //
+        // Liveness lives in the PtyManager, not under the records lock this
+        // holds, so `get_or_respawn` can revive a surface at any point in
+        // here. The gap between the last read and the removal is therefore
+        // the whole exposure, and it used to span a file copy. It is asked
+        // twice now: once as a cheap filter that can return without writing a
+        // backup at all, and again after the backup, immediately before the
+        // records leave the map. That leaves an in-memory partition rather
+        // than disk I/O in the window. It does not close it — closing it
+        // means holding the reservation `get_or_respawn` takes, which would
+        // put a records → reservation order against the reservation → records
+        // one the PTY paths already use.
+        let still_dead = |records: &HashMap<String, super::persist::PersistedProjectPresentation>,
+                          candidates: Vec<ProjectPresentationStatus>,
+                          skipped: &mut Vec<ProjectPresentationPruneSkip>| {
+            let live_now = self.live_surface_ids();
+            let (dead, revived): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|status| {
+                records
+                    .get(&status.project_id)
+                    .map(|record| {
+                        let instance = self.presentation_instance(&status.project_id);
+                        Self::presentation_status(record, &live_now, instance).live_surfaces == 0
+                    })
+                    .unwrap_or(false)
             });
-        }
+            for status in revived {
+                skipped.push(ProjectPresentationPruneSkip {
+                    project_id: status.project_id,
+                    reason: "live",
+                });
+            }
+            dead
+        };
+
+        let removed = still_dead(&records, removed, &mut skipped);
         if removed.is_empty() {
             return Ok(ProjectPresentationPruneReport {
                 applied: false,
@@ -1694,6 +1713,18 @@ impl PeerHost {
             Some(path) => super::persist::backup_state_file(path)?,
             None => None,
         };
+        let removed = still_dead(&records, removed, &mut skipped);
+        if removed.is_empty() {
+            // The backup is already written. Reporting it is the point: it is
+            // the only trace that this ran at all.
+            return Ok(ProjectPresentationPruneReport {
+                applied: false,
+                backup_path,
+                terminated_surfaces: 0,
+                removed,
+                skipped,
+            });
+        }
         let previous: Vec<_> = removed
             .iter()
             .filter_map(|status| records.remove(&status.project_id))
