@@ -4,6 +4,24 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.228.0] - 2026-09-06
+
+### Added
+- Reclaim a Project name that a record from another installation still holds. New Project offers `Reclaim Name…` when the colliding record was published by an installation that is gone — a rotated peer identity, a reinstalled app — which the owner-authorized delete refuses by design. The host checks the record twice, seconds apart, refuses while anything behind it is still running, keeps a backup, and leaves workspaces, other Projects and files untouched.
+- `tm-agent daemon reset --scope projects|workspaces|all` frees a name a dead leader still holds. An ordinary prune skips a record whose project folder still exists, so a leader that died leaves a name nothing reclaims. The dry run names how many shells a removal would stop before anything runs, and a live surface or the default workspace is reported as skipped rather than removed.
+- `tm-agent daemon doctor` gains a peer-state section: the resolved directory, what each state file holds and whether it parses, every manifest with its live-surface count, the workspace names, and whether a reset is safe right now. It reads the files directly, so it still answers when no daemon is running.
+- Diagnostics bundles now list the Project manifests behind a host's team count — name, project id, recorded directory, ownership and leader state. A bundle previously reported `teams: 3`, which cannot tell three running Projects from three records holding their names.
+
+### Fixed
+- A daemon restart no longer leaves pane shells behind. Its teardown used to spend the whole server-join budget draining connections, so the step that stops those shells and removes the peer socket never ran on a busy daemon. An unreaped shell outlives the daemon and keeps its PTY.
+- Reclaiming a name never removes a Project that came back. The host identifies the exact record it was shown, not merely its revision — a deleted and republished Project repeats the revision of the one it replaced — and it refuses a pane a viewer revived while the removal was being decided.
+- Cancelling a name reclaim now stops it. The wait before the second check swallowed the cancellation and went on to remove the record anyway.
+- Removing a Project record also retires the panes it was the last to name, instead of leaving them in the workspace tree with nothing able to reach or revive them.
+- `term-meshd` rejects arguments it does not understand instead of starting and ignoring them.
+- An offline peer-state reset reports what it removed before the failure, rather than losing that with the error.
+- `tm-agent daemon reset --scope all` finishes in the call that starts it.
+- Reset safety on a Linux peer counts that host's sockets, so an owned state directory is no longer judged free.
+
 ## [0.227.0] - 2026-09-04
 
 ### Fixed
