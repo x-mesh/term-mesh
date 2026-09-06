@@ -17,7 +17,7 @@ use crate::headless::HeadlessManager;
 use crate::monitor::{Anomaly, MonitorHandle, SystemSnapshot};
 use crate::pane_tracker::PaneTracker;
 use crate::peer::surface;
-use crate::supervisor::{shutdown_supervised, spawn_supervised};
+use crate::supervisor::{shutdown_supervised, spawn_supervised, CONNECTION_DRAIN_LIMIT};
 use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
 use crate::worktree;
@@ -1475,7 +1475,7 @@ pub async fn serve(
     jsonl_usage_broadcast_task.abort();
     codex_usage_broadcast_task.abort();
     usage_flush_task.abort();
-    shutdown_supervised(&mut connection_tasks, "socket").await;
+    shutdown_supervised(&mut connection_tasks, "socket", CONNECTION_DRAIN_LIMIT).await;
 
     // Phase 2.5: final usage flush before exit (best-effort).
     {
