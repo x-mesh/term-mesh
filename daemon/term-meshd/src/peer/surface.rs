@@ -3333,7 +3333,7 @@ impl PtyManager {
     /// the shell running until every viewer detaches, which is not what
     /// "close" means.
     pub fn remove(&self, surface_id: &[u8]) -> bool {
-        match self.remove_inner(surface_id, false) {
+        match self.remove_inner(surface_id, false, false) {
             Ok(removed) => removed,
             Err(error) => {
                 tracing::error!(
@@ -3349,7 +3349,7 @@ impl PtyManager {
     /// logical record. A failed save leaves the live process and registries
     /// intact and returns the persistence error to the RPC layer.
     pub fn terminate_ensured(&self, surface_id: &[u8]) -> Result<bool, EnsureError> {
-        self.remove_inner(surface_id, true)
+        self.remove_inner(surface_id, true, false)
     }
 
     /// Explicit destructive termination for any registered surface. Cleanup
@@ -3357,10 +3357,32 @@ impl PtyManager {
     /// explicit terminate is allowed to remove the final pane in a workspace.
     /// Ensured state is still removed transactionally when it exists.
     pub fn terminate(&self, surface_id: &[u8]) -> Result<bool, EnsureError> {
-        self.remove_inner(surface_id, false)
+        self.remove_inner(surface_id, false, false)
     }
 
-    fn remove_inner(&self, surface_id: &[u8], require_ensured: bool) -> Result<bool, EnsureError> {
+    /// Remove a surface only while it is still dead.
+    ///
+    /// A caller that decided to drop a surface *because* nothing was live
+    /// must not act on that decision after an attach revived it. Its check
+    /// and this removal are separated by real work — a manifest write and a
+    /// file save — and `closing` only bars a respawn once a removal is
+    /// already under way, so it cannot cover that gap. Nor can the caller
+    /// close it from outside: `PeerHost`'s per-surface lifecycle lock and
+    /// this manager's per-surface reservation are unrelated mutexes, and
+    /// `get_or_respawn` takes only the latter. The re-check therefore has to
+    /// happen here, under the reservation the respawn also needs.
+    ///
+    /// `Ok(false)` means the surface was live and nothing changed.
+    pub fn terminate_if_dead(&self, surface_id: &[u8]) -> Result<bool, EnsureError> {
+        self.remove_inner(surface_id, false, true)
+    }
+
+    fn remove_inner(
+        &self,
+        surface_id: &[u8],
+        require_ensured: bool,
+        only_if_dead: bool,
+    ) -> Result<bool, EnsureError> {
         if !self.begin_close(surface_id) {
             return Err(EnsureError::Internal("closing registry poisoned"));
         }
@@ -3377,6 +3399,16 @@ impl PtyManager {
                 .lock()
                 .map_err(|_| EnsureError::Internal("surface reservation poisoned"))?;
             if require_ensured && !self.ensured.read().unwrap().contains_key(surface_id) {
+                return Ok(false);
+            }
+            if only_if_dead
+                && self
+                    .surfaces
+                    .read()
+                    .unwrap()
+                    .get(surface_id)
+                    .is_some_and(|surface| surface.is_live())
+            {
                 return Ok(false);
             }
             let removed = self.surfaces.write().unwrap().remove(surface_id);
