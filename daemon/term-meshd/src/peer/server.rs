@@ -17,7 +17,7 @@ use super::connection;
 use super::layout::{PeerHost, DAEMON_WORKSPACE};
 use super::persist;
 use super::surface::PtyManager;
-use crate::supervisor::{shutdown_supervised, spawn_supervised};
+use crate::supervisor::{shutdown_supervised, spawn_supervised, CONNECTION_DRAIN_LIMIT};
 
 /// Default ceiling on concurrent peer-federation connections.
 ///
@@ -89,6 +89,19 @@ pub async fn serve(
     let manager = Arc::new(PtyManager::new());
     manager.spawn_from_config();
     let workspaces_path = persist::default_workspaces_path();
+    // Held until this listener returns, so an offline repair tool can tell the
+    // state directory is still owned. Not fatal when it fails: the lock gates
+    // repair, never this daemon's own writes.
+    let _state_lock = match persist::acquire_state_lock_shared(&workspaces_path) {
+        Ok(file) => Some(file),
+        Err(error) => {
+            tracing::warn!(
+                "peer state lock {} unavailable: {error}",
+                persist::state_lock_path(&workspaces_path).display()
+            );
+            None
+        }
+    };
     let default_name_fallback = connection::hostname_or(DAEMON_WORKSPACE);
     let entries = persist::boot(&workspaces_path, &default_name_fallback);
     let host = Arc::new(PeerHost::with_workspaces(manager, entries));
@@ -253,7 +266,11 @@ async fn serve_with_prepared_host(
             }
         }
     }
-    shutdown_supervised(&mut connection_tasks, "peer").await;
+    // Strictly under `SERVER_JOIN_LIMIT`, because the surface reaping below and
+    // the socket removal after it are what the remaining budget pays for. They
+    // are the part that must not be skipped: an unreaped pane shell outlives
+    // the daemon holding its PTY.
+    shutdown_supervised(&mut connection_tasks, "peer", CONNECTION_DRAIN_LIMIT).await;
 
     // Host surfaces are `$SHELL -l` children of this daemon (surface.rs:8) and
     // nothing else in the shutdown sequence reaps them: the daemon's own

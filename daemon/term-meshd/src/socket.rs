@@ -17,7 +17,7 @@ use crate::headless::HeadlessManager;
 use crate::monitor::{Anomaly, MonitorHandle, SystemSnapshot};
 use crate::pane_tracker::PaneTracker;
 use crate::peer::surface;
-use crate::supervisor::{shutdown_supervised, spawn_supervised};
+use crate::supervisor::{shutdown_supervised, spawn_supervised, CONNECTION_DRAIN_LIMIT};
 use crate::tokens::UsageTracker;
 use crate::watcher::WatcherHandle;
 use crate::worktree;
@@ -1475,7 +1475,7 @@ pub async fn serve(
     jsonl_usage_broadcast_task.abort();
     codex_usage_broadcast_task.abort();
     usage_flush_task.abort();
-    shutdown_supervised(&mut connection_tasks, "socket").await;
+    shutdown_supervised(&mut connection_tasks, "socket", CONNECTION_DRAIN_LIMIT).await;
 
     // Phase 2.5: final usage flush before exit (best-effort).
     {
@@ -5103,6 +5103,38 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                             serde_json::to_value(report).map_err(|e| e.to_string())
                         }),
                     None => Err("peer host is not running (daemon started without TERMMESH_PEER_SOCKET)".to_string()),
+                },
+                Err(e) => Err(format!("invalid params: {e}")),
+            }
+        }
+
+        // Operator reset of durable peer state: clears names a dead leader
+        // still holds so a new Project can take them. Unlike the prune above
+        // this ignores `directory_present` — a project folder does not vanish
+        // when its leader dies — but it still refuses live surfaces and the
+        // default workspace. Dry-run unless `apply`; backs each file up first.
+        "peer.state.reset" => {
+            #[derive(Deserialize)]
+            struct P {
+                scope: String,
+                #[serde(default)]
+                apply: bool,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(params) => match crate::peer::layout::PeerStateResetScope::parse(&params.scope) {
+                    Some(scope) => match crate::peer::layout::PeerHost::active_host() {
+                        Some(host) => host
+                            .reset_peer_state(scope, params.apply)
+                            .map_err(|code| code.to_string())
+                            .and_then(|report| {
+                                serde_json::to_value(report).map_err(|e| e.to_string())
+                            }),
+                        None => Err("peer host is not running (daemon started without TERMMESH_PEER_SOCKET)".to_string()),
+                    },
+                    None => Err(format!(
+                        "invalid scope {:?}: expected projects, workspaces or all",
+                        params.scope
+                    )),
                 },
                 Err(e) => Err(format!("invalid params: {e}")),
             }

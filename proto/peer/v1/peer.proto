@@ -102,6 +102,10 @@ message Envelope {
     // present it. Gated behind capability "project.presentation.v1".
     UpsertProjectPresentationRequest upsert_project_presentation_request = 62;
     UpsertProjectPresentationResponse upsert_project_presentation_response = 63;
+    // Operator removal of a manifest this peer does not own. Gated behind
+    // capability "project.presentation.repair.v1".
+    RepairStaleProjectPresentationRequest repair_stale_project_presentation_request = 64;
+    RepairStaleProjectPresentationResponse repair_stale_project_presentation_response = 65;
 
     Error error = 99;
   }
@@ -1007,6 +1011,62 @@ message UpsertProjectPresentationResponse {
   uint64 revision = 3;
   string error_code = 4;
   string error_message = 5;
+}
+
+// ============================================================
+// Stale manifest repair (capability "project.presentation.repair.v1")
+// ============================================================
+
+// What the host sees behind one manifest right now.
+message StaleProjectObservation {
+  string project_id = 1;
+  uint64 revision = 2;
+  // Surfaces the manifest names, and how many of those are still alive.
+  uint32 referenced_surfaces = 3;
+  uint32 live_surfaces = 4;
+  // Whether the recorded working directory still exists. A folder outliving
+  // its leader is why an ordinary prune never reclaims the name.
+  bool directory_present = 5;
+  bool owned_by_requester = 6;
+  string working_directory = 7;
+}
+
+// Operator-authorized removal of a manifest this peer does not own.
+//
+// The owner-authorized delete answers `not_owner` by design, so a record left
+// by an installation that is gone — a rotated peer identity, a reinstalled app
+// — holds its name for good, and the only escape the UI offered was a different
+// name. This is deliberately narrow: an exact project id, never a name; a
+// refusal while any surface it names is alive; and a removal only after the
+// host has seen the same record stale twice, `min_recheck_secs` apart, and
+// still the same manifest instance. One transient missing surface is not
+// evidence, and neither is a same-named record published since: `revision`
+// restarts at 1 for a project id with no record, so it cannot tell a manifest
+// apart from its replacement.
+//
+// Workspaces, other manifests, and files are untouched. The host copies the
+// manifest file before it writes.
+message RepairStaleProjectPresentationRequest {
+  bytes request_id = 1;
+  // Exact record. A name is never accepted: two hosts can hold the same one.
+  string project_id = 2;
+  // False observes and records the observation. True removes, and is refused
+  // until an earlier observation on this connection has aged past
+  // `min_recheck_secs` at the same revision.
+  bool apply = 3;
+}
+
+message RepairStaleProjectPresentationResponse {
+  bytes request_id = 1;
+  bool ok = 2;
+  string error_code = 3;
+  string error_message = 4;
+  bool removed = 5;
+  StaleProjectObservation observed = 6;
+  // How long an observation must age before an apply is accepted.
+  uint32 min_recheck_secs = 7;
+  // Where the host copied the manifest file before writing.
+  string backup_path = 8;
 }
 
 // ============================================================

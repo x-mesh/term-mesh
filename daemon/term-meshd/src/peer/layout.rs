@@ -1092,6 +1092,9 @@ static ACTIVE_HOST: std::sync::OnceLock<Mutex<Weak<PeerHost>>> = std::sync::Once
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProjectPresentationStatus {
     pub project_id: String,
+    /// Which instance of this project id the record is. See
+    /// `project_presentation_instances`.
+    pub instance: u64,
     pub team_name: String,
     pub working_directory: String,
     pub owner_peer_id: String,
@@ -1112,8 +1115,71 @@ pub struct ProjectPresentationPruneSkip {
 pub struct ProjectPresentationPruneReport {
     pub applied: bool,
     pub backup_path: Option<String>,
+    /// Surfaces retired because the removed records held their last durable
+    /// reference. Zero is the normal case for a record whose panes another
+    /// manifest also names.
+    pub terminated_surfaces: usize,
     pub removed: Vec<ProjectPresentationStatus>,
     pub skipped: Vec<ProjectPresentationPruneSkip>,
+}
+
+
+/// What a peer state reset is allowed to touch. Deliberately not "everything
+/// under the state directory": ensured-surface records, the agent session DB
+/// and the sync stores are out of scope, because losing those costs task
+/// history and device trust rather than a stale name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerStateResetScope {
+    Projects,
+    Workspaces,
+    All,
+}
+
+impl PeerStateResetScope {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "projects" => Some(Self::Projects),
+            "workspaces" => Some(Self::Workspaces),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    fn covers_projects(self) -> bool {
+        matches!(self, Self::Projects | Self::All)
+    }
+
+    fn covers_workspaces(self) -> bool {
+        matches!(self, Self::Workspaces | Self::All)
+    }
+}
+
+/// One workspace a reset removed, or would remove on `--apply`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorkspaceResetEntry {
+    pub workspace_id: String,
+    pub name: String,
+    /// Host processes this removal kills. A reset is not a tidy-up when this
+    /// is non-zero, which is why the dry-run reports it before anything runs.
+    pub surfaces: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorkspaceResetSkip {
+    pub workspace_id: String,
+    pub name: String,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PeerStateResetReport {
+    pub applied: bool,
+    /// Present when the scope covered manifests. Carries its own backup path
+    /// and per-record skip reasons.
+    pub projects: Option<ProjectPresentationPruneReport>,
+    pub workspaces_backup_path: Option<String>,
+    pub workspaces_removed: Vec<WorkspaceResetEntry>,
+    pub workspaces_skipped: Vec<WorkspaceResetSkip>,
 }
 
 /// Shared state of one daemon peer host: the PTYs, the workspaces they are
@@ -1197,6 +1263,25 @@ pub struct PeerHost {
     project_presentations: Mutex<HashMap<String, super::persist::PersistedProjectPresentation>>,
     project_presentations_path: Mutex<Option<PathBuf>>,
     project_presentations_persistence: Mutex<()>,
+    /// How many times each project id's manifest has been written or removed.
+    ///
+    /// Locking: take `project_presentations` first and this second, always.
+    /// The counter is only meaningful paired with the record it counts, so a
+    /// read or a write that does not hold both can hand out a stale count for
+    /// a fresh record — which is the whole defect it exists to prevent.
+    ///
+    /// Entries outlive their records on purpose. Dropping one when its record
+    /// is deleted would restart the count at zero for that project id, and a
+    /// republished manifest would again be indistinguishable from the one it
+    /// replaced.
+    ///
+    /// `revision` cannot identify a manifest instance: it restarts at 1
+    /// whenever a project id has no record, so a delete followed by a
+    /// republish produces a second instance that reads as the first. A repair
+    /// that compared revisions alone would accept an observation of the record
+    /// that is gone as evidence about the record that replaced it. This only
+    /// counts up, and the repair compares it under the same lock that removes.
+    project_presentation_instances: Mutex<HashMap<String, u64>>,
     project_presentation_watchers: Mutex<HashSet<Vec<u8>>>,
 }
 
@@ -1322,6 +1407,7 @@ impl PeerHost {
             project_presentations: Mutex::new(HashMap::new()),
             project_presentations_path: Mutex::new(None),
             project_presentations_persistence: Mutex::new(()),
+            project_presentation_instances: Mutex::new(HashMap::new()),
             project_presentation_watchers: Mutex::new(HashSet::new()),
         }
     }
@@ -1408,10 +1494,12 @@ impl PeerHost {
     fn presentation_status(
         record: &super::persist::PersistedProjectPresentation,
         live: &HashSet<Vec<u8>>,
+        instance: u64,
     ) -> ProjectPresentationStatus {
         let ids = Self::presentation_surface_ids(record);
         ProjectPresentationStatus {
             project_id: record.project_id.clone(),
+            instance,
             team_name: record.team_name.clone(),
             working_directory: record.working_directory.clone(),
             owner_peer_id: record.owner_peer_id.clone(),
@@ -1424,6 +1512,43 @@ impl PeerHost {
         }
     }
 
+    /// Record that this project id's manifest changed, and report the new
+    /// instance. Called for every write and every removal.
+    fn bump_presentation_instance(&self, project_id: &str) -> u64 {
+        let mut instances = self.project_presentation_instances.lock().unwrap();
+        let counter = instances.entry(project_id.to_string()).or_insert(0);
+        *counter += 1;
+        *counter
+    }
+
+    fn presentation_instance(&self, project_id: &str) -> u64 {
+        self.project_presentation_instances
+            .lock()
+            .unwrap()
+            .get(project_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// One durable manifest's facts, or None when nothing holds that id.
+    ///
+    /// Reads the whole liveness set for a single record on purpose: a repair
+    /// must judge the record against the same snapshot a prune would, not
+    /// against a cheaper per-surface probe that could disagree with it.
+    pub fn project_presentation_status(
+        &self,
+        project_id: &str,
+    ) -> Option<ProjectPresentationStatus> {
+        let live = self.live_surface_ids();
+        let records = self.project_presentations.lock().unwrap();
+        // Read inside the map lock. Taken before it, the count could be the one
+        // a delete had already published for a record this then reads fresh.
+        let instance = self.presentation_instance(project_id);
+        records
+            .get(project_id)
+            .map(|record| Self::presentation_status(record, &live, instance))
+    }
+
     /// Every durable manifest with the facts an operator needs to judge it:
     /// how many of its surfaces are live and whether its directory exists.
     pub fn project_presentation_statuses(&self) -> Vec<ProjectPresentationStatus> {
@@ -1433,27 +1558,53 @@ impl PeerHost {
             .lock()
             .unwrap()
             .values()
-            .map(|record| Self::presentation_status(record, &live))
+            .map(|record| {
+                let instance = self.presentation_instance(&record.project_id);
+                Self::presentation_status(record, &live, instance)
+            })
             .collect();
         statuses.sort_by(|a, b| a.project_id.cmp(&b.project_id));
         statuses
     }
 
-    /// Host-side removal of manifests nothing can resume. This is the
-    /// operator path for records another installation owns (protocol
-    /// deletion answers `not_owner`); it bypasses ownership on purpose and
-    /// therefore never runs from a peer connection.
+    /// Host-side removal of manifests nothing can resume.
+    ///
+    /// This bypasses ownership on purpose, so it is the path for records
+    /// another installation owns, which protocol deletion answers `not_owner`
+    /// for. Two callers reach it: the local operator over the control socket,
+    /// and — only with `expected` naming an exact instance it already observed
+    /// stale — the `project.presentation.repair.v1` handler.
     ///
     /// Selection: with `project_ids` the named records are candidates; without
     /// them only records whose working directory is gone. A record with any
     /// live surface is never removed, whichever way it was selected — a
-    /// project that is merely idle must stay resumable. Nothing here touches
-    /// workspaces or surfaces. `apply = false` reports without writing; an
-    /// applied prune first copies the current file to a timestamped `.bak`.
+    /// project that is merely idle must stay resumable. Workspaces are never
+    /// touched. `apply = false` reports without writing; an applied prune
+    /// first copies the current file to a timestamped `.bak`.
+    ///
+    /// Removing a record does drop its surfaces' last durable reference. A
+    /// declared surface has no death watcher on purpose — its dead pane stays
+    /// in the tree and revives on the next attach — so leaving them behind
+    /// strands panes nothing can revive or reach. Whatever no remaining
+    /// manifest names is therefore retired here, exactly as the owner-side
+    /// delete does.
     pub fn prune_stale_project_presentations(
-        &self,
+        self: &Arc<Self>,
         project_ids: &[String],
         apply: bool,
+    ) -> Result<ProjectPresentationPruneReport, &'static str> {
+        self.prune_stale_project_presentations_expecting(project_ids, apply, None)
+    }
+
+    /// `expected` is `(project_id, instance)`: the record that id held when
+    /// the caller observed it stale. It is checked under the lock that
+    /// commits, so a manifest deleted and republished between the observation
+    /// and here is refused instead of removed unseen.
+    pub fn prune_stale_project_presentations_expecting(
+        self: &Arc<Self>,
+        project_ids: &[String],
+        apply: bool,
+        expected: Option<(&str, u64)>,
     ) -> Result<ProjectPresentationPruneReport, &'static str> {
         let _persist_guard = self.project_presentations_persistence.lock().unwrap();
         let live = self.live_surface_ids();
@@ -1474,10 +1625,20 @@ impl PeerHost {
                 skipped.push(ProjectPresentationPruneSkip { project_id, reason: "not_found" });
                 continue;
             };
-            let status = Self::presentation_status(record, &live);
+            let status =
+                Self::presentation_status(record, &live, self.presentation_instance(&project_id));
             if status.live_surfaces > 0 {
                 skipped.push(ProjectPresentationPruneSkip { project_id, reason: "live" });
                 continue;
+            }
+            if let Some((expected_id, expected_instance)) = expected {
+                if expected_id == project_id && status.instance != expected_instance {
+                    skipped.push(ProjectPresentationPruneSkip {
+                        project_id,
+                        reason: "record_changed",
+                    });
+                    continue;
+                }
             }
             if !explicit && status.directory_present {
                 skipped.push(ProjectPresentationPruneSkip {
@@ -1493,6 +1654,7 @@ impl PeerHost {
             return Ok(ProjectPresentationPruneReport {
                 applied: false,
                 backup_path: None,
+                terminated_surfaces: 0,
                 removed,
                 skipped,
             });
@@ -1500,34 +1662,69 @@ impl PeerHost {
 
         // The liveness set above is a snapshot: an attach can respawn a dead
         // surface (`get_or_respawn`) between it and the removal below. Look
-        // again right before committing so a record that just came back to
-        // life is reported as live instead of removed.
-        let live_now = self.live_surface_ids();
-        let (removed, revived): (Vec<_>, Vec<_>) = removed.into_iter().partition(|status| {
-            records
-                .get(&status.project_id)
-                .map(|record| Self::presentation_status(record, &live_now).live_surfaces == 0)
-                .unwrap_or(false)
-        });
-        for status in revived {
-            skipped.push(ProjectPresentationPruneSkip {
-                project_id: status.project_id,
-                reason: "live",
+        // again before committing so a record that just came back to life is
+        // reported as live instead of removed.
+        //
+        // Liveness lives in the PtyManager, not under the records lock this
+        // holds, so `get_or_respawn` can revive a surface at any point in
+        // here. The gap between the last read and the removal is therefore
+        // the whole exposure, and it used to span a file copy. It is asked
+        // twice now: once as a cheap filter that can return without writing a
+        // backup at all, and again after the backup, immediately before the
+        // records leave the map. That leaves an in-memory partition rather
+        // than disk I/O in the window. It does not close it — closing it
+        // means holding the reservation `get_or_respawn` takes, which would
+        // put a records → reservation order against the reservation → records
+        // one the PTY paths already use.
+        let still_dead = |records: &HashMap<String, super::persist::PersistedProjectPresentation>,
+                          candidates: Vec<ProjectPresentationStatus>,
+                          skipped: &mut Vec<ProjectPresentationPruneSkip>| {
+            let live_now = self.live_surface_ids();
+            let (dead, revived): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|status| {
+                records
+                    .get(&status.project_id)
+                    .map(|record| {
+                        let instance = self.presentation_instance(&status.project_id);
+                        Self::presentation_status(record, &live_now, instance).live_surfaces == 0
+                    })
+                    .unwrap_or(false)
             });
-        }
+            for status in revived {
+                skipped.push(ProjectPresentationPruneSkip {
+                    project_id: status.project_id,
+                    reason: "live",
+                });
+            }
+            dead
+        };
+
+        let removed = still_dead(&records, removed, &mut skipped);
         if removed.is_empty() {
             return Ok(ProjectPresentationPruneReport {
                 applied: false,
                 backup_path: None,
+                terminated_surfaces: 0,
                 removed,
                 skipped,
             });
         }
         let path = self.project_presentations_path.lock().unwrap().clone();
         let backup_path = match &path {
-            Some(path) => Self::backup_project_presentations_file(path)?,
+            Some(path) => super::persist::backup_state_file(path)?,
             None => None,
         };
+        let removed = still_dead(&records, removed, &mut skipped);
+        if removed.is_empty() {
+            // The backup is already written. Reporting it is the point: it is
+            // the only trace that this ran at all.
+            return Ok(ProjectPresentationPruneReport {
+                applied: false,
+                backup_path,
+                terminated_surfaces: 0,
+                removed,
+                skipped,
+            });
+        }
         let previous: Vec<_> = removed
             .iter()
             .filter_map(|status| records.remove(&status.project_id))
@@ -1538,42 +1735,192 @@ impl PeerHost {
                 for record in previous {
                     records.insert(record.project_id.clone(), record);
                 }
+                // The records are back, so nothing lost a reference and no
+                // instance changed: a rolled-back prune must be invisible.
                 return Err("persistence_failed");
+            }
+        }
+        // Surfaces the removed records named that nothing left names. Computed
+        // while the map is still locked so a concurrent upsert cannot make a
+        // still-referenced surface look orphaned.
+        let orphaned: Vec<Vec<u8>> = previous
+            .iter()
+            .flat_map(Self::presentation_surface_ids)
+            .filter(|surface_id| {
+                let encoded = hex::encode(surface_id);
+                !records.values().any(|record| {
+                    record.leader_surface_id == encoded
+                        || record.members.iter().any(|member| member.surface_id == encoded)
+                })
+            })
+            .collect();
+        // Under the map lock, with the removal: a counter bumped after the
+        // records lock is released leaves a window where a republished
+        // manifest reads with the count of the record it replaced.
+        for status in &removed {
+            self.bump_presentation_instance(&status.project_id);
+        }
+        drop(records);
+        drop(_persist_guard);
+        // Same shape as the owner-side delete: take each surface's lifecycle
+        // lock and re-check the reference under it, so a manifest published
+        // between the snapshot above and here keeps its pane.
+        let mut terminated_surfaces = 0;
+        for surface_id in orphaned {
+            let lifecycle = self.surface_lifecycle_lock(&surface_id);
+            let Ok(_lifecycle_guard) = lifecycle.lock() else { continue };
+            if !self.presentation_references_surface(&surface_id)
+                && self.retire_surface_locked(&surface_id).unwrap_or(false)
+            {
+                terminated_surfaces += 1;
             }
         }
         Ok(ProjectPresentationPruneReport {
             applied: true,
             backup_path,
+            terminated_surfaces,
             removed,
             skipped,
         })
     }
 
-    /// Copy the persisted manifest file next to itself as
-    /// `peer-project-presentations.<unix-secs>[-<n>].bak.json`. The loader
-    /// reads only the exact primary path, so backups are never mistaken for
-    /// state. `Ok(None)` when nothing was persisted yet.
-    fn backup_project_presentations_file(path: &Path) -> Result<Option<String>, &'static str> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or(0);
-        let mut candidate = path.with_file_name(format!("peer-project-presentations.{stamp}.bak.json"));
-        let mut suffix = 1;
-        while candidate.exists() {
-            if suffix > 1000 {
-                return Err("backup_failed");
+
+    /// Empty this host's durable peer state so a name it still holds stops
+    /// blocking a new Project.
+    ///
+    /// Distinct from `prune_stale_project_presentations`, which only reclaims
+    /// what nothing could resume: an idle manifest whose working directory
+    /// still exists is skipped there, and a project folder does not disappear,
+    /// so a leader that died leaves a record that never becomes a candidate.
+    /// A reset is the operator saying "remove it anyway".
+    ///
+    /// What it still refuses is live work. A manifest with a live surface, and
+    /// the default workspace, are reported as skipped rather than removed —
+    /// the point is to clear names, not to kill sessions the user can see.
+    /// Removing a non-default workspace does kill that workspace's processes
+    /// (`remove_workspace`), so the dry-run names the surface count first.
+    ///
+    /// Workspaces go first, and under `All` that ordering is the whole point.
+    /// A manifest whose leader lives in a named workspace is live right up
+    /// until that workspace is removed, so pruning first would skip it as
+    /// `live`, kill its leader moments later, and leave the operator holding
+    /// the name they asked to have cleared — the exact failure this command
+    /// exists to end. Running the removal first means the prune sees the
+    /// post-removal surface set: `remove_workspace` drops each surface from
+    /// the registry synchronously, so `live_surface_ids` is already current.
+    ///
+    /// It also puts every failure that can abort the call before the first
+    /// manifest is deleted. The workspace backup is the one step here that
+    /// returns `Err`, and returning it early costs nothing, where returning
+    /// it after the prune would discard the report carrying that prune's own
+    /// backup path.
+    pub fn reset_peer_state(
+        self: &Arc<Self>,
+        scope: PeerStateResetScope,
+        apply: bool,
+    ) -> Result<PeerStateResetReport, &'static str> {
+        let mut removed = Vec::new();
+        let mut skipped = Vec::new();
+        let mut workspaces_backup_path = None;
+
+        if scope.covers_workspaces() {
+            let default_id = self.default_id();
+            let inventory: Vec<(Vec<u8>, String, bool, usize)> = {
+                let workspaces = self.workspaces.lock().unwrap();
+                workspaces
+                    .iter()
+                    .map(|(id, entry)| {
+                        (
+                            id.clone(),
+                            entry.name.clone(),
+                            entry.is_default,
+                            entry.store.surface_ids().len(),
+                        )
+                    })
+                    .collect()
+            };
+
+            let mut candidates = Vec::new();
+            for (id, name, is_default, surfaces) in inventory {
+                if is_default || id == default_id {
+                    skipped.push(WorkspaceResetSkip {
+                        workspace_id: hex::encode(&id),
+                        name,
+                        reason: "default",
+                    });
+                    continue;
+                }
+                candidates.push((id, name, surfaces));
             }
-            candidate = path.with_file_name(format!(
-                "peer-project-presentations.{stamp}-{suffix}.bak.json"
-            ));
-            suffix += 1;
+            candidates.sort_by(|a, b| a.1.cmp(&b.1));
+
+            if !apply {
+                removed = candidates
+                    .into_iter()
+                    .map(|(id, name, surfaces)| WorkspaceResetEntry {
+                        workspace_id: hex::encode(&id),
+                        name,
+                        surfaces,
+                    })
+                    .collect();
+            } else if !candidates.is_empty() {
+                let path = self.persist_path.lock().unwrap().clone();
+                if let Some(path) = &path {
+                    workspaces_backup_path = super::persist::backup_state_file(path)?;
+                }
+                for (id, name, surfaces) in candidates {
+                    // `remove_workspace` persists and broadcasts on its own,
+                    // and refuses to leave the host with no workspace at all.
+                    match self.remove_workspace(&id) {
+                        Ok(()) => removed.push(WorkspaceResetEntry {
+                            workspace_id: hex::encode(&id),
+                            name,
+                            surfaces,
+                        }),
+                        Err(RemoveWorkspaceError::LastWorkspace) => {
+                            skipped.push(WorkspaceResetSkip {
+                                workspace_id: hex::encode(&id),
+                                name,
+                                reason: "last_workspace",
+                            })
+                        }
+                        Err(RemoveWorkspaceError::NotFound) => {
+                            skipped.push(WorkspaceResetSkip {
+                                workspace_id: hex::encode(&id),
+                                name,
+                                reason: "not_found",
+                            })
+                        }
+                    }
+                }
+            }
         }
-        std::fs::copy(path, &candidate).map_err(|_| "backup_failed")?;
-        Ok(Some(candidate.display().to_string()))
+
+        let projects = if scope.covers_projects() {
+            // Every id named explicitly: that is what makes the prune ignore
+            // `directory_present`, which is the whole reason a dead leader's
+            // record survives an ordinary prune.
+            let ids: Vec<String> = self
+                .project_presentations
+                .lock()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            Some(self.prune_stale_project_presentations(&ids, apply)?)
+        } else {
+            None
+        };
+
+        let applied = apply
+            && (projects.as_ref().is_some_and(|report| report.applied) || !removed.is_empty());
+        Ok(PeerStateResetReport {
+            applied,
+            projects,
+            workspaces_backup_path,
+            workspaces_removed: removed,
+            workspaces_skipped: skipped,
+        })
     }
 
     /// Every surface id a stored manifest names, leader first.
@@ -1653,12 +2000,23 @@ impl PeerHost {
                     || record.members.iter().any(|member| member.surface_id == encoded)
             })
         }).cloned().collect::<Vec<_>>();
+        // Whatever replaces this project id next is a different manifest, and
+        // `revision` will not say so: it restarts at 1 for an id with no
+        // record. Counting the removal is what keeps the two apart, and it has
+        // to happen under the map lock that removed it.
+        self.bump_presentation_instance(project_id);
         drop(records);
         drop(_persist_guard);
         for surface_id in unreferenced {
             let lifecycle = self.surface_lifecycle_lock(&surface_id);
             let _lifecycle_guard = lifecycle.lock().map_err(|_| "surface_lifecycle_poisoned")?;
             if !self.presentation_references_surface(&surface_id) {
+                // Unconditional on purpose, and covered by
+                // `explicit_delete_terminates_a_project_surface_even_while_attached`:
+                // the owner asked for this Project to be retired, so its panes
+                // go with it whether or not a viewer is looking at one. The
+                // prune path cannot claim that authority — see
+                // `retire_surface_locked`.
                 let _ = self.terminate_surface_locked(&surface_id);
             }
         }
@@ -1891,6 +2249,9 @@ impl PeerHost {
             )
             .filter_map(|surface_id| surfaces.get(surface_id).cloned())
             .collect::<Vec<_>>();
+        // Under the map lock, with the write, for the same reason the removal
+        // paths count under theirs.
+        self.bump_presentation_instance(&project.project_id);
         drop(records);
         for surface in watched {
             self.watch_presentation_surface(surface);
@@ -1991,6 +2352,37 @@ impl PeerHost {
             .lock()
             .map_err(|_| EnsureError::Internal("host surface lifecycle lock poisoned"))?;
         self.terminate_surface_locked(surface_id)
+    }
+
+    /// Drop a surface a prune orphaned, unless it came back to life while
+    /// that was being decided.
+    ///
+    /// The authority is what separates this from the owner-side delete. There,
+    /// the owner asked for the Project to be retired and its panes go with it,
+    /// attached or not. A prune asks nobody: it reclaims a name from an
+    /// installation that is gone, on the strength of having found nothing
+    /// live. Acting on that finding after it stopped being true would take a
+    /// pane on no authority at all.
+    ///
+    /// The lifecycle lock held by the callers does not make that safe on its
+    /// own: a peer attach reaches `PtyManager::get_or_respawn` directly and
+    /// takes only that manager's reservation, which is a different mutex. The
+    /// liveness re-check therefore lives inside `terminate_if_dead`, under
+    /// the lock a respawn also needs. `Ok(false)` means nothing changed.
+    fn retire_surface_locked(self: &Arc<Self>, surface_id: &[u8]) -> Result<bool, EnsureError> {
+        let workspace_id = self.workspace_id_for_surface(surface_id);
+        if !self.pty.terminate_if_dead(surface_id)? {
+            return Ok(false);
+        }
+        let layout_removed = workspace_id.as_ref().is_some_and(|workspace_id| {
+            self.with_store(workspace_id, |store| store.remove_surface_allow_empty(surface_id))
+                .unwrap_or(false)
+        });
+        self.surface_workspace.lock().unwrap().remove(surface_id);
+        if layout_removed {
+            self.schedule_layout_push(workspace_id.expect("checked above"));
+        }
+        Ok(true)
     }
 
     fn terminate_surface_locked(self: &Arc<Self>, surface_id: &[u8]) -> Result<bool, EnsureError> {
@@ -4846,6 +5238,562 @@ mod tests {
         host.terminate_surface(&replacement_leader.surface_id)
             .unwrap();
         host.terminate_surface(&member.surface_id).unwrap();
+    }
+
+    /// The gap `prune` leaves open: a leader that died still holds its Project
+    /// name, because an implicit prune skips any record whose working
+    /// directory exists — and a project folder does not disappear when its
+    /// leader does. Reset is the operator saying "take the name anyway", and
+    /// it still has to refuse a Project someone is looking at.
+    #[tokio::test]
+    async fn reset_clears_a_dead_leaders_name_that_prune_keeps_forever() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces_path = tmp.path().join("peer-workspaces.json");
+        let presentations_path =
+            crate::peer::persist::project_presentations_path(&workspaces_path);
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(workspaces_path.clone());
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let foreign_owner = vec![vec![9; 16]];
+        let publish = |key: &str, project_id: &str| {
+            let leader = host.ensure_surface(key, &spec).unwrap();
+            let team = peer_proto::v1::Team {
+                name: project_id.to_string(),
+                team_uuid: format!("uuid-{project_id}"),
+                // Both records point at a directory that exists — that is
+                // exactly the shape an implicit prune refuses to touch.
+                working_directory: "/tmp".to_string(),
+                leader_surface_id: leader.surface_id.clone(),
+                project_id: project_id.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(
+                host.upsert_project_presentation(&foreign_owner, &team),
+                Ok((1, true))
+            );
+            leader
+        };
+        let watched = publish("watched-leader", "watched");
+        let abandoned = publish("abandoned-leader", "abandoned");
+        host.terminate_surface(&abandoned.surface_id).unwrap();
+        for _ in 0..50 {
+            if !host.live_surface_ids().contains(&abandoned.surface_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+
+        // Baseline: an implicit prune finds nothing, which is the bug.
+        let prune = host.prune_stale_project_presentations(&[], true).unwrap();
+        assert!(prune.removed.is_empty());
+        assert!(prune
+            .skipped
+            .iter()
+            .any(|skip| skip.project_id == "abandoned" && skip.reason == "directory_present"));
+
+        // Dry run changes nothing on disk.
+        let before = std::fs::read(&presentations_path).expect("persisted file");
+        let preview = host
+            .reset_peer_state(PeerStateResetScope::Projects, false)
+            .unwrap();
+        assert!(!preview.applied);
+        let preview_projects = preview.projects.expect("projects scope reports");
+        assert_eq!(
+            preview_projects
+                .removed
+                .iter()
+                .map(|status| status.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["abandoned"]
+        );
+        assert_eq!(std::fs::read(&presentations_path).unwrap(), before);
+
+        let report = host
+            .reset_peer_state(PeerStateResetScope::Projects, true)
+            .unwrap();
+        assert!(report.applied);
+        let projects = report.projects.expect("projects scope reports");
+        assert_eq!(
+            projects
+                .removed
+                .iter()
+                .map(|status| status.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["abandoned"]
+        );
+        // The one still being watched is refused, by liveness and nothing else.
+        assert!(projects
+            .skipped
+            .iter()
+            .any(|skip| skip.project_id == "watched" && skip.reason == "live"));
+        assert!(projects.backup_path.is_some());
+
+        let surviving: Vec<String> = host
+            .project_presentation_statuses()
+            .into_iter()
+            .map(|status| status.project_id)
+            .collect();
+        assert_eq!(surviving, vec!["watched".to_string()]);
+        // And the removal is durable, not just in memory.
+        assert!(!String::from_utf8_lossy(&std::fs::read(&presentations_path).unwrap())
+            .contains("abandoned"));
+        drop(watched);
+    }
+
+    /// Clearing names must not leave the host without a workspace to resolve
+    /// un-namespaced control to, so the default one is reported rather than
+    /// removed. Everything else goes — and takes its shells with it, which is
+    /// why the dry-run has to say how many first.
+    #[tokio::test]
+    async fn reset_removes_named_workspaces_but_never_the_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces_path = tmp.path().join("peer-workspaces.json");
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(workspaces_path.clone());
+        let default_id = host.default_id();
+        let named = host.create_workspace("Project · aic".to_string());
+        let also_named = host.create_workspace("newnew".to_string());
+
+        let preview = host
+            .reset_peer_state(PeerStateResetScope::Workspaces, false)
+            .unwrap();
+        assert!(!preview.applied);
+        assert!(preview.projects.is_none());
+        let previewed: Vec<&str> = preview
+            .workspaces_removed
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(previewed, vec!["Project · aic", "newnew"]);
+        assert!(preview
+            .workspaces_skipped
+            .iter()
+            .any(|skip| skip.reason == "default"));
+        // Nothing removed yet.
+        assert_eq!(host.list_workspaces().len(), 3);
+
+        let report = host
+            .reset_peer_state(PeerStateResetScope::Workspaces, true)
+            .unwrap();
+        assert!(report.applied);
+        assert_eq!(report.workspaces_removed.len(), 2);
+        assert!(report.workspaces_backup_path.is_some());
+
+        let remaining = host.list_workspaces();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, default_id);
+        // Durable, and the removed names are gone from the file too.
+        let persisted = String::from_utf8_lossy(&std::fs::read(&workspaces_path).unwrap()).to_string();
+        assert!(!persisted.contains("newnew"));
+        assert!(!persisted.contains("Project · aic"));
+        drop((named, also_named));
+    }
+
+    /// `all` has to finish the job in one call. A manifest whose leader lives
+    /// in a named workspace is live until that workspace goes, so pruning
+    /// manifests first skipped it as `live`, killed the leader moments later,
+    /// and handed back a report claiming success while the name it was asked
+    /// to clear was still held. Removing workspaces first means the prune
+    /// reads the surface set this same call already emptied.
+    #[tokio::test]
+    async fn all_scope_clears_a_manifest_whose_leader_dies_with_its_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspaces_path = tmp.path().join("peer-workspaces.json");
+        let manager = Arc::new(PtyManager::new());
+        let host = Arc::new(PeerHost::new(Arc::clone(&manager)));
+        host.set_persist_path(workspaces_path.clone());
+
+        // Named workspace built directly, holding the leader surface — the
+        // same manual-construction pattern as
+        // `remove_workspace_tears_down_surfaces_and_broadcasts_removal`,
+        // because `ensure_surface` always lands in the default workspace.
+        let leader = sid("aic-leader");
+        let surface = PtySurface::spawn(leader.clone(), "cat".into(), "/bin/cat", &[], 80, 24, None)
+            .expect("spawn /bin/cat");
+        manager.insert_surface(surface);
+        let named_id = sid("aic-workspace");
+        {
+            let mut workspaces = host.workspaces.lock().unwrap();
+            let mut store = LayoutStore {
+                root: None,
+                next_split_id: 1,
+            };
+            store.seed_first_pane(leader.clone());
+            workspaces.insert(
+                named_id.clone(),
+                WorkspaceEntry {
+                    id: named_id.clone(),
+                    name: "Project · aic".into(),
+                    is_default: false,
+                    store,
+                },
+            );
+        }
+        host.surface_workspace
+            .lock()
+            .unwrap()
+            .insert(leader.clone(), named_id.clone());
+
+        let team = peer_proto::v1::Team {
+            name: "aic".to_string(),
+            team_uuid: "uuid-aic".to_string(),
+            // The directory exists, so an ordinary prune would never take it.
+            working_directory: "/tmp".to_string(),
+            leader_surface_id: leader.clone(),
+            project_id: "aic".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            host.upsert_project_presentation(&[vec![9; 16]], &team),
+            Ok((1, true))
+        );
+
+        // The dry-run has to name the shells the apply will kill, or the
+        // surface count is a field nothing ever exercises.
+        let preview = host
+            .reset_peer_state(PeerStateResetScope::All, false)
+            .unwrap();
+        let previewed = preview
+            .workspaces_removed
+            .iter()
+            .find(|entry| entry.name == "Project · aic")
+            .expect("named workspace previewed");
+        assert_eq!(previewed.surfaces, 1, "dry-run must warn about the shell");
+        // Before the workspace goes, the manifest is genuinely live.
+        assert!(preview
+            .projects
+            .expect("projects scope reports")
+            .skipped
+            .iter()
+            .any(|skip| skip.project_id == "aic" && skip.reason == "live"));
+
+        let report = host.reset_peer_state(PeerStateResetScope::All, true).unwrap();
+        assert!(report.applied);
+        assert_eq!(report.workspaces_removed.len(), 1);
+        // One call, both halves: the workspace went and the name came free.
+        let projects = report.projects.expect("projects scope reports");
+        assert_eq!(
+            projects
+                .removed
+                .iter()
+                .map(|status| status.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aic"],
+            "the manifest must not survive the call that killed its leader"
+        );
+        assert!(host.project_presentation_statuses().is_empty());
+    }
+
+    /// `all` is the two scopes together, not a third behaviour.
+    #[test]
+    fn reset_scope_parses_exactly_the_three_documented_values() {
+        assert_eq!(
+            PeerStateResetScope::parse("projects"),
+            Some(PeerStateResetScope::Projects)
+        );
+        assert_eq!(
+            PeerStateResetScope::parse("workspaces"),
+            Some(PeerStateResetScope::Workspaces)
+        );
+        assert_eq!(PeerStateResetScope::parse("all"), Some(PeerStateResetScope::All));
+        assert_eq!(PeerStateResetScope::parse("everything"), None);
+        assert_eq!(PeerStateResetScope::parse(""), None);
+    }
+
+    /// A removed manifest holds its panes' last durable reference, and a
+    /// declared surface has no death watcher on purpose — its dead pane stays
+    /// in the tree and revives on the next attach. Leaving them behind after a
+    /// prune strands panes nothing can revive or reach, so the prune retires
+    /// exactly what no remaining manifest names, as the owner delete does.
+    #[tokio::test]
+    async fn prune_retires_the_panes_its_records_were_the_last_to_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(tmp.path().join("peer-workspaces.json"));
+        let workspace_count = host.list_workspaces().len();
+        // The leader must die the way a real one does — its own process
+        // exiting — not through terminate_surface, which is the explicit
+        // destructive verb and removes the pane itself. A declared surface
+        // that merely exits keeps its dead pane, which is the state that
+        // strands it once its manifest is gone.
+        // It has to outlive its own spawn — ensure_surface refuses a command
+        // that is already gone — and then exit by itself.
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 0.3".into()],
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let foreign_owner = vec![vec![9; 16]];
+        let publish = |project_id: &str, leader: &[u8]| {
+            let team = peer_proto::v1::Team {
+                name: project_id.to_string(),
+                team_uuid: format!("uuid-{project_id}"),
+                working_directory: "/tmp".to_string(),
+                leader_surface_id: leader.to_vec(),
+                project_id: project_id.to_string(),
+                ..Default::default()
+            };
+            host.upsert_project_presentation(&foreign_owner, &team).expect("publish");
+        };
+
+        let solo = host.ensure_surface("solo", &spec).unwrap().surface_id;
+        let shared = host.ensure_surface("shared", &spec).unwrap().surface_id;
+        publish("solo", &solo);
+        publish("goner", &shared);
+        publish("keeper", &shared);
+        for _ in 0..100 {
+            let live = host.live_surface_ids();
+            if !live.contains(&solo) && !live.contains(&shared) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        // The precondition the fix is about: both panes are dead and still
+        // registered. Without this the prune would have nothing to strand and
+        // the assertions below would pass for the wrong reason.
+        let registered: Vec<Vec<u8>> =
+            host.pty.list().into_iter().map(|s| s.surface_id.clone()).collect();
+        assert!(registered.contains(&solo) && registered.contains(&shared));
+        assert!(host.live_surface_ids().is_empty());
+
+        let report = host
+            .prune_stale_project_presentations(&["solo".into(), "goner".into()], true)
+            .unwrap();
+
+        assert!(report.applied);
+        assert_eq!(
+            report.terminated_surfaces, 1,
+            "only the pane nothing else names may be retired"
+        );
+        let registered: Vec<Vec<u8>> =
+            host.pty.list().into_iter().map(|s| s.surface_id.clone()).collect();
+        assert!(!registered.contains(&solo), "an unreferenced pane must not be left behind");
+        assert!(registered.contains(&shared), "a pane another manifest names must stay");
+        assert_eq!(host.project_presentations().len(), 1);
+        assert_eq!(host.project_presentations()[0].project_id, "keeper");
+        assert_eq!(host.list_workspaces().len(), workspace_count);
+        host.terminate_surface(&shared).ok();
+    }
+
+    /// The implicit removal must not take a pane that came back to life.
+    ///
+    /// The callers decide to retire a surface because no manifest names it,
+    /// and between that decision and this call there is a manifest write and
+    /// a file save. A peer attach reaching `get_or_respawn` in that window
+    /// revives the surface, and the lifecycle lock the callers hold does not
+    /// exclude it — that path takes the PtyManager's own reservation, an
+    /// unrelated mutex. Only a re-check under the reservation can refuse.
+    #[tokio::test]
+    async fn an_implicit_retirement_refuses_a_surface_that_came_back_to_life() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(tmp.path().join("peer-workspaces.json"));
+        // A declared surface, not an ensured one. Only a declared surface
+        // keeps a respawn spec, so only it can be revived by an attach — an
+        // ensured surface has no spec and `get_or_respawn` answers None for
+        // it. That is the real reach of this race, and a manifest may name
+        // either kind.
+        let surface = super::super::surface::surface_id_from_name("revived").to_vec();
+        host.pty.register_and_spawn(
+            surface.clone(),
+            super::super::surface::SpawnSpec {
+                title: "revived".into(),
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 0.3".into()],
+                cols: 80,
+                rows: 24,
+                cwd: Some("/tmp".into()),
+                kind: super::super::surface::SurfaceKind::Pty,
+                agent_cli: String::new(),
+            },
+        );
+        for _ in 0..100 {
+            if !host.live_surface_ids().contains(&surface) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert!(!host.live_surface_ids().contains(&surface), "the leader must have exited");
+        assert!(
+            host.pty.list().iter().any(|s| s.surface_id == surface),
+            "a declared surface keeps its dead pane"
+        );
+
+        // The window: an attach revives the dead pane after the caller judged
+        // it dead and before the retirement lands.
+        assert!(host.pty.get_or_respawn(&surface).is_some(), "attach revives it");
+        assert!(host.live_surface_ids().contains(&surface));
+
+        let retired = host.retire_surface_locked(&surface).expect("retire");
+
+        assert!(!retired, "a revived pane must survive an implicit retirement");
+        assert!(
+            host.pty.list().iter().any(|s| s.surface_id == surface),
+            "the pane must still be registered"
+        );
+        assert!(host.live_surface_ids().contains(&surface));
+
+        // Explicit termination is a different verb and stays unconditional.
+        assert!(host.terminate_surface(&surface).expect("terminate"));
+        assert!(!host.pty.list().iter().any(|s| s.surface_id == surface));
+    }
+
+    /// The same guard at the layer that owns it: a caller cannot get this
+    /// right from outside, because the respawn it races takes only this lock.
+    #[tokio::test]
+    async fn terminate_if_dead_refuses_a_live_surface_and_takes_a_dead_one() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 0.3".into()],
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let surface_id = host.ensure_surface("live-one", &spec).expect("surface").surface_id;
+
+        assert!(host.live_surface_ids().contains(&surface_id));
+        assert!(
+            !host.pty.terminate_if_dead(&surface_id).expect("refuse"),
+            "a live surface must not be retired"
+        );
+        assert!(host.pty.list().iter().any(|s| s.surface_id == surface_id));
+
+        for _ in 0..100 {
+            if !host.live_surface_ids().contains(&surface_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert!(
+            host.pty.terminate_if_dead(&surface_id).expect("retire"),
+            "a dead surface is what this is for"
+        );
+        assert!(!host.pty.list().iter().any(|s| s.surface_id == surface_id));
+    }
+
+    /// The counter must never hand a project id a number it has already used.
+    ///
+    /// Reclaiming an entry when its record is deleted looks like tidy
+    /// housekeeping and would restart the count at zero, which is exactly the
+    /// state a republished manifest was indistinguishable in before this
+    /// existed. This holds that door shut.
+    #[tokio::test]
+    async fn a_project_id_never_reuses_an_instance_it_has_already_held() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(tmp.path().join("peer-workspaces.json"));
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let owner = vec![vec![9; 16]];
+        let publish = |key: &str| {
+            let leader = host.ensure_surface(key, &spec).expect("surface").surface_id;
+            host.upsert_project_presentation(
+                &owner,
+                &peer_proto::v1::Team {
+                    name: "x".into(),
+                    team_uuid: "uuid-x".into(),
+                    working_directory: "/tmp".into(),
+                    leader_surface_id: leader.clone(),
+                    project_id: "x".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("publish");
+            leader
+        };
+
+        let first = publish("one");
+        let first_instance = host.project_presentation_status("x").expect("status").instance;
+        host.delete_project_presentation(&owner, "x").expect("delete");
+        let second = publish("two");
+        let second_instance = host.project_presentation_status("x").expect("status").instance;
+
+        assert_eq!(
+            host.project_presentation_status("x").expect("status").revision,
+            1,
+            "the premise: the revision restarts, which is why the count exists"
+        );
+        assert!(
+            second_instance > first_instance,
+            "a republished manifest reused instance {first_instance}"
+        );
+        host.terminate_surface(&first).ok();
+        host.terminate_surface(&second).ok();
+    }
+
+    /// The repair path's expectation is checked where the record leaves the
+    /// map, not only by its caller: a manifest replaced between the two is
+    /// refused rather than removed unseen.
+    #[tokio::test]
+    async fn an_expecting_prune_refuses_an_instance_it_was_not_promised() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        host.set_persist_path(tmp.path().join("peer-workspaces.json"));
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let owner = vec![vec![9; 16]];
+        let leader = host.ensure_surface("x", &spec).unwrap().surface_id;
+        host.upsert_project_presentation(
+            &owner,
+            &peer_proto::v1::Team {
+                name: "x".into(),
+                team_uuid: "uuid-x".into(),
+                working_directory: "/tmp".into(),
+                leader_surface_id: leader.clone(),
+                project_id: "x".into(),
+                ..Default::default()
+            },
+        )
+        .expect("publish");
+        host.terminate_surface(&leader).unwrap();
+        for _ in 0..50 {
+            if !host.live_surface_ids().contains(&leader) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let instance = host.project_presentation_status("x").expect("status").instance;
+
+        let stale = host
+            .prune_stale_project_presentations_expecting(
+                &["x".into()],
+                true,
+                Some(("x", instance + 1)),
+            )
+            .unwrap();
+        assert!(!stale.applied);
+        assert!(stale.skipped.iter().any(|s| s.reason == "record_changed"));
+        assert_eq!(host.project_presentations().len(), 1);
+
+        let matching = host
+            .prune_stale_project_presentations_expecting(&["x".into()], true, Some(("x", instance)))
+            .unwrap();
+        assert!(matching.applied);
+        assert!(host.project_presentations().is_empty());
     }
 
     /// Operator prune for issue #389: records another installation owns

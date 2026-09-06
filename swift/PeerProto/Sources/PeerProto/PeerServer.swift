@@ -1629,6 +1629,7 @@ actor PeerServerSession {
             // advertise the durable publication endpoint.
             advertisedCapabilities.removeAll {
                 $0 == PeerCapability.projectPresentationV1
+                    || $0 == PeerCapability.projectPresentationRepairV1
                     || $0 == PeerCapability.teamRouteFileV1
             }
             try await sendEnvelope { env in

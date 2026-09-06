@@ -50,6 +50,11 @@ tower-http = { version = "0.6", features = ["fs", "cors"] }
 # SQLite for agent session persistence (F-06)
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# Argument parsing. term-meshd takes no subcommands; this exists so an
+# unrecognized argument is refused instead of silently starting a second
+# daemon that shares this machine's peer state files.
+clap = { version = "4", features = ["derive"] }
+
 # Error handling
 anyhow = "1"
 

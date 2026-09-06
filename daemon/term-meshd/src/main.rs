@@ -108,14 +108,65 @@ async fn wait_for_owner_exit(owner_pid: Option<u32>) {
     }
 }
 
+/// Running term-meshd *is* starting the daemon, so there are no subcommands
+/// and no flags beyond the two clap generates. The parser exists for what it
+/// refuses: `args.iter().any(...)` used to ignore everything it did not
+/// recognize, so `term-meshd doctor` — or any typo — started a second daemon
+/// that shares this machine's peer state files with the first.
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "term-meshd",
+    about = "term-mesh background daemon",
+    disable_version_flag = false,
+    version
+)]
+struct Cli {}
+
+/// `EX_USAGE` from sysexits.h. Deliberately not clap's default of 2: that is
+/// already `shutdown::FORCED_EXIT_CODE`, so reusing it would make "your
+/// arguments were wrong" indistinguishable from "teardown blew its budget and
+/// the watchdog killed us".
+const EXIT_USAGE: i32 = 64;
+
+/// What a parse failure should exit with. `--help` and `--version` reach us
+/// as errors too, and those are successful runs.
+fn usage_exit_code(kind: clap::error::ErrorKind) -> i32 {
+    use clap::error::ErrorKind;
+
+    match kind {
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        | ErrorKind::DisplayVersion => 0,
+        _ => EXIT_USAGE,
+    }
+}
+
+/// Parse argv, or exit. Returns only when the daemon should start.
+fn parse_args_or_exit() {
+    use clap::error::ErrorKind;
+    use clap::Parser;
+
+    let Err(error) = Cli::try_parse() else { return };
+    let code = usage_exit_code(error.kind());
+    if error.kind() == ErrorKind::DisplayVersion {
+        // Printed here rather than left to clap: the app's host probe matches
+        // `^term-meshd \S+$` exactly to tell a Linux daemon from a Mac app
+        // bundle (`PeerHostDoctor.parseHostVersionLine`), and that contract
+        // must not move when clap changes its rendering.
+        println!("term-meshd {}", env!("CARGO_PKG_VERSION"));
+    } else if code == 0 {
+        print!("{error}");
+    } else {
+        eprint!("{error}");
+    }
+    std::process::exit(code);
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Handle --version before any subsystem init
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("term-meshd {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
+    // Before any subsystem init: a rejected argument must not have started a
+    // logger, a socket, or a second peer server.
+    parse_args_or_exit();
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("term_meshd=debug".parse()?))
@@ -582,7 +633,19 @@ async fn main() -> anyhow::Result<()> {
         }
         }
     };
+    // Before the wedge, not after: the hard-exit thread starts its budget from
+    // either the raw signal or this mark, and only a signal sets the first.
+    // Shutting down because the GUI owner exited or a required socket closed
+    // sets no signal, so a wedge placed ahead of this had no deadline at all
+    // on those paths and simply slept.
     shutdown::begin();
+    // Injected before the receipt below on purpose: the 2026-08-27 hang logged
+    // no SIGTERM receipt at all, so the wedge has to sit where nothing else on
+    // this path has run yet. Only the hard-exit thread can end the process
+    // from here, which is the property under test.
+    if shutdown::stall() == Some(shutdown::Stall::Teardown) {
+        shutdown::wedge_teardown(SHUTDOWN_BUDGET);
+    }
     tracing::info!("received {shutdown_reason}, initiating graceful shutdown...");
 
     // 7. Shutdown sequence
@@ -677,6 +740,32 @@ async fn sigterm() {
 }
 
 #[cfg(test)]
+mod shutdown_budget_tests {
+    use super::SERVER_JOIN_LIMIT;
+    use crate::supervisor::CONNECTION_DRAIN_LIMIT;
+
+    /// The drain must finish with budget left for the work that follows it.
+    ///
+    /// These were both 5s. A drain that ran long therefore ended at the exact
+    /// moment the step bounding it did, and the peer server's surface reaping
+    /// and socket removal never ran — measured on a production daemon, three
+    /// surfaces left unreaped. Equal budgets are the bug; keep the gap.
+    #[test]
+    fn a_connection_drain_leaves_room_for_what_follows_it() {
+        assert!(
+            CONNECTION_DRAIN_LIMIT < SERVER_JOIN_LIMIT,
+            "drain {CONNECTION_DRAIN_LIMIT:?} must be under the step's {SERVER_JOIN_LIMIT:?}"
+        );
+        // Not merely smaller: the reaping after it signals every surface, waits
+        // 100ms, then escalates. A sliver of margin would starve that.
+        assert!(
+            SERVER_JOIN_LIMIT - CONNECTION_DRAIN_LIMIT >= SERVER_JOIN_LIMIT / 3,
+            "the margin after the drain is too thin to reap surfaces in"
+        );
+    }
+}
+
+#[cfg(test)]
 mod owner_tests {
     use super::*;
 
@@ -715,5 +804,67 @@ mod owner_tests {
         assert!(!preserve_shared_processes_after_required_server_exit(
             true, false, false
         ));
+    }
+
+    /// The parser's whole job is refusing what the old `args.iter().any(...)`
+    /// swallowed. An unrecognized argument must not reach daemon startup.
+    #[test]
+    fn unknown_arguments_are_refused_rather_than_starting_a_daemon() {
+        use clap::Parser;
+
+        for argv in [
+            vec!["term-meshd", "doctor"],
+            vec!["term-meshd", "reset", "--apply"],
+            vec!["term-meshd", "--nope"],
+            vec!["term-meshd", "-x"],
+        ] {
+            let error = Cli::try_parse_from(&argv).expect_err(&format!("{argv:?} must not parse"));
+            assert_eq!(
+                usage_exit_code(error.kind()),
+                EXIT_USAGE,
+                "{argv:?} should exit {EXIT_USAGE}"
+            );
+        }
+    }
+
+    /// systemd's ExecStart runs the binary with no arguments at all.
+    #[test]
+    fn no_arguments_still_means_start_the_daemon() {
+        use clap::Parser;
+
+        assert!(Cli::try_parse_from(["term-meshd"]).is_ok());
+    }
+
+    /// clap reports these as errors; they are successful runs.
+    #[test]
+    fn help_and_version_exit_zero() {
+        use clap::error::ErrorKind;
+        use clap::Parser;
+
+        for (argv, expected) in [
+            (vec!["term-meshd", "--help"], ErrorKind::DisplayHelp),
+            (vec!["term-meshd", "-h"], ErrorKind::DisplayHelp),
+            (vec!["term-meshd", "--version"], ErrorKind::DisplayVersion),
+            (vec!["term-meshd", "-V"], ErrorKind::DisplayVersion),
+        ] {
+            let error = Cli::try_parse_from(&argv).expect_err(&format!("{argv:?}"));
+            assert_eq!(error.kind(), expected, "{argv:?}");
+            assert_eq!(usage_exit_code(error.kind()), 0, "{argv:?}");
+        }
+    }
+
+    /// A usage error and a teardown that blew its budget must stay
+    /// distinguishable — which is why this is 64 and not clap's default of 2.
+    #[test]
+    fn usage_exit_code_does_not_collide_with_the_shutdown_watchdog() {
+        assert_ne!(EXIT_USAGE, shutdown::FORCED_EXIT_CODE);
+        assert_ne!(EXIT_USAGE, 0);
+    }
+
+    #[test]
+    fn cli_definition_is_well_formed() {
+        use clap::CommandFactory;
+
+        Cli::command().debug_assert();
     }
 }

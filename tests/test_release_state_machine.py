@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import importlib.util
 import json
 import subprocess
@@ -101,8 +102,69 @@ class ReleaseStateMachineTests(unittest.TestCase):
     def test_homebrew_cask_parses_version_and_sha(self):
         import base64
         body = 'cask "term-mesh" do\n  version "1.2.3"\n  sha256 "' + ('a' * 64) + '"\nend\n'
-        with unittest.mock.patch.object(release, "run", return_value=base64.b64encode(body.encode()).decode()):
+        encoded = base64.b64encode(body.encode()).decode()
+        with unittest.mock.patch.object(
+            release, "gh_text_optional", return_value=(encoded, None)
+        ):
             self.assertEqual(release.homebrew_cask(), ("1.2.3", "a" * 64))
+
+    def test_an_unreadable_cask_is_reported_rather_than_read_as_absent(self):
+        """observe() records why every other fact could not be read; the cask
+        used to answer None for "no cask" and for "nobody could read it"."""
+        with unittest.mock.patch.object(
+            release, "gh_text_optional", return_value=(None, "HTTP 401: Bad credentials")
+        ):
+            reading, error = release.homebrew_cask_reading()
+        self.assertIsNone(reading)
+        self.assertIn("Bad credentials", error)
+
+    def test_absence_is_believed_only_when_the_repository_still_reads(self):
+        """The message alone cannot decide this.
+
+        Measured against the live `gh`: a missing release prints exactly
+        `release not found`, and a repository the token cannot see prints the
+        same, because GitHub answers 404 for both. Matching on the text was the
+        bug; the repository has to be asked.
+        """
+        with unittest.mock.patch.object(release, "repo_is_readable", return_value=True) as probe:
+            self.assertIsNone(release.gh_failure_reason("release not found", release.REPO))
+            self.assertIsNone(release.gh_failure_reason("gh: Not Found (HTTP 404)", release.REPO))
+        self.assertEqual(probe.call_count, 2)
+
+        # Same message, but the repository does not read: access, not absence.
+        with unittest.mock.patch.object(release, "repo_is_readable", return_value=False):
+            reason = release.gh_failure_reason("release not found", release.REPO)
+        self.assertIsNotNone(reason)
+        self.assertIn("access, not absence", reason)
+
+        # A failure that never claimed absence needs no probe at all.
+        with unittest.mock.patch.object(release, "repo_is_readable") as probe:
+            self.assertEqual(
+                release.gh_failure_reason("HTTP 403: rate limit exceeded", release.REPO),
+                "HTTP 403: rate limit exceeded",
+            )
+        probe.assert_not_called()
+
+    def test_a_failure_with_no_output_is_still_a_failure(self):
+        """An empty message is falsy, so returning it would put the caller
+        back where `if error:` reads a failed call as absence."""
+        self.assertEqual(release.gh_failure_reason("", release.REPO), "gh failed without output")
+
+    def test_emit_survives_a_receipt_written_before_mismatches_carried_a_stage(self):
+        import contextlib, io
+        state = {
+            "schema": 1, "version": "0.226.4", "candidate_develop_sha": "a" * 40,
+            "candidate_main_sha": "a" * 40, "latest_tag": "v0.226.3",
+            "steps": {name: {"status": "completed"} for name in release.STEP_ORDER},
+            "observation": {"mismatched": ["a plain string from an older receipt"]},
+        }
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            release.emit(state, command="status")
+        self.assertEqual(
+            json.loads(buffer.getvalue())["mismatched"],
+            ["a plain string from an older receipt"],
+        )
 
     def test_state_dir_can_be_isolated(self):
         with tempfile.TemporaryDirectory() as directory, unittest.mock.patch.dict(
@@ -152,6 +214,248 @@ class ReleaseStateMachineTests(unittest.TestCase):
             source,
         )
 
+
+    # --- resuming a release the remote has already moved past (#454) ---
+
+    LINUX_ASSETS = [
+        "term-meshd-linux-aarch64.tar.gz",
+        "term-meshd-linux-aarch64.tar.gz.sha256",
+        "term-meshd-linux-x86_64.tar.gz",
+        "term-meshd-linux-x86_64.tar.gz.sha256",
+    ]
+
+    @staticmethod
+    def _interrupted_receipt(state_dir, version, *, merge_sha, running="release_build", **overrides):
+        """A receipt that stopped mid-publish, as v0.226.4's did."""
+        steps = {name: {"status": "pending"} for name in release.STEP_ORDER}
+        for name in ("develop_to_main", "release_metadata", "release_pr", "release_merge"):
+            steps[name] = {"status": "completed"}
+        steps["release_pr"] = {"status": "completed", "pr": 452}
+        steps["release_merge"] = {"status": "completed", "merge_sha": merge_sha}
+        if running:
+            steps[running] = {"status": "running", "started_at": "2026-09-03T07:00:00Z"}
+        steps.update(overrides)
+        (Path(state_dir) / f"v{version}.json").write_text(json.dumps({
+            "schema": 1, "version": version, "candidate_develop_sha": merge_sha,
+            "candidate_main_sha": merge_sha, "latest_tag": "v0.226.3", "steps": steps,
+        }))
+
+    @staticmethod
+    def _facts(version, **overrides):
+        facts = {
+            "tag": f"v{version}", "tag_commit": None, "release": None,
+            "homebrew": None, "mismatched": [], "unreadable": {},
+        }
+        facts.update(overrides)
+        return facts
+
+    def test_resume_adopts_a_tag_and_release_published_out_of_band(self):
+        """v0.226.4: the tag and the Linux assets were public, the receipt was not.
+
+        Resuming from the receipt alone would re-tag a tag that already exists and
+        would read `release_build: running` as work still in flight.
+        """
+        merge_sha = "87a6656ba8e629452a1ca78d2335500a7fdf494f"
+        with tempfile.TemporaryDirectory() as state, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}
+        ):
+            self._interrupted_receipt(state, "0.226.4", merge_sha=merge_sha)
+            loaded = release.load_state("0.226.4")
+            facts = self._facts("0.226.4", tag_commit=merge_sha, release={
+                "url": "https://github.com/x-mesh/term-mesh/releases/tag/v0.226.4",
+                "isDraft": False, "isPrerelease": False,
+                "assets": [{"name": name} for name in self.LINUX_ASSETS],
+            })
+            release.reconcile(loaded, facts)
+            reloaded = release.load_state("0.226.4")
+
+        self.assertTrue(release.completed(reloaded, "tag"))
+        self.assertIn("origin already holds v0.226.4", reloaded["steps"]["tag"]["reconciled_from"])
+        self.assertEqual(reloaded["steps"]["tag"]["commit"], merge_sha)
+        # The macOS artifacts were never built, so their stages stay outstanding.
+        self.assertEqual(reloaded["steps"]["release_build"]["status"], "interrupted")
+        self.assertFalse(release.completed(reloaded, "dmg"))
+        self.assertFalse(release.completed(reloaded, "github_release"))
+        self.assertFalse(release.completed(reloaded, "homebrew"))
+        self.assertEqual(reloaded["observation"]["release_assets"], sorted(self.LINUX_ASSETS))
+        self.assertEqual(facts["mismatched"], [])
+
+    def test_reconcile_refuses_a_tag_that_points_at_another_commit(self):
+        with tempfile.TemporaryDirectory() as state, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}
+        ):
+            self._interrupted_receipt(state, "0.226.4", merge_sha="a" * 40)
+            loaded = release.load_state("0.226.4")
+            facts = self._facts("0.226.4", tag_commit="b" * 40)
+            release.reconcile(loaded, facts)
+            reloaded = release.load_state("0.226.4")
+
+        self.assertFalse(release.completed(reloaded, "tag"))
+        self.assertEqual(len(facts["mismatched"]), 1)
+        self.assertEqual(facts["mismatched"][0]["step"], "tag")
+        self.assertIn("not the release commit", facts["mismatched"][0]["detail"])
+        self.assertEqual(reloaded["observation"]["mismatched"], facts["mismatched"])
+
+    def test_reconcile_adopts_a_published_dmg_only_with_a_local_checksum(self):
+        """Homebrew publishes the DMG's checksum, so an unrecorded asset is not proof.
+
+        Leaving the stage outstanding makes it rebuild from the pinned release
+        commit and replace that asset, which is what keeps the cask honest.
+        """
+        merge_sha = "c" * 40
+        assets = self.LINUX_ASSETS + ["term-mesh-macos-0.226.4.dmg"]
+        published = {
+            "url": "https://github.com/x-mesh/term-mesh/releases/tag/v0.226.4",
+            "isDraft": False, "isPrerelease": False,
+            "assets": [{"name": name} for name in assets],
+        }
+        with tempfile.TemporaryDirectory() as state, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}
+        ):
+            self._interrupted_receipt(state, "0.226.4", merge_sha=merge_sha, running=None)
+            without_receipt = release.load_state("0.226.4")
+            facts = self._facts("0.226.4", tag_commit=merge_sha, release=published)
+            release.reconcile(without_receipt, facts)
+            self.assertFalse(release.completed(release.load_state("0.226.4"), "github_release"))
+            self.assertEqual(len(facts["mismatched"]), 1)
+            self.assertEqual(facts["mismatched"][0]["step"], "github_release")
+            self.assertIn("no local dmg receipt", facts["mismatched"][0]["detail"])
+
+            self._interrupted_receipt(
+                state, "0.226.4", merge_sha=merge_sha, running=None,
+                dmg={"status": "completed", "path": "/tmp/x.dmg", "sha256": "d" * 64},
+            )
+            with_receipt = release.load_state("0.226.4")
+            release.reconcile(with_receipt, self._facts(
+                "0.226.4", tag_commit=merge_sha, release=published))
+            reloaded = release.load_state("0.226.4")
+
+        self.assertTrue(release.completed(reloaded, "github_release"))
+        self.assertEqual(reloaded["steps"]["github_release"]["assets"], sorted(assets))
+
+    def test_reconcile_adopts_the_cask_only_for_the_published_checksum(self):
+        merge_sha = "e" * 40
+        with tempfile.TemporaryDirectory() as state, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}
+        ):
+            dmg = {"status": "completed", "path": "/tmp/x.dmg", "sha256": "f" * 64}
+            self._interrupted_receipt(state, "0.226.4", merge_sha=merge_sha, running=None, dmg=dmg)
+            stale = release.load_state("0.226.4")
+            release.reconcile(stale, self._facts("0.226.4", homebrew=("0.226.3", "f" * 64)))
+            self.assertFalse(release.completed(release.load_state("0.226.4"), "homebrew"))
+
+            self._interrupted_receipt(state, "0.226.4", merge_sha=merge_sha, running=None, dmg=dmg)
+            current = release.load_state("0.226.4")
+            release.reconcile(current, self._facts("0.226.4", homebrew=("0.226.4", "f" * 64)))
+            reloaded = release.load_state("0.226.4")
+
+        self.assertTrue(release.completed(reloaded, "homebrew"))
+        self.assertEqual(reloaded["steps"]["homebrew"]["sha256"], "f" * 64)
+
+    def test_an_unread_remote_fact_neither_adopts_nor_fails(self):
+        """A release must stay inspectable when `gh` cannot answer."""
+        with tempfile.TemporaryDirectory() as state, unittest.mock.patch.dict(
+            "os.environ", {"TERMMESH_RELEASE_STATE_DIR": state}
+        ):
+            self._interrupted_receipt(state, "0.226.4", merge_sha="a" * 40, running=None)
+            loaded = release.load_state("0.226.4")
+            facts = self._facts("0.226.4")
+            facts["unreadable"]["release"] = "gh: could not connect"
+            release.reconcile(loaded, facts)
+            reloaded = release.load_state("0.226.4")
+
+        self.assertFalse(release.completed(reloaded, "tag"))
+        self.assertFalse(release.completed(reloaded, "github_release"))
+        self.assertEqual(reloaded["observation"]["unreadable"], {"release": "gh: could not connect"})
+
+    def test_gh_json_optional_separates_an_absent_release_from_an_unreachable_gh(self):
+        absent = subprocess.CompletedProcess(
+            args=("gh",), returncode=1, stdout="", stderr="release not found",
+        )
+        broken = subprocess.CompletedProcess(
+            args=("gh",), returncode=1, stdout="", stderr="could not connect to api.github.com",
+        )
+        with unittest.mock.patch.object(release.subprocess, "run", return_value=absent), \
+                unittest.mock.patch.object(release, "repo_is_readable", return_value=True):
+            self.assertEqual(release.gh_json_optional("release", "view", "v9.9.9"), (None, None))
+        with unittest.mock.patch.object(release.subprocess, "run", return_value=broken):
+            value, error = release.gh_json_optional("release", "view", "v9.9.9")
+        self.assertIsNone(value)
+        self.assertIn("could not connect", error)
+
+    def test_an_unreadable_asset_list_is_raised_not_read_as_empty(self):
+        """An unreadable asset list must stop the publish, not read as "no assets".
+
+        Before the upload that would wave a real loss through; after it every
+        asset reads as dropped and a release that succeeded fails on a loss
+        that never happened.
+        """
+        with unittest.mock.patch.object(
+            release, "gh_json_optional", return_value=(None, "could not connect to api.github.com")
+        ):
+            with self.assertRaisesRegex(release.ReleaseError, "could not read the assets"):
+                release.release_assets("v0.226.4")
+
+        # A tag with no release is absence, not failure, and still answers.
+        with unittest.mock.patch.object(release, "gh_json_optional", return_value=(None, None)):
+            self.assertEqual(release.release_assets("v9.9.9"), [])
+
+    def test_a_mismatch_stops_being_reported_once_its_stage_completes(self):
+        """The observation is taken once, at load. A stage that has completed
+        since has resolved whatever its mismatch was, and printing it beside
+        "state": "complete" reads as an unresolved problem."""
+        import contextlib, io
+        state = {
+            "schema": 1, "version": "0.226.4", "candidate_develop_sha": "a" * 40,
+            "candidate_main_sha": "a" * 40, "latest_tag": "v0.226.3",
+            "steps": {name: {"status": "completed"} for name in release.STEP_ORDER},
+            "observation": {"mismatched": [
+                {"step": "tag", "detail": "origin v0.226.4 points elsewhere"},
+                {"step": "github_release", "detail": "a DMG with no local receipt"},
+            ]},
+        }
+        state["steps"]["github_release"] = {"status": "pending"}
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            release.emit(state, command="status")
+        reported = json.loads(buffer.getvalue())
+
+        self.assertEqual(reported["mismatched"], ["a DMG with no local receipt"])
+
+    def test_publish_reuses_the_receipt_resume_already_reconciled(self):
+        """Each reconcile is four remote reads and a write. Running them again
+        would only re-derive what the caller is holding."""
+        # Seeded the way load_state and plan both leave it; publish refuses at
+        # the first unprepared stage, which is all this needs to observe.
+        state = {
+            "version": "0.226.4",
+            "steps": {name: {"status": "pending"} for name in release.STEP_ORDER},
+        }
+        with unittest.mock.patch.object(release, "load_reconciled") as loader:
+            with self.assertRaises(release.ReleaseError):
+                release.publish(
+                    argparse.Namespace(version="0.226.4", yes=True, keep_worktrees=False),
+                    state,
+                )
+        loader.assert_not_called()
+
+    def test_publishing_the_dmg_keeps_the_linux_assets(self):
+        dmg = "term-mesh-macos-0.226.4.dmg"
+        before = list(self.LINUX_ASSETS)
+        with unittest.mock.patch.object(release, "run", return_value=""), \
+                unittest.mock.patch.object(
+                    release, "release_assets", side_effect=[before, before + [dmg]]):
+            published, retained = release.upload_release_dmg(
+                "0.226.4", "v0.226.4", dmg, ROOT)
+        self.assertEqual(published, sorted(before + [dmg]))
+        self.assertEqual(retained, sorted(before))
+
+        with unittest.mock.patch.object(release, "run", return_value=""), \
+                unittest.mock.patch.object(
+                    release, "release_assets", side_effect=[before, [dmg]]):
+            with self.assertRaisesRegex(release.ReleaseError, "dropped existing release assets"):
+                release.upload_release_dmg("0.226.4", "v0.226.4", dmg, ROOT)
 
     def test_cleanup_runs_after_verify(self):
         self.assertEqual(release.STEP_ORDER[-1], "cleanup")

@@ -593,6 +593,39 @@ public actor PeerSession {
         return response
     }
 
+    /// Remove a durable manifest this installation does not own, once the
+    /// host has seen it stale twice.
+    ///
+    /// `apply: false` observes and returns the evidence; the host remembers
+    /// that look. `apply: true` removes, and the host refuses it until its own
+    /// earlier observation has aged past `min_recheck_secs` at an unchanged
+    /// revision. The waiting is deliberately the host's to enforce: evidence a
+    /// client carried would not be evidence.
+    public func repairStaleProjectPresentation(
+        projectID: String,
+        apply: Bool,
+        timeoutSeconds: TimeInterval = 10
+    ) async throws -> Termmesh_Peer_V1_RepairStaleProjectPresentationResponse {
+        try requireHostCapability(PeerCapability.projectPresentationRepairV1)
+        try beginDirectResponseRPC()
+        defer { directResponseRPCInFlight = false }
+        var request = Termmesh_Peer_V1_RepairStaleProjectPresentationRequest()
+        request.requestID = Self.makeEnsureRequestID()
+        request.projectID = projectID
+        request.apply = apply
+        try await sendEnvelope { env in
+            env.repairStaleProjectPresentationRequest = request
+        }
+        let reply = try await readFrame(
+            timeoutSeconds: timeoutSeconds,
+            operation: "repairStaleProjectPresentation"
+        )
+        guard case .repairStaleProjectPresentationResponse(let response) = reply.payload else {
+            throw PeerSessionError.unexpectedMessage(String(describing: reply.payload))
+        }
+        return response
+    }
+
     /// Run one allow-listed `team.*` method on the host and get its JSON
     /// result. Same single-reader contract as `listTeams()`.
     ///

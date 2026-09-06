@@ -2237,6 +2237,116 @@ final class RemoteHostStore: ObservableObject {
         refreshTeamRoster(forHostKey: hostKey)
     }
 
+    /// Longest recheck interval this app will sit through before it tells the
+    /// user to do the removal on the host. The host names the interval; this
+    /// only bounds how long a window the app will hold a connection open for.
+    static let maximumRepairRecheckSeconds: UInt32 = 120
+
+    /// Reclaim a name held by a Project record another installation published.
+    ///
+    /// The owner-authorized delete answers `notOwner` by design, so a record
+    /// left by an installation that is gone — a rotated peer identity, a
+    /// reinstalled app — holds its name for good, and the only escape New
+    /// Project offered was a different name.
+    ///
+    /// Two calls, because one look at a missing surface is not evidence that a
+    /// Project is dead: the first observes and the host remembers it, the
+    /// second removes and is refused until the host's own observation has aged
+    /// past the interval it names. The wait belongs to the host — evidence this
+    /// app carried would not be evidence — so this sleeps for what it is told
+    /// rather than for a constant of its own.
+    func repairStaleProjectRecord(hostKey: String, projectID: String) async throws {
+        guard let host = hosts[hostKey], host.isConnected, let spec = host.teamHostSpec else {
+            throw StaleProjectRecordRepairError.hostUnavailable
+        }
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await PeerPaneHostRegistry.shared.acquire(spec)
+        } catch {
+            throw StaleProjectRecordRepairError.hostUnavailable
+        }
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+        let connection: PeerRelayConnection
+        do {
+            connection = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+        } catch {
+            throw StaleProjectRecordRepairError.hostUnavailable
+        }
+        defer { Task { await connection.cancel() } }
+        guard connection.hostCapabilities.has(PeerCapability.projectPresentationRepairV1) else {
+            throw StaleProjectRecordRepairError.unsupported
+        }
+
+        let observed = try await repairStep(connection, projectID: projectID, apply: false)
+        // The recheck must span both looks, so wait on the same connection the
+        // host recorded the first one against.
+        //
+        // The wait is cancellable and the step after it is destructive, so the
+        // cancellation has to be honoured rather than swallowed: `try?` here
+        // woke the moment the task was cancelled and then removed the record
+        // anyway, which is the opposite of what cancelling asked for.
+        // Waiting less than the host asked for only earns a refusal from it,
+        // with nothing to say why, so a request beyond what this app serves is
+        // reported instead of quietly shortened.
+        guard observed.minRecheckSecs <= Self.maximumRepairRecheckSeconds else {
+            throw StaleProjectRecordRepairError.tooLongToWait(observed.minRecheckSecs)
+        }
+        let recheck = max(1, Int(observed.minRecheckSecs))
+        do {
+            try await Task.sleep(for: .seconds(recheck))
+        } catch {
+            throw StaleProjectRecordRepairError.cancelled
+        }
+        guard !Task.isCancelled else { throw StaleProjectRecordRepairError.cancelled }
+        let applied = try await repairStep(connection, projectID: projectID, apply: true)
+        guard applied.removed else {
+            throw StaleProjectRecordRepairError.rejected(
+                applied.errorMessage.isEmpty ? applied.errorCode : applied.errorMessage
+            )
+        }
+
+        RemoteWorkLog.info(
+            "Reclaimed Project name from stale record \(projectID) on \(hostKey)"
+                + (applied.backupPath.isEmpty ? "" : " (backup: \(applied.backupPath))")
+        )
+        // Drop the record locally right away so collision classification stops
+        // naming it before the asynchronous roster refresh lands.
+        hosts[hostKey]?.teams.removeAll { $0.projectID == projectID }
+        refreshTeamRoster(forHostKey: hostKey)
+    }
+
+    private func repairStep(
+        _ connection: PeerRelayConnection,
+        projectID: String,
+        apply: Bool
+    ) async throws -> Termmesh_Peer_V1_RepairStaleProjectPresentationResponse {
+        let response: Termmesh_Peer_V1_RepairStaleProjectPresentationResponse
+        do {
+            response = try await connection.session.repairStaleProjectPresentation(
+                projectID: projectID, apply: apply
+            )
+        } catch {
+            // A refusal comes back as a response with `ok == false`. Reaching
+            // here means the call never got an answer — the relay dropped
+            // during the recheck wait, most often — and reporting that as
+            // "the host refused" sends the user after the wrong thing.
+            throw StaleProjectRecordRepairError.transport(error.localizedDescription)
+        }
+        guard response.ok else {
+            switch response.errorCode {
+            case "not_found": throw StaleProjectRecordRepairError.notFound
+            case "live": throw StaleProjectRecordRepairError.live
+            case "record_changed": throw StaleProjectRecordRepairError.changed
+            case "capability_unavailable": throw StaleProjectRecordRepairError.unsupported
+            default:
+                throw StaleProjectRecordRepairError.rejected(
+                    response.errorMessage.isEmpty ? response.errorCode : response.errorMessage
+                )
+            }
+        }
+        return response
+    }
+
     /// Re-read the project roster after a manifest upsert/delete. The daemon
     /// has no team-roster push event, while the serving GUI's workspace stream
     /// cannot observe changes on the separate session owner.
@@ -2674,6 +2784,46 @@ final class RemoteHostStore: ObservableObject {
     }
 }
 
+/// Why an operator repair of a record this installation does not own did not
+/// happen. `live` and `changed` are refusals by the host, not failures: it
+/// re-checks the record itself and will not remove one that came back.
+enum StaleProjectRecordRepairError: LocalizedError {
+    case hostUnavailable
+    case unsupported
+    case notFound
+    case live
+    case changed
+    case cancelled
+    case transport(String)
+    case tooLongToWait(UInt32)
+    case rejected(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .hostUnavailable:
+            "The host is not connected."
+        case .unsupported:
+            "This host cannot reclaim a name held by another installation. Update the remote "
+                + "term-mesh daemon and restart it."
+        case .notFound:
+            "The host no longer holds that Project record."
+        case .live:
+            "That Project is running on the host. Open it instead of removing its record."
+        case .changed:
+            "The Project record changed while it was being checked. Try again."
+        case .cancelled:
+            "The name reclaim was cancelled before the host was asked to remove anything."
+        case .transport(let detail):
+            "Lost the connection to the host while reclaiming the name: \(detail)"
+        case .tooLongToWait(let seconds):
+            "The host wants \(seconds)s between its two checks, longer than this app waits. "
+                + "Remove the record on the host instead."
+        case .rejected(let detail):
+            "The host refused to remove the Project record: \(detail)"
+        }
+    }
+}
+
 enum OwnedProjectRecordRemovalError: LocalizedError {
     case hostUnavailable
     case unsupported
@@ -2687,8 +2837,8 @@ enum OwnedProjectRecordRemovalError: LocalizedError {
         case .unsupported:
             "The remote daemon does not support Project record deletion. Update and restart it."
         case .notOwner:
-            "Another installation owns this Project record. Remove it on the host with "
-                + "`tm-agent daemon project-presentations prune --project-id <id> --apply`."
+            "Another installation owns this Project record, so it cannot be deleted from here. "
+                + "Use Reclaim Name if nothing behind it is still running."
         case .rejected(let detail):
             "The host refused to delete the Project record: \(detail)"
         }
