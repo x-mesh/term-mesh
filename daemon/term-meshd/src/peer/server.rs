@@ -17,7 +17,7 @@ use super::connection;
 use super::layout::{PeerHost, DAEMON_WORKSPACE};
 use super::persist;
 use super::surface::PtyManager;
-use crate::supervisor::{shutdown_supervised, spawn_supervised};
+use crate::supervisor::{shutdown_supervised, spawn_supervised, CONNECTION_DRAIN_LIMIT};
 
 /// Default ceiling on concurrent peer-federation connections.
 ///
@@ -266,7 +266,11 @@ async fn serve_with_prepared_host(
             }
         }
     }
-    shutdown_supervised(&mut connection_tasks, "peer").await;
+    // Strictly under `SERVER_JOIN_LIMIT`, because the surface reaping below and
+    // the socket removal after it are what the remaining budget pays for. They
+    // are the part that must not be skipped: an unreaped pane shell outlives
+    // the daemon holding its PTY.
+    shutdown_supervised(&mut connection_tasks, "peer", CONNECTION_DRAIN_LIMIT).await;
 
     // Host surfaces are `$SHELL -l` children of this daemon (surface.rs:8) and
     // nothing else in the shutdown sequence reaps them: the daemon's own

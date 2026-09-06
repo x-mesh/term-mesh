@@ -740,6 +740,32 @@ async fn sigterm() {
 }
 
 #[cfg(test)]
+mod shutdown_budget_tests {
+    use super::SERVER_JOIN_LIMIT;
+    use crate::supervisor::CONNECTION_DRAIN_LIMIT;
+
+    /// The drain must finish with budget left for the work that follows it.
+    ///
+    /// These were both 5s. A drain that ran long therefore ended at the exact
+    /// moment the step bounding it did, and the peer server's surface reaping
+    /// and socket removal never ran — measured on a production daemon, three
+    /// surfaces left unreaped. Equal budgets are the bug; keep the gap.
+    #[test]
+    fn a_connection_drain_leaves_room_for_what_follows_it() {
+        assert!(
+            CONNECTION_DRAIN_LIMIT < SERVER_JOIN_LIMIT,
+            "drain {CONNECTION_DRAIN_LIMIT:?} must be under the step's {SERVER_JOIN_LIMIT:?}"
+        );
+        // Not merely smaller: the reaping after it signals every surface, waits
+        // 100ms, then escalates. A sliver of margin would starve that.
+        assert!(
+            SERVER_JOIN_LIMIT - CONNECTION_DRAIN_LIMIT >= SERVER_JOIN_LIMIT / 3,
+            "the margin after the drain is too thin to reap surfaces in"
+        );
+    }
+}
+
+#[cfg(test)]
 mod owner_tests {
     use super::*;
 
