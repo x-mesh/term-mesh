@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.231.0] - 2026-09-08
+
+### Added
+- `tm-agent daemon` gains short forms — `tm-agent d doctor`, `d pp ls`, `d pp prune <id> --apply`, `d replay <size>`, `d reset <scope> --apply` — and an interactive repair picker. `tm-agent d -i` diagnoses a host and offers each finding's repair as a numbered choice: dry run first, then `apply` on confirmation. Every long form still works.
+
+### Fixed
+- Chat no longer disappears from the mobile page for a Claude or Codex CLI started directly in a terminal pane. The daemon now resolves each pane's chat session the same way it already attributes token usage, instead of relying on a value only a CLI's own child process can see. A remote pane mirroring another host now explains why `/rc on` fails there and points to the pane-header mobile button instead.
+- New Project explains and recovers three failures in the same sheet. A Project whose leader process had merely exited now offers **Repair collaboration** instead of an Open Existing button that could only fail, and the sheet reports which step declined — host disconnected, manifest gone, leader inactive, or attach failed. An unconfirmed host roster no longer blocks `Create` for a Project that no longer exists on that host, though the conflicting record is still shown so the user can see what holds the name. `Refresh` on a collision card now re-reads the host instead of its cache.
+
 ## [0.230.0] - 2026-09-07
 
 ### Fixed
