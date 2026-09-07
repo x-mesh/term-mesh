@@ -13258,12 +13258,16 @@ fn safe_inspect_repair() -> (String, Vec<Value>) {
 }
 
 fn with_multiple_daemon_repair_withheld(mut finding: Value) -> Value {
-    let applied = finding["repair_argv"]
-        .as_array()
+    let repair_argv = finding["repair_argv"].as_array();
+    let applied = repair_argv
         .and_then(|argv| argv.last())
         .and_then(Value::as_str)
         == Some("--apply");
-    if !applied {
+    let legacy_nonempty_remedy = repair_argv.is_none_or(Vec::is_empty)
+        && finding["remedy"]
+            .as_str()
+            .is_some_and(|remedy| !remedy.is_empty());
+    if !applied && !legacy_nonempty_remedy {
         return finding;
     }
     if let Some(object) = finding.as_object_mut() {
@@ -21992,6 +21996,33 @@ mod watcher_spec_tests {
                 .unwrap()
                 .contains("applied repair is withheld"));
         }
+
+        let legacy = with_multiple_daemon_repair_withheld(json!({
+            "code": "legacy_surface_missing",
+            "severity": "error",
+            "detail": "legacy missing",
+            "remedy": "tm-agent daemon project-presentations prune --project-id team:x --apply"
+        }));
+        assert_eq!(
+            legacy["repair_argv"],
+            json!(["tm-agent", "daemon", "project-presentations", "list"])
+        );
+        assert_eq!(
+            legacy["remedy"],
+            "'tm-agent' 'daemon' 'project-presentations' 'list'"
+        );
+
+        let structured_inspect = json!({
+            "code": "surface_predates_record",
+            "severity": "warning",
+            "detail": "inspect",
+            "remedy": "'tm-agent' 'daemon' 'project-presentations' 'list'",
+            "repair_argv": ["tm-agent", "daemon", "project-presentations", "list"]
+        });
+        assert_eq!(
+            with_multiple_daemon_repair_withheld(structured_inspect.clone()),
+            structured_inspect
+        );
     }
 
     #[test]
