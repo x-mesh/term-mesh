@@ -1925,16 +1925,13 @@ enum DaemonCommand {
         apply: bool,
     },
     /// Check this host for the state that makes a Project look healthy while
-    /// being broken, and print the command that repairs each problem.
+    /// being broken, and print a safe next command for each problem.
     ///
     /// Read-only: it changes nothing, so it is always safe to run first.
     ///
     /// Checks the daemon answers for (`peer.doctor`): manifests naming a
     /// surface nothing holds, and manifests naming a surface older than
-    /// themselves — an id inherited from an earlier daemon run rather than
-    /// minted for this project, which is what a lost leader looks like from
-    /// the outside. Checked here instead: more than one term-meshd listening
-    /// on this host, where whichever one a client reaches is a coin toss.
+    /// themselves. It also reports more than one trusted term-meshd process.
     Doctor {
         /// Print the raw report instead of the human summary.
         #[arg(long)]
@@ -4707,8 +4704,14 @@ fn doctor_expected_uid() -> u32 {
     doctor_expected_uid_from(uid, sudo_uid)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DoctorPeerIdentity {
+    uid: u32,
+    pid: u32,
+}
+
 #[cfg(target_os = "linux")]
-fn unix_peer_uid(stream: &UnixStream) -> Option<u32> {
+fn doctor_peer_identity(stream: &UnixStream) -> Option<DoctorPeerIdentity> {
     use std::os::fd::AsRawFd;
     let mut credential = std::mem::MaybeUninit::<libc::ucred>::zeroed();
     let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -4721,39 +4724,51 @@ fn unix_peer_uid(stream: &UnixStream) -> Option<u32> {
             &mut length,
         )
     };
-    (result == 0 && length as usize >= std::mem::size_of::<libc::ucred>())
-        .then(|| unsafe { credential.assume_init().uid })
+    if result != 0 || (length as usize) < std::mem::size_of::<libc::ucred>() {
+        return None;
+    }
+    let credential = unsafe { credential.assume_init() };
+    Some(DoctorPeerIdentity {
+        uid: credential.uid,
+        pid: u32::try_from(credential.pid).ok()?,
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn unix_peer_uid(stream: &UnixStream) -> Option<u32> {
+fn doctor_peer_identity(stream: &UnixStream) -> Option<DoctorPeerIdentity> {
     use std::os::fd::AsRawFd;
+    const LOCAL_PEERPID: libc::c_int = 0x002;
+    const SOL_LOCAL: libc::c_int = 0;
+
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;
-    (unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0).then_some(uid)
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return None;
+    }
+    let mut pid: libc::pid_t = 0;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            SOL_LOCAL,
+            LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    } != 0
+        || (length as usize) < std::mem::size_of::<libc::pid_t>()
+    {
+        return None;
+    }
+    Some(DoctorPeerIdentity {
+        uid,
+        pid: u32::try_from(pid).ok()?,
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn unix_peer_uid(_stream: &UnixStream) -> Option<u32> {
+fn doctor_peer_identity(_stream: &UnixStream) -> Option<DoctorPeerIdentity> {
     None
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct UnixSocketIdentity {
-    device: u64,
-    inode: u64,
-}
-
-fn connected_socket_identity(stream: &UnixStream) -> Option<UnixSocketIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    let peer_path = stream.peer_addr().ok()?.as_pathname()?.to_path_buf();
-    let target = std::fs::canonicalize(peer_path).ok()?;
-    let metadata = std::fs::metadata(target).ok()?;
-    Some(UnixSocketIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
 }
 
 fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String> {
@@ -13210,6 +13225,73 @@ fn local_doctor_finding(code: &str, socket: &Path, detail: String) -> Value {
     })
 }
 
+fn safe_inspect_repair() -> (String, Vec<Value>) {
+    let argv = vec![
+        Value::String("tm-agent".into()),
+        Value::String("daemon".into()),
+        Value::String("project-presentations".into()),
+        Value::String("list".into()),
+    ];
+    (
+        "'tm-agent' 'daemon' 'project-presentations' 'list'".into(),
+        argv,
+    )
+}
+
+fn with_multiple_daemon_repair_withheld(mut finding: Value) -> Value {
+    let applied = finding["repair_argv"]
+        .as_array()
+        .and_then(|argv| argv.last())
+        .and_then(Value::as_str)
+        == Some("--apply");
+    if !applied {
+        return finding;
+    }
+    if let Some(object) = finding.as_object_mut() {
+        let detail = object
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        object.insert(
+            "detail".into(),
+            Value::String(format!(
+                "{detail}; applied repair is withheld because multiple daemons are live and the source socket must be resolved first"
+            )),
+        );
+        let (remedy, argv) = safe_inspect_repair();
+        object.insert("remedy".into(), Value::String(remedy));
+        object.insert("repair_argv".into(), Value::Array(argv));
+    }
+    finding
+}
+
+fn doctor_exit_code(outcomes: &[(PathBuf, DoctorSocketOutcome)], findings: &[Value]) -> i32 {
+    if !outcomes
+        .iter()
+        .any(|(_, outcome)| matches!(outcome, DoctorSocketOutcome::Report(_)))
+    {
+        1
+    } else if findings.is_empty() {
+        0
+    } else {
+        2
+    }
+}
+
+fn human_remedy(finding: &Value) -> String {
+    let has_control = finding["repair_argv"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|argument| argument.chars().any(char::is_control));
+    if has_control {
+        "unavailable in human output; inspect --json".into()
+    } else {
+        terminal_safe(finding["remedy"].as_str().unwrap_or_default())
+    }
+}
+
 fn aggregate_doctor_findings(outcomes: &[(PathBuf, DoctorSocketOutcome)]) -> Vec<Value> {
     let trusted: Vec<_> = outcomes
         .iter()
@@ -13238,6 +13320,7 @@ fn aggregate_doctor_findings(outcomes: &[(PathBuf, DoctorSocketOutcome)]) -> Vec
             "repair_argv": [],
         }));
     }
+    let multiple_daemons = trusted.len() > 1;
     for (path, outcome) in outcomes {
         match outcome {
             DoctorSocketOutcome::Report(reported) => {
@@ -13249,7 +13332,11 @@ fn aggregate_doctor_findings(outcomes: &[(PathBuf, DoctorSocketOutcome)]) -> Vec
                             Value::String(path.display().to_string()),
                         );
                     }
-                    findings.push(finding);
+                    findings.push(if multiple_daemons {
+                        with_multiple_daemon_repair_withheld(finding)
+                    } else {
+                        finding
+                    });
                 }
             }
             DoctorSocketOutcome::Unsupported(message) => {
@@ -13327,7 +13414,7 @@ fn cmd_daemon_doctor(json: bool) {
                 continue;
             }
         };
-        let Some(peer_uid) = unix_peer_uid(&stream) else {
+        let Some(identity) = doctor_peer_identity(&stream) else {
             outcomes.push((
                 path,
                 DoctorSocketOutcome::Untrusted(
@@ -13336,24 +13423,16 @@ fn cmd_daemon_doctor(json: bool) {
             ));
             continue;
         };
-        if !uid_is_trusted(peer_uid, expected_uid) {
+        if !uid_is_trusted(identity.uid, expected_uid) {
             outcomes.push((
                 path,
                 DoctorSocketOutcome::Untrusted(format!(
-                    "socket owner uid {peer_uid} is neither expected uid {expected_uid} nor root"
+                    "socket owner uid {} is neither expected uid {expected_uid} nor root",
+                    identity.uid
                 )),
             ));
             continue;
         }
-        let Some(identity) = connected_socket_identity(&stream) else {
-            outcomes.push((
-                path,
-                DoctorSocketOutcome::Untrusted(
-                    "connected socket identity is unavailable; refusing this socket".into(),
-                ),
-            ));
-            continue;
-        };
         if !trusted_identities.insert(identity) {
             continue;
         }
@@ -13371,6 +13450,7 @@ fn cmd_daemon_doctor(json: bool) {
 
     if outcomes.is_empty() {
         let report = json!({
+            "complete": false,
             "healthy": false,
             "findings": [{
                 "code": "no_daemon",
@@ -13385,10 +13465,12 @@ fn cmd_daemon_doctor(json: bool) {
         } else {
             println!("no term-meshd is listening on this host.");
         }
-        process::exit(2);
+        process::exit(1);
     }
     let findings = aggregate_doctor_findings(&outcomes);
-    let healthy = findings.is_empty();
+    let exit_code = doctor_exit_code(&outcomes, &findings);
+    let complete = exit_code != 1;
+    let healthy = complete && findings.is_empty();
     let sockets = outcomes
         .iter()
         .map(|(path, _)| path.display().to_string())
@@ -13396,7 +13478,7 @@ fn cmd_daemon_doctor(json: bool) {
     if json {
         println!(
             "{}",
-            pretty(&json!({ "sockets": sockets, "healthy": healthy,
+            pretty(&json!({ "sockets": sockets, "complete": complete, "healthy": healthy,
                             "findings": findings }))
         );
     } else if healthy {
@@ -13425,12 +13507,11 @@ fn cmd_daemon_doctor(json: bool) {
                 });
             }
             println!("  {}", text("detail"));
-            println!("  fix: {}\n", text("remedy"));
+            println!("  fix: {}\n", human_remedy(finding));
         }
     }
-    // A non-zero exit lets this sit in a health check without parsing output.
-    if !healthy {
-        process::exit(2);
+    if exit_code != 0 {
+        process::exit(exit_code);
     }
 }
 
@@ -21735,6 +21816,78 @@ mod watcher_spec_tests {
             .any(|finding| finding["code"] == "multiple_daemon_owners"));
         assert!(findings.iter().any(|f| f["code"] == "doctor_unsupported"));
         assert!(findings.iter().any(|f| f["code"] == "doctor_rpc_failed"));
+        assert_eq!(doctor_exit_code(&outcomes, &findings), 2);
+        let incomplete = vec![
+            (
+                PathBuf::from("/old.sock"),
+                DoctorSocketOutcome::Unsupported("unknown method".into()),
+            ),
+            (
+                PathBuf::from("/failed.sock"),
+                DoctorSocketOutcome::RpcFailed("timeout".into()),
+            ),
+        ];
+        let incomplete_findings = aggregate_doctor_findings(&incomplete);
+        assert_eq!(doctor_exit_code(&incomplete, &incomplete_findings), 1);
+        let healthy = vec![(
+            PathBuf::from("/healthy.sock"),
+            DoctorSocketOutcome::Report(vec![]),
+        )];
+        assert_eq!(doctor_exit_code(&healthy, &[]), 0);
+    }
+
+    #[test]
+    fn multiple_daemons_withhold_applied_repairs() {
+        let applied = json!({
+            "code": "surface_missing",
+            "severity": "error",
+            "detail": "missing",
+            "remedy": "dangerous",
+            "repair_argv": ["tm-agent", "daemon", "project-presentations", "prune",
+                "--project-id", "team:x", "--apply"],
+        });
+        let outcomes = vec![
+            (
+                PathBuf::from("/one.sock"),
+                DoctorSocketOutcome::Report(vec![applied.clone()]),
+            ),
+            (
+                PathBuf::from("/two.sock"),
+                DoctorSocketOutcome::Report(vec![applied]),
+            ),
+        ];
+        let findings = aggregate_doctor_findings(&outcomes);
+        let reported = findings
+            .iter()
+            .filter(|finding| finding["code"] == "surface_missing")
+            .collect::<Vec<_>>();
+        assert_eq!(reported.len(), 2);
+        for finding in reported {
+            assert_eq!(
+                finding["repair_argv"],
+                json!(["tm-agent", "daemon", "project-presentations", "list"])
+            );
+            assert_eq!(
+                finding["remedy"],
+                "'tm-agent' 'daemon' 'project-presentations' 'list'"
+            );
+            assert!(finding["detail"]
+                .as_str()
+                .unwrap()
+                .contains("applied repair is withheld"));
+        }
+    }
+
+    #[test]
+    fn human_remedy_suppresses_control_characters() {
+        let finding = json!({
+            "remedy": "dangerous",
+            "repair_argv": ["tm-agent", "bad\nproject"],
+        });
+        assert_eq!(
+            human_remedy(&finding),
+            "unavailable in human output; inspect --json"
+        );
     }
 
     #[test]
@@ -21758,8 +21911,14 @@ mod watcher_spec_tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let client = UnixStream::connect(&path).unwrap();
         let (server, _) = listener.accept().unwrap();
-        assert_eq!(unix_peer_uid(&client), Some(unsafe { libc::getuid() }));
-        assert_eq!(unix_peer_uid(&server), Some(unsafe { libc::getuid() }));
+        assert_eq!(
+            doctor_peer_identity(&client).map(|identity| identity.uid),
+            Some(unsafe { libc::getuid() })
+        );
+        assert_eq!(
+            doctor_peer_identity(&server).map(|identity| identity.uid),
+            Some(unsafe { libc::getuid() })
+        );
     }
 
     #[test]
@@ -21769,19 +21928,21 @@ mod watcher_spec_tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("daemon.sock");
         let alias = dir.path().join("daemon-alias.sock");
-        let other = dir.path().join("other.sock");
         let listener = std::os::unix::net::UnixListener::bind(&target).unwrap();
-        let other_listener = std::os::unix::net::UnixListener::bind(&other).unwrap();
         symlink(&target, &alias).unwrap();
 
         let target_stream = UnixStream::connect(&target).unwrap();
         let alias_stream = UnixStream::connect(&alias).unwrap();
-        let other_stream = UnixStream::connect(&other).unwrap();
-        let target_identity = connected_socket_identity(&target_stream).unwrap();
-        let alias_identity = connected_socket_identity(&alias_stream).unwrap();
-        let other_identity = connected_socket_identity(&other_stream).unwrap();
+        let target_identity = doctor_peer_identity(&target_stream).unwrap();
+        let alias_identity = doctor_peer_identity(&alias_stream).unwrap();
         assert_eq!(target_identity, alias_identity);
-        assert_ne!(target_identity, other_identity);
+        assert_ne!(
+            target_identity,
+            DoctorPeerIdentity {
+                uid: target_identity.uid,
+                pid: target_identity.pid.saturating_add(1),
+            }
+        );
 
         let mut identities = std::collections::HashSet::new();
         let mut outcomes = Vec::new();
@@ -21805,7 +21966,6 @@ mod watcher_spec_tests {
             .any(|finding| finding["code"] == "multiple_daemon_owners"));
 
         drop(listener);
-        drop(other_listener);
     }
 }
 

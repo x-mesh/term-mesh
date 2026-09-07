@@ -785,13 +785,17 @@ first live socket in the discovery list. The doctor probes every configured
 user and system socket. It accepts only the expected account or root and
 reports old daemons or failed RPC calls per socket.
 
+If a dedicated account runs the service, run the doctor as that account. Root
+can use sudo with the service account to run tm-agent daemon doctor.
+
 Two trusted listeners can expose different state. Discovery order selects the
 daemon. See
 [Running one daemon at a time](#running-one-daemon-at-a-time).
 
-**Does every manifest name a surface that exists?** A referenced surface with
-no live pane behind it is reported per surface, with the prune command for
-that project.
+**Does every manifest name a surface that exists?** The doctor reports each
+missing surface. It offers applied prune only when all referenced surfaces are
+dead. If one remains live, it offers the inspection command because prune will
+refuse that record.
 
 **Does a surface predate the manifest timestamp?** This is a warning only.
 Publisher and daemon clocks can differ, so ordering cannot prove ownership.
