@@ -781,24 +781,25 @@ It answers three questions that cost an ssh session and a lot of `ps` output
 to answer by hand:
 
 **Is exactly one daemon serving this host?** Every other command stops at the
-first live socket in the discovery list; the doctor probes all of them and
-reports each one that answers. Two listeners means whichever a client happens
-to reach decides what it sees — one host was found running a systemd daemon
-alongside a stray left over from a `term-meshd --help` invocation weeks
-earlier. See [Running one daemon at a time](#running-one-daemon-at-a-time).
+first live socket in the discovery list. The doctor probes every configured
+user and system socket. It accepts only the expected account or root and
+reports old daemons or failed RPC calls per socket.
+
+Two trusted listeners can expose different state. Discovery order selects the
+daemon. See
+[Running one daemon at a time](#running-one-daemon-at-a-time).
 
 **Does every manifest name a surface that exists?** A referenced surface with
 no live pane behind it is reported per surface, with the prune command for
 that project.
 
-**Does every manifest name a surface that is actually its own?** This is the
-one a surface count cannot tell you. Surface ids are derived, so an id can be
-re-minted over a pane still alive from an earlier daemon run. The manifest then
-reads as perfectly healthy — every surface it references resolves — while
-pointing at someone else's process, and the leader vanishes from the sidebar
-while its process keeps running. A surface that was spawned *before* the
-manifest claiming it was never that manifest's surface, and the doctor says so.
+**Does a surface predate the manifest timestamp?** This is a warning only.
+Publisher and daemon clocks can differ, so ordering cannot prove ownership.
+The warning provides an inspection command and never an applied prune command.
 
 Repairs stay where they were: `tm-agent daemon project-presentations prune`
 and `tm-agent daemon reset`, both dry-run until `--apply`. The doctor decides
 nothing on its own.
+
+Exit status `0` means no findings. Exit status `2` means that diagnosis
+completed and found a problem. Exit status `1` means that the command failed.

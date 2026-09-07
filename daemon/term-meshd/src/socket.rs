@@ -1368,7 +1368,7 @@ pub async fn serve(
     harden_socket_permissions(&path);
     tracing::info!("listening on {}", path.display());
 
-    let owner_uid = current_uid();
+    let owner_uid = configured_expected_peer_uid(current_uid());
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
     let pane_tracker = PaneTracker::new().start();
     let project_registry = Arc::new(open_project_registry_recovering(
@@ -1436,7 +1436,7 @@ pub async fn serve(
                 match result {
                     Ok((stream, _)) => {
                         if !peer_uid_matches(&stream, owner_uid) {
-                            tracing::warn!("rejecting connection from foreign uid (only uid {owner_uid} may attach)");
+                            tracing::warn!("rejecting connection from foreign uid (only uid {owner_uid} or root may attach)");
                             drop(stream);
                             continue;
                         }
@@ -5727,6 +5727,25 @@ fn current_uid() -> u32 {
     0
 }
 
+fn expected_peer_uid(server_uid: u32, sudo_uid: Option<u32>) -> u32 {
+    if server_uid == 0 {
+        sudo_uid.unwrap_or(0)
+    } else {
+        server_uid
+    }
+}
+
+fn peer_uid_is_allowed(peer_uid: u32, expected_uid: u32) -> bool {
+    peer_uid == expected_uid || peer_uid == 0
+}
+
+fn configured_expected_peer_uid(server_uid: u32) -> u32 {
+    let sudo_uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    expected_peer_uid(server_uid, sudo_uid)
+}
+
 /// Bind with umask(0o077) so the socket file is created at 0600 immediately,
 /// eliminating the bind→chmod TOCTOU window.
 #[cfg(unix)]
@@ -5787,7 +5806,7 @@ fn peer_uid_matches(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool 
         return false;
     }
     let cred = unsafe { cred.assume_init() };
-    cred.cr_uid == expected_uid
+    peer_uid_is_allowed(cred.cr_uid, expected_uid)
 }
 
 #[cfg(target_os = "linux")]
@@ -5810,12 +5829,43 @@ fn peer_uid_matches(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool 
         return false;
     }
     let cred = unsafe { cred.assume_init() };
-    cred.uid == expected_uid
+    peer_uid_is_allowed(cred.uid, expected_uid)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn peer_uid_matches(_stream: &tokio::net::UnixStream, _expected_uid: u32) -> bool {
     false
+}
+
+#[cfg(test)]
+mod peer_credential_policy_tests {
+    use super::{expected_peer_uid, peer_uid_is_allowed};
+
+    #[test]
+    fn expected_uid_uses_sudo_caller_only_for_root_server() {
+        assert_eq!(expected_peer_uid(0, Some(501)), 501);
+        assert_eq!(expected_peer_uid(0, None), 0);
+        assert_eq!(expected_peer_uid(1000, Some(501)), 1000);
+    }
+
+    #[test]
+    fn server_accepts_expected_uid_or_root_only() {
+        assert!(peer_uid_is_allowed(501, 501));
+        assert!(peer_uid_is_allowed(0, 501));
+        assert!(!peer_uid_is_allowed(502, 501));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn extracts_uid_from_a_connected_unix_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        assert!(super::peer_uid_matches(&server, super::current_uid()));
+        drop(client);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

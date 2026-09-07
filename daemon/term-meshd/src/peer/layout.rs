@@ -1128,13 +1128,49 @@ pub struct PeerHostFinding {
     pub detail: String,
     /// A command that repairs this finding.
     pub remedy: String,
+    /// Exact arguments for callers that must not parse the human command.
+    pub repair_argv: Vec<String>,
 }
 
 impl PeerHostFinding {
-    fn prune_remedy(project_id: &str) -> String {
-        format!(
-            "tm-agent daemon project-presentations prune --project-ids {project_id} --apply"
-        )
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    fn repair(project_id: &str, apply: bool) -> (String, Vec<String>) {
+        let mut argv = vec![
+            "tm-agent",
+            "daemon",
+            "project-presentations",
+            "prune",
+            "--project-id",
+            project_id,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        if apply {
+            argv.push("--apply".into());
+        }
+        let command = argv
+            .iter()
+            .map(|arg| Self::shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        (command, argv)
+    }
+
+    fn inspect() -> (String, Vec<String>) {
+        let argv = vec!["tm-agent", "daemon", "project-presentations", "list"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let command = argv
+            .iter()
+            .map(|arg| Self::shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        (command, argv)
     }
 
     fn malformed_surface_id(
@@ -1142,6 +1178,7 @@ impl PeerHostFinding {
         role: &'static str,
         encoded: &str,
     ) -> Self {
+        let (remedy, repair_argv) = Self::repair(&record.project_id, true);
         Self {
             code: "malformed_surface_id",
             severity: "error",
@@ -1150,7 +1187,8 @@ impl PeerHostFinding {
             role,
             surface_id: encoded.to_string(),
             detail: format!("{role} surface id {encoded:?} is not hex and names nothing"),
-            remedy: Self::prune_remedy(&record.project_id),
+            remedy,
+            repair_argv,
         }
     }
 
@@ -1159,6 +1197,7 @@ impl PeerHostFinding {
         role: &'static str,
         encoded: &str,
     ) -> Self {
+        let (remedy, repair_argv) = Self::repair(&record.project_id, true);
         Self {
             code: "surface_missing",
             severity: "error",
@@ -1169,7 +1208,8 @@ impl PeerHostFinding {
             detail: format!(
                 "{role} surface {encoded} is named by this manifest but no live surface holds it"
             ),
-            remedy: Self::prune_remedy(&record.project_id),
+            remedy,
+            repair_argv,
         }
     }
 
@@ -1182,19 +1222,21 @@ impl PeerHostFinding {
         let older_by = record
             .created_at_unix_secs
             .saturating_sub(spawned_at_unix_secs);
+        let (remedy, repair_argv) = Self::inspect();
         Self {
             code: "surface_predates_record",
-            severity: "error",
+            severity: "warning",
             project_id: record.project_id.clone(),
             team_name: record.team_name.clone(),
             role,
             surface_id: encoded.to_string(),
             detail: format!(
                 "{role} surface {encoded} was spawned {older_by}s before this manifest was \
-                 written, so it belongs to something else — the id was inherited, not minted \
-                 for this project"
+                 written. The publisher and daemon can have different wall clocks, so this is \
+                 suspicious but does not prove ownership"
             ),
-            remedy: Self::prune_remedy(&record.project_id),
+            remedy,
+            repair_argv,
         }
     }
 }
@@ -5336,7 +5378,13 @@ mod tests {
         assert_eq!(findings[0].code, "surface_missing");
         assert_eq!(findings[0].role, "leader");
         assert_eq!(findings[0].surface_id, hex::encode(&leader_id));
-        assert!(findings[0].remedy.contains("project-presentations prune"));
+        assert_eq!(findings[0].repair_argv[2], "project-presentations");
+        assert_eq!(findings[0].repair_argv[3], "prune");
+        assert_eq!(findings[0].repair_argv[4], "--project-id");
+        assert_eq!(
+            findings[0].repair_argv.last().map(String::as_str),
+            Some("--apply")
+        );
     }
 
     /// The incident this whole command exists for: every referenced surface
@@ -5365,13 +5413,54 @@ mod tests {
         assert!(findings
             .iter()
             .all(|finding| finding.code == "surface_predates_record"));
+        assert!(findings
+            .iter()
+            .all(|finding| finding.severity == "warning"));
+        assert!(findings
+            .iter()
+            .all(|finding| !finding.remedy.contains("--apply")));
+        assert!(findings
+            .iter()
+            .all(|finding| finding.detail.contains("different wall clocks")));
         let leader = findings
             .iter()
             .find(|finding| finding.role == "leader")
             .expect("leader finding");
         assert_eq!(leader.surface_id, hex::encode(&leader_id));
         assert_eq!(leader.team_name, "rca");
-        assert!(leader.detail.contains("inherited"));
+        assert!(leader.remedy.contains("project-presentations"));
+        assert_eq!(
+            leader.remedy,
+            "'tm-agent' 'daemon' 'project-presentations' 'list'"
+        );
+        assert_eq!(
+            leader.repair_argv,
+            vec!["tm-agent", "daemon", "project-presentations", "list"]
+        );
+    }
+
+    #[test]
+    fn repair_command_quotes_one_project_id_and_uses_real_flag() {
+        let project_id = "team:it's $(still one); argument";
+        let (command, argv) = PeerHostFinding::repair(project_id, true);
+        assert_eq!(argv[4], "--project-id");
+        assert_eq!(argv[5], project_id);
+        assert_eq!(argv[6], "--apply");
+        assert!(command.contains("'team:it'\\''s $(still one); argument'"));
+        assert!(!command.contains("--project-ids"));
+    }
+
+    #[test]
+    fn inspect_command_exactly_matches_structured_argv() {
+        let (command, argv) = PeerHostFinding::inspect();
+        assert_eq!(
+            command,
+            "'tm-agent' 'daemon' 'project-presentations' 'list'"
+        );
+        assert_eq!(
+            argv,
+            vec!["tm-agent", "daemon", "project-presentations", "list"]
+        );
     }
 
     /// A record written before `created_at_unix_secs` existed carries 0. That
