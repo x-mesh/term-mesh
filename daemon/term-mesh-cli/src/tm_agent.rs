@@ -13345,6 +13345,10 @@ fn aggregate_doctor_findings(outcomes: &[(PathBuf, DoctorSocketOutcome)]) -> Vec
             )
         })
         .collect();
+    let connected_count = outcomes
+        .iter()
+        .filter(|(_, outcome)| !matches!(outcome, DoctorSocketOutcome::ProbeFailed(_)))
+        .count();
     let mut findings = Vec::new();
     if trusted.len() > 1 {
         let paths = trusted
@@ -13363,7 +13367,7 @@ fn aggregate_doctor_findings(outcomes: &[(PathBuf, DoctorSocketOutcome)]) -> Vec
             "repair_argv": [],
         }));
     }
-    let multiple_daemons = trusted.len() > 1;
+    let connected_ambiguity = connected_count > 1;
     for (path, outcome) in outcomes {
         match outcome {
             DoctorSocketOutcome::Report(reported) => {
@@ -13375,7 +13379,7 @@ fn aggregate_doctor_findings(outcomes: &[(PathBuf, DoctorSocketOutcome)]) -> Vec
                             Value::String(path.display().to_string()),
                         );
                     }
-                    findings.push(if multiple_daemons {
+                    findings.push(if connected_ambiguity {
                         with_multiple_daemon_repair_withheld(finding)
                     } else {
                         finding
@@ -22023,6 +22027,53 @@ mod watcher_spec_tests {
             with_multiple_daemon_repair_withheld(structured_inspect.clone()),
             structured_inspect
         );
+    }
+
+    #[test]
+    fn untrusted_connected_socket_withholds_applied_repair() {
+        let outcomes = vec![
+            (
+                PathBuf::from("/untrusted.sock"),
+                DoctorSocketOutcome::Untrusted("foreign uid".into()),
+            ),
+            (
+                PathBuf::from("/trusted.sock"),
+                DoctorSocketOutcome::Report(vec![json!({
+                    "code": "surface_missing",
+                    "severity": "error",
+                    "detail": "missing",
+                    "remedy": "dangerous",
+                    "repair_argv": ["tm-agent", "daemon", "project-presentations",
+                        "prune", "--project-id", "team:x", "--apply"],
+                })]),
+            ),
+        ];
+
+        let findings = aggregate_doctor_findings(&outcomes);
+        let repair = findings
+            .iter()
+            .find(|finding| finding["code"] == "surface_missing")
+            .expect("surface finding");
+        assert_eq!(
+            repair["repair_argv"],
+            json!(["tm-agent", "daemon", "project-presentations", "list"])
+        );
+        assert_eq!(
+            repair["remedy"],
+            "'tm-agent' 'daemon' 'project-presentations' 'list'"
+        );
+        assert!(!repair["repair_argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|argument| argument == "--apply"));
+        assert!(findings
+            .iter()
+            .any(|finding| finding["code"] == "untrusted_socket_owner"));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding["code"] == "multiple_daemon_owners"));
+        assert_eq!(doctor_exit_code(&outcomes, &findings), 2);
     }
 
     #[test]
