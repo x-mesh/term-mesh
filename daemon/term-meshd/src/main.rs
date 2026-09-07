@@ -40,7 +40,7 @@ mod watcher;
 mod worktree;
 
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
@@ -62,6 +62,117 @@ const SERVER_JOIN_LIMIT: Duration = Duration::from_secs(5);
 /// GUI owner PID, when the daemon was launched as an app child. Standalone and
 /// headless daemon launches intentionally leave this unset.
 static OWNER_PID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+
+#[derive(Debug)]
+struct RuntimeOwnerState {
+    owner_pid: Option<u32>,
+    managed: bool,
+    shutdown_committed: bool,
+    ownerless_empty_checks: u8,
+}
+
+/// Runtime ownership for a daemon launched by the GUI.
+///
+/// Claim, release, dead-owner observation, and ownerless shutdown all use one
+/// mutex. Once shutdown wins that mutex, a later claim cannot revive a daemon
+/// whose teardown already started. Standalone daemons never become managed.
+pub(crate) struct RuntimeOwner {
+    state: Mutex<RuntimeOwnerState>,
+    shutdown_tx: watch::Sender<bool>,
+}
+
+impl RuntimeOwner {
+    fn new(initial_owner: Option<u32>, shutdown_tx: watch::Sender<bool>) -> Self {
+        Self {
+            state: Mutex::new(RuntimeOwnerState {
+                owner_pid: initial_owner,
+                managed: initial_owner.is_some(),
+                shutdown_committed: false,
+                ownerless_empty_checks: 0,
+            }),
+            shutdown_tx,
+        }
+    }
+
+    pub(crate) fn owner_pid(&self) -> Option<u32> {
+        self.state.lock().unwrap().owner_pid
+    }
+
+    pub(crate) fn claim(&self, pid: u32, peer_ready: bool) -> Result<(), String> {
+        if parse_owner_pid(Some(&pid.to_string()), std::process::id()).is_none() {
+            return Err("invalid owner pid".to_string());
+        }
+        if !process_exists(pid) {
+            return Err(format!("owner pid {pid} is not running"));
+        }
+        if !peer_ready {
+            return Err(
+                "durable peer listener is unavailable (daemon started without a working TERMMESH_PEER_SOCKET)"
+                    .to_string(),
+            );
+        }
+
+        let mut state = self.state.lock().unwrap();
+        if state.shutdown_committed {
+            return Err("daemon shutdown is already committed".to_string());
+        }
+        if let Some(owner) = state.owner_pid {
+            if owner != pid && process_exists(owner) {
+                return Err(format!("daemon is owned by live pid {owner}"));
+            }
+        }
+        state.owner_pid = Some(pid);
+        state.managed = true;
+        state.ownerless_empty_checks = 0;
+        Ok(())
+    }
+
+    pub(crate) fn release(&self, pid: u32) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap();
+        if state.owner_pid != Some(pid) {
+            return Err(format!(
+                "pid {pid} cannot release owner {:?}",
+                state.owner_pid
+            ));
+        }
+        state.owner_pid = None;
+        state.ownerless_empty_checks = 0;
+        Ok(())
+    }
+
+    fn evaluate(&self, live_surfaces: bool) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.owner_pid.is_some_and(|pid| !process_exists(pid)) {
+            state.owner_pid = None;
+            state.ownerless_empty_checks = 0;
+        }
+        Self::commit_ownerless_shutdown(&mut state, live_surfaces, &self.shutdown_tx);
+        state.shutdown_committed
+    }
+
+    fn commit_ownerless_shutdown(
+        state: &mut RuntimeOwnerState,
+        live_surfaces: bool,
+        shutdown_tx: &watch::Sender<bool>,
+    ) {
+        if state.owner_pid.is_some() || live_surfaces {
+            state.ownerless_empty_checks = 0;
+            return;
+        }
+        if state.managed && !state.shutdown_committed {
+            state.ownerless_empty_checks = state.ownerless_empty_checks.saturating_add(1);
+        }
+        // Require two 500ms observations. The first empty read can race a
+        // surface ensure that already authenticated but has not inserted into
+        // the registry yet; a full grace interval lets that mutation land.
+        if state.managed
+            && state.ownerless_empty_checks >= 2
+            && !state.shutdown_committed {
+            state.shutdown_committed = true;
+            let _ = shutdown_tx.send(true);
+        }
+    }
+}
 
 fn parse_owner_pid(value: Option<&str>, daemon_pid: u32) -> Option<u32> {
     value
@@ -93,18 +204,21 @@ fn process_exists(pid: u32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-async fn wait_for_owner_exit(owner_pid: Option<u32>) {
-    let Some(owner_pid) = owner_pid else {
-        std::future::pending::<()>().await;
-        return;
-    };
+fn evaluate_runtime_owner(owner: &RuntimeOwner) {
+    if let Some(host) = peer::layout::PeerHost::active_host() {
+        host.evaluate_surface_admission(|| {
+            owner.evaluate(host.has_live_attachable_surfaces())
+        });
+    } else {
+        owner.evaluate(false);
+    }
+}
 
+async fn supervise_runtime_owner(owner: Arc<RuntimeOwner>) {
     let mut interval = tokio::time::interval(Duration::from_millis(500));
     loop {
         interval.tick().await;
-        if !process_exists(owner_pid) {
-            return;
-        }
+        evaluate_runtime_owner(&owner);
     }
 }
 
@@ -415,6 +529,9 @@ async fn main() -> anyhow::Result<()> {
 
     // 3. Shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (owner_shutdown_tx, mut owner_shutdown_rx) = watch::channel(false);
+    let runtime_owner = Arc::new(RuntimeOwner::new(owner_pid, owner_shutdown_tx));
+    let owner_supervisor = tokio::spawn(supervise_runtime_owner(runtime_owner.clone()));
 
     // 3b. watcher Phase 2: autonomous drift-watch scheduler (P4) + result
     // controller (P5). The scheduler runs one-shot watchers on a cadence and
@@ -578,6 +695,7 @@ async fn main() -> anyhow::Result<()> {
         watch_sink_for_serve,
         remote_registry.clone(),
         pane_tracker,
+        runtime_owner,
         shutdown_rx,
         control_started_tx,
     ));
@@ -589,8 +707,6 @@ async fn main() -> anyhow::Result<()> {
     // still looking alive: the exact shape a corrupt sync DB produced. Select
     // on it too, so control-socket death is a clean, logged exit instead of a
     // silent zombie.
-    let owner_exit = wait_for_owner_exit(owner_pid);
-    tokio::pin!(owner_exit);
     let runtime_signal = async {
         if raw_signal_observer {
             std::future::pending::<()>().await;
@@ -613,7 +729,14 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
         _ = shutdown::stop_requested() => ("SIGTERM/SIGINT", false),
         _ = &mut runtime_signal => ("SIGTERM/SIGINT (runtime fallback)", false),
-        _ = &mut owner_exit => ("GUI owner process exited", false),
+        changed = owner_shutdown_rx.changed() => {
+            let reason = if changed.is_err() {
+                "runtime owner supervisor stopped"
+            } else {
+                "GUI owner released and no live peer surfaces remain"
+            };
+            (reason, false)
+        },
         result = socket_task => {
             let reason = match result {
                 Ok(Ok(())) => "control socket closed",
@@ -662,6 +785,7 @@ async fn main() -> anyhow::Result<()> {
     // 7. Shutdown sequence
     // a. Signal servers to stop
     let _ = shutdown_tx.send(true);
+    owner_supervisor.abort();
 
     if preserve_shared_processes_after_required_server_exit(
         *control_started_rx.borrow(),
@@ -850,6 +974,77 @@ mod owner_tests {
     #[test]
     fn current_process_is_detected_as_alive() {
         assert!(process_exists(std::process::id()));
+    }
+
+    #[test]
+    fn non_owner_release_is_rejected() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let owner = RuntimeOwner::new(Some(std::process::id()), shutdown_tx);
+        assert!(owner.release(std::process::id() + 1).is_err());
+        assert_eq!(owner.owner_pid(), Some(std::process::id()));
+        assert!(!*shutdown_rx.borrow());
+    }
+
+    #[test]
+    fn ownerless_daemon_stays_for_live_surfaces_then_stops() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let owner = RuntimeOwner::new(Some(std::process::id()), shutdown_tx);
+        owner.release(std::process::id()).unwrap();
+        assert!(!*shutdown_rx.borrow());
+        owner.evaluate(true);
+        assert!(!*shutdown_rx.borrow());
+        owner.evaluate(false);
+        assert!(!*shutdown_rx.borrow());
+        owner.evaluate(false);
+        assert!(*shutdown_rx.borrow());
+    }
+
+    #[test]
+    fn shutdown_commit_fences_a_late_claim() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let owner = RuntimeOwner::new(Some(std::process::id()), shutdown_tx);
+        owner.release(std::process::id()).unwrap();
+        owner.evaluate(false);
+        owner.evaluate(false);
+        assert!(*shutdown_rx.borrow());
+        assert!(owner.claim(std::process::id(), true).is_err());
+        assert_eq!(owner.owner_pid(), None);
+    }
+
+    #[test]
+    fn a_surface_arriving_during_ownerless_grace_cancels_shutdown() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let owner = RuntimeOwner::new(Some(std::process::id()), shutdown_tx);
+        owner.release(std::process::id()).unwrap();
+        owner.evaluate(false);
+        owner.evaluate(true);
+        owner.evaluate(false);
+        assert!(!*shutdown_rx.borrow());
+        owner.evaluate(false);
+        assert!(*shutdown_rx.borrow());
+    }
+
+    #[test]
+    fn surface_admission_serializes_registry_mutation_and_owner_evaluation() {
+        let manager = std::sync::Arc::new(crate::peer::surface::PtyManager::new());
+        let host = crate::peer::layout::PeerHost::new(manager);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let owner = RuntimeOwner::new(Some(std::process::id()), shutdown_tx);
+        owner.release(std::process::id()).unwrap();
+        host.evaluate_surface_admission(|| owner.evaluate(false));
+        assert!(!*shutdown_rx.borrow());
+        host.evaluate_surface_admission(|| owner.evaluate(false));
+        assert!(*shutdown_rx.borrow());
+        assert!(host.with_open_surface_admission(|| ()).is_none());
+    }
+
+    #[test]
+    fn claim_requires_a_durable_peer_listener() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let owner = RuntimeOwner::new(None, shutdown_tx);
+        assert!(owner.claim(std::process::id(), false).is_err());
+        assert_eq!(owner.owner_pid(), None);
+        assert!(!*shutdown_rx.borrow());
     }
 
     #[test]

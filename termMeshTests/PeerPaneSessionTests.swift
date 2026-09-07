@@ -144,6 +144,114 @@ final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
 }
 
 final class PeerPaneSessionTests: XCTestCase {
+    func test_cleanupProjectsBecomeEligibleOnlyWhenEveryLiveSurfaceIsSelected() {
+        let a = Data([1])
+        let b = Data([2])
+        let ids: Set<Data> = [a, b]
+
+        let partial = TeamOrchestrator.projectCleanupState(
+            liveSurfaceCount: 2,
+            projectSurfaceIDs: ids,
+            selectedPaneIDs: [a]
+        )
+        XCTAssertEqual(partial.0, .live)
+        XCTAssertEqual(partial.1, 1)
+
+        let complete = TeamOrchestrator.projectCleanupState(
+            liveSurfaceCount: 2,
+            projectSurfaceIDs: ids,
+            selectedPaneIDs: ids
+        )
+        XCTAssertEqual(complete.0, .closesWithSelectedPanes)
+        XCTAssertEqual(complete.1, 0)
+    }
+
+    func test_cleanupDeadProjectDoesNotNeedPaneSelection() {
+        let state = TeamOrchestrator.projectCleanupState(
+            liveSurfaceCount: 0,
+            projectSurfaceIDs: [Data([1])],
+            selectedPaneIDs: []
+        )
+        XCTAssertEqual(state.0, .dead)
+        XCTAssertEqual(state.1, 0)
+    }
+
+    @MainActor
+    func test_cleanupDoesNotResetProjectsAfterPartialPaneClose() async throws {
+        let host = HostEntry(
+            id: "host", displayName: "host", connectionState: .connected,
+            workspaces: [], activeSockPath: "/tmp/missing", sshTarget: nil,
+            remoteSockPath: "/tmp/missing"
+        )
+        let result = try await TeamOrchestrator.shared.cleanPeerState(
+            host: host,
+            paneIDs: [Data([1])],
+            projectIDs: ["team:must-not-reset"],
+            force: false
+        )
+        XCTAssertEqual(result.closedPanes, 0)
+        XCTAssertEqual(result.resetProjects, 0)
+        XCTAssertEqual(result.failedProjects.count, 1)
+        XCTAssertTrue(result.failedProjects[0].hasPrefix("panes:"))
+    }
+
+    func test_cleanupProjectIdentityIncludesItsHost() {
+        XCTAssertTrue(TeamOrchestrator.cleanupProjectMatchesLocalTeam(
+            projectID: "team:shared",
+            hostKey: "host-a",
+            localProjectID: "team:shared",
+            localHostKey: "host-a"
+        ))
+        XCTAssertFalse(TeamOrchestrator.cleanupProjectMatchesLocalTeam(
+            projectID: "team:shared",
+            hostKey: "host-a",
+            localProjectID: "team:shared",
+            localHostKey: "host-b"
+        ))
+    }
+
+    func test_stateOnlyProjectRemovalNeverSelectsFilesystemLocations() {
+        let locations = [
+            TeamOrchestrator.Team.RemoteProjectLocation(
+                hostKey: "ssh:host", path: "/srv/project", owned: false
+            ),
+            TeamOrchestrator.Team.RemoteProjectLocation(
+                hostKey: "ssh:host", path: "/srv/project-worktree", owned: true
+            ),
+        ]
+
+        XCTAssertTrue(
+            TeamOrchestrator.projectLocationsForFilesystemDeletion(
+                locations, removalScope: .stateOnly
+            ).isEmpty
+        )
+    }
+
+    func test_localStateOnlyRemovalDoesNotRequireRemoteManifest() {
+        XCTAssertFalse(TeamOrchestrator.stateOnlyRemovalNeedsRemoteManifest(
+            leaderEndpoint: .local
+        ))
+        XCTAssertTrue(TeamOrchestrator.stateOnlyRemovalNeedsRemoteManifest(
+            leaderEndpoint: .peer(hostKey: "host")
+        ))
+    }
+
+    func test_fullDeleteProjectRemovalKeepsExistingOwnedLocationBehavior() {
+        let source = TeamOrchestrator.Team.RemoteProjectLocation(
+            hostKey: "ssh:host", path: "/srv/project", owned: false
+        )
+        let worktree = TeamOrchestrator.Team.RemoteProjectLocation(
+            hostKey: "ssh:host", path: "/srv/project-worktree", owned: true
+        )
+
+        XCTAssertEqual(
+            TeamOrchestrator.projectLocationsForFilesystemDeletion(
+                [source, worktree], removalScope: .fullDelete
+            ),
+            [worktree]
+        )
+    }
+
     func testPaneHealthRequiresStartupBeforeTransportCanBeLive() {
         XCTAssertEqual(
             PeerPaneSession.derivePaneHealth(
@@ -4565,7 +4673,7 @@ final class PeerShellSweepTests: XCTestCase {
     func test_authoritative_absence_removes_exact_rows_and_recomputes_counts() {
         func pane(_ id: UInt8, tabs: Int, busy: Bool) -> RemotePaneSummary {
             RemotePaneSummary(
-                id: Data([id]), title: "pane-\(id)",
+                id: Data([id]), surfaceIDs: [Data([id])], title: "pane-\(id)",
                 workingDirectoryPath: "/tmp", workingDirectoryName: "tmp",
                 projectRootPath: nil, tabCount: tabs, columns: 80, rows: 24,
                 isBusy: busy
@@ -4619,7 +4727,7 @@ final class PeerShellSweepTests: XCTestCase {
         var layout = Termmesh_Peer_V1_WorkspaceLayout()
         layout.pane = pane
         let summaryPane = RemotePaneSummary(
-            id: surfaceID, title: "old", workingDirectoryPath: "/tmp",
+            id: surfaceID, surfaceIDs: [surfaceID], title: "old", workingDirectoryPath: "/tmp",
             workingDirectoryName: "tmp", projectRootPath: nil, tabCount: 1,
             columns: 80, rows: 24, isBusy: false
         )

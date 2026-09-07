@@ -392,6 +392,16 @@ final class PeerHostCoordinator: NSObject {
 
     private func bringUp(at path: String, silent: Bool = false, persistPath: Bool = false) async {
         guard canStartServer(at: path, silent: silent) else { return }
+        guard await TermMeshDaemon.shared.ensureDurablePeerReadiness() else {
+            markStartFailed()
+            showInfo(
+                title: LanguageSettings.localized("Peer server could not start"),
+                body: LanguageSettings.localized(
+                    "The daemon has no reachable durable peer listener. Restart the daemon, then try again."
+                )
+            )
+            return
+        }
         let provider = GhosttyPaneSurfaceProvider()
 
         var config = PeerServerConfig()

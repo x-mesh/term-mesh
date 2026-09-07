@@ -1368,7 +1368,7 @@
     },
     "Restart Host Daemon…": {
       "localizations": {
-        "ko": { "stringUnit": { "state": "translated", "value": "호스트 데몬 재시작…" } }
+        "ko": { "stringUnit": { "state": "translated", "value": "Restart Host Daemon…" } }
       }
     },
     "Scanning %@…": {

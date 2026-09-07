@@ -305,7 +305,8 @@ async fn reader_loop(
         let host = host.clone();
         Arc::new(move |key, spec, env| {
             if spec.kind == SurfaceKind::Agent {
-                host.pty.ensure_with_env(&key, &spec, &env)
+                host.with_open_surface_admission(|| host.pty.ensure_with_env(&key, &spec, &env))
+                    .unwrap_or_else(|| Err(EnsureError::Internal("daemon shutdown is committed")))
             } else if env.is_empty() {
                 host.ensure_surface(&key, &spec)
             } else {
@@ -1076,7 +1077,9 @@ async fn reader_loop(
                 // has exited (e.g., the user typed `exit` in a previous
                 // attach). Unknown ids or respawn failures fall through
                 // to the "surface not found" reply below.
-                let Some(surface) = manager.get_or_respawn(&req.surface_id) else {
+                let Some(surface) = host.with_open_surface_admission(|| {
+                    manager.get_or_respawn(&req.surface_id)
+                }).flatten() else {
                     let reply = Envelope {
                         seq: next_seq(&seq_counter),
                         correlation_id: env.seq,

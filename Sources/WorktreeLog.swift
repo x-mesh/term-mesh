@@ -27,9 +27,9 @@ enum WorktreeLog {
         let line = "[\(ts)] [swift] \(message)\n"
         if fm.fileExists(atPath: logFile.path) {
             if let handle = try? FileHandle(forWritingTo: logFile) {
-                handle.seekToEndOfFile()
-                handle.write(Data(line.utf8))
-                handle.closeFile()
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: Data(line.utf8))
+                try? handle.close()
             }
         } else {
             try? line.write(to: logFile, atomically: false, encoding: .utf8)

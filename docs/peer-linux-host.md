@@ -42,6 +42,11 @@ The exact paths and commands depend on the selected scope:
 | User (default) | `~/.local/bin/term-meshd` | `~/.config/term-mesh/peer.env` | `~/.config/systemd/user/term-meshd.service` | `/run/user/<uid>/tm-peer.sock` | `/run/user/<uid>/term-meshd.sock` | `systemctl --user …`; `journalctl --user …` |
 | System (root installer) | `/usr/local/bin/term-meshd` | `/etc/term-mesh/peer.env` | `/etc/systemd/system/term-meshd.service` | `/run/term-mesh/tm-peer.sock` | `/run/term-mesh/term-meshd.sock` | `systemctl …`; `journalctl …` |
 
+`tm-agent` finds the control socket in either scope without configuration. It
+reads `TERMMESH_DAEMON_SOCKET`, `TERMMESH_DAEMON_UNIX_PATH`, `peer.env`,
+`$XDG_RUNTIME_DIR`, and then both defaults in the table. Export the variable
+only for a socket in a different location.
+
 The daemon runs as the connecting account by default. This keeps SSH project
 setup, file ownership, HOME/PATH, and pane processes under the same identity:
 a normal account with a user bus gets a user service, `sudo` keeps `SUDO_USER`
@@ -760,3 +765,45 @@ deletes the new socket file out from under it. The daemon keeps serving its
 which the Mac side surfaces as `unexpectedEof`. The `start-peer.sh` pattern
 that avoids this: `kill -9` every `term-meshd`, poll until none remain, then
 remove the socket file and start exactly one.
+
+## Diagnosing a host: `tm-agent daemon doctor`
+
+Run this before anything else when a Project misbehaves on a peer host. It is
+read-only, so it is always safe. It reports a safe next step when one is
+available.
+
+```bash
+tm-agent daemon doctor          # human summary; exit 2 if anything is wrong
+tm-agent daemon doctor --json   # the raw report
+```
+
+It answers three questions that cost an ssh session and a lot of `ps` output
+to answer by hand:
+
+**Is exactly one daemon serving this host?** Every other command stops at the
+first live socket in the discovery list. The doctor probes every configured
+user and system socket. It accepts only the expected account or root and
+reports old daemons or failed RPC calls per socket.
+
+If a dedicated account runs the service, run the doctor as that account. Root
+can use sudo with the service account to run tm-agent daemon doctor.
+
+Two trusted listeners can expose different state. Discovery order selects the
+daemon. See
+[Running one daemon at a time](#running-one-daemon-at-a-time).
+
+**Does every manifest name a surface that exists?** The doctor reports each
+missing surface. It offers applied prune only when all referenced surfaces are
+dead. If one remains live, it offers the inspection command because prune will
+refuse that record.
+
+**Does a surface predate the manifest timestamp?** This is a warning only.
+Publisher and daemon clocks can differ, so ordering cannot prove ownership.
+The warning provides an inspection command and never an applied prune command.
+
+Repairs stay where they were: `tm-agent daemon project-presentations prune`
+and `tm-agent daemon reset`, both dry-run until `--apply`. The doctor decides
+nothing on its own.
+
+Exit status `0` means no findings. Exit status `2` means that diagnosis
+completed and found a problem. Exit status `1` means that the command failed.

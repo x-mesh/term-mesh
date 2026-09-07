@@ -253,6 +253,7 @@
 		A5002000 /* THIRD_PARTY_LICENSES.md in Resources */ = {isa = PBXBuildFile; fileRef = A5002001 /* THIRD_PARTY_LICENSES.md */; };
 		A5001292 /* brew-upgrade-helper.sh in Resources */ = {isa = PBXBuildFile; fileRef = A5001293 /* brew-upgrade-helper.sh */; };
 			B9000012A1B2C3D4E5F60719 /* AutomationSocketUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000011A1B2C3D4E5F60719 /* AutomationSocketUITests.swift */; };
+			C1EA00000000000000000002 /* SidebarProjectCleanupUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1EA00000000000000000001 /* SidebarProjectCleanupUITests.swift */; };
 			B8F266236A1A3D9A45BD840F /* SidebarResizeUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 818DBCD4AB69EB72573E8138 /* SidebarResizeUITests.swift */; };
 			C0B4D9B0A1B2C3D4E5F60718 /* UpdatePillUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0B4D9B1A1B2C3D4E5F60718 /* UpdatePillUITests.swift */; };
 					B9000014A1B2C3D4E5F60719 /* JumpToUnreadUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9000013A1B2C3D4E5F60719 /* JumpToUnreadUITests.swift */; };
@@ -300,6 +301,8 @@
 		A5009040 /* WorktreeApprovalHelperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009041 /* WorktreeApprovalHelperTests.swift */; };
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */; };
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */; };
+				F9000092A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000093A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift */; };
+				F9000090A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9000091A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift */; };
 				D5000101A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5000102A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift */; };
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */; };
 				FA000000A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA000001A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift */; };
@@ -316,6 +319,7 @@
 		FC000004A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */; };
 		A15100000000000000000045 /* RemoteWorkLogRetentionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000046 /* RemoteWorkLogRetentionTests.swift */; };
 		A15100000000000000000043 /* InputInjectionLogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000044 /* InputInjectionLogTests.swift */; };
+		A15100000000000000000047 /* FileHandleRaisingAPISourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15100000000000000000048 /* FileHandleRaisingAPISourceTests.swift */; };
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */; };
 			FD000010A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000011A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift */; };
 			FD000020A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD000021A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift */; };
@@ -624,6 +628,7 @@
 		B9000001A1B2C3D4E5F60719 /* term-mesh.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = term-mesh.swift; sourceTree = "<group>"; };
 		B9000004A1B2C3D4E5F60719 /* term-mesh */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = term-mesh; sourceTree = BUILT_PRODUCTS_DIR; };
 				B9000011A1B2C3D4E5F60719 /* AutomationSocketUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutomationSocketUITests.swift; sourceTree = "<group>"; };
+				C1EA00000000000000000001 /* SidebarProjectCleanupUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarProjectCleanupUITests.swift; sourceTree = "<group>"; };
 					B9000013A1B2C3D4E5F60719 /* JumpToUnreadUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JumpToUnreadUITests.swift; sourceTree = "<group>"; };
 					B9000016A1B2C3D4E5F60719 /* MultiWindowNotificationsUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultiWindowNotificationsUITests.swift; sourceTree = "<group>"; };
 					B9000019A1B2C3D4E5F60719 /* CloseWorkspaceConfirmDialogUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloseWorkspaceConfirmDialogUITests.swift; sourceTree = "<group>"; };
@@ -670,6 +675,8 @@
 		A5009041 /* WorktreeApprovalHelperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorktreeApprovalHelperTests.swift; sourceTree = "<group>"; };
 			F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRetrievalDirectoryTests.swift; sourceTree = "<group>"; };
 			F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostStatsTests.swift; sourceTree = "<group>"; };
+			F9000093A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LargeTextSelectionSourceTests.swift; sourceTree = "<group>"; };
+			F9000091A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostResyncTests.swift; sourceTree = "<group>"; };
 			D5000102A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessTreeSnapshotTests.swift; sourceTree = "<group>"; };
 			FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSocketProberTests.swift; sourceTree = "<group>"; };
 			FA000001A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerHostBinaryInventoryTests.swift; sourceTree = "<group>"; };
@@ -686,6 +693,7 @@
 		FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerSSHTunnelBudgetTests.swift; sourceTree = "<group>"; };
 			A15100000000000000000046 /* RemoteWorkLogRetentionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteWorkLogRetentionTests.swift; sourceTree = "<group>"; };
 			A15100000000000000000044 /* InputInjectionLogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputInjectionLogTests.swift; sourceTree = "<group>"; };
+			A15100000000000000000048 /* FileHandleRaisingAPISourceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileHandleRaisingAPISourceTests.swift; sourceTree = "<group>"; };
 			FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerDaemonVersionTests.swift; sourceTree = "<group>"; };
 			FD000011A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalOverrideIsolationTests.swift; sourceTree = "<group>"; };
 			FD000021A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerTerminalQueryStripperTests.swift; sourceTree = "<group>"; };
@@ -1054,6 +1062,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				isa = PBXGroup;
 						children = (
 							B9000011A1B2C3D4E5F60719 /* AutomationSocketUITests.swift */,
+							C1EA00000000000000000001 /* SidebarProjectCleanupUITests.swift */,
 							B9000013A1B2C3D4E5F60719 /* JumpToUnreadUITests.swift */,
 							B9000022A1B2C3D4E5F60719 /* CloseWorkspaceCmdDUITests.swift */,
 							B9000019A1B2C3D4E5F60719 /* CloseWorkspaceConfirmDialogUITests.swift */,
@@ -1109,6 +1118,8 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				A5009041 /* WorktreeApprovalHelperTests.swift */,
 				F9000011A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift */,
 				F9000015A1B2C3D4E5F60718 /* PeerHostStatsTests.swift */,
+				F9000093A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift */,
+				F9000091A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift */,
 				D5000102A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift */,
 				FA000001A1B2C3D4E5F60718 /* PeerSocketProberTests.swift */,
 				FA000001A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift */,
@@ -1125,6 +1136,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				FC000005A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift */,
 				A15100000000000000000046 /* RemoteWorkLogRetentionTests.swift */,
 				A15100000000000000000044 /* InputInjectionLogTests.swift */,
+				A15100000000000000000048 /* FileHandleRaisingAPISourceTests.swift */,
 				FD000001A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift */,
 				FD000011A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift */,
 				FD000021A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift */,
@@ -1510,6 +1522,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				buildActionMask = 2147483647;
 						files = (
 							B9000012A1B2C3D4E5F60719 /* AutomationSocketUITests.swift in Sources */,
+							C1EA00000000000000000002 /* SidebarProjectCleanupUITests.swift in Sources */,
 							B9000014A1B2C3D4E5F60719 /* JumpToUnreadUITests.swift in Sources */,
 							B900001AA1B2C3D4E5F60719 /* CloseWorkspaceConfirmDialogUITests.swift in Sources */,
 							B9000023A1B2C3D4E5F60719 /* CloseWorkspaceCmdDUITests.swift in Sources */,
@@ -1565,6 +1578,8 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				A5009040 /* WorktreeApprovalHelperTests.swift in Sources */,
 				F9000010A1B2C3D4E5F60718 /* WorkspaceRetrievalDirectoryTests.swift in Sources */,
 				F9000014A1B2C3D4E5F60718 /* PeerHostStatsTests.swift in Sources */,
+				F9000092A1B2C3D4E5F60718 /* LargeTextSelectionSourceTests.swift in Sources */,
+				F9000090A1B2C3D4E5F60718 /* RemoteHostResyncTests.swift in Sources */,
 				D5000101A1B2C3D4E5F60718 /* ProcessTreeSnapshotTests.swift in Sources */,
 				FA000000A1B2C3D4E5F60718 /* PeerSocketProberTests.swift in Sources */,
 				FA000000A1B2C3D4E5F60719 /* PeerHostBinaryInventoryTests.swift in Sources */,
@@ -1581,6 +1596,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				FC000004A1B2C3D4E5F60718 /* PeerSSHTunnelBudgetTests.swift in Sources */,
 				A15100000000000000000045 /* RemoteWorkLogRetentionTests.swift in Sources */,
 				A15100000000000000000043 /* InputInjectionLogTests.swift in Sources */,
+				A15100000000000000000047 /* FileHandleRaisingAPISourceTests.swift in Sources */,
 				FD000000A1B2C3D4E5F60718 /* PeerDaemonVersionTests.swift in Sources */,
 				FD000010A1B2C3D4E5F60718 /* TerminalOverrideIsolationTests.swift in Sources */,
 				FD000020A1B2C3D4E5F60718 /* PeerTerminalQueryStripperTests.swift in Sources */,
@@ -1714,7 +1730,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 300;
+				CURRENT_PROJECT_VERSION = 302;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1723,7 +1739,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.228.0;
+				MARKETING_VERSION = 0.230.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1753,7 +1769,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 				CODE_SIGN_ENTITLEMENTS = "";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 300;
+				CURRENT_PROJECT_VERSION = 302;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1762,7 +1778,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.228.0;
+				MARKETING_VERSION = 0.230.0;
 				OTHER_LDFLAGS = (
 					"-lc++",
 					"-framework",
@@ -1816,10 +1832,10 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 300;
+				CURRENT_PROJECT_VERSION = 302;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.228.0;
+				MARKETING_VERSION = 0.230.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1833,10 +1849,10 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 300;
+				CURRENT_PROJECT_VERSION = 302;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.228.0;
+				MARKETING_VERSION = 0.230.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.appuitests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1850,10 +1866,10 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 300;
+				CURRENT_PROJECT_VERSION = 302;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.228.0;
+				MARKETING_VERSION = 0.230.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -1869,10 +1885,10 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 300;
+				CURRENT_PROJECT_VERSION = 302;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 0.228.0;
+				MARKETING_VERSION = 0.230.0;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.termmesh.apptests;
 				PRODUCT_NAME = "$(TARGET_NAME)";

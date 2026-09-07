@@ -369,9 +369,9 @@ extension WorkspaceContentView {
             let line = "[\(ts)] PANEL NOT FOUND for tabId=\(tab.id) ws=\(workspace.id) panelCount=\(workspace.panels.count)\n"
             let logPath = "/tmp/term-mesh-panel-debug.log"
             if let handle = FileHandle(forWritingAtPath: logPath) {
-                handle.seekToEndOfFile()
-                handle.write(line.data(using: .utf8)!)
-                handle.closeFile()
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: Data(line.utf8))
+                try? handle.close()
             } else {
                 FileManager.default.createFile(atPath: logPath, contents: line.data(using: .utf8))
             }

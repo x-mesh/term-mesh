@@ -257,6 +257,14 @@ final class ManagedPeerSurfaceStore {
         persist()
     }
 
+    /// Remove local ownership records after the host has confirmed Project
+    /// teardown. This never touches the paths named by those records.
+    func forget(teamName: String) {
+        let before = records.count
+        records.removeAll { $0.teamName == teamName }
+        if records.count != before { persist() }
+    }
+
     func records(hostKey: String) -> [Record] {
         records.filter { $0.hostKey == hostKey }
     }

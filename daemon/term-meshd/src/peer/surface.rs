@@ -523,6 +523,18 @@ pub struct PtySurface {
     /// Only a fallback for reporting: what a viewer is shown is where the
     /// shell is *now*, via [`PtySurface::current_cwd`].
     pub cwd: String,
+    /// Wall clock at spawn, so a reader can tell a surface apart from an
+    /// older one that happens to answer to the same id.
+    ///
+    /// Surface ids are derived, and a derived id can be re-minted over a pane
+    /// that is still alive from an earlier daemon run. When that happens the
+    /// manifest naming the id looks perfectly healthy — every surface it
+    /// references resolves — while pointing at the wrong process. The one
+    /// fact that separates the two is age: a surface that predates the
+    /// manifest claiming it was never the surface that manifest created.
+    /// `process_start_time` cannot answer this; it is boot-relative, kept for
+    /// pid-reuse checks, and not comparable to a record's unix timestamp.
+    pub spawned_at_unix_secs: u64,
     /// The authoritative broadcast sender. Subscribers are created via
     /// `.subscribe()`; the reader task owns a cloned sender for fan-out.
     pub broadcast_tx: broadcast::Sender<PtyChunk>,
@@ -608,6 +620,14 @@ fn process_group_exists(process_group: libc::pid_t) -> bool {
     process_group > 1
         && (unsafe { libc::killpg(process_group, 0) } == 0
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+/// Seconds since the epoch, saturating to 0 if the clock is before it.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(target_os = "linux")]
@@ -979,6 +999,7 @@ impl PtySurface {
             cols: AtomicU32::new(cols as u32),
             rows: AtomicU32::new(rows as u32),
             cwd: resolved_cwd,
+            spawned_at_unix_secs: now_unix_secs(),
             broadcast_tx: tx.clone(),
             dead: AtomicBool::new(false),
             dead_notify: Notify::new(),
@@ -1278,6 +1299,7 @@ impl PtySurface {
             cols: AtomicU32::new(0),
             rows: AtomicU32::new(0),
             cwd: resolved_cwd,
+            spawned_at_unix_secs: now_unix_secs(),
             broadcast_tx: tx.clone(),
             dead: AtomicBool::new(false),
             dead_notify: Notify::new(),

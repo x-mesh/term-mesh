@@ -9,6 +9,22 @@ final class TermMeshDaemon: ObservableObject {
     static let shared = TermMeshDaemon()
 
     private var daemonProcess: Process?
+    /// Set only after this process claims the daemon over its control socket.
+    /// A failed adopter must never release another app's daemon on quit.
+    private let runtimeOwnerLock = NSLock()
+    private var ownsDaemonRuntimeStorage = false
+    private var ownsDaemonRuntime: Bool {
+        get {
+            runtimeOwnerLock.lock()
+            defer { runtimeOwnerLock.unlock() }
+            return ownsDaemonRuntimeStorage
+        }
+        set {
+            runtimeOwnerLock.lock()
+            defer { runtimeOwnerLock.unlock() }
+            ownsDaemonRuntimeStorage = newValue
+        }
+    }
     /// Whether a daemon is currently WANTED on this machine. `startDaemon`
     /// intends one; an explicit `stopDaemon` that actually proceeds does
     /// not. Read by the subscribe loop's watchdog, which must never respawn
@@ -310,13 +326,9 @@ final class TermMeshDaemon: ObservableObject {
     /// The path to advertise as this machine's session owner, or empty when it
     /// has none right now.
     ///
-    /// Deciding this from settings does not work, and the first attempt proved
-    /// it twice over. `daemonShouldOutliveApp(peerServingEnabled: true)` is
-    /// `true` by inspection, so the guard advertised a session owner
-    /// unconditionally; and even a guard reading the real setting would be
-    /// wrong for an *adopted* daemon, which was started by an earlier run whose
-    /// setting nobody here can see. Ask the socket instead — the answer is
-    /// about the daemon, not about this app's preferences.
+    /// Deciding this from settings does not work. An adopted daemon was
+    /// started by an earlier run whose preferences this app cannot inspect.
+    /// Ask the socket instead because the answer describes runtime readiness.
     static func advertisedSessionHostSocket(
         peerSocketPath: String,
         isListening: (String) -> Bool
@@ -362,20 +374,17 @@ final class TermMeshDaemon: ObservableObject {
 
     // MARK: - Daemon Lifecycle
 
-    /// Whether this machine's daemon should outlive the app that started it.
-    ///
-    /// A daemon that dies with its app cannot hold a session for anybody. That
-    /// is the whole reason a project placed on a peer ends when someone quits
-    /// term-mesh there: the work exists only inside that app's process tree.
-    /// Serving peers is exactly the case where another machine may come back to
-    /// a session, so it is the case that decouples.
-    ///
-    /// A machine that serves nobody keeps the old contract — owned, and gone on
-    /// quit. `TERMMESH_OWNER_PID` was added so a crashed or force-reloaded app
-    /// could not leave a daemon behind, and with no one to serve, surviving is
-    /// exactly that leak rather than a feature.
-    static func daemonShouldOutliveApp(peerServingEnabled: Bool) -> Bool {
-        peerServingEnabled
+    /// The app always launches a session-capable daemon. Auto-start controls
+    /// only the app-hosted GUI listener and never changes this environment.
+    static func daemonEnvironment(
+        processEnvironment: [String: String],
+        ownerPID: Int32,
+        peerSocketPath: String
+    ) -> [String: String] {
+        var environment = processEnvironment
+        environment["TERMMESH_OWNER_PID"] = String(ownerPID)
+        environment["TERMMESH_PEER_SOCKET"] = peerSocketPath
+        return environment
     }
 
     /// A daemon from another app version must be replaced, even when it is
@@ -465,81 +474,75 @@ final class TermMeshDaemon: ObservableObject {
             // Already running (tracked process)?
             if let proc = self.daemonProcess, proc.isRunning { return }
 
-            let outlivesApp = Self.daemonShouldOutliveApp(
-                peerServingEnabled: PeerFederationSettings.autoStart
-            )
-
             // Daemon from a previous app launch?
             if self.ping() {
-                if outlivesApp {
-                    let runningVersion = self.runningDaemonVersion()
-                    let requiresUpgrade = Self.daemonRequiresUpgrade(
-                        runningVersion: runningVersion,
-                        appVersion: Self.appMarketingVersion
+                let runningVersion = self.runningDaemonVersion()
+                let requiresUpgrade = Self.daemonRequiresUpgrade(
+                    runningVersion: runningVersion,
+                    appVersion: Self.appMarketingVersion
+                )
+                // The replacement must be proven launchable BEFORE the
+                // working daemon is destroyed. A bare Xcode build or an
+                // incomplete bundle carries no term-meshd; destroy-then-
+                // verify traded a live daemon — and every peer session it
+                // owned — for a "binary not found, skipping launch".
+                let replacementReady = requiresUpgrade
+                    && self.daemonBinaryPath().map {
+                        FileManager.default.isExecutableFile(atPath: $0)
+                    } == true
+                if requiresUpgrade && !replacementReady {
+                    Logger.daemon.error(
+                        "daemon \(runningVersion ?? "unknown", privacy: .public) is older than this app, but no replacement binary is launchable — keeping the running daemon"
                     )
-                    // The replacement must be proven launchable BEFORE the
-                    // working daemon is destroyed. A bare Xcode build or an
-                    // incomplete bundle carries no term-meshd; destroy-then-
-                    // verify traded a live daemon — and every peer session it
-                    // owned — for a "binary not found, skipping launch".
-                    let replacementReady = requiresUpgrade
-                        && self.daemonBinaryPath().map {
-                            FileManager.default.isExecutableFile(atPath: $0)
-                        } == true
-                    if requiresUpgrade && !replacementReady {
+                    RemoteWorkLog.warningOffMain(
+                        "This machine's daemon (\(runningVersion ?? "unknown")) is older than the app, but this build bundles no replacement — keeping the running daemon"
+                    )
+                }
+                if replacementReady {
+                    Logger.daemon.warning(
+                        "replacing daemon version \(runningVersion ?? "unknown", privacy: .public) with bundled version \(Self.appMarketingVersion ?? "unknown", privacy: .public); live peer sessions will end"
+                    )
+                    RemoteWorkLog.warningOffMain(
+                        "Updating this machine's daemon from \(runningVersion ?? "unknown") to \(Self.appMarketingVersion ?? "unknown"); live project sessions will end"
+                    )
+                    self.stopDaemon(force: true)
+                    // stopDaemon withdraws run intent. This is a replacement,
+                    // not a user stop, so keep the watchdog and spawn path live.
+                    self.daemonRunIntended = true
+                    Thread.sleep(forTimeInterval: 0.3)
+                } else {
+                    // Adopt rather than restart when versions match, when
+                    // the version is unknown, or when a stale daemon has
+                    // no launchable replacement — neither uncertainty nor
+                    // an impossible upgrade is a reason to destroy live
+                    // peer sessions.
+                    Logger.daemon.info(
+                        "adopting the running daemon; settings changed since it started are not applied"
+                    )
+                    if runningVersion == nil {
                         Logger.daemon.error(
-                            "daemon \(runningVersion ?? "unknown", privacy: .public) is older than this app, but no replacement binary is launchable — keeping the running daemon"
+                            "adopted a daemon that did not answer the version probe — it may be shutting down"
                         )
-                        RemoteWorkLog.warningOffMain(
-                            "This machine's daemon (\(runningVersion ?? "unknown")) is older than the app, but this build bundles no replacement — keeping the running daemon"
+                        RemoteWorkLog.infoOffMain(
+                            "Adopted this machine's daemon without a version answer; if its sessions vanish shortly, it was already shutting down"
                         )
                     }
-                    if replacementReady {
-                        Logger.daemon.warning(
-                            "replacing daemon version \(runningVersion ?? "unknown", privacy: .public) with bundled version \(Self.appMarketingVersion ?? "unknown", privacy: .public); live peer sessions will end"
+                    guard self.claimDaemonOwner() else {
+                        Logger.daemon.error(
+                            "could not adopt daemon: durable peer readiness or runtime ownership claim failed"
                         )
                         RemoteWorkLog.warningOffMain(
-                            "Updating this machine's daemon from \(runningVersion ?? "unknown") to \(Self.appMarketingVersion ?? "unknown"); live project sessions will end"
+                            "This machine's running daemon cannot own Projects because its durable peer listener is unavailable; restart the daemon"
                         )
-                        self.stopDaemon(force: true)
-                        // stopDaemon withdraws run intent. This is a replacement,
-                        // not a user stop, so keep the watchdog and spawn path live.
-                        self.daemonRunIntended = true
-                        Thread.sleep(forTimeInterval: 0.3)
-                    } else {
-                        // Adopt rather than restart when versions match, when
-                        // the version is unknown, or when a stale daemon has
-                        // no launchable replacement — neither uncertainty nor
-                        // an impossible upgrade is a reason to destroy live
-                        // peer sessions.
-                        Logger.daemon.info(
-                            "adopting the running daemon; settings changed since it started are not applied"
-                        )
-                        if runningVersion == nil {
-                            Logger.daemon.error(
-                                "adopted a daemon that did not answer the version probe — it may be shutting down"
-                            )
-                            RemoteWorkLog.infoOffMain(
-                                "Adopted this machine's daemon without a version answer; if its sessions vanish shortly, it was already shutting down"
-                            )
-                        }
-                        if let pid = self.getDaemonPeerPid() {
-                            DispatchQueue.main.async {
-                                TerminalController.shared.trustedDaemonPid = pid
-                            }
-                        }
                         return
                     }
+                    if let pid = self.getDaemonPeerPid() {
+                        DispatchQueue.main.async {
+                            TerminalController.shared.trustedDaemonPid = pid
+                        }
+                    }
+                    return
                 }
-                // Restart it so current settings (dashboard enabled/port/bind)
-                // are applied.
-                Logger.daemon.info("daemon already running on socket — restarting with current settings")
-                self.stopDaemon()
-                // stopDaemon records "no daemon wanted"; this path stops only
-                // to start again, so the intent stays on.
-                self.daemonRunIntended = true
-                // Brief pause so the socket file is fully released
-                Thread.sleep(forTimeInterval: 0.3)
             }
 
             // The daemon probes and removes only a stale pathname whose inode
@@ -555,20 +558,11 @@ final class TermMeshDaemon: ObservableObject {
 
             let process = Process()
             process.executableURL = URL(fileURLWithPath: binaryPath)
-            var env = ProcessInfo.processInfo.environment
-            // A GUI-owned daemon must not outlive the app after a crash,
-            // forced reload, or SIGKILL. Standalone/headless launches omit
-            // this variable and retain their independent lifecycle — and so
-            // does a machine serving peers, whose sessions are the point.
-            if !outlivesApp {
-                env["TERMMESH_OWNER_PID"] = String(ProcessInfo.processInfo.processIdentifier)
-            } else {
-                // A daemon that outlives the app is the only component here that
-                // can hold a session across a quit. Serving the peer protocol is
-                // how anything reaches one — this app included, which attaches
-                // to it exactly as it attaches to another machine's.
-                env["TERMMESH_PEER_SOCKET"] = self.daemonPeerSocketPath
-            }
+            var env = Self.daemonEnvironment(
+                processEnvironment: ProcessInfo.processInfo.environment,
+                ownerPID: ProcessInfo.processInfo.processIdentifier,
+                peerSocketPath: self.daemonPeerSocketPath
+            )
 
             // Ensure Resources/bin is in PATH for daemon and all its child processes.
             // When launched from Finder/Spotlight, macOS provides a minimal PATH that
@@ -663,6 +657,7 @@ final class TermMeshDaemon: ObservableObject {
                 // Close our copy of the log fd — Process dup'd it internally
                 try? logHandle?.close()
                 self.daemonProcess = process
+                self.ownsDaemonRuntime = true
                 let daemonPid = process.processIdentifier
                 Logger.daemon.info("daemon started (pid: \(daemonPid, privacy: .public), binary: \(binaryPath, privacy: .public))")
                 DispatchQueue.main.async {
@@ -677,28 +672,83 @@ final class TermMeshDaemon: ObservableObject {
         }
     }
 
-    /// Stop the daemon process.
-    /// Called from applicationWillTerminate — must complete quickly.
+    /// Explicit Stop is destructive. Orderly app quit uses
+    /// `releaseDaemonOwnerForQuit` instead.
     func stopDaemon() {
-        stopDaemon(force: false)
+        stopDaemon(force: true)
+    }
+
+    /// Release this app's runtime claim. The daemon decides atomically whether
+    /// live attachable surfaces require it to remain running.
+    func releaseDaemonOwnerForQuit() {
+        guard ownsDaemonRuntime else {
+            daemonProcess = nil
+            return
+        }
+        let pid = ProcessInfo.processInfo.processIdentifier
+        if rpcCall(method: "daemon.owner.release", params: ["pid": pid], timeout: 2) != nil {
+            ownsDaemonRuntime = false
+            daemonProcess = nil
+            Logger.daemon.info("released daemon runtime ownership")
+        } else {
+            Logger.daemon.error("failed to release daemon runtime ownership")
+        }
+    }
+
+    @discardableResult
+    private func claimDaemonOwner() -> Bool {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        guard let response = rpcCall(
+            method: "daemon.owner.claim", params: ["pid": pid], timeout: 2
+        ) as? [String: Any], response["peer_ready"] as? Bool == true else {
+            return false
+        }
+        let listening = Self.isListening(atUnixSocketPath: daemonPeerSocketPath)
+        if listening { ownsDaemonRuntime = true }
+        return listening
+    }
+
+    /// Start or adopt the daemon, then prove that its durable peer listener is
+    /// reachable. An adopted daemon without that listener fails visibly and is
+    /// never reported as ready.
+    func ensureDurablePeerReadiness() async -> Bool {
+        startDaemon()
+        return await withCheckedContinuation { continuation in
+            telemetryQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                for _ in 0..<20 {
+                    if self.ping(), self.claimDaemonOwner() {
+                        continuation.resume(returning: true)
+                        return
+                    }
+                    // A prior GUI can release an idle daemon just before this
+                    // app claims it. Once that daemon commits shutdown, claim
+                    // is correctly refused; re-run the normal start/adopt
+                    // path so the next iteration can spawn its replacement.
+                    self.startDaemon()
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                continuation.resume(returning: false)
+            }
+        }
     }
 
     /// Stop the daemon bound to this app variant's exact socket. `force` is
     /// reserved for explicit restart/upgrade paths where continuing to run an
     /// old daemon is worse than ending the sessions it owns.
     private func stopDaemon(force: Bool) {
-        // A daemon serving peers holds sessions another machine reattaches to.
-        // Killing it here is precisely what made "quit term-mesh on the peer"
-        // end the project, so this path declines to.
-        if !force, Self.daemonShouldOutliveApp(peerServingEnabled: PeerFederationSettings.autoStart) {
-            daemonProcess = nil
-            Logger.daemon.info("leaving the daemon running; it holds sessions for other machines")
+        if !force {
+            releaseDaemonOwnerForQuit()
             return
         }
         // Only a stop that actually proceeds withdraws the intent — the
         // subscribe watchdog must not resurrect a daemon the user stopped,
         // and must keep resurrecting one the outlive policy declined to stop.
         daemonRunIntended = false
+        ownsDaemonRuntime = false
 
         // Case 1: We spawned the daemon — terminate directly
         if let proc = daemonProcess, proc.isRunning {

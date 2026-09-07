@@ -21,6 +21,8 @@ mod prompts;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -1921,6 +1923,19 @@ enum DaemonCommand {
         /// Perform the reset instead of previewing it.
         #[arg(long)]
         apply: bool,
+    },
+    /// Check this host for the state that makes a Project look healthy while
+    /// being broken, and report a safe next step when one is available.
+    ///
+    /// Read-only: it changes nothing, so it is always safe to run first.
+    ///
+    /// Checks the daemon answers for (`peer.doctor`): manifests naming a
+    /// surface nothing holds, and manifests naming a surface older than
+    /// themselves. It also reports more than one trusted term-meshd process.
+    Doctor {
+        /// Print the raw report instead of the human summary.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -4671,6 +4686,91 @@ fn is_socket_alive(path: &PathBuf) -> bool {
     }
 }
 
+fn uid_is_trusted(peer_uid: u32, expected_uid: u32) -> bool {
+    peer_uid == expected_uid || peer_uid == 0
+}
+
+fn doctor_expected_uid_from(uid: u32, sudo_uid: Option<u32>) -> u32 {
+    if uid == 0 {
+        sudo_uid.unwrap_or(0)
+    } else {
+        uid
+    }
+}
+
+fn doctor_expected_uid() -> u32 {
+    let uid = unsafe { libc::getuid() };
+    let sudo_uid = env::var("SUDO_UID").ok().and_then(|value| value.parse().ok());
+    doctor_expected_uid_from(uid, sudo_uid)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DoctorPeerIdentity {
+    uid: u32,
+    pid: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn doctor_peer_identity(stream: &UnixStream) -> Option<DoctorPeerIdentity> {
+    use std::os::fd::AsRawFd;
+    let mut credential = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credential.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result != 0 || (length as usize) < std::mem::size_of::<libc::ucred>() {
+        return None;
+    }
+    let credential = unsafe { credential.assume_init() };
+    Some(DoctorPeerIdentity {
+        uid: credential.uid,
+        pid: u32::try_from(credential.pid).ok()?,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn doctor_peer_identity(stream: &UnixStream) -> Option<DoctorPeerIdentity> {
+    use std::os::fd::AsRawFd;
+    const LOCAL_PEERPID: libc::c_int = 0x002;
+    const SOL_LOCAL: libc::c_int = 0;
+
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return None;
+    }
+    let mut pid: libc::pid_t = 0;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            SOL_LOCAL,
+            LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    } != 0
+        || (length as usize) < std::mem::size_of::<libc::pid_t>()
+    {
+        return None;
+    }
+    Some(DoctorPeerIdentity {
+        uid,
+        pid: u32::try_from(pid).ok()?,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn doctor_peer_identity(_stream: &UnixStream) -> Option<DoctorPeerIdentity> {
+    None
+}
+
 fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String> {
     let timeout = env::var("TERMMESH_RPC_TIMEOUT")
         .ok()
@@ -6198,6 +6298,20 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn terminal_safe(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' => safe.push_str("\\n"),
+            '\r' => safe.push_str("\\r"),
+            '\t' => safe.push_str("\\t"),
+            ch if ch.is_control() => safe.push_str(&format!("\\u{{{:04X}}}", ch as u32)),
+            ch => safe.push(ch),
+        }
+    }
+    safe
+}
+
 // ── Research helpers ──────────────────────────────────────────────────────────
 
 /// Lightweight info about one agent, extracted from `team.status` response.
@@ -7710,6 +7824,12 @@ fn main() {
                         process::exit(1);
                     });
                 cmd_daemon_replay_capacity(&sock, set.as_deref());
+                return;
+            }
+            DaemonCommand::Doctor { json } => {
+                // Resolves its own sockets: finding the ones this CLI would
+                // NOT have reached is half of what it checks.
+                cmd_daemon_doctor(*json);
                 return;
             }
             DaemonCommand::Reset { scope, apply } => {
@@ -12984,48 +13104,467 @@ fn detect_watch_socket() -> Option<PathBuf> {
             }
         }
     }
-    // Default daemon socket.
-    let dir = env::var("TMPDIR")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let path = dir.join("term-meshd.sock");
-    if is_socket_alive(&path) {
-        return Some(path);
+    // Default daemon socket, then every other place a daemon binds one.
+    daemon_socket_candidates()
+        .into_iter()
+        .find(is_socket_alive)
+        // Last resort: any socket the generic resolver finds.
+        .or_else(detect_socket)
+}
+
+/// `TERMMESH_DAEMON_UNIX_PATH` as the peer-host config records it.
+///
+/// systemd hands this file to the service through `EnvironmentFile`, so the
+/// daemon binds what it says while a login shell never sees the value. That
+/// is the whole reason a Linux operator had to export the variable by hand
+/// before `tm-agent` could reach their own daemon.
+///
+/// Later files win, matching the `tail -n 1` the ssh probe applies over the
+/// same two paths.
+fn peer_env_daemon_sockets_from_paths(configs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for config in configs {
+        let Ok(contents) = std::fs::read_to_string(&config) else {
+            continue;
+        };
+        for line in contents.lines() {
+            let Some(value) = line.trim().strip_prefix("TERMMESH_DAEMON_UNIX_PATH=") else {
+                continue;
+            };
+            let value = value.trim().trim_matches(['"', '\''].as_slice());
+            if !value.is_empty() {
+                let path = PathBuf::from(value);
+                found.retain(|existing| existing != &path);
+                found.insert(0, path);
+            }
+        }
     }
-    // Last resort: any socket the generic resolver finds.
-    detect_socket()
+    found
+}
+
+fn peer_env_daemon_sockets() -> Vec<PathBuf> {
+    let mut configs = Vec::new();
+    if let Some(home) = env::var_os("HOME") {
+        configs.push(PathBuf::from(home).join(".config/term-mesh/peer.env"));
+    }
+    configs.push(PathBuf::from("/etc/term-mesh/peer.env"));
+    peer_env_daemon_sockets_from_paths(&configs)
+}
+
+/// Every place a term-meshd control socket can live, in the order to try.
+///
+/// The daemon's own `default_socket_path` resolves `dirs::runtime_dir()`
+/// before `TMPDIR`. On Linux that is `$XDG_RUNTIME_DIR` — a directory this
+/// resolver never looked in — while on macOS there is no runtime dir at all
+/// and the daemon lands in `TMPDIR`. That asymmetry, not any Linux-specific
+/// packaging, is why the CLI needed no environment on a Mac and needed
+/// `TERMMESH_DAEMON_UNIX_PATH` exported by hand on every Linux host.
+///
+/// The installer's two scopes add the rest: a user service binds
+/// `/run/user/<uid>/term-meshd.sock`, a system service
+/// `/run/term-mesh/term-meshd.sock`.
+///
+/// Same paths and same order as `REMOTE_CONTROL_SOCKET_DISCOVERY` in
+/// `peer.rs`, which has always resolved this correctly over ssh. A path that
+/// cannot exist on this platform fails the liveness probe on its first
+/// syscall, so one list serves both rather than a per-OS pair that can drift.
+fn daemon_socket_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !path.as_os_str().is_empty() && !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    };
+    for var in ["TERMMESH_DAEMON_SOCKET", "TERMMESH_DAEMON_UNIX_PATH"] {
+        if let Ok(value) = env::var(var) {
+            push(PathBuf::from(value));
+        }
+    }
+    for path in peer_env_daemon_sockets() {
+        push(path);
+    }
+    if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
+        if !runtime_dir.is_empty() {
+            push(PathBuf::from(runtime_dir).join("term-meshd.sock"));
+        }
+    }
+    // `id -u` without spawning it: the ssh probe's `/run/user/$(id -u)` for a
+    // user-scope service whose XDG_RUNTIME_DIR did not reach this shell.
+    push(PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })).join("term-meshd.sock"));
+    push(PathBuf::from("/run/term-mesh/term-meshd.sock"));
+    if let Ok(tmpdir) = env::var("TMPDIR") {
+        if !tmpdir.is_empty() {
+            push(PathBuf::from(tmpdir).join("term-meshd.sock"));
+        }
+    }
+    push(PathBuf::from("/tmp/term-meshd.sock"));
+    candidates
 }
 
 fn detect_daemon_socket() -> Option<PathBuf> {
-    // Priority 1: TERMMESH_DAEMON_SOCKET (injected by daemon into headless agent env)
-    if let Ok(p) = env::var("TERMMESH_DAEMON_SOCKET") {
-        if !p.is_empty() {
-            let path = PathBuf::from(&p);
-            if is_socket_alive(&path) {
-                return Some(path);
-            }
-        }
+    daemon_socket_candidates().into_iter().find(is_socket_alive)
+}
+
+#[derive(Debug, Clone)]
+enum DoctorSocketOutcome {
+    Report(Vec<Value>),
+    Unsupported(String),
+    RpcFailed(String),
+    ProbeFailed(String),
+    Untrusted(String),
+}
+
+fn parse_doctor_result(result: Value) -> Result<Vec<Value>, String> {
+    let object = result
+        .as_object()
+        .ok_or_else(|| "protocol error: peer.doctor result is not an object".to_string())?;
+    let healthy = object
+        .get("healthy")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "protocol error: peer.doctor result has no boolean healthy".to_string())?;
+    let findings = object
+        .get("findings")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "protocol error: peer.doctor result has no findings array".to_string())?;
+    if healthy != findings.is_empty() {
+        return Err("protocol error: peer.doctor healthy disagrees with findings".to_string());
     }
-    // Priority 2: TERMMESH_DAEMON_UNIX_PATH (tagged build override)
-    if let Ok(p) = env::var("TERMMESH_DAEMON_UNIX_PATH") {
-        if !p.is_empty() {
-            let path = PathBuf::from(&p);
-            if is_socket_alive(&path) {
-                return Some(path);
-            }
-        }
+    Ok(findings)
+}
+
+fn local_doctor_finding(code: &str, socket: &Path, detail: String) -> Value {
+    json!({
+        "code": code,
+        "severity": "error",
+        "socket": socket.display().to_string(),
+        "detail": detail,
+        "remedy": "",
+        "repair_argv": [],
+    })
+}
+
+fn safe_inspect_repair() -> (String, Vec<Value>) {
+    let argv = vec![
+        Value::String("tm-agent".into()),
+        Value::String("daemon".into()),
+        Value::String("project-presentations".into()),
+        Value::String("list".into()),
+    ];
+    (
+        "'tm-agent' 'daemon' 'project-presentations' 'list'".into(),
+        argv,
+    )
+}
+
+fn with_multiple_daemon_repair_withheld(mut finding: Value) -> Value {
+    let repair_argv = finding["repair_argv"].as_array();
+    let applied = repair_argv
+        .and_then(|argv| argv.last())
+        .and_then(Value::as_str)
+        == Some("--apply");
+    let legacy_nonempty_remedy = repair_argv.is_none_or(Vec::is_empty)
+        && finding["remedy"]
+            .as_str()
+            .is_some_and(|remedy| !remedy.is_empty());
+    if !applied && !legacy_nonempty_remedy {
+        return finding;
     }
-    // Default daemon socket path
-    let dir = env::var("TMPDIR")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let path = dir.join("term-meshd.sock");
-    if is_socket_alive(&path) {
-        Some(path)
+    if let Some(object) = finding.as_object_mut() {
+        let detail = object
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        object.insert(
+            "detail".into(),
+            Value::String(format!(
+                "{detail}; applied repair is withheld because multiple daemons are live and the source socket must be resolved first"
+            )),
+        );
+        let (remedy, argv) = safe_inspect_repair();
+        object.insert("remedy".into(), Value::String(remedy));
+        object.insert("repair_argv".into(), Value::Array(argv));
+    }
+    finding
+}
+
+fn doctor_is_complete(outcomes: &[(PathBuf, DoctorSocketOutcome)]) -> bool {
+    outcomes
+        .iter()
+        .any(|(_, outcome)| matches!(outcome, DoctorSocketOutcome::Report(_)))
+        && !outcomes.iter().any(|(_, outcome)| {
+            matches!(
+                outcome,
+                DoctorSocketOutcome::Unsupported(_)
+                    | DoctorSocketOutcome::RpcFailed(_)
+                    | DoctorSocketOutcome::ProbeFailed(_)
+            )
+        })
+}
+
+fn doctor_exit_code(outcomes: &[(PathBuf, DoctorSocketOutcome)], findings: &[Value]) -> i32 {
+    if !doctor_is_complete(outcomes) {
+        1
+    } else if findings.is_empty() {
+        0
     } else {
+        2
+    }
+}
+
+fn human_remedy(finding: &Value) -> String {
+    let has_control = finding["repair_argv"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|argument| argument.chars().any(char::is_control));
+    if has_control {
+        "unavailable in human output; inspect --json".into()
+    } else {
+        terminal_safe(finding["remedy"].as_str().unwrap_or_default())
+    }
+}
+
+fn human_remedy_line(finding: &Value) -> Option<String> {
+    let remedy = finding["remedy"].as_str().unwrap_or_default();
+    if remedy.is_empty() {
         None
+    } else {
+        Some(human_remedy(finding))
+    }
+}
+
+fn aggregate_doctor_findings(outcomes: &[(PathBuf, DoctorSocketOutcome)]) -> Vec<Value> {
+    let trusted: Vec<_> = outcomes
+        .iter()
+        .filter(|(_, outcome)| {
+            !matches!(
+                outcome,
+                DoctorSocketOutcome::ProbeFailed(_) | DoctorSocketOutcome::Untrusted(_)
+            )
+        })
+        .collect();
+    let connected_count = outcomes
+        .iter()
+        .filter(|(_, outcome)| !matches!(outcome, DoctorSocketOutcome::ProbeFailed(_)))
+        .count();
+    let mut findings = Vec::new();
+    if trusted.len() > 1 {
+        let paths = trusted
+            .iter()
+            .map(|(path, _)| path.display().to_string())
+            .collect::<Vec<_>>();
+        findings.push(json!({
+            "code": "multiple_daemon_owners",
+            "severity": "error",
+            "detail": format!(
+                "{} trusted term-meshd sockets are listening ({})",
+                paths.len(),
+                paths.join(", ")
+            ),
+            "remedy": "stop every term-meshd but the intended owner, then restart it",
+            "repair_argv": [],
+        }));
+    }
+    let connected_ambiguity = connected_count > 1;
+    for (path, outcome) in outcomes {
+        match outcome {
+            DoctorSocketOutcome::Report(reported) => {
+                for finding in reported {
+                    let mut finding = finding.clone();
+                    if let Some(object) = finding.as_object_mut() {
+                        object.insert(
+                            "socket".into(),
+                            Value::String(path.display().to_string()),
+                        );
+                    }
+                    findings.push(if connected_ambiguity {
+                        with_multiple_daemon_repair_withheld(finding)
+                    } else {
+                        finding
+                    });
+                }
+            }
+            DoctorSocketOutcome::Unsupported(message) => {
+                findings.push(local_doctor_finding(
+                    "doctor_unsupported",
+                    path,
+                    format!("the daemon does not support peer.doctor: {message}"),
+                ));
+            }
+            DoctorSocketOutcome::RpcFailed(message) => {
+                findings.push(local_doctor_finding(
+                    "doctor_rpc_failed",
+                    path,
+                    format!("peer.doctor failed: {message}"),
+                ));
+            }
+            DoctorSocketOutcome::ProbeFailed(message) => findings.push(local_doctor_finding(
+                "socket_probe_failed",
+                path,
+                message.clone(),
+            )),
+            DoctorSocketOutcome::Untrusted(message) => findings.push(local_doctor_finding(
+                "untrusted_socket_owner",
+                path,
+                message.clone(),
+            )),
+        }
+    }
+    findings
+}
+
+fn daemon_rpc_on_stream(stream: &UnixStream) -> Result<Value, String> {
+    stream.set_read_timeout(Some(Duration::from_secs(6))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(6))).ok();
+    let mut reader = BufReader::new(stream);
+    let response = rpc_call_with_reader(stream, &mut reader, "peer.doctor", json!({}))?;
+    if response["error"].is_null() {
+        Ok(response["result"].clone())
+    } else {
+        Err(response["error"]["message"]
+            .as_str()
+            .unwrap_or("peer.doctor failed")
+            .to_string())
+    }
+}
+
+/// `tm-agent daemon doctor`: report, never repair.
+///
+/// Probes the whole candidate list rather than stopping at the first live
+/// socket the way [`detect_daemon_socket`] does. Which one a client picks is
+/// exactly the thing being checked: a host was found running one daemon under
+/// systemd and a second, left from a `--help` invocation weeks earlier, still
+/// listening on the runtime-dir default. Every client silently chose one of
+/// them.
+fn cmd_daemon_doctor(json: bool) {
+    let expected_uid = doctor_expected_uid();
+    let mut outcomes = Vec::new();
+    let mut trusted_identities = std::collections::HashSet::new();
+    for path in daemon_socket_candidates() {
+        let stream = match UnixStream::connect(&path) {
+            Ok(stream) => stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::ConnectionRefused
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                outcomes.push((
+                    path,
+                    DoctorSocketOutcome::ProbeFailed(format!("connect: {error}")),
+                ));
+                continue;
+            }
+        };
+        let Some(identity) = doctor_peer_identity(&stream) else {
+            outcomes.push((
+                path,
+                DoctorSocketOutcome::Untrusted(
+                    "peer credentials are unavailable; refusing this socket".into(),
+                ),
+            ));
+            continue;
+        };
+        if !uid_is_trusted(identity.uid, expected_uid) {
+            outcomes.push((
+                path,
+                DoctorSocketOutcome::Untrusted(format!(
+                    "socket owner uid {} is neither expected uid {expected_uid} nor root",
+                    identity.uid
+                )),
+            ));
+            continue;
+        }
+        if !trusted_identities.insert(identity) {
+            continue;
+        }
+        let outcome = match daemon_rpc_on_stream(&stream) {
+            Ok(result) => match parse_doctor_result(result) {
+                Ok(findings) => DoctorSocketOutcome::Report(findings),
+                Err(message) => DoctorSocketOutcome::RpcFailed(message),
+            },
+            Err(message) if message.contains("unknown method") => {
+                DoctorSocketOutcome::Unsupported(message)
+            }
+            Err(message) => DoctorSocketOutcome::RpcFailed(message),
+        };
+        outcomes.push((path, outcome));
+    }
+
+    if outcomes.is_empty() {
+        let report = json!({
+            "sockets": [],
+            "complete": false,
+            "healthy": false,
+            "findings": [{
+                "code": "no_daemon",
+                "severity": "error",
+                "detail": "no term-meshd is listening on any known socket path on this host",
+                "remedy": "start term-meshd",
+                "repair_argv": []
+            }]
+        });
+        if json {
+            println!("{}", pretty(&report));
+        } else {
+            println!("no term-meshd is listening on this host.");
+        }
+        process::exit(1);
+    }
+    let findings = aggregate_doctor_findings(&outcomes);
+    let exit_code = doctor_exit_code(&outcomes, &findings);
+    let complete = doctor_is_complete(&outcomes);
+    let healthy = complete && findings.is_empty();
+    let sockets = outcomes
+        .iter()
+        .map(|(path, _)| path.display().to_string())
+        .collect::<Vec<_>>();
+    if json {
+        println!(
+            "{}",
+            pretty(&json!({ "sockets": sockets, "complete": complete, "healthy": healthy,
+                            "findings": findings }))
+        );
+    } else if healthy {
+        println!("{}: no problems found.", terminal_safe(&sockets.join(", ")));
+    } else {
+        println!(
+            "{} problem(s) across {} socket(s).\n",
+            findings.len(),
+            sockets.len()
+        );
+        for finding in &findings {
+            let text = |key: &str| terminal_safe(finding[key].as_str().unwrap_or(""));
+            let (severity, code) = (text("severity"), text("code"));
+            println!("[{severity}] {code}");
+            let socket = text("socket");
+            if !socket.is_empty() {
+                println!("  socket {socket}");
+            }
+            let project = text("project_id");
+            if !project.is_empty() {
+                let team = text("team_name");
+                println!("  project {project}{}", if team.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (team {team})")
+                });
+            }
+            println!("  {}", text("detail"));
+            if let Some(remedy) = human_remedy_line(finding) {
+                println!("  fix: {remedy}\n");
+            } else {
+                println!();
+            }
+        }
+    }
+    if exit_code != 0 {
+        process::exit(exit_code);
     }
 }
 
@@ -21195,6 +21734,7 @@ mod watcher_spec_tests {
 
     #[test]
     fn derive_daemon_socket_maps_tagged_app_to_app_support() {
+        let _env = SocketDiscoveryEnv::isolated();
         std::env::set_var("HOME", "/Users/tester");
         let derived =
             derive_daemon_socket_from_app(Path::new("/tmp/term-mesh-debug-watcher-p2.sock"));
@@ -21208,6 +21748,7 @@ mod watcher_spec_tests {
 
     #[test]
     fn derive_daemon_socket_skips_live_and_untagged() {
+        let _env = SocketDiscoveryEnv::isolated();
         std::env::set_var("HOME", "/Users/tester");
         // Live/release app socket → no derivation (falls through to default daemon).
         assert_eq!(
@@ -21224,6 +21765,471 @@ mod watcher_spec_tests {
             derive_daemon_socket_from_app(Path::new("/tmp/term-meshd.sock")),
             None
         );
+    }
+
+    // ── Linux control-socket discovery ────────────────────────────────────
+
+    /// Guards the regression this list exists for: a Linux host binds its
+    /// control socket under the runtime dir or the installer's service
+    /// directory, and before these entries existed `tm-agent` looked only in
+    /// `/tmp` and answered DAEMON_UNAVAILABLE on a host whose daemon was up.
+    /// Both socket-discovery tests clear and set the same five process-global
+    /// environment variables, so running them concurrently lets one observe
+    /// the other's cleared state. Observed once as
+    /// `daemon_socket_candidates_cover_both_linux_install_scopes` failing in a
+    /// full-suite run that passed on the next four. Serialize them; a flake
+    /// that rare is worse than one that always fails.
+    static SOCKET_DISCOVERY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const SOCKET_ENV_KEYS: [&str; 6] = [
+        "TERMMESH_DAEMON_SOCKET",
+        "TERMMESH_DAEMON_UNIX_PATH",
+        "XDG_RUNTIME_DIR",
+        "TMPDIR",
+        "HOME",
+        "SUDO_UID",
+    ];
+    struct SocketDiscoveryEnv {
+        saved: Vec<(&'static str, Option<OsString>)>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+    impl SocketDiscoveryEnv {
+        fn isolated() -> Self {
+            let guard = SOCKET_DISCOVERY_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let saved = SOCKET_ENV_KEYS
+                .iter()
+                .map(|&key| {
+                    let value = env::var_os(key);
+                    env::remove_var(key);
+                    (key, value)
+                })
+                .collect();
+            Self { saved, _guard: guard }
+        }
+    }
+    impl Drop for SocketDiscoveryEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_socket_candidates_cover_both_linux_install_scopes() {
+        let _env = SocketDiscoveryEnv::isolated();
+        // An empty HOME would make the user peer.env path `/.config/...`.
+        std::env::set_var("HOME", "/nonexistent-home-for-tests");
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/4242");
+
+        let candidates = daemon_socket_candidates();
+
+        // User-scope service (installer default for a non-root install).
+        assert!(candidates.contains(&PathBuf::from("/run/user/4242/term-meshd.sock")));
+        // System-scope service (root installer default, and what peer.env pins).
+        assert!(candidates.contains(&PathBuf::from("/run/term-mesh/term-meshd.sock")));
+        // The historical default stays last so macOS behaviour is unchanged.
+        assert_eq!(
+            candidates.last(),
+            Some(&PathBuf::from("/tmp/term-meshd.sock"))
+        );
+
+    }
+
+    /// An explicitly exported socket must still win over every default, and
+    /// the list must not offer the same path twice — a duplicate would make
+    /// the caller probe a dead pathname a second time before moving on.
+    #[test]
+    fn daemon_socket_candidates_rank_env_first_and_deduplicate() {
+        let _env = SocketDiscoveryEnv::isolated();
+        std::env::set_var("HOME", "/nonexistent-home-for-tests");
+        // Both variables name the same socket, as a daemon-spawned pane sees it.
+        std::env::set_var("TERMMESH_DAEMON_SOCKET", "/run/term-mesh/term-meshd.sock");
+        std::env::set_var(
+            "TERMMESH_DAEMON_UNIX_PATH",
+            "/run/term-mesh/term-meshd.sock",
+        );
+
+        let candidates = daemon_socket_candidates();
+
+        assert_eq!(
+            candidates.first(),
+            Some(&PathBuf::from("/run/term-mesh/term-meshd.sock"))
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|path| *path == &PathBuf::from("/run/term-mesh/term-meshd.sock"))
+                .count(),
+            1,
+            "the same socket must be probed once, however many names point at it"
+        );
+
+    }
+
+    /// The value systemd reads from `peer.env` is invisible to a login shell,
+    /// so the resolver reads the file itself rather than requiring every
+    /// operator to re-export what the installer already wrote.
+    #[test]
+    fn peer_env_daemon_socket_reads_the_installer_written_value() {
+        let _env = SocketDiscoveryEnv::isolated();
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.env");
+        let system = dir.path().join("system.env");
+        std::fs::write(
+            &user,
+            "TERMMESH_DAEMON_UNIX_PATH=\"/run/user/0/term-meshd.sock\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &system,
+            "TERMMESH_DAEMON_UNIX_PATH='/run/term-mesh/term-meshd.sock'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            peer_env_daemon_sockets_from_paths(&[user, system]),
+            vec![
+                PathBuf::from("/run/term-mesh/term-meshd.sock"),
+                PathBuf::from("/run/user/0/term-meshd.sock"),
+            ]
+        );
+    }
+
+    #[test]
+    fn socket_environment_is_restored_when_a_test_panics() {
+        let before = env::var_os("SUDO_UID");
+        let _ = std::panic::catch_unwind(|| {
+            let _env = SocketDiscoveryEnv::isolated();
+            env::set_var("SUDO_UID", OsString::from("4242"));
+            panic!("exercise Drop");
+        });
+        assert_eq!(env::var_os("SUDO_UID"), before);
+    }
+
+    #[test]
+    fn doctor_uid_and_mixed_outcome_helpers_are_deterministic() {
+        assert!(uid_is_trusted(501, 501));
+        assert!(uid_is_trusted(0, 501));
+        assert!(!uid_is_trusted(502, 501));
+        assert_eq!(doctor_expected_uid_from(0, Some(501)), 501);
+        let outcomes = vec![
+            (
+                PathBuf::from("/old.sock"),
+                DoctorSocketOutcome::Unsupported("unknown method".into()),
+            ),
+            (PathBuf::from("/new.sock"), DoctorSocketOutcome::Report(vec![])),
+            (
+                PathBuf::from("/failed.sock"),
+                DoctorSocketOutcome::RpcFailed("timeout".into()),
+            ),
+        ];
+        let findings = aggregate_doctor_findings(&outcomes);
+        assert!(findings
+            .iter()
+            .any(|finding| finding["code"] == "multiple_daemon_owners"));
+        assert!(findings.iter().any(|f| f["code"] == "doctor_unsupported"));
+        assert!(findings.iter().any(|f| f["code"] == "doctor_rpc_failed"));
+        assert_eq!(doctor_exit_code(&outcomes, &findings), 1);
+        let incomplete = vec![
+            (
+                PathBuf::from("/old.sock"),
+                DoctorSocketOutcome::Unsupported("unknown method".into()),
+            ),
+            (
+                PathBuf::from("/failed.sock"),
+                DoctorSocketOutcome::RpcFailed("timeout".into()),
+            ),
+        ];
+        let incomplete_findings = aggregate_doctor_findings(&incomplete);
+        assert_eq!(doctor_exit_code(&incomplete, &incomplete_findings), 1);
+        let healthy = vec![(
+            PathBuf::from("/healthy.sock"),
+            DoctorSocketOutcome::Report(vec![]),
+        )];
+        assert_eq!(doctor_exit_code(&healthy, &[]), 0);
+        let report_and_unsupported = vec![
+            (
+                PathBuf::from("/healthy.sock"),
+                DoctorSocketOutcome::Report(vec![]),
+            ),
+            (
+                PathBuf::from("/old.sock"),
+                DoctorSocketOutcome::Unsupported("unknown method".into()),
+            ),
+        ];
+        assert_eq!(
+            doctor_exit_code(
+                &report_and_unsupported,
+                &aggregate_doctor_findings(&report_and_unsupported)
+            ),
+            1
+        );
+        let report_and_failure = vec![
+            (
+                PathBuf::from("/healthy.sock"),
+                DoctorSocketOutcome::Report(vec![]),
+            ),
+            (
+                PathBuf::from("/failed.sock"),
+                DoctorSocketOutcome::RpcFailed("timeout".into()),
+            ),
+        ];
+        assert_eq!(
+            doctor_exit_code(
+                &report_and_failure,
+                &aggregate_doctor_findings(&report_and_failure)
+            ),
+            1
+        );
+        let report_and_untrusted = vec![
+            (
+                PathBuf::from("/healthy.sock"),
+                DoctorSocketOutcome::Report(vec![]),
+            ),
+            (
+                PathBuf::from("/untrusted.sock"),
+                DoctorSocketOutcome::Untrusted("foreign uid".into()),
+            ),
+        ];
+        assert_eq!(
+            doctor_exit_code(
+                &report_and_untrusted,
+                &aggregate_doctor_findings(&report_and_untrusted)
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn doctor_result_parser_rejects_malformed_or_inconsistent_reports() {
+        assert_eq!(
+            parse_doctor_result(json!({"healthy": true, "findings": []})).unwrap(),
+            Vec::<Value>::new()
+        );
+        assert!(parse_doctor_result(json!({"healthy": true})).is_err());
+        assert!(parse_doctor_result(json!({"healthy": "yes", "findings": []})).is_err());
+        assert!(parse_doctor_result(json!({
+            "healthy": true,
+            "findings": [{"code": "surface_missing"}]
+        }))
+        .is_err());
+        assert!(parse_doctor_result(json!({
+            "healthy": false,
+            "findings": []
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn multiple_daemons_withhold_applied_repairs() {
+        let applied = json!({
+            "code": "surface_missing",
+            "severity": "error",
+            "detail": "missing",
+            "remedy": "dangerous",
+            "repair_argv": ["tm-agent", "daemon", "project-presentations", "prune",
+                "--project-id", "team:x", "--apply"],
+        });
+        let outcomes = vec![
+            (
+                PathBuf::from("/one.sock"),
+                DoctorSocketOutcome::Report(vec![applied.clone()]),
+            ),
+            (
+                PathBuf::from("/two.sock"),
+                DoctorSocketOutcome::Report(vec![applied]),
+            ),
+        ];
+        let findings = aggregate_doctor_findings(&outcomes);
+        let reported = findings
+            .iter()
+            .filter(|finding| finding["code"] == "surface_missing")
+            .collect::<Vec<_>>();
+        assert_eq!(reported.len(), 2);
+        for finding in reported {
+            assert_eq!(
+                finding["repair_argv"],
+                json!(["tm-agent", "daemon", "project-presentations", "list"])
+            );
+            assert_eq!(
+                finding["remedy"],
+                "'tm-agent' 'daemon' 'project-presentations' 'list'"
+            );
+            assert!(finding["detail"]
+                .as_str()
+                .unwrap()
+                .contains("applied repair is withheld"));
+        }
+
+        let legacy = with_multiple_daemon_repair_withheld(json!({
+            "code": "legacy_surface_missing",
+            "severity": "error",
+            "detail": "legacy missing",
+            "remedy": "tm-agent daemon project-presentations prune --project-id team:x --apply"
+        }));
+        assert_eq!(
+            legacy["repair_argv"],
+            json!(["tm-agent", "daemon", "project-presentations", "list"])
+        );
+        assert_eq!(
+            legacy["remedy"],
+            "'tm-agent' 'daemon' 'project-presentations' 'list'"
+        );
+
+        let structured_inspect = json!({
+            "code": "surface_predates_record",
+            "severity": "warning",
+            "detail": "inspect",
+            "remedy": "'tm-agent' 'daemon' 'project-presentations' 'list'",
+            "repair_argv": ["tm-agent", "daemon", "project-presentations", "list"]
+        });
+        assert_eq!(
+            with_multiple_daemon_repair_withheld(structured_inspect.clone()),
+            structured_inspect
+        );
+    }
+
+    #[test]
+    fn untrusted_connected_socket_withholds_applied_repair() {
+        let outcomes = vec![
+            (
+                PathBuf::from("/untrusted.sock"),
+                DoctorSocketOutcome::Untrusted("foreign uid".into()),
+            ),
+            (
+                PathBuf::from("/trusted.sock"),
+                DoctorSocketOutcome::Report(vec![json!({
+                    "code": "surface_missing",
+                    "severity": "error",
+                    "detail": "missing",
+                    "remedy": "dangerous",
+                    "repair_argv": ["tm-agent", "daemon", "project-presentations",
+                        "prune", "--project-id", "team:x", "--apply"],
+                })]),
+            ),
+        ];
+
+        let findings = aggregate_doctor_findings(&outcomes);
+        let repair = findings
+            .iter()
+            .find(|finding| finding["code"] == "surface_missing")
+            .expect("surface finding");
+        assert_eq!(
+            repair["repair_argv"],
+            json!(["tm-agent", "daemon", "project-presentations", "list"])
+        );
+        assert_eq!(
+            repair["remedy"],
+            "'tm-agent' 'daemon' 'project-presentations' 'list'"
+        );
+        assert!(!repair["repair_argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|argument| argument == "--apply"));
+        assert!(findings
+            .iter()
+            .any(|finding| finding["code"] == "untrusted_socket_owner"));
+        assert!(!findings
+            .iter()
+            .any(|finding| finding["code"] == "multiple_daemon_owners"));
+        assert_eq!(doctor_exit_code(&outcomes, &findings), 2);
+    }
+
+    #[test]
+    fn human_remedy_suppresses_control_characters() {
+        let finding = json!({
+            "remedy": "dangerous",
+            "repair_argv": ["tm-agent", "bad\nproject"],
+        });
+        assert_eq!(
+            human_remedy(&finding),
+            "unavailable in human output; inspect --json"
+        );
+        let blank = json!({"remedy": "", "repair_argv": []});
+        assert_eq!(human_remedy_line(&blank), None);
+    }
+
+    #[test]
+    fn terminal_safe_escapes_terminal_controls() {
+        let raw = format!(
+            "project{}]8;;bad{}{}done",
+            char::from(27),
+            char::from(7),
+            char::from(133)
+        );
+        let rendered = terminal_safe(&raw);
+        assert_eq!(rendered, "project\\u{001B}]8;;bad\\u{0007}\\u{0085}done");
+        assert!(!rendered.chars().any(char::is_control));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn extracts_uid_from_a_connected_unix_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doctor.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert_eq!(
+            doctor_peer_identity(&client).map(|identity| identity.uid),
+            Some(unsafe { libc::getuid() })
+        );
+        assert_eq!(
+            doctor_peer_identity(&server).map(|identity| identity.uid),
+            Some(unsafe { libc::getuid() })
+        );
+    }
+
+    #[test]
+    fn doctor_collapses_a_symlink_alias_to_one_listener() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("daemon.sock");
+        let alias = dir.path().join("daemon-alias.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        symlink(&target, &alias).unwrap();
+
+        let target_stream = UnixStream::connect(&target).unwrap();
+        let alias_stream = UnixStream::connect(&alias).unwrap();
+        let target_identity = doctor_peer_identity(&target_stream).unwrap();
+        let alias_identity = doctor_peer_identity(&alias_stream).unwrap();
+        assert_eq!(target_identity, alias_identity);
+        assert_ne!(
+            target_identity,
+            DoctorPeerIdentity {
+                uid: target_identity.uid,
+                pid: target_identity.pid.saturating_add(1),
+            }
+        );
+
+        let mut identities = std::collections::HashSet::new();
+        let mut outcomes = Vec::new();
+        for (path, identity) in [(&target, target_identity), (&alias, alias_identity)] {
+            if identities.insert(identity) {
+                outcomes.push((
+                    path.to_path_buf(),
+                    DoctorSocketOutcome::Report(vec![json!({
+                        "code": "one_report",
+                        "severity": "warning",
+                    })]),
+                ));
+            }
+        }
+        let findings = aggregate_doctor_findings(&outcomes);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["code"], "one_report");
+        assert!(!findings
+            .iter()
+            .any(|finding| finding["code"] == "multiple_daemon_owners"));
+
+        drop(listener);
     }
 }
 

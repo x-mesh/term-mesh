@@ -1105,6 +1105,164 @@ pub struct ProjectPresentationStatus {
     pub directory_present: bool,
 }
 
+/// One thing wrong with a durable manifest, and the command that fixes it.
+///
+/// `severity` separates "this project is already broken" from "this will
+/// break the next time something attaches", because the two deserve different
+/// urgency from whoever is reading. The remedy is a literal command rather
+/// than a description: an operator staring at a host at 2am should be able to
+/// copy it, not translate it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PeerHostFinding {
+    /// Stable machine-readable identifier, e.g. `surface_predates_record`.
+    pub code: &'static str,
+    /// `error` when the project is already unusable, `warning` when it still
+    /// works but rests on something untrue.
+    pub severity: &'static str,
+    pub project_id: String,
+    pub team_name: String,
+    /// `leader` or `member` — which slot of the manifest names this surface.
+    pub role: &'static str,
+    pub surface_id: String,
+    /// One sentence an operator can act on, with the numbers that prove it.
+    pub detail: String,
+    /// A command that repairs this finding.
+    pub remedy: String,
+    /// Exact arguments for callers that must not parse the human command.
+    pub repair_argv: Vec<String>,
+}
+
+impl PeerHostFinding {
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    fn repair(project_id: &str, apply: bool) -> (String, Vec<String>) {
+        let mut argv = vec![
+            "tm-agent",
+            "daemon",
+            "project-presentations",
+            "prune",
+            "--project-id",
+            project_id,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        if apply {
+            argv.push("--apply".into());
+        }
+        let command = argv
+            .iter()
+            .map(|arg| Self::shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        (command, argv)
+    }
+
+    fn inspect() -> (String, Vec<String>) {
+        let argv = vec!["tm-agent", "daemon", "project-presentations", "list"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let command = argv
+            .iter()
+            .map(|arg| Self::shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        (command, argv)
+    }
+
+    fn malformed_surface_id(
+        record: &super::persist::PersistedProjectPresentation,
+        role: &'static str,
+        encoded: &str,
+        can_prune: bool,
+    ) -> Self {
+        let (remedy, repair_argv) = if can_prune {
+            Self::repair(&record.project_id, true)
+        } else {
+            Self::inspect()
+        };
+        let live_note = if can_prune {
+            ""
+        } else {
+            "; another referenced surface is live, so prune would refuse this record"
+        };
+        Self {
+            code: "malformed_surface_id",
+            severity: "error",
+            project_id: record.project_id.clone(),
+            team_name: record.team_name.clone(),
+            role,
+            surface_id: encoded.to_string(),
+            detail: format!(
+                "{role} surface id {encoded:?} is not hex and names nothing{live_note}"
+            ),
+            remedy,
+            repair_argv,
+        }
+    }
+
+    fn surface_missing(
+        record: &super::persist::PersistedProjectPresentation,
+        role: &'static str,
+        encoded: &str,
+        can_prune: bool,
+    ) -> Self {
+        let (remedy, repair_argv) = if can_prune {
+            Self::repair(&record.project_id, true)
+        } else {
+            Self::inspect()
+        };
+        let live_note = if can_prune {
+            ""
+        } else {
+            "; another referenced surface is live, so prune would refuse this record"
+        };
+        Self {
+            code: "surface_missing",
+            severity: "error",
+            project_id: record.project_id.clone(),
+            team_name: record.team_name.clone(),
+            role,
+            surface_id: encoded.to_string(),
+            detail: format!(
+                "{role} surface {encoded} is named by this manifest but no live surface holds it{live_note}"
+            ),
+            remedy,
+            repair_argv,
+        }
+    }
+
+    fn surface_predates_record(
+        record: &super::persist::PersistedProjectPresentation,
+        role: &'static str,
+        encoded: &str,
+        spawned_at_unix_secs: u64,
+    ) -> Self {
+        let older_by = record
+            .created_at_unix_secs
+            .saturating_sub(spawned_at_unix_secs);
+        let (remedy, repair_argv) = Self::inspect();
+        Self {
+            code: "surface_predates_record",
+            severity: "warning",
+            project_id: record.project_id.clone(),
+            team_name: record.team_name.clone(),
+            role,
+            surface_id: encoded.to_string(),
+            detail: format!(
+                "{role} surface {encoded} was spawned {older_by}s before this manifest was \
+                 written. The publisher and daemon can have different wall clocks, so this is \
+                 suspicious but does not prove ownership"
+            ),
+            remedy,
+            repair_argv,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ProjectPresentationPruneSkip {
     pub project_id: String,
@@ -1213,10 +1371,26 @@ pub struct PeerHost {
     /// mutations and `watch_ephemeral` removals to the right tree without
     /// scanning every workspace.
     surface_workspace: Mutex<HashMap<SurfaceId, Vec<u8>>>,
-    /// Names split/new-tab surfaces (`split-1`, `split-2`, …). Lifetime
-    /// of this daemon only, like the tree itself. Host-wide (not
-    /// per-workspace) so ephemeral ids never collide across workspaces.
+    /// Names split/new-tab surfaces (`split-1`, `split-2`, …). Host-wide
+    /// (not per-workspace) so ephemeral ids never collide across
+    /// workspaces.
     ephemeral_counter: AtomicU64,
+    /// Makes the counter above unique across daemon *processes*, not just
+    /// within one.
+    ///
+    /// The counter restarts at 1 every time the daemon does, so on its own
+    /// the first split pane of every run hashed to the same surface id —
+    /// and a pane from a previous run can still be alive to hold it. That
+    /// happened: a leader pane spawned minutes after a restart took the id
+    /// of a six-day-old orphan, and the viewer attaching to the id it had
+    /// been handed reached the wrong surface. Ids are also written into a
+    /// project manifest that outlives the process that minted them, so
+    /// "lifetime of this daemon" was never true of what they identify.
+    ///
+    /// A per-process nonce keeps the sequence from ever repeating while
+    /// leaving the `\0` prefix — and the declared-name guarantee that rests
+    /// on it — exactly as it was.
+    ephemeral_nonce: String,
     /// Workspace ids with a debounced layout push currently pending —
     /// collapses a burst of mutations (divider drags especially) against
     /// the SAME workspace into one push, while still letting a different
@@ -1237,6 +1411,8 @@ pub struct PeerHost {
     /// Host-level lifecycle boundary covering PTY, layout, and reverse index.
     /// The manager's per-id lock remains authoritative for PTY internals.
     surface_lifecycle: Mutex<HashMap<SurfaceId, Weak<Mutex<()>>>>,
+    /// Serializes ownerless shutdown admission with surface creation.
+    surface_admission: Mutex<SurfaceAdmission>,
     /// Live system stats for the machine this host runs on, if the daemon
     /// wired its monitor in. `None` for every host built without one (the
     /// test constructors, and any embedder that has no monitor) — those
@@ -1283,6 +1459,10 @@ pub struct PeerHost {
     /// counts up, and the repair compares it under the same lock that removes.
     project_presentation_instances: Mutex<HashMap<String, u64>>,
     project_presentation_watchers: Mutex<HashSet<Vec<u8>>>,
+}
+
+struct SurfaceAdmission {
+    closed: bool,
 }
 
 /// Debounce window for layout pushes. Mirrors the Swift host's 120 ms
@@ -1397,10 +1577,12 @@ impl PeerHost {
             workspace_id: Mutex::new(workspace_id),
             surface_workspace: Mutex::new(surface_workspace),
             ephemeral_counter: AtomicU64::new(1),
+            ephemeral_nonce: uuid::Uuid::new_v4().simple().to_string(),
             pending_pushes: Mutex::new(HashSet::new()),
             persist_path: Mutex::new(None),
             workspace_persistence: Mutex::new(()),
             surface_lifecycle: Mutex::new(HashMap::new()),
+            surface_admission: Mutex::new(SurfaceAdmission { closed: false }),
             monitor: Mutex::new(None),
             teams: Mutex::new(None),
             agents: Mutex::new(None),
@@ -1421,6 +1603,21 @@ impl PeerHost {
         let lock = Arc::new(Mutex::new(()));
         locks.insert(surface_id.to_vec(), Arc::downgrade(&lock));
         lock
+    }
+
+    pub fn with_open_surface_admission<T>(&self, body: impl FnOnce() -> T) -> Option<T> {
+        let guard = self.surface_admission.lock().unwrap();
+        if guard.closed {
+            return None;
+        }
+        Some(body())
+    }
+
+    pub fn evaluate_surface_admission(&self, body: impl FnOnce() -> bool) {
+        let mut guard = self.surface_admission.lock().unwrap();
+        if body() {
+            guard.closed = true;
+        }
     }
 
     /// Wire the on-disk persistence path after construction. Kept out of
@@ -1489,6 +1686,13 @@ impl PeerHost {
             .filter(|surface| surface.info().attachable)
             .map(|surface| surface.surface_id.clone())
             .collect()
+    }
+
+    pub(crate) fn has_live_attachable_surfaces(&self) -> bool {
+        self.pty
+            .list()
+            .into_iter()
+            .any(|surface| surface.info().attachable)
     }
 
     fn presentation_status(
@@ -1937,6 +2141,94 @@ impl PeerHost {
             .collect()
     }
 
+    /// Read-only health check over this host's durable manifests.
+    ///
+    /// Written because diagnosing a lost leader took an ssh session, `ps`,
+    /// `ss -lxp`, and reading `/proc/<pid>/environ` by hand — and the one
+    /// number an operator would have reached for was reassuring and wrong.
+    /// `peer.project_presentations.list` reported the project's surfaces as
+    /// 5 live out of 5 referenced while its leader id resolved to a six-day-old
+    /// orphan from a previous daemon run. Every check here is a fact that
+    /// listing could not express.
+    ///
+    /// Nothing is removed and nothing is signalled: each finding names an
+    /// existing command that would repair it, so the operator stays the one
+    /// who decides.
+    pub fn diagnose(&self) -> Vec<PeerHostFinding> {
+        let live: HashMap<Vec<u8>, Arc<super::surface::PtySurface>> = self
+            .pty
+            .list()
+            .into_iter()
+            .filter(|surface| surface.info().attachable)
+            .map(|surface| (surface.surface_id.clone(), surface))
+            .collect();
+
+        let records: Vec<_> = self
+            .project_presentations
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+
+        let mut findings = Vec::new();
+        for record in records {
+            let mut labelled = vec![("leader", record.leader_surface_id.clone())];
+            labelled.extend(
+                record
+                    .members
+                    .iter()
+                    .map(|member| ("member", member.surface_id.clone())),
+            );
+            let live_references = labelled
+                .iter()
+                .filter_map(|(_, encoded)| hex::decode(encoded).ok())
+                .filter(|id| live.contains_key(id))
+                .count();
+            let can_prune = live_references == 0;
+
+            for (role, encoded) in labelled {
+                let Some(id) = hex::decode(&encoded).ok() else {
+                    findings.push(PeerHostFinding::malformed_surface_id(
+                        &record,
+                        role,
+                        &encoded,
+                        can_prune,
+                    ));
+                    continue;
+                };
+                let Some(surface) = live.get(&id) else {
+                    findings.push(PeerHostFinding::surface_missing(
+                        &record,
+                        role,
+                        &encoded,
+                        can_prune,
+                    ));
+                    continue;
+                };
+                // A surface that already existed when the manifest was written
+                // cannot be one the manifest created. Records written before
+                // `created_at_unix_secs` existed carry 0 and are not judged;
+                // neither is a surface whose spawn clock is unavailable.
+                if record.created_at_unix_secs > 0
+                    && surface.spawned_at_unix_secs > 0
+                    && surface.spawned_at_unix_secs < record.created_at_unix_secs
+                {
+                    findings.push(PeerHostFinding::surface_predates_record(
+                        &record,
+                        role,
+                        &encoded,
+                        surface.spawned_at_unix_secs,
+                    ));
+                }
+            }
+        }
+        findings.sort_by(|a, b| {
+            (&a.project_id, &a.code, &a.surface_id).cmp(&(&b.project_id, &b.code, &b.surface_id))
+        });
+        findings
+    }
+
     pub fn delete_project_presentation(
         self: &Arc<Self>,
         owner_peer_ids: &[Vec<u8>],
@@ -2312,6 +2604,10 @@ impl PeerHost {
         key: &str,
         spec: &SurfaceSpec,
     ) -> Result<EnsureOutcome, EnsureError> {
+        let admission_guard = self.surface_admission.lock().unwrap();
+        if admission_guard.closed {
+            return Err(EnsureError::Internal("daemon shutdown is committed"));
+        }
         let surface_id = surface_id_from_name(key);
         let lifecycle = self.surface_lifecycle_lock(&surface_id);
         let _lifecycle_guard = lifecycle
@@ -2776,23 +3072,23 @@ impl PeerHost {
         {
             return None;
         }
-        // A dead source pane revives first, same as attach would do — the
-        // user is clearly working in it. No-op when it is alive.
-        self.pty.get_or_respawn(pane_id);
-        let new_id = self.spawn_ephemeral(pane_id, &ws_id)?;
-        match self.with_store(&ws_id, |store| {
-            store.split_pane(pane_id, orientation, new_id.clone())
-        }) {
-            Some(Ok(true)) => Some(ws_id),
-            Some(Ok(false)) => None,
-            _ => {
-                // Source pane (or its workspace) vanished between probe and
-                // insert; don't leak the shell we spawned for it.
-                self.pty.remove(&new_id);
-                self.surface_workspace.lock().unwrap().remove(&new_id);
-                None
+        self.with_open_surface_admission(|| {
+            // A dead source pane revives first, same as attach would do — the
+            // user is clearly working in it. No-op when it is alive.
+            self.pty.get_or_respawn(pane_id);
+            let new_id = self.spawn_ephemeral_unlocked(pane_id, &ws_id)?;
+            match self.with_store(&ws_id, |store| {
+                store.split_pane(pane_id, orientation, new_id.clone())
+            }) {
+                Some(Ok(true)) => Some(ws_id),
+                Some(Ok(false)) => None,
+                _ => {
+                    self.pty.remove(&new_id);
+                    self.surface_workspace.lock().unwrap().remove(&new_id);
+                    None
+                }
             }
-        }
+        }).flatten()
     }
 
     /// `pane_id` resolving to an existing pane always wins (matches every
@@ -2812,17 +3108,18 @@ impl PeerHost {
                 })
                 .unwrap_or(false)
             {
-                self.pty.get_or_respawn(pane_id);
-                let new_id = self.spawn_ephemeral(pane_id, &ws_id)?;
-                return match self.with_store(&ws_id, |store| store.add_tab(pane_id, new_id.clone()))
-                {
-                    Some(Ok(true)) => Some(ws_id),
-                    _ => {
-                        self.pty.remove(&new_id);
-                        self.surface_workspace.lock().unwrap().remove(&new_id);
-                        None
+                return self.with_open_surface_admission(|| {
+                    self.pty.get_or_respawn(pane_id);
+                    let new_id = self.spawn_ephemeral_unlocked(pane_id, &ws_id)?;
+                    match self.with_store(&ws_id, |store| store.add_tab(pane_id, new_id.clone())) {
+                        Some(Ok(true)) => Some(ws_id),
+                        _ => {
+                            self.pty.remove(&new_id);
+                            self.surface_workspace.lock().unwrap().remove(&new_id);
+                            None
+                        }
                     }
-                };
+                }).flatten();
             }
         }
 
@@ -2925,6 +3222,16 @@ impl PeerHost {
         source_pane: &[u8],
         workspace_id: &[u8],
     ) -> Option<SurfaceId> {
+        self.with_open_surface_admission(|| {
+            self.spawn_ephemeral_unlocked(source_pane, workspace_id)
+        }).flatten()
+    }
+
+    fn spawn_ephemeral_unlocked(
+        self: &Arc<Self>,
+        source_pane: &[u8],
+        workspace_id: &[u8],
+    ) -> Option<SurfaceId> {
         let cwd = self
             .pty
             .list()
@@ -2941,7 +3248,12 @@ impl PeerHost {
         // any POSIX system, so parse_surfaces_env can never hand back a
         // name that produces this prefix -- the collision is structurally
         // impossible, not just unlikely.
-        let surface_id = surface_id_from_name(&format!("\0split-{n}"));
+        //
+        // The nonce covers the other direction: without it the counter
+        // restarts at 1 with the daemon and replays the same ids over panes
+        // and manifests that survived the restart.
+        let surface_id =
+            surface_id_from_name(&format!("\0split-{}-{n}", self.ephemeral_nonce));
         let spec = SpawnSpec {
             title: format!("shell {n}"),
             command: "/bin/sh".into(),
@@ -3945,6 +4257,54 @@ mod tests {
                 "a declared surface literally named {guess:?} would collide with an ephemeral id"
             );
         }
+    }
+
+    /// The counter behind an ephemeral id restarts at 1 with the daemon,
+    /// so before the per-process nonce the first split pane of every run
+    /// hashed to the same surface id. That is not academic: a leader pane
+    /// spawned two minutes after a daemon restart took the id of a
+    /// six-day-old orphan that was still running, and the viewer holding
+    /// that id in a project manifest reached the wrong surface.
+    ///
+    /// Two hosts here stand in for two daemon runs, exactly as
+    /// `default_workspace_id_is_random_across_hosts` does for the
+    /// workspace id this same fix already reached.
+    #[tokio::test]
+    async fn ephemeral_ids_do_not_repeat_across_daemon_runs() {
+        async fn first_split_id(host: Arc<PeerHost>) -> Vec<u8> {
+            host.apply_control(WorkspaceControl {
+                kind: Some(workspace_control::Kind::SplitPane(
+                    peer_proto::v1::SplitPaneRequest {
+                        pane_id: sid("base"),
+                        orientation: "horizontal".into(),
+                    },
+                )),
+            });
+            let ids = default_surface_ids(&host);
+            ids.into_iter()
+                .find(|id| id != &sid("base"))
+                .expect("split added a pane")
+        }
+
+        async fn booted_host() -> Arc<PeerHost> {
+            let manager = Arc::new(PtyManager::new());
+            let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+                .expect("spawn /bin/cat");
+            manager.insert_surface(base);
+            Arc::new(PeerHost::new(manager))
+        }
+
+        let host_a = booted_host().await;
+        let host_b = booted_host().await;
+        assert_ne!(
+            host_a.ephemeral_nonce, host_b.ephemeral_nonce,
+            "each daemon process must name its ephemeral surfaces in its own space"
+        );
+        assert_ne!(
+            first_split_id(host_a).await,
+            first_split_id(host_b).await,
+            "the first split of two daemon runs must not share a surface id"
+        );
     }
 
     /// F4 regression: SplitPane must stop forking shells once the
@@ -5103,6 +5463,189 @@ mod tests {
         std::fs::remove_dir(&ensured_path).unwrap();
         assert!(host.terminate_surface(&created.surface_id).unwrap());
         assert!(crate::peer::persist::load_ensured_surfaces(&ensured_path).is_empty());
+    }
+
+    /// Builds a host with one manifest whose leader and member surfaces are
+    /// live, `created_at_unix_secs` set by the caller. Returns the host and
+    /// the leader's surface id.
+    async fn host_with_manifest(
+        created_at_unix_secs: u64,
+    ) -> (Arc<PeerHost>, Vec<u8>, Vec<u8>) {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let leader = host.ensure_surface("doctor-leader", &spec).unwrap();
+        let member = host.ensure_surface("doctor-member", &spec).unwrap();
+        let project = peer_proto::v1::Team {
+            name: "rca".into(),
+            team_uuid: "team-uuid".into(),
+            working_directory: "/tmp".into(),
+            leader_surface_id: leader.surface_id.clone(),
+            project_id: "team:team-uuid".into(),
+            created_at_unix_secs,
+            members: vec![peer_proto::v1::TeamMember {
+                name: "executor".into(),
+                agent_instance_id: "instance-1".into(),
+                working_directory: "/tmp".into(),
+                surface_id: member.surface_id.clone(),
+                surface_type: "terminal".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        host.upsert_project_presentation(&[vec![1; 16]], &project)
+            .expect("publish");
+        (host, leader.surface_id, member.surface_id)
+    }
+
+    fn seconds_since_epoch() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// A manifest whose surfaces are live and were spawned for it is clean —
+    /// the doctor must not invent work.
+    #[tokio::test]
+    async fn diagnose_is_quiet_when_a_manifest_owns_its_surfaces() {
+        let (host, _, _) = host_with_manifest(seconds_since_epoch() - 60).await;
+        assert_eq!(host.diagnose(), Vec::new());
+    }
+
+    /// The manifest names a surface nothing holds. `live_surfaces` already
+    /// counts this, but only as a number an operator has to interpret; the
+    /// doctor has to say which surface and what to run.
+    #[tokio::test]
+    async fn diagnose_reports_a_surface_no_live_pane_holds() {
+        let (host, leader_id, _) = host_with_manifest(seconds_since_epoch() - 60).await;
+        host.terminate_surface(&leader_id).unwrap();
+
+        let findings = host.diagnose();
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].code, "surface_missing");
+        assert_eq!(findings[0].role, "leader");
+        assert_eq!(findings[0].surface_id, hex::encode(&leader_id));
+        assert_eq!(
+            findings[0].remedy,
+            "'tm-agent' 'daemon' 'project-presentations' 'list'"
+        );
+        assert_eq!(
+            findings[0].repair_argv,
+            vec!["tm-agent", "daemon", "project-presentations", "list"]
+        );
+        assert!(findings[0].detail.contains("prune would refuse"));
+    }
+
+    #[tokio::test]
+    async fn diagnose_offers_applied_prune_when_every_surface_is_dead() {
+        let (host, leader_id, member_id) =
+            host_with_manifest(seconds_since_epoch() - 60).await;
+        host.terminate_surface(&leader_id).unwrap();
+        host.terminate_surface(&member_id).unwrap();
+
+        let findings = host.diagnose();
+        assert_eq!(findings.len(), 2, "{findings:#?}");
+        assert!(findings
+            .iter()
+            .all(|finding| finding.repair_argv[4] == "--project-id"));
+        assert!(findings.iter().all(|finding| {
+            finding.repair_argv.last().map(String::as_str) == Some("--apply")
+        }));
+        assert!(findings
+            .iter()
+            .all(|finding| !finding.detail.contains("prune would refuse")));
+    }
+
+    /// The incident this whole command exists for: every referenced surface
+    /// resolves, so the manifest reads as healthy, but the leader id was
+    /// re-minted over a pane that had been alive since a previous daemon run.
+    ///
+    /// The surface here spawns at "now" and the record claims to have been
+    /// written an hour later, which is the same comparison as a manifest
+    /// written days after the pane it inherited.
+    #[tokio::test]
+    async fn diagnose_reports_a_surface_older_than_the_manifest_claiming_it() {
+        let (host, leader_id, _) = host_with_manifest(seconds_since_epoch() + 3600).await;
+
+        // The count an operator would have checked still looks perfect.
+        let status = host
+            .project_presentation_status("team:team-uuid")
+            .expect("record present");
+        assert_eq!(status.live_surfaces, status.referenced_surfaces);
+
+        let findings = host.diagnose();
+        assert_eq!(
+            findings.len(),
+            2,
+            "leader and member are both inherited: {findings:#?}"
+        );
+        assert!(findings
+            .iter()
+            .all(|finding| finding.code == "surface_predates_record"));
+        assert!(findings
+            .iter()
+            .all(|finding| finding.severity == "warning"));
+        assert!(findings
+            .iter()
+            .all(|finding| !finding.remedy.contains("--apply")));
+        assert!(findings
+            .iter()
+            .all(|finding| finding.detail.contains("different wall clocks")));
+        let leader = findings
+            .iter()
+            .find(|finding| finding.role == "leader")
+            .expect("leader finding");
+        assert_eq!(leader.surface_id, hex::encode(&leader_id));
+        assert_eq!(leader.team_name, "rca");
+        assert!(leader.remedy.contains("project-presentations"));
+        assert_eq!(
+            leader.remedy,
+            "'tm-agent' 'daemon' 'project-presentations' 'list'"
+        );
+        assert_eq!(
+            leader.repair_argv,
+            vec!["tm-agent", "daemon", "project-presentations", "list"]
+        );
+    }
+
+    #[test]
+    fn repair_command_quotes_one_project_id_and_uses_real_flag() {
+        let project_id = "team:it's $(still one); argument";
+        let (command, argv) = PeerHostFinding::repair(project_id, true);
+        assert_eq!(argv[4], "--project-id");
+        assert_eq!(argv[5], project_id);
+        assert_eq!(argv[6], "--apply");
+        assert!(command.contains("'team:it'\\''s $(still one); argument'"));
+        assert!(!command.contains("--project-ids"));
+    }
+
+    #[test]
+    fn inspect_command_exactly_matches_structured_argv() {
+        let (command, argv) = PeerHostFinding::inspect();
+        assert_eq!(
+            command,
+            "'tm-agent' 'daemon' 'project-presentations' 'list'"
+        );
+        assert_eq!(
+            argv,
+            vec!["tm-agent", "daemon", "project-presentations", "list"]
+        );
+    }
+
+    /// A record written before `created_at_unix_secs` existed carries 0. That
+    /// is missing data, not evidence of a stolen id, and must not be reported
+    /// as one.
+    #[tokio::test]
+    async fn diagnose_does_not_judge_a_record_with_no_creation_time() {
+        let (host, _, _) = host_with_manifest(0).await;
+        assert_eq!(host.diagnose(), Vec::new());
     }
 
     #[tokio::test]

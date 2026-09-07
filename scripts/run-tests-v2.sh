@@ -734,6 +734,21 @@ for f in "${test_files[@]}"; do
       failed_tests[${#failed_tests[@]}]="$f:create"
     fi
     if [ "$create_result" -eq 0 ]; then
+      if [ "${TERMMESH_E2E_REATTACH_STATE_ONLY:-0}" = "1" ]; then
+        echo "RUN  $f (phase state-only cleanup)"
+        set +e
+        phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=state-only "$PYTHON" "$f"
+        state_only_result=$?
+        set -e
+        if [ "$state_only_result" -eq 2 ]; then
+          phase_skipped=1
+        elif [ "$state_only_result" -ne 0 ]; then
+          echo "FAIL $f (phase state-only cleanup)" >&2
+          phase_failed=1
+          failed_tests[${#failed_tests[@]}]="$f:state-only"
+        fi
+        adopt_result=2
+      else
       echo "== relaunch ($base adopt; fresh viewer installation) =="
       TERMMESH_PEER_IDENTITY_EPHEMERAL=1 launch_and_wait 1
       echo "RUN  $f (phase adopt/reconnect)"
@@ -772,6 +787,9 @@ for f in "${test_files[@]}"; do
         fi
       fi
 
+      fi
+
+      if [ "${TERMMESH_E2E_REATTACH_STATE_ONLY:-0}" != "1" ]; then
       echo "RUN  $f (phase owner cleanup)"
       set +e
       phase_result "$phase_output" env TERMMESH_E2E_REATTACH_PHASE=cleanup "$PYTHON" "$f"
@@ -783,6 +801,7 @@ for f in "${test_files[@]}"; do
         echo "FAIL $f (phase owner cleanup)" >&2
         phase_failed=1
         failed_tests[${#failed_tests[@]}]="$f:cleanup"
+      fi
       fi
     fi
     rm -f "$phase_output"
