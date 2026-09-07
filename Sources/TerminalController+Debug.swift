@@ -1278,15 +1278,7 @@ extension TerminalController {
                     )?.count ?? -1,
                 ]
             } catch let ProjectCreationFlow.CreationError.nameConflict(conflict) {
-                let kind: String = switch conflict {
-                case .exactLive: "exact_live"
-                case .exactDetached: "exact_detached"
-                case .incomplete: "incomplete"
-                case .localNameCollision: "local_name_collision"
-                case .remoteNameCollision: "remote_name_collision"
-                case .reservedByAnotherRequest: "reserved"
-                case .none: "none"
-                }
+                let kind = Self.debugProjectConflictKind(conflict)
                 let action = Self.debugProjectConflictAction(conflict)
                 self.debugProjectCreationStatus[operationID] = [
                     "state": "conflict", "name": name,
@@ -1371,6 +1363,106 @@ extension TerminalController {
         return .ok(TeamDataStore.shared.leaderRequestDictionary(request, includeContent: false))
     }
 
+    nonisolated static func debugProjectConflictKind(
+        _ conflict: TeamOrchestrator.ProjectNameConflict
+    ) -> String {
+        switch conflict {
+        case .exactLive: "exact_live"
+        case .exactDetached: "exact_detached"
+        case .incomplete: "incomplete"
+        case .localNameCollision: "local_name_collision"
+        case .remoteNameCollision: "remote_name_collision"
+        case .reservedByAnotherRequest: "reserved"
+        case .none: "none"
+        }
+    }
+
+    /// Evaluate a New Project name exactly as the sheet does, and create
+    /// nothing.
+    ///
+    /// `debug.project.creation_attempt` reports the same verdict, but reaches
+    /// it by creating the Project whenever there is no conflict — so it can
+    /// assert that a name *is* blocked and never that it is not. The rule that
+    /// an unconfirmed remote roster must not block is exactly an absence, so
+    /// it needs a read-only answer.
+    func v2DebugProjectNameConflict(params: [String: Any]) -> V2CallResult {
+        guard let raw = params["name"] as? String,
+              case let name = raw.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty
+        else {
+            return .err(code: "invalid_params", message: "name is required", data: nil)
+        }
+        var result: V2CallResult = .err(
+            code: "internal_error", message: "conflict evaluation timed out", data: nil
+        )
+        _ = v2MainExec(timeout: 5) {
+            MainActor.assumeIsolated {
+                let identity = TeamOrchestrator.ProjectCreationIdentity(
+                    projectID: params["project_id"] as? String,
+                    hostKey: params["host_key"] as? String,
+                    workingDirectory: params["working_directory"] as? String
+                )
+                let conflict = TeamOrchestrator.shared.projectNameConflict(
+                    name: name, identity: identity, currentTabManager: self.tabManager
+                )
+                var payload: [String: Any] = [
+                    "name": name,
+                    "conflict": Self.debugProjectConflictKind(conflict),
+                    "action": Self.debugProjectConflictAction(conflict),
+                    "location": Self.debugProjectConflictLocation(conflict),
+                    "blocks_create": conflict.blocksCreate,
+                ]
+                if let record = conflict.record {
+                    payload["roster_verified"] = record.rosterVerified
+                    payload["leader_ready"] = record.leaderReady
+                    payload["leader_process_active_known"] = record.leaderProcessActiveKnown
+                    payload["can_open_remote"] = record.canOpenRemoteProject
+                    payload["can_repair_leader"] = record.canRepairRemoteLeaderProcess
+                    payload["project_id"] = record.identity.projectID ?? NSNull()
+                }
+                result = .ok(payload)
+            }
+        }
+        return result
+    }
+
+    /// Put a host's Project roster into the state a failed read leaves it in —
+    /// the previous entries kept, the host still reading connected — and take
+    /// it back out again.
+    ///
+    /// That combination is what let a deleted Project keep blocking its own
+    /// name, and it cannot be produced from outside the app: it needs a real
+    /// name-resolution or transport failure on a live machine. Injecting it is
+    /// the only way the rule that came out of it stays tested.
+    func v2DebugPeerRosterFailure(params: [String: Any]) -> V2CallResult {
+        guard let handle = params["host"] as? String, !handle.isEmpty else {
+            return .err(code: "invalid_params", message: "host is required", data: nil)
+        }
+        let reason = (params["reason"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var result: V2CallResult = .err(code: "not_found", message: "host not found", data: nil)
+        _ = v2MainExec(timeout: 5) {
+            MainActor.assumeIsolated {
+                guard let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                    $0.id == handle
+                        || $0.displayName.caseInsensitiveCompare(handle) == .orderedSame
+                }) else { return }
+                RemoteHostStore.shared.setDebugRosterFailure(
+                    hostKey: host.id,
+                    reason: (reason?.isEmpty ?? true) ? nil : reason
+                )
+                let updated = RemoteHostStore.shared.sortedHosts.first { $0.id == host.id }
+                let verified: Bool = updated?.teamRosterIsVerified ?? false
+                result = .ok([
+                    "host": host.id,
+                    "last_roster_failure": updated?.lastRosterFailure ?? NSNull(),
+                    "team_roster_verified": verified,
+                ])
+            }
+        }
+        return result
+    }
+
     nonisolated static func debugProjectConflictLocation(
         _ conflict: TeamOrchestrator.ProjectNameConflict
     ) -> String {
@@ -1395,14 +1487,22 @@ extension TerminalController {
         _ conflict: TeamOrchestrator.ProjectNameConflict
     ) -> String {
         switch conflict {
-        case .exactLive, .exactDetached:
-            "open_existing"
+        case .exactLive(let record), .exactDetached(let record):
+            record.canRepairRemoteLeaderProcess ? "repair_leader" : "open_existing"
         case .incomplete:
             "resume_setup"
         case .localNameCollision:
             "rename"
         case .remoteNameCollision(let record):
-            record.canOpenRemoteProject ? "open_existing" : "rename"
+            // A leaderless remote Project offers repair, never an Open Existing
+            // that adoption is guaranteed to refuse.
+            if record.canRepairRemoteLeaderProcess {
+                "repair_leader"
+            } else if record.canOpenRemoteProject {
+                "open_existing"
+            } else {
+                "rename"
+            }
         case .reservedByAnotherRequest:
             "wait"
         case .none:
