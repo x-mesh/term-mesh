@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.230.0] - 2026-09-07
+
+### Fixed
+
+- Repair macOS peer connections from the host editor. The repair now launches the installed app, verifies the peer handshake, and reconnects only after verification.
+- Preserve explicit socket routes and rediscover automatic socket routes after an app restart.
+- Prevent canceled or concurrent repairs from saving stale host settings.
+
 ## [0.229.0] - 2026-09-07
 
 ### Added
