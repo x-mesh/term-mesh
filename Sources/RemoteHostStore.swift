@@ -595,6 +595,13 @@ struct HostEntry: Identifiable, Equatable {
     /// Exact endpoint tuple captured before the handshake that supplied
     /// `hostCLIBinDirs`. Nil means the metadata is pending or invalid.
     var hostCLIBinDirsProvenance: PeerHostEndpointProvenance?
+    /// Whether a full re-read of this host is running right now.
+    ///
+    /// It lives on the entry rather than beside the task that owns it because
+    /// the sidebar row is `Equatable` over exactly this value: a flag kept
+    /// anywhere else changes without the row ever being asked to redraw, and
+    /// the control reads as dead while the work it started is under way.
+    var isRefreshing: Bool = false
 
     var isConnected: Bool { connectionState == .connected }
     var servingVersionDisplay: String? {
@@ -1824,9 +1831,16 @@ final class RemoteHostStore: ObservableObject {
         stopWorkspaceSubscription(for: key)
         let path = hostSockPath
         fetchInFlight.insert(key)
+        // Mirrored onto the entry so the sidebar can show the work: the row
+        // compares `HostEntry` to decide whether to redraw, so a flag held
+        // only in the set above never reaches it.
+        hosts[key]?.isRefreshing = true
         // Task inherits @MainActor; await suspensions yield main without blocking it.
         fetchTasks[key] = Task {
-            defer { self.fetchInFlight.remove(key) }
+            defer {
+                self.fetchInFlight.remove(key)
+                self.hosts[key]?.isRefreshing = false
+            }
             do {
                 let conn = try await PeerRelaySession.connect(hostSockPath: path)
                 // Record capability regardless of what listWorkspaces below does —
@@ -2355,6 +2369,58 @@ final class RemoteHostStore: ObservableObject {
             return
         }
         scheduleTeamRosterRefresh(for: host.activeSockPath, key: key)
+    }
+
+    /// Re-read everything this app believes about one connected host.
+    ///
+    /// Project state has no push channel at all: `ListTeams` is a plain
+    /// request/response, and the roster the host does push carries workspaces
+    /// and nothing else. So work done on the host itself — `tm-agent` over
+    /// ssh, a manifest another installation rewrote — stays invisible here
+    /// until this app asks again. The 15s poll asks for most people most of
+    /// the time; when it has stopped there was no way to make it ask.
+    ///
+    /// It stops for a reason worth naming. Session-owner discovery retries on
+    /// a fixed ladder and then gives up for good, and every later
+    /// `fetchTeamRoster` returns early on the `unresolved` route it left
+    /// behind — so `teams` freezes for the rest of the session with the host
+    /// still reading `connected`. Going back through the connect-time fetch
+    /// restarts that discovery, which is the part a bare roster re-read
+    /// cannot do.
+    ///
+    /// This is not a reconnect. The ssh tunnel, the relays, and every open
+    /// pane stay exactly as they are; `retryConnectingHost` is the heavier
+    /// tool for a host that has actually stopped answering. What it does cost
+    /// is the connect-time work: capabilities, serving version, CLI bin dirs,
+    /// the workspace roster, and a re-armed subscription and poll.
+    ///
+    /// Returns false when the host is not in a state that can be re-read, so
+    /// the caller can say why instead of showing a spinner over nothing.
+    @discardableResult
+    func resyncConnectedHost(_ host: HostEntry) -> Bool {
+        guard let current = hosts[host.id], current.isConnected,
+              !current.activeSockPath.isEmpty
+        else {
+            RemoteWorkLog.info(
+                "Resync skipped for \(host.displayName): the host is not connected"
+            )
+            return false
+        }
+        // Re-entry would cancel the fetch already in flight and start the same
+        // work over, which reads as a hang rather than as progress.
+        guard !fetchInFlight.contains(host.id) else {
+            RemoteWorkLog.info(
+                "Resync already running for \(current.displayName)"
+            )
+            return true
+        }
+        RemoteWorkLog.info("Resyncing \(current.displayName) from the host")
+        fetchWorkspaces(
+            for: current.activeSockPath,
+            key: host.id,
+            provenance: current.hostCLIBinDirsProvenance
+        )
+        return true
     }
 
     /// Read team/project manifests from their owning endpoint. Ordinary hosts
