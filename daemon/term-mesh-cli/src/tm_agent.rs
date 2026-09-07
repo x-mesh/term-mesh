@@ -12984,49 +12984,100 @@ fn detect_watch_socket() -> Option<PathBuf> {
             }
         }
     }
-    // Default daemon socket.
-    let dir = env::var("TMPDIR")
+    // Default daemon socket, then every other place a daemon binds one.
+    daemon_socket_candidates()
+        .into_iter()
+        .find(is_socket_alive)
+        // Last resort: any socket the generic resolver finds.
+        .or_else(detect_socket)
+}
+
+/// `TERMMESH_DAEMON_UNIX_PATH` as the peer-host config records it.
+///
+/// systemd hands this file to the service through `EnvironmentFile`, so the
+/// daemon binds what it says while a login shell never sees the value. That
+/// is the whole reason a Linux operator had to export the variable by hand
+/// before `tm-agent` could reach their own daemon.
+///
+/// Later files win, matching the `tail -n 1` the ssh probe applies over the
+/// same two paths.
+fn peer_env_daemon_socket() -> Option<PathBuf> {
+    let mut found = None;
+    let user_config = env::var("HOME")
         .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let path = dir.join("term-meshd.sock");
-    if is_socket_alive(&path) {
-        return Some(path);
+        .map(|home| PathBuf::from(home).join(".config/term-mesh/peer.env"));
+    let candidates = user_config
+        .into_iter()
+        .chain(std::iter::once(PathBuf::from("/etc/term-mesh/peer.env")));
+    for config in candidates {
+        let Ok(contents) = std::fs::read_to_string(&config) else {
+            continue;
+        };
+        for line in contents.lines() {
+            let Some(value) = line.trim().strip_prefix("TERMMESH_DAEMON_UNIX_PATH=") else {
+                continue;
+            };
+            let value = value.trim().trim_matches(['"', '\''].as_slice());
+            if !value.is_empty() {
+                found = Some(PathBuf::from(value));
+            }
+        }
     }
-    // Last resort: any socket the generic resolver finds.
-    detect_socket()
+    found
+}
+
+/// Every place a term-meshd control socket can live, in the order to try.
+///
+/// The daemon's own `default_socket_path` resolves `dirs::runtime_dir()`
+/// before `TMPDIR`. On Linux that is `$XDG_RUNTIME_DIR` — a directory this
+/// resolver never looked in — while on macOS there is no runtime dir at all
+/// and the daemon lands in `TMPDIR`. That asymmetry, not any Linux-specific
+/// packaging, is why the CLI needed no environment on a Mac and needed
+/// `TERMMESH_DAEMON_UNIX_PATH` exported by hand on every Linux host.
+///
+/// The installer's two scopes add the rest: a user service binds
+/// `/run/user/<uid>/term-meshd.sock`, a system service
+/// `/run/term-mesh/term-meshd.sock`.
+///
+/// Same paths and same order as `REMOTE_CONTROL_SOCKET_DISCOVERY` in
+/// `peer.rs`, which has always resolved this correctly over ssh. A path that
+/// cannot exist on this platform fails the liveness probe on its first
+/// syscall, so one list serves both rather than a per-OS pair that can drift.
+fn daemon_socket_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !path.as_os_str().is_empty() && !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    };
+    for var in ["TERMMESH_DAEMON_SOCKET", "TERMMESH_DAEMON_UNIX_PATH"] {
+        if let Ok(value) = env::var(var) {
+            push(PathBuf::from(value));
+        }
+    }
+    if let Some(path) = peer_env_daemon_socket() {
+        push(path);
+    }
+    if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
+        if !runtime_dir.is_empty() {
+            push(PathBuf::from(runtime_dir).join("term-meshd.sock"));
+        }
+    }
+    // `id -u` without spawning it: the ssh probe's `/run/user/$(id -u)` for a
+    // user-scope service whose XDG_RUNTIME_DIR did not reach this shell.
+    push(PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })).join("term-meshd.sock"));
+    push(PathBuf::from("/run/term-mesh/term-meshd.sock"));
+    if let Ok(tmpdir) = env::var("TMPDIR") {
+        if !tmpdir.is_empty() {
+            push(PathBuf::from(tmpdir).join("term-meshd.sock"));
+        }
+    }
+    push(PathBuf::from("/tmp/term-meshd.sock"));
+    candidates
 }
 
 fn detect_daemon_socket() -> Option<PathBuf> {
-    // Priority 1: TERMMESH_DAEMON_SOCKET (injected by daemon into headless agent env)
-    if let Ok(p) = env::var("TERMMESH_DAEMON_SOCKET") {
-        if !p.is_empty() {
-            let path = PathBuf::from(&p);
-            if is_socket_alive(&path) {
-                return Some(path);
-            }
-        }
-    }
-    // Priority 2: TERMMESH_DAEMON_UNIX_PATH (tagged build override)
-    if let Ok(p) = env::var("TERMMESH_DAEMON_UNIX_PATH") {
-        if !p.is_empty() {
-            let path = PathBuf::from(&p);
-            if is_socket_alive(&path) {
-                return Some(path);
-            }
-        }
-    }
-    // Default daemon socket path
-    let dir = env::var("TMPDIR")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let path = dir.join("term-meshd.sock");
-    if is_socket_alive(&path) {
-        Some(path)
-    } else {
-        None
-    }
+    daemon_socket_candidates().into_iter().find(is_socket_alive)
 }
 
 // ── `tm-agent remote` (docs/mobile-remote-control.md §4.2) ─────────────
@@ -21160,6 +21211,129 @@ mod watcher_spec_tests {
             derive_daemon_socket_from_app(Path::new("/tmp/term-meshd.sock")),
             None
         );
+    }
+
+    // ── Linux control-socket discovery ────────────────────────────────────
+
+    /// Guards the regression this list exists for: a Linux host binds its
+    /// control socket under the runtime dir or the installer's service
+    /// directory, and before these entries existed `tm-agent` looked only in
+    /// `/tmp` and answered DAEMON_UNAVAILABLE on a host whose daemon was up.
+    #[test]
+    fn daemon_socket_candidates_cover_both_linux_install_scopes() {
+        let saved: Vec<_> = [
+            "TERMMESH_DAEMON_SOCKET",
+            "TERMMESH_DAEMON_UNIX_PATH",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+            "HOME",
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var(key).ok()))
+        .collect();
+        for (key, _) in &saved {
+            std::env::remove_var(key);
+        }
+        // An empty HOME would make the user peer.env path `/.config/...`.
+        std::env::set_var("HOME", "/nonexistent-home-for-tests");
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/4242");
+
+        let candidates = daemon_socket_candidates();
+
+        // User-scope service (installer default for a non-root install).
+        assert!(candidates.contains(&PathBuf::from("/run/user/4242/term-meshd.sock")));
+        // System-scope service (root installer default, and what peer.env pins).
+        assert!(candidates.contains(&PathBuf::from("/run/term-mesh/term-meshd.sock")));
+        // The historical default stays last so macOS behaviour is unchanged.
+        assert_eq!(
+            candidates.last(),
+            Some(&PathBuf::from("/tmp/term-meshd.sock"))
+        );
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    /// An explicitly exported socket must still win over every default, and
+    /// the list must not offer the same path twice — a duplicate would make
+    /// the caller probe a dead pathname a second time before moving on.
+    #[test]
+    fn daemon_socket_candidates_rank_env_first_and_deduplicate() {
+        let saved: Vec<_> = [
+            "TERMMESH_DAEMON_SOCKET",
+            "TERMMESH_DAEMON_UNIX_PATH",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+            "HOME",
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var(key).ok()))
+        .collect();
+        for (key, _) in &saved {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("HOME", "/nonexistent-home-for-tests");
+        // Both variables name the same socket, as a daemon-spawned pane sees it.
+        std::env::set_var("TERMMESH_DAEMON_SOCKET", "/run/term-mesh/term-meshd.sock");
+        std::env::set_var(
+            "TERMMESH_DAEMON_UNIX_PATH",
+            "/run/term-mesh/term-meshd.sock",
+        );
+
+        let candidates = daemon_socket_candidates();
+
+        assert_eq!(
+            candidates.first(),
+            Some(&PathBuf::from("/run/term-mesh/term-meshd.sock"))
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|path| *path == &PathBuf::from("/run/term-mesh/term-meshd.sock"))
+                .count(),
+            1,
+            "the same socket must be probed once, however many names point at it"
+        );
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    /// The value systemd reads from `peer.env` is invisible to a login shell,
+    /// so the resolver reads the file itself rather than requiring every
+    /// operator to re-export what the installer already wrote.
+    #[test]
+    fn peer_env_daemon_socket_reads_the_installer_written_value() {
+        let dir = std::env::temp_dir().join(format!("tm-agent-peer-env-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".config/term-mesh")).unwrap();
+        std::fs::write(
+            dir.join(".config/term-mesh/peer.env"),
+            "# comment\nTERMMESH_PEER_SOCKET=/run/user/0/tm-peer.sock\n\
+             TERMMESH_DAEMON_UNIX_PATH=\"/run/user/0/term-meshd.sock\"\n",
+        )
+        .unwrap();
+        let saved_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &dir);
+
+        assert_eq!(
+            peer_env_daemon_socket(),
+            Some(PathBuf::from("/run/user/0/term-meshd.sock")),
+            "quotes are stripped and unrelated keys are ignored"
+        );
+
+        match saved_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
