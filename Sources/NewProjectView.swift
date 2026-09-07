@@ -2288,9 +2288,11 @@ struct NewProjectView: View {
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.discard")
         case .remoteNameCollision(let record):
+            // Same shape as `.exactLive` above: the existing Project keeps the
+            // default action, because two buttons carrying it leave Return
+            // undefined between them.
             if !projectNameConflict.blocksCreate {
                 createButton
-                    .keyboardShortcut(.defaultAction)
             }
             if record.canOpenRemoteProject {
                 Button("Open Existing") { openExistingProject(record) }
