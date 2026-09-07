@@ -1925,7 +1925,7 @@ enum DaemonCommand {
         apply: bool,
     },
     /// Check this host for the state that makes a Project look healthy while
-    /// being broken, and print a safe next command for each problem.
+    /// being broken, and report a safe next step when one is available.
     ///
     /// Read-only: it changes nothing, so it is always safe to run first.
     ///
@@ -13214,6 +13214,25 @@ enum DoctorSocketOutcome {
     Untrusted(String),
 }
 
+fn parse_doctor_result(result: Value) -> Result<Vec<Value>, String> {
+    let object = result
+        .as_object()
+        .ok_or_else(|| "protocol error: peer.doctor result is not an object".to_string())?;
+    let healthy = object
+        .get("healthy")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "protocol error: peer.doctor result has no boolean healthy".to_string())?;
+    let findings = object
+        .get("findings")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "protocol error: peer.doctor result has no findings array".to_string())?;
+    if healthy != findings.is_empty() {
+        return Err("protocol error: peer.doctor healthy disagrees with findings".to_string());
+    }
+    Ok(findings)
+}
+
 fn local_doctor_finding(code: &str, socket: &Path, detail: String) -> Value {
     json!({
         "code": code,
@@ -13265,11 +13284,22 @@ fn with_multiple_daemon_repair_withheld(mut finding: Value) -> Value {
     finding
 }
 
-fn doctor_exit_code(outcomes: &[(PathBuf, DoctorSocketOutcome)], findings: &[Value]) -> i32 {
-    if !outcomes
+fn doctor_is_complete(outcomes: &[(PathBuf, DoctorSocketOutcome)]) -> bool {
+    outcomes
         .iter()
         .any(|(_, outcome)| matches!(outcome, DoctorSocketOutcome::Report(_)))
-    {
+        && !outcomes.iter().any(|(_, outcome)| {
+            matches!(
+                outcome,
+                DoctorSocketOutcome::Unsupported(_)
+                    | DoctorSocketOutcome::RpcFailed(_)
+                    | DoctorSocketOutcome::ProbeFailed(_)
+            )
+        })
+}
+
+fn doctor_exit_code(outcomes: &[(PathBuf, DoctorSocketOutcome)], findings: &[Value]) -> i32 {
+    if !doctor_is_complete(outcomes) {
         1
     } else if findings.is_empty() {
         0
@@ -13289,6 +13319,15 @@ fn human_remedy(finding: &Value) -> String {
         "unavailable in human output; inspect --json".into()
     } else {
         terminal_safe(finding["remedy"].as_str().unwrap_or_default())
+    }
+}
+
+fn human_remedy_line(finding: &Value) -> Option<String> {
+    let remedy = finding["remedy"].as_str().unwrap_or_default();
+    if remedy.is_empty() {
+        None
+    } else {
+        Some(human_remedy(finding))
     }
 }
 
@@ -13437,9 +13476,10 @@ fn cmd_daemon_doctor(json: bool) {
             continue;
         }
         let outcome = match daemon_rpc_on_stream(&stream) {
-            Ok(result) => DoctorSocketOutcome::Report(
-                result["findings"].as_array().cloned().unwrap_or_default(),
-            ),
+            Ok(result) => match parse_doctor_result(result) {
+                Ok(findings) => DoctorSocketOutcome::Report(findings),
+                Err(message) => DoctorSocketOutcome::RpcFailed(message),
+            },
             Err(message) if message.contains("unknown method") => {
                 DoctorSocketOutcome::Unsupported(message)
             }
@@ -13450,6 +13490,7 @@ fn cmd_daemon_doctor(json: bool) {
 
     if outcomes.is_empty() {
         let report = json!({
+            "sockets": [],
             "complete": false,
             "healthy": false,
             "findings": [{
@@ -13469,7 +13510,7 @@ fn cmd_daemon_doctor(json: bool) {
     }
     let findings = aggregate_doctor_findings(&outcomes);
     let exit_code = doctor_exit_code(&outcomes, &findings);
-    let complete = exit_code != 1;
+    let complete = doctor_is_complete(&outcomes);
     let healthy = complete && findings.is_empty();
     let sockets = outcomes
         .iter()
@@ -13507,7 +13548,11 @@ fn cmd_daemon_doctor(json: bool) {
                 });
             }
             println!("  {}", text("detail"));
-            println!("  fix: {}\n", human_remedy(finding));
+            if let Some(remedy) = human_remedy_line(finding) {
+                println!("  fix: {remedy}\n");
+            } else {
+                println!();
+            }
         }
     }
     if exit_code != 0 {
@@ -21816,7 +21861,7 @@ mod watcher_spec_tests {
             .any(|finding| finding["code"] == "multiple_daemon_owners"));
         assert!(findings.iter().any(|f| f["code"] == "doctor_unsupported"));
         assert!(findings.iter().any(|f| f["code"] == "doctor_rpc_failed"));
-        assert_eq!(doctor_exit_code(&outcomes, &findings), 2);
+        assert_eq!(doctor_exit_code(&outcomes, &findings), 1);
         let incomplete = vec![
             (
                 PathBuf::from("/old.sock"),
@@ -21834,6 +21879,77 @@ mod watcher_spec_tests {
             DoctorSocketOutcome::Report(vec![]),
         )];
         assert_eq!(doctor_exit_code(&healthy, &[]), 0);
+        let report_and_unsupported = vec![
+            (
+                PathBuf::from("/healthy.sock"),
+                DoctorSocketOutcome::Report(vec![]),
+            ),
+            (
+                PathBuf::from("/old.sock"),
+                DoctorSocketOutcome::Unsupported("unknown method".into()),
+            ),
+        ];
+        assert_eq!(
+            doctor_exit_code(
+                &report_and_unsupported,
+                &aggregate_doctor_findings(&report_and_unsupported)
+            ),
+            1
+        );
+        let report_and_failure = vec![
+            (
+                PathBuf::from("/healthy.sock"),
+                DoctorSocketOutcome::Report(vec![]),
+            ),
+            (
+                PathBuf::from("/failed.sock"),
+                DoctorSocketOutcome::RpcFailed("timeout".into()),
+            ),
+        ];
+        assert_eq!(
+            doctor_exit_code(
+                &report_and_failure,
+                &aggregate_doctor_findings(&report_and_failure)
+            ),
+            1
+        );
+        let report_and_untrusted = vec![
+            (
+                PathBuf::from("/healthy.sock"),
+                DoctorSocketOutcome::Report(vec![]),
+            ),
+            (
+                PathBuf::from("/untrusted.sock"),
+                DoctorSocketOutcome::Untrusted("foreign uid".into()),
+            ),
+        ];
+        assert_eq!(
+            doctor_exit_code(
+                &report_and_untrusted,
+                &aggregate_doctor_findings(&report_and_untrusted)
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn doctor_result_parser_rejects_malformed_or_inconsistent_reports() {
+        assert_eq!(
+            parse_doctor_result(json!({"healthy": true, "findings": []})).unwrap(),
+            Vec::<Value>::new()
+        );
+        assert!(parse_doctor_result(json!({"healthy": true})).is_err());
+        assert!(parse_doctor_result(json!({"healthy": "yes", "findings": []})).is_err());
+        assert!(parse_doctor_result(json!({
+            "healthy": true,
+            "findings": [{"code": "surface_missing"}]
+        }))
+        .is_err());
+        assert!(parse_doctor_result(json!({
+            "healthy": false,
+            "findings": []
+        }))
+        .is_err());
     }
 
     #[test]
@@ -21888,6 +22004,8 @@ mod watcher_spec_tests {
             human_remedy(&finding),
             "unavailable in human output; inspect --json"
         );
+        let blank = json!({"remedy": "", "repair_argv": []});
+        assert_eq!(human_remedy_line(&blank), None);
     }
 
     #[test]
