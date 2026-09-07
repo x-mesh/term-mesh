@@ -5113,6 +5113,22 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         // this ignores `directory_present` — a project folder does not vanish
         // when its leader dies — but it still refuses live surfaces and the
         // default workspace. Dry-run unless `apply`; backs each file up first.
+        // Read-only. It reports and never repairs, so unlike `peer.state.reset`
+        // it takes no `apply` and needs no dry-run.
+        "peer.doctor" => match crate::peer::layout::PeerHost::active_host() {
+            Some(host) => {
+                let findings = host.diagnose();
+                Ok(serde_json::json!({
+                    "healthy": findings.is_empty(),
+                    "findings": findings,
+                }))
+            }
+            None => Err(
+                "peer host is not running (daemon started without TERMMESH_PEER_SOCKET)"
+                    .to_string(),
+            ),
+        },
+
         "peer.state.reset" => {
             #[derive(Deserialize)]
             struct P {
