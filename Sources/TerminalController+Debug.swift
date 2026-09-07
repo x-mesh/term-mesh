@@ -1427,12 +1427,15 @@ extension TerminalController {
             return .err(code: "invalid_params", message: "team is required", data: nil)
         }
         let operationID = UUID().uuidString
+        let removalScope: TeamOrchestrator.ProjectRemovalScope =
+            (params["state_only"] as? Bool) == true ? .stateOnly : .fullDelete
         debugProjectDeletionStatus[operationID] = ["state": "running", "team": team]
         Task { @MainActor in
             do {
                 try await TeamOrchestrator.shared.deleteProject(
                     teamName: team,
-                    tabManager: tabManager
+                    tabManager: tabManager,
+                    removalScope: removalScope
                 )
                 #if DEBUG
                 dlog("debug.project.delete complete team=\(team)")

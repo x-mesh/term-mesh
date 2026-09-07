@@ -72,6 +72,12 @@ struct RemoteTeamSummary: Identifiable, Equatable {
 
     var id: String { teamUUID.isEmpty ? name : teamUUID }
 
+    var presentationSurfaceIDs: Set<Data> {
+        var ids = Set(members.map(\.surfaceID).filter { !$0.isEmpty })
+        if !leaderSurfaceID.isEmpty { ids.insert(leaderSurfaceID) }
+        return ids
+    }
+
     init(
         name: String,
         teamUUID: String,
@@ -109,6 +115,8 @@ struct RemoteTeamSummary: Identifiable, Equatable {
 
 struct RemotePaneSummary: Identifiable, Equatable {
     let id: Data
+    /// Every tab surface in this pane, including the active surface.
+    let surfaceIDs: Set<Data>
     let title: String
     let workingDirectoryPath: String?
     let workingDirectoryName: String?
@@ -137,8 +145,11 @@ func peerPaneSummaries(
     func walk(_ node: Termmesh_Peer_V1_WorkspaceLayout) -> [RemotePaneSummary] {
         switch node.node {
         case .pane(let pane):
+            var surfaceIDs = Set(pane.tabs.map(\.surfaceID).filter { !$0.isEmpty })
+            if !pane.surfaceID.isEmpty { surfaceIDs.insert(pane.surfaceID) }
             return [RemotePaneSummary(
                 id: pane.surfaceID,
+                surfaceIDs: surfaceIDs,
                 title: pane.title.isEmpty ? "Shell" : pane.title,
                 workingDirectoryPath: pane.cwd.isEmpty ? nil : pane.cwd,
                 workingDirectoryName: shortDirectoryName(pane.cwd),
@@ -595,6 +606,13 @@ struct HostEntry: Identifiable, Equatable {
     /// Exact endpoint tuple captured before the handshake that supplied
     /// `hostCLIBinDirs`. Nil means the metadata is pending or invalid.
     var hostCLIBinDirsProvenance: PeerHostEndpointProvenance?
+    /// Whether a full re-read of this host is running right now.
+    ///
+    /// It lives on the entry rather than beside the task that owns it because
+    /// the sidebar row is `Equatable` over exactly this value: a flag kept
+    /// anywhere else changes without the row ever being asked to redraw, and
+    /// the control reads as dead while the work it started is under way.
+    var isRefreshing: Bool = false
 
     var isConnected: Bool { connectionState == .connected }
     var servingVersionDisplay: String? {
@@ -942,10 +960,35 @@ final class RemoteHostStore: ObservableObject {
     func installPeerShellCleanupCacheForTesting(
         hostID: String, sockPath: String, workspaces: [WorkspaceSummary]
     ) {
+        let profileID = UUID()
+        let endpoint = PeerHostEndpointProvenance(
+            sshTarget: "",
+            port: nil,
+            identityFile: nil,
+            remoteSocket: sockPath
+        )
         hosts[hostID] = HostEntry(
             id: hostID, displayName: hostID, connectionState: .connected,
             workspaces: workspaces, activeSockPath: sockPath,
-            sshTarget: nil, remoteSockPath: sockPath
+            sshTarget: nil, remoteSockPath: sockPath,
+            profileID: profileID,
+            hostCLIBinDirs: [],
+            hostCLIBinDirsResolved: true,
+            configuredEndpoint: endpoint,
+            hostCLIBinDirsProvenance: endpoint
+        )
+        hosts[hostID]?.sessionHostRemoteSockPath = sockPath
+        hosts[hostID]?.teamHostReadiness = .ready(
+            TeamHostCapabilitySnapshot(
+                endpoint: hosts[hostID]?.paneHostSpec.hostKey
+                    ?? .direct(sockPath: sockPath),
+                appVersion: "test",
+                supportsPeerOwnedAgentHosting: true,
+                supportsRemoteTeamRoute: true,
+                supportsAuthoritativeLeaderLiveness: true,
+                looksLikeGUIPeerHost: false,
+                redirectedFromServingEndpoint: false
+            )
         )
         workspaceRosterGenerations[hostID, default: 0] &+= 1
     }
@@ -988,7 +1031,7 @@ final class RemoteHostStore: ObservableObject {
         }
         let stalePanes = stale.enumerated().map { index, id in
             RemotePaneSummary(
-                id: id, title: "stale-\(index)", workingDirectoryPath: "/tmp",
+                id: id, surfaceIDs: [id], title: "stale-\(index)", workingDirectoryPath: "/tmp",
                 workingDirectoryName: "tmp", projectRootPath: nil, tabCount: 1,
                 columns: 80, rows: 24, isBusy: false
             )
@@ -1824,9 +1867,16 @@ final class RemoteHostStore: ObservableObject {
         stopWorkspaceSubscription(for: key)
         let path = hostSockPath
         fetchInFlight.insert(key)
+        // Mirrored onto the entry so the sidebar can show the work: the row
+        // compares `HostEntry` to decide whether to redraw, so a flag held
+        // only in the set above never reaches it.
+        hosts[key]?.isRefreshing = true
         // Task inherits @MainActor; await suspensions yield main without blocking it.
         fetchTasks[key] = Task {
-            defer { self.fetchInFlight.remove(key) }
+            defer {
+                self.fetchInFlight.remove(key)
+                self.hosts[key]?.isRefreshing = false
+            }
             do {
                 let conn = try await PeerRelaySession.connect(hostSockPath: path)
                 // Record capability regardless of what listWorkspaces below does —
@@ -2315,6 +2365,71 @@ final class RemoteHostStore: ObservableObject {
         refreshTeamRoster(forHostKey: hostKey)
     }
 
+    /// Observe one manifest without changing it. Cleanup uses the host's
+    /// exact live-surface count instead of inferring death from a stale row.
+    func inspectProjectRecord(
+        hostKey: String,
+        projectID: String
+    ) async throws -> Termmesh_Peer_V1_StaleProjectObservation {
+        guard let host = hosts[hostKey], host.isConnected, let spec = host.teamHostSpec else {
+            throw StaleProjectRecordRepairError.hostUnavailable
+        }
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await PeerPaneHostRegistry.shared.acquire(spec)
+        } catch {
+            throw StaleProjectRecordRepairError.hostUnavailable
+        }
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+        let connection: PeerRelayConnection
+        do {
+            connection = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+        } catch {
+            throw StaleProjectRecordRepairError.hostUnavailable
+        }
+        defer { Task { await connection.cancel() } }
+        guard connection.hostCapabilities.has(PeerCapability.projectPresentationRepairV1) else {
+            throw StaleProjectRecordRepairError.unsupported
+        }
+        let response: Termmesh_Peer_V1_RepairStaleProjectPresentationResponse
+        do {
+            response = try await connection.session.repairStaleProjectPresentation(
+                projectID: projectID,
+                apply: false
+            )
+        } catch {
+            throw StaleProjectRecordRepairError.transport(error.localizedDescription)
+        }
+        if !response.ok, !response.hasObserved {
+            switch response.errorCode {
+            case "not_found": throw StaleProjectRecordRepairError.notFound
+            case "capability_unavailable": throw StaleProjectRecordRepairError.unsupported
+            default:
+                throw StaleProjectRecordRepairError.rejected(
+                    response.errorMessage.isEmpty ? response.errorCode : response.errorMessage
+                )
+            }
+        }
+        guard response.hasObserved else {
+            throw StaleProjectRecordRepairError.rejected("the host returned no observation")
+        }
+        return response.observed
+    }
+
+    /// Remove state only after the host proves that no declared surface is
+    /// alive. Ownership chooses the fast path; stale foreign records retain
+    /// the repair protocol's second observation and exact-instance check.
+    func resetDeadProjectRecord(hostKey: String, projectID: String) async throws {
+        let observed = try await inspectProjectRecord(hostKey: hostKey, projectID: projectID)
+        guard observed.liveSurfaces == 0 else {
+            throw StaleProjectRecordRepairError.live
+        }
+        // Cleanup is not an explicit "stop this live Project" action. Use the
+        // repair transaction even for our own record so the host rechecks
+        // liveness and the exact manifest instance at the mutation boundary.
+        try await repairStaleProjectRecord(hostKey: hostKey, projectID: projectID)
+    }
+
     private func repairStep(
         _ connection: PeerRelayConnection,
         projectID: String,
@@ -2355,6 +2470,58 @@ final class RemoteHostStore: ObservableObject {
             return
         }
         scheduleTeamRosterRefresh(for: host.activeSockPath, key: key)
+    }
+
+    /// Re-read everything this app believes about one connected host.
+    ///
+    /// Project state has no push channel at all: `ListTeams` is a plain
+    /// request/response, and the roster the host does push carries workspaces
+    /// and nothing else. So work done on the host itself — `tm-agent` over
+    /// ssh, a manifest another installation rewrote — stays invisible here
+    /// until this app asks again. The 15s poll asks for most people most of
+    /// the time; when it has stopped there was no way to make it ask.
+    ///
+    /// It stops for a reason worth naming. Session-owner discovery retries on
+    /// a fixed ladder and then gives up for good, and every later
+    /// `fetchTeamRoster` returns early on the `unresolved` route it left
+    /// behind — so `teams` freezes for the rest of the session with the host
+    /// still reading `connected`. Going back through the connect-time fetch
+    /// restarts that discovery, which is the part a bare roster re-read
+    /// cannot do.
+    ///
+    /// This is not a reconnect. The ssh tunnel, the relays, and every open
+    /// pane stay exactly as they are; `retryConnectingHost` is the heavier
+    /// tool for a host that has actually stopped answering. What it does cost
+    /// is the connect-time work: capabilities, serving version, CLI bin dirs,
+    /// the workspace roster, and a re-armed subscription and poll.
+    ///
+    /// Returns false when the host is not in a state that can be re-read, so
+    /// the caller can say why instead of showing a spinner over nothing.
+    @discardableResult
+    func resyncConnectedHost(_ host: HostEntry) -> Bool {
+        guard let current = hosts[host.id], current.isConnected,
+              !current.activeSockPath.isEmpty
+        else {
+            RemoteWorkLog.info(
+                "Resync skipped for \(host.displayName): the host is not connected"
+            )
+            return false
+        }
+        // Re-entry would cancel the fetch already in flight and start the same
+        // work over, which reads as a hang rather than as progress.
+        guard !fetchInFlight.contains(host.id) else {
+            RemoteWorkLog.info(
+                "Resync already running for \(current.displayName)"
+            )
+            return true
+        }
+        RemoteWorkLog.info("Resyncing \(current.displayName) from the host")
+        fetchWorkspaces(
+            for: current.activeSockPath,
+            key: host.id,
+            provenance: current.hostCLIBinDirsProvenance
+        )
+        return true
     }
 
     /// Read team/project manifests from their owning endpoint. Ordinary hosts

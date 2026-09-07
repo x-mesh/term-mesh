@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use std::time::Instant;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
@@ -37,6 +38,12 @@ pub async fn shutdown_supervised(joinset: &mut JoinSet<()>, label: &str, budget:
         return;
     }
 
+    // What a drain that runs long costs is now bounded, but not explained: a
+    // journal saying only "timed out" cannot tell one connection ignoring
+    // `shutdown_rx` from many draining slowly, and those have different causes.
+    // Report what it started with, what it got through, and how long that took.
+    let started_with = joinset.len();
+    let began = Instant::now();
     match timeout(budget, async {
         while let Some(result) = joinset.join_next().await {
             if let Err(err) = result {
@@ -46,11 +53,19 @@ pub async fn shutdown_supervised(joinset: &mut JoinSet<()>, label: &str, budget:
     })
     .await
     {
-        Ok(()) => {}
+        Ok(()) => {
+            tracing::debug!(
+                "{label}: drained {started_with} task(s) in {}ms",
+                began.elapsed().as_millis()
+            );
+        }
         Err(_) => {
             tracing::warn!(
-                "{label}: supervised task shutdown timed out after {}ms; aborting",
-                budget.as_millis()
+                "{label}: supervised task shutdown timed out after {}ms; \
+                 {} of {started_with} task(s) still running after {}ms; aborting",
+                budget.as_millis(),
+                joinset.len(),
+                began.elapsed().as_millis()
             );
             joinset.abort_all();
             while joinset.join_next().await.is_some() {}
@@ -66,6 +81,28 @@ mod tests {
     /// A task that ignores shutdown must not hold the drain past its budget:
     /// everything the caller does after this call is paid for out of the rest
     /// of the caller's own bound.
+    /// The timeout has to say how much was left, not only that it ran out.
+    /// One task ignoring shutdown and forty draining slowly both end here, and
+    /// they are different bugs.
+    #[tokio::test]
+    async fn a_timed_out_drain_reports_what_was_still_running() {
+        let mut joinset = JoinSet::new();
+        for _ in 0..3 {
+            spawn_supervised(&mut joinset, async {});
+        }
+        spawn_supervised(&mut joinset, async {
+            std::future::pending::<()>().await;
+        });
+        assert_eq!(joinset.len(), 4);
+
+        shutdown_supervised(&mut joinset, "test", Duration::from_millis(200)).await;
+
+        // The three cooperative tasks were collected before the budget ran out
+        // and only the parked one was aborted; the counter the warning prints
+        // is this length, read at the timeout.
+        assert!(joinset.is_empty(), "the drain must leave nothing behind");
+    }
+
     #[tokio::test]
     async fn a_task_that_never_finishes_is_aborted_at_the_budget() {
         let mut joinset = JoinSet::new();

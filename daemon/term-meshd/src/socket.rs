@@ -257,6 +257,7 @@ pub struct Context {
     pub project_registry: Arc<crate::sync::ProjectRegistry>,
     pub paused_sync_projects: Arc<RwLock<HashSet<String>>>,
     pub operation_manager: crate::sync::OperationManager,
+    pub runtime_owner: Arc<crate::RuntimeOwner>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1235,19 +1236,19 @@ fn connect_unix_socket_with_timeout(path: &Path, timeout: Duration) -> std::io::
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
-    let status_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
-    if status_flags < 0
-        || unsafe {
-            libc::fcntl(
-                fd.as_raw_fd(),
-                libc::F_SETFL,
-                status_flags | libc::O_NONBLOCK,
-            )
-        } < 0
-        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
+        let status_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if status_flags < 0
+            || unsafe {
+                libc::fcntl(
+                    fd.as_raw_fd(),
+                    libc::F_SETFL,
+                    status_flags | libc::O_NONBLOCK,
+                )
+            } < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
     }
     let result = unsafe {
         libc::connect(
@@ -1358,6 +1359,7 @@ pub async fn serve(
         tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>,
     >,
     remote_registry: crate::remote::SharedRegistry,
+    runtime_owner: Arc<crate::RuntimeOwner>,
     mut shutdown_rx: watch::Receiver<bool>,
     started: watch::Sender<bool>,
 ) -> anyhow::Result<()> {
@@ -1398,6 +1400,7 @@ pub async fn serve(
         project_registry,
         paused_sync_projects: Arc::new(RwLock::new(HashSet::new())),
         operation_manager,
+        runtime_owner,
     });
     let heartbeat_task = tokio::spawn(run_heartbeat_staleness_watcher(
         ctx.clone(),
@@ -1512,6 +1515,7 @@ async fn handle_connection(
     ctx: &Context,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let peer_pid = connected_peer_pid(&stream);
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
@@ -1578,7 +1582,7 @@ async fn handle_connection(
             return stream_subscribe_events(req, writer, reader, ctx, shutdown_rx).await;
         }
 
-        let resp = dispatch(&req, ctx).await;
+        let resp = dispatch(&req, ctx, peer_pid).await;
 
         let mut buf = serialize_bounded_response(&resp, req.id.clone())?;
         buf.push(b'\n');
@@ -2758,7 +2762,7 @@ fn iso8601_from_unix_secs(secs: u64) -> String {
     format!("{year:04}-{month2:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-async fn dispatch(req: &Request, ctx: &Context) -> Response {
+async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Response {
     let result = match req.method.as_str() {
         // --- General ---
         "ping" => Ok(serde_json::json!({"status": "pong"})),
@@ -3043,7 +3047,7 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
 
             Ok(serde_json::json!({
                 "pid": std::process::id(),
-                "owner_pid": crate::configured_owner_pid(),
+                "owner_pid": ctx.runtime_owner.owner_pid(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "uptime_secs": uptime_secs,
                 "subsystems": {
@@ -3066,6 +3070,63 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
                     },
                 },
             }))
+        }
+        "daemon.owner.claim" => {
+            #[derive(Deserialize)]
+            struct P {
+                pid: u32,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(params) => {
+                    if peer_pid != Some(params.pid) {
+                        return Response {
+                            id: req.id.clone(),
+                            result: None,
+                            error: Some(RpcError {
+                                code: -32601,
+                                message: "owner pid does not match the connected process".to_string(),
+                            }),
+                        };
+                    }
+                    let peer_ready = crate::peer::layout::PeerHost::active_host().is_some();
+                    ctx.runtime_owner
+                        .claim(params.pid, peer_ready)
+                        .map(|()| serde_json::json!({
+                            "owner_pid": params.pid,
+                            "peer_ready": true,
+                        }))
+                }
+                Err(error) => Err(format!("invalid params: {error}")),
+            }
+        }
+        "daemon.owner.release" => {
+            #[derive(Deserialize)]
+            struct P {
+                pid: u32,
+            }
+            match serde_json::from_value::<P>(req.params.clone()) {
+                Ok(params) => {
+                    if peer_pid != Some(params.pid) {
+                        return Response {
+                            id: req.id.clone(),
+                            result: None,
+                            error: Some(RpcError {
+                                code: -32601,
+                                message: "owner pid does not match the connected process".to_string(),
+                            }),
+                        };
+                    }
+                    let live_surfaces = crate::peer::layout::PeerHost::active_host()
+                        .is_some_and(|host| host.has_live_attachable_surfaces());
+                    ctx.runtime_owner
+                        .release(params.pid)
+                        .map(|()| serde_json::json!({
+                            "released": true,
+                            "live_surfaces": live_surfaces,
+                        }))
+                }
+                Err(error) => Err(format!("invalid params: {error}")),
+            }
         }
 
         // --- Sessions (pushed by Swift app) ---
@@ -5113,6 +5174,22 @@ async fn dispatch(req: &Request, ctx: &Context) -> Response {
         // this ignores `directory_present` — a project folder does not vanish
         // when its leader dies — but it still refuses live surfaces and the
         // default workspace. Dry-run unless `apply`; backs each file up first.
+        // Read-only. It reports and never repairs, so unlike `peer.state.reset`
+        // it takes no `apply` and needs no dry-run.
+        "peer.doctor" => match crate::peer::layout::PeerHost::active_host() {
+            Some(host) => {
+                let findings = host.diagnose();
+                Ok(serde_json::json!({
+                    "healthy": findings.is_empty(),
+                    "findings": findings,
+                }))
+            }
+            None => Err(
+                "peer host is not running (daemon started without TERMMESH_PEER_SOCKET)"
+                    .to_string(),
+            ),
+        },
+
         "peer.state.reset" => {
             #[derive(Deserialize)]
             struct P {
@@ -5800,6 +5877,53 @@ fn peer_uid_matches(stream: &tokio::net::UnixStream, expected_uid: u32) -> bool 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn peer_uid_matches(_stream: &tokio::net::UnixStream, _expected_uid: u32) -> bool {
     false
+}
+
+#[cfg(target_os = "macos")]
+fn connected_peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+
+    const LOCAL_PEERPID: libc::c_int = 0x002;
+    const SOL_LOCAL: libc::c_int = 0;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            SOL_LOCAL,
+            LOCAL_PEERPID,
+            &mut pid as *mut libc::pid_t as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (rc == 0 && pid > 1).then_some(pid as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn connected_peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+
+    let mut cred = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let cred = unsafe { cred.assume_init() };
+    (cred.pid > 1).then_some(cred.pid as u32)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn connected_peer_pid(_stream: &tokio::net::UnixStream) -> Option<u32> {
+    None
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

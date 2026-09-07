@@ -1362,6 +1362,7 @@ private struct SidebarProjectDeletionTarget: Identifiable {
     let label: String
     let teamName: String
     let locations: [TeamOrchestrator.Team.RemoteProjectLocation]
+    let removalScope: TeamOrchestrator.ProjectRemovalScope
     var id: String { teamName }
 }
 
@@ -1984,6 +1985,17 @@ private struct SidebarPeerProjectsView: View {
             .accessibilityIdentifier("sidebar.projects.detached.\(team.id)")
             .help("Attach this project's existing leader and agents to the current window")
         }
+        .contentShape(Rectangle())
+        .contextMenu {
+            Button("Delete Project…", role: .destructive) {
+                deletionTarget = SidebarProjectDeletionTarget(
+                    label: team.id,
+                    teamName: team.id,
+                    locations: team.remoteProjectLocations,
+                    removalScope: .stateOnly
+                )
+            }
+        }
     }
 
     private func remoteManifestRow(_ item: RemoteManifestItem) -> some View {
@@ -2123,7 +2135,8 @@ private struct SidebarPeerProjectsView: View {
                 deletionTarget = SidebarProjectDeletionTarget(
                     label: group.identity.label,
                     teamName: teamName,
-                    locations: team.remoteProjectLocations
+                    locations: team.remoteProjectLocations,
+                    removalScope: .fullDelete
                 )
             }
             .disabled(teamName(for: group) == nil)
@@ -2284,7 +2297,8 @@ private struct SidebarPeerProjectsView: View {
                     do {
                         try await TeamOrchestrator.shared.deleteProject(
                             teamName: target.teamName,
-                            tabManager: tabManager
+                            tabManager: tabManager,
+                            removalScope: target.removalScope
                         )
                     } catch {
                         deletionFailure = error.localizedDescription
@@ -2293,7 +2307,9 @@ private struct SidebarPeerProjectsView: View {
             }
             Button("Cancel", role: .cancel) { deletionTarget = nil }
         } message: { target in
-            if target.locations.isEmpty {
+            if target.removalScope == .stateOnly {
+                Text("The project, its panes, and its saved state will be removed. Repositories, working folders, checkouts, and worktrees are kept.")
+            } else if target.locations.isEmpty {
                 Text("The project and its panes will close. Local folders are kept.")
             } else {
                 let paths = target.locations
@@ -2533,9 +2549,11 @@ private struct PeerShellCleanupSheet: View {
     let hostName: String
     var scopeName: String? = nil
     let items: [TeamOrchestrator.PeerShellCleanupItem]
+    let projects: [TeamOrchestrator.PeerProjectCleanupItem]
     let isLoading: Bool
     let error: String?
     @Binding var selection: Set<Data>
+    @Binding var projectSelection: Set<String>
     let onRefresh: () -> Void
     let onClose: (Bool) -> Void
     @Environment(\.dismiss) private var dismiss
@@ -2560,6 +2578,19 @@ private struct PeerShellCleanupSheet: View {
 
     private var allCloseableSelected: Bool {
         !closeableIDs.isEmpty && closeableIDs.isSubset(of: selection)
+    }
+
+    private func projectState(
+        _ project: TeamOrchestrator.PeerProjectCleanupItem
+    ) -> (TeamOrchestrator.PeerProjectCleanupItem.State, Int) {
+        if case .unresolved = project.state {
+            return (project.state, project.remainingLiveSurfaceCount)
+        }
+        return TeamOrchestrator.projectCleanupState(
+            liveSurfaceCount: project.liveSurfaceCount,
+            projectSurfaceIDs: project.surfaceIDs,
+            selectedPaneIDs: selection
+        )
     }
 
     var body: some View {
@@ -2672,6 +2703,39 @@ private struct PeerShellCleanupSheet: View {
             }
             .frame(minHeight: 300)
 
+            if !projects.isEmpty {
+                Text("Projects")
+                    .font(.subheadline.weight(.semibold))
+                ForEach(projects) { project in
+                    let state = projectState(project)
+                    HStack(spacing: 10) {
+                        Toggle("", isOn: Binding(
+                            get: { projectSelection.contains(project.id) },
+                            set: { selected in
+                                if selected { projectSelection.insert(project.id) }
+                                else { projectSelection.remove(project.id) }
+                            }
+                        ))
+                        .labelsHidden()
+                        .disabled(!projectStateIsResettable(state.0) || isLoading)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(project.name)
+                            Text(project.workingDirectory)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        Spacer()
+                        Text(projectStateLabel(state.0, remaining: state.1))
+                            .foregroundColor(
+                                projectStateIsResettable(state.0) ? .orange : .secondary
+                            )
+                    }
+                    .font(.caption)
+                }
+            }
+
             HStack {
                 Text("\(items.count) panes · \(closeableCount) safe to close")
                     .font(.caption)
@@ -2680,22 +2744,28 @@ private struct PeerShellCleanupSheet: View {
                 Button("Refresh", action: onRefresh)
                     .disabled(isLoading)
                 Button("Cancel") { dismiss() }
-                Button("Close \(selection.count) Panes", role: .destructive) {
+                Button(cleanupButtonLabel, role: .destructive) {
                     showCloseConfirm = true
                 }
-                .disabled(selection.isEmpty || isLoading)
+                .disabled((selection.isEmpty && projectSelection.isEmpty) || isLoading)
             }
         }
         .padding(18)
         .frame(minWidth: 680, minHeight: 430)
+        .onChange(of: selection) { _ in
+            let eligible = Set(projects.compactMap { project in
+                projectStateIsResettable(projectState(project).0) ? project.id : nil
+            })
+            projectSelection.formIntersection(eligible)
+        }
         // Select All puts every closeable shell one click from termination,
         // so the irreversible step gets its own confirmation. This is the one
         // place in the host menu that earns a prompt.
         .confirmationDialog(
-            "Close \(selection.count) panes on \"\(hostName)\"?",
+            "Clean up selected state on \"\(hostName)\"?",
             isPresented: $showCloseConfirm
         ) {
-            Button("Close \(selection.count) Panes", role: .destructive) {
+            Button(cleanupButtonLabel, role: .destructive) {
                 onClose(force)
             }
             Button("Cancel", role: .cancel) {}
@@ -2703,6 +2773,32 @@ private struct PeerShellCleanupSheet: View {
             Text(protectedSelectedCount > 0
                  ? "Force overrides protection for \(protectedSelectedCount) in-use or busy panes. Their local panes close too. This cannot be undone."
                  : "The processes inside end immediately. This cannot be undone.")
+        }
+    }
+
+    private var cleanupButtonLabel: String {
+        if projectSelection.isEmpty { return "Close \(selection.count) Panes" }
+        return "Clean Up \(selection.count) Panes and \(projectSelection.count) Projects"
+    }
+
+    private func projectStateLabel(
+        _ state: TeamOrchestrator.PeerProjectCleanupItem.State,
+        remaining: Int
+    ) -> String {
+        switch state {
+        case .dead: return "dead · reset state"
+        case .closesWithSelectedPanes: return "dead after selected panes close"
+        case .live: return "\(remaining) live surfaces remain"
+        case .unresolved(let reason): return "unavailable · \(reason)"
+        }
+    }
+
+    private func projectStateIsResettable(
+        _ state: TeamOrchestrator.PeerProjectCleanupItem.State
+    ) -> Bool {
+        switch state {
+        case .dead, .closesWithSelectedPanes: return true
+        case .live, .unresolved: return false
         }
     }
 
@@ -2748,6 +2844,8 @@ struct RemoteHostGroupView: View, Equatable {
     @State private var showShellCleanup = false
     @State private var shellCleanupItems: [TeamOrchestrator.PeerShellCleanupItem] = []
     @State private var shellCleanupSelection = Set<Data>()
+    @State private var projectCleanupItems: [TeamOrchestrator.PeerProjectCleanupItem] = []
+    @State private var projectCleanupSelection = Set<String>()
     @State private var shellCleanupLoading = false
     @State private var shellCleanupError: String?
     init(host: HostEntry, store: RemoteHostStore,
@@ -3013,7 +3111,36 @@ struct RemoteHostGroupView: View, Equatable {
             .accessibilityLabel(isExpanded ? "Collapse \(host.displayName)" : "Expand \(host.displayName)")
             .help(isExpanded ? "Collapse \(host.displayName)" : "Expand \(host.displayName)")
 
+            // Ahead of the acting controls beside it: everything they operate
+            // on is what this row currently shows, and project state reaches
+            // the app only when the app asks for it. Work done on the host
+            // itself stays invisible until then, so the way to ask belongs
+            // where the stale number is read.
             if host.isConnected {
+                Button {
+                    store.resyncConnectedHost(host)
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .opacity(host.isRefreshing ? 0.4 : 1)
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(host.isRefreshing)
+                .accessibilityLabel(
+                    host.isRefreshing
+                        ? "Resyncing \(host.displayName)"
+                        : "Resync \(host.displayName) from the host"
+                )
+                .help(
+                    host.isRefreshing
+                        ? "Resyncing…"
+                        : "Resync from Host — re-read workspaces and projects. "
+                            + "Keeps the connection and open panes."
+                )
+
                 Button {
                     showShellCleanup = true
                     Task { await loadShellCleanup() }
@@ -3065,10 +3192,21 @@ struct RemoteHostGroupView: View, Equatable {
                     Button("Retry Connection") { store.retryConnectingHost(host) }
                 }
             case .connected:
-                // Grouped by what the action touches. Browsing the host,
-                // closing local views, and ending remote processes are three
-                // different scopes and their labels must say which one they
-                // affect.
+                // Grouped by what the action touches. Reading the host,
+                // browsing it, closing local views, and ending remote
+                // processes are four different scopes and their labels must
+                // say which one they affect.
+                //
+                // Reading comes first because everything under it acts on what
+                // this list currently shows, and the list can be out of date:
+                // project state reaches the app only when the app asks, so
+                // anything done on the host itself is invisible until it does.
+                Button(host.isRefreshing ? "Resyncing…" : "Resync from Host") {
+                    store.resyncConnectedHost(host)
+                }
+                .disabled(host.isRefreshing)
+
+                Divider()
                 Button("Open Surface as Pane…") {
                     store.openSurfaceAsPane(host)
                 }
@@ -3314,9 +3452,11 @@ struct RemoteHostGroupView: View, Equatable {
             PeerShellCleanupSheet(
                 hostName: host.displayName,
                 items: shellCleanupItems,
+                projects: projectCleanupItems,
                 isLoading: shellCleanupLoading,
                 error: shellCleanupError,
                 selection: $shellCleanupSelection,
+                projectSelection: $projectCleanupSelection,
                 onRefresh: {
                     Task { await loadShellCleanup() }
                 },
@@ -3342,18 +3482,40 @@ struct RemoteHostGroupView: View, Equatable {
             let currentHost = RemoteHostStore.currentHostSnapshot(
                 for: host, in: store.hosts
             )
-            let items = try await TeamOrchestrator.shared.inspectPeerShells(host: currentHost)
-            shellCleanupItems = items
-            shellCleanupSelection = Set(items.compactMap { item in
+            let inspection = try await TeamOrchestrator.shared.inspectPeerCleanup(
+                host: currentHost,
+                selectedPaneIDs: shellCleanupSelection
+            )
+            shellCleanupItems = inspection.panes
+            shellCleanupSelection = Set(inspection.panes.compactMap { item in
                 guard !item.isBusy else { return nil }
                 switch item.state {
                 case .managedOrphan, .missingDirectory: return item.id
                 case .inUse, .unclaimed: return nil
                 }
             })
+            projectCleanupItems = inspection.projects
+            projectCleanupSelection = Set(inspection.projects.compactMap { project in
+                let state: TeamOrchestrator.PeerProjectCleanupItem.State
+                if case .unresolved = project.state {
+                    state = project.state
+                } else {
+                    state = TeamOrchestrator.projectCleanupState(
+                        liveSurfaceCount: project.liveSurfaceCount,
+                        projectSurfaceIDs: project.surfaceIDs,
+                        selectedPaneIDs: shellCleanupSelection
+                    ).0
+                }
+                switch state {
+                case .dead, .closesWithSelectedPanes: return project.id
+                case .live, .unresolved: return nil
+                }
+            })
         } catch {
             shellCleanupItems = []
             shellCleanupSelection = []
+            projectCleanupItems = []
+            projectCleanupSelection = []
             shellCleanupError = String(describing: error)
         }
         shellCleanupLoading = false
@@ -3384,11 +3546,15 @@ struct RemoteHostGroupView: View, Equatable {
             let currentHost = RemoteHostStore.currentHostSnapshot(
                 for: host, in: store.hosts
             )
-            _ = try await TeamOrchestrator.shared.closePeerShells(
+            let result = try await TeamOrchestrator.shared.cleanPeerState(
                 host: currentHost,
-                surfaceIDs: shellCleanupSelection,
+                paneIDs: shellCleanupSelection,
+                projectIDs: projectCleanupSelection,
                 force: force
             )
+            if !result.failedProjects.isEmpty {
+                throw TeamOrchestrator.PeerCleanupProjectResetError.partial(result)
+            }
             // ClosePane is asynchronous on the host and protected selections
             // may be skipped. Re-read the authoritative roster instead of
             // making the sheet claim that every selected row disappeared.
@@ -3437,6 +3603,8 @@ struct RemoteWorkspaceRowView: View {
     @State private var showShellCleanup = false
     @State private var shellCleanupItems: [TeamOrchestrator.PeerShellCleanupItem] = []
     @State private var shellCleanupSelection = Set<Data>()
+    @State private var projectCleanupItems: [TeamOrchestrator.PeerProjectCleanupItem] = []
+    @State private var projectCleanupSelection = Set<String>()
     @State private var shellCleanupLoading = false
     @State private var shellCleanupError: String?
     @State private var panesExpanded = false
@@ -3997,9 +4165,11 @@ struct RemoteWorkspaceRowView: View {
                 hostName: host.displayName,
                 scopeName: workspace.title,
                 items: shellCleanupItems,
+                projects: projectCleanupItems,
                 isLoading: shellCleanupLoading,
                 error: shellCleanupError,
                 selection: $shellCleanupSelection,
+                projectSelection: $projectCleanupSelection,
                 onRefresh: {
                     Task { await loadShellCleanup() }
                 },
@@ -4018,21 +4188,41 @@ struct RemoteWorkspaceRowView: View {
             let currentHost = RemoteHostStore.currentHostSnapshot(
                 for: host, in: store.hosts
             )
-            let items = try await TeamOrchestrator.shared.inspectPeerShells(
+            let inspection = try await TeamOrchestrator.shared.inspectPeerCleanup(
                 host: currentHost,
-                workspaceID: workspace.id
+                workspaceID: workspace.id,
+                selectedPaneIDs: shellCleanupSelection
             )
-            shellCleanupItems = items
-            shellCleanupSelection = Set(items.compactMap { item in
+            shellCleanupItems = inspection.panes
+            shellCleanupSelection = Set(inspection.panes.compactMap { item in
                 guard !item.isBusy else { return nil }
                 switch item.state {
                 case .managedOrphan, .missingDirectory: return item.id
                 case .inUse, .unclaimed: return nil
                 }
             })
+            projectCleanupItems = inspection.projects
+            projectCleanupSelection = Set(inspection.projects.compactMap { project in
+                let state: TeamOrchestrator.PeerProjectCleanupItem.State
+                if case .unresolved = project.state {
+                    state = project.state
+                } else {
+                    state = TeamOrchestrator.projectCleanupState(
+                        liveSurfaceCount: project.liveSurfaceCount,
+                        projectSurfaceIDs: project.surfaceIDs,
+                        selectedPaneIDs: shellCleanupSelection
+                    ).0
+                }
+                switch state {
+                case .dead, .closesWithSelectedPanes: return project.id
+                case .live, .unresolved: return nil
+                }
+            })
         } catch {
             shellCleanupItems = []
             shellCleanupSelection = []
+            projectCleanupItems = []
+            projectCleanupSelection = []
             shellCleanupError = String(describing: error)
         }
         shellCleanupLoading = false
@@ -4046,11 +4236,15 @@ struct RemoteWorkspaceRowView: View {
             let currentHost = RemoteHostStore.currentHostSnapshot(
                 for: host, in: store.hosts
             )
-            _ = try await TeamOrchestrator.shared.closePeerShells(
+            let result = try await TeamOrchestrator.shared.cleanPeerState(
                 host: currentHost,
-                surfaceIDs: shellCleanupSelection,
+                paneIDs: shellCleanupSelection,
+                projectIDs: projectCleanupSelection,
                 force: force
             )
+            if !result.failedProjects.isEmpty {
+                throw TeamOrchestrator.PeerCleanupProjectResetError.partial(result)
+            }
             await loadShellCleanup()
         } catch {
             let message = String(describing: error)

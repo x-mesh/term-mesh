@@ -56,12 +56,54 @@ journal_scoped() {
 PEER_SOCKET=${TERMMESH_PEER_SOCKET:-$(systemctl_scoped show "$UNIT" -p Environment --value \
   | tr ' ' '\n' | sed -n 's/^TERMMESH_PEER_SOCKET=//p' | tail -1)}
 PEER_SOCKET=${PEER_SOCKET:-/run/term-mesh/tm-peer.sock}
+CONTROL_SOCKET=${TERMMESH_DAEMON_UNIX_PATH:-/run/term-mesh/term-meshd.sock}
 
 STOP_TIMEOUT_US=$(systemctl_scoped show "$UNIT" -p TimeoutStopUSec --value)
 echo "unit:        $UNIT ($SCOPE scope)"
 echo "relay:       $PEER_SOCKET"
 echo "stop bound:  $STOP_TIMEOUT_US"
 echo "round bound: ${BOUND}s"
+
+# The daemon's own definition of started, which a connect does not prove: both
+# listeners bind before the startup work that follows them, so the kernel
+# accepts into the backlog while the daemon still counts a server unstarted.
+# Restarting in that window is read as a required server failing during
+# startup, and teardown then skips the agent steps on purpose — which measures
+# that path instead of a restart, and hides an injected step stall entirely.
+control_answers() {
+  python3 -c 'import json,socket,sys
+try:
+    s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1.0)
+    s.connect(sys.argv[1])
+    s.sendall(b"{\"id\":1,\"method\":\"ping\"}\n")
+    sys.exit(0 if b"pong" in s.recv(4096) else 1)
+except OSError:
+    sys.exit(1)' "$CONTROL_SOCKET" 2>/dev/null
+}
+
+# The peer server needs a third proof. It publishes its started receipt right
+# after the line it logs, and a connect reaches its listener before that — the
+# same backlog gap the control socket has, which is why neither socket alone
+# can answer "has this daemon started".
+peer_started_since() {
+  local since=$1
+  local journal
+  journal=$(journal_scoped -u "$UNIT" --since "$since" --no-pager 2>/dev/null || true)
+  grep -q "peer-federation listening on" <<<"$journal"
+}
+
+await_started() {
+  local since=$1
+  for _ in $(seq 1 300); do
+    if relay_accepts && control_answers && peer_started_since "$since"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "FAIL: the daemon did not report both servers started" >&2
+  exit 1
+}
 
 # The relay is back when a client's connect stops being refused. That is the
 # exact signal the reporting client saw fail for 90 seconds.
@@ -93,17 +135,35 @@ if [[ -n "$STALL" ]]; then
   trap 'rm -f "$DROPIN_DIR/99-shutdown-stall.conf"; systemctl_scoped daemon-reload; systemctl_scoped restart "$UNIT" || true' EXIT
   STALL_SINCE=$(date '+%Y-%m-%d %H:%M:%S')
   systemctl_scoped restart "$UNIT"
-  until relay_accepts; do sleep 0.1; done
-  # A release build compiles the injection out, so the drop-in above would be
-  # a silent no-op and every measurement below would read as "the bound works".
+  await_started "$STALL_SINCE"
+  # A release build compiles the injection out, so the drop-in above would be a
+  # silent no-op and every measurement below would read as "the bound works".
   # Make that a failure instead.
-  if ! journal_scoped -u "$UNIT" --since "$STALL_SINCE" --no-pager \
-      | grep -q "teardown fault injection active"; then
+  #
+  # Read the journal into a variable before matching. Piping it into `grep -q`
+  # looks right and is not: grep exits at the first match and closes the pipe,
+  # journalctl dies of SIGPIPE, and `pipefail` turns the whole pipeline into a
+  # failure — so a working injection read as absent. This guard exists to stop
+  # a false pass and was itself producing a false failure.
+  #
+  # Polled because the relay accepting does not prove the journal has the line
+  # yet.
+  INJECTED=0
+  for _ in $(seq 1 50); do
+    JOURNAL=$(journal_scoped -u "$UNIT" --since "$STALL_SINCE" --no-pager 2>/dev/null || true)
+    if grep -q "teardown fault injection active" <<<"$JOURNAL"; then
+      INJECTED=1
+      break
+    fi
+    sleep 0.2
+  done
+  if [[ "$INJECTED" != 1 ]]; then
     echo "FAIL: --stall $STALL had no effect. This daemon build injects no" >&2
     echo "      teardown fault (release builds never do). Measure without" >&2
     echo "      --stall, or install a debug build to exercise the bound." >&2
     exit 1
   fi
+  echo "stall active: confirmed in the journal"
 fi
 
 WORST=0
@@ -113,16 +173,20 @@ for ((round = 1; round <= ROUNDS; round++)); do
   START=$(date +%s.%N)
   systemctl_scoped restart "$UNIT"
   until relay_accepts; do sleep 0.05; done
+  # The window closes when a client could connect again — that is the number
+  # this measures. Full readiness is waited for after it, so the next round
+  # signals a daemon that has actually started.
   WINDOW=$(python3 -c "print(f'{$(date +%s.%N) - $START:.2f}')")
+  await_started "$SINCE"
   echo "round $round: relay unavailable for ${WINDOW}s"
   awk -v w="$WINDOW" -v b="$BOUND" 'BEGIN { exit !(w > b) }' && {
     echo "  OVER the ${BOUND}s bound" >&2
     FAILED=1
   }
   awk -v w="$WINDOW" -v m="$WORST" 'BEGIN { exit !(w > m) }' && WORST=$WINDOW
-  journal_scoped -u "$UNIT" --since "$SINCE" --no-pager \
-    | grep -E "shutdown step|shutdown budget|runtime stalled|Killing" \
-    | sed 's/^/  /' || true
+  ROUND_JOURNAL=$(journal_scoped -u "$UNIT" --since "$SINCE" --no-pager 2>/dev/null || true)
+  grep -E "shutdown step|shutdown budget|runtime stalled|peer surface|Killing" \
+    <<<"$ROUND_JOURNAL" | sed 's/^/  /' || true
 done
 
 echo "worst window: ${WORST}s"

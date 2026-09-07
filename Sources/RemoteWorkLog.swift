@@ -200,8 +200,8 @@ enum RemoteWorkLog {
         if let size = try? handle.seekToEnd(), size > maxFileBytes {
             dropOldestHalf(handle, size: size)
         }
-        handle.seekToEndOfFile()
-        handle.write(data)
+        try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
     }
 
     /// Keep the newer half, cut at a line boundary.
@@ -221,7 +221,7 @@ enum RemoteWorkLog {
         let kept = tailAfterFirstPartialLine(tail)
         try? handle.truncate(atOffset: 0)
         try? handle.seek(toOffset: 0)
-        handle.write(kept)
+        try? handle.write(contentsOf: kept)
     }
 
     /// Drop everything up to and including the first newline.

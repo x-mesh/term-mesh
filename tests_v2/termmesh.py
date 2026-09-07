@@ -1665,8 +1665,11 @@ class termmesh:
             "operation_id": operation_id,
         }) or {})
 
-    def debug_project_delete(self, team_name: str) -> dict:
-        return dict(self._call("debug.project.delete", {"team": team_name}) or {})
+    def debug_project_delete(self, team_name: str, state_only: bool = False) -> dict:
+        return dict(self._call("debug.project.delete", {
+            "team": team_name,
+            "state_only": state_only,
+        }) or {})
 
     def debug_project_delete_status(self, operation_id: str) -> dict:
         return dict(self._call("debug.project.delete_status", {

@@ -6,37 +6,22 @@ import XCTest
 @testable import term_mesh
 #endif
 
-/// A daemon that dies with its app cannot hold a session for anybody, which is
-/// why quitting term-mesh on a peer ends a project placed there: the work
-/// exists only inside that app's process tree.
-///
-/// The mechanism to decouple already existed — omit `TERMMESH_OWNER_PID` and
-/// the daemon's `wait_for_owner_exit` waits forever — so what was missing was
-/// deciding when to use it. These tests hold that decision still, because both
-/// answers are wrong somewhere: a daemon that always survives is the leak
-/// `TERMMESH_OWNER_PID` was added to stop, and one that never does cannot serve.
+/// Runtime ownership and durable peer capability are independent of the GUI
+/// peer-server Auto-start preference.
 final class DaemonLifetimeTests: XCTestCase {
 
-    /// Serving peers is the case where another machine may come back to a
-    /// session, so it is the case that decouples.
-    func test_aMachineServingPeersKeepsItsDaemon() {
-        XCTAssertTrue(TermMeshDaemon.daemonShouldOutliveApp(peerServingEnabled: true))
-    }
-
-    /// With nobody to serve, a daemon outliving a crash or a forced reload is
-    /// exactly the leak the owner-pid tie was added to prevent — not a feature.
-    func test_aMachineServingNobodyKeepsTheOldContract() {
-        XCTAssertFalse(TermMeshDaemon.daemonShouldOutliveApp(peerServingEnabled: false))
-    }
-
-    /// The decision must come from the argument alone. Reading the live setting
-    /// inside would make it untestable and would couple the answer to whatever
-    /// this machine happens to have configured while a test runs.
-    func test_theDecisionIsAFunctionOfItsInputOnly() {
-        for _ in 0..<3 {
-            XCTAssertTrue(TermMeshDaemon.daemonShouldOutliveApp(peerServingEnabled: true))
-            XCTAssertFalse(TermMeshDaemon.daemonShouldOutliveApp(peerServingEnabled: false))
-        }
+    func test_spawnEnvironmentAlwaysConfiguresOwnerAndBuildScopedPeerSocket() {
+        let environment = TermMeshDaemon.daemonEnvironment(
+            processEnvironment: ["UNCHANGED": "yes"],
+            ownerPID: 1234,
+            peerSocketPath: "/tmp/term-meshd-dev-tag-peer.sock"
+        )
+        XCTAssertEqual(environment["UNCHANGED"], "yes")
+        XCTAssertEqual(environment["TERMMESH_OWNER_PID"], "1234")
+        XCTAssertEqual(
+            environment["TERMMESH_PEER_SOCKET"],
+            "/tmp/term-meshd-dev-tag-peer.sock"
+        )
     }
 
     // MARK: - Replacing a daemon that is not this build
@@ -140,9 +125,7 @@ final class DaemonPeerSocketTests: XCTestCase {
 }
 
 /// Naming a session owner is a promise that a client can come back to a session
-/// later. The first version made it unconditionally: the guard read
-/// `daemonShouldOutliveApp(peerServingEnabled: true)`, which is `true` by
-/// inspection, so every host advertised an owner whether or not it had one.
+/// later. The answer must come from runtime readiness, not a preference.
 final class SessionHostAdvertisementDecisionTests: XCTestCase {
 
     /// Advertise only what is actually there. Anything else sends a client to a

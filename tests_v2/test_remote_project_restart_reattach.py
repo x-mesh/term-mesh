@@ -1367,12 +1367,56 @@ def _phase_cleanup(c, host: str, state_path: Path) -> None:
     state_path.unlink(missing_ok=True)
 
 
+def _phase_state_only(c, host: str, state_path: Path) -> None:
+    state = json.loads(state_path.read_text())
+    team_name = state["team_name"]
+    source_directory = state["source_directory"]
+    sentinel = Path(source_directory) / ".term-mesh-state-only-sentinel"
+    _remote_stdout(host, f"touch {str(sentinel)!r}")
+
+    project = _wait(lambda: next((
+        item for item in c.debug_project_remote_presentations(host)
+        if item.get("project_id") == state["project_id"]
+    ), None))
+    if project is None:
+        raise termmeshError("state-only cleanup cannot find the durable Project manifest")
+    if not any(item.get("team_name") == team_name for item in c.team_list()):
+        c.debug_project_adopt_remote(host, state["project_id"])
+        if _wait(lambda: any(
+            item.get("team_name") == team_name for item in c.team_list()
+        )) is None:
+            raise termmeshError("state-only cleanup could not adopt the Project model")
+
+    deletion = c.debug_project_delete(team_name, state_only=True)
+    operation_id = str(deletion.get("operation_id") or "")
+    if not operation_id:
+        raise termmeshError(f"state-only cleanup returned no operation id: {deletion!r}")
+    _wait_for_project_deletion(c, operation_id)
+
+    if any(
+        item.get("project_id") == state["project_id"]
+        for item in c.debug_project_remote_presentations(host)
+    ):
+        raise termmeshError("state-only cleanup left the Project manifest behind")
+    if any(item.get("team_name") == team_name for item in c.team_list()):
+        raise termmeshError("state-only cleanup left the local team behind")
+    _remote_stdout(host, f"test -f {str(sentinel)!r}")
+    for checkout in state.get("checkouts") or []:
+        path = checkout.get("path") if isinstance(checkout, dict) else checkout
+        if path:
+            _remote_stdout(host, f"test -d {str(path)!r}")
+    _remote_stdout(host, f"rm -f {str(sentinel)!r}")
+    state_path.unlink(missing_ok=True)
+
+
 def main() -> int:
     host = os.environ.get(HOST_ENV, "").strip()
     remote_dir = os.environ.get(DIR_ENV, "").strip()
     phase = os.environ.get(PHASE_ENV, "").strip()
     state_path = Path(os.environ.get(STATE_ENV, "/tmp/term-mesh-remote-project-e2e-state.json"))
-    if not host or not remote_dir or phase not in {"create", "adopt", "repair", "cleanup"}:
+    if not host or not remote_dir or phase not in {
+        "create", "adopt", "repair", "cleanup", "state-only"
+    }:
         if os.environ.get(REQUIRE_REMOTE_PROJECT_ENV) == "1":
             raise termmeshError(
                 f"required remote Project topology missing: set {HOST_ENV}, "
@@ -1380,7 +1424,7 @@ def main() -> int:
             )
         print(
             f"SKIP: set {HOST_ENV}, {DIR_ENV}, and "
-            f"{PHASE_ENV}=full (runner) or create|adopt|repair|cleanup"
+            f"{PHASE_ENV}=full (runner) or create|adopt|repair|cleanup|state-only"
         )
         return 0
 
@@ -1392,6 +1436,8 @@ def main() -> int:
             _phase_adopt(c, host, state_path)
         elif phase == "repair":
             _phase_repair(c, host, remote_dir, state_path)
+        elif phase == "state-only":
+            _phase_state_only(c, host, state_path)
         else:
             _phase_cleanup(c, host, state_path)
     print(f"PASS: remote Project restart reattach phase {phase}")
