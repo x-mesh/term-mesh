@@ -1177,8 +1177,18 @@ impl PeerHostFinding {
         record: &super::persist::PersistedProjectPresentation,
         role: &'static str,
         encoded: &str,
+        can_prune: bool,
     ) -> Self {
-        let (remedy, repair_argv) = Self::repair(&record.project_id, true);
+        let (remedy, repair_argv) = if can_prune {
+            Self::repair(&record.project_id, true)
+        } else {
+            Self::inspect()
+        };
+        let live_note = if can_prune {
+            ""
+        } else {
+            "; another referenced surface is live, so prune would refuse this record"
+        };
         Self {
             code: "malformed_surface_id",
             severity: "error",
@@ -1186,7 +1196,9 @@ impl PeerHostFinding {
             team_name: record.team_name.clone(),
             role,
             surface_id: encoded.to_string(),
-            detail: format!("{role} surface id {encoded:?} is not hex and names nothing"),
+            detail: format!(
+                "{role} surface id {encoded:?} is not hex and names nothing{live_note}"
+            ),
             remedy,
             repair_argv,
         }
@@ -1196,8 +1208,18 @@ impl PeerHostFinding {
         record: &super::persist::PersistedProjectPresentation,
         role: &'static str,
         encoded: &str,
+        can_prune: bool,
     ) -> Self {
-        let (remedy, repair_argv) = Self::repair(&record.project_id, true);
+        let (remedy, repair_argv) = if can_prune {
+            Self::repair(&record.project_id, true)
+        } else {
+            Self::inspect()
+        };
+        let live_note = if can_prune {
+            ""
+        } else {
+            "; another referenced surface is live, so prune would refuse this record"
+        };
         Self {
             code: "surface_missing",
             severity: "error",
@@ -1206,7 +1228,7 @@ impl PeerHostFinding {
             role,
             surface_id: encoded.to_string(),
             detail: format!(
-                "{role} surface {encoded} is named by this manifest but no live surface holds it"
+                "{role} surface {encoded} is named by this manifest but no live surface holds it{live_note}"
             ),
             remedy,
             repair_argv,
@@ -2112,14 +2134,30 @@ impl PeerHost {
                     .iter()
                     .map(|member| ("member", member.surface_id.clone())),
             );
+            let live_references = labelled
+                .iter()
+                .filter_map(|(_, encoded)| hex::decode(encoded).ok())
+                .filter(|id| live.contains_key(id))
+                .count();
+            let can_prune = live_references == 0;
 
             for (role, encoded) in labelled {
                 let Some(id) = hex::decode(&encoded).ok() else {
-                    findings.push(PeerHostFinding::malformed_surface_id(&record, role, &encoded));
+                    findings.push(PeerHostFinding::malformed_surface_id(
+                        &record,
+                        role,
+                        &encoded,
+                        can_prune,
+                    ));
                     continue;
                 };
                 let Some(surface) = live.get(&id) else {
-                    findings.push(PeerHostFinding::surface_missing(&record, role, &encoded));
+                    findings.push(PeerHostFinding::surface_missing(
+                        &record,
+                        role,
+                        &encoded,
+                        can_prune,
+                    ));
                     continue;
                 };
                 // A surface that already existed when the manifest was written
@@ -5316,7 +5354,9 @@ mod tests {
     /// Builds a host with one manifest whose leader and member surfaces are
     /// live, `created_at_unix_secs` set by the caller. Returns the host and
     /// the leader's surface id.
-    async fn host_with_manifest(created_at_unix_secs: u64) -> (Arc<PeerHost>, Vec<u8>) {
+    async fn host_with_manifest(
+        created_at_unix_secs: u64,
+    ) -> (Arc<PeerHost>, Vec<u8>, Vec<u8>) {
         let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
         let spec = SurfaceSpec {
             cwd: "/tmp".into(),
@@ -5347,7 +5387,7 @@ mod tests {
         };
         host.upsert_project_presentation(&[vec![1; 16]], &project)
             .expect("publish");
-        (host, leader.surface_id)
+        (host, leader.surface_id, member.surface_id)
     }
 
     fn seconds_since_epoch() -> u64 {
@@ -5361,7 +5401,7 @@ mod tests {
     /// the doctor must not invent work.
     #[tokio::test]
     async fn diagnose_is_quiet_when_a_manifest_owns_its_surfaces() {
-        let (host, _) = host_with_manifest(seconds_since_epoch() - 60).await;
+        let (host, _, _) = host_with_manifest(seconds_since_epoch() - 60).await;
         assert_eq!(host.diagnose(), Vec::new());
     }
 
@@ -5370,7 +5410,7 @@ mod tests {
     /// doctor has to say which surface and what to run.
     #[tokio::test]
     async fn diagnose_reports_a_surface_no_live_pane_holds() {
-        let (host, leader_id) = host_with_manifest(seconds_since_epoch() - 60).await;
+        let (host, leader_id, _) = host_with_manifest(seconds_since_epoch() - 60).await;
         host.terminate_surface(&leader_id).unwrap();
 
         let findings = host.diagnose();
@@ -5378,13 +5418,35 @@ mod tests {
         assert_eq!(findings[0].code, "surface_missing");
         assert_eq!(findings[0].role, "leader");
         assert_eq!(findings[0].surface_id, hex::encode(&leader_id));
-        assert_eq!(findings[0].repair_argv[2], "project-presentations");
-        assert_eq!(findings[0].repair_argv[3], "prune");
-        assert_eq!(findings[0].repair_argv[4], "--project-id");
         assert_eq!(
-            findings[0].repair_argv.last().map(String::as_str),
-            Some("--apply")
+            findings[0].remedy,
+            "'tm-agent' 'daemon' 'project-presentations' 'list'"
         );
+        assert_eq!(
+            findings[0].repair_argv,
+            vec!["tm-agent", "daemon", "project-presentations", "list"]
+        );
+        assert!(findings[0].detail.contains("prune would refuse"));
+    }
+
+    #[tokio::test]
+    async fn diagnose_offers_applied_prune_when_every_surface_is_dead() {
+        let (host, leader_id, member_id) =
+            host_with_manifest(seconds_since_epoch() - 60).await;
+        host.terminate_surface(&leader_id).unwrap();
+        host.terminate_surface(&member_id).unwrap();
+
+        let findings = host.diagnose();
+        assert_eq!(findings.len(), 2, "{findings:#?}");
+        assert!(findings
+            .iter()
+            .all(|finding| finding.repair_argv[4] == "--project-id"));
+        assert!(findings.iter().all(|finding| {
+            finding.repair_argv.last().map(String::as_str) == Some("--apply")
+        }));
+        assert!(findings
+            .iter()
+            .all(|finding| !finding.detail.contains("prune would refuse")));
     }
 
     /// The incident this whole command exists for: every referenced surface
@@ -5396,7 +5458,7 @@ mod tests {
     /// written days after the pane it inherited.
     #[tokio::test]
     async fn diagnose_reports_a_surface_older_than_the_manifest_claiming_it() {
-        let (host, leader_id) = host_with_manifest(seconds_since_epoch() + 3600).await;
+        let (host, leader_id, _) = host_with_manifest(seconds_since_epoch() + 3600).await;
 
         // The count an operator would have checked still looks perfect.
         let status = host
@@ -5468,7 +5530,7 @@ mod tests {
     /// as one.
     #[tokio::test]
     async fn diagnose_does_not_judge_a_record_with_no_creation_time() {
-        let (host, _) = host_with_manifest(0).await;
+        let (host, _, _) = host_with_manifest(0).await;
         assert_eq!(host.diagnose(), Vec::new());
     }
 

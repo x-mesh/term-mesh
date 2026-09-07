@@ -769,8 +769,8 @@ remove the socket file and start exactly one.
 ## Diagnosing a host: `tm-agent daemon doctor`
 
 Run this before anything else when a Project misbehaves on a peer host. It is
-read-only, so it is always safe, and it prints the command that repairs each
-problem it finds.
+read-only, so it is always safe. It prints a safe next command for each
+problem.
 
 ```bash
 tm-agent daemon doctor          # human summary; exit 2 if anything is wrong
