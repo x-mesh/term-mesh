@@ -1213,10 +1213,26 @@ pub struct PeerHost {
     /// mutations and `watch_ephemeral` removals to the right tree without
     /// scanning every workspace.
     surface_workspace: Mutex<HashMap<SurfaceId, Vec<u8>>>,
-    /// Names split/new-tab surfaces (`split-1`, `split-2`, …). Lifetime
-    /// of this daemon only, like the tree itself. Host-wide (not
-    /// per-workspace) so ephemeral ids never collide across workspaces.
+    /// Names split/new-tab surfaces (`split-1`, `split-2`, …). Host-wide
+    /// (not per-workspace) so ephemeral ids never collide across
+    /// workspaces.
     ephemeral_counter: AtomicU64,
+    /// Makes the counter above unique across daemon *processes*, not just
+    /// within one.
+    ///
+    /// The counter restarts at 1 every time the daemon does, so on its own
+    /// the first split pane of every run hashed to the same surface id —
+    /// and a pane from a previous run can still be alive to hold it. That
+    /// happened: a leader pane spawned minutes after a restart took the id
+    /// of a six-day-old orphan, and the viewer attaching to the id it had
+    /// been handed reached the wrong surface. Ids are also written into a
+    /// project manifest that outlives the process that minted them, so
+    /// "lifetime of this daemon" was never true of what they identify.
+    ///
+    /// A per-process nonce keeps the sequence from ever repeating while
+    /// leaving the `\0` prefix — and the declared-name guarantee that rests
+    /// on it — exactly as it was.
+    ephemeral_nonce: String,
     /// Workspace ids with a debounced layout push currently pending —
     /// collapses a burst of mutations (divider drags especially) against
     /// the SAME workspace into one push, while still letting a different
@@ -1397,6 +1413,7 @@ impl PeerHost {
             workspace_id: Mutex::new(workspace_id),
             surface_workspace: Mutex::new(surface_workspace),
             ephemeral_counter: AtomicU64::new(1),
+            ephemeral_nonce: uuid::Uuid::new_v4().simple().to_string(),
             pending_pushes: Mutex::new(HashSet::new()),
             persist_path: Mutex::new(None),
             workspace_persistence: Mutex::new(()),
@@ -2941,7 +2958,12 @@ impl PeerHost {
         // any POSIX system, so parse_surfaces_env can never hand back a
         // name that produces this prefix -- the collision is structurally
         // impossible, not just unlikely.
-        let surface_id = surface_id_from_name(&format!("\0split-{n}"));
+        //
+        // The nonce covers the other direction: without it the counter
+        // restarts at 1 with the daemon and replays the same ids over panes
+        // and manifests that survived the restart.
+        let surface_id =
+            surface_id_from_name(&format!("\0split-{}-{n}", self.ephemeral_nonce));
         let spec = SpawnSpec {
             title: format!("shell {n}"),
             command: "/bin/sh".into(),
@@ -3945,6 +3967,54 @@ mod tests {
                 "a declared surface literally named {guess:?} would collide with an ephemeral id"
             );
         }
+    }
+
+    /// The counter behind an ephemeral id restarts at 1 with the daemon,
+    /// so before the per-process nonce the first split pane of every run
+    /// hashed to the same surface id. That is not academic: a leader pane
+    /// spawned two minutes after a daemon restart took the id of a
+    /// six-day-old orphan that was still running, and the viewer holding
+    /// that id in a project manifest reached the wrong surface.
+    ///
+    /// Two hosts here stand in for two daemon runs, exactly as
+    /// `default_workspace_id_is_random_across_hosts` does for the
+    /// workspace id this same fix already reached.
+    #[tokio::test]
+    async fn ephemeral_ids_do_not_repeat_across_daemon_runs() {
+        async fn first_split_id(host: Arc<PeerHost>) -> Vec<u8> {
+            host.apply_control(WorkspaceControl {
+                kind: Some(workspace_control::Kind::SplitPane(
+                    peer_proto::v1::SplitPaneRequest {
+                        pane_id: sid("base"),
+                        orientation: "horizontal".into(),
+                    },
+                )),
+            });
+            let ids = default_surface_ids(&host);
+            ids.into_iter()
+                .find(|id| id != &sid("base"))
+                .expect("split added a pane")
+        }
+
+        async fn booted_host() -> Arc<PeerHost> {
+            let manager = Arc::new(PtyManager::new());
+            let base = PtySurface::spawn(sid("base"), "cat".into(), "/bin/cat", &[], 80, 24, None)
+                .expect("spawn /bin/cat");
+            manager.insert_surface(base);
+            Arc::new(PeerHost::new(manager))
+        }
+
+        let host_a = booted_host().await;
+        let host_b = booted_host().await;
+        assert_ne!(
+            host_a.ephemeral_nonce, host_b.ephemeral_nonce,
+            "each daemon process must name its ephemeral surfaces in its own space"
+        );
+        assert_ne!(
+            first_split_id(host_a).await,
+            first_split_id(host_b).await,
+            "the first split of two daemon runs must not share a surface id"
+        );
     }
 
     /// F4 regression: SplitPane must stop forking shells once the
