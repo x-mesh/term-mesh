@@ -42,6 +42,11 @@ The exact paths and commands depend on the selected scope:
 | User (default) | `~/.local/bin/term-meshd` | `~/.config/term-mesh/peer.env` | `~/.config/systemd/user/term-meshd.service` | `/run/user/<uid>/tm-peer.sock` | `/run/user/<uid>/term-meshd.sock` | `systemctl --user …`; `journalctl --user …` |
 | System (root installer) | `/usr/local/bin/term-meshd` | `/etc/term-mesh/peer.env` | `/etc/systemd/system/term-meshd.service` | `/run/term-mesh/tm-peer.sock` | `/run/term-mesh/term-meshd.sock` | `systemctl …`; `journalctl …` |
 
+`tm-agent` finds the control socket in either scope without configuration. It
+reads `TERMMESH_DAEMON_SOCKET`, `TERMMESH_DAEMON_UNIX_PATH`, `peer.env`,
+`$XDG_RUNTIME_DIR`, and then both defaults in the table. Export the variable
+only for a socket in a different location.
+
 The daemon runs as the connecting account by default. This keeps SSH project
 setup, file ownership, HOME/PATH, and pane processes under the same identity:
 a normal account with a user bus gets a user service, `sudo` keeps `SUDO_USER`
