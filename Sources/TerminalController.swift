@@ -1460,6 +1460,10 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugProjectReattachLeader(params: params))
         case "debug.project.restore_presentation":
             return v2Result(id: id, self.v2DebugProjectRestorePresentation(params: params))
+        case "debug.project.name_conflict":
+            return v2Result(id: id, self.v2DebugProjectNameConflict(params: params))
+        case "debug.peer.roster_failure":
+            return v2Result(id: id, self.v2DebugPeerRosterFailure(params: params))
         case "debug.project.remote_presentations":
             return v2Result(id: id, self.v2DebugProjectRemotePresentations(params: params))
         case "debug.project.adopt_remote":

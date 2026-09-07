@@ -1736,25 +1736,46 @@ extension TeamOrchestrator {
 
         for host in hosts where host.isConnected {
             for remote in host.teams {
-                records.append(ProjectConflictRecord(
-                    name: remote.name,
-                    identity: ProjectCreationIdentity(
-                        projectID: remote.projectID, hostKey: host.id,
-                        workingDirectory: remote.workingDirectory
-                    ),
-                    location: .remote(hostKey: host.id, hostName: host.displayName),
-                    teamName: remote.name,
-                    leaderReady: remote.leaderProcessActiveKnown
-                        ? remote.leaderProcessActive : !remote.leaderSurfaceID.isEmpty,
-                    failureDescription: remote.leaderProcessActiveKnown
-                        && !remote.leaderProcessActive
-                        ? "Remote leader process is not active" : nil,
-                    presentationOwnedByRequester: remote.presentationOwnedByRequester,
-                    leaderProcessActiveKnown: remote.leaderProcessActiveKnown
+                records.append(Self.remoteConflictRecord(
+                    remote, hostKey: host.id, hostName: host.displayName,
+                    rosterVerified: host.teamRosterIsVerified
                 ))
             }
         }
         return records
+    }
+
+    /// The single place a discovered manifest becomes a conflict record.
+    ///
+    /// While the projection lived inline here, the affordances derived from it
+    /// drifted from `remoteManifestLeaderIsAdoptable`, the gate that decides
+    /// whether those affordances can do anything — so New Project offered an
+    /// Open Existing button that adoption refused on its first line. Keeping
+    /// the projection addressable lets that invariant be asserted directly.
+    nonisolated static func remoteConflictRecord(
+        _ remote: RemoteTeamSummary,
+        hostKey: String,
+        hostName: String,
+        rosterVerified: Bool = true
+    ) -> ProjectConflictRecord {
+        ProjectConflictRecord(
+            name: remote.name,
+            identity: ProjectCreationIdentity(
+                projectID: remote.projectID, hostKey: hostKey,
+                workingDirectory: remote.workingDirectory
+            ),
+            location: .remote(hostKey: hostKey, hostName: hostName),
+            teamName: remote.name,
+            leaderReady: remote.leaderProcessActiveKnown
+                ? remote.leaderProcessActive : !remote.leaderSurfaceID.isEmpty,
+            failureDescription: remote.leaderProcessActiveKnown
+                && !remote.leaderProcessActive
+                ? "Remote leader process is not active" : nil,
+            presentationOwnedByRequester: remote.presentationOwnedByRequester,
+            leaderProcessActiveKnown: remote.leaderProcessActiveKnown,
+            remoteTeamUUID: remote.teamUUID,
+            rosterVerified: rosterVerified
+        )
     }
 
     func projectNameConflict(

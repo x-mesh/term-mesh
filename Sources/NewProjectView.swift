@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -157,6 +158,11 @@ struct NewProjectView: View {
     @State private var showsCreationProgress = false
     @State private var creationStartedAt: Date?
     @State private var bootSteps: [ProjectBootStep] = []
+    /// Whether the in-sheet activity log is open. Opened automatically the
+    /// first time something fails, because that is when its contents stop
+    /// being noise and start being the answer.
+    @State private var showsActivityLog = false
+    @ObservedObject private var workLog = RemoteWorkLogBuffer.shared
     @State private var showsBootCommands = true
     @State private var showsFailureDetail = false
     @State private var isDiscarding = false
@@ -231,6 +237,7 @@ struct NewProjectView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         projectFields
+                        preflightSection
                         remoteCollisionDetails
                         Divider()
                         teamSummaryRow
@@ -264,9 +271,14 @@ struct NewProjectView: View {
                 }
             }
             Divider()
+            activityLogSection
+            Divider()
             footer
         }
-        .frame(width: 860, height: 620)
+        // Tall enough that the collision card's decisive rows — its leader
+        // state, who owns the record, and how old the roster is — are not the
+        // part that falls below the fold.
+        .frame(width: 860, height: 680)
         .onAppear {
             applyInitialTeamPreset()
             adoptProjectMachineForNewRows()
@@ -316,6 +328,12 @@ struct NewProjectView: View {
         }
         .onChange(of: projectConflictInputID) { _, _ in
             submissionConflict = nil
+        }
+        .onChange(of: creationError != nil) { _, failed in
+            // The lines that explain a failure are already in the buffer by
+            // the time the message appears. Open onto them rather than
+            // printing a file path and asking the user to go find them.
+            if failed { showsActivityLog = true }
         }
         .sheet(isPresented: $showingSavePreset) {
             savePresetSheet
@@ -2236,23 +2254,29 @@ struct NewProjectView: View {
     private var projectConflictAction: some View {
         switch projectNameConflict {
         case .none:
-            Button(createActionLabel) {
-                startCreation()
-            }
-            .keyboardShortcut(.defaultAction)
-            .disabled(
-                !canCreate || !placementHostsAreReady
-                    || TeamAgentComposer.blocksRemoteTeamCreation(
-                        agents: agents, hosts: hostStore.sortedHosts,
-                        requiresDurableProject: true
-                    )
-            )
-            .accessibilityIdentifier("newProject.create")
-        case .exactLive(let record), .exactDetached(let record):
-            Button("Open Existing") { openExistingProject(record) }
+            createButton
                 .keyboardShortcut(.defaultAction)
-                .disabled(isResolvingConflict)
-                .accessibilityIdentifier("newProject.conflict.openExisting")
+        case .exactLive(let record), .exactDetached(let record):
+            // A conflict the host never confirmed must not be the thing that
+            // decides. Offer the existing Project first, but leave a way past
+            // a record that may describe a machine as it no longer is.
+            if !projectNameConflict.blocksCreate {
+                createButton
+            }
+            // A remote Project whose leader has exited cannot be adopted, so
+            // offering Open Existing here would be a button guaranteed to
+            // fail. Repair is the move that actually reaches the Project.
+            if record.canRepairRemoteLeaderProcess {
+                Button("Repair collaboration") { repairRemoteLeaderProcess(record) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isResolvingConflict)
+                    .accessibilityIdentifier("newProject.conflict.repairLeader")
+            } else {
+                Button("Open Existing") { openExistingProject(record) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isResolvingConflict)
+                    .accessibilityIdentifier("newProject.conflict.openExisting")
+            }
         case .incomplete(let record):
             Button("Resume Setup") { resumeExistingProject(record) }
                 .keyboardShortcut(.defaultAction)
@@ -2264,11 +2288,21 @@ struct NewProjectView: View {
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.discard")
         case .remoteNameCollision(let record):
+            if !projectNameConflict.blocksCreate {
+                createButton
+                    .keyboardShortcut(.defaultAction)
+            }
             if record.canOpenRemoteProject {
                 Button("Open Existing") { openExistingProject(record) }
                     .keyboardShortcut(.defaultAction)
                     .disabled(isResolvingConflict)
                     .accessibilityIdentifier("newProject.conflict.openExisting")
+            }
+            if record.canRepairRemoteLeaderProcess {
+                Button("Repair collaboration") { repairRemoteLeaderProcess(record) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isResolvingConflict)
+                    .accessibilityIdentifier("newProject.conflict.repairLeader")
             }
             if record.canDeleteOwnedRemoteRecord {
                 Button("Delete Project record…", role: .destructive) {
@@ -2287,7 +2321,9 @@ struct NewProjectView: View {
             Button(Self.separateProjectButtonTitle()) {
                 chooseSeparateProjectName()
             }
-                .keyboardShortcut(record.canOpenRemoteProject ? nil : .defaultAction)
+                .keyboardShortcut(
+                    remoteConflictHasDefaultAction(record) ? nil : .defaultAction
+                )
                 .disabled(isResolvingConflict)
                 .accessibilityIdentifier("newProject.conflict.rename")
         case .localNameCollision, .reservedByAnotherRequest:
@@ -2300,6 +2336,31 @@ struct NewProjectView: View {
         }
     }
 
+    @ViewBuilder
+    private var createButton: some View {
+        Button(createActionLabel) {
+            startCreation()
+        }
+        .disabled(
+            !canCreate || !placementHostsAreReady
+                || TeamAgentComposer.blocksRemoteTeamCreation(
+                    agents: agents, hosts: hostStore.sortedHosts,
+                    requiresDurableProject: true
+                )
+        )
+        .accessibilityIdentifier("newProject.create")
+    }
+
+    /// Whether some button other than Choose Another Name already owns the
+    /// default action, so two of them never claim Return at once.
+    private func remoteConflictHasDefaultAction(
+        _ record: TeamOrchestrator.ProjectConflictRecord
+    ) -> Bool {
+        !projectNameConflict.blocksCreate
+            || record.canOpenRemoteProject
+            || record.canRepairRemoteLeaderProcess
+    }
+
     /// What owns the colliding name on the remote host, so the user can tell
     /// a live Project from a leftover record and act on the right one.
     @ViewBuilder
@@ -2307,15 +2368,31 @@ struct NewProjectView: View {
         if case let .remoteNameCollision(record) = projectNameConflict,
            case let .remote(_, hostName) = record.location {
             VStack(alignment: .leading, spacing: 8) {
-                Label(
-                    "Existing remote Project",
-                    systemImage: record.canOpenRemoteProject
-                        ? "folder.fill" : "exclamationmark.triangle.fill"
-                )
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(
-                        record.canOpenRemoteProject ? Color.accentColor : Color.orange
+                HStack(spacing: 8) {
+                    Label(
+                        "Existing remote Project",
+                        systemImage: record.canOpenRemoteProject
+                            ? "folder.fill" : "exclamationmark.triangle.fill"
                     )
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(
+                            record.canOpenRemoteProject ? Color.accentColor : Color.orange
+                        )
+                    Spacer(minLength: 8)
+                    if conflictHost(record)?.isRefreshing == true {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Button {
+                            refreshConflictHost(record)
+                        } label: {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                        }
+                        .controlSize(.small)
+                        .disabled(isResolvingConflict || conflictHost(record) == nil)
+                        .help("Re-read this machine's Projects, ignoring what is cached here.")
+                        .accessibilityIdentifier("newProject.conflict.refreshHost")
+                    }
+                }
                 Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 5) {
                     conflictDetailRow("Host", hostName)
                     conflictDetailRow("Directory", record.identity.workingDirectory ?? "Not recorded")
@@ -2332,16 +2409,15 @@ struct NewProjectView: View {
                             ? "This installation"
                             : "Another installation"
                     )
+                    if let host = conflictHost(record) {
+                        conflictDetailRow(
+                            "Roster",
+                            Self.rosterFreshnessText(host),
+                            tint: record.rosterVerified ? nil : .orange
+                        )
+                    }
                 }
-                Text(
-                    record.canDeleteOwnedRemoteRecord
-                        ? "Open Existing to reuse this Project. Delete the record only if this Project is gone; files and the workspace stay."
-                        : (record.presentationOwnedByRequester
-                            ? "Open Existing to reuse this Project. Its leader is running, so the record cannot be deleted."
-                            : (record.canRepairStaleRemoteRecord
-                                ? "Open Existing to reuse this Project. Another installation owns this record, so only Reclaim Name can free it — and only while nothing behind it is running."
-                                : "Open Existing to reuse this Project. Another installation owns this record and its leader is running."))
-                )
+                Text(Self.remoteCollisionGuidance(record))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2357,7 +2433,406 @@ struct NewProjectView: View {
         }
     }
 
-    private func conflictDetailRow(_ label: String, _ value: String) -> some View {
+    /// What this record is, and the one action that fits the state it is in.
+    ///
+    /// Every branch of this used to open with "Open Existing to reuse this
+    /// Project" — including the state where that button is not offered at all,
+    /// because adoption refuses a manifest whose leader process is gone. The
+    /// leaderless case leads now, since it is both the most common and the one
+    /// with a real repair.
+    static func remoteCollisionGuidance(
+        _ record: TeamOrchestrator.ProjectConflictRecord
+    ) -> String {
+        if record.canRepairRemoteLeaderProcess {
+            return "This Project is intact on the machine; only its leader process has "
+                + "exited. Repair collaboration starts a new leader and reattaches the "
+                + "agents that are still running. Delete the record only if the Project is "
+                + "gone; files and the workspace stay."
+        }
+        if record.remoteLeaderProcessIsInactive {
+            return record.presentationOwnedByRequester
+                ? "This Project's leader process has exited, and the record carries no exact "
+                    + "team identity to repair against. Delete the record and create the "
+                    + "Project again; files and the workspace stay."
+                : "This Project's leader process has exited and another installation owns "
+                    + "this record, so only that installation can repair it. Reclaim Name "
+                    + "frees the name here."
+        }
+        if record.canDeleteOwnedRemoteRecord {
+            return "Open Existing to reuse this Project. Delete the record only if this "
+                + "Project is gone; files and the workspace stay."
+        }
+        if record.presentationOwnedByRequester {
+            return "Open Existing to reuse this Project. Its leader is running, so the "
+                + "record cannot be deleted."
+        }
+        if record.canRepairStaleRemoteRecord {
+            return "Open Existing to reuse this Project. Another installation owns this "
+                + "record, so only Reclaim Name can free it — and only while nothing behind "
+                + "it is running."
+        }
+        return "Open Existing to reuse this Project. Another installation owns this record "
+            + "and its leader is running."
+    }
+
+    // MARK: - Preflight
+
+    /// One thing the sheet already knows, before Create is pressed.
+    struct PreflightRow: Identifiable, Equatable {
+        enum State: Equatable {
+            case ok
+            /// Being determined right now.
+            case working
+            /// Worth knowing, but it does not stop the run.
+            case warning
+            /// This will stop the run.
+            case failed
+        }
+
+        let id: String
+        let title: String
+        let detail: String
+        let state: State
+    }
+
+    /// What can be checked without starting anything.
+    ///
+    /// All of it used to be invisible until creation ran, so every failure
+    /// rooted in the machine, its Project roster, or the branch arrived as a
+    /// disabled button with one sentence beneath it. The roster line matters
+    /// most: it is the only place the app can say that what it knows about a
+    /// machine's Projects is older than the machine.
+    private var preflightRows: [PreflightRow] {
+        var rows: [PreflightRow] = []
+
+        if let hostKey = runsOnHostKey {
+            let host = hostStore.sortedHosts.first { $0.id == hostKey }
+            if let host, host.isLaunchable {
+                rows.append(.init(
+                    id: "machine", title: "Machine",
+                    detail: host.versionedDisplayName, state: .ok
+                ))
+            } else if let host, host.isConnected {
+                rows.append(.init(
+                    id: "machine", title: "Machine",
+                    detail: "\(host.displayName) · preparing remote tools", state: .working
+                ))
+            } else {
+                rows.append(.init(
+                    id: "machine", title: "Machine",
+                    detail: "\(host?.displayName ?? machineLabel(hostKey)) is not connected",
+                    state: .failed
+                ))
+            }
+        } else {
+            rows.append(.init(
+                id: "machine", title: "Machine", detail: "This Mac", state: .ok
+            ))
+        }
+
+        let connected = hostStore.sortedHosts.filter(\.isConnected)
+        if let stale = connected.first(where: { !$0.teamRosterIsVerified }) {
+            rows.append(.init(
+                id: "roster", title: "Project roster",
+                detail: "\(stale.displayName): \(Self.rosterFreshnessText(stale))",
+                state: .warning
+            ))
+        } else if !connected.isEmpty {
+            rows.append(.init(
+                id: "roster", title: "Project roster",
+                detail: connected.count == 1
+                    ? "confirmed on \(connected[0].displayName)"
+                    : "confirmed on \(connected.count) machines",
+                state: .ok
+            ))
+        }
+
+        if sourceKind == .clone {
+            let branch = RepositoryBranchLookup.singleLine(gitBranch)
+            switch branchPresence {
+            case .exists:
+                rows.append(.init(
+                    id: "branch", title: "Branch",
+                    detail: "\(branch) exists in this repository", state: .ok
+                ))
+            case .missing:
+                rows.append(.init(
+                    id: "branch", title: "Branch",
+                    detail: "\(branch) is not in this repository", state: .failed
+                ))
+            case .unknown where isLoadingRepositoryBranches:
+                rows.append(.init(
+                    id: "branch", title: "Branch", detail: "checking…", state: .working
+                ))
+            case .unknown:
+                break
+            }
+        }
+
+        let conflict = projectNameConflict
+        if case .none = conflict {
+            if !effectiveName.isEmpty {
+                rows.append(.init(
+                    id: "name", title: "Project name",
+                    detail: "\(effectiveName) is available", state: .ok
+                ))
+            }
+        } else {
+            rows.append(.init(
+                id: "name", title: "Project name",
+                detail: Self.preflightNameDetail(conflict),
+                state: conflict.blocksCreate ? .failed : .warning
+            ))
+        }
+        return rows
+    }
+
+    /// The name row's status in one short line.
+    ///
+    /// Deliberately not `projectConflictMessage`: the footer already prints
+    /// that whole sentence whenever it blocks, and repeating it here wrapped
+    /// to two lines and pushed the collision card — the part carrying the
+    /// host, the Project ID and the roster's age — off the bottom of a sheet
+    /// with a fixed height.
+    static func preflightNameDetail(
+        _ conflict: TeamOrchestrator.ProjectNameConflict
+    ) -> String {
+        let host: String? = {
+            guard case let .remote(_, hostName)? = conflict.record?.location else { return nil }
+            return hostName
+        }()
+        if !conflict.blocksCreate {
+            return host.map { "held by an unconfirmed record on \($0); it cannot block creation" }
+                ?? "held by an unconfirmed record; it cannot block creation"
+        }
+        switch conflict {
+        case .reservedByAnotherRequest:
+            return "another window is creating this name"
+        case .incomplete:
+            return "an unfinished setup holds this name"
+        default:
+            return host.map { "already used by a Project on \($0)" }
+                ?? "already used by another Project"
+        }
+    }
+
+    @ViewBuilder
+    private var preflightSection: some View {
+        let rows = preflightRows
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(rows) { row in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        preflightSymbol(row.state)
+                            .frame(width: 14)
+                        Text(row.title)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 96, alignment: .leading)
+                        Text(row.detail)
+                            .font(.caption)
+                            .foregroundStyle(Self.preflightColor(row.state))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("newProject.preflight.\(row.id)")
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+            .accessibilityIdentifier("newProject.preflight")
+        }
+    }
+
+    @ViewBuilder
+    private func preflightSymbol(_ state: PreflightRow.State) -> some View {
+        switch state {
+        case .ok:
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .working:
+            ProgressView().controlSize(.small)
+        case .warning:
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        case .failed:
+            Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+        }
+    }
+
+    static func preflightColor(_ state: PreflightRow.State) -> Color {
+        switch state {
+        case .ok, .working: .secondary
+        case .warning: .orange
+        case .failed: .red
+        }
+    }
+
+    // MARK: - Roster freshness
+
+    static let rosterStampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
+
+    /// How current this machine's Project list is, in one line.
+    ///
+    /// A failed read keeps the previous roster on purpose, so without this the
+    /// UI showed a frozen list and a connected machine with nothing to
+    /// separate them — and a Project deleted on its host went on owning its
+    /// name with no visible reason.
+    static func rosterFreshnessText(_ host: HostEntry, now: Date = Date()) -> String {
+        guard let confirmed = host.teamsConfirmedAt else {
+            guard let failure = host.lastRosterFailure else { return "not read yet" }
+            return "never confirmed · \(failure)"
+        }
+        let stamp = rosterStampFormatter.string(from: confirmed)
+        guard let failure = host.lastRosterFailure else { return "confirmed \(stamp)" }
+        return "last confirmed \(stamp) (\(elapsedText(from: confirmed, to: now)) ago) · \(failure)"
+    }
+
+    private func conflictHost(
+        _ record: TeamOrchestrator.ProjectConflictRecord
+    ) -> HostEntry? {
+        guard case let .remote(hostKey, _) = record.location else { return nil }
+        return hostStore.sortedHosts.first { $0.id == hostKey }
+    }
+
+    /// Re-read this Project's machine, ignoring what is already cached.
+    ///
+    /// `resyncConnectedHost` has existed for the sidebar since a host could
+    /// read `connected` with a dead roster behind it. New Project — the one
+    /// place where that roster actually stops the user — had no way to ask.
+    private func refreshConflictHost(_ record: TeamOrchestrator.ProjectConflictRecord) {
+        guard let host = conflictHost(record) else { return }
+        creationError = nil
+        submissionConflict = nil
+        showsActivityLog = true
+        guard hostStore.resyncConnectedHost(host) else {
+            creationError = "\(host.displayName) is not connected, so its Projects "
+                + "cannot be re-read. Reconnect it in Settings → Peer Hosts."
+            return
+        }
+    }
+
+    // MARK: - Activity log
+
+    static let activityStampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
+
+    /// Newest first, bounded. Reversing is what lets this drop the scroll
+    /// plumbing entirely: the line that matters is the one already at the top.
+    private var visibleActivityEntries: [RemoteWorkLogEntry] {
+        workLog.entries.suffix(400).reversed()
+    }
+
+    static func activityColor(_ severity: RemoteWorkLogSeverity) -> Color {
+        switch severity {
+        case .info: .secondary
+        case .warning: .orange
+        case .error: .red
+        }
+    }
+
+    /// What the app has been doing, inside the sheet that needs it.
+    ///
+    /// The failure detail used to print the path of a log file and leave the
+    /// user to open a terminal. Worse, the lines that explain a creation
+    /// failure are usually written *before* this sheet was opened, so a panel
+    /// that only streamed from subscription time would show none of them.
+    /// `RemoteWorkLogBuffer` keeps that history, so this opens onto it.
+    @ViewBuilder
+    private var activityLogSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Button {
+                    showsActivityLog.toggle()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: showsActivityLog ? "chevron.down" : "chevron.right")
+                            .font(.caption2)
+                        Text("Activity")
+                            .font(.caption.weight(.medium))
+                        if !showsActivityLog, let latest = workLog.entries.last {
+                            Text(latest.message)
+                                .font(.caption)
+                                .foregroundStyle(Self.activityColor(latest.severity))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("newProject.activity.toggle")
+                Spacer(minLength: 8)
+                if showsActivityLog {
+                    Button("Copy") { copyActivityLog() }
+                        .controlSize(.small)
+                        .accessibilityIdentifier("newProject.activity.copy")
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 7)
+
+            if showsActivityLog {
+                Divider()
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 3) {
+                        ForEach(visibleActivityEntries) { entry in
+                            activityRow(entry)
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 8)
+                }
+                .frame(height: 148)
+                .accessibilityIdentifier("newProject.activity.list")
+                Text("Full log: \(RemoteWorkLog.path)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 7)
+            }
+        }
+        .background(Color.secondary.opacity(0.05))
+    }
+
+    private func activityRow(_ entry: RemoteWorkLogEntry) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(Self.activityStampFormatter.string(from: entry.date))
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.tertiary)
+            Text(Self.activityLine(entry))
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(Self.activityColor(entry.severity))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// A folded run says how many times, so "still happening" stays readable.
+    static func activityLine(_ entry: RemoteWorkLogEntry) -> String {
+        entry.repeatCount > 1 ? "\(entry.message)  ×\(entry.repeatCount)" : entry.message
+    }
+
+    private func copyActivityLog() {
+        let text = workLog.entries.suffix(400).map {
+            "\(Self.activityStampFormatter.string(from: $0.date))  \(Self.activityLine($0))"
+        }.joined(separator: "\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    private func conflictDetailRow(
+        _ label: String, _ value: String, tint: Color? = nil
+    ) -> some View {
         GridRow {
             Text(label)
                 .font(.caption)
@@ -2365,6 +2840,7 @@ struct NewProjectView: View {
                 .gridColumnAlignment(.trailing)
             Text(value)
                 .font(.caption.monospaced())
+                .foregroundStyle(tint ?? Color.primary)
                 .textSelection(.enabled)
                 .lineLimit(2)
                 .truncationMode(.middle)
@@ -2473,12 +2949,97 @@ struct NewProjectView: View {
         isResolvingConflict = true
         Task { @MainActor in
             defer { isResolvingConflict = false }
-            guard await TeamOrchestrator.shared.openExistingProject(
+            let outcome = await TeamOrchestrator.shared.openExistingProjectOutcome(
                 record, from: tabManager
-            ) else {
-                creationError = "Could not open the existing Project. It may no longer be available."
+            )
+            guard outcome == .opened else {
+                creationError = Self.openExistingFailureMessage(outcome, record: record)
                 return
             }
+            onClose()
+        }
+    }
+
+    /// Name the step that actually declined, and the one move that answers it.
+    ///
+    /// The single sentence this replaced — "It may no longer be available" —
+    /// was wrong in the case users hit most: the Project was still on its host,
+    /// still listed, still holding the name, and only its leader process had
+    /// exited. Saying "gone" there sends people to delete a record and rebuild
+    /// a Project that needed a leader restarted.
+    static func openExistingFailureMessage(
+        _ outcome: TeamOrchestrator.OpenExistingProjectOutcome,
+        record: TeamOrchestrator.ProjectConflictRecord
+    ) -> String {
+        let hostName: String? = {
+            if case let .remote(_, name) = record.location { return name }
+            return nil
+        }()
+        switch outcome {
+        case .opened:
+            return ""
+        case .noProjectRecord:
+            return "This record carries no exact Project ID, so there is nothing specific to open."
+        case .workspaceGone:
+            return "That Project's window is no longer open. Close this sheet and reopen it to refresh."
+        case .hostDisconnected:
+            return "\(hostName ?? "The Project's machine") is not connected right now. "
+                + "Reconnect it, then try again."
+        case .manifestGone:
+            return "\(hostName ?? "That machine") no longer lists this Project. It was removed "
+                + "elsewhere; close this sheet and reopen it to refresh."
+        case .leaderProcessInactive:
+            let where_ = hostName ?? "its machine"
+            return record.canRepairRemoteLeaderProcess
+                ? "This Project is still on \(where_), but its leader process has exited. "
+                    + "Choose Repair collaboration to start a new leader on it."
+                : "This Project is still on \(where_), but its leader process has exited and "
+                    + "another installation owns the record, so only that installation can "
+                    + "repair it."
+        case .attachFailed:
+            return "Could not attach this Project's panes. Check the machine's connection, "
+                + "then try again."
+        }
+    }
+
+    /// The Project is intact on its host and only the leader has exited, so
+    /// recover it in place rather than making the user rename around it.
+    /// `repairCollaboration` owns the whole sequence: it rebuilds the owner's
+    /// repair state from the exact durable identity, boots a replacement
+    /// leader, and reattaches the workers that are still running.
+    private func repairRemoteLeaderProcess(
+        _ record: TeamOrchestrator.ProjectConflictRecord
+    ) {
+        guard case let .remote(hostKey, _) = record.location,
+              let projectID = record.identity.projectID,
+              let teamName = record.teamName else { return }
+        isResolvingConflict = true
+        Task { @MainActor in
+            defer { isResolvingConflict = false }
+            let report = await TeamOrchestrator.shared.repairCollaboration(
+                teamName: teamName,
+                exactIdentity: .init(
+                    hostKey: hostKey,
+                    teamUUID: record.remoteTeamUUID,
+                    projectID: projectID
+                )
+            )
+            guard report.succeeded else {
+                creationError = "Could not repair this Project. \(report.message)"
+                return
+            }
+            // Repair materializes its workspace unselected so recovery never
+            // steals focus. The user asked for this one, so select it.
+            if let workspaceID = TeamOrchestrator.shared.teams[teamName]?.workspaceId,
+               let manager = AppDelegate.shared?.tabManagerFor(tabId: workspaceID),
+               let workspace = manager.tabs.first(where: { $0.id == workspaceID }) {
+                manager.selectWorkspace(workspace)
+            }
+            submissionConflict = nil
+            creationError = nil
+            RemoteWorkLog.info(
+                "Repaired remote Project leader \(projectID) from New Project"
+            )
             onClose()
         }
     }
@@ -2490,9 +3051,11 @@ struct NewProjectView: View {
         isResolvingConflict = true
         Task { @MainActor in
             defer { isResolvingConflict = false }
-            guard await TeamOrchestrator.shared.openExistingProject(record, from: tabManager)
-            else {
-                creationError = "Could not open the incomplete Project setup."
+            let outcome = await TeamOrchestrator.shared.openExistingProjectOutcome(
+                record, from: tabManager
+            )
+            guard outcome == .opened else {
+                creationError = Self.openExistingFailureMessage(outcome, record: record)
                 return
             }
             let repaired = await TeamOrchestrator.shared.resumeIncompleteProjectSetup(
@@ -4036,9 +4599,13 @@ enum ProjectCreationFlow {
             "A different local Project already uses this name. Choose another Project name; the selected folder will not be created or renamed."
         case .remoteNameCollision(let record):
             if case let .remote(_, hostName) = record.location {
-                record.canOpenRemoteProject
-                    ? "A Project with this name already exists on \(hostName). Choose Open Existing, or choose another Project name; the selected folder stays unchanged."
-                    : "A different Project on \(hostName) already uses this name. Choose another Project name; the selected folder will not be created or renamed."
+                if record.canRepairRemoteLeaderProcess {
+                    "A Project with this name already exists on \(hostName), and its leader process has exited. Choose Repair collaboration to bring it back, or choose another Project name; the selected folder stays unchanged."
+                } else if record.canOpenRemoteProject {
+                    "A Project with this name already exists on \(hostName). Choose Open Existing, or choose another Project name; the selected folder stays unchanged."
+                } else {
+                    "A different Project on \(hostName) already uses this name. Choose another Project name; the selected folder will not be created or renamed."
+                }
             } else {
                 "A different Project on a connected machine already uses this name. Choose another Project name; the selected folder will not be created or renamed."
             }
