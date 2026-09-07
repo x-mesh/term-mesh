@@ -257,9 +257,14 @@ struct BugReportView: View {
             }
 
             ScrollView {
+                // Deliberately not selectable, for the reason the review
+                // board's patch pane is not: dragging inside a selectable
+                // SwiftUI Text makes TextKit 2 re-enumerate the whole document
+                // on every mouse-moved event, and this one is the entire
+                // bundle. Copy and Save below already hand over all of it, so
+                // reading — which is what this pane asks for — is untouched.
                 Text(bundle)
                     .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(8)
             }
