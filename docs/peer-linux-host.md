@@ -780,12 +780,12 @@ tm-agent daemon doctor --json   # the raw report
 It answers three questions that cost an ssh session and a lot of `ps` output
 to answer by hand:
 
-**Is exactly one daemon serving this host?** The doctor probes every path a
-term-meshd can listen on — `$XDG_RUNTIME_DIR/term-meshd.sock` (the daemon's own
-default), `/run/term-mesh/term-meshd.sock` (the systemd unit), `$TMPDIR` and
-`/tmp` — which is wider than the set an ordinary `tm-agent` will find. Two
-listeners means whichever one a client reaches decides what it sees. See
-[Running one daemon at a time](#running-one-daemon-at-a-time).
+**Is exactly one daemon serving this host?** Every other command stops at the
+first live socket in the discovery list; the doctor probes all of them and
+reports each one that answers. Two listeners means whichever a client happens
+to reach decides what it sees — one host was found running a systemd daemon
+alongside a stray left over from a `term-meshd --help` invocation weeks
+earlier. See [Running one daemon at a time](#running-one-daemon-at-a-time).
 
 **Does every manifest name a surface that exists?** A referenced surface with
 no live pane behind it is reported per surface, with the prune command for

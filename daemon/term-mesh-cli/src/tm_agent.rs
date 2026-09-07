@@ -13102,51 +13102,18 @@ fn detect_daemon_socket() -> Option<PathBuf> {
     daemon_socket_candidates().into_iter().find(is_socket_alive)
 }
 
-/// Every path a term-meshd on this host could be listening on.
-///
-/// Deliberately wider than [`detect_daemon_socket`], which stops at
-/// `$TMPDIR`. The daemon's own default is `dirs::runtime_dir()` — for a root
-/// daemon that is `/run/user/0` — and the systemd unit puts it under
-/// `/run/term-mesh`, so neither is reachable from a plain `tm-agent` on a
-/// Linux host. That is not a hypothetical: a host was found running one
-/// daemon under systemd and a second, left over from a `--help` invocation
-/// weeks earlier, still listening on the runtime-dir default. Whichever a
-/// client reached decided what it saw. The doctor has to look everywhere a
-/// daemon can be, not only where this CLI would have found one.
-fn daemon_socket_candidates() -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = Vec::new();
-    let mut push = |path: PathBuf| {
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    };
-    for name in ["TERMMESH_DAEMON_SOCKET", "TERMMESH_DAEMON_UNIX_PATH"] {
-        if let Ok(value) = env::var(name) {
-            if !value.is_empty() {
-                push(PathBuf::from(value));
-            }
-        }
-    }
-    if let Ok(runtime) = env::var("XDG_RUNTIME_DIR") {
-        if !runtime.is_empty() {
-            push(PathBuf::from(runtime).join("term-meshd.sock"));
-        }
-    }
-    push(PathBuf::from("/run/term-mesh/term-meshd.sock"));
-    if let Ok(tmp) = env::var("TMPDIR") {
-        if !tmp.is_empty() {
-            push(PathBuf::from(tmp).join("term-meshd.sock"));
-        }
-    }
-    push(PathBuf::from("/tmp/term-meshd.sock"));
-    paths
-}
-
 /// `tm-agent daemon doctor`: report, never repair.
+///
+/// Probes the whole candidate list rather than stopping at the first live
+/// socket the way [`detect_daemon_socket`] does. Which one a client picks is
+/// exactly the thing being checked: a host was found running one daemon under
+/// systemd and a second, left from a `--help` invocation weeks earlier, still
+/// listening on the runtime-dir default. Every client silently chose one of
+/// them.
 fn cmd_daemon_doctor(json: bool) {
     let listening: Vec<PathBuf> = daemon_socket_candidates()
         .into_iter()
-        .filter(|path| is_socket_alive(path))
+        .filter(is_socket_alive)
         .collect();
 
     let mut findings: Vec<Value> = Vec::new();
