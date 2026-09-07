@@ -1011,9 +1011,18 @@ extension ReviewBoardPanelView {
             // ScrollView, and a patch dropped into it would push everything
             // else — including the buttons — off the bottom.
             ScrollView([.horizontal, .vertical]) {
+                // Deliberately not selectable. Dragging inside a selectable
+                // SwiftUI Text puts AppKit in its mouse-tracking loop, and
+                // TextKit 2 answers every mouse-moved event by enumerating the
+                // whole document from the start — so the cost is per-move and
+                // proportional to the text behind it. A patch is the largest
+                // thing this app shows that way: `displayByteLimit` caps it at
+                // 256KB, chosen against laying out a megabyte, not against
+                // being dragged across. #321 was this same loop over a much
+                // smaller document and it pinned the main thread until the app
+                // was killed. Copy below replaces the drag.
                 Text(patch.text)
                     .font(.system(size: 10, design: .monospaced))
-                    .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(6)
             }
@@ -1025,12 +1034,24 @@ extension ReviewBoardPanelView {
                     .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
             )
             .accessibilityIdentifier("reviewBoard.review.patch")
-            if patch.isTruncated {
-                // The digest still covers the whole patch; only the display is
-                // shortened. Saying so keeps "I read it" honest.
-                Text("Shown up to \(ReviewBoardEvidence.displayByteLimit / 1024)KB — the digest covers all of it.")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
+            HStack(spacing: 8) {
+                // The only way out of this pane now that dragging is gone, so
+                // it is not optional dressing.
+                Button("Copy Patch") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(patch.text, forType: .string)
+                }
+                .font(.system(size: 10))
+                .accessibilityIdentifier("reviewBoard.review.copyPatch")
+                if patch.isTruncated {
+                    // The digest still covers the whole patch; only the display
+                    // is shortened. Saying so keeps "I read it" honest, and now
+                    // also says what Copy hands over.
+                    Text("Shown and copied up to \(ReviewBoardEvidence.displayByteLimit / 1024)KB — the digest covers all of it.")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+                Spacer(minLength: 0)
             }
         }
     }
