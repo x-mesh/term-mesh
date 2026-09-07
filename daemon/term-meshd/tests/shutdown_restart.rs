@@ -153,9 +153,17 @@ impl Host {
     /// check sees nothing live.
     ///
     /// The daemon logs this once it observes the exit — from the PTY reader
-    /// reaching EOF, or from the liveness check reaping the child. The journal
-    /// is searched as a whole, so this only distinguishes surfaces while the
-    /// daemon runs exactly one; `SELF_ENDING_SURFACE` is what keeps that true.
+    /// reaching EOF, or from the liveness check reaping the child.
+    ///
+    /// The journal is searched as a whole, so this only tells surfaces apart
+    /// while the daemon runs exactly one. Three things hold that: the
+    /// declaration names one, an empty `HOME` yields one workspace, and
+    /// `PtyManager::list` keeps dead surfaces, so the workspace never looks
+    /// empty and `seed_empty_workspaces` adds nothing. The last is the fragile
+    /// one — teaching `list` to filter by liveness would seed a login shell the
+    /// moment the declared surface exits, and this would then return on the
+    /// wrong surface. `wait_within` is what keeps that a failure instead of a
+    /// hang.
     #[cfg(debug_assertions)]
     fn await_surface_exit(&self, daemon: &Daemon) {
         let deadline = Instant::now() + START_BUDGET;
@@ -205,7 +213,8 @@ impl Daemon {
     /// whole test run instead of failing one test — and libtest has no per-test
     /// timeout to end it. That is exactly how this file's own regression showed
     /// up. Returning `None` at the bound turns it back into a failure the
-    /// journal can explain, and the process is killed either way so the next
+    /// journal can explain. The child is reaped on both paths — by `try_wait`
+    /// when the daemon ends on its own, by `kill` at the bound — so the next
     /// test starts clean.
     #[cfg(debug_assertions)]
     fn wait_within(&mut self, limit: Duration) -> Option<std::process::ExitStatus> {
