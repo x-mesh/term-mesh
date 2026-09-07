@@ -2748,9 +2748,9 @@ class TerminalController {
                 let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(msg)\n"
                 let path = "/tmp/term-mesh-team-routing.log"
                 if let fh = FileHandle(forWritingAtPath: path) {
-                    fh.seekToEndOfFile()
-                    fh.write(Data(line.utf8))
-                    fh.closeFile()
+                    try? fh.seekToEnd()
+                    try? fh.write(contentsOf: Data(line.utf8))
+                    try? fh.close()
                 } else {
                     FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
                 }

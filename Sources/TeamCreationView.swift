@@ -87,22 +87,22 @@ struct ClaudeSession: Identifiable, Hashable {
     /// Read first N lines from a file (reads only enough bytes, not the whole file).
     private static func readLines(path: String, maxLines: Int = 50) -> [String] {
         guard let fh = FileHandle(forReadingAtPath: path) else { return [] }
-        defer { fh.closeFile() }
+        defer { try? fh.close() }
         // Read first ~64KB which is enough for 50 lines of typical JSONL
-        let data = fh.readData(ofLength: 65536)
-        guard let text = String(data: data, encoding: .utf8) else { return [] }
+        guard let data = try? fh.read(upToCount: 65536),
+              let text = String(data: data, encoding: .utf8) else { return [] }
         return Array(text.components(separatedBy: "\n").prefix(maxLines))
     }
 
     /// Read last N bytes of a file and return lines.
     private static func readTailLines(path: String, bytes: Int = 32768) -> [String] {
         guard let fh = FileHandle(forReadingAtPath: path) else { return [] }
-        defer { fh.closeFile() }
-        let fileSize = fh.seekToEndOfFile()
+        defer { try? fh.close() }
+        guard let fileSize = try? fh.seekToEnd() else { return [] }
         let offset = fileSize > UInt64(bytes) ? fileSize - UInt64(bytes) : 0
-        fh.seek(toFileOffset: offset)
-        let data = fh.readDataToEndOfFile()
-        guard let text = String(data: data, encoding: .utf8) else { return [] }
+        guard (try? fh.seek(toOffset: offset)) != nil,
+              let data = try? fh.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { return [] }
         return text.components(separatedBy: "\n")
     }
 
