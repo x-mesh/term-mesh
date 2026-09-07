@@ -1922,6 +1922,22 @@ enum DaemonCommand {
         #[arg(long)]
         apply: bool,
     },
+    /// Check this host for the state that makes a Project look healthy while
+    /// being broken, and print the command that repairs each problem.
+    ///
+    /// Read-only: it changes nothing, so it is always safe to run first.
+    ///
+    /// Checks the daemon answers for (`peer.doctor`): manifests naming a
+    /// surface nothing holds, and manifests naming a surface older than
+    /// themselves — an id inherited from an earlier daemon run rather than
+    /// minted for this project, which is what a lost leader looks like from
+    /// the outside. Checked here instead: more than one term-meshd listening
+    /// on this host, where whichever one a client reaches is a coin toss.
+    Doctor {
+        /// Print the raw report instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -7712,6 +7728,12 @@ fn main() {
                 cmd_daemon_replay_capacity(&sock, set.as_deref());
                 return;
             }
+            DaemonCommand::Doctor { json } => {
+                // Resolves its own sockets: finding the ones this CLI would
+                // NOT have reached is half of what it checks.
+                cmd_daemon_doctor(*json);
+                return;
+            }
             DaemonCommand::Reset { scope, apply } => {
                 // With the daemon up, go through it: clearing the files alone
                 // would be undone by its next save, which writes a full
@@ -13078,6 +13100,147 @@ fn daemon_socket_candidates() -> Vec<PathBuf> {
 
 fn detect_daemon_socket() -> Option<PathBuf> {
     daemon_socket_candidates().into_iter().find(is_socket_alive)
+}
+
+/// Every path a term-meshd on this host could be listening on.
+///
+/// Deliberately wider than [`detect_daemon_socket`], which stops at
+/// `$TMPDIR`. The daemon's own default is `dirs::runtime_dir()` — for a root
+/// daemon that is `/run/user/0` — and the systemd unit puts it under
+/// `/run/term-mesh`, so neither is reachable from a plain `tm-agent` on a
+/// Linux host. That is not a hypothetical: a host was found running one
+/// daemon under systemd and a second, left over from a `--help` invocation
+/// weeks earlier, still listening on the runtime-dir default. Whichever a
+/// client reached decided what it saw. The doctor has to look everywhere a
+/// daemon can be, not only where this CLI would have found one.
+fn daemon_socket_candidates() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    };
+    for name in ["TERMMESH_DAEMON_SOCKET", "TERMMESH_DAEMON_UNIX_PATH"] {
+        if let Ok(value) = env::var(name) {
+            if !value.is_empty() {
+                push(PathBuf::from(value));
+            }
+        }
+    }
+    if let Ok(runtime) = env::var("XDG_RUNTIME_DIR") {
+        if !runtime.is_empty() {
+            push(PathBuf::from(runtime).join("term-meshd.sock"));
+        }
+    }
+    push(PathBuf::from("/run/term-mesh/term-meshd.sock"));
+    if let Ok(tmp) = env::var("TMPDIR") {
+        if !tmp.is_empty() {
+            push(PathBuf::from(tmp).join("term-meshd.sock"));
+        }
+    }
+    push(PathBuf::from("/tmp/term-meshd.sock"));
+    paths
+}
+
+/// `tm-agent daemon doctor`: report, never repair.
+fn cmd_daemon_doctor(json: bool) {
+    let listening: Vec<PathBuf> = daemon_socket_candidates()
+        .into_iter()
+        .filter(|path| is_socket_alive(path))
+        .collect();
+
+    let mut findings: Vec<Value> = Vec::new();
+    if listening.len() > 1 {
+        let paths: Vec<String> = listening
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        findings.push(json!({
+            "code": "multiple_daemon_owners",
+            "severity": "error",
+            "detail": format!(
+                "{} term-meshd sockets are listening on this host ({}); which one a client \
+                 reaches decides what it sees, so surfaces and manifests split between them",
+                paths.len(),
+                paths.join(", ")
+            ),
+            "remedy": "stop every term-meshd but the one this host should run, then restart it",
+        }));
+    }
+
+    let Some(sock) = listening.first().cloned() else {
+        // Not an error worth exiting non-zero over on its own: a host with no
+        // daemon has nothing to diagnose, and saying so beats a bare failure.
+        let report = json!({ "healthy": false, "findings": [json!({
+            "code": "no_daemon",
+            "severity": "error",
+            "detail": "no term-meshd is listening on any known socket path on this host",
+            "remedy": "start term-meshd (systemctl start term-meshd, or launch the app)",
+        })] });
+        if json {
+            println!("{}", pretty(&report));
+        } else {
+            println!("no term-meshd is listening on this host.");
+            for path in daemon_socket_candidates() {
+                println!("  looked at {}", path.display());
+            }
+        }
+        process::exit(1);
+    };
+
+    match cmd_daemon_rpc(&sock, "peer.doctor", json!({})) {
+        Ok(result) => {
+            if let Some(reported) = result["findings"].as_array() {
+                findings.extend(reported.iter().cloned());
+            }
+        }
+        Err(msg) if msg.contains("unknown method") => {
+            eprintln!(
+                "Error: the term-meshd at {} does not know `peer.doctor`.\n\
+                 It predates this command — upgrade and restart it.",
+                sock.display()
+            );
+            process::exit(3);
+        }
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            process::exit(1);
+        }
+    }
+
+    let healthy = findings.is_empty();
+    if json {
+        println!(
+            "{}",
+            pretty(&json!({ "socket": sock.display().to_string(),
+                            "healthy": healthy,
+                            "findings": findings }))
+        );
+    } else if healthy {
+        println!("{}: no problems found.", sock.display());
+    } else {
+        println!("{}: {} problem(s).\n", sock.display(), findings.len());
+        for finding in &findings {
+            let text = |key: &str| finding[key].as_str().unwrap_or("").to_string();
+            let (severity, code) = (text("severity"), text("code"));
+            println!("[{severity}] {code}");
+            let project = text("project_id");
+            if !project.is_empty() {
+                let team = text("team_name");
+                println!("  project {project}{}", if team.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (team {team})")
+                });
+            }
+            println!("  {}", text("detail"));
+            println!("  fix: {}\n", text("remedy"));
+        }
+    }
+    // A non-zero exit lets this sit in a health check without parsing output.
+    if !healthy {
+        process::exit(2);
+    }
 }
 
 // ── `tm-agent remote` (docs/mobile-remote-control.md §4.2) ─────────────

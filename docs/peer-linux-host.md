@@ -765,3 +765,40 @@ deletes the new socket file out from under it. The daemon keeps serving its
 which the Mac side surfaces as `unexpectedEof`. The `start-peer.sh` pattern
 that avoids this: `kill -9` every `term-meshd`, poll until none remain, then
 remove the socket file and start exactly one.
+
+## Diagnosing a host: `tm-agent daemon doctor`
+
+Run this before anything else when a Project misbehaves on a peer host. It is
+read-only, so it is always safe, and it prints the command that repairs each
+problem it finds.
+
+```bash
+tm-agent daemon doctor          # human summary; exit 2 if anything is wrong
+tm-agent daemon doctor --json   # the raw report
+```
+
+It answers three questions that cost an ssh session and a lot of `ps` output
+to answer by hand:
+
+**Is exactly one daemon serving this host?** The doctor probes every path a
+term-meshd can listen on — `$XDG_RUNTIME_DIR/term-meshd.sock` (the daemon's own
+default), `/run/term-mesh/term-meshd.sock` (the systemd unit), `$TMPDIR` and
+`/tmp` — which is wider than the set an ordinary `tm-agent` will find. Two
+listeners means whichever one a client reaches decides what it sees. See
+[Running one daemon at a time](#running-one-daemon-at-a-time).
+
+**Does every manifest name a surface that exists?** A referenced surface with
+no live pane behind it is reported per surface, with the prune command for
+that project.
+
+**Does every manifest name a surface that is actually its own?** This is the
+one a surface count cannot tell you. Surface ids are derived, so an id can be
+re-minted over a pane still alive from an earlier daemon run. The manifest then
+reads as perfectly healthy — every surface it references resolves — while
+pointing at someone else's process, and the leader vanishes from the sidebar
+while its process keeps running. A surface that was spawned *before* the
+manifest claiming it was never that manifest's surface, and the doctor says so.
+
+Repairs stay where they were: `tm-agent daemon project-presentations prune`
+and `tm-agent daemon reset`, both dry-run until `--apply`. The doctor decides
+nothing on its own.
