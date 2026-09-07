@@ -21349,8 +21349,19 @@ mod watcher_spec_tests {
     /// control socket under the runtime dir or the installer's service
     /// directory, and before these entries existed `tm-agent` looked only in
     /// `/tmp` and answered DAEMON_UNAVAILABLE on a host whose daemon was up.
+    /// Both socket-discovery tests clear and set the same five process-global
+    /// environment variables, so running them concurrently lets one observe
+    /// the other's cleared state. Observed once as
+    /// `daemon_socket_candidates_cover_both_linux_install_scopes` failing in a
+    /// full-suite run that passed on the next four. Serialize them; a flake
+    /// that rare is worse than one that always fails.
+    static SOCKET_DISCOVERY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn daemon_socket_candidates_cover_both_linux_install_scopes() {
+        let _guard = SOCKET_DISCOVERY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let saved: Vec<_> = [
             "TERMMESH_DAEMON_SOCKET",
             "TERMMESH_DAEMON_UNIX_PATH",
@@ -21393,6 +21404,9 @@ mod watcher_spec_tests {
     /// the caller probe a dead pathname a second time before moving on.
     #[test]
     fn daemon_socket_candidates_rank_env_first_and_deduplicate() {
+        let _guard = SOCKET_DISCOVERY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let saved: Vec<_> = [
             "TERMMESH_DAEMON_SOCKET",
             "TERMMESH_DAEMON_UNIX_PATH",
