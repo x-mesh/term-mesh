@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 /// The daemon's own teardown budget (`SHUTDOWN_BUDGET` in `main.rs`).
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 /// The agent-session step's limit (`AGENT_LIMIT` in `main.rs`).
+#[cfg(debug_assertions)]
 const AGENT_LIMIT: Duration = Duration::from_secs(12);
 /// What one restart may cost. A clean teardown takes well under a second; this
 /// leaves room for a loaded host without ever approaching the stop timeout.
@@ -22,7 +23,20 @@ const RESTART_BUDGET: Duration = Duration::from_secs(15);
 /// How long a start may take before the test gives up on the socket.
 const START_BUDGET: Duration = Duration::from_secs(30);
 /// Slack over a bound, for process spawn and scheduling on a busy host.
+#[cfg(debug_assertions)]
 const SLACK: Duration = Duration::from_secs(8);
+/// A declared peer surface that ends by itself, shortly after the daemon
+/// starts.
+///
+/// With `TERMMESH_PEER_SURFACES` unset the daemon publishes a login shell and
+/// keeps it, and an ownerless daemon deliberately stays for as long as any peer
+/// surface is live — `ownerless_daemon_stays_for_live_surfaces_then_stops` in
+/// `main.rs` fixes that policy, because a surface outlives the GUI that opened
+/// it. A test about the owner-death path therefore has to arrive at the
+/// ownerless check with nothing live, or the check resets on every poll and no
+/// shutdown is ever committed.
+#[cfg(debug_assertions)]
+const SELF_ENDING_SURFACE: &str = "shell=sleep 1";
 
 struct Host {
     _home: tempfile::TempDir,
@@ -45,10 +59,6 @@ impl Host {
     }
 
     /// Start a daemon that shares nothing with the developer's own.
-    ///
-    /// The environment is cleared rather than extended: these tests run inside
-    /// a term-mesh pane, which exports the production socket paths, and an
-    /// inherited one would point this daemon at the running installation.
     fn start(&self, stall: Option<&str>, log: &str) -> Daemon {
         self.start_owned_by(stall, log, None)
     }
@@ -56,6 +66,22 @@ impl Host {
     /// `owner_pid` makes the daemon a GUI child: it stops when that process
     /// does, which is a shutdown reason no signal accompanies.
     fn start_owned_by(&self, stall: Option<&str>, log: &str, owner_pid: Option<u32>) -> Daemon {
+        self.start_configured(stall, log, owner_pid, None)
+    }
+
+    /// `surfaces` is `TERMMESH_PEER_SURFACES`. Leave it `None` to take the
+    /// daemon's own default, which is one login shell that never exits.
+    ///
+    /// The environment is cleared rather than extended: these tests run inside
+    /// a term-mesh pane, which exports the production socket paths, and an
+    /// inherited one would point this daemon at the running installation.
+    fn start_configured(
+        &self,
+        stall: Option<&str>,
+        log: &str,
+        owner_pid: Option<u32>,
+        surfaces: Option<&str>,
+    ) -> Daemon {
         let log_path = self.root.join(log);
         // `tracing_subscriber::fmt()` writes to stdout; keep stderr with it so a
         // panic on the way down lands in the same journal.
@@ -78,6 +104,9 @@ impl Host {
         }
         if let Some(pid) = owner_pid {
             command.env("TERMMESH_OWNER_PID", pid.to_string());
+        }
+        if let Some(declared) = surfaces {
+            command.env("TERMMESH_PEER_SURFACES", declared);
         }
         let child = command.spawn().expect("term-meshd did not start");
         Daemon { child: Some(child), log: log_path }
@@ -120,6 +149,25 @@ impl Host {
         panic!("both servers did not report started within {START_BUDGET:?}");
     }
 
+    /// Block until the declared surface has exited, so the next ownerless
+    /// check sees nothing live.
+    ///
+    /// The daemon logs this once it observes the exit — from the PTY reader
+    /// reaching EOF, or from the liveness check reaping the child. The journal
+    /// is searched as a whole, so this only distinguishes surfaces while the
+    /// daemon runs exactly one; `SELF_ENDING_SURFACE` is what keeps that true.
+    #[cfg(debug_assertions)]
+    fn await_surface_exit(&self, daemon: &Daemon) {
+        let deadline = Instant::now() + START_BUDGET;
+        while Instant::now() < deadline {
+            if daemon.journal().contains("surface marked dead") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the declared surface did not exit within {START_BUDGET:?}");
+    }
+
     fn answers_ping(&self) -> bool {
         let Ok(stream) = UnixStream::connect(self.control_socket()) else {
             return false;
@@ -149,6 +197,29 @@ struct Daemon {
 impl Daemon {
     fn pid(&self) -> i32 {
         self.child.as_ref().expect("daemon is running").id() as i32
+    }
+
+    /// Wait for the daemon to exit, giving up at `limit`.
+    ///
+    /// `Child::wait` has no deadline, so a shutdown that never starts stops the
+    /// whole test run instead of failing one test — and libtest has no per-test
+    /// timeout to end it. That is exactly how this file's own regression showed
+    /// up. Returning `None` at the bound turns it back into a failure the
+    /// journal can explain, and the process is killed either way so the next
+    /// test starts clean.
+    #[cfg(debug_assertions)]
+    fn wait_within(&mut self, limit: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + limit;
+        let mut child = self.child.take().expect("daemon is running");
+        while Instant::now() < deadline {
+            match child.try_wait().expect("waiting on term-meshd") {
+                Some(status) => return Some(status),
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        None
     }
 
     /// Ask for a stop the way `systemd` does, and report how long the process
@@ -203,6 +274,11 @@ fn a_restart_costs_seconds_not_the_stop_timeout() {
     }
 }
 
+/// A release build injects no fault: `shutdown.rs` compiles `parse_stall` to a
+/// `None` stub under `#[cfg(not(debug_assertions))]`, so the daemon tears down
+/// cleanly and this measures nothing. Gate the test rather than leave a release
+/// run red.
+#[cfg(debug_assertions)]
 #[test]
 fn a_stalled_step_ends_at_its_own_limit_and_teardown_continues() {
     let host = Host::new();
@@ -235,6 +311,11 @@ fn a_stalled_step_ends_at_its_own_limit_and_teardown_continues() {
     );
 }
 
+/// A release build injects no fault: `shutdown.rs` compiles `parse_stall` to a
+/// `None` stub under `#[cfg(not(debug_assertions))]`, so the daemon tears down
+/// cleanly and this measures nothing. Gate the test rather than leave a release
+/// run red.
+#[cfg(debug_assertions)]
 #[test]
 fn a_wedged_teardown_is_ended_by_the_bound_that_lives_off_the_runtime() {
     let host = Host::new();
@@ -264,6 +345,12 @@ fn a_wedged_teardown_is_ended_by_the_bound_that_lives_off_the_runtime() {
 /// it, the hard-exit thread had no start time on this path and simply waited
 /// out the wedge — the one shape the earlier test could not see, because it
 /// always sent SIGTERM.
+///
+/// A release build injects no fault: `shutdown.rs` compiles `parse_stall` to a
+/// `None` stub under `#[cfg(not(debug_assertions))]`, so the daemon tears down
+/// cleanly and this measures nothing. Gate the test rather than leave a release
+/// run red.
+#[cfg(debug_assertions)]
 #[test]
 fn a_wedged_teardown_is_bounded_when_no_signal_started_it() {
     let host = Host::new();
@@ -274,22 +361,32 @@ fn a_wedged_teardown_is_bounded_when_no_signal_started_it() {
         .stderr(Stdio::null())
         .spawn()
         .expect("owner process");
-    let mut daemon = host.start_owned_by(Some("teardown"), "wedged-owner.log", Some(owner.id()));
+    let mut daemon = host.start_configured(
+        Some("teardown"),
+        "wedged-owner.log",
+        Some(owner.id()),
+        Some(SELF_ENDING_SURFACE),
+    );
     host.await_ready(&daemon);
+    // Owner death is the only trigger here, and it is refused while a surface
+    // is live. Reach it with the declared surface already gone.
+    host.await_surface_exit(&daemon);
 
-    let began = Instant::now();
     owner.kill().expect("stop the owner");
     owner.wait().expect("reap the owner");
-    let mut child = daemon.child.take().expect("daemon is running");
-    let status = child.wait().expect("waiting on term-meshd");
-    let teardown = began.elapsed();
-
-    assert_eq!(status.code(), Some(2), "the hard-exit status changed");
-    assert!(
-        teardown < SHUTDOWN_BUDGET + SLACK,
-        "the daemon took {teardown:?} to notice its owner was gone, over its own {SHUTDOWN_BUDGET:?} budget"
-    );
+    // The bound is the assertion: the daemon has this long to notice, and
+    // going over it fails here instead of hanging the run.
+    let limit = SHUTDOWN_BUDGET + SLACK;
+    let exited = daemon.wait_within(limit);
     let journal = daemon.journal();
+
+    let Some(status) = exited else {
+        panic!(
+            "the daemon did not exit within {limit:?} of losing its owner, \
+             over its own {SHUTDOWN_BUDGET:?} budget:\n{journal}"
+        );
+    };
+    assert_eq!(status.code(), Some(2), "the hard-exit status changed");
     assert!(
         !journal.contains("initiating graceful shutdown"),
         "the wedge must sit ahead of the receipt, as the reported hang did:\n{journal}"
