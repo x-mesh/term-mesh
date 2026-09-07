@@ -143,6 +143,10 @@ struct TrackerState {
     session_started_at: HashMap<String, i64>,
 }
 
+/// What one panel is running: its session id, and the totals that session has
+/// booked. Named because both public views destructure it.
+type PanelCorrelation = HashMap<String, (String, (u64, u64, u64, u64))>;
+
 /// Tracks real API token usage by parsing Claude Code JSONL log files.
 #[derive(Clone)]
 pub struct UsageTracker {
@@ -406,6 +410,35 @@ impl UsageTracker {
         &self,
         panes: &[(String, String, i64, u32)],
     ) -> HashMap<String, (u64, u64, u64, u64)> {
+        self.correlate_panels(panes)
+            .into_iter()
+            .map(|(panel_id, (_session_id, tokens))| (panel_id, tokens))
+            .collect()
+    }
+
+    /// The session each panel is running, by the same correlation the token
+    /// totals above use.
+    ///
+    /// The mobile listener needs this to offer Chat for a CLI someone started
+    /// by hand in a terminal pane. That CLI exports its session id only to its
+    /// own children, so the app which owns the pane cannot read it and cannot
+    /// put it in the exposure record; without this the pane is exposed as a
+    /// screen mirror and the Chat/Terminal switch disappears.
+    ///
+    /// Returns: panel_id → session_id.
+    pub fn sessions_by_panel(
+        &self,
+        panes: &[(String, String, i64, u32)],
+    ) -> HashMap<String, String> {
+        self.correlate_panels(panes)
+            .into_iter()
+            .map(|(panel_id, (session_id, _tokens))| (panel_id, session_id))
+            .collect()
+    }
+
+    /// Both public views come from one walk so they can never disagree about
+    /// which session a panel is running.
+    fn correlate_panels(&self, panes: &[(String, String, i64, u32)]) -> PanelCorrelation {
         const MAX_DIFF: i64 = 300;
         let state = self.state.lock().unwrap();
 
@@ -462,13 +495,13 @@ impl UsageTracker {
                 })
                 .collect();
             for (i, &(panel_id, proc_start, _pid)) in cwd_panes.iter().enumerate() {
-                let Some(&&(started, _sid, tokens)) = relevant.get(i) else {
+                let Some(&&(started, sid, tokens)) = relevant.get(i) else {
                     continue;
                 };
                 if (started - proc_start).abs() > MAX_DIFF {
                     continue;
                 }
-                by_panel.insert(panel_id.to_string(), tokens);
+                by_panel.insert(panel_id.to_string(), (sid.to_string(), tokens));
             }
         }
         by_panel
@@ -1146,6 +1179,90 @@ mod tests {
         );
         assert_eq!(by_panel["panelA"].0, 100); // → sessA
         assert_eq!(by_panel["panelB"].0, 200); // → sessB
+    }
+
+    /// Chat on the phone needs the session id behind a panel, and it has to be
+    /// the same session the token totals are attributed to — two walks that
+    /// could disagree would show one pane's transcript under another's usage.
+    #[test]
+    fn sessions_by_panel_names_the_same_session_the_totals_came_from() {
+        let mut state = make_state();
+        let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
+        let entry_a = assistant_entry(
+            "sessA",
+            Some("/cwd/shared"),
+            Some("2026-05-13T01:00:00.000Z"),
+            usage(100, 50, 0, 0),
+        );
+        let entry_b = assistant_entry(
+            "sessB",
+            Some("/cwd/shared"),
+            Some("2026-05-13T01:01:00.000Z"),
+            usage(200, 100, 0, 0),
+        );
+        record_session_start(&mut state, &entry_a);
+        process_line(&mut state, &entry_a, &path);
+        record_session_start(&mut state, &entry_b);
+        process_line(&mut state, &entry_b, &path);
+
+        let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
+        let tracker = UsageTracker {
+            state: Arc::new(Mutex::new(state)),
+        };
+        let panes = vec![
+            (
+                "panelA".to_string(),
+                "/cwd/shared".to_string(),
+                base + 5,
+                1_u32,
+            ),
+            (
+                "panelB".to_string(),
+                "/cwd/shared".to_string(),
+                base + 62,
+                2_u32,
+            ),
+        ];
+
+        let sessions = tracker.sessions_by_panel(&panes);
+        assert_eq!(sessions["panelA"], "sessA");
+        assert_eq!(sessions["panelB"], "sessB");
+        // The pairing is the one the totals used: sessA carried 100 input.
+        let totals = tracker.snapshot_by_panel(&panes);
+        assert_eq!(totals["panelA"].0, 100);
+        assert_eq!(totals.len(), sessions.len());
+    }
+
+    /// A pane too far from any session gets no tokens, and must get no session
+    /// either — otherwise the phone opens a transcript belonging to somebody
+    /// else's run in the same directory.
+    #[test]
+    fn sessions_by_panel_drops_a_pane_outside_the_correlation_window() {
+        let mut state = make_state();
+        let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
+        let entry = assistant_entry(
+            "sessA",
+            Some("/cwd/shared"),
+            Some("2026-05-13T01:00:00.000Z"),
+            usage(100, 50, 0, 0),
+        );
+        record_session_start(&mut state, &entry);
+        process_line(&mut state, &entry, &path);
+
+        let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
+        let tracker = UsageTracker {
+            state: Arc::new(Mutex::new(state)),
+        };
+        // 3600s away: well past the 300s MAX_DIFF guard.
+        let panes = vec![(
+            "panelFar".to_string(),
+            "/cwd/shared".to_string(),
+            base + 3600,
+            1_u32,
+        )];
+
+        assert!(tracker.sessions_by_panel(&panes).is_empty());
+        assert!(tracker.snapshot_by_panel(&panes).is_empty());
     }
 
     #[test]

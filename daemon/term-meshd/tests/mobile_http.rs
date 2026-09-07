@@ -112,6 +112,14 @@ struct Harness {
 }
 
 async fn start(auth: AuthMode, allowed: &[&str]) -> Harness {
+    start_with_resolver(auth, allowed, None).await
+}
+
+async fn start_with_resolver(
+    auth: AuthMode,
+    allowed: &[&str],
+    session_resolver: Option<http_mobile::SessionResolver>,
+) -> Harness {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let config = MobileConfig {
@@ -120,7 +128,7 @@ async fn start(auth: AuthMode, allowed: &[&str]) -> Harness {
         allowed_logins: allowed.iter().map(|s| s.to_string()).collect(),
     };
     let registry = remote::new_registry();
-    let state = http_mobile::new_state(config, registry.clone());
+    let state = http_mobile::new_state(config, registry.clone(), session_resolver);
     let (tx, rx) = watch::channel(false);
     tokio::spawn(http_mobile::serve_listener(listener, state, rx));
     Harness {
@@ -1407,4 +1415,88 @@ async fn targets_by_id_for(h: &Harness) -> serde_json::Map<String, Value> {
         out.insert(t["surface_id"].as_str().unwrap().to_string(), t.clone());
     }
     out
+}
+
+/// The regression the resolver exists for.
+///
+/// A terminal pane running a hand-started CLI is exposed by the app's mobile
+/// button, which cannot know the session id — the CLI hands that only to its
+/// own children. The record therefore says `chat_capable: false`, and the page
+/// hides the whole Chat/Terminal switch on exactly that value. With the daemon
+/// answering instead, the same record offers Chat again.
+#[tokio::test]
+async fn a_pane_running_a_cli_is_chat_capable_even_when_the_record_is_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+
+    // Exposed exactly as the app's button does it: a plain pane, no session.
+    let spec = EnableSpec {
+        surface_id: "panel-1".into(),
+        kind: TargetKind::Pane,
+        app_socket: Some(app.path_str()),
+        ..EnableSpec::default()
+    };
+
+    let without = start_tailscale().await;
+    without
+        .registry
+        .lock()
+        .await
+        .upsert(spec.clone(), remote::now_unix())
+        .unwrap();
+    let target = get(&without, "/api/targets").await.json()["targets"][0].clone();
+    assert_eq!(
+        target["chat_capable"], false,
+        "precondition: the record itself cannot claim chat"
+    );
+
+    let resolver: http_mobile::SessionResolver =
+        Arc::new(|surface_id: &str| match surface_id {
+            "panel-1" => Some(http_mobile::PaneSession {
+                cli: "claude".into(),
+                session_id: "sess-abc".into(),
+            }),
+            _ => None,
+        });
+    let with = start_with_resolver(AuthMode::Tailscale, &[LOGIN], Some(resolver)).await;
+    with.registry
+        .lock()
+        .await
+        .upsert(spec, remote::now_unix())
+        .unwrap();
+    let target = get(&with, "/api/targets").await.json()["targets"][0].clone();
+    assert_eq!(
+        target["chat_capable"], true,
+        "the daemon knows this pane's session, so the switch must come back"
+    );
+    assert_eq!(
+        target["agent_cli"], "claude",
+        "the page picks its transcript reader from this"
+    );
+}
+
+/// A pane the resolver knows nothing about stays a screen mirror. Claiming
+/// chat there would open an empty conversation in place of the terminal.
+#[tokio::test]
+async fn an_unresolvable_pane_stays_terminal_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    let resolver: http_mobile::SessionResolver = Arc::new(|_: &str| None);
+    let h = start_with_resolver(AuthMode::Tailscale, &[LOGIN], Some(resolver)).await;
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "panel-2".into(),
+                kind: TargetKind::Pane,
+                app_socket: Some(app.path_str()),
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
+
+    let target = get(&h, "/api/targets").await.json()["targets"][0].clone();
+    assert_eq!(target["chat_capable"], false);
 }

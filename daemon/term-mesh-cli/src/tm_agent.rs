@@ -14118,10 +14118,7 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
                 .map(str::to_string)
                 .or_else(resolve_remote_app_socket);
             if app_socket.is_none() {
-                eprintln!(
-                    "Error: no app socket for this surface (TERMMESH_SOCKET_PATH is not set); \
-                     run inside a term-mesh pane or pass --app-socket <path>"
-                );
+                eprintln!("Error: {}", missing_app_socket_help());
                 process::exit(1);
             }
             let cwd = env::current_dir()
@@ -14480,6 +14477,47 @@ fn remote_surface_from(explicit: Option<&str>, env_value: Option<&str>) -> Resul
         })
 }
 
+/// Why `remote on` found no app socket, and what to do about it.
+///
+/// Two situations arrive here identically — `TERMMESH_SOCKET_PATH` unset —
+/// and want opposite answers, which is why the old single sentence sent
+/// people looking for a path that does not exist on their machine.
+///
+/// A pane mirroring a peer host runs its shell *on that host*. The daemon
+/// there injects a surface id and its own control socket, never this Mac's
+/// app socket, so no argument to this command can reach the app that draws
+/// the pane. Registering it is the app's job, and the mobile button in the
+/// pane header is how to ask.
+///
+/// Outside any pane there is simply nothing to expose, and the original
+/// advice is right.
+fn missing_app_socket_help() -> String {
+    missing_app_socket_help_from(
+        env::var("TERMMESH_SOCKET_PATH").ok().as_deref(),
+        env::var("TERMMESH_SURFACE_ID").ok().as_deref(),
+    )
+}
+
+/// A pane the app owns carries both variables; the app writes them together
+/// (`GhosttyTerminalView`). A surface id with no app socket therefore means
+/// some other daemon injected it — a peer host's, or a headless one.
+fn missing_app_socket_help_from(
+    socket_path: Option<&str>,
+    surface_id: Option<&str>,
+) -> String {
+    let present = |v: Option<&str>| v.map(str::trim).is_some_and(|v| !v.is_empty());
+    if !present(socket_path) && present(surface_id) {
+        return "this pane's shell runs on the host that owns the surface, not on the \
+                Mac running the app, so it cannot reach the app socket this needs. \
+                Expose it from the app instead: the mobile button in the pane header \
+                (top right) registers exactly this pane."
+            .to_string();
+    }
+    "no app socket for this surface (TERMMESH_SOCKET_PATH is not set); \
+     run inside a term-mesh pane or pass --app-socket <path>"
+        .to_string()
+}
+
 /// The app socket that owns this pane. `TERMMESH_SOCKET_PATH` is what the app
 /// injects into every pane; `TERMMESH_SOCKET` counts only when it is an app
 /// socket (agent panes get it too, but daemon-spawned panes get the daemon's).
@@ -14815,6 +14853,32 @@ mod remote_command_tests {
         );
         assert_eq!(remote_app_socket_from(Some("relative.sock"), None), None);
         assert_eq!(remote_app_socket_from(None, None), None);
+    }
+
+    /// The failure that sent people hunting for a socket path their machine
+    /// does not have. A peer pane's shell runs on the host that owns the
+    /// surface, so nothing typed in it can reach this Mac's app; the answer
+    /// is the pane header's button, and the message has to say so.
+    #[test]
+    fn missing_app_socket_help_names_the_button_for_a_peer_pane() {
+        let peer = missing_app_socket_help_from(None, Some("9fb438c217455fcd8bdf9f80eeb164d5"));
+        assert!(
+            peer.contains("mobile button"),
+            "a peer pane must be pointed at the control that can register it: {peer}"
+        );
+        assert!(
+            !peer.contains("TERMMESH_SOCKET_PATH"),
+            "naming the variable invites setting it by hand, which cannot work here: {peer}"
+        );
+
+        // Outside any pane the original advice is the correct one.
+        let nowhere = missing_app_socket_help_from(None, None);
+        assert!(nowhere.contains("TERMMESH_SOCKET_PATH"), "{nowhere}");
+        assert!(!nowhere.contains("mobile button"), "{nowhere}");
+
+        // Blank is absent, not present: an exported-but-empty surface id must
+        // not be read as "this is a peer pane".
+        assert_eq!(missing_app_socket_help_from(None, Some("  ")), nowhere);
     }
 
     #[test]
