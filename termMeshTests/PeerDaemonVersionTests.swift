@@ -50,6 +50,82 @@ final class PeerDaemonVersionTests: XCTestCase {
         XCTAssertNil(PeerHostDoctor.parseMacAppRuntimeStatus("app-version=0.220.0\n"))
     }
 
+    func testMacAppLaunchCommandIsFixedAndProductionOnly() {
+        let command = PeerHostDoctor.macAppLaunchCommand
+        XCTAssertTrue(command.hasPrefix("sh -c '"))
+        XCTAssertTrue(command.hasSuffix("'"))
+        let body = String(command.dropFirst("sh -c '".count).dropLast())
+        XCTAssertFalse(body.contains("'"))
+        XCTAssertTrue(body.contains(#"$(uname -s)"#))
+        XCTAssertTrue(body.contains("Darwin"))
+        XCTAssertTrue(body.contains("/Applications/term-mesh.app"))
+        XCTAssertTrue(body.contains("/usr/bin/open -gj /Applications/term-mesh.app"))
+        XCTAssertFalse(body.contains("sshTarget"))
+        XCTAssertFalse(body.contains("remoteSocket"))
+        XCTAssertFalse(body.contains("identityFile"))
+    }
+
+    func testMacAppLaunchParserClassifiesEveryOutcome() {
+        XCTAssertEqual(PeerHostDoctor.parseMacAppLaunchResult("repair-launched\n"), .launched)
+        XCTAssertEqual(
+            PeerHostDoctor.parseMacAppLaunchResult("repair-already-running\n"),
+            .alreadyRunning
+        )
+        XCTAssertEqual(PeerHostDoctor.parseMacAppLaunchResult("repair-not-mac\n"), .notMac)
+        XCTAssertEqual(
+            PeerHostDoctor.parseMacAppLaunchResult("repair-not-installed\n"),
+            .notInstalled
+        )
+        XCTAssertEqual(
+            PeerHostDoctor.parseMacAppLaunchResult("repair-failed\n"),
+            .failed("The remote open command failed.")
+        )
+        XCTAssertEqual(
+            PeerHostDoctor.parseMacAppLaunchResult("unexpected\n"),
+            .failed("The remote app launch returned an invalid response.")
+        )
+    }
+
+    func testRepairDecisionLaunchesOnlyForAppNotRunning() {
+        let details = failedRouteDetails()
+        XCTAssertEqual(
+            PeerHostDoctor.repairDecision(for: .ok(details: details, hostCLIBinDirs: [])),
+            .reconnect
+        )
+        XCTAssertEqual(
+            PeerHostDoctor.repairDecision(
+                for: .appNotRunning(details: details, installedVersion: "0.220.0")
+            ),
+            .launchMacAppThenRetest
+        )
+        XCTAssertEqual(
+            PeerHostDoctor.repairDecision(
+                for: .daemonMissing,
+                macAppStatus: .init(
+                    isInstalled: true, installedVersion: "0.229.0", isRunning: false
+                )
+            ),
+            .launchMacAppThenRetest
+        )
+        for result in [
+            PeerHostTestResult.daemonMissing,
+            .relayFailed(details: details, message: "refused"),
+            .sshFailed("auth failed"),
+        ] {
+            guard case .blocked = PeerHostDoctor.repairDecision(for: result) else {
+                return XCTFail("non-app failure must block recovery: \(result)")
+            }
+        }
+    }
+
+    func testRepairRetestSocketKeepsOnlyExplicitConfiguration() {
+        XCTAssertNil(PeerHostDoctor.repairRetestSocket(configuredSocket: ""))
+        XCTAssertEqual(
+            PeerHostDoctor.repairRetestSocket(configuredSocket: "/tmp/pinned.sock"),
+            "/tmp/pinned.sock"
+        )
+    }
+
     func testFailedStaleMacSocketReportsAppNotRunning() {
         let details = failedRouteDetails()
         let result = PeerHostDoctor.classifyFailedRoute(
@@ -109,6 +185,14 @@ final class PeerDaemonVersionTests: XCTestCase {
             agentInstallInFlight: false,
             daemonCleanupBusy: false,
             binaryCleanupBusy: false
+        ))
+        XCTAssertTrue(PeerHostEditorView.doctorActionsBusy(
+            doctorState: .idle,
+            installInFlight: false,
+            agentInstallInFlight: false,
+            daemonCleanupBusy: false,
+            binaryCleanupBusy: false,
+            repairInFlight: true
         ))
     }
 

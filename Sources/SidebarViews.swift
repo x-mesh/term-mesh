@@ -1257,7 +1257,7 @@ struct SidebarRemoteHostsSection: View, Equatable {
                     editorContext = nil
                 },
                 onRepair: { profile in
-                    RemoteHostStore.shared.repairConnection(using: profile)
+                    await RemoteHostStore.shared.repairConnection(using: profile)
                 },
                 onCancel: { editorContext = nil }
             )

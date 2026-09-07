@@ -20,7 +20,7 @@ struct PeerHostEditorView: View {
     @State private var profile: PeerHostProfile
     private let isNew: Bool
     private let onSave: (PeerHostProfile) -> Void
-    private let onRepair: ((PeerHostProfile) -> RemoteHostStore.RepairConnectionResult)?
+    private let onRepair: ((PeerHostProfile) async -> RemoteHostStore.RepairConnectionResult)?
     private let onCancel: () -> Void
 
     /// Text mirror of the optional Int port (empty = nil).
@@ -29,6 +29,9 @@ struct PeerHostEditorView: View {
     @State private var environmentText: String
     @State private var validationError: String?
     @State private var repairError: String?
+    @State private var repairInFlight = false
+    @State private var repairGeneration = 0
+    @State private var repairTask: Task<Void, Never>?
     @State private var discovered: [DiscoveredPeer] = []
     /// Held for the sheet's lifetime; started/stopped with appearance.
     @State private var bonjourBrowser = PeerBonjourBrowser()
@@ -195,7 +198,7 @@ struct PeerHostEditorView: View {
 
     init(context: PeerHostEditorContext,
          onSave: @escaping (PeerHostProfile) -> Void,
-         onRepair: ((PeerHostProfile) -> RemoteHostStore.RepairConnectionResult)? = nil,
+         onRepair: ((PeerHostProfile) async -> RemoteHostStore.RepairConnectionResult)? = nil,
          onCancel: @escaping () -> Void) {
         _profile = State(initialValue: context.profile)
         self.isNew = context.isNew
@@ -303,6 +306,7 @@ struct PeerHostEditorView: View {
                 }
             }
             .font(.system(size: 12))
+            .disabled(repairInFlight)
 
             if let validationError {
                 Text(validationError)
@@ -357,15 +361,16 @@ struct PeerHostEditorView: View {
                 }
                 if !isNew, onRepair != nil {
                     Button("Repair Connection") { validateAndRepair() }
-                        .disabled(doctorBusy)
-                        .help("Save this host, clear the failed auto-detected socket, and reconnect")
+                        .disabled(doctorBusy || repairInFlight)
+                        .help("Verify the remote peer owner, repair it when safe, then reconnect")
                 }
                 Spacer()
                 Button("Cancel", action: onCancel)
                     .keyboardShortcut(.cancelAction)
                 Button(isNew ? "Add" : "Save", action: validateAndSave)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(profile.sshTarget.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(repairInFlight
+                              || profile.sshTarget.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
         .padding(20)
@@ -375,13 +380,17 @@ struct PeerHostEditorView: View {
                 discovered = peers
             }
         }
-        .onDisappear { bonjourBrowser.stop() }
+        .onDisappear {
+            bonjourBrowser.stop()
+            invalidateRepairState()
+        }
         // A stale doctorState/testedDraft is worse than none: any edit to
         // a field the doctor actually probes invalidates the last Test so
         // Install/Update can never fire against a since-changed target.
         .onChange(of: profile.sshTarget) { invalidateDoctorState() }
         .onChange(of: portText) { invalidateDoctorState() }
         .onChange(of: profile.identityFile) { invalidateDoctorState() }
+        .onChange(of: profile.remoteSocket) { invalidateRepairState() }
         .confirmationDialog(
             "Install term-meshd on \"\(profile.sshTarget)\"?",
             isPresented: $showInstallConfirm
@@ -600,7 +609,8 @@ struct PeerHostEditorView: View {
             installInFlight: installInFlight,
             agentInstallInFlight: agentInstallInFlight,
             daemonCleanupBusy: daemonCleanupBusy,
-            binaryCleanupBusy: binaryCleanupBusy
+            binaryCleanupBusy: binaryCleanupBusy,
+            repairInFlight: repairInFlight
         )
     }
 
@@ -612,10 +622,11 @@ struct PeerHostEditorView: View {
         installInFlight: Bool,
         agentInstallInFlight: Bool,
         daemonCleanupBusy: Bool,
-        binaryCleanupBusy: Bool
+        binaryCleanupBusy: Bool,
+        repairInFlight: Bool = false
     ) -> Bool {
         if installInFlight || agentInstallInFlight
-            || daemonCleanupBusy || binaryCleanupBusy { return true }
+            || daemonCleanupBusy || binaryCleanupBusy || repairInFlight { return true }
         switch doctorState {
         case .testing, .installing, .diagnosing: return true
         default: return false
@@ -1316,6 +1327,7 @@ struct PeerHostEditorView: View {
     /// The resets below are the visible half — immediate UI feedback
     /// that the last Test/Install no longer applies to the edited target.
     private func invalidateDoctorState() {
+        invalidateRepairState()
         doctorGeneration += 1
         doctorState = .idle
         testedDraft = nil
@@ -1926,14 +1938,32 @@ struct PeerHostEditorView: View {
     }
 
     private func validateAndRepair() {
-        guard let draft = validatedDraft(), let onRepair else { return }
+        guard !repairInFlight, let draft = validatedDraft(), let onRepair else { return }
         repairError = nil
-        switch onRepair(draft) {
-        case .started:
-            onCancel()
-        case .blocked(let message):
-            repairError = message
+        repairGeneration += 1
+        let generation = repairGeneration
+        repairInFlight = true
+        repairTask?.cancel()
+        repairTask = Task {
+            let result = await onRepair(draft)
+            guard generation == repairGeneration else { return }
+            repairTask = nil
+            repairInFlight = false
+            switch result {
+            case .started:
+                onCancel()
+            case .blocked(let message):
+                repairError = message
+            }
         }
+    }
+
+    private func invalidateRepairState() {
+        repairTask?.cancel()
+        repairTask = nil
+        repairInFlight = false
+        repairGeneration += 1
+        repairError = nil
     }
 
     /// Binding for optional String fields ("" ↔ nil).

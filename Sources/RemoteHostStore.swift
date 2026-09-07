@@ -1142,6 +1142,7 @@ final class RemoteHostStore: ObservableObject {
         // main-queue hop reads the post-change state.
         profileCancellable = PeerHostProfileStore.shared.objectWillChange
             .sink { [weak self] _ in
+                guard self?.profileRebuildSuppressionCount == 0 else { return }
                 DispatchQueue.main.async { self?.rebuild() }
             }
         // Catch connections that opened before the sidebar first rendered.
@@ -1649,11 +1650,36 @@ final class RemoteHostStore: ObservableObject {
         case blocked(String)
     }
 
+    /// A repair draft must not become the active route before its handshake
+    /// succeeds. Otherwise a failed repair makes a previously usable row adopt
+    /// the same unverified endpoint that just failed.
+    private var profileRebuildSuppressionCount = 0
+    private var connectionRepairInFlight = false
+
     @discardableResult
-    func repairConnection(using profile: PeerHostProfile) -> RepairConnectionResult {
+    func repairConnection(using profile: PeerHostProfile) async -> RepairConnectionResult {
+        guard !connectionRepairInFlight else {
+            return .blocked(
+                "Another connection repair is already running. Wait for it to finish, then retry."
+            )
+        }
+        connectionRepairInFlight = true
+        defer { connectionRepairInFlight = false }
+        let remoteResult = await PeerHostDoctor.repairConnection(profile: profile)
+        guard !Task.isCancelled else {
+            return .blocked("Connection repair was cancelled.")
+        }
+        switch remoteResult {
+        case .ready:
+            break
+        case .blocked(let message):
+            return .blocked(message)
+        }
+        profileRebuildSuppressionCount += 1
         PeerHostProfileStore.shared.upsert(profile)
-        let key = profile.stableKey
+        profileRebuildSuppressionCount -= 1
         rebuild()
+        let key = profile.stableKey
         guard let host = hosts[key] else {
             return .blocked("The saved host is not available in the connection roster yet.")
         }
