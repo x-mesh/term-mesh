@@ -213,6 +213,204 @@ mod project_sync_cli_tests {
         assert!(matches!(quarantine.command, Commands::Orchestrator(_)));
     }
 
+    /// The short forms are aliases and positional spellings of the long
+    /// commands, so both must parse to the same request.
+    #[test]
+    fn daemon_short_forms_match_the_long_ones() {
+        // clap panics at runtime on a duplicate alias; catch it here instead.
+        Cli::command().debug_assert();
+
+        for argv in [
+            ["tm-agent", "daemon", "project-presentations", "list"],
+            ["tm-agent", "d", "pp", "ls"],
+        ] {
+            let DaemonCommand::ProjectPresentations(pp) = daemon_command(argv) else {
+                panic!("expected project-presentations");
+            };
+            assert!(matches!(pp.command, ProjectPresentationsCommand::List));
+        }
+
+        let long = daemon_command(["tm-agent", "daemon", "replay-capacity", "--set", "2mb"]);
+        let short = daemon_command(["tm-agent", "d", "replay", "2mb"]);
+        for parsed in [long, short] {
+            let DaemonCommand::ReplayCapacity { capacity, set } = parsed else {
+                panic!("expected replay-capacity");
+            };
+            assert_eq!(capacity.or(set).as_deref(), Some("2mb"));
+        }
+
+        let long = daemon_command(["tm-agent", "daemon", "reset", "--scope", "projects"]);
+        let short = daemon_command(["tm-agent", "d", "reset", "projects"]);
+        for parsed in [long, short] {
+            let DaemonCommand::Reset {
+                scope_arg, scope, ..
+            } = parsed
+            else {
+                panic!("expected reset");
+            };
+            assert_eq!(scope_arg.or(scope).as_deref(), Some("projects"));
+        }
+
+        // No scope on either side still means the documented default.
+        let DaemonCommand::Reset {
+            scope_arg, scope, ..
+        } = daemon_command(["tm-agent", "d", "reset"])
+        else {
+            panic!("expected reset");
+        };
+        assert!(scope_arg.is_none() && scope.is_none());
+    }
+
+    /// A positional value and its long flag name the same thing, so passing
+    /// both is a mistake rather than a merge — except for prune, where the
+    /// ids of both forms are one set.
+    #[test]
+    fn daemon_positional_and_flag_forms_do_not_silently_merge() {
+        assert!(Cli::try_parse_from(["tm-agent", "d", "replay", "2mb", "--set", "4mb"]).is_err());
+        assert!(
+            Cli::try_parse_from(["tm-agent", "d", "reset", "projects", "--scope", "all"]).is_err()
+        );
+
+        let DaemonCommand::ProjectPresentations(pp) = daemon_command([
+            "tm-agent",
+            "d",
+            "pp",
+            "prune",
+            "team:a",
+            "--project-id",
+            "team:b",
+        ]) else {
+            panic!("expected project-presentations");
+        };
+        let ProjectPresentationsCommand::Prune {
+            project_id_args,
+            project_ids,
+            ..
+        } = pp.command
+        else {
+            panic!("expected prune");
+        };
+        assert_eq!(project_id_args, vec!["team:a".to_string()]);
+        assert_eq!(project_ids, vec!["team:b".to_string()]);
+    }
+
+    fn daemon_command<const N: usize>(argv: [&str; N]) -> DaemonCommand {
+        daemon_group(argv)
+            .command
+            .expect("expected a daemon subcommand")
+    }
+
+    #[test]
+    fn daemon_interactive_is_opt_in_and_leaves_bare_daemon_alone() {
+        // Bare `daemon` parses with no subcommand; the dispatcher prints help.
+        let bare = daemon_group(["tm-agent", "d"]);
+        assert!(!bare.interactive && bare.command.is_none());
+
+        let group = daemon_group(["tm-agent", "d", "-i"]);
+        assert!(group.interactive && group.command.is_none());
+
+        let DaemonCommand::Doctor { json, interactive } =
+            daemon_command(["tm-agent", "d", "doctor", "-i"])
+        else {
+            panic!("expected doctor");
+        };
+        assert!(interactive && !json);
+
+        // The picker prints a report, so it cannot also be raw JSON.
+        assert!(Cli::try_parse_from(["tm-agent", "d", "doctor", "-i", "--json"]).is_err());
+
+        // A subcommand still parses next to the group flag; the dispatcher
+        // rejects that pair, which keeps the message specific.
+        let mixed = daemon_group(["tm-agent", "d", "-i", "doctor"]);
+        assert!(mixed.interactive && mixed.command.is_some());
+    }
+
+    /// The daemon composes `repair_argv`, so the picker runs only the
+    /// `daemon` repairs it knows and prints anything else for the operator.
+    #[test]
+    fn daemon_repair_argv_runs_only_daemon_repairs() {
+        let prune = json!({ "repair_argv": [
+            "tm-agent", "daemon", "project-presentations", "prune",
+            "--project-id", "team:a", "--apply"
+        ]});
+        let argv = daemon_repair_argv(&prune).expect("prune is runnable");
+        assert!(daemon_repair_runs(&argv).1.is_some());
+
+        let inspect = json!({ "repair_argv": [
+            "tm-agent", "daemon", "project-presentations", "list"
+        ]});
+        let argv = daemon_repair_argv(&inspect).expect("list is runnable");
+        assert!(daemon_repair_runs(&argv).1.is_none());
+
+        let reset = json!({ "repair_argv": [
+            "tm-agent", "daemon", "reset", "--scope", "projects", "--apply"
+        ]});
+        assert!(daemon_repair_argv(&reset).is_some());
+
+        for refused in [
+            json!({ "repair_argv": [] }),
+            json!({ "repair_argv": ["sh", "-c", "rm -rf /"] }),
+            json!({ "repair_argv": ["tm-agent", "peer", "status", "--host", "h"] }),
+            json!({ "repair_argv": ["tm-agent", "daemon", "replay-capacity", "--set", "1mb"] }),
+            json!({ "repair_argv": ["tm-agent", "daemon", 7] }),
+            json!({ "remedy": "start term-meshd" }),
+        ] {
+            assert!(
+                daemon_repair_argv(&refused).is_none(),
+                "must not run {refused}"
+            );
+        }
+    }
+
+    /// The picker shows the dry run, then repeats exactly that command with
+    /// `--apply`. Both halves come from one argv so they cannot drift.
+    #[test]
+    fn daemon_repair_runs_splits_the_dry_run_from_the_applied_one() {
+        let argv: Vec<String> = [
+            "tm-agent",
+            "daemon",
+            "project-presentations",
+            "prune",
+            "--apply",
+            "--project-id",
+            "team:a",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        let (dry_run, applied) = daemon_repair_runs(&argv);
+        // `--apply` goes wherever the daemon put it; every other argument
+        // keeps its place, so the two runs address the same record.
+        assert_eq!(
+            dry_run,
+            vec![
+                "tm-agent",
+                "daemon",
+                "project-presentations",
+                "prune",
+                "--project-id",
+                "team:a"
+            ]
+        );
+        assert_eq!(applied.as_deref(), Some(argv.as_slice()));
+
+        let inspect: Vec<String> = ["tm-agent", "daemon", "project-presentations", "list"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        let (dry_run, applied) = daemon_repair_runs(&inspect);
+        assert_eq!(dry_run, inspect);
+        assert!(applied.is_none());
+    }
+
+    fn daemon_group<const N: usize>(argv: [&str; N]) -> DaemonCommands {
+        let parsed = Cli::try_parse_from(argv).unwrap();
+        let Commands::Daemon(daemon) = parsed.command else {
+            panic!("expected daemon command");
+        };
+        daemon
+    }
+
     #[test]
     fn daemon_errors_preserve_stable_machine_code() {
         let error = decode_daemon_response(json!({
@@ -1862,6 +2060,7 @@ enum Commands {
 
     /// Daemon-local diagnostics/configuration (talks directly to the
     /// term-meshd socket — no team/app socket required).
+    #[command(visible_alias = "d")]
     Daemon(DaemonCommands),
 
     /// Mobile remote control: expose this pane to the tailnet mobile page
@@ -1884,8 +2083,12 @@ struct PeerCommands {
 
 #[derive(clap::Args)]
 struct DaemonCommands {
+    /// Diagnose, then pick a repair from the findings instead of typing one.
+    /// Takes no subcommand: bare `daemon` still prints help.
+    #[arg(short = 'i', long)]
+    interactive: bool,
     #[command(subcommand)]
-    command: DaemonCommand,
+    command: Option<DaemonCommand>,
 }
 
 #[derive(Subcommand)]
@@ -1894,7 +2097,11 @@ enum DaemonCommand {
     /// recent PTY output replayed to a newly attached relay
     /// (`peer.replay_capacity` RPC). Omit `--set` to just print the current
     /// value.
+    #[command(visible_alias = "replay")]
     ReplayCapacity {
+        /// New capacity as a positional value — the short form of `--set`.
+        #[arg(value_name = "CAPACITY", conflicts_with = "set")]
+        capacity: Option<String>,
         /// New capacity: plain byte count, or with a k/kb (KiB) or m/mb
         /// (MiB) suffix, e.g. `262144`, `256kb`, `2mb`. Omit to only read
         /// the current value.
@@ -1905,6 +2112,7 @@ enum DaemonCommand {
     /// (`peer-project-presentations.json`). Records another installation
     /// owns cannot be deleted over the peer protocol; this is the
     /// host-side path for them.
+    #[command(visible_alias = "pp")]
     ProjectPresentations(ProjectPresentationsCommands),
     /// Clear durable peer state so names a dead leader still holds stop
     /// blocking new Projects. Unlike `project-presentations prune` this does
@@ -1916,10 +2124,15 @@ enum DaemonCommand {
     /// refused and reported; with the daemon down there is nothing to ask
     /// about liveness, so the whole file goes.
     Reset {
+        /// Scope as a positional value — the short form of `--scope`.
+        #[arg(value_name = "SCOPE", conflicts_with = "scope",
+              value_parser = ["projects", "workspaces", "all"])]
+        scope_arg: Option<String>,
         /// projects = Project manifests, workspaces = named workspaces
         /// (removing one kills that workspace's shells), all = both.
-        #[arg(long, default_value = "all", value_parser = ["projects", "workspaces", "all"])]
-        scope: String,
+        /// Defaults to `all`.
+        #[arg(long, value_parser = ["projects", "workspaces", "all"])]
+        scope: Option<String>,
         /// Perform the reset instead of previewing it.
         #[arg(long)]
         apply: bool,
@@ -1936,6 +2149,10 @@ enum DaemonCommand {
         /// Print the raw report instead of the human summary.
         #[arg(long)]
         json: bool,
+        /// Offer each finding's repair as a numbered choice. Same picker as
+        /// `daemon -i`. Needs a terminal on stdin.
+        #[arg(short = 'i', long, conflicts_with = "json")]
+        interactive: bool,
     },
 }
 
@@ -1949,6 +2166,7 @@ struct ProjectPresentationsCommands {
 enum ProjectPresentationsCommand {
     /// List every manifest with its referenced/live surface counts, owner
     /// and whether the recorded directory still exists.
+    #[command(visible_alias = "ls")]
     List,
     /// Remove manifests nothing can resume. Without --project-id only
     /// records whose directory is gone and whose surfaces are all dead are
@@ -1956,6 +2174,10 @@ enum ProjectPresentationsCommand {
     /// only unless --apply is given; an applied prune writes a timestamped
     /// .bak copy next to the file first. Workspaces are never touched.
     Prune {
+        /// Project IDs as positional values — the short form of
+        /// `--project-id`. Combined with any `--project-id` given.
+        #[arg(value_name = "PROJECT_ID")]
+        project_id_args: Vec<String>,
         /// Restrict to these Project IDs (repeatable). Explicitly named
         /// records are removed even if their directory still exists.
         #[arg(long = "project-id")]
@@ -7815,24 +8037,56 @@ fn main() {
     // Daemon commands talk directly to term-meshd, bypassing team/app socket
     // resolution — same reasoning as XmbBridge/XkBridge above.
     if let Commands::Daemon(ref daemon_cmd) = cli.command {
-        match &daemon_cmd.command {
-            DaemonCommand::ReplayCapacity { set } => {
+        let Some(daemon_command) = &daemon_cmd.command else {
+            if daemon_cmd.interactive {
+                cmd_daemon_interactive();
+            }
+            // Bare `daemon` still prints help and exits 2, the way a required
+            // subcommand did before `-i` made the subcommand optional.
+            eprintln!("{}", daemon_help_text());
+            process::exit(2);
+        };
+        if daemon_cmd.interactive {
+            eprintln!(
+                "Error: -i/--interactive takes no subcommand.\n       \
+                 Run `tm-agent daemon -i`, or `tm-agent daemon doctor -i`."
+            );
+            process::exit(2);
+        }
+        match daemon_command {
+            DaemonCommand::ReplayCapacity { capacity, set } => {
                 let sock = detect_daemon_socket()
                     .or_else(detect_socket)
                     .unwrap_or_else(|| {
                         eprintln!("Error: no daemon socket found");
                         process::exit(1);
                     });
-                cmd_daemon_replay_capacity(&sock, set.as_deref());
+                // The positional form and `--set` are mutually exclusive at
+                // parse time, so either one alone is the requested capacity.
+                let requested = capacity.as_deref().or(set.as_deref());
+                cmd_daemon_replay_capacity(&sock, requested);
                 return;
             }
-            DaemonCommand::Doctor { json } => {
+            DaemonCommand::Doctor { json, interactive } => {
+                if *interactive {
+                    cmd_daemon_interactive();
+                }
                 // Resolves its own sockets: finding the ones this CLI would
                 // NOT have reached is half of what it checks.
                 cmd_daemon_doctor(*json);
                 return;
             }
-            DaemonCommand::Reset { scope, apply } => {
+            DaemonCommand::Reset {
+                scope_arg,
+                scope,
+                apply,
+            } => {
+                let scope = scope_arg
+                    .as_deref()
+                    .or(scope.as_deref())
+                    .unwrap_or("all")
+                    .to_string();
+                let scope = &scope;
                 // With the daemon up, go through it: clearing the files alone
                 // would be undone by its next save, which writes a full
                 // in-memory snapshot. Without one, fall back to the files.
@@ -7894,11 +8148,19 @@ fn main() {
                     ProjectPresentationsCommand::List => {
                         cmd_daemon_rpc_print(&sock, "peer.project_presentations.list", json!({}));
                     }
-                    ProjectPresentationsCommand::Prune { project_ids, apply } => {
+                    ProjectPresentationsCommand::Prune {
+                        project_id_args,
+                        project_ids,
+                        apply,
+                    } => {
+                        // Positional ids and `--project-id` name the same set;
+                        // both forms may appear in one invocation.
+                        let mut ids = project_id_args.clone();
+                        ids.extend(project_ids.iter().cloned());
                         let result = cmd_daemon_rpc_print(
                             &sock,
                             "peer.project_presentations.prune",
-                            json!({ "project_ids": project_ids, "apply": apply }),
+                            json!({ "project_ids": ids, "apply": apply }),
                         );
                         let removed = result["removed"].as_array().map(|r| r.len()).unwrap_or(0);
                         if !apply && removed > 0 {
@@ -13438,7 +13700,11 @@ fn daemon_rpc_on_stream(stream: &UnixStream) -> Result<Value, String> {
 /// systemd and a second, left from a `--help` invocation weeks earlier, still
 /// listening on the runtime-dir default. Every client silently chose one of
 /// them.
-fn cmd_daemon_doctor(json: bool) {
+/// Probe every candidate socket once and keep what each one answered.
+///
+/// Split out of `cmd_daemon_doctor` so the interactive picker diagnoses with
+/// exactly the same probe rather than a second, drifting copy of it.
+fn collect_doctor_outcomes() -> Vec<(PathBuf, DoctorSocketOutcome)> {
     let expected_uid = doctor_expected_uid();
     let mut outcomes = Vec::new();
     let mut trusted_identities = std::collections::HashSet::new();
@@ -13495,6 +13761,11 @@ fn cmd_daemon_doctor(json: bool) {
         };
         outcomes.push((path, outcome));
     }
+    outcomes
+}
+
+fn cmd_daemon_doctor(json: bool) {
+    let outcomes = collect_doctor_outcomes();
 
     if outcomes.is_empty() {
         let report = json!({
@@ -13568,6 +13839,218 @@ fn cmd_daemon_doctor(json: bool) {
     }
 }
 
+/// The `daemon` help clap would have printed for a missing subcommand.
+fn daemon_help_text() -> String {
+    use clap::CommandFactory;
+    let mut command = Cli::command();
+    // Without build() the nested command renders its usage as bare `daemon`
+    // instead of `tm-agent daemon`.
+    command.build();
+    command
+        .find_subcommand_mut("daemon")
+        .map(|daemon| daemon.render_help().to_string())
+        .unwrap_or_default()
+}
+
+/// `daemon` subcommands whose argv the picker will execute.
+///
+/// The daemon composes `repair_argv`, so this list is the boundary that keeps
+/// a malformed or unexpected report from choosing what runs. Everything else
+/// is printed for the operator to run by hand.
+const DAEMON_REPAIR_COMMANDS: [&str; 2] = ["project-presentations", "reset"];
+
+/// The runnable argv a finding carries, or None when the picker must not run it.
+fn daemon_repair_argv(finding: &Value) -> Option<Vec<String>> {
+    let argv = finding["repair_argv"]
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()?;
+    if argv.first().map(String::as_str) != Some("tm-agent")
+        || argv.get(1).map(String::as_str) != Some("daemon")
+    {
+        return None;
+    }
+    let group = argv.get(2)?;
+    if !DAEMON_REPAIR_COMMANDS.contains(&group.as_str()) {
+        return None;
+    }
+    Some(argv)
+}
+
+/// The word the applied run needs. Anything else cancels.
+const DAEMON_REPAIR_CONFIRM_WORD: &str = "apply";
+
+/// Split one repair into the run that reports and the run that changes things.
+///
+/// The dry run is the same argv without `--apply`, so what the operator sees
+/// is what the applied run repeats. The second element is None when the repair
+/// only inspects, and there is then nothing to confirm.
+fn daemon_repair_runs(argv: &[String]) -> (Vec<String>, Option<Vec<String>>) {
+    let dry_run: Vec<String> = argv
+        .iter()
+        .filter(|arg| *arg != "--apply")
+        .cloned()
+        .collect();
+    let applied = (dry_run.len() != argv.len()).then(|| argv.to_vec());
+    (dry_run, applied)
+}
+
+fn daemon_repair_display(argv: &[String]) -> String {
+    terminal_safe(&argv.join(" "))
+}
+
+/// Run one repair argv by re-entering this same binary.
+///
+/// Arguments go to the process directly, never through a shell, and the child
+/// inherits the terminal so its own report reaches the operator unchanged.
+fn run_daemon_repair(argv: &[String]) -> Result<i32, String> {
+    let exe = env::current_exe().map_err(|error| format!("cannot locate this binary: {error}"))?;
+    let status = process::Command::new(exe)
+        .args(&argv[1..])
+        .status()
+        .map_err(|error| format!("cannot run the repair: {error}"))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+/// Read one line from the terminal, or None when stdin ends.
+fn daemon_prompt_line(prompt: &str) -> Option<String> {
+    eprint!("{prompt}");
+    std::io::stderr().flush().ok();
+    let mut input = String::new();
+    match std::io::stdin().read_line(&mut input) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(input.trim().to_string()),
+    }
+}
+
+/// `daemon -i` / `daemon doctor -i`: diagnose, then offer each finding's
+/// repair as a numbered choice.
+///
+/// The picker never applies anything on its own. It runs the dry run first,
+/// shows what the repair reports, and asks for a typed word before it repeats
+/// the command with `--apply`.
+fn cmd_daemon_interactive() -> ! {
+    // Without this the picker blocks forever in a script, a hook, or an ssh
+    // command — the places that call this CLI without a terminal.
+    if !std::io::stdin().is_terminal() {
+        eprintln!("Error: -i/--interactive needs a terminal on stdin.");
+        eprintln!("       Run `tm-agent daemon doctor --json` and act on the findings instead.");
+        process::exit(2);
+    }
+
+    let outcomes = collect_doctor_outcomes();
+    if outcomes.is_empty() {
+        println!("no term-meshd is listening on this host.");
+        process::exit(1);
+    }
+    let findings = aggregate_doctor_findings(&outcomes);
+    let exit_code = doctor_exit_code(&outcomes, &findings);
+    if findings.is_empty() {
+        let sockets = outcomes
+            .iter()
+            .map(|(path, _)| path.display().to_string())
+            .collect::<Vec<_>>();
+        println!("{}: no problems found.", terminal_safe(&sockets.join(", ")));
+        process::exit(exit_code);
+    }
+
+    println!("{} problem(s) found.\n", findings.len());
+    let mut choices: Vec<Vec<String>> = Vec::new();
+    for finding in &findings {
+        let text = |key: &str| terminal_safe(finding[key].as_str().unwrap_or(""));
+        let argv = daemon_repair_argv(finding);
+        let label = match &argv {
+            Some(_) => {
+                choices.push(argv.clone().expect("checked above"));
+                format!("{:>2})", choices.len())
+            }
+            None => "  -".to_string(),
+        };
+        println!("{label} [{}] {}", text("severity"), text("code"));
+        let project = text("project_id");
+        if !project.is_empty() {
+            println!("     project {project}");
+        }
+        println!("     {}", text("detail"));
+        match &argv {
+            Some(argv) => println!("     fix: {}\n", daemon_repair_display(argv)),
+            None => match human_remedy_line(finding) {
+                // A finding the daemon did not hand a runnable repair for:
+                // report it the way `doctor` does and let the operator act.
+                Some(remedy) => println!("     fix (run by hand): {remedy}\n"),
+                None => println!(),
+            },
+        }
+    }
+
+    if choices.is_empty() {
+        println!("No repair here is runnable from this picker. Act on the findings by hand.");
+        process::exit(exit_code);
+    }
+
+    let prompt = format!("Select a repair [1-{}] or q to quit: ", choices.len());
+    let Some(answer) = daemon_prompt_line(&prompt) else {
+        process::exit(exit_code);
+    };
+    if answer.is_empty() || answer == "q" {
+        process::exit(exit_code);
+    }
+    let Some(argv) = answer
+        .parse::<usize>()
+        .ok()
+        .filter(|choice| (1..=choices.len()).contains(choice))
+        .map(|choice| choices[choice - 1].clone())
+    else {
+        eprintln!(
+            "Error: `{}` is not one of the choices.",
+            terminal_safe(&answer)
+        );
+        process::exit(2);
+    };
+
+    let (dry_run, applied) = daemon_repair_runs(&argv);
+    println!("\n$ {}", daemon_repair_display(&dry_run));
+    let code = match run_daemon_repair(&dry_run) {
+        Ok(code) => code,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            process::exit(1);
+        }
+    };
+    if code != 0 {
+        eprintln!("The dry run failed (exit {code}). Nothing was changed.");
+        process::exit(code);
+    }
+    let Some(applied) = applied else {
+        // The daemon offered inspection only, so there is nothing to confirm.
+        process::exit(exit_code);
+    };
+
+    println!("\nThe run above changed nothing. Applying repeats it with --apply:");
+    println!("  {}", daemon_repair_display(&applied));
+    let confirmed = daemon_prompt_line(&format!(
+        "Type `{DAEMON_REPAIR_CONFIRM_WORD}` to run it, anything else to cancel: "
+    ))
+    .is_some_and(|answer| answer == DAEMON_REPAIR_CONFIRM_WORD);
+    if !confirmed {
+        println!("Cancelled. Nothing was changed.");
+        process::exit(exit_code);
+    }
+    println!("\n$ {}", daemon_repair_display(&applied));
+    match run_daemon_repair(&applied) {
+        Ok(0) => {
+            println!("\nRepair applied. Run `tm-agent daemon doctor` again to confirm.");
+            process::exit(0);
+        }
+        Ok(code) => process::exit(code),
+        Err(message) => {
+            eprintln!("Error: {message}");
+            process::exit(1);
+        }
+    }
+}
+
 // ── `tm-agent remote` (docs/mobile-remote-control.md §4.2) ─────────────
 
 /// Run one `remote` subcommand against the daemon control socket.
@@ -13635,10 +14118,7 @@ fn run_remote_command(sock: &PathBuf, team_flag: Option<&str>, cmd: &RemoteComma
                 .map(str::to_string)
                 .or_else(resolve_remote_app_socket);
             if app_socket.is_none() {
-                eprintln!(
-                    "Error: no app socket for this surface (TERMMESH_SOCKET_PATH is not set); \
-                     run inside a term-mesh pane or pass --app-socket <path>"
-                );
+                eprintln!("Error: {}", missing_app_socket_help());
                 process::exit(1);
             }
             let cwd = env::current_dir()
@@ -13997,6 +14477,47 @@ fn remote_surface_from(explicit: Option<&str>, env_value: Option<&str>) -> Resul
         })
 }
 
+/// Why `remote on` found no app socket, and what to do about it.
+///
+/// Two situations arrive here identically — `TERMMESH_SOCKET_PATH` unset —
+/// and want opposite answers, which is why the old single sentence sent
+/// people looking for a path that does not exist on their machine.
+///
+/// A pane mirroring a peer host runs its shell *on that host*. The daemon
+/// there injects a surface id and its own control socket, never this Mac's
+/// app socket, so no argument to this command can reach the app that draws
+/// the pane. Registering it is the app's job, and the mobile button in the
+/// pane header is how to ask.
+///
+/// Outside any pane there is simply nothing to expose, and the original
+/// advice is right.
+fn missing_app_socket_help() -> String {
+    missing_app_socket_help_from(
+        env::var("TERMMESH_SOCKET_PATH").ok().as_deref(),
+        env::var("TERMMESH_SURFACE_ID").ok().as_deref(),
+    )
+}
+
+/// A pane the app owns carries both variables; the app writes them together
+/// (`GhosttyTerminalView`). A surface id with no app socket therefore means
+/// some other daemon injected it — a peer host's, or a headless one.
+fn missing_app_socket_help_from(
+    socket_path: Option<&str>,
+    surface_id: Option<&str>,
+) -> String {
+    let present = |v: Option<&str>| v.map(str::trim).is_some_and(|v| !v.is_empty());
+    if !present(socket_path) && present(surface_id) {
+        return "this pane's shell runs on the host that owns the surface, not on the \
+                Mac running the app, so it cannot reach the app socket this needs. \
+                Expose it from the app instead: the mobile button in the pane header \
+                (top right) registers exactly this pane."
+            .to_string();
+    }
+    "no app socket for this surface (TERMMESH_SOCKET_PATH is not set); \
+     run inside a term-mesh pane or pass --app-socket <path>"
+        .to_string()
+}
+
 /// The app socket that owns this pane. `TERMMESH_SOCKET_PATH` is what the app
 /// injects into every pane; `TERMMESH_SOCKET` counts only when it is an app
 /// socket (agent panes get it too, but daemon-spawned panes get the daemon's).
@@ -14332,6 +14853,32 @@ mod remote_command_tests {
         );
         assert_eq!(remote_app_socket_from(Some("relative.sock"), None), None);
         assert_eq!(remote_app_socket_from(None, None), None);
+    }
+
+    /// The failure that sent people hunting for a socket path their machine
+    /// does not have. A peer pane's shell runs on the host that owns the
+    /// surface, so nothing typed in it can reach this Mac's app; the answer
+    /// is the pane header's button, and the message has to say so.
+    #[test]
+    fn missing_app_socket_help_names_the_button_for_a_peer_pane() {
+        let peer = missing_app_socket_help_from(None, Some("9fb438c217455fcd8bdf9f80eeb164d5"));
+        assert!(
+            peer.contains("mobile button"),
+            "a peer pane must be pointed at the control that can register it: {peer}"
+        );
+        assert!(
+            !peer.contains("TERMMESH_SOCKET_PATH"),
+            "naming the variable invites setting it by hand, which cannot work here: {peer}"
+        );
+
+        // Outside any pane the original advice is the correct one.
+        let nowhere = missing_app_socket_help_from(None, None);
+        assert!(nowhere.contains("TERMMESH_SOCKET_PATH"), "{nowhere}");
+        assert!(!nowhere.contains("mobile button"), "{nowhere}");
+
+        // Blank is absent, not present: an exported-but-empty surface id must
+        // not be read as "this is a peer pane".
+        assert_eq!(missing_app_socket_help_from(None, Some("  ")), nowhere);
     }
 
     #[test]

@@ -142,12 +142,61 @@ pub fn parse_logins(raw: Option<&str>) -> BTreeSet<String> {
         .collect()
 }
 
+/// The CLI session a pane is running.
+pub struct PaneSession {
+    pub cli: String,
+    pub session_id: String,
+}
+
+/// Finds the session behind a surface whose exposure record carries none.
+///
+/// A CLI exports its session id only to its own children, so `/rc on` — which
+/// the CLI runs as a child — reads it straight from the environment, while the
+/// app that owns the pane cannot see it and cannot put it in the record. The
+/// app's mobile button therefore registered terminal panes with no session,
+/// the page saw `chat_capable: false`, and the Chat/Terminal switch vanished
+/// for exactly the panes people run a CLI in by hand.
+///
+/// Injected rather than imported: this module stays on `crate::remote` and
+/// `crate::app_socket` alone so `tests/mobile_http.rs` can `#[path]` the three
+/// together, and the trackers behind this reach the rest of the daemon.
+pub type SessionResolver = Arc<dyn Fn(&str) -> Option<PaneSession> + Send + Sync>;
+
 pub struct MobileState {
     pub config: MobileConfig,
     pub registry: SharedRegistry,
+    /// None in tests and wherever the daemon cannot correlate panes, which
+    /// leaves the record's own answer standing.
+    session_resolver: Option<SessionResolver>,
     /// Request ids are reserved while delivery is in flight and become
     /// deduplicable only after the app acknowledges the write.
     dedupe: Mutex<HashMap<String, (Instant, DedupeState)>>,
+}
+
+impl MobileState {
+    /// The session this entry can show a transcript for, from the record when
+    /// the exposing client knew it and from the daemon's own pane correlation
+    /// when it did not.
+    fn resolved_session(&self, entry: &Entry) -> Option<PaneSession> {
+        if let (Some(session_id), false) =
+            (entry.session_id.as_deref(), entry.agent_cli.is_empty())
+        {
+            return Some(PaneSession {
+                cli: entry.agent_cli.clone(),
+                session_id: session_id.to_string(),
+            });
+        }
+        self.session_resolver.as_ref()?(&entry.surface_id)
+    }
+
+    /// Whether the phone should offer Chat beside Terminal.
+    ///
+    /// Only ever adds: an agent target is a chat by construction, and a record
+    /// that already claims the capability keeps it. What changes is the pane
+    /// running a hand-started CLI, which can now say so.
+    fn chat_capable(&self, entry: &Entry) -> bool {
+        entry.chat_capable || self.resolved_session(entry).is_some()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -164,10 +213,15 @@ enum DedupeAdmission {
 
 pub type SharedState = Arc<MobileState>;
 
-pub fn new_state(config: MobileConfig, registry: SharedRegistry) -> SharedState {
+pub fn new_state(
+    config: MobileConfig,
+    registry: SharedRegistry,
+    session_resolver: Option<SessionResolver>,
+) -> SharedState {
     Arc::new(MobileState {
         config,
         registry,
+        session_resolver,
         dedupe: Mutex::new(HashMap::new()),
     })
 }
@@ -177,10 +231,16 @@ pub fn new_state(config: MobileConfig, registry: SharedRegistry) -> SharedState 
 pub async fn serve(
     config: MobileConfig,
     registry: SharedRegistry,
+    session_resolver: Option<SessionResolver>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.addr).await?;
-    serve_listener(listener, new_state(config, registry), shutdown_rx).await
+    serve_listener(
+        listener,
+        new_state(config, registry, session_resolver),
+        shutdown_rx,
+    )
+    .await
 }
 
 /// Serve on an already-bound listener (tests bind `127.0.0.1:0`).
@@ -420,14 +480,27 @@ async fn health_handler(State(state): State<SharedState>) -> Response {
     .into_response()
 }
 
-fn target_json(entry: &Entry) -> Value {
+/// One target as the page sees it.
+///
+/// `chat_capable` and `agent_cli` are answered by `state`, not read straight
+/// off the record: a pane the app exposed carries neither, because the CLI
+/// running in it hands its session id only to its own children. The page hides
+/// the whole Chat/Terminal switch on a false here, so leaving the record to
+/// answer alone is what made that switch disappear.
+fn target_json(state: &MobileState, entry: &Entry) -> Value {
+    let session = state.resolved_session(entry);
+    let cli = if entry.agent_cli.is_empty() {
+        session.as_ref().map(|s| s.cli.clone()).unwrap_or_default()
+    } else {
+        entry.agent_cli.clone()
+    };
     json!({
         "surface_id": entry.surface_id,
         "kind": entry.kind,
-        "chat_capable": entry.chat_capable,
+        "chat_capable": entry.chat_capable || session.is_some(),
         "team_name": entry.team_name,
         "agent_name": entry.agent_name,
-        "agent_cli": entry.agent_cli,
+        "agent_cli": cli,
         "title": entry.title,
         "cwd": entry.cwd,
         "source": if entry.app_socket.is_some() { "gui" } else { "headless" },
@@ -1018,7 +1091,7 @@ async fn targets_handler(State(state): State<SharedState>) -> Response {
     if !pruned.is_empty() {
         tracing::info!("mobile: pruned {} stale exposure(s)", pruned.len());
     }
-    let targets: Vec<Value> = reg.list().iter().map(target_json).collect();
+    let targets: Vec<Value> = reg.list().iter().map(|e| target_json(&state, e)).collect();
     Json(json!({ "targets": targets, "now": now })).into_response()
 }
 
@@ -1683,12 +1756,21 @@ async fn transcript_handler(
     Path(surface_id): Path<String>,
     Query(q): Query<TranscriptQuery>,
 ) -> ApiResult {
-    let entry = live_entry(&state, &surface_id).await?;
-    if !entry.chat_capable {
+    let mut entry = live_entry(&state, &surface_id).await?;
+    if !state.chat_capable(&entry) {
         return Err(ApiError::conflict(
             "not_an_agent",
             "this target has no structured conversation; use /screen",
         ));
+    }
+    // Read the session back onto the entry so the blocking reader below needs
+    // to know nothing about where it came from. A record that already carried
+    // one is left exactly as it was.
+    if entry.session_id.is_none() || entry.agent_cli.is_empty() {
+        if let Some(session) = state.resolved_session(&entry) {
+            entry.session_id = Some(session.session_id);
+            entry.agent_cli = session.cli;
+        }
     }
     let limit = q.limit.unwrap_or(200).clamp(1, 2000);
     let (result, terminal_running) = if entry.kind == TargetKind::Agent {

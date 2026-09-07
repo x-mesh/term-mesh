@@ -1676,6 +1676,47 @@ class termmesh:
             "operation_id": operation_id,
         }) or {})
 
+    def debug_project_name_conflict(
+        self,
+        name: str,
+        working_directory: Optional[str] = None,
+        host_key: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate a New Project name exactly as the sheet does, creating
+        nothing (`debug.project.name_conflict`).
+
+        `debug_project_creation_attempt` reaches the same verdict only by
+        actually creating the Project when nothing blocks it, so it can assert
+        that a name is taken and never that it is free. Reports
+        {conflict, action, location, blocks_create} plus, when a record backs
+        the conflict, {roster_verified, leader_ready, can_open_remote,
+        can_repair_leader, project_id}."""
+        params: Dict[str, Any] = {"name": name}
+        if working_directory is not None:
+            params["working_directory"] = working_directory
+        if host_key is not None:
+            params["host_key"] = host_key
+        if project_id is not None:
+            params["project_id"] = project_id
+        return dict(self._call("debug.project.name_conflict", params) or {})
+
+    def debug_peer_roster_failure(
+        self, host: str, reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Hold a host's Project roster in the state a failed read leaves it in
+        — previous entries kept, host still connected — or clear it by passing
+        no reason (`debug.peer.roster_failure`).
+
+        The real cause is a transport or name-resolution failure on a live
+        machine, which a test cannot arrange from outside. Note the 15s roster
+        poll clears an injected failure on its next success, so assert
+        promptly after injecting."""
+        params: Dict[str, Any] = {"host": host}
+        if reason is not None:
+            params["reason"] = reason
+        return dict(self._call("debug.peer.roster_failure", params) or {})
+
     def debug_project_remote_presentations(self, host: str) -> List[Dict[str, Any]]:
         result = dict(self._call("debug.project.remote_presentations", {"host": host}) or {})
         return list(result.get("projects") or [])

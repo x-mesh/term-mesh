@@ -40,6 +40,10 @@ struct CodexState {
 ///
 /// Same incremental-parse model as the Claude `UsageTracker`; the 2s codex
 /// broadcaster tick is the poll that drives `scan()`.
+/// What one panel is running: its rollout file, and the totals that session
+/// has booked. Named because both public views destructure it.
+type PanelCorrelation = HashMap<String, (PathBuf, (u64, u64, u64, u64))>;
+
 pub struct CodexUsageTracker {
     sessions_dir: PathBuf,
     state: Arc<Mutex<CodexState>>,
@@ -130,6 +134,41 @@ impl CodexUsageTracker {
         &self,
         panes: &[(String, String, i64, u32)],
     ) -> anyhow::Result<HashMap<String, (u64, u64, u64, u64)>> {
+        Ok(self
+            .correlate_panels(panes)?
+            .into_iter()
+            .map(|(panel_id, (_rollout, tokens))| (panel_id, tokens))
+            .collect())
+    }
+
+    /// The session each panel is running, by the same correlation the token
+    /// totals above use. See `UsageTracker::sessions_by_panel` for why the
+    /// mobile listener cannot get this from the pane's own environment.
+    ///
+    /// The id is the rollout file's trailing UUID, which is what
+    /// `CODEX_THREAD_ID` holds and what the transcript reader searches file
+    /// names for.
+    ///
+    /// Returns: panel_id → session_id.
+    pub fn sessions_by_panel(
+        &self,
+        panes: &[(String, String, i64, u32)],
+    ) -> anyhow::Result<HashMap<String, String>> {
+        Ok(self
+            .correlate_panels(panes)?
+            .into_iter()
+            .filter_map(|(panel_id, (rollout, _tokens))| {
+                rollout_session_id(&rollout).map(|id| (panel_id, id))
+            })
+            .collect())
+    }
+
+    /// Both public views come from one walk so they can never disagree about
+    /// which session a panel is running.
+    fn correlate_panels(
+        &self,
+        panes: &[(String, String, i64, u32)],
+    ) -> anyhow::Result<PanelCorrelation> {
         self.scan()?;
         const MAX_DIFF: i64 = 300;
         let state = self.state.lock().unwrap();
@@ -175,17 +214,34 @@ impl CodexUsageTracker {
                 })
                 .collect();
             for (i, &(panel_id, proc_start, _pid)) in cwd_panes.iter().enumerate() {
-                let Some(&&(started, _path, tokens)) = relevant.get(i) else {
+                let Some(&&(started, path, tokens)) = relevant.get(i) else {
                     continue;
                 };
                 if (started - proc_start).abs() > MAX_DIFF {
                     continue;
                 }
-                by_panel.insert(panel_id.to_string(), tokens);
+                by_panel.insert(panel_id.to_string(), (path.to_path_buf(), tokens));
             }
         }
         Ok(by_panel)
     }
+}
+
+/// The session UUID a rollout file name ends with.
+///
+/// `rollout-<ISO timestamp>-<uuid>.jsonl`, where the timestamp itself is
+/// dash-separated — so the split has to come from the fixed 36-character UUID
+/// at the end rather than from counting dashes.
+fn rollout_session_id(path: &Path) -> Option<String> {
+    const UUID_LEN: usize = 36;
+    let stem = path.file_stem()?.to_str()?;
+    let candidate = stem.get(stem.len().checked_sub(UUID_LEN)?..)?;
+    let shaped = candidate.len() == UUID_LEN
+        && candidate.chars().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        });
+    shaped.then(|| candidate.to_string())
 }
 
 /// Recursively collect `rollout-*.jsonl` files. Depth-capped as a guard; the
@@ -473,6 +529,31 @@ mod tests {
         let panes = vec![("panelX".to_string(), "/far".to_string(), base + 500, 1_u32)];
         let by_panel = tracker.snapshot_by_panel(&panes).unwrap();
         assert!(by_panel.is_empty());
+    }
+
+    #[test]
+    /// The id Chat needs out of a rollout path. The timestamp in the name is
+    /// dash-separated too, so counting dashes finds the wrong boundary; the
+    /// UUID's fixed width is what makes the split unambiguous.
+    #[test]
+    fn rollout_session_id_takes_the_trailing_uuid() {
+        assert_eq!(
+            rollout_session_id(Path::new(
+                "/x/2026/06/02/rollout-2026-06-02T16-15-19-019e872f-d511-7171-b210-0860b926ed70.jsonl"
+            ))
+            .as_deref(),
+            Some("019e872f-d511-7171-b210-0860b926ed70")
+        );
+        // Anything not shaped like a UUID is refused rather than guessed at:
+        // a wrong id would open somebody else's transcript.
+        assert_eq!(rollout_session_id(Path::new("/x/rollout-2026-06-02.jsonl")), None);
+        assert_eq!(rollout_session_id(Path::new("/x/rollout.jsonl")), None);
+        assert_eq!(
+            rollout_session_id(Path::new(
+                "/x/rollout-2026-06-02T16-15-19-not-a-uuid-here-000000000000.jsonl"
+            )),
+            None
+        );
     }
 
     #[test]

@@ -1229,6 +1229,312 @@ final class PeerPaneSessionTests: XCTestCase {
         )
     }
 
+    private func leaderlessManifest(
+        active: Bool = false,
+        activeKnown: Bool = true,
+        owned: Bool = true,
+        teamUUID: String = "A70D3DBC",
+        projectID: String = "team:A70D3DBC"
+    ) -> RemoteTeamSummary {
+        RemoteTeamSummary(
+            name: "xm", teamUUID: teamUUID, workingDirectory: "/work/tm-projects/xm",
+            projectRootPath: nil, agentNames: [], projectID: projectID,
+            leaderSurfaceID: Data(repeating: 0x56, count: 16),
+            leaderCLI: "claude", leaderModel: "opus",
+            presentationOwnedByRequester: owned,
+            leaderProcessActive: active, leaderProcessActiveKnown: activeKnown
+        )
+    }
+
+    /// The defect this pins. New Project decided "can this be opened?" from the
+    /// Project ID alone, while adoption decided it from the leader's liveness.
+    /// A Project whose leader had merely exited therefore showed an Open
+    /// Existing button whose only reachable outcome was the sheet reporting a
+    /// still-present Project as one that "may no longer be available".
+    func testRemoteOpenAffordanceAgreesWithTheAdoptionGate() {
+        for active in [true, false] {
+            for known in [true, false] {
+                let remote = leaderlessManifest(active: active, activeKnown: known)
+                let record = TeamOrchestrator.remoteConflictRecord(
+                    remote, hostKey: "ssh:mac-sub", hostName: "mac-sub"
+                )
+                XCTAssertEqual(
+                    record.canOpenRemoteProject,
+                    TeamOrchestrator.remoteManifestLeaderIsAdoptable(remote),
+                    "open affordance disagreed with the adoption gate "
+                        + "(active=\(active) known=\(known))"
+                )
+            }
+        }
+    }
+
+    func testLeaderlessOwnedRemoteProjectOffersRepairAndSaysWhy() {
+        let record = TeamOrchestrator.remoteConflictRecord(
+            leaderlessManifest(), hostKey: "ssh:mac-sub", hostName: "mac-sub"
+        )
+        XCTAssertTrue(record.remoteLeaderProcessIsInactive)
+        XCTAssertFalse(record.canOpenRemoteProject, "adoption would refuse this manifest")
+        XCTAssertTrue(record.canRepairRemoteLeaderProcess)
+        XCTAssertEqual(
+            TerminalController.debugProjectConflictAction(.remoteNameCollision(record)),
+            "repair_leader"
+        )
+        XCTAssertEqual(
+            TerminalController.debugProjectConflictAction(.exactLive(record)),
+            "repair_leader",
+            "an exact-identity leaderless Project is the same dead end"
+        )
+
+        let failure = NewProjectView.openExistingFailureMessage(
+            .leaderProcessInactive, record: record
+        )
+        XCTAssertTrue(failure.contains("Repair collaboration"))
+        XCTAssertFalse(
+            failure.contains("no longer"),
+            "the Project is still listed by its host; it must not be reported as gone"
+        )
+        XCTAssertTrue(
+            NewProjectView.remoteCollisionGuidance(record).contains("Repair collaboration"),
+            "the card must point at the action it actually offers"
+        )
+    }
+
+    func testRemoteRepairIsWithheldWhenItCannotAddressTheProject() {
+        func record(_ remote: RemoteTeamSummary) -> TeamOrchestrator.ProjectConflictRecord {
+            TeamOrchestrator.remoteConflictRecord(
+                remote, hostKey: "ssh:mac-sub", hostName: "mac-sub"
+            )
+        }
+        // Repair republishes the manifest, so it belongs to the owner alone.
+        let foreign = record(leaderlessManifest(owned: false))
+        XCTAssertFalse(foreign.canRepairRemoteLeaderProcess)
+        XCTAssertTrue(foreign.canRepairStaleRemoteRecord, "Reclaim Name is the way out here")
+        XCTAssertTrue(
+            NewProjectView.remoteCollisionGuidance(foreign).contains("Reclaim Name")
+        )
+        // A running leader is live work to open, not something to repair.
+        XCTAssertFalse(record(leaderlessManifest(active: true)).canRepairRemoteLeaderProcess)
+        // Unprobed liveness stays conservative: the existing offer policy wins.
+        XCTAssertFalse(
+            record(leaderlessManifest(activeKnown: false)).canRepairRemoteLeaderProcess
+        )
+        // Repair addresses a Project by exact durable identity or not at all.
+        XCTAssertFalse(record(leaderlessManifest(teamUUID: "")).canRepairRemoteLeaderProcess)
+        XCTAssertFalse(record(leaderlessManifest(projectID: "")).canRepairRemoteLeaderProcess)
+    }
+
+    func testOpenExistingFailureMessagesNameTheStepThatDeclined() {
+        let record = TeamOrchestrator.remoteConflictRecord(
+            leaderlessManifest(active: true), hostKey: "ssh:mac-sub", hostName: "mac-sub"
+        )
+        let outcomes: [TeamOrchestrator.OpenExistingProjectOutcome] = [
+            .noProjectRecord, .workspaceGone, .hostDisconnected,
+            .manifestGone, .leaderProcessInactive, .attachFailed,
+        ]
+        let messages = outcomes.map {
+            NewProjectView.openExistingFailureMessage($0, record: record)
+        }
+        XCTAssertEqual(
+            Set(messages).count, outcomes.count,
+            "each declining step must be distinguishable to the user"
+        )
+        XCTAssertTrue(messages.allSatisfy { !$0.isEmpty })
+        XCTAssertTrue(
+            NewProjectView.openExistingFailureMessage(.hostDisconnected, record: record)
+                .contains("mac-sub"),
+            "a disconnected host must be named"
+        )
+        XCTAssertEqual(
+            NewProjectView.openExistingFailureMessage(.opened, record: record), "",
+            "success carries no failure copy"
+        )
+    }
+
+    private func rosterHost(
+        connected: Bool = true,
+        confirmedAt: Date? = Date(timeIntervalSince1970: 1_788_000_000),
+        failure: String? = nil
+    ) -> HostEntry {
+        var host = HostEntry(
+            id: "ssh:mac-sub", displayName: "mac-sub",
+            connectionState: connected ? .connected : .failed("down"),
+            workspaces: [], activeSockPath: "/tmp/live", sshTarget: "mac-sub",
+            remoteSockPath: "/tmp/peer.sock"
+        )
+        host.teamsConfirmedAt = confirmedAt
+        host.lastRosterFailure = failure
+        return host
+    }
+
+    func testTeamRosterIsVerifiedOnlyAfterAReadThatActuallyConfirmedIt() {
+        XCTAssertTrue(rosterHost().teamRosterIsVerified)
+        XCTAssertFalse(
+            rosterHost(failure: "the host did not answer ListTeams").teamRosterIsVerified,
+            "a failed read keeps the previous roster, so it is no longer confirmed"
+        )
+        XCTAssertFalse(
+            rosterHost(confirmedAt: nil).teamRosterIsVerified,
+            "a host that has never answered has nothing to trust"
+        )
+        XCTAssertFalse(
+            rosterHost(connected: false).teamRosterIsVerified,
+            "a disconnected host cannot be describing itself now"
+        )
+    }
+
+    /// The defect this pins. A Project deleted on its host went on blocking
+    /// its own name for the rest of the session, because the roster it came
+    /// from had frozen while the host still read `connected` — and nothing
+    /// distinguished that from a roster the host had just confirmed.
+    func testAnUnconfirmedRemoteRosterCannotBlockCreation() {
+        let manifest = leaderlessManifest(active: true)
+        func record(verified: Bool) -> TeamOrchestrator.ProjectConflictRecord {
+            TeamOrchestrator.remoteConflictRecord(
+                manifest, hostKey: "ssh:mac-sub", hostName: "mac-sub",
+                rosterVerified: verified
+            )
+        }
+        XCTAssertTrue(
+            TeamOrchestrator.ProjectNameConflict
+                .remoteNameCollision(record(verified: true)).blocksCreate
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.ProjectNameConflict
+                .remoteNameCollision(record(verified: false)).blocksCreate
+        )
+        // The exact-identity conflicts read the same frozen roster and reach
+        // the same dead end, so they must follow the same rule.
+        XCTAssertTrue(
+            TeamOrchestrator.ProjectNameConflict.exactLive(record(verified: true)).blocksCreate
+        )
+        XCTAssertFalse(
+            TeamOrchestrator.ProjectNameConflict.exactLive(record(verified: false)).blocksCreate
+        )
+        // A local record is read from live state; there is no roster to freeze.
+        var local = conflictRecord(location: .detached(workspaceID: UUID()))
+        local.rosterVerified = false
+        XCTAssertTrue(
+            TeamOrchestrator.ProjectNameConflict.localNameCollision(local).blocksCreate,
+            "local lifecycle never depends on a remote roster read"
+        )
+        XCTAssertFalse(TeamOrchestrator.ProjectNameConflict.none.blocksCreate)
+        // Callers that do not deal in rosters must keep the old behaviour.
+        XCTAssertTrue(
+            TeamOrchestrator.remoteConflictRecord(
+                manifest, hostKey: "ssh:mac-sub", hostName: "mac-sub"
+            ).rosterVerified
+        )
+    }
+
+    func testRosterFreshnessTextSeparatesConfirmedFromFrozen() {
+        let confirmed = Date(timeIntervalSince1970: 1_788_000_000)
+        XCTAssertTrue(
+            NewProjectView.rosterFreshnessText(rosterHost(confirmedAt: confirmed))
+                .hasPrefix("confirmed ")
+        )
+        let frozen = NewProjectView.rosterFreshnessText(
+            rosterHost(confirmedAt: confirmed, failure: "the host did not answer ListTeams"),
+            now: confirmed.addingTimeInterval(600)
+        )
+        XCTAssertTrue(frozen.contains("last confirmed"))
+        XCTAssertTrue(
+            frozen.contains("did not answer ListTeams"),
+            "the reason the roster stopped refreshing is the whole point of the line"
+        )
+        XCTAssertEqual(
+            NewProjectView.rosterFreshnessText(rosterHost(confirmedAt: nil)), "not read yet"
+        )
+        XCTAssertTrue(
+            NewProjectView.rosterFreshnessText(
+                rosterHost(confirmedAt: nil, failure: "the session-owner route is unresolved")
+            ).hasPrefix("never confirmed")
+        )
+    }
+
+    @MainActor
+    func testRemoteWorkLogBufferFoldsRepeatsAndKeepsHistoryForLateReaders() {
+        let start = Date(timeIntervalSince1970: 1_788_000_000)
+        let buffer = RemoteWorkLogBuffer()
+        for offset in [0.0, 15.0, 30.0] {
+            buffer.record(
+                "probe skipped", severity: .info, at: start.addingTimeInterval(offset)
+            )
+        }
+        XCTAssertEqual(
+            buffer.entries.count, 1,
+            "a 15s repeat must not push the lines that explain a failure out of the window"
+        )
+        XCTAssertEqual(buffer.entries.last?.repeatCount, 3)
+        XCTAssertEqual(
+            buffer.entries.last?.date, start.addingTimeInterval(30),
+            "a folded run reports its latest occurrence, which is what 'still happening' asks"
+        )
+
+        // The same sentence at a different severity is a different fact.
+        buffer.record("probe skipped", severity: .error, at: start.addingTimeInterval(45))
+        XCTAssertEqual(buffer.entries.count, 2)
+
+        // A panel opened after the fact still sees what already happened; that
+        // is the whole reason this exists rather than a subscribe-only sink.
+        XCTAssertEqual(buffer.entries(since: start.addingTimeInterval(20)).count, 2)
+        XCTAssertEqual(buffer.entries(since: start.addingTimeInterval(40)).count, 1)
+    }
+
+    @MainActor
+    func testRemoteWorkLogBufferIsBoundedAndDropsTheOldest() {
+        let start = Date(timeIntervalSince1970: 1_788_000_000)
+        let buffer = RemoteWorkLogBuffer()
+        for index in 0..<(RemoteWorkLogBuffer.capacity + 10) {
+            buffer.record("line \(index)", severity: .info, at: start)
+        }
+        XCTAssertEqual(buffer.entries.count, RemoteWorkLogBuffer.capacity)
+        XCTAssertEqual(buffer.entries.first?.message, "line 10")
+        XCTAssertEqual(
+            buffer.entries.last?.message,
+            "line \(RemoteWorkLogBuffer.capacity + 9)"
+        )
+    }
+
+    func testPreflightNameDetailStaysShortAndDoesNotRepeatTheFooter() {
+        let manifest = leaderlessManifest(active: true)
+        func record(verified: Bool) -> TeamOrchestrator.ProjectConflictRecord {
+            TeamOrchestrator.remoteConflictRecord(
+                manifest, hostKey: "ssh:mac-sub", hostName: "mac-sub",
+                rosterVerified: verified
+            )
+        }
+        let blocking = TeamOrchestrator.ProjectNameConflict
+            .remoteNameCollision(record(verified: true))
+        let blocked = NewProjectView.preflightNameDetail(blocking)
+        XCTAssertEqual(blocked, "already used by a Project on mac-sub")
+        XCTAssertNotEqual(
+            blocked, ProjectCreationFlow.conflictDescription(blocking),
+            "the footer already prints the long sentence; repeating it pushed the "
+                + "collision card off the bottom of a fixed-height sheet"
+        )
+
+        let unconfirmed = TeamOrchestrator.ProjectNameConflict
+            .remoteNameCollision(record(verified: false))
+        XCTAssertTrue(
+            NewProjectView.preflightNameDetail(unconfirmed).contains("cannot block creation"),
+            "a row the user can act past must say so"
+        )
+        XCTAssertEqual(
+            NewProjectView.preflightNameDetail(.reservedByAnotherRequest(name: "xm")),
+            "another window is creating this name"
+        )
+    }
+
+    func testActivityLineNamesAFoldedRun() {
+        let entry = RemoteWorkLogEntry(
+            id: 1, date: Date(), message: "probe skipped", severity: .warning, repeatCount: 7
+        )
+        XCTAssertEqual(NewProjectView.activityLine(entry), "probe skipped  ×7")
+        var once = entry
+        once.repeatCount = 1
+        XCTAssertEqual(NewProjectView.activityLine(once), "probe skipped")
+    }
+
     func testRemoteManifestUIKeySeparatesHostsAndProjects() {
         let first = RemoteTeamSummary(
             name: "same-name", teamUUID: "one", workingDirectory: "/work",

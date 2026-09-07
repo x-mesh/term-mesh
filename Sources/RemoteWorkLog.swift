@@ -20,6 +20,71 @@ enum RemoteWorkLogSeverity: String, Hashable, Sendable {
     case error
 }
 
+/// One remote-work line as the UI shows it.
+struct RemoteWorkLogEntry: Identifiable, Equatable, Sendable {
+    let id: UInt64
+    /// The most recent time this line was emitted; a folded run reports its
+    /// latest occurrence, which is what "is this still happening?" asks.
+    var date: Date
+    let message: String
+    let severity: RemoteWorkLogSeverity
+    /// Consecutive identical lines are folded rather than repeated, the same
+    /// way the file does it. A 15s probe would otherwise push everything else
+    /// out of the window within an hour.
+    var repeatCount: Int = 1
+}
+
+/// The recent remote-work lines, kept in memory so any number of views can
+/// read them.
+///
+/// `RemoteWorkLog.sink` is a single closure owned by whichever view set it
+/// last, so a second reader silently stole the first one's lines. More
+/// importantly, a sink only ever delivers what happens *after* someone
+/// subscribes — and the lines that explain a failure are usually already
+/// past by the time anyone opens a panel to look. This keeps them.
+@MainActor
+final class RemoteWorkLogBuffer: ObservableObject {
+    static let shared = RemoteWorkLogBuffer()
+
+    /// Enough to cover the minutes before a sheet was opened, bounded so a
+    /// week-long session cannot grow it without limit.
+    static let capacity = 2000
+
+    @Published private(set) var entries: [RemoteWorkLogEntry] = []
+    private var nextID: UInt64 = 0
+
+    func record(
+        _ message: String,
+        severity: RemoteWorkLogSeverity,
+        at date: Date = Date()
+    ) {
+        if var last = entries.last, last.message == message, last.severity == severity {
+            last.repeatCount += 1
+            last.date = date
+            entries[entries.count - 1] = last
+            return
+        }
+        nextID += 1
+        entries.append(
+            RemoteWorkLogEntry(
+                id: nextID, date: date, message: message, severity: severity
+            )
+        )
+        if entries.count > Self.capacity {
+            entries.removeFirst(entries.count - Self.capacity)
+        }
+    }
+
+    /// Lines emitted at or after `date`, newest last.
+    func entries(since date: Date) -> [RemoteWorkLogEntry] {
+        entries.filter { $0.date >= date }
+    }
+
+    func clear() {
+        entries.removeAll()
+    }
+}
+
 /// Progress and failures of the remote-work (git checkpoint) path.
 ///
 /// This path used to fail invisibly: a guard set `errorMessage`, the drawer
@@ -114,6 +179,7 @@ enum RemoteWorkLog {
         dlog("remotework.\(message)")
         #endif
         guard messageLevel == .info || level == .debug else { return }
+        RemoteWorkLogBuffer.shared.record(message, severity: severity)
         sink?(message, severity)
     }
 
@@ -128,6 +194,7 @@ enum RemoteWorkLog {
         #endif
         Task { @MainActor in
             guard messageLevel == .info || level == .debug else { return }
+            RemoteWorkLogBuffer.shared.record(message, severity: severity)
             sink?(message, severity)
         }
     }
