@@ -4,6 +4,23 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.229.0] - 2026-09-07
+
+### Added
+- `tm-agent daemon doctor` diagnoses a peer host. It reports whether more than one `term-meshd` is listening there, whether a Project manifest names a surface nothing holds, and whether a manifest names a surface older than itself — the case no surface count can express, where a re-minted id points at an orphan from an earlier run. The doctor is read-only and repairs nothing: each finding names the existing prune or reset command that fixes it.
+- Resync a connected host from the sidebar. The host row gains a refresh button and a first context-menu item that re-read the host's capabilities, serving version, CLI directories and workspace roster, and re-arm both the subscription and the team poll. Work done on the host itself — `tm-agent` over ssh, a manifest another installation rewrote — used to stay invisible until the 15s poll caught it, and after session-owner discovery gave up it stayed invisible for the rest of the session. Resync is not a reconnect: the ssh tunnel, the relays and every open pane stay up.
+- Copy the patch out of a review board patch pane. Dragging was the only way to get that text out before.
+- Remove a stale Project without touching its files. A detached project row now offers `Delete Project…`, and the peer cleanup sheet lists Projects beside panes, marking each one dead, live, or closing with the panes you selected. Repositories, working folders, checkouts and worktrees are kept. The host proves at removal time that no declared surface is alive, so a stale row cannot remove a Project that came back.
+
+### Fixed
+- Dragging across a large block of text no longer freezes the app. TextKit 2 answered every mouse-moved event by laying out the document from the start, so the cost grew with the whole text rather than with what was on screen — a full second of main-thread work on a 256KB patch. The review board's patch pane and the Report an Issue bundle stop being selectable; the bundle already had Copy and Save, and the patch pane gains Copy Patch. Short strings elsewhere — an error message, a SHA, a path — stay selectable.
+- A daemon restart no longer makes a Project's leader vanish from the sidebar. The counter naming split panes restarted with the process, so the first split of every run hashed to one id and could take it from an orphan an earlier run left behind. A viewer following the manifest's leader id then reached the wrong surface while the leader process kept running. Split ids now carry a per-process nonce.
+- `tm-agent` finds the daemon on a Linux host with no environment set. The CLI probed `TMPDIR` and `/tmp` only, while the daemon binds `$XDG_RUNTIME_DIR/term-meshd.sock` or one of the installer's service paths, so a Linux host answered `DAEMON_UNAVAILABLE` until someone exported `TERMMESH_DAEMON_UNIX_PATH` by hand. The CLI now probes the same paths, in the same order, that remote discovery already probes over ssh, including the `peer.env` file the installer writes and a login shell never sees. An explicitly exported socket still wins, and macOS behaviour is unchanged.
+- A failed log write no longer kills the app. `FileHandle`'s older API raises an Objective-C exception that Swift cannot catch, so a single append on a full disk terminated the process and took every terminal session and remote pane with it. File-backed writes and reads now drop the line instead. Closes #479.
+- A daemon the app launched stops when its owner is gone, instead of outliving the app and holding its panes. Ownership belongs to the launching process and is claimed only when the peer listener is durable; a daemon started on its own is never adopted. An ownerless daemon confirms twice, 500ms apart, that no surface is live before it shuts down, and a surface arriving in that window cancels the shutdown.
+- A daemon shutdown that runs out of time says how much of the connection drain was left — how many tasks it started with, how many were still running, and how long it spent. The message read the same whether one connection ignored the shutdown or forty drained slowly, and those are different faults.
+- The systemd restart measurement can fail honestly. Three defects in it let a round pass for the wrong reason: a `grep -q` that killed `journalctl` mid-pipe and read a present line as absent, and a readiness check that accepted a socket connect before either server had started. Readiness is now all three facts — the relay accepts, the control server answers a ping, and the peer server has logged its listener.
+
 ## [0.228.0] - 2026-09-06
 
 ### Added
