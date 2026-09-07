@@ -3013,7 +3013,36 @@ struct RemoteHostGroupView: View, Equatable {
             .accessibilityLabel(isExpanded ? "Collapse \(host.displayName)" : "Expand \(host.displayName)")
             .help(isExpanded ? "Collapse \(host.displayName)" : "Expand \(host.displayName)")
 
+            // Ahead of the acting controls beside it: everything they operate
+            // on is what this row currently shows, and project state reaches
+            // the app only when the app asks for it. Work done on the host
+            // itself stays invisible until then, so the way to ask belongs
+            // where the stale number is read.
             if host.isConnected {
+                Button {
+                    store.resyncConnectedHost(host)
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .opacity(host.isRefreshing ? 0.4 : 1)
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(host.isRefreshing)
+                .accessibilityLabel(
+                    host.isRefreshing
+                        ? "Resyncing \(host.displayName)"
+                        : "Resync \(host.displayName) from the host"
+                )
+                .help(
+                    host.isRefreshing
+                        ? "Resyncing…"
+                        : "Resync from Host — re-read workspaces and projects. "
+                            + "Keeps the connection and open panes."
+                )
+
                 Button {
                     showShellCleanup = true
                     Task { await loadShellCleanup() }
@@ -3065,10 +3094,21 @@ struct RemoteHostGroupView: View, Equatable {
                     Button("Retry Connection") { store.retryConnectingHost(host) }
                 }
             case .connected:
-                // Grouped by what the action touches. Browsing the host,
-                // closing local views, and ending remote processes are three
-                // different scopes and their labels must say which one they
-                // affect.
+                // Grouped by what the action touches. Reading the host,
+                // browsing it, closing local views, and ending remote
+                // processes are four different scopes and their labels must
+                // say which one they affect.
+                //
+                // Reading comes first because everything under it acts on what
+                // this list currently shows, and the list can be out of date:
+                // project state reaches the app only when the app asks, so
+                // anything done on the host itself is invisible until it does.
+                Button(host.isRefreshing ? "Resyncing…" : "Resync from Host") {
+                    store.resyncConnectedHost(host)
+                }
+                .disabled(host.isRefreshing)
+
+                Divider()
                 Button("Open Surface as Pane…") {
                     store.openSurfaceAsPane(host)
                 }
