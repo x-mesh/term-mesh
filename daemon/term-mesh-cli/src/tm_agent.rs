@@ -4738,6 +4738,24 @@ fn unix_peer_uid(_stream: &UnixStream) -> Option<u32> {
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct UnixSocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn connected_socket_identity(stream: &UnixStream) -> Option<UnixSocketIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let peer_path = stream.peer_addr().ok()?.as_pathname()?.to_path_buf();
+    let target = std::fs::canonicalize(peer_path).ok()?;
+    let metadata = std::fs::metadata(target).ok()?;
+    Some(UnixSocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
 fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String> {
     let timeout = env::var("TERMMESH_RPC_TIMEOUT")
         .ok()
@@ -13289,6 +13307,7 @@ fn daemon_rpc_on_stream(stream: &UnixStream) -> Result<Value, String> {
 fn cmd_daemon_doctor(json: bool) {
     let expected_uid = doctor_expected_uid();
     let mut outcomes = Vec::new();
+    let mut trusted_identities = std::collections::HashSet::new();
     for path in daemon_socket_candidates() {
         let stream = match UnixStream::connect(&path) {
             Ok(stream) => stream,
@@ -13324,6 +13343,18 @@ fn cmd_daemon_doctor(json: bool) {
                     "socket owner uid {peer_uid} is neither expected uid {expected_uid} nor root"
                 )),
             ));
+            continue;
+        }
+        let Some(identity) = connected_socket_identity(&stream) else {
+            outcomes.push((
+                path,
+                DoctorSocketOutcome::Untrusted(
+                    "connected socket identity is unavailable; refusing this socket".into(),
+                ),
+            ));
+            continue;
+        };
+        if !trusted_identities.insert(identity) {
             continue;
         }
         let outcome = match daemon_rpc_on_stream(&stream) {
@@ -21729,6 +21760,52 @@ mod watcher_spec_tests {
         let (server, _) = listener.accept().unwrap();
         assert_eq!(unix_peer_uid(&client), Some(unsafe { libc::getuid() }));
         assert_eq!(unix_peer_uid(&server), Some(unsafe { libc::getuid() }));
+    }
+
+    #[test]
+    fn doctor_collapses_a_symlink_alias_to_one_listener() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("daemon.sock");
+        let alias = dir.path().join("daemon-alias.sock");
+        let other = dir.path().join("other.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        let other_listener = std::os::unix::net::UnixListener::bind(&other).unwrap();
+        symlink(&target, &alias).unwrap();
+
+        let target_stream = UnixStream::connect(&target).unwrap();
+        let alias_stream = UnixStream::connect(&alias).unwrap();
+        let other_stream = UnixStream::connect(&other).unwrap();
+        let target_identity = connected_socket_identity(&target_stream).unwrap();
+        let alias_identity = connected_socket_identity(&alias_stream).unwrap();
+        let other_identity = connected_socket_identity(&other_stream).unwrap();
+        assert_eq!(target_identity, alias_identity);
+        assert_ne!(target_identity, other_identity);
+
+        let mut identities = std::collections::HashSet::new();
+        let mut outcomes = Vec::new();
+        for (path, identity) in [(&target, target_identity), (&alias, alias_identity)] {
+            if identities.insert(identity) {
+                outcomes.push((
+                    path.to_path_buf(),
+                    DoctorSocketOutcome::Report(vec![json!({
+                        "code": "one_report",
+                        "severity": "warning",
+                    })]),
+                ));
+            }
+        }
+        let findings = aggregate_doctor_findings(&outcomes);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["code"], "one_report");
+        assert!(!findings
+            .iter()
+            .any(|finding| finding["code"] == "multiple_daemon_owners"));
+
+        drop(listener);
+        drop(other_listener);
     }
 }
 
