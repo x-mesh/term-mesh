@@ -329,6 +329,7 @@ final class ReviewBoardCoordinatorServiceTests: XCTestCase {
         let panes = paneRoots.enumerated().map { index, root in
             RemotePaneSummary(
                 id: Data([UInt8(index)]),
+                surfaceIDs: [Data([UInt8(index)])],
                 title: "pane",
                 workingDirectoryPath: root,
                 workingDirectoryName: nil,

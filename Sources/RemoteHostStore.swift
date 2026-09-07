@@ -72,6 +72,12 @@ struct RemoteTeamSummary: Identifiable, Equatable {
 
     var id: String { teamUUID.isEmpty ? name : teamUUID }
 
+    var presentationSurfaceIDs: Set<Data> {
+        var ids = Set(members.map(\.surfaceID).filter { !$0.isEmpty })
+        if !leaderSurfaceID.isEmpty { ids.insert(leaderSurfaceID) }
+        return ids
+    }
+
     init(
         name: String,
         teamUUID: String,
@@ -109,6 +115,8 @@ struct RemoteTeamSummary: Identifiable, Equatable {
 
 struct RemotePaneSummary: Identifiable, Equatable {
     let id: Data
+    /// Every tab surface in this pane, including the active surface.
+    let surfaceIDs: Set<Data>
     let title: String
     let workingDirectoryPath: String?
     let workingDirectoryName: String?
@@ -137,8 +145,11 @@ func peerPaneSummaries(
     func walk(_ node: Termmesh_Peer_V1_WorkspaceLayout) -> [RemotePaneSummary] {
         switch node.node {
         case .pane(let pane):
+            var surfaceIDs = Set(pane.tabs.map(\.surfaceID).filter { !$0.isEmpty })
+            if !pane.surfaceID.isEmpty { surfaceIDs.insert(pane.surfaceID) }
             return [RemotePaneSummary(
                 id: pane.surfaceID,
+                surfaceIDs: surfaceIDs,
                 title: pane.title.isEmpty ? "Shell" : pane.title,
                 workingDirectoryPath: pane.cwd.isEmpty ? nil : pane.cwd,
                 workingDirectoryName: shortDirectoryName(pane.cwd),
@@ -949,10 +960,35 @@ final class RemoteHostStore: ObservableObject {
     func installPeerShellCleanupCacheForTesting(
         hostID: String, sockPath: String, workspaces: [WorkspaceSummary]
     ) {
+        let profileID = UUID()
+        let endpoint = PeerHostEndpointProvenance(
+            sshTarget: "",
+            port: nil,
+            identityFile: nil,
+            remoteSocket: sockPath
+        )
         hosts[hostID] = HostEntry(
             id: hostID, displayName: hostID, connectionState: .connected,
             workspaces: workspaces, activeSockPath: sockPath,
-            sshTarget: nil, remoteSockPath: sockPath
+            sshTarget: nil, remoteSockPath: sockPath,
+            profileID: profileID,
+            hostCLIBinDirs: [],
+            hostCLIBinDirsResolved: true,
+            configuredEndpoint: endpoint,
+            hostCLIBinDirsProvenance: endpoint
+        )
+        hosts[hostID]?.sessionHostRemoteSockPath = sockPath
+        hosts[hostID]?.teamHostReadiness = .ready(
+            TeamHostCapabilitySnapshot(
+                endpoint: hosts[hostID]?.paneHostSpec.hostKey
+                    ?? .direct(sockPath: sockPath),
+                appVersion: "test",
+                supportsPeerOwnedAgentHosting: true,
+                supportsRemoteTeamRoute: true,
+                supportsAuthoritativeLeaderLiveness: true,
+                looksLikeGUIPeerHost: false,
+                redirectedFromServingEndpoint: false
+            )
         )
         workspaceRosterGenerations[hostID, default: 0] &+= 1
     }
@@ -995,7 +1031,7 @@ final class RemoteHostStore: ObservableObject {
         }
         let stalePanes = stale.enumerated().map { index, id in
             RemotePaneSummary(
-                id: id, title: "stale-\(index)", workingDirectoryPath: "/tmp",
+                id: id, surfaceIDs: [id], title: "stale-\(index)", workingDirectoryPath: "/tmp",
                 workingDirectoryName: "tmp", projectRootPath: nil, tabCount: 1,
                 columns: 80, rows: 24, isBusy: false
             )
@@ -2327,6 +2363,71 @@ final class RemoteHostStore: ObservableObject {
         // naming it before the asynchronous roster refresh lands.
         hosts[hostKey]?.teams.removeAll { $0.projectID == projectID }
         refreshTeamRoster(forHostKey: hostKey)
+    }
+
+    /// Observe one manifest without changing it. Cleanup uses the host's
+    /// exact live-surface count instead of inferring death from a stale row.
+    func inspectProjectRecord(
+        hostKey: String,
+        projectID: String
+    ) async throws -> Termmesh_Peer_V1_StaleProjectObservation {
+        guard let host = hosts[hostKey], host.isConnected, let spec = host.teamHostSpec else {
+            throw StaleProjectRecordRepairError.hostUnavailable
+        }
+        let lease: PeerPaneHostLease
+        do {
+            lease = try await PeerPaneHostRegistry.shared.acquire(spec)
+        } catch {
+            throw StaleProjectRecordRepairError.hostUnavailable
+        }
+        defer { PeerPaneHostRegistry.shared.release(lease) }
+        let connection: PeerRelayConnection
+        do {
+            connection = try await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
+        } catch {
+            throw StaleProjectRecordRepairError.hostUnavailable
+        }
+        defer { Task { await connection.cancel() } }
+        guard connection.hostCapabilities.has(PeerCapability.projectPresentationRepairV1) else {
+            throw StaleProjectRecordRepairError.unsupported
+        }
+        let response: Termmesh_Peer_V1_RepairStaleProjectPresentationResponse
+        do {
+            response = try await connection.session.repairStaleProjectPresentation(
+                projectID: projectID,
+                apply: false
+            )
+        } catch {
+            throw StaleProjectRecordRepairError.transport(error.localizedDescription)
+        }
+        if !response.ok, !response.hasObserved {
+            switch response.errorCode {
+            case "not_found": throw StaleProjectRecordRepairError.notFound
+            case "capability_unavailable": throw StaleProjectRecordRepairError.unsupported
+            default:
+                throw StaleProjectRecordRepairError.rejected(
+                    response.errorMessage.isEmpty ? response.errorCode : response.errorMessage
+                )
+            }
+        }
+        guard response.hasObserved else {
+            throw StaleProjectRecordRepairError.rejected("the host returned no observation")
+        }
+        return response.observed
+    }
+
+    /// Remove state only after the host proves that no declared surface is
+    /// alive. Ownership chooses the fast path; stale foreign records retain
+    /// the repair protocol's second observation and exact-instance check.
+    func resetDeadProjectRecord(hostKey: String, projectID: String) async throws {
+        let observed = try await inspectProjectRecord(hostKey: hostKey, projectID: projectID)
+        guard observed.liveSurfaces == 0 else {
+            throw StaleProjectRecordRepairError.live
+        }
+        // Cleanup is not an explicit "stop this live Project" action. Use the
+        // repair transaction even for our own record so the host rechecks
+        // liveness and the exact manifest instance at the mutation boundary.
+        try await repairStaleProjectRecord(hostKey: hostKey, projectID: projectID)
     }
 
     private func repairStep(

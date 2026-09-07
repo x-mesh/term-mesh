@@ -94,6 +94,7 @@ final class PeerWorkspaceMirrorTests: XCTestCase {
     ) -> RemotePaneSummary {
         RemotePaneSummary(
             id: Data([id]),
+            surfaceIDs: [Data([id])],
             title: "pane-\(id)",
             workingDirectoryPath: cwd,
             workingDirectoryName: cwd.flatMap { ($0 as NSString).lastPathComponent },

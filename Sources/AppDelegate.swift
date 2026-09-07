@@ -651,10 +651,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 #endif
 
-        // Peer federation: opt-in auto-start via `TERMMESH_PEER_SERVER_PATH`
-        // (or its legacy `TERMMESH_DEBUG_PEER_SERVER_PATH` alias). Without
-        // the env var the user must manually start the server from the
-        // status-bar menu — there is no implicit listener.
+        // Peer federation: the preference controls only whether the GUI peer
+        // server starts now. The daemon session owner starts independently.
         PeerHostCoordinator.autoStartIfConfigured()
 
         // Eager init so the NotificationCenter subscription is wired up
@@ -1133,7 +1131,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         TerminalController.shared.stop()
         // Worktree cleanup, if enabled, was started in applicationShouldTerminate
         // so it can run while the daemon is still up.
-        daemon.stopDaemon()
+        if let daemon = daemon as? TermMeshDaemon {
+            daemon.releaseDaemonOwnerForQuit()
+        } else {
+            daemon.stopDaemon()
+        }
         browserHistory.flushPendingSaves()
         PostHogAnalytics.shared.flush()
         notificationStore?.clearAll()

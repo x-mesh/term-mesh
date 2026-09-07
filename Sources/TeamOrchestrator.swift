@@ -8,6 +8,13 @@ import PeerProto
 /// each running in split panes within a single workspace.
 @MainActor
 final class TeamOrchestrator: ObservableObject {
+    enum ProjectRemovalScope: Equatable, Sendable {
+        case fullDelete
+        case stateOnly
+
+        nonisolated var removesFiles: Bool { self == .fullDelete }
+    }
+
     static let shared = TeamOrchestrator()
     static let localLeaderReadinessQueue = DispatchQueue(
         label: "term-mesh.leader-readiness", qos: .userInitiated
@@ -609,13 +616,17 @@ final class TeamOrchestrator: ObservableObject {
     /// second reattach/bootstrap against the same team. Runtime EOF can also
     /// arrive more than once while Ghostty and the peer relay unwind.
     var remoteLeaderRecoveryInFlight: Set<String> = []
+    /// Prevent a delete transaction from racing a newly-started leader or
+    /// member attach after the generation snapshot has been retired.
+    var projectDeletionInFlight: Set<String> = []
     /// The operator repair is one route transaction per Project. Review Board
     /// and the owner socket can invoke it concurrently, so MainActor alone is
     /// not a lock once the first call suspends for remote I/O.
     var collaborationRepairInFlight: Set<String> = []
 
     func beginRemoteLeaderAttach(teamName: String) -> Bool {
-        remoteLeaderRecoveryInFlight.insert(teamName).inserted
+        guard !projectDeletionInFlight.contains(teamName) else { return false }
+        return remoteLeaderRecoveryInFlight.insert(teamName).inserted
     }
 
     func endRemoteLeaderAttach(teamName: String) {
@@ -8156,7 +8167,8 @@ final class TeamOrchestrator: ObservableObject {
     func destroyTeam(
         name: String,
         tabManager: TabManager,
-        archive: Bool = true
+        archive: Bool = true,
+        removalScope: ProjectRemovalScope = .fullDelete
     ) -> Bool {
         guard let team = teams[name] else { return false }
         remoteProjectManifestTasks.removeValue(forKey: name)?.cancel()
@@ -8207,7 +8219,9 @@ final class TeamOrchestrator: ObservableObject {
             )
         }
         guard let workspace = tabManager.tabs.first(where: { $0.id == team.workspaceId }) else {
-            cleanupWorktrees(team: team, name: name)
+            if removalScope.removesFiles {
+                cleanupWorktrees(team: team, name: name)
+            }
             clearResults(teamName: name)
             clearMessages(teamName: name)
             clearTasks(teamName: name)
@@ -8246,8 +8260,11 @@ final class TeamOrchestrator: ObservableObject {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             tabManager.closeTab(wsRef)
-            // Clean up worktrees after workspace is closed
-            self.cleanupWorktrees(team: teamCopy, name: name)
+            if removalScope.removesFiles {
+                // Clean up worktrees after workspace is closed. State-only
+                // removal deliberately leaves every checkout on disk.
+                self.cleanupWorktrees(team: teamCopy, name: name)
+            }
         }
 
         // Stop periodic render timer if no teams remain after this removal

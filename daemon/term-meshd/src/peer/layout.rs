@@ -1411,6 +1411,8 @@ pub struct PeerHost {
     /// Host-level lifecycle boundary covering PTY, layout, and reverse index.
     /// The manager's per-id lock remains authoritative for PTY internals.
     surface_lifecycle: Mutex<HashMap<SurfaceId, Weak<Mutex<()>>>>,
+    /// Serializes ownerless shutdown admission with surface creation.
+    surface_admission: Mutex<SurfaceAdmission>,
     /// Live system stats for the machine this host runs on, if the daemon
     /// wired its monitor in. `None` for every host built without one (the
     /// test constructors, and any embedder that has no monitor) — those
@@ -1457,6 +1459,10 @@ pub struct PeerHost {
     /// counts up, and the repair compares it under the same lock that removes.
     project_presentation_instances: Mutex<HashMap<String, u64>>,
     project_presentation_watchers: Mutex<HashSet<Vec<u8>>>,
+}
+
+struct SurfaceAdmission {
+    closed: bool,
 }
 
 /// Debounce window for layout pushes. Mirrors the Swift host's 120 ms
@@ -1576,6 +1582,7 @@ impl PeerHost {
             persist_path: Mutex::new(None),
             workspace_persistence: Mutex::new(()),
             surface_lifecycle: Mutex::new(HashMap::new()),
+            surface_admission: Mutex::new(SurfaceAdmission { closed: false }),
             monitor: Mutex::new(None),
             teams: Mutex::new(None),
             agents: Mutex::new(None),
@@ -1596,6 +1603,21 @@ impl PeerHost {
         let lock = Arc::new(Mutex::new(()));
         locks.insert(surface_id.to_vec(), Arc::downgrade(&lock));
         lock
+    }
+
+    pub fn with_open_surface_admission<T>(&self, body: impl FnOnce() -> T) -> Option<T> {
+        let guard = self.surface_admission.lock().unwrap();
+        if guard.closed {
+            return None;
+        }
+        Some(body())
+    }
+
+    pub fn evaluate_surface_admission(&self, body: impl FnOnce() -> bool) {
+        let mut guard = self.surface_admission.lock().unwrap();
+        if body() {
+            guard.closed = true;
+        }
     }
 
     /// Wire the on-disk persistence path after construction. Kept out of
@@ -1664,6 +1686,13 @@ impl PeerHost {
             .filter(|surface| surface.info().attachable)
             .map(|surface| surface.surface_id.clone())
             .collect()
+    }
+
+    pub(crate) fn has_live_attachable_surfaces(&self) -> bool {
+        self.pty
+            .list()
+            .into_iter()
+            .any(|surface| surface.info().attachable)
     }
 
     fn presentation_status(
@@ -2575,6 +2604,10 @@ impl PeerHost {
         key: &str,
         spec: &SurfaceSpec,
     ) -> Result<EnsureOutcome, EnsureError> {
+        let admission_guard = self.surface_admission.lock().unwrap();
+        if admission_guard.closed {
+            return Err(EnsureError::Internal("daemon shutdown is committed"));
+        }
         let surface_id = surface_id_from_name(key);
         let lifecycle = self.surface_lifecycle_lock(&surface_id);
         let _lifecycle_guard = lifecycle
@@ -3039,23 +3072,23 @@ impl PeerHost {
         {
             return None;
         }
-        // A dead source pane revives first, same as attach would do — the
-        // user is clearly working in it. No-op when it is alive.
-        self.pty.get_or_respawn(pane_id);
-        let new_id = self.spawn_ephemeral(pane_id, &ws_id)?;
-        match self.with_store(&ws_id, |store| {
-            store.split_pane(pane_id, orientation, new_id.clone())
-        }) {
-            Some(Ok(true)) => Some(ws_id),
-            Some(Ok(false)) => None,
-            _ => {
-                // Source pane (or its workspace) vanished between probe and
-                // insert; don't leak the shell we spawned for it.
-                self.pty.remove(&new_id);
-                self.surface_workspace.lock().unwrap().remove(&new_id);
-                None
+        self.with_open_surface_admission(|| {
+            // A dead source pane revives first, same as attach would do — the
+            // user is clearly working in it. No-op when it is alive.
+            self.pty.get_or_respawn(pane_id);
+            let new_id = self.spawn_ephemeral_unlocked(pane_id, &ws_id)?;
+            match self.with_store(&ws_id, |store| {
+                store.split_pane(pane_id, orientation, new_id.clone())
+            }) {
+                Some(Ok(true)) => Some(ws_id),
+                Some(Ok(false)) => None,
+                _ => {
+                    self.pty.remove(&new_id);
+                    self.surface_workspace.lock().unwrap().remove(&new_id);
+                    None
+                }
             }
-        }
+        }).flatten()
     }
 
     /// `pane_id` resolving to an existing pane always wins (matches every
@@ -3075,17 +3108,18 @@ impl PeerHost {
                 })
                 .unwrap_or(false)
             {
-                self.pty.get_or_respawn(pane_id);
-                let new_id = self.spawn_ephemeral(pane_id, &ws_id)?;
-                return match self.with_store(&ws_id, |store| store.add_tab(pane_id, new_id.clone()))
-                {
-                    Some(Ok(true)) => Some(ws_id),
-                    _ => {
-                        self.pty.remove(&new_id);
-                        self.surface_workspace.lock().unwrap().remove(&new_id);
-                        None
+                return self.with_open_surface_admission(|| {
+                    self.pty.get_or_respawn(pane_id);
+                    let new_id = self.spawn_ephemeral_unlocked(pane_id, &ws_id)?;
+                    match self.with_store(&ws_id, |store| store.add_tab(pane_id, new_id.clone())) {
+                        Some(Ok(true)) => Some(ws_id),
+                        _ => {
+                            self.pty.remove(&new_id);
+                            self.surface_workspace.lock().unwrap().remove(&new_id);
+                            None
+                        }
                     }
-                };
+                }).flatten();
             }
         }
 
@@ -3184,6 +3218,16 @@ impl PeerHost {
     /// closing it is permanent for this daemon lifetime and a raw
     /// `AttachSurface` for the same id can't resurrect it.
     fn spawn_ephemeral(
+        self: &Arc<Self>,
+        source_pane: &[u8],
+        workspace_id: &[u8],
+    ) -> Option<SurfaceId> {
+        self.with_open_surface_admission(|| {
+            self.spawn_ephemeral_unlocked(source_pane, workspace_id)
+        }).flatten()
+    }
+
+    fn spawn_ephemeral_unlocked(
         self: &Arc<Self>,
         source_pane: &[u8],
         workspace_id: &[u8],

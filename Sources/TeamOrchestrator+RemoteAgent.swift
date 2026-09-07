@@ -3139,6 +3139,48 @@ extension TeamOrchestrator {
         var idLabel: String { id.prefix(4).map { String(format: "%02x", $0) }.joined() }
     }
 
+    struct PeerProjectCleanupItem: Identifiable, Equatable {
+        enum State: Equatable {
+            case dead
+            case closesWithSelectedPanes
+            case live
+            case unresolved(String)
+        }
+
+        let id: String
+        let name: String
+        let workingDirectory: String
+        let surfaceIDs: Set<Data>
+        let ownedByRequester: Bool
+        let liveSurfaceCount: Int
+        let state: State
+        let remainingLiveSurfaceCount: Int
+    }
+
+    struct PeerCleanupInspection: Equatable {
+        let panes: [PeerShellCleanupItem]
+        let projects: [PeerProjectCleanupItem]
+    }
+
+    struct PeerCleanupResult: Equatable {
+        let closedPanes: Int
+        let resetProjects: Int
+        let failedProjects: [String]
+    }
+
+    enum PeerCleanupProjectResetError: LocalizedError {
+        case partial(PeerCleanupResult)
+
+        var errorDescription: String? {
+            switch self {
+            case .partial(let result):
+                let failures = result.failedProjects.joined(separator: "; ")
+                return "Closed \(result.closedPanes) panes and reset "
+                    + "\(result.resetProjects) Projects. Remaining: \(failures)"
+            }
+        }
+    }
+
     /// `LocalizedError` is what puts `description` in front of the user. An
     /// alert reads `localizedDescription`, and a plain `Error` answers that
     /// with "(term_mesh.TeamOrchestrator.RemoteAgentError error 12.)" — so a
@@ -4086,6 +4128,89 @@ extension TeamOrchestrator {
         }
     }
 
+    func inspectPeerCleanup(
+        host: HostEntry,
+        workspaceID: Data? = nil,
+        selectedPaneIDs: Set<Data> = []
+    ) async throws -> PeerCleanupInspection {
+        let panes = try await inspectPeerShells(host: host, workspaceID: workspaceID)
+        let workspaceSurfaceIDs: Set<Data>? = workspaceID.flatMap { id in
+            host.workspaces.first(where: { $0.id == id }).map { workspace in
+                workspace.panes.reduce(into: Set<Data>()) {
+                    $0.formUnion($1.surfaceIDs)
+                }
+            }
+        }
+        var projects: [PeerProjectCleanupItem] = []
+        for team in host.teams {
+            let surfaceIDs = team.presentationSurfaceIDs
+            if let workspaceSurfaceIDs, surfaceIDs.isDisjoint(with: workspaceSurfaceIDs) {
+                continue
+            }
+            guard !team.projectID.isEmpty else { continue }
+            let observation: Termmesh_Peer_V1_StaleProjectObservation
+            do {
+                observation = try await RemoteHostStore.shared.inspectProjectRecord(
+                    hostKey: host.id,
+                    projectID: team.projectID
+                )
+            } catch {
+                projects.append(PeerProjectCleanupItem(
+                    id: team.projectID,
+                    name: team.name,
+                    workingDirectory: team.workingDirectory,
+                    surfaceIDs: surfaceIDs,
+                    ownedByRequester: false,
+                    liveSurfaceCount: 0,
+                    state: .unresolved(error.localizedDescription),
+                    remainingLiveSurfaceCount: 0
+                ))
+                continue
+            }
+            let live = Int(observation.liveSurfaces)
+            let (state, remaining) = Self.projectCleanupState(
+                liveSurfaceCount: live,
+                projectSurfaceIDs: surfaceIDs,
+                selectedPaneIDs: selectedPaneIDs
+            )
+            projects.append(PeerProjectCleanupItem(
+                id: team.projectID,
+                name: team.name,
+                workingDirectory: team.workingDirectory,
+                surfaceIDs: surfaceIDs,
+                ownedByRequester: observation.ownedByRequester,
+                liveSurfaceCount: live,
+                state: state,
+                remainingLiveSurfaceCount: remaining
+            ))
+        }
+        projects.sort {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+        return PeerCleanupInspection(panes: panes, projects: projects)
+    }
+
+    nonisolated static func projectCleanupState(
+        liveSurfaceCount: Int,
+        projectSurfaceIDs: Set<Data>,
+        selectedPaneIDs: Set<Data>
+    ) -> (PeerProjectCleanupItem.State, Int) {
+        let selected = projectSurfaceIDs.intersection(selectedPaneIDs).count
+        let remaining = max(0, liveSurfaceCount - selected)
+        if liveSurfaceCount == 0 { return (.dead, 0) }
+        if remaining == 0, selected > 0 { return (.closesWithSelectedPanes, 0) }
+        return (.live, remaining)
+    }
+
+    nonisolated static func cleanupProjectMatchesLocalTeam(
+        projectID: String,
+        hostKey: String,
+        localProjectID: String,
+        localHostKey: String?
+    ) -> Bool {
+        projectID == localProjectID && hostKey == localHostKey
+    }
+
     /// Sweeps leftover *shells*, which is why this one keeps the serving
     /// endpoint while the team lifecycle above moved to the session owner.
     ///
@@ -4131,6 +4256,115 @@ extension TeamOrchestrator {
             group.cancelAll()
             return first
         }
+    }
+
+    func cleanPeerState(
+        host: HostEntry,
+        paneIDs: Set<Data>,
+        projectIDs: Set<String>,
+        force: Bool = false
+    ) async throws -> PeerCleanupResult {
+        var closedPanes = 0
+        var paneFailure: Error?
+        if !paneIDs.isEmpty {
+            do {
+                closedPanes = try await closePeerShells(
+                    host: host, surfaceIDs: paneIDs, force: force
+                )
+            } catch {
+                paneFailure = error
+            }
+        }
+
+        if paneFailure != nil || closedPanes != paneIDs.count {
+            let reason = paneFailure?.localizedDescription
+                ?? "host closed \(closedPanes) of \(paneIDs.count) selected panes"
+            return PeerCleanupResult(
+                closedPanes: closedPanes,
+                resetProjects: 0,
+                failedProjects: ["panes: \(reason)"]
+            )
+        }
+
+        var resetProjects = 0
+        var failedProjects: [String] = []
+        for projectID in projectIDs.sorted() {
+            do {
+                let remoteSummary = host.teams.first { $0.projectID == projectID }
+                // Pane selection is only a projection. The host must prove at
+                // mutation time that the exact manifest has no live surface.
+                try await RemoteHostStore.shared.resetDeadProjectRecord(
+                    hostKey: host.id,
+                    projectID: projectID
+                )
+                projectDeletionSuppressions.insert(
+                    Self.projectDeletionSuppressionKey(
+                        hostID: host.id, projectID: projectID
+                    )
+                )
+                let local = teams.values.first(where: {
+                    let localProjectID = Self.effectiveRemotePresentationProjectID(
+                        storedProjectID: $0.remotePresentationProjectID,
+                        teamUUID: $0.teamUuid,
+                        teamName: $0.id
+                    )
+                    let localHostKey: String?
+                    if let stored = $0.remotePresentationHostKey {
+                        localHostKey = stored
+                    } else if case let .peer(key) = $0.leaderEndpoint {
+                        localHostKey = key
+                    } else {
+                        localHostKey = nil
+                    }
+                    return Self.cleanupProjectMatchesLocalTeam(
+                        projectID: projectID,
+                        hostKey: host.id,
+                        localProjectID: localProjectID,
+                        localHostKey: localHostKey
+                    )
+                })
+                if let local {
+                    let manager = AppDelegate.shared?.tabManagerFor(tabId: local.workspaceId)
+                        ?? AppDelegate.shared?.mainWindowContexts.values.first?.tabManager
+                    guard let manager else {
+                        throw RemoteAgentError.projectDeletionIncomplete(
+                            "No window can close the local Project state"
+                        )
+                    }
+                    try await deleteProject(
+                            teamName: local.id,
+                            tabManager: manager,
+                            removalScope: .stateOnly
+                    )
+                }
+                for record in ManagedPeerSurfaceStore.shared.records(hostKey: host.id)
+                where record.projectID == projectID
+                    || record.teamName == remoteSummary?.name {
+                    if let surfaceID = record.surfaceID {
+                        ManagedPeerSurfaceStore.shared.forget(
+                            hostKey: host.id, surfaceID: surfaceID
+                        )
+                    }
+                }
+                if let remoteSummary {
+                    ManagedPeerSurfaceStore.shared.forget(teamName: remoteSummary.name)
+                    RemoteProjectLocationStore.shared.forget(teamName: remoteSummary.name)
+                    RemoteProjectPaths.shared.forget(
+                        host: host.id,
+                        localRoot: remoteSummary.workingDirectory
+                    )
+                }
+                resetProjects += 1
+            } catch {
+                failedProjects.append("\(projectID): \(error.localizedDescription)")
+            }
+        }
+
+        return PeerCleanupResult(
+            closedPanes: closedPanes,
+            resetProjects: resetProjects,
+            failedProjects: failedProjects
+        )
     }
 
     private func performClosePeerShells(
@@ -6763,6 +6997,9 @@ extension TeamOrchestrator {
         cli: String = "claude",
         agentInstanceId reservedAgentInstanceId: String? = nil
     ) async throws -> AgentMember {
+        guard !projectDeletionInFlight.contains(teamName) else {
+            throw RemoteAgentError.teamNotFound(teamName)
+        }
         guard let team = teams[teamName] else { throw RemoteAgentError.teamNotFound(teamName) }
         let requiresDurableRemoteMember: Bool
         if team.ownsRemotePresentation, case .peer = team.leaderEndpoint {
@@ -10440,9 +10677,24 @@ extension TeamOrchestrator {
     }
 
     @MainActor
-    func deleteProject(teamName: String, tabManager: TabManager) async throws {
+    func deleteProject(
+        teamName: String,
+        tabManager: TabManager,
+        removalScope: ProjectRemovalScope = .fullDelete
+    ) async throws {
         guard let team = teams[teamName] else {
             throw RemoteAgentError.teamNotFound(teamName)
+        }
+        guard projectDeletionInFlight.insert(teamName).inserted else {
+            throw RemoteAgentError.projectDeletionIncomplete(
+                "Project deletion is already in progress."
+            )
+        }
+        var removalCommitted = false
+        defer {
+            if !removalCommitted {
+                projectDeletionInFlight.remove(teamName)
+            }
         }
         // Destructive Project actions follow the workspace owner. A sheet in
         // window A may resolve an incomplete Project in window B; using A's
@@ -10450,6 +10702,22 @@ extension TeamOrchestrator {
         // alive. Resolve once, before any teardown side effect.
         let tabManager = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId)
             ?? tabManager
+        if removalScope == .stateOnly, team.leaderEndpoint == .local {
+            LeaderAttachGenerationGate.shared.invalidateAll(teamName: teamName)
+            _ = destroyTeam(
+                name: teamName,
+                tabManager: tabManager,
+                archive: false,
+                removalScope: .stateOnly
+            )
+            if let projectID = team.remotePresentationProjectID
+                ?? team.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:)) {
+                removeProjectPresentationLayout(projectID: projectID)
+            }
+            projectDeletionInFlight.remove(teamName)
+            removalCommitted = true
+            return
+        }
         let deletionSuppression: String? = {
             guard case let .peer(hostKey) = team.leaderEndpoint,
                   let projectID = team.remotePresentationProjectID
@@ -10457,14 +10725,48 @@ extension TeamOrchestrator {
             else { return nil }
             return Self.projectDeletionSuppressionKey(hostID: hostKey, projectID: projectID)
         }()
+        var stateOnlyManifestRemoved = false
+        if removalScope == .stateOnly {
+            guard case let .peer(hostKey) = team.leaderEndpoint,
+                  let projectID = team.remotePresentationProjectID
+                    ?? team.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:))
+            else {
+                throw RemoteAgentError.projectDeletionIncomplete(
+                    "The Project has no authoritative host record to remove."
+                )
+            }
+            LeaderAttachGenerationGate.shared.invalidateAll(teamName: teamName)
+            let suppression = Self.projectDeletionSuppressionKey(
+                hostID: hostKey, projectID: projectID
+            )
+            if !projectDeletionSuppressions.contains(suppression) {
+                do {
+                    try await RemoteHostStore.shared.deleteOwnedProjectRecord(
+                        hostKey: hostKey, projectID: projectID
+                    )
+                } catch OwnedProjectRecordRemovalError.notOwner {
+                    try await RemoteHostStore.shared.repairStaleProjectRecord(
+                        hostKey: hostKey, projectID: projectID
+                    )
+                }
+                projectDeletionSuppressions.insert(suppression)
+            }
+            stateOnlyManifestRemoved = true
+        }
         // A discovered presentation is a local viewer, not an ownership
-        // grant. Its destructive action is therefore a detach: close only
-        // this app's sessions and leave the daemon-owned surfaces and files.
+        // grant. Full deletion remains a detach. State-only removal must first
+        // prove that the authoritative record is ours or stale; otherwise a
+        // live Project would disappear from this sidebar while staying live.
         guard team.ownsRemotePresentation else {
-            _ = destroyTeam(name: teamName, tabManager: tabManager, archive: false)
+            _ = destroyTeam(
+                name: teamName, tabManager: tabManager, archive: false,
+                removalScope: removalScope
+            )
+            removalCommitted = true
+            projectDeletionInFlight.remove(teamName)
             return
         }
-        if Self.shouldTombstoneDeletedProject(
+        if removalScope == .fullDelete, Self.shouldTombstoneDeletedProject(
             ownsRemotePresentation: team.ownsRemotePresentation
         ), let deletionSuppression {
             projectDeletionSuppressions.insert(deletionSuppression)
@@ -10522,9 +10824,9 @@ extension TeamOrchestrator {
         // the pathname alive, while this connection keeps the authenticated
         // protocol session itself alive across every destructive step.
         var manifestDeletionConnection: PeerRelayConnection?
-        if case let .peer(hostKey) = team.leaderEndpoint,
-           let teamUUID = team.teamUuid,
-           !teamUUID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !stateOnlyManifestRemoved,
+           case let .peer(hostKey) = team.leaderEndpoint,
+           team.remotePresentationProjectID != nil || team.teamUuid != nil {
             let sock = teamSock(hostKey)
             guard !sock.isEmpty else {
                 throw RemoteAgentError.projectDeletionIncomplete(
@@ -10555,18 +10857,22 @@ extension TeamOrchestrator {
         // timed out and discovery hid the now-dead surfaces even though the
         // record was still on disk. A successful response here proves the
         // durable record is gone before local/remote runtime cleanup begins.
-        if case let .peer(hostKey) = team.leaderEndpoint,
-           let teamUUID = team.teamUuid,
-           !teamUUID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        if !stateOnlyManifestRemoved,
+           case let .peer(hostKey) = team.leaderEndpoint,
+           let projectID = team.remotePresentationProjectID
+                ?? team.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:)),
            let connection = manifestDeletionConnection {
             do {
                 let response = try await connection.session.deleteProjectPresentation(
-                    projectID: Self.remoteProjectPresentationID(teamUUID: teamUUID)
+                    projectID: projectID
                 )
                 guard response.ok else {
                     throw RemoteAgentError.projectDeletionIncomplete(
                         "manifest \(hostKey): \(response.errorCode)"
                     )
+                }
+                if removalScope == .stateOnly, let deletionSuppression {
+                    projectDeletionSuppressions.insert(deletionSuppression)
                 }
                 RemoteHostStore.shared.refreshTeamRoster(forHostKey: hostKey)
             } catch {
@@ -10628,9 +10934,10 @@ extension TeamOrchestrator {
 
         // Read through the durable record: after a restart the team's
         // in-memory list is empty while its checkouts are still on the peers.
+        let knownLocations = knownRemoteProjectLocations(teamName: teamName)
         let grouped = Dictionary(
-            grouping: Self.ownedRemoteProjectLocations(
-                knownRemoteProjectLocations(teamName: teamName)
+            grouping: Self.projectLocationsForFilesystemDeletion(
+                knownLocations, removalScope: removalScope
             ),
             by: \.hostKey
         )
@@ -10916,7 +11223,8 @@ extension TeamOrchestrator {
             }
         }
 
-        if case let .peer(hostKey) = team.leaderEndpoint,
+        if removalScope.removesFiles,
+           case let .peer(hostKey) = team.leaderEndpoint,
            let teamUUID = team.teamUuid,
            let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }) {
             do {
@@ -10941,10 +11249,38 @@ extension TeamOrchestrator {
         }
         let projectID = team.remotePresentationProjectID
             ?? team.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:))
-        _ = destroyTeam(name: teamName, tabManager: tabManager, archive: false)
+        if removalScope == .stateOnly {
+            for hostKey in Set(knownLocations.map(\.hostKey)) {
+                RemoteProjectPaths.shared.forget(
+                    host: hostKey, localRoot: team.workingDirectory
+                )
+            }
+        }
+        ManagedPeerSurfaceStore.shared.forget(teamName: teamName)
+        _ = destroyTeam(
+            name: teamName, tabManager: tabManager, archive: false,
+            removalScope: removalScope
+        )
         if let projectID {
             removeProjectPresentationLayout(projectID: projectID)
         }
+        removalCommitted = true
+        projectDeletionInFlight.remove(teamName)
+    }
+
+    nonisolated static func projectLocationsForFilesystemDeletion(
+        _ locations: [Team.RemoteProjectLocation],
+        removalScope: ProjectRemovalScope
+    ) -> [Team.RemoteProjectLocation] {
+        guard removalScope.removesFiles else { return [] }
+        return ownedRemoteProjectLocations(locations)
+    }
+
+    nonisolated static func stateOnlyRemovalNeedsRemoteManifest(
+        leaderEndpoint: LeaderEndpoint
+    ) -> Bool {
+        if case .peer = leaderEndpoint { return true }
+        return false
     }
 
     /// Terminal panes inside a project-owned workspace are removed by the
