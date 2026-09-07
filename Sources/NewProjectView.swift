@@ -337,7 +337,7 @@ struct NewProjectView: View {
                     peerHostEditorContext = nil
                 },
                 onRepair: { profile in
-                    hostStore.repairConnection(using: profile)
+                    await hostStore.repairConnection(using: profile)
                 },
                 onCancel: { peerHostEditorContext = nil }
             )

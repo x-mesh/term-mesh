@@ -28,6 +28,17 @@ enum PeerHostTestResult: Equatable {
     case sshFailed(String)
 }
 
+enum PeerHostRepairDecision: Equatable {
+    case reconnect
+    case launchMacAppThenRetest
+    case blocked(String)
+}
+
+enum PeerHostRepairResult: Equatable {
+    case ready
+    case blocked(String)
+}
+
 /// Exact route proven by Test Relay. Kept separate from the connection state
 /// so the editor can show which socket was configured, which one discovery
 /// found, which endpoint answered, and which durable session owner the host
@@ -183,10 +194,168 @@ enum PeerHostDoctor {
         var isRunning: Bool
     }
 
+    enum MacAppLaunchResult: Equatable {
+        case launched
+        case alreadyRunning
+        case notMac
+        case notInstalled
+        case failed(String)
+    }
+
     /// Distinguishes a dead/stale macOS app socket from a live server that
     /// rejected the protocol. Fixed shell text; no user input enters syntax.
     static let macAppRuntimeProbeCommand =
         #"sh -c 'if [ "$(uname -s)" != Darwin ]; then exit 44; fi; if [ -d /Applications/term-mesh.app ]; then echo app-installed=1; else echo app-installed=0; fi; v=$(/usr/bin/defaults read /Applications/term-mesh.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null); [ -n "$v" ] && echo "app-version=$v"; if /usr/bin/pgrep -f "^/Applications/term-mesh[.]app/Contents/MacOS/term-mesh$" >/dev/null 2>&1; then echo app-running=1; else echo app-running=0; fi; exit 0'"#
+
+    /// Starts only the installed production macOS app. The command is fixed:
+    /// profile fields travel only as validated ssh argv and never enter it.
+    static let macAppLaunchCommand =
+        #"sh -c 'if [ "$(uname -s)" != Darwin ]; then echo repair-not-mac; exit 0; fi; if [ ! -d /Applications/term-mesh.app ]; then echo repair-not-installed; exit 0; fi; if /usr/bin/pgrep -f "^/Applications/term-mesh[.]app/Contents/MacOS/term-mesh$" >/dev/null 2>&1; then echo repair-already-running; exit 0; fi; if /usr/bin/open -gj /Applications/term-mesh.app; then echo repair-launched; else echo repair-failed; fi'"#
+
+    static func parseMacAppLaunchResult(_ output: String) -> MacAppLaunchResult {
+        var result: MacAppLaunchResult?
+        for rawLine in output.split(whereSeparator: { $0.isNewline }) {
+            switch rawLine.trimmingCharacters(in: .whitespacesAndNewlines) {
+            case "repair-launched": result = .launched
+            case "repair-already-running": result = .alreadyRunning
+            case "repair-not-mac": result = .notMac
+            case "repair-not-installed": result = .notInstalled
+            case "repair-failed": result = .failed("The remote open command failed.")
+            default: continue
+            }
+        }
+        return result ?? .failed("The remote app launch returned an invalid response.")
+    }
+
+    static func repairDecision(
+        for result: PeerHostTestResult,
+        macAppStatus: MacAppRuntimeStatus? = nil
+    ) -> PeerHostRepairDecision {
+        switch result {
+        case .ok:
+            return .reconnect
+        case .appNotRunning:
+            return .launchMacAppThenRetest
+        case .daemonMissing where macAppStatus?.isInstalled == true
+            && macAppStatus?.isRunning == false:
+            return .launchMacAppThenRetest
+        case .daemonMissing:
+            return .blocked(
+                "No live peer socket was found. Start term-meshd on the Linux host, then retry."
+            )
+        case .relayFailed(_, let message):
+            return .blocked("The remote peer handshake failed: \(message)")
+        case .sshFailed(let message):
+            return .blocked("SSH failed: \(message)")
+        }
+    }
+
+    static func repairRetestSocket(configuredSocket: String) -> String? {
+        configuredSocket.nonEmpty
+    }
+
+    private static func launchInstalledMacApp(
+        sshTarget: String,
+        port: Int?,
+        identityFile: String?
+    ) async -> MacAppLaunchResult {
+        do {
+            let output = try await runRemote(
+                sshTarget: sshTarget, port: port, identityFile: identityFile,
+                command: macAppLaunchCommand, timeoutSeconds: 15
+            )
+            return parseMacAppLaunchResult(output)
+        } catch {
+            return .failed(String(describing: error))
+        }
+    }
+
+    /// Repairs only the known macOS owner-app failure. A pathname is never
+    /// enough: success requires the same peer handshake as Test Relay.
+    static func repairConnection(
+        profile: PeerHostProfile,
+        deadlineSeconds: TimeInterval = 20
+    ) async -> PeerHostRepairResult {
+        if Task.isCancelled {
+            return .blocked("Connection repair was cancelled.")
+        }
+        let initial = await test(
+            sshTarget: profile.sshTarget, port: profile.sshPort,
+            identityFile: profile.identityFile, remoteSocket: profile.remoteSocket
+        )
+        if Task.isCancelled {
+            return .blocked("Connection repair was cancelled.")
+        }
+        let macAppStatus: MacAppRuntimeStatus?
+        if case .daemonMissing = initial {
+            macAppStatus = await macAppRuntimeStatus(
+                sshTarget: profile.sshTarget,
+                port: profile.sshPort,
+                identityFile: profile.identityFile
+            )
+            if Task.isCancelled {
+                return .blocked("Connection repair was cancelled.")
+            }
+        } else {
+            macAppStatus = nil
+        }
+        switch repairDecision(for: initial, macAppStatus: macAppStatus) {
+        case .reconnect:
+            return .ready
+        case .blocked(let message):
+            return .blocked(message)
+        case .launchMacAppThenRetest:
+            break
+        }
+
+        // Preserve only a user-pinned socket. An auto-detected pathname can
+        // change when the app restarts, so every retry must discover it again.
+        let repairSocket = repairRetestSocket(configuredSocket: profile.remoteSocket)
+        if Task.isCancelled {
+            return .blocked("Connection repair was cancelled.")
+        }
+        switch await launchInstalledMacApp(
+            sshTarget: profile.sshTarget, port: profile.sshPort,
+            identityFile: profile.identityFile
+        ) {
+        case .launched, .alreadyRunning:
+            break
+        case .notMac:
+            return .blocked("The remote host is not macOS. Start term-meshd, then retry.")
+        case .notInstalled:
+            return .blocked("The production app is not installed at /Applications/term-mesh.app.")
+        case .failed(let message):
+            return .blocked("Could not launch the remote production app: \(message)")
+        }
+        if Task.isCancelled {
+            return .blocked("Connection repair was cancelled.")
+        }
+
+        let deadline = Date().addingTimeInterval(deadlineSeconds)
+        repeat {
+            if Task.isCancelled {
+                return .blocked("Connection repair was cancelled.")
+            }
+            let result = await test(
+                sshTarget: profile.sshTarget, port: profile.sshPort,
+                identityFile: profile.identityFile,
+                remoteSocket: repairSocket
+            )
+            if Task.isCancelled {
+                return .blocked("Connection repair was cancelled.")
+            }
+            if case .ok = result { return .ready }
+            if Date() >= deadline { break }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        } while !Task.isCancelled
+        if Task.isCancelled {
+            return .blocked("Connection repair was cancelled.")
+        }
+
+        return .blocked(
+            "The remote app was launched, but the peer handshake did not recover before the timeout."
+        )
+    }
 
     static func parseMacAppRuntimeStatus(_ output: String) -> MacAppRuntimeStatus? {
         var installed: Bool?
@@ -1686,6 +1855,14 @@ enum PeerHostDoctor {
         var timedOut = false
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while proc.isRunning {
+            if Task.isCancelled {
+                proc.terminate()
+                if await !waitForExit(proc, timeout: 2.0) {
+                    kill(proc.processIdentifier, SIGKILL)
+                    _ = await waitForExit(proc, timeout: 1.0)
+                }
+                throw CancellationError()
+            }
             if Date() > deadline {
                 timedOut = true
                 proc.terminate()
