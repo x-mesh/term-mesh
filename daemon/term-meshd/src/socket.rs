@@ -1358,6 +1358,9 @@ pub async fn serve(
         tokio::sync::mpsc::UnboundedSender<crate::headless::one_shot::WatchCheckOutcome>,
     >,
     remote_registry: crate::remote::SharedRegistry,
+    // Owned by `main` so the mobile listener can read the same correlation
+    // rather than poll the process table a second time.
+    pane_tracker: PaneTracker,
     mut shutdown_rx: watch::Receiver<bool>,
     started: watch::Sender<bool>,
 ) -> anyhow::Result<()> {
@@ -1370,7 +1373,6 @@ pub async fn serve(
 
     let owner_uid = current_uid();
     let (event_tx, _) = tokio::sync::broadcast::channel(256);
-    let pane_tracker = PaneTracker::new().start();
     let project_registry = Arc::new(open_project_registry_recovering(
         crate::sync::default_registry_db_path(),
     )?);

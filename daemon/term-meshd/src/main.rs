@@ -206,6 +206,12 @@ async fn main() -> anyhow::Result<()> {
     let usage_tracker = tokens::UsageTracker::new().start();
     tracing::info!("usage tracker initialized (JSONL parsing)");
 
+    // Owned here rather than inside `socket::serve` because the mobile
+    // listener needs the same correlation: which panel is running which CLI.
+    // One poller, two readers — a second tracker would walk the process table
+    // again every three seconds to learn the same thing.
+    let pane_tracker = pane_tracker::PaneTracker::new().start();
+
     // Agent session manager (F-06)
     let agent_db_path = agent::default_db_path();
     let agent_manager = Arc::new(
@@ -516,6 +522,10 @@ async fn main() -> anyhow::Result<()> {
                 Ok(config) => Some(tokio::spawn(http_mobile::serve(
                     config,
                     remote_registry.clone(),
+                    Some(mobile_session_resolver(
+                        pane_tracker.clone(),
+                        usage_tracker.clone(),
+                    )),
                     shutdown_rx.clone(),
                 ))),
                 Err(e) => {
@@ -567,6 +577,7 @@ async fn main() -> anyhow::Result<()> {
         watch_runner_for_serve,
         watch_sink_for_serve,
         remote_registry.clone(),
+        pane_tracker,
         shutdown_rx,
         control_started_tx,
     ));
@@ -763,6 +774,62 @@ mod shutdown_budget_tests {
             "the margin after the drain is too thin to reap surfaces in"
         );
     }
+}
+
+/// Answer, for one exposed pane, which CLI session the phone can follow.
+///
+/// The pane trackers already correlate panels to sessions for token
+/// accounting: `PaneTracker` reads `TERMMESH_PANEL_ID` out of every live
+/// `claude`/`codex` process, and each usage tracker zips those panes against
+/// the session files by start time within a working directory. Chat needs the
+/// same answer, so it asks the same question rather than inventing a second
+/// way to guess.
+///
+/// This exists because the CLI hands its session id only to its own children.
+/// `/rc on` runs as one of those children and reads it directly; the app that
+/// owns the pane never sees it, so a pane exposed from the app arrived with no
+/// session and the phone hid the Chat/Terminal switch.
+///
+/// `None` means this surface is not running a CLI we can follow right now —
+/// resolved per request, so starting or restarting a CLI is picked up without
+/// re-exposing the pane.
+fn mobile_session_resolver(
+    pane_tracker: pane_tracker::PaneTracker,
+    usage_tracker: tokens::UsageTracker,
+) -> http_mobile::SessionResolver {
+    // Built once: `new` only locates `~/.codex/sessions`, while the scan that
+    // costs anything happens per call and is incremental.
+    let codex = codex_tokens::CodexUsageTracker::new();
+    std::sync::Arc::new(move |surface_id: &str| {
+        let panes = pane_tracker.snapshot();
+        let info = panes.get(surface_id)?;
+        let correlation: Vec<(String, String, i64, u32)> = panes
+            .iter()
+            .map(|(panel_id, pane)| {
+                (
+                    panel_id.clone(),
+                    pane.cwd.clone(),
+                    pane.proc_start_unix,
+                    pane.pid,
+                )
+            })
+            .collect();
+        let session_id = match info.cli.as_str() {
+            "claude" => usage_tracker
+                .sessions_by_panel(&correlation)
+                .remove(surface_id)?,
+            "codex" => codex
+                .as_ref()?
+                .sessions_by_panel(&correlation)
+                .ok()?
+                .remove(surface_id)?,
+            _ => return None,
+        };
+        Some(http_mobile::PaneSession {
+            cli: info.cli.clone(),
+            session_id,
+        })
+    })
 }
 
 #[cfg(test)]
