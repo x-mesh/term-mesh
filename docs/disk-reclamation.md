@@ -96,6 +96,17 @@ tm-agent daemon project-presentations prune --apply
 tm-agent daemon project-presentations prune --project-id team:<uuid> --apply
 ```
 
+Short forms exist for every part of the command. `daemon` accepts `d`,
+`project-presentations` accepts `pp`, `list` accepts `ls`, and `prune` takes the
+Project IDs as positional values. The long form stays valid:
+
+```bash
+tm-agent d pp ls
+tm-agent d pp prune                          # dry-run
+tm-agent d pp prune --apply
+tm-agent d pp prune team:<uuid> --apply
+```
+
 - `list` shows every record with its persisted leader surface ID,
   live/referenced surface counts, owner, and whether the recorded directory
   still exists.
