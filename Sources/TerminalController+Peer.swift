@@ -71,7 +71,19 @@ extension TerminalController {
             // A connected transport is not enough to launch a remote CLI.
             // The authenticated PATH metadata lands on a second round trip.
             "launchable": host.isLaunchable,
+            // A `connected` host can still be answering from a Project roster
+            // that stopped refreshing, and nothing here used to say so — the
+            // state that let a deleted Project keep blocking its own name was
+            // not observable from outside the app at all.
+            "team_roster_verified": host.teamRosterIsVerified,
+            "team_count": host.teams.count,
         ]
+        if let confirmed = host.teamsConfirmedAt {
+            dict["teams_confirmed_at"] = ISO8601DateFormatter().string(from: confirmed)
+        }
+        if let failure = host.lastRosterFailure {
+            dict["last_roster_failure"] = failure
+        }
         if let version = host.servingVersionDisplay {
             dict["serving_app_version"] = version
         }

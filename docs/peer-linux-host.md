@@ -775,7 +775,24 @@ available.
 ```bash
 tm-agent daemon doctor          # human summary; exit 2 if anything is wrong
 tm-agent daemon doctor --json   # the raw report
+tm-agent d doctor               # `d` is the short form of `daemon`
 ```
+
+The `daemon` subcommand accepts `d`. The long form stays valid.
+
+To act on the report without retyping a Project ID, add `-i`:
+
+```bash
+tm-agent d -i           # diagnose, then pick a repair by number
+tm-agent d doctor -i    # the same picker
+```
+
+The picker lists each finding with the repair the daemon supplies. It runs that
+repair as a dry run first. Then it asks you to type `apply` before it changes
+anything. It runs no other command.
+
+The picker needs a terminal on stdin. A script, a hook, or an ssh command must
+use the plain commands and read the JSON report.
 
 It answers three questions that cost an ssh session and a lot of `ps` output
 to answer by hand:
@@ -803,7 +820,8 @@ The warning provides an inspection command and never an applied prune command.
 
 Repairs stay where they were: `tm-agent daemon project-presentations prune`
 and `tm-agent daemon reset`, both dry-run until `--apply`. The doctor decides
-nothing on its own.
+nothing on its own. Short forms: `tm-agent d pp prune` and
+`tm-agent d reset [projects|workspaces|all]`.
 
 Exit status `0` means no findings. Exit status `2` means that diagnosis
 completed and found a problem. Exit status `1` means that the command failed.

@@ -613,8 +613,27 @@ struct HostEntry: Identifiable, Equatable {
     /// anywhere else changes without the row ever being asked to redraw, and
     /// the control reads as dead while the work it started is under way.
     var isRefreshing: Bool = false
+    /// When a roster read last confirmed `teams`, and why the most recent
+    /// attempt did not.
+    ///
+    /// A failed read deliberately keeps the previous roster, so that one
+    /// transient error does not blank the Projects a user is looking at. The
+    /// cost is that a frozen roster is indistinguishable from a current one —
+    /// which is how a Project deleted on its host went on blocking its own
+    /// name, from a host still reading `connected`, for the rest of a session.
+    /// These two make the difference visible instead.
+    var teamsConfirmedAt: Date?
+    var lastRosterFailure: String?
 
     var isConnected: Bool { connectionState == .connected }
+
+    /// Whether `teams` describes the host now, rather than whenever it was
+    /// last reachable. Callers that would *block* the user on a roster entry
+    /// must consult this: refusing on unverifiable state is worse than
+    /// letting the host refuse for itself.
+    var teamRosterIsVerified: Bool {
+        isConnected && teamsConfirmedAt != nil && lastRosterFailure == nil
+    }
     var servingVersionDisplay: String? {
         guard let raw = servingAppVersion?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else { return nil }
@@ -2256,6 +2275,8 @@ final class RemoteHostStore: ObservableObject {
                 else { return }
                 if let teams {
                     self.hosts[key]?.teams = teams
+                    self.hosts[key]?.teamsConfirmedAt = Date()
+                    self.hosts[key]?.lastRosterFailure = nil
                 }
                 // A push that arrived during even a failed RPC still owns a
                 // retry. Dropping it here would make one transient session-
@@ -2553,14 +2574,37 @@ final class RemoteHostStore: ObservableObject {
     /// Read team/project manifests from their owning endpoint. Ordinary hosts
     /// reuse the serving socket. A redirecting Mac gets a short registry lease
     /// to its advertised session owner for the whole ListTeams RPC.
+    /// Record, once and in one shape, why a roster read did not confirm this
+    /// host's Projects.
+    ///
+    /// Every early return below used to end differently — four logged their
+    /// own sentence and one returned in complete silence — and none of them
+    /// left anything the UI could read. So a roster that had stopped
+    /// refreshing was indistinguishable, on screen, from one that agreed with
+    /// the host. Routing them all through here also keeps the repeated
+    /// failure a single identical line, which the file's repeat folding then
+    /// collapses instead of interleaving two alternating messages.
+    private func noteRosterFailure(_ key: String, _ reason: String) {
+        hosts[key]?.lastRosterFailure = reason
+        RemoteWorkLog.info(
+            "Project roster not refreshed for \(hosts[key]?.displayName ?? key): \(reason)"
+        )
+    }
+
+    /// Test hook: hold a host in the state a failed roster read leaves it in —
+    /// previous entries kept, still connected — or clear it as a successful
+    /// read does. The real cause is a transport or name-resolution failure on
+    /// a live machine, which no test can arrange from outside.
+    func setDebugRosterFailure(hostKey: String, reason: String?) {
+        hosts[hostKey]?.lastRosterFailure = reason
+    }
+
     private func fetchTeamRoster(
         hostKey key: String,
         servingSockPath: String
     ) async -> [RemoteTeamSummary]? {
         guard let host = hosts[key], host.teamRouteResolved else {
-            RemoteWorkLog.info(
-                "Team host probe skipped for \(key): session-owner route is unresolved"
-            )
+            noteRosterFailure(key, "the session-owner route is unresolved")
             return nil
         }
 
@@ -2570,9 +2614,7 @@ final class RemoteHostStore: ObservableObject {
         let redirected = host.redirectsTeamWorkToSessionHost
         if host.redirectsTeamWorkToSessionHost {
             guard let spec = host.teamHostSpec else {
-                RemoteWorkLog.info(
-                    "Team host probe skipped for \(host.displayName): redirect has no endpoint"
-                )
+                noteRosterFailure(key, "the session-owner redirect has no endpoint")
                 return nil
             }
             RemoteWorkLog.info(
@@ -2582,9 +2624,7 @@ final class RemoteHostStore: ObservableObject {
             do {
                 acquired = try await PeerPaneHostRegistry.shared.acquire(spec)
             } catch {
-                RemoteWorkLog.info(
-                    "Session-owner tunnel failed for \(host.displayName): \(error)"
-                )
+                noteRosterFailure(key, "the session-owner tunnel failed: \(error)")
                 if let endpoint = host.teamHostSpec?.hostKey,
                    hosts[key]?.activeSockPath == servingSockPath,
                    hosts[key]?.teamHostReadiness.endpoint == endpoint {
@@ -2606,9 +2646,7 @@ final class RemoteHostStore: ObservableObject {
         do {
             connection = try await PeerRelaySession.connect(hostSockPath: rosterSockPath)
         } catch {
-            RemoteWorkLog.info(
-                "Session-owner handshake failed for \(host.displayName): \(error)"
-            )
+            noteRosterFailure(key, "the session-owner handshake failed: \(error)")
             if redirected,
                hosts[key]?.activeSockPath == servingSockPath,
                hosts[key]?.teamHostReadiness.endpoint == teamEndpoint {
@@ -2640,6 +2678,11 @@ final class RemoteHostStore: ObservableObject {
             }
             guard let reported = try? await connection.session.listTeams() else {
                 await connection.cancel()
+                // The one failure on this path that said nothing at all. A
+                // roster frozen here looked exactly like one the host had just
+                // confirmed, which is what made a deleted Project impossible
+                // to explain from inside the app.
+                noteRosterFailure(key, "the host did not answer ListTeams")
                 return nil
             }
             await connection.cancel()

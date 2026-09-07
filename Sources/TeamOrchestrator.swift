@@ -103,6 +103,15 @@ final class TeamOrchestrator: ObservableObject {
         /// Whether `leaderReady` reflects a real foreground probe rather than
         /// mere surface presence.
         var leaderProcessActiveKnown: Bool = false
+        /// The remote manifest's team UUID. Repair addresses a Project by its
+        /// exact durable identity, and deriving that from the `team:<uuid>`
+        /// Project ID string would re-encode a format decision here.
+        var remoteTeamUUID: String = ""
+        /// Whether the owning host confirmed the roster this record came from.
+        /// Local records are read from live state and are always current;
+        /// only a remote roster can freeze. Defaults to true so a caller that
+        /// does not deal in rosters keeps the previous behaviour.
+        var rosterVerified: Bool = true
 
         /// A remote record this installation owns can be deleted straight
         /// from the collision UI, without adopting it as a team first.
@@ -135,14 +144,60 @@ final class TeamOrchestrator: ObservableObject {
             return !(leaderProcessActiveKnown && leaderReady)
         }
 
+        /// The host probed the manifest's leader surface and found no leader
+        /// process on it. The surface, the workers, and the record itself are
+        /// all still there; only the leader has exited.
+        var remoteLeaderProcessIsInactive: Bool {
+            guard case .remote = location else { return false }
+            return leaderProcessActiveKnown && !leaderReady
+        }
+
         /// A discovered manifest with an exact Project ID can be adopted into
         /// this window even when the folder currently entered in New Project
         /// differs. The name collision still blocks creating a second Project;
         /// this only exposes the existing Project's explicit open path.
+        ///
+        /// Adoption itself refuses a manifest whose leader process the host
+        /// reports as gone (`remoteManifestLeaderIsAdoptable`), so this must
+        /// refuse it too. While the two disagreed, New Project offered an
+        /// Open Existing button that could only ever fail, and reported the
+        /// still-present Project as one that "may no longer be available".
         var canOpenRemoteProject: Bool {
             guard case .remote = location else { return false }
-            return identity.projectID != nil
+            guard identity.projectID != nil else { return false }
+            return !remoteLeaderProcessIsInactive
         }
+
+        /// The leader exited but everything it led is still on the host, so
+        /// the Project is recoverable in place: Repair collaboration boots a
+        /// replacement leader against the same durable identity and reattaches
+        /// the existing workers. Offered only for records this installation
+        /// owns, because repair republishes the manifest.
+        var canRepairRemoteLeaderProcess: Bool {
+            guard case .remote = location else { return false }
+            guard presentationOwnedByRequester, identity.projectID != nil,
+                  !remoteTeamUUID.isEmpty else { return false }
+            return remoteLeaderProcessIsInactive
+        }
+    }
+
+    /// Why an explicit open did or did not present the Project. A bare `false`
+    /// forced every caller to guess, and the guess it printed named the one
+    /// cause — a vanished Project — that had been ruled out by getting here.
+    enum OpenExistingProjectOutcome: Equatable, Sendable {
+        case opened
+        /// The conflict record carries no Project to open.
+        case noProjectRecord
+        /// The local workspace this record pointed at is gone.
+        case workspaceGone
+        /// The owning host is not currently connected.
+        case hostDisconnected
+        /// The host is connected but no longer publishes this Project ID.
+        case manifestGone
+        /// The manifest is intact; its leader process is not running.
+        case leaderProcessInactive
+        /// Adoption ran and could not complete its attach.
+        case attachFailed
     }
 
     enum ProjectNameConflict: Equatable, Sendable {
@@ -154,8 +209,30 @@ final class TeamOrchestrator: ObservableObject {
         case remoteNameCollision(ProjectConflictRecord)
         case reservedByAnotherRequest(name: String)
 
+        /// The record this conflict is about, when there is one.
+        var record: ProjectConflictRecord? {
+            switch self {
+            case .none, .reservedByAnotherRequest:
+                nil
+            case .exactLive(let record), .exactDetached(let record),
+                 .incomplete(let record), .localNameCollision(let record),
+                 .remoteNameCollision(let record):
+                record
+            }
+        }
+
         var blocksCreate: Bool {
             if case .none = self { return false }
+            // A conflict read from a roster the host never confirmed describes
+            // the machine as it was, not as it is. Refusing on that is how a
+            // Project deleted on its host went on owning its name for a whole
+            // session, behind a host the sidebar still called connected, with
+            // no way to say so and no way out but a different name. Creation
+            // is re-checked against a live identity at commit time, so a real
+            // duplicate is still refused — by the host, which knows.
+            if let record, case .remote = record.location, !record.rosterVerified {
+                return false
+            }
             return true
         }
     }
@@ -1007,38 +1084,54 @@ final class TeamOrchestrator: ObservableObject {
         _ record: ProjectConflictRecord,
         from tabManager: TabManager
     ) async -> Bool {
-        guard let teamName = record.teamName else { return false }
+        await openExistingProjectOutcome(record, from: tabManager) == .opened
+    }
+
+    /// The same open, reporting which step declined it so the caller can say
+    /// so. Each `guard` below names a distinct, separately actionable state;
+    /// collapsing them into one boolean is what produced a dialog that blamed
+    /// a missing Project for a merely leaderless one.
+    func openExistingProjectOutcome(
+        _ record: ProjectConflictRecord,
+        from tabManager: TabManager
+    ) async -> OpenExistingProjectOutcome {
+        guard let teamName = record.teamName else { return .noProjectRecord }
         switch record.location {
         case .detached:
             return await restoreDetachedProjectPresentation(
                 teamName: teamName, tabManager: tabManager
-            )
+            ) ? .opened : .attachFailed
         case let .currentWindow(_, workspaceID):
             guard let workspace = tabManager.tabs.first(where: { $0.id == workspaceID })
-            else { return false }
+            else { return .workspaceGone }
             tabManager.selectWorkspace(workspace)
-            return true
+            return .opened
         case let .otherWindow(windowID, workspaceID):
             guard let manager = AppDelegate.shared?.tabManagerFor(windowId: windowID),
                   let workspace = manager.tabs.first(where: { $0.id == workspaceID })
-            else { return false }
+            else { return .workspaceGone }
             manager.selectWorkspace(workspace)
             AppDelegate.shared?.windowForMainWindowId(windowID)?.makeKeyAndOrderFront(nil)
-            return true
+            return .opened
         case let .remote(hostKey, _):
             // A remote manifest has no local workspace to select. Adopt its
             // exact project identity, never merely its display name.
-            guard let projectID = record.identity.projectID,
-                  let host = RemoteHostStore.shared.sortedHosts.first(where: {
-                      $0.id == hostKey && $0.isConnected
-                  }),
-                  let remote = host.teams.first(where: {
-                      $0.projectID == projectID
-                  })
-            else { return false }
+            guard let projectID = record.identity.projectID else { return .noProjectRecord }
+            guard let host = RemoteHostStore.shared.sortedHosts.first(where: {
+                $0.id == hostKey && $0.isConnected
+            }) else { return .hostDisconnected }
+            guard let remote = host.teams.first(where: {
+                $0.projectID == projectID
+            }) else { return .manifestGone }
+            // Adoption's own first guard, read here so a leaderless Project is
+            // reported as leaderless — and can be offered Repair — instead of
+            // being folded into a generic attach failure.
+            guard Self.remoteManifestLeaderIsAdoptable(remote) else {
+                return .leaderProcessInactive
+            }
             return await adoptRemoteProjectPresentation(
                 remote, host: host, tabManager: tabManager
-            )
+            ) ? .opened : .attachFailed
         }
     }
 
