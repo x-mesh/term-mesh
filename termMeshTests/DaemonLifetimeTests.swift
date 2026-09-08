@@ -47,6 +47,27 @@ final class DaemonLifetimeTests: XCTestCase {
         ))
     }
 
+    func test_automaticUpgradeRequiresAuthoritativeEmptySurfaceInventory() {
+        XCTAssertEqual(
+            TermMeshDaemon.automaticUpgradeDecision(
+                requiresUpgrade: true, replacementReady: true, liveProjectSurfaces: 0
+            ),
+            .replace
+        )
+        XCTAssertEqual(
+            TermMeshDaemon.automaticUpgradeDecision(
+                requiresUpgrade: true, replacementReady: true, liveProjectSurfaces: 5
+            ),
+            .preserveLiveSurfaces(5)
+        )
+        XCTAssertEqual(
+            TermMeshDaemon.automaticUpgradeDecision(
+                requiresUpgrade: true, replacementReady: true, liveProjectSurfaces: nil
+            ),
+            .preserveUnknownInventory
+        )
+    }
+
     // MARK: - Subscribe-loop watchdog (the one observer of a dead daemon)
 
     /// Neither an adopted daemon (no Process handle) nor a spawned one (no

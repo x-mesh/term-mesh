@@ -401,6 +401,26 @@ final class TermMeshDaemon: ObservableObject {
         return runningVersion != appVersion
     }
 
+    enum AutomaticUpgradeDecision: Equatable {
+        case replace
+        case preserveLiveSurfaces(Int)
+        case preserveUnknownInventory
+    }
+
+    static func automaticUpgradeDecision(
+        requiresUpgrade: Bool, replacementReady: Bool, liveProjectSurfaces: Int?
+    ) -> AutomaticUpgradeDecision {
+        guard requiresUpgrade, replacementReady else { return .preserveUnknownInventory }
+        guard let liveProjectSurfaces else { return .preserveUnknownInventory }
+        return liveProjectSurfaces == 0 ? .replace : .preserveLiveSurfaces(liveProjectSurfaces)
+    }
+
+    func liveProjectSurfaceCount() -> Int? {
+        guard let response = rpcCall(method: "daemon.status", params: [:]) as? [String: Any],
+              let count = response["live_project_surfaces"] as? NSNumber else { return nil }
+        return count.intValue
+    }
+
     /// Whether the subscribe loop's consecutive connect failures warrant
     /// re-running `startDaemon`. This loop is the one place that reliably
     /// observes "the daemon is gone": an adopted daemon has no Process
@@ -498,7 +518,11 @@ final class TermMeshDaemon: ObservableObject {
                         "This machine's daemon (\(runningVersion ?? "unknown")) is older than the app, but this build bundles no replacement — keeping the running daemon"
                     )
                 }
-                if replacementReady {
+                let upgradeDecision = Self.automaticUpgradeDecision(
+                    requiresUpgrade: requiresUpgrade, replacementReady: replacementReady,
+                    liveProjectSurfaces: self.liveProjectSurfaceCount()
+                )
+                if upgradeDecision == .replace {
                     Logger.daemon.warning(
                         "replacing daemon version \(runningVersion ?? "unknown", privacy: .public) with bundled version \(Self.appMarketingVersion ?? "unknown", privacy: .public); live peer sessions will end"
                     )
@@ -511,6 +535,18 @@ final class TermMeshDaemon: ObservableObject {
                     self.daemonRunIntended = true
                     Thread.sleep(forTimeInterval: 0.3)
                 } else {
+                    if case .preserveLiveSurfaces(let count) = upgradeDecision {
+                        Logger.daemon.warning(
+                            "deferring daemon upgrade; \(count, privacy: .public) live peer surface(s) are still running"
+                        )
+                        RemoteWorkLog.warningOffMain(
+                            "This machine has \(count) live Project surface(s); keeping daemon \(runningVersion ?? "unknown") until they finish"
+                        )
+                    } else if requiresUpgrade && replacementReady {
+                        Logger.daemon.warning(
+                            "deferring daemon upgrade because live Project surface inventory is unavailable"
+                        )
+                    }
                     // Adopt rather than restart when versions match, when
                     // the version is unknown, or when a stale daemon has
                     // no launchable replacement — neither uncertainty nor
