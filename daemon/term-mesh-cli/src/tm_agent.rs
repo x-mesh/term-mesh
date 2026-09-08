@@ -18753,11 +18753,19 @@ fn run_leader_turn_route(
                 "dispatch_bounds": record["dispatch_bounds"],
             })
         });
+    let route_deviation = match record.get("suggested_route").and_then(Value::as_str) {
+        Some(suggested) if suggested != record["actual_route"] => Some(json!({
+            "suggested": suggested,
+            "stated": record["actual_route"],
+        })),
+        _ => None,
+    };
     Ok(json!({
         "ok": true,
         "path": path.display().to_string(),
         "record": record,
         "directive": directive,
+        "route_deviation": route_deviation,
     }))
 }
 
@@ -19460,6 +19468,80 @@ mod leader_turn_record_tests {
         let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(mode, 0o600, "mode was {mode:o}");
+    }
+
+    /// A leader that states the same route the policy would have suggested
+    /// needs no callout — `route_deviation` must read as absent, not as an
+    /// empty-but-present object, so a consumer can treat `null` as the
+    /// no-news case.
+    #[test]
+    fn route_deviation_is_null_when_stated_route_matches_the_suggestion() {
+        let home = std::env::temp_dir().join(format!("tm-routedev-match-{}", std::process::id()));
+        fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create temp home");
+        let prev_home = env::var("HOME").ok();
+        env::set_var("HOME", &home);
+
+        let team = TeamNameResolution {
+            name: "term-mesh".to_string(),
+            source: TeamNameSource::Explicit,
+        };
+        // No `available_workers` makes the policy suggest "direct" (see
+        // `LeaderParticipationDirective::from_input`), matching the stated
+        // route below.
+        let result = run_leader_turn_route(&team, "turn-dev-1", "direct", None, None, &[], None)
+            .expect("run_leader_turn_route");
+
+        match prev_home {
+            Some(v) => env::set_var("HOME", v),
+            None => env::remove_var("HOME"),
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        assert_eq!(result["record"]["suggested_route"], "direct");
+        assert_eq!(result["record"]["actual_route"], "direct");
+        assert_eq!(result["route_deviation"], Value::Null);
+    }
+
+    /// A leader that states a route other than what the policy would have
+    /// suggested must have that gap surfaced in the response — the log
+    /// record already carries both fields, but the reply never told the
+    /// leader they diverged.
+    #[test]
+    fn route_deviation_reports_suggested_and_stated_when_they_differ() {
+        let home = std::env::temp_dir().join(format!("tm-routedev-diff-{}", std::process::id()));
+        fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create temp home");
+        let prev_home = env::var("HOME").ok();
+        env::set_var("HOME", &home);
+
+        let team = TeamNameResolution {
+            name: "term-mesh".to_string(),
+            source: TeamNameSource::Explicit,
+        };
+        // `multi_unit` with two available workers makes the policy suggest
+        // "parallel"; the leader states "direct" instead.
+        let result = run_leader_turn_route(
+            &team,
+            "turn-dev-2",
+            "direct",
+            Some("multi_unit"),
+            Some(2),
+            &[],
+            None,
+        )
+        .expect("run_leader_turn_route");
+
+        match prev_home {
+            Some(v) => env::set_var("HOME", v),
+            None => env::remove_var("HOME"),
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        assert_eq!(result["record"]["suggested_route"], "parallel");
+        assert_eq!(result["record"]["actual_route"], "direct");
+        assert_eq!(
+            result["route_deviation"],
+            json!({"suggested": "parallel", "stated": "direct"})
+        );
     }
 }
 
