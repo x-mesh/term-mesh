@@ -68,6 +68,67 @@ final class RemoteHostResyncTests: XCTestCase {
     /// The sidebar row is `Equatable` over `HostEntry`, so in-flight state has
     /// to travel on the entry. Held anywhere else the row is never asked to
     /// redraw and the control reads as dead while its work runs.
+    /// Reconnect retires the pooled transport even while a pane still holds
+    /// it, so the connect that follows cannot reuse a dead tunnel. Releasing
+    /// only the sidebar's ref used to leave that lease pooled.
+    @MainActor
+    func testReconnectRetiresAPooledLeaseAPaneStillHolds() async throws {
+        let store = RemoteHostStore.shared
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/rhr-unit-\(getpid())-reconnect.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let teardownsBefore = registry.teardownCountForTests
+
+        // A pane's ref, which the store never releases.
+        let pane = try await registry.acquire(spec)
+        // No SSH target: the spec resolves to the direct socket, and the
+        // connect that reconnect would schedule has nothing to dial.
+        let host = HostEntry(
+            id: "direct:\(sockPath)",
+            displayName: "local",
+            connectionState: .connected,
+            workspaces: [],
+            activeSockPath: sockPath,
+            sshTarget: nil,
+            remoteSockPath: nil
+        )
+
+        let outcome = store.reconnectHost(host)
+        XCTAssertTrue(outcome.transportReplaced, "the pooled lease is retired")
+        XCTAssertEqual(outcome.previousSockPath, sockPath)
+        XCTAssertFalse(outcome.started, "no SSH target — nothing to reconnect through")
+        XCTAssertNil(registry.activeLease(forKey: key))
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 1)
+
+        // The pane's late release must not revive anything.
+        registry.release(pane)
+        XCTAssertNil(registry.activeLease(forKey: key))
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 1)
+    }
+
+    /// With nothing pooled there is nothing to replace, and the outcome says
+    /// so instead of claiming a fresh tunnel.
+    @MainActor
+    func testReconnectWithoutAPooledLeaseReportsNothingReplaced() {
+        let store = RemoteHostStore.shared
+        let host = HostEntry(
+            id: "direct:rhr-none-\(getpid())",
+            displayName: "local",
+            connectionState: .saved,
+            workspaces: [],
+            activeSockPath: "/tmp/rhr-unit-\(getpid())-none.sock",
+            sshTarget: nil,
+            remoteSockPath: nil
+        )
+        let outcome = store.reconnectHost(host)
+        XCTAssertFalse(outcome.transportReplaced)
+        XCTAssertNil(outcome.previousSockPath)
+        XCTAssertEqual(outcome.panesPreserved, 0)
+        XCTAssertFalse(outcome.started)
+        XCTAssertEqual(store.retryConnectingHost(host), outcome.started)
+    }
+
     func testRefreshFlagTravelsOnTheEntryTheSidebarCompares() {
         var idle = makeHost()
         var running = idle

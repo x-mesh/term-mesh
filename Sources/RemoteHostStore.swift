@@ -1598,15 +1598,46 @@ final class RemoteHostStore: ObservableObject {
     /// Returns false when the attempt could not actually be restarted.
     @discardableResult
     func retryConnectingHost(_ host: HostEntry) -> Bool {
+        reconnectHost(host).started
+    }
+
+    /// What `reconnectHost` did, for callers that must not overstate it.
+    struct HostReconnectOutcome: Equatable {
+        /// A fresh connect was scheduled. False when another pane waits on
+        /// the same coalesced start, or the host has no SSH route.
+        let started: Bool
+        /// A pooled tunnel existed and was retired; the next acquire builds
+        /// a new one.
+        let transportReplaced: Bool
+        let previousSockPath: String?
+        /// Panes flagged to reattach once the replacement lease is up.
+        let panesPreserved: Int
+    }
+
+    /// Replace whatever transport this host has and start over. Reachable
+    /// from every state; open panes and mirrors keep their objects and come
+    /// back through `resumePanesAfterHostReconnect` once the replacement is
+    /// up, the same way they do after Disconnect Host → Connect.
+    ///
+    /// Retiring the transport is the point. Releasing only the sidebar's ref
+    /// left a lease a pane still held in the pool, and the connect that
+    /// followed reused it — so "Retry" on a dead tunnel reconnected nothing.
+    @discardableResult
+    func reconnectHost(_ host: HostEntry) -> HostReconnectOutcome {
         let key = host.id
-        // Release the sidebar lease first. `connectSavedHost` returns early
-        // while one exists, so retrying a row that already holds a lease — a
-        // connected host, or one whose watchdog gave up after the acquire had
-        // in fact succeeded — would report that it started and then do
-        // nothing at all.
-        if let lease = sidebarLeases[key] {
-            sidebarLeases[key] = nil
-            PeerPaneHostRegistry.shared.release(lease)
+        let registry = PeerPaneHostRegistry.shared
+        // Resolve the pooled key before `invalidateAutoDetectedSocket` below
+        // clears `remoteSockPath` — it is part of the key.
+        let hostKey = sidebarLeases[key]?.key ?? (hosts[key] ?? host).paneHostSpec.hostKey
+        let panesPreserved = PeerClientCoordinator.shared.preparePanesForHostDisconnect(hostKey)
+        let retiredPath = registry.disconnectTransport(for: hostKey)
+        if let lease = sidebarLeases.removeValue(forKey: key) {
+            registry.release(lease)
+        }
+        // A pane preserved on the retired tunnel still reports its path;
+        // `syncFromCoordinator` must not promote the row through it.
+        if let retiredPath, !retiredPath.isEmpty {
+            disconnectedSockPaths[key, default: []].insert(retiredPath)
         }
         connectAttemptIDs[key] = nil
         connectTasks[key]?.cancel()
@@ -1623,6 +1654,10 @@ final class RemoteHostStore: ObservableObject {
         hosts[key]?.activeSockPath = ""
         hosts[key]?.clearServingMetadata()
         hosts[key]?.clearAuthenticatedHostCLIBinDirs()
+        // The roster came over the retired transport; the reconnect re-reads
+        // it, and a stale entry must not block a Create in the meantime.
+        hosts[key]?.teams = []
+        hosts[key]?.lastRosterFailure = nil
         hosts[key]?.connectionState = .saved
 
         // Retry means the cached auto-detection result already failed. Clear
@@ -1645,6 +1680,14 @@ final class RemoteHostStore: ObservableObject {
         #if DEBUG
         dlog("peer.sidebar.connect retry key=\(key) cancelledPending=\(cancelledPending)")
         #endif
+        let outcome = { (started: Bool) in
+            HostReconnectOutcome(
+                started: started,
+                transportReplaced: retiredPath != nil,
+                previousSockPath: retiredPath,
+                panesPreserved: panesPreserved
+            )
+        }
         if !cancelledPending {
             // A pane or mirror is waiting on the same coalesced start, so it
             // cannot be cancelled from here. connectSavedHost would rejoin that
@@ -1653,11 +1696,20 @@ final class RemoteHostStore: ObservableObject {
             RemoteWorkLog.info(
                 "Cannot restart \(host.displayName) — another pane is waiting on the same connection attempt; close it first"
             )
-            return false
+            return outcome(false)
         }
-        RemoteWorkLog.info("Retrying connection to \(host.displayName)")
+        // connectSavedHost declines a row with no SSH target; do not report a
+        // start that never happened.
+        guard (hosts[key] ?? host).sshTarget?.isEmpty == false else {
+            return outcome(false)
+        }
+        RemoteWorkLog.info(
+            retiredPath == nil
+                ? "Retrying connection to \(host.displayName)"
+                : "Reconnecting \(host.displayName) — replacing the SSH tunnel; open panes reattach when it is back"
+        )
         connectSavedHost(hosts[key] ?? host)
-        return true
+        return outcome(true)
     }
 
     /// Shared recovery entry point for Edit Peer Host and New Project.

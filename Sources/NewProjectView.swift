@@ -3437,11 +3437,17 @@ struct NewProjectView: View {
     private func runPlacementRetry() {
         let store = RemoteHostStore.shared
         for host in placementRetryHosts {
-            // A connected host can still be waiting for the authenticated CLI
-            // directory handshake. Reusing connectSavedHost here is a no-op
-            // because it intentionally rejects hosts that already have a
-            // sidebar lease; reset the lease and start a real retry instead.
-            _ = store.retryConnectingHost(host)
+            switch host.connectionState {
+            case .connected:
+                // The tunnel is up and only the authenticated CLI directory
+                // handshake is outstanding. Re-read it; a retry here would
+                // replace the transport every open pane on the host rides.
+                _ = store.resyncConnectedHost(host)
+            case .failed, .saved:
+                _ = store.retryConnectingHost(host)
+            case .connecting:
+                break
+            }
         }
     }
 
