@@ -97,6 +97,8 @@ struct TokenUsage {
 struct CacheCreationBreakdown {
     #[serde(default)]
     ephemeral_1h_input_tokens: u64,
+    #[serde(default)]
+    ephemeral_5m_input_tokens: u64,
 }
 
 // ── Aggregated Stats ──
@@ -605,8 +607,15 @@ fn process_line(state: &mut TrackerState, entry: &JsonlLine, file_path: &Path) {
         usage.cache_creation_input_tokens
     };
     stats.cache_write_tokens += cache_write_this_line;
+    let cache_creation_for_context = if usage.cache_creation_input_tokens > 0 {
+        usage.cache_creation_input_tokens
+    } else if let Some(ref cc) = usage.cache_creation {
+        cc.ephemeral_1h_input_tokens + cc.ephemeral_5m_input_tokens
+    } else {
+        0
+    };
     stats.last_context_tokens =
-        usage.input_tokens + usage.cache_read_input_tokens + cache_write_this_line;
+        usage.input_tokens + usage.cache_read_input_tokens + cache_creation_for_context;
 
     stats.api_calls += 1;
     stats.cost_usd += cost;
@@ -839,6 +848,7 @@ mod tests {
             cache_read_input_tokens: 0,
             cache_creation: Some(CacheCreationBreakdown {
                 ephemeral_1h_input_tokens: 1_000_000,
+                ephemeral_5m_input_tokens: 0,
             }),
         };
         let cost = calculate_line_cost(&usage, "claude-opus-4-6");
@@ -1412,6 +1422,38 @@ mod tests {
         // views measure different things from the same data.
         let totals = tracker.snapshot_by_panel(&panes);
         assert_eq!(totals["panelOne"].0, 140);
+    }
+
+    #[test]
+    fn context_by_panel_uses_total_cache_creation_over_breakdown_bucket() {
+        let mut state = make_state();
+        let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
+        let entry = assistant_entry(
+            "sess",
+            Some("/cwd/one"),
+            Some("2026-05-13T01:00:00.000Z"),
+            TokenUsage {
+                input_tokens: 40,
+                output_tokens: 0,
+                cache_creation_input_tokens: 30,
+                cache_read_input_tokens: 15,
+                cache_creation: Some(CacheCreationBreakdown {
+                    ephemeral_1h_input_tokens: 10,
+                    ephemeral_5m_input_tokens: 20,
+                }),
+            },
+        );
+        record_session_start(&mut state, &entry);
+        process_line(&mut state, &entry, &path);
+
+        let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
+        let tracker = UsageTracker {
+            state: Arc::new(Mutex::new(state)),
+        };
+        let panes = vec![("panelOne".to_string(), "/cwd/one".to_string(), base, 1_u32)];
+
+        let context = tracker.context_by_panel(&panes);
+        assert_eq!(context["panelOne"].0, 85);
     }
 
     // ── JSONL parsing from string ──
