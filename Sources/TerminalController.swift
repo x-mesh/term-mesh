@@ -1528,6 +1528,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPeerMirrorTeardownPaneSession(params: params))
         case "debug.peer.tunnel_probe":
             return v2Result(id: id, self.v2DebugPeerTunnelProbe(params: params))
+        case "debug.app.simulate_wake":
+            return v2Result(id: id, self.v2DebugAppSimulateWake(params: params))
         case "debug.panel_snapshot":
             return v2Result(id: id, self.v2DebugPanelSnapshot(params: params))
         case "debug.panel_snapshot.reset":

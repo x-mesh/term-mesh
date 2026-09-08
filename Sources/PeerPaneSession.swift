@@ -614,6 +614,11 @@ final class PeerPaneHostRegistry {
         #endif
     }
 
+    /// Every pooled lease, for a sweep that judges each one after a wake.
+    func pooledLeases() -> [(key: PeerPaneHostKey, lease: PeerPaneHostLease)] {
+        leases.map { (key: $0.key, lease: $0.value) }
+    }
+
     /// Diagnostics/tests.
     func activeLease(forKey key: PeerPaneHostKey) -> PeerPaneHostLease? { leases[key] }
     var activeLeaseCount: Int { leases.count }
