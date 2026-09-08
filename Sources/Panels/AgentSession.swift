@@ -1575,6 +1575,7 @@ final class AgentSession {
     static func claudeLaunch(
         claudePath: String,
         model: String,
+        effort: String = "",
         instructions: String,
         extraArgs: [String],
         workingDirectory: String,
@@ -1596,6 +1597,7 @@ final class AgentSession {
             "--dangerously-skip-permissions",
         ]
         if !model.isEmpty { args += ["--model", model] }
+        if !effort.isEmpty { args += ["--effort", effort] }
         if !instructions.isEmpty { args += ["--append-system-prompt", instructions] }
         args += extraArgs
         return Launch(executable: claudePath, arguments: args,
@@ -1620,6 +1622,7 @@ final class AgentSession {
         cli: String,
         bridgePath: String,
         model: String,
+        effort: String = "",
         cliPath: String = "",
         workingDirectory: String,
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -1628,6 +1631,13 @@ final class AgentSession {
     ) -> Launch {
         var args = [bridgePath, "--cli", cli, "--cwd", workingDirectory]
         if !model.isEmpty { args += ["--model", model] }
+        // Only codex and kiro take an effort level today; the bridge itself
+        // decides how each spells it (codex's `-c model_reasoning_effort=`,
+        // kiro's ACP arg after probing `--help` for support). gemini/cursor/agy
+        // have no such knob, so the flag is withheld rather than sent unused.
+        if !effort.isEmpty && (cli == "codex" || cli == "kiro") {
+            args += ["--effort", effort]
+        }
         // The path Settings resolved, so the bridge runs the binary the user
         // chose rather than whichever one PATH happens to find.
         if !cliPath.isEmpty { args += ["--exe", cliPath] }
@@ -1672,6 +1682,7 @@ final class AgentSession {
         port: Int?,
         identityFile: String?,
         model: String,
+        effort: String = "",
         instructions: String,
         extraArgs: [String] = [],
         workingDirectory: String,
@@ -1682,6 +1693,7 @@ final class AgentSession {
         let claude = claudeLaunch(
             claudePath: "claude",
             model: model,
+            effort: effort,
             instructions: instructions,
             extraArgs: extraArgs,
             workingDirectory: workingDirectory,
@@ -1717,6 +1729,7 @@ final class AgentSession {
         cli: String,
         bridgePath: String,
         model: String,
+        effort: String = "",
         sshTarget: String,
         port: Int?,
         identityFile: String?,
@@ -1747,6 +1760,11 @@ final class AgentSession {
 
         var args = [bridgePath, "--cli", cli, "--cwd", workingDirectory]
         if !model.isEmpty { args += ["--model", model] }
+        // Only codex and kiro take an effort level; the bridge itself decides
+        // how each spells it. gemini/cursor/agy have no such knob.
+        if !effort.isEmpty && (cli == "codex" || cli == "kiro") {
+            args += ["--effort", effort]
+        }
         return Launch(
             executable: "/usr/bin/env",
             arguments: AgentPipeTransport.bridgeInterpreter(for: bridgePath) + args,

@@ -2330,6 +2330,7 @@ final class TeamOrchestrator: ObservableObject {
                     claudePath: cliPath,
                     fifoPath: AgentPipeTransport.fifoPath(agentId: transportId),
                     model: Self.resolveClaudeModelArg(agentModel),
+                    effort: agentEffort,
                     instructions: agentInstructions,
                     extraArgs: extraArgs,
                     rendererPath: AgentPipeTransport.rendersOutput
@@ -2356,6 +2357,7 @@ final class TeamOrchestrator: ObservableObject {
                 // codex as `--model sonnet`, which it accepts and then answers
                 // nothing at all — measured.
                 model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
+                effort: agentEffort,
                 cliPath: cliPath,
                 bridgePath: bridge,
                 rendererPath: AgentPipeTransport.rendersOutput
@@ -2426,6 +2428,7 @@ final class TeamOrchestrator: ObservableObject {
                 agentPanel.start(
                     bridgedCli: agentCli, bridgePath: bridge,
                     model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
+                    effort: agentEffort,
                     cliPath: cliPath,
                     environment: nativeEnvironment,
                     protectedEnvironmentKeys: Set(paneEnv.keys)
@@ -2457,6 +2460,7 @@ final class TeamOrchestrator: ObservableObject {
                 agentPanel.start(
                     claudePath: cliPath,
                     model: Self.resolveClaudeModelArg(agentModel),
+                    effort: agentEffort,
                     instructions: agentInstructions,
                     extraArgs: extraArgs,
                     environment: nativeEnvironment,

@@ -118,4 +118,122 @@ final class EffortLaunchArgsTests: XCTestCase {
         let decoded = try JSONDecoder().decode(AgentRolePreset.self, from: data)
         XCTAssertEqual(decoded.effort, "high")
     }
+
+    // MARK: - AgentSession.claudeLaunch: native claude pane argv
+
+    func testClaudeLaunchIncludesEffortAfterModel() {
+        let launch = AgentSession.claudeLaunch(
+            claudePath: "/usr/bin/claude",
+            model: "opus",
+            effort: "high",
+            instructions: "",
+            extraArgs: [],
+            workingDirectory: "/tmp"
+        )
+        guard let modelIndex = launch.arguments.firstIndex(of: "--model") else {
+            return XCTFail("expected --model in \(launch.arguments)")
+        }
+        XCTAssertEqual(Array(launch.arguments[(modelIndex + 2)...(modelIndex + 3)]), ["--effort", "high"])
+    }
+
+    func testClaudeLaunchOmitsEffortFlagWhenEmpty() {
+        let launch = AgentSession.claudeLaunch(
+            claudePath: "/usr/bin/claude",
+            model: "opus",
+            effort: "",
+            instructions: "",
+            extraArgs: [],
+            workingDirectory: "/tmp"
+        )
+        XCTAssertFalse(launch.arguments.contains("--effort"))
+    }
+
+    // MARK: - AgentSession.bridgeLaunch: native bridged-CLI pane argv
+
+    func testBridgeLaunchIncludesEffortForCodexAndKiro() {
+        for cli in ["codex", "kiro"] {
+            let launch = AgentSession.bridgeLaunch(
+                cli: cli,
+                bridgePath: "/tmp/tm-agent-bridge.py",
+                model: "sonnet",
+                effort: "xhigh",
+                workingDirectory: "/tmp"
+            )
+            guard let idx = launch.arguments.firstIndex(of: "--effort") else {
+                return XCTFail("expected --effort in \(launch.arguments) for \(cli)")
+            }
+            XCTAssertEqual(launch.arguments[idx + 1], "xhigh", cli)
+        }
+    }
+
+    func testBridgeLaunchOmitsEffortForGemini() {
+        let launch = AgentSession.bridgeLaunch(
+            cli: "gemini",
+            bridgePath: "/tmp/tm-agent-bridge.py",
+            model: "sonnet",
+            effort: "xhigh",
+            workingDirectory: "/tmp"
+        )
+        XCTAssertFalse(launch.arguments.contains("--effort"))
+    }
+
+    // MARK: - AgentPipeTransport.launchCommand: claude FIFO shell line
+
+    func testPipeLaunchCommandIncludesEffortFlag() {
+        let command = AgentPipeTransport.launchCommand(
+            claudePath: "/usr/bin/claude",
+            fifoPath: "/tmp/agent.stdin",
+            model: "opus",
+            effort: "medium",
+            instructions: "",
+            extraArgs: []
+        )
+        // The whole chain is itself shell-quoted for the outer `zsh -c`, so
+        // the inner `'medium'` comes back escaped as `'\''medium'\'''`
+        // rather than a literal `'medium'` substring.
+        XCTAssertTrue(command.contains("--effort") && command.contains("medium"), command)
+    }
+
+    func testPipeLaunchCommandOmitsEffortWhenEmpty() {
+        let command = AgentPipeTransport.launchCommand(
+            claudePath: "/usr/bin/claude",
+            fifoPath: "/tmp/agent.stdin",
+            model: "opus",
+            effort: "",
+            instructions: "",
+            extraArgs: []
+        )
+        XCTAssertFalse(command.contains("--effort"))
+    }
+
+    // MARK: - AgentPipeTransport.bridgeLaunchCommand: bridged-CLI shell line
+
+    func testBridgeLaunchCommandIncludesEffortForCodexAndKiro() {
+        for cli in ["codex", "kiro"] {
+            let command = AgentPipeTransport.bridgeLaunchCommand(
+                cli: cli,
+                fifoPath: "/tmp/agent.stdin",
+                model: "sonnet",
+                effort: "xhigh",
+                bridgePath: "/tmp/tm-agent-bridge.py",
+                rendererPath: nil,
+                workingDirectory: "/tmp"
+            )
+            // Same outer-shell escaping as the pipe-launch case above.
+            XCTAssertTrue(command.contains("--effort") && command.contains("xhigh"), "\(cli): \(command)")
+        }
+    }
+
+    func testBridgeLaunchCommandOmitsEffortForGemini() {
+        let command = AgentPipeTransport.bridgeLaunchCommand(
+            cli: "gemini",
+            fifoPath: "/tmp/agent.stdin",
+            model: "sonnet",
+            effort: "xhigh",
+            bridgePath: "/tmp/tm-agent-bridge.py",
+            rendererPath: nil,
+            workingDirectory: "/tmp"
+        )
+        XCTAssertFalse(command.contains("--effort"), command)
+    }
 }
