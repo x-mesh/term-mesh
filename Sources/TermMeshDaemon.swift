@@ -1528,38 +1528,57 @@ final class TermMeshDaemon: ObservableObject {
     ///     { "name": "explorer",
     ///       "input_tokens": 8200,
     ///       "output_tokens": 1300,
-    ///       "cache_read_tokens": 22000,
-    ///       "cache_creation_tokens": 13000 }
+    ///       "cache_read_input_tokens": 22000,
+    ///       "cache_creation_input_tokens": 13000,
+    ///       "model": "claude-sonnet-4-6",
+    ///       "context_tokens": 30200 }
     ///   ] }
+    ///
+    /// `context_tokens` is absent (not decoded) when the source cannot report
+    /// a non-cumulative context occupancy (e.g. Codex) — see
+    /// `UsageTickAgent.context_tokens` in daemon/term-meshd/src/headless/mod.rs.
     ///
     /// Marshals onto the main thread and forwards to `TeamDataStore.updateUsage`.
     /// Safe to call from any thread. Backend wiring (socket-notify subscription)
     /// is intentionally left as a future addition — until then this method is
     /// callable from tests / debug bridges without breakage.
+    /// Decode one tick's `agents` array. Split out of `handleAgentUsageTick`
+    /// so the wire contract is testable without the shared store: the keys are
+    /// `UsageTickAgent`'s serde names in `term-meshd/src/headless/mod.rs`, and
+    /// a name that only matches the Swift property spelling reads as 0 with no
+    /// error — which is how the two cache counters silently stayed empty.
+    static func parseUsageTickAgents(
+        _ agentsRaw: [[String: Any]], now: Date
+    ) -> [(name: String, snapshot: AgentUsageSnapshot)] {
+        var parsed: [(name: String, snapshot: AgentUsageSnapshot)] = []
+        for entry in agentsRaw {
+            guard let name = entry["name"] as? String else { continue }
+            parsed.append((
+                name: name,
+                snapshot: AgentUsageSnapshot(
+                    inputTokens: (entry["input_tokens"] as? NSNumber)?.uint64Value ?? 0,
+                    outputTokens: (entry["output_tokens"] as? NSNumber)?.uint64Value ?? 0,
+                    cacheReadTokens: (entry["cache_read_input_tokens"] as? NSNumber)?.uint64Value ?? 0,
+                    cacheCreationTokens: (entry["cache_creation_input_tokens"] as? NSNumber)?.uint64Value ?? 0,
+                    updatedAt: now,
+                    model: entry["model"] as? String ?? "",
+                    // Absent rather than null when the daemon cannot report a
+                    // non-cumulative occupancy for this CLI (e.g. Codex). Left
+                    // nil, never 0: a 0 renders as "0%", which reads as real
+                    // data instead of an absent measurement.
+                    contextTokens: (entry["context_tokens"] as? NSNumber)?.uint64Value
+                )
+            ))
+        }
+        return parsed
+    }
+
     func handleAgentUsageTick(payload: [String: Any]) {
         guard let teamName = payload["team_name"] as? String,
               let agentsRaw = payload["agents"] as? [[String: Any]] else {
             return
         }
-        var parsed: [(name: String, snapshot: AgentUsageSnapshot)] = []
-        let now = Date()
-        for entry in agentsRaw {
-            guard let name = entry["name"] as? String else { continue }
-            let input = (entry["input_tokens"] as? NSNumber)?.uint64Value ?? 0
-            let output = (entry["output_tokens"] as? NSNumber)?.uint64Value ?? 0
-            let cacheRead = (entry["cache_read_tokens"] as? NSNumber)?.uint64Value ?? 0
-            let cacheCreation = (entry["cache_creation_tokens"] as? NSNumber)?.uint64Value ?? 0
-            parsed.append((
-                name: name,
-                snapshot: AgentUsageSnapshot(
-                    inputTokens: input,
-                    outputTokens: output,
-                    cacheReadTokens: cacheRead,
-                    cacheCreationTokens: cacheCreation,
-                    updatedAt: now
-                )
-            ))
-        }
+        let parsed = Self.parseUsageTickAgents(agentsRaw, now: Date())
         DispatchQueue.main.async {
             TeamDataStore.shared.updateUsage(teamName: teamName, agents: parsed)
         }

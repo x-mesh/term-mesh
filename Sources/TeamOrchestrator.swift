@@ -424,6 +424,7 @@ final class TeamOrchestrator: ObservableObject {
         let cli: String          // "claude", "kiro" (which CLI to run)
         let launchCommand: String // bare binary name fallback (e.g. "claude") for retype
         let model: String        // "opus", "sonnet", "haiku"
+        var effort: String = ""  // "low"/"medium"/"high"/"xhigh"/"max", empty = CLI default
         let agentType: String    // "Explore", "executor", etc.
         let color: String        // terminal color
         let instructions: String // role description for leader routing
@@ -569,6 +570,7 @@ final class TeamOrchestrator: ObservableObject {
         let leaderSessionId: String
         let leaderMode: String    // "repl", "claude", "kiro", "codex", "gemini", "adopted"
         var leaderModel: String   // e.g. "sonnet", "opus", "haiku"
+        var leaderEffort: String = ""  // "low"/"medium"/"high"/"xhigh"/"max", empty = CLI default
         var leaderCli: String?    // actual CLI for adopted/recovered leaders
         var leaderPanelId: UUID   // leader pane for sending instructions
         var leaderWorkspaceId: UUID?  // only set in "adopted" mode (leader lives in a separate workspace)
@@ -2237,6 +2239,7 @@ final class TeamOrchestrator: ObservableObject {
         agentName: String,
         agentCli: String,
         agentModel: String,
+        agentEffort: String = "",
         agentType: String,
         agentColor: String,
         agentInstructions: String,
@@ -2278,6 +2281,7 @@ final class TeamOrchestrator: ObservableObject {
                 agentName: agentName,
                 teamName: teamName,
                 model: agentModel,
+                effort: agentEffort,
                 systemPrompt: workerPrompt,
                 extraArgs: extraArgs
             )
@@ -2287,6 +2291,7 @@ final class TeamOrchestrator: ObservableObject {
                 agentName: agentName,
                 teamName: teamName,
                 model: agentModel,
+                effort: agentEffort,
                 extraArgs: extraArgs
             )
         case "gemini":
@@ -2307,6 +2312,7 @@ final class TeamOrchestrator: ObservableObject {
                 parentSessionId: leaderSessionId,
                 agentType: agentType,
                 model: agentModel,
+                effort: agentEffort,
                 instructions: agentInstructions,
                 extraArgs: extraArgs
             )
@@ -2324,6 +2330,7 @@ final class TeamOrchestrator: ObservableObject {
                     claudePath: cliPath,
                     fifoPath: AgentPipeTransport.fifoPath(agentId: transportId),
                     model: Self.resolveClaudeModelArg(agentModel),
+                    effort: agentEffort,
                     instructions: agentInstructions,
                     extraArgs: extraArgs,
                     rendererPath: AgentPipeTransport.rendersOutput
@@ -2350,6 +2357,7 @@ final class TeamOrchestrator: ObservableObject {
                 // codex as `--model sonnet`, which it accepts and then answers
                 // nothing at all — measured.
                 model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
+                effort: agentEffort,
                 cliPath: cliPath,
                 bridgePath: bridge,
                 rendererPath: AgentPipeTransport.rendersOutput
@@ -2420,6 +2428,7 @@ final class TeamOrchestrator: ObservableObject {
                 agentPanel.start(
                     bridgedCli: agentCli, bridgePath: bridge,
                     model: Self.bridgeModelArg(cli: agentCli, model: agentModel),
+                    effort: agentEffort,
                     cliPath: cliPath,
                     environment: nativeEnvironment,
                     protectedEnvironmentKeys: Set(paneEnv.keys)
@@ -2451,6 +2460,7 @@ final class TeamOrchestrator: ObservableObject {
                 agentPanel.start(
                     claudePath: cliPath,
                     model: Self.resolveClaudeModelArg(agentModel),
+                    effort: agentEffort,
                     instructions: agentInstructions,
                     extraArgs: extraArgs,
                     environment: nativeEnvironment,
@@ -2494,6 +2504,7 @@ final class TeamOrchestrator: ObservableObject {
                 cli: agentCli,
                 launchCommand: Self.defaultLaunchCommand(for: agentCli),
                 model: agentModel,
+                effort: agentEffort,
                 agentType: agentType,
                 color: agentColor,
                 instructions: agentInstructions,
@@ -2678,11 +2689,12 @@ final class TeamOrchestrator: ObservableObject {
     /// Returns the team info on success.
     func createTeam(
         name: String,
-        agents: [(name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String)],
+        agents: [(name: String, cli: String, model: String, effort: String, agentType: String, color: String, instructions: String, customInstructions: String)],
         workingDirectory: String,
         leaderSessionId: String,
         leaderMode: String = "repl",
         leaderModel: String = "sonnet",
+        leaderEffort: String = "",
         leaderCli: String = "claude",
         pairMode: String = "none",
         pairModel: String = "",
@@ -2743,10 +2755,11 @@ final class TeamOrchestrator: ObservableObject {
         if pairEligible {
             let watcherInstructions = AgentRolePresetManager.builtInPresets.first { $0.name == "watcher" }?.instructions ?? ""
             let watcherModel = pairModel.isEmpty ? "sonnet" : pairModel
-            let watcherTuple: (name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String) = (
+            let watcherTuple: (name: String, cli: String, model: String, effort: String, agentType: String, color: String, instructions: String, customInstructions: String) = (
                 name: "watcher",
                 cli: pairMode,
                 model: watcherModel,
+                effort: "",
                 agentType: "watcher",
                 color: "yellow",
                 instructions: watcherInstructions,
@@ -3157,7 +3170,7 @@ final class TeamOrchestrator: ObservableObject {
                     let agentListStr = agents.enumerated().map { i, a in
                         Self.leaderRosterLine(
                             index: i, name: a.name, role: a.agentType, cli: a.cli,
-                            model: a.model, agentInstanceId: reservedAgentInstanceIds[i],
+                            model: a.model, effort: a.effort, agentInstanceId: reservedAgentInstanceIds[i],
                             host: "local", instructions: a.instructions
                         )
                     }.joined(separator: "\n")
@@ -3183,6 +3196,7 @@ final class TeamOrchestrator: ObservableObject {
                     if !leaderModel.isEmpty && leaderModel != "sonnet" {
                         claudeLeaderParts.append("--model '\(Self.resolveClaudeModelArg(leaderModel))'")
                     }
+                    claudeLeaderParts += Self.effortLaunchArgs(cli: "claude", effort: leaderEffort)
                     if let sid = resumeSessionId, !sid.isEmpty {
                         claudeLeaderParts.append("--resume \(sid)")
                     }
@@ -3192,7 +3206,7 @@ final class TeamOrchestrator: ObservableObject {
                 }
             case "kiro":
                 if let path = agentBinaryPath(cli: "kiro") {
-                    leaderCommand = buildKiroCommand(kiroPath: path, agentName: "leader", teamName: name, model: leaderModel, isLeader: true)
+                    leaderCommand = buildKiroCommand(kiroPath: path, agentName: "leader", teamName: name, model: leaderModel, effort: leaderEffort, isLeader: true)
                 } else { leaderCommand = nil }
             case "codex":
                 if let path = agentBinaryPath(cli: "codex") {
@@ -3200,7 +3214,7 @@ final class TeamOrchestrator: ObservableObject {
                         .map(Self.codexLeaderTurnHookArguments) ?? []
                     leaderCommand = buildCodexCommand(
                         codexPath: path, agentName: "leader", teamName: name,
-                        model: leaderModel, extraArgs: hookArgs
+                        model: leaderModel, effort: leaderEffort, extraArgs: hookArgs
                     )
                 } else { leaderCommand = nil }
             case "gemini":
@@ -3305,6 +3319,9 @@ final class TeamOrchestrator: ObservableObject {
                 let headlessExtraEnv = headlessProfile?.env ?? [:]
                 let headlessModel = headlessProfile?.modelOverride ?? a.model
                 var spec: [String: Any] = ["name": a.name, "agent_type": a.agentType, "cli": cli, "model": headlessModel]
+                if !a.effort.isEmpty {
+                    spec["effort"] = a.effort
+                }
                 if let path = cliPaths[cli] {
                     spec["cli_path"] = path
                 }
@@ -3319,13 +3336,16 @@ final class TeamOrchestrator: ObservableObject {
                 }
                 return spec
             }
-            let createParams: [String: Any] = [
+            var createParams: [String: Any] = [
                 "team_name": name,
                 "working_directory": workingDirectory,
                 "leader_session_id": leaderSessionId,
                 "agents": agentSpecs,
                 "app_socket_path": SocketControlSettings.socketPath(),
             ]
+            if !leaderEffort.isEmpty {
+                createParams["leader_effort"] = leaderEffort
+            }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else { return }
                 let result = self.daemon.rpcCallRaw(method: "headless.create_team", params: createParams)
@@ -3386,6 +3406,7 @@ final class TeamOrchestrator: ObservableObject {
                     cli: agentCli,
                     launchCommand: Self.defaultLaunchCommand(for: agentCli),
                     model: agent.model,
+                    effort: agent.effort,
                     agentType: agent.agentType,
                     color: agentColor,
                     instructions: effectiveInstructions,
@@ -3419,6 +3440,7 @@ final class TeamOrchestrator: ObservableObject {
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
                 leaderModel: leaderModel,
+                leaderEffort: leaderEffort,
                 leaderCli: detectedLeaderCli,
                 leaderPanelId: leaderPanelId,
                 leaderWorkspaceId: leaderWorkspaceId,
@@ -3539,6 +3561,7 @@ final class TeamOrchestrator: ObservableObject {
                 agentName: agent.name,
                 agentCli: agentCli,
                 agentModel: effectiveModel,
+                agentEffort: agent.effort,
                 agentType: agent.agentType,
                 agentColor: agentColor,
                 agentInstructions: effectiveInstructions,
@@ -3610,6 +3633,7 @@ final class TeamOrchestrator: ObservableObject {
             leaderSessionId: leaderSessionId,
             leaderMode: leaderMode,
             leaderModel: leaderModel,
+            leaderEffort: leaderEffort,
             leaderCli: detectedLeaderCli,
             leaderPanelId: leaderPanelId,
             leaderWorkspaceId: leaderWorkspaceId,
@@ -4110,6 +4134,7 @@ final class TeamOrchestrator: ObservableObject {
         agentType: String,
         agentName: String,
         agentModel: String,
+        agentEffort: String = "",
         agentCli: String,
         customInstructions: String? = nil
     ) -> Result<AgentMember, AddAgentError> {
@@ -4165,6 +4190,7 @@ final class TeamOrchestrator: ObservableObject {
             agentName: agentName,
             agentCli: normalizedCli,
             agentModel: effectiveModel,
+            agentEffort: agentEffort,
             agentType: agentType,
             agentColor: agentColor,
             agentInstructions: effectiveInstructions,
@@ -4575,13 +4601,16 @@ final class TeamOrchestrator: ObservableObject {
         role: String,
         cli: String,
         model: String,
+        effort: String = "",
         agentInstanceId: String,
         host: String,
         instructions: String
     ) -> String {
         let summary = oneLinerFromInstructions(instructions)
         let mode = roleDefaultsToReadOnly(role) ? "read-only-default" : "may-mutate"
-        let metadata = "role=\(role) instance=\(agentInstanceId) cli=\(cli) model=\(model) host=\(host) mode=\(mode)"
+        var metadata = "role=\(role) instance=\(agentInstanceId) cli=\(cli) model=\(model)"
+        if !effort.isEmpty { metadata += " effort=\(effort)" }
+        metadata += " host=\(host) mode=\(mode)"
         return summary.isEmpty
             ? "  \(index + 1). \(name) [\(metadata)]"
             : "  \(index + 1). \(name) [\(metadata)] — \(summary)"
@@ -4591,7 +4620,7 @@ final class TeamOrchestrator: ObservableObject {
         let instructions = row.customInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
         return leaderRosterLine(
             index: index, name: row.preset.name, role: row.preset.name,
-            cli: row.preset.cli, model: row.preset.model,
+            cli: row.preset.cli, model: row.preset.model, effort: row.preset.effort,
             agentInstanceId: row.id.uuidString, host: row.hostKey ?? "local",
             instructions: instructions.isEmpty ? row.preset.instructions : instructions
         )
@@ -4600,7 +4629,7 @@ final class TeamOrchestrator: ObservableObject {
     private static func leaderRosterLine(index: Int, agent: AgentMember) -> String {
         leaderRosterLine(
             index: index, name: agent.name, role: agent.agentType, cli: agent.cli,
-            model: agent.model, agentInstanceId: agent.agentInstanceId,
+            model: agent.model, effort: agent.effort, agentInstanceId: agent.agentInstanceId,
             host: agent.hostKey ?? "local", instructions: agent.instructions
         )
     }
@@ -7989,6 +8018,7 @@ final class TeamOrchestrator: ObservableObject {
                         "agent_instance_id": agent.agentInstanceId,
                         "cli": agent.cli,
                         "model": agent.model,
+                        "effort": agent.effort,
                         "agent_type": agent.agentType,
                         "read_only_default": Self.roleDefaultsToReadOnly(agent.agentType),
                         "host": agent.hostKey as Any? ?? NSNull(),
@@ -8020,6 +8050,7 @@ final class TeamOrchestrator: ObservableObject {
                 // usage-tick broadcaster can attribute token usage to the leader
                 // (the leader is intentionally NOT part of the `agents` array).
                 "leader_cli": team.leaderMode,
+                "leader_effort": team.leaderEffort,
                 "leader_panel_id": team.leaderPanelId.uuidString,
                 "leader_endpoint": leaderEndpoint,
                 "leader_ready": team.leaderReady,
@@ -8163,6 +8194,7 @@ final class TeamOrchestrator: ObservableObject {
         var status: [String: Any] = [
             "team_name": team.id,
             "leader_session_id": team.leaderSessionId,
+            "leader_effort": team.leaderEffort,
             "leader_ready": team.leaderReady,
             "leader_pane_attached": isLeaderPaneAttached(teamName: team.id),
             "leader_failure": team.leaderFailureDescription as Any? ?? NSNull(),
@@ -8196,6 +8228,7 @@ final class TeamOrchestrator: ObservableObject {
                     "agent_instance_id": agent.agentInstanceId,
                     "cli": agent.cli,
                     "model": agent.model,
+                    "effort": agent.effort,
                     "agent_type": agent.agentType,
                     "active_task_id": enrichment["active_task_id"] ?? NSNull(),
                     "active_task_title": enrichment["active_task_title"] ?? NSNull(),
@@ -8438,6 +8471,7 @@ final class TeamOrchestrator: ObservableObject {
         let leaderSessionId = (leaderDict?["session_id"] as? String) ?? ""
         let leaderMode = (leaderDict?["mode"] as? String) ?? "claude"
         let leaderModel = (leaderDict?["model"] as? String) ?? "sonnet"
+        let leaderEffort = (leaderDict?["effort"] as? String) ?? ""
         let restoredDelegation = ProjectDelegationState(
             configuredRaw: result["delegation_configured"] as? String,
             effectiveRaw: result["delegation_effective"] as? String,
@@ -8456,12 +8490,13 @@ final class TeamOrchestrator: ObservableObject {
         }()
 
         // Build agents tuple in createTeam's expected shape.
-        typealias AgentTuple = (name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String)
+        typealias AgentTuple = (name: String, cli: String, model: String, effort: String, agentType: String, color: String, instructions: String, customInstructions: String)
         let agentTuples: [AgentTuple] = agentsArr.map { a in
             (
                 name: (a["name"] as? String) ?? "agent",
                 cli: (a["cli"] as? String) ?? "claude",
                 model: (a["model"] as? String) ?? "sonnet",
+                effort: (a["effort"] as? String) ?? "",
                 agentType: (a["agent_type"] as? String) ?? ((a["name"] as? String) ?? "agent"),
                 color: (a["color"] as? String) ?? "blue",
                 instructions: (a["instructions"] as? String) ?? "",
@@ -8524,6 +8559,7 @@ final class TeamOrchestrator: ObservableObject {
             leaderSessionId: freshLeaderSessionId,
             leaderMode: leaderMode,
             leaderModel: leaderModel,
+            leaderEffort: leaderEffort,
             delegationLevel: restoredDelegation.configured,
             resumeSessionId: leaderClaudeSid,
             worktreeMode: archivedWorktreeMode,
@@ -8797,6 +8833,7 @@ final class TeamOrchestrator: ObservableObject {
             "leader_session_id": leaderSid,
             "leader_mode": team.leaderMode,
             "leader_model": team.leaderModel,
+            "leader_effort": team.leaderEffort,
             "delegation_configured": team.delegationState.configured.rawValue,
             "delegation_effective": team.delegationState.effective.rawValue,
             "delegation_pending": team.delegationState.pending?.rawValue as Any? ?? NSNull(),
@@ -8808,6 +8845,7 @@ final class TeamOrchestrator: ObservableObject {
                     "agent_instance_id": a.agentInstanceId,
                     "cli": a.cli,
                     "model": a.model,
+                    "effort": a.effort,
                     "agent_type": a.agentType,
                     "color": a.color,
                 ]
@@ -8999,6 +9037,7 @@ final class TeamOrchestrator: ObservableObject {
             "leader_session_id": leaderSid,
             "leader_mode": team.leaderMode,
             "leader_model": team.leaderModel,
+            "leader_effort": team.leaderEffort,
             "delegation_configured": team.delegationState.configured.rawValue,
             "delegation_effective": team.delegationState.effective.rawValue,
             "delegation_pending": team.delegationState.pending?.rawValue as Any? ?? NSNull(),
@@ -9012,6 +9051,7 @@ final class TeamOrchestrator: ObservableObject {
                     "agent_instance_id": a.agentInstanceId,
                     "cli": a.cli,
                     "model": a.model,
+                    "effort": a.effort,
                     "agent_type": a.agentType,
                     "color": a.color,
                 ]
@@ -9238,6 +9278,24 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
+    /// Translate a stored effort value into CLI launch tokens. Empty effort
+    /// means "use the CLI default" — no tokens at all, so an unset value never
+    /// forces a flag the CLI wasn't asked for. codex spells it as a config
+    /// override rather than a bare flag; its own tier→effort fallback
+    /// (`codexReasoningEffort`) only fires when this returns empty, so an
+    /// explicit choice always wins over the model-tier guess.
+    static func effortLaunchArgs(cli: String, effort: String) -> [String] {
+        guard !effort.isEmpty else { return [] }
+        switch cli {
+        case "claude", "kiro":
+            return ["--effort", effort]
+        case "codex":
+            return ["-c", "model_reasoning_effort=\(effort)"]
+        default:
+            return []
+        }
+    }
+
     private func buildClaudeCommand(
         claudePath: String,
         agentId: String,
@@ -9247,6 +9305,7 @@ final class TeamOrchestrator: ObservableObject {
         parentSessionId: String,
         agentType: String,
         model: String,
+        effort: String = "",
         instructions: String = "",
         extraArgs: [String] = []
     ) -> String {
@@ -9264,6 +9323,8 @@ final class TeamOrchestrator: ObservableObject {
         if !model.isEmpty {
             parts.append("--model '\(Self.resolveClaudeModelArg(model))'")
         }
+
+        parts += Self.effortLaunchArgs(cli: "claude", effort: effort)
 
         if !instructions.isEmpty {
             // Escape single quotes for shell and pass as --append-system-prompt
@@ -9366,6 +9427,7 @@ final class TeamOrchestrator: ObservableObject {
         agentName: String,
         teamName: String,
         model: String,
+        effort: String = "",
         isLeader: Bool = false,
         systemPrompt: String? = nil,
         extraArgs: [String] = []
@@ -9410,6 +9472,8 @@ final class TeamOrchestrator: ObservableObject {
             let kiroModel = Self.kiroModelName(model)
             parts.append("--model \(kiroModel)")
         }
+
+        parts += Self.effortLaunchArgs(cli: "kiro", effort: effort)
 
         parts += extraArgs.map { shellQuote($0) }
 
@@ -9486,7 +9550,7 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Map short model tier to Codex reasoning effort (high/medium/low).
     /// Returns nil for non-tier model names so we don't override user-specified models.
-    private static func codexReasoningEffort(_ shortName: String) -> String? {
+    static func codexReasoningEffort(_ shortName: String) -> String? {
         switch shortName.lowercased() {
         case "opus": return "high"
         case "sonnet": return "medium"
@@ -9500,6 +9564,7 @@ final class TeamOrchestrator: ObservableObject {
         agentName: String,
         teamName: String,
         model: String,
+        effort: String = "",
         extraArgs: [String] = []
     ) -> String {
         let path = codexPath.contains(" ") ? "\"\(codexPath)\"" : codexPath
@@ -9514,8 +9579,13 @@ final class TeamOrchestrator: ObservableObject {
             parts.append("--model \(codexModel)")
         }
 
-        if !model.isEmpty, let effort = Self.codexReasoningEffort(model) {
-            parts.append("-c model_reasoning_effort=\(effort)")
+        // An explicit effort always wins over the tier-derived guess — only
+        // fall back to opus/sonnet/haiku → high/medium/low when the caller
+        // didn't ask for a specific level.
+        if !effort.isEmpty {
+            parts += Self.effortLaunchArgs(cli: "codex", effort: effort)
+        } else if !model.isEmpty, let tierEffort = Self.codexReasoningEffort(model) {
+            parts.append("-c model_reasoning_effort=\(tierEffort)")
         }
 
         parts += extraArgs.map { shellQuote($0) }
@@ -9668,6 +9738,8 @@ final class TeamOrchestrator: ObservableObject {
                 "applied_turns": policy.appliedTurns,
                 "suggested_turns": policy.suggestedTurns,
                 "route_deviations": policy.routeDeviations,
+                "more_parallel_than_suggested": policy.moreParallelThanSuggested,
+                "less_parallel_than_suggested": policy.lessParallelThanSuggested,
                 "shadow_turns": policy.shadowTurns,
                 "canary_turns": policy.canaryTurns,
                 "holdout_turns": policy.holdoutTurns,

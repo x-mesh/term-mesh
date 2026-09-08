@@ -147,6 +147,7 @@ struct NewProjectView: View {
     /// starting a project means.
     @State private var leaderCli = "claude"
     @State private var leaderModel = "opus"
+    @State private var leaderEffort = ""
     @State private var selectedTeamPresetId: TemplateID?
     @State private var appliedTeamSignature: TeamSignature?
     @State private var showingSavePreset = false
@@ -202,11 +203,13 @@ struct NewProjectView: View {
             let role: String
             let cli: String
             let model: String
+            let effort: String
             let instructions: String
         }
 
         let leaderCli: String
         let leaderModel: String?
+        let leaderEffort: String?
         let agents: [Agent]
     }
 
@@ -791,11 +794,15 @@ struct NewProjectView: View {
             leaderModel: leaderCli == "repl"
                 ? nil
                 : AgentRolePreset.normalizeModel(leaderModel, for: leaderCli),
+            leaderEffort: leaderCli == "repl"
+                ? nil
+                : AgentRolePreset.normalizeEffort(leaderEffort, for: leaderCli),
             agents: agents.map {
                 TeamSignature.Agent(
                     role: $0.preset.name,
                     cli: $0.preset.cli,
                     model: AgentRolePreset.normalizeModel($0.preset.model, for: $0.preset.cli),
+                    effort: AgentRolePreset.normalizeEffort($0.preset.effort, for: $0.preset.cli),
                     instructions: $0.customInstructions
                 )
             }
@@ -846,6 +853,12 @@ struct NewProjectView: View {
                         if AgentRolePreset.models(for: old) != AgentRolePreset.models(for: newCli) {
                             leaderModel = Self.defaultLeaderModel(for: newCli)
                         }
+                        // A value valid for the old CLI (e.g. "high" on claude) may
+                        // not be for the new one — collapse it to "" rather than
+                        // carrying it forward unchecked. The submit path already
+                        // re-normalizes, but the picker's own binding should never
+                        // display a value the current CLI cannot run.
+                        leaderEffort = AgentRolePreset.normalizeEffort(leaderEffort, for: newCli)
                     }
                 )) {
                     ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
@@ -879,6 +892,20 @@ struct NewProjectView: View {
                     }
                     .labelsHidden()
                     .frame(width: 132)
+
+                    if AgentRolePreset.supportsEffort(cli: leaderCli) {
+                        Picker("", selection: Binding(
+                            get: { AgentRolePreset.normalizeEffort(leaderEffort, for: leaderCli) },
+                            set: { leaderEffort = $0 }
+                        )) {
+                            Text("Default").tag("")
+                            ForEach(AgentRolePreset.efforts(for: leaderCli), id: \.self) { e in
+                                Text(e.capitalized).tag(e)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(width: 100)
+                    }
                 } else {
                     Text("Manual console")
                         .font(.caption)
@@ -2902,6 +2929,7 @@ struct NewProjectView: View {
         ProjectLeader(
             mode: leaderCli,
             model: leaderModel,
+            effort: leaderCli == "repl" ? "" : AgentRolePreset.normalizeEffort(leaderEffort, for: leaderCli),
             endpoint: runsOnHostKey.map { .peer(hostKey: $0) } ?? .local,
             delegationLevel: delegationLevel
         )
@@ -3115,6 +3143,7 @@ struct NewProjectView: View {
         let leader = ProjectLeader(
             mode: leaderCli,
             model: leaderModel,
+            effort: leaderCli == "repl" ? "" : AgentRolePreset.normalizeEffort(leaderEffort, for: leaderCli),
             endpoint: runsOnHostKey.map { .peer(hostKey: $0) } ?? .local,
             delegationLevel: delegationLevel
         )
@@ -4820,6 +4849,7 @@ enum ProjectCreationFlow {
             ),
             leaderMode: leader.mode,
             leaderModel: leader.model,
+            leaderEffort: leader.effort,
             leaderEndpoint: leader.endpoint,
             leaderWorkingDirectory: prepared.leaderProjectPath,
             worktreeMode: source.isolateAgents

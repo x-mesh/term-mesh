@@ -13,13 +13,22 @@ struct AgentUsageSnapshot: Equatable {
     var cacheReadTokens: UInt64
     var cacheCreationTokens: UInt64
     var updatedAt: Date
+    /// Model identifier as reported by the daemon, used to look up a
+    /// context-window limit. Empty when unknown.
+    var model: String = ""
+    /// Current context-window occupancy (last request's input + cache_read +
+    /// cache_creation) — distinct from the accumulated totals above. `nil`
+    /// when the source cannot report a non-cumulative value (e.g. Codex).
+    var contextTokens: UInt64? = nil
 
     static let empty = AgentUsageSnapshot(
         inputTokens: 0,
         outputTokens: 0,
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
-        updatedAt: .distantPast
+        updatedAt: .distantPast,
+        model: "",
+        contextTokens: nil
     )
 
     /// Cache-hit ratio: cacheRead / (cacheRead + cacheCreation). Nil when both are zero.
@@ -27,6 +36,16 @@ struct AgentUsageSnapshot: Equatable {
         let denom = cacheReadTokens &+ cacheCreationTokens
         guard denom > 0 else { return nil }
         return Double(cacheReadTokens) / Double(denom)
+    }
+
+    /// Context-window usage as a fraction of the model's limit. Nil when
+    /// either the current occupancy or the model's limit is unknown.
+    var contextUsageFraction: Double? {
+        guard let contextTokens, let limit = ModelContextLimits.contextLimit(forModel: model),
+              limit > 0 else {
+            return nil
+        }
+        return Double(contextTokens) / Double(limit)
     }
 }
 

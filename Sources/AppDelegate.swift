@@ -226,13 +226,14 @@ struct TermMeshWindowRoot<Content: View>: View {
     private func makeTeamCreationView(mode: String) -> TeamCreationView {
         let (defaultDir, defaultSource) = resolveDefaultWorkingDirectory()
         return TeamCreationView(
-            onCreate: { teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, resumeSessionId, pairMode, pairModel, pairSpec, workingDirectory in
+            onCreate: { teamName, leaderMode, leaderModel, leaderEffort, agents, worktreeMode, executionMode, resumeSessionId, pairMode, pairModel, pairSpec, workingDirectory in
                 TeamOrchestrator.shared.createTeam(
                     named: teamName,
                     rows: agents,
                     workingDirectory: workingDirectory,
                     leaderMode: leaderMode,
                     leaderModel: leaderModel,
+                    leaderEffort: leaderEffort,
                     worktreeMode: worktreeMode,
                     executionMode: executionMode,
                     resumeSessionId: resumeSessionId,

@@ -46,7 +46,7 @@ Valid roles: `architect` `executor` `explorer` `frontend` `backend` `tester` `re
 Defaults: `--cli claude`; the model defaults to that CLI's native default. Works for headless and GUI teams. Rejects duplicate name within the team. Run exactly one command:
 
 ```bash
-tm-agent add <role> [--cli X] [--model Y] [--name Z] --warmup
+tm-agent add <role> [--cli X] [--model Y] [--effort E] [--name Z] --warmup
 ```
 
 Do not run `status`, `--help`, `preset`, or `runbook` first. Do not run a separate `warmup` or post-add `status`; investigate only if this command fails.

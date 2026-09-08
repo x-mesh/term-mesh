@@ -368,7 +368,7 @@ struct TeamCreationView: View {
     @ObservedObject var teamTemplateManager = TeamTemplateManager.shared
     @ObservedObject var providerDetector = ProviderDetector.shared
 
-    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?, _ pairMode: String, _ pairModel: String, _ pairSpec: String, _ workingDirectory: String) -> Bool)?
+    var onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ leaderEffort: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?, _ pairMode: String, _ pairModel: String, _ pairSpec: String, _ workingDirectory: String) -> Bool)?
     /// Phase 2: called after a successful `headless.resume_team` RPC.
     /// Receives the decoded result dictionary. Caller is responsible for
     /// registering the team in TeamOrchestrator and switching workspace cwd
@@ -382,7 +382,7 @@ struct TeamCreationView: View {
     var defaultWorkingDirectorySource: WorkingDirectorySource = .currentPane
 
     init(
-        onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?, _ pairMode: String, _ pairModel: String, _ pairSpec: String, _ workingDirectory: String) -> Bool)? = nil,
+        onCreate: ((_ teamName: String, _ leaderMode: String, _ leaderModel: String, _ leaderEffort: String, _ agents: [TeamAgentRow], _ worktreeMode: String, _ executionMode: String, _ resumeSessionId: String?, _ pairMode: String, _ pairModel: String, _ pairSpec: String, _ workingDirectory: String) -> Bool)? = nil,
         onResume: ((_ result: [String: Any]) -> Void)? = nil,
         initialMode: String = "new",
         defaultWorkingDirectory: String = "",
@@ -400,10 +400,13 @@ struct TeamCreationView: View {
     @AppStorage("teamDefaultLeaderMode") private var defaultLeaderMode = "claude"
     @AppStorage("teamDefaultModel") private var defaultModel = "sonnet"
     @AppStorage("teamDefaultLeaderModel") private var defaultLeaderModel = "sonnet"
+    @AppStorage("teamDefaultEffort") private var defaultEffort = ""
+    @AppStorage("teamDefaultLeaderEffort") private var defaultLeaderEffort = ""
 
     @State private var teamName = "my-team"
     @State private var leaderMode = "repl"  // "repl" or "claude"
     @State private var leaderModel = "sonnet"
+    @State private var leaderEffort = ""
     @State private var agents: [TeamAgentRow] = []
     @State private var showPresetEditor = false
     @State private var showSaveTemplate = false
@@ -412,6 +415,7 @@ struct TeamCreationView: View {
     @State private var previewTemplate: TeamTemplate?
     @State private var hoveredAgentId: UUID?
     @State private var bulkModel = "sonnet"
+    @State private var bulkEffort = ""
     @State private var selectedSmartPresetId: String?
     @State private var hoveredSmartPresetId: String? = nil
     @State private var deletingSmartPresetId: String? = nil
@@ -516,7 +520,9 @@ struct TeamCreationView: View {
         .onAppear {
             leaderMode = TeamTemplateManager.shared.resolveLeaderMode(fallback: defaultLeaderMode)
             leaderModel = defaultLeaderModel
+            leaderEffort = defaultLeaderEffort
             bulkModel = defaultModel
+            bulkEffort = defaultEffort
             worktreeMode = TermMeshDaemon.shared.worktreeEnabled ? "isolated" : "off"
             autoRecycleEvery = globalAutoRecycleDefault
             if agents.isEmpty {
@@ -1194,6 +1200,10 @@ struct TeamCreationView: View {
                         if newMode != "repl" && AgentRolePreset.models(for: oldMode) != AgentRolePreset.models(for: newMode) {
                             leaderModel = AgentRolePreset.defaultModel(for: newMode)
                         }
+                        // A value valid for the old CLI (e.g. "high" on claude) may
+                        // not be for the new one (e.g. gemini has no effort at all) —
+                        // collapse it to "" rather than carrying it forward unchecked.
+                        leaderEffort = AgentRolePreset.normalizeEffort(leaderEffort, for: newMode)
                         // Reset hidden pair state when switching to repl (no pair pane possible).
                         if newMode == "repl" {
                             leaderPairMode = "none"
@@ -1238,6 +1248,19 @@ struct TeamCreationView: View {
                         }
                     }
                     .fixedSize()
+
+                    if AgentRolePreset.supportsEffort(cli: leaderMode) {
+                        Picker("", selection: Binding(
+                            get: { AgentRolePreset.normalizeEffort(leaderEffort, for: leaderMode) },
+                            set: { leaderEffort = $0 }
+                        )) {
+                            Text("Default").tag("")
+                            ForEach(AgentRolePreset.efforts(for: leaderMode), id: \.self) { e in
+                                Text(e.capitalized).tag(e)
+                            }
+                        }
+                        .fixedSize()
+                    }
                 }
             }
 
@@ -2527,11 +2550,17 @@ struct TeamCreationView: View {
         // Same-CLI pair is allowed — user may want e.g. claude + claude with a different model.
         let effectivePair = executionMode == "headless" ? "none" : leaderPairMode
         let effectivePairSpec = effectivePair == "none" ? "" : leaderPairSpec
-        let success = onCreate?(teamName, leaderMode, leaderModel, agents, worktreeMode, executionMode, sid, effectivePair, effectivePair == "none" ? "" : leaderPairModel, effectivePairSpec, workingDirectory) ?? false
+        // Re-normalize at submit time too — `leaderEffort` reflects whatever
+        // CLI was selected when it was last touched, and a picker path that
+        // missed the reset (or a value restored from AppStorage) must not
+        // reach onCreate as a value the current leaderMode doesn't support.
+        let effectiveLeaderEffort = AgentRolePreset.normalizeEffort(leaderEffort, for: leaderMode)
+        let success = onCreate?(teamName, leaderMode, leaderModel, effectiveLeaderEffort, agents, worktreeMode, executionMode, sid, effectivePair, effectivePair == "none" ? "" : leaderPairModel, effectivePairSpec, workingDirectory) ?? false
         guard success else { return }
         TeamCreationRecentDirs.shared.promote(workingDirectory)
         defaultLeaderMode = leaderMode
         defaultLeaderModel = leaderModel
+        defaultLeaderEffort = effectiveLeaderEffort
         if autoRecycleEvery > 0 {
             TeamOrchestrator.shared.setTeamDefaultAutoRecycle(teamName: teamName, every: autoRecycleEvery)
             for (agentName, threshold) in perAgentOverrides where threshold > 0 {

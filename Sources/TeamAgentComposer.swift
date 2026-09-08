@@ -102,6 +102,7 @@ struct TeamAgentComposer: View {
     @State private var hoveredAgentId: UUID?
     @State private var bulkCli: String = "claude"
     @State private var bulkModel: String = AgentRolePreset.defaultModel(for: "claude")
+    @State private var bulkEffort: String = ""
     @State private var bulkHostKey: String?
     @State private var bulkHostDirectory: String = ""
     @State private var bulkUsesDefaultPlacement = true
@@ -287,6 +288,7 @@ struct TeamAgentComposer: View {
                             set: { newCli in
                                 bulkCli = newCli
                                 bulkModel = AgentRolePreset.defaultModel(for: newCli)
+                                bulkEffort = AgentRolePreset.normalizeEffort(bulkEffort, for: newCli)
                             }
                         )) {
                             ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
@@ -311,6 +313,15 @@ struct TeamAgentComposer: View {
                             }
                         }
                         .frame(width: 130)
+                        if AgentRolePreset.supportsEffort(cli: bulkCli) {
+                            Picker("", selection: $bulkEffort) {
+                                Text("Default").tag("")
+                                ForEach(AgentRolePreset.efforts(for: bulkCli), id: \.self) { e in
+                                    Text(e.capitalized).tag(e)
+                                }
+                            }
+                            .frame(width: 100)
+                        }
                         Button(action: applyModelToAll) {
                             Label("Apply to All", systemImage: "arrow.triangle.2.circlepath")
                                 .font(.caption)
@@ -442,6 +453,7 @@ struct TeamAgentComposer: View {
             Text("Role").frame(width: 148, alignment: .leading)
             Text("CLI").frame(width: 90, alignment: .leading)
             Text("Model").frame(width: 142, alignment: .leading)
+            Text("Effort").frame(width: 90, alignment: .leading)
             if showsPlacementControls {
                 Text("Runs on").frame(width: 168, alignment: .leading)
                 Text("Folder").frame(maxWidth: 200, alignment: .leading)
@@ -503,6 +515,9 @@ struct TeamAgentComposer: View {
                         if AgentRolePreset.models(for: oldCli) != AgentRolePreset.models(for: newCli) {
                             agents[index].preset.model = AgentRolePreset.defaultModel(for: newCli)
                         }
+                        agents[index].preset.effort = AgentRolePreset.normalizeEffort(
+                            agents[index].preset.effort, for: newCli
+                        )
                         onComposionChanged()
                     }
                 )) {
@@ -542,6 +557,27 @@ struct TeamAgentComposer: View {
                 }
                 .labelsHidden()
                 .frame(width: 142)
+
+                if AgentRolePreset.supportsEffort(cli: agent.preset.cli) {
+                    Picker("", selection: Binding(
+                        get: { AgentRolePreset.normalizeEffort(agent.preset.effort, for: agent.preset.cli) },
+                        set: {
+                            agents[index].preset.effort = $0
+                            onComposionChanged()
+                        }
+                    )) {
+                        Text("Default").tag("")
+                        ForEach(AgentRolePreset.efforts(for: agent.preset.cli), id: \.self) { e in
+                            Text(e.capitalized).tag(e)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 90)
+                } else {
+                    Text("—")
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 90, alignment: .leading)
+                }
 
                 if showsPlacementControls {
                     placementPicker(index: index, agent: agent, width: 168)
@@ -776,6 +812,9 @@ struct TeamAgentComposer: View {
                         if AgentRolePreset.models(for: oldCli) != AgentRolePreset.models(for: newCli) {
                             agents[index].preset.model = AgentRolePreset.defaultModel(for: newCli)
                         }
+                        agents[index].preset.effort = AgentRolePreset.normalizeEffort(
+                            agents[index].preset.effort, for: newCli
+                        )
                         onComposionChanged()
                     }
                 )) {
@@ -820,6 +859,25 @@ struct TeamAgentComposer: View {
                     }
                 }
                 .frame(width: 130)
+
+                // Effort picker — only CLIs with an explicit reasoning-effort
+                // flag (claude/kiro/codex) get one; others hide it entirely
+                // rather than showing a picker with nothing to pick.
+                if AgentRolePreset.supportsEffort(cli: agent.preset.cli) {
+                    Picker("", selection: Binding(
+                        get: { AgentRolePreset.normalizeEffort(agent.preset.effort, for: agent.preset.cli) },
+                        set: {
+                            agents[index].preset.effort = $0
+                            onComposionChanged()
+                        }
+                    )) {
+                        Text("Default").tag("")
+                        ForEach(AgentRolePreset.efforts(for: agent.preset.cli), id: \.self) { e in
+                            Text(e.capitalized).tag(e)
+                        }
+                    }
+                    .frame(width: 100)
+                }
 
                 // Provider badge
                 switch agent.providerBadge {
@@ -1091,9 +1149,15 @@ struct TeamAgentComposer: View {
 
 
     private func applyModelToAll() {
+        // `bulkEffort` is normally kept in step with `bulkCli` by the bulk CLI
+        // picker's own setter, but `syncBulkFromAgents()` can also set it from
+        // a majority vote across rows that does not necessarily match
+        // `bulkCli` — re-normalize here rather than trust it arrived scoped.
+        let effectiveBulkEffort = AgentRolePreset.normalizeEffort(bulkEffort, for: bulkCli)
         for i in agents.indices {
             agents[i].preset.cli = bulkCli
             agents[i].preset.model = bulkModel
+            agents[i].preset.effort = effectiveBulkEffort
             agents[i].providerBadge = .none
         }
         onComposionChanged()
@@ -1261,8 +1325,10 @@ struct TeamAgentComposer: View {
         guard !agents.isEmpty else { return }
         let cliCounts = Dictionary(grouping: agents, by: { $0.preset.cli }).mapValues(\.count)
         let modelCounts = Dictionary(grouping: agents, by: { $0.preset.model }).mapValues(\.count)
+        let effortCounts = Dictionary(grouping: agents, by: { $0.preset.effort }).mapValues(\.count)
         bulkCli = cliCounts.max(by: { $0.value < $1.value })?.key ?? bulkCli
         bulkModel = modelCounts.max(by: { $0.value < $1.value })?.key ?? bulkModel
+        bulkEffort = effortCounts.max(by: { $0.value < $1.value })?.key ?? bulkEffort
     }
 
     private func runbookPreviewSummary(for agent: TeamAgentRow) -> String {

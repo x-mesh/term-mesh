@@ -157,6 +157,7 @@ pub fn build_claude_command(
     name: &str,
     team_name: &str,
     model: &str,
+    effort: Option<&str>,
     _working_directory: &str,
     daemon_socket: &str,
     cli_path: Option<&str>,
@@ -205,6 +206,10 @@ pub fn build_claude_command(
         other => other,
     };
     args.push(OsString::from(resolved_model));
+    if let Some(effort) = effort.filter(|effort| !effort.is_empty()) {
+        args.push(OsString::from("--effort"));
+        args.push(OsString::from(effort));
+    }
 
     // Pass agent-specific instructions as --append-system-prompt.
     // Raw bytes — no escaping. `Command::arg` does NOT pass through a shell,
@@ -267,6 +272,7 @@ pub fn build_kiro_command(
     name: &str,
     team_name: &str,
     model: &str,
+    effort: Option<&str>,
     daemon_socket: &str,
     cli_path: Option<&str>,
     app_socket_path: Option<&str>,
@@ -301,6 +307,10 @@ pub fn build_kiro_command(
         "--model".into(),
         OsString::from(kiro_model),
     ];
+    if let Some(effort) = effort.filter(|effort| !effort.is_empty()) {
+        args.push(OsString::from("--effort"));
+        args.push(OsString::from(effort));
+    }
 
     for arg in extra_args {
         args.push(OsString::from(arg));
@@ -367,6 +377,7 @@ pub fn build_codex_command(
     name: &str,
     team_name: &str,
     model: &str,
+    effort: Option<&str>,
     daemon_socket: &str,
     cli_path: Option<&str>,
     app_socket_path: Option<&str>,
@@ -388,7 +399,10 @@ pub fn build_codex_command(
         "--model".into(),
         OsString::from(codex_model),
     ];
-    if let Some(effort) = codex_reasoning_effort(model) {
+    if let Some(effort) = effort
+        .filter(|effort| !effort.is_empty())
+        .or_else(|| codex_reasoning_effort(model))
+    {
         args.push("-c".into());
         args.push(OsString::from(format!("model_reasoning_effort={effort}")));
     }
@@ -511,6 +525,7 @@ mod tests {
             "pair",
             "team",
             "sonnet",
+            None,
             "/tmp/daemon.sock",
             None,
             None,
@@ -530,6 +545,114 @@ mod tests {
         );
         let index = args.iter().position(|arg| arg == "--sandbox").unwrap();
         assert_eq!(args[index + 1], "read-only");
+    }
+
+    #[test]
+    fn explicit_effort_overrides_the_codex_tier_default() {
+        let cmd = build_codex_command(
+            "pair",
+            "team",
+            "opus",
+            Some("max"),
+            "/tmp/daemon.sock",
+            None,
+            None,
+            &[],
+            &std::collections::HashMap::new(),
+        );
+        let args: Vec<String> = cmd
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"model_reasoning_effort=max".to_string()));
+        assert!(!args.contains(&"model_reasoning_effort=high".to_string()));
+    }
+
+    #[test]
+    fn codex_passthrough_model_uses_explicit_effort() {
+        let cmd = build_codex_command(
+            "pair",
+            "team",
+            "gpt-5.6-terra",
+            Some("xhigh"),
+            "/tmp/daemon.sock",
+            None,
+            None,
+            &[],
+            &std::collections::HashMap::new(),
+        );
+        let args: Vec<String> = cmd
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"gpt-5.6-terra".to_string()));
+        assert!(args.contains(&"model_reasoning_effort=xhigh".to_string()));
+    }
+
+    #[test]
+    fn claude_and_kiro_forward_explicit_effort() {
+        let claude = build_claude_command(
+            "explorer",
+            "team",
+            "sonnet",
+            Some("high"),
+            "/proj",
+            "/tmp/daemon.sock",
+            None,
+            None,
+            None,
+            ClaudeSpawnMode::Fresh {
+                session_id: "uuid".into(),
+            },
+            &[],
+            &std::collections::HashMap::new(),
+        );
+        let kiro = build_kiro_command(
+            "explorer",
+            "team",
+            "sonnet",
+            Some("low"),
+            "/tmp/daemon.sock",
+            None,
+            None,
+            &[],
+            &std::collections::HashMap::new(),
+        );
+        let claude_args: Vec<String> = claude
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let kiro_args: Vec<String> = kiro
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(claude_args.windows(2).any(|pair| pair == ["--effort", "high"]));
+        assert!(kiro_args.windows(2).any(|pair| pair == ["--effort", "low"]));
+    }
+
+    #[test]
+    fn no_effort_preserves_the_codex_tier_default() {
+        let cmd = build_codex_command(
+            "pair",
+            "team",
+            "sonnet",
+            None,
+            "/tmp/daemon.sock",
+            None,
+            None,
+            &[],
+            &std::collections::HashMap::new(),
+        );
+        let args: Vec<String> = cmd
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"model_reasoning_effort=medium".to_string()));
     }
 
     #[test]
@@ -585,6 +708,7 @@ mod tests {
             "explorer",
             "my-team",
             "sonnet",
+            None,
             "/proj",
             "/tmp/term-meshd.sock",
             None,
@@ -622,6 +746,7 @@ mod tests {
                 "explorer",
                 "my-team",
                 model,
+                None,
                 "/proj",
                 "/tmp/term-meshd.sock",
                 None,
@@ -652,6 +777,7 @@ mod tests {
             "explorer",
             "my-team",
             "sonnet",
+            None,
             "/proj",
             "/tmp/term-meshd.sock",
             None,
@@ -675,6 +801,7 @@ mod tests {
             "explorer",
             "my-team",
             "sonnet",
+            None,
             "/proj",
             "/tmp/term-meshd.sock",
             None,
@@ -705,6 +832,7 @@ mod tests {
             "x",
             "t",
             "sonnet",
+            None,
             "/p",
             "/tmp/s",
             None,

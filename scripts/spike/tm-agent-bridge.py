@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from dataclasses import dataclass
 import json
 import math
 import os
@@ -66,6 +67,78 @@ DIFF_LIMIT = 65536
 # agent pane is exactly where that is worth nothing to an attacker and fatal
 # to the user. Real capsules are kilobytes; a megabyte is already generous.
 MAX_FRAME_BYTES = 1_048_576
+
+
+class _ControlFieldMissing:
+    pass
+
+
+CONTROL_FIELD_MISSING = _ControlFieldMissing()
+
+
+@dataclass
+class TurnFrame:
+    text: str
+
+
+@dataclass
+class ControlFrame:
+    # The sentinel means the field was omitted. None means JSON null cleared it.
+    model: str | None | _ControlFieldMissing = CONTROL_FIELD_MISSING
+    effort: str | None | _ControlFieldMissing = CONTROL_FIELD_MISSING
+
+
+def turn_text(line: str) -> str:
+    line = line.strip()
+    if not line:
+        return ""
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return line
+    if not isinstance(obj, dict):
+        return ""
+    message = obj.get("message")
+    if not isinstance(message, dict):
+        return ""
+    text = message.get("content", "")
+    if isinstance(text, list):
+        return "".join(
+            block.get("text", "") for block in text if isinstance(block, dict)
+        )
+    return text if isinstance(text, str) else ""
+
+
+def optional_control_string(obj: dict, key: str, reject_empty: bool):
+    if key not in obj:
+        return CONTROL_FIELD_MISSING
+    value = obj[key]
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"control {key} must be a string or null")
+    if reject_empty and not value.strip():
+        raise ValueError(f"control {key} must be a non-empty string or null")
+    return value
+
+
+def input_frame(line: str) -> TurnFrame | ControlFrame:
+    try:
+        obj = json.loads(line.strip())
+    except json.JSONDecodeError:
+        return TurnFrame(turn_text(line))
+    if (
+        not isinstance(obj, dict)
+        or "message" in obj
+        or obj.get("type") != "control"
+    ):
+        return TurnFrame(turn_text(line))
+
+    model = optional_control_string(obj, "model", reject_empty=False)
+    effort = optional_control_string(obj, "effort", reject_empty=True)
+    if model is CONTROL_FIELD_MISSING and effort is CONTROL_FIELD_MISSING:
+        raise ValueError("control frame must include model or effort")
+    return ControlFrame(model=model, effort=effort)
 
 
 def positive_timeout(raw: str) -> float:
@@ -944,14 +1017,29 @@ class CodexBridge:
     }
 
     def __init__(self, cwd: str, model: str | None, emitter: Emitter,
-                 exe: str | None = None):
-        argv = [exe or "codex", "app-server"]
+                 exe: str | None = None, effort: str | None = None):
+        argv = [exe or "codex"]
+        if effort:
+            # `-c` is a Codex global option and must precede `app-server`.
+            argv.extend(["-c", f"model_reasoning_effort={effort}"])
+        argv.append("app-server")
         self.child = Child(argv, cwd)
         self.rpc = JsonRpc(self.child, emitter, on_request=self._serve_request)
         self.out = emitter
         self.cwd = cwd
-        self.model = model
+        # The sentinel distinguishes no model override from control-frame null.
+        self.model: str | None | _ControlFieldMissing = (
+            model if model is not None else CONTROL_FIELD_MISSING
+        )
+        # None means no effort override. A control-frame null sends JSON null.
+        self.effort: str | None | _ControlFieldMissing = CONTROL_FIELD_MISSING
         self.thread_id: str | None = None
+
+    def apply_control(self, control: ControlFrame) -> None:
+        if control.model is not CONTROL_FIELD_MISSING:
+            self.model = control.model
+        if control.effort is not CONTROL_FIELD_MISSING:
+            self.effort = control.effort
 
     def _serve_request(self, obj: dict) -> dict | None:
         method = obj.get("method", "")
@@ -1006,7 +1094,9 @@ class CodexBridge:
             log(f"codex thread/start gave no id: {json.dumps(started)[:160] if started else 'no reply'}")
             return False
         self.out.emit({"type": "system", "subtype": "init",
-                       "cwd": self.cwd, "model": self.model or "", "tools": []})
+                       "cwd": self.cwd,
+                       "model": self.model if isinstance(self.model, str) else "",
+                       "tools": []})
         return True
 
     @staticmethod
@@ -1107,8 +1197,10 @@ class CodexBridge:
 
         params = {"threadId": self.thread_id,
                   "input": [{"type": "text", "text": text}]}
-        if self.model:
+        if self.model is not CONTROL_FIELD_MISSING:
             params["model"] = self.model
+        if self.effort is not CONTROL_FIELD_MISSING:
+            params["effort"] = self.effort
         # `turn/start` acknowledges at once; the work arrives as notifications
         # and ends with `turn/completed`. Waiting on the response alone measures
         # how fast codex says "got it".
@@ -1329,6 +1421,12 @@ def main() -> int:
     # find a different binary on PATH than the one the user chose.
     ap.add_argument("--exe", default=None, help="path to the CLI binary")
     ap.add_argument(
+        "--effort",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        default=None,
+        help="reasoning effort for CLIs that support it",
+    )
+    ap.add_argument(
         "--turn-timeout",
         type=positive_timeout,
         default=None,
@@ -1342,13 +1440,25 @@ def main() -> int:
     if args.cli in ("cursor", "agy"):
         bridge = PerTurnBridge(args.cli, cwd, args.model, out, exe=args.exe)
     elif args.cli == "codex":
-        bridge = CodexBridge(cwd, args.model, out, exe=args.exe)
+        bridge = CodexBridge(cwd, args.model, out, exe=args.exe, effort=args.effort)
     elif args.cli == "kiro":
         # `kiro-cli acp`, NOT `kiro-cli chat acp`: both parse and only the first
         # is a server. The second starts the interactive chat agent, which reads
         # the handshake as a user message and answers it in prose.
-        bridge = AcpBridge([args.exe or "kiro-cli", "acp", "--trust-all-tools"],
-                           cwd, out, model=args.model)
+        kiro_argv = [args.exe or "kiro-cli", "acp", "--trust-all-tools"]
+        if args.effort:
+            try:
+                help_output = subprocess.run(
+                    [args.exe or "kiro-cli", "acp", "--help"],
+                    capture_output=True, text=True, check=False, timeout=10,
+                )
+                if "--effort" in help_output.stdout + help_output.stderr:
+                    kiro_argv.extend(["--effort", args.effort])
+                else:
+                    log("kiro-cli acp --help has no --effort option; starting without effort")
+            except (OSError, subprocess.TimeoutExpired):
+                log("could not inspect kiro-cli acp --help; starting without effort")
+        bridge = AcpBridge(kiro_argv, cwd, out, model=args.model)
     else:
         bridge = AcpBridge([args.exe or "gemini", "--acp", "--yolo"], cwd, out,
                            model=args.model)
@@ -1373,17 +1483,24 @@ def main() -> int:
         line = line.strip()
         if not line:
             return False
-        # Turns arrive in claude's envelope whoever wrote them, so the caller
-        # never has to know which CLI is behind this.
         try:
-            obj = json.loads(line)
-            text = obj.get("message", {}).get("content", "")
-            if isinstance(text, list):
-                text = "".join(b.get("text", "") for b in text if isinstance(b, dict))
-        except json.JSONDecodeError:
-            text = line
-        if text:
-            bridge.turn(text, args.turn_timeout)
+            frame = input_frame(line)
+        except ValueError as exc:
+            out.result(str(exc), stop="invalid_control", failed=True)
+            return True
+        if isinstance(frame, ControlFrame):
+            apply_control = getattr(bridge, "apply_control", None)
+            if apply_control is None:
+                out.result(
+                    "model and effort control frames are only supported by codex",
+                    stop="unsupported_control",
+                    failed=True,
+                )
+                return True
+            apply_control(frame)
+            return False
+        if frame.text:
+            bridge.turn(frame.text, args.turn_timeout)
             rpc = getattr(bridge, "rpc", None)
             return bool(getattr(rpc, "failure", None))
         return False

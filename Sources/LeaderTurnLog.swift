@@ -7,6 +7,15 @@ enum LeaderTurnLog {
     private static let identityLock = NSLock()
     private static var knownIdentities: [String: (teamUUID: String, leaderSessionID: String?)] = [:]
 
+    /// Delegation-intensity order matching `ProjectRoutingRoute` in LeaderParallelPolicy.swift.
+    /// Unknown route strings are absent and excluded from direction comparisons.
+    private static let routeDelegationRank: [String: Int] = [
+        "direct": 0,
+        "probe": 1,
+        "delegated": 2,
+        "parallel": 3,
+    ]
+
     enum MeasurementCapability: String, Codable, CaseIterable {
         case supported
         case unsupported
@@ -37,6 +46,10 @@ enum LeaderTurnLog {
         let appliedTurns: Int
         let suggestedTurns: Int
         let routeDeviations: Int
+        /// Deviations where the leader delegated more than the policy suggested (direct < probe < delegated < parallel).
+        let moreParallelThanSuggested: Int
+        /// Deviations where the leader delegated less than the policy suggested.
+        let lessParallelThanSuggested: Int
         let shadowTurns: Int
         let canaryTurns: Int
         let holdoutTurns: Int
@@ -893,6 +906,20 @@ enum LeaderTurnLog {
             routeDeviations: routes.filter { route in
                 guard let actual = route.actualRoute, let suggested = route.suggestedRoute else { return false }
                 return actual != suggested
+            }.count,
+            moreParallelThanSuggested: routes.filter { route in
+                guard let actual = route.actualRoute, let suggested = route.suggestedRoute,
+                      actual != suggested,
+                      let actualRank = routeDelegationRank[actual], let suggestedRank = routeDelegationRank[suggested]
+                else { return false }
+                return actualRank > suggestedRank
+            }.count,
+            lessParallelThanSuggested: routes.filter { route in
+                guard let actual = route.actualRoute, let suggested = route.suggestedRoute,
+                      actual != suggested,
+                      let actualRank = routeDelegationRank[actual], let suggestedRank = routeDelegationRank[suggested]
+                else { return false }
+                return actualRank < suggestedRank
             }.count,
             shadowTurns: routes.filter { $0.policyMode == "shadow" }.count,
             canaryTurns: cohorts["canary", default: 0],

@@ -34,6 +34,7 @@
 		RBVT00000000000000003 /* ReviewBoardVisibilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RBVT00000000000000006 /* ReviewBoardVisibilityTests.swift */; };
 		ASPT000000000000000003 /* AgentStartupPromptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ASPT000000000000000006 /* AgentStartupPromptTests.swift */; };
 		STPD00000000000000003 /* SmartTeamPresetDecodingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = STPD00000000000000006 /* SmartTeamPresetDecodingTests.swift */; };
+		ELAT00000000000000003 /* EffortLaunchArgsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ELAT00000000000000006 /* EffortLaunchArgsTests.swift */; };
 		TTPI00000000000000003 /* TeamTemplatePlacementInheritanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = TTPI00000000000000006 /* TeamTemplatePlacementInheritanceTests.swift */; };
 		A17000000000000000000001 /* ReviewBoardModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000005 /* ReviewBoardModels.swift */; };
 		A17000000000000000000101 /* RemoteExposureStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000105 /* RemoteExposureStore.swift */; };
@@ -166,6 +167,7 @@
 		TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = TORA0001 /* TeamOrchestrator+RemoteAgent.swift */; };
 		APT0000000000000000003 /* AgentPipeTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = APT0000000000000000006 /* AgentPipeTransport.swift */; };
 		APC0000000000000000003 /* AgentPipeCompletion.swift in Sources */ = {isa = PBXBuildFile; fileRef = APC0000000000000000006 /* AgentPipeCompletion.swift */; };
+		MCL0000000000000000001 /* ModelContextLimits.swift in Sources */ = {isa = PBXBuildFile; fileRef = MCL0000000000000000002 /* ModelContextLimits.swift */; };
 		A5001702 /* DashboardController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001703 /* DashboardController.swift */; };
 		A5001704 /* dashboard in Resources */ = {isa = PBXBuildFile; fileRef = A5001705 /* dashboard */; };
 		ARB00002 /* AgentRunbookService.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARB00001 /* AgentRunbookService.swift */; };
@@ -207,6 +209,7 @@
 		A5009007 /* AgentPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A500900A /* AgentPanelView.swift */; };
 		A5009080 /* AgentMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009081 /* AgentMarkdown.swift */; };
 		A5009090 /* AgentDiff.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009091 /* AgentDiff.swift */; };
+		A5009092 /* AgentSlashCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5009093 /* AgentSlashCommands.swift */; };
 		A5001405 /* PanelContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001415 /* PanelContentView.swift */; };
 		A5001406 /* Workspace.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001416 /* Workspace.swift */; };
 		A5001407 /* WorkspaceContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001417 /* WorkspaceContentView.swift */; };
@@ -410,6 +413,7 @@
 			RBVT00000000000000006 /* ReviewBoardVisibilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardVisibilityTests.swift; sourceTree = "<group>"; };
 			ASPT000000000000000006 /* AgentStartupPromptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStartupPromptTests.swift; sourceTree = "<group>"; };
 			STPD00000000000000006 /* SmartTeamPresetDecodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmartTeamPresetDecodingTests.swift; sourceTree = "<group>"; };
+			ELAT00000000000000006 /* EffortLaunchArgsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EffortLaunchArgsTests.swift; sourceTree = "<group>"; };
 			TTPI00000000000000006 /* TeamTemplatePlacementInheritanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamTemplatePlacementInheritanceTests.swift; sourceTree = "<group>"; };
 			A17000000000000000000005 /* ReviewBoardModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardModels.swift; sourceTree = "<group>"; };
 			A17000000000000000000105 /* RemoteExposureStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteExposureStore.swift; sourceTree = "<group>"; };
@@ -538,6 +542,7 @@
 		TORA0001 /* TeamOrchestrator+RemoteAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TeamOrchestrator+RemoteAgent.swift"; sourceTree = "<group>"; };
 			APT0000000000000000006 /* AgentPipeTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPipeTransport.swift; sourceTree = "<group>"; };
 			APC0000000000000000006 /* AgentPipeCompletion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPipeCompletion.swift; sourceTree = "<group>"; };
+			MCL0000000000000000002 /* ModelContextLimits.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelContextLimits.swift; sourceTree = "<group>"; };
 		A5001703 /* DashboardController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardController.swift; sourceTree = "<group>"; };
 		A5001705 /* dashboard */ = {isa = PBXFileReference; lastKnownFileType = folder; path = dashboard; sourceTree = "<group>"; };
 		ARB00001 /* AgentRunbookService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRunbookService.swift; sourceTree = "<group>"; };
@@ -582,6 +587,7 @@
 		A500900A /* AgentPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/AgentPanelView.swift; sourceTree = "<group>"; };
 		A5009081 /* AgentMarkdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/AgentMarkdown.swift; sourceTree = "<group>"; };
 		A5009091 /* AgentDiff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/AgentDiff.swift; sourceTree = "<group>"; };
+		A5009093 /* AgentSlashCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/AgentSlashCommands.swift; sourceTree = "<group>"; };
 		A5001415 /* PanelContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panels/PanelContentView.swift; sourceTree = "<group>"; };
 		A5001416 /* Workspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Workspace.swift; sourceTree = "<group>"; };
 		A5001417 /* WorkspaceContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceContentView.swift; sourceTree = "<group>"; };
@@ -961,6 +967,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				TORA0001 /* TeamOrchestrator+RemoteAgent.swift */,
 				APT0000000000000000006 /* AgentPipeTransport.swift */,
 				APC0000000000000000006 /* AgentPipeCompletion.swift */,
+				MCL0000000000000000002 /* ModelContextLimits.swift */,
 				ARB00001 /* AgentRunbookService.swift */,
 				ARB00003 /* AgentRunbookSettingsView.swift */,
 				CPF00001 /* CliProfile.swift */,
@@ -1005,6 +1012,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				A500900A /* AgentPanelView.swift */,
 				A5009081 /* AgentMarkdown.swift */,
 				A5009091 /* AgentDiff.swift */,
+				A5009093 /* AgentSlashCommands.swift */,
 				A5001510 /* TermMeshWebView.swift */,
 				A5009910 /* EnvCompat.swift */,
 				A5001415 /* PanelContentView.swift */,
@@ -1169,6 +1177,7 @@ A1760000000000000000000C /* ReviewBoardMergeRunnerTests.swift */,
 				A15100000000000000000008 /* WorkspaceRetrievalStoreTests.swift */,
 				5A57E1F90000000000000004 /* PasteShelfStoreTests.swift */,
 				STPD00000000000000006 /* SmartTeamPresetDecodingTests.swift */,
+				ELAT00000000000000006 /* EffortLaunchArgsTests.swift */,
 				TTPI00000000000000006 /* TeamTemplatePlacementInheritanceTests.swift */,
 			);
 			path = termMeshTests;
@@ -1450,6 +1459,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */,
 				APT0000000000000000003 /* AgentPipeTransport.swift in Sources */,
 				APC0000000000000000003 /* AgentPipeCompletion.swift in Sources */,
+				MCL0000000000000000001 /* ModelContextLimits.swift in Sources */,
 				ARB00002 /* AgentRunbookService.swift in Sources */,
 				ARB00004 /* AgentRunbookSettingsView.swift in Sources */,
 				CPF00002 /* CliProfile.swift in Sources */,
@@ -1497,6 +1507,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				A5009007 /* AgentPanelView.swift in Sources */,
 				A5009080 /* AgentMarkdown.swift in Sources */,
 				A5009090 /* AgentDiff.swift in Sources */,
+				A5009092 /* AgentSlashCommands.swift in Sources */,
 				A5001500 /* TermMeshWebView.swift in Sources */,
 				A5009900 /* EnvCompat.swift in Sources */,
 				A5001405 /* PanelContentView.swift in Sources */,
@@ -1629,6 +1640,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 				A15100000000000000000004 /* WorkspaceRetrievalStoreTests.swift in Sources */,
 				5A57E1F90000000000000002 /* PasteShelfStoreTests.swift in Sources */,
 				STPD00000000000000003 /* SmartTeamPresetDecodingTests.swift in Sources */,
+				ELAT00000000000000003 /* EffortLaunchArgsTests.swift in Sources */,
 				TTPI00000000000000003 /* TeamTemplatePlacementInheritanceTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

@@ -1519,6 +1519,12 @@ enum Commands {
         /// Set model for the leader (e.g. opus, sonnet, haiku)
         #[arg(long)]
         leader_model: Option<String>,
+        /// Set reasoning effort for all agents (low, medium, high, xhigh, max)
+        #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
+        effort: Option<String>,
+        /// Set reasoning effort for the leader (low, medium, high, xhigh, max)
+        #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
+        leader_effort: Option<String>,
         #[arg(long)]
         kiro: Option<String>,
         #[arg(long)]
@@ -1573,6 +1579,9 @@ enum Commands {
         /// CLI to use (claude, codex, kiro, gemini)
         #[arg(long, default_value = "claude")]
         cli: String,
+        /// Set reasoning effort (low, medium, high, xhigh, max)
+        #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
+        effort: Option<String>,
         /// Disable automatic /watch on after adding a watcher (also: TERMMESH_AUTO_WATCH=0)
         #[arg(long)]
         no_auto_watch: bool,
@@ -9268,6 +9277,8 @@ fn main() {
             claude_leader,
             model,
             leader_model,
+            effort,
+            leader_effort,
             kiro,
             codex,
             gemini,
@@ -9295,6 +9306,8 @@ fn main() {
                     &team,
                     count.unwrap_or(2),
                     &model,
+                    effort.as_deref(),
+                    leader_effort.as_deref(),
                     roles.as_deref(),
                     watcher_spec.as_deref(),
                     no_auto_watch,
@@ -9308,6 +9321,8 @@ fn main() {
                     claude_leader,
                     &model,
                     leader_model.as_deref(),
+                    effort.as_deref(),
+                    leader_effort.as_deref(),
                     &kiro,
                     &codex,
                     &gemini,
@@ -9328,6 +9343,7 @@ fn main() {
             name,
             model,
             cli,
+            effort,
             no_auto_watch,
             auto_recycle,
             host,
@@ -9355,6 +9371,7 @@ fn main() {
                             &agent_type,
                             &model,
                             &cli,
+                            effort.as_deref(),
                             no_auto_watch,
                             auto_recycle,
                         );
@@ -9375,6 +9392,7 @@ fn main() {
                 &agent_name,
                 &model,
                 &cli,
+                effort.as_deref(),
                 no_auto_watch,
                 auto_recycle,
                 host.as_deref(),
@@ -12199,6 +12217,8 @@ fn run_create(
     claude_leader: bool,
     model: &str,
     leader_model: Option<&str>,
+    effort: Option<&str>,
+    leader_effort: Option<&str>,
     kiro: &Option<String>,
     codex: &Option<String>,
     gemini: &Option<String>,
@@ -12362,6 +12382,11 @@ fn run_create(
 
     // Attach watcher spec (if any) to watcher agents only (R7: watcher-only).
     apply_watcher_spec(&mut agents, watcher_spec);
+    if let Some(effort) = effort {
+        for agent in &mut agents {
+            agent["effort"] = json!(effort);
+        }
+    }
 
     // Destroy existing team first, then poll until gone (max 10 × 50ms = 500ms)
     let _ = rpc_call_timeout(sock, "team.destroy", json!({ "team_name": team }), 2);
@@ -12424,6 +12449,9 @@ fn run_create(
     }
     if let Some(n) = auto_recycle {
         create_params["default_auto_recycle_every"] = json!(n);
+    }
+    if let Some(effort) = leader_effort {
+        create_params["leader_effort"] = json!(effort);
     }
     if let Some(per_agent_str) = auto_recycle_per_agent {
         let map: serde_json::Map<String, serde_json::Value> = per_agent_str
@@ -13265,6 +13293,7 @@ fn run_add_gui(
     agent_name: &str,
     model: &str,
     cli: &str,
+    effort: Option<&str>,
     no_auto_watch: bool,
     auto_recycle: Option<u32>,
     host: Option<&str>,
@@ -13290,6 +13319,9 @@ fn run_add_gui(
     });
     if let Some(n) = auto_recycle {
         params["auto_recycle_every"] = json!(n);
+    }
+    if let Some(effort) = effort {
+        params["effort"] = json!(effort);
     }
     if let Some(h) = host {
         params["host"] = json!(h);
@@ -15528,6 +15560,8 @@ fn run_create_headless(
     team: &str,
     count: u32,
     model: &str,
+    effort: Option<&str>,
+    leader_effort: Option<&str>,
     roles: Option<&str>,
     watcher_spec: Option<&str>,
     no_auto_watch: bool,
@@ -15577,6 +15611,11 @@ fn run_create_headless(
 
     // Attach watcher spec (if any) to watcher agents only (R7: watcher-only).
     apply_watcher_spec(&mut agent_specs, watcher_spec);
+    if let Some(effort) = effort {
+        for agent in &mut agent_specs {
+            agent["effort"] = json!(effort);
+        }
+    }
 
     let workdir = env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -15594,13 +15633,16 @@ fn run_create_headless(
     eprintln!("Creating headless team '{team}' with {agent_count} agent(s) on daemon...");
     eprintln!("Daemon socket: {}", daemon_sock.display());
 
-    let create_params = json!({
+    let mut create_params = json!({
         "team_name": team,
         "working_directory": workdir,
         "leader_session_id": format!("leader-{}", process::id()),
         "agents": agent_specs,
         "app_socket_path": app_sock.to_string_lossy(),
     });
+    if let Some(effort) = leader_effort {
+        create_params["leader_effort"] = json!(effort);
+    }
 
     match rpc_call_timeout(&daemon_sock, "headless.create_team", create_params, 30) {
         Ok(resp) => {
@@ -15661,6 +15703,7 @@ fn run_add_headless(
     agent_type: &str,
     model: &str,
     cli: &str,
+    effort: Option<&str>,
     no_auto_watch: bool,
     auto_recycle: Option<u32>,
 ) {
@@ -15678,6 +15721,9 @@ fn run_add_headless(
     });
     if let Some(n) = auto_recycle {
         add_params["auto_recycle_every"] = json!(n);
+    }
+    if let Some(effort) = effort {
+        add_params["effort"] = json!(effort);
     }
 
     match rpc_call_timeout(daemon_sock, "headless.add_agent", add_params, 15) {
@@ -18707,11 +18753,19 @@ fn run_leader_turn_route(
                 "dispatch_bounds": record["dispatch_bounds"],
             })
         });
+    let route_deviation = match record.get("suggested_route").and_then(Value::as_str) {
+        Some(suggested) if suggested != record["actual_route"] => Some(json!({
+            "suggested": suggested,
+            "stated": record["actual_route"],
+        })),
+        _ => None,
+    };
     Ok(json!({
         "ok": true,
         "path": path.display().to_string(),
         "record": record,
         "directive": directive,
+        "route_deviation": route_deviation,
     }))
 }
 
@@ -19414,6 +19468,80 @@ mod leader_turn_record_tests {
         let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(mode, 0o600, "mode was {mode:o}");
+    }
+
+    /// A leader that states the same route the policy would have suggested
+    /// needs no callout — `route_deviation` must read as absent, not as an
+    /// empty-but-present object, so a consumer can treat `null` as the
+    /// no-news case.
+    #[test]
+    fn route_deviation_is_null_when_stated_route_matches_the_suggestion() {
+        let home = std::env::temp_dir().join(format!("tm-routedev-match-{}", std::process::id()));
+        fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create temp home");
+        let prev_home = env::var("HOME").ok();
+        env::set_var("HOME", &home);
+
+        let team = TeamNameResolution {
+            name: "term-mesh".to_string(),
+            source: TeamNameSource::Explicit,
+        };
+        // No `available_workers` makes the policy suggest "direct" (see
+        // `LeaderParticipationDirective::from_input`), matching the stated
+        // route below.
+        let result = run_leader_turn_route(&team, "turn-dev-1", "direct", None, None, &[], None)
+            .expect("run_leader_turn_route");
+
+        match prev_home {
+            Some(v) => env::set_var("HOME", v),
+            None => env::remove_var("HOME"),
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        assert_eq!(result["record"]["suggested_route"], "direct");
+        assert_eq!(result["record"]["actual_route"], "direct");
+        assert_eq!(result["route_deviation"], Value::Null);
+    }
+
+    /// A leader that states a route other than what the policy would have
+    /// suggested must have that gap surfaced in the response — the log
+    /// record already carries both fields, but the reply never told the
+    /// leader they diverged.
+    #[test]
+    fn route_deviation_reports_suggested_and_stated_when_they_differ() {
+        let home = std::env::temp_dir().join(format!("tm-routedev-diff-{}", std::process::id()));
+        fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create temp home");
+        let prev_home = env::var("HOME").ok();
+        env::set_var("HOME", &home);
+
+        let team = TeamNameResolution {
+            name: "term-mesh".to_string(),
+            source: TeamNameSource::Explicit,
+        };
+        // `multi_unit` with two available workers makes the policy suggest
+        // "parallel"; the leader states "direct" instead.
+        let result = run_leader_turn_route(
+            &team,
+            "turn-dev-2",
+            "direct",
+            Some("multi_unit"),
+            Some(2),
+            &[],
+            None,
+        )
+        .expect("run_leader_turn_route");
+
+        match prev_home {
+            Some(v) => env::set_var("HOME", v),
+            None => env::remove_var("HOME"),
+        }
+        let _ = fs::remove_dir_all(&home);
+
+        assert_eq!(result["record"]["suggested_route"], "parallel");
+        assert_eq!(result["record"]["actual_route"], "direct");
+        assert_eq!(
+            result["route_deviation"],
+            json!({"suggested": "parallel", "stated": "direct"})
+        );
     }
 }
 

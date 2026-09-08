@@ -2100,6 +2100,7 @@ async fn run_jsonl_usage_tick_broadcaster(
                 if by_panel.is_empty() {
                     continue;
                 }
+                let context_by_panel = ctx.usage_tracker.context_by_panel(&claude_panes);
                 let team_state = ctx.team_state.read().unwrap().clone();
                 let Some(teams) = team_state.get("teams").and_then(|v| v.as_array()) else {
                     continue;
@@ -2161,12 +2162,18 @@ async fn run_jsonl_usage_tick_broadcaster(
                             continue;
                         }
                         last_emitted.insert(key, (in_tok, out_tok, cr_tok, cw_tok));
+                        let (context_tokens, model) = context_by_panel
+                            .get(panel_id)
+                            .map(|&(ctx_tok, ref m)| (Some(ctx_tok), m.clone()))
+                            .unwrap_or((None, String::new()));
                         tick_agents.push(crate::headless::UsageTickAgent {
                             name: agent_name.to_string(),
                             input_tokens: in_tok,
                             output_tokens: out_tok,
                             cache_read_input_tokens: cr_tok,
                             cache_creation_input_tokens: cw_tok,
+                            model,
+                            context_tokens,
                         });
                     }
                     // Leader pane: runs its own claude session but is not part of
@@ -2186,12 +2193,18 @@ async fn run_jsonl_usage_tick_broadcaster(
                                 let last = last_emitted.get(&key).copied().unwrap_or_default();
                                 if (in_tok, out_tok, cr_tok, cw_tok) != last {
                                     last_emitted.insert(key, (in_tok, out_tok, cr_tok, cw_tok));
+                                    let (context_tokens, model) = context_by_panel
+                                        .get(leader_panel)
+                                        .map(|&(ctx_tok, ref m)| (Some(ctx_tok), m.clone()))
+                                        .unwrap_or((None, String::new()));
                                     tick_agents.push(crate::headless::UsageTickAgent {
                                         name: LEADER_USAGE_NAME.to_string(),
                                         input_tokens: in_tok,
                                         output_tokens: out_tok,
                                         cache_read_input_tokens: cr_tok,
                                         cache_creation_input_tokens: cw_tok,
+                                        model,
+                                        context_tokens,
                                     });
                                 }
                             }
@@ -2327,12 +2340,17 @@ async fn run_codex_usage_tick_broadcaster(
                         );
                         // Rollout JSONL splits usage: input / output(+reasoning) /
                         // cached_input → cache_read. Codex has no cache-write.
+                        // Codex's rollout `total_token_usage` is cumulative with no
+                        // way to isolate the last request's share, so context_tokens
+                        // stays unsupported (None) rather than approximated.
                         tick_agents.push(crate::headless::UsageTickAgent {
                             name: agent_name.to_string(),
                             input_tokens: in_tok,
                             output_tokens: out_tok,
                             cache_read_input_tokens: cr_tok,
                             cache_creation_input_tokens: cw_tok,
+                            model: String::new(),
+                            context_tokens: None,
                         });
                     }
                     if !tick_agents.is_empty() {
@@ -3966,13 +3984,16 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
         }
         "headless.create_team" => {
             match serde_json::from_value::<crate::headless::TeamCreateParams>(req.params.clone()) {
-                Ok(p) => {
-                    let mut mgr = ctx.headless.lock().await;
-                    match mgr.create_team(p).await {
-                        Ok(team) => Ok(serde_json::to_value(team).unwrap()),
-                        Err(e) => Err(e),
+                Ok(mut p) => match crate::headless::normalize_team_efforts(&mut p) {
+                    Ok(()) => {
+                        let mut mgr = ctx.headless.lock().await;
+                        match mgr.create_team(p).await {
+                            Ok(team) => Ok(serde_json::to_value(team).unwrap()),
+                            Err(e) => Err(e),
+                        }
                     }
-                }
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
@@ -5068,6 +5089,8 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
                 agent_type: Option<String>,
                 #[serde(default)]
                 auto_recycle_every: Option<u32>,
+                #[serde(default)]
+                effort: String,
             }
             fn default_cli() -> String {
                 "claude".into()
@@ -5076,11 +5099,13 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
                 "sonnet".into()
             }
             match serde_json::from_value::<P>(req.params.clone()) {
-                Ok(p) => {
+                Ok(p) => match crate::headless::normalize_effort(&p.effort) {
+                    Ok(effort) => {
                     let spec = crate::headless::AgentSpec {
                         name: p.name,
                         cli: p.cli,
                         model: p.model,
+                        effort,
                         cli_path: p.cli_path,
                         instructions: p.instructions,
                         custom_instructions: None,
@@ -5098,7 +5123,9 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
                         Ok(info) => Ok(serde_json::to_value(info).unwrap()),
                         Err(e) => Err(e),
                     }
-                }
+                    }
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
