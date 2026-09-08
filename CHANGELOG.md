@@ -4,6 +4,17 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.233.0] - 2026-09-09
+
+### Added
+- Set a reasoning effort per agent and per leader. Team creation, the agent composer, and New Project gain an effort picker (`low`, `medium`, `high`, `xhigh`, `max`, or the CLI default) next to the model picker, and `tm-agent create --effort/--leader-effort` and `tm-agent add --effort` set it from the CLI. Claude and Kiro receive `--effort`, Codex receives `model_reasoning_effort`, and an explicit choice now overrides the tier guess that used to leave a Codex model named directly (for example `gpt-5.6-terra`) at the CLI default. The value reaches terminal panes, native agent panes, headless daemon agents, and remote agents alike; Gemini, Cursor, and agy ignore it because their model names carry the level. A value outside the list is rejected with `invalid_effort`, and a value picked for one CLI is dropped when the picker switches to a CLI that cannot use it.
+- Run `/model`, `/effort`, `/cost`, and `/help` inside a native agent pane. `/model` switches a Codex agent without a restart and offers a confirmed restart for other CLIs, `/effort` changes a Codex agent's reasoning effort in place, `/cost` shows the agent's accumulated usage, and `/help` lists only the commands the pane's CLI can run. Any other `/command` still goes to the agent as text.
+- Show how full an agent's context window is. A Claude native pane's header shows the share of the model's context window that the last request occupied, orange from 90%, and the raw token count when the model's window is unknown. Codex reports only session totals, so its pane shows nothing rather than a guess.
+- `tm-agent leader turn route` reports `route_deviation` when the stated route differs from the policy suggestion, and the policy report splits deviations into more-parallel and less-parallel than suggested.
+
+### Fixed
+- Usage ticks read the daemon's own cache token field names, so cached input no longer shows as `0 in` on the sidebar.
+
 ## [0.232.0] - 2026-09-08
 
 ### Fixed
