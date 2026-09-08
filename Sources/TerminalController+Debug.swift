@@ -2343,6 +2343,24 @@ extension TerminalController {
         return .ok(["ok": true, "surface_id": torndownSurface ?? ""])
     }
 
+    /// What a wake does, now and without the network grace: the peer tunnel
+    /// sweep. Reports how many pooled tunnels were dead and got replaced, so
+    /// an e2e can kill a tunnel, simulate the wake, and assert on the count.
+    func v2DebugAppSimulateWake(params: [String: Any]) -> V2CallResult {
+        let semaphore = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var replaced = -1
+        Task { @MainActor in
+            defer { semaphore.signal() }
+            replaced = await AppDelegate.shared?.debugSimulateWake() ?? -1
+        }
+        // The sweep joins each restarting tunnel for up to 15s; bound above
+        // that so a wedged host still answers instead of hanging the socket.
+        guard semaphore.wait(timeout: .now() + 60) == .success else {
+            return .err(code: "timeout", message: "wake recovery did not finish within 60s", data: nil)
+        }
+        return .ok(["ok": true, "replaced": replaced])
+    }
+
     /// Test-only: run the real tunnel spawn against a target that cannot
     /// answer, and report which error came back and how long it took.
     ///

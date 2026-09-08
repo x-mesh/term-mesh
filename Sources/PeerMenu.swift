@@ -240,6 +240,58 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         postRelaysChanged()
     }
 
+    /// Route the registry's own lease replacement through the same reattach
+    /// path Disconnect Host → Connect uses. `acquire` retires a dead tunnel
+    /// on its own; without this the panes, mirrors and sidebar row that held
+    /// that lease are stranded on it while a replacement they never hear
+    /// about carries the host.
+    func installHostTransportReplacementHooks() {
+        let registry = PeerPaneHostRegistry.shared
+        registry.hostTransportWillRetire = { [weak self] key in
+            self?.preparePanesForHostDisconnect(key)
+        }
+        registry.hostTransportDidReplace = { [weak self] key, lease in
+            self?.resumePanesAfterHostReconnect(key)
+            RemoteHostStore.shared.adoptReplacementTransport(hostKey: key, lease: lease)
+        }
+    }
+
+    /// Judge every pooled lease after a wake and replace the dead ones.
+    ///
+    /// Sleep is where a tunnel's own reconnect budget runs out. Nothing asks
+    /// the pool about that host until the next acquire, and a host only the
+    /// sidebar is watching never acquires again — its row stays connected on
+    /// a tunnel that is gone until a roster read fails on it. One temporary
+    /// acquire per pooled lease runs the judgment `acquire` applies on
+    /// demand: a tunnel still restarting is joined, a dead one is retired and
+    /// replaced, and the replacement reaches panes, mirrors and the sidebar
+    /// through the registry hooks. A tunnel that is up is left alone — ssh's
+    /// own keepalive settles a half-dead one within 45s of waking, and an
+    /// end-to-end probe here would read a cold post-wake network as death.
+    @discardableResult
+    func recoverPeerTransportsAfterWake() async -> Int {
+        let registry = PeerPaneHostRegistry.shared
+        var replaced = 0
+        for (key, lease) in registry.pooledLeases() {
+            guard registry.liveness(of: lease) != .usable,
+                  registry.activeLease(forKey: key) === lease
+            else { continue }
+            do {
+                let current = try await registry.acquire(lease.spec)
+                registry.release(current)
+                if current !== lease { replaced += 1 }
+            } catch {
+                RemoteWorkLog.info(
+                    "Could not replace the SSH tunnel to \(key.shortLabel) after wake: \(error)"
+                )
+            }
+        }
+        #if DEBUG
+        dlog("wakeRecovery.peer replaced=\(replaced)")
+        #endif
+        return replaced
+    }
+
     /// Mark every pane on this host as intentionally disconnected before the
     /// shared tunnel is stopped. Direct hosts have no tunnel, so stop each
     /// owned relay transport explicitly; in both cases the pane object stays.
@@ -1790,6 +1842,10 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 var entry: [String: Any] = [
                     "host_key": String(describing: mirror.spec.hostKey),
                     "subscription_alive": mirror.subscriptionAlive,
+                    // Kept separate from subscription_alive on purpose: the
+                    // reconnect defect was exactly the two disagreeing.
+                    "receive_loop_active": mirror.isReceiveLoopActive,
+                    "layout_recovery_generation": mirror.layoutRecoveryGeneration,
                     "applying": mirror.isApplyingRemoteLayout,
                     "leaf_count": mirror.panelBySurfaceID.count,
                     "split_map_count": mirror.hostSplitToLocal.count,

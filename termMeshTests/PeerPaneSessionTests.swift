@@ -140,6 +140,14 @@ final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
             expectedGeneration: 7, currentGeneration: 7,
             isCancelled: false, isTornDown: true
         ))
+        // A cancelled task may not continue even at the current generation
+        // — the case the reconnect guard relied on and nothing covered.
+        XCTAssertFalse(
+            PeerMirrorLayoutRecoveryPolicy.mayContinue(
+                expectedGeneration: 7, currentGeneration: 7,
+                isCancelled: true, isTornDown: false
+            )
+        )
     }
 }
 
@@ -3923,6 +3931,358 @@ final class PeerPaneSessionTests: XCTestCase {
         registry.release(replacement)
         XCTAssertNil(registry.activeLease(forKey: key))
         XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 2)
+    }
+
+    // MARK: - leaseVerdict (pooled lease liveness)
+
+    func test_leaseVerdict_directLeaseIsAlwaysUsable() {
+        // No process to replace; the daemon behind it is the consumer's
+        // connect to judge.
+        XCTAssertEqual(
+            PeerPaneHostLease.leaseVerdict(state: nil, isTornDown: false, localSocketAccepts: false),
+            .usable
+        )
+        XCTAssertEqual(
+            PeerPaneHostLease.leaseVerdict(state: nil, isTornDown: false, localSocketAccepts: true),
+            .usable
+        )
+    }
+
+    func test_leaseVerdict_tornDownWinsOverAnyState() {
+        XCTAssertEqual(
+            PeerPaneHostLease.leaseVerdict(state: nil, isTornDown: true, localSocketAccepts: true),
+            .dead
+        )
+        XCTAssertEqual(
+            PeerPaneHostLease.leaseVerdict(state: .up, isTornDown: true, localSocketAccepts: true),
+            .dead
+        )
+    }
+
+    func test_leaseVerdict_failedOrStoppedTunnelIsDead() {
+        XCTAssertEqual(
+            PeerPaneHostLease.leaseVerdict(
+                state: .failed(reason: "gave up"), isTornDown: false, localSocketAccepts: true
+            ),
+            .dead
+        )
+        XCTAssertEqual(
+            PeerPaneHostLease.leaseVerdict(state: .stopped, isTornDown: false, localSocketAccepts: true),
+            .dead
+        )
+    }
+
+    func test_leaseVerdict_restartingTunnelIsWaitedFor() {
+        let restarting: [PeerSSHTunnelState] = [
+            .starting, .down(reason: "eof"), .reconnecting(attempt: 1), .reconnecting(attempt: 12),
+        ]
+        for state in restarting {
+            for accepts in [false, true] {
+                XCTAssertEqual(
+                    PeerPaneHostLease.leaseVerdict(
+                        state: state, isTornDown: false, localSocketAccepts: accepts
+                    ),
+                    .waitForRestart,
+                    "\(state) accepts=\(accepts)"
+                )
+            }
+        }
+    }
+
+    func test_leaseVerdict_upTunnelNeedsAnAcceptingSocket() {
+        XCTAssertEqual(
+            PeerPaneHostLease.leaseVerdict(state: .up, isTornDown: false, localSocketAccepts: true),
+            .usable
+        )
+        // ssh just exited and `.down` has not been emitted yet, or the socket
+        // file is a ghost: the restart in flight settles both.
+        XCTAssertEqual(
+            PeerPaneHostLease.leaseVerdict(state: .up, isTornDown: false, localSocketAccepts: false),
+            .waitForRestart
+        )
+    }
+
+    /// A pooled lease whose tunnel gave up is the state a long sleep leaves
+    /// behind. Handing it out again strands the caller on a socket nothing
+    /// listens on; acquire must retire it and build a replacement.
+    @MainActor
+    func test_registry_acquireReplacesADeadPooledLease() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-deadlease.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        XCTAssertNil(registry.activeLease(forKey: key))
+        let teardownsBefore = registry.teardownCountForTests
+
+        let dead = try await registry.acquire(spec)
+        registry.retain(dead) // a pane still holds it
+        registry.livenessOverrideForTests = { $0 === dead ? .dead : .usable }
+        defer { registry.livenessOverrideForTests = nil }
+
+        let replacement = try await registry.acquire(spec)
+        XCTAssertFalse(replacement === dead, "a dead pooled lease must not be handed out again")
+        XCTAssertTrue(registry.activeLease(forKey: key) === replacement)
+        XCTAssertEqual(
+            registry.teardownCountForTests, teardownsBefore + 1,
+            "retiring the dead lease stops its transport exactly once"
+        )
+
+        // The pane's refs on the dead lease come back later and must not
+        // touch the replacement.
+        registry.release(dead)
+        registry.release(dead)
+        XCTAssertTrue(registry.activeLease(forKey: key) === replacement)
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 1)
+
+        registry.release(replacement)
+        XCTAssertNil(registry.activeLease(forKey: key))
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 2)
+    }
+
+    /// The retirement reaches the coordinator before the teardown lands, and
+    /// the replacement reaches it once it is pooled — each exactly once.
+    @MainActor
+    func test_registry_replacementFiresHooksAroundTheTeardown() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-hooks.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let teardownsBefore = registry.teardownCountForTests
+        let replacementsBefore = registry.replacementCountForTests
+        let savedRetire = registry.hostTransportWillRetire
+        let savedReplace = registry.hostTransportDidReplace
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.hostTransportWillRetire = savedRetire
+            registry.hostTransportDidReplace = savedReplace
+        }
+
+        let dead = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === dead ? .dead : .usable }
+        var events: [String] = []
+        registry.hostTransportWillRetire = { retired in
+            XCTAssertEqual(retired, key)
+            XCTAssertEqual(
+                registry.teardownCountForTests, teardownsBefore,
+                "the flag must go out before the tunnel stops"
+            )
+            events.append("retire")
+        }
+        registry.hostTransportDidReplace = { replaced, lease in
+            XCTAssertEqual(replaced, key)
+            XCTAssertTrue(registry.activeLease(forKey: key) === lease, "the replacement is pooled when it fires")
+            events.append("replace")
+        }
+
+        let replacement = try await registry.acquire(spec)
+        XCTAssertFalse(replacement === dead)
+        XCTAssertEqual(events, ["retire", "replace"])
+        XCTAssertEqual(registry.replacementCountForTests, replacementsBefore + 1)
+
+        registry.release(dead)
+        registry.release(replacement)
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
+    /// A tunnel restarting on its own is joined, not raced with a second ssh.
+    @MainActor
+    func test_registry_waitForRestartKeepsTheLeaseThatComesBack() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-restart-ok.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let teardownsBefore = registry.teardownCountForTests
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+        }
+
+        let lease = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === lease ? .waitForRestart : .usable }
+        var joined = 0
+        registry.restartWaitOverrideForTests = { _ in joined += 1; return true }
+
+        let again = try await registry.acquire(spec)
+        XCTAssertTrue(again === lease, "a restart that came back keeps the pooled lease")
+        XCTAssertEqual(joined, 1)
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore)
+
+        registry.release(lease)
+        registry.release(lease)
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
+    /// A restart that does not come back is a dead lease.
+    @MainActor
+    func test_registry_waitForRestartReplacesTheLeaseThatDoesNot() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-restart-fail.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let teardownsBefore = registry.teardownCountForTests
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+        }
+
+        let stuck = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === stuck ? .waitForRestart : .usable }
+        registry.restartWaitOverrideForTests = { _ in false }
+
+        let replacement = try await registry.acquire(spec)
+        XCTAssertFalse(replacement === stuck)
+        XCTAssertTrue(registry.activeLease(forKey: key) === replacement)
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 1)
+
+        registry.release(stuck)
+        registry.release(replacement)
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
+    /// A caller cancelled while joining a restart takes no ref and leaves
+    /// the pool alone.
+    @MainActor
+    func test_registry_cancelledWaitForRestartTakesNoRef() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-restart-cancel.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let teardownsBefore = registry.teardownCountForTests
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.restartWaitOverrideForTests = nil
+        }
+
+        let lease = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === lease ? .waitForRestart : .usable }
+        let task = Task { @MainActor in try await registry.acquire(spec) }
+        registry.restartWaitOverrideForTests = { _ in
+            task.cancel()
+            return true
+        }
+        do {
+            _ = try await task.value
+            XCTFail("a cancelled acquire must throw")
+        } catch is CancellationError {}
+        XCTAssertTrue(registry.activeLease(forKey: key) === lease)
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore)
+
+        // Exactly the one ref from the first acquire remains.
+        registry.release(lease)
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
+    /// `retain` joins a lease the caller already holds; it never judges it.
+    @MainActor
+    func test_registry_retainDoesNotJudgeTheLease() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-retain.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let teardownsBefore = registry.teardownCountForTests
+        defer { registry.livenessOverrideForTests = nil }
+
+        let lease = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { _ in .dead }
+        registry.retain(lease)
+        XCTAssertTrue(registry.activeLease(forKey: key) === lease)
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore)
+
+        registry.release(lease)
+        registry.release(lease)
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
+    /// Two callers finding the same dead lease produce one replacement.
+    @MainActor
+    func test_registry_concurrentAcquiresReplaceADeadLeaseOnce() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-concurrent.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let teardownsBefore = registry.teardownCountForTests
+        let replacementsBefore = registry.replacementCountForTests
+        defer { registry.livenessOverrideForTests = nil }
+
+        let dead = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === dead ? .dead : .usable }
+
+        async let first = registry.acquire(spec)
+        async let second = registry.acquire(spec)
+        let (a, b) = try await (first, second)
+        XCTAssertTrue(a === b, "the second caller joins the first replacement")
+        XCTAssertFalse(a === dead)
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 1)
+        XCTAssertEqual(registry.replacementCountForTests, replacementsBefore + 1)
+
+        registry.release(dead)
+        registry.release(a)
+        registry.release(b)
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
+    /// The wake sweep replaces a dead pooled lease and leaves a usable one
+    /// alone. With no consumer to adopt it, the replacement is released
+    /// again at once — that is the sweep taking one temporary ref, not a
+    /// leak.
+    @MainActor
+    func test_wakeRecovery_replacesDeadLeasesAndLeavesUsableOnes() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let deadPath = "/tmp/psp-unit-\(getpid())-wake-dead.sock"
+        let livePath = "/tmp/psp-unit-\(getpid())-wake-live.sock"
+        let deadSpec = PeerPaneHostSpec.direct(sockPath: deadPath)
+        let liveSpec = PeerPaneHostSpec.direct(sockPath: livePath)
+        let teardownsBefore = registry.teardownCountForTests
+        let replacementsBefore = registry.replacementCountForTests
+        defer { registry.livenessOverrideForTests = nil }
+
+        let dead = try await registry.acquire(deadSpec)
+        let live = try await registry.acquire(liveSpec)
+        registry.livenessOverrideForTests = { $0 === dead ? .dead : .usable }
+
+        let replaced = await PeerClientCoordinator.shared.recoverPeerTransportsAfterWake()
+        XCTAssertEqual(replaced, 1)
+        XCTAssertTrue(registry.activeLease(forKey: liveSpec.hostKey) === live, "a usable lease is left alone")
+        XCTAssertEqual(registry.replacementCountForTests, replacementsBefore + 1)
+        // dead retired, replacement pooled then released by the sweep.
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 2)
+        XCTAssertNil(registry.activeLease(forKey: deadSpec.hostKey))
+
+        registry.release(dead)
+        registry.release(live)
+        XCTAssertNil(registry.activeLease(forKey: liveSpec.hostKey))
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 3)
+    }
+
+    /// A consumer that adopts the replacement through the hook keeps it
+    /// alive past the sweep's own release.
+    @MainActor
+    func test_wakeRecovery_replacementSurvivesWhenAHookAdoptsIt() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-wake-adopt.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let savedReplace = registry.hostTransportDidReplace
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.hostTransportDidReplace = savedReplace
+        }
+
+        let dead = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === dead ? .dead : .usable }
+        var adopted: PeerPaneHostLease?
+        registry.hostTransportDidReplace = { _, lease in
+            registry.retain(lease)   // what the sidebar does in adoptReplacementTransport
+            adopted = lease
+        }
+
+        _ = await PeerClientCoordinator.shared.recoverPeerTransportsAfterWake()
+        XCTAssertNotNil(adopted)
+        XCTAssertTrue(registry.activeLease(forKey: key) === adopted)
+
+        registry.release(dead)
+        if let adopted { registry.release(adopted) }
+        XCTAssertNil(registry.activeLease(forKey: key))
     }
 
     @MainActor

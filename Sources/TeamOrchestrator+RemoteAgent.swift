@@ -652,7 +652,17 @@ extension TeamOrchestrator {
                 // callback land after a fresh row briefly reported ready.
                 // Repair owns route recovery, so start one fresh generation
                 // before waiting on the ordinary bounded readiness funnel.
-                _ = RemoteHostStore.shared.retryConnectingHost(current)
+                switch current.connectionState {
+                case .connected:
+                    // The tunnel is up; only the authenticated metadata or
+                    // the session-owner route is stale. Re-read it rather
+                    // than replace the transport the team's panes ride on.
+                    _ = RemoteHostStore.shared.resyncConnectedHost(current)
+                case .failed, .saved:
+                    _ = RemoteHostStore.shared.retryConnectingHost(current)
+                case .connecting:
+                    break
+                }
             }
             let readyHost = try await Self.waitForTeamHostLaunchReadiness(
                 hostKey: host.id

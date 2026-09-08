@@ -1366,6 +1366,14 @@ class termmesh:
         for a row wedged in `.connecting`."""
         return dict(self._call("peer.host.retry", {"host": host}) or {})
 
+    def peer_host_reconnect(self, host: str) -> dict:
+        """Replace the host transport and start over (`peer.host.reconnect`).
+        Reports {started, state, transport_replaced, panes_preserved,
+        previous_sock_path?}. The connect is asynchronous: poll
+        `peer_host_list` until `active_sock_path` differs from
+        `previous_sock_path`."""
+        return dict(self._call("peer.host.reconnect", {"host": host}) or {})
+
     def peer_host_cancel(self, host: str) -> dict:
         """Cancel an in-progress connect (`peer.host.cancel`), returning the
         row to `saved`. Reports {cancelled: bool, state}."""
@@ -1484,6 +1492,13 @@ class termmesh:
         next push reattaches the surface as a second tab."""
         params = {"surface_id": surface_id} if surface_id else {}
         return dict(self._call("debug.peer.mirror_teardown_pane_session", params) or {})
+
+    def debug_simulate_wake(self, timeout_s: float = 70.0) -> dict:
+        """Run the post-wake peer tunnel sweep now (`debug.app.simulate_wake`,
+        DEBUG-only) and report {replaced}: how many pooled tunnels were dead
+        and got a replacement. The sweep joins each restarting tunnel for up
+        to 15s, so the call can take that long per host."""
+        return dict(self._call("debug.app.simulate_wake", {}, timeout_s=timeout_s) or {})
 
     def peer_tunnel_probe(self, target: str, remote_sock: Optional[str] = None,
                           timeout_s: float = 60.0) -> dict:

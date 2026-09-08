@@ -689,6 +689,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         DispatchQueue.global(qos: .utility).async {
             PeerSSHTunnel.sweepStaleTunnels()
         }
+        // Before any host can be acquired: a lease the registry replaces on
+        // its own must reach the panes and the sidebar that held the old one.
+        PeerClientCoordinator.shared.installHostTransportReplacementHooks()
 
 #if DEBUG
         writeUITestDiagnosticsIfNeeded(stage: "didFinishLaunching")
@@ -953,7 +956,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         dlog("wakeRecovery.fire reason=\(reason) agents=\(agentCount) paused=\(paused)")
 #endif
         TeamOrchestrator.shared.drawAgentSurfacesAfterWake()
+        // Peer tunnels get the same three seconds the grant renewal gives
+        // the network, so a replacement's ssh meets a link that is back up.
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            await PeerClientCoordinator.shared.recoverPeerTransportsAfterWake()
+        }
     }
+
+#if DEBUG
+    /// Test-only: what a wake does, now and without the network grace.
+    /// Returns how many peer tunnels were replaced.
+    func debugSimulateWake() async -> Int {
+        TeamOrchestrator.shared.drawAgentSurfacesAfterWake()
+        return await PeerClientCoordinator.shared.recoverPeerTransportsAfterWake()
+    }
+#endif
 
 #if DEBUG
     func writeUITestDiagnosticsIfNeeded(stage: String) {

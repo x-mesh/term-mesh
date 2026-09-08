@@ -1489,4 +1489,53 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
             isTornDown: false, dialedLeaseIsCurrent: true, isCancelled: true
         ))
     }
+
+    // MARK: - reconnectCommit (what the installed subscription becomes)
+
+    /// The generation only decides who owns layout recovery. A step that
+    /// says abandon wins regardless; a proceeding step keeps the
+    /// subscription either way.
+    func test_reconnectCommit_abandonWinsRegardlessOfGeneration() {
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.reconnectCommit(step: .abandon, recoveryGenerationIsCurrent: true),
+            .abandon
+        )
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.reconnectCommit(step: .abandon, recoveryGenerationIsCurrent: false),
+            .abandon
+        )
+    }
+
+    func test_reconnectCommit_currentGenerationCommitsRecoveryToo() {
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.reconnectCommit(step: .proceed, recoveryGenerationIsCurrent: true),
+            .commit
+        )
+    }
+
+    /// A newer generation landed during reconcile. The subscription still
+    /// goes live — leaving it dead but flagged alive is the defect.
+    func test_reconnectCommit_staleGenerationStillInstallsTheSubscription() {
+        XCTAssertEqual(
+            PeerWorkspaceMirrorController.reconnectCommit(step: .proceed, recoveryGenerationIsCurrent: false),
+            .commitSubscriptionOnly
+        )
+    }
+
+    // MARK: - reconnect failure cleanup
+
+    func test_reconnectFailureClearsOnlyItsOwnSubscriptionState() {
+        XCTAssertTrue(
+            PeerWorkspaceMirrorController.reconnectAttemptOwnsSubscription(
+                currentSessionIsAttempt: true
+            )
+        )
+        XCTAssertFalse(
+            PeerWorkspaceMirrorController.reconnectAttemptOwnsSubscription(
+                currentSessionIsAttempt: false
+            ),
+            "a failed old reconnect must not clear a newer subscription"
+        )
+    }
+
 }
