@@ -3040,6 +3040,8 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
             let watched_count = ctx.watcher_handle.snapshot().watched_paths.len();
             let active_agents = ctx.agent_manager.list(false).len();
             let tracked_pids = ctx.monitor_handle.tracked_pids().len();
+            let live_project_surfaces = crate::peer::layout::PeerHost::active_host()
+                .map(|host| host.live_project_surface_count());
 
             let http_disabled = std::env::var("TERM_MESH_HTTP_DISABLED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -3051,6 +3053,7 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
                 "pid": std::process::id(),
                 "owner_pid": ctx.runtime_owner.owner_pid(),
                 "version": env!("CARGO_PKG_VERSION"),
+                "live_project_surfaces": live_project_surfaces,
                 "uptime_secs": uptime_secs,
                 "subsystems": {
                     "socket": { "status": "running" },
