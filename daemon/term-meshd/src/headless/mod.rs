@@ -116,6 +116,7 @@ pub struct HeadlessAgent {
     pub name: String,
     pub cli: String,
     pub model: String,
+    pub effort: String,
     pub team_name: String,
     #[allow(dead_code)] // back-reference; future RPCs may need it
     pub team_uuid: String,
@@ -328,6 +329,7 @@ pub struct AgentInfo {
     pub name: String,
     pub cli: String,
     pub model: String,
+    pub effort: String,
     pub team_name: String,
     pub working_directory: String,
     pub status: AgentStatus,
@@ -350,6 +352,7 @@ pub struct HeadlessTeam {
     pub agents: Vec<String>,
     pub working_directory: String,
     pub leader_session_id: String,
+    pub leader_effort: String,
     pub created_at: u64,
 }
 
@@ -386,6 +389,25 @@ fn default_cli() -> String {
 }
 fn default_model() -> String {
     "sonnet".into()
+}
+
+const VALID_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+pub fn normalize_effort(effort: &str) -> Result<String, String> {
+    let normalized = effort.to_ascii_lowercase();
+    if normalized.is_empty() || VALID_EFFORTS.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        Err(format!("invalid_effort: {effort}"))
+    }
+}
+
+pub fn normalize_team_efforts(params: &mut TeamCreateParams) -> Result<(), String> {
+    params.leader_effort = normalize_effort(&params.leader_effort)?;
+    for agent in &mut params.agents {
+        agent.effort = normalize_effort(&agent.effort)?;
+    }
+    Ok(())
 }
 
 /// Parameters for creating a headless team.
@@ -434,6 +456,8 @@ pub struct TeamCreateParams {
     /// Leader model for metadata.
     #[serde(default)]
     pub leader_model: Option<String>,
+    #[serde(default)]
+    pub leader_effort: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -451,6 +475,8 @@ pub struct AgentSpec {
     pub cli: String,
     #[serde(default = "default_model")]
     pub model: String,
+    #[serde(default)]
+    pub effort: String,
     /// Resolved absolute path to the CLI binary (from Swift's agentBinaryPath).
     pub cli_path: Option<String>,
     /// Agent-specific instructions (preset system prompt).
@@ -545,6 +571,7 @@ struct InternalSpawnArgs {
     team_uuid: String,
     cli: String,
     model: String,
+    effort: String,
     working_directory: String,
     cli_path: Option<String>,
     app_socket_path: Option<String>,
@@ -640,6 +667,7 @@ impl HeadlessManager {
             team_uuid,
             cli: params.cli.clone(),
             model: params.model.clone(),
+            effort: String::new(),
             working_directory: params.working_directory.clone(),
             cli_path: params.cli_path.clone(),
             app_socket_path: params.app_socket_path.clone(),
@@ -667,12 +695,16 @@ impl HeadlessManager {
         let daemon_socket = cli_builder::daemon_socket_path()
             .to_string_lossy()
             .to_string();
+        let effort = matches!(args.cli.as_str(), "claude" | "kiro" | "codex")
+            .then_some(args.effort.as_str())
+            .filter(|effort| !effort.is_empty());
 
         let cmd = match args.cli.as_str() {
             "kiro" => cli_builder::build_kiro_command(
                 &args.name,
                 &args.team_name,
                 &args.model,
+                effort,
                 &daemon_socket,
                 args.cli_path.as_deref(),
                 args.app_socket_path.as_deref(),
@@ -683,6 +715,7 @@ impl HeadlessManager {
                 &args.name,
                 &args.team_name,
                 &args.model,
+                effort,
                 &daemon_socket,
                 args.cli_path.as_deref(),
                 args.app_socket_path.as_deref(),
@@ -713,6 +746,7 @@ impl HeadlessManager {
                     &args.name,
                     &args.team_name,
                     &args.model,
+                    effort,
                     &args.working_directory,
                     &daemon_socket,
                     args.cli_path.as_deref(),
@@ -897,6 +931,7 @@ impl HeadlessManager {
             name: args.name.clone(),
             cli: args.cli.clone(),
             model: args.model.clone(),
+            effort: args.effort.clone(),
             team_name: args.team_name.clone(),
             working_directory: args.working_directory.clone(),
             status: AgentStatus::Running,
@@ -914,6 +949,7 @@ impl HeadlessManager {
                 name: args.name,
                 cli: args.cli,
                 model: args.model,
+                effort: args.effort,
                 team_name: args.team_name,
                 team_uuid: args.team_uuid,
                 working_directory: args.working_directory,
@@ -1087,6 +1123,7 @@ impl HeadlessManager {
             name: agent.name.clone(),
             cli: agent.cli.clone(),
             model: agent.model.clone(),
+            effort: agent.effort.clone(),
             team_name: agent.team_name.clone(),
             working_directory: agent.working_directory.clone(),
             status: agent.status,
@@ -1113,6 +1150,7 @@ impl HeadlessManager {
                 name: agent.name.clone(),
                 cli: agent.cli.clone(),
                 model: agent.model.clone(),
+                effort: agent.effort.clone(),
                 team_name: agent.team_name.clone(),
                 working_directory: agent.working_directory.clone(),
                 status: agent.status,
@@ -1127,7 +1165,8 @@ impl HeadlessManager {
     }
 
     /// Create a headless team: register team metadata and spawn all agents.
-    pub async fn create_team(&mut self, params: TeamCreateParams) -> Result<HeadlessTeam, String> {
+    pub async fn create_team(&mut self, mut params: TeamCreateParams) -> Result<HeadlessTeam, String> {
+        normalize_team_efforts(&mut params)?;
         if self.teams.contains_key(&params.team_name) {
             return Err(format!("team_name_in_use: {}", params.team_name));
         }
@@ -1209,6 +1248,7 @@ impl HeadlessManager {
                 agent_type: spec.agent_type.clone().unwrap_or_else(|| spec.name.clone()),
                 cli: spec.cli.clone(),
                 model: spec.model.clone(),
+                effort: spec.effort.clone(),
                 session_id: session_id.clone(),
                 color: spec.color.clone(),
                 created_at: now,
@@ -1257,6 +1297,7 @@ impl HeadlessManager {
             leader: meta::LeaderMeta {
                 mode: leader_mode,
                 model: leader_model,
+                effort: params.leader_effort.clone(),
                 session_id: leader_session_id,
             },
             agents: params.agents.iter().map(|s| s.name.clone()).collect(),
@@ -1306,6 +1347,7 @@ impl HeadlessManager {
                 team_uuid: team_uuid.clone(),
                 cli: spec.cli.clone(),
                 model: spec.model.clone(),
+                effort: spec.effort.clone(),
                 working_directory: params.working_directory.clone(),
                 cli_path: spec.cli_path.clone(),
                 app_socket_path: params.app_socket_path.clone(),
@@ -1344,6 +1386,7 @@ impl HeadlessManager {
             agents: agent_ids,
             working_directory: params.working_directory,
             leader_session_id: params.leader_session_id,
+            leader_effort: params.leader_effort,
             created_at: now,
         };
         self.teams.insert(params.team_name, team.clone());
@@ -1524,6 +1567,7 @@ impl HeadlessManager {
             leader: meta::LeaderMeta {
                 mode: params.leader_mode.clone(),
                 model: params.leader_model.clone(),
+                effort: String::new(),
                 session_id: Some(params.leader_session_id.clone()).filter(|s| !s.is_empty()),
             },
             agents: params.agents.iter().map(|a| a.name.clone()).collect(),
@@ -1588,6 +1632,7 @@ impl HeadlessManager {
                 agent_type: a.agent_type.clone(),
                 cli: a.cli.clone(),
                 model: a.model.clone(),
+                effort: String::new(),
                 session_id: a.session_id.clone().filter(|s| !s.is_empty()),
                 color: a.color.clone(),
                 created_at: now,
@@ -1701,6 +1746,7 @@ impl HeadlessManager {
                 agent_type: a.agent_type.clone(),
                 cli: a.cli.clone(),
                 model: a.model.clone(),
+                effort: String::new(),
                 session_id: a.session_id.clone().filter(|s| !s.is_empty()),
                 color: a.color.clone(),
                 created_at: now,
@@ -1729,6 +1775,7 @@ impl HeadlessManager {
             leader: meta::LeaderMeta {
                 mode: params.leader_mode.clone(),
                 model: params.leader_model.clone(),
+                effort: String::new(),
                 session_id: Some(params.leader_session_id.clone()).filter(|s| !s.is_empty()),
             },
             agents: params.agents.iter().map(|a| a.name.clone()).collect(),
@@ -1932,6 +1979,7 @@ impl HeadlessManager {
                 agents,
                 working_directory: working_directory.to_string(),
                 leader_session_id: String::new(),
+                leader_effort: String::new(),
                 created_at: 0,
             },
         );
@@ -2039,6 +2087,7 @@ impl HeadlessManager {
             team_uuid: team_uuid.clone(),
             cli: agent_meta.cli.clone(),
             model: agent_meta.model.clone(),
+            effort: agent_meta.effort.clone(),
             working_directory,
             cli_path: agent_meta.cli_path_at_create.clone(),
             app_socket_path,
@@ -2157,6 +2206,7 @@ impl HeadlessManager {
                 agent_type: spec.agent_type.clone().unwrap_or_else(|| spec.name.clone()),
                 cli: spec.cli.clone(),
                 model: spec.model.clone(),
+                effort: spec.effort.clone(),
                 session_id: session_id.clone(),
                 color: spec.color.clone(),
                 created_at: meta::now_unix(),
@@ -2189,6 +2239,7 @@ impl HeadlessManager {
             team_uuid,
             cli: spec.cli,
             model: spec.model,
+            effort: spec.effort,
             working_directory,
             cli_path: spec.cli_path,
             app_socket_path: app_socket_path.map(String::from),
@@ -2372,6 +2423,7 @@ impl HeadlessManager {
             team_uuid: team_uuid.clone(),
             cli: agent_meta.cli.clone(),
             model: agent_meta.model.clone(),
+            effort: agent_meta.effort.clone(),
             working_directory,
             cli_path: agent_meta.cli_path_at_create.clone(),
             app_socket_path: app_socket_path.map(String::from),
@@ -3071,6 +3123,7 @@ impl HeadlessManager {
                 team_uuid: team_uuid.clone(),
                 cli: m.cli.clone(),
                 model: m.model.clone(),
+                effort: m.effort.clone(),
                 working_directory: team_meta.working_directory.clone(),
                 cli_path: m.cli_path_at_create.clone(),
                 app_socket_path: params.app_socket_path.clone(),
@@ -3130,6 +3183,7 @@ impl HeadlessManager {
             agents: spawned_ids,
             working_directory: team_meta.working_directory.clone(),
             leader_session_id: leader_sid,
+            leader_effort: team_meta.leader.effort.clone(),
             created_at: now,
         };
         self.teams.insert(team_name.clone(), team.clone());
@@ -3481,6 +3535,7 @@ fn make_pre_phase2_stub(team: &HeadlessTeam, destroyed_at: u64) -> meta::TeamMet
         leader: meta::LeaderMeta {
             mode: "headless".into(),
             model: "sonnet".into(),
+            effort: team.leader_effort.clone(),
             session_id: None,
         },
         agents: team
@@ -3825,6 +3880,7 @@ mod tests {
             agent_type: "explorer".into(),
             cli: "claude".into(),
             model: "sonnet".into(),
+            effort: String::new(),
             session_id: Some("1a2b3c4d-1111-2222-3333-444455556666".into()),
             color: Some("green".into()),
             created_at: 1715500000,
@@ -3856,6 +3912,7 @@ mod tests {
             leader: meta::LeaderMeta {
                 mode: "claude".into(),
                 model: "sonnet".into(),
+                effort: String::new(),
                 session_id: None,
             },
             agents: vec!["explorer".into()],
@@ -3917,6 +3974,7 @@ mod tests {
             agent_type: "explorer".into(),
             cli: "claude".into(),
             model: "sonnet".into(),
+            effort: String::new(),
             session_id: None,
             color: Some("green".into()),
             created_at: destroyed_at - 100,
@@ -3948,6 +4006,7 @@ mod tests {
             leader: meta::LeaderMeta {
                 mode: "claude".into(),
                 model: "sonnet".into(),
+                effort: String::new(),
                 session_id: Some("leader-sid".into()),
             },
             agents: vec!["explorer".into()],
@@ -4091,6 +4150,7 @@ mod tests {
             agent_type: "executor".into(),
             cli: "claude".into(),
             model: "sonnet".into(),
+            effort: "high".into(),
             session_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
             color: None,
             created_at: 1715600000,
@@ -4112,6 +4172,7 @@ mod tests {
         };
         let bytes = serde_json::to_vec_pretty(&meta_in).unwrap();
         let meta_out: meta::AgentMeta = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(meta_out.effort, "high");
         let u = meta_out.usage_total.expect("usage_total preserved");
         assert_eq!(u.input_tokens, 12345);
         assert_eq!(u.output_tokens, 678);
@@ -4139,6 +4200,16 @@ mod tests {
         }"#;
         let parsed: meta::AgentMeta = serde_json::from_str(json).unwrap();
         assert!(parsed.usage_total.is_none());
+        assert!(parsed.effort.is_empty());
+    }
+
+    #[test]
+    fn effort_normalization_accepts_case_insensitive_values_and_rejects_others() {
+        assert_eq!(normalize_effort("XHIGH").unwrap(), "xhigh");
+        assert_eq!(normalize_effort("").unwrap(), "");
+        assert!(normalize_effort("turbo")
+            .unwrap_err()
+            .starts_with("invalid_effort:"));
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -4507,6 +4578,7 @@ mod tests {
             leader: meta::LeaderMeta {
                 mode: "claude".into(),
                 model: "sonnet".into(),
+                effort: String::new(),
                 session_id: None,
             },
             agents: vec!["a".into()],
@@ -4536,6 +4608,7 @@ mod tests {
             agent_type: "explorer".into(),
             cli: "claude".into(),
             model: "sonnet".into(),
+            effort: String::new(),
             session_id: None,
             color: None,
             created_at: destroyed_at - 100,
@@ -4601,6 +4674,7 @@ mod tests {
             leader: meta::LeaderMeta {
                 mode: "claude".into(),
                 model: "sonnet".into(),
+                effort: String::new(),
                 session_id: Some("lead-sid".into()),
             },
             agents: vec![],
@@ -4645,6 +4719,7 @@ mod tests {
             name: agent_id.clone(),
             cli: "claude".into(),
             model: "sonnet".into(),
+            effort: String::new(),
             team_name: "test-team".into(),
             team_uuid: "00000000-0000-0000-0000-000000000000".into(),
             working_directory: "/tmp".into(),

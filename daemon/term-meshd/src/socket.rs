@@ -3984,13 +3984,16 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
         }
         "headless.create_team" => {
             match serde_json::from_value::<crate::headless::TeamCreateParams>(req.params.clone()) {
-                Ok(p) => {
-                    let mut mgr = ctx.headless.lock().await;
-                    match mgr.create_team(p).await {
-                        Ok(team) => Ok(serde_json::to_value(team).unwrap()),
-                        Err(e) => Err(e),
+                Ok(mut p) => match crate::headless::normalize_team_efforts(&mut p) {
+                    Ok(()) => {
+                        let mut mgr = ctx.headless.lock().await;
+                        match mgr.create_team(p).await {
+                            Ok(team) => Ok(serde_json::to_value(team).unwrap()),
+                            Err(e) => Err(e),
+                        }
                     }
-                }
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }
@@ -5086,6 +5089,8 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
                 agent_type: Option<String>,
                 #[serde(default)]
                 auto_recycle_every: Option<u32>,
+                #[serde(default)]
+                effort: String,
             }
             fn default_cli() -> String {
                 "claude".into()
@@ -5094,11 +5099,13 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
                 "sonnet".into()
             }
             match serde_json::from_value::<P>(req.params.clone()) {
-                Ok(p) => {
+                Ok(p) => match crate::headless::normalize_effort(&p.effort) {
+                    Ok(effort) => {
                     let spec = crate::headless::AgentSpec {
                         name: p.name,
                         cli: p.cli,
                         model: p.model,
+                        effort,
                         cli_path: p.cli_path,
                         instructions: p.instructions,
                         custom_instructions: None,
@@ -5116,7 +5123,9 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
                         Ok(info) => Ok(serde_json::to_value(info).unwrap()),
                         Err(e) => Err(e),
                     }
-                }
+                    }
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(format!("invalid params: {e}")),
             }
         }

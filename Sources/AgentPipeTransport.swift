@@ -241,6 +241,7 @@ enum AgentPipeTransport {
         cli: String,
         fifoPath: String,
         model: String,
+        effort: String = "",
         cliPath: String = "",
         bridgePath: String,
         rendererPath: String?,
@@ -255,6 +256,11 @@ enum AgentPipeTransport {
             + " --events \(quoted(fifoPath + ".events"))"
             + " --cwd \(quoted(workingDirectory))"
         if !model.isEmpty { run += " --model \(quoted(model))" }
+        // Only codex and kiro take an effort level; the bridge itself decides
+        // how each spells it. gemini/cursor/agy have no such knob.
+        if !effort.isEmpty && (cli == "codex" || cli == "kiro") {
+            run += " --effort \(quoted(effort))"
+        }
         // The binary Settings resolved. Without it the bridge finds whatever
         // PATH offers, which is not necessarily the one the user chose.
         if !cliPath.isEmpty { run += " --exe \(quoted(cliPath))" }
@@ -338,6 +344,7 @@ enum AgentPipeTransport {
         claudePath: String,
         fifoPath: String,
         model: String,
+        effort: String = "",
         instructions: String,
         extraArgs: [String],
         rendererPath: String? = nil
@@ -353,6 +360,9 @@ enum AgentPipeTransport {
         ]
         if !model.isEmpty {
             parts += ["--model", quoted(model)]
+        }
+        if !effort.isEmpty {
+            parts += ["--effort", quoted(effort)]
         }
         if !instructions.isEmpty {
             parts += ["--append-system-prompt", quoted(instructions)]

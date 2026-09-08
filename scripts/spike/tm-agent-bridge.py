@@ -944,8 +944,12 @@ class CodexBridge:
     }
 
     def __init__(self, cwd: str, model: str | None, emitter: Emitter,
-                 exe: str | None = None):
-        argv = [exe or "codex", "app-server"]
+                 exe: str | None = None, effort: str | None = None):
+        argv = [exe or "codex"]
+        if effort:
+            # `-c` is a Codex global option and must precede `app-server`.
+            argv.extend(["-c", f"model_reasoning_effort={effort}"])
+        argv.append("app-server")
         self.child = Child(argv, cwd)
         self.rpc = JsonRpc(self.child, emitter, on_request=self._serve_request)
         self.out = emitter
@@ -1329,6 +1333,12 @@ def main() -> int:
     # find a different binary on PATH than the one the user chose.
     ap.add_argument("--exe", default=None, help="path to the CLI binary")
     ap.add_argument(
+        "--effort",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        default=None,
+        help="reasoning effort for CLIs that support it",
+    )
+    ap.add_argument(
         "--turn-timeout",
         type=positive_timeout,
         default=None,
@@ -1342,7 +1352,7 @@ def main() -> int:
     if args.cli in ("cursor", "agy"):
         bridge = PerTurnBridge(args.cli, cwd, args.model, out, exe=args.exe)
     elif args.cli == "codex":
-        bridge = CodexBridge(cwd, args.model, out, exe=args.exe)
+        bridge = CodexBridge(cwd, args.model, out, exe=args.exe, effort=args.effort)
     elif args.cli == "kiro":
         # `kiro-cli acp`, NOT `kiro-cli chat acp`: both parse and only the first
         # is a server. The second starts the interactive chat agent, which reads

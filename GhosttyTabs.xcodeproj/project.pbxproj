@@ -34,6 +34,7 @@
 		RBVT00000000000000003 /* ReviewBoardVisibilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = RBVT00000000000000006 /* ReviewBoardVisibilityTests.swift */; };
 		ASPT000000000000000003 /* AgentStartupPromptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ASPT000000000000000006 /* AgentStartupPromptTests.swift */; };
 		STPD00000000000000003 /* SmartTeamPresetDecodingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = STPD00000000000000006 /* SmartTeamPresetDecodingTests.swift */; };
+		ELAT00000000000000003 /* EffortLaunchArgsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ELAT00000000000000006 /* EffortLaunchArgsTests.swift */; };
 		TTPI00000000000000003 /* TeamTemplatePlacementInheritanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = TTPI00000000000000006 /* TeamTemplatePlacementInheritanceTests.swift */; };
 		A17000000000000000000001 /* ReviewBoardModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000005 /* ReviewBoardModels.swift */; };
 		A17000000000000000000101 /* RemoteExposureStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A17000000000000000000105 /* RemoteExposureStore.swift */; };
@@ -412,6 +413,7 @@
 			RBVT00000000000000006 /* ReviewBoardVisibilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardVisibilityTests.swift; sourceTree = "<group>"; };
 			ASPT000000000000000006 /* AgentStartupPromptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentStartupPromptTests.swift; sourceTree = "<group>"; };
 			STPD00000000000000006 /* SmartTeamPresetDecodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmartTeamPresetDecodingTests.swift; sourceTree = "<group>"; };
+			ELAT00000000000000006 /* EffortLaunchArgsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EffortLaunchArgsTests.swift; sourceTree = "<group>"; };
 			TTPI00000000000000006 /* TeamTemplatePlacementInheritanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamTemplatePlacementInheritanceTests.swift; sourceTree = "<group>"; };
 			A17000000000000000000005 /* ReviewBoardModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReviewBoardModels.swift; sourceTree = "<group>"; };
 			A17000000000000000000105 /* RemoteExposureStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteExposureStore.swift; sourceTree = "<group>"; };
@@ -1175,6 +1177,7 @@ A1760000000000000000000C /* ReviewBoardMergeRunnerTests.swift */,
 				A15100000000000000000008 /* WorkspaceRetrievalStoreTests.swift */,
 				5A57E1F90000000000000004 /* PasteShelfStoreTests.swift */,
 				STPD00000000000000006 /* SmartTeamPresetDecodingTests.swift */,
+				ELAT00000000000000006 /* EffortLaunchArgsTests.swift */,
 				TTPI00000000000000006 /* TeamTemplatePlacementInheritanceTests.swift */,
 			);
 			path = termMeshTests;
@@ -1637,6 +1640,7 @@ A1760000000000000000000B /* ReviewBoardMergeRunnerTests.swift in Sources */,
 				A15100000000000000000004 /* WorkspaceRetrievalStoreTests.swift in Sources */,
 				5A57E1F90000000000000002 /* PasteShelfStoreTests.swift in Sources */,
 				STPD00000000000000003 /* SmartTeamPresetDecodingTests.swift in Sources */,
+				ELAT00000000000000003 /* EffortLaunchArgsTests.swift in Sources */,
 				TTPI00000000000000003 /* TeamTemplatePlacementInheritanceTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

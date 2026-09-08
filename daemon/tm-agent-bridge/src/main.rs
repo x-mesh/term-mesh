@@ -32,6 +32,7 @@ mod transport;
 use tm_agent_bridge::location;
 
 use std::io::Read;
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -97,6 +98,10 @@ struct Args {
     /// would find a different binary on PATH than the one the user chose.
     #[arg(long)]
     exe: Option<String>,
+
+    /// Reasoning effort for CLIs that support it.
+    #[arg(long, value_parser = ["low", "medium", "high", "xhigh", "max"])]
+    effort: Option<String>,
 
     /// Optional absolute deadline for one turn. Omitted means unlimited.
     #[arg(long = "turn-timeout", value_parser = parse_positive_duration)]
@@ -237,6 +242,56 @@ fn turn_text(line: &str) -> String {
     }
 }
 
+fn persistent_argv(
+    cli: Cli,
+    exe: Option<&str>,
+    effort: Option<&str>,
+    kiro_supports_effort: bool,
+) -> Option<Vec<String>> {
+    let effort = effort.filter(|effort| !effort.is_empty());
+    match cli {
+        Cli::Codex => {
+            let mut argv = vec![exe.unwrap_or("codex").to_string()];
+            if let Some(effort) = effort {
+                argv.push("-c".into());
+                argv.push(format!("model_reasoning_effort={effort}"));
+            }
+            argv.push("app-server".into());
+            Some(argv)
+        }
+        // `kiro-cli acp`, NOT `kiro-cli chat acp`: both parse and only the
+        // first is a server. The second starts the interactive chat agent,
+        // which reads the handshake as a user message and answers it in prose.
+        Cli::Kiro => {
+            let mut argv = vec![
+                exe.unwrap_or("kiro-cli").to_string(),
+                "acp".into(),
+                "--trust-all-tools".into(),
+            ];
+            if let Some(effort) = effort.filter(|_| kiro_supports_effort) {
+                argv.push("--effort".into());
+                argv.push(effort.to_string());
+            }
+            Some(argv)
+        }
+        Cli::Gemini => Some(vec![
+            exe.unwrap_or("gemini").to_string(),
+            "--acp".into(),
+            "--yolo".into(),
+        ]),
+        Cli::Cursor | Cli::Agy => None,
+    }
+}
+
+fn kiro_acp_supports_effort(exe: &str) -> bool {
+    let Ok(output) = Command::new(exe).args(["acp", "--help"]).output() else {
+        return false;
+    };
+    let mut help = String::from_utf8_lossy(&output.stdout).into_owned();
+    help.push_str(&String::from_utf8_lossy(&output.stderr));
+    help.contains("--effort")
+}
+
 /// A per-session override for later Codex `turn/start` requests.
 ///
 /// An outer `None` means the frame omitted the field. An inner `None` means
@@ -309,26 +364,21 @@ fn main() -> std::process::ExitCode {
 
     // A persistent CLI is spawned once and spoken to; a per-turn CLI has
     // nothing running between turns, so there is no child here to watch.
-    let persistent_argv: Option<Vec<String>> = match args.cli {
-        Cli::Codex => Some(vec![
-            args.exe.clone().unwrap_or_else(|| "codex".into()),
-            "app-server".into(),
-        ]),
-        // `kiro-cli acp`, NOT `kiro-cli chat acp`: both parse and only the
-        // first is a server. The second starts the interactive chat agent,
-        // which reads the handshake as a user message and answers it in prose.
-        Cli::Kiro => Some(vec![
-            args.exe.clone().unwrap_or_else(|| "kiro-cli".into()),
-            "acp".into(),
-            "--trust-all-tools".into(),
-        ]),
-        Cli::Gemini => Some(vec![
-            args.exe.clone().unwrap_or_else(|| "gemini".into()),
-            "--acp".into(),
-            "--yolo".into(),
-        ]),
-        Cli::Cursor | Cli::Agy => None,
-    };
+    let kiro_supports_effort = args.cli == Cli::Kiro
+        && args
+            .effort
+            .as_deref()
+            .is_some_and(|effort| !effort.is_empty())
+        && kiro_acp_supports_effort(args.exe.as_deref().unwrap_or("kiro-cli"));
+    if args.cli == Cli::Kiro && args.effort.is_some() && !kiro_supports_effort {
+        log("kiro-cli acp --help has no --effort option; starting without effort");
+    }
+    let persistent_argv = persistent_argv(
+        args.cli,
+        args.exe.as_deref(),
+        args.effort.as_deref(),
+        kiro_supports_effort,
+    );
 
     let (mut bridge, exit_rx): (Box<dyn Bridge>, Option<Receiver<()>>) = match persistent_argv {
         Some(argv) => {
@@ -787,6 +837,62 @@ mod tests {
                 "{invalid} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn codex_effort_precedes_the_app_server_subcommand() {
+        assert_eq!(
+            persistent_argv(Cli::Codex, Some("/bin/codex"), Some("xhigh"), false),
+            Some(vec![
+                "/bin/codex".into(),
+                "-c".into(),
+                "model_reasoning_effort=xhigh".into(),
+                "app-server".into(),
+            ])
+        );
+    }
+
+    #[test]
+    fn absent_effort_preserves_existing_codex_argv() {
+        assert_eq!(
+            persistent_argv(Cli::Codex, None, None, false),
+            Some(vec!["codex".into(), "app-server".into()])
+        );
+    }
+
+    #[test]
+    fn unsupported_clis_ignore_effort() {
+        assert_eq!(
+            persistent_argv(Cli::Gemini, Some("gemini-bin"), Some("high"), false),
+            Some(vec!["gemini-bin".into(), "--acp".into(), "--yolo".into(),])
+        );
+        assert_eq!(
+            persistent_argv(Cli::Cursor, None, Some("high"), false),
+            None
+        );
+        assert_eq!(persistent_argv(Cli::Agy, None, Some("high"), false), None);
+    }
+
+    #[test]
+    fn kiro_effort_requires_help_advertisement() {
+        assert_eq!(
+            persistent_argv(Cli::Kiro, None, Some("max"), true),
+            Some(vec![
+                "kiro-cli".into(),
+                "acp".into(),
+                "--trust-all-tools".into(),
+                "--effort".into(),
+                "max".into(),
+            ])
+        );
+        assert_eq!(
+            persistent_argv(Cli::Kiro, None, Some("max"), false),
+            Some(vec![
+                "kiro-cli".into(),
+                "acp".into(),
+                "--trust-all-tools".into(),
+            ])
+        );
     }
 }
 

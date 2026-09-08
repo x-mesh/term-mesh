@@ -2720,6 +2720,10 @@ class TerminalController {
         let leaderSessionId = params["leader_session_id"] as? String ?? UUID().uuidString
         let leaderMode = params["leader_mode"] as? String ?? "repl"
         let leaderModel = params["leader_model"] as? String ?? "sonnet"
+        let leaderEffort = (params["leader_effort"] as? String ?? "").lowercased()
+        guard leaderEffort.isEmpty || AgentRolePreset.allEffortLevels.contains(leaderEffort.lowercased()) else {
+            return v2Error(id: id, code: "invalid_effort", message: "Invalid leader_effort '\(leaderEffort)'")
+        }
         let leaderCli = params["leader_cli"] as? String ?? "claude"
         let resumeSessionId = params["resume_session_id"] as? String
         // F2 fix: socket param `runbook_init_prompt: true` means "DO inject
@@ -2736,11 +2740,19 @@ class TerminalController {
         if leaderMode == "adopted" && adoptedLeaderSurfaceId == nil {
             return v2Error(id: id, code: "invalid_params", message: "adopted mode requires a valid surface_id")
         }
-        let agents = agentsParam.map { dict -> (name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String) in
+        for dict in agentsParam {
+            let effort = dict["effort"] as? String ?? ""
+            guard effort.isEmpty || AgentRolePreset.allEffortLevels.contains(effort.lowercased()) else {
+                let agentName = dict["name"] as? String ?? "agent"
+                return v2Error(id: id, code: "invalid_effort", message: "Invalid effort '\(effort)' for agent '\(agentName)'")
+            }
+        }
+        let agents = agentsParam.map { dict -> (name: String, cli: String, model: String, effort: String, agentType: String, color: String, instructions: String, customInstructions: String) in
             (
                 name: dict["name"] as? String ?? "agent",
                 cli: dict["cli"] as? String ?? "claude",
                 model: dict["model"] as? String ?? "sonnet",
+                effort: (dict["effort"] as? String ?? "").lowercased(),
                 agentType: dict["agent_type"] as? String ?? "",
                 color: dict["color"] as? String ?? "green",
                 instructions: dict["instructions"] as? String ?? "",
@@ -2836,6 +2848,7 @@ class TerminalController {
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
                 leaderModel: leaderModel,
+                leaderEffort: leaderEffort,
                 leaderCli: leaderCli,
                 resumeSessionId: resumeSessionId,
                 adoptedLeaderSurfaceId: adoptedLeaderSurfaceId,
@@ -2860,6 +2873,7 @@ class TerminalController {
                             "id": agent.id, "name": agent.name,
                             "agent_instance_id": agent.agentInstanceId,
                             "model": agent.model,
+                            "effort": agent.effort,
                             "workspace_id": agent.workspaceId.uuidString,
                         ]
                         if let pid = agent.panelId {
@@ -3117,6 +3131,7 @@ class TerminalController {
         agentType: String,
         agentName: String,
         agentModel: String,
+        agentEffort: String = "",
         agentCli: String,
         host: String,
         directory: String?,
@@ -3199,6 +3214,7 @@ class TerminalController {
                 workingDirectory: resolved.directory,
                 agentType: agentType,
                 model: agentModel,
+                effort: agentEffort,
                 cli: agentCli
             )
             let checkout = Self.remoteAgentResponseWorkingDirectory(
@@ -3212,6 +3228,7 @@ class TerminalController {
                 "agent_type": member.agentType,
                 "cli": member.cli,
                 "model": member.model,
+                "effort": member.effort,
                 "host": resolved.key,
                 "working_directory": checkout.directory,
                 "checkout_reused": checkout.reused,
@@ -3233,6 +3250,10 @@ class TerminalController {
         let rawName = params["name"] as? String ?? ""
         let agentName = rawName.isEmpty ? agentType : rawName
         let agentModel = (params["model"] as? String) ?? "sonnet"
+        let agentEffort = ((params["effort"] as? String) ?? "").lowercased()
+        guard agentEffort.isEmpty || AgentRolePreset.allEffortLevels.contains(agentEffort.lowercased()) else {
+            return v2Error(id: id, code: "invalid_effort", message: "Invalid effort '\(agentEffort)'")
+        }
         let agentCli = (params["cli"] as? String) ?? "claude"
         // R7: spec is carried as custom_instructions (watcher only via the CLI).
         let customInstructions = params["custom_instructions"] as? String
@@ -3249,6 +3270,7 @@ class TerminalController {
                 agentType: agentType,
                 agentName: agentName,
                 agentModel: agentModel,
+                agentEffort: agentEffort,
                 agentCli: agentCli,
                 host: hostParam,
                 directory: (params["directory"] as? String)
@@ -3263,6 +3285,7 @@ class TerminalController {
                 agentType: agentType,
                 agentName: agentName,
                 agentModel: agentModel,
+                agentEffort: agentEffort,
                 agentCli: agentCli,
                 customInstructions: customInstructions
             )
@@ -3279,6 +3302,7 @@ class TerminalController {
                     "agent_type": member.agentType,
                     "cli": member.cli,
                     "model": member.model,
+                    "effort": member.effort,
                 ]
                 if let pid = member.panelId {
                     payload["panel_id"] = pid.uuidString
@@ -3978,13 +4002,14 @@ class TerminalController {
         // and `checkout` falling back to a workspace UUID. Derived here, on the
         // actor that owns the member, so both status implementations answer
         // with the same value.
-        let teamInfo: (leaderSessionId: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?, workingDirectory: String?)], createdAt: String, policyState: String, policyFailure: String?, measurement: [String: Any])? = await MainActor.run {
+        let teamInfo: (leaderSessionId: String, leaderEffort: String, workspaceId: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, effort: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?, workingDirectory: String?)], createdAt: String, policyState: String, policyFailure: String?, measurement: [String: Any])? = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teamStruct(name: teamName) else { return nil }
             return (
                 leaderSessionId: team.leaderSessionId,
+                leaderEffort: team.leaderEffort,
                 workspaceId: team.workspaceId.uuidString,
                 agents: team.agents.map { a in
-                    (name: a.name, id: a.id, instanceId: a.agentInstanceId, cli: a.cli, model: a.model, agentType: a.agentType, color: a.color,
+                    (name: a.name, id: a.id, instanceId: a.agentInstanceId, cli: a.cli, model: a.model, effort: a.effort, agentType: a.agentType, color: a.color,
                      workspaceId: a.workspaceId.uuidString, panelId: a.panelId?.uuidString,
                      completedTaskCount: a.completedTaskCount, worktreeBranch: a.worktreeBranch, worktreePath: a.worktreePath,
                      hostKey: a.hostKey,
@@ -4019,6 +4044,7 @@ class TerminalController {
                 "agent_instance_id": agent.instanceId,
                 "cli": agent.cli,
                 "model": agent.model,
+                "effort": agent.effort,
                 "agent_type": agent.agentType,
                 "read_only_default": TeamOrchestrator.roleDefaultsToReadOnly(agent.agentType),
                 "workspace_id": agent.workspaceId,
@@ -4059,6 +4085,7 @@ class TerminalController {
         return v2Ok(id: id, result: [
             "team_name": teamName,
             "leader_session_id": teamInfo.leaderSessionId,
+            "leader_effort": teamInfo.leaderEffort,
             "workspace_id": teamInfo.workspaceId,
             "agent_count": teamInfo.agents.count,
             "agents": agents,
@@ -6172,6 +6199,9 @@ class TerminalController {
                         "role": agent.role,
                         "cli": agent.cli,
                         "model": agent.model,
+                        // Smart presets don't carry a per-role effort choice —
+                        // exposed for schema parity with team.create's agents[].
+                        "effort": "",
                         "status": {
                             switch agent.status {
                             case .normal: return "normal"
@@ -6224,6 +6254,7 @@ class TerminalController {
                         "name": agent.role,
                         "cli": agent.cli,
                         "model": agent.model,
+                        "effort": rolePreset?.effort ?? "",
                         "agent_type": agent.role,
                         "color": rolePreset?.color ?? defaultColors[i % defaultColors.count],
                         "instructions": rolePreset?.instructions ?? "",
@@ -6305,6 +6336,7 @@ class TerminalController {
                     "name": rolePreset.name,
                     "cli": cli,
                     "model": model,
+                    "effort": rolePreset.effort,
                     "agent_type": rolePreset.name,
                     "color": rolePreset.color.isEmpty ? defaultColors[i % defaultColors.count] : rolePreset.color,
                     "instructions": rolePreset.instructions,
@@ -6342,6 +6374,7 @@ class TerminalController {
                 "name": rolePreset.name,
                 "cli": cli,
                 "model": model,
+                "effort": rolePreset.effort,
                 "agent_type": rolePreset.name,
                 "color": rolePreset.color.isEmpty ? defaultColors[i % defaultColors.count] : rolePreset.color,
                 "instructions": rolePreset.instructions,
@@ -6371,11 +6404,19 @@ class TerminalController {
         let workingDirectory = params["working_directory"] as? String ?? FileManager.default.currentDirectoryPath
         let leaderSessionId = params["leader_session_id"] as? String ?? UUID().uuidString
 
-        let agents = agentsParam.map { dict -> (name: String, cli: String, model: String, agentType: String, color: String, instructions: String, customInstructions: String) in
+        for dict in agentsParam {
+            let effort = dict["effort"] as? String ?? ""
+            guard effort.isEmpty || AgentRolePreset.allEffortLevels.contains(effort.lowercased()) else {
+                let agentName = dict["name"] as? String ?? "agent"
+                return .err(code: "invalid_effort", message: "Invalid effort '\(effort)' for agent '\(agentName)'", data: nil)
+            }
+        }
+        let agents = agentsParam.map { dict -> (name: String, cli: String, model: String, effort: String, agentType: String, color: String, instructions: String, customInstructions: String) in
             (
                 name: dict["name"] as? String ?? "agent",
                 cli: dict["cli"] as? String ?? "claude",
                 model: dict["model"] as? String ?? "sonnet",
+                effort: (dict["effort"] as? String ?? "").lowercased(),
                 agentType: dict["agent_type"] as? String ?? "general",
                 color: dict["color"] as? String ?? "",
                 instructions: dict["instructions"] as? String ?? "",
@@ -6388,6 +6429,10 @@ class TerminalController {
 
         let leaderMode = params["leader_mode"] as? String ?? "repl"
         let leaderModel = params["leader_model"] as? String ?? "sonnet"
+        let leaderEffort = (params["leader_effort"] as? String ?? "").lowercased()
+        guard leaderEffort.isEmpty || AgentRolePreset.allEffortLevels.contains(leaderEffort.lowercased()) else {
+            return .err(code: "invalid_effort", message: "Invalid leader_effort '\(leaderEffort)'", data: nil)
+        }
         let resumeSessionId = params["resume_session_id"] as? String
         // F2 fix: see TerminalController.swift:2031 — socket flag means
         // "include runbook"; orchestrator wants the inverse.
@@ -6409,6 +6454,7 @@ class TerminalController {
                 leaderSessionId: leaderSessionId,
                 leaderMode: leaderMode,
                 leaderModel: leaderModel,
+                leaderEffort: leaderEffort,
                 resumeSessionId: resumeSessionId,
                 adoptedLeaderSurfaceId: adoptedLeaderSurfaceId,
                 skipRunbookPromptForInteractiveAgents: skipRunbookInitPrompt,
@@ -6423,6 +6469,7 @@ class TerminalController {
                             "id": agent.id,
                             "name": agent.name,
                             "model": agent.model,
+                            "effort": agent.effort,
                             "workspace_id": agent.workspaceId.uuidString,
                         ]
                         if let pid = agent.panelId {

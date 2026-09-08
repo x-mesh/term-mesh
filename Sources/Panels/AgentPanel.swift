@@ -102,12 +102,12 @@ final class AgentPanel: ObservableObject, Panel {
     ///
     /// Leader panes never showed this because they are built by a different
     /// path that has always passed their environment through.
-    func start(claudePath: String, model: String, instructions: String,
+    func start(claudePath: String, model: String, effort: String = "", instructions: String,
                extraArgs: [String] = [],
                environment: [String: String] = ProcessInfo.processInfo.environment,
                protectedEnvironmentKeys: Set<String> = []) {
         session.start(AgentSession.claudeLaunch(
-            claudePath: claudePath, model: model, instructions: instructions,
+            claudePath: claudePath, model: model, effort: effort, instructions: instructions,
             extraArgs: extraArgs, workingDirectory: workingDirectory,
             environment: environment,
             loadsAccountEnvironment: true,
@@ -122,11 +122,12 @@ final class AgentPanel: ObservableObject, Panel {
     /// `environment` carries the same team identity as the Claude launch
     /// above, and for the same reason.
     func start(bridgedCli: String, bridgePath: String, model: String,
+               effort: String = "",
                cliPath: String = "",
                environment: [String: String] = ProcessInfo.processInfo.environment,
                protectedEnvironmentKeys: Set<String> = []) {
         session.start(AgentSession.bridgeLaunch(
-            cli: bridgedCli, bridgePath: bridgePath, model: model,
+            cli: bridgedCli, bridgePath: bridgePath, model: model, effort: effort,
             cliPath: cliPath, workingDirectory: workingDirectory,
             environment: environment,
             loadsAccountEnvironment: true,
@@ -135,13 +136,13 @@ final class AgentPanel: ObservableObject, Panel {
     }
 
     func start(remoteClaudeAt target: String, port: Int?, identityFile: String?,
-               model: String, instructions: String,
+               model: String, effort: String = "", instructions: String,
                remoteEnvironment: [String: String] = [:],
                remoteEnvironmentFile: String? = nil,
                reverseUnixForward: (remote: String, local: String)? = nil) {
         session.start(AgentSession.remoteClaudeLaunch(
             sshTarget: target, port: port, identityFile: identityFile,
-            model: model, instructions: instructions,
+            model: model, effort: effort, instructions: instructions,
             workingDirectory: workingDirectory,
             remoteEnvironment: remoteEnvironment,
             remoteEnvironmentFile: remoteEnvironmentFile,
@@ -150,12 +151,13 @@ final class AgentPanel: ObservableObject, Panel {
     }
 
     func start(remoteBridgedCli cli: String, bridgePath: String, model: String,
+               effort: String = "",
                target: String, port: Int?, identityFile: String?,
                remoteEnvironment: [String: String] = [:],
                remoteEnvironmentFile: String? = nil,
                reverseUnixForward: (remote: String, local: String)? = nil) {
         session.start(AgentSession.remoteBridgeLaunch(
-            cli: cli, bridgePath: bridgePath, model: model,
+            cli: cli, bridgePath: bridgePath, model: model, effort: effort,
             sshTarget: target, port: port, identityFile: identityFile,
             workingDirectory: workingDirectory,
             remoteEnvironment: remoteEnvironment,

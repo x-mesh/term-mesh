@@ -1102,6 +1102,7 @@ extension TerminalController {
                             name: slot.roleName,
                             cli: slot.cli,
                             model: slot.model,
+                            effort: "",
                             agentType: slot.roleName,
                             color: AgentRolePresetManager.shared.presets
                                 .first { $0.name == slot.roleName }?.color ?? "green",

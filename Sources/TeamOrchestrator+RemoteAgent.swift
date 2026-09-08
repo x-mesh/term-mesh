@@ -7025,6 +7025,7 @@ extension TeamOrchestrator {
         workingDirectory: String,
         agentType: String = "executor",
         model: String = "sonnet",
+        effort: String = "",
         cli: String = "claude",
         agentInstanceId reservedAgentInstanceId: String? = nil
     ) async throws -> AgentMember {
@@ -7211,6 +7212,7 @@ extension TeamOrchestrator {
                 workingDirectory: workingDirectory,
                 agentType: agentType,
                 model: model,
+                effort: effort,
                 cli: cli,
                 routeGrant: routeGrant,
                 routeFilePath: routeFilePath
@@ -7272,6 +7274,7 @@ extension TeamOrchestrator {
                     workingDirectory: workingDirectory,
                     agentType: agentType,
                     model: model,
+                    effort: effort,
                     cli: cli,
                     routeGrant: routeGrant,
                     routeFilePath: routeFilePath,
@@ -7473,6 +7476,7 @@ extension TeamOrchestrator {
             cli: cli,
             launchCommand: cli,
             model: model,
+            effort: effort,
             agentType: agentType,
             color: agentColor,
             instructions: "",
@@ -8095,11 +8099,17 @@ extension TeamOrchestrator {
         cli: String,
         workingDirectory: String,
         model: String,
+        effort: String = "",
         remoteCLIPath: String
     ) -> [String] {
         var args = ["--cli", cli, "--cwd", workingDirectory]
         let modelArg = Self.bridgeModelArg(cli: cli, model: model)
         if !modelArg.isEmpty { args += ["--model", modelArg] }
+        // Only codex and kiro take an effort level; the bridge itself decides
+        // how each spells it. gemini/cursor/agy have no such knob.
+        if !effort.isEmpty && (cli == "codex" || cli == "kiro") {
+            args += ["--effort", effort]
+        }
         if !remoteCLIPath.isEmpty { args += ["--exe", remoteCLIPath] }
         return args
     }
@@ -8119,12 +8129,14 @@ extension TeamOrchestrator {
         cli: String,
         workingDirectory: String,
         model: String,
+        effort: String = "",
         binaries: RemoteAgentBinaries
     ) -> PeerRunnerSurfaceSpec {
         if cli == "claude" {
             let launch = AgentSession.claudeLaunch(
                 claudePath: binaries.cliPath.isEmpty ? "claude" : binaries.cliPath,
                 model: model,
+                effort: effort,
                 instructions: "",
                 extraArgs: [],
                 workingDirectory: workingDirectory
@@ -8159,6 +8171,7 @@ extension TeamOrchestrator {
                 cli: cli,
                 workingDirectory: workingDirectory,
                 model: model,
+                effort: effort,
                 remoteCLIPath: binaries.execPath
             ),
             restartPolicy: .never,
@@ -8870,6 +8883,7 @@ extension TeamOrchestrator {
         workingDirectory: String,
         agentType: String,
         model: String,
+        effort: String = "",
         cli: String,
         routeGrant: Termmesh_Peer_V1_TeamLeaderGrant,
         routeFilePath: String?,
@@ -8892,6 +8906,7 @@ extension TeamOrchestrator {
             cli: cli,
             workingDirectory: workingDirectory,
             model: model,
+            effort: effort,
             binaries: binaries
         )
         // Match the documented remote-native launch contract: active CLI
@@ -9001,6 +9016,7 @@ extension TeamOrchestrator {
             cli: cli,
             launchCommand: cli,
             model: model,
+            effort: effort,
             agentType: agentType,
             color: color,
             instructions: instructions,
@@ -9207,6 +9223,7 @@ extension TeamOrchestrator {
             cli: agent.cli,
             workingDirectory: workingDirectory,
             model: agent.model,
+            effort: agent.effort,
             binaries: binaries
         )
         let environment: [String: String]
@@ -9343,6 +9360,7 @@ extension TeamOrchestrator {
         workingDirectory: String,
         agentType: String,
         model: String,
+        effort: String = "",
         cli: String,
         routeGrant: Termmesh_Peer_V1_TeamLeaderGrant,
         routeFilePath: String?
@@ -9429,6 +9447,7 @@ extension TeamOrchestrator {
                 remoteBridgedCli: cli,
                 bridgePath: bridge,
                 model: Self.bridgeModelArg(cli: cli, model: model),
+                effort: effort,
                 target: sshTarget,
                 port: host.sshPort,
                 identityFile: host.identityFile,
@@ -9449,6 +9468,7 @@ extension TeamOrchestrator {
                 port: host.sshPort,
                 identityFile: host.identityFile,
                 model: Self.resolveClaudeModelArg(model),
+                effort: effort,
                 instructions: instructions,
                 remoteEnvironment: bridgeEnvironment,
                 remoteEnvironmentFile: remoteEnvironmentFile,
@@ -9499,6 +9519,7 @@ extension TeamOrchestrator {
             cli: cli,
             launchCommand: cli,
             model: model,
+            effort: effort,
             agentType: agentType,
             color: color,
             instructions: instructions,
@@ -10354,6 +10375,7 @@ extension TeamOrchestrator {
         workingDirectory: String,
         leaderMode: String,
         leaderModel: String = "sonnet",
+        leaderEffort: String = "",
         leaderEndpoint: LeaderEndpoint = .local,
         leaderWorkingDirectory: String? = nil,
         worktreeMode: String = "off",
@@ -10465,6 +10487,7 @@ extension TeamOrchestrator {
                 name: row.preset.name,
                 cli: row.preset.cli,
                 model: row.preset.model,
+                effort: row.preset.effort,
                 agentType: row.preset.name,
                 color: row.preset.color,
                 // The custom instructions are composed into `instructions`
@@ -10481,6 +10504,7 @@ extension TeamOrchestrator {
             leaderSessionId: UUID().uuidString,
             leaderMode: leaderMode,
             leaderModel: leaderModel,
+            leaderEffort: leaderEffort,
             pairMode: pairMode,
             pairModel: pairModel,
             pairSpec: pairSpec,
@@ -10669,6 +10693,7 @@ extension TeamOrchestrator {
                         workingDirectory: resolved.workingDirectory,
                         agentType: row.preset.name,
                         model: row.preset.model,
+                        effort: row.preset.effort,
                         cli: row.preset.cli,
                         agentInstanceId: row.id.uuidString
                     )

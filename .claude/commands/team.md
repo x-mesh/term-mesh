@@ -72,14 +72,14 @@ tm-agent status
 
 Render JSON output as a human-readable table: `NAME (state, cli, model) — active_task_title or "idle"` per agent.
 
-### `/team add <role> [--cli X] [--model Y] [--name Z]`
+### `/team add <role> [--cli X] [--model Y] [--effort E] [--name Z]`
 
 Valid roles: `architect` `executor` `explorer` `frontend` `backend` `tester` `reviewer` `security` `writer` `planner`
 
-Defaults: `--cli claude`; the model defaults to that CLI's native default. If role is not in the list, print the valid list and stop. Run exactly one command:
+Defaults: `--cli claude`; the model defaults to that CLI's native default. `--effort` accepts `low`, `medium`, `high`, `xhigh`, or `max` and applies only to claude, codex, and kiro; omit it to keep the CLI default. If role is not in the list, print the valid list and stop. Run exactly one command:
 
 ```bash
-tm-agent add <role> [--cli X] [--model Y] [--name Z] --warmup
+tm-agent add <role> [--cli X] [--model Y] [--effort E] [--name Z] --warmup
 ```
 
 Do not run `status`, `--help`, `preset`, or `runbook` first. Do not run a separate `warmup` or post-add `status`; investigate only if this command fails.
@@ -155,6 +155,7 @@ If `tm-agent` is not in PATH:
 | `/team add <role>` | `/team add reviewer` | Add and warm one agent in a single call; CLI-native model default |
 | `/team add <role> --cli codex` | `/team add executor --cli codex` | Add with specific CLI |
 | `/team add <role> --model opus` | `/team add architect --model opus` | Add with specific model |
+| `/team add <role> --effort xhigh` | `/team add architect --effort xhigh` | Add with specific reasoning effort (low/medium/high/xhigh/max; claude, codex, kiro only) |
 | `/team remove <name>` | `/team remove reviewer` | Remove agent from team (team-scoped; cf. `tm-agent detach` = workspace-adopt path) |
 | `/team remove <name> --force` | `/team remove reviewer --force` | Force remove even if working |
 | `/team recycle <name>` | `/team recycle reviewer` | Guarded hard restart for an idle/stopped worker; drops accumulated pane context |
@@ -166,6 +167,7 @@ If `tm-agent` is not in PATH:
 | `create [N]` | `/team create 3` | Create team with N agents (default 2) |
 | `create N --claude-leader` | `/team create 3 --claude-leader` | Create team with you as leader |
 | `create N --model opus` | `/team create 3 --model opus` | Set model for all agents (sonnet/opus/haiku) |
+| `create N --effort high` | `/team create 3 --effort high --leader-effort max` | Set reasoning effort for all agents and the leader |
 | `create N (CLI mix)` | `/team create 4 --kiro 2 --cli-mix` | Mix CLI types (see CLAUDE.md for full flags) |
 | `list` | `/team list` | List all teams |
 
