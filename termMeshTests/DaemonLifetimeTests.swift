@@ -10,6 +10,48 @@ import XCTest
 /// peer-server Auto-start preference.
 final class DaemonLifetimeTests: XCTestCase {
 
+    /// The daemon serializes `UsageTickAgent` with serde's field names, so the
+    /// two cache counters arrive as `cache_read_input_tokens` and
+    /// `cache_creation_input_tokens`. Reading the Swift property spelling
+    /// instead returned 0 for both without any decode error.
+    func test_usageTickCacheCountersDecodeFromTheDaemonWireNames() {
+        let now = Date()
+        let parsed = TermMeshDaemon.parseUsageTickAgents(
+            [[
+                "name": "explorer",
+                "input_tokens": NSNumber(value: 8200),
+                "output_tokens": NSNumber(value: 1300),
+                "cache_read_input_tokens": NSNumber(value: 22000),
+                "cache_creation_input_tokens": NSNumber(value: 13000),
+            ]],
+            now: now
+        )
+
+        XCTAssertEqual(parsed.count, 1)
+        XCTAssertEqual(parsed.first?.name, "explorer")
+        XCTAssertEqual(parsed.first?.snapshot.inputTokens, 8200)
+        XCTAssertEqual(parsed.first?.snapshot.outputTokens, 1300)
+        XCTAssertEqual(parsed.first?.snapshot.cacheReadTokens, 22000)
+        XCTAssertEqual(parsed.first?.snapshot.cacheCreationTokens, 13000)
+    }
+
+    /// The Swift property spelling is not a second accepted name. Keeping this
+    /// explicit stops a future edit from "fixing" the mismatch by accepting
+    /// both and hiding which side is actually wrong.
+    func test_usageTickIgnoresTheSwiftPropertySpellingForCacheCounters() {
+        let parsed = TermMeshDaemon.parseUsageTickAgents(
+            [[
+                "name": "explorer",
+                "cache_read_tokens": NSNumber(value: 22000),
+                "cache_creation_tokens": NSNumber(value: 13000),
+            ]],
+            now: Date()
+        )
+
+        XCTAssertEqual(parsed.first?.snapshot.cacheReadTokens, 0)
+        XCTAssertEqual(parsed.first?.snapshot.cacheCreationTokens, 0)
+    }
+
     func test_spawnEnvironmentAlwaysConfiguresOwnerAndBuildScopedPeerSocket() {
         let environment = TermMeshDaemon.daemonEnvironment(
             processEnvironment: ["UNCHANGED": "yes"],
