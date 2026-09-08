@@ -166,6 +166,7 @@
 		TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = TORA0001 /* TeamOrchestrator+RemoteAgent.swift */; };
 		APT0000000000000000003 /* AgentPipeTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = APT0000000000000000006 /* AgentPipeTransport.swift */; };
 		APC0000000000000000003 /* AgentPipeCompletion.swift in Sources */ = {isa = PBXBuildFile; fileRef = APC0000000000000000006 /* AgentPipeCompletion.swift */; };
+		MCL0000000000000000001 /* ModelContextLimits.swift in Sources */ = {isa = PBXBuildFile; fileRef = MCL0000000000000000002 /* ModelContextLimits.swift */; };
 		A5001702 /* DashboardController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5001703 /* DashboardController.swift */; };
 		A5001704 /* dashboard in Resources */ = {isa = PBXBuildFile; fileRef = A5001705 /* dashboard */; };
 		ARB00002 /* AgentRunbookService.swift in Sources */ = {isa = PBXBuildFile; fileRef = ARB00001 /* AgentRunbookService.swift */; };
@@ -539,6 +540,7 @@
 		TORA0001 /* TeamOrchestrator+RemoteAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TeamOrchestrator+RemoteAgent.swift"; sourceTree = "<group>"; };
 			APT0000000000000000006 /* AgentPipeTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPipeTransport.swift; sourceTree = "<group>"; };
 			APC0000000000000000006 /* AgentPipeCompletion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentPipeCompletion.swift; sourceTree = "<group>"; };
+			MCL0000000000000000002 /* ModelContextLimits.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelContextLimits.swift; sourceTree = "<group>"; };
 		A5001703 /* DashboardController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardController.swift; sourceTree = "<group>"; };
 		A5001705 /* dashboard */ = {isa = PBXFileReference; lastKnownFileType = folder; path = dashboard; sourceTree = "<group>"; };
 		ARB00001 /* AgentRunbookService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRunbookService.swift; sourceTree = "<group>"; };
@@ -963,6 +965,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				TORA0001 /* TeamOrchestrator+RemoteAgent.swift */,
 				APT0000000000000000006 /* AgentPipeTransport.swift */,
 				APC0000000000000000006 /* AgentPipeCompletion.swift */,
+				MCL0000000000000000002 /* ModelContextLimits.swift */,
 				ARB00001 /* AgentRunbookService.swift */,
 				ARB00003 /* AgentRunbookSettingsView.swift */,
 				CPF00001 /* CliProfile.swift */,
@@ -1453,6 +1456,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				TORA0002 /* TeamOrchestrator+RemoteAgent.swift in Sources */,
 				APT0000000000000000003 /* AgentPipeTransport.swift in Sources */,
 				APC0000000000000000003 /* AgentPipeCompletion.swift in Sources */,
+				MCL0000000000000000001 /* ModelContextLimits.swift in Sources */,
 				ARB00002 /* AgentRunbookService.swift in Sources */,
 				ARB00004 /* AgentRunbookSettingsView.swift in Sources */,
 				CPF00002 /* CliProfile.swift in Sources */,
