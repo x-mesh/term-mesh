@@ -689,6 +689,7 @@ pub const DAEMON_WORKSPACE: &str = "term-meshd";
 /// buffering.
 pub struct Broadcaster {
     clients: Mutex<HashMap<u64, RegisteredClient>>,
+    client_changes: watch::Sender<u64>,
     next_id: AtomicU64,
     next_leader_generation: AtomicU64,
     leader_pending: Mutex<HashMap<Vec<u8>, PendingLeaderResponse>>,
@@ -785,8 +786,10 @@ impl Broadcaster {
     }
 
     pub fn new() -> Self {
+        let (client_changes, _) = watch::channel(0);
         Self {
             clients: Mutex::new(HashMap::new()),
+            client_changes,
             next_id: AtomicU64::new(1),
             next_leader_generation: AtomicU64::new(1),
             leader_pending: Mutex::new(HashMap::new()),
@@ -821,6 +824,9 @@ impl Broadcaster {
                 wants_roster,
             },
         );
+        self.client_changes.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
         BroadcastGuard {
             broadcaster: Arc::clone(self),
             id,
@@ -887,17 +893,30 @@ impl Broadcaster {
         if request.request_id.len() != peer_proto::team_leader::REQUEST_ID_BYTES {
             return Err("invalid request_id".into());
         }
-        let targets = self
-            .clients
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, client)| client.peer_id == target_peer_id)
-            .map(|(id, client)| (*id, client.clone()))
-            .collect::<Vec<_>>();
-        if targets.is_empty() {
-            return Err("authorized peer viewer is not connected".to_string());
-        }
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(peer_proto::team_leader::COMMAND_PENDING_TIMEOUT_SECS);
+        let mut client_changes = self.client_changes.subscribe();
+        let targets = loop {
+            let targets = self
+                .clients
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, client)| client.peer_id == target_peer_id)
+                .map(|(id, client)| (*id, client.clone()))
+                .collect::<Vec<_>>();
+            if !targets.is_empty() {
+                break targets;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero()
+                || tokio::time::timeout(remaining, client_changes.changed())
+                    .await
+                    .is_err()
+            {
+                return Err("authorized peer viewer did not reconnect".into());
+            }
+        };
         let (tx, rx) = oneshot::channel();
         let mut joined = false;
         let generation;
@@ -935,7 +954,7 @@ impl Broadcaster {
         }
         if joined {
             return match tokio::time::timeout(
-                Duration::from_secs(peer_proto::team_leader::COMMAND_PENDING_TIMEOUT_SECS),
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
                 rx,
             )
             .await
@@ -974,7 +993,7 @@ impl Broadcaster {
             }
         }
         match tokio::time::timeout(
-            Duration::from_secs(peer_proto::team_leader::COMMAND_PENDING_TIMEOUT_SECS),
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
             rx,
         )
         .await
@@ -1035,6 +1054,9 @@ impl BroadcastGuard {
 impl Drop for BroadcastGuard {
     fn drop(&mut self) {
         self.broadcaster.clients.lock().unwrap().remove(&self.id);
+        self.broadcaster.client_changes.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
         // A reverse leader request may be in flight on several connections
         // for the same peer. Retire only this connection's route and fail the
         // callers immediately only when no route remains.
@@ -3537,6 +3559,90 @@ mod tests {
             "a duplicate response cannot complete the request again"
         );
         assert!(call.await.unwrap().unwrap().ok);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leader_reverse_route_waits_for_authorized_viewer_reconnect() {
+        let router = Arc::new(Broadcaster::new());
+        let peer_id = vec![0xA1; 16];
+        let request = TeamLeaderCommandRequest {
+            request_id: vec![0x45; peer_proto::team_leader::REQUEST_ID_BYTES],
+            method: "team.delegate".into(),
+            params_json: r#"{"submit_return":true}"#.into(),
+            ..Default::default()
+        };
+
+        let pending_router = Arc::clone(&router);
+        let pending_request = request.clone();
+        let pending_peer_id = peer_id.clone();
+        let call = tokio::spawn(async move {
+            pending_router
+                .call_team_leader(pending_request, &pending_peer_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !call.is_finished(),
+            "a transient viewer gap must not reject delegation before reconnect"
+        );
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let (attacker_tx, _attacker_rx) = mpsc::channel(4);
+        let _attacker = router.register(
+            attacker_tx,
+            Arc::new(AtomicU64::new(10)),
+            vec![0xB1; 16],
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            !call.is_finished(),
+            "an unrelated viewer must not satisfy the scoped reconnect wait"
+        );
+        let (viewer_tx, mut viewer_rx) = mpsc::channel(4);
+        let viewer = router.register(
+            viewer_tx,
+            Arc::new(AtomicU64::new(10)),
+            peer_id,
+        );
+        let envelope = viewer_rx.recv().await.expect("reconnected viewer request");
+        let response = TeamLeaderCommandResponse {
+            request_id: request.request_id,
+            ok: true,
+            result_json: r#"{"task":{"id":"task-1"}}"#.into(),
+            ..Default::default()
+        };
+        assert!(router.resolve_team_leader(
+            viewer.connection_id(),
+            envelope.seq,
+            response,
+        ));
+        assert!(call.await.unwrap().unwrap().ok);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leader_reverse_route_bounds_the_viewer_reconnect_wait() {
+        let router = Arc::new(Broadcaster::new());
+        let request = TeamLeaderCommandRequest {
+            request_id: vec![0x44; peer_proto::team_leader::REQUEST_ID_BYTES],
+            method: "team.status".into(),
+            params_json: "{}".into(),
+            ..Default::default()
+        };
+
+        let pending_router = Arc::clone(&router);
+        let call = tokio::spawn(async move {
+            pending_router.call_team_leader(request, &[0xA1; 16]).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(
+            peer_proto::team_leader::COMMAND_PENDING_TIMEOUT_SECS + 1,
+        ))
+        .await;
+
+        assert_eq!(
+            call.await.unwrap().unwrap_err(),
+            "authorized peer viewer did not reconnect"
+        );
     }
 
     #[tokio::test]
