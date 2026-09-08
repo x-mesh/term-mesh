@@ -3220,6 +3220,13 @@ struct RemoteHostGroupView: View, Equatable {
                 .disabled(host.supportsWorkspaceLifecycle != true)
 
                 Divider()
+                // Transport scope, least destructive first: replace it, end
+                // it, end it and the local views. Resync above keeps the
+                // tunnel; Reconnect is for a tunnel that is up but wrong.
+                Button("Reconnect Host") {
+                    store.reconnectHost(host)
+                }
+                .help("Replace the SSH tunnel and reconnect. Open panes and mirrors reattach; processes on the host keep running.")
                 // Disconnect ends only the transport: pane UI and host-side
                 // processes survive, and the pane's banner offers reconnect.
                 // Closing local views is a separate, explicitly labelled
@@ -3332,7 +3339,7 @@ struct RemoteHostGroupView: View, Equatable {
                         Button("Retry") { store.retryConnectingHost(host) }
                             .buttonStyle(.borderless)
                             .controlSize(.mini)
-                            .help("Try connecting again")
+                            .help("Start over with a new SSH tunnel")
                     }
                 }
                 .padding(.leading, 20)

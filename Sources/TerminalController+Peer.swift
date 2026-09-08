@@ -180,6 +180,48 @@ extension TerminalController {
         }
     }
 
+    /// Replace the host transport and start over. Differs from `retry` only
+    /// in what it reports: whether a tunnel actually existed to replace, so
+    /// an e2e can tell "fresh tunnel" from "nothing was running".
+    /// `active_sock_path` is deliberately absent — the connect is
+    /// asynchronous; poll `peer.host.list` until it differs from
+    /// `previous_sock_path`.
+    ///
+    /// Main-thread exception, shared with `peer.host.disconnect`: retiring a
+    /// pooled lease stops its ssh synchronously and may hold main for up to
+    /// three seconds while the process is reaped.
+    func v2PeerHostReconnect(params: [String: Any]) -> V2CallResult {
+        peerDispatchHostAction(params: params, action: "reconnect") { store, host in
+            guard let ssh = host.sshTarget, !ssh.isEmpty else {
+                throw PeerCommandFailure(
+                    code: "not_supported",
+                    message: "\(host.displayName) has no SSH target — direct-socket hosts cannot be reconnected"
+                )
+            }
+            let outcome = store.reconnectHost(host)
+            guard outcome.started else {
+                // A coalesced start with another waiter cannot be cancelled
+                // from here. Nothing is half-done: a lease that is still
+                // starting was never pooled, so there was none to retire.
+                throw PeerCommandFailure(
+                    code: "conflict",
+                    message: "another pane is waiting on the same connection attempt; close it first"
+                )
+            }
+            var reply: [String: Any] = [
+                "ok": true,
+                "started": true,
+                "state": "connecting",
+                "transport_replaced": outcome.transportReplaced,
+                "panes_preserved": outcome.panesPreserved,
+            ]
+            if let previous = outcome.previousSockPath, !previous.isEmpty {
+                reply["previous_sock_path"] = previous
+            }
+            return reply
+        }
+    }
+
     /// Cancel an in-progress connect, returning the row to `.saved`.
     func v2PeerHostCancel(params: [String: Any]) -> V2CallResult {
         peerDispatchHostAction(params: params, action: "cancel") { store, host in

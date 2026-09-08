@@ -1348,6 +1348,8 @@ class TerminalController {
             return v2Result(id: id, self.v2PeerHostConnect(params: params))
         case "peer.host.retry":
             return v2Result(id: id, self.v2PeerHostRetry(params: params))
+        case "peer.host.reconnect":
+            return v2Result(id: id, self.v2PeerHostReconnect(params: params))
         case "peer.host.cancel":
             return v2Result(id: id, self.v2PeerHostCancel(params: params))
         case "peer.host.disconnect":
@@ -1617,6 +1619,7 @@ class TerminalController {
             "peer.host.list",
             "peer.host.connect",
             "peer.host.retry",
+            "peer.host.reconnect",
             "peer.host.cancel",
             "peer.host.disconnect",
             "peer.host.force_disconnect",

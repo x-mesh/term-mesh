@@ -1366,6 +1366,14 @@ class termmesh:
         for a row wedged in `.connecting`."""
         return dict(self._call("peer.host.retry", {"host": host}) or {})
 
+    def peer_host_reconnect(self, host: str) -> dict:
+        """Replace the host transport and start over (`peer.host.reconnect`).
+        Reports {started, state, transport_replaced, panes_preserved,
+        previous_sock_path?}. The connect is asynchronous: poll
+        `peer_host_list` until `active_sock_path` differs from
+        `previous_sock_path`."""
+        return dict(self._call("peer.host.reconnect", {"host": host}) or {})
+
     def peer_host_cancel(self, host: str) -> dict:
         """Cancel an in-progress connect (`peer.host.cancel`), returning the
         row to `saved`. Reports {cancelled: bool, state}."""
