@@ -1717,6 +1717,17 @@ impl PeerHost {
             .any(|surface| surface.info().attachable)
     }
 
+    pub(crate) fn live_project_surface_count(&self) -> usize {
+        let live = self.live_surface_ids();
+        let records = self.project_presentations.lock().unwrap();
+        records
+            .values()
+            .flat_map(Self::presentation_surface_ids)
+            .collect::<HashSet<_>>()
+            .intersection(&live)
+            .count()
+    }
+
     fn presentation_status(
         record: &super::persist::PersistedProjectPresentation,
         live: &HashSet<Vec<u8>>,
@@ -6651,6 +6662,37 @@ mod tests {
         host.terminate_surface(&leader.surface_id).unwrap();
         host.terminate_surface(&first_member.surface_id).unwrap();
         host.terminate_surface(&next_member.surface_id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upgrade_inventory_counts_only_live_manifest_surfaces() {
+        let host = Arc::new(PeerHost::new(Arc::new(PtyManager::new())));
+        let spec = SurfaceSpec {
+            cwd: "/tmp".into(),
+            executable: "/bin/cat".into(),
+            args: Vec::new(),
+            restart_policy: super::super::surface::EnsureRestartPolicy::Never,
+            kind: super::super::surface::SurfaceKind::Pty,
+            agent_cli: String::new(),
+        };
+        let default_shell = host.ensure_surface("unmanaged-shell", &spec).unwrap();
+        assert_eq!(host.live_project_surface_count(), 0);
+
+        let leader = host.ensure_surface("project-leader", &spec).unwrap();
+        let team = peer_proto::v1::Team {
+            name: "project".into(),
+            team_uuid: "uuid-project".into(),
+            working_directory: "/tmp".into(),
+            leader_surface_id: leader.surface_id.clone(),
+            project_id: "team:uuid-project".into(),
+            ..Default::default()
+        };
+        host.upsert_project_presentation(&[vec![7; 16]], &team).unwrap();
+        assert_eq!(host.live_project_surface_count(), 1);
+
+        host.terminate_surface(&leader.surface_id).unwrap();
+        assert_eq!(host.live_project_surface_count(), 0);
+        host.terminate_surface(&default_shell.surface_id).unwrap();
     }
 
     /// A delete releases the surfaces of the record it removed — never the
