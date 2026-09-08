@@ -2720,7 +2720,7 @@ class TerminalController {
         let leaderSessionId = params["leader_session_id"] as? String ?? UUID().uuidString
         let leaderMode = params["leader_mode"] as? String ?? "repl"
         let leaderModel = params["leader_model"] as? String ?? "sonnet"
-        let leaderEffort = params["leader_effort"] as? String ?? ""
+        let leaderEffort = (params["leader_effort"] as? String ?? "").lowercased()
         guard leaderEffort.isEmpty || AgentRolePreset.allEffortLevels.contains(leaderEffort.lowercased()) else {
             return v2Error(id: id, code: "invalid_effort", message: "Invalid leader_effort '\(leaderEffort)'")
         }
@@ -2752,7 +2752,7 @@ class TerminalController {
                 name: dict["name"] as? String ?? "agent",
                 cli: dict["cli"] as? String ?? "claude",
                 model: dict["model"] as? String ?? "sonnet",
-                effort: dict["effort"] as? String ?? "",
+                effort: (dict["effort"] as? String ?? "").lowercased(),
                 agentType: dict["agent_type"] as? String ?? "",
                 color: dict["color"] as? String ?? "green",
                 instructions: dict["instructions"] as? String ?? "",
@@ -3248,7 +3248,7 @@ class TerminalController {
         let rawName = params["name"] as? String ?? ""
         let agentName = rawName.isEmpty ? agentType : rawName
         let agentModel = (params["model"] as? String) ?? "sonnet"
-        let agentEffort = (params["effort"] as? String) ?? ""
+        let agentEffort = ((params["effort"] as? String) ?? "").lowercased()
         guard agentEffort.isEmpty || AgentRolePreset.allEffortLevels.contains(agentEffort.lowercased()) else {
             return v2Error(id: id, code: "invalid_effort", message: "Invalid effort '\(agentEffort)'")
         }
@@ -6413,7 +6413,7 @@ class TerminalController {
                 name: dict["name"] as? String ?? "agent",
                 cli: dict["cli"] as? String ?? "claude",
                 model: dict["model"] as? String ?? "sonnet",
-                effort: dict["effort"] as? String ?? "",
+                effort: (dict["effort"] as? String ?? "").lowercased(),
                 agentType: dict["agent_type"] as? String ?? "general",
                 color: dict["color"] as? String ?? "",
                 instructions: dict["instructions"] as? String ?? "",
@@ -6426,7 +6426,7 @@ class TerminalController {
 
         let leaderMode = params["leader_mode"] as? String ?? "repl"
         let leaderModel = params["leader_model"] as? String ?? "sonnet"
-        let leaderEffort = params["leader_effort"] as? String ?? ""
+        let leaderEffort = (params["leader_effort"] as? String ?? "").lowercased()
         guard leaderEffort.isEmpty || AgentRolePreset.allEffortLevels.contains(leaderEffort.lowercased()) else {
             return .err(code: "invalid_effort", message: "Invalid leader_effort '\(leaderEffort)'", data: nil)
         }
