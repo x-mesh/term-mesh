@@ -1493,6 +1493,13 @@ class termmesh:
         params = {"surface_id": surface_id} if surface_id else {}
         return dict(self._call("debug.peer.mirror_teardown_pane_session", params) or {})
 
+    def debug_simulate_wake(self, timeout_s: float = 70.0) -> dict:
+        """Run the post-wake peer tunnel sweep now (`debug.app.simulate_wake`,
+        DEBUG-only) and report {replaced}: how many pooled tunnels were dead
+        and got a replacement. The sweep joins each restarting tunnel for up
+        to 15s, so the call can take that long per host."""
+        return dict(self._call("debug.app.simulate_wake", {}, timeout_s=timeout_s) or {})
+
     def peer_tunnel_probe(self, target: str, remote_sock: Optional[str] = None,
                           timeout_s: float = 60.0) -> dict:
         """Spawn the real SSH tunnel against `target` and report what came
