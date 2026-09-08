@@ -159,7 +159,8 @@ final class AgentContextUsageTests: XCTestCase {
             inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
             updatedAt: Date(), model: "claude-sonnet-4-6", contextTokens: 100_000
         )
-        XCTAssertEqual(snapshot.contextUsageFraction ?? -1, 0.5, accuracy: 0.0001)
+        // Sonnet 4.6's window is 1M, so 100k is a tenth of it.
+        XCTAssertEqual(snapshot.contextUsageFraction ?? -1, 0.1, accuracy: 0.0001)
     }
 
     /// A model absent from `ModelContextLimits` must not fabricate a
@@ -186,10 +187,29 @@ final class AgentContextUsageTests: XCTestCase {
     }
 
     func test_modelContextLimitsKnowsClaudeButNotUnknownModels() {
-        XCTAssertEqual(ModelContextLimits.contextLimit(forModel: "claude-opus-4-6"), 200_000)
-        XCTAssertEqual(ModelContextLimits.contextLimit(forModel: "claude-sonnet-3-5"), 200_000)
+        XCTAssertEqual(ModelContextLimits.contextLimit(forModel: "claude-opus-5"), 1_000_000)
+        XCTAssertEqual(ModelContextLimits.contextLimit(forModel: "claude-opus-4-6"), 1_000_000)
+        XCTAssertEqual(ModelContextLimits.contextLimit(forModel: "claude-sonnet-4-6"), 1_000_000)
+        XCTAssertEqual(ModelContextLimits.contextLimit(forModel: "claude-haiku-4-5"), 200_000)
         XCTAssertNil(ModelContextLimits.contextLimit(forModel: "gpt-5-codex"))
         XCTAssertNil(ModelContextLimits.contextLimit(forModel: ""))
+    }
+
+    /// A model the table has never heard of must not borrow another entry's
+    /// number. Older Claude models and ones released after this file was last
+    /// touched both land here, and both would otherwise render a percentage
+    /// against a denominator nobody checked.
+    func test_modelContextLimitsHasNoCatchAllForUnlistedClaudeModels() {
+        XCTAssertNil(ModelContextLimits.contextLimit(forModel: "claude-sonnet-3-5"))
+        XCTAssertNil(ModelContextLimits.contextLimit(forModel: "claude-opus-9"))
+        XCTAssertNil(ModelContextLimits.contextLimit(forModel: "claude-"))
+    }
+
+    /// Longest prefix wins, so adding a shorter family key later cannot
+    /// silently take over a model a more specific entry already answers for.
+    func test_modelContextLimitsPrefersTheMostSpecificPrefix() {
+        XCTAssertEqual(ModelContextLimits.contextLimit(forModel: "claude-haiku-4-5-20260101"), 200_000)
+        XCTAssertEqual(ModelContextLimits.contextLimit(forModel: "claude-opus-4-8-preview"), 1_000_000)
     }
 
     /// `handleAgentUsageTick` must decode the daemon's exact serde field
@@ -224,7 +244,7 @@ final class AgentContextUsageTests: XCTestCase {
         XCTAssertEqual(snapshot?.cacheReadTokens, 15)
         XCTAssertEqual(snapshot?.model, "claude-sonnet-4-6")
         XCTAssertEqual(snapshot?.contextTokens, 55)
-        XCTAssertEqual(snapshot?.contextUsageFraction ?? -1, 55.0 / 200_000.0, accuracy: 0.0000001)
+        XCTAssertEqual(snapshot?.contextUsageFraction ?? -1, 55.0 / 1_000_000.0, accuracy: 0.0000001)
     }
 
     /// Codex omits `context_tokens` on the wire; the decoded snapshot must

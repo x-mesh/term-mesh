@@ -1,28 +1,55 @@
 import Foundation
 
-/// Model identifier → context-window token limit, for computing "how full is
-/// the context right now" as a percentage from the daemon's usage tick.
+/// Model identifier → context-window token limit, for turning the daemon's
+/// usage tick into "how full is the context right now".
 ///
-/// This is a maintenance liability by nature — a new model needs a new entry
-/// here — so every value is kept in one place with its source noted. An
-/// unknown model returns `nil` rather than a guessed value: showing a wrong
-/// percentage is worse than showing none.
+/// A cache of a value the provider owns, so it is wrong the moment a model
+/// ships and nobody edits this file. That is the reason for the shape below:
+/// every family is listed explicitly and anything unlisted returns `nil`. A
+/// default would quietly answer for models it has never heard of, and the
+/// caller cannot tell a real limit from a filled-in one — a percentage
+/// computed against a guessed denominator looks exactly like a measured one.
+///
+/// The authoritative live source is the Models API (`GET /v1/models/{id}`,
+/// field `max_input_tokens`). Nothing here can call it: the daemon reads
+/// usage out of CLI session logs and holds no API credentials of its own.
 enum ModelContextLimits {
-    /// Standard context window, in tokens, published by Anthropic for the
-    /// Claude 3.x/4.x model families (docs.anthropic.com/en/docs/about-claude/models,
-    /// as of this codebase's knowledge cutoff). Excludes the opt-in 1M-token
-    /// beta context window some Sonnet 4.x deployments can enable — that beta
-    /// is not something this table can detect from the model string alone,
-    /// so the conservative standard limit is used.
-    private static let claudeStandardContextWindow = 200_000
+    /// Anthropic's current generation — Opus 4.6 and later, Sonnet 4.6 and
+    /// later, and the Fable/Mythos tier — all carry a 1M-token context window
+    /// as their standard (not opt-in) size.
+    private static let oneMillion = 1_000_000
 
-    /// Look up the context-window limit for a model identifier. Matches by
-    /// prefix the same way `daemon/term-meshd/src/tokens.rs`'s
-    /// `model_pricing` does, since both read the same `model` strings emitted
-    /// by the Claude/Codex CLIs. Returns `nil` for anything not explicitly
-    /// known — never an approximation.
+    /// Haiku 4.5 and the generations before the 1M rollout.
+    private static let twoHundredThousand = 200_000
+
+    /// Longest prefix wins, so a family entry cannot be shadowed by a shorter
+    /// one that happens to match first (`claude-opus-4-6` before
+    /// `claude-opus-4`). Keys are the model IDs the CLIs report, which for the
+    /// current generation carry no date suffix.
+    private static let limitsByModelPrefix: [String: Int] = [
+        "claude-fable-5": oneMillion,
+        "claude-mythos-5": oneMillion,
+        "claude-opus-5": oneMillion,
+        "claude-opus-4-8": oneMillion,
+        "claude-opus-4-7": oneMillion,
+        "claude-opus-4-6": oneMillion,
+        "claude-sonnet-5": oneMillion,
+        "claude-sonnet-4-6": oneMillion,
+        "claude-haiku-4-5": twoHundredThousand,
+    ]
+
+    /// The context-window limit for a model identifier, or `nil` when this
+    /// table has no entry for it.
+    ///
+    /// `nil` is a normal answer, not a failure: an older model, a new one
+    /// released after this file was last touched, and a non-Anthropic model
+    /// all land here. Callers show the raw token count instead of a
+    /// percentage — see `AgentPanelView.header`.
     static func contextLimit(forModel model: String) -> Int? {
-        guard model.hasPrefix("claude-") else { return nil }
-        return claudeStandardContextWindow
+        guard !model.isEmpty else { return nil }
+        return limitsByModelPrefix
+            .filter { model.hasPrefix($0.key) }
+            .max { $0.key.count < $1.key.count }?
+            .value
     }
 }
