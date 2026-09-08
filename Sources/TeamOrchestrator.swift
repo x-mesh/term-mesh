@@ -9668,6 +9668,8 @@ final class TeamOrchestrator: ObservableObject {
                 "applied_turns": policy.appliedTurns,
                 "suggested_turns": policy.suggestedTurns,
                 "route_deviations": policy.routeDeviations,
+                "more_parallel_than_suggested": policy.moreParallelThanSuggested,
+                "less_parallel_than_suggested": policy.lessParallelThanSuggested,
                 "shadow_turns": policy.shadowTurns,
                 "canary_turns": policy.canaryTurns,
                 "holdout_turns": policy.holdoutTurns,
