@@ -132,6 +132,7 @@ pub fn log(message: &str) {
 trait Bridge {
     fn start(&mut self) -> bool;
     fn turn(&mut self, text: &str, timeout: Option<Duration>);
+    fn apply_control(&mut self, control: &ControlFrame) -> Result<(), &'static str>;
     fn alive(&self) -> bool;
     /// Why the session ended, if the transport knows.
     fn failure(&self) -> Option<String>;
@@ -145,6 +146,10 @@ impl<T: Transport> Bridge for CodexBridge<T> {
     }
     fn turn(&mut self, text: &str, timeout: Option<Duration>) {
         CodexBridge::turn(self, text, timeout)
+    }
+    fn apply_control(&mut self, control: &ControlFrame) -> Result<(), &'static str> {
+        CodexBridge::apply_control(self, control);
+        Ok(())
     }
     fn alive(&self) -> bool {
         self.rpc.child.alive()
@@ -163,6 +168,9 @@ impl Bridge for PerTurnBridge {
     }
     fn turn(&mut self, text: &str, timeout: Option<Duration>) {
         PerTurnBridge::turn(self, text, timeout)
+    }
+    fn apply_control(&mut self, _control: &ControlFrame) -> Result<(), &'static str> {
+        Err("model and effort control frames are only supported by codex")
     }
     fn alive(&self) -> bool {
         // Cursor and agy use a fresh child for every turn, so the bridge that
@@ -183,6 +191,9 @@ impl<T: Transport> Bridge for AcpBridge<T> {
     }
     fn turn(&mut self, text: &str, timeout: Option<Duration>) {
         AcpBridge::turn(self, text, timeout)
+    }
+    fn apply_control(&mut self, _control: &ControlFrame) -> Result<(), &'static str> {
+        Err("model and effort control frames are only supported by codex")
     }
     fn alive(&self) -> bool {
         self.rpc.child.alive()
@@ -224,6 +235,60 @@ fn turn_text(line: &str) -> String {
             .collect(),
         _ => String::new(),
     }
+}
+
+/// A per-session override for later Codex `turn/start` requests.
+///
+/// An outer `None` means the frame omitted the field. An inner `None` means
+/// the frame explicitly sent JSON null, which clears the stored override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlFrame {
+    model: Option<Option<String>>,
+    effort: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputFrame {
+    Turn(String),
+    Control(ControlFrame),
+}
+
+fn optional_control_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    reject_empty: bool,
+) -> Result<Option<Option<String>>, String> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(Some(None)),
+        Value::String(value) if reject_empty && value.trim().is_empty() => {
+            Err(format!("control {key} must be a non-empty string or null"))
+        }
+        Value::String(value) => Ok(Some(Some(value.clone()))),
+        _ => Err(format!("control {key} must be a string or null")),
+    }
+}
+
+/// Keep the existing text shapes untouched and reserve an explicit type for
+/// session controls so a prompt can never be mistaken for configuration.
+fn input_frame(line: &str) -> Result<InputFrame, String> {
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(line.trim()) else {
+        return Ok(InputFrame::Turn(turn_text(line)));
+    };
+    if object.contains_key("message")
+        || object.get("type").and_then(Value::as_str) != Some("control")
+    {
+        return Ok(InputFrame::Turn(turn_text(line)));
+    }
+
+    let model = optional_control_string(&object, "model", false)?;
+    let effort = optional_control_string(&object, "effort", true)?;
+    if model.is_none() && effort.is_none() {
+        return Err("control frame must include model or effort".to_string());
+    }
+    Ok(InputFrame::Control(ControlFrame { model, effort }))
 }
 
 fn main() -> std::process::ExitCode {
@@ -411,7 +476,7 @@ fn consume(
             Wake::InputClosed => {
                 if !pending.iter().all(u8::is_ascii_whitespace) {
                     let line = String::from_utf8_lossy(&pending).into_owned();
-                    let reported = take(bridge, &line, turn_timeout);
+                    let reported = take(bridge, &line, turn_timeout, &mut out);
                     if !bridge.alive() {
                         if !reported {
                             out.result(&exit_failure(bridge), "process_exited", None, true);
@@ -425,7 +490,7 @@ fn consume(
                 let split = split_input_frames(&mut pending, &chunk);
                 pending = split.remainder;
                 for raw in split.frames {
-                    let reported = take(bridge, &raw, turn_timeout);
+                    let reported = take(bridge, &raw, turn_timeout, &mut out);
                     if !bridge.alive() {
                         if !reported {
                             out.result(&exit_failure(bridge), "process_exited", None, true);
@@ -452,18 +517,34 @@ fn consume(
 
 /// Run one turn. Returns whether the bridge already reported a failure, so
 /// the caller does not report it twice.
-fn take(bridge: &mut dyn Bridge, line: &str, timeout: Option<Duration>) -> bool {
-    let text = turn_text(line);
-    if text.is_empty() {
-        return false;
+fn take(bridge: &mut dyn Bridge, line: &str, timeout: Option<Duration>, out: &mut Emitter) -> bool {
+    match input_frame(line) {
+        Ok(InputFrame::Turn(text)) => {
+            if text.is_empty() {
+                return false;
+            }
+            bridge.turn(&text, timeout);
+            bridge.failure().is_some()
+        }
+        Ok(InputFrame::Control(control)) => match bridge.apply_control(&control) {
+            Ok(()) => false,
+            Err(message) => {
+                out.result(message, "unsupported_control", None, true);
+                true
+            }
+        },
+        Err(message) => {
+            out.result(&message, "invalid_control", None, true);
+            true
+        }
     }
-    bridge.turn(&text, timeout);
-    bridge.failure().is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emitter::testing::captured;
+    use crate::transport::testing::ScriptedChild;
     use serde_json::json;
 
     #[test]
@@ -495,6 +576,194 @@ mod tests {
     }
 
     #[test]
+    fn a_control_frame_is_distinct_from_existing_turn_frames() {
+        assert_eq!(
+            input_frame(
+                &json!({"type": "user", "message": {"content": "keep this turn"}})
+                    .to_string()
+            )
+                .unwrap()
+                .into_turn(),
+            Some("keep this turn".to_string())
+        );
+        assert_eq!(
+            input_frame("plain turn").unwrap().into_turn(),
+            Some("plain turn".to_string())
+        );
+
+        let InputFrame::Control(control) = input_frame(
+            &json!({"type": "control", "model": "gpt-5.6", "effort": "high"}).to_string(),
+        )
+        .unwrap() else {
+            panic!("control frame must not become a turn");
+        };
+        assert_eq!(control.model, Some(Some("gpt-5.6".to_string())));
+        assert_eq!(control.effort, Some(Some("high".to_string())));
+    }
+
+    #[test]
+    fn omitted_control_keys_keep_overrides_and_null_effort_clears_it() {
+        let (bridge_out, _bridge_events) = captured();
+        let mut bridge = CodexBridge::new(
+            ScriptedChild::new(vec![
+                json!({"id": 1, "result": {}}),
+                json!({"method": "turn/completed", "params": {"turn": {"status": "completed"}}}),
+                json!({"id": 2, "result": {}}),
+                json!({"method": "turn/completed", "params": {"turn": {"status": "completed"}}}),
+                json!({"id": 3, "result": {}}),
+                json!({"method": "turn/completed", "params": {"turn": {"status": "completed"}}}),
+            ]),
+            bridge_out,
+            "/tmp/project",
+            None,
+        );
+        bridge.thread_id = Some("thread-1".into());
+        let (mut feedback, feedback_events) = captured();
+
+        assert!(!take(
+            &mut bridge,
+            &json!({"type": "control", "model": "gpt-5.6", "effort": "high"}).to_string(),
+            Some(Duration::from_secs(1)),
+            &mut feedback
+        ));
+        assert!(!take(
+            &mut bridge,
+            "first turn",
+            Some(Duration::from_secs(1)),
+            &mut feedback
+        ));
+        assert!(!take(
+            &mut bridge,
+            &json!({"type": "control", "model": "gpt-5.7"}).to_string(),
+            Some(Duration::from_secs(1)),
+            &mut feedback
+        ));
+        assert!(!take(
+            &mut bridge,
+            "second turn",
+            Some(Duration::from_secs(1)),
+            &mut feedback
+        ));
+        assert!(!take(
+            &mut bridge,
+            &json!({"type": "control", "effort": null}).to_string(),
+            Some(Duration::from_secs(1)),
+            &mut feedback
+        ));
+        assert!(!take(
+            &mut bridge,
+            "third turn",
+            Some(Duration::from_secs(1)),
+            &mut feedback
+        ));
+
+        let sent = bridge.rpc.child.sent.lock().unwrap().clone();
+        let turns: Vec<&Value> = sent
+            .iter()
+            .filter(|frame| frame["method"] == "turn/start")
+            .collect();
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0]["params"]["model"], "gpt-5.6");
+        assert_eq!(turns[0]["params"]["effort"], "high");
+        assert_eq!(turns[1]["params"]["model"], "gpt-5.7");
+        assert_eq!(turns[1]["params"]["effort"], "high");
+        assert_eq!(turns[2]["params"]["model"], "gpt-5.7");
+        assert_eq!(turns[2]["params"]["effort"], Value::Null);
+        assert!(feedback_events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_empty_effort_is_rejected() {
+        assert_eq!(
+            input_frame(&json!({"type": "control", "effort": "  "}).to_string()),
+            Err("control effort must be a non-empty string or null".to_string())
+        );
+    }
+
+    #[test]
+    fn a_control_frame_updates_later_codex_turn_params() {
+        let (bridge_out, _bridge_events) = captured();
+        let mut bridge = CodexBridge::new(
+            ScriptedChild::new(vec![
+                json!({"id": 1, "result": {}}),
+                json!({"method": "turn/completed", "params": {"turn": {"status": "completed"}}}),
+            ]),
+            bridge_out,
+            "/tmp/project",
+            None,
+        );
+        bridge.thread_id = Some("thread-1".into());
+        let (mut feedback, feedback_events) = captured();
+        let control = json!({"type": "control", "model": "gpt-5.6", "effort": "xhigh"});
+
+        assert!(!take(
+            &mut bridge,
+            &control.to_string(),
+            Some(Duration::from_secs(1)),
+            &mut feedback
+        ));
+        assert!(!take(
+            &mut bridge,
+            "continue",
+            Some(Duration::from_secs(1)),
+            &mut feedback
+        ));
+
+        let sent = bridge.rpc.child.sent.lock().unwrap().clone();
+        let turn = sent
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .expect("turn/start request");
+        assert_eq!(turn["params"]["model"], "gpt-5.6");
+        assert_eq!(turn["params"]["effort"], "xhigh");
+        assert!(feedback_events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unsupported_cli_reports_a_control_error() {
+        let (bridge_out, _bridge_events) = captured();
+        let mut bridge =
+            PerTurnBridge::new(PerTurnCli::Cursor, "/tmp/project", None, bridge_out, None);
+        let (mut feedback, feedback_events) = captured();
+
+        assert!(take(
+            &mut bridge,
+            &json!({"type": "control", "effort": "high"}).to_string(),
+            None,
+            &mut feedback
+        ));
+
+        let event = feedback_events.lock().unwrap()[0].clone();
+        assert_eq!(event["type"], "result");
+        assert_eq!(event["stop_reason"], "unsupported_control");
+        assert_eq!(event["is_error"], true);
+    }
+
+    #[test]
+    fn an_acp_cli_reports_a_control_error() {
+        let (bridge_out, _bridge_events) = captured();
+        let mut bridge = AcpBridge::new(
+            ScriptedChild::new(vec![]),
+            bridge_out,
+            "/tmp/project",
+            None,
+        );
+        let (mut feedback, feedback_events) = captured();
+
+        assert!(take(
+            &mut bridge,
+            &json!({"type": "control", "model": "gpt-5.6"}).to_string(),
+            None,
+            &mut feedback
+        ));
+
+        let event = feedback_events.lock().unwrap()[0].clone();
+        assert_eq!(event["type"], "result");
+        assert_eq!(event["stop_reason"], "unsupported_control");
+        assert_eq!(event["is_error"], true);
+    }
+
+    #[test]
     fn turn_timeout_is_optional_and_must_be_positive_and_finite() {
         let unlimited = Args::try_parse_from(["tm-agent-bridge", "--cli", "codex"])
             .expect("omitted timeout is valid");
@@ -517,6 +786,16 @@ mod tests {
                 .is_err(),
                 "{invalid} must be rejected"
             );
+        }
+    }
+}
+
+impl InputFrame {
+    #[cfg(test)]
+    fn into_turn(self) -> Option<String> {
+        match self {
+            Self::Turn(text) => Some(text),
+            Self::Control(_) => None,
         }
     }
 }

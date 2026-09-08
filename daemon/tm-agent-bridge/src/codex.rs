@@ -10,6 +10,7 @@ use crate::emitter::Emitter;
 use crate::jsonrpc::JsonRpc;
 use crate::text::{clamp, DIFF_LIMIT, TEXT_LIMIT};
 use crate::transport::Transport;
+use crate::ControlFrame;
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -220,6 +221,8 @@ pub struct CodexBridge<T: Transport> {
     pub out: Emitter,
     pub cwd: String,
     pub model: Option<String>,
+    /// None means no effort override. Some(None) sends JSON null to Codex.
+    pub effort: Option<Option<String>>,
     pub thread_id: Option<String>,
 }
 
@@ -230,7 +233,17 @@ impl<T: Transport> CodexBridge<T> {
             out,
             cwd: cwd.to_string(),
             model,
+            effort: None,
             thread_id: None,
+        }
+    }
+
+    pub fn apply_control(&mut self, control: &ControlFrame) {
+        if let Some(model) = &control.model {
+            self.model = model.clone();
+        }
+        if let Some(effort) = &control.effort {
+            self.effort = Some(effort.clone());
         }
     }
 
@@ -311,6 +324,7 @@ impl<T: Transport> CodexBridge<T> {
             rpc,
             out,
             model,
+            effort,
             thread_id,
             ..
         } = self;
@@ -328,6 +342,12 @@ impl<T: Transport> CodexBridge<T> {
         });
         if let Some(model) = model.as_deref() {
             params["model"] = Value::String(model.to_string());
+        }
+        if let Some(effort) = effort {
+            params["effort"] = effort
+                .as_ref()
+                .map(|value| Value::String(value.clone()))
+                .unwrap_or(Value::Null);
         }
 
         let mut notify = |o: &Value| {
