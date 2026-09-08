@@ -671,7 +671,12 @@ def _phase_create_inner(
     # Depending on which side of the root split this pane occupies, only one
     # horizontal direction grows it. Try both and require an observed mutation.
     for direction in ("right", "left"):
-        c.resize_pane(panes[0][1], direction, 40)
+        try:
+            c.resize_pane(panes[0][1], direction, 40)
+        except termmeshError as exc:
+            if exc.code != "invalid_state":
+                raise
+            continue
         changed = _wait(
             lambda: (live if (live := c.debug_project_layout(team_name)["live"])
                      != layout_before_resize else None),
