@@ -5096,7 +5096,7 @@ fn rpc_call_with_timeout_secs(
                 sock,
                 method,
                 params,
-                remote_leader_timeout(Duration::from_secs(timeout_secs)).as_secs(),
+                remote_leader_timeout(method, Duration::from_secs(timeout_secs)).as_secs(),
             );
         }
         // A remote leader's TERMMESH_SOCKET points at the peer host's local
@@ -5134,12 +5134,20 @@ fn rpc_call_with_timeout_duration(
 }
 
 const REMOTE_LEADER_TIMEOUT_MARGIN: Duration = Duration::from_secs(1);
+const REMOTE_LEADER_DELEGATE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-fn remote_leader_timeout(requested: Duration) -> Duration {
-    requested.max(
-        Duration::from_secs(peer_proto::team_leader::COMMAND_PENDING_TIMEOUT_SECS)
-            + REMOTE_LEADER_TIMEOUT_MARGIN,
-    )
+fn remote_leader_timeout(method: &str, requested: Duration) -> Duration {
+    let transport_window =
+        // One window lets the old audience report that its viewer never
+        // returned. A Project adoption can replace the route file during that
+        // wait, so reserve a second complete window for the refreshed route.
+        Duration::from_secs(peer_proto::team_leader::COMMAND_PENDING_TIMEOUT_SECS * 2)
+            + REMOTE_LEADER_TIMEOUT_MARGIN;
+    if method == "team.delegate" {
+        requested.max(REMOTE_LEADER_DELEGATE_RECOVERY_TIMEOUT)
+    } else {
+        requested.max(transport_window)
+    }
 }
 
 #[cfg(test)]
@@ -5149,12 +5157,20 @@ mod remote_leader_timeout_tests {
     #[test]
     fn remote_leader_timeout_outlives_daemon_pending_window() {
         assert_eq!(
-            remote_leader_timeout(Duration::from_secs(6)),
-            Duration::from_secs(16)
+            remote_leader_timeout("team.status", Duration::from_secs(6)),
+            Duration::from_secs(31)
         );
         assert_eq!(
-            remote_leader_timeout(Duration::from_secs(30)),
-            Duration::from_secs(30)
+            remote_leader_timeout("team.status", Duration::from_secs(30)),
+            Duration::from_secs(31)
+        );
+        assert_eq!(
+            remote_leader_timeout("team.status", Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            remote_leader_timeout("team.delegate", Duration::from_secs(6)),
+            REMOTE_LEADER_DELEGATE_RECOVERY_TIMEOUT
         );
     }
 }
@@ -5179,7 +5195,7 @@ fn remote_leader_rpc_policy(has_route: bool, method: &str) -> RemoteLeaderRpcPol
     RemoteLeaderRpcPolicy::Local
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RemoteLeaderRoute {
     grant_id_hex: String,
     project_id: String,
@@ -5339,6 +5355,7 @@ fn validated_remote_leader_route(route: RemoteLeaderRoute) -> Option<RemoteLeade
 mod remote_leader_route_file_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
 
     const ROUTE_ENV: [&str; 6] = [
         "HOME",
@@ -5553,6 +5570,84 @@ mod remote_leader_route_file_tests {
     }
 
     #[test]
+    fn viewer_error_retries_the_same_request_through_the_replaced_route_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = stage(&dir, "route.json", &route_json(&"cd".repeat(32)), 0o600);
+        let socket_path = dir.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind");
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let seen_server = Arc::clone(&seen);
+        let replacement_path = path.clone();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone"))
+                    .read_line(&mut line)
+                    .expect("read request");
+                let request: Value = serde_json::from_str(&line).expect("request json");
+                seen_server.lock().unwrap().push(request);
+                let response = if attempt == 0 {
+                    let replacement = json!({
+                        "version": 1,
+                        "grant_id_hex": "99".repeat(32),
+                        "project_id": "name:file-project",
+                        "team_uuid": "file-team",
+                        "expires_at_unix_secs": 4_102_444_800u64,
+                        "target_peer_id_hex": "ef".repeat(16),
+                    });
+                    let staged = replacement_path.with_extension("tmp");
+                    fs::write(&staged, replacement.to_string()).expect("write replacement");
+                    fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))
+                        .expect("chmod replacement");
+                    fs::rename(&staged, &replacement_path).expect("replace route");
+                    json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "error": {
+                            "code": -32601,
+                            "message": "authorized peer viewer is unavailable"
+                        }
+                    })
+                } else {
+                    json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "result": {
+                            "ok": true, "cached": false,
+                            "result": {"task": {"id": "task-1"}}
+                        }
+                    })
+                };
+                let mut writer = stream;
+                writeln!(writer, "{response}").expect("write response");
+            }
+        });
+
+        let guard = RouteEnv::new();
+        guard.set_env_route(&"11".repeat(32));
+        env::set_var(REMOTE_LEADER_ROUTE_FILE_ENV, &path);
+        let result = remote_leader_rpc_call(
+            &socket_path,
+            "team.delegate",
+            json!({"agent_name": "reviewer"}),
+            2,
+        )
+        .expect("retried delegation");
+        server.join().expect("server");
+
+        assert_eq!(result["result"]["task"]["id"], "task-1");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[0]["params"]["request_id_hex"],
+            seen[1]["params"]["request_id_hex"],
+            "route replacement must not mint a second delegation identity"
+        );
+        assert_eq!(seen[0]["params"]["target_peer_id_hex"], "ab".repeat(16));
+        assert_eq!(seen[1]["params"]["target_peer_id_hex"], "ef".repeat(16));
+        assert_eq!(seen[1]["params"]["grant_id_hex"], "99".repeat(32));
+    }
+
+    #[test]
     fn an_unusable_route_file_falls_back_to_the_spawn_time_environment() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = stage(&dir, "route.json", "{ truncated", 0o600);
@@ -5644,43 +5739,23 @@ fn remote_leader_rpc_call(
     params: Value,
     timeout: u64,
 ) -> Result<Value, String> {
-    let route = remote_leader_route().ok_or_else(|| "invalid remote leader route".to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(timeout);
     let request_id_hex = remote_leader_request_id_hex();
-    let proxy_params = remote_leader_proxy_params(&route, method, params, &request_id_hex)?;
+    let mut route =
+        remote_leader_route().ok_or_else(|| "invalid remote leader route".to_string())?;
+    let proxy_params =
+        remote_leader_proxy_params(&route, method, params.clone(), &request_id_hex)?;
 
     // A dropped local daemon response may be retried, but the opaque request
     // id stays fixed so the viewer returns its cached outcome and never
     // inserts text or presses Return twice.
-    let first = rpc_call_timeout(sock, "peer.leader.call", proxy_params.clone(), timeout);
-    let outer = match first {
-        Ok(value) => value,
-        Err(_) => match rpc_call_timeout(sock, "peer.leader.call", proxy_params, timeout) {
-            Ok(value) => value,
-            Err(error) => {
-                append_remote_leader_route_failure(&route, method, &request_id_hex);
-                return Err(error);
-            }
-        },
-    };
-    let result = decode_daemon_response(outer).and_then(remote_leader_proxy_result);
-    if result.is_err() {
-        append_remote_leader_route_failure(&route, method, &request_id_hex);
-    }
-    result
-}
-
-fn remote_leader_rpc_call_duration(
-    sock: &PathBuf,
-    method: &str,
-    params: Value,
-    timeout: Duration,
-) -> Result<Value, String> {
-    let route = remote_leader_route().ok_or_else(|| "invalid remote leader route".to_string())?;
-    let request_id_hex = remote_leader_request_id_hex();
-    let proxy_params = remote_leader_proxy_params(&route, method, params, &request_id_hex)?;
-    let deadline = Instant::now() + timeout;
-    let first = rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params.clone(), timeout);
-    let outer = match first {
+    let first = rpc_call_timeout_duration(
+        sock,
+        "peer.leader.call",
+        proxy_params.clone(),
+        deadline.saturating_duration_since(Instant::now()),
+    );
+    let mut outer = match first {
         Ok(value) => value,
         Err(first_error) => {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -5697,11 +5772,128 @@ fn remote_leader_rpc_call_duration(
             }
         }
     };
+    outer = retry_remote_leader_after_viewer_error(
+        sock, method, &params, &request_id_hex, deadline, &mut route, outer,
+    )?;
     let result = decode_daemon_response(outer).and_then(remote_leader_proxy_result);
     if result.is_err() {
         append_remote_leader_route_failure(&route, method, &request_id_hex);
     }
     result
+}
+
+fn remote_leader_rpc_call_duration(
+    sock: &PathBuf,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let request_id_hex = remote_leader_request_id_hex();
+    let mut route =
+        remote_leader_route().ok_or_else(|| "invalid remote leader route".to_string())?;
+    let proxy_params =
+        remote_leader_proxy_params(&route, method, params.clone(), &request_id_hex)?;
+    let deadline = Instant::now() + timeout;
+    let first = rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params.clone(), timeout);
+    let mut outer = match first {
+        Ok(value) => value,
+        Err(first_error) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                append_remote_leader_route_failure(&route, method, &request_id_hex);
+                return Err(first_error);
+            }
+            match rpc_call_timeout_duration(sock, "peer.leader.call", proxy_params, remaining) {
+                Ok(value) => value,
+                Err(error) => {
+                    append_remote_leader_route_failure(&route, method, &request_id_hex);
+                    return Err(error);
+                }
+            }
+        }
+    };
+    outer = retry_remote_leader_after_viewer_error(
+        sock, method, &params, &request_id_hex, deadline, &mut route, outer,
+    )?;
+    let result = decode_daemon_response(outer).and_then(remote_leader_proxy_result);
+    if result.is_err() {
+        append_remote_leader_route_failure(&route, method, &request_id_hex);
+    }
+    result
+}
+
+fn remote_leader_viewer_unavailable(response: &Value) -> bool {
+    matches!(
+        response
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str),
+        Some(
+            "authorized peer viewer is not connected"
+                | "authorized peer viewer is unavailable"
+                | "authorized peer viewer did not reconnect"
+        )
+    )
+}
+
+fn remote_leader_route_retry_candidate(
+    current: &RemoteLeaderRoute,
+    response: &Value,
+    refreshed: Option<RemoteLeaderRoute>,
+) -> Option<RemoteLeaderRoute> {
+    if !remote_leader_viewer_unavailable(response) {
+        return None;
+    }
+    Some(refreshed.unwrap_or_else(|| current.clone()))
+}
+
+fn retry_remote_leader_after_viewer_error(
+    sock: &PathBuf,
+    method: &str,
+    params: &Value,
+    request_id_hex: &str,
+    deadline: Instant,
+    route: &mut RemoteLeaderRoute,
+    mut response: Value,
+) -> Result<Value, String> {
+    if !remote_leader_viewer_unavailable(&response) {
+        return Ok(response);
+    }
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(response);
+        }
+        *route = remote_leader_route_retry_candidate(
+            route,
+            &response,
+            remote_leader_route(),
+        )
+        .expect("viewer unavailability is retryable");
+        let refreshed =
+            remote_leader_proxy_params(route, method, params.clone(), request_id_hex)?;
+        response = match rpc_call_timeout_duration(
+            sock,
+            "peer.leader.call",
+            refreshed,
+            remaining.min(Duration::from_secs(
+                peer_proto::team_leader::COMMAND_PENDING_TIMEOUT_SECS
+                    + REMOTE_LEADER_TIMEOUT_MARGIN.as_secs(),
+            )),
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                    append_remote_leader_route_failure(route, method, request_id_hex);
+                    return Err(error);
+                }
+                continue;
+            }
+        };
+        if !remote_leader_viewer_unavailable(&response) {
+            return Ok(response);
+        }
+    }
 }
 
 fn append_remote_leader_route_failure(
@@ -23108,6 +23300,86 @@ mod auto_watch_tests {
             error.contains("reconnect or restart the remote leader pane"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn viewer_route_retry_requires_an_explicit_error_and_uses_the_latest_route() {
+        let current = RemoteLeaderRoute {
+            grant_id_hex: "ab".repeat(32),
+            project_id: "name:demo".into(),
+            team_uuid: "team-uuid".into(),
+            expires_at_unix_secs: 100,
+            target_peer_id_hex: "11".repeat(16),
+        };
+        let mut refreshed = current.clone();
+        refreshed.grant_id_hex = "cd".repeat(32);
+        refreshed.target_peer_id_hex = "22".repeat(16);
+        let unavailable = json!({
+            "ok": false,
+            "error": {"message": "authorized peer viewer is unavailable"},
+        });
+
+        assert_eq!(
+            remote_leader_route_retry_candidate(
+                &current,
+                &unavailable,
+                Some(refreshed.clone()),
+            ),
+            Some(refreshed),
+        );
+        assert_eq!(
+            remote_leader_route_retry_candidate(&current, &unavailable, None),
+            Some(current.clone()),
+            "a same-route transport reconnect still retries the stable request id"
+        );
+        assert!(remote_leader_route_retry_candidate(
+            &current,
+            &json!({"ok": false, "error": {"message": "unknown_grant"}}),
+            Some(current.clone()),
+        )
+        .is_none());
+        for message in [
+            "authorized peer viewer is not connected",
+            "authorized peer viewer did not reconnect",
+        ] {
+            assert!(remote_leader_viewer_unavailable(&json!({
+                "ok": false, "error": {"message": message}
+            })));
+        }
+    }
+
+    #[test]
+    fn viewer_route_refresh_reuses_request_id_with_the_replacement_audience() {
+        let current = RemoteLeaderRoute {
+            grant_id_hex: "ab".repeat(32),
+            project_id: "name:demo".into(),
+            team_uuid: "team-uuid".into(),
+            expires_at_unix_secs: 100,
+            target_peer_id_hex: "11".repeat(16),
+        };
+        let mut refreshed = current.clone();
+        refreshed.grant_id_hex = "cd".repeat(32);
+        refreshed.target_peer_id_hex = "22".repeat(16);
+        let request_id = "41".repeat(16);
+        let original = remote_leader_proxy_params(
+            &current,
+            "team.delegate",
+            json!({"agent_name": "reviewer"}),
+            &request_id,
+        )
+        .unwrap();
+        let replacement = remote_leader_proxy_params(
+            &refreshed,
+            "team.delegate",
+            json!({"agent_name": "reviewer"}),
+            &request_id,
+        )
+        .unwrap();
+
+        assert_eq!(original["request_id_hex"], replacement["request_id_hex"]);
+        assert_eq!(replacement["target_peer_id_hex"], "22".repeat(16));
+        assert_eq!(replacement["grant_id_hex"], "cd".repeat(32));
+        assert_eq!(original["params_json"], replacement["params_json"]);
     }
 
     #[test]
