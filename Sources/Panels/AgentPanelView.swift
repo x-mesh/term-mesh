@@ -530,6 +530,7 @@ struct AgentPanelView: View {
             draft: $draft,
             focused: $composerFocused,
             agentName: panel.agentName,
+            cli: panel.cli,
             accent: accent,
             isThinking: session.isThinking,
             canStop: canStop,
@@ -552,6 +553,10 @@ private struct AgentComposer: View, Equatable {
     @Binding var draft: String
     var focused: FocusState<Bool>.Binding
     let agentName: String
+    /// Which CLI is behind this pane — needed to filter the slash-command
+    /// popover down to commands `AgentSlashCommand.supports(cli:)` actually
+    /// supports here.
+    let cli: String
     let accent: Color
     let isThinking: Bool
     let canStop: Bool
@@ -559,6 +564,14 @@ private struct AgentComposer: View, Equatable {
     let isFocused: Bool
     let onSend: () -> Void
     let onStop: () -> Void
+
+    /// Which slash-command row is highlighted while the autocomplete popover
+    /// is open, and whether the person dismissed it without clearing what
+    /// they typed (`Esc`, matching `IMEInputBar`'s picker: cancel hides the
+    /// list, it does not eat the draft). Neither is compared by `==` below —
+    /// this is local UI state the parent never reads.
+    @State private var slashSelection = 0
+    @State private var slashPaletteDismissed = false
 
     /// `draft` is compared, and has to be: the field is the one thing here that
     /// the person is changing, and skipping its body would drop keystrokes.
@@ -573,6 +586,7 @@ private struct AgentComposer: View, Equatable {
     nonisolated static func == (lhs: AgentComposer, rhs: AgentComposer) -> Bool {
         lhs.draft == rhs.draft
             && lhs.agentName == rhs.agentName
+            && lhs.cli == rhs.cli
             && lhs.accent == rhs.accent
             && lhs.isThinking == rhs.isThinking
             && lhs.canStop == rhs.canStop
@@ -580,14 +594,70 @@ private struct AgentComposer: View, Equatable {
             && lhs.isFocused == rhs.isFocused
     }
 
+    /// The draft reads as a slash-command query only while it is still one
+    /// unbroken token — the first space means the person is past the command
+    /// name and into an argument or plain text, so the popover should get
+    /// out of the way.
+    private var isSlashQuery: Bool {
+        draft.hasPrefix("/") && !draft.contains(where: { $0.isWhitespace })
+    }
+
+    private var slashMatches: [AgentSlashCommand] {
+        guard isSlashQuery, !slashPaletteDismissed else { return [] }
+        return AgentSlashCommands.matches(prefix: draft, for: cli)
+    }
+
     var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if !slashMatches.isEmpty {
+                slashPalette
+            }
+            inputRow
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.primary.opacity(isFocused ? 0.04 : 0.02))
+        .animation(.easeOut(duration: 0.2), value: isThinking)
+    }
+
+    private var inputRow: some View {
         HStack(alignment: .bottom, spacing: 8) {
             TextField("Message \(agentName)…", text: $draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
                 .lineLimit(1...8)
                 .focused(focused)
-                .onSubmit(onSend)
+                .onSubmit {
+                    if !slashMatches.isEmpty {
+                        applySlashSelection()
+                    } else {
+                        onSend()
+                    }
+                }
+                .backport.onKeyPress(.upArrow) { _ in
+                    guard !slashMatches.isEmpty else { return .ignored }
+                    slashSelection = (slashSelection - 1 + slashMatches.count) % slashMatches.count
+                    return .handled
+                }
+                .backport.onKeyPress(.downArrow) { _ in
+                    guard !slashMatches.isEmpty else { return .ignored }
+                    slashSelection = (slashSelection + 1) % slashMatches.count
+                    return .handled
+                }
+                .backport.onKeyPress(.tab) { _ in
+                    guard !slashMatches.isEmpty else { return .ignored }
+                    applySlashSelection()
+                    return .handled
+                }
+                .backport.onKeyPress(.escape) { _ in
+                    guard !slashMatches.isEmpty else { return .ignored }
+                    slashPaletteDismissed = true
+                    return .handled
+                }
+                .onChange(of: draft) { _, _ in
+                    slashPaletteDismissed = false
+                    if slashSelection >= slashMatches.count { slashSelection = 0 }
+                }
             // Which of six panes is working is a question you answer by
             // glancing, not by reading. So the state has a shape — and it
             // lives here rather than over the transcript, where it landed on
@@ -614,10 +684,48 @@ private struct AgentComposer: View, Equatable {
             .disabled(!canStop && !canSend)
             .help(canStop ? "Stop this turn" : "Send")
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(Color.primary.opacity(isFocused ? 0.04 : 0.02))
-        .animation(.easeOut(duration: 0.2), value: isThinking)
+    }
+
+    /// Fills the draft with the highlighted command and a trailing space, the
+    /// way `IMEInputBar`'s own slash picker does, so the person can keep
+    /// typing an argument without hunting for the space bar.
+    private func applySlashSelection() {
+        guard slashSelection < slashMatches.count else { return }
+        draft = slashMatches[slashSelection].name + " "
+        slashPaletteDismissed = true
+    }
+
+    private var slashPalette: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            ForEach(Array(slashMatches.enumerated()), id: \.offset) { i, command in
+                Button {
+                    slashSelection = i
+                    applySlashSelection()
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(command.name)
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .frame(minWidth: 70, alignment: .leading)
+                        Text(command.desc)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(
+                        i == slashSelection ? Color.accentColor.opacity(0.18) : Color.clear
+                    )
+                    .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(4)
+        .background(Color.primary.opacity(0.03))
+        .cornerRadius(6)
+        .padding(.bottom, 4)
     }
 }
 
@@ -633,6 +741,24 @@ extension AgentPanelView {
     private func send() {
         guard canSend else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A recognized app command is executed directly and never reaches the
+        // CLI — the whole point of a native palette over the old
+        // text-through-the-bridge path. Anything starting with "/" that is
+        // *not* in the catalog still goes to `session.send` below: a person
+        // typing a CLI's own slash command must not be silently swallowed.
+        if let parsed = AgentSlashCommandParser.parse(text),
+           let command = AgentSlashCommands.command(named: parsed.name) {
+            draft = ""
+            guard command.supports(cli: panel.cli) else {
+                // Recognized, but not for this pane's CLI — a guidance notice,
+                // not silent execution and not a forward to a process that
+                // never asked for it.
+                session.appendLocalNotice("\(command.name) is not supported for \(panel.cli).")
+                return
+            }
+            runSlashCommand(command, argument: parsed.argument)
+            return
+        }
         do {
             try session.send(text, from: .person)
             draft = ""
@@ -642,6 +768,138 @@ extension AgentPanelView {
             // exists to stop making.
             NSSound.beep()
         }
+    }
+
+    private func runSlashCommand(_ command: AgentSlashCommand, argument: String) {
+        switch command.kind {
+        case .profileField(let field):
+            // `send()` already checked `command.supports(cli: panel.cli)`
+            // before calling this, so `application(for:)` returning `nil`
+            // here would mean the two disagree — treat it the same way as
+            // that earlier guard rather than silently doing nothing.
+            guard let application = command.application(for: panel.cli) else {
+                session.appendLocalNotice("\(command.name) is not supported for \(panel.cli).")
+                return
+            }
+            switch application {
+            case .restart:
+                runRestartProfileFieldSlashCommand(command, field: field, argument: argument)
+            case .nextTurnParameter:
+                runNextTurnParameterSlashCommand(command, field: field, argument: argument)
+            }
+        case .localReport:
+            runLocalReportSlashCommand(command)
+        }
+    }
+
+    /// The `.restart` application: rewrites the pane's `CliProfile` and hard-
+    /// restarts it, which drops the running conversation's context — the one
+    /// part of this command that cannot be undone by typing again, so it
+    /// confirms first. Shared by every command whose CLI applies its field
+    /// this way; a future `/effort` on a CLI without a confirmed turn-
+    /// parameter path reuses this unchanged.
+    private func runRestartProfileFieldSlashCommand(
+        _ command: AgentSlashCommand, field: AgentSlashProfileField, argument: String
+    ) {
+        let value = argument.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            session.appendLocalNotice("Usage: \(command.name) <value>")
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Run \(command.name) \(value) on \(panel.agentName)?"
+        alert.informativeText =
+            "The pane restarts to apply it. The current conversation context is lost."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Restart")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        // Reuses the CLI-profile override + hard-restart path the menu bar's
+        // "Apply to Active Pane (Restart)" already drives (see
+        // `MenuBarExtra.applyProfileToActivePaneAction`), rather than adding
+        // a second way to change a running pane's settings.
+        var profile = CLIPathSettings.activeProfile(for: panel.cli) ?? CliProfile(
+            name: "\(panel.cli) (\(command.name))",
+            family: panel.cli,
+            executable: CLIPathSettings.resolvedExecutable(for: panel.cli) ?? ""
+        )
+        guard AgentSlashCommands.apply(field, argument: value, to: &profile) else {
+            // The catalog routed this field to `.restart`, but the field has no
+            // `CliProfile` to restart into. Report the disagreement instead of
+            // restarting the pane and losing its context for nothing.
+            session.appendLocalNotice(
+                "\(command.name) cannot be applied by restarting \(panel.cli)."
+            )
+            return
+        }
+        CliProfileStore.shared.save(profile, for: panel.cli)
+        CLIPathSettings.setActiveProfile(profile, for: panel.cli)
+
+        let panelId = panel.id
+        Task { @MainActor in
+            _ = await TeamOrchestrator.shared.restartAgentPaneHard(panelId: panelId)
+        }
+    }
+
+    /// The `.nextTurnParameter` application: no restart, so no confirmation
+    /// either — the whole point of preferring it over `.restart` where a CLI
+    /// supports it. The value rides the bridge's `{"type":"control"}` frame
+    /// and takes effect on the next turn, so nothing is claimed about the
+    /// turn already in flight.
+    private func runNextTurnParameterSlashCommand(
+        _ command: AgentSlashCommand, field: AgentSlashProfileField, argument: String
+    ) {
+        let value = argument.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            session.appendLocalNotice("Usage: \(command.name) <value>")
+            return
+        }
+        guard session.sendControlOverride([field.controlFrameKey: value]) else {
+            // No transport: the pane is not running, or its sink is gone. Said
+            // plainly, because a settings change that never left the app reads
+            // exactly like one that applied.
+            session.appendLocalNotice(
+                "\(command.name) \(value) was not sent — \(panel.agentName) has no live input channel."
+            )
+            return
+        }
+        session.appendLocalNotice("\(command.name) \(value) applies from the next turn.")
+    }
+
+    private func runLocalReportSlashCommand(_ command: AgentSlashCommand) {
+        switch command.name {
+        case "/cost":
+            runCostSlashCommand()
+        case "/help":
+            runHelpSlashCommand()
+        default:
+            break
+        }
+    }
+
+    private func runCostSlashCommand() {
+        guard let usage = TeamDataStore.shared.agentUsage[panel.teamName]?[panel.agentName],
+              usage.updatedAt != .distantPast
+        else {
+            session.appendLocalNotice("No usage data yet for \(panel.agentName).")
+            return
+        }
+        var line = "Tokens — input \(usage.inputTokens) · output \(usage.outputTokens)"
+        let cacheTotal = usage.cacheReadTokens &+ usage.cacheCreationTokens
+        if cacheTotal > 0, let ratio = usage.cacheHitRatio {
+            let percent = Int((ratio * 100).rounded())
+            line += " · cache hit \(percent)% (\(usage.cacheReadTokens) cached, \(usage.cacheCreationTokens) fresh)"
+        }
+        session.appendLocalNotice(line)
+    }
+
+    private func runHelpSlashCommand() {
+        let lines = AgentSlashCommands.catalog
+            .filter { $0.supports(cli: panel.cli) }
+            .map { "\($0.name) — \($0.desc)" }
+        session.appendLocalNotice((["Commands this pane can run:"] + lines).joined(separator: "\n"))
     }
 }
 
