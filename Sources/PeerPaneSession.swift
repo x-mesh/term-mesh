@@ -102,12 +102,26 @@ enum PeerPaneHostKey: Hashable, CustomStringConvertible, Sendable {
 
 // MARK: - Per-host lease
 
+/// What `PeerPaneHostRegistry.acquire` may do with a lease it finds pooled.
+enum PeerPaneHostLeaseVerdict: Equatable {
+    /// Hand it out as-is.
+    case usable
+    /// The tunnel is restarting on its own; join that restart before deciding.
+    case waitForRestart
+    /// The tunnel gave up or was stopped. Retire it and build a replacement.
+    case dead
+}
+
 /// Shared per-host resources leased by remote panes. Created/pooled by
 /// `PeerPaneHostRegistry`; holders must balance every `acquire`/`retain`
 /// with a `release`.
 @MainActor
 final class PeerPaneHostLease {
     let key: PeerPaneHostKey
+    /// Everything needed to build a replacement tunnel to the same host. The
+    /// key drops `identityFile` on purpose (it does not change which host is
+    /// reached), so a re-acquire cannot be derived from the key alone.
+    let spec: PeerPaneHostSpec
     /// Local Unix socket to dial for this host: the tunnel's forwarded
     /// socket for SSH hosts, the host's own socket for direct ones.
     var hostSockPath: String {
@@ -136,8 +150,9 @@ final class PeerPaneHostLease {
     /// wait for the same restart instead of killing the replacement again.
     private let transportRecovery = PeerPaneTransportRecovery()
 
-    fileprivate init(key: PeerPaneHostKey, tunnel: PeerSSHTunnel?) {
-        self.key = key
+    fileprivate init(spec: PeerPaneHostSpec, tunnel: PeerSSHTunnel?) {
+        self.spec = spec
+        self.key = spec.hostKey
         self.tunnel = tunnel
     }
 
@@ -183,6 +198,29 @@ final class PeerPaneHostLease {
                     return false
                 }
             }
+        }
+    }
+
+    /// Whether a pooled lease is still worth handing out.
+    ///
+    /// A direct lease has no process to replace, so it is always usable: its
+    /// daemon being down is for the consumer's own connect to discover, and a
+    /// replacement would be the same object. For an SSH lease the tunnel
+    /// state is the verdict, with one refinement — `.up` whose local socket
+    /// refuses is in flight, not dead: ssh just exited and the `.down` emit
+    /// has not landed yet, or the socket file is a ghost, and the restart the
+    /// tunnel is about to run settles both.
+    nonisolated static func leaseVerdict(
+        state: PeerSSHTunnelState?,
+        isTornDown: Bool,
+        localSocketAccepts: Bool
+    ) -> PeerPaneHostLeaseVerdict {
+        if isTornDown { return .dead }
+        guard let state else { return .usable }
+        switch state {
+        case .failed, .stopped: return .dead
+        case .starting, .down, .reconnecting: return .waitForRestart
+        case .up: return localSocketAccepts ? .usable : .waitForRestart
         }
     }
 
@@ -316,7 +354,49 @@ final class PeerPaneHostRegistry {
     /// whose `teardown()` stops no real process, so this counter is the only
     /// way to tell a released lease from an orphaned one.
     private(set) var teardownCountForTests = 0
+    /// Test-only: stand in for `liveness(of:)`. A `.direct` lease is always
+    /// usable for real, so this is the only way a test can make the registry
+    /// see a dead or restarting tunnel without spawning ssh.
+    var livenessOverrideForTests: ((PeerPaneHostLease) -> PeerPaneHostLeaseVerdict)?
+    /// Test-only: stand in for joining a tunnel's own restart. Returns
+    /// whether the restart brought the lease back.
+    var restartWaitOverrideForTests: ((PeerPaneHostLease) async -> Bool)?
+    /// Test-only: replacements pooled so far.
+    private(set) var replacementCountForTests = 0
     #endif
+
+    /// Fires just before `acquire` tears down a pooled lease it judged dead,
+    /// and before anything else can observe the teardown. The coordinator
+    /// flags that host's panes as deliberately disconnected here so their
+    /// EOF reads as a retirement to wait out, not an accident to recover
+    /// from on their own — otherwise the reattach runs twice.
+    var hostTransportWillRetire: (@MainActor (PeerPaneHostKey) -> Void)?
+    /// Fires once the replacement for a retired lease is pooled and owned.
+    /// The coordinator reattaches that host's panes and mirrors through it
+    /// and the sidebar adopts its socket path. Without this every consumer
+    /// of the old lease stays stranded and the row turns unreachable.
+    var hostTransportDidReplace: (@MainActor (PeerPaneHostKey, PeerPaneHostLease) -> Void)?
+    /// Hosts whose dead lease `acquire` retired and whose replacement is not
+    /// pooled yet. A key stays here across a failed start on purpose: the
+    /// panes were flagged, so the first replacement that does land must
+    /// still reach them.
+    private var replacingKeys: Set<PeerPaneHostKey> = []
+
+    /// Whether a pooled lease can still carry traffic. The tunnel state is
+    /// the answer for every state but `.up`, which also gets one local
+    /// `connect(2)`: a stopped ssh leaves its socket file behind, and that
+    /// file alone is the same broken promise as no socket at all.
+    func liveness(of lease: PeerPaneHostLease) -> PeerPaneHostLeaseVerdict {
+        #if DEBUG
+        if let override = livenessOverrideForTests { return override(lease) }
+        #endif
+        let state = lease.tunnel?.currentState
+        let accepts = state == .up
+            && TermMeshDaemon.isListening(atUnixSocketPath: lease.hostSockPath)
+        return PeerPaneHostLease.leaseVerdict(
+            state: state, isTornDown: lease.isTornDown, localSocketAccepts: accepts
+        )
+    }
 
     /// Local socket of a lease that already exists for `key`, or nil.
     ///
@@ -333,11 +413,36 @@ final class PeerPaneHostRegistry {
 
     /// Acquire a lease for the host (+1 ref). Starts the SSH tunnel on
     /// first acquire; later acquires reuse the live lease.
+    ///
+    /// A pooled lease is judged before it is handed out. A long sleep can
+    /// exhaust the tunnel's own reconnect budget and leave it `.failed` in
+    /// the pool; handing that out strands the caller on a socket nothing
+    /// listens on, and no consumer ever asks for a replacement.
     func acquire(_ spec: PeerPaneHostSpec) async throws -> PeerPaneHostLease {
         let key = spec.hostKey
         if let lease = leases[key] {
-            lease.refCount += 1
-            return lease
+            switch liveness(of: lease) {
+            case .usable:
+                lease.refCount += 1
+                return lease
+            case .waitForRestart:
+                // Join the restart the tunnel is already running instead of
+                // racing it with a second ssh to the same host.
+                let observed = lease.transportGeneration
+                let cameBack = await waitForRestart(of: lease, after: observed)
+                try Task.checkCancellation()
+                guard leases[key] === lease else {
+                    // Replaced while we waited; take whatever is pooled now.
+                    return try await acquire(spec)
+                }
+                if cameBack || liveness(of: lease) == .usable {
+                    lease.refCount += 1
+                    return lease
+                }
+                retireDeadLease(lease, key: key)
+            case .dead:
+                retireDeadLease(lease, key: key)
+            }
         }
         if let startingLease = starting[key] {
             starting[key]?.waiters += 1
@@ -372,22 +477,57 @@ final class PeerPaneHostRegistry {
         // same task); pool exactly one instance. A *different* pooled instance
         // makes ours an orphan whose tunnel nobody would ever stop.
         let pooled: PeerPaneHostLease
+        var isReplacement = false
         if let existing = leases[key] {
             if existing !== lease { teardown(lease) }
             pooled = existing
         } else {
             leases[key] = lease
             pooled = lease
+            isReplacement = replacingKeys.remove(key) != nil
             #if DEBUG
-            dlog("peer.pane.lease.up key=\(key)")
+            dlog("peer.pane.lease.up key=\(key) replacement=\(isReplacement)")
             #endif
         }
         pooled.refCount += 1
         if Task.isCancelled {
             release(pooled)
+            // The replacement never reached its consumers; the next one
+            // that lands must still fire for them.
+            if isReplacement { replacingKeys.insert(key) }
             throw CancellationError()
         }
+        if isReplacement {
+            #if DEBUG
+            replacementCountForTests += 1
+            #endif
+            hostTransportDidReplace?(key, pooled)
+        }
         return pooled
+    }
+
+    /// Join a tunnel's own restart; true when a new generation came up.
+    private func waitForRestart(of lease: PeerPaneHostLease, after observed: UInt64) async -> Bool {
+        #if DEBUG
+        if let override = restartWaitOverrideForTests { return await override(lease) }
+        #endif
+        let after = await lease.refreshTransport(
+            after: observed, reason: "acquire found the tunnel restarting"
+        )
+        return after > observed
+    }
+
+    /// Take a dead lease out of the pool ahead of its replacement. Order
+    /// matters: the panes are flagged before teardown so the EOF they are
+    /// about to see reads as this retirement.
+    private func retireDeadLease(_ lease: PeerPaneHostLease, key: PeerPaneHostKey) {
+        hostTransportWillRetire?(key)
+        leases[key] = nil
+        replacingKeys.insert(key)
+        teardown(lease)
+        #if DEBUG
+        dlog("peer.pane.lease.retire key=\(key)")
+        #endif
     }
 
     /// Stop this caller's in-flight first acquire.
@@ -481,7 +621,7 @@ final class PeerPaneHostRegistry {
     private static func makeLease(spec: PeerPaneHostSpec) async throws -> PeerPaneHostLease {
         switch spec {
         case .direct:
-            return PeerPaneHostLease(key: spec.hostKey, tunnel: nil)
+            return PeerPaneHostLease(spec: spec, tunnel: nil)
         case .ssh(let target, let remoteSockPath, let port, let identityFile):
             let tunnel = PeerSSHTunnel(
                 sshTarget: target,
@@ -493,7 +633,7 @@ final class PeerPaneHostRegistry {
                 identityFile: identityFile
             )
             try await tunnel.start()
-            return PeerPaneHostLease(key: spec.hostKey, tunnel: tunnel)
+            return PeerPaneHostLease(spec: spec, tunnel: tunnel)
         }
     }
 }

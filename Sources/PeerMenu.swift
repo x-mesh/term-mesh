@@ -240,6 +240,22 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         postRelaysChanged()
     }
 
+    /// Route the registry's own lease replacement through the same reattach
+    /// path Disconnect Host → Connect uses. `acquire` retires a dead tunnel
+    /// on its own; without this the panes, mirrors and sidebar row that held
+    /// that lease are stranded on it while a replacement they never hear
+    /// about carries the host.
+    func installHostTransportReplacementHooks() {
+        let registry = PeerPaneHostRegistry.shared
+        registry.hostTransportWillRetire = { [weak self] key in
+            self?.preparePanesForHostDisconnect(key)
+        }
+        registry.hostTransportDidReplace = { [weak self] key, lease in
+            self?.resumePanesAfterHostReconnect(key)
+            RemoteHostStore.shared.adoptReplacementTransport(hostKey: key, lease: lease)
+        }
+    }
+
     /// Mark every pane on this host as intentionally disconnected before the
     /// shared tunnel is stopped. Direct hosts have no tunnel, so stop each
     /// owned relay transport explicitly; in both cases the pane object stays.
