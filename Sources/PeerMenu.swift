@@ -256,6 +256,42 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         }
     }
 
+    /// Judge every pooled lease after a wake and replace the dead ones.
+    ///
+    /// Sleep is where a tunnel's own reconnect budget runs out. Nothing asks
+    /// the pool about that host until the next acquire, and a host only the
+    /// sidebar is watching never acquires again — its row stays connected on
+    /// a tunnel that is gone until a roster read fails on it. One temporary
+    /// acquire per pooled lease runs the judgment `acquire` applies on
+    /// demand: a tunnel still restarting is joined, a dead one is retired and
+    /// replaced, and the replacement reaches panes, mirrors and the sidebar
+    /// through the registry hooks. A tunnel that is up is left alone — ssh's
+    /// own keepalive settles a half-dead one within 45s of waking, and an
+    /// end-to-end probe here would read a cold post-wake network as death.
+    @discardableResult
+    func recoverPeerTransportsAfterWake() async -> Int {
+        let registry = PeerPaneHostRegistry.shared
+        var replaced = 0
+        for (key, lease) in registry.pooledLeases() {
+            guard registry.liveness(of: lease) != .usable,
+                  registry.activeLease(forKey: key) === lease
+            else { continue }
+            do {
+                let current = try await registry.acquire(lease.spec)
+                registry.release(current)
+                if current !== lease { replaced += 1 }
+            } catch {
+                RemoteWorkLog.info(
+                    "Could not replace the SSH tunnel to \(key.shortLabel) after wake: \(error)"
+                )
+            }
+        }
+        #if DEBUG
+        dlog("wakeRecovery.peer replaced=\(replaced)")
+        #endif
+        return replaced
+    }
+
     /// Mark every pane on this host as intentionally disconnected before the
     /// shared tunnel is stopped. Direct hosts have no tunnel, so stop each
     /// owned relay transport explicitly; in both cases the pane object stays.

@@ -4221,6 +4221,70 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertNil(registry.activeLease(forKey: key))
     }
 
+    /// The wake sweep replaces a dead pooled lease and leaves a usable one
+    /// alone. With no consumer to adopt it, the replacement is released
+    /// again at once — that is the sweep taking one temporary ref, not a
+    /// leak.
+    @MainActor
+    func test_wakeRecovery_replacesDeadLeasesAndLeavesUsableOnes() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let deadPath = "/tmp/psp-unit-\(getpid())-wake-dead.sock"
+        let livePath = "/tmp/psp-unit-\(getpid())-wake-live.sock"
+        let deadSpec = PeerPaneHostSpec.direct(sockPath: deadPath)
+        let liveSpec = PeerPaneHostSpec.direct(sockPath: livePath)
+        let teardownsBefore = registry.teardownCountForTests
+        let replacementsBefore = registry.replacementCountForTests
+        defer { registry.livenessOverrideForTests = nil }
+
+        let dead = try await registry.acquire(deadSpec)
+        let live = try await registry.acquire(liveSpec)
+        registry.livenessOverrideForTests = { $0 === dead ? .dead : .usable }
+
+        let replaced = await PeerClientCoordinator.shared.recoverPeerTransportsAfterWake()
+        XCTAssertEqual(replaced, 1)
+        XCTAssertTrue(registry.activeLease(forKey: liveSpec.hostKey) === live, "a usable lease is left alone")
+        XCTAssertEqual(registry.replacementCountForTests, replacementsBefore + 1)
+        // dead retired, replacement pooled then released by the sweep.
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 2)
+        XCTAssertNil(registry.activeLease(forKey: deadSpec.hostKey))
+
+        registry.release(dead)
+        registry.release(live)
+        XCTAssertNil(registry.activeLease(forKey: liveSpec.hostKey))
+        XCTAssertEqual(registry.teardownCountForTests, teardownsBefore + 3)
+    }
+
+    /// A consumer that adopts the replacement through the hook keeps it
+    /// alive past the sweep's own release.
+    @MainActor
+    func test_wakeRecovery_replacementSurvivesWhenAHookAdoptsIt() async throws {
+        let registry = PeerPaneHostRegistry.shared
+        let sockPath = "/tmp/psp-unit-\(getpid())-wake-adopt.sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: sockPath)
+        let key = spec.hostKey
+        let savedReplace = registry.hostTransportDidReplace
+        defer {
+            registry.livenessOverrideForTests = nil
+            registry.hostTransportDidReplace = savedReplace
+        }
+
+        let dead = try await registry.acquire(spec)
+        registry.livenessOverrideForTests = { $0 === dead ? .dead : .usable }
+        var adopted: PeerPaneHostLease?
+        registry.hostTransportDidReplace = { _, lease in
+            registry.retain(lease)   // what the sidebar does in adoptReplacementTransport
+            adopted = lease
+        }
+
+        _ = await PeerClientCoordinator.shared.recoverPeerTransportsAfterWake()
+        XCTAssertNotNil(adopted)
+        XCTAssertTrue(registry.activeLease(forKey: key) === adopted)
+
+        registry.release(dead)
+        if let adopted { registry.release(adopted) }
+        XCTAssertNil(registry.activeLease(forKey: key))
+    }
+
     @MainActor
     func test_transportRecovery_coalescesStaleGenerationAndAllowsNextIncident() async {
         let recovery = PeerPaneTransportRecovery()
