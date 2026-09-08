@@ -1200,6 +1200,10 @@ struct TeamCreationView: View {
                         if newMode != "repl" && AgentRolePreset.models(for: oldMode) != AgentRolePreset.models(for: newMode) {
                             leaderModel = AgentRolePreset.defaultModel(for: newMode)
                         }
+                        // A value valid for the old CLI (e.g. "high" on claude) may
+                        // not be for the new one (e.g. gemini has no effort at all) —
+                        // collapse it to "" rather than carrying it forward unchecked.
+                        leaderEffort = AgentRolePreset.normalizeEffort(leaderEffort, for: newMode)
                         // Reset hidden pair state when switching to repl (no pair pane possible).
                         if newMode == "repl" {
                             leaderPairMode = "none"
@@ -2546,12 +2550,17 @@ struct TeamCreationView: View {
         // Same-CLI pair is allowed — user may want e.g. claude + claude with a different model.
         let effectivePair = executionMode == "headless" ? "none" : leaderPairMode
         let effectivePairSpec = effectivePair == "none" ? "" : leaderPairSpec
-        let success = onCreate?(teamName, leaderMode, leaderModel, leaderEffort, agents, worktreeMode, executionMode, sid, effectivePair, effectivePair == "none" ? "" : leaderPairModel, effectivePairSpec, workingDirectory) ?? false
+        // Re-normalize at submit time too — `leaderEffort` reflects whatever
+        // CLI was selected when it was last touched, and a picker path that
+        // missed the reset (or a value restored from AppStorage) must not
+        // reach onCreate as a value the current leaderMode doesn't support.
+        let effectiveLeaderEffort = AgentRolePreset.normalizeEffort(leaderEffort, for: leaderMode)
+        let success = onCreate?(teamName, leaderMode, leaderModel, effectiveLeaderEffort, agents, worktreeMode, executionMode, sid, effectivePair, effectivePair == "none" ? "" : leaderPairModel, effectivePairSpec, workingDirectory) ?? false
         guard success else { return }
         TeamCreationRecentDirs.shared.promote(workingDirectory)
         defaultLeaderMode = leaderMode
         defaultLeaderModel = leaderModel
-        defaultLeaderEffort = leaderEffort
+        defaultLeaderEffort = effectiveLeaderEffort
         if autoRecycleEvery > 0 {
             TeamOrchestrator.shared.setTeamDefaultAutoRecycle(teamName: teamName, every: autoRecycleEvery)
             for (agentName, threshold) in perAgentOverrides where threshold > 0 {

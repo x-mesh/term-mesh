@@ -515,6 +515,9 @@ struct TeamAgentComposer: View {
                         if AgentRolePreset.models(for: oldCli) != AgentRolePreset.models(for: newCli) {
                             agents[index].preset.model = AgentRolePreset.defaultModel(for: newCli)
                         }
+                        agents[index].preset.effort = AgentRolePreset.normalizeEffort(
+                            agents[index].preset.effort, for: newCli
+                        )
                         onComposionChanged()
                     }
                 )) {
@@ -809,6 +812,9 @@ struct TeamAgentComposer: View {
                         if AgentRolePreset.models(for: oldCli) != AgentRolePreset.models(for: newCli) {
                             agents[index].preset.model = AgentRolePreset.defaultModel(for: newCli)
                         }
+                        agents[index].preset.effort = AgentRolePreset.normalizeEffort(
+                            agents[index].preset.effort, for: newCli
+                        )
                         onComposionChanged()
                     }
                 )) {
@@ -1143,10 +1149,15 @@ struct TeamAgentComposer: View {
 
 
     private func applyModelToAll() {
+        // `bulkEffort` is normally kept in step with `bulkCli` by the bulk CLI
+        // picker's own setter, but `syncBulkFromAgents()` can also set it from
+        // a majority vote across rows that does not necessarily match
+        // `bulkCli` — re-normalize here rather than trust it arrived scoped.
+        let effectiveBulkEffort = AgentRolePreset.normalizeEffort(bulkEffort, for: bulkCli)
         for i in agents.indices {
             agents[i].preset.cli = bulkCli
             agents[i].preset.model = bulkModel
-            agents[i].preset.effort = bulkEffort
+            agents[i].preset.effort = effectiveBulkEffort
             agents[i].providerBadge = .none
         }
         onComposionChanged()

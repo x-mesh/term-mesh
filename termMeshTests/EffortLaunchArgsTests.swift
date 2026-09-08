@@ -80,6 +80,21 @@ final class EffortLaunchArgsTests: XCTestCase {
         XCTAssertEqual(AgentRolePreset.normalizeEffort("high", for: "cursor"), "")
     }
 
+    /// The CLI-switch case a pre-release review flagged: TeamCreationView /
+    /// TeamAgentComposer / NewProjectView all re-run `normalizeEffort` on
+    /// their picker's CLI-change handler so a value picked for one CLI never
+    /// rides along into a CLI that can't run it — gemini has no effort knob
+    /// at all, so "high" carried over from claude must collapse to "".
+    func testNormalizeEffortDropsAValuePickedForAnotherCLIOnSwitchToAnUnsupportedOne() {
+        XCTAssertEqual(AgentRolePreset.normalizeEffort("high", for: "gemini"), "")
+    }
+
+    /// The counterpart case: switching between two CLIs that both support
+    /// effort keeps the value rather than resetting it needlessly.
+    func testNormalizeEffortKeepsAValueValidForTheNewCLIOnSwitch() {
+        XCTAssertEqual(AgentRolePreset.normalizeEffort("high", for: "codex"), "high")
+    }
+
     func testSupportsEffortMatchesEffortsList() {
         XCTAssertTrue(AgentRolePreset.supportsEffort(cli: "claude"))
         XCTAssertTrue(AgentRolePreset.supportsEffort(cli: "kiro"))

@@ -853,6 +853,12 @@ struct NewProjectView: View {
                         if AgentRolePreset.models(for: old) != AgentRolePreset.models(for: newCli) {
                             leaderModel = Self.defaultLeaderModel(for: newCli)
                         }
+                        // A value valid for the old CLI (e.g. "high" on claude) may
+                        // not be for the new one — collapse it to "" rather than
+                        // carrying it forward unchecked. The submit path already
+                        // re-normalizes, but the picker's own binding should never
+                        // display a value the current CLI cannot run.
+                        leaderEffort = AgentRolePreset.normalizeEffort(leaderEffort, for: newCli)
                     }
                 )) {
                     ForEach(AgentRolePreset.supportedCLIs, id: \.self) { cli in
