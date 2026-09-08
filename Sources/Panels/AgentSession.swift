@@ -2554,6 +2554,14 @@ final class AgentSession {
         return data
     }
 
+    /// Appends a notice row the app produced itself — e.g. a slash command's
+    /// output — rather than something read off the CLI's stdout. Goes through
+    /// the same `Entry.notice` case the transport uses for its own
+    /// diagnostics, so it renders identically and needs no dedicated view.
+    func appendLocalNotice(_ text: String) {
+        append(.notice(id: UUID(), text))
+    }
+
     /// Stop the turn in flight, keeping the session.
     ///
     /// Not a signal and not a restart: claude reads this on the same stdin its
@@ -2570,6 +2578,34 @@ final class AgentSession {
         data.append(0x0A)
         try? writeToTransport(data)
         stopRequested = true
+    }
+
+    /// One `{"type":"control"}` line, the frame `tm-agent-bridge` reads to
+    /// override codex `TurnStartParams` fields (`model`, `effort`) on the
+    /// next turn and the ones after it. No restart, so the conversation keeps
+    /// its context.
+    ///
+    /// Written the same way `interrupt()` writes its control line — through
+    /// `writeToTransport`, so a local stdin and a remote sink cannot diverge.
+    /// A field the caller omits keeps whatever the bridge already stored; the
+    /// bridge reserves an explicit JSON null for clearing one, which nothing
+    /// here sends yet.
+    ///
+    /// `false` when there is no transport to write to, so a caller can say the
+    /// value did not take rather than report a change that never left the app.
+    @discardableResult
+    func sendControlOverride(_ fields: [String: String]) -> Bool {
+        guard !fields.isEmpty, hasInputTransport else { return false }
+        var control: [String: Any] = ["type": "control"]
+        for (key, value) in fields { control[key] = value }
+        guard var data = try? JSONSerialization.data(withJSONObject: control) else { return false }
+        data.append(0x0A)
+        do {
+            try writeToTransport(data)
+            return true
+        } catch {
+            return false
+        }
     }
 
     /// Set when the stop came from here, so the turn that ends a moment later

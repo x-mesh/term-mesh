@@ -3945,4 +3945,163 @@ extension AgentSessionTests {
         )
         XCTAssertTrue(resolve.contains("/bin/sh"), "an unusable shell still needs a floor")
     }
+
+    // MARK: - Agent pane slash commands
+
+    func testSlashCommandParserSplitsNameAndArgument() {
+        let parsed = AgentSlashCommandParser.parse("/model opus")
+        XCTAssertEqual(parsed?.name, "/model")
+        XCTAssertEqual(parsed?.argument, "opus")
+    }
+
+    func testSlashCommandParserTrimsSurroundingWhitespaceAndCollapsesTheArgument() {
+        let parsed = AgentSlashCommandParser.parse("  /model   opus sonnet  ")
+        XCTAssertEqual(parsed?.name, "/model")
+        XCTAssertEqual(parsed?.argument, "opus sonnet")
+    }
+
+    func testSlashCommandParserReturnsEmptyArgumentForABareCommand() {
+        let parsed = AgentSlashCommandParser.parse("/cost")
+        XCTAssertEqual(parsed?.name, "/cost")
+        XCTAssertEqual(parsed?.argument, "")
+    }
+
+    func testSlashCommandParserReturnsNilForTextThatIsNotASlashCommand() {
+        XCTAssertNil(AgentSlashCommandParser.parse("hello /model"))
+        XCTAssertNil(AgentSlashCommandParser.parse(""))
+    }
+
+    /// The catalog only lists what the app can actually perform — see
+    /// `AgentSlashCommands`'s note on why `SlashCommands.builtinCommands`
+    /// (the terminal-CLI list) is not reused here. `/compact` stands for that
+    /// list: a real Claude Code command the app cannot perform, so it must not
+    /// appear in this catalog just because a CLI somewhere accepts it.
+    func testCatalogLookupIsCaseInsensitiveAndExcludesUnsupportedCommands() {
+        XCTAssertEqual(AgentSlashCommands.command(named: "/model")?.name, "/model")
+        XCTAssertEqual(AgentSlashCommands.command(named: "/MODEL")?.name, "/model")
+        XCTAssertNotNil(AgentSlashCommands.command(named: "/effort"))
+        XCTAssertNotNil(AgentSlashCommands.command(named: "/cost"))
+        XCTAssertNotNil(AgentSlashCommands.command(named: "/help"))
+        XCTAssertNil(AgentSlashCommands.command(named: "/compact"))
+    }
+
+    /// A `/xxx` the app does not implement must round-trip through the
+    /// catalog lookup as unrecognized, exactly like an ordinary "not found"
+    /// case — this is the fact `AgentPanelView.send()` relies on to fall
+    /// through to `session.send`, so a person's own CLI slash command is
+    /// never silently swallowed by the app instead of reaching the process.
+    func testUnknownSlashCommandIsNotInTheCatalogSoItFallsThroughToPlainSend() {
+        let parsed = AgentSlashCommandParser.parse("/doctor")
+        XCTAssertNotNil(parsed, "still parses as a slash command...")
+        XCTAssertNil(
+            AgentSlashCommands.command(named: parsed!.name),
+            "...but is not one the app executes, so the caller must send it as-is"
+        )
+    }
+
+    func testSlashCommandMatchesFiltersByPrefixCaseInsensitively() {
+        XCTAssertEqual(AgentSlashCommands.matches(prefix: "/m", for: "claude").map(\.name), ["/model"])
+        XCTAssertEqual(AgentSlashCommands.matches(prefix: "/M", for: "claude").map(\.name), ["/model"])
+        // A bare "/" lists what *this* CLI can run, not the whole catalog:
+        // codex sees `/effort` too, claude does not.
+        XCTAssertEqual(
+            AgentSlashCommands.matches(prefix: "/", for: "codex").count,
+            AgentSlashCommands.catalog.count
+        )
+        XCTAssertEqual(
+            AgentSlashCommands.matches(prefix: "/", for: "claude").count,
+            AgentSlashCommands.catalog.filter { $0.supports(cli: "claude") }.count
+        )
+        XCTAssertFalse(
+            AgentSlashCommands.matches(prefix: "/", for: "claude").contains { $0.name == "/effort" }
+        )
+        XCTAssertTrue(AgentSlashCommands.matches(prefix: "/zzz", for: "claude").isEmpty)
+    }
+
+    /// `applicationsByCLI == nil` is the "every CLI, uniformly" case a
+    /// `.localReport` command like `/help` uses. A `.profileField` command
+    /// scoped to specific CLIs must both drop out of an unlisted CLI's
+    /// popover and decline to execute if typed anyway — the two guarantees
+    /// `AgentPanelView.send()` relies on `supports(cli:)` for.
+    func testProfileFieldCommandScopedToOneCLIDropsOutOfAnotherClisPopoverAndSupportCheck() {
+        let scoped = AgentSlashCommand(
+            name: "/scoped", desc: "test-only",
+            kind: .profileField(.model), applicationsByCLI: ["claude": .restart]
+        )
+        XCTAssertTrue(scoped.supports(cli: "claude"))
+        XCTAssertFalse(scoped.supports(cli: "codex"))
+
+        let unscoped = AgentSlashCommands.command(named: "/help")
+        XCTAssertEqual(unscoped?.applicationsByCLI, nil)
+        XCTAssertTrue(unscoped?.supports(cli: "anything") ?? false)
+    }
+
+    /// codex-cli 0.153.4's `TurnStartParams.model` is confirmed to apply to
+    /// the next turn with no restart (see `AgentSlashFieldApplication`'s
+    /// doc). Every other known CLI defaults to the restart path, since only
+    /// codex has been checked against its own schema — a claim this test
+    /// pins so a change to the default is a deliberate edit, not a silent
+    /// drift.
+    func testModelCommandAppliesAsNextTurnParameterOnlyOnCodex() {
+        let model = AgentSlashCommands.command(named: "/model")
+        XCTAssertEqual(model?.application(for: "codex"), .nextTurnParameter)
+        XCTAssertEqual(model?.application(for: "claude"), .restart)
+        XCTAssertEqual(model?.application(for: "gemini"), .restart)
+        XCTAssertNil(model?.application(for: "some-unknown-cli"))
+    }
+
+    /// `/effort` reuses `/model`'s shape without touching `AgentPanelView`:
+    /// one more `AgentSlashProfileField` case, applied through the same
+    /// generic switch `/model` already goes through.
+    func testApplyingAProfileFieldCommandSetsOnlyItsOwnField() {
+        var profile = CliProfile(name: "test", family: "claude", executable: "/usr/bin/claude")
+        XCTAssertTrue(AgentSlashCommands.apply(.model, argument: "opus", to: &profile))
+        XCTAssertEqual(profile.modelOverride, "opus")
+    }
+
+    /// codex is the only CLI confirmed to take a reasoning effort at all, so an
+    /// absent entry means unsupported — not "restart to apply it instead".
+    /// Reading `.restart` here would send a pane through a context-losing
+    /// restart that could not carry the value anyway.
+    func testEffortCommandIsOfferedOnlyOnCodexAndOnlyAsANextTurnParameter() {
+        let effort = AgentSlashCommands.command(named: "/effort")
+        XCTAssertEqual(effort?.application(for: "codex"), .nextTurnParameter)
+        XCTAssertNil(effort?.application(for: "claude"))
+        XCTAssertFalse(effort?.supports(cli: "claude") ?? true)
+        XCTAssertTrue(AgentSlashCommands.matches(prefix: "/eff", for: "codex").contains { $0.name == "/effort" })
+        XCTAssertTrue(AgentSlashCommands.matches(prefix: "/eff", for: "claude").isEmpty)
+    }
+
+    /// `AgentPanelView.runHelpSlashCommand()` lists
+    /// `AgentSlashCommands.catalog.filter { $0.supports(cli: panel.cli) }` —
+    /// listing the full catalog regardless of pane CLI (the bug this pins)
+    /// would print `/effort` for a claude pane, which the pane cannot run.
+    func testHelpListsOnlyTheCommandsThisCLISupports() {
+        let claudeHelp = AgentSlashCommands.catalog.filter { $0.supports(cli: "claude") }
+        XCTAssertFalse(claudeHelp.contains { $0.name == "/effort" })
+        XCTAssertTrue(claudeHelp.contains { $0.name == "/model" })
+        XCTAssertTrue(claudeHelp.contains { $0.name == "/cost" })
+        XCTAssertTrue(claudeHelp.contains { $0.name == "/help" })
+
+        let codexHelp = AgentSlashCommands.catalog.filter { $0.supports(cli: "codex") }
+        XCTAssertTrue(codexHelp.contains { $0.name == "/effort" })
+        XCTAssertEqual(codexHelp.count, AgentSlashCommands.catalog.count)
+    }
+
+    /// Effort has no `CliProfile` field, so the restart path cannot carry it.
+    /// `apply` says so rather than writing nothing and letting the caller
+    /// restart a pane for a change that never happened.
+    func testApplyingEffortToAProfileReportsThatItHasNoProfileField() {
+        var profile = CliProfile(name: "test", family: "codex", executable: "/usr/bin/codex")
+        XCTAssertFalse(AgentSlashCommands.apply(.effort, argument: "high", to: &profile))
+        XCTAssertNil(profile.modelOverride)
+    }
+
+    /// The keys are codex `TurnStartParams`' own names, forwarded verbatim by
+    /// the bridge's control frame. Renaming one here silently stops the
+    /// override from reaching the CLI, so they are pinned.
+    func testControlFrameKeysMatchTheCodexTurnStartParameterNames() {
+        XCTAssertEqual(AgentSlashProfileField.model.controlFrameKey, "model")
+        XCTAssertEqual(AgentSlashProfileField.effort.controlFrameKey, "effort")
+    }
 }
