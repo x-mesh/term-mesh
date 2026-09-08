@@ -3131,6 +3131,7 @@ class TerminalController {
         agentType: String,
         agentName: String,
         agentModel: String,
+        agentEffort: String = "",
         agentCli: String,
         host: String,
         directory: String?,
@@ -3213,6 +3214,7 @@ class TerminalController {
                 workingDirectory: resolved.directory,
                 agentType: agentType,
                 model: agentModel,
+                effort: agentEffort,
                 cli: agentCli
             )
             let checkout = Self.remoteAgentResponseWorkingDirectory(
@@ -3268,6 +3270,7 @@ class TerminalController {
                 agentType: agentType,
                 agentName: agentName,
                 agentModel: agentModel,
+                agentEffort: agentEffort,
                 agentCli: agentCli,
                 host: hostParam,
                 directory: (params["directory"] as? String)
