@@ -1529,8 +1529,14 @@ final class TermMeshDaemon: ObservableObject {
     ///       "input_tokens": 8200,
     ///       "output_tokens": 1300,
     ///       "cache_read_input_tokens": 22000,
-    ///       "cache_creation_input_tokens": 13000 }
+    ///       "cache_creation_input_tokens": 13000,
+    ///       "model": "claude-sonnet-4-6",
+    ///       "context_tokens": 30200 }
     ///   ] }
+    ///
+    /// `context_tokens` is absent (not decoded) when the source cannot report
+    /// a non-cumulative context occupancy (e.g. Codex) — see
+    /// `UsageTickAgent.context_tokens` in daemon/term-meshd/src/headless/mod.rs.
     ///
     /// Marshals onto the main thread and forwards to `TeamDataStore.updateUsage`.
     /// Safe to call from any thread. Backend wiring (socket-notify subscription)
@@ -1554,7 +1560,13 @@ final class TermMeshDaemon: ObservableObject {
                     outputTokens: (entry["output_tokens"] as? NSNumber)?.uint64Value ?? 0,
                     cacheReadTokens: (entry["cache_read_input_tokens"] as? NSNumber)?.uint64Value ?? 0,
                     cacheCreationTokens: (entry["cache_creation_input_tokens"] as? NSNumber)?.uint64Value ?? 0,
-                    updatedAt: now
+                    updatedAt: now,
+                    model: entry["model"] as? String ?? "",
+                    // Absent rather than null when the daemon cannot report a
+                    // non-cumulative occupancy for this CLI (e.g. Codex). Left
+                    // nil, never 0: a 0 renders as "0%", which reads as real
+                    // data instead of an absent measurement.
+                    contextTokens: (entry["context_tokens"] as? NSNumber)?.uint64Value
                 )
             ))
         }

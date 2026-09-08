@@ -160,6 +160,11 @@ pub struct UsageCounters {
     pub output_total: AtomicU64,
     pub cache_read_total: AtomicU64,
     pub cache_creation_total: AtomicU64,
+    /// `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`
+    /// of the *last* observation only (overwritten, not accumulated) — the
+    /// current context-window occupancy. The four totals above are lifetime
+    /// billing sums and cannot answer "how full is the context right now".
+    pub last_context_total: AtomicU64,
     pub last_updated_ms: AtomicU64,
     /// Set whenever any total is incremented. Cleared by the broadcast
     /// emitter (so each tick reflects "changed since last tick") and by the
@@ -178,14 +183,18 @@ impl UsageCounters {
             output_total: AtomicU64::new(t.output_tokens),
             cache_read_total: AtomicU64::new(t.cache_read_input_tokens),
             cache_creation_total: AtomicU64::new(t.cache_creation_input_tokens),
+            // Not part of the persisted snapshot: unknown until the next
+            // observation arrives after resume/unpark.
+            last_context_total: AtomicU64::new(0),
             last_updated_ms: AtomicU64::new(t.last_updated_ms),
             broadcast_dirty: AtomicBool::new(false),
             flush_dirty: AtomicBool::new(false),
         })
     }
 
-    /// Apply a single usage observation. Each field is `fetch_add` (cumulative).
-    /// Marks both dirty bits.
+    /// Apply a single usage observation. Each field is `fetch_add` (cumulative)
+    /// except `last_context_total`, which is overwritten with this
+    /// observation's context occupancy. Marks both dirty bits.
     pub fn observe(&self, u: &ParsedUsage, now_ms: u64) {
         if u.input_tokens == 0
             && u.output_tokens == 0
@@ -210,6 +219,10 @@ impl UsageCounters {
             self.cache_creation_total
                 .fetch_add(u.cache_creation_input_tokens, Ordering::Relaxed);
         }
+        self.last_context_total.store(
+            u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens,
+            Ordering::Relaxed,
+        );
         self.last_updated_ms.store(now_ms, Ordering::Relaxed);
         self.broadcast_dirty.store(true, Ordering::Release);
         self.flush_dirty.store(true, Ordering::Release);
@@ -224,6 +237,11 @@ impl UsageCounters {
             cache_creation_input_tokens: self.cache_creation_total.load(Ordering::Relaxed),
             last_updated_ms: self.last_updated_ms.load(Ordering::Relaxed),
         }
+    }
+
+    /// Current context-window occupancy (last observation, not accumulated).
+    pub fn context_tokens(&self) -> u64 {
+        self.last_context_total.load(Ordering::Relaxed)
     }
 
     /// Atomically clear the broadcast-dirty bit. Returns the previous value.
@@ -284,6 +302,16 @@ pub struct UsageTickAgent {
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    /// Model identifier, used by the client to look up a context-window
+    /// limit. Empty string if unknown for this CLI/path.
+    #[serde(default)]
+    pub model: String,
+    /// Current context-window occupancy (last request's input + cache_read +
+    /// cache_creation), distinct from the accumulated totals above. `None`
+    /// when the source cannot report a non-cumulative value (e.g. Codex,
+    /// whose rollout logs only expose a cumulative session total).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2443,6 +2471,8 @@ impl HeadlessManager {
                 output_tokens: snap.output_tokens,
                 cache_read_input_tokens: snap.cache_read_input_tokens,
                 cache_creation_input_tokens: snap.cache_creation_input_tokens,
+                model: agent.model.clone(),
+                context_tokens: Some(agent.usage.context_tokens()),
             });
         }
 

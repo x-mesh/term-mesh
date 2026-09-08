@@ -114,6 +114,12 @@ pub struct SessionUsageStats {
     pub api_calls: u64,
     pub cost_usd: f64,
     pub last_activity_ms: u64,
+    /// `input_tokens + cache_read_input_tokens + cache_creation` of the *last*
+    /// assistant line only (not accumulated like the fields above). This is
+    /// the current context-window occupancy, used to compute a % against a
+    /// model's context limit; the accumulated fields above are lifetime
+    /// billing totals and cannot answer "how full is the context right now".
+    pub last_context_tokens: u64,
 }
 
 /// Snapshot of all sessions.
@@ -436,6 +442,27 @@ impl UsageTracker {
             .collect()
     }
 
+    /// Panel → (current context tokens, model) for the context-window %
+    /// display. Unlike `snapshot_by_panel` (lifetime accumulated totals),
+    /// this is the *last* request's context occupancy, keyed by the same
+    /// panel↔session correlation `sessions_by_panel` uses.
+    pub fn context_by_panel(
+        &self,
+        panes: &[(String, String, i64, u32)],
+    ) -> HashMap<String, (u64, String)> {
+        let sessions = self.sessions_by_panel(panes);
+        let state = self.state.lock().unwrap();
+        sessions
+            .into_iter()
+            .filter_map(|(panel_id, session_id)| {
+                state
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| (panel_id, (s.last_context_tokens, s.model.clone())))
+            })
+            .collect()
+    }
+
     /// Both public views come from one walk so they can never disagree about
     /// which session a panel is running.
     fn correlate_panels(&self, panes: &[(String, String, i64, u32)]) -> PanelCorrelation {
@@ -572,11 +599,14 @@ fn process_line(state: &mut TrackerState, entry: &JsonlLine, file_path: &Path) {
     stats.output_tokens += usage.output_tokens;
     stats.cache_read_tokens += usage.cache_read_input_tokens;
 
-    if let Some(ref cc) = usage.cache_creation {
-        stats.cache_write_tokens += cc.ephemeral_1h_input_tokens;
+    let cache_write_this_line = if let Some(ref cc) = usage.cache_creation {
+        cc.ephemeral_1h_input_tokens
     } else {
-        stats.cache_write_tokens += usage.cache_creation_input_tokens;
-    }
+        usage.cache_creation_input_tokens
+    };
+    stats.cache_write_tokens += cache_write_this_line;
+    stats.last_context_tokens =
+        usage.input_tokens + usage.cache_read_input_tokens + cache_write_this_line;
 
     stats.api_calls += 1;
     stats.cost_usd += cost;
@@ -1336,6 +1366,52 @@ mod tests {
         assert_eq!(by_panel.len(), 2, "no tie-refusal — both panels matched");
         assert_eq!(by_panel["panelLow"].0, 100); // lower pid → sessA
         assert_eq!(by_panel["panelHigh"].0, 200); // higher pid → sessB
+    }
+
+    /// `context_by_panel` must report the *last* request's context occupancy,
+    /// not the lifetime accumulated total `snapshot_by_panel` reports — a
+    /// session that has sent several turns should show only the latest one.
+    #[test]
+    fn context_by_panel_reports_last_request_not_accumulated_total() {
+        let mut state = make_state();
+        let path = PathBuf::from("/home/user/.claude/projects/-test/file.jsonl");
+        let first = assistant_entry(
+            "sess",
+            Some("/cwd/one"),
+            Some("2026-05-13T01:00:00.000Z"),
+            usage(100, 10, 20, 5),
+        );
+        let second = assistant_entry(
+            "sess",
+            Some("/cwd/one"),
+            Some("2026-05-13T01:00:01.000Z"),
+            usage(40, 10, 15, 0),
+        );
+        record_session_start(&mut state, &first);
+        process_line(&mut state, &first, &path);
+        process_line(&mut state, &second, &path);
+
+        let base = iso8601_to_unix("2026-05-13T01:00:00.000Z").unwrap();
+        let tracker = UsageTracker {
+            state: Arc::new(Mutex::new(state)),
+        };
+        let panes = vec![(
+            "panelOne".to_string(),
+            "/cwd/one".to_string(),
+            base + 1,
+            1_u32,
+        )];
+
+        let context = tracker.context_by_panel(&panes);
+        // Last line: input=40, cache_read=15, cache_write=0 → 55, not the
+        // accumulated 100+40=140 input alone.
+        assert_eq!(context["panelOne"].0, 55);
+        assert_eq!(context["panelOne"].1, "claude-sonnet-4-6");
+
+        // The accumulated view still sums both lines, confirming the two
+        // views measure different things from the same data.
+        let totals = tracker.snapshot_by_panel(&panes);
+        assert_eq!(totals["panelOne"].0, 140);
     }
 
     // ── JSONL parsing from string ──

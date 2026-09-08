@@ -114,6 +114,14 @@ struct AgentPanelView: View {
 
     // MARK: - Header
 
+    /// Context-window usage for this pane's agent, from the daemon's usage
+    /// tick. Read directly rather than via an `@ObservedObject` — `header`
+    /// already re-evaluates on every session change (streamed deltas), which
+    /// is frequent enough to keep this fresh without widening observed state.
+    private var contextUsage: AgentUsageSnapshot? {
+        TeamDataStore.shared.agentUsage[panel.teamName]?[panel.agentName]
+    }
+
     private var header: some View {
         HStack(spacing: 7) {
             // The agent's own colour, as a rail rather than a dot: five panes
@@ -159,6 +167,28 @@ struct AgentPanelView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .layoutPriority(-1)
+            }
+            // Hidden entirely (not a blank placeholder) unless the daemon can
+            // report current context occupancy for this CLI — Codex cannot
+            // (see UsageTickAgent.context_tokens on the daemon side).
+            if let contextTokens = contextUsage?.contextTokens {
+                if let fraction = contextUsage?.contextUsageFraction {
+                    Text("\(Int((fraction * 100).rounded()))%")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(fraction >= 0.9 ? Color.orange : Color.secondary)
+                        .fixedSize()
+                        .help("Context window: \(contextTokens) tokens used")
+                } else {
+                    // Model unknown to ModelContextLimits — show the raw count
+                    // rather than guess at a limit.
+                    Text(contextTokens >= 1000
+                        ? String(format: "%.1fk ctx", Double(contextTokens) / 1000)
+                        : "\(contextTokens) ctx")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                        .help("Context window: \(contextTokens) tokens used (limit unknown)")
+                }
             }
             Spacer(minLength: 4)
             if !session.isRunning {

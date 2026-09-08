@@ -15,7 +15,6 @@ final class DaemonLifetimeTests: XCTestCase {
     /// `cache_creation_input_tokens`. Reading the Swift property spelling
     /// instead returned 0 for both without any decode error.
     func test_usageTickCacheCountersDecodeFromTheDaemonWireNames() {
-        let now = Date()
         let parsed = TermMeshDaemon.parseUsageTickAgents(
             [[
                 "name": "explorer",
@@ -24,7 +23,7 @@ final class DaemonLifetimeTests: XCTestCase {
                 "cache_read_input_tokens": NSNumber(value: 22000),
                 "cache_creation_input_tokens": NSNumber(value: 13000),
             ]],
-            now: now
+            now: Date()
         )
 
         XCTAssertEqual(parsed.count, 1)
@@ -36,8 +35,8 @@ final class DaemonLifetimeTests: XCTestCase {
     }
 
     /// The Swift property spelling is not a second accepted name. Keeping this
-    /// explicit stops a future edit from "fixing" the mismatch by accepting
-    /// both and hiding which side is actually wrong.
+    /// explicit stops a future edit from "fixing" a mismatch by accepting both
+    /// and hiding which side is actually wrong.
     func test_usageTickIgnoresTheSwiftPropertySpellingForCacheCounters() {
         let parsed = TermMeshDaemon.parseUsageTickAgents(
             [[
@@ -144,6 +143,117 @@ final class DaemonLifetimeTests: XCTestCase {
             consecutiveFailures: 9, runIntended: true,
             nowNanos: interval, lastRespawnNanos: 0
         ))
+    }
+}
+
+/// Context-window usage: the daemon reports the *last* request's occupancy
+/// under `context_tokens`, distinct from the lifetime accumulated totals the
+/// other fields carry. The panel must show a `%` only when both the current
+/// occupancy and the model's limit are known, an absolute count when only the
+/// occupancy is known, and hide the element entirely when the CLI cannot
+/// report occupancy at all (e.g. Codex omits `context_tokens`).
+final class AgentContextUsageTests: XCTestCase {
+
+    func test_knownModelYieldsAContextUsageFraction() {
+        let snapshot = AgentUsageSnapshot(
+            inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
+            updatedAt: Date(), model: "claude-sonnet-4-6", contextTokens: 100_000
+        )
+        XCTAssertEqual(snapshot.contextUsageFraction ?? -1, 0.5, accuracy: 0.0001)
+    }
+
+    /// A model absent from `ModelContextLimits` must not fabricate a
+    /// percentage — the panel falls back to showing the raw token count.
+    func test_unknownModelYieldsNoFractionEvenWithAKnownContextTokenCount() {
+        let snapshot = AgentUsageSnapshot(
+            inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
+            updatedAt: Date(), model: "some-future-model-nobody-has-mapped-yet",
+            contextTokens: 100_000
+        )
+        XCTAssertNil(snapshot.contextUsageFraction)
+        XCTAssertEqual(snapshot.contextTokens, 100_000, "the absolute count itself is still known")
+    }
+
+    /// No `context_tokens` at all (Codex) must not yield a fraction, and the
+    /// panel is expected to hide its badge entirely in that case — verified
+    /// here at the data layer the view reads.
+    func test_missingContextTokensYieldsNoFraction() {
+        let snapshot = AgentUsageSnapshot(
+            inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheCreationTokens: 0,
+            updatedAt: Date(), model: "claude-sonnet-4-6", contextTokens: nil
+        )
+        XCTAssertNil(snapshot.contextUsageFraction)
+    }
+
+    func test_modelContextLimitsKnowsClaudeButNotUnknownModels() {
+        XCTAssertEqual(ModelContextLimits.contextLimit(forModel: "claude-opus-4-6"), 200_000)
+        XCTAssertEqual(ModelContextLimits.contextLimit(forModel: "claude-sonnet-3-5"), 200_000)
+        XCTAssertNil(ModelContextLimits.contextLimit(forModel: "gpt-5-codex"))
+        XCTAssertNil(ModelContextLimits.contextLimit(forModel: ""))
+    }
+
+    /// `handleAgentUsageTick` must decode the daemon's exact serde field
+    /// names — `cache_read_input_tokens` / `cache_creation_input_tokens`, not
+    /// the `..._tokens` shorthand a prior version of this handler used, which
+    /// silently decoded to zero because the keys never matched.
+    @MainActor
+    func test_handleAgentUsageTickDecodesExactDaemonFieldNamesIncludingContext() {
+        let teamName = "context-usage-decode-\(UUID().uuidString)"
+        let payload: [String: Any] = [
+            "team_name": teamName,
+            "agents": [
+                [
+                    "name": "explorer",
+                    "input_tokens": 40,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 15,
+                    "cache_creation_input_tokens": 0,
+                    "model": "claude-sonnet-4-6",
+                    "context_tokens": 55,
+                ]
+            ],
+        ]
+        TermMeshDaemon.shared.handleAgentUsageTick(payload: payload)
+
+        let expectation = expectation(description: "usage applied on main thread")
+        DispatchQueue.main.async { expectation.fulfill() }
+        wait(for: [expectation], timeout: 2.0)
+
+        let snapshot = TeamDataStore.shared.agentUsage[teamName]?["explorer"]
+        XCTAssertEqual(snapshot?.inputTokens, 40)
+        XCTAssertEqual(snapshot?.cacheReadTokens, 15)
+        XCTAssertEqual(snapshot?.model, "claude-sonnet-4-6")
+        XCTAssertEqual(snapshot?.contextTokens, 55)
+        XCTAssertEqual(snapshot?.contextUsageFraction ?? -1, 55.0 / 200_000.0, accuracy: 0.0000001)
+    }
+
+    /// Codex omits `context_tokens` on the wire; the decoded snapshot must
+    /// carry `nil`, not `0` — a `0` would render as "0%", a wrong value that
+    /// looks like real data instead of an absent one.
+    @MainActor
+    func test_handleAgentUsageTickLeavesContextTokensNilWhenAbsentFromPayload() {
+        let teamName = "context-usage-absent-\(UUID().uuidString)"
+        let payload: [String: Any] = [
+            "team_name": teamName,
+            "agents": [
+                [
+                    "name": "codex-worker",
+                    "input_tokens": 40,
+                    "output_tokens": 10,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                ]
+            ],
+        ]
+        TermMeshDaemon.shared.handleAgentUsageTick(payload: payload)
+
+        let expectation = expectation(description: "usage applied on main thread")
+        DispatchQueue.main.async { expectation.fulfill() }
+        wait(for: [expectation], timeout: 2.0)
+
+        let snapshot = TeamDataStore.shared.agentUsage[teamName]?["codex-worker"]
+        XCTAssertEqual(snapshot?.inputTokens, 40)
+        XCTAssertNil(snapshot?.contextTokens)
     }
 }
 
