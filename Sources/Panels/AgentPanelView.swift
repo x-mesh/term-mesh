@@ -896,7 +896,9 @@ extension AgentPanelView {
     }
 
     private func runHelpSlashCommand() {
-        let lines = AgentSlashCommands.catalog.map { "\($0.name) — \($0.desc)" }
+        let lines = AgentSlashCommands.catalog
+            .filter { $0.supports(cli: panel.cli) }
+            .map { "\($0.name) — \($0.desc)" }
         session.appendLocalNotice((["Commands this pane can run:"] + lines).joined(separator: "\n"))
     }
 }

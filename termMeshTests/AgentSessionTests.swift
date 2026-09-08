@@ -4072,6 +4072,22 @@ extension AgentSessionTests {
         XCTAssertTrue(AgentSlashCommands.matches(prefix: "/eff", for: "claude").isEmpty)
     }
 
+    /// `AgentPanelView.runHelpSlashCommand()` lists
+    /// `AgentSlashCommands.catalog.filter { $0.supports(cli: panel.cli) }` —
+    /// listing the full catalog regardless of pane CLI (the bug this pins)
+    /// would print `/effort` for a claude pane, which the pane cannot run.
+    func testHelpListsOnlyTheCommandsThisCLISupports() {
+        let claudeHelp = AgentSlashCommands.catalog.filter { $0.supports(cli: "claude") }
+        XCTAssertFalse(claudeHelp.contains { $0.name == "/effort" })
+        XCTAssertTrue(claudeHelp.contains { $0.name == "/model" })
+        XCTAssertTrue(claudeHelp.contains { $0.name == "/cost" })
+        XCTAssertTrue(claudeHelp.contains { $0.name == "/help" })
+
+        let codexHelp = AgentSlashCommands.catalog.filter { $0.supports(cli: "codex") }
+        XCTAssertTrue(codexHelp.contains { $0.name == "/effort" })
+        XCTAssertEqual(codexHelp.count, AgentSlashCommands.catalog.count)
+    }
+
     /// Effort has no `CliProfile` field, so the restart path cannot carry it.
     /// `apply` says so rather than writing nothing and letting the caller
     /// restart a pane for a change that never happened.
