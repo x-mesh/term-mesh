@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.232.0] - 2026-09-08
+
+### Fixed
+
+- Preserve active Project surfaces during a daemon upgrade. The daemon defers the upgrade and reports its state until every live Project surface closes.
+- Retry peer delegation after a viewer reconnects, so a restored viewer can resume remote collaboration.
+- Recover workspace mirrors after tunnel and subscription failures. Reconnect replaces stale tunnels, keeps a newer subscription alive, and clears a failed reconnect only when it still owns that subscription.
+- Verify Project restart recovery when either side of a divider is the only valid resize direction.
+
 ## [0.231.0] - 2026-09-08
 
 ### Added
