@@ -1034,6 +1034,33 @@ final class PeerWorkspaceMirrorController {
         return recoveryGenerationIsCurrent ? .commit : .commitSubscriptionOnly
     }
 
+    /// A failed attempt can close its own transport, but it may clear shared
+    /// subscription state only while it still owns that state.
+    nonisolated static func reconnectAttemptOwnsSubscription(
+        currentSessionIsAttempt: Bool
+    ) -> Bool {
+        currentSessionIsAttempt
+    }
+
+    /// Retract the subscription installed by a reconnect attempt that failed
+    /// after it became the current subscription. A newer attempt can replace
+    /// it while the old session stops its heartbeat, so clear shared state
+    /// only when this attempt still owns it.
+    private func retractReconnectSubscription(
+        session: PeerSession,
+        transport: UnixSocketTransport
+    ) async -> Bool {
+        await session.stopHeartbeat()
+        await transport.close()
+        guard Self.reconnectAttemptOwnsSubscription(
+            currentSessionIsAttempt: subscriptionSession === session
+        ) else { return false }
+        subscriptionAlive = false
+        subscriptionSession = nil
+        subscriptionTransport = nil
+        return true
+    }
+
     private func reconnectLoop(after failedGeneration: UInt64) async {
         var attempt = 0
         #if DEBUG
@@ -1177,7 +1204,12 @@ final class PeerWorkspaceMirrorController {
                 // ones that are.
                 markPanesStaleKeepingRecovered()
                 let recoveryGeneration = beginLayoutRecoveryGeneration()
-                try await reconcile(target: target.layout)
+                do {
+                    try await reconcile(target: target.layout)
+                } catch {
+                    _ = await retractReconnectSubscription(session: session, transport: transport)
+                    throw error
+                }
                 let step = Self.reconnectStep(
                     isTornDown: isTornDown, hasWorkspace: workspace != nil,
                     isCancelled: Task.isCancelled, hostLeaseIsActive: lease.canReconnectTransport
@@ -1187,18 +1219,11 @@ final class PeerWorkspaceMirrorController {
                     recoveryGenerationIsCurrent: recoveryGeneration == layoutRecoveryGeneration
                 ) {
                 case .abandon:
-                    await session.stopHeartbeat()
-                    await transport.close()
-                    // Retract only what this attempt installed. A superseding
-                    // resume may already have put its own session here, and
-                    // that one is not ours to clear.
-                    if subscriptionSession === session {
-                        subscriptionAlive = false
-                        subscriptionSession = nil
-                        subscriptionTransport = nil
-                        if !lease.canReconnectTransport {
-                            markWorkspaceTitle(suffix: "disconnected")
-                        }
+                    let retracted = await retractReconnectSubscription(
+                        session: session, transport: transport
+                    )
+                    if retracted, !lease.canReconnectTransport {
+                        markWorkspaceTitle(suffix: "disconnected")
                     }
                     return
                 case .commitSubscriptionOnly:

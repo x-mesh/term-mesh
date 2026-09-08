@@ -1522,4 +1522,20 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         )
     }
 
+    // MARK: - reconnect failure cleanup
+
+    func test_reconnectFailureClearsOnlyItsOwnSubscriptionState() {
+        XCTAssertTrue(
+            PeerWorkspaceMirrorController.reconnectAttemptOwnsSubscription(
+                currentSessionIsAttempt: true
+            )
+        )
+        XCTAssertFalse(
+            PeerWorkspaceMirrorController.reconnectAttemptOwnsSubscription(
+                currentSessionIsAttempt: false
+            ),
+            "a failed old reconnect must not clear a newer subscription"
+        )
+    }
+
 }
