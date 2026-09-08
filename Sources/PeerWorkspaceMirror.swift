@@ -138,12 +138,21 @@ final class PeerWorkspaceMirrorController {
     private var subscriptionTransport: UnixSocketTransport?
     private var subscriptionSession: PeerSession?
     private var receiveTask: Task<Void, Never>?
+    /// Session the current receive loop reads from; nil once that loop
+    /// exits. A status probe can then tell "subscription installed" from
+    /// "subscription installed and someone is reading it" — the two came
+    /// apart exactly in the defect this guards.
+    private(set) var receiveLoopSession: PeerSession?
+    /// True only while a receive loop is reading the current subscription.
+    var isReceiveLoopActive: Bool {
+        receiveLoopSession != nil && receiveLoopSession === subscriptionSession
+    }
     private var reconnectTask: Task<Void, Never>?
     /// Apply serialization (relay-window pattern): one reconcile at a
     /// time; a newer push cancels a stale queued one.
     private var applyTask: Task<Void, Never>?
     private var incompleteLayoutRetryTask: Task<Void, Never>?
-    private var layoutRecoveryGeneration: UInt64 = 0
+    private(set) var layoutRecoveryGeneration: UInt64 = 0
     private(set) var layoutRecoveryState: PeerMirrorLayoutRecoveryState = .opening
     /// True while the reconciler mutates the bonsplit tree — gates every
     /// veto/forwarding hook so remote application never echoes back out.
@@ -356,6 +365,7 @@ final class PeerWorkspaceMirrorController {
 
     private func startReceiveLoop(session: PeerSession) {
         receiveTask?.cancel()
+        receiveLoopSession = session
         receiveTask = Task { [weak self] in
             var lostReason: String?
             var hostGone = false
@@ -387,6 +397,9 @@ final class PeerWorkspaceMirrorController {
                     break
                 }
                 if hostGone || lostReason != nil { break }
+            }
+            if let self, self.receiveLoopSession === session {
+                self.receiveLoopSession = nil
             }
             guard let self, !self.isTornDown, self.subscriptionSession === session else { return }
             if hostGone {
@@ -1000,6 +1013,27 @@ final class PeerWorkspaceMirrorController {
             ? .proceed : .abandon
     }
 
+    /// What a reconnect attempt does with the subscription it just
+    /// installed, once its reconcile has returned. `step` already folds in
+    /// cancellation, teardown, workspace presence and lease retirement, so
+    /// the recovery generation is the only question left — and it decides
+    /// who owns layout recovery, not whether the subscription lives.
+    enum ReconnectCommit: Equatable {
+        case abandon
+        /// Subscription and receive loop are installed; layout recovery is
+        /// left to whoever bumped the generation meanwhile.
+        case commitSubscriptionOnly
+        case commit
+    }
+
+    nonisolated static func reconnectCommit(
+        step: ReconnectStep,
+        recoveryGenerationIsCurrent: Bool
+    ) -> ReconnectCommit {
+        guard step == .proceed else { return .abandon }
+        return recoveryGenerationIsCurrent ? .commit : .commitSubscriptionOnly
+    }
+
     private func reconnectLoop(after failedGeneration: UInt64) async {
         var attempt = 0
         #if DEBUG
@@ -1144,22 +1178,45 @@ final class PeerWorkspaceMirrorController {
                 markPanesStaleKeepingRecovered()
                 let recoveryGeneration = beginLayoutRecoveryGeneration()
                 try await reconcile(target: target.layout)
-                guard Self.reconnectStep(
+                let step = Self.reconnectStep(
                     isTornDown: isTornDown, hasWorkspace: workspace != nil,
                     isCancelled: Task.isCancelled, hostLeaseIsActive: lease.canReconnectTransport
-                ) == .proceed, PeerMirrorLayoutRecoveryPolicy.mayContinue(
-                    expectedGeneration: recoveryGeneration,
-                    currentGeneration: layoutRecoveryGeneration,
-                    isCancelled: Task.isCancelled, isTornDown: isTornDown
-                ) else {
+                )
+                switch Self.reconnectCommit(
+                    step: step,
+                    recoveryGenerationIsCurrent: recoveryGeneration == layoutRecoveryGeneration
+                ) {
+                case .abandon:
                     await session.stopHeartbeat()
                     await transport.close()
+                    // Retract only what this attempt installed. A superseding
+                    // resume may already have put its own session here, and
+                    // that one is not ours to clear.
+                    if subscriptionSession === session {
+                        subscriptionAlive = false
+                        subscriptionSession = nil
+                        subscriptionTransport = nil
+                        if !lease.canReconnectTransport {
+                            markWorkspaceTitle(suffix: "disconnected")
+                        }
+                    }
                     return
+                case .commitSubscriptionOnly:
+                    // A newer generation owns layout recovery now — a resync, a
+                    // local shape change, the pane watchdog. None of them touch
+                    // this transport, so the subscription still goes live.
+                    // Returning here used to leave `subscriptionAlive` true on
+                    // a closed transport with no receive loop, and nothing
+                    // ever noticed.
+                    RemoteWorkLog.debugOffMain(
+                        "Workspace mirror reconnect landed under a newer layout recovery — subscription installed, recovery left to its owner"
+                    )
+                case .commit:
+                    updateIncompleteLayoutRecovery(
+                        target: target.layout, generation: recoveryGeneration,
+                        completedAttempts: 0
+                    )
                 }
-                updateIncompleteLayoutRecovery(
-                    target: target.layout, generation: recoveryGeneration,
-                    completedAttempts: 0
-                )
                 startReceiveLoop(session: session)
                 #if DEBUG
                 dlog("peer.mirror.reconnected attempt=\(attempt)")

@@ -140,6 +140,14 @@ final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
             expectedGeneration: 7, currentGeneration: 7,
             isCancelled: false, isTornDown: true
         ))
+        // A cancelled task may not continue even at the current generation
+        // — the case the reconnect guard relied on and nothing covered.
+        XCTAssertFalse(
+            PeerMirrorLayoutRecoveryPolicy.mayContinue(
+                expectedGeneration: 7, currentGeneration: 7,
+                isCancelled: true, isTornDown: false
+            )
+        )
     }
 }
 

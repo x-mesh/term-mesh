@@ -1790,6 +1790,10 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 var entry: [String: Any] = [
                     "host_key": String(describing: mirror.spec.hostKey),
                     "subscription_alive": mirror.subscriptionAlive,
+                    // Kept separate from subscription_alive on purpose: the
+                    // reconnect defect was exactly the two disagreeing.
+                    "receive_loop_active": mirror.isReceiveLoopActive,
+                    "layout_recovery_generation": mirror.layoutRecoveryGeneration,
                     "applying": mirror.isApplyingRemoteLayout,
                     "leaf_count": mirror.panelBySurfaceID.count,
                     "split_map_count": mirror.hostSplitToLocal.count,
