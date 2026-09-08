@@ -1063,6 +1063,7 @@ struct ProjectSource: Equatable {
 struct ProjectLeader: Equatable {
     var mode: String
     var model: String
+    var effort: String = ""
     /// The machine that owns the leader pane.  This is deliberately distinct
     /// from `ProjectSource.hostKey`: a project can live on one peer while its
     /// leader is local, or the leader can be on another connected peer.

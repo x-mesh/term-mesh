@@ -2412,6 +2412,7 @@ final class CoordinatorPlacementDispatcher {
                 name: "executor",
                 cli: "claude",
                 model: "sonnet",
+                effort: "",
                 agentType: "executor",
                 color: "",
                 instructions: "",

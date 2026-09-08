@@ -7,9 +7,32 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     var displayName: String   // e.g. "Explorer", "Code Executor"
     var cli: String           // "claude", "kiro", "codex", or "gemini" — which CLI agent to run
     var model: String         // "sonnet", "opus", "haiku"
+    var effort: String = ""   // "low"/"medium"/"high"/"xhigh"/"max", empty = CLI default
     var color: String         // terminal color
     var instructions: String  // system prompt / instructions for this role
     var isBuiltIn: Bool       // built-in presets can't be deleted
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, displayName, cli, model, effort, color, instructions, isBuiltIn
+    }
+
+    /// `effort` was added after this type shipped — a preset saved before
+    /// then has no such key at all, not merely an empty one. Synthesized
+    /// `Decodable` calls `decode`, not `decodeIfPresent`, for every key
+    /// regardless of the property's declared default, so a plain
+    /// `Codable` conformance would fail every load of that older data.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        cli = try container.decode(String.self, forKey: .cli)
+        model = try container.decode(String.self, forKey: .model)
+        effort = try container.decodeIfPresent(String.self, forKey: .effort) ?? ""
+        color = try container.decode(String.self, forKey: .color)
+        instructions = try container.decode(String.self, forKey: .instructions)
+        isBuiltIn = try container.decode(Bool.self, forKey: .isBuiltIn)
+    }
 
     /// Supported CLI types for agent execution.
     /// The CLIs a picker may offer.
@@ -155,6 +178,35 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
         return model
     }
 
+    /// The full set of syntactically valid effort values, independent of
+    /// which CLI is asking. Socket-boundary validation checks a value against
+    /// this directly, so a typo on an unsupported CLI's ignored effort is
+    /// still rejected rather than silently accepted.
+    static let allEffortLevels = ["low", "medium", "high", "xhigh", "max"]
+
+    /// Reasoning-effort levels a CLI accepts, empty when the CLI has no such flag.
+    static func efforts(for cli: String) -> [String] {
+        switch cli {
+        case "claude", "kiro", "codex":
+            return allEffortLevels
+        default:
+            return []
+        }
+    }
+
+    /// Whether a CLI exposes an explicit reasoning-effort setting at all.
+    static func supportsEffort(cli: String) -> Bool {
+        !efforts(for: cli).isEmpty
+    }
+
+    /// Normalize a stored effort value: an unsupported CLI or a value outside
+    /// the allowed set collapses to "" (CLI default), never fails silently
+    /// into a value the launch path can't use.
+    static func normalizeEffort(_ effort: String, for cli: String) -> String {
+        let lowered = effort.lowercased()
+        return efforts(for: cli).contains(lowered) ? lowered : ""
+    }
+
     // MARK: - Custom Models (UserDefaults)
 
     /// UserDefaults key for storing custom model names per CLI.
@@ -200,6 +252,7 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
         displayName: String = "",
         cli: String = "claude",
         model: String = "sonnet",
+        effort: String = "",
         color: String = "",
         instructions: String = "",
         isBuiltIn: Bool = false
@@ -209,6 +262,7 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
         self.displayName = displayName.isEmpty ? name.capitalized : displayName
         self.cli = cli
         self.model = model
+        self.effort = effort
         self.color = color
         self.instructions = instructions
         self.isBuiltIn = isBuiltIn

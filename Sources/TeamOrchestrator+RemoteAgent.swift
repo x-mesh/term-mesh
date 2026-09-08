@@ -10354,6 +10354,7 @@ extension TeamOrchestrator {
         workingDirectory: String,
         leaderMode: String,
         leaderModel: String = "sonnet",
+        leaderEffort: String = "",
         leaderEndpoint: LeaderEndpoint = .local,
         leaderWorkingDirectory: String? = nil,
         worktreeMode: String = "off",
@@ -10465,6 +10466,7 @@ extension TeamOrchestrator {
                 name: row.preset.name,
                 cli: row.preset.cli,
                 model: row.preset.model,
+                effort: row.preset.effort,
                 agentType: row.preset.name,
                 color: row.preset.color,
                 // The custom instructions are composed into `instructions`
@@ -10481,6 +10483,7 @@ extension TeamOrchestrator {
             leaderSessionId: UUID().uuidString,
             leaderMode: leaderMode,
             leaderModel: leaderModel,
+            leaderEffort: leaderEffort,
             pairMode: pairMode,
             pairModel: pairModel,
             pairSpec: pairSpec,
