@@ -1859,6 +1859,37 @@ final class RemoteHostStore: ObservableObject {
         }
     }
 
+    /// The registry replaced this host's lease on its own: `acquire` found
+    /// the tunnel dead and built another. Take it the way `connectSavedHost`
+    /// takes a first lease. Left alone, the row keeps the retired socket
+    /// path, and the next roster read on it reports the host unreachable.
+    func adoptReplacementTransport(hostKey: PeerPaneHostKey, lease: PeerPaneHostLease) {
+        guard let (key, old) = sidebarLeases.first(where: { $0.value.key == hostKey }),
+              old !== lease
+        else { return }
+        let registry = PeerPaneHostRegistry.shared
+        registry.retain(lease)
+        registry.release(old)
+        sidebarLeases[key] = lease
+        // The retired path must not promote the row through a preserved
+        // pane that still reports it (see `syncFromCoordinator`).
+        if !old.hostSockPath.isEmpty {
+            disconnectedSockPaths[key, default: []].insert(old.hostSockPath)
+        }
+        hosts[key]?.activeSockPath = lease.hostSockPath
+        hosts[key]?.connectionState = .connected
+        fetchWorkspaces(
+            for: lease.hostSockPath, key: key,
+            provenance: hosts[key]?.hostCLIBinDirsProvenance
+        )
+        #if DEBUG
+        dlog("peer.sidebar.adoptReplacement key=\(key) sock=\(lease.hostSockPath)")
+        #endif
+        RemoteWorkLog.info(
+            "Replaced the SSH tunnel to \(hosts[key]?.displayName ?? key) — it had stopped; open panes reattach"
+        )
+    }
+
     /// End only this host's pooled transport. Pane/mirror objects and remote
     /// processes remain alive; their existing disconnected UI keeps the local
     /// context visible and reconnects through a fresh lease when requested.

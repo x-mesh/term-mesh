@@ -689,6 +689,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         DispatchQueue.global(qos: .utility).async {
             PeerSSHTunnel.sweepStaleTunnels()
         }
+        // Before any host can be acquired: a lease the registry replaces on
+        // its own must reach the panes and the sidebar that held the old one.
+        PeerClientCoordinator.shared.installHostTransportReplacementHooks()
 
 #if DEBUG
         writeUITestDiagnosticsIfNeeded(stage: "didFinishLaunching")
