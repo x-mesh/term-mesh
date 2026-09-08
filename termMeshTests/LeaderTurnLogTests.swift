@@ -219,6 +219,24 @@ final class LeaderTurnLogTests: XCTestCase {
         XCTAssertEqual(report.routeDeviations, 2)
     }
 
+    func testPolicyReportDecomposesRouteDeviationsByDirection() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_route","turn_id":"more","ts":"2026-08-24T00:00:00Z","team":"t","actual_route":"parallel","suggested_route":"probe"}
+        {"event":"turn_route","turn_id":"less","ts":"2026-08-24T00:00:01Z","team":"t","actual_route":"direct","suggested_route":"parallel"}
+        {"event":"turn_route","turn_id":"match","ts":"2026-08-24T00:00:02Z","team":"t","actual_route":"delegated","suggested_route":"delegated"}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        let report = LeaderTurnLog.policyReport(from: log)
+        XCTAssertEqual(report.routeDeviations, 2)
+        XCTAssertEqual(report.moreParallelThanSuggested, 1)
+        XCTAssertEqual(report.lessParallelThanSuggested, 1)
+    }
+
     func testPolicyReportJoinsRouteWaveToActualDispatchAndLifecycle() throws {
         let log = try temporaryLog()
         try FileManager.default.createDirectory(
