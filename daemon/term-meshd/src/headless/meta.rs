@@ -80,6 +80,8 @@ fn default_delegation_level() -> String {
 pub struct LeaderMeta {
     pub mode: String,
     pub model: String,
+    #[serde(default)]
+    pub effort: String,
     pub session_id: Option<String>,
 }
 
@@ -102,6 +104,8 @@ pub struct AgentMeta {
     pub agent_type: String,
     pub cli: String,
     pub model: String,
+    #[serde(default)]
+    pub effort: String,
     pub session_id: Option<String>,
     pub color: Option<String>,
     pub created_at: u64,
