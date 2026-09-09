@@ -7988,6 +7988,9 @@ final class TeamOrchestrator: ObservableObject {
     func listTeams() -> [[String: Any]] {
         teams.values.map { team in
             let teamInbox = inboxItems(teamName: team.id)
+            let activeTasks = Self.activeTasksByAssignee(
+                in: taskBoards[team.id, default: []]
+            )
             let leaderEndpoint: [String: Any] = switch team.leaderEndpoint {
             case .local:
                 ["kind": "local"]
@@ -8010,7 +8013,7 @@ final class TeamOrchestrator: ObservableObject {
                 }(),
                 "agent_count": team.agents.count,
                 "agents": team.agents.map { agent in
-                    let activeTask = activeTask(for: team.id, agentName: agent.name)
+                    let activeTask = activeTasks[agent.name]
                     let heartbeat = heartbeats[team.id]?[agent.name]
                     var info: [String: Any] = [
                         "id": agent.id,
@@ -8028,7 +8031,11 @@ final class TeamOrchestrator: ObservableObject {
                         "active_task_title": activeTask?.title as Any? ?? NSNull(),
                         "active_task_status": activeTask?.status as Any? ?? NSNull(),
                         "active_task_is_stale": activeTask.map(isTaskStale) ?? false,
-                        "agent_state": agentRuntimeState(teamName: team.id, agentName: agent.name),
+                        "agent_state": agentRuntimeState(
+                            teamName: team.id,
+                            agentName: agent.name,
+                            activeTask: activeTask
+                        ),
                         // Mission Control: separate boolean rather than a new
                         // agent_state value — tm-agent hard-matches
                         // agent_state == "idle" for delegation eligibility, so
@@ -10681,11 +10688,30 @@ final class TeamOrchestrator: ObservableObject {
 
     #if DEBUG
     func agentRuntimeStateForTesting(teamName: String, agentName: String) -> String {
-        agentRuntimeState(teamName: teamName, agentName: agentName)
+        let activeTasks = Self.activeTasksByAssignee(
+            in: taskBoards[teamName, default: []]
+        )
+        return agentRuntimeState(
+            teamName: teamName,
+            agentName: agentName,
+            activeTask: activeTasks[agentName]
+        )
     }
     #endif
 
     private func agentRuntimeState(teamName: String, agentName: String) -> String {
+        agentRuntimeState(
+            teamName: teamName,
+            agentName: agentName,
+            activeTask: activeTask(for: teamName, agentName: agentName)
+        )
+    }
+
+    private func agentRuntimeState(
+        teamName: String,
+        agentName: String,
+        activeTask: TeamTask?
+    ) -> String {
         // Phase 2: parked is daemon-authoritative — overrides task-derived state
         // because the subprocess is not live regardless of task board entry.
         if TeamDataStore.shared.isAgentParked(teamName: teamName, agentName: agentName) {
@@ -10709,7 +10735,7 @@ final class TeamOrchestrator: ObservableObject {
             .agents.first { $0.name == agentName }?
             .panelId
             .map { AutoReplyPoller.shared.isPaneActive(panelId: $0) } ?? false
-        guard let task = activeTask(for: teamName, agentName: agentName) else {
+        guard let task = activeTask else {
             return paneIsWorking ? "running" : "idle"
         }
         // Phase E Wave 1: an assigned/queued task that has gone stale past the
@@ -10736,14 +10762,31 @@ final class TeamOrchestrator: ObservableObject {
         }
     }
 
+    /// Derive each assignee's newest active task once before serializing a
+    /// team's agents. Keeping the existing entry on equal timestamps preserves
+    /// the task-board order that the previous sort exposed for ties.
+    static func activeTasksByAssignee(in tasks: [TeamTask]) -> [String: TeamTask] {
+        var activeTasks: [String: TeamTask] = [:]
+        for task in tasks {
+            guard let assignee = task.assignee, !isTerminalTaskStatus(task.status) else {
+                continue
+            }
+            guard let current = activeTasks[assignee], current.updatedAt >= task.updatedAt else {
+                activeTasks[assignee] = task
+                continue
+            }
+        }
+        return activeTasks
+    }
+
     private func activeTask(for teamName: String, agentName: String) -> TeamTask? {
         taskBoards[teamName, default: []]
-            .filter { $0.assignee == agentName && !isTerminalTaskStatus($0.status) }
+            .filter { $0.assignee == agentName && !Self.isTerminalTaskStatus($0.status) }
             .sorted { $0.updatedAt > $1.updatedAt }
             .first
     }
 
-    private func isTerminalTaskStatus(_ status: String) -> Bool {
+    private static func isTerminalTaskStatus(_ status: String) -> Bool {
         // Phase E Wave 1: "cancelled" joins the terminal set so it drops out of
         // `activeTask` derivation in the same tick as the status flip.
         ["completed", "failed", "abandoned", "cancelled"].contains(status)
@@ -10758,7 +10801,7 @@ final class TeamOrchestrator: ObservableObject {
     }
 
     private func staleAgeSeconds(for task: TeamTask, now: Date) -> Int? {
-        guard !isTerminalTaskStatus(task.status) else { return nil }
+        guard !Self.isTerminalTaskStatus(task.status) else { return nil }
         let anchor = task.lastProgressAt ?? task.startedAt ?? task.updatedAt
         let age = Int(now.timeIntervalSince(anchor))
         return age >= Int(staleTaskThreshold) ? age : nil
