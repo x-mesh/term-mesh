@@ -469,6 +469,24 @@ FLOOR_OUT=$(floor_hook "$FLOOR_CTL/bad-schema.json" --start '{"prompt":"bad-sche
     || fail "bad-schema start returned nonzero"
 [ -z "$FLOOR_OUT" ] || fail "unrecognized schema_version should inject nothing, got: $FLOOR_OUT"
 
+# An empty TERMMESH_TEAM leaves the identity comparison off rather than
+# silencing the floor. This is deliberate and load-bearing: the app sets
+# TERMMESH_TEAM beside the request token this hook already gates on, so an
+# empty value means an environment this code cannot judge, not a foreign file.
+# Failing closed here would silently disable delegation everywhere a single
+# variable went missing, which is a worse failure than the one it prevents.
+FLOOR_OUT=$(HOME="$FLOOR_HOME" \
+    TERMMESH_TEAM= \
+    TERMMESH_SURFACE_ID=99999999-8888-7777-6666-555555555555 \
+    TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+    TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$FLOOR_CTL/delegated.json" \
+    "$HOOK" --start '{"prompt":"no team name"}') \
+    || fail "empty TERMMESH_TEAM start returned nonzero"
+case "$FLOOR_OUT" in
+    *"level: delegated"*) ;;
+    *) fail "an empty TERMMESH_TEAM must not silence the floor: $FLOOR_OUT" ;;
+esac
+
 # A remote leader pane also carries TERMMESH_LEADER_PROJECT_ID, a display ID
 # ("team:<uuid>") distinct from the team name control payloads use as
 # project_id. It must not be compared against project_id: doing so silently
