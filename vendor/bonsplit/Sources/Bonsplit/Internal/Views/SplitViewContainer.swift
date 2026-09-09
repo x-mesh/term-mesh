@@ -38,9 +38,9 @@ struct SplitViewContainer<Content: View, EmptyContent: View>: View {
 
     @ViewBuilder
     private var splitNodeContent: some View {
-        let nodeToRender = controller.zoomedNode ?? controller.rootNode
         SplitNodeView(
-            node: nodeToRender,
+            node: controller.rootNode,
+            zoomedPaneId: controller.zoomedPaneId,
             contentBuilder: contentBuilder,
             emptyPaneBuilder: emptyPaneBuilder,
             appearance: appearance,
