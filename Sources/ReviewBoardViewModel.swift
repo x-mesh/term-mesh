@@ -166,10 +166,15 @@ final class ReviewBoardViewModel: ObservableObject {
         // it. Rebuilding to discover that nothing moved cost more than every
         // other thing this tick does put together.
         //
-        // The coordinator is the exception: its snapshot has no publisher, so
-        // with the distributed integration on, this beat is still the only
-        // thing that would notice a remote task.
-        guard !ReviewBoardCoordinatorSettings.isIntegrationEnabled() else {
+        // Two exceptions, both because something moves with no mutation to
+        // publish. Panel runs age on the clock: `xkPanelRunsSnapshot` derives
+        // `age_seconds` from now and prunes expired terminal runs as it reads,
+        // so while any run is on the board this beat is what advances it and
+        // what eventually clears it. And the coordinator's snapshot has no
+        // publisher at all, so with the distributed integration on this beat is
+        // the only thing that would notice a remote task.
+        guard snapshot.panelRuns.isEmpty,
+              !ReviewBoardCoordinatorSettings.isIntegrationEnabled() else {
             refresh()
             return
         }
