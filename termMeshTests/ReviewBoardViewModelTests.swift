@@ -8,6 +8,34 @@ import XCTest
 
 final class ReviewBoardViewModelTests: XCTestCase {
     @MainActor
+    func testActiveTasksByAssigneeUsesNewestNonterminalTaskAndKeepsTieOrder() {
+        func task(
+            _ id: String, assignee: String, status: String, updatedAt: Date
+        ) -> TeamOrchestrator.TeamTask {
+            TeamOrchestrator.TeamTask(
+                id: id, title: id, details: nil, acceptanceCriteria: [], labels: [],
+                estimatedSize: nil, assignee: assignee, status: status, priority: 2,
+                dependsOn: [], parentTaskId: nil, childTaskIds: [],
+                reassignmentCount: 0, createdBy: "leader", result: nil,
+                createdAt: updatedAt, updatedAt: updatedAt
+            )
+        }
+
+        let oldest = Date(timeIntervalSince1970: 10)
+        let newest = Date(timeIntervalSince1970: 20)
+        let active = TeamOrchestrator.activeTasksByAssignee(in: [
+            task("terminal", assignee: "alex", status: "completed", updatedAt: newest),
+            task("first-tie", assignee: "alex", status: "assigned", updatedAt: newest),
+            task("second-tie", assignee: "alex", status: "in_progress", updatedAt: newest),
+            task("older", assignee: "blair", status: "assigned", updatedAt: oldest),
+            task("newer", assignee: "blair", status: "review_ready", updatedAt: newest),
+        ])
+
+        XCTAssertEqual(active["alex"]?.id, "first-tie")
+        XCTAssertEqual(active["blair"]?.id, "newer")
+    }
+
+    @MainActor
     func testRemoteCollaborationPublishesOnlyForTheActiveTeam() {
         XCTAssertTrue(ReviewBoardViewModel.shouldPublishRemoteCollaboration(
             fetchedTeam: "aic", activeTeam: "aic"
