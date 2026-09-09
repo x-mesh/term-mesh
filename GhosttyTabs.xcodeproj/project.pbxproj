@@ -107,6 +107,7 @@
 			CVB00091 /* PeerConnectionsWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00091 /* PeerConnectionsWindowController.swift */; };
 			CVB00092 /* PeerRelayBannerPresenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00092 /* PeerRelayBannerPresenter.swift */; };
 			CVB00093 /* RemoteHostStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00093 /* RemoteHostStore.swift */; };
+			CGL00001 /* RemoteLiveProject.swift in Sources */ = {isa = PBXBuildFile; fileRef = CGL00002 /* RemoteLiveProject.swift */; };
 			CVB00094 /* PeerRelayWorkspaceSidebar.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00094 /* PeerRelayWorkspaceSidebar.swift */; };
 			CVB00095 /* WatchConfigSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS00095 /* WatchConfigSheet.swift */; };
 			CVB0009B /* PairReviewSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = CVS0009B /* PairReviewSheet.swift */; };
@@ -483,6 +484,7 @@
 			CVS00091 /* PeerConnectionsWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerConnectionsWindowController.swift; sourceTree = "<group>"; };
 			CVS00092 /* PeerRelayBannerPresenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayBannerPresenter.swift; sourceTree = "<group>"; };
 			CVS00093 /* RemoteHostStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteHostStore.swift; sourceTree = "<group>"; };
+			CGL00002 /* RemoteLiveProject.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteLiveProject.swift; sourceTree = "<group>"; };
 			CVS00094 /* PeerRelayWorkspaceSidebar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PeerRelayWorkspaceSidebar.swift; sourceTree = "<group>"; };
 			CVS00095 /* WatchConfigSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchConfigSheet.swift; sourceTree = "<group>"; };
 			CVS0009B /* PairReviewSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairReviewSheet.swift; sourceTree = "<group>"; };
@@ -898,6 +900,7 @@ A1740000000000000000000C /* ProcessRun.swift */,
 				CVS00091 /* PeerConnectionsWindowController.swift */,
 				CVS00092 /* PeerRelayBannerPresenter.swift */,
 				CVS00093 /* RemoteHostStore.swift */,
+				CGL00002 /* RemoteLiveProject.swift */,
 				CVS00094 /* PeerRelayWorkspaceSidebar.swift */,
 				CVS00095 /* WatchConfigSheet.swift */,
 				CVS0009B /* PairReviewSheet.swift */,
@@ -1388,6 +1391,7 @@ A1740000000000000000000B /* ProcessRun.swift in Sources */,
 				CVB00091 /* PeerConnectionsWindowController.swift in Sources */,
 				CVB00092 /* PeerRelayBannerPresenter.swift in Sources */,
 				CVB00093 /* RemoteHostStore.swift in Sources */,
+				CGL00001 /* RemoteLiveProject.swift in Sources */,
 				CVB00094 /* PeerRelayWorkspaceSidebar.swift in Sources */,
 				CVB00095 /* WatchConfigSheet.swift in Sources */,
 				CVB0009B /* PairReviewSheet.swift in Sources */,

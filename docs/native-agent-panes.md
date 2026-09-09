@@ -38,6 +38,13 @@ Spike 상세: `docs/spike/agent-pipe-render.md`
 
 ### Remote native agent environment
 
+GUI에서 만든 Project도 양쪽 앱이 live-presentation protocol을 지원하면 원격에서
+leader와 native worker를 함께 열 수 있다. GUI와 daemon의 Project 목록을 별도로
+조회하며, GUI-owned worker는 원래 앱의 현재 대화 snapshot과 실시간 변경분을
+공유한다. `App-owned` 표시는 원래 앱이 실행 중이어야 한다는 뜻이다. viewer를
+닫아도 원래 worker는 종료되지 않으며, daemon-owned Project로 소유권을 옮기지 않는다.
+구버전 viewer에는 native model stream을 노출하지 않는다.
+
 Remote native agents start through the account's Bourne-compatible login shell.
 For daemon-owned agents, `/etc/passwd` is authoritative; a systemd-inherited
 `SHELL=/bin/sh` must not override an account that uses zsh. Change the account

@@ -1367,6 +1367,11 @@ class TerminalController {
 
 #if DEBUG
         // Debug / test-only
+        case "debug.project.live_fixture":
+            // UI fixture creation is an explicit main-actor exception.
+            return v2Result(id: id, v2MainSync {
+                RemoteLiveProjectFixture.command(params, tabManager: tabManager)
+            })
         case "debug.shortcut.set":
             return v2Result(id: id, self.v2DebugShortcutSet(params: params))
         case "debug.shortcut.simulate":

@@ -26,7 +26,60 @@ private actor RecordingTerminateProvider: PeerSurfaceProvider {
     }
 }
 
+private actor LivePresentationTestProvider: PeerSurfaceProvider {
+    private(set) var inputs = 0
+    let surfaceID = Data(repeating: 0x79, count: 16)
+    func supportsLivePresentation() async -> Bool { true }
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] {
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = surfaceID
+        surface.surfaceType = "agent"
+        surface.attachable = true
+        return [surface]
+    }
+    func attach(surfaceID: Data, clientCols: UInt32, clientRows: UInt32,
+                resumeFromSeq: UInt64) async -> PeerSurfaceAttachment? {
+        guard surfaceID == self.surfaceID else { return nil }
+        let pair = AsyncStream<PtyTapChunk>.makeStream()
+        return PeerSurfaceAttachment(byteStream: pair.stream,
+            input: { _ in await self.recordInput() }, detach: { pair.continuation.finish() })
+    }
+    private func recordInput() { inputs += 1 }
+}
+
 final class PeerServerTests: XCTestCase {
+    func testLiveAgentNegotiationAndReadOnlyInputAreEnforcedByHost() async throws {
+        let provider = LivePresentationTestProvider()
+        let socket = "/tmp/tm-live-gate-\(UUID().uuidString.prefix(8)).sock"
+        let server = PeerServer(socketPath: socket, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+        let surfaceID = await provider.surfaceID
+        for capable in [false, true] {
+            let transport = try await UnixSocketTransport.connect(socketPath: socket)
+            let session = PeerSession(transport: transport)
+            let capabilities = capable ? PeerCapability.supported : PeerCapability.supported.filter {
+                $0 != PeerCapability.agentPresentationV1
+            }
+            _ = try await session.handshake(options: PeerSessionOptions(capabilities: capabilities))
+            let surfaces = try await session.listSurfaces()
+            XCTAssertEqual(surfaces.first?.attachable, capable)
+            do {
+                _ = try await session.attachSurface(id: surfaceID, mode: .readOnly, cols: 1, rows: 1)
+                if !capable { XCTFail("legacy client attached to model stream") }
+                if capable {
+                    try await session.sendInput(surfaceID: surfaceID, keys: Data("ignored\n".utf8))
+                    // Same connection round trip is a processing barrier, not a sleep.
+                    _ = try await session.listSurfaces()
+                    let count = await provider.inputs
+                    XCTAssertEqual(count, 0)
+                }
+            } catch { if capable { throw error } }
+            try await session.sendGoodbye(reason: "test done")
+            await transport.close()
+        }
+    }
+
     func testTerminateMissingSurfaceReturnsCorrelatedIdempotentNotFound() async throws {
         let sockPath = "/tmp/tm-peer-terminate-missing-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }

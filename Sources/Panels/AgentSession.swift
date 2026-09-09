@@ -1,4 +1,5 @@
 import Foundation
+import PeerProto
 import Combine
 
 struct AgentEnvironmentSummary: Equatable, Sendable {
@@ -483,7 +484,7 @@ final class AgentSession {
     /// are identical on the wire — deliberately, so the agent cannot treat
     /// them differently — so the distinction is kept here, where it is only a
     /// label.
-    enum Speaker: Equatable {
+    enum Speaker: Equatable, Codable, Sendable {
         case leader
         case person
     }
@@ -493,7 +494,7 @@ final class AgentSession {
         case error
     }
 
-    enum Entry: Identifiable, Equatable {
+    enum Entry: Identifiable, Equatable, Codable, Sendable {
         case said(id: UUID, Speaker, String)
         case answered(id: UUID, String)
         case thought(id: UUID, String?)
@@ -510,7 +511,7 @@ final class AgentSession {
         }
     }
 
-    struct ToolCall: Equatable {
+    struct ToolCall: Equatable, Codable, Sendable {
         let name: String
         let headline: String
         /// What this call did to a file, when it did something to a file.
@@ -530,7 +531,7 @@ final class AgentSession {
         var canExpand: Bool { change != nil || result?.isEmpty == false }
     }
 
-    struct TurnEnd: Equatable {
+    struct TurnEnd: Equatable, Codable, Sendable {
         let stop: String
         let failed: Bool
         let cost: Double?
@@ -623,7 +624,7 @@ final class AgentSession {
     /// them this header — 83% of the most-read element on screen was protocol.
     /// And the app was already parsing it to close the task, so it was being
     /// shown raw *and* read structurally. Only one of those is necessary.
-    struct Verdict: Equatable {
+    struct Verdict: Equatable, Codable, Sendable {
         var status: String
         var files: String
         var verify: String
@@ -737,6 +738,112 @@ final class AgentSession {
                            taskId: taskId, full: text)
     }
 
+    // MARK: - Live GUI presentation (never transfers process ownership)
+
+    struct LiveState: Codable, Equatable, Sendable {
+        var generation: UUID
+        var entries: [Entry]
+        var running: Bool
+        var thinking: Bool
+        var interruptible: Bool
+        var streaming: Set<UUID>
+        var summary: String?
+        var model: String
+        var usage: AgentUsageSnapshot?
+    }
+
+    @ObservationIgnored private var liveGeneration = UUID()
+    @ObservationIgnored private var liveSubscribers: [UUID: AsyncStream<LiveState>.Continuation] = [:]
+    @ObservationIgnored private var livePublishScheduled = false
+    @ObservationIgnored private(set) var receivesLivePresentation = false
+    @ObservationIgnored private var liveReceivedRevision: UInt64 = 0
+
+    private func liveState() -> LiveState {
+        LiveState(generation: liveGeneration, entries: entries,
+                  running: isRunning, thinking: isThinking, interruptible: canInterrupt,
+                  streaming: streamingIds, summary: summary, model: modelName, usage: usage)
+    }
+
+    private func publishLivePresentation() {
+        guard !liveSubscribers.isEmpty, !livePublishScheduled else { return }
+        livePublishScheduled = true
+        // Coalesce model mutations, independent of visibility/SwiftUI rows.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.livePublishScheduled = false
+            let state = self.liveState()
+            for subscriber in self.liveSubscribers.values { subscriber.yield(state) }
+        }
+    }
+
+    func subscribeLivePresentation() -> (UUID, AsyncStream<LiveState>) {
+        let id = UUID()
+        let pair = AsyncStream<LiveState>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        liveSubscribers[id] = pair.continuation
+        // Registration and the initial snapshot share the MainActor boundary.
+        pair.continuation.yield(liveState())
+        return (id, pair.stream)
+    }
+
+    func unsubscribeLivePresentation(_ id: UUID) {
+        liveSubscribers.removeValue(forKey: id)?.finish()
+    }
+
+    func endLivePresentation() {
+        var final = liveState()
+        final.running = false
+        final.thinking = false
+        final.interruptible = false
+        for subscriber in liveSubscribers.values {
+            subscriber.yield(final)
+            subscriber.finish()
+        }
+        liveSubscribers.removeAll()
+    }
+
+    @discardableResult
+    func acceptLivePresentation(_ frame: AgentLiveFrame) -> Bool {
+        guard receivesLivePresentation else { return false }
+        if !frame.full {
+            guard frame.state.generation == liveGeneration,
+                  frame.baseRevision == liveReceivedRevision else { return false }
+        }
+        guard frame.full || frame.revision > liveReceivedRevision else { return false }
+        var indexed = frame.full ? [:] : Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
+        for entry in frame.state.entries { indexed[entry.id] = entry }
+        guard Set(frame.order).count == frame.order.count,
+              frame.order.count <= Self.maxEntries,
+              frame.order.allSatisfy({ indexed[$0] != nil }) else { return false }
+        withEntryTransaction {
+            liveGeneration = frame.state.generation
+            entries = frame.order.compactMap { indexed[$0] }
+            isRunning = frame.state.running
+            isThinking = frame.state.thinking
+            canInterrupt = frame.state.interruptible
+            streamingIds = frame.state.streaming
+            summary = frame.state.summary
+            modelName = frame.state.model
+            usage = frame.state.usage
+            liveReceivedRevision = frame.revision
+        }
+        return true
+    }
+
+    func prepareLivePresentation() {
+        receivesLivePresentation = true
+        liveReceivedRevision = 0
+        isRunning = false
+        // A viewer must not independently time out or complete the owner's turn.
+        cancelStartupWatchdog()
+        cancelExtendedSilenceWatchdog()
+    }
+
+    func livePresentationDisconnected() {
+        guard receivesLivePresentation else { return }
+        isRunning = false
+        canInterrupt = false
+    }
+
     // MARK: - State
 
     /// The model's own history, deliberately outside observation.
@@ -804,7 +911,10 @@ final class AgentSession {
         mutationDepth += 1
         body()
         mutationDepth -= 1
-        if mutationDepth == 0, entriesDirty { publishEntries() }
+        if mutationDepth == 0 {
+            publishEntries()
+            publishLivePresentation()
+        }
     }
 
     private func publishEntries() {
@@ -1356,16 +1466,19 @@ final class AgentSession {
     private func setThinking(_ value: Bool) {
         guard isThinking != value else { return }
         isThinking = value
+        publishLivePresentation()
     }
 
     private func setRunning(_ value: Bool) {
         guard isRunning != value else { return }
         isRunning = value
+        publishLivePresentation()
     }
 
     private func setCanInterrupt(_ value: Bool) {
         guard canInterrupt != value else { return }
         canInterrupt = value
+        publishLivePresentation()
     }
 
     private func setExtendedSilence(_ value: Bool) {
@@ -1997,6 +2110,7 @@ final class AgentSession {
 
     func start(_ launch: Launch) {
         guard process == nil, remoteSink == nil else { return }
+        liveGeneration = UUID()
         stderrDiagnostic = nil
         streamDiagnostic = nil
         launchedTeamIdentity = launch.environment.filter {
@@ -2496,6 +2610,11 @@ final class AgentSession {
         receipt: (@MainActor (SendDisposition) -> Void)? = nil
     ) throws -> Int {
         guard isRunning else { throw SendError.notRunning }
+        if receivesLivePresentation {
+            let payload = try Self.encode(text: text)
+            try writeToTransport(payload)
+            return payload.count
+        }
         // Native turns report completion from their result event. Peer-proxied
         // worktree delegates can bypass deliverNatively(), so strip terminal
         // completion instructions again at the final stdin boundary.
@@ -2654,6 +2773,7 @@ final class AgentSession {
     /// diagnostics, so it renders identically and needs no dedicated view.
     func appendLocalNotice(_ text: String) {
         append(.notice(id: UUID(), text))
+        publishLivePresentation()
     }
 
     /// Stop the turn in flight, keeping the session.
@@ -3452,4 +3572,156 @@ final class AgentSession {
     /// The process going away.
     func finishForTesting(code: Int32) { finishAfterDrain(code: code) }
     #endif
+}
+
+/// Versioned model projection, not CLI input/output. This stream is negotiated
+/// exclusively by agent.presentation.v1; a terminal client must never attach it.
+struct AgentLiveFrame: Codable, Sendable {
+    var full: Bool
+    var baseRevision: UInt64
+    var revision: UInt64
+    var order: [UUID]
+    var state: AgentSession.LiveState
+}
+
+private struct AgentLivePacket: Codable {
+    var begin: Bool
+    var end: Bool
+    var payload: Data
+}
+
+/// AsyncStream unfolding supplies backpressure: only the latest pending MODEL
+/// is retained, while a frame already in flight is delivered in its entirety.
+/// The single stream consumer serializes next(); encoding never runs on main.
+final class AgentLiveEncoder: @unchecked Sendable {
+    private var iterator: AsyncStream<AgentSession.LiveState>.Iterator
+    private var previous: AgentSession.LiveState?
+    private var revision: UInt64 = 0
+    private var bytes = Data()
+    private var offset = 0
+    private var seq: UInt64 = 0
+
+    init(_ stream: AsyncStream<AgentSession.LiveState>) { iterator = stream.makeAsyncIterator() }
+
+    func next() async -> PtyTapChunk? {
+        if offset >= bytes.count {
+            while let state = await iterator.next() {
+                if state == previous { continue }
+                let full = previous?.generation != state.generation
+                let old = full ? [:] : Dictionary(uniqueKeysWithValues: (previous?.entries ?? []).map { ($0.id, $0) })
+                var delta = state
+                delta.entries = state.entries.filter { old[$0.id] != $0 }
+                let frame = AgentLiveFrame(full: full, baseRevision: revision,
+                                           revision: revision + 1,
+                                           order: state.entries.map(\.id), state: delta)
+                guard let encoded = try? JSONEncoder().encode(frame) else { return nil }
+                bytes = encoded
+                offset = 0
+                revision += 1
+                previous = state
+                break
+            }
+            if offset >= bytes.count { return nil }
+        }
+        let end = min(bytes.count, offset + 32_768)
+        let packet = AgentLivePacket(begin: offset == 0, end: end == bytes.count,
+                                     payload: bytes.subdata(in: offset..<end))
+        guard var encoded = try? JSONEncoder().encode(packet) else { return nil }
+        encoded.append(10)
+        offset = end
+        let chunk = PtyTapChunk(bytes: encoded, seq: seq)
+        seq += UInt64(encoded.count)
+        return chunk
+    }
+}
+
+/// Decodes complete frames off-main; partial snapshots never change the model.
+final class AgentLiveDecoder: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.termmesh.agent-live.decode")
+    private let decoder = AgentStreamDecoder(maxLineBytes: 65_536)
+    private var pending = Data()
+    private var assembling = false
+    private var active = true
+    private let receive: @Sendable (AgentLiveFrame) -> Void
+    private let invalid: @Sendable () -> Void
+
+    init(invalid: @escaping @Sendable () -> Void = {},
+         receive: @escaping @Sendable (AgentLiveFrame) -> Void) {
+        self.receive = receive
+        self.invalid = invalid
+    }
+
+    private func fail() {
+        active = false
+        pending.removeAll()
+        invalid()
+    }
+
+    func stop() { queue.async { self.active = false; self.pending.removeAll() } }
+
+    func consume(_ data: Data) {
+        queue.async {
+            guard self.active else { return }
+            for output in self.decoder.consume(data) {
+                guard case .line(let line) = output,
+                      let packet = try? JSONDecoder().decode(AgentLivePacket.self, from: Data(line.utf8)) else {
+                    self.fail()
+                    return
+                }
+                if packet.begin { self.pending.removeAll(keepingCapacity: true); self.assembling = true }
+                guard self.assembling else { continue }
+                guard self.pending.count + packet.payload.count <= 64 * 1024 * 1024 else {
+                    self.fail()
+                    return
+                }
+                self.pending.append(packet.payload)
+                if packet.end {
+                    if let frame = try? JSONDecoder().decode(AgentLiveFrame.self, from: self.pending) {
+                        self.receive(frame)
+                    } else { self.fail(); return }
+                    self.pending.removeAll(keepingCapacity: true)
+                    self.assembling = false
+                }
+            }
+        }
+    }
+}
+
+/// Per-attachment framing keeps one viewer's partial input from joining another
+/// viewer's input. Only existing native composer operations cross this boundary.
+final class AgentLiveInput: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.termmesh.agent-live.input")
+    private let decoder = AgentStreamDecoder(maxLineBytes: 65_536)
+    private weak var session: AgentSession?
+    private let lock = NSLock()
+    private var active = true
+
+    func stop() { lock.lock(); active = false; lock.unlock() }
+    private var isActive: Bool { lock.lock(); defer { lock.unlock() }; return active }
+
+    init(_ session: AgentSession) { self.session = session }
+
+    func consume(_ data: Data) {
+        queue.async {
+            for output in self.decoder.consume(data) {
+                guard case .line(let line) = output,
+                      let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+                else { continue }
+                let type = object["type"] as? String
+                let text = (object["message"] as? [String: Any])?["content"] as? String
+                let interrupt = (object["request"] as? [String: Any])?["subtype"] as? String == "interrupt"
+                var fields: [String: String] = [:]
+                for key in ["model", "effort"] {
+                    if let value = object[key] as? String { fields[key] = value }
+                }
+                let controlFields = fields
+                DispatchQueue.main.async { [weak self, weak session = self.session] in
+                    guard self?.isActive == true, let session, !session.receivesLivePresentation else { return }
+                    if type == "user", let text { _ = try? session.send(text, from: .person) }
+                    else if type == "control_request", interrupt { session.interrupt() }
+                    else if type == "control" { _ = session.sendControlOverride(controlFields) }
+                }
+            }
+        }
+    }
 }

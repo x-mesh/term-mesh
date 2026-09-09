@@ -499,6 +499,8 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
 
     // MARK: PeerSurfaceProvider
 
+    func supportsLivePresentation() async -> Bool { true }
+
     func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] {
         // Background panes have a lazy `ghostty_surface_t` — newly opened
         // splits / non-active tabs may not have one yet. Kick lazy init
@@ -539,6 +541,44 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                 wire.projectRoot = team.gitRepoRoot ?? ""
                 wire.agentNames = team.agents.map(\.name)
                 wire.createdAtUnixSecs = UInt64(max(0, team.createdAt.timeIntervalSince1970))
+                if case .local = team.leaderEndpoint,
+                   !wire.teamUuid.isEmpty,
+                   let workspace = AppDelegate.shared?.tabManagerFor(tabId: team.leaderWorkspaceId ?? team.workspaceId)?
+                    .tabs.first(where: { $0.id == (team.leaderWorkspaceId ?? team.workspaceId) }),
+                   let leader = workspace.panels[team.leaderPanelId] as? TerminalPanel,
+                   !leader.isRemoteOrigin {
+                    wire.projectID = "team:\(wire.teamUuid)"
+                    wire.liveWorkspaceID = withUnsafeBytes(of: workspace.id.uuid) { Data($0) }
+                    wire.leaderSurfaceID = surfaceIDBytes(leader.surface.id)
+                    wire.leaderCli = team.leaderCli ?? team.leaderMode
+                    wire.leaderModel = team.leaderModel
+                    wire.presentationRevision = 1
+                    wire.members = team.agents.map { agent in
+                        var member = Termmesh_Peer_V1_TeamMember()
+                        member.name = agent.name
+                        member.agentInstanceID = agent.agentInstanceId
+                        member.cli = agent.cli
+                        member.model = agent.model
+                        member.agentType = agent.agentType
+                        member.color = agent.color
+                        member.workingDirectory = agent.originalAgentWorkDir ?? team.workingDirectory
+                        if let id = agent.panelId,
+                           let owner = AppDelegate.shared?.tabManagerFor(tabId: agent.workspaceId)?
+                            .tabs.first(where: { $0.id == agent.workspaceId }) {
+                            if let native = owner.panels[id] as? AgentPanel,
+                               !native.session.receivesLivePresentation,
+                               owner.remoteAgentPaneSessions[id] == nil {
+                                member.surfaceID = surfaceIDBytes(native.id)
+                                member.surfaceType = "agent"
+                            } else if let terminal = owner.panels[id] as? TerminalPanel,
+                                      !terminal.isRemoteOrigin {
+                                member.surfaceID = surfaceIDBytes(terminal.surface.id)
+                                member.surfaceType = "terminal"
+                            }
+                        }
+                        return member
+                    }
+                }
                 return wire
             }
         }
@@ -799,6 +839,26 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         clientRows: UInt32,
         resumeFromSeq: UInt64
     ) async -> PeerSurfaceAttachment? {
+        for ctx in allWindowContexts() {
+            for workspace in ctx.tabManager.tabs {
+                if let native = workspace.panels.values.compactMap({ $0 as? AgentPanel }).first(where: {
+                    surfaceIDBytes($0.id) == surfaceID && !$0.session.receivesLivePresentation
+                        && workspace.remoteAgentPaneSessions[$0.id] == nil
+                }) {
+                    let (id, states) = native.session.subscribeLivePresentation()
+                    let encoder = AgentLiveEncoder(states)
+                    let input = AgentLiveInput(native.session)
+                    return PeerSurfaceAttachment(
+                        byteStream: AsyncStream(unfolding: { await encoder.next() }),
+                        input: { data in input.consume(data) },
+                        detach: { [weak session = native.session] in
+                            input.stop()
+                            await session?.unsubscribeLivePresentation(id)
+                        }
+                    )
+                }
+            }
+        }
         guard let (sfcPtr, ts) = findSurface(id: surfaceID)
         else { return nil }
 
@@ -1745,6 +1805,19 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         for ctx in allWindowContexts() {
             for workspace in ctx.tabManager.tabs {
                 for (_, panel) in workspace.panels {
+                    if let native = panel as? AgentPanel,
+                       !native.session.receivesLivePresentation,
+                       workspace.remoteAgentPaneSessions[native.id] == nil {
+                        var info = Termmesh_Peer_V1_SurfaceInfo()
+                        info.surfaceID = surfaceIDBytes(native.id)
+                        info.title = native.title
+                        info.surfaceType = "agent"
+                        info.agentCli = native.cli
+                        info.attachable = true
+                        info.cwd = native.workingDirectory
+                        result.append(info)
+                        continue
+                    }
                     guard let terminal = panel as? TerminalPanel,
                           !terminal.isRemoteOrigin else { continue }
                     let ts = terminal.surface

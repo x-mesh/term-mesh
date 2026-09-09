@@ -9,12 +9,14 @@ import Combine
 /// and Live Activity log have gone away.
 enum AgentRuntimeOwnership: Equatable {
     case local
+    case guiOwned(hostName: String)
     case sshOwned(hostName: String)
     case peerOwned(hostName: String)
 
     var badgeTitle: String? {
         switch self {
         case .local: return nil
+        case .guiOwned: return "App-owned"
         case .sshOwned: return "SSH-owned"
         case .peerOwned: return "Host-owned"
         }
@@ -24,6 +26,8 @@ enum AgentRuntimeOwnership: Equatable {
         switch self {
         case .local:
             return nil
+        case .guiOwned(let hostName):
+            return "Runs in term-mesh on \(hostName) · Available while that app is running"
         case .sshOwned(let hostName):
             return "SSH-owned on \(hostName) · Stops when term-mesh on this Mac quits"
         case .peerOwned(let hostName):
@@ -182,6 +186,7 @@ final class AgentPanel: ObservableObject, Panel {
         onClose?()
         onClose = nil
         session.stop()
+        session.endLivePresentation()
     }
 
     func focus() { focusRequest?() }
