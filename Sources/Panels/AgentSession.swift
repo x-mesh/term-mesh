@@ -451,7 +451,7 @@ final class AgentSession {
     /// standing: a window does not empty because one turn failed before the
     /// model saw anything.
     private func recordUsage(
-        _ usage: [String: Any], window: Int?, at completedAt: Date
+        _ usage: [String: Any], window: Int?, fraction: Double?, at completedAt: Date
     ) {
         func count(_ key: String) -> UInt64 {
             guard let value = usage[key] as? Int, value > 0 else { return 0 }
@@ -461,7 +461,9 @@ final class AgentSession {
         let cacheRead = count("cache_read_input_tokens")
         let cacheCreation = count("cache_creation_input_tokens")
         let occupancy = input &+ cacheRead &+ cacheCreation
-        guard occupancy > 0 else { return }
+        // kiro states a fraction and no counts at all, so an empty usage
+        // object is still a reading when one came with it.
+        guard occupancy > 0 || fraction != nil else { return }
         self.usage = AgentUsageSnapshot(
             inputTokens: input,
             outputTokens: count("output_tokens"),
@@ -469,7 +471,8 @@ final class AgentSession {
             cacheCreationTokens: cacheCreation,
             updatedAt: completedAt,
             model: modelName,
-            contextTokens: occupancy,
+            contextTokens: occupancy > 0 ? occupancy : nil,
+            contextFraction: fraction,
             contextWindow: window
         )
     }
@@ -3016,7 +3019,12 @@ final class AgentSession {
         )
         // A bridged CLI states its own window; claude does not, and falls back
         // to the model table.
-        recordUsage(usage, window: o["context_window"] as? Int, at: completedAt)
+        recordUsage(
+            usage,
+            window: o["context_window"] as? Int,
+            fraction: o["context_fraction"] as? Double,
+            at: completedAt
+        )
         // The header moves out of the prose and into the turn, where it is a
         // value the footer can render as a verdict. Shown raw *and* parsed was
         // paying for the same five lines twice.

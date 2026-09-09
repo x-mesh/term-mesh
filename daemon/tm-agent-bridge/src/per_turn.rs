@@ -445,7 +445,23 @@ impl PerTurnBridge {
     /// sit open; but nothing was said, so it cannot be called a success. The
     /// reasoning is not promoted into the answer — inventing one from what the
     /// model was thinking is worse than saying nothing was said.
-    fn cursor_result(&mut self, obj: Value) {
+    fn cursor_result(&mut self, mut obj: Value) {
+        // The one place cursor is *not* already claude's shape: it names its
+        // usage in camelCase where claude uses snake_case, so the reader that
+        // serves every other CLI found nothing and the pane's context readout
+        // stayed empty. Rename rather than teach it a second spelling.
+        //
+        // cursor states no window, so the percentage falls back to the model
+        // table and a model it does not list shows a raw count instead.
+        if let Some(usage) = obj.get("usage").cloned() {
+            let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+            obj["usage"] = json!({
+                "input_tokens": field("inputTokens"),
+                "cache_read_input_tokens": field("cacheReadTokens"),
+                "cache_creation_input_tokens": field("cacheWriteTokens"),
+                "output_tokens": field("outputTokens"),
+            });
+        }
         let said = obj
             .get("result")
             .and_then(Value::as_str)

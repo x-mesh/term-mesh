@@ -21,6 +21,11 @@ struct AgentUsageSnapshot: Equatable {
     /// when the source cannot report a non-cumulative value.
     var contextTokens: UInt64? = nil
 
+    /// Occupancy as a fraction, when the source states that and nothing else.
+    /// kiro reports `contextUsagePercentage` and never a token count, so there
+    /// is no numerator to divide and this is the whole answer.
+    var contextFraction: Double? = nil
+
     /// The window this model was given, when the source states it outright.
     /// Codex reports `modelContextWindow` with every usage update, which is
     /// better than a table of model names: it cannot go stale, and it is right
@@ -35,6 +40,7 @@ struct AgentUsageSnapshot: Equatable {
         updatedAt: .distantPast,
         model: "",
         contextTokens: nil,
+        contextFraction: nil,
         contextWindow: nil
     )
 
@@ -48,6 +54,7 @@ struct AgentUsageSnapshot: Equatable {
     /// Context-window usage as a fraction of the model's limit. Nil when
     /// either the current occupancy or the model's limit is unknown.
     var contextUsageFraction: Double? {
+        if let contextFraction { return contextFraction }
         guard let contextTokens else { return nil }
         // A stated window wins over a looked-up one: it came from the CLI that
         // is running the model, not from a table this build shipped with.

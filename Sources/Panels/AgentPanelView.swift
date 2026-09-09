@@ -175,27 +175,29 @@ struct AgentPanelView: View {
                     .truncationMode(.tail)
                     .layoutPriority(-1)
             }
-            // Hidden entirely (not a blank placeholder) unless the daemon can
-            // report current context occupancy for this CLI — Codex cannot
-            // (see UsageTickAgent.context_tokens on the daemon side).
-            if let contextTokens = contextUsage?.contextTokens {
-                if let fraction = contextUsage?.contextUsageFraction {
-                    Text("\(Int((fraction * 100).rounded()))%")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(fraction >= 0.9 ? Color.orange : Color.secondary)
-                        .fixedSize()
-                        .help("Context window: \(contextTokens) tokens used")
-                } else {
-                    // Model unknown to ModelContextLimits — show the raw count
-                    // rather than guess at a limit.
-                    Text(contextTokens >= 1000
-                        ? String(format: "%.1fk ctx", Double(contextTokens) / 1000)
-                        : "\(contextTokens) ctx")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .fixedSize()
-                        .help("Context window: \(contextTokens) tokens used (limit unknown)")
-                }
+            // Hidden entirely rather than shown blank when nothing can report
+            // occupancy for this pane. What can differs by CLI: claude and
+            // codex give token counts, kiro states a percentage outright and
+            // no count at all, and a model no table knows falls back to the
+            // raw number below.
+            if let fraction = contextUsage?.contextUsageFraction {
+                Text("\(Int((fraction * 100).rounded()))%")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(fraction >= 0.9 ? Color.orange : Color.secondary)
+                    .fixedSize()
+                    .help(contextUsage?.contextTokens.map {
+                        "Context window: \($0) tokens used"
+                    } ?? "Context window")
+            } else if let contextTokens = contextUsage?.contextTokens {
+                // A count with no window to divide it by — show it rather than
+                // guess at a limit.
+                Text(contextTokens >= 1000
+                    ? String(format: "%.1fk ctx", Double(contextTokens) / 1000)
+                    : "\(contextTokens) ctx")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+                    .help("Context window: \(contextTokens) tokens used (limit unknown)")
             }
             Spacer(minLength: 4)
             if !session.isRunning {

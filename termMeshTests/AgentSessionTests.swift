@@ -833,6 +833,19 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(s.streamingIds.contains(id))
     }
 
+    /// kiro reports occupancy as a percentage and no token count at all, so
+    /// there is nothing to divide. The reading is still real and the header
+    /// still has a number to show.
+    func testAStatedFractionIsAReadingWithoutAnyTokenCount() throws {
+        let s = session([
+            event(["type": "system", "subtype": "init", "model": "kiro-default"]),
+            event(["type": "result", "stop_reason": "end_turn",
+                   "context_fraction": 0.166722]),
+        ])
+        let usage = try XCTUnwrap(s.usage)
+        XCTAssertNil(usage.contextTokens)
+        XCTAssertEqual(try XCTUnwrap(usage.contextUsageFraction), 0.166722, accuracy: 1e-6)
+    }
     /// A bridged CLI states the window it was given. Codex sends
     /// `modelContextWindow` with every usage update, and that beats a table
     /// this build shipped with: it cannot go stale, and it is right for a
