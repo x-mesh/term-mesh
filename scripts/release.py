@@ -74,9 +74,12 @@ def run(
 ) -> str:
     if args and args[0] not in {"git", "grep", "shasum"}:
         print(f"[release] run: {' '.join(args)}", file=sys.stderr, flush=True)
-    proc = subprocess.run(
-        args, cwd=cwd, input=input_text, text=True, capture_output=True, check=False
-    )
+    try:
+        proc = subprocess.run(
+            args, cwd=cwd, input=input_text, text=True, capture_output=True, check=False
+        )
+    except FileNotFoundError:
+        raise ReleaseError(f"{args[0]} was not found on PATH") from None
     if check and proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip()
         if len(detail) > 12000:
@@ -87,6 +90,16 @@ def run(
 
 def git(*args: str, cwd: Path = ROOT) -> str:
     return run("git", *args, cwd=cwd)
+
+
+def cargo_path() -> str:
+    found = shutil.which("cargo")
+    if found:
+        return found
+    home_cargo = Path.home() / ".cargo/bin/cargo"
+    if os.access(home_cargo, os.X_OK):
+        return str(home_cargo)
+    raise ReleaseError("cargo was not found on PATH or in ~/.cargo/bin; install Rust or add cargo to PATH")
 
 
 def gk(*args: str, cwd: Path = ROOT, input_text: str | None = None) -> dict[str, Any]:
@@ -1015,7 +1028,7 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         run("bash", "scripts/test-ghostty-kit-guard.sh", cwd=wt)
         run("xcodebuild", "-project", "GhosttyTabs.xcodeproj", "-scheme", "term-mesh",
             "-configuration", "Debug", "-destination", "platform=macOS", "build", cwd=wt)
-        run("cargo", "build", "--release", cwd=wt / "daemon")
+        run(cargo_path(), "build", "--release", cwd=wt / "daemon")
         run("git", "diff", "--check", cwd=wt)
         gk("push", cwd=wt)
         mark(state, "release_metadata", branch=state["release_branch"], commit=git("-C", str(wt), "rev-parse", "HEAD"), worktree=str(wt))
