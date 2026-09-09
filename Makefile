@@ -420,8 +420,16 @@ install-commands:
 	done
 	@echo "==> Claude commands installed (tm, team, team-up, tm-op, tm-bench, watch, release, rc)"
 
-clean: require-cargo
+# Not guarded by `require-cargo`: removing build output is a reasonable thing
+# to want on a machine that has no toolchain, and `rm -rf` does not need one.
+# Only the daemon's own tree does, so say what was left rather than refusing
+# to clean anything.
+clean:
 	@echo "==> Cleaning build artifacts..."
 	@rm -rf "$(DERIVED_DATA)" /tmp/term-mesh-prod
-	@cd daemon && $(CARGO) clean
+	@if [ -n "$(CARGO)" ]; then \
+		cd daemon && $(CARGO) clean; \
+	else \
+		echo "==> cargo not found; daemon/target left in place"; \
+	fi
 	@echo "==> Clean complete"
