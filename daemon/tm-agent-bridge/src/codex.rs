@@ -801,6 +801,34 @@ mod tests {
         assert_eq!(result["context_window"], 950_000);
     }
 
+    /// codex can report usage more than once in a turn. The last reading is
+    /// the one that describes the window now.
+    #[test]
+    fn the_last_usage_reading_of_a_turn_is_the_one_reported() {
+        let (mut b, sink) = bridge(vec![
+            json!({"id": 1, "result": {}}),
+            json!({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {
+                "last": {"inputTokens": 100, "cachedInputTokens": 0,
+                         "cacheWriteInputTokens": 0, "outputTokens": 1},
+                "modelContextWindow": 200_000}}}),
+            json!({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {
+                "last": {"inputTokens": 40_000, "cachedInputTokens": 5,
+                         "cacheWriteInputTokens": 0, "outputTokens": 9},
+                "modelContextWindow": 950_000}}}),
+            json!({"method": "item/completed",
+                   "params": {"item": {"type": "agentMessage", "text": "ok"}}}),
+            json!({"method": "turn/completed",
+                   "params": {"turn": {"status": "completed"}}}),
+        ]);
+
+        b.turn("say it", Some(Duration::from_secs(2)));
+
+        let result = last_result(&sink);
+        assert_eq!(result["usage"]["input_tokens"], 40_000);
+        assert_eq!(result["usage"]["cache_read_input_tokens"], 5);
+        assert_eq!(result["context_window"], 950_000);
+    }
+
     /// A turn with no usage notification must not invent one: the reader
     /// treats a missing key as "this CLI does not report it".
     #[test]

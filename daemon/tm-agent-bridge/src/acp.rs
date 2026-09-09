@@ -111,7 +111,11 @@ impl<T: Transport> AcpBridge<T> {
                     .and_then(|p| p.get("contextUsagePercentage"))
                     .and_then(Value::as_f64)
                 {
-                    if percent.is_finite() && percent >= 0.0 {
+                    // Out of range is not a fuller window, it is a figure
+                    // that cannot be trusted — and a wrong percentage reads
+                    // exactly like a right one. Showing nothing is the honest
+                    // answer, the same one an unlisted model gets.
+                    if percent.is_finite() && (0.0..=100.0).contains(&percent) {
                         seen_percent = Some(percent / 100.0);
                     }
                 }
@@ -285,6 +289,28 @@ mod tests {
         let result = last_result(&sink);
         let fraction = result["context_fraction"].as_f64().expect("a fraction");
         assert!((fraction - 0.166722).abs() < 1e-6, "got {fraction}");
+    }
+
+    /// Out of range is not a fuller window, it is a figure that cannot be
+    /// trusted — and 150% reads exactly like a real reading.
+    #[test]
+    fn a_percentage_outside_its_range_is_refused() {
+        for percent in [150.0, -1.0] {
+            let (mut b, sink) = bridge(vec![
+                update(json!({"sessionUpdate": "agent_message_chunk",
+                              "content": {"type": "text", "text": "ok"}})),
+                json!({"method": "_kiro.dev/metadata",
+                       "params": {"sessionId": "s", "contextUsagePercentage": percent}}),
+                json!({"id": 1, "result": {"stopReason": "end_turn"}}),
+            ]);
+
+            b.turn("say it", Some(Duration::from_secs(2)));
+
+            assert!(
+                last_result(&sink).get("context_fraction").is_none(),
+                "{percent} should have been refused"
+            );
+        }
     }
 
     /// A CLI on this path that states nothing must not gain a key: the reader
