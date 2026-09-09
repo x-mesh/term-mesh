@@ -4,6 +4,26 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.236.0] - 2026-09-09
+
+### Added
+
+- Pick a model or an effort level from a list instead of typing its name. In a native agent pane, `/model ` and `/effort ` now offer the values the pane's CLI accepts, narrowing as you type; Return or a click completes the line. The space that used to dismiss the palette is what brings the values up. Commands that take no argument, such as `/cost` and `/help`, still suggest nothing.
+
+### Fixed
+
+- The context readout in a native agent pane works, on every CLI that can report one. It had shown nothing since it shipped: the daemon was its only source, and a native pane has no terminal for the daemon to match it by — and even matched, the daemon reads session files that a native pane never writes. The pane now reads the figures off each turn as it ends. Claude and Codex report token counts (Codex states its own window, so a model no table lists is still a percentage), Kiro states a percentage outright, and Cursor reports counts with no window to divide by, so it shows the raw total. agy reports nothing usable and its pane stays empty rather than guessing.
+- x-kit panel runs appear on the Review Board as soon as they arrive, rather than up to two seconds later. Nothing published when one changed; the board only ever saw them because it rebuilt its whole snapshot on a timer.
+
+### Changed
+
+- The app uses far less CPU while it sits idle. Seven places recomputed the same answer from unchanged input, several of them on a timer: the leader turn log was re-read and JSON-decoded on every ask from three callers, a regular expression was compiled per redacted field, a date formatter was built per timestamp — six per task — a demangled type name and two locale-aware string searches ran per view node, and the Review Board rebuilt its entire snapshot every two seconds to discover that nothing had moved. Measured on an isolated runner with a forty-task board, the board's main-thread cost fell by 91%; on a CPU-time profile of a quiet app, the paths behind it accounted for 62% of main-thread work before the change. Nothing about how any of it works changed — only how often it repeats.
+- `/release` resolves `cargo` from the usual install locations instead of failing with a stack trace when it is not on the release shell's PATH.
+
+### Internal
+
+- `CLAUDE.md` carries the current git-kit contract block.
+
 ## [0.235.0] - 2026-09-09
 
 ### Fixed
