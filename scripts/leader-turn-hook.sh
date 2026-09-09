@@ -60,17 +60,28 @@ LEADER_SESSION_ID="${TERMMESH_LEADER_SESSION_ID:-}"
 if [ -n "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
     && [ -r "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
     && command -v python3 >/dev/null 2>&1; then
-    _turn_control_session="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" <<'TURN_HOOK_IDENTITY' 2>/dev/null || true
+    # A stray or another Project's control file must never redirect this turn's identity.
+    # TERMMESH_LEADER_PROJECT_ID is a display ID (e.g. "team:<uuid>"), not the team
+    # name control payloads use as project_id, so only TERMMESH_TEAM can match it.
+    _turn_control_session="$(python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$TEAM" <<'TURN_HOOK_IDENTITY' 2>/dev/null || true
 import json
-import os
 import sys
 
 try:
     with open(sys.argv[1], "r", encoding="utf-8") as handle:
-        value = json.load(handle).get("session_id")
+        control = json.load(handle)
 except Exception:
-    value = None
-if isinstance(value, str) and value:
+    control = None
+
+value = None
+if isinstance(control, dict):
+    expected = sys.argv[2]
+    project_id = control.get("project_id")
+    if not expected or project_id == expected:
+        session_value = control.get("session_id")
+        if isinstance(session_value, str) and session_value:
+            value = session_value
+if value is not None:
     print(value, end="")
 TURN_HOOK_IDENTITY
 )"
@@ -532,7 +543,9 @@ if [ "$MODE" = --start ] \
     && [ -n "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
     && [ -r "${TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE:-}" ] \
     && command -v python3 >/dev/null 2>&1; then
-    python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" <<'TURN_HOOK_FLOOR' 2>/dev/null || true
+    # TERMMESH_LEADER_PROJECT_ID is a display ID (e.g. "team:<uuid>"), not the team
+    # name control payloads use as project_id, so only TERMMESH_TEAM can match it.
+    python3 - "$TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE" "$TEAM" <<'TURN_HOOK_FLOOR' 2>/dev/null || true
 import json
 import os
 import sys
@@ -544,6 +557,15 @@ except Exception:
     sys.exit(0)
 
 if not isinstance(control, dict) or control.get("kill_switch") is True:
+    sys.exit(0)
+
+# Refuse an unrecognized schema or another Project's control file rather than inject its floor here.
+schema_version = control.get("schema_version")
+if type(schema_version) is not int or schema_version != 1:
+    sys.exit(0)
+
+expected_project = sys.argv[2] if len(sys.argv) > 2 else ""
+if expected_project and control.get("project_id") != expected_project:
     sys.exit(0)
 
 # The per-Project switch for this whole block. Off restores the pre-existing

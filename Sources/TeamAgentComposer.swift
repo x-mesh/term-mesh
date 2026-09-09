@@ -586,7 +586,12 @@ struct TeamAgentComposer: View {
                         .frame(maxWidth: 200, alignment: .leading)
                 }
 
+                // The status must not be the control that yields when the row
+                // runs out of width: without a fixed size SwiftUI squeezed it
+                // to a one-character column and the row grew several times
+                // taller. The folder summary truncates instead.
                 compactStatus(for: agent, hasCustomInstructions: hasCustomInstructions)
+                    .fixedSize()
 
                 Spacer(minLength: 0)
 
