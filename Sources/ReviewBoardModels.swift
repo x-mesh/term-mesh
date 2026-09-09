@@ -1114,7 +1114,35 @@ enum ReviewBoardText {
         return (nil, trimmed)
     }
 
+    /// Redaction is a pure function of the text, and the board re-derives the
+    /// same task strings on every refresh — three redacted fields per task,
+    /// every tick. Profiles on a forty-task board put this and `safeLabel` at
+    /// a third of the board's refresh cost, so remember what each input maps
+    /// to. The table is dropped whole once it outgrows a board's worth of
+    /// strings; hit rate is what matters here, not recency.
     static func safeBody(_ value: String, limit: Int = 240) -> String {
+        let key = RedactionKey(value: value, limit: limit)
+        redactionCacheLock.lock()
+        let hit = redactionCache[key]
+        redactionCacheLock.unlock()
+        if let hit { return hit }
+        let result = computeSafeBody(value, limit: limit)
+        redactionCacheLock.lock()
+        if redactionCache.count >= 1024 { redactionCache.removeAll(keepingCapacity: true) }
+        redactionCache[key] = result
+        redactionCacheLock.unlock()
+        return result
+    }
+
+    private struct RedactionKey: Hashable {
+        let value: String
+        let limit: Int
+    }
+
+    private static let redactionCacheLock = NSLock()
+    private static var redactionCache: [RedactionKey: String] = [:]
+
+    private static func computeSafeBody(_ value: String, limit: Int) -> String {
         var text = value.trimmingCharacters(in: .whitespacesAndNewlines)
         text = replace(uuidRegex, in: text, with: "<uuid>")
         text = replace(longHexRegex, in: text, with: "<token>")

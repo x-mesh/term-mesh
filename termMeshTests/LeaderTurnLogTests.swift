@@ -292,6 +292,35 @@ final class LeaderTurnLogTests: XCTestCase {
         XCTAssertEqual(records[1].policyApplied, nil)
     }
 
+    /// `policyReport` is cached on the log file's identity and keyed by team,
+    /// so a rewrite must be seen and one team's report must never answer for
+    /// another's.
+    func testPolicyReportFollowsTheFileAndScopesByTeam() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let one = """
+        {"event":"turn_route","turn_id":"a","ts":"2026-08-24T00:00:00Z","team":"alpha","actual_route":"direct","suggested_route":"parallel","policy_mode":"shadow","policy_applied":false,"cohort":"shadow"}
+        """ + "\n"
+        try Data(one.utf8).write(to: log)
+        let first = LeaderTurnLog.policyReport(from: log)
+        XCTAssertEqual(first.suggestedTurns, 1)
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log), first)
+
+        // A team with no records must not be handed the whole-file report.
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log, team: "beta").suggestedTurns, 0)
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log, team: "alpha").suggestedTurns, 1)
+
+        let two = one + """
+        {"event":"turn_route","turn_id":"b","ts":"2026-08-24T00:00:01Z","team":"alpha","actual_route":"parallel","suggested_route":"parallel","policy_mode":"canary","policy_applied":true,"cohort":"canary"}
+        """ + "\n"
+        try Data(two.utf8).write(to: log)
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log).suggestedTurns, 2)
+
+        try FileManager.default.removeItem(at: log)
+        XCTAssertEqual(LeaderTurnLog.policyReport(from: log).suggestedTurns, 0)
+    }
     func testPolicyReportSeparatesCohortsAppliedAndSuggestedDeviation() throws {
         let log = try temporaryLog()
         try FileManager.default.createDirectory(

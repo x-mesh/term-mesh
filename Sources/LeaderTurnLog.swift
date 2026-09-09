@@ -785,6 +785,7 @@ enum LeaderTurnLog {
     private static var healthCache: (stamp: LogFileStamp, value: FileDerivedHealth)?
     private static var recordCache: (stamp: LogFileStamp, records: [Record])?
     private static var recentCache: (stamp: LogFileStamp, entries: [RecentKey: [Record]])?
+    private static var policyCache: (stamp: LogFileStamp, entries: [String: PolicyReport])?
 
     /// Decoding the whole append-only history is the dominant main-thread cost
     /// of `fleet.state`, `team.status` and the dashboard's three-second tick.
@@ -998,7 +999,36 @@ enum LeaderTurnLog {
         value.lowercased().filter { $0.isASCII && $0.isHexDigit }
     }
 
+    /// `fleet.state` asks for this on the Review Board's beat, and the report
+    /// walks the whole history three times plus several set builds. Caching the
+    /// decoded records removed the parse but left that aggregate repeating on
+    /// every tick, where profiles put it at 42% of the board's refresh. Key the
+    /// finished report on the file's identity, as `health` does.
     static func policyReport(from logFile: URL = logFile, team: String? = nil) -> PolicyReport {
+        let path = logFile.path
+        let key = team ?? ""
+        let stamp = LogFileStamp(path: path)
+        if let stamp {
+            logCacheLock.lock()
+            let cached = policyCache
+            logCacheLock.unlock()
+            if let cached, cached.stamp == stamp, let hit = cached.entries[key] { return hit }
+        }
+        let report = computePolicyReport(from: logFile, team: team)
+        if let stamp, let after = LogFileStamp(path: path), after == stamp {
+            logCacheLock.lock()
+            if var current = policyCache, current.stamp == stamp {
+                current.entries[key] = report
+                policyCache = current
+            } else {
+                policyCache = (stamp, [key: report])
+            }
+            logCacheLock.unlock()
+        }
+        return report
+    }
+
+    private static func computePolicyReport(from logFile: URL, team: String?) -> PolicyReport {
         let records = readAll(from: logFile).filter { record in
             guard let team else { return true }
             return record.team == team
