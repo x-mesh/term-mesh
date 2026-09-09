@@ -7,6 +7,26 @@ import XCTest
 #endif
 
 final class ReviewBoardViewModelTests: XCTestCase {
+    /// x-kit panel runs are part of what the board's snapshot reads, so a run
+    /// arriving has to publish like every other change. Without this the board
+    /// saw new runs only because its timer rebuilt the whole snapshot.
+    @MainActor
+    func testPanelRunIngestPublishesABoardChange() {
+        let store = TeamDataStore.shared
+        let before = store.taskRevision
+        store.ingestXkPanelRun(payload: [
+            "v": 1,
+            "run": "probe-\(UUID().uuidString)",
+            "source": "test",
+            "model": "m1",
+            "state": "running",
+        ])
+        let settled = expectation(description: "revision bump reaches the main queue")
+        DispatchQueue.main.async { settled.fulfill() }
+        wait(for: [settled], timeout: 5)
+        XCTAssertGreaterThan(store.taskRevision, before)
+    }
+
     @MainActor
     func testActiveTasksByAssigneeUsesNewestNonterminalTaskAndKeepsTieOrder() {
         func task(

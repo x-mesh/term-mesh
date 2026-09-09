@@ -71,7 +71,16 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     @Published private(set) var taskRevision: Int = 0
 
     /// Safe to call with the store's lock held: the bump is dispatched.
-    func noteTasksChanged() {
+    func noteTasksChanged() { noteBoardDataChanged() }
+
+    /// Anything the Review Board's snapshot reads, which is more than tasks:
+    /// x-kit panel runs live in this store too and had no signal at all. The
+    /// board only ever saw them because its two-second tick rebuilt the whole
+    /// snapshot — so one rarely-changing collection was keeping a full rebuild
+    /// on a timer for everything else.
+    ///
+    /// Safe to call with the store's lock held: the bump is dispatched.
+    func noteBoardDataChanged() {
         DispatchQueue.main.async { [weak self] in
             self?.taskRevision &+= 1
         }
@@ -2335,6 +2344,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         updated.updatedAt = now
         xkPanelRuns[run] = updated
         pruneXkPanelRunsUnsafe(now: now)
+        noteBoardDataChanged()
     }
 
     /// Caller holds `lock`.
