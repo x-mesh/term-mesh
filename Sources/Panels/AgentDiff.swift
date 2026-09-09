@@ -17,7 +17,7 @@ import Foundation
 enum AgentDiff {
 
     /// What one tool call did to one file.
-    struct Change: Equatable {
+    struct Change: Equatable, Codable, Sendable {
         /// The path as the tool named it. Shortened for display, never here: a
         /// row is a view's problem and a path is the model's fact.
         var path: String
@@ -36,7 +36,7 @@ enum AgentDiff {
         var everywhere: Bool
     }
 
-    enum Kind: Equatable {
+    enum Kind: Equatable, Codable, Sendable {
         case edit
         /// `created` is unknown until the result arrives and says which it was.
         /// The difference between "97 lines of new file" and "97 lines over the
@@ -53,7 +53,7 @@ enum AgentDiff {
     /// none: the tool hands over a fragment of a file and never says where in
     /// the file it sits. A unified diff does say, in its hunk headers, so one
     /// shape carries both rather than the reader learning two.
-    enum Line: Equatable {
+    enum Line: Equatable, Codable, Sendable {
         case context(old: Int?, new: Int?, text: String)
         case added(new: Int?, text: String)
         case removed(old: Int?, text: String)

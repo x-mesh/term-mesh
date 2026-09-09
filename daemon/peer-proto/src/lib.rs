@@ -77,6 +77,9 @@ pub mod capability {
     /// older viewers degrade for free through the existing `attachable`
     /// filter.
     pub const SURFACE_AGENT_V1: &str = "surface.agent.v1";
+    /// GUI-owned view support; the Rust daemon does not advertise these.
+    pub const AGENT_PRESENTATION_V1: &str = "agent.presentation.v1";
+    pub const PROJECT_PRESENTATION_LIVE_V1: &str = "project.presentation.live.v1";
     /// The host reports a surface process exit after its final data frame.
     /// Advertised by the CLIENT because it opts into the new pushed payload.
     pub const SURFACE_EXIT_V1: &str = "surface.exit.v1";

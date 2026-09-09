@@ -674,6 +674,7 @@ async fn reader_loop(
                             delegation_pending: manifest.delegation_pending,
                             leader_cli: manifest.leader_cli,
                             leader_model: manifest.leader_model,
+                            live_workspace_id: Vec::new(),
                         });
                     }
                 }

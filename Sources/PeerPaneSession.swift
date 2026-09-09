@@ -687,6 +687,7 @@ final class PeerPaneSession {
     /// how this pane's host was reached and which surface it mirrored.
     let originSpec: PeerPaneHostSpec
     let originSurface: Termmesh_Peer_V1_SurfaceInfo
+    private(set) var usesLivePresentation = false
 
     /// Set by the pane host (Workspace.openRemotePane) so roster-driven
     /// disconnects can close the hosting pane instead of leaving a dead
@@ -1020,6 +1021,8 @@ final class PeerPaneSession {
             originSpec: spec,
             originSurface: surface
         )
+        paneSession.usesLivePresentation = surface.surfaceType == "agent"
+            && conn.hostCapabilities.has(PeerCapability.agentPresentationV1)
         // Roster registration keeps the sidebar's Remote Hosts section
         // and the Connections panel in sync with pane-based connections;
         // teardown() balances it.

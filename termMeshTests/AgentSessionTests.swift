@@ -17,6 +17,152 @@ import SwiftUI
 /// parsing: turning the stream into things a view can draw as what they are.
 @MainActor
 final class AgentSessionTests: XCTestCase {
+    private func recoveryFrame(full: Bool = true) -> AgentLiveFrame {
+        AgentLiveFrame(full: full, baseRevision: 0, revision: 1, order: [], state: .init(
+            generation: UUID(), entries: [], running: true, thinking: false,
+            interruptible: true, streaming: [], summary: nil, model: "fixture", usage: nil))
+    }
+
+    private func recoveryPacket(_ payload: Data, begin: Bool = true, end: Bool = true) throws -> Data {
+        var data = try JSONSerialization.data(withJSONObject: [
+            "begin": begin, "end": end, "payload": payload.base64EncodedString()
+        ])
+        data.append(10)
+        return data
+    }
+
+    func testLiveProjectionRosterFailureDoesNotDisableIdleWorker() {
+        let viewer = AgentSession()
+        viewer.prepareLivePresentation()
+        XCTAssertTrue(viewer.acceptLivePresentation(recoveryFrame()))
+        for (present, verified) in [(true, false), (false, false), (true, true)] {
+            RemoteLiveProject.applyRosterAvailability(
+                projectPresent: present, rosterVerified: verified, sessions: [viewer])
+            XCTAssertTrue(viewer.isRunning, "roster failure/recovery must not require fresh agent output")
+            XCTAssertTrue(viewer.canInterrupt)
+        }
+        RemoteLiveProject.applyRosterAvailability(
+            projectPresent: false, rosterVerified: true, sessions: [viewer])
+        XCTAssertFalse(viewer.isRunning, "confirmed Project removal still disables input")
+        XCTAssertFalse(viewer.canInterrupt)
+    }
+
+    func testLiveProjectionRestartsAfterPartialLineAndFrame() async throws {
+        for partialFrame in [false, true] {
+            let received = expectation(description: "fresh snapshot after restart \(partialFrame)")
+            let frame = recoveryFrame()
+            let payload = try JSONEncoder().encode(frame)
+            let packet = try recoveryPacket(payload)
+            let decoder = AgentLiveDecoder(invalid: { XCTFail("old bytes corrupted the new stream") }) { result in
+                XCTAssertTrue(result.full)
+                XCTAssertEqual(result.state.generation, frame.state.generation)
+                received.fulfill()
+            }
+            if partialFrame {
+                decoder.consume(try recoveryPacket(payload.prefix(payload.count / 2), end: false))
+            } else {
+                decoder.consume(packet.prefix(packet.count / 2))
+            }
+            decoder.resetForRestart()
+            decoder.consume(packet)
+            await fulfillment(of: [received], timeout: 3)
+            decoder.stop()
+        }
+    }
+
+    func testLiveProjectionRestartRequiresFullSnapshot() async throws {
+        let refused = expectation(description: "delta cannot bootstrap restarted stream")
+        let decoder = AgentLiveDecoder(invalid: { refused.fulfill() }) { _ in
+            XCTFail("delta was delivered before a full snapshot")
+        }
+        decoder.resetForRestart()
+        decoder.consume(try recoveryPacket(JSONEncoder().encode(recoveryFrame(full: false))))
+        await fulfillment(of: [refused], timeout: 3)
+        decoder.stop()
+    }
+
+    func testLiveProjectionSnapshotsExistingHiddenTranscriptAndThenDeltas() async throws {
+        let source = AgentSession()
+        source.isVisible = false
+        source.appendLocalNotice(String(repeating: "한글 transcript ", count: 6_000))
+        let (subscription, stream) = source.subscribeLivePresentation()
+        defer { source.unsubscribeLivePresentation(subscription) }
+        let encoder = AgentLiveEncoder(stream)
+        let viewer = AgentSession()
+        viewer.prepareLivePresentation()
+        let initial = expectation(description: "chunked initial snapshot")
+        let changed = expectation(description: "hidden pane delta")
+        let decoder = AgentLiveDecoder { frame in
+            DispatchQueue.main.async {
+                viewer.acceptLivePresentation(frame)
+                if frame.full { initial.fulfill() } else { changed.fulfill() }
+            }
+        }
+        defer { decoder.stop() }
+        func deliverFrame() async throws {
+            while let chunk = await encoder.next() {
+                // Exercise arbitrary packet/UTF-8 boundaries in the transport.
+                let middle = chunk.bytes.count / 2
+                decoder.consume(chunk.bytes.prefix(middle))
+                decoder.consume(chunk.bytes.suffix(chunk.bytes.count - middle))
+                let object = try XCTUnwrap(JSONSerialization.jsonObject(with: chunk.bytes) as? [String: Any])
+                if object["end"] as? Bool == true { return }
+            }
+            XCTFail("stream ended before a complete frame")
+        }
+        try await deliverFrame()
+        await fulfillment(of: [initial], timeout: 3)
+        XCTAssertEqual(viewer.entries, source.entries)
+        source.appendLocalNotice("after attach")
+        try await deliverFrame()
+        await fulfillment(of: [changed], timeout: 3)
+        XCTAssertEqual(viewer.entries, source.entries)
+        XCTAssertEqual(viewer.entries.count, 2)
+    }
+
+    func testLiveProjectionRejectsGapAndFullSnapshotReplacesWithoutDuplication() {
+        let viewer = AgentSession()
+        viewer.prepareLivePresentation()
+        let generation = UUID()
+        let first = AgentSession.Entry.notice(id: UUID(), "first")
+        let second = AgentSession.Entry.notice(id: UUID(), "second")
+        func frame(_ entries: [AgentSession.Entry], full: Bool, base: UInt64, revision: UInt64) -> AgentLiveFrame {
+            AgentLiveFrame(full: full, baseRevision: base, revision: revision,
+                           order: entries.map(\.id), state: .init(
+                            generation: generation, entries: entries, running: true, thinking: false,
+                            interruptible: true, streaming: [], summary: nil, model: "test", usage: nil))
+        }
+        viewer.acceptLivePresentation(frame([first], full: true, base: 0, revision: 1))
+        viewer.acceptLivePresentation(frame([second], full: false, base: 7, revision: 8))
+        XCTAssertEqual(viewer.entries, [first])
+        viewer.acceptLivePresentation(frame([first, second], full: true, base: 0, revision: 1))
+        viewer.acceptLivePresentation(frame([first, second], full: true, base: 0, revision: 1))
+        XCTAssertEqual(viewer.entries, [first, second])
+        viewer.livePresentationDisconnected()
+        XCTAssertFalse(viewer.isRunning)
+        XCTAssertEqual(viewer.entries, [first, second])
+    }
+
+    func testLiveProjectionCoalescesPendingModelsWithoutDroppingDeliveredEntries() async throws {
+        let pair = AsyncStream<AgentSession.LiveState>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let generation = UUID()
+        for index in 1...50 {
+            pair.continuation.yield(.init(generation: generation,
+                entries: [.notice(id: generation, "value \(index)")], running: true, thinking: false,
+                interruptible: false, streaming: [], summary: nil, model: "", usage: nil))
+        }
+        pair.continuation.finish()
+        let encoder = AgentLiveEncoder(pair.stream)
+        let chunk = await encoder.next()
+        let bytes = try XCTUnwrap(chunk?.bytes)
+        let packet = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+        let payload = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(packet["payload"] as? String)))
+        let frame = try JSONDecoder().decode(AgentLiveFrame.self, from: payload)
+        XCTAssertEqual(frame.state.entries, [.notice(id: generation, "value 50")])
+        let end = await encoder.next()
+        XCTAssertNil(end)
+    }
+
     func testChatTurnPreservesLineBreaksAndNormalizesCarriageReturns() {
         XCTAssertEqual(
             TerminalSurface.normalizedChatTurn("first\r\nsecond\rthird"),
