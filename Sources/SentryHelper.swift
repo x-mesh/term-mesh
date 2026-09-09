@@ -153,10 +153,19 @@ enum LayoutHangDiagnostics {
                 if node.depth > maxDepth { maxDepth = node.depth }
 
                 var host = node.host
-                let cls = String(describing: type(of: node.view))
-                if cls.contains("HostingView") || cls.contains("PlatformViewHost") {
+                // This runs on every node up to the budget. Building a demangled
+                // Swift type name per node and then calling String.contains -
+                // which resolves to Foundation's locale-aware search - was 44% of
+                // this census in main-thread profiles. The raw class name matches
+                // the same two markers, allocates nothing, and only the rare
+                // hosting node pays for the readable name.
+                let rawName = class_getName(type(of: node.view))
+                if strstr(rawName, "HostingView") != nil
+                    || strstr(rawName, "PlatformViewHost") != nil {
                     hostingCount += 1
-                    if host == nil { host = shortHostName(cls) }
+                    if host == nil {
+                        host = shortHostName(String(describing: type(of: node.view)))
+                    }
                 }
                 if let host { hostSubtree[host, default: 0] += 1 }
 
