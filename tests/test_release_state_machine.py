@@ -214,6 +214,18 @@ class ReleaseStateMachineTests(unittest.TestCase):
             source,
         )
 
+    def test_cargo_path_raises_release_error_when_cargo_is_nowhere(self):
+        with tempfile.TemporaryDirectory() as home:
+            with unittest.mock.patch.object(release.shutil, "which", return_value=None), \
+                    unittest.mock.patch.object(release.Path, "home", return_value=Path(home)):
+                with self.assertRaisesRegex(release.ReleaseError, "cargo"):
+                    release.cargo_path()
+
+    def test_run_converts_missing_executable_into_release_error(self):
+        with unittest.mock.patch.object(release.subprocess, "run", side_effect=FileNotFoundError):
+            with self.assertRaisesRegex(release.ReleaseError, "not found on PATH"):
+                release.run("definitely-not-a-real-binary")
+
 
     # --- resuming a release the remote has already moved past (#454) ---
 

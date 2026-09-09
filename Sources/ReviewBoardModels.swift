@@ -1114,11 +1114,39 @@ enum ReviewBoardText {
         return (nil, trimmed)
     }
 
+    /// Redaction is a pure function of the text, and the board re-derives the
+    /// same task strings on every refresh — three redacted fields per task,
+    /// every tick. Profiles on a forty-task board put this and `safeLabel` at
+    /// a third of the board's refresh cost, so remember what each input maps
+    /// to. The table is dropped whole once it outgrows a board's worth of
+    /// strings; hit rate is what matters here, not recency.
     static func safeBody(_ value: String, limit: Int = 240) -> String {
+        let key = RedactionKey(value: value, limit: limit)
+        redactionCacheLock.lock()
+        let hit = redactionCache[key]
+        redactionCacheLock.unlock()
+        if let hit { return hit }
+        let result = computeSafeBody(value, limit: limit)
+        redactionCacheLock.lock()
+        if redactionCache.count >= 1024 { redactionCache.removeAll(keepingCapacity: true) }
+        redactionCache[key] = result
+        redactionCacheLock.unlock()
+        return result
+    }
+
+    private struct RedactionKey: Hashable {
+        let value: String
+        let limit: Int
+    }
+
+    private static let redactionCacheLock = NSLock()
+    private static var redactionCache: [RedactionKey: String] = [:]
+
+    private static func computeSafeBody(_ value: String, limit: Int) -> String {
         var text = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        text = replace(pattern: uuidPattern, in: text, with: "<uuid>")
-        text = replace(pattern: longHexPattern, in: text, with: "<token>")
-        text = replace(pattern: tokenPattern, in: text, with: "<token>")
+        text = replace(uuidRegex, in: text, with: "<uuid>")
+        text = replace(longHexRegex, in: text, with: "<token>")
+        text = replace(tokenRegex, in: text, with: "<token>")
         text = text
             .split(separator: " ")
             .map { token -> String in
@@ -1148,8 +1176,18 @@ enum ReviewBoardText {
         return "…/\(name)"
     }
 
-    private static func replace(pattern: String, in text: String, with replacement: String) -> String {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+    // Compiling an NSRegularExpression costs far more than running one, and
+    // safeBody ran three compiles per redacted field. The board rebuilds its
+    // whole snapshot on every refresh, so those compiles repeated for every
+    // task on every tick. The patterns are constants; compile them once.
+    private static let uuidRegex = try? NSRegularExpression(pattern: uuidPattern)
+    private static let longHexRegex = try? NSRegularExpression(pattern: longHexPattern)
+    private static let tokenRegex = try? NSRegularExpression(pattern: tokenPattern)
+
+    private static func replace(
+        _ regex: NSRegularExpression?, in text: String, with replacement: String
+    ) -> String {
+        guard let regex else { return text }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return regex.stringByReplacingMatches(in: text, range: range, withTemplate: replacement)
     }

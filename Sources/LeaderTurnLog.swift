@@ -576,7 +576,28 @@ enum LeaderTurnLog {
 
     /// Inspection helper. A final segment without a newline is considered torn,
     /// and malformed complete lines are skipped independently.
+    /// `policyReport` and `countsByEvent` both walk the whole history, and
+    /// `fleet.state` asks for them on the main actor every three seconds, so
+    /// this shares the identity-keyed cache used by `health`.
     static func readAll(from logFile: URL = logFile) -> [Record] {
+        let path = logFile.path
+        let stamp = LogFileStamp(path: path)
+        if let stamp {
+            logCacheLock.lock()
+            let cached = recordCache
+            logCacheLock.unlock()
+            if let cached, cached.stamp == stamp { return cached.records }
+        }
+        let records = decodeAll(from: logFile)
+        if let stamp, let after = LogFileStamp(path: path), after == stamp {
+            logCacheLock.lock()
+            recordCache = (stamp, records)
+            logCacheLock.unlock()
+        }
+        return records
+    }
+
+    private static func decodeAll(from logFile: URL) -> [Record] {
         guard let data = try? Data(contentsOf: logFile), !data.isEmpty else { return [] }
         var lines = data.split(separator: 0x0A)
         if data.last != 0x0A {
@@ -598,10 +619,48 @@ enum LeaderTurnLog {
     /// Decode only the newest records for one Project. The file is shared by
     /// every team, so callers that draw one card must not decode and sort the
     /// entire append-only history on the main actor.
+    /// The delegation panel asks for this on the Review Board's own beat, which
+    /// is every settled team change, so the tail is re-decoded far more often
+    /// than a turn is written. Cache per (team, limit) under one file identity;
+    /// a changed file replaces the whole table, so it never grows past the
+    /// number of teams on screen.
     static func readRecent(
         from logFile: URL = logFile,
         team: String,
         limit: Int = 200
+    ) -> [Record] {
+        let path = logFile.path
+        let key = RecentKey(team: team, limit: limit)
+        let stamp = LogFileStamp(path: path)
+        if let stamp {
+            logCacheLock.lock()
+            let cached = recentCache
+            logCacheLock.unlock()
+            if let cached, cached.stamp == stamp, let hit = cached.entries[key] { return hit }
+        }
+        let records = decodeRecent(from: logFile, team: team, limit: limit)
+        if let stamp, let after = LogFileStamp(path: path), after == stamp {
+            logCacheLock.lock()
+            if var current = recentCache, current.stamp == stamp {
+                current.entries[key] = records
+                recentCache = current
+            } else {
+                recentCache = (stamp, [key: records])
+            }
+            logCacheLock.unlock()
+        }
+        return records
+    }
+
+    private struct RecentKey: Hashable {
+        let team: String
+        let limit: Int
+    }
+
+    private static func decodeRecent(
+        from logFile: URL,
+        team: String,
+        limit: Int
     ) -> [Record] {
         guard let data = try? Data(contentsOf: logFile), !data.isEmpty else { return [] }
         var lines = data.split(separator: 0x0A)
@@ -663,13 +722,100 @@ enum LeaderTurnLog {
         from logFile: URL = logFile,
         capabilities: [MeasurementCapability] = []
     ) -> Health {
+        let derived = fileDerivedHealth(from: logFile)
+        return Health(
+            supportedTurns: derived.supportedTurns,
+            linkedTurns: derived.linkedTurns,
+            statedTurns: derived.statedTurns,
+            unstatedTurns: derived.unstatedTurns,
+            unsupportedTurns: capabilities.filter { $0 == .unsupported }.count,
+            degradedTurns: capabilities.filter { $0 == .degraded }.count,
+            malformedLines: derived.malformedLines,
+            observedDays: derived.observedDays
+        )
+    }
+
+    /// The part of `Health` that depends only on the log bytes. `capabilities`
+    /// is a live runtime signal supplied by the caller, so it stays out of the
+    /// cache below.
+    private struct FileDerivedHealth {
+        let supportedTurns: Int
+        let linkedTurns: Int
+        let statedTurns: Int
+        let unstatedTurns: Int
+        let malformedLines: Int
+        let observedDays: Int
+
+        static let empty = FileDerivedHealth(
+            supportedTurns: 0,
+            linkedTurns: 0,
+            statedTurns: 0,
+            unstatedTurns: 0,
+            malformedLines: 0,
+            observedDays: 0
+        )
+    }
+
+    /// Identity of the exact bytes an aggregate came from. Rotation renames the
+    /// file, so a changed inode invalidates on its own; `birthtime` separates a
+    /// rotated file from an older one that happens to reuse the inode number.
+    private struct LogFileStamp: Equatable {
+        let deviceID: dev_t
+        let fileID: ino_t
+        let size: off_t
+        let modifiedSeconds: Int
+        let modifiedNanoseconds: Int
+        let createdSeconds: Int
+        let createdNanoseconds: Int
+
+        init?(path: String) {
+            var info = stat()
+            guard stat(path, &info) == 0 else { return nil }
+            deviceID = info.st_dev
+            fileID = info.st_ino
+            size = info.st_size
+            modifiedSeconds = info.st_mtimespec.tv_sec
+            modifiedNanoseconds = info.st_mtimespec.tv_nsec
+            createdSeconds = info.st_birthtimespec.tv_sec
+            createdNanoseconds = info.st_birthtimespec.tv_nsec
+        }
+    }
+
+    private static let logCacheLock = NSLock()
+    private static var healthCache: (stamp: LogFileStamp, value: FileDerivedHealth)?
+    private static var recordCache: (stamp: LogFileStamp, records: [Record])?
+    private static var recentCache: (stamp: LogFileStamp, entries: [RecentKey: [Record]])?
+    private static var policyCache: (stamp: LogFileStamp, entries: [String: PolicyReport])?
+
+    /// Decoding the whole append-only history is the dominant main-thread cost
+    /// of `fleet.state`, `team.status` and the dashboard's three-second tick.
+    /// All three ask for this aggregate far more often than a turn is written,
+    /// so key it on the file's identity and never decode an unchanged file
+    /// twice. A file that grows keeps paying the full decode; only repeats of
+    /// identical bytes become free.
+    private static func fileDerivedHealth(from logFile: URL) -> FileDerivedHealth {
+        let path = logFile.path
+        let stamp = LogFileStamp(path: path)
+        if let stamp {
+            logCacheLock.lock()
+            let cached = healthCache
+            logCacheLock.unlock()
+            if let cached, cached.stamp == stamp { return cached.value }
+        }
+        let value = computeFileDerivedHealth(from: logFile)
+        // Cache only when the file did not change while it was being read.
+        // Otherwise the aggregate describes bytes the stamp no longer names.
+        if let stamp, let after = LogFileStamp(path: path), after == stamp {
+            logCacheLock.lock()
+            healthCache = (stamp, value)
+            logCacheLock.unlock()
+        }
+        return value
+    }
+
+    private static func computeFileDerivedHealth(from logFile: URL) -> FileDerivedHealth {
         guard let data = try? Data(contentsOf: logFile), !data.isEmpty else {
-            return Health(
-                supportedTurns: 0, linkedTurns: 0, statedTurns: 0, unstatedTurns: 0,
-                unsupportedTurns: capabilities.filter { $0 == .unsupported }.count,
-                degradedTurns: capabilities.filter { $0 == .degraded }.count,
-                malformedLines: 0, observedDays: 0
-            )
+            return .empty
         }
         var rawLines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
         if data.last == 0x0A { rawLines.removeLast() }
@@ -723,12 +869,13 @@ enum LeaderTurnLog {
                 linked += 1
             }
         }
-        return Health(
-            supportedTurns: starts.count, linkedTurns: linked,
-            statedTurns: stated, unstatedTurns: unstated,
-            unsupportedTurns: capabilities.filter { $0 == .unsupported }.count,
-            degradedTurns: capabilities.filter { $0 == .degraded }.count,
-            malformedLines: malformed, observedDays: observedDays
+        return FileDerivedHealth(
+            supportedTurns: starts.count,
+            linkedTurns: linked,
+            statedTurns: stated,
+            unstatedTurns: unstated,
+            malformedLines: malformed,
+            observedDays: observedDays
         )
     }
 
@@ -852,7 +999,36 @@ enum LeaderTurnLog {
         value.lowercased().filter { $0.isASCII && $0.isHexDigit }
     }
 
+    /// `fleet.state` asks for this on the Review Board's beat, and the report
+    /// walks the whole history three times plus several set builds. Caching the
+    /// decoded records removed the parse but left that aggregate repeating on
+    /// every tick, where profiles put it at 42% of the board's refresh. Key the
+    /// finished report on the file's identity, as `health` does.
     static func policyReport(from logFile: URL = logFile, team: String? = nil) -> PolicyReport {
+        let path = logFile.path
+        let key = team ?? ""
+        let stamp = LogFileStamp(path: path)
+        if let stamp {
+            logCacheLock.lock()
+            let cached = policyCache
+            logCacheLock.unlock()
+            if let cached, cached.stamp == stamp, let hit = cached.entries[key] { return hit }
+        }
+        let report = computePolicyReport(from: logFile, team: team)
+        if let stamp, let after = LogFileStamp(path: path), after == stamp {
+            logCacheLock.lock()
+            if var current = policyCache, current.stamp == stamp {
+                current.entries[key] = report
+                policyCache = current
+            } else {
+                policyCache = (stamp, [key: report])
+            }
+            logCacheLock.unlock()
+        }
+        return report
+    }
+
+    private static func computePolicyReport(from logFile: URL, team: String?) -> PolicyReport {
         let records = readAll(from: logFile).filter { record in
             guard let team else { return true }
             return record.team == team
