@@ -135,6 +135,100 @@ final class LeaderTurnLogTests: XCTestCase {
         XCTAssertEqual(LeaderTurnLog.health(from: log).observedDays, 7)
     }
 
+    /// `readAll` backs `policyReport` and `countsByEvent`, which `fleet.state`
+    /// rebuilds on the main actor every three seconds. Its cache must follow
+    /// `readRecent` backs the delegation panel, which refreshes on every
+    /// settled team change. Its per-team cache must still follow the file, and
+    /// two teams must not read each other's tail.
+    func testReadRecentCachesPerTeamAndFollowsTheFile() throws {
+        let log = try temporaryLog()
+        let alpha = LeaderTurnLog.Record.turnStart(
+            team: "alpha", surfaceID: "surface-1", prompt: "one"
+        )
+        let beta = LeaderTurnLog.Record.turnStart(
+            team: "beta", surfaceID: "surface-2", prompt: "two"
+        )
+        try LeaderTurnLog.append(alpha, to: log)
+        try LeaderTurnLog.append(beta, to: log)
+
+        XCTAssertEqual(LeaderTurnLog.readRecent(from: log, team: "alpha"), [alpha])
+        XCTAssertEqual(LeaderTurnLog.readRecent(from: log, team: "beta"), [beta])
+        XCTAssertEqual(LeaderTurnLog.readRecent(from: log, team: "alpha"), [alpha])
+
+        let alphaAgain = LeaderTurnLog.Record.turnEnd(
+            team: "alpha", surfaceID: "surface-3", prompt: "three"
+        )
+        try LeaderTurnLog.append(alphaAgain, to: log)
+        XCTAssertEqual(LeaderTurnLog.readRecent(from: log, team: "alpha"), [alpha, alphaAgain])
+        XCTAssertEqual(LeaderTurnLog.readRecent(from: log, team: "beta"), [beta])
+
+        // The limit is part of the key, not something a cached tail can ignore.
+        XCTAssertEqual(LeaderTurnLog.readRecent(from: log, team: "alpha", limit: 1), [alphaAgain])
+
+        try FileManager.default.removeItem(at: log)
+        XCTAssertEqual(LeaderTurnLog.readRecent(from: log, team: "alpha"), [])
+    }
+    /// every way the log file can change.
+    func testReadAllFollowsAppendsAndRotation() throws {
+        let log = try temporaryLog()
+        let first = LeaderTurnLog.Record.turnStart(
+            team: "alpha", surfaceID: "surface-1", prompt: "one"
+        )
+        try LeaderTurnLog.append(first, to: log)
+        XCTAssertEqual(LeaderTurnLog.readAll(from: log), [first])
+        XCTAssertEqual(LeaderTurnLog.readAll(from: log), [first])
+
+        let second = LeaderTurnLog.Record.turnEnd(
+            team: "alpha", surfaceID: "surface-2", prompt: "two"
+        )
+        try LeaderTurnLog.append(second, to: log)
+        XCTAssertEqual(LeaderTurnLog.readAll(from: log), [first, second])
+
+        // Rotation puts a different file at the same path.
+        try FileManager.default.removeItem(at: log)
+        try LeaderTurnLog.append(second, to: log)
+        XCTAssertEqual(LeaderTurnLog.readAll(from: log), [second])
+
+        try FileManager.default.removeItem(at: log)
+        XCTAssertEqual(LeaderTurnLog.readAll(from: log), [])
+    }
+    /// The aggregate is cached on the log file's identity, so every way the
+    /// file can change must invalidate it, and the caller's live capability
+    /// inventory must never be frozen into that cache.
+    func testHealthFollowsFileChangesAndKeepsCapabilitiesLive() throws {
+        let log = try temporaryLog()
+        let day = Date(timeIntervalSince1970: 1_777_777_777)
+        let first = LeaderTurnLog.Record.turnStart(
+            team: "alpha", surfaceID: "surface-1", prompt: "one", timestamp: day
+        )
+        try LeaderTurnLog.append(first, to: log)
+
+        let once = LeaderTurnLog.health(from: log)
+        XCTAssertEqual(once.supportedTurns, 1)
+        XCTAssertEqual(LeaderTurnLog.health(from: log), once)
+
+        let withCapabilities = LeaderTurnLog.health(
+            from: log, capabilities: [.degraded, .unsupported]
+        )
+        XCTAssertEqual(withCapabilities.supportedTurns, 1)
+        XCTAssertEqual(withCapabilities.degradedTurns, 1)
+        XCTAssertEqual(withCapabilities.unsupportedTurns, 1)
+
+        let second = LeaderTurnLog.Record.turnStart(
+            team: "alpha", surfaceID: "surface-2", prompt: "two", timestamp: day
+        )
+        try LeaderTurnLog.append(second, to: log)
+        XCTAssertEqual(LeaderTurnLog.health(from: log).supportedTurns, 2)
+
+        // Rotation renames the file and a fresh one takes its place.
+        try FileManager.default.removeItem(at: log)
+        try LeaderTurnLog.append(first, to: log)
+        XCTAssertEqual(LeaderTurnLog.health(from: log).supportedTurns, 1)
+
+        // A log that disappears reports nothing, not the last aggregate.
+        try FileManager.default.removeItem(at: log)
+        XCTAssertEqual(LeaderTurnLog.health(from: log).supportedTurns, 0)
+    }
     func testRouteRecordWinsMarkerRaceAndCoverageNeverExceedsOne() throws {
         let log = try temporaryLog()
         try FileManager.default.createDirectory(
