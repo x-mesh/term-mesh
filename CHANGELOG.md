@@ -4,6 +4,11 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.234.0] - 2026-09-09
+
+### Fixed
+- Typing no longer lags while agents are working. Two paths were holding the main thread. Each terminal pane created a hosting view that published an intrinsic minimum size, so AppKit measured every pane's whole view tree on each layout pass — work the split view discards, because it already owns pane geometry. And the Review Board rebuilt the entire fleet snapshot every two seconds, deriving each agent's active task by scanning and sorting the team's whole task list twice per agent. The board now skips that tick while it is closed and derives every agent's task in a single pass, and it still refreshes the moment you open it. Measured with ten agents streaming across six panes: the SwiftUI update cycle fell from 672 to 448, graph traversal from 642 to 381, and main-thread idle rose from 62-66% to 70-79%.
+
 ## [0.233.0] - 2026-09-09
 
 ### Added
