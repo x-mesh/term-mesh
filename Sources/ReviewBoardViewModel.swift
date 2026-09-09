@@ -159,7 +159,26 @@ final class ReviewBoardViewModel: ObservableObject {
             refreshDelegationPanel()
             return
         }
-        refresh()
+        // Rebuilding the snapshot on this beat used to be how the board saw
+        // anything at all change. It no longer has to be: tasks publish through
+        // `taskRevision`, teams and agents through the orchestrator, and x-kit
+        // panel runs now publish too — `observeTeams` is subscribed to all of
+        // it. Rebuilding to discover that nothing moved cost more than every
+        // other thing this tick does put together.
+        //
+        // The coordinator is the exception: its snapshot has no publisher, so
+        // with the distributed integration on, this beat is still the only
+        // thing that would notice a remote task.
+        guard !ReviewBoardCoordinatorSettings.isIntegrationEnabled() else {
+            refresh()
+            return
+        }
+        // What this tick is actually for: whether an agent is printing changes
+        // with nothing published at all.
+        let working = Self.runningAgentNames()
+        if workingAssignees != working { workingAssignees = working }
+        refreshDelegationPanel()
+        keepSelectionValid()
     }
 
     /// Agent names that are printing right now, by the task they hold. The
