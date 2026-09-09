@@ -554,11 +554,19 @@ class Emitter:
                    "isReplay": True})
 
     def result(self, final: str, stop: str = "end_turn", cost: float | None = None,
-               failed: bool = False) -> None:
+               failed: bool = False, usage: dict | None = None,
+               context_window: int | None = None) -> None:
         obj = {"type": "result", "subtype": "error" if failed else "success",
                "is_error": failed, "stop_reason": stop, "result": final}
         if cost is not None:
             obj["total_cost_usd"] = cost
+        # Claude's own shape, so the reader needs no per-CLI branch. The window
+        # rides alongside because codex reports its own and the app should not
+        # have to keep a table of model names to divide by.
+        if usage:
+            obj["usage"] = usage
+        if context_window:
+            obj["context_window"] = context_window
         self.emit(obj)
 
 
@@ -1140,6 +1148,10 @@ class CodexBridge:
         said: list[str] = []
         streamed = [False]
         failed_because: list[str] = []
+        # `thread/tokenUsage/updated` lands before `turn/completed`, so the
+        # figures are held here until the turn is reported.
+        seen_usage: dict = {}
+        seen_window: list[int | None] = [None]
 
         def notify(o: dict) -> None:
             m = o.get("method", "")
@@ -1159,6 +1171,22 @@ class CodexBridge:
                 detail = ((p.get("error") or {}).get("message") or "").strip()
                 if detail:
                     failed_because.append((bool(p.get("willRetry")), detail))
+                return
+            if m == "thread/tokenUsage/updated":
+                # The bridge used to report no cost for codex because
+                # `turn/completed` carries none. It arrives here instead, one
+                # notification earlier, and `last` is the figure that answers
+                # "how full is the window right now" — `total` accumulates
+                # across the thread. codex names the window too, so nothing
+                # downstream has to keep a table of model names.
+                usage = p.get("tokenUsage")
+                if isinstance(usage, dict):
+                    last = usage.get("last")
+                    if isinstance(last, dict):
+                        seen_usage.update(last)
+                    window = usage.get("modelContextWindow")
+                    if isinstance(window, int) and window > 0:
+                        seen_window[0] = window
                 return
             if m == "item/agentMessage/delta":
                 chunk = p.get("delta") or ""
@@ -1248,12 +1276,25 @@ class CodexBridge:
         # `turn/completed` carries `{threadId, turn}` and no usage at all, so
         # there is no cost to report here. Reading one out of a key that does
         # not exist looked like the number was simply always zero.
+        # codex counts cached input separately from fresh input, the same
+        # split claude reports; naming them claude's way keeps one reader for
+        # every CLI.
+        usage = {}
+        if seen_usage:
+            usage = {
+                "input_tokens": seen_usage.get("inputTokens") or 0,
+                "cache_read_input_tokens": seen_usage.get("cachedInputTokens") or 0,
+                "cache_creation_input_tokens": seen_usage.get("cacheWriteInputTokens") or 0,
+                "output_tokens": seen_usage.get("outputTokens") or 0,
+            }
+        window = seen_window[0]
         if done is None and self.rpc.failure:
             self.out.result(final or self.rpc.failure, stop="process_exited",
-                            failed=True)
+                            failed=True, usage=usage, context_window=window)
         else:
             self.out.result(final, stop="end_turn" if done else "timeout",
-                            failed=done is None)
+                            failed=done is None, usage=usage,
+                            context_window=window)
 
     CHANGE_TOOL = {"add": "write", "update": "edit", "delete": "delete"}
 

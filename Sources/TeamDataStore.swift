@@ -18,8 +18,14 @@ struct AgentUsageSnapshot: Equatable {
     var model: String = ""
     /// Current context-window occupancy (last request's input + cache_read +
     /// cache_creation) — distinct from the accumulated totals above. `nil`
-    /// when the source cannot report a non-cumulative value (e.g. Codex).
+    /// when the source cannot report a non-cumulative value.
     var contextTokens: UInt64? = nil
+
+    /// The window this model was given, when the source states it outright.
+    /// Codex reports `modelContextWindow` with every usage update, which is
+    /// better than a table of model names: it cannot go stale, and it is right
+    /// for a model nobody has added to one yet.
+    var contextWindow: Int? = nil
 
     static let empty = AgentUsageSnapshot(
         inputTokens: 0,
@@ -28,7 +34,8 @@ struct AgentUsageSnapshot: Equatable {
         cacheCreationTokens: 0,
         updatedAt: .distantPast,
         model: "",
-        contextTokens: nil
+        contextTokens: nil,
+        contextWindow: nil
     )
 
     /// Cache-hit ratio: cacheRead / (cacheRead + cacheCreation). Nil when both are zero.
@@ -41,7 +48,10 @@ struct AgentUsageSnapshot: Equatable {
     /// Context-window usage as a fraction of the model's limit. Nil when
     /// either the current occupancy or the model's limit is unknown.
     var contextUsageFraction: Double? {
-        guard let contextTokens, let limit = ModelContextLimits.contextLimit(forModel: model),
+        guard let contextTokens else { return nil }
+        // A stated window wins over a looked-up one: it came from the CLI that
+        // is running the model, not from a table this build shipped with.
+        guard let limit = contextWindow ?? ModelContextLimits.contextLimit(forModel: model),
               limit > 0 else {
             return nil
         }

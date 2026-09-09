@@ -833,6 +833,31 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(s.streamingIds.contains(id))
     }
 
+    /// A bridged CLI states the window it was given. Codex sends
+    /// `modelContextWindow` with every usage update, and that beats a table
+    /// this build shipped with: it cannot go stale, and it is right for a
+    /// model nobody has added to one.
+    func testStatedContextWindowBeatsTheModelTable() throws {
+        let s = session([
+            event(["type": "system", "subtype": "init", "model": "gpt-5.6-sol"]),
+            event(["type": "result", "stop_reason": "end_turn",
+                   "context_window": 258_400,
+                   "usage": [
+                       "input_tokens": 23_274,
+                       "cache_read_input_tokens": 0,
+                       "cache_creation_input_tokens": 0,
+                       "output_tokens": 10,
+                   ]]),
+        ])
+        let usage = try XCTUnwrap(s.usage)
+        XCTAssertEqual(usage.contextTokens, 23_274)
+        XCTAssertEqual(usage.contextWindow, 258_400)
+        XCTAssertEqual(
+            try XCTUnwrap(usage.contextUsageFraction),
+            23_274.0 / 258_400.0,
+            accuracy: 0.0001
+        )
+    }
     /// Occupancy is the whole prompt the model saw. Claude reads most of a
     /// long conversation out of the cache, so `input_tokens` alone reports
     /// single digits for a nearly full window — the pane header would have

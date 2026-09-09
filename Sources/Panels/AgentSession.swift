@@ -450,7 +450,9 @@ final class AgentSession {
     /// A turn that reports no input at all leaves the previous reading
     /// standing: a window does not empty because one turn failed before the
     /// model saw anything.
-    private func recordUsage(_ usage: [String: Any], at completedAt: Date) {
+    private func recordUsage(
+        _ usage: [String: Any], window: Int?, at completedAt: Date
+    ) {
         func count(_ key: String) -> UInt64 {
             guard let value = usage[key] as? Int, value > 0 else { return 0 }
             return UInt64(value)
@@ -467,7 +469,8 @@ final class AgentSession {
             cacheCreationTokens: cacheCreation,
             updatedAt: completedAt,
             model: modelName,
-            contextTokens: occupancy
+            contextTokens: occupancy,
+            contextWindow: window
         )
     }
 
@@ -3011,7 +3014,9 @@ final class AgentSession {
             tokensOut: usage["output_tokens"] as? Int,
             completedAt: completedAt
         )
-        recordUsage(usage, at: completedAt)
+        // A bridged CLI states its own window; claude does not, and falls back
+        // to the model table.
+        recordUsage(usage, window: o["context_window"] as? Int, at: completedAt)
         // The header moves out of the prose and into the turn, where it is a
         // value the footer can render as a verdict. Shown raw *and* parsed was
         // paying for the same five lines twice.
