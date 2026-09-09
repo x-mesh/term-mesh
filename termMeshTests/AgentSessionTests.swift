@@ -1348,6 +1348,9 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(AgentSession.rows(for: []).isEmpty)
     }
 
+    /// A thought immediately ahead of a tool run folds into it — that is the
+    /// point of the fix — but the group's disclosure identity still pins to
+    /// the first *tool*, not to the thought now sitting ahead of it in `rows`.
     func testTranscriptItemsGroupThreeConsecutiveToolsWithStableIdentity() {
         let firstID = UUID()
         let entries: [AgentSession.Entry] = [
@@ -1360,39 +1363,118 @@ final class AgentSessionTests: XCTestCase {
 
         let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
 
-        XCTAssertEqual(items.count, 3)
-        guard case .toolGroup(let group) = items[1] else {
-            return XCTFail("three consecutive tools should become one group")
+        XCTAssertEqual(items.count, 2)
+        guard case .toolGroup(let group) = items[0] else {
+            return XCTFail("the leading thought and three tools should become one group")
         }
         XCTAssertEqual(group.id, firstID)
-        XCTAssertEqual(group.rows.count, 3)
+        XCTAssertEqual(group.rows.count, 4)
         XCTAssertEqual(group.kindSummary, "shell 2 · read")
         XCTAssertTrue(group.isRunning)
         XCTAssertEqual(group.failureCount, 0)
     }
 
+    /// Grouping now splits at prose, not at an interleaved thought: a run of
+    /// three tools still becomes one group, and counts and failures still
+    /// aggregate across it regardless of where a `thought` sits in the middle.
     func testTranscriptItemsKeepShortRunsInlineAndSplitAtProse() {
         let entries: [AgentSession.Entry] = [
-            .tool(id: UUID(), .init(name: "shell", headline: "one", result: "")),
-            .tool(id: UUID(), .init(name: "shell", headline: "two", result: "")),
-            .thought(id: UUID(), "next"),
+            .answered(id: UUID(), "starting"),
             .tool(id: UUID(), .init(name: "shell", headline: "three", result: "")),
+            .thought(id: UUID(), "next"),
             .tool(id: UUID(), .init(name: "edit", headline: "four", result: "")),
             .tool(id: UUID(), .init(name: "shell", headline: "five", result: "failed", failed: true)),
+            .answered(id: UUID(), "done"),
         ]
 
         let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
 
-        XCTAssertEqual(items.count, 4)
-        guard case .row = items[0], case .row = items[1], case .row = items[2] else {
-            return XCTFail("two tools and intervening prose should remain individual rows")
+        XCTAssertEqual(items.count, 3)
+        guard case .row = items[0] else {
+            return XCTFail("prose ahead of the run should remain its own row")
         }
-        guard case .toolGroup(let group) = items[3] else {
-            return XCTFail("the later run of three tools should form its own group")
+        guard case .toolGroup(let group) = items[1] else {
+            return XCTFail("the run of three tools should form its own group")
         }
         XCTAssertFalse(group.isRunning)
         XCTAssertEqual(group.failureCount, 1)
         XCTAssertEqual(group.kindSummary, "shell 2 · edit")
+        guard case .row = items[2] else {
+            return XCTFail("prose after the run should remain its own row")
+        }
+    }
+
+    /// (a) A thought sandwiched directly between two tools is part of the same
+    /// run; `kindSummary` ignoring it keeps the group's tool count honest.
+    func testAThoughtBetweenTwoToolsJoinsTheGroup() {
+        let entries: [AgentSession.Entry] = [
+            .tool(id: UUID(), .init(name: "shell", headline: "one", result: "")),
+            .thought(id: UUID(), "checking the result"),
+            .tool(id: UUID(), .init(name: "shell", headline: "two", result: nil)),
+        ]
+
+        let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
+
+        XCTAssertEqual(items.count, 1)
+        guard case .toolGroup(let group) = items[0] else {
+            return XCTFail("tool, thought, tool should become one group")
+        }
+        XCTAssertEqual(group.rows.count, 3)
+        XCTAssertEqual(group.kindSummary, "shell 2")
+    }
+
+    /// (b) Two consecutive thoughts never touch a tool, so the run they
+    /// buffer counts zero tools and must never become a group.
+    func testTwoConsecutiveThoughtsNeverBecomeAGroup() {
+        let entries: [AgentSession.Entry] = [
+            .thought(id: UUID(), "first idea"),
+            .thought(id: UUID(), "second idea"),
+        ]
+
+        let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
+
+        XCTAssertEqual(items.count, 2)
+        for item in items {
+            guard case .row = item else {
+                return XCTFail("a thought-only run must stay individual rows, got \(item)")
+            }
+        }
+    }
+
+    /// (c) A single tool below `minimumToolCount` stays inline even with
+    /// prose on both sides.
+    func testASingleToolBetweenProseStaysInline() {
+        let entries: [AgentSession.Entry] = [
+            .answered(id: UUID(), "before"),
+            .tool(id: UUID(), .init(name: "shell", headline: "one", result: "")),
+            .answered(id: UUID(), "after"),
+        ]
+
+        let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
+
+        XCTAssertEqual(items.count, 3)
+        for item in items {
+            guard case .row = item else {
+                return XCTFail("a single tool call must remain inline, got \(item)")
+            }
+        }
+    }
+
+    /// (d) A thought with no tool on either side of it is not "between
+    /// tools" and must not be swallowed into a neighbouring group.
+    func testALoneThoughtBetweenProseStaysIndependent() {
+        let entries: [AgentSession.Entry] = [
+            .answered(id: UUID(), "before"),
+            .thought(id: UUID(), "just thinking"),
+            .answered(id: UUID(), "after"),
+        ]
+
+        let items = AgentSession.transcriptItems(for: AgentSession.rows(for: entries))
+
+        XCTAssertEqual(items.count, 3)
+        guard case .row(let row) = items[1], case .thought = row.entry else {
+            return XCTFail("a lone thought between prose should remain its own row")
+        }
     }
 
     /// The panel uses a regular VStack to avoid SwiftUI's non-converging lazy

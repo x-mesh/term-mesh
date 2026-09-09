@@ -35,11 +35,10 @@ struct AgentPanelView: View {
     /// back — barely visible on a one-line result, impossible to miss on a
     /// diff someone was reading.
     @State private var openTools: Set<UUID> = []
-    /// Completed tool runs collapse into one activity row. Keep only explicit
-    /// choices here: running groups open themselves, completed groups close
-    /// themselves, and a group the user opens stays open as it ages.
+    /// Tool runs collapse into one activity row, folded by default. Only an
+    /// explicit choice here opens one — a running or failed group still says
+    /// so in its header, but no longer springs open on its own.
     @State private var openToolGroups: Set<UUID> = []
-    @State private var closedRunningToolGroups: Set<UUID> = []
 
     private var session: AgentSession { panel.session }
 
@@ -504,21 +503,14 @@ struct AgentPanelView: View {
 
     private func toolGroupIsOpen(_ group: AgentSession.ToolGroup) -> Bool {
         openToolGroups.contains(group.id)
-            || (group.isRunning && !closedRunningToolGroups.contains(group.id))
     }
 
     private func setToolGroupOpen(_ group: AgentSession.ToolGroup, _ open: Bool) {
         grewAt = Date()
         if open {
             openToolGroups.insert(group.id)
-            closedRunningToolGroups.remove(group.id)
         } else {
             openToolGroups.remove(group.id)
-            if group.isRunning {
-                closedRunningToolGroups.insert(group.id)
-            } else {
-                closedRunningToolGroups.remove(group.id)
-            }
         }
     }
 
@@ -995,8 +987,8 @@ private struct TranscriptRow: View, Equatable {
             // arriving and leave "did it stop there?" to be guessed.
             Answer(text: text, streaming: streaming)
         case .thought(_, let body):
-            label("✻", (body?.isEmpty == false ? body! : "thinking"),
-                  muted: true, streaming: streaming)
+            transcriptGlyphLabel("✻", (body?.isEmpty == false ? body! : "thinking"),
+                                 muted: true, streaming: streaming)
         case .tool(_, let call):
             if let change = call.change {
                 ChangeRow(call: call, change: change, root: root, open: openBinding)
@@ -1006,7 +998,7 @@ private struct TranscriptRow: View, Equatable {
         case .turnEnded(_, let end):
             TurnFooter(end: end, facts: Self.facts(end))
         case .notice(_, let text):
-            label("!", text, muted: false)
+            transcriptGlyphLabel("!", text, muted: false)
         }
     }
 
@@ -1014,24 +1006,26 @@ private struct TranscriptRow: View, Equatable {
         Binding(get: { open }, set: { setOpen($0) })
     }
 
-    private func label(_ glyph: String, _ text: String, muted: Bool,
-                       streaming: Bool = false) -> some View {
-        HStack(alignment: .top, spacing: 6) {
-            Text(glyph).font(.system(size: 11))
-            // Thinking streams too, and it is the part that runs longest with
-            // nothing else to show. Pinned to the tail so a long reasoning
-            // block does not push the pane around while it is written.
-            Text(streaming ? String(text.suffix(120)) : text)
-                .font(.system(size: 11))
-                .lineLimit(muted ? 2 : nil)
-            if streaming { Caret() }
-        }
-        .foregroundStyle(muted ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
-    }
-
     private static func facts(_ end: AgentSession.TurnEnd) -> String {
         AgentSession.turnFacts(end)
     }
+}
+
+/// Shared with `ToolGroupRow`: a thought folded into a tool group still needs
+/// to draw as a thought, not disappear because only `.tool` rows were handled.
+private func transcriptGlyphLabel(_ glyph: String, _ text: String, muted: Bool,
+                                  streaming: Bool = false) -> some View {
+    HStack(alignment: .top, spacing: 6) {
+        Text(glyph).font(.system(size: 11))
+        // Thinking streams too, and it is the part that runs longest with
+        // nothing else to show. Pinned to the tail so a long reasoning
+        // block does not push the pane around while it is written.
+        Text(streaming ? String(text.suffix(120)) : text)
+            .font(.system(size: 11))
+            .lineLimit(muted ? 2 : nil)
+        if streaming { Caret() }
+    }
+    .foregroundStyle(muted ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.orange))
 }
 
 private struct Instruction: View {
@@ -1735,7 +1729,7 @@ private struct ToolGroupRow: View {
                     statusMark
                     Text("tool activity")
                         .font(.system(size: 11, weight: .medium))
-                    Text("\(group.rows.count) tools")
+                    Text("\(group.toolCount) tools")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                     Text(group.kindSummary)
@@ -1776,6 +1770,17 @@ private struct ToolGroupRow: View {
                             } else {
                                 ToolRow(call: call, open: toolBinding(row.id))
                             }
+                        } else if case .thought(_, let body) = row.entry {
+                            // Reasoning folded into the run is still the
+                            // transcript. Dropping it here would delete what
+                            // the agent said between two commands.
+                            HStack(alignment: .top, spacing: 6) {
+                                Text("✻").font(.system(size: 11))
+                                Text(body?.isEmpty == false ? body! : "thinking")
+                                    .font(.system(size: 11))
+                                    .lineLimit(2)
+                            }
+                            .foregroundStyle(.secondary)
                         }
                     }
                 }

@@ -845,13 +845,17 @@ final class AgentSession {
     struct ToolGroup: Identifiable, Equatable {
         /// The first tool is stable while results stream into the run. Using it
         /// as the disclosure identity keeps a user's expanded/collapsed choice
-        /// attached to the same work rather than to a transient array index.
+        /// attached to the same work rather than to a transient array index —
+        /// including when a `thought` folded ahead of it makes it not `rows.first`.
         let id: UUID
         let topGap: CGFloat
         let rows: [Row]
 
         var isRunning: Bool { calls.contains(where: \.isRunning) }
         var failureCount: Int { calls.lazy.filter(\.failed).count }
+        /// `rows.count` also counts any `thought` folded into the run; the
+        /// header says how many tools ran, not how many rows are stored.
+        var toolCount: Int { calls.count }
 
         /// Compact enough for a narrow pane: `shell 7 · read 1`, retaining the
         /// first-seen order so the summary follows the work rather than sorting
@@ -912,20 +916,44 @@ final class AgentSession {
         }
     }
 
-    /// Fold only runs large enough to be visual noise. One or two calls remain
-    /// inline because opening a disclosure to inspect two short commands costs
-    /// more attention than it saves. Any prose, reasoning or turn boundary
-    /// closes the run, so tools never migrate across the explanation they
-    /// belong to.
-    static func transcriptItems(for rows: [Row], minimumToolCount: Int = 3) -> [TranscriptItem] {
+    /// Fold only runs large enough to be visual noise. One call remains inline
+    /// because opening a disclosure to inspect a single short command costs
+    /// more attention than it saves. Any prose or turn boundary closes the run,
+    /// so tools never migrate across the explanation they belong to.
+    ///
+    /// Reasoning does not close a run by itself: a real turn interleaves
+    /// `Bash / thinking / Edit / thinking / ...`, and treating each `thought`
+    /// as a break meant no run ever reached the minimum. A `thought` is instead
+    /// held in `pendingThoughts` until the next entry decides its fate — folded
+    /// into the run if a tool follows, flushed as its own row otherwise — so
+    /// only a thought actually sandwiched between tools joins a group, and a
+    /// lone thought between prose stays a standalone row.
+    static func transcriptItems(for rows: [Row], minimumToolCount: Int = 2) -> [TranscriptItem] {
         var items: [TranscriptItem] = []
         var toolRun: [Row] = []
+        var pendingThoughts: [Row] = []
+
+        // Grouping is decided by tool count alone: a `thought` folded into the
+        // run must never help it reach the threshold, or a thought-only run
+        // could pass as a tool group.
+        func toolCount(in run: [Row]) -> Int {
+            run.reduce(0) { count, row in
+                if case .tool = row.entry { return count + 1 }
+                return count
+            }
+        }
 
         func flushTools() {
             guard !toolRun.isEmpty else { return }
-            if toolRun.count >= minimumToolCount, let first = toolRun.first {
+            // `first` decides where the group's spacing starts, which is the
+            // true first row even when that row is a folded-in thought. `id`
+            // stays pinned to the first *tool* so a leading thought never
+            // changes the group's disclosure identity.
+            if toolCount(in: toolRun) >= minimumToolCount,
+               let first = toolRun.first,
+               let firstTool = toolRun.first(where: { if case .tool = $0.entry { return true }; return false }) {
                 items.append(.toolGroup(ToolGroup(
-                    id: first.id,
+                    id: firstTool.id,
                     topGap: first.topGap,
                     rows: toolRun
                 )))
@@ -935,15 +963,28 @@ final class AgentSession {
             toolRun.removeAll(keepingCapacity: true)
         }
 
+        func flushPendingThoughts() {
+            guard !pendingThoughts.isEmpty else { return }
+            items.append(contentsOf: pendingThoughts.map(TranscriptItem.row))
+            pendingThoughts.removeAll(keepingCapacity: true)
+        }
+
         for row in rows {
-            if case .tool = row.entry {
+            switch row.entry {
+            case .tool:
+                toolRun.append(contentsOf: pendingThoughts)
+                pendingThoughts.removeAll(keepingCapacity: true)
                 toolRun.append(row)
-            } else {
+            case .thought:
+                pendingThoughts.append(row)
+            default:
                 flushTools()
+                flushPendingThoughts()
                 items.append(.row(row))
             }
         }
         flushTools()
+        flushPendingThoughts()
         return items
     }
 
