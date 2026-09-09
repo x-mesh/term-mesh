@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.237.0] - 2026-09-10
+
+### Added
+
+- A Project created in the macOS app now opens in full on another Mac. Opening it used to show the leader terminal alone: the app never published its native worker panes, and a viewer listed Projects from the daemon only. Both halves are now connected. A viewer fetches the app roster and the daemon roster separately, keeps each one's origin and freshness, and lists every Project. An app-owned worker shares its current conversation, every later change, and your input, and a reconnect returns the same agent identity. The original app keeps the process and the team, so closing the viewer does not stop the worker and ownership never moves to the daemon — `App-owned` in the list means the original app has to be running. Both sides need the new live-presentation capability; an older viewer sees app-owned agents as unattachable rather than as an empty pane, and a read-only attachment cannot type into a shared pane.
+
+### Fixed
+
+- A release no longer dies minutes after it has already pushed the tag when `cargo` is missing from the release shell's PATH. That is how v0.236.0 ended, with `cargo: command not found`. The Makefile now resolves cargo the same two ways `/release` itself already did — PATH, then rustup's standard location — and every target that needs it fails up front, saying which toolchain is missing, instead of failing as a missing command inside a build two minutes later.
+- `/release` no longer adopts a half-finished Release build. The build makes the app bundle first and the Rust daemon second, so a build that died between the two still looked complete: the resume skipped it and stopped several stages later at DMG packaging, with an error that named neither the stage that failed nor why. The check now requires the daemon binaries as well, and reads which ones from the exact declaration in the Makefile rather than from a second list that can drift. A declaration split across lines, or a longer name that merely starts the same way, is refused outright instead of yielding a partial list that would pass an incomplete build.
+- `make clean` works on a machine with no Rust toolchain. It used to refuse the whole target; it now removes what it can and reports what it left.
+
 ## [0.236.0] - 2026-09-09
 
 ### Added
