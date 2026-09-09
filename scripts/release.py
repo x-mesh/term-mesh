@@ -521,11 +521,20 @@ def daemon_binaries(worktree: Path) -> tuple[str, ...]:
     outright that it is the single source of truth.
     """
     for line in (worktree / "Makefile").read_text().splitlines():
-        if line.startswith("DAEMON_BINS"):
-            _, _, value = line.partition(":=")
-            names = tuple(value.split())
-            if names:
-                return names
+        # The exact name, so `DAEMON_BINS_EXTRA` is not mistaken for it, and
+        # only a plain assignment: a continued or appended declaration would
+        # give a partial list, which is worse than not reading one at all.
+        if not re.match(r"^DAEMON_BINS[ \t]*:?=", line):
+            continue
+        if line.rstrip().endswith("\\"):
+            raise ReleaseError(
+                f"{worktree}/Makefile continues DAEMON_BINS across lines; "
+                "this reader only understands a single-line assignment"
+            )
+        _, _, value = line.partition("=")
+        names = tuple(value.split("#", 1)[0].split())
+        if names:
+            return names
     raise ReleaseError(f"{worktree}/Makefile declares no DAEMON_BINS")
 
 

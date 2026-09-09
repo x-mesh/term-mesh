@@ -98,6 +98,25 @@ class ReleaseStateMachineTests(unittest.TestCase):
             )
             self.assertEqual(release.daemon_binaries(worktree), ("alpha", "beta", "gamma"))
 
+    def test_a_similarly_named_variable_is_not_mistaken_for_the_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            (worktree / "Makefile").write_text(
+                "DAEMON_BINS_EXTRA := decoy\n"
+                "DAEMON_BINS   := alpha beta  # the two that ship\n"
+            )
+            self.assertEqual(release.daemon_binaries(worktree), ("alpha", "beta"))
+
+    def test_a_continued_declaration_is_refused_rather_than_read_in_part(self):
+        """A partial list would pass a build that is missing binaries."""
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            (worktree / "Makefile").write_text(
+                "DAEMON_BINS   := alpha \\\\\n"
+                "\tbeta gamma\n"
+            )
+            with self.assertRaises(release.ReleaseError):
+                release.daemon_binaries(worktree)
     def test_a_makefile_without_the_list_is_an_error_not_an_empty_answer(self):
         with tempfile.TemporaryDirectory() as tmp:
             worktree = Path(tmp)
