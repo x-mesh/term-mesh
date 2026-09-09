@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.235.0] - 2026-09-09
+
+### Fixed
+
+- New Project dialog: the leader row and each agent row stay on one line again. The effort picker had pushed the row past the dialog edge, which hid the "Delegation" and "Agents run" labels and cut off the last picker. Every picker is now sized to its longest option and the dialog is wider.
+- Agent pane: markdown tables written by an agent render as tables again. A table with a compact divider such as `|:-:|:-:|`, or with any empty cell in a row, used to fall back to a paragraph of raw pipes.
+- Leader turn hook: the delegation floor no longer trusts a participation control file left behind by another Project, or one written under a schema it does not recognize.
+
+### Changed
+
+- Agent pane: tool activity is folded by default. Reasoning between two tool calls no longer breaks the run, so a turn that alternates commands and thinking collapses into one "tool activity" row instead of dozens of lines. A running group no longer opens itself; its header still shows what is running and what failed.
+
 ## [0.234.0] - 2026-09-09
 
 ### Fixed
