@@ -599,6 +599,133 @@ final class BonsplitTests: XCTestCase {
     }
 
     @MainActor
+    private final class ZoomMountProbe {
+        var mounts = 0
+        var views: [PaneID: NSView] = [:]
+    }
+
+    @MainActor
+    private struct ZoomMountContent: NSViewRepresentable {
+        let probe: ZoomMountProbe
+        let pane: PaneID
+
+        func makeNSView(context: Context) -> NSView {
+            probe.mounts += 1
+            let view = NSView()
+            probe.views[pane] = view
+            return view
+        }
+
+        func updateNSView(_ nsView: NSView, context: Context) {}
+    }
+
+    @MainActor
+    func testPaneZoomRestoresWithoutRemountingContent() throws {
+        let controller = BonsplitController()
+        controller.configuration.appearance.enableAnimations = false
+        let pane = try XCTUnwrap(controller.focusedPaneId)
+        let second = try XCTUnwrap(controller.splitPane(pane, orientation: .horizontal))
+        _ = try XCTUnwrap(controller.splitPane(second, orientation: .vertical))
+        let probe = ZoomMountProbe()
+        let host = NSHostingView(rootView: BonsplitView(controller: controller) { _, pane in
+            ZoomMountContent(probe: probe, pane: pane)
+        } emptyPane: { pane in
+            ZoomMountContent(probe: probe, pane: pane)
+        })
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.contentView = host
+        window.orderBack(nil)
+        defer { window.orderOut(nil) }
+
+        func settle() {
+            host.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            host.layoutSubtreeIfNeeded()
+        }
+        settle()
+        let originalMounts = probe.mounts
+        XCTAssertEqual(originalMounts, 3)
+        let originalFrames = probe.views.mapValues { $0.convert($0.bounds, to: host) }
+        for target in controller.allPaneIds {
+            XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+            settle()
+            let targetView = try XCTUnwrap(probe.views[target])
+            XCTAssertEqual(targetView.bounds.width, host.bounds.width, accuracy: 1)
+            for (id, view) in probe.views {
+                XCTAssertEqual(view.isHiddenOrHasHiddenAncestor, id != target)
+            }
+            let zoomedHeight = targetView.bounds.height
+            window.setContentSize(NSSize(width: 960, height: 720))
+            settle()
+            XCTAssertEqual(targetView.bounds.width, host.bounds.width, accuracy: 1)
+            XCTAssertEqual(targetView.bounds.height, zoomedHeight + 120, accuracy: 1)
+            window.setContentSize(NSSize(width: 800, height: 600))
+            settle()
+            XCTAssertTrue(controller.togglePaneZoom(inPane: target))
+            settle()
+            XCTAssertEqual(probe.mounts, originalMounts,
+                           "Zoom must retain pane content instead of rebuilding every transcript")
+            for (id, view) in probe.views {
+                XCTAssertFalse(view.isHiddenOrHasHiddenAncestor)
+                let original = try XCTUnwrap(originalFrames[id])
+                let restored = view.convert(view.bounds, to: host)
+                XCTAssertEqual(restored.minX, original.minX, accuracy: 1)
+                XCTAssertEqual(restored.minY, original.minY, accuracy: 1)
+                XCTAssertEqual(restored.width, original.width, accuracy: 1)
+                XCTAssertEqual(restored.height, original.height, accuracy: 1)
+            }
+        }
+    }
+
+    @MainActor
+    func testPaneZoomDuringSplitEntryAnimationKeepsSiblingHidden() throws {
+        let controller = BonsplitController()
+        controller.configuration.appearance.enableAnimations = true
+        let pane = try XCTUnwrap(controller.focusedPaneId)
+        let probe = ZoomMountProbe()
+        let host = NSHostingView(rootView: BonsplitView(controller: controller) { _, pane in
+            ZoomMountContent(probe: probe, pane: pane)
+        } emptyPane: { pane in
+            ZoomMountContent(probe: probe, pane: pane)
+        })
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.contentView = host
+        window.orderBack(nil)
+        defer { window.orderOut(nil) }
+
+        func settle() {
+            host.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+            host.layoutSubtreeIfNeeded()
+        }
+        settle()
+
+        // Zoom before the split entry animation's pending callback reveals the new pane.
+        let second = try XCTUnwrap(controller.splitPane(pane, orientation: .horizontal))
+        XCTAssertTrue(controller.togglePaneZoom(inPane: second))
+        settle()
+
+        XCTAssertEqual(controller.zoomedPaneId, second)
+        for (id, view) in probe.views {
+            XCTAssertEqual(view.isHiddenOrHasHiddenAncestor, id != second,
+                           "Entry animation must not reveal a sibling while zoom is active")
+        }
+
+        // Zoom exit still restores both panes.
+        XCTAssertTrue(controller.togglePaneZoom(inPane: second))
+        settle()
+        for (_, view) in probe.views {
+            XCTAssertFalse(view.isHiddenOrHasHiddenAncestor)
+        }
+    }
+
+    @MainActor
     func testSplitClearsExistingPaneZoom() {
         let controller = BonsplitController()
         guard let originalPane = controller.focusedPaneId else {

@@ -6,6 +6,7 @@ struct SplitNodeView<Content: View, EmptyContent: View>: View {
     @Environment(SplitViewController.self) private var controller
 
     let node: SplitNode
+    var zoomedPaneId: PaneID? = nil
     let contentBuilder: (TabItem, PaneID) -> Content
     let emptyPaneBuilder: (PaneID) -> EmptyContent
     let appearance: BonsplitConfiguration.Appearance
@@ -31,6 +32,7 @@ struct SplitNodeView<Content: View, EmptyContent: View>: View {
             SplitContainerView(
                 splitState: splitState,
                 controller: controller,
+                zoomedPaneId: zoomedPaneId,
                 appearance: appearance,
                 contentBuilder: contentBuilder,
                 emptyPaneBuilder: emptyPaneBuilder,
