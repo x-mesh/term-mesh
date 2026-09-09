@@ -118,7 +118,15 @@ struct AgentPanelView: View {
     /// already re-evaluates on every session change (streamed deltas), which
     /// is frequent enough to keep this fresh without widening observed state.
     private var contextUsage: AgentUsageSnapshot? {
-        TeamDataStore.shared.agentUsage[panel.teamName]?[panel.agentName]
+        let daemon = TeamDataStore.shared.agentUsage[panel.teamName]?[panel.agentName]
+        // The daemon's reading wins when it has one: it carries accumulated
+        // totals this session never sees. But it reports occupancy only for
+        // sources that can produce a non-cumulative figure, and never for a
+        // native pane, whose CLI it cannot see at all. The session parses the
+        // same numbers off every turn end, so fall back to those rather than
+        // showing nothing.
+        if daemon?.contextTokens != nil { return daemon }
+        return session.usage ?? daemon
     }
 
     private var header: some View {

@@ -833,6 +833,41 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(s.streamingIds.contains(id))
     }
 
+    /// Occupancy is the whole prompt the model saw. Claude reads most of a
+    /// long conversation out of the cache, so `input_tokens` alone reports
+    /// single digits for a nearly full window — the pane header would have
+    /// said 0% at 900k tokens.
+    func testTurnUsageCountsCachedInputTowardContextOccupancy() throws {
+        let s = session([
+            event(["type": "system", "subtype": "init", "model": "claude-sonnet-4-5"]),
+            event(["type": "result", "stop_reason": "end_turn", "usage": [
+                "input_tokens": 12,
+                "cache_read_input_tokens": 180_000,
+                "cache_creation_input_tokens": 2_400,
+                "output_tokens": 350,
+            ]]),
+        ])
+        let usage = try XCTUnwrap(s.usage)
+        XCTAssertEqual(usage.contextTokens, 182_412)
+        XCTAssertEqual(usage.inputTokens, 12)
+        XCTAssertEqual(usage.cacheReadTokens, 180_000)
+        XCTAssertEqual(usage.outputTokens, 350)
+        XCTAssertEqual(usage.model, "claude-sonnet-4-5")
+    }
+
+    /// A turn that reports nothing must not erase the last real reading: a
+    /// window does not empty because one turn failed before the model saw
+    /// anything.
+    func testTurnWithoutUsageKeepsTheLastContextReading() throws {
+        let s = session([
+            event(["type": "system", "subtype": "init", "model": "claude-sonnet-4-5"]),
+            event(["type": "result", "stop_reason": "end_turn", "usage": [
+                "input_tokens": 5, "cache_read_input_tokens": 40_000,
+            ]]),
+            event(["type": "result", "is_error": true, "result": ""]),
+        ])
+        XCTAssertEqual(try XCTUnwrap(s.usage).contextTokens, 40_005)
+    }
     /// Measured on kiro: five tool rows left spinning, because the bridge
     /// dropped the `toolCallId` its results carried and a row with no id can
     /// never be closed by one. The id is carried now — and a CLI that simply

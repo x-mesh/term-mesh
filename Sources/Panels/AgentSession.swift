@@ -424,6 +424,53 @@ private struct AgentParsedLine: @unchecked Sendable {
 @Observable @MainActor
 final class AgentSession {
 
+    // MARK: - Context occupancy
+
+    /// The model this session reported at `init`, kept apart from `summary`
+    /// so the context readout can look up a window without parsing prose.
+    private(set) var modelName = ""
+
+    /// How full the context window was at the end of the last turn that
+    /// reported usage.
+    ///
+    /// `term-meshd` has its own path for this and the pane header prefers it,
+    /// but a native pane never reached it — it has no PTY, so nothing gave the
+    /// CLI process the panel id the daemon matches on, and even with that
+    /// fixed the daemon reads Claude's JSONL session files, which a pane
+    /// launched with `--print --input-format stream-json` does not write. The
+    /// numbers were arriving here the whole time: every turn ends with a
+    /// `usage` object.
+    private(set) var usage: AgentUsageSnapshot?
+
+    /// Occupancy is the whole prompt the model saw, not the uncached
+    /// remainder. Claude reads most of a long conversation out of the cache,
+    /// so `input_tokens` alone reports single digits for a nearly full window
+    /// — which is why this adds the two cache figures back in.
+    ///
+    /// A turn that reports no input at all leaves the previous reading
+    /// standing: a window does not empty because one turn failed before the
+    /// model saw anything.
+    private func recordUsage(_ usage: [String: Any], at completedAt: Date) {
+        func count(_ key: String) -> UInt64 {
+            guard let value = usage[key] as? Int, value > 0 else { return 0 }
+            return UInt64(value)
+        }
+        let input = count("input_tokens")
+        let cacheRead = count("cache_read_input_tokens")
+        let cacheCreation = count("cache_creation_input_tokens")
+        let occupancy = input &+ cacheRead &+ cacheCreation
+        guard occupancy > 0 else { return }
+        self.usage = AgentUsageSnapshot(
+            inputTokens: input,
+            outputTokens: count("output_tokens"),
+            cacheReadTokens: cacheRead,
+            cacheCreationTokens: cacheCreation,
+            updatedAt: completedAt,
+            model: modelName,
+            contextTokens: occupancy
+        )
+    }
+
     // MARK: - What a session is made of
 
     /// Who spoke. A turn from the leader and a turn from the person watching
@@ -2784,6 +2831,7 @@ final class AgentSession {
         // watching for; the totals come with the turn.
         guard o["subtype"] as? String == "init", summary == nil else { return }
         let model = o["model"] as? String ?? ""
+        modelName = model
         let tools = (o["tools"] as? [Any])?.count ?? 0
         let mcp = (o["mcp_servers"] as? [Any])?.count ?? 0
         summary = [model, tools > 0 ? "\(tools) tools" : "", mcp > 0 ? "\(mcp) mcp" : ""]
@@ -2963,6 +3011,7 @@ final class AgentSession {
             tokensOut: usage["output_tokens"] as? Int,
             completedAt: completedAt
         )
+        recordUsage(usage, at: completedAt)
         // The header moves out of the prose and into the turn, where it is a
         // value the footer can render as a verdict. Shown raw *and* parsed was
         // paying for the same five lines twice.
