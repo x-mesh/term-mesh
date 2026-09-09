@@ -80,7 +80,7 @@ enum AgentMarkdown {
                 flushParagraph()
                 lines = lines.dropFirst()
                 var rows: [[String]] = []
-                while let row = lines.first, let cells = tableCells(row) {
+                while let row = lines.first, let cells = tableCells(row, allowEmptyCells: true) {
                     rows.append(cells)
                     lines = lines.dropFirst()
                 }
@@ -138,21 +138,30 @@ enum AgentMarkdown {
     /// GitHub-style tables are useful for compact status reports. Keep this
     /// deliberately narrow: a header plus a divider is a table; pipe-shaped
     /// prose is still prose.
-    private static func tableCells(_ line: String) -> [String]? {
+    /// Header and divider lines still require every cell to be non-empty —
+    /// that requirement is what keeps ordinary pipe-shaped prose from being
+    /// mistaken for a table. Body rows allow empty cells: a comparison table's
+    /// blank first header cell, or a blank trailing cell mid-table, are both
+    /// legitimate table content once the header and divider already matched.
+    private static func tableCells(_ line: String, allowEmptyCells: Bool = false) -> [String]? {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         guard trimmed.contains("|") else { return nil }
         let body = trimmed
             .trimmingCharacters(in: CharacterSet(charactersIn: "|"))
         let cells = body.split(separator: "|", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespaces) }
-        return cells.count >= 2 && cells.allSatisfy { !$0.isEmpty } ? cells : nil
+        guard cells.count >= 2 else { return nil }
+        return allowEmptyCells || cells.allSatisfy { !$0.isEmpty } ? cells : nil
     }
 
     private static func isTableDivider(_ line: String) -> Bool {
         guard let cells = tableCells(line) else { return false }
         return cells.allSatisfy { cell in
             let trimmed = cell.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
-            return trimmed.count >= 3 && trimmed.allSatisfy { $0 == "-" }
+            // GFM only requires one dash per cell; a compact status table (this
+            // file's own stated use case) commonly writes `:-:` or `-`, and a
+            // 3-dash minimum silently dropped those tables to plain paragraphs.
+            return !trimmed.isEmpty && trimmed.allSatisfy { $0 == "-" }
         }
     }
 

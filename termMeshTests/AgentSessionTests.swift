@@ -2223,6 +2223,52 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(rows, [["Mac", "Ready"], ["Linux", "Offline"]])
     }
 
+    /// A compact status report — this file's own stated use case — commonly
+    /// writes a one-dash divider like `:-:`, not the 3-dash form every other
+    /// test here uses. A 3-dash minimum silently dropped these tables to a
+    /// literal-pipe paragraph.
+    func testTableWithACompactDividerStillParses() {
+        let blocks = AgentMarkdown.blocks("""
+            |Host|Status|
+            |:-:|:-:|
+            |Mac|Ready|
+            """)
+        guard case .table(let headers, let rows) = try? XCTUnwrap(blocks.first) else {
+            return XCTFail("expected a table")
+        }
+        XCTAssertEqual(headers, ["Host", "Status"])
+        XCTAssertEqual(rows, [["Mac", "Ready"]])
+    }
+
+    /// An empty body cell — a blank trailing column mid-table — used to break
+    /// the table there, dropping the rest of the lines to a literal-pipe
+    /// paragraph. Only the header and divider still require every cell filled.
+    func testTableRowWithAnEmptyCellStaysInTheTable() {
+        let blocks = AgentMarkdown.blocks("""
+            | Metric | A | B |
+            | --- | --- | --- |
+            | 행 간격 | 8 | 7 |
+            | 지연 | 3 | |
+            """)
+        guard case .table(let headers, let rows) = try? XCTUnwrap(blocks.first) else {
+            return XCTFail("expected a table")
+        }
+        XCTAssertEqual(headers, ["Metric", "A", "B"])
+        XCTAssertEqual(rows, [["행 간격", "8", "7"], ["지연", "3", ""]])
+    }
+
+    /// Two ordinary pipe-shaped prose lines, with no divider, must stay prose.
+    func testPipeShapedProseWithoutADividerIsNotATable() {
+        let blocks = AgentMarkdown.blocks("""
+            The path is home | work | notes and it is not a table.
+            Same here: a | b | c, still just a sentence.
+            """)
+        XCTAssertEqual(blocks.count, 1)
+        guard case .paragraph = blocks[0] else {
+            return XCTFail("expected a paragraph, got \(blocks[0])")
+        }
+    }
+
     /// In JSON the interesting strings are the keys, and a key is a string
     /// with a colon after it.
     func testJsonKeysReadDifferentlyFromValues() {
