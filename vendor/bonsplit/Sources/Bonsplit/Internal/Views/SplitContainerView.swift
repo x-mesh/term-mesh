@@ -5,6 +5,53 @@ private var splitContainerProgrammaticSyncDepth = 0
 
 private class ThemedSplitView: NSSplitView {
     var customDividerColor: NSColor?
+    private(set) var zoomedChildIndex: Int?
+
+    override var dividerThickness: CGFloat {
+        zoomedChildIndex == nil ? super.dividerThickness : 0
+    }
+
+    func setZoomedChild(_ index: Int?) {
+        guard zoomedChildIndex != index else { return }
+        splitContainerProgrammaticSyncDepth += 1
+        defer { splitContainerProgrammaticSyncDepth -= 1 }
+        zoomedChildIndex = index
+        // Keep hidden transcripts mounted at their old size during pane zoom.
+        for (childIndex, child) in arrangedSubviews.enumerated() {
+            child.isHidden = index.map { $0 != childIndex } ?? false
+        }
+        adjustSubviews()
+        needsDisplay = true
+    }
+
+    /// Reveal a child that the split entry animation hid.
+    /// Pane zoom owns child visibility while it is active, so an entry animation that
+    /// was scheduled before the zoom must not unhide the sibling it would reveal;
+    /// `setZoomedChild` returns early on an unchanged index and would never re-hide it.
+    /// Returns false when the reveal was suppressed.
+    func revealEntryAnimationChild(_ index: Int) -> Bool {
+        guard zoomedChildIndex == nil else { return false }
+        guard arrangedSubviews.indices.contains(index) else { return false }
+        arrangedSubviews[index].isHidden = false
+        return true
+    }
+
+    override func adjustSubviews() {
+        guard let index = zoomedChildIndex else {
+            super.adjustSubviews()
+            return
+        }
+        guard arrangedSubviews.indices.contains(index) else { return }
+        arrangedSubviews[index].frame = bounds
+    }
+
+    override func resizeSubviews(withOldSize oldSize: NSSize) {
+        if zoomedChildIndex != nil {
+            adjustSubviews()
+        } else {
+            super.resizeSubviews(withOldSize: oldSize)
+        }
+    }
 
     override var dividerColor: NSColor {
         customDividerColor ?? super.dividerColor
@@ -78,6 +125,7 @@ private final class DebugSplitView: ThemedSplitView {
 struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentable {
     @Bindable var splitState: SplitState
     let controller: SplitViewController
+    var zoomedPaneId: PaneID? = nil
     let appearance: BonsplitConfiguration.Appearance
     let contentBuilder: (TabItem, PaneID) -> Content
     let emptyPaneBuilder: (PaneID) -> EmptyContent
@@ -209,7 +257,7 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
                 // Safety fallback: don't leave the new pane hidden forever.
                 context.coordinator.didApplyInitialDividerPosition = true
                 if animationOrigin != nil, shouldAnimate {
-                    splitView.arrangedSubviews[newPaneIndex].isHidden = false
+                    _ = splitView.revealEntryAnimationChild(newPaneIndex)
                     context.coordinator.isAnimating = false
                 }
 #if DEBUG
@@ -244,7 +292,12 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
                     // Wait for layout
                     DispatchQueue.main.async {
                         // Show the new pane and animate
-                        splitView.arrangedSubviews[newPaneIndex].isHidden = false
+                        guard splitView.revealEntryAnimationChild(newPaneIndex) else {
+                            // Zoom claimed visibility while this animation was pending.
+                            // Zoom exit unhides both children and re-syncs the divider.
+                            context.coordinator.isAnimating = false
+                            return
+                        }
 
                         SplitAnimator.shared.animate(
                             splitView: splitView,
@@ -305,6 +358,21 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
         // .allowsHitTesting(false) only affects gesture recognizers, not AppKit's
         // view-hierarchy-based NSDraggingDestination routing.
         splitView.isHidden = !controller.isInteractive
+        let zoomedChild: Int? = zoomedPaneId.flatMap { paneID in
+            if splitState.first.findPane(paneID) != nil { return 0 }
+            if splitState.second.findPane(paneID) != nil { return 1 }
+            return nil
+        }
+        let themedSplit = splitView as? ThemedSplitView
+        let restoringZoom = themedSplit?.zoomedChildIndex != nil && zoomedChild == nil
+        themedSplit?.setZoomedChild(zoomedChild)
+        if restoringZoom {
+            // An ancestor's layout suppresses nested divider sync during zoom restoration.
+            DispatchQueue.main.async { [weak splitView, weak coordinator = context.coordinator] in
+                guard let splitView, let coordinator else { return }
+                coordinator.syncPosition(coordinator.splitState.dividerPosition, in: splitView)
+            }
+        }
         splitView.wantsLayer = true
         splitView.layer?.backgroundColor = NSColor.clear.cgColor
         splitView.layer?.isOpaque = false
@@ -433,6 +501,7 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
             SplitContainerView(
                 splitState: nestedSplitState,
                 controller: controller,
+                zoomedPaneId: zoomedPaneId,
                 appearance: appearance,
                 contentBuilder: contentBuilder,
                 emptyPaneBuilder: emptyPaneBuilder,
@@ -589,6 +658,7 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
 #endif
         /// Apply external position changes to the NSSplitView
         func setPositionSafely(_ position: CGFloat, in splitView: NSSplitView, layout: Bool = true) {
+            guard (splitView as? ThemedSplitView)?.zoomedChildIndex == nil else { return }
             isSyncingProgrammatically = true
             splitContainerProgrammaticSyncDepth += 1
             defer {
@@ -606,6 +676,7 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
         /// Pass `layout: false` when called from within a resize delegate callback to avoid
         /// reentrant NSHostingView layout (which SwiftUI silently skips, causing pane disappearance).
         func syncPosition(_ statePosition: CGFloat, in splitView: NSSplitView, layout: Bool = true) {
+            guard (splitView as? ThemedSplitView)?.zoomedChildIndex == nil else { return }
             guard !isAnimating else { return }
             guard !isSyncingProgrammatically else { return }
             guard splitContainerProgrammaticSyncDepth == 0 else { return }
@@ -653,6 +724,10 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
 
         func splitViewWillResizeSubviews(_ notification: Notification) {
             guard let splitView = notification.object as? NSSplitView else { return }
+            guard (splitView as? ThemedSplitView)?.zoomedChildIndex == nil else {
+                isDragging = false
+                return
+            }
             // If the left mouse button isn't down, this can't be an interactive divider drag.
             // (`splitViewWillResizeSubviews` can fire for programmatic/layout-driven resizes too.)
             guard (NSEvent.pressedMouseButtons & 1) != 0 else {
@@ -762,6 +837,7 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
             // Skip position updates during animation
             guard !isAnimating else { return }
             guard let splitView = notification.object as? NSSplitView else { return }
+            guard (splitView as? ThemedSplitView)?.zoomedChildIndex == nil else { return }
 #if DEBUG
             let subframes = splitView.arrangedSubviews.enumerated().map { (i, v) in
                 "\(i)=\(Int(v.frame.width))x\(Int(v.frame.height))"
@@ -871,11 +947,13 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
         }
 
         func splitView(_ splitView: NSSplitView, effectiveRect proposedEffectiveRect: NSRect, forDrawnRect drawnRect: NSRect, ofDividerAt dividerIndex: Int) -> NSRect {
+            guard (splitView as? ThemedSplitView)?.zoomedChildIndex == nil else { return .zero }
             let expanded = drawnRect.insetBy(dx: -5, dy: -5)
             return proposedEffectiveRect.union(expanded)
         }
 
         func splitView(_ splitView: NSSplitView, additionalEffectiveRectOfDividerAt dividerIndex: Int) -> NSRect {
+            guard (splitView as? ThemedSplitView)?.zoomedChildIndex == nil else { return .zero }
             guard splitView.arrangedSubviews.count >= dividerIndex + 2 else { return .zero }
 
             let first = splitView.arrangedSubviews[dividerIndex].frame
