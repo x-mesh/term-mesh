@@ -87,6 +87,61 @@ class ReleaseStateMachineTests(unittest.TestCase):
         ]))
         self.assertFalse(release.relay_e2e_required_for_paths(["README.md"]))
 
+    def test_daemon_binaries_come_from_the_makefile_not_a_second_list(self):
+        """The Makefile says it is the single source of truth for these."""
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            (worktree / "Makefile").write_text(
+                "PROJECT_DIR   := $(shell pwd)\n"
+                "DAEMON_BINS   := alpha beta gamma\n"
+                "\nbuild:\n\t@true\n"
+            )
+            self.assertEqual(release.daemon_binaries(worktree), ("alpha", "beta", "gamma"))
+
+    def test_a_similarly_named_variable_is_not_mistaken_for_the_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            (worktree / "Makefile").write_text(
+                "DAEMON_BINS_EXTRA := decoy\n"
+                "DAEMON_BINS   := alpha beta  # the two that ship\n"
+            )
+            self.assertEqual(release.daemon_binaries(worktree), ("alpha", "beta"))
+
+    def test_a_continued_declaration_is_refused_rather_than_read_in_part(self):
+        """A partial list would pass a build that is missing binaries."""
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            (worktree / "Makefile").write_text(
+                "DAEMON_BINS   := alpha \\\\\n"
+                "\tbeta gamma\n"
+            )
+            with self.assertRaises(release.ReleaseError):
+                release.daemon_binaries(worktree)
+    def test_a_makefile_without_the_list_is_an_error_not_an_empty_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            (worktree / "Makefile").write_text("build:\n\t@true\n")
+            with self.assertRaises(release.ReleaseError):
+                release.daemon_binaries(worktree)
+
+    def test_an_app_bundle_alone_does_not_prove_make_prod_ran(self):
+        """`make prod` builds Xcode first and the daemon second.
+
+        v0.236.0 adopted a build that died between the two, skipped the rebuild,
+        and failed two stages later with every binary missing.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            (worktree / "Makefile").write_text("DAEMON_BINS   := alpha beta\n")
+            target = worktree / "daemon/target/release"
+            target.mkdir(parents=True)
+            self.assertEqual(release.missing_daemon_binaries(worktree), ["alpha", "beta"])
+
+            (target / "alpha").write_text("")
+            self.assertEqual(release.missing_daemon_binaries(worktree), ["beta"])
+
+            (target / "beta").write_text("")
+            self.assertEqual(release.missing_daemon_binaries(worktree), [])
     def test_steps_preserve_release_order(self):
         self.assertLess(
             release.STEP_ORDER.index("develop_to_main"),

@@ -514,6 +514,43 @@ def remote_sha(branch: str) -> str:
     return git("rev-parse", f"origin/{branch}")
 
 
+def daemon_binaries(worktree: Path) -> tuple[str, ...]:
+    """The binaries `make prod` builds, read from the Makefile that declares them.
+
+    Duplicating the list here would let the two drift, and the Makefile says
+    outright that it is the single source of truth.
+    """
+    for line in (worktree / "Makefile").read_text().splitlines():
+        # The exact name, so `DAEMON_BINS_EXTRA` is not mistaken for it, and
+        # only a plain assignment: a continued or appended declaration would
+        # give a partial list, which is worse than not reading one at all.
+        if not re.match(r"^DAEMON_BINS[ \t]*:?=", line):
+            continue
+        if line.rstrip().endswith("\\"):
+            raise ReleaseError(
+                f"{worktree}/Makefile continues DAEMON_BINS across lines; "
+                "this reader only understands a single-line assignment"
+            )
+        _, _, value = line.partition("=")
+        names = tuple(value.split("#", 1)[0].split())
+        if names:
+            return names
+    raise ReleaseError(f"{worktree}/Makefile declares no DAEMON_BINS")
+
+
+def missing_daemon_binaries(worktree: Path) -> list[str]:
+    """Which of them `make prod` has not produced.
+
+    The app bundle alone is not proof the build ran: `make prod` builds Xcode
+    first and the Rust daemon second, so a cargo failure leaves a bundle that
+    passes every check below with no daemon beside it. v0.236.0 stopped exactly
+    there — the release adopted a half-finished build, skipped `make prod`, and
+    failed two stages later at DMG packaging with all five binaries missing.
+    """
+    target = worktree / "daemon/target/release"
+    return [name for name in daemon_binaries(worktree) if not (target / name).is_file()]
+
+
 def valid_release_product(product: Path, dsym: Path, version: str, commit: str) -> bool:
     if not product.is_dir() or not dsym.is_dir():
         return False
@@ -1090,11 +1127,23 @@ def publish(args: argparse.Namespace, state: dict[str, Any] | None = None) -> di
         derived = Path("/tmp") / f"term-mesh-release-{state['version']}"
         product = derived / "Build/Products/Release/term-mesh.app"
         dsym = Path(str(product) + ".dSYM")
-        if not valid_release_product(product, dsym, state["version"], merge_sha):
+        # Both halves of `make prod`, or it runs again. Checking only the app
+        # let a build that died in cargo look finished.
+        if (
+            not valid_release_product(product, dsym, state["version"], merge_sha)
+            or missing_daemon_binaries(artifact_wt)
+        ):
             run("./scripts/setup.sh", cwd=artifact_wt)
             run("make", "prod", "SENTRY_UPLOAD_DSYM=0", f"PROD_DERIVED_DATA={derived}", cwd=artifact_wt)
         if not valid_release_product(product, dsym, state["version"], merge_sha):
             raise ReleaseError("Release app or dSYM failed version/UUID verification")
+        # Named here rather than at DMG packaging, which is two stages and
+        # several minutes later and reports them as a make error.
+        still_missing = missing_daemon_binaries(artifact_wt)
+        if still_missing:
+            raise ReleaseError(
+                "make prod left daemon binaries unbuilt: " + ", ".join(still_missing)
+            )
         mark(state, "release_build", worktree=str(artifact_wt), app=str(product), dsym=str(dsym), derived_data=str(derived))
     dsym = Path(state["steps"]["release_build"]["dsym"])
     if not completed(state, "dsym"):

@@ -38,7 +38,17 @@ XCFW          := GhosttyKit.xcframework
 # that each one was actually built before any packaging step runs.
 DAEMON_BINS   := term-meshd term-mesh-run tm-agent term-mesh-peer-relay tm-agent-bridge
 
-.PHONY: init doctor sync setup build prod deploy deploy-prod dmg dmg-package run stop clean daemon test install-commands sentry-upload-dsym verify-daemon-binaries
+# `cargo` is not always on the PATH a build inherits. A release run reaches
+# `prod` through a shell that never sourced a login profile, and the failure it
+# produced was `/bin/sh: cargo: command not found` two minutes into a Release
+# build — after the tag had already been pushed. Resolve it the way
+# `scripts/release.py` does: PATH first, then rustup's standard location.
+# Empty when neither has it, which `require-cargo` reports as itself rather
+# than letting `cd daemon && build --release` fail as a missing command.
+CARGO         := $(shell command -v cargo 2>/dev/null || \
+	{ [ -x "$$HOME/.cargo/bin/cargo" ] && printf '%s' "$$HOME/.cargo/bin/cargo"; })
+
+.PHONY: init doctor sync setup build prod deploy deploy-prod dmg dmg-package run stop clean daemon test install-commands sentry-upload-dsym verify-daemon-binaries require-cargo
 
 # One-shot onboarding: sync the ghostty submodule and build/cache GhosttyKit
 # only when out of date. Safe to run repeatedly — no-op when everything matches.
@@ -101,7 +111,7 @@ sync:
 setup:
 	@./scripts/setup.sh
 
-build:
+build: require-cargo
 	@echo "==> Generating BuildInfo.swift..."
 	@./scripts/generate-build-info.sh
 	@echo "==> Building Xcode (Debug)..."
@@ -128,7 +138,7 @@ build:
 		exit 1; \
 	fi
 	@echo "==> Building Rust daemon (release)..."
-	@cd daemon && cargo build --release 2>&1 | tee /tmp/term-mesh-cargo.log | grep -v "Compiling "; \
+	@cd daemon && $(CARGO) build --release 2>&1 | tee /tmp/term-mesh-cargo.log | grep -v "Compiling "; \
 		RESULT=$${PIPESTATUS[0]}; \
 		if [ $$RESULT -ne 0 ]; then \
 			echo "==> Rust daemon build FAILED (exit $$RESULT). Full log: /tmp/term-mesh-cargo.log"; \
@@ -137,13 +147,13 @@ build:
 		fi
 	@echo "==> Build complete"
 
-daemon:
+daemon: require-cargo
 	@echo "==> Building Rust daemon (release)..."
-	@cd daemon && cargo build --release
+	@cd daemon && $(CARGO) build --release
 	@echo "==> daemon: target/release/term-mesh-run, target/release/term-meshd"
 
-test:
-	@cd daemon && cargo test
+test: require-cargo
+	@cd daemon && $(CARGO) test
 
 deploy: build
 	@echo "==> Stopping existing app + daemon..."
@@ -205,7 +215,7 @@ cleanup:
 cleanup-all:
 	@./scripts/cleanup-daemons.sh --all
 
-prod:
+prod: require-cargo
 	@echo "==> Generating BuildInfo.swift..."
 	@./scripts/generate-build-info.sh
 	@echo "==> Building Xcode (Release)..."
@@ -224,7 +234,7 @@ prod:
 			exit 1; \
 		fi
 	@echo "==> Building Rust daemon (release)..."
-	@cd daemon && cargo build --release 2>&1 | tee /tmp/term-mesh-cargo.log | grep -v "Compiling "; \
+	@cd daemon && $(CARGO) build --release 2>&1 | tee /tmp/term-mesh-cargo.log | grep -v "Compiling "; \
 		RESULT=$${PIPESTATUS[0]}; \
 		if [ $$RESULT -ne 0 ]; then \
 			echo "==> Rust daemon build FAILED (exit $$RESULT). Full log: /tmp/term-mesh-cargo.log"; \
@@ -307,6 +317,13 @@ sentry-upload-dsym:
 	echo "==> Uploading dSYMs to Sentry..."; \
 	sentry-cli debug-files upload --include-sources $$ARGS || \
 		echo "==> dSYM upload failed (non-fatal)"
+
+require-cargo:
+	@if [ -z "$(CARGO)" ]; then \
+		echo "ERROR: cargo was not found on PATH or in ~/.cargo/bin"; \
+		echo "       Install Rust, or add cargo to this shell's PATH."; \
+		exit 1; \
+	fi
 
 verify-daemon-binaries:
 	@for b in $(DAEMON_BINS); do \
@@ -403,8 +420,16 @@ install-commands:
 	done
 	@echo "==> Claude commands installed (tm, team, team-up, tm-op, tm-bench, watch, release, rc)"
 
+# Not guarded by `require-cargo`: removing build output is a reasonable thing
+# to want on a machine that has no toolchain, and `rm -rf` does not need one.
+# Only the daemon's own tree does, so say what was left rather than refusing
+# to clean anything.
 clean:
 	@echo "==> Cleaning build artifacts..."
 	@rm -rf "$(DERIVED_DATA)" /tmp/term-mesh-prod
-	@cd daemon && cargo clean
+	@if [ -n "$(CARGO)" ]; then \
+		cd daemon && $(CARGO) clean; \
+	else \
+		echo "==> cargo not found; daemon/target left in place"; \
+	fi
 	@echo "==> Clean complete"
