@@ -17,6 +17,70 @@ import SwiftUI
 /// parsing: turning the stream into things a view can draw as what they are.
 @MainActor
 final class AgentSessionTests: XCTestCase {
+    private func recoveryFrame(full: Bool = true) -> AgentLiveFrame {
+        AgentLiveFrame(full: full, baseRevision: 0, revision: 1, order: [], state: .init(
+            generation: UUID(), entries: [], running: true, thinking: false,
+            interruptible: true, streaming: [], summary: nil, model: "fixture", usage: nil))
+    }
+
+    private func recoveryPacket(_ payload: Data, begin: Bool = true, end: Bool = true) throws -> Data {
+        var data = try JSONSerialization.data(withJSONObject: [
+            "begin": begin, "end": end, "payload": payload.base64EncodedString()
+        ])
+        data.append(10)
+        return data
+    }
+
+    func testLiveProjectionRosterFailureDoesNotDisableIdleWorker() {
+        let viewer = AgentSession()
+        viewer.prepareLivePresentation()
+        XCTAssertTrue(viewer.acceptLivePresentation(recoveryFrame()))
+        for (present, verified) in [(true, false), (false, false), (true, true)] {
+            RemoteLiveProject.applyRosterAvailability(
+                projectPresent: present, rosterVerified: verified, sessions: [viewer])
+            XCTAssertTrue(viewer.isRunning, "roster failure/recovery must not require fresh agent output")
+            XCTAssertTrue(viewer.canInterrupt)
+        }
+        RemoteLiveProject.applyRosterAvailability(
+            projectPresent: false, rosterVerified: true, sessions: [viewer])
+        XCTAssertFalse(viewer.isRunning, "confirmed Project removal still disables input")
+        XCTAssertFalse(viewer.canInterrupt)
+    }
+
+    func testLiveProjectionRestartsAfterPartialLineAndFrame() async throws {
+        for partialFrame in [false, true] {
+            let received = expectation(description: "fresh snapshot after restart \(partialFrame)")
+            let frame = recoveryFrame()
+            let payload = try JSONEncoder().encode(frame)
+            let packet = try recoveryPacket(payload)
+            let decoder = AgentLiveDecoder(invalid: { XCTFail("old bytes corrupted the new stream") }) { result in
+                XCTAssertTrue(result.full)
+                XCTAssertEqual(result.state.generation, frame.state.generation)
+                received.fulfill()
+            }
+            if partialFrame {
+                decoder.consume(try recoveryPacket(payload.prefix(payload.count / 2), end: false))
+            } else {
+                decoder.consume(packet.prefix(packet.count / 2))
+            }
+            decoder.resetForRestart()
+            decoder.consume(packet)
+            await fulfillment(of: [received], timeout: 3)
+            decoder.stop()
+        }
+    }
+
+    func testLiveProjectionRestartRequiresFullSnapshot() async throws {
+        let refused = expectation(description: "delta cannot bootstrap restarted stream")
+        let decoder = AgentLiveDecoder(invalid: { refused.fulfill() }) { _ in
+            XCTFail("delta was delivered before a full snapshot")
+        }
+        decoder.resetForRestart()
+        decoder.consume(try recoveryPacket(JSONEncoder().encode(recoveryFrame(full: false))))
+        await fulfillment(of: [refused], timeout: 3)
+        decoder.stop()
+    }
+
     func testLiveProjectionSnapshotsExistingHiddenTranscriptAndThenDeltas() async throws {
         let source = AgentSession()
         source.isVisible = false

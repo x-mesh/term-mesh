@@ -68,6 +68,15 @@ final class RemoteLiveProject {
     }
 
     /// Source freshness is independent: a failed daemon poll cannot remove GUI panes.
+    static func applyRosterAvailability(
+        projectPresent: Bool, rosterVerified: Bool, sessions: [AgentSession]
+    ) {
+        // A failed roster read says nothing about an existing live attachment.
+        // Its own transport callbacks remain responsible for disconnects.
+        guard rosterVerified, !projectPresent else { return }
+        for session in sessions { session.livePresentationDisconnected() }
+    }
+
     static func refresh(host: HostEntry) {
         for project in host.teams where project.isGUILive && project.rosterVerified {
             if let mirror = PeerClientCoordinator.shared.mirroredWorkspace(
@@ -83,14 +92,15 @@ final class RemoteLiveProject {
                 continue
             }
             guard viewer.hostID == host.id else { continue }
-            if let project = host.teams.first(where: {
+            let project = host.teams.first(where: {
                 $0.isGUILive && $0.projectID == viewer.projectID
-            }), project.rosterVerified {
+            })
+            applyRosterAvailability(
+                projectPresent: project != nil, rosterVerified: host.guiRosterVerified,
+                sessions: workspace.panels.values.compactMap { ($0 as? AgentPanel)?.session }
+            )
+            if let project, project.rosterVerified {
                 Task { await viewer.update(host: host, project: project) }
-            } else {
-                for panel in workspace.panels.values.compactMap({ $0 as? AgentPanel }) {
-                    panel.session.livePresentationDisconnected()
-                }
             }
         }
     }

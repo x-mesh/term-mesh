@@ -3776,7 +3776,7 @@ final class Workspace: Identifiable {
             relay.onPtyData = { bytes in decoder.consume(bytes) }
             // Full snapshots replace the projection atomically on reconnect.
             // They never replay CLI events or restart the host's process.
-            relay.onPtyDeliveryRestart = { }
+            relay.onPtyDeliveryRestart = { decoder.resetForRestart() }
             relay.onDisconnect = { [weak agentSession] in
                 Task { @MainActor in agentSession?.livePresentationDisconnected() }
             }

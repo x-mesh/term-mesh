@@ -3638,10 +3638,11 @@ final class AgentLiveEncoder: @unchecked Sendable {
 /// Decodes complete frames off-main; partial snapshots never change the model.
 final class AgentLiveDecoder: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.termmesh.agent-live.decode")
-    private let decoder = AgentStreamDecoder(maxLineBytes: 65_536)
+    private var decoder = AgentStreamDecoder(maxLineBytes: 65_536)
     private var pending = Data()
     private var assembling = false
     private var active = true
+    private var awaitingSnapshot = true
     private let receive: @Sendable (AgentLiveFrame) -> Void
     private let invalid: @Sendable () -> Void
 
@@ -3658,6 +3659,19 @@ final class AgentLiveDecoder: @unchecked Sendable {
     }
 
     func stop() { queue.async { self.active = false; self.pending.removeAll() } }
+
+    /// Called before the relay delivers any bytes from a restarted stream.
+    /// Queue ordering separates both partial NDJSON lines and partial frames
+    /// from the new connection without blocking the main actor.
+    func resetForRestart() {
+        queue.async {
+            self.decoder = AgentStreamDecoder(maxLineBytes: 65_536)
+            self.pending.removeAll()
+            self.assembling = false
+            self.active = true
+            self.awaitingSnapshot = true
+        }
+    }
 
     func consume(_ data: Data) {
         queue.async {
@@ -3677,6 +3691,8 @@ final class AgentLiveDecoder: @unchecked Sendable {
                 self.pending.append(packet.payload)
                 if packet.end {
                     if let frame = try? JSONDecoder().decode(AgentLiveFrame.self, from: self.pending) {
+                        guard !self.awaitingSnapshot || frame.full else { self.fail(); return }
+                        self.awaitingSnapshot = false
                         self.receive(frame)
                     } else { self.fail(); return }
                     self.pending.removeAll(keepingCapacity: true)
