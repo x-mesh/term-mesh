@@ -4099,6 +4099,30 @@ extension AgentSessionTests {
         XCTAssertNil(AgentSlashCommandParser.parse(""))
     }
 
+    /// The palette offers values, not just command names — a native pane wants
+    /// a full model name and nobody should have to remember one per CLI. The
+    /// values come from the same catalog the pickers use, and a command that
+    /// takes no argument offers nothing so the popover stays out of the way.
+    func testArgumentSuggestionsComeFromTheCLICatalog() {
+        guard let model = AgentSlashCommands.command(named: "/model"),
+              let effort = AgentSlashCommands.command(named: "/effort"),
+              let cost = AgentSlashCommands.command(named: "/cost") else {
+            return XCTFail("catalog is missing a command this test needs")
+        }
+        XCTAssertEqual(
+            AgentSlashCommands.argumentSuggestions(for: model, cli: "codex"),
+            AgentRolePreset.models(for: "codex")
+        )
+        XCTAssertEqual(
+            AgentSlashCommands.argumentSuggestions(for: model, cli: "claude"),
+            AgentRolePreset.models(for: "claude")
+        )
+        XCTAssertEqual(
+            AgentSlashCommands.argumentSuggestions(for: effort, cli: "codex"),
+            AgentRolePreset.efforts(for: "codex")
+        )
+        XCTAssertTrue(AgentSlashCommands.argumentSuggestions(for: cost, cli: "codex").isEmpty)
+    }
     /// The catalog only lists what the app can actually perform — see
     /// `AgentSlashCommands`'s note on why `SlashCommands.builtinCommands`
     /// (the terminal-CLI list) is not reused here. `/compact` stands for that

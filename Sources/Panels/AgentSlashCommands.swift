@@ -124,6 +124,18 @@ enum AgentSlashCommands {
         ),
     ]
 
+    /// The values a `.profileField` command accepts on this CLI, so the
+    /// palette can offer the CLI's own catalog rather than asking someone to
+    /// remember what it calls its models. Empty for commands that take no
+    /// argument, which is what keeps the palette out of the way for them.
+    static func argumentSuggestions(for command: AgentSlashCommand, cli: String) -> [String] {
+        guard case let .profileField(field) = command.kind else { return [] }
+        switch field {
+        case .model: return AgentRolePreset.models(for: cli)
+        case .effort: return AgentRolePreset.efforts(for: cli)
+        }
+    }
+
     /// Looks up a catalog entry by name, case-insensitively, regardless of
     /// CLI support — a caller that finds a hit still has to check
     /// `supports(cli:)` itself, so it can tell "not an app command" (fall
