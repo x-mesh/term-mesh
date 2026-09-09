@@ -281,7 +281,7 @@ struct NewProjectView: View {
         // Tall enough that the collision card's decisive rows — its leader
         // state, who owns the record, and how old the roster is — are not the
         // part that falls below the fold.
-        .frame(width: 860, height: 680)
+        .frame(width: 1060, height: 680)
         .onAppear {
             applyInitialTeamPreset()
             adoptProjectMachineForNewRows()
@@ -840,10 +840,10 @@ struct NewProjectView: View {
     /// section.
     private var teamRuntimeRow: some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 8) {
+            HStack(spacing: 7) {
                 Text("Leader")
                     .font(.subheadline.bold())
-                    .frame(width: 120, alignment: .leading)
+                    .frame(width: 80, alignment: .leading)
 
                 Picker("", selection: Binding(
                     get: { leaderCli },
@@ -904,7 +904,7 @@ struct NewProjectView: View {
                             }
                         }
                         .labelsHidden()
-                        .frame(width: 100)
+                        .frame(width: 84)
                     }
                 } else {
                     Text("Manual console")
@@ -915,7 +915,7 @@ struct NewProjectView: View {
 
                 Divider()
                     .frame(height: 24)
-                    .padding(.horizontal, 4)
+                    .padding(.horizontal, 2)
 
                 Text("Delegation")
                     .font(.caption.bold())
@@ -927,13 +927,13 @@ struct NewProjectView: View {
                     }
                 }
                 .labelsHidden()
-                .frame(width: 126)
+                .frame(width: 106)
                 .help(delegationLevel.detail)
                 .accessibilityIdentifier("newProject.delegationLevel")
 
                 Divider()
                     .frame(height: 24)
-                    .padding(.horizontal, 4)
+                    .padding(.horizontal, 2)
 
                 Text("Agents run")
                     .font(.caption.bold())
@@ -954,7 +954,7 @@ struct NewProjectView: View {
                     }
                 }
                 .labelsHidden()
-                .frame(width: 165)
+                .frame(width: 152)
                 .accessibilityIdentifier("newProject.agentPlacementMode")
 
                 if agentPlacementMode == .allOnOneMachine {
@@ -966,7 +966,7 @@ struct NewProjectView: View {
                         }
                     }
                     .labelsHidden()
-                    .frame(maxWidth: 150)
+                    .frame(maxWidth: 132)
                     .accessibilityIdentifier("newProject.allAgentsHost")
                     .onChange(of: allAgentsHostKey) { _, hostKey in
                         connectHostIfNeeded(hostKey)
@@ -978,7 +978,7 @@ struct NewProjectView: View {
             }
 
             HStack(spacing: 8) {
-                Color.clear.frame(width: 390, height: 1)
+                Color.clear.frame(width: 87, height: 1)
                 Text(agentPlacementDetail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
