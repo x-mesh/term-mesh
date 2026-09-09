@@ -4,6 +4,12 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.238.0] - 2026-09-10
+
+### Fixed
+
+- Zooming a pane no longer rebuilds the panes around it. Zoom used to render the zoomed branch alone, so every other pane was torn down on the way in and built again on the way out. A native agent pane came back as a fresh transcript, and the restore itself stalled while that work ran. The split tree and all pane content now stay mounted: the zoomed branch fills its ancestor split views, the other branches stay hidden, and your divider positions return on exit. A split animation that is still running when you zoom no longer reveals the pane it was animating in.
+
 ## [0.237.0] - 2026-09-10
 
 ### Added
