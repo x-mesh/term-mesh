@@ -681,6 +681,51 @@ final class BonsplitTests: XCTestCase {
     }
 
     @MainActor
+    func testPaneZoomDuringSplitEntryAnimationKeepsSiblingHidden() throws {
+        let controller = BonsplitController()
+        controller.configuration.appearance.enableAnimations = true
+        let pane = try XCTUnwrap(controller.focusedPaneId)
+        let probe = ZoomMountProbe()
+        let host = NSHostingView(rootView: BonsplitView(controller: controller) { _, pane in
+            ZoomMountContent(probe: probe, pane: pane)
+        } emptyPane: { pane in
+            ZoomMountContent(probe: probe, pane: pane)
+        })
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.contentView = host
+        window.orderBack(nil)
+        defer { window.orderOut(nil) }
+
+        func settle() {
+            host.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+            host.layoutSubtreeIfNeeded()
+        }
+        settle()
+
+        // Zoom before the split entry animation's pending callback reveals the new pane.
+        let second = try XCTUnwrap(controller.splitPane(pane, orientation: .horizontal))
+        XCTAssertTrue(controller.togglePaneZoom(inPane: second))
+        settle()
+
+        XCTAssertEqual(controller.zoomedPaneId, second)
+        for (id, view) in probe.views {
+            XCTAssertEqual(view.isHiddenOrHasHiddenAncestor, id != second,
+                           "Entry animation must not reveal a sibling while zoom is active")
+        }
+
+        // Zoom exit still restores both panes.
+        XCTAssertTrue(controller.togglePaneZoom(inPane: second))
+        settle()
+        for (_, view) in probe.views {
+            XCTAssertFalse(view.isHiddenOrHasHiddenAncestor)
+        }
+    }
+
+    @MainActor
     func testSplitClearsExistingPaneZoom() {
         let controller = BonsplitController()
         guard let originalPane = controller.focusedPaneId else {

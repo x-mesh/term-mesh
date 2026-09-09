@@ -24,6 +24,18 @@ private class ThemedSplitView: NSSplitView {
         needsDisplay = true
     }
 
+    /// Reveal a child that the split entry animation hid.
+    /// Pane zoom owns child visibility while it is active, so an entry animation that
+    /// was scheduled before the zoom must not unhide the sibling it would reveal;
+    /// `setZoomedChild` returns early on an unchanged index and would never re-hide it.
+    /// Returns false when the reveal was suppressed.
+    func revealEntryAnimationChild(_ index: Int) -> Bool {
+        guard zoomedChildIndex == nil else { return false }
+        guard arrangedSubviews.indices.contains(index) else { return false }
+        arrangedSubviews[index].isHidden = false
+        return true
+    }
+
     override func adjustSubviews() {
         guard let index = zoomedChildIndex else {
             super.adjustSubviews()
@@ -245,7 +257,7 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
                 // Safety fallback: don't leave the new pane hidden forever.
                 context.coordinator.didApplyInitialDividerPosition = true
                 if animationOrigin != nil, shouldAnimate {
-                    splitView.arrangedSubviews[newPaneIndex].isHidden = false
+                    _ = splitView.revealEntryAnimationChild(newPaneIndex)
                     context.coordinator.isAnimating = false
                 }
 #if DEBUG
@@ -280,7 +292,12 @@ struct SplitContainerView<Content: View, EmptyContent: View>: NSViewRepresentabl
                     // Wait for layout
                     DispatchQueue.main.async {
                         // Show the new pane and animate
-                        splitView.arrangedSubviews[newPaneIndex].isHidden = false
+                        guard splitView.revealEntryAnimationChild(newPaneIndex) else {
+                            // Zoom claimed visibility while this animation was pending.
+                            // Zoom exit unhides both children and re-syncs the divider.
+                            context.coordinator.isAnimating = false
+                            return
+                        }
 
                         SplitAnimator.shared.animate(
                             splitView: splitView,
