@@ -445,7 +445,32 @@ impl PerTurnBridge {
     /// sit open; but nothing was said, so it cannot be called a success. The
     /// reasoning is not promoted into the answer — inventing one from what the
     /// model was thinking is worse than saying nothing was said.
-    fn cursor_result(&mut self, obj: Value) {
+    fn cursor_result(&mut self, mut obj: Value) {
+        // The one place cursor is *not* already claude's shape: it names its
+        // usage in camelCase where claude uses snake_case, so the reader that
+        // serves every other CLI found nothing and the pane's context readout
+        // stayed empty. Rename rather than teach it a second spelling.
+        //
+        // cursor states no window, so the percentage falls back to the model
+        // table and a model it does not list shows a raw count instead.
+        if let Some(usage) = obj.get("usage").cloned() {
+            let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+            let renamed = [
+                ("input_tokens", field("inputTokens")),
+                ("cache_read_input_tokens", field("cacheReadTokens")),
+                ("cache_creation_input_tokens", field("cacheWriteTokens")),
+                ("output_tokens", field("outputTokens")),
+            ];
+            // Added beside what cursor sent rather than replacing it: this
+            // path passes cursor's events through, and a wholesale swap would
+            // drop anything else it puts here — a cost, a per-model breakdown,
+            // a field it gains later.
+            if let Some(map) = obj.get_mut("usage").and_then(Value::as_object_mut) {
+                for (key, value) in renamed {
+                    map.insert(key.into(), Value::Number(value.into()));
+                }
+            }
+        }
         let said = obj
             .get("result")
             .and_then(Value::as_str)
@@ -668,6 +693,40 @@ mod tests {
         let result = last_result(&sink);
         assert_eq!(result["is_error"], false);
         assert_eq!(result["result"], "TANGERINE");
+    }
+
+    /// cursor names its usage in camelCase where claude uses snake_case, so
+    /// the reader that serves every other CLI found nothing. The rename is
+    /// added beside what cursor sent — this path passes its events through,
+    /// and a wholesale swap would drop whatever else it puts there.
+    #[test]
+    fn cursor_usage_is_renamed_without_losing_what_it_sent() {
+        let (mut b, sink) = bridge(PerTurnCli::Cursor);
+
+        b.cursor_result(json!({"type": "result", "is_error": false, "result": "ok",
+            "usage": {"inputTokens": 29592, "outputTokens": 1,
+                      "cacheReadTokens": 7, "cacheWriteTokens": 3,
+                      "costUsd": 0.25, "somethingNew": "keep me"}}));
+
+        let usage = &last_result(&sink)["usage"];
+        assert_eq!(usage["input_tokens"], 29592);
+        assert_eq!(usage["cache_read_input_tokens"], 7);
+        assert_eq!(usage["cache_creation_input_tokens"], 3);
+        assert_eq!(usage["output_tokens"], 1);
+        // Whatever else cursor said is still there.
+        assert_eq!(usage["costUsd"], 0.25);
+        assert_eq!(usage["somethingNew"], "keep me");
+        assert_eq!(usage["inputTokens"], 29592);
+    }
+
+    /// A turn with no usage must not gain one.
+    #[test]
+    fn a_cursor_turn_without_usage_gains_no_usage_key() {
+        let (mut b, sink) = bridge(PerTurnCli::Cursor);
+
+        b.cursor_result(json!({"type": "result", "is_error": false, "result": "ok"}));
+
+        assert!(last_result(&sink).get("usage").is_none());
     }
 
     #[test]

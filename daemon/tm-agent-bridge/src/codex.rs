@@ -335,6 +335,10 @@ impl<T: Transport> CodexBridge<T> {
         let mut said: Vec<String> = Vec::new();
         let mut streamed = false;
         let mut errors: Vec<TurnError> = Vec::new();
+        // `thread/tokenUsage/updated` lands before `turn/completed`, so the
+        // figures are held here until the turn is reported.
+        let mut seen_usage: Option<Value> = None;
+        let mut seen_window: Option<u64> = None;
 
         let mut params = json!({
             "threadId": thread_id.clone().unwrap_or_default(),
@@ -354,6 +358,27 @@ impl<T: Transport> CodexBridge<T> {
             let method = o.get("method").and_then(Value::as_str).unwrap_or("");
             let p = o.get("params").cloned().unwrap_or(Value::Null);
 
+            if method == "thread/tokenUsage/updated" {
+                // The bridge reported no usage for codex because
+                // `turn/completed` carries none. It arrives here instead, one
+                // notification earlier. `last` answers "how full is the window
+                // right now"; `total` accumulates across the thread. codex
+                // names the window too, so nothing downstream has to keep a
+                // table of model names.
+                if let Some(usage) = p.get("tokenUsage") {
+                    if let Some(last) = usage.get("last") {
+                        seen_usage = Some(last.clone());
+                    }
+                    if let Some(window) =
+                        usage.get("modelContextWindow").and_then(Value::as_u64)
+                    {
+                        if window > 0 {
+                            seen_window = Some(window);
+                        }
+                    }
+                }
+                return;
+            }
             if method == "error" {
                 // codex says why a turn died here, and says it *before* the
                 // `turn/completed` that carries no items. Dropping this left
@@ -509,9 +534,20 @@ impl<T: Transport> CodexBridge<T> {
             return;
         }
 
-        // `turn/completed` carries `{threadId, turn}` and no usage at all, so
-        // there is no cost to report here. Reading one out of a key that does
-        // not exist looked like the number was simply always zero.
+        // `turn/completed` carries `{threadId, turn}` and no usage, which is
+        // why this used to report none at all. It comes from
+        // `thread/tokenUsage/updated` instead. codex counts cached input
+        // separately from fresh input, the same split claude reports, so
+        // naming them claude's way keeps one reader for every CLI.
+        let usage = seen_usage.as_ref().map(|last| {
+            let field = |key: &str| last.get(key).and_then(Value::as_u64).unwrap_or(0);
+            json!({
+                "input_tokens": field("inputTokens"),
+                "cache_read_input_tokens": field("cachedInputTokens"),
+                "cache_creation_input_tokens": field("cacheWriteInputTokens"),
+                "output_tokens": field("outputTokens"),
+            })
+        });
         match (&done, &rpc.failure) {
             (None, Some(failure)) => {
                 let body = if final_text.is_empty() {
@@ -519,10 +555,14 @@ impl<T: Transport> CodexBridge<T> {
                 } else {
                     final_text
                 };
-                out.result(&body, "process_exited", None, true);
+                out.result_with_usage(&body, "process_exited", None, true, usage, seen_window);
             }
-            (None, None) => out.result(&final_text, "timeout", None, true),
-            (Some(_), _) => out.result(&final_text, "end_turn", None, false),
+            (None, None) => {
+                out.result_with_usage(&final_text, "timeout", None, true, usage, seen_window)
+            }
+            (Some(_), _) => {
+                out.result_with_usage(&final_text, "end_turn", None, false, usage, seen_window)
+            }
         }
     }
 }
@@ -728,6 +768,85 @@ mod tests {
     }
 
     // ── thread start ───────────────────────────────────────────────────
+
+    /// codex sends its accounting one notification before `turn/completed`,
+    /// which carries none — so the bridge reported none at all and the pane's
+    /// context readout stayed empty. `last` is the figure that answers "how
+    /// full is the window now"; `total` accumulates across the thread.
+    #[test]
+    fn a_turn_carries_the_usage_codex_reports_before_it_completes() {
+        let (mut b, sink) = bridge(vec![
+            json!({"id": 1, "result": {}}),
+            json!({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {
+                "total": {"inputTokens": 90_000, "cachedInputTokens": 40_000,
+                          "cacheWriteInputTokens": 100, "outputTokens": 700},
+                "last": {"inputTokens": 23_274, "cachedInputTokens": 12_000,
+                         "cacheWriteInputTokens": 26, "outputTokens": 10},
+                "modelContextWindow": 950_000}}}),
+            json!({"method": "item/completed",
+                   "params": {"item": {"type": "agentMessage", "text": "ok"}}}),
+            json!({"method": "turn/completed",
+                   "params": {"turn": {"status": "completed"}}}),
+        ]);
+
+        b.turn("say it", Some(Duration::from_secs(2)));
+
+        let result = last_result(&sink);
+        // Claude's names, so one reader serves every CLI.
+        assert_eq!(result["usage"]["input_tokens"], 23_274);
+        assert_eq!(result["usage"]["cache_read_input_tokens"], 12_000);
+        assert_eq!(result["usage"]["cache_creation_input_tokens"], 26);
+        assert_eq!(result["usage"]["output_tokens"], 10);
+        // Stated by codex, so no table of model names has to be right.
+        assert_eq!(result["context_window"], 950_000);
+    }
+
+    /// codex can report usage more than once in a turn. The last reading is
+    /// the one that describes the window now.
+    #[test]
+    fn the_last_usage_reading_of_a_turn_is_the_one_reported() {
+        let (mut b, sink) = bridge(vec![
+            json!({"id": 1, "result": {}}),
+            json!({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {
+                "last": {"inputTokens": 100, "cachedInputTokens": 0,
+                         "cacheWriteInputTokens": 0, "outputTokens": 1},
+                "modelContextWindow": 200_000}}}),
+            json!({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {
+                "last": {"inputTokens": 40_000, "cachedInputTokens": 5,
+                         "cacheWriteInputTokens": 0, "outputTokens": 9},
+                "modelContextWindow": 950_000}}}),
+            json!({"method": "item/completed",
+                   "params": {"item": {"type": "agentMessage", "text": "ok"}}}),
+            json!({"method": "turn/completed",
+                   "params": {"turn": {"status": "completed"}}}),
+        ]);
+
+        b.turn("say it", Some(Duration::from_secs(2)));
+
+        let result = last_result(&sink);
+        assert_eq!(result["usage"]["input_tokens"], 40_000);
+        assert_eq!(result["usage"]["cache_read_input_tokens"], 5);
+        assert_eq!(result["context_window"], 950_000);
+    }
+
+    /// A turn with no usage notification must not invent one: the reader
+    /// treats a missing key as "this CLI does not report it".
+    #[test]
+    fn a_turn_without_usage_carries_no_usage_key() {
+        let (mut b, sink) = bridge(vec![
+            json!({"id": 1, "result": {}}),
+            json!({"method": "item/completed",
+                   "params": {"item": {"type": "agentMessage", "text": "ok"}}}),
+            json!({"method": "turn/completed",
+                   "params": {"turn": {"status": "completed"}}}),
+        ]);
+
+        b.turn("say it", Some(Duration::from_secs(2)));
+
+        let result = last_result(&sink);
+        assert!(result.get("usage").is_none());
+        assert!(result.get("context_window").is_none());
+    }
 
     #[test]
     fn thread_start_asks_for_no_approvals() {

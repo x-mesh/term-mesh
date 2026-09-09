@@ -118,7 +118,15 @@ struct AgentPanelView: View {
     /// already re-evaluates on every session change (streamed deltas), which
     /// is frequent enough to keep this fresh without widening observed state.
     private var contextUsage: AgentUsageSnapshot? {
-        TeamDataStore.shared.agentUsage[panel.teamName]?[panel.agentName]
+        let daemon = TeamDataStore.shared.agentUsage[panel.teamName]?[panel.agentName]
+        // The daemon's reading wins when it has one: it carries accumulated
+        // totals this session never sees. But it reports occupancy only for
+        // sources that can produce a non-cumulative figure, and never for a
+        // native pane, whose CLI it cannot see at all. The session parses the
+        // same numbers off every turn end, so fall back to those rather than
+        // showing nothing.
+        if daemon?.contextTokens != nil { return daemon }
+        return session.usage ?? daemon
     }
 
     private var header: some View {
@@ -167,27 +175,29 @@ struct AgentPanelView: View {
                     .truncationMode(.tail)
                     .layoutPriority(-1)
             }
-            // Hidden entirely (not a blank placeholder) unless the daemon can
-            // report current context occupancy for this CLI — Codex cannot
-            // (see UsageTickAgent.context_tokens on the daemon side).
-            if let contextTokens = contextUsage?.contextTokens {
-                if let fraction = contextUsage?.contextUsageFraction {
-                    Text("\(Int((fraction * 100).rounded()))%")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(fraction >= 0.9 ? Color.orange : Color.secondary)
-                        .fixedSize()
-                        .help("Context window: \(contextTokens) tokens used")
-                } else {
-                    // Model unknown to ModelContextLimits — show the raw count
-                    // rather than guess at a limit.
-                    Text(contextTokens >= 1000
-                        ? String(format: "%.1fk ctx", Double(contextTokens) / 1000)
-                        : "\(contextTokens) ctx")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .fixedSize()
-                        .help("Context window: \(contextTokens) tokens used (limit unknown)")
-                }
+            // Hidden entirely rather than shown blank when nothing can report
+            // occupancy for this pane. What can differs by CLI: claude and
+            // codex give token counts, kiro states a percentage outright and
+            // no count at all, and a model no table knows falls back to the
+            // raw number below.
+            if let fraction = contextUsage?.contextUsageFraction {
+                Text("\(Int((fraction * 100).rounded()))%")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(fraction >= 0.9 ? Color.orange : Color.secondary)
+                    .fixedSize()
+                    .help(contextUsage?.contextTokens.map {
+                        "Context window: \($0) tokens used"
+                    } ?? "Context window")
+            } else if let contextTokens = contextUsage?.contextTokens {
+                // A count with no window to divide it by — show it rather than
+                // guess at a limit.
+                Text(contextTokens >= 1000
+                    ? String(format: "%.1fk ctx", Double(contextTokens) / 1000)
+                    : "\(contextTokens) ctx")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+                    .help("Context window: \(contextTokens) tokens used (limit unknown)")
             }
             Spacer(minLength: 4)
             if !session.isRunning {
@@ -616,22 +626,49 @@ private struct AgentComposer: View, Equatable {
             && lhs.isFocused == rhs.isFocused
     }
 
-    /// The draft reads as a slash-command query only while it is still one
-    /// unbroken token — the first space means the person is past the command
-    /// name and into an argument or plain text, so the popover should get
-    /// out of the way.
-    private var isSlashQuery: Bool {
-        draft.hasPrefix("/") && !draft.contains(where: { $0.isWhitespace })
+    /// One palette row, whether it offers a command name or a value for one.
+    /// Both being the same shape is what lets the arrow keys, Return and the
+    /// click target stay exactly as they were.
+    private struct SlashPaletteRow: Equatable {
+        let title: String
+        let detail: String
+        /// What the draft becomes when this row is taken.
+        let completion: String
     }
 
-    private var slashMatches: [AgentSlashCommand] {
-        guard isSlashQuery, !slashPaletteDismissed else { return [] }
-        return AgentSlashCommands.matches(prefix: draft, for: cli)
+    /// Command names while the draft is still one unbroken token; once it
+    /// names a command that takes a value, the values themselves.
+    ///
+    /// The first space used to close the popover, which left `/model ` asking
+    /// the person to remember what this CLI calls its models — and a native
+    /// pane wants the full name, not a tier. The catalog is right here, so
+    /// offer it. A command that takes no argument suggests nothing and the
+    /// popover stays out of the way exactly as before.
+    private var slashRows: [SlashPaletteRow] {
+        guard !slashPaletteDismissed, draft.hasPrefix("/") else { return [] }
+        guard draft.contains(where: { $0.isWhitespace }),
+              let parsed = AgentSlashCommandParser.parse(draft) else {
+            return AgentSlashCommands.matches(prefix: draft, for: cli).map {
+                SlashPaletteRow(title: $0.name, detail: $0.desc, completion: $0.name + " ")
+            }
+        }
+        guard let command = AgentSlashCommands.command(named: parsed.name),
+              command.supports(cli: cli) else { return [] }
+        let typed = parsed.argument.lowercased()
+        return AgentSlashCommands.argumentSuggestions(for: command, cli: cli)
+            .filter { typed.isEmpty || $0.lowercased().hasPrefix(typed) }
+            .map {
+                SlashPaletteRow(
+                    title: $0,
+                    detail: command.name,
+                    completion: "\(command.name) \($0)"
+                )
+            }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if !slashMatches.isEmpty {
+            if !slashRows.isEmpty {
                 slashPalette
             }
             inputRow
@@ -650,35 +687,35 @@ private struct AgentComposer: View, Equatable {
                 .lineLimit(1...8)
                 .focused(focused)
                 .onSubmit {
-                    if !slashMatches.isEmpty {
+                    if !slashRows.isEmpty {
                         applySlashSelection()
                     } else {
                         onSend()
                     }
                 }
                 .backport.onKeyPress(.upArrow) { _ in
-                    guard !slashMatches.isEmpty else { return .ignored }
-                    slashSelection = (slashSelection - 1 + slashMatches.count) % slashMatches.count
+                    guard !slashRows.isEmpty else { return .ignored }
+                    slashSelection = (slashSelection - 1 + slashRows.count) % slashRows.count
                     return .handled
                 }
                 .backport.onKeyPress(.downArrow) { _ in
-                    guard !slashMatches.isEmpty else { return .ignored }
-                    slashSelection = (slashSelection + 1) % slashMatches.count
+                    guard !slashRows.isEmpty else { return .ignored }
+                    slashSelection = (slashSelection + 1) % slashRows.count
                     return .handled
                 }
                 .backport.onKeyPress(.tab) { _ in
-                    guard !slashMatches.isEmpty else { return .ignored }
+                    guard !slashRows.isEmpty else { return .ignored }
                     applySlashSelection()
                     return .handled
                 }
                 .backport.onKeyPress(.escape) { _ in
-                    guard !slashMatches.isEmpty else { return .ignored }
+                    guard !slashRows.isEmpty else { return .ignored }
                     slashPaletteDismissed = true
                     return .handled
                 }
                 .onChange(of: draft) { _, _ in
                     slashPaletteDismissed = false
-                    if slashSelection >= slashMatches.count { slashSelection = 0 }
+                    if slashSelection >= slashRows.count { slashSelection = 0 }
                 }
             // Which of six panes is working is a question you answer by
             // glancing, not by reading. So the state has a shape — and it
@@ -708,27 +745,29 @@ private struct AgentComposer: View, Equatable {
         }
     }
 
-    /// Fills the draft with the highlighted command and a trailing space, the
-    /// way `IMEInputBar`'s own slash picker does, so the person can keep
-    /// typing an argument without hunting for the space bar.
+    /// Fills the draft with the highlighted row. A command name lands with a
+    /// trailing space, the way `IMEInputBar`'s own slash picker does, which
+    /// is also what brings up its values; a value lands complete, ready to
+    /// send.
     private func applySlashSelection() {
-        guard slashSelection < slashMatches.count else { return }
-        draft = slashMatches[slashSelection].name + " "
+        let rows = slashRows
+        guard slashSelection < rows.count else { return }
+        draft = rows[slashSelection].completion
         slashPaletteDismissed = true
     }
 
     private var slashPalette: some View {
         VStack(alignment: .leading, spacing: 1) {
-            ForEach(Array(slashMatches.enumerated()), id: \.offset) { i, command in
+            ForEach(Array(slashRows.enumerated()), id: \.offset) { i, row in
                 Button {
                     slashSelection = i
                     applySlashSelection()
                 } label: {
                     HStack(spacing: 6) {
-                        Text(command.name)
+                        Text(row.title)
                             .font(.system(size: 11, weight: .medium, design: .monospaced))
                             .frame(minWidth: 70, alignment: .leading)
-                        Text(command.desc)
+                        Text(row.detail)
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)

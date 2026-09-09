@@ -99,9 +99,29 @@ impl<T: Transport> AcpBridge<T> {
         // A tool's output can arrive across several updates, before the one
         // that reports its status.
         let mut tool_output: HashMap<String, String> = HashMap::new();
+        // kiro states occupancy as a percentage and never as a token count, so
+        // this is the only figure there is to report for it.
+        let mut seen_percent: Option<f64> = None;
 
         let mut notify = |o: &Value| {
-            if o.get("method").and_then(Value::as_str) != Some("session/update") {
+            let method = o.get("method").and_then(Value::as_str).unwrap_or("");
+            if method == "_kiro.dev/metadata" {
+                if let Some(percent) = o
+                    .get("params")
+                    .and_then(|p| p.get("contextUsagePercentage"))
+                    .and_then(Value::as_f64)
+                {
+                    // Out of range is not a fuller window, it is a figure
+                    // that cannot be trusted — and a wrong percentage reads
+                    // exactly like a right one. Showing nothing is the honest
+                    // answer, the same one an unlisted model gets.
+                    if percent.is_finite() && (0.0..=100.0).contains(&percent) {
+                        seen_percent = Some(percent / 100.0);
+                    }
+                }
+                return;
+            }
+            if method != "session/update" {
                 return;
             }
             let update = o
@@ -208,10 +228,10 @@ impl<T: Transport> AcpBridge<T> {
                 } else {
                     said.clone()
                 };
-                out.result(&body, "process_exited", None, true);
+                out.result_with_context(&body, "process_exited", None, true, seen_percent);
             }
-            (None, None) => out.result(&said, &stop, None, true),
-            (Some(_), _) => out.result(&said, &stop, None, false),
+            (None, None) => out.result_with_context(&said, &stop, None, true, seen_percent),
+            (Some(_), _) => out.result_with_context(&said, &stop, None, false, seen_percent),
         }
     }
 }
@@ -249,6 +269,63 @@ mod tests {
 
     fn update(update: Value) -> Value {
         json!({"method": "session/update", "params": {"update": update}})
+    }
+
+    /// kiro states occupancy as a percentage and never as a token count, so
+    /// there is no numerator to divide and this is the whole answer. It rides
+    /// on a vendor notification the update loop otherwise ignores.
+    #[test]
+    fn a_turn_carries_the_context_percentage_kiro_states() {
+        let (mut b, sink) = bridge(vec![
+            update(json!({"sessionUpdate": "agent_message_chunk",
+                          "content": {"type": "text", "text": "ok"}})),
+            json!({"method": "_kiro.dev/metadata",
+                   "params": {"sessionId": "s", "contextUsagePercentage": 16.6722}}),
+            json!({"id": 1, "result": {"stopReason": "end_turn"}}),
+        ]);
+
+        b.turn("say it", Some(Duration::from_secs(2)));
+
+        let result = last_result(&sink);
+        let fraction = result["context_fraction"].as_f64().expect("a fraction");
+        assert!((fraction - 0.166722).abs() < 1e-6, "got {fraction}");
+    }
+
+    /// Out of range is not a fuller window, it is a figure that cannot be
+    /// trusted — and 150% reads exactly like a real reading.
+    #[test]
+    fn a_percentage_outside_its_range_is_refused() {
+        for percent in [150.0, -1.0] {
+            let (mut b, sink) = bridge(vec![
+                update(json!({"sessionUpdate": "agent_message_chunk",
+                              "content": {"type": "text", "text": "ok"}})),
+                json!({"method": "_kiro.dev/metadata",
+                       "params": {"sessionId": "s", "contextUsagePercentage": percent}}),
+                json!({"id": 1, "result": {"stopReason": "end_turn"}}),
+            ]);
+
+            b.turn("say it", Some(Duration::from_secs(2)));
+
+            assert!(
+                last_result(&sink).get("context_fraction").is_none(),
+                "{percent} should have been refused"
+            );
+        }
+    }
+
+    /// A CLI on this path that states nothing must not gain a key: the reader
+    /// treats a missing one as "this CLI does not report it".
+    #[test]
+    fn a_turn_without_a_percentage_carries_no_context_key() {
+        let (mut b, sink) = bridge(vec![
+            update(json!({"sessionUpdate": "agent_message_chunk",
+                          "content": {"type": "text", "text": "ok"}})),
+            json!({"id": 1, "result": {"stopReason": "end_turn"}}),
+        ]);
+
+        b.turn("say it", Some(Duration::from_secs(2)));
+
+        assert!(last_result(&sink).get("context_fraction").is_none());
     }
 
     #[test]

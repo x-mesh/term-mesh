@@ -170,6 +170,20 @@ impl Emitter {
     }
 
     pub fn result(&mut self, final_text: &str, stop: &str, cost: Option<f64>, failed: bool) {
+        self.result_with_usage(final_text, stop, cost, failed, None, None);
+    }
+
+    /// For a CLI that states occupancy as a fraction and never as a token
+    /// count — kiro reports `contextUsagePercentage` and nothing else, so
+    /// there is no numerator to divide.
+    pub fn result_with_context(
+        &mut self,
+        final_text: &str,
+        stop: &str,
+        cost: Option<f64>,
+        failed: bool,
+        context_fraction: Option<f64>,
+    ) {
         let mut obj = Map::new();
         obj.insert("type".into(), Value::String("result".into()));
         obj.insert(
@@ -183,6 +197,47 @@ impl Emitter {
             if let Some(n) = serde_json::Number::from_f64(cost) {
                 obj.insert("total_cost_usd".into(), Value::Number(n));
             }
+        }
+        if let Some(fraction) = context_fraction {
+            if let Some(n) = serde_json::Number::from_f64(fraction) {
+                obj.insert("context_fraction".into(), Value::Number(n));
+            }
+        }
+        self.emit(Value::Object(obj));
+    }
+
+    /// `usage` is claude's own shape, so the reader needs no per-CLI branch.
+    /// `context_window` rides alongside because codex states the window it was
+    /// given, and a stated one beats a table of model names: it cannot go
+    /// stale, and it is right for a model nobody has added to one.
+    pub fn result_with_usage(
+        &mut self,
+        final_text: &str,
+        stop: &str,
+        cost: Option<f64>,
+        failed: bool,
+        usage: Option<Value>,
+        context_window: Option<u64>,
+    ) {
+        let mut obj = Map::new();
+        obj.insert("type".into(), Value::String("result".into()));
+        obj.insert(
+            "subtype".into(),
+            Value::String(if failed { "error" } else { "success" }.into()),
+        );
+        obj.insert("is_error".into(), Value::Bool(failed));
+        obj.insert("stop_reason".into(), Value::String(stop.to_string()));
+        obj.insert("result".into(), Value::String(final_text.to_string()));
+        if let Some(cost) = cost {
+            if let Some(n) = serde_json::Number::from_f64(cost) {
+                obj.insert("total_cost_usd".into(), Value::Number(n));
+            }
+        }
+        if let Some(usage) = usage {
+            obj.insert("usage".into(), usage);
+        }
+        if let Some(window) = context_window {
+            obj.insert("context_window".into(), Value::Number(window.into()));
         }
         self.emit(Value::Object(obj));
     }

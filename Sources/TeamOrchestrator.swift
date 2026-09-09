@@ -2429,8 +2429,21 @@ final class TeamOrchestrator: ObservableObject {
             // `Process.environment` replaces rather than overlays its parent.
             // Keep ordinary launch values such as HOME and TMPDIR while the
             // pane-specific team identity wins on collisions.
-            let nativeEnvironment = ProcessInfo.processInfo.environment
+            //
+            // `TERMMESH_PANEL_ID` is added here rather than in
+            // `buildAgentPaneEnv` because only this branch has a panel: the
+            // terminal path gets the same value from `GhosttyTerminalView`
+            // when it builds the PTY, and a native pane has no PTY to get it
+            // from. Without it `term-meshd`'s `pane_tracker`, which maps a
+            // running process to a pane by reading this out of its
+            // environment, never confirms the panel — and it only emits the
+            // usage tick for a confirmed one. So every native agent reported
+            // no tokens and no context at all, and the pane header, which
+            // hides rather than showing a blank, showed nothing.
+            var nativeEnvironment = ProcessInfo.processInfo.environment
                 .merging(paneEnv) { _, paneValue in paneValue }
+            nativeEnvironment["TERMMESH_PANEL_ID"] = agentPanel.id.uuidString
+            let protectedNativeKeys = Set(paneEnv.keys).union(["TERMMESH_PANEL_ID"])
             if AgentPipeTransport.needsBridge(cli: agentCli),
                let bridge = AgentPipeTransport.bridgePath(workingDirectory: agentWorkDir) {
                 agentPanel.start(
@@ -2439,7 +2452,7 @@ final class TeamOrchestrator: ObservableObject {
                     effort: agentEffort,
                     cliPath: cliPath,
                     environment: nativeEnvironment,
-                    protectedEnvironmentKeys: Set(paneEnv.keys)
+                    protectedEnvironmentKeys: protectedNativeKeys
                 )
                 // A bridged CLI has no `--append-system-prompt`, and none of
                 // them agree on an equivalent, so its role has to arrive as a
@@ -2472,7 +2485,7 @@ final class TeamOrchestrator: ObservableObject {
                     instructions: agentInstructions,
                     extraArgs: extraArgs,
                     environment: nativeEnvironment,
-                    protectedEnvironmentKeys: Set(paneEnv.keys)
+                    protectedEnvironmentKeys: protectedNativeKeys
                 )
             }
             // The turn states its own end and carries its final text, so the

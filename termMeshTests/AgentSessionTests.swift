@@ -833,6 +833,79 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertFalse(s.streamingIds.contains(id))
     }
 
+    /// kiro reports occupancy as a percentage and no token count at all, so
+    /// there is nothing to divide. The reading is still real and the header
+    /// still has a number to show.
+    func testAStatedFractionIsAReadingWithoutAnyTokenCount() throws {
+        let s = session([
+            event(["type": "system", "subtype": "init", "model": "kiro-default"]),
+            event(["type": "result", "stop_reason": "end_turn",
+                   "context_fraction": 0.166722]),
+        ])
+        let usage = try XCTUnwrap(s.usage)
+        XCTAssertNil(usage.contextTokens)
+        XCTAssertEqual(try XCTUnwrap(usage.contextUsageFraction), 0.166722, accuracy: 1e-6)
+    }
+    /// A bridged CLI states the window it was given. Codex sends
+    /// `modelContextWindow` with every usage update, and that beats a table
+    /// this build shipped with: it cannot go stale, and it is right for a
+    /// model nobody has added to one.
+    func testStatedContextWindowBeatsTheModelTable() throws {
+        let s = session([
+            event(["type": "system", "subtype": "init", "model": "gpt-5.6-sol"]),
+            event(["type": "result", "stop_reason": "end_turn",
+                   "context_window": 258_400,
+                   "usage": [
+                       "input_tokens": 23_274,
+                       "cache_read_input_tokens": 0,
+                       "cache_creation_input_tokens": 0,
+                       "output_tokens": 10,
+                   ]]),
+        ])
+        let usage = try XCTUnwrap(s.usage)
+        XCTAssertEqual(usage.contextTokens, 23_274)
+        XCTAssertEqual(usage.contextWindow, 258_400)
+        XCTAssertEqual(
+            try XCTUnwrap(usage.contextUsageFraction),
+            23_274.0 / 258_400.0,
+            accuracy: 0.0001
+        )
+    }
+    /// Occupancy is the whole prompt the model saw. Claude reads most of a
+    /// long conversation out of the cache, so `input_tokens` alone reports
+    /// single digits for a nearly full window — the pane header would have
+    /// said 0% at 900k tokens.
+    func testTurnUsageCountsCachedInputTowardContextOccupancy() throws {
+        let s = session([
+            event(["type": "system", "subtype": "init", "model": "claude-sonnet-4-5"]),
+            event(["type": "result", "stop_reason": "end_turn", "usage": [
+                "input_tokens": 12,
+                "cache_read_input_tokens": 180_000,
+                "cache_creation_input_tokens": 2_400,
+                "output_tokens": 350,
+            ]]),
+        ])
+        let usage = try XCTUnwrap(s.usage)
+        XCTAssertEqual(usage.contextTokens, 182_412)
+        XCTAssertEqual(usage.inputTokens, 12)
+        XCTAssertEqual(usage.cacheReadTokens, 180_000)
+        XCTAssertEqual(usage.outputTokens, 350)
+        XCTAssertEqual(usage.model, "claude-sonnet-4-5")
+    }
+
+    /// A turn that reports nothing must not erase the last real reading: a
+    /// window does not empty because one turn failed before the model saw
+    /// anything.
+    func testTurnWithoutUsageKeepsTheLastContextReading() throws {
+        let s = session([
+            event(["type": "system", "subtype": "init", "model": "claude-sonnet-4-5"]),
+            event(["type": "result", "stop_reason": "end_turn", "usage": [
+                "input_tokens": 5, "cache_read_input_tokens": 40_000,
+            ]]),
+            event(["type": "result", "is_error": true, "result": ""]),
+        ])
+        XCTAssertEqual(try XCTUnwrap(s.usage).contextTokens, 40_005)
+    }
     /// Measured on kiro: five tool rows left spinning, because the bridge
     /// dropped the `toolCallId` its results carried and a row with no id can
     /// never be closed by one. The id is carried now — and a CLI that simply
@@ -4099,6 +4172,30 @@ extension AgentSessionTests {
         XCTAssertNil(AgentSlashCommandParser.parse(""))
     }
 
+    /// The palette offers values, not just command names — a native pane wants
+    /// a full model name and nobody should have to remember one per CLI. The
+    /// values come from the same catalog the pickers use, and a command that
+    /// takes no argument offers nothing so the popover stays out of the way.
+    func testArgumentSuggestionsComeFromTheCLICatalog() {
+        guard let model = AgentSlashCommands.command(named: "/model"),
+              let effort = AgentSlashCommands.command(named: "/effort"),
+              let cost = AgentSlashCommands.command(named: "/cost") else {
+            return XCTFail("catalog is missing a command this test needs")
+        }
+        XCTAssertEqual(
+            AgentSlashCommands.argumentSuggestions(for: model, cli: "codex"),
+            AgentRolePreset.models(for: "codex")
+        )
+        XCTAssertEqual(
+            AgentSlashCommands.argumentSuggestions(for: model, cli: "claude"),
+            AgentRolePreset.models(for: "claude")
+        )
+        XCTAssertEqual(
+            AgentSlashCommands.argumentSuggestions(for: effort, cli: "codex"),
+            AgentRolePreset.efforts(for: "codex")
+        )
+        XCTAssertTrue(AgentSlashCommands.argumentSuggestions(for: cost, cli: "codex").isEmpty)
+    }
     /// The catalog only lists what the app can actually perform — see
     /// `AgentSlashCommands`'s note on why `SlashCommands.builtinCommands`
     /// (the terminal-CLI list) is not reused here. `/compact` stands for that
