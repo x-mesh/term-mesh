@@ -303,16 +303,16 @@ floor_hook() {
 }
 
 cat > "$FLOOR_CTL/delegated.json" <<'JSON' || exit 1
-{"delegation_effective":"delegated","available_workers":3,
+{"schema_version":1,"delegation_effective":"delegated","available_workers":3,
  "worker_names":["executor","architect","reviewer"],"kill_switch":false,
  "project_id":"floor-test"}
 JSON
 cat > "$FLOOR_CTL/leader-first-solo.json" <<'JSON' || exit 1
-{"delegation_effective":"leaderFirst","available_workers":1,
+{"schema_version":1,"delegation_effective":"leaderFirst","available_workers":1,
  "worker_names":["executor"],"kill_switch":false,"project_id":"floor-test"}
 JSON
 cat > "$FLOOR_CTL/killed.json" <<'JSON' || exit 1
-{"delegation_effective":"delegated","available_workers":3,"kill_switch":true,
+{"schema_version":1,"delegation_effective":"delegated","available_workers":3,"kill_switch":true,
  "project_id":"floor-test"}
 JSON
 printf 'not json {{{' > "$FLOOR_CTL/broken.json" || exit 1
@@ -390,17 +390,17 @@ PY
 # file: a cap of one means waves are off rather than small, and the injection
 # switch has to silence the floor without silencing measurement.
 cat > "$FLOOR_CTL/capped.json" <<'JSON' || exit 1
-{"delegation_effective":"delegated","available_workers":4,
+{"schema_version":1,"delegation_effective":"delegated","available_workers":4,
  "worker_names":["a","b","c","d"],"kill_switch":false,"project_id":"floor-test",
  "max_parallel_workers":2}
 JSON
 cat > "$FLOOR_CTL/no-waves.json" <<'JSON' || exit 1
-{"delegation_effective":"leaderFirst","available_workers":4,
+{"schema_version":1,"delegation_effective":"leaderFirst","available_workers":4,
  "worker_names":["a","b","c","d"],"kill_switch":false,"project_id":"floor-test",
  "max_parallel_workers":1}
 JSON
 cat > "$FLOOR_CTL/injection-off.json" <<'JSON' || exit 1
-{"delegation_effective":"delegated","available_workers":3,"kill_switch":false,
+{"schema_version":1,"delegation_effective":"delegated","available_workers":3,"kill_switch":false,
  "project_id":"floor-test","inject_directive":false}
 JSON
 
@@ -448,6 +448,44 @@ if last_end.get("delegation_floor") != "unmet":
         + repr(last_end.get("delegation_floor"))
     )
 PY
+
+# A control file belonging to another Project must not inject this Project's
+# floor, even with an otherwise valid, well-formed payload.
+cat > "$FLOOR_CTL/foreign-project.json" <<'JSON' || exit 1
+{"schema_version":1,"delegation_effective":"delegated","available_workers":3,
+ "worker_names":["executor"],"kill_switch":false,"project_id":"other-project"}
+JSON
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/foreign-project.json" --start '{"prompt":"foreign"}') \
+    || fail "foreign-project start returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "mismatched project_id should inject nothing, got: $FLOOR_OUT"
+
+# An unrecognized schema_version must not be trusted, even with a matching
+# project_id and an otherwise well-formed payload.
+cat > "$FLOOR_CTL/bad-schema.json" <<'JSON' || exit 1
+{"schema_version":2,"delegation_effective":"delegated","available_workers":3,
+ "worker_names":["executor"],"kill_switch":false,"project_id":"floor-test"}
+JSON
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/bad-schema.json" --start '{"prompt":"bad-schema"}') \
+    || fail "bad-schema start returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "unrecognized schema_version should inject nothing, got: $FLOOR_OUT"
+
+# A remote leader pane also carries TERMMESH_LEADER_PROJECT_ID, a display ID
+# ("team:<uuid>") distinct from the team name control payloads use as
+# project_id. It must not be compared against project_id: doing so silently
+# kills the floor and session_id adoption for every remote leader.
+FLOOR_OUT=$(HOME="$FLOOR_HOME" \
+    TERMMESH_TEAM=floor-test \
+    TERMMESH_SURFACE_ID=99999999-8888-7777-6666-555555555555 \
+    TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+    TERMMESH_LEADER_TEAM_UUID=05AC84AA-1E7C-4B21-86CE-77239B138078 \
+    TERMMESH_LEADER_PROJECT_ID=team:some-uuid \
+    TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$FLOOR_CTL/delegated.json" \
+    "$HOOK" --start '{"prompt":"remote leader"}') \
+    || fail "remote leader start returned nonzero"
+case "$FLOOR_OUT" in
+    *"level: delegated"*) ;;
+    *) fail "remote leader's floor was suppressed by TERMMESH_LEADER_PROJECT_ID: $FLOOR_OUT" ;;
+esac
 
 printf '%s\n' 'PASS: leader turn hook logs private, correlated start/end boundaries'
 printf '%s\n' 'PASS: leader turn hook injects and measures the delegation floor'
@@ -613,7 +651,7 @@ PY
 IDENTITY_HOME="$TEST_TMP/identity"
 mkdir -p "$IDENTITY_HOME/.term-mesh/logs" || exit 1
 IDENTITY_CONTROL="$IDENTITY_HOME/control.json"
-printf '%s\n' '{"session_id":"adopted-session"}' > "$IDENTITY_CONTROL" || exit 1
+printf '%s\n' '{"schema_version":1,"project_id":"aic","session_id":"adopted-session"}' > "$IDENTITY_CONTROL" || exit 1
 HOME="$IDENTITY_HOME" \
     TERMMESH_TEAM=aic \
     TERMMESH_SURFACE_ID=identity-surface \
