@@ -34,6 +34,11 @@ struct WorkspaceSummary: Identifiable, Equatable {
 /// arranged — so this arrives over its own RPC and is the only way to know
 /// where a project's leader sits on a machine that is not this one.
 struct RemoteTeamSummary: Identifiable, Equatable {
+    // The serving GUI and its daemon are independent authorities.
+    var isGUILive = false
+    var liveWorkspaceID = Data()
+    var rosterVerified = true
+    var sourceEndpoint: PeerPaneHostKey? = nil
     struct Member: Identifiable, Equatable {
         let name: String
         let agentInstanceID: String
@@ -70,7 +75,7 @@ struct RemoteTeamSummary: Identifiable, Equatable {
     let leaderProcessActiveKnown: Bool
     let delegationState: ProjectDelegationState
 
-    var id: String { teamUUID.isEmpty ? name : teamUUID }
+    var id: String { (isGUILive ? "gui:" : "") + (teamUUID.isEmpty ? name : teamUUID) }
 
     var presentationSurfaceIDs: Set<Data> {
         var ids = Set(members.map(\.surfaceID).filter { !$0.isEmpty })
@@ -529,6 +534,8 @@ nonisolated func acceptingTeamHostSnapshot(
 }
 
 struct HostEntry: Identifiable, Equatable {
+    var guiRosterVerified = false
+    var daemonRosterVerified = false
     let id: String         // stable dedup key (stableKey)
     var displayName: String
     var connectionState: HostConnectionState
@@ -2360,6 +2367,7 @@ final class RemoteHostStore: ObservableObject {
                     self.hosts[key]?.teams = teams
                     self.hosts[key]?.teamsConfirmedAt = Date()
                     self.hosts[key]?.lastRosterFailure = nil
+                    if let host = self.hosts[key] { RemoteLiveProject.refresh(host: host) }
                 }
                 // A push that arrived during even a failed RPC still owns a
                 // retry. Dropping it here would make one transient session-
@@ -2686,6 +2694,48 @@ final class RemoteHostStore: ObservableObject {
         hostKey key: String,
         servingSockPath: String
     ) async -> [RemoteTeamSummary]? {
+        guard let host = hosts[key] else { return nil }
+        let previous = host.teams
+        var live: [RemoteTeamSummary]? = nil
+        if let connection = try? await PeerRelaySession.connect(hostSockPath: servingSockPath) {
+            if connection.hostCapabilities.has(PeerCapability.projectPresentationLiveV1) {
+                if let teams = try? await connection.session.listTeams() {
+                    live = teams.filter { !$0.liveWorkspaceID.isEmpty }.map {
+                        var summary = Self.remoteTeamSummary($0)
+                        summary.isGUILive = true
+                        summary.liveWorkspaceID = $0.liveWorkspaceID
+                        summary.sourceEndpoint = host.paneHostSpec.hostKey
+                        return summary
+                    }
+                }
+            } else { live = [] }
+            await connection.cancel()
+        }
+        let durable = await fetchDurableTeamRoster(hostKey: key, servingSockPath: servingSockPath)
+        guard hosts[key]?.activeSockPath == servingSockPath else { return nil }
+        hosts[key]?.guiRosterVerified = live != nil
+        hosts[key]?.daemonRosterVerified = durable != nil
+        return Self.mergeProjectRosters(previous: previous, gui: live, durable: durable)
+    }
+
+    nonisolated static func mergeProjectRosters(
+        previous: [RemoteTeamSummary], gui: [RemoteTeamSummary]?, durable: [RemoteTeamSummary]?
+    ) -> [RemoteTeamSummary]? {
+        guard gui != nil || durable != nil else { return nil }
+        func stale(_ isGUI: Bool) -> [RemoteTeamSummary] {
+            previous.filter { $0.isGUILive == isGUI }.map {
+                var record = $0
+                record.rosterVerified = false
+                return record
+            }
+        }
+        return (gui ?? stale(true)) + (durable ?? stale(false))
+    }
+
+    private func fetchDurableTeamRoster(
+        hostKey key: String,
+        servingSockPath: String
+    ) async -> [RemoteTeamSummary]? {
         guard let host = hosts[key], host.teamRouteResolved else {
             noteRosterFailure(key, "the session-owner route is unresolved")
             return nil
@@ -2769,7 +2819,11 @@ final class RemoteHostStore: ObservableObject {
                 return nil
             }
             await connection.cancel()
-            return reported.map(Self.remoteTeamSummary)
+            return reported.filter { $0.liveWorkspaceID.isEmpty }.map {
+                var summary = Self.remoteTeamSummary($0)
+                summary.sourceEndpoint = teamEndpoint
+                return summary
+            }
         } onCancel: {
             // Cooperative cancellation does not wake an NWConnection read by
             // itself. Closing the transport is what releases listTeams, its

@@ -2577,6 +2577,13 @@ public nonisolated struct Termmesh_Peer_V1_Team: @unchecked Sendable {
     set {_uniqueStorage()._leaderModel = newValue}
   }
 
+  /// GUI live presentation only: exact workspace owned by the serving app.
+  /// Does not imply daemon ownership or permission to publish a manifest.
+  public var liveWorkspaceID: Data {
+    get {_storage._liveWorkspaceID}
+    set {_uniqueStorage()._liveWorkspaceID = newValue}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -6647,7 +6654,7 @@ nonisolated extension Termmesh_Peer_V1_TeamList: SwiftProtobuf.Message, SwiftPro
 
 nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Team"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}name\0\u{3}team_uuid\0\u{3}working_directory\0\u{3}project_root\0\u{3}agent_names\0\u{3}created_at_unix_secs\0\u{3}leader_surface_id\0\u{1}members\0\u{3}project_id\0\u{3}presentation_revision\0\u{3}presentation_owned_by_requester\0\u{3}leader_process_active\0\u{3}leader_process_active_known\0\u{3}delegation_configured\0\u{3}delegation_effective\0\u{3}delegation_pending\0\u{3}leader_cli\0\u{3}leader_model\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}name\0\u{3}team_uuid\0\u{3}working_directory\0\u{3}project_root\0\u{3}agent_names\0\u{3}created_at_unix_secs\0\u{3}leader_surface_id\0\u{1}members\0\u{3}project_id\0\u{3}presentation_revision\0\u{3}presentation_owned_by_requester\0\u{3}leader_process_active\0\u{3}leader_process_active_known\0\u{3}delegation_configured\0\u{3}delegation_effective\0\u{3}delegation_pending\0\u{3}leader_cli\0\u{3}leader_model\0\u{3}live_workspace_id\0")
 
   fileprivate class _StorageClass {
     var _name: String = String()
@@ -6668,6 +6675,7 @@ nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobu
     var _delegationPending: String = String()
     var _leaderCli: String = String()
     var _leaderModel: String = String()
+    var _liveWorkspaceID: Data = Data()
 
       // This property is used as the initial default value for new instances of the type.
       // The type itself is protecting the reference to its storage via CoW semantics.
@@ -6696,6 +6704,7 @@ nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobu
       _delegationPending = source._delegationPending
       _leaderCli = source._leaderCli
       _leaderModel = source._leaderModel
+      _liveWorkspaceID = source._liveWorkspaceID
     }
   }
 
@@ -6732,6 +6741,7 @@ nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobu
         case 16: try { try decoder.decodeSingularStringField(value: &_storage._delegationPending) }()
         case 17: try { try decoder.decodeSingularStringField(value: &_storage._leaderCli) }()
         case 18: try { try decoder.decodeSingularStringField(value: &_storage._leaderModel) }()
+        case 19: try { try decoder.decodeSingularBytesField(value: &_storage._liveWorkspaceID) }()
         default: break
         }
       }
@@ -6794,6 +6804,9 @@ nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobu
       if !_storage._leaderModel.isEmpty {
         try visitor.visitSingularStringField(value: _storage._leaderModel, fieldNumber: 18)
       }
+      if !_storage._liveWorkspaceID.isEmpty {
+        try visitor.visitSingularBytesField(value: _storage._liveWorkspaceID, fieldNumber: 19)
+      }
     }
     try unknownFields.traverse(visitor: &visitor)
   }
@@ -6821,6 +6834,7 @@ nonisolated extension Termmesh_Peer_V1_Team: SwiftProtobuf.Message, SwiftProtobu
         if _storage._delegationPending != rhs_storage._delegationPending {return false}
         if _storage._leaderCli != rhs_storage._leaderCli {return false}
         if _storage._leaderModel != rhs_storage._leaderModel {return false}
+        if _storage._liveWorkspaceID != rhs_storage._liveWorkspaceID {return false}
         return true
       }
       if !storagesAreEqual {return false}

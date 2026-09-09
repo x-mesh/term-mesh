@@ -978,6 +978,9 @@ message Team {
   // for manifests written by hosts that predate durable leader recovery.
   string leader_cli = 17;
   string leader_model = 18;
+  // GUI live presentation only: exact workspace owned by the serving app.
+  // Does not imply daemon ownership or permission to publish a manifest.
+  bytes live_workspace_id = 19;
 }
 
 message TeamMember {

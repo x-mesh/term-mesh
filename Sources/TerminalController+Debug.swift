@@ -1640,6 +1640,9 @@ extension TerminalController {
             "started": true,
             "team": remote.name,
             "project_id": remote.projectID,
+            "source": remote.isGUILive ? "gui_live" : "daemon_durable",
+            "workspace_id": remote.liveWorkspaceID.base64EncodedString(),
+            "roster_verified": remote.rosterVerified,
             "leader_surface_id": remote.leaderSurfaceID.base64EncodedString(),
         ])
     }

@@ -123,6 +123,7 @@ public struct PeerWorkspaceMeta: Sendable, Equatable {
 /// implement this in Phase C-3c.3.3; tests use `StaticSurfaceProvider`
 /// for list-only scenarios and `EchoSurfaceProvider` for round-trip.
 public protocol PeerSurfaceProvider: AnyObject, Sendable {
+    func supportsLivePresentation() async -> Bool
     func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo]
     /// Return an attachment for `surfaceID`, or `nil` if unknown. The
     /// server sends an `AttachResult(accepted: false)` back to the
@@ -234,6 +235,7 @@ public struct PeerTeamCallFailure: Error, Sendable, Equatable {
 }
 
 public extension PeerSurfaceProvider {
+    func supportsLivePresentation() async -> Bool { false }
     func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace] { [] }
     func terminateSurface(
         surfaceID: Data
@@ -1334,6 +1336,7 @@ actor PeerServerSession {
     private var seq: UInt64 = 0
     private var pendingInbound = Data()
     private var attachments: [Data: PeerSurfaceAttachment] = [:]
+    private var writableAttachments: Set<Data> = []
     private var relayTasks: [Data: Task<Void, Never>] = [:]
     /// A roster subscription is intentionally independent of surface
     /// attachments. The sidebar needs to observe a host before opening a
@@ -1570,6 +1573,7 @@ actor PeerServerSession {
         }
         let snapshot = attachments
         attachments.removeAll()
+        writableAttachments.removeAll()
         relayTasks.removeAll()
         for (_, attachment) in snapshot {
             await attachment.detach()
@@ -1606,6 +1610,11 @@ actor PeerServerSession {
             // a provider. A nil result from that provider merely skips one
             // tick; the capability still describes implemented support.
             var advertisedCapabilities = PeerCapability.supported
+            if !(await provider.supportsLivePresentation()) {
+                advertisedCapabilities.removeAll {
+                    $0 == PeerCapability.agentPresentationV1 || $0 == PeerCapability.projectPresentationLiveV1
+                }
+            }
             if config.hostStatsProvider == nil {
                 advertisedCapabilities.removeAll { $0 == PeerCapability.hostStatsV1 }
             }
@@ -1680,7 +1689,13 @@ actor PeerServerSession {
             try await sendError(code: 103, message: "expected Auth")
 
         case (.ready, .listSurfaces):
-            let surfaces = await provider.listSurfaces()
+            let surfaces = await provider.listSurfaces().map { surface in
+                var result = surface
+                if result.surfaceType == "agent", !hasClientCapability(PeerCapability.agentPresentationV1) {
+                    result.attachable = false
+                }
+                return result
+            }
             try await sendEnvelopeWithCorrelation(env.seq) { inner in
                 var list = Termmesh_Peer_V1_SurfaceList()
                 list.surfaces = surfaces
@@ -1706,7 +1721,19 @@ actor PeerServerSession {
             try await pushWorkspaceListChanged(await provider.listWorkspaces())
 
         case (.ready, .listTeams):
-            let teams = await provider.listTeams()
+            let teams = await provider.listTeams().map { team in
+                guard !hasClientCapability(PeerCapability.projectPresentationLiveV1),
+                      !team.liveWorkspaceID.isEmpty else { return team }
+                // Legacy GUI roster metadata never promised an attachable Project.
+                var legacy = Termmesh_Peer_V1_Team()
+                legacy.name = team.name
+                legacy.teamUuid = team.teamUuid
+                legacy.workingDirectory = team.workingDirectory
+                legacy.projectRoot = team.projectRoot
+                legacy.agentNames = team.agentNames
+                legacy.createdAtUnixSecs = team.createdAtUnixSecs
+                return legacy
+            }
             try await sendEnvelopeWithCorrelation(env.seq) { inner in
                 var list = Termmesh_Peer_V1_TeamList()
                 list.teams = teams
@@ -1927,7 +1954,8 @@ actor PeerServerSession {
             await detachSurface(id: det.surfaceID)
 
         case (.ready, .input(let input)):
-            guard let attachment = attachments[input.surfaceID] else { return }
+            guard writableAttachments.contains(input.surfaceID),
+                  let attachment = attachments[input.surfaceID] else { return }
             switch input.kind {
             case .keys(let keys):
                 await attachment.input(keys)
@@ -1996,6 +2024,16 @@ actor PeerServerSession {
         _ req: Termmesh_Peer_V1_AttachSurface,
         correlationID: UInt64
     ) async throws {
+        if let surface = await provider.listSurfaces().first(where: { $0.surfaceID == req.surfaceID }),
+           surface.surfaceType == "agent", !hasClientCapability(PeerCapability.agentPresentationV1) {
+            try await sendEnvelopeWithCorrelation(correlationID) { inner in
+                var result = Termmesh_Peer_V1_AttachResult()
+                result.surfaceID = req.surfaceID
+                result.reason = "agent presentation capability required"
+                inner.attachResult = result
+            }
+            return
+        }
         if attachments[req.surfaceID] != nil {
             try await sendEnvelopeWithCorrelation(correlationID) { inner in
                 var r = Termmesh_Peer_V1_AttachResult()
@@ -2059,6 +2097,7 @@ actor PeerServerSession {
         }
 
         attachments[req.surfaceID] = attachment
+        if grantedMode == .coWrite { writableAttachments.insert(req.surfaceID) }
         let surfaceID = req.surfaceID
         let relayTask: Task<Void, Never> = Task { [weak self] in
             guard let self else { return }
@@ -2144,6 +2183,7 @@ actor PeerServerSession {
     }
 
     private func detachSurface(id: Data) async {
+        writableAttachments.remove(id)
         relayTasks.removeValue(forKey: id)?.cancel()
         if let attachment = attachments.removeValue(forKey: id) {
             await attachment.detach()

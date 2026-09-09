@@ -8,6 +8,26 @@ import PeerProto
 #endif
 
 final class PeerProjectBootstrapTests: XCTestCase {
+    func testGUIAndDaemonRostersKeepIndependentIdentityAndFreshness() throws {
+        var gui = RemoteTeamSummary(name: "same", teamUUID: "uuid", workingDirectory: "/tmp",
+                                    projectRootPath: nil, agentNames: [], projectID: "team:uuid")
+        gui.isGUILive = true
+        let durable = RemoteTeamSummary(name: "same", teamUUID: "uuid", workingDirectory: "/tmp",
+                                        projectRootPath: nil, agentNames: [], projectID: "team:uuid")
+        XCTAssertNotEqual(gui.id, durable.id)
+        let both = try XCTUnwrap(RemoteHostStore.mergeProjectRosters(previous: [], gui: [gui], durable: [durable]))
+        XCTAssertEqual(both.count, 2)
+        let failedGUI = try XCTUnwrap(RemoteHostStore.mergeProjectRosters(previous: both, gui: nil, durable: []))
+        XCTAssertEqual(failedGUI.count, 1)
+        XCTAssertTrue(failedGUI[0].isGUILive)
+        XCTAssertFalse(failedGUI[0].rosterVerified)
+        let failedDaemon = try XCTUnwrap(RemoteHostStore.mergeProjectRosters(previous: both, gui: [], durable: nil))
+        XCTAssertEqual(failedDaemon.count, 1)
+        XCTAssertFalse(failedDaemon[0].isGUILive)
+        XCTAssertFalse(failedDaemon[0].rosterVerified)
+        XCTAssertNil(RemoteHostStore.mergeProjectRosters(previous: both, gui: nil, durable: nil))
+    }
+
     func test_lateRemoteAgentCheckoutPlanIsDistinctFromRequestedCheckout() {
         let requested = "/app/tm-projects/term-mesh-reviewer-260729-c741"
         let plan = TeamOrchestrator.lateRemoteAgentCheckoutPlan(

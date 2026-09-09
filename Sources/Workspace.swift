@@ -3661,7 +3661,9 @@ final class Workspace: Identifiable {
         orientation: SplitOrientation = .horizontal,
         insertFirst: Bool = false,
         focus: Bool = true,
-        from explicitSourcePanelId: UUID? = nil
+        from explicitSourcePanelId: UUID? = nil,
+        agentName: String? = nil,
+        color: String = ""
     ) -> AgentPanel? {
         guard SessionHostPanes.isAgentSurfaceType(session.originSurface.surfaceType) else {
             return nil
@@ -3685,12 +3687,13 @@ final class Workspace: Identifiable {
             from: sourcePanelId,
             orientation: orientation,
             insertFirst: insertFirst,
-            agentName: Self.remoteAgentPaneTitle(
+            agentName: agentName ?? Self.remoteAgentPaneTitle(
                 surfaceTitle: session.surfaceTitle, agentCli: cli, hostLabel: hostLabel
             ),
             teamName: "",
             workingDirectory: surface.cwd,
             cli: cli,
+            color: color,
             focus: focus
         ) else { return nil }
         bindRemoteAgentPane(session: session, to: panel)
@@ -3752,6 +3755,38 @@ final class Workspace: Identifiable {
         }
 
         installRemoteAgentPaneLifecycle(session: session, panelId: panelId)
+
+        if session.usesLivePresentation {
+            panel.runtimeOwnership = .guiOwned(hostName: session.lease.hostDisplayName)
+            agentSession.prepareLivePresentation()
+            let decoder = AgentLiveDecoder(invalid: { [weak agentSession, weak session] in
+                DispatchQueue.main.async {
+                    agentSession?.livePresentationDisconnected()
+                    session?.teardown()
+                }
+            }) { [weak agentSession, weak session] frame in
+                DispatchQueue.main.async {
+                    guard let session, !session.isTorndown else { return }
+                    if agentSession?.acceptLivePresentation(frame) == false {
+                        agentSession?.livePresentationDisconnected()
+                        session.teardown()
+                    }
+                }
+            }
+            relay.onPtyData = { bytes in decoder.consume(bytes) }
+            // Full snapshots replace the projection atomically on reconnect.
+            // They never replay CLI events or restart the host's process.
+            relay.onPtyDeliveryRestart = { decoder.resetForRestart() }
+            relay.onDisconnect = { [weak agentSession] in
+                Task { @MainActor in agentSession?.livePresentationDisconnected() }
+            }
+            session.requestHostReconnectReattach = { [weak agentSession] in
+                agentSession?.livePresentationDisconnected()
+            }
+            session.requestPaneClose = { [weak agentSession] in
+                agentSession?.livePresentationDisconnected()
+            }
+        }
 
         // Callback delivery has no helper to accept, so start is quick —
         // but a failure must still be final and visible, matching

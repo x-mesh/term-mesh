@@ -96,6 +96,35 @@ A connection may send one `Ping` every 15 s by default; if no `Pong` arrives wit
 8. `project.presentation.v1` gates publication of a durable project-to-surface manifest. A daemon host advertises it when it can validate and persist exact leader/member surface IDs. The first authenticated `peer_id` to publish a project becomes its owner; other installations may discover and attach the project but may not overwrite its topology. `Hello.project_owner_aliases` carries at most eight locally retained IDs after an explicit identity rotation. A host may consult them only for existing project-presentation ownership; leader-command routing and every other `peer_id` authority continue to use the current ID.
 9. `project.presentation.repair.v1` gates removal of a manifest that the requesting peer does not own. The owner-authorized delete in `project.presentation.v1` answers `not_owner`. A record from an installation that no longer exists therefore holds its name permanently. A host advertises this capability when it can re-check a record itself. The client sends `RepairStaleProjectPresentationRequest` with an exact `project_id`. A name is never accepted. If `apply` is false, the host answers with the current `StaleProjectObservation` and keeps that observation. If `apply` is true, the host removes the record. The host must refuse the removal in three cases: a surface that the manifest names is alive, the host's own observation is younger than `min_recheck_secs`, or the manifest is not the instance that was observed. The host must identify the instance by its own per-project mutation counter. It must not use `revision`. A revision restarts at 1 for a project id with no record, so a deleted and republished manifest repeats the revision of the record it replaced. The host must verify the instance under the lock that removes the record. The host copies the manifest file before it writes, and reports the copy in `backup_path`. The host must not change workspaces, other manifests, or files. An observation belongs to the connection that made it. The host must not persist it.
 
+## Live GUI Project presentation
+
+`project.presentation.live.v1` exposes GUI-owned Projects through `ListTeams`.
+`Team.live_workspace_id` identifies the owning GUI workspace; leader/member IDs
+address the GUI endpoint, never its `session_host_socket`. Viewers fetch both
+GUI and daemon rosters, preserve their endpoint provenance and freshness, and
+do not adopt or republish GUI-owned teams as daemon manifests. Legacy clients
+receive only the original name/UUID/path/agent-name metadata.
+
+`agent.presentation.v1` negotiates native GUI agent views. `SurfaceInfo` keeps
+`surface_type = "agent"`, but the attached `PtyData` carries model projection
+packets rather than CLI NDJSON. Each newline-delimited packet contains `begin`,
+`end` and a base64 `payload` (at most 32 KiB before encoding). Joined payloads
+decode as an `AgentLiveFrame`: full/delta flag, generation, base/revision,
+ordered entry IDs, changed entries and current session display state. Apply
+only complete frames, retain at most the owner's 2,000 entries, and require a
+fresh snapshot after a revision gap or malformed frame. Pending producer
+models coalesce before encoding; an in-flight frame is never partially dropped.
+Assembly is limited to 64 MiB and parsing/encoding runs off-main.
+
+The GUI advertises neither durable agent creation nor durable manifest
+publication. A client without `agent.presentation.v1` sees GUI agents as
+unattachable and is refused at attach. Read-only attachments cannot send input.
+Co-write input is limited to the existing user-message, interrupt and
+model/effort operations; it is handled by the owner's AgentSession. Detach only
+releases the view, while host process termination is reflected in session state.
+Peer-backed panes are not re-exported. Both apps need live-presentation support;
+these sessions remain dependent on the owning GUI app staying open.
+
 ## Message Reference
 
 ### Hello

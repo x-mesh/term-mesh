@@ -7,7 +7,7 @@ import os
 /// `agent.usage_tick` notify pushes. Values are absolute totals (the daemon is
 /// expected to coalesce at ~1Hz before sending). The Swift side simply replaces
 /// the entry whenever a fresher snapshot arrives.
-struct AgentUsageSnapshot: Equatable {
+struct AgentUsageSnapshot: Equatable, Codable, Sendable {
     var inputTokens: UInt64
     var outputTokens: UInt64
     var cacheReadTokens: UInt64

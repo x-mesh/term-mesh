@@ -1222,6 +1222,16 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
         // focus drifted to.
         let targetTabManager = AppDelegate.shared?.tabManager
 
+        if let workspaceID, let targetTabManager,
+           let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.paneHostSpec.hostKey == spec.hostKey }),
+           let project = host.teams.first(where: { $0.isGUILive && $0.liveWorkspaceID == workspaceID }) {
+            if !(await RemoteLiveProject.open(host: host, project: project,
+                                             tabManager: targetTabManager, select: select)) {
+                RemoteWorkLog.info("Some Project panes on \(host.displayName) could not be attached")
+            }
+            return
+        }
+
         // Live-mirror dedupe, APP-WIDE: one app holds one view of a host
         // workspace, whichever window it lives in. A click in another window
         // used to materialize a second mirror there (b581635a), which read as

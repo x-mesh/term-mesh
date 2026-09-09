@@ -2082,6 +2082,7 @@ extension TeamOrchestrator {
         remote: RemoteTeamSummary,
         hostKey: String
     ) -> (shouldOffer: Bool, isUpdate: Bool) {
+        if remote.isGUILive { return (true, false) }
         let matching = localTeam.map {
             remotePresentationIdentityMatches(
                 team: $0, remote: remote, hostKey: hostKey
@@ -2131,6 +2132,7 @@ extension TeamOrchestrator {
     ) -> [RemoteTeamSummary] {
         guard isConnected else { return [] }
         return teams.filter { team in
+            if team.isGUILive { return !team.leaderSurfaceID.isEmpty }
             guard !team.leaderSurfaceID.isEmpty,
                   remoteManifestLeaderIsAdoptable(team) else { return false }
             return sidebarRemoteManifestState(
@@ -2152,7 +2154,7 @@ extension TeamOrchestrator {
         hostID: String, team: RemoteTeamSummary
     ) -> String {
         let projectIdentity = team.projectID.isEmpty ? team.id : team.projectID
-        return Data(hostID.utf8).base64EncodedString() + "."
+        return (team.isGUILive ? "gui." : "") + Data(hostID.utf8).base64EncodedString() + "."
             + Data(projectIdentity.utf8).base64EncodedString()
     }
 
@@ -2842,6 +2844,10 @@ extension TeamOrchestrator {
         tabManager: TabManager,
         selectWorkspace: Bool = true
     ) async -> Bool {
+        if remote.isGUILive {
+            return await RemoteLiveProject.open(host: host, project: remote,
+                                               tabManager: tabManager, select: selectWorkspace)
+        }
         guard !projectDeletionSuppressions.contains(
             Self.projectDeletionSuppressionKey(hostID: host.id, projectID: remote.projectID)
         ), Self.remoteManifestLeaderIsAdoptable(remote) else { return false }
