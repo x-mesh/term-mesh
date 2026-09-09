@@ -138,6 +138,10 @@ final class ReviewBoardViewModel: ObservableObject {
         // is a read of state already in memory.
         activityTicker?.invalidate()
         let ticker = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            // `ReviewBoardPanelView.onAppear` refreshes immediately when the
+            // board returns, so an off-screen board can skip this work without
+            // reopening with a stale snapshot.
+            guard ReviewBoardSettings.isVisible else { return }
             Task { @MainActor in self?.refreshWhileWorkIsRunning() }
         }
         RunLoop.main.add(ticker, forMode: .common)

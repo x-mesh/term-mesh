@@ -69,6 +69,14 @@ struct SinglePaneWrapper<Content: View, EmptyContent: View>: NSViewRepresentable
             contentViewLifecycle: contentViewLifecycle
         )
         let hostingController = NSHostingController(rootView: paneView)
+        if #available(macOS 13.0, *) {
+            // The four edge constraints below already pin hostingController.view
+            // to containerView, so the container fully owns pane geometry —
+            // keep NSHostingController from also publishing intrinsic-size
+            // constraints that force AppKit to walk the SwiftUI graph on every
+            // updateConstraints pass.
+            hostingController.sizingOptions = []
+        }
         hostingController.view.translatesAutoresizingMaskIntoConstraints = false
 
         let containerView = PaneDragContainerView()
