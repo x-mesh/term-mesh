@@ -182,6 +182,41 @@ Rules learned the hard way:
 
 ## Measuring "the app feels slow" (`scripts/perf-sample.sh`)
 
+### Relay input latency
+
+`peer.pane.status` returns `result.status.pane_sessions[].input_latency`;
+`peer.mirror.status` includes the same field in each mirrored pane's diagnostic
+row. These snapshots are read-only and do not reset the measurements.
+
+The helper input pump retains the most recent 512 **input frames**, not physical
+keypresses. Each stage reports its own `n`, `p50_ms`, `p95_ms`, `p99_ms`, and
+`max_ms` (nearest-rank percentiles). An unvisited stage returns only `n: 0`.
+
+| Stage | Measured interval |
+| --- | --- |
+| `queue` | Complete frame read from the helper socket → pump dequeues it |
+| `session_access` | Before `await self.session` → return to the pump; includes MainActor access and task resumption |
+| `browse_exit` | Optional scrollback exit request submission; not its rendered response |
+| `send` | `sendInput` call → transport completion or failure; not remote acknowledgement |
+| `total` | Complete frame read → send completion, failure, or early exit |
+
+`outcomes_total` counts completed/dequeued samples over this relay object's
+lifetime (`sent`, `failed`, `cancelled`, `no_session`). Stage distributions
+include failed attempts if the stage was visited; they use the recent window,
+not the lifetime counts. Buffered frames abandoned during teardown are not
+counted as cancelled, and an in-flight stall appears only after it completes.
+Callback delivery via `sendRemoteKeys` does not traverse the helper pump and
+therefore does not populate these measurements.
+
+No input contents are recorded. Memory is bounded, collection adds no tasks or
+timers, and percentiles are computed only on explicit diagnostic reads, outside
+the collection lock. Avoid polling on every key: read after a typing interval.
+These metrics exclude helper-side Escape disambiguation, network RTT, remote
+shell/TUI processing, and rendering. Compare them with peer wire RTT and host
+input-injection diagnostics before attributing a delay to MainActor.
+
+### Main-thread sampling
+
 "Slow" here has almost always meant *the main thread is busy in SwiftUI*, not
 that a log is large or a daemon is looping. Sample it rather than reasoning
 about it:

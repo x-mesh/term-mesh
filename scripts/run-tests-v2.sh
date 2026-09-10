@@ -418,6 +418,7 @@ launch_and_wait() {
   defaults write com.termmesh.app.debug socketControlMode -string full >/dev/null 2>&1 || true
 
   TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
+  TERMMESH_PEER_SOCKET="${DAEMON_SOCK_PATH%.sock}-peer.sock" \
   TERM_MESH_HTTP_DISABLED=1 \
   TERM_MESH_MOBILE_ENABLED=1 \
   TERM_MESH_MOBILE_AUTH=loopback \
@@ -429,6 +430,7 @@ launch_and_wait() {
   PROJECT_DIR="$PWD" \
   DAEMON_BINARY_PATH="$PWD/daemon/target/release/term-meshd" \
   TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
+  TERMMESH_PEER_SERVER_PATH="${DAEMON_SOCK_PATH%.sock}-app-peer.sock" \
   TERMMESH_SOCKET_PATH="$APP_SOCK_PATH" \
   TERMMESH_ALLOW_SOCKET_OVERRIDE=1 \
   TERMMESH_UI_TEST_MODE=1 \

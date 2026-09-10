@@ -340,11 +340,13 @@ extension TerminalController {
 
     /// Live-mirror state (subscription health, leaf count, shape hash) — the
     /// poll counterpart to `peer.workspace.open_mirror`.
-    func v2PeerMirrorStatus(params _: [String: Any]) -> V2CallResult {
+    func v2PeerMirrorStatus(params: [String: Any]) -> V2CallResult {
         var status: [String: Any] = [:]
         let ok = v2MainExec(timeout: 5) {
             MainActor.assumeIsolated {
-                status = PeerClientCoordinator.shared.debugMirrorStatus()
+                status = PeerClientCoordinator.shared.debugMirrorStatus(
+                    includeInputLatency: params["include_input_latency"] as? Bool == true
+                )
             }
         }
         guard ok else {
@@ -356,11 +358,13 @@ extension TerminalController {
     /// Remote-pane sessions and host-lease count. The counterpart poll for
     /// `peer.surface.open_pane`, and what a test asserts against to confirm a
     /// force disconnect actually tore every pane down.
-    func v2PeerPaneStatus(params _: [String: Any]) -> V2CallResult {
+    func v2PeerPaneStatus(params: [String: Any]) -> V2CallResult {
         var status: [String: Any] = [:]
         let ok = v2MainExec(timeout: 5) {
             MainActor.assumeIsolated {
-                status = PeerClientCoordinator.shared.debugPaneStatus()
+                status = PeerClientCoordinator.shared.debugPaneStatus(
+                    includeInputLatency: params["include_input_latency"] as? Bool == true
+                )
             }
         }
         guard ok else {

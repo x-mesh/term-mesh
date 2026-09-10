@@ -1404,7 +1404,7 @@ class termmesh:
         `peer_open_remote_pane`: watch `peer_pane_status()`."""
         return dict(self._call("peer.surface.open_pane", {"host": host}) or {})
 
-    def peer_pane_status(self) -> dict:
+    def peer_pane_status(self, include_input_latency: bool = False) -> dict:
         """Snapshot of remote-pane sessions + host-lease count via
         `peer.pane.status`. Returns the inner status dict: {pane_sessions:
         [...], lease_count: N, last_open_result}.
@@ -1413,7 +1413,9 @@ class termmesh:
         `debug.peer.pane_status`: `peer_open_pane()` is a production command,
         and polling its outcome through a DEBUG-only method would fail with
         `unknown_method` against a Release app. Both return the same payload."""
-        reply = dict(self._call("peer.pane.status", {}) or {})
+        reply = dict(self._call("peer.pane.status", {
+            "include_input_latency": include_input_latency,
+        }) or {})
         return dict(reply.get("status") or {})
 
     def peer_mirror_status(self) -> dict:
