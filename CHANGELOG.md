@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.239.0] - 2026-09-10
+
+### Added
+
+- The Host section of the sidebar now lists every Project a host holds, including Projects whose leader has stopped and Projects you already have open. It used to list only what could be attached at that moment, so a stopped Project disappeared from the machine that stores it and its record became unreachable. Each row now shows the Project's directory, names its Project ID and leader state, and counts the agents that are actually live. A record no live app on that host is serving offers deletion from its menu: "Stop and Delete Project" for a Project this installation published, and "Delete Stale Project" for a foreign record once the host confirms nothing is running. Project folders and repositories are never removed.
+- `tm-agent daemon pp prune --force` retires Projects on the host that ordinary pruning refuses. It selects live records and records whose directory still exists, and with no Project ID it selects every record. It stops each selected leader, its agents, and the native CLI processes they started, while keeping any surface another Project still shares. A termination that fails keeps its record in place for a retry, names it in the report, and returns a failure status. Forced pruning still previews until you pass `--apply`, and an applied run backs the manifest file up first.
+
+### Fixed
+
+- A team preset no longer loses its reasoning effort. The forms have offered model and effort as separate controls for a while, but a preset recorded only the model — and a Codex effort used to travel inside the model name, where the tier `opus` meant high effort. Saving therefore kept the tier, and reading it back handed that tier to a form with its own effort control, so the two disagreed. A preset now records the effort as its own field, for each agent and for the leader, and a saved Codex tier is split into the model plus the effort it implied. An effort you set to Default on purpose stays the CLI default instead of reverting to the tier's level. Codex tiers also stop appearing in the model list, where they duplicated the model they resolve to. Without this, the Codex reviewer in most built-in presets silently dropped from high effort to the CLI default the first time you edited its team.
+- The Project name field in New Project is visible without opening Advanced options, whichever source you pick. Cloning a repository showed no name until you expanded that section, which is where you needed it when the derived name collided with a Project you already had. The field now sits with the rest of the form and states that the name comes from the repository URL.
+
 ## [0.238.0] - 2026-09-10
 
 ### Fixed
