@@ -141,6 +141,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
     /// Mirrors the Project's execution setting off-main. Requests snapshot the
     /// effective value here so a later UI change cannot rewrite history.
     private var projectDelegationStates: [String: ProjectDelegationState] = [:]
+    private var projectDelegationRevisions: [String: UInt64] = [:]
     private struct PlaceholderBoardGeneration {
         let teamUUID: String
         let contentBytes: Data
@@ -342,6 +343,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         } else if projectDelegationStates[name] == nil {
             projectDelegationStates[name] = .default
         }
+        if projectDelegationRevisions[name] == nil { projectDelegationRevisions[name] = 1 }
         lock.unlock()
         notifyChanged()
     }
@@ -484,6 +486,12 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         return projectDelegationStates[teamName] ?? .default
     }
 
+    func projectDelegationRevision(teamName: String) -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return projectDelegationRevisions[teamName] ?? 1
+    }
+
     @discardableResult
     func configureProjectDelegation(
         teamName: String, level: ProjectDelegationLevel
@@ -505,6 +513,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
             state.pending = nil
         }
         projectDelegationStates[teamName] = state
+        projectDelegationRevisions[teamName] = (projectDelegationRevisions[teamName] ?? 1) &+ 1
         lock.unlock()
         notifyChanged()
         return state
@@ -551,6 +560,7 @@ final class TeamDataStore: ObservableObject, @unchecked Sendable {
         leaderRequests.removeValue(forKey: name)
         leaderRequestTokens.removeValue(forKey: name)
         projectDelegationStates.removeValue(forKey: name)
+        projectDelegationRevisions.removeValue(forKey: name)
         placeholderBoardGenerations.removeValue(forKey: name)
         parkedAgents.removeValue(forKey: name)
         watchDrifts.removeValue(forKey: name)
