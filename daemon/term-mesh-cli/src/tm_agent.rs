@@ -18169,7 +18169,7 @@ impl LeaderParticipationDirective {
                 participation: "coordinator",
                 route: "parallel",
                 reasons: vec!["parallel_ready"],
-                dispatch_bounds: "two or three dependency-ready, ownership-disjoint tasks",
+                dispatch_bounds: "two to ten dependency-ready, ownership-disjoint tasks within the configured limit",
             };
         }
         if workers == 0 || shape.as_deref() == Some("single_unit") {
@@ -18858,7 +18858,7 @@ mod leader_turn_record_tests {
         assert_eq!(parallel.reasons, ["parallel_ready"]);
         assert_eq!(
             parallel.dispatch_bounds,
-            "two or three dependency-ready, ownership-disjoint tasks"
+            "two to ten dependency-ready, ownership-disjoint tasks within the configured limit"
         );
 
         let risk = LeaderParticipationDirective::from_input(

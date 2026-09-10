@@ -59,7 +59,7 @@ enum LeaderParticipationPolicy {
         if workers >= 2, ["multi_unit", "cross_subsystem", "parallelizable"].contains(shape ?? "") {
             return .init(
                 participation: .coordinator, route: .parallel, reasons: [.parallelReady],
-                observableDispatchBounds: "two or three dependency-ready, ownership-disjoint tasks"
+                observableDispatchBounds: "two to ten dependency-ready, ownership-disjoint tasks within the configured limit"
             )
         }
         if shape == "single_unit" || workers == 0 {

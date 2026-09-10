@@ -51,7 +51,7 @@ final class RoutingInstrumentationTests: XCTestCase {
             ProjectRoutingDecision.decide(
                 level: .delegated, taskShape: .singleUnit, risks: [], availableWorkers: 1
             ),
-            .init(route: .delegated, reasons: ["delegated_serial_work"], workerCount: 1)
+            .init(route: .delegated, reasons: ["delegated_max_capacity"], workerCount: 1)
         )
         XCTAssertEqual(
             ProjectRoutingDecision.decide(
@@ -86,8 +86,16 @@ final class RoutingInstrumentationTests: XCTestCase {
             ProjectRoutingDecision.decide(
                 level: .delegated, taskShape: nil, risks: [], availableWorkers: 1
             ),
-            .init(route: .delegated, reasons: ["delegated_serial_work"], workerCount: 1),
+            .init(route: .delegated, reasons: ["delegated_max_capacity"], workerCount: 1),
             "delegated must not need a stated shape to hand work over"
+        )
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .delegated, taskShape: nil, risks: [],
+                availableWorkers: 12, maxParallelWorkers: 10
+            ),
+            .init(route: .delegated, reasons: ["delegated_max_capacity"], workerCount: 10),
+            "delegated fills the configured capacity but never exceeds its limit"
         )
         XCTAssertEqual(
             ProjectRoutingDecision.decide(
@@ -148,6 +156,7 @@ final class RoutingInstrumentationTests: XCTestCase {
             .save(teamName: "capped", to: defaults)
         let loaded = ProjectExecutionOptions.load(teamName: "capped", from: defaults)
         XCTAssertEqual(loaded.maxParallelWorkers, ProjectExecutionOptions.workerBounds.upperBound)
+        XCTAssertEqual(ProjectExecutionOptions.workerBounds.upperBound, 10)
         XCTAssertFalse(loaded.injectDirective)
 
         ProjectExecutionOptions(maxParallelWorkers: 0, injectDirective: true)
@@ -174,7 +183,7 @@ final class RoutingInstrumentationTests: XCTestCase {
         }
         XCTAssertNil(request.taskShape, "an omitted shape must stay unstated")
         XCTAssertEqual(request.selectedRoute, .delegated)
-        XCTAssertEqual(request.selectedWorkerCount, 1)
+        XCTAssertEqual(request.selectedWorkerCount, 2)
     }
 
     func testLeaderRequestSnapshotsEffectiveDelegationAndEngineRoute() throws {

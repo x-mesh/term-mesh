@@ -14,11 +14,12 @@ installed has them regardless of which repo is checked out.
 
 ## Runtime orchestration contract
 
-`LeaderParallelPolicy` v6 is runtime-enforced from the canonical Swift source
-`Sources/LeaderParallelPolicy.swift`. Local and peer leaders receive the same policy version and
-SHA-256 digest; `team.status` exposes the source, version, digest, and injection state. A failed
-or unverifiable injection is explicit `failed` state; policy guidance requires degraded situations
-to be reported explicitly rather than silently falling back.
+The canonical Swift source enforces `LeaderParallelPolicy` v13.
+The source is `Sources/LeaderParallelPolicy.swift`.
+Local and peer leaders receive the same version and SHA-256 digest.
+`team.status` exposes the source, version, digest, and injection state.
+If injection fails, the state is `failed`.
+The policy requires leaders to report a degraded state.
 
 Execution is single-leader by default. A leader escalates only when at least two independently
 verifiable, ownership-disjoint, DAG-ready tasks contain enough work to amortize coordination.
@@ -27,10 +28,14 @@ ranked in one pool using placement and checkout metadata. Routing and observabil
 stable `task_id + agent_instance_id` key, including duplicate role/name rows. Ambiguous name-only
 selection is rejected; unique-name callers remain compatible.
 
-Every request is classified with a structured `direct|probe|parallel` decision. Direct has no
-worker tasks. Probe has one read-only task with a 60-90 second estimate. Parallel has two or three
-dependency-ready tasks. Each task carries a worker, goal, owned/forbidden scope, dependencies, one
-verification command, mutation flag, and estimate; only tasks in the decision may be dispatched.
+Every request uses a structured `direct|probe|parallel` decision.
+Direct has no worker tasks.
+Probe has one read-only task with a 60-90 second estimate.
+Parallel has two to ten ready tasks within the Project worker limit.
+Delegated mode fills useful independent tasks up to that limit.
+It does not create work to fill unused capacity.
+Each task defines a worker, goal, scope, dependencies, verification command, mutation flag, and estimate.
+Dispatch only tasks from the decision.
 After dispatch, the leader uses an integration lane: prepare acceptance and merge order without
 touching worker-owned paths, wait in `any` mode for named task IDs, consume the first result, and
 perform at most one additional wait/collect when a remaining result is required. Reviewer capacity

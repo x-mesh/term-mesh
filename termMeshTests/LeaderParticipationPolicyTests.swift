@@ -24,6 +24,10 @@ final class LeaderParticipationPolicyTests: XCTestCase {
         let parallel = LeaderParticipationPolicy.evaluate(.init(taskShape: "multi_unit", availableWorkers: 2))
         XCTAssertEqual(parallel.participation, .coordinator)
         XCTAssertEqual(parallel.route, .parallel)
+        XCTAssertEqual(
+            parallel.observableDispatchBounds,
+            "two to ten dependency-ready, ownership-disjoint tasks within the configured limit"
+        )
     }
 
     /// Per-Project execution options are keyed by name, and the key used to
@@ -48,6 +52,12 @@ final class LeaderParticipationPolicyTests: XCTestCase {
         ProjectExecutionOptions(maxParallelWorkers: 4, injectDirective: false)
             .save(teamName: "aic", to: defaults)
         XCTAssertEqual(defaults.object(forKey: "team.aic.maxParallelWorkers") as? Int, 4)
+        ProjectExecutionOptions(maxParallelWorkers: 12, injectDirective: true)
+            .save(teamName: "upper-bound", to: defaults)
+        XCTAssertEqual(
+            ProjectExecutionOptions.load(teamName: "upper-bound", from: defaults).maxParallelWorkers,
+            10
+        )
     }
 
     func testFreshSettingsAreShadowWithNoCanaryAndRoundTripAdditively() {
