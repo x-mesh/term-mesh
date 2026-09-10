@@ -793,7 +793,7 @@ struct NewProjectView: View {
             leaderCli: leaderCli,
             leaderModel: leaderCli == "repl"
                 ? nil
-                : AgentRolePreset.normalizeModel(leaderModel, for: leaderCli),
+                : AgentRolePreset.normalizeModel(leaderModel, for: leaderCli, separateEffort: true),
             leaderEffort: leaderCli == "repl"
                 ? nil
                 : AgentRolePreset.normalizeEffort(leaderEffort, for: leaderCli),
@@ -801,7 +801,7 @@ struct NewProjectView: View {
                 TeamSignature.Agent(
                     role: $0.preset.name,
                     cli: $0.preset.cli,
-                    model: AgentRolePreset.normalizeModel($0.preset.model, for: $0.preset.cli),
+                    model: AgentRolePreset.normalizeModel($0.preset.model, for: $0.preset.cli, separateEffort: true),
                     effort: AgentRolePreset.normalizeEffort($0.preset.effort, for: $0.preset.cli),
                     instructions: $0.customInstructions
                 )
@@ -850,7 +850,7 @@ struct NewProjectView: View {
                     set: { newCli in
                         let old = leaderCli
                         leaderCli = newCli
-                        if AgentRolePreset.models(for: old) != AgentRolePreset.models(for: newCli) {
+                        if AgentRolePreset.models(for: old, separateEffort: true) != AgentRolePreset.models(for: newCli, separateEffort: true) {
                             leaderModel = Self.defaultLeaderModel(for: newCli)
                         }
                         // A value valid for the old CLI (e.g. "high" on claude) may
@@ -872,8 +872,8 @@ struct NewProjectView: View {
                 if leaderCli != "repl" {
                     Picker("", selection: Binding(
                         get: {
-                            let options = AgentRolePreset.models(for: leaderCli)
-                            let normalized = AgentRolePreset.normalizeModel(leaderModel, for: leaderCli)
+                            let options = AgentRolePreset.models(for: leaderCli, separateEffort: true)
+                            let normalized = AgentRolePreset.normalizeModel(leaderModel, for: leaderCli, separateEffort: true)
                             guard options.contains(normalized) else {
                                 let fallback = Self.defaultLeaderModel(for: leaderCli)
                                 DispatchQueue.main.async { leaderModel = fallback }
@@ -886,7 +886,7 @@ struct NewProjectView: View {
                         },
                         set: { leaderModel = $0 }
                     )) {
-                        ForEach(AgentRolePreset.models(for: leaderCli), id: \.self) { model in
+                        ForEach(AgentRolePreset.models(for: leaderCli, separateEffort: true), id: \.self) { model in
                             Text(AgentRolePreset.modelDisplayLabel(model, for: leaderCli)).tag(model)
                         }
                     }
@@ -1110,23 +1110,27 @@ struct NewProjectView: View {
                     }
                 }
 
-                if sourceKind == .empty || sourceKind == .existingFolder {
-                    GridRow(alignment: .top) {
-                        Text("Project name")
-                            .padding(.top, 5)
-                        VStack(alignment: .leading, spacing: 4) {
-                            TextField("project-name", text: Binding(
-                                get: { name },
-                                set: { name = $0; nameEdited = true }
-                            ))
-                            .textFieldStyle(.roundedBorder)
-                            .focused($focusedField, equals: .name)
-                            if sourceKind == .existingFolder {
-                                Text(Self.existingFolderNameHelp())
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
+                GridRow(alignment: .top) {
+                    Text("Project name")
+                        .padding(.top, 5)
+                    VStack(alignment: .leading, spacing: 4) {
+                        TextField("project-name", text: Binding(
+                            get: { name },
+                            set: { name = $0; nameEdited = true }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        .focused($focusedField, equals: .name)
+                        .accessibilityIdentifier("newProject.name")
+                        if sourceKind == .clone {
+                            Text("Derived from the repository URL. Change it to use a different Project name.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        if sourceKind == .existingFolder {
+                            Text(Self.existingFolderNameHelp())
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }
@@ -1193,18 +1197,6 @@ struct NewProjectView: View {
 
             if showsAdvancedOptions {
                 Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
-                    if sourceKind == .clone {
-                        GridRow {
-                            Text("Project name")
-                            TextField("project-name", text: Binding(
-                                get: { name },
-                                set: { name = $0; nameEdited = true }
-                            ))
-                            .textFieldStyle(.roundedBorder)
-                            .focused($focusedField, equals: .name)
-                        }
-                    }
-
                     GridRow {
                         Text("Agent checkouts")
                         if sourceKind == .existingFolder && gitURL.isEmpty {
@@ -2961,16 +2953,9 @@ struct NewProjectView: View {
     }
 
     private func chooseSeparateProjectName() {
-        if Self.shouldRevealAdvancedOptionsForName(sourceKind: sourceKind) {
-            showsAdvancedOptions = true
-        }
         creationError = nil
         submissionConflict = nil
         focusedField = .name
-    }
-
-    static func shouldRevealAdvancedOptionsForName(sourceKind: ProjectSourceKind) -> Bool {
-        sourceKind == .clone
     }
 
     private func openExistingProject(
@@ -3557,6 +3542,7 @@ struct NewProjectView: View {
         preset.model = AgentRolePreset.defaultModel(for: "claude")
         leaderCli = "claude"
         leaderModel = Self.defaultLeaderModel(for: "claude")
+        leaderEffort = ""
         selectedTeamPresetId = nil
         installPresetAgents([
             TeamAgentRow(preset: preset, customInstructions: "")
@@ -3571,9 +3557,15 @@ struct NewProjectView: View {
         guard case .smart(let preset) = payload else { return }
 
         leaderCli = preset.leaderMode
+        let leaderSelection = AgentRolePreset.separateModelAndEffort(
+            model: preset.leaderModel ?? Self.defaultLeaderModel(for: leaderCli),
+            effort: preset.leaderEffort,
+            for: leaderCli
+        )
+        leaderEffort = leaderSelection.effort
         if leaderCli != "repl" {
-            let candidate = preset.leaderModel ?? Self.defaultLeaderModel(for: leaderCli)
-            leaderModel = AgentRolePreset.models(for: leaderCli).contains(candidate)
+            let candidate = leaderSelection.model
+            leaderModel = AgentRolePreset.models(for: leaderCli, separateEffort: true).contains(candidate)
                 ? candidate
                 : Self.defaultLeaderModel(for: leaderCli)
         }
@@ -3586,7 +3578,13 @@ struct NewProjectView: View {
                     ?? presetManager.presets.first(where: { $0.name == "executor" })
                     ?? presetManager.presets.first else { return nil }
             role.cli = resolved.cli
-            role.model = resolved.model
+            let selection = AgentRolePreset.separateModelAndEffort(
+                model: resolved.model,
+                effort: resolved.effort ?? (role.effort.isEmpty ? nil : role.effort),
+                for: resolved.cli
+            )
+            role.model = selection.model
+            role.effort = selection.effort
             let badge: TeamAgentRow.ProviderBadge
             switch resolved.status {
             case .normal:
@@ -3628,6 +3626,7 @@ struct NewProjectView: View {
             name: name,
             leaderMode: leaderCli,
             leaderModel: leaderCli == "repl" ? nil : leaderModel,
+            leaderEffort: leaderCli == "repl" ? nil : AgentRolePreset.normalizeEffort(leaderEffort, for: leaderCli),
             agents: currentProviderPreferences
         )
         selectedTeamPresetId = id
@@ -3645,7 +3644,8 @@ struct NewProjectView: View {
                 fallbackCli: row.preset.cli,
                 fallbackModel: row.preset.model,
                 reason: "",
-                customInstructions: row.customInstructions.isEmpty ? nil : row.customInstructions
+                customInstructions: row.customInstructions.isEmpty ? nil : row.customInstructions,
+                effort: AgentRolePreset.normalizeEffort(row.preset.effort, for: row.preset.cli)
             )
         }
     }
@@ -3664,6 +3664,7 @@ struct NewProjectView: View {
         guard case .smart(var preset) = sourcePayload else { return }
         preset.leaderMode = leaderCli
         preset.leaderModel = leaderCli == "repl" ? nil : leaderModel
+        preset.leaderEffort = leaderCli == "repl" ? nil : AgentRolePreset.normalizeEffort(leaderEffort, for: leaderCli)
         preset.agents = currentProviderPreferences
         preset.description = "\(agents.count) agent\(agents.count == 1 ? "" : "s")"
         let updatedPayload = TeamTemplatePayload.smart(preset)

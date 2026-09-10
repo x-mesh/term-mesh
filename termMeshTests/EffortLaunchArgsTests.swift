@@ -134,6 +134,43 @@ final class EffortLaunchArgsTests: XCTestCase {
         XCTAssertEqual(decoded.effort, "high")
     }
 
+    // MARK: - Team creation sheet: preset write path
+
+    /// Built-in presets store the codex reviewer as the legacy tier `opus`,
+    /// which carried effort `high` inside the model name. The shared composer
+    /// splits that into `gpt-5.6-sol` + `high`, so the sheet's write path has
+    /// to persist the effort: dropping it returned the reviewer to the codex
+    /// default effort with nothing on screen to show that it had moved.
+    func testTeamCreationPresetWritePreservesSeparatedCodexEffort() {
+        let migrated = AgentRolePreset.separateModelAndEffort(
+            model: "opus", effort: nil, for: "codex"
+        )
+        var preset = AgentRolePreset(name: "reviewer", cli: "codex", model: migrated.model)
+        preset.effort = migrated.effort
+        let preference = TeamCreationView.providerPreferences(
+            from: [TeamAgentRow(preset: preset, customInstructions: "")]
+        ).first
+        XCTAssertEqual(preference?.primaryModel, "gpt-5.6-sol")
+        XCTAssertEqual(preference?.effort, TeamOrchestrator.codexReasoningEffort("opus"))
+        XCTAssertEqual(
+            TeamOrchestrator.effortLaunchArgs(cli: "codex", effort: preference?.effort ?? ""),
+            ["-c", "model_reasoning_effort=high"]
+        )
+    }
+
+    /// An explicit "Default" selection is an empty effort, not an absent one,
+    /// so it must survive the write rather than be re-inherited from a tier.
+    func testTeamCreationPresetWriteKeepsExplicitDefaultEffort() {
+        let preset = AgentRolePreset(name: "reviewer", cli: "codex", model: "gpt-5.6-sol")
+        let preference = TeamCreationView.providerPreferences(
+            from: [TeamAgentRow(preset: preset, customInstructions: "")]
+        ).first
+        XCTAssertEqual(preference?.effort, "")
+        XCTAssertTrue(
+            TeamOrchestrator.effortLaunchArgs(cli: "codex", effort: preference?.effort ?? "").isEmpty
+        )
+    }
+
     // MARK: - AgentSession.claudeLaunch: native claude pane argv
 
     func testClaudeLaunchIncludesEffortAfterModel() {

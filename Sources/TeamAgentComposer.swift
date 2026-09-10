@@ -512,7 +512,7 @@ struct TeamAgentComposer: View {
                         let oldCli = agents[index].preset.cli
                         agents[index].preset.cli = newCli
                         agents[index].providerBadge = .none
-                        if AgentRolePreset.models(for: oldCli) != AgentRolePreset.models(for: newCli) {
+                        if AgentRolePreset.models(for: oldCli, separateEffort: true) != AgentRolePreset.models(for: newCli, separateEffort: true) {
                             agents[index].preset.model = AgentRolePreset.defaultModel(for: newCli)
                         }
                         agents[index].preset.effort = AgentRolePreset.normalizeEffort(
@@ -530,10 +530,11 @@ struct TeamAgentComposer: View {
 
                 Picker("", selection: Binding(
                     get: {
-                        let options = AgentRolePreset.models(for: agent.preset.cli)
+                        let options = AgentRolePreset.models(for: agent.preset.cli, separateEffort: true)
                         let normalized = AgentRolePreset.normalizeModel(
                             agent.preset.model,
-                            for: agent.preset.cli
+                            for: agent.preset.cli,
+                            separateEffort: true
                         )
                         guard options.contains(normalized) else {
                             let fallback = AgentRolePreset.defaultModel(for: agent.preset.cli)
@@ -550,7 +551,7 @@ struct TeamAgentComposer: View {
                         onComposionChanged()
                     }
                 )) {
-                    ForEach(AgentRolePreset.models(for: agent.preset.cli), id: \.self) { model in
+                    ForEach(AgentRolePreset.models(for: agent.preset.cli, separateEffort: true), id: \.self) { model in
                         Text(AgentRolePreset.modelDisplayLabel(model, for: agent.preset.cli))
                             .tag(model)
                     }
@@ -814,7 +815,7 @@ struct TeamAgentComposer: View {
                         agents[index].preset.cli = newCli
                         agents[index].providerBadge = .none  // clear badge on manual change
                         // Reset model to CLI default when switching CLI families
-                        if AgentRolePreset.models(for: oldCli) != AgentRolePreset.models(for: newCli) {
+                        if AgentRolePreset.models(for: oldCli, separateEffort: true) != AgentRolePreset.models(for: newCli, separateEffort: true) {
                             agents[index].preset.model = AgentRolePreset.defaultModel(for: newCli)
                         }
                         agents[index].preset.effort = AgentRolePreset.normalizeEffort(
@@ -836,15 +837,9 @@ struct TeamAgentComposer: View {
                 // the picker from rendering empty before onChange handlers re-sync.
                 Picker("", selection: Binding(
                     get: {
-                        let opts = AgentRolePreset.models(for: agent.preset.cli)
-                        let normalized = AgentRolePreset.normalizeModel(agent.preset.model, for: agent.preset.cli)
+                        let opts = AgentRolePreset.models(for: agent.preset.cli, separateEffort: true)
+                        let normalized = AgentRolePreset.normalizeModel(agent.preset.model, for: agent.preset.cli, separateEffort: true)
                         if opts.contains(normalized) {
-                            if normalized != agent.preset.model {
-                                DispatchQueue.main.async {
-                                    guard index < agents.count else { return }
-                                    agents[index].preset.model = normalized
-                                }
-                            }
                             return normalized
                         }
                         let fallback = AgentRolePreset.defaultModel(for: agent.preset.cli)
@@ -859,7 +854,7 @@ struct TeamAgentComposer: View {
                         onComposionChanged()
                     }
                 )) {
-                    ForEach(AgentRolePreset.models(for: agent.preset.cli), id: \.self) { m in
+                    ForEach(AgentRolePreset.models(for: agent.preset.cli, separateEffort: true), id: \.self) { m in
                         Text(AgentRolePreset.modelDisplayLabel(m, for: agent.preset.cli)).tag(m)
                     }
                 }
@@ -1314,7 +1309,7 @@ struct TeamAgentComposer: View {
     }
 
     private var bulkModels: [String] {
-        AgentRolePreset.models(for: bulkCli)
+        AgentRolePreset.models(for: bulkCli, separateEffort: true)
     }
 
     private func addAgent() {
@@ -1328,6 +1323,18 @@ struct TeamAgentComposer: View {
 
     private func syncBulkFromAgents() {
         guard !agents.isEmpty else { return }
+        for index in agents.indices {
+            let preset = agents[index].preset
+            let selection = AgentRolePreset.separateModelAndEffort(
+                model: preset.model,
+                effort: preset.effort.isEmpty ? nil : preset.effort,
+                for: preset.cli
+            )
+            if preset.model != selection.model || preset.effort != selection.effort {
+                agents[index].preset.model = selection.model
+                agents[index].preset.effort = selection.effort
+            }
+        }
         let cliCounts = Dictionary(grouping: agents, by: { $0.preset.cli }).mapValues(\.count)
         let modelCounts = Dictionary(grouping: agents, by: { $0.preset.model }).mapValues(\.count)
         let effortCounts = Dictionary(grouping: agents, by: { $0.preset.effort }).mapValues(\.count)

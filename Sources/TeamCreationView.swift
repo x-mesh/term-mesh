@@ -2215,7 +2215,19 @@ struct TeamCreationView: View {
         selectedSmartPresetId = effectivePreset.id
         selectedWorkflowName = nil
         leaderMode = effectivePreset.leaderMode
-        if let presetLeaderModel = effectivePreset.leaderModel,
+        // A preset saved before model and effort were separate controls keeps
+        // its effort inside the tier, so the split is what recovers it. With no
+        // stored model there is no tier to read and nil means CLI default.
+        let leaderSelection = effectivePreset.leaderModel.map {
+            AgentRolePreset.separateModelAndEffort(
+                model: $0, effort: effectivePreset.leaderEffort, for: effectivePreset.leaderMode
+            )
+        }
+        leaderEffort = leaderSelection?.effort
+            ?? AgentRolePreset.normalizeEffort(
+                effectivePreset.leaderEffort ?? "", for: effectivePreset.leaderMode
+            )
+        if let presetLeaderModel = leaderSelection?.model,
            AgentRolePreset.models(for: effectivePreset.leaderMode).contains(presetLeaderModel) {
             leaderModel = presetLeaderModel
         } else if !AgentRolePreset.models(for: effectivePreset.leaderMode).contains(leaderModel) {
@@ -2227,7 +2239,13 @@ struct TeamCreationView: View {
             guard var rolePreset = available.first(where: { $0.name == agent.role })
                     ?? available.first else { return nil as TeamAgentRow? }
             rolePreset.cli = agent.cli
-            rolePreset.model = agent.model
+            let selection = AgentRolePreset.separateModelAndEffort(
+                model: agent.model,
+                effort: agent.effort ?? (rolePreset.effort.isEmpty ? nil : rolePreset.effort),
+                for: agent.cli
+            )
+            rolePreset.model = selection.model
+            rolePreset.effort = selection.effort
 
             let badge: TeamAgentRow.ProviderBadge
             switch agent.status {
@@ -2369,6 +2387,9 @@ struct TeamCreationView: View {
             guard case .smart(var preset) = template.payload else { return }
             preset.leaderMode = leaderMode
             preset.leaderModel = leaderMode == "repl" ? nil : leaderModel
+            preset.leaderEffort = leaderMode == "repl"
+                ? nil
+                : AgentRolePreset.normalizeEffort(leaderEffort, for: leaderMode)
             preset.agents = liveProviderPreferences()
             var updated = template
             updated.payload = .smart(preset)
@@ -2385,6 +2406,13 @@ struct TeamCreationView: View {
     /// Map the live agent rows to the smart-preset `[ProviderPreference]` schema.
     /// Shared by the custom and builtIn persist branches.
     private func liveProviderPreferences() -> [ProviderPreference] {
+        Self.providerPreferences(from: agents)
+    }
+
+    /// Static so the effort a row carries is testable without the sheet: the
+    /// composer migrates a legacy codex tier into model + effort, and dropping
+    /// the effort here silently returned that agent to the CLI default.
+    static func providerPreferences(from agents: [TeamAgentRow]) -> [ProviderPreference] {
         agents.map { row in
             ProviderPreference(
                 role: row.preset.name,
@@ -2393,7 +2421,8 @@ struct TeamCreationView: View {
                 fallbackCli: row.preset.cli,
                 fallbackModel: row.preset.model,
                 reason: "Inline edit",
-                customInstructions: row.customInstructions.isEmpty ? nil : row.customInstructions
+                customInstructions: row.customInstructions.isEmpty ? nil : row.customInstructions,
+                effort: AgentRolePreset.normalizeEffort(row.preset.effort, for: row.preset.cli)
             )
         }
     }
@@ -2404,6 +2433,9 @@ struct TeamCreationView: View {
         )?.payload else { return nil }
         preset.leaderMode = leaderMode
         preset.leaderModel = leaderMode == "repl" ? nil : leaderModel
+        preset.leaderEffort = leaderMode == "repl"
+            ? nil
+            : AgentRolePreset.normalizeEffort(leaderEffort, for: leaderMode)
         preset.agents = liveProviderPreferences()
         return preset
     }
