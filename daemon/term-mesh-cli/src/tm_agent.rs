@@ -20668,6 +20668,27 @@ fn subscribe_events_channel(
     Ok(rx)
 }
 
+fn initialize_wait_task_scope(
+    explicit_task_ids: Option<&std::collections::HashSet<String>>,
+    task_id: Option<&str>,
+) -> (std::collections::HashSet<String>, bool) {
+    let mut task_ids = explicit_task_ids.cloned().unwrap_or_default();
+    let task_argument = task_id.filter(|id| !id.trim().is_empty());
+    if let Some(id) = task_argument {
+        task_ids.insert(id.to_string());
+    }
+    let is_explicit = explicit_task_ids.is_some() || task_argument.is_some();
+    (task_ids, is_explicit)
+}
+
+fn should_discover_wait_tasks(
+    explicit_task_scope: bool,
+    tracked_initialized: bool,
+    tracked_agents_empty: bool,
+) -> bool {
+    !explicit_task_scope && (!tracked_initialized || tracked_agents_empty)
+}
+
 fn run_wait(
     sock: &PathBuf,
     team: &str,
@@ -20728,10 +20749,8 @@ fn run_wait(
     // A plain broadcast has no task or correlation ID, so waiting for it used
     // to consume the entire timeout while displaying report=0/0. Fail before
     // subscribing or polling and point callers to the tracked healthcheck.
-    let mut initial_task_ids = explicit_task_ids.cloned().unwrap_or_default();
-    if let Some(id) = task_id.filter(|id| !id.trim().is_empty()) {
-        initial_task_ids.insert(id.to_string());
-    }
+    let (mut initial_task_ids, explicit_task_scope) =
+        initialize_wait_task_scope(explicit_task_ids, task_id);
     let mut initial_tracked_agents = std::collections::HashSet::new();
     if matches!(mode, "report" | "any") && initial_task_ids.is_empty() {
         if let Some(agents) = status_agents {
@@ -20853,7 +20872,13 @@ fn run_wait(
             // accumulate both their task IDs and names. Re-running on each poll
             // (not just the first) closes the race where wait fires before
             // delegate's task is visible in team.status.
-            if !tracked_initialized || tracked_agents.is_empty() {
+            // Explicit --task/--tasks correlation is closed: another task that
+            // happens to be active must not extend this wait's completion set.
+            if should_discover_wait_tasks(
+                explicit_task_scope,
+                tracked_initialized,
+                tracked_agents.is_empty(),
+            ) {
                 if let Ok(r) = rpc_call(sock, "team.status", json!({ "team_name": team })) {
                     if let Some(agents) = r["result"]["agents"].as_array() {
                         for a in agents {
@@ -21220,6 +21245,42 @@ fn run_wait(
         println!("{}", pretty(&r));
     }
     process::exit(1);
+}
+
+#[cfg(test)]
+mod wait_task_scope_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_tasks_form_a_closed_wait_scope() {
+        let explicit = std::collections::HashSet::from(["requested-task".to_string()]);
+        let (scope, is_explicit) = initialize_wait_task_scope(Some(&explicit), None);
+
+        assert!(is_explicit);
+        assert_eq!(scope, explicit);
+        assert!(!should_discover_wait_tasks(is_explicit, true, true));
+    }
+
+    #[test]
+    fn single_task_argument_forms_a_closed_wait_scope() {
+        let (scope, is_explicit) = initialize_wait_task_scope(None, Some("requested-task"));
+
+        assert!(is_explicit);
+        assert_eq!(
+            scope,
+            std::collections::HashSet::from(["requested-task".to_string()])
+        );
+        assert!(!should_discover_wait_tasks(is_explicit, true, true));
+    }
+
+    #[test]
+    fn absent_task_arguments_allow_active_task_discovery() {
+        let (scope, is_explicit) = initialize_wait_task_scope(None, None);
+
+        assert!(!is_explicit);
+        assert!(scope.is_empty());
+        assert!(should_discover_wait_tasks(is_explicit, false, true));
+    }
 }
 
 fn run_warmup(sock: &PathBuf, team: &str, target: Option<&str>, timeout: u32) {
