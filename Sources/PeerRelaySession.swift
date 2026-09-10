@@ -3423,11 +3423,16 @@ final class PeerRelaySession {
                 do {
                     for try await frame in reader.frames() {
                         framesConsumed &+= 1
+                        // Classify the frame by the session generation that
+                        // owned it when processing began. sendInput suspends;
+                        // a resume-heal during that await must not relabel an
+                        // old-session stall as a sample from the replacement.
+                        let inputGeneration = resumeTransitionGate.currentGeneration()
                         if Task.isCancelled {
                             if frame.type == kTypeKeyInput {
                                 let elapsed = DispatchTime.now().uptimeNanoseconds - frame.readAtNs
                                 inputLatencyStats.record(.init(
-                                    generation: resumeTransitionGate.currentGeneration(),
+                                    generation: inputGeneration,
                                     queueNs: elapsed, sessionAccessNs: nil, browseExitNs: nil,
                                     sendNs: nil, totalNs: elapsed, outcome: .cancelled
                                 ))
@@ -3444,7 +3449,7 @@ final class PeerRelaySession {
                             var outcome: RelayInputLatencyStats.Outcome = .noSession
                             defer {
                                 inputLatencyStats.record(.init(
-                                    generation: resumeTransitionGate.currentGeneration(),
+                                    generation: inputGeneration,
                                     queueNs: dequeuedAt - frame.readAtNs,
                                     sessionAccessNs: sessionAccessNs, browseExitNs: browseExitNs,
                                     sendNs: sendNs,

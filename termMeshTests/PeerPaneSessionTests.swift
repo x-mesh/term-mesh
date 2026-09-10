@@ -6547,6 +6547,23 @@ final class RelayInputLatencyStatsTests: XCTestCase {
         XCTAssertEqual(totals["failed"], 1)
         XCTAssertEqual(totals["sent"], 1)
     }
+
+    func testLateOldGenerationCompletionCannotReplaceTheCurrentWindow() throws {
+        let stats = RelayInputLatencyStats(capacity: 4)
+        stats.record(.init(generation: 2, queueNs: 2_000_000, sessionAccessNs: 1,
+                           browseExitNs: nil, sendNs: 1, totalNs: 2_000_002,
+                           outcome: .sent))
+        // An input sent through generation 1 can finish after generation 2
+        // starts. Arrival order must not make the old sample current again.
+        stats.record(.init(generation: 1, queueNs: 900_000_000, sessionAccessNs: nil,
+                           browseExitNs: nil, sendNs: nil, totalNs: 900_000_000,
+                           outcome: .failed))
+        let snapshot = stats.snapshot()
+        XCTAssertEqual(snapshot["session_generation"] as? UInt64, 2)
+        XCTAssertEqual(snapshot["window_samples"] as? Int, 1)
+        let queue = try XCTUnwrap(snapshot["queue"] as? [String: Any])
+        XCTAssertEqual(queue["max_ms"] as? Double, 2)
+    }
 }
 
 // MARK: - Relay stall production logging
