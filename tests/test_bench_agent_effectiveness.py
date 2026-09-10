@@ -638,7 +638,7 @@ end
             self.assertIn("STATUS: DONE", headers)
             self.assertEqual(headers.count("STATUS: BLOCKED"), 2)
 
-    def test_controller_returns_after_ready_results_settle(self):
+    def test_controller_waits_for_slow_worker_until_its_estimate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             files = [root / f"{role}.result" for role in ("explorer", "executor", "reviewer")]
@@ -646,6 +646,10 @@ end
             def publish_results() -> None:
                 time.sleep(0.02)
                 files[0].write_text("STATUS: DONE\nNEXT: leader integrates\n")
+                # This arrives well after the removed short settle window, but
+                # before its task estimate. The controller must still collect it.
+                time.sleep(0.12)
+                files[1].write_text("STATUS: DONE\nNEXT: leader keeps implementation\n")
                 time.sleep(0.02)
                 files[2].write_text("STATUS: DONE\nNEXT: leader verifies\n")
 
@@ -653,15 +657,16 @@ end
             publisher.start()
             started = time.perf_counter()
             headers, elapsed_ms, ready = module.wait_for_worker_results(
-                files, timeout=1.0, settle_after_ready=0.05,
+                files, timeout=1.0,
+                estimated_seconds={path: 1 for path in files}, estimate_grace=0,
             )
             publisher.join()
 
-            self.assertEqual(ready, 2)
-            self.assertLess(time.perf_counter() - started, 0.5)
+            self.assertEqual(ready, 3)
+            self.assertGreaterEqual(time.perf_counter() - started, 0.14)
             self.assertLess(elapsed_ms, 500)
-            self.assertEqual(headers.count("STATUS: DONE"), 2)
-            self.assertEqual(headers.count("STATUS: BLOCKED"), 1)
+            self.assertEqual(headers.count("STATUS: DONE"), 3)
+            self.assertNotIn("STATUS: BLOCKED", headers)
 
     def test_worker_instructions_partition_write_ownership(self):
         fixture = module.FIXTURES["homebrew-smoke"]
@@ -869,17 +874,18 @@ end
             "/tmp/term-mesh-effectiveness-run-a/Sources/View.swift:42:7: "
             "error: expected divider overlay [a1b2c3d4]"
         )
-        second = (
+        same = (
             "remote Xcode acceptance failed: "
             "/tmp/term-mesh-effectiveness-run-b/Sources/View.swift:84:3: "
-            "error: expected divider overlay [ffeeddcc]"
+            "error: expected divider overlay [a1b2c3d4]"
         )
-        different = second.replace("expected divider overlay", "missing reset control")
-        different_file = second.replace("Sources/View.swift", "Sources/SettingsView.swift")
+        different = same.replace("expected divider overlay", "missing reset control")
+        different_file = same.replace("Sources/View.swift", "Sources/SettingsView.swift")
+        different_hex = same.replace("a1b2c3d4", "ffeeddcc")
 
         self.assertEqual(
             module.acceptance_failure_fingerprint(first),
-            module.acceptance_failure_fingerprint(second),
+            module.acceptance_failure_fingerprint(same),
         )
         self.assertNotEqual(
             module.acceptance_failure_fingerprint(first),
@@ -888,6 +894,10 @@ end
         self.assertNotEqual(
             module.acceptance_failure_fingerprint(first),
             module.acceptance_failure_fingerprint(different_file),
+        )
+        self.assertNotEqual(
+            module.acceptance_failure_fingerprint(first),
+            module.acceptance_failure_fingerprint(different_hex),
         )
 
     def test_second_identical_acceptance_failure_is_repeated(self):

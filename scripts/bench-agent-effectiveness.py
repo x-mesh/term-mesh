@@ -477,6 +477,7 @@ def run_divider_acceptance(
     tests = (
         "termMeshTests/HiddenSplitDividerBehaviorAcceptanceTests/testOverrideSerializationAndResetUseExistingSettingsBoundary",
         "termMeshTests/HiddenSplitDividerBehaviorAcceptanceTests/testParsedDividerColorReachesBonsplitAppearance",
+        "termMeshTests/HiddenSplitDividerBehaviorAcceptanceTests/testExistingWorkspaceAppliesConfiguredColorAndResetImmediately",
         "termMeshTests/HiddenSplitDividerPortalAcceptanceTests/testOpaqueDividerRendersWithoutSurfaceOcclusion",
         "termMeshTests/HiddenSplitDividerPortalAcceptanceTests/testTranslucentDividerKeepsOcclusionPolicy",
     )
@@ -1326,13 +1327,19 @@ working tree에서 구현과 관련 테스트, 가능한 검증까지 완료하�
 
 def wait_for_worker_results(
     result_files: list[Path], *, timeout: float, trace: Optional[TraceWriter] = None,
-    settle_after_ready: float = 5.0,
+    estimated_seconds: Optional[dict[Path, int]] = None, estimate_grace: float = 120.0,
 ) -> tuple[str, int, int]:
-    """Wait for the first result, then collect results until the set settles."""
+    """Wait for every result until its task estimate and grace expire."""
     started = time.perf_counter()
     deadline = started + max(0, timeout)
-    ready_paths: set[Path] = set()
-    settle_deadline: Optional[float] = None
+    worker_deadlines = {
+        path: min(
+            deadline,
+            started + max(0, (estimated_seconds or {}).get(path, 0))
+            + max(0, estimate_grace),
+        )
+        for path in result_files
+    }
     while time.perf_counter() < deadline:
         ready_now = {
             path for path in result_files
@@ -1341,13 +1348,12 @@ def wait_for_worker_results(
         if len(ready_now) == len(result_files):
             break
         now = time.perf_counter()
-        if ready_now != ready_paths:
-            ready_paths = ready_now
-            if ready_paths:
-                settle_deadline = min(deadline, now + max(0, settle_after_ready))
-        if settle_deadline is not None and now >= settle_deadline:
+        pending = [path for path in result_files if path not in ready_now]
+        if pending and all(now >= worker_deadlines[path] for path in pending):
             break
-        next_deadline = min(deadline, settle_deadline or deadline)
+        next_deadline = min(
+            [deadline] + [worker_deadlines[path] for path in pending]
+        )
         time.sleep(min(0.25, max(0, next_deadline - now)))
     elapsed_ms = round((time.perf_counter() - started) * 1000)
     sections = []
@@ -1392,9 +1398,6 @@ def acceptance_failure_fingerprint(reason: str) -> str:
         r"<HOME>/Library/Developer/Xcode/DerivedData/[^/\s]+",
         "<derived-data>",
         normalized,
-    )
-    normalized = re.sub(
-        r"\b[0-9a-f]{8,64}\b", "<build-id>", normalized, flags=re.IGNORECASE
     )
     normalized = re.sub(r":\d+:\d+(?=:)", ":<line>:<column>", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
@@ -1511,6 +1514,10 @@ def run_one(
             remaining = timeout - (time.perf_counter() - total_started)
             worker_headers, worker_wait_ms, _ = wait_for_worker_results(
                 result_files, timeout=min(15 * 60, max(0, remaining)), trace=trace,
+                estimated_seconds={
+                    path: task["estimated_seconds"]
+                    for path, task in zip(result_files, default_worker_tasks())
+                },
             )
             record.worker_active_critical_path_ms = worker_wait_ms
         else:
@@ -1799,6 +1806,10 @@ def run_policy_one(
                         wave_timeout = min(10 * 60, estimate + 60, max(0, remaining))
                         headers, wait_ms, ready = wait_for_worker_results(
                             result_files, timeout=wave_timeout, trace=trace,
+                            estimated_seconds={
+                                path: task["estimated_seconds"]
+                                for path, task in zip(result_files, routing_tasks)
+                            },
                         )
                         record.worker_active_critical_path_ms = wait_ms
                         record.coordination_commands["controller_dispatch"] = record.worker_tasks
