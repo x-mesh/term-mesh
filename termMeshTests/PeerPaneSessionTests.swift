@@ -6459,7 +6459,7 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
 final class RelayInputLatencyStatsTests: XCTestCase {
     private func sample(_ ms: UInt64, outcome: RelayInputLatencyStats.Outcome = .sent)
         -> RelayInputLatencyStats.Sample {
-        .init(queueNs: ms * 1_000_000, sessionAccessNs: ms * 2_000_000,
+        .init(generation: 1, queueNs: ms * 1_000_000, sessionAccessNs: ms * 2_000_000,
               browseExitNs: nil, sendNs: ms * 3_000_000,
               totalNs: ms * 6_000_000, outcome: outcome)
     }
@@ -6505,7 +6505,7 @@ final class RelayInputLatencyStatsTests: XCTestCase {
         let access = try XCTUnwrap(snapshot["session_access"] as? [String: Any])
         XCTAssertEqual(access["p95_ms"] as? Double, 190)
         let single = RelayInputLatencyStats()
-        single.record(.init(queueNs: 125_000, sessionAccessNs: nil, browseExitNs: nil,
+        single.record(.init(generation: 1, queueNs: 125_000, sessionAccessNs: nil, browseExitNs: nil,
                             sendNs: nil, totalNs: 125_000, outcome: .cancelled))
         let fraction = try XCTUnwrap(single.snapshot()["queue"] as? [String: Any])
         XCTAssertEqual(fraction["p99_ms"] as? Double, 0.125)
@@ -6513,9 +6513,9 @@ final class RelayInputLatencyStatsTests: XCTestCase {
 
     func testUnsentFramesDoNotPolluteSendDistribution() throws {
         let stats = RelayInputLatencyStats()
-        stats.record(.init(queueNs: 1, sessionAccessNs: nil, browseExitNs: nil,
+        stats.record(.init(generation: 1, queueNs: 1, sessionAccessNs: nil, browseExitNs: nil,
                            sendNs: nil, totalNs: 1, outcome: .cancelled))
-        stats.record(.init(queueNs: 1, sessionAccessNs: 2, browseExitNs: nil,
+        stats.record(.init(generation: 1, queueNs: 1, sessionAccessNs: 2, browseExitNs: nil,
                            sendNs: nil, totalNs: 3, outcome: .noSession))
         stats.record(sample(4, outcome: .failed))
         let snapshot = stats.snapshot()
@@ -6528,6 +6528,24 @@ final class RelayInputLatencyStatsTests: XCTestCase {
         XCTAssertEqual(totals["no_session"], 1)
         XCTAssertEqual(totals["failed"], 1)
         XCTAssertEqual(totals["sent"], 0)
+    }
+
+    func testSnapshotSeparatesResumeGenerationsButKeepsLifetimeOutcomes() throws {
+        let stats = RelayInputLatencyStats(capacity: 4)
+        stats.record(.init(generation: 1, queueNs: 900_000_000, sessionAccessNs: nil,
+                           browseExitNs: nil, sendNs: nil, totalNs: 900_000_000,
+                           outcome: .failed))
+        stats.record(.init(generation: 2, queueNs: 2_000_000, sessionAccessNs: 1,
+                           browseExitNs: nil, sendNs: 1, totalNs: 2_000_002,
+                           outcome: .sent))
+        let snapshot = stats.snapshot()
+        XCTAssertEqual(snapshot["session_generation"] as? UInt64, 2)
+        XCTAssertEqual(snapshot["window_samples"] as? Int, 1)
+        let queue = try XCTUnwrap(snapshot["queue"] as? [String: Any])
+        XCTAssertEqual(queue["max_ms"] as? Double, 2)
+        let totals = try XCTUnwrap(snapshot["outcomes_total"] as? [String: UInt64])
+        XCTAssertEqual(totals["failed"], 1)
+        XCTAssertEqual(totals["sent"], 1)
     }
 }
 

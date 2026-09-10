@@ -1483,6 +1483,7 @@ final class RelayInputLatencyStats: @unchecked Sendable {
     }
 
     struct Sample {
+        let generation: UInt64
         let queueNs: UInt64
         let sessionAccessNs: UInt64?
         let browseExitNs: UInt64?
@@ -1517,7 +1518,8 @@ final class RelayInputLatencyStats: @unchecked Sendable {
 
     func snapshot() -> [String: Any] {
         lock.lock()
-        let recent = samples
+        let generation = samples.map(\.generation).max() ?? 0
+        let recent = samples.filter { $0.generation == generation }
         let totals = counts
         lock.unlock()
 
@@ -1537,6 +1539,7 @@ final class RelayInputLatencyStats: @unchecked Sendable {
             "scope": "relay_helper_local_handoff",
             "window_capacity": capacity,
             "window_samples": recent.count,
+            "session_generation": generation,
             "outcomes_total": Dictionary(uniqueKeysWithValues: Outcome.allCases.map {
                 ($0.rawValue, totals[$0.rawValue, default: 0])
             }),
@@ -3424,6 +3427,7 @@ final class PeerRelaySession {
                             if frame.type == kTypeKeyInput {
                                 let elapsed = DispatchTime.now().uptimeNanoseconds - frame.readAtNs
                                 inputLatencyStats.record(.init(
+                                    generation: resumeTransitionGate.currentGeneration(),
                                     queueNs: elapsed, sessionAccessNs: nil, browseExitNs: nil,
                                     sendNs: nil, totalNs: elapsed, outcome: .cancelled
                                 ))
@@ -3440,6 +3444,7 @@ final class PeerRelaySession {
                             var outcome: RelayInputLatencyStats.Outcome = .noSession
                             defer {
                                 inputLatencyStats.record(.init(
+                                    generation: resumeTransitionGate.currentGeneration(),
                                     queueNs: dequeuedAt - frame.readAtNs,
                                     sessionAccessNs: sessionAccessNs, browseExitNs: browseExitNs,
                                     sendNs: sendNs,
