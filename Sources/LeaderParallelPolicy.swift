@@ -37,7 +37,7 @@ enum ProjectDelegationLevel: String, CaseIterable, Codable, Sendable {
         case .guarded:
             return "Serial work stays with the leader; risk conditions add one read-only probe."
         case .delegated:
-            return "Serial implementation goes to one worker; independent units still run in parallel."
+            return "Workers take as many independent units as the configured limit allows; the leader integrates and verifies."
         }
     }
 }
@@ -61,7 +61,7 @@ struct ProjectExecutionOptions: Equatable, Sendable {
     var injectDirective: Bool
 
     static let `default` = Self(maxParallelWorkers: 3, injectDirective: true)
-    static let workerBounds = 1...5
+    static let workerBounds = 1...10
 
     private static func key(_ suffix: String, teamName: String) -> String {
         guard !teamName.isEmpty else { return "team.unknown.\(suffix)" }
@@ -176,7 +176,10 @@ struct ProjectRoutingDecision: Codable, Equatable, Sendable {
         // A cap of one is a deliberate "never fan out", not a small wave: two
         // is the smallest wave the policy recognises, so a cap below it has to
         // close the gate rather than emit a one-worker "parallel" run.
-        let cap = max(1, maxParallelWorkers)
+        let cap = min(
+            ProjectExecutionOptions.workerBounds.upperBound,
+            max(ProjectExecutionOptions.workerBounds.lowerBound, maxParallelWorkers)
+        )
         if let taskShape, taskShape.supportsParallelWave, workers >= 2, cap >= 2 {
             return Self(
                 route: .parallel, reasons: ["parallel_ready"],
@@ -203,7 +206,15 @@ struct ProjectRoutingDecision: Codable, Equatable, Sendable {
                 route: .probe, reasons: risks.map(\.rawValue).sorted(), workerCount: 1
             )
         case .delegated:
-            return Self(route: .delegated, reasons: ["delegated_serial_work"], workerCount: 1)
+            if taskShape == .singleUnit {
+                return Self(
+                    route: .delegated, reasons: ["delegated_serial_work"], workerCount: 1
+                )
+            }
+            return Self(
+                route: .delegated, reasons: ["delegated_max_capacity"],
+                workerCount: min(cap, workers)
+            )
         }
     }
 }
@@ -212,7 +223,7 @@ struct ProjectRoutingDecision: Codable, Equatable, Sendable {
 /// renderer consumes `renderedInstructions`; no renderer owns a fork of these
 /// scheduling rules.
 enum LeaderParallelPolicy {
-    static let version = "12"
+    static let version = "13"
     static let activation = "request-boundary-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do
@@ -221,7 +232,7 @@ enum LeaderParallelPolicy {
     static let rules: [(id: String, text: String)] = [
         (
             "team-aware-decomposition-default",
-            "When the Project roster has available workers, start each non-trivial request by decomposing it into independently completable units and assign eligible units before doing that work in the leader lane. Prefer a two- or three-worker parallel wave whenever at least two units are dependency-ready, independently verifiable, and ownership-disjoint. The leader owns coordination, integration, and any distinct unowned lane. Direct execution is the explicit exception for trivial, same-file, dependency-serial, or worker-ineligible work; record a concise reason. Never manufacture work solely to occupy an idle worker."
+            "When the Project roster has available workers, start each non-trivial request by decomposing it into independently completable units and assign eligible units before doing that work in the leader lane. Prefer a bounded parallel wave whenever at least two units are dependency-ready, independently verifiable, and ownership-disjoint. Use no more than the configured worker limit or ten workers, whichever is lower. Delegated mode fills every useful independent unit up to that limit; never manufacture work solely to occupy capacity. The leader owns coordination, integration, and any distinct unowned lane. Direct execution is the explicit exception for trivial, same-file, dependency-serial, or worker-ineligible work; record a concise reason."
         ),
         (
             "parallel-admission-gate",
@@ -229,7 +240,7 @@ enum LeaderParallelPolicy {
         ),
         (
             "structured-routing-decision",
-            "Classify execution as direct, probe, or parallel before dispatch. Direct has no worker tasks. Probe has exactly one read-only task with a 60-90 second budget. Parallel has two or three dependency-ready tasks. Every worker task names its worker, goal, owned and forbidden paths, dependencies, verification command, mutation flag, and time estimate."
+            "Classify execution as direct, probe, or parallel before dispatch. Direct has no worker tasks. Probe has exactly one read-only task with a 60-90 second budget. Parallel has between two and the configured maximum of ten dependency-ready tasks. Delegated mode uses every useful independent task up to that maximum. Every worker task names its worker, goal, owned and forbidden paths, dependencies, verification command, mutation flag, and time estimate."
         ),
         (
             "turn-route-measurement",
@@ -349,7 +360,7 @@ enum LeaderParallelPolicy {
           ]
         }
         ```
-        Route invariants: direct has zero implementation tasks; probe has exactly one read-only implementation task (`mutates=false`) estimated at 60-90 seconds; parallel has two or three implementation tasks whose `depends_on` prerequisites are already satisfied. For implementation requests, `validation_gates` are a later wave derived from the integrated diff, never speculative implementation capacity. For explicit review-only requests, `review-only-fast-path` may start validators after bounded manifest triage against one frozen target while the leader works concurrently. Dispatch at most two gates once, collect once, and keep every gate read-only. A validator capsule covers one risk question and at most three primary files with a 90-second target. Require the normal final 5-field reply; `review_ready` without that final reply is partial evidence, not completion.
+        Route invariants: direct has zero implementation tasks; probe has exactly one read-only implementation task (`mutates=false`) estimated at 60-90 seconds; parallel has between two and the configured maximum of ten implementation tasks whose `depends_on` prerequisites are already satisfied. Delegated mode fills useful independent tasks up to that maximum without inventing work. For implementation requests, `validation_gates` are a later wave derived from the integrated diff, never speculative implementation capacity. For explicit review-only requests, `review-only-fast-path` may start validators after bounded manifest triage against one frozen target while the leader works concurrently. Dispatch at most two gates once, collect once, and keep every gate read-only. A validator capsule covers one risk question and at most three primary files with a 90-second target. Require the normal final 5-field reply; `review_ready` without that final reply is partial evidence, not completion.
 
         \(renderedRules)
         """

@@ -590,6 +590,7 @@ try:
 except (TypeError, ValueError):
     cap = 3
 cap = max(1, cap)
+cap = min(10, cap)
 # What a wave can actually be here: never more than the roster, never more than
 # the Project allows. A cap of one means waves are off, not that they are small.
 wave = min(cap, workers)
@@ -634,9 +635,11 @@ FLOORS = {
         + wave_clause
     ),
     "delegated": (
-        "Hand serial implementation to a worker and keep coordination, integration, and "
-        "review in the leader lane. Implementing it yourself requires a reason recorded "
-        "with `tm-agent leader turn route`. " + wave_clause
+        "Fill every useful independent unit with workers up to the configured maximum, "
+        "and keep coordination, integration, and review in the leader lane. If the work "
+        "is serial, use one worker. Never invent units only to fill capacity. Implementing "
+        "it yourself requires a reason recorded with `tm-agent leader turn route`. "
+        + wave_clause
     ),
 }
 floor = FLOORS.get(level)

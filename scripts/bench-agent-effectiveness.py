@@ -60,6 +60,7 @@ class Fixture:
     prompt: str
     oracle_files: tuple[str, ...]
     acceptance: str
+    hidden_tests: tuple[tuple[str, str], ...] = ()
 
 
 FIXTURES: dict[str, Fixture] = {
@@ -92,10 +93,20 @@ FIXTURES: dict[str, Fixture] = {
             "terminal surface가 divider를 가리지 않아도 overlay로 보여야 하고 기존 "
             "translucent separator의 occlusion 정책은 유지하라. 관련 unit test를 추가하라."
         ),
-        oracle_files=(
-            "termMeshTests/GhosttyConfigTests.swift",
-            "termMeshTests/GhosttyTerminalViewComposingTests.swift",
-            "termMeshTests/TerminalOverrideIsolationTests.swift",
+        oracle_files=(),
+        hidden_tests=(
+            (
+                "termMeshTests/TerminalOverrideIsolationTests.swift",
+                "tests/fixtures/effectiveness/split-divider-color/TerminalOverrideIsolationTests.swift.inc",
+            ),
+            (
+                "termMeshTests/TermMeshWebViewKeyEquivalentTests.swift",
+                "tests/fixtures/effectiveness/split-divider-color/TermMeshWebViewKeyEquivalentTests.swift.inc",
+            ),
+            (
+                "Sources/TerminalWindowPortal.swift",
+                "tests/fixtures/effectiveness/split-divider-color/TerminalWindowPortal.swift.inc",
+            ),
         ),
         acceptance="divider",
     ),
@@ -181,9 +192,13 @@ def validate_fixture_metadata() -> list[dict[str, Any]]:
         parent = git("rev-parse", f"{fixture.solution}^")
         for path in fixture.oracle_files:
             git("cat-file", "-e", f"{fixture.solution}:{path}")
+        for _, source in fixture.hidden_tests:
+            if not (ROOT / source).is_file():
+                raise RuntimeError(f"hidden acceptance source missing: {source}")
         rows.append({
             "fixture": fixture.name, "solution": solution, "base": parent,
             "oracle_files": list(fixture.oracle_files),
+            "hidden_tests": [source for _, source in fixture.hidden_tests],
         })
     return rows
 
@@ -317,6 +332,21 @@ def oracle_overlay(fixture: Fixture, checkout: Path) -> Iterator[None]:
                     target.chmod(mode)
 
 
+@contextlib.contextmanager
+def hidden_test_overlay(fixture: Fixture, checkout: Path) -> Iterator[None]:
+    backups: dict[str, bytes] = {}
+    try:
+        for target_relative, source_relative in fixture.hidden_tests:
+            target = checkout / target_relative
+            backups[target_relative] = target.read_bytes()
+            source = (ROOT / source_relative).read_bytes()
+            target.write_bytes(backups[target_relative] + source)
+        yield
+    finally:
+        for target_relative, content in backups.items():
+            (checkout / target_relative).write_bytes(content)
+
+
 def shell_full_only_lines(text: str) -> set[int]:
     """Return lines proven to execute only when SMOKE_TEST is ``full``.
 
@@ -425,14 +455,30 @@ def run_logged(
     return True, "passed"
 
 
+def xcode_failure_summary(output: str) -> str:
+    diagnostics: list[str] = []
+    patterns = (
+        re.compile(r"^.*?:\d+:\d+: (?:error|warning): .+$"),
+        re.compile(r"^.*?XCTAssert.* failed.*$"),
+        re.compile(r"^Test Case '.*' failed.*$"),
+    )
+    for raw in output.splitlines():
+        line = raw.strip()
+        if any(pattern.match(line) for pattern in patterns) and line not in diagnostics:
+            diagnostics.append(line)
+    if diagnostics:
+        return "\n".join(diagnostics[-20:])
+    return output[-1200:].replace("\x00", "")
+
+
 def run_divider_acceptance(
     checkout: Path, log: TextIO, timeout: float, xcode_host: str, run_id: str,
 ) -> tuple[bool, str]:
     tests = (
-        "termMeshTests/WorkspaceChromeThemeTests/testResolvedChromeColorsUsesExplicitSplitDividerColor",
-        "termMeshTests/GhosttyTerminalViewComposingTests/testDividerOverlayAlwaysRendersOpaqueUserColor",
-        "termMeshTests/GhosttyTerminalViewComposingTests/testDividerOverlayKeepsDefaultSeparatorOcclusionPolicy",
-        "termMeshTests/TerminalOverrideIsolationTests/test_configLines_setSplitDividerColorIsWritten",
+        "termMeshTests/HiddenSplitDividerBehaviorAcceptanceTests/testOverrideSerializationAndResetUseExistingSettingsBoundary",
+        "termMeshTests/HiddenSplitDividerBehaviorAcceptanceTests/testParsedDividerColorReachesBonsplitAppearance",
+        "termMeshTests/HiddenSplitDividerPortalAcceptanceTests/testOpaqueDividerRendersWithoutSurfaceOcclusion",
+        "termMeshTests/HiddenSplitDividerPortalAcceptanceTests/testTranslucentDividerKeepsOcclusionPolicy",
     )
     command = [
         "xcodebuild", "-project", "GhosttyTabs.xcodeproj", "-scheme", "term-mesh-unit",
@@ -476,7 +522,12 @@ def run_divider_acceptance(
         )
         result = run_command(("ssh", xcode_host, remote_command), timeout=timeout)
         log.write(redact_text(result.stdout + result.stderr, checkout))
-        return (result.returncode == 0, "passed" if result.returncode == 0 else f"remote Xcode acceptance failed: {(result.stdout + result.stderr)[-1200:]}")
+        return (
+            result.returncode == 0,
+            "passed" if result.returncode == 0
+            else "remote Xcode acceptance failed:\n"
+            + xcode_failure_summary(result.stdout + result.stderr),
+        )
     finally:
         # The target is an exact, controller-created /tmp path.  Never expand a remote variable.
         run_command(("ssh", xcode_host, "rm", "-rf", remote), timeout=30)
@@ -487,7 +538,7 @@ def run_acceptance(
     xcode_host: str, run_id: str,
 ) -> tuple[bool, int, str]:
     started = time.perf_counter()
-    with oracle_overlay(fixture, checkout):
+    with oracle_overlay(fixture, checkout), hidden_test_overlay(fixture, checkout):
         if fixture.acceptance == "homebrew":
             passed, reason = homebrew_acceptance(checkout)
             log.write(reason + "\n")
@@ -1196,7 +1247,7 @@ controller, solution commit, 외부 checkout에서 정답을 찾지 마라. 문�
     assert team
     headers = worker_headers or "worker result envelope가 아직 없다. leader가 직접 구현을 완료하라."
     protocol = f"""
-controller가 explorer, executor, reviewer 세 worker를 이미 동시에 dispatch하고 최대 15분 기다렸다.
+controller가 explorer, executor, reviewer 세 worker를 이미 동시에 dispatch하고 첫 결과 뒤 bounded settle window까지 기다렸다.
 explorer와 reviewer는 read-only이고 executor만 구현 파일을 소유한다. 아래 worker envelope를 참고하고
 필요할 때만 그 안의 FULL_REPORT를 읽어 통합·수정·최종 검증하라. 누락 worker를 다시 기다리거나
 result 파일을 재조회하지 말고 leader가 직접 남은 일을 끝내라. 어떤 `tm-agent` 명령도 호출하지 마라.
@@ -1275,14 +1326,29 @@ working tree에서 구현과 관련 테스트, 가능한 검증까지 완료하�
 
 def wait_for_worker_results(
     result_files: list[Path], *, timeout: float, trace: Optional[TraceWriter] = None,
+    settle_after_ready: float = 5.0,
 ) -> tuple[str, int, int]:
-    """Wait once in the controller and return bounded worker envelopes."""
+    """Wait for the first result, then collect results until the set settles."""
     started = time.perf_counter()
     deadline = started + max(0, timeout)
+    ready_paths: set[Path] = set()
+    settle_deadline: Optional[float] = None
     while time.perf_counter() < deadline:
-        if all(path.is_file() and path.stat().st_size > 0 for path in result_files):
+        ready_now = {
+            path for path in result_files
+            if path.is_file() and path.stat().st_size > 0
+        }
+        if len(ready_now) == len(result_files):
             break
-        time.sleep(min(0.25, max(0, deadline - time.perf_counter())))
+        now = time.perf_counter()
+        if ready_now != ready_paths:
+            ready_paths = ready_now
+            if ready_paths:
+                settle_deadline = min(deadline, now + max(0, settle_after_ready))
+        if settle_deadline is not None and now >= settle_deadline:
+            break
+        next_deadline = min(deadline, settle_deadline or deadline)
+        time.sleep(min(0.25, max(0, next_deadline - now)))
     elapsed_ms = round((time.perf_counter() - started) * 1000)
     sections = []
     ready = 0
@@ -1316,6 +1382,30 @@ def claude_command(
 
 def safe_failure(reason: str) -> str:
     return redact_text(reason)[-1800:]
+
+
+def acceptance_failure_fingerprint(reason: str) -> str:
+    """Identify the failing check while ignoring per-run paths and build ids."""
+    normalized = redact_text(reason)
+    normalized = re.sub(r"/tmp/term-mesh-effectiveness-[^/\s:'\"]+", "<checkout>", normalized)
+    normalized = re.sub(
+        r"<HOME>/Library/Developer/Xcode/DerivedData/[^/\s]+",
+        "<derived-data>",
+        normalized,
+    )
+    normalized = re.sub(
+        r"\b[0-9a-f]{8,64}\b", "<build-id>", normalized, flags=re.IGNORECASE
+    )
+    normalized = re.sub(r":\d+:\d+(?=:)", ":<line>:<column>", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
+def note_acceptance_failure(reason: str, seen: set[str]) -> tuple[str, bool]:
+    fingerprint = acceptance_failure_fingerprint(reason)
+    repeated = fingerprint in seen
+    seen.add(fingerprint)
+    return fingerprint, repeated
 
 
 def redact_text(text: str, checkout: Optional[Path] = None) -> str:
@@ -1429,6 +1519,7 @@ def run_one(
         prompt = leader_prompt(fixture, spec.condition, team, worker_headers)
         with (experiment / paths["stdout"]).open("w") as stdout_log, (experiment / paths["acceptance"]).open("w") as acceptance_log:
             resume = False
+            acceptance_failures: set[str] = set()
             while True:
                 elapsed = time.perf_counter() - total_started
                 remaining = timeout - elapsed
@@ -1495,6 +1586,23 @@ def run_one(
                 if classify_infra_failure(record.failure_reason):
                     record.infra_invalid = True
                     record.status = "infra_invalid"
+                    break
+                fingerprint, repeated = note_acceptance_failure(
+                    record.failure_reason, acceptance_failures
+                )
+                trace.write(
+                    "acceptance_failure", attempt=record.correction_count + 1,
+                    fingerprint=fingerprint, repeated=repeated,
+                )
+                if repeated:
+                    trace.write(
+                        "correction_skipped", reason="repeated_acceptance_failure",
+                        fingerprint=fingerprint,
+                    )
+                    record.failure_reason = (
+                        f"repeated acceptance failure ({fingerprint}); correction stopped: "
+                        + record.failure_reason
+                    )
                     break
                 record.correction_count += 1
                 prompt = (
@@ -1617,6 +1725,7 @@ def run_policy_one(
         ).open("w") as acceptance_log:
             resume = False
             routed = False
+            acceptance_failures: set[str] = set()
             while True:
                 remaining = timeout - (time.perf_counter() - total_started)
                 if remaining <= 0:
@@ -1722,6 +1831,23 @@ envelope와 필요한 FULL_REPORT만 읽어 구현을 통합·수정하고 최�
                 if classify_infra_failure(record.failure_reason):
                     record.infra_invalid = True
                     record.status = "infra_invalid"
+                    break
+                fingerprint, repeated = note_acceptance_failure(
+                    record.failure_reason, acceptance_failures
+                )
+                trace.write(
+                    "acceptance_failure", attempt=record.correction_count + 1,
+                    fingerprint=fingerprint, repeated=repeated,
+                )
+                if repeated:
+                    trace.write(
+                        "correction_skipped", reason="repeated_acceptance_failure",
+                        fingerprint=fingerprint,
+                    )
+                    record.failure_reason = (
+                        f"repeated acceptance failure ({fingerprint}); correction stopped: "
+                        + record.failure_reason
+                    )
                     break
                 record.correction_count += 1
                 prompt = (

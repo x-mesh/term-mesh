@@ -6,6 +6,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -369,6 +371,42 @@ end
                 self.assertNotEqual(target.read_text(), "candidate\n")
             self.assertEqual(target.read_text(), "candidate\n")
 
+    def test_hidden_test_overlay_appends_and_restores_candidate_tests(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            originals = {}
+            for target_relative, _ in fixture.hidden_tests:
+                target = checkout / target_relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(f"candidate test: {target.name}\n")
+                originals[target_relative] = target.read_bytes()
+
+            with module.hidden_test_overlay(fixture, checkout):
+                for target_relative, _ in fixture.hidden_tests:
+                    target = checkout / target_relative
+                    self.assertTrue(target.read_bytes().startswith(originals[target_relative]))
+                    self.assertGreater(len(target.read_bytes()), len(originals[target_relative]))
+
+            for target_relative, content in originals.items():
+                self.assertEqual((checkout / target_relative).read_bytes(), content)
+
+    def test_divider_fixture_uses_behavior_hidden_tests_not_solution_test_files(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        self.assertEqual(fixture.oracle_files, ())
+        self.assertEqual(len(fixture.hidden_tests), 3)
+        self.assertTrue(all(source.endswith(".swift.inc") for _, source in fixture.hidden_tests))
+
+    def test_xcode_failure_summary_keeps_actionable_diagnostics(self):
+        output = "\n".join((
+            "CompileSwift normal arm64",
+            "/tmp/run/Sources/View.swift:42:7: error: missing divider behavior",
+            "Testing cancelled because the build failed.",
+        ))
+        summary = module.xcode_failure_summary(output)
+        self.assertIn("View.swift:42:7: error: missing divider behavior", summary)
+        self.assertNotIn("Testing cancelled", summary)
+
     def test_build_info_is_generated_before_xcode_acceptance(self):
         source = SCRIPT.read_text()
         function = source[source.index("def run_divider_acceptance"):source.index("def run_acceptance")]
@@ -600,6 +638,31 @@ end
             self.assertIn("STATUS: DONE", headers)
             self.assertEqual(headers.count("STATUS: BLOCKED"), 2)
 
+    def test_controller_returns_after_ready_results_settle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files = [root / f"{role}.result" for role in ("explorer", "executor", "reviewer")]
+
+            def publish_results() -> None:
+                time.sleep(0.02)
+                files[0].write_text("STATUS: DONE\nNEXT: leader integrates\n")
+                time.sleep(0.02)
+                files[2].write_text("STATUS: DONE\nNEXT: leader verifies\n")
+
+            publisher = threading.Thread(target=publish_results)
+            publisher.start()
+            started = time.perf_counter()
+            headers, elapsed_ms, ready = module.wait_for_worker_results(
+                files, timeout=1.0, settle_after_ready=0.05,
+            )
+            publisher.join()
+
+            self.assertEqual(ready, 2)
+            self.assertLess(time.perf_counter() - started, 0.5)
+            self.assertLess(elapsed_ms, 500)
+            self.assertEqual(headers.count("STATUS: DONE"), 2)
+            self.assertEqual(headers.count("STATUS: BLOCKED"), 1)
+
     def test_worker_instructions_partition_write_ownership(self):
         fixture = module.FIXTURES["homebrew-smoke"]
         explorer = module.worker_instruction(fixture, "bench-test", "explorer")
@@ -799,6 +862,42 @@ end
         value = module.safe_failure(f"{Path.home()}/repo token=abc123")
         self.assertNotIn(str(Path.home()), value)
         self.assertNotIn("abc123", value)
+
+    def test_acceptance_failure_fingerprint_ignores_checkout_and_build_ids(self):
+        first = (
+            "remote Xcode acceptance failed: "
+            "/tmp/term-mesh-effectiveness-run-a/Sources/View.swift:42:7: "
+            "error: expected divider overlay [a1b2c3d4]"
+        )
+        second = (
+            "remote Xcode acceptance failed: "
+            "/tmp/term-mesh-effectiveness-run-b/Sources/View.swift:84:3: "
+            "error: expected divider overlay [ffeeddcc]"
+        )
+        different = second.replace("expected divider overlay", "missing reset control")
+        different_file = second.replace("Sources/View.swift", "Sources/SettingsView.swift")
+
+        self.assertEqual(
+            module.acceptance_failure_fingerprint(first),
+            module.acceptance_failure_fingerprint(second),
+        )
+        self.assertNotEqual(
+            module.acceptance_failure_fingerprint(first),
+            module.acceptance_failure_fingerprint(different),
+        )
+        self.assertNotEqual(
+            module.acceptance_failure_fingerprint(first),
+            module.acceptance_failure_fingerprint(different_file),
+        )
+
+    def test_second_identical_acceptance_failure_is_repeated(self):
+        seen: set[str] = set()
+        first, first_repeated = module.note_acceptance_failure("error: same check", seen)
+        second, second_repeated = module.note_acceptance_failure("error: same check", seen)
+
+        self.assertEqual(first, second)
+        self.assertFalse(first_repeated)
+        self.assertTrue(second_repeated)
 
     def test_failed_and_timeout_runs_stay_out_of_latency_pairs(self):
         rows = [

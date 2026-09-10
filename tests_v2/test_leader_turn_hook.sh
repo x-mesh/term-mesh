@@ -327,6 +327,10 @@ case "$FLOOR_OUT" in
     *executor*) ;;
     *) fail "roster missing from injected floor: $FLOOR_OUT" ;;
 esac
+case "$FLOOR_OUT" in
+    *"Fill every useful independent unit"*) ;;
+    *) fail "delegated max-capacity rule missing: $FLOOR_OUT" ;;
+esac
 
 # Stop's stdout is not injected anywhere, so --end must stay silent.
 FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-1"}') \
@@ -403,6 +407,11 @@ cat > "$FLOOR_CTL/injection-off.json" <<'JSON' || exit 1
 {"schema_version":1,"delegation_effective":"delegated","available_workers":3,"kill_switch":false,
  "project_id":"floor-test","inject_directive":false}
 JSON
+cat > "$FLOOR_CTL/ten-workers.json" <<'JSON' || exit 1
+{"schema_version":1,"delegation_effective":"delegated","available_workers":12,
+ "worker_names":["a","b","c","d","e","f","g","h","i","j","k","l"],
+ "kill_switch":false,"project_id":"floor-test","max_parallel_workers":12}
+JSON
 
 FLOOR_OUT=$(floor_hook "$FLOOR_CTL/capped.json" --start '{"prompt":"capped"}') \
     || fail "capped start returned nonzero"
@@ -417,6 +426,17 @@ esac
 case "$FLOOR_OUT" in
     *"TERMMESH_LEADER_ROUTE_FILE="*) ;;
     *) fail "current Project route missing from the floor: $FLOOR_OUT" ;;
+esac
+
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/ten-workers.json" --start '{"prompt":"ten workers"}') \
+    || fail "ten-worker start returned nonzero"
+case "$FLOOR_OUT" in
+    *"max parallel: 10"*) ;;
+    *) fail "ten-worker header cap not enforced: $FLOOR_OUT" ;;
+esac
+case "$FLOOR_OUT" in
+    *"up to 10 workers"*) ;;
+    *) fail "ten-worker floor cap not enforced: $FLOOR_OUT" ;;
 esac
 
 # leaderFirst with waves capped off has nothing left to say beyond the default.
