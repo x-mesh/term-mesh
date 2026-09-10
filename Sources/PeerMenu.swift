@@ -1846,7 +1846,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     #endif
 
     /// Snapshot of live-mirror state for e2e assertions.
-    func debugMirrorStatus() -> [String: Any] {
+    func debugMirrorStatus(includeInputLatency: Bool = false) -> [String: Any] {
         [
             "mirrors": openWorkspaceMirrors.map { mirror -> [String: Any] in
                 var entry: [String: Any] = [
@@ -1920,7 +1920,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                             "pane_torn_down": session?.isTorndown ?? true,
                         ]
                         row["io"] = session?.relaySession.ioSnapshot ?? [:]
-                        row["input_latency"] = session?.relaySession.inputLatencySnapshot ?? [:]
+                        if includeInputLatency {
+                            row["input_latency"] = session?.relaySession.inputLatencySnapshot ?? [:]
+                        }
                         return row
                     }
                 return entry
@@ -1985,7 +1987,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     #endif
 
     /// Snapshot of remote-pane state for e2e assertions.
-    func debugPaneStatus() -> [String: Any] {
+    func debugPaneStatus(includeInputLatency: Bool = false) -> [String: Any] {
         [
             "pane_sessions": openPaneSessions.map { session in
                 var row: [String: Any] = [
@@ -2002,7 +2004,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 // instead of by scraping logs after the fact: received==0
                 // means nothing ever arrived from the host.
                 row["io"] = session.relaySession.ioSnapshot
-                row["input_latency"] = session.relaySession.inputLatencySnapshot
+                if includeInputLatency {
+                    row["input_latency"] = session.relaySession.inputLatencySnapshot
+                }
                 return row
             },
             "lease_count": PeerPaneHostRegistry.shared.activeLeaseCount,

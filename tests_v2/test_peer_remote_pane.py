@@ -99,7 +99,7 @@ def main() -> int:
         # Exercise the real helper → pump → peer path. Diagnostic reads must
         # expose timings without modifying, dropping, or logging typed content.
         def _latency():
-            rows = c.peer_pane_status().get("pane_sessions") or []
+            rows = c.peer_pane_status(include_input_latency=True).get("pane_sessions") or []
             return rows[0].get("input_latency", {}) if rows else {}
 
         # The loopback picker may choose either initial local surface. Drive
