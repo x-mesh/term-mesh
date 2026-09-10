@@ -1196,7 +1196,7 @@ controller, solution commit, 외부 checkout에서 정답을 찾지 마라. 문�
     assert team
     headers = worker_headers or "worker result envelope가 아직 없다. leader가 직접 구현을 완료하라."
     protocol = f"""
-controller가 explorer, executor, reviewer 세 worker를 이미 동시에 dispatch하고 최대 15분 기다렸다.
+controller가 explorer, executor, reviewer 세 worker를 이미 동시에 dispatch하고 첫 결과 뒤 bounded settle window까지 기다렸다.
 explorer와 reviewer는 read-only이고 executor만 구현 파일을 소유한다. 아래 worker envelope를 참고하고
 필요할 때만 그 안의 FULL_REPORT를 읽어 통합·수정·최종 검증하라. 누락 worker를 다시 기다리거나
 result 파일을 재조회하지 말고 leader가 직접 남은 일을 끝내라. 어떤 `tm-agent` 명령도 호출하지 마라.
@@ -1275,14 +1275,29 @@ working tree에서 구현과 관련 테스트, 가능한 검증까지 완료하�
 
 def wait_for_worker_results(
     result_files: list[Path], *, timeout: float, trace: Optional[TraceWriter] = None,
+    settle_after_ready: float = 5.0,
 ) -> tuple[str, int, int]:
-    """Wait once in the controller and return bounded worker envelopes."""
+    """Wait for the first result, then collect results until the set settles."""
     started = time.perf_counter()
     deadline = started + max(0, timeout)
+    ready_paths: set[Path] = set()
+    settle_deadline: Optional[float] = None
     while time.perf_counter() < deadline:
-        if all(path.is_file() and path.stat().st_size > 0 for path in result_files):
+        ready_now = {
+            path for path in result_files
+            if path.is_file() and path.stat().st_size > 0
+        }
+        if len(ready_now) == len(result_files):
             break
-        time.sleep(min(0.25, max(0, deadline - time.perf_counter())))
+        now = time.perf_counter()
+        if ready_now != ready_paths:
+            ready_paths = ready_now
+            if ready_paths:
+                settle_deadline = min(deadline, now + max(0, settle_after_ready))
+        if settle_deadline is not None and now >= settle_deadline:
+            break
+        next_deadline = min(deadline, settle_deadline or deadline)
+        time.sleep(min(0.25, max(0, next_deadline - now)))
     elapsed_ms = round((time.perf_counter() - started) * 1000)
     sections = []
     ready = 0

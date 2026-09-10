@@ -6,6 +6,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -599,6 +601,31 @@ end
             self.assertGreaterEqual(elapsed_ms, 0)
             self.assertIn("STATUS: DONE", headers)
             self.assertEqual(headers.count("STATUS: BLOCKED"), 2)
+
+    def test_controller_returns_after_ready_results_settle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files = [root / f"{role}.result" for role in ("explorer", "executor", "reviewer")]
+
+            def publish_results() -> None:
+                time.sleep(0.02)
+                files[0].write_text("STATUS: DONE\nNEXT: leader integrates\n")
+                time.sleep(0.02)
+                files[2].write_text("STATUS: DONE\nNEXT: leader verifies\n")
+
+            publisher = threading.Thread(target=publish_results)
+            publisher.start()
+            started = time.perf_counter()
+            headers, elapsed_ms, ready = module.wait_for_worker_results(
+                files, timeout=1.0, settle_after_ready=0.05,
+            )
+            publisher.join()
+
+            self.assertEqual(ready, 2)
+            self.assertLess(time.perf_counter() - started, 0.5)
+            self.assertLess(elapsed_ms, 500)
+            self.assertEqual(headers.count("STATUS: DONE"), 2)
+            self.assertEqual(headers.count("STATUS: BLOCKED"), 1)
 
     def test_worker_instructions_partition_write_ownership(self):
         fixture = module.FIXTURES["homebrew-smoke"]
