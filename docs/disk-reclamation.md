@@ -80,51 +80,44 @@ rebuild that failed while the previous build is live.
 
 ## Stale Project manifests on a host (`tm-agent daemon project-presentations`)
 
-A daemon keeps one durable record per published Project in
-`peer-project-presentations.json`. A record remains in the peer roster when its
-surfaces are gone so the owning installation can identify the exact Project and
-repair its leader. Normal attach UI does not offer a record whose leader is
-authoritatively inactive; the raw roster entry is recovery state, not evidence
-of an attachable pane. Only the installation that published a record may delete
-it over the peer protocol (`not_owner` otherwise). The host-side command is the
-path for everything the protocol refuses:
+A daemon keeps one durable record per published Project in `peer-project-presentations.json`.
+
+The Host sidebar lists every Project record, including inactive leaders and Projects that are already open.
+Use the Project menu to stop and delete an owned Project or remove a stale foreign record.
+Project folders and repositories stay on disk.
+
+Only the publisher can delete a live record over the peer protocol.
+A host operator can use forced prune for records from any installation.
 
 ```bash
-tm-agent daemon project-presentations list
-tm-agent daemon project-presentations prune                     # dry-run
-tm-agent daemon project-presentations prune --apply
-tm-agent daemon project-presentations prune --project-id team:<uuid> --apply
+tm-agent daemon pp list
+tm-agent daemon pp prune                          # preview stale records
+tm-agent daemon pp prune --apply
+tm-agent daemon pp prune team:<uuid> --apply
+
+tm-agent daemon pp prune --force                  # preview every record
+tm-agent daemon pp prune team:<uuid> --force       # preview one record
+tm-agent daemon pp prune team:<uuid> --force --apply
 ```
 
-Short forms exist for every part of the command. `daemon` accepts `d`,
-`project-presentations` accepts `pp`, `list` accepts `ls`, and `prune` takes the
-Project IDs as positional values. The long form stays valid:
+Without `--force`, unnamed candidates must have no live surfaces and no directory.
+Explicit Project IDs bypass the directory check.
 
-```bash
-tm-agent d pp ls
-tm-agent d pp prune                          # dry-run
-tm-agent d pp prune --apply
-tm-agent d pp prune team:<uuid> --apply
-```
+With `--force`, candidates include live Projects and records whose directories still exist.
+Without Project IDs, forced prune selects every record.
 
-- `list` shows every record with its persisted leader surface ID,
-  live/referenced surface counts, owner, and whether the recorded directory
-  still exists.
-- `prune` without `--project-id` considers only records whose directory is gone
-  and whose surfaces are all dead. Named records are removed even if their
-  directory exists. A record with any live surface is never removed, whichever
-  way it was selected.
-- `--apply` first copies the file to `peer-project-presentations.<unix>.bak.json`
-  beside it, then removes only the selected records. Workspaces, shells and
-  files are never touched; restore by copying the backup back and restarting
-  the daemon.
+Without `--apply`, prune reports candidates and changes no state.
+With `--apply`, prune creates a timestamped backup before it removes records.
 
-New Project's remote-name collision shows the same facts (host, directory,
-Project ID, leader state, ownership) and offers "Delete Project record…" for
-records this installation owns whose leader is not running. That delete is
-the normal protocol delete: it also stops the panes only that manifest
-referenced (leader shell, agent panes); the workspace and files stay. Foreign
-records and running leaders point here or to the sidebar respectively.
+Forced prune stops each selected Project's leader and agents, including native CLI descendants.
+Surfaces that another Project still references stay alive.
+Project folders, repositories, and workspace records stay on disk.
+
+If surface termination fails, the Project record remains available for a retry.
+The report names the skipped Project, and the CLI returns a failure status.
+
+Run the same command without `--apply` before each forced removal.
+Update both `tm-agent` and `term-meshd` to use `--force`.
 
 VERIFY:
 
