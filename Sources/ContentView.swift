@@ -666,6 +666,13 @@ struct ContentView: View {
         return candidates.count == 1 ? candidates[0].id : nil
     }
 
+    @MainActor
+    static func reviewBoardRemoteContext(
+        forWorkspace workspaceId: UUID?
+    ) -> RemoteLiveProject.BoardContext? {
+        RemoteLiveProject.boardContext(for: workspaceId)
+    }
+
     private var terminalContentWithReviewBoard: some View {
         HStack(spacing: 0) {
             terminalContentWithSidebarDropOverlay
@@ -1800,6 +1807,10 @@ struct ContentView: View {
                 guard let manager else { return nil }
                 return Self.reviewBoardTeamName(forWorkspace: manager.selectedTabId)
             }
+            reviewBoardViewModel.setRemoteContextProvider { [weak manager] in
+                guard let manager else { return nil }
+                return Self.reviewBoardRemoteContext(forWorkspace: manager.selectedTabId)
+            }
             reviewBoardViewModel.refresh()
         })
 
@@ -1821,6 +1832,7 @@ struct ContentView: View {
             // follows the workspace on screen rather than guessing from a task
             // list that is empty exactly when the setting matters most.
             reviewBoardViewModel.setActiveTeam(Self.reviewBoardTeamName(forWorkspace: newValue))
+            reviewBoardViewModel.workspaceSelectionDidChange()
             guard let newValue else { return }
             if selectedTabIds.count <= 1 {
                 selectedTabIds = [newValue]

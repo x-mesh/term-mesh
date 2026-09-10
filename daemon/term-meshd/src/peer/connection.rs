@@ -1968,6 +1968,7 @@ const TEAM_CALL_ALLOWED_METHODS: &[&str] = &[
     "team.broadcast",
     "team.delegate",
     "team.message.post",
+    "team.delegation.configure",
     "team.task.list",
     "team.task.get",
     "team.task.create",
