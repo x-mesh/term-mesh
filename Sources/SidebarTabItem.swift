@@ -431,7 +431,9 @@ struct TabItemView: View, Equatable {
                                 .foregroundColor(activeSecondaryColor(0.7))
                         }
                         .buttonStyle(.plain)
-                        .help(KeyboardShortcutSettings.Action.closeWorkspace.tooltip("Close Workspace"))
+                        .help(activeTeam.map { $0.leaderEndpoint != .local } == true
+                              ? "Detach Project — remote processes keep running. Use Stop and Delete Project in the host's project menu to stop them."
+                              : KeyboardShortcutSettings.Action.closeWorkspace.tooltip("Close Workspace"))
                         .frame(width: 16, height: 16, alignment: .center)
                         .transition(.opacity)
                     } else {

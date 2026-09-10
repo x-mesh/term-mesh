@@ -301,6 +301,35 @@ mod project_sync_cli_tests {
     }
 
     #[test]
+    fn forced_project_prune_still_requires_explicit_apply() {
+        for apply in [false, true] {
+            let mut args = vec!["tm-agent", "daemon", "pp", "prune", "--force", "team:one"];
+            if apply {
+                args.push("--apply");
+            }
+            let parsed = Cli::try_parse_from(args).expect("force prune parses");
+            let Commands::Daemon(group) = parsed.command else {
+                panic!("daemon");
+            };
+            let Some(DaemonCommand::ProjectPresentations(pp)) = group.command else {
+                panic!("pp");
+            };
+            let ProjectPresentationsCommand::Prune {
+                force,
+                apply: actual,
+                project_id_args,
+                ..
+            } = pp.command
+            else {
+                panic!("prune");
+            };
+            assert!(force);
+            assert_eq!(actual, apply);
+            assert_eq!(project_id_args, vec!["team:one"]);
+        }
+    }
+
+    #[test]
     fn daemon_interactive_is_opt_in_and_leaves_bare_daemon_alone() {
         // Bare `daemon` parses with no subcommand; the dispatcher prints help.
         let bare = daemon_group(["tm-agent", "d"]);
@@ -2179,7 +2208,7 @@ enum ProjectPresentationsCommand {
     List,
     /// Remove manifests nothing can resume. Without --project-id only
     /// records whose directory is gone and whose surfaces are all dead are
-    /// candidates; a record with any live surface is never removed. Reports
+    /// candidates. --force also selects live records and existing directories. Reports
     /// only unless --apply is given; an applied prune writes a timestamped
     /// .bak copy next to the file first. Workspaces are never touched.
     Prune {
@@ -2194,6 +2223,11 @@ enum ProjectPresentationsCommand {
         /// Perform the removal instead of previewing it.
         #[arg(long)]
         apply: bool,
+        /// Stop the selected projects, including live leaders and agents.
+        /// Without Project IDs, select every manifest. Requires --apply to
+        /// change anything. Keep project folders and surfaces shared by other projects.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -8353,6 +8387,7 @@ fn main() {
                         project_id_args,
                         project_ids,
                         apply,
+                        force,
                     } => {
                         // Positional ids and `--project-id` name the same set;
                         // both forms may appear in one invocation.
@@ -8361,8 +8396,20 @@ fn main() {
                         let result = cmd_daemon_rpc_print(
                             &sock,
                             "peer.project_presentations.prune",
-                            json!({ "project_ids": ids, "apply": apply }),
+                            json!({ "project_ids": ids, "apply": apply, "force": force }),
                         );
+                        if *force && result["forced"].as_bool() != Some(true) {
+                            eprintln!("Error: the daemon does not support forced project pruning; update term-meshd");
+                            process::exit(1);
+                        }
+                        if *force
+                            && result["skipped"].as_array().is_some_and(|skipped| {
+                                skipped.iter().any(|item| item["reason"] != "not_found")
+                            })
+                        {
+                            eprintln!("Error: some projects could not be removed; inspect skipped and retry");
+                            process::exit(1);
+                        }
                         let removed = result["removed"].as_array().map(|r| r.len()).unwrap_or(0);
                         if !apply && removed > 0 {
                             println!("(dry-run — pass --apply to remove {removed} record(s))");
@@ -11165,7 +11212,20 @@ fn parse_byte_size(raw: &str) -> Result<usize, String> {
 
 /// One daemon RPC: the `result` value, or the transport/RPC error message.
 fn cmd_daemon_rpc(sock: &PathBuf, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
-    match rpc_call(sock, method, params) {
+    // Forced prune waits for each selected process group to stop.
+    let response = if method == "peer.project_presentations.prune"
+        && params["force"] == true
+        && params["apply"] == true
+    {
+        let timeout = env::var("TERMMESH_RPC_TIMEOUT")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(120);
+        rpc_call_with_timeout_secs(sock, method, params, timeout)
+    } else {
+        rpc_call(sock, method, params)
+    };
+    match response {
         Ok(resp) if resp["error"].is_null() => Ok(resp["result"].clone()),
         Ok(resp) => Err(resp["error"]["message"]
             .as_str()

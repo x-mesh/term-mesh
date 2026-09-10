@@ -5177,8 +5177,8 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
             }
         }
         // Host-side removal of manifests nothing can resume (issue #389).
-        // Dry-run unless `apply`; live records are never removed; an applied
-        // prune backs the file up first. Never touches workspaces.
+        // Dry-run unless `apply`; `force` also retires live records and their
+        // unshared surfaces. An applied prune backs the file up first.
         "peer.project_presentations.prune" => {
             #[derive(Deserialize)]
             struct P {
@@ -5186,11 +5186,16 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
                 project_ids: Vec<String>,
                 #[serde(default)]
                 apply: bool,
+                #[serde(default)]
+                force: bool,
             }
             match serde_json::from_value::<P>(req.params.clone()) {
                 Ok(params) => match crate::peer::layout::PeerHost::active_host() {
-                    Some(host) => host
-                        .prune_stale_project_presentations(&params.project_ids, params.apply)
+                    Some(host) => (if params.force {
+                        host.force_prune_project_presentations(&params.project_ids, params.apply)
+                    } else {
+                        host.prune_stale_project_presentations(&params.project_ids, params.apply)
+                    })
                         .map_err(|code| code.to_string())
                         .and_then(|report| {
                             serde_json::to_value(report).map_err(|e| e.to_string())

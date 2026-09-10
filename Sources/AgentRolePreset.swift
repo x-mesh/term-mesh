@@ -146,11 +146,15 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     }
 
     /// Available models per CLI type (built-in + user-custom).
-    static func models(for cli: String) -> [String] {
+    static func models(for cli: String, separateEffort: Bool = false) -> [String] {
         let builtIn = builtInModels(for: cli)
         let custom = customModels(for: cli)
         // Custom models appear first so they're easy to find.
-        return custom + builtIn
+        let models = custom + builtIn
+        guard separateEffort, cli == "codex" else { return models }
+        var seen = Set<String>()
+        return models.map { normalizeModel($0, for: cli, separateEffort: true) }
+            .filter { seen.insert($0).inserted }
     }
 
     /// Default model for a given CLI.
@@ -173,9 +177,24 @@ struct AgentRolePreset: Identifiable, Codable, Equatable {
     /// window, and the two are still different models to the CLI. Rewriting it
     /// to the bare tier silently moved every agent that had picked 1M onto the
     /// standard context window.
-    static func normalizeModel(_ model: String, for cli: String) -> String {
+    static func normalizeModel(_ model: String, for cli: String, separateEffort: Bool = false) -> String {
         if cli == "claude" && model == "opus-1m" { return "opus[1m]" }
+        if separateEffort, cli == "codex", legacyCodexEfforts[model.lowercased()] != nil {
+            return defaultModel(for: cli)
+        }
         return model
+    }
+
+    private static let legacyCodexEfforts = ["opus": "high", "sonnet": "medium", "haiku": "low"]
+
+    /// Legacy Codex tiers embed effort. Preserve it when a form splits the two controls.
+    /// An explicit empty effort means CLI default, not the legacy tier's effort.
+    static func separateModelAndEffort(model: String, effort: String?, for cli: String) -> (model: String, effort: String) {
+        let legacyEffort = cli == "codex" ? legacyCodexEfforts[model.lowercased()] : nil
+        return (
+            normalizeModel(model, for: cli, separateEffort: true),
+            normalizeEffort(effort ?? legacyEffort ?? "", for: cli)
+        )
     }
 
     /// The full set of syntactically valid effort values, independent of
@@ -1752,6 +1771,7 @@ class TeamTemplateManager: ObservableObject {
         name: String,
         leaderMode: String,
         leaderModel: String?,
+        leaderEffort: String? = nil,
         agents: [ProviderPreference]
     ) -> TemplateID {
         let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1766,6 +1786,7 @@ class TeamTemplateManager: ObservableObject {
             description: "\(agents.count) agent\(agents.count == 1 ? "" : "s")",
             leaderMode: leaderMode,
             leaderModel: leaderModel,
+            leaderEffort: leaderEffort,
             resolutionMode: .exact,
             agents: agents
         )
@@ -2192,6 +2213,8 @@ struct ProviderPreference: Codable, Equatable {
     /// Optional so schema-1 built-ins and existing user presets continue to
     /// decode. Placement is deliberately not part of a team preset.
     var customInstructions: String? = nil
+    /// nil preserves legacy role defaults; an empty string explicitly selects CLI default.
+    var effort: String? = nil
 }
 
 enum SmartPresetResolutionMode: String, Codable {
@@ -2207,6 +2230,7 @@ struct ResolvedAgent {
     let status: Status
     let reason: String
     let customInstructions: String
+    var effort: String? = nil
 
     enum Status: Equatable {
         case normal                     // primary == fallback (no badge)
@@ -2224,6 +2248,7 @@ struct SmartTeamPreset: Identifiable, Codable, Equatable {
     var leaderMode: String
     /// The leader model was not part of schema 1. nil means the CLI default.
     var leaderModel: String? = nil
+    var leaderEffort: String? = nil
     /// Legacy presets and customized built-ins omit this and retain provider
     /// fallback behavior. New Project snapshots opt into exact restoration.
     var resolutionMode: SmartPresetResolutionMode? = nil
@@ -2246,7 +2271,8 @@ struct SmartTeamPreset: Identifiable, Codable, Equatable {
                 model: pref.primaryModel ?? AgentRolePreset.defaultModel(for: pref.primaryCli),
                 status: .normal,
                 reason: pref.reason,
-                customInstructions: pref.customInstructions ?? ""
+                customInstructions: pref.customInstructions ?? "",
+                effort: pref.effort
             )
         }
     }
@@ -2274,7 +2300,8 @@ struct SmartTeamPreset: Identifiable, Codable, Equatable {
             return ResolvedAgent(
                 role: pref.role, cli: usedCli, model: usedModel,
                 status: status, reason: pref.reason,
-                customInstructions: pref.customInstructions ?? ""
+                customInstructions: pref.customInstructions ?? "",
+                effort: pref.effort
             )
         }
     }

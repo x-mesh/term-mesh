@@ -21,6 +21,61 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
 
     // MARK: - ProviderPreference / SmartTeamPreset
 
+    func testEffortSurvivesPresetRoundTripIncludingExplicitDefault() throws {
+        for effort in ["high", ""] {
+            let json = """
+            {
+                "id": "standard", "name": "Standard", "icon": "person.3",
+                "description": "Effort regression", "leaderMode": "claude",
+                "leaderEffort": "\(effort)",
+                "agents": [{
+                    "role": "executor", "primaryCli": "claude",
+                    "fallbackCli": "claude", "reason": "", "effort": "\(effort)"
+                }]
+            }
+            """
+            let preset = try JSONDecoder().decode(SmartTeamPreset.self, from: Data(json.utf8))
+            let data = try JSONEncoder().encode(preset)
+            let restored = try JSONDecoder().decode(SmartTeamPreset.self, from: data)
+
+            XCTAssertEqual(restored.leaderEffort, effort)
+            XCTAssertEqual(restored.agents.first?.effort, effort)
+            XCTAssertEqual(restored.resolveExactly().first?.effort, effort)
+            XCTAssertEqual(restored.resolve(with: ProviderDetector()).first?.effort, effort)
+        }
+    }
+
+    func testSeparateCodexModelSelectionHasNoEffortAliasesOrDuplicates() {
+        let models = AgentRolePreset.models(for: "codex", separateEffort: true)
+        XCTAssertFalse(models.contains("opus"))
+        XCTAssertFalse(models.contains("sonnet"))
+        XCTAssertFalse(models.contains("haiku"))
+        XCTAssertEqual(models.filter { $0 == "gpt-5.6-sol" }.count, 1)
+        XCTAssertEqual(Set(models).count, models.count)
+        XCTAssertEqual(AgentRolePreset.modelDisplayLabel("gpt-5.6-sol", for: "codex"), "gpt-5.6-sol")
+        XCTAssertTrue(AgentRolePreset.models(for: "codex").contains("opus"))
+    }
+
+    @MainActor
+    func testLegacyCodexEffortBecomesSeparateAndExplicitSelectionWins() {
+        for (tier, inheritedEffort) in [("opus", "high"), ("sonnet", "medium"), ("haiku", "low")] {
+            let inherited = AgentRolePreset.separateModelAndEffort(model: tier, effort: nil, for: "codex")
+            XCTAssertEqual(inherited.model, "gpt-5.6-sol")
+            XCTAssertEqual(inherited.effort, inheritedEffort)
+            XCTAssertEqual(inherited.effort, TeamOrchestrator.codexReasoningEffort(tier))
+            for effort in ["low", ""] {
+                let explicit = AgentRolePreset.separateModelAndEffort(model: tier, effort: effort, for: "codex")
+                XCTAssertEqual(explicit.model, "gpt-5.6-sol")
+                XCTAssertEqual(explicit.effort, effort)
+            }
+        }
+        let claude = AgentRolePreset.separateModelAndEffort(model: "opus", effort: "high", for: "claude")
+        XCTAssertEqual(claude.model, "opus")
+        XCTAssertEqual(claude.effort, "high")
+        let unsupported = AgentRolePreset.separateModelAndEffort(model: "auto", effort: "high", for: "cursor")
+        XCTAssertEqual(unsupported.effort, "")
+    }
+
     /// `primaryModel`/`fallbackModel` are optional ("nil = use CLI default"),
     /// so a preference written before a role had a pinned model must still
     /// decode rather than fail the whole preset.
@@ -40,6 +95,7 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
         XCTAssertNil(pref.primaryModel)
         XCTAssertEqual(pref.fallbackCli, "claude")
         XCTAssertNil(pref.fallbackModel)
+        XCTAssertNil(pref.effort)
     }
 
     /// A whole preset saved before per-role models existed: every agent slot
@@ -62,11 +118,13 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
 
         XCTAssertEqual(preset.id, "standard")
         XCTAssertNil(preset.leaderModel)
+        XCTAssertNil(preset.leaderEffort)
         XCTAssertNil(preset.resolutionMode)
         XCTAssertFalse(preset.usesExactResolution)
         XCTAssertEqual(preset.agents.count, 2)
         XCTAssertTrue(preset.agents.allSatisfy { $0.primaryModel == nil && $0.fallbackModel == nil })
         XCTAssertTrue(preset.agents.allSatisfy { $0.customInstructions == nil })
+        XCTAssertTrue(preset.resolveExactly().allSatisfy { $0.effort == nil })
     }
 
     /// An unrecognized top-level field (e.g. added by a newer build) must not
@@ -299,12 +357,12 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
             ProviderPreference(
                 role: "architect", primaryCli: "claude", primaryModel: "opus",
                 fallbackCli: "claude", fallbackModel: "opus", reason: "",
-                customInstructions: "Design first."
+                customInstructions: "Design first.", effort: "high"
             ),
             ProviderPreference(
                 role: "tester", primaryCli: "codex", primaryModel: "sonnet",
                 fallbackCli: "codex", fallbackModel: "sonnet", reason: "",
-                customInstructions: "Test remotely."
+                customInstructions: "Test remotely.", effort: ""
             ),
         ]
 
@@ -312,6 +370,7 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
             name: "Architecture 3",
             leaderMode: "codex",
             leaderModel: "gpt-5.5",
+            leaderEffort: "low",
             agents: preferences
         )
         let reloaded = TeamTemplateManager(catalog: .fallback, fileURL: fileURL)
@@ -321,6 +380,7 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
 
         XCTAssertEqual(reloaded.lastSelectedId, id)
         XCTAssertEqual(preset.leaderModel, "gpt-5.5")
+        XCTAssertEqual(preset.leaderEffort, "low")
         XCTAssertEqual(preset.resolutionMode, .exact)
         XCTAssertTrue(preset.usesExactResolution)
         XCTAssertEqual(preset.agents, preferences)
@@ -329,10 +389,25 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
         XCTAssertEqual(exactAgents.map(\.role), ["architect", "tester"])
         XCTAssertEqual(exactAgents.map(\.cli), ["claude", "codex"])
         XCTAssertEqual(exactAgents.map(\.model), ["opus", "sonnet"])
+        XCTAssertEqual(exactAgents.map(\.effort), ["high", ""])
 
         let raw = String(decoding: try Data(contentsOf: fileURL), as: UTF8.self)
         XCTAssertFalse(raw.contains("hostKey"))
         XCTAssertFalse(raw.contains("hostDirectory"))
+
+        var edited = preset
+        edited.leaderEffort = ""
+        edited.agents[0].effort = "low"
+        var template = try XCTUnwrap(reloaded.template(for: id))
+        template.payload = .smart(edited)
+        try reloaded.updateCustom(template)
+        let updated = TeamTemplateManager(catalog: .fallback, fileURL: fileURL)
+        guard case .smart(let saved) = updated.template(for: id)?.payload else {
+            return XCTFail("expected updated custom preset")
+        }
+        XCTAssertEqual(saved, edited)
+        XCTAssertEqual(saved.leaderEffort, "")
+        XCTAssertEqual(saved.resolveExactly()[0].effort, "low")
     }
 
     func testRenameKeepsTemplateAndSmartPayloadNamesInSync() throws {
@@ -374,6 +449,9 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
 
         preset.leaderMode = "codex"
         preset.leaderModel = "gpt-5.6-sol"
+        preset.leaderEffort = "low"
+        preset.agents[0].effort = "high"
+        preset.agents[1].effort = ""
         manager.saveOverride(for: template.id, payload: .smart(preset))
 
         let reloaded = TeamTemplateManager(catalog: .fallback, fileURL: fileURL)
@@ -383,5 +461,10 @@ final class SmartTeamPresetDecodingTests: XCTestCase {
         }
         XCTAssertEqual(saved.leaderMode, "codex")
         XCTAssertEqual(saved.leaderModel, "gpt-5.6-sol")
+        XCTAssertEqual(saved.leaderEffort, "low")
+        XCTAssertEqual(saved.agents[0].effort, "high")
+        XCTAssertEqual(saved.agents[1].effort, "")
+        XCTAssertEqual(saved.resolveExactly()[0].effort, "high")
+        XCTAssertEqual(saved.resolve(with: ProviderDetector())[1].effort, "")
     }
 }

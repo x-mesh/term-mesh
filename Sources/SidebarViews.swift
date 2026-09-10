@@ -1692,14 +1692,27 @@ private struct SidebarRemoteProjectRow: View {
     /// Axis-specific so a manifest listed under both does not answer to one
     /// identifier twice.
     let accessibilityPrefix: String
+    @State private var showDeleteConfirmation = false
+    @State private var isDeleting = false
+    @State private var deletionFailure: String?
 
     var body: some View {
         let isRestoring = restoreState.isRestoring(host: host, team: team)
-        let isUpdate = TeamOrchestrator.sidebarRemoteManifestState(
+        let state = TeamOrchestrator.sidebarRemoteManifestState(
             localTeam: orchestrator.teams[team.name],
             remote: team, hostKey: host.id
-        ).isUpdate
+        )
+        let isUpdate = state.isUpdate && state.shouldOffer
+        let canOpen = !team.leaderSurfaceID.isEmpty
+            && TeamOrchestrator.remoteManifestLeaderIsAdoptable(team)
         Button {
+            guard canOpen, team.rosterVerified else { return }
+            if state.isUpdate, !state.shouldOffer,
+               let local = orchestrator.teams[team.name] {
+                let manager = AppDelegate.shared?.tabManagerFor(tabId: local.workspaceId) ?? tabManager
+                manager.selectedTabId = local.workspaceId
+                return
+            }
             guard let restoreKey = restoreState.begin(host: host, team: team) else { return }
             Task { @MainActor in
                 let restored = await orchestrator.adoptRemoteProjectPresentation(
@@ -1726,28 +1739,70 @@ private struct SidebarRemoteProjectRow: View {
                         ProgressView().controlSize(.small)
                     }
                 }
-                Text(
-                    "\(isUpdate ? "Update from" : "Open on") \(host.displayName)"
-                        + " · \(team.members.count) agents"
-                )
+                Text(team.rosterVerified
+                     ? (canOpen ? "\(isUpdate ? "Update from" : "Open on") \(host.displayName)"
+                        : "Leader inactive")
+                        + " · \(team.agentNames.count) live agents"
+                     : "Status unconfirmed · Resync host")
                     .font(.system(size: 9))
                     .foregroundColor(.secondary)
+                Text(team.workingDirectory)
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help("\(team.projectID)\n\(team.workingDirectory)")
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 6)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(isRestoring)
+        .disabled(isRestoring || isDeleting)
         .accessibilityIdentifier(
             "\(accessibilityPrefix)."
                 + TeamOrchestrator.sidebarRemoteManifestKey(hostID: host.id, team: team)
         )
         .help(
-            isUpdate
+            !canOpen ? "The saved project remains on the host. Use its menu to delete it." : isUpdate
                 ? "Replace this viewer with the host's latest project topology"
                 : "Attach the leader and agents already running on this host"
         )
+        .contextMenu {
+            if !team.isGUILive, !team.projectID.isEmpty {
+                Button(team.presentationOwnedByRequester ? "Stop and Delete Project…" : "Delete Stale Project…", role: .destructive) {
+                    showDeleteConfirmation = true
+                }
+                .disabled(!team.rosterVerified || !host.isConnected)
+                .accessibilityIdentifier("\(accessibilityPrefix).delete.\(team.projectID)")
+            }
+        }
+        .alert("Delete “\(team.name)” from \(host.displayName)?", isPresented: $showDeleteConfirmation) {
+            Button("Delete Project", role: .destructive) {
+                isDeleting = true
+                Task { @MainActor in
+                    defer { isDeleting = false }
+                    do {
+                        try await orchestrator.deleteHostProject(host: host, project: team, tabManager: tabManager)
+                    } catch {
+                        deletionFailure = error.localizedDescription
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(team.presentationOwnedByRequester
+                 ? "The leader and agents will stop, and the saved project record will be removed. Project folders and repositories stay."
+                 : "This removes the saved record only if the host confirms that no project process is alive. Project folders and repositories stay.")
+        }
+        .alert("Couldn’t Delete Project", isPresented: Binding(
+            get: { deletionFailure != nil },
+            set: { if !$0 { deletionFailure = nil } }
+        )) {
+            Button("OK", role: .cancel) { deletionFailure = nil }
+        } message: {
+            Text(deletionFailure ?? "")
+        }
     }
 }
 
@@ -3279,7 +3334,8 @@ struct RemoteHostGroupView: View, Equatable {
             isConnected: host.isConnected,
             teams: host.teams,
             hostKey: host.id,
-            localTeamForName: { orchestrator.teams[$0] }
+            localTeamForName: { orchestrator.teams[$0] },
+            includeInactiveAndOpen: true
         )
     }
 
