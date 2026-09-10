@@ -827,6 +827,42 @@ end
         self.assertNotIn(str(Path.home()), value)
         self.assertNotIn("abc123", value)
 
+    def test_acceptance_failure_fingerprint_ignores_checkout_and_build_ids(self):
+        first = (
+            "remote Xcode acceptance failed: "
+            "/tmp/term-mesh-effectiveness-run-a/Sources/View.swift:42:7: "
+            "error: expected divider overlay [a1b2c3d4]"
+        )
+        second = (
+            "remote Xcode acceptance failed: "
+            "/tmp/term-mesh-effectiveness-run-b/Sources/View.swift:84:3: "
+            "error: expected divider overlay [ffeeddcc]"
+        )
+        different = second.replace("expected divider overlay", "missing reset control")
+        different_file = second.replace("Sources/View.swift", "Sources/SettingsView.swift")
+
+        self.assertEqual(
+            module.acceptance_failure_fingerprint(first),
+            module.acceptance_failure_fingerprint(second),
+        )
+        self.assertNotEqual(
+            module.acceptance_failure_fingerprint(first),
+            module.acceptance_failure_fingerprint(different),
+        )
+        self.assertNotEqual(
+            module.acceptance_failure_fingerprint(first),
+            module.acceptance_failure_fingerprint(different_file),
+        )
+
+    def test_second_identical_acceptance_failure_is_repeated(self):
+        seen: set[str] = set()
+        first, first_repeated = module.note_acceptance_failure("error: same check", seen)
+        second, second_repeated = module.note_acceptance_failure("error: same check", seen)
+
+        self.assertEqual(first, second)
+        self.assertFalse(first_repeated)
+        self.assertTrue(second_repeated)
+
     def test_failed_and_timeout_runs_stay_out_of_latency_pairs(self):
         rows = [
             self.row("single", 1, 1000, True), self.row("multi", 1, 500, False),

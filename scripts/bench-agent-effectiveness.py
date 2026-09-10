@@ -1333,6 +1333,30 @@ def safe_failure(reason: str) -> str:
     return redact_text(reason)[-1800:]
 
 
+def acceptance_failure_fingerprint(reason: str) -> str:
+    """Identify the failing check while ignoring per-run paths and build ids."""
+    normalized = redact_text(reason)
+    normalized = re.sub(r"/tmp/term-mesh-effectiveness-[^/\s:'\"]+", "<checkout>", normalized)
+    normalized = re.sub(
+        r"<HOME>/Library/Developer/Xcode/DerivedData/[^/\s]+",
+        "<derived-data>",
+        normalized,
+    )
+    normalized = re.sub(
+        r"\b[0-9a-f]{8,64}\b", "<build-id>", normalized, flags=re.IGNORECASE
+    )
+    normalized = re.sub(r":\d+:\d+(?=:)", ":<line>:<column>", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
+def note_acceptance_failure(reason: str, seen: set[str]) -> tuple[str, bool]:
+    fingerprint = acceptance_failure_fingerprint(reason)
+    repeated = fingerprint in seen
+    seen.add(fingerprint)
+    return fingerprint, repeated
+
+
 def redact_text(text: str, checkout: Optional[Path] = None) -> str:
     text = re.sub(
         r"(?i)\b(token|secret|password|authorization|api[_-]?key)\b([=:]\s*|\s+)([^\s'\"]+)",
@@ -1444,6 +1468,7 @@ def run_one(
         prompt = leader_prompt(fixture, spec.condition, team, worker_headers)
         with (experiment / paths["stdout"]).open("w") as stdout_log, (experiment / paths["acceptance"]).open("w") as acceptance_log:
             resume = False
+            acceptance_failures: set[str] = set()
             while True:
                 elapsed = time.perf_counter() - total_started
                 remaining = timeout - elapsed
@@ -1510,6 +1535,23 @@ def run_one(
                 if classify_infra_failure(record.failure_reason):
                     record.infra_invalid = True
                     record.status = "infra_invalid"
+                    break
+                fingerprint, repeated = note_acceptance_failure(
+                    record.failure_reason, acceptance_failures
+                )
+                trace.write(
+                    "acceptance_failure", attempt=record.correction_count + 1,
+                    fingerprint=fingerprint, repeated=repeated,
+                )
+                if repeated:
+                    trace.write(
+                        "correction_skipped", reason="repeated_acceptance_failure",
+                        fingerprint=fingerprint,
+                    )
+                    record.failure_reason = (
+                        f"repeated acceptance failure ({fingerprint}); correction stopped: "
+                        + record.failure_reason
+                    )
                     break
                 record.correction_count += 1
                 prompt = (
@@ -1632,6 +1674,7 @@ def run_policy_one(
         ).open("w") as acceptance_log:
             resume = False
             routed = False
+            acceptance_failures: set[str] = set()
             while True:
                 remaining = timeout - (time.perf_counter() - total_started)
                 if remaining <= 0:
@@ -1737,6 +1780,23 @@ envelope와 필요한 FULL_REPORT만 읽어 구현을 통합·수정하고 최�
                 if classify_infra_failure(record.failure_reason):
                     record.infra_invalid = True
                     record.status = "infra_invalid"
+                    break
+                fingerprint, repeated = note_acceptance_failure(
+                    record.failure_reason, acceptance_failures
+                )
+                trace.write(
+                    "acceptance_failure", attempt=record.correction_count + 1,
+                    fingerprint=fingerprint, repeated=repeated,
+                )
+                if repeated:
+                    trace.write(
+                        "correction_skipped", reason="repeated_acceptance_failure",
+                        fingerprint=fingerprint,
+                    )
+                    record.failure_reason = (
+                        f"repeated acceptance failure ({fingerprint}); correction stopped: "
+                        + record.failure_reason
+                    )
                     break
                 record.correction_count += 1
                 prompt = (
