@@ -130,8 +130,11 @@ final class RemoteLiveProject {
         guard delegationRequests[workspaceID] == request,
               let refreshed = boardContexts[workspaceID],
               refreshed.viewerGeneration == context.viewerGeneration,
+              refreshed.teamUUID == context.teamUUID,
+              refreshed.projectID == context.projectID,
               refreshed.liveWorkspaceID == context.liveWorkspaceID,
-              refreshed.leaderSurfaceID == context.leaderSurfaceID
+              refreshed.leaderSurfaceID == context.leaderSurfaceID,
+              wire.presentationRevision >= refreshed.presentationRevision
         else { throw DelegationError.staleViewer }
         boardContexts[workspaceID] = BoardContext(
             workspaceID: workspaceID, teamName: context.teamName, teamUUID: context.teamUUID,
@@ -347,6 +350,8 @@ enum RemoteLiveProjectFixture {
     private static var cleaning = false
     private static var boardModel: ReviewBoardViewModel?
     private static var identityRefusal = false
+    private static var staleRevisionRefusal = false
+    private static var staleIncarnationRefusal = false
     private static var savedBoardVisibility: Bool?
 
     static func command(_ params: [String: Any], tabManager: TabManager?) -> TerminalController.V2CallResult {
@@ -355,6 +360,9 @@ enum RemoteLiveProjectFixture {
         if action == "start", !starting, source == nil {
             starting = true
             failure = nil
+            identityRefusal = false
+            staleRevisionRefusal = false
+            staleIncarnationRefusal = false
             savedBoardVisibility = ReviewBoardSettings.isVisible
             ReviewBoardSettings.setVisible(false)
             Task { @MainActor in
@@ -471,7 +479,8 @@ enum RemoteLiveProjectFixture {
                     boardModel?.workspaceSelectionDidChange()
                 } catch { failure = String(describing: error) }
             }
-        } else if action == "invalid_identity", let context = project.flatMap({
+        } else if ["invalid_identity", "stale_revision", "stale_incarnation"].contains(action),
+                  let context = project.flatMap({
             RemoteLiveProject.boardContextForTesting(projectID: $0.projectID)
         }) {
             Task {
@@ -481,21 +490,31 @@ enum RemoteLiveProjectFixture {
                 let connection = try? await PeerRelaySession.connect(hostSockPath: lease.hostSockPath)
                 guard let connection else { failure = "identity test handshake failed"; return }
                 defer { Task { await connection.cancel() } }
-                let params: [String: Any] = [
-                    "team_name": context.teamName, "team_uuid": "wrong",
+                var params: [String: Any] = [
+                    "team_name": context.teamName, "team_uuid": context.teamUUID,
                     "project_id": context.projectID,
                     "live_workspace_id": context.liveWorkspaceID.base64EncodedString(),
                     "leader_surface_id": context.leaderSurfaceID.base64EncodedString(),
                     "presentation_revision": context.presentationRevision,
                     "level": ProjectDelegationLevel.guarded.rawValue,
                 ]
+                if action == "invalid_identity" { params["team_uuid"] = "wrong" }
+                if action == "stale_revision" {
+                    params["presentation_revision"] = max(0, context.presentationRevision - 1)
+                }
+                if action == "stale_incarnation" {
+                    params["leader_surface_id"] = Data(repeating: 0xA5, count: 16).base64EncodedString()
+                }
                 let data = try? JSONSerialization.data(withJSONObject: params)
                 let json = data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
                 let response = try? await connection.session.callTeam(
                     method: "team.delegation.configure", paramsJSON: json
                 )
-                identityRefusal = response?.ok == false && response?.errorCode == "identity_mismatch"
-                if !identityRefusal { failure = "stale Project identity was accepted" }
+                let refused = response?.ok == false && response?.errorCode == "identity_mismatch"
+                if action == "invalid_identity" { identityRefusal = refused }
+                if action == "stale_revision" { staleRevisionRefusal = refused }
+                if action == "stale_incarnation" { staleIncarnationRefusal = refused }
+                if !refused { failure = "stale Project identity was accepted: \(action)" }
             }
         } else if action == "cleanup" {
             cleaning = true
@@ -564,7 +583,9 @@ enum RemoteLiveProjectFixture {
                     "panel_delegation": boardModel?.delegation?.level.rawValue ?? "",
                     "panel_remote": boardModel?.delegation?.isRemoteViewer ?? false,
                     "delegation_error": boardModel?.delegationError ?? "",
-                    "identity_refusal": identityRefusal])
+                    "identity_refusal": identityRefusal,
+                    "stale_revision_refusal": staleRevisionRefusal,
+                    "stale_incarnation_refusal": staleIncarnationRefusal])
     }
 }
 #endif

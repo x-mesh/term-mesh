@@ -472,11 +472,21 @@ final class ReviewBoardViewModel: ObservableObject {
         refreshDelegationPanel()
     }
 
-    func workspaceSelectionDidChange() { refreshDelegationPanel() }
+    func workspaceSelectionDidChange() {
+        delegationRequestGeneration &+= 1
+        delegationChangeInFlight = false
+        delegationError = nil
+        refreshDelegationPanel()
+    }
 
     func setDelegationLevel(_ level: ProjectDelegationLevel) {
         guard let panel = delegation else { return }
-        if panel.isRemoteViewer, let context = remoteContextProvider() {
+        if panel.isRemoteViewer {
+            guard let context = remoteContextProvider() else {
+                delegationChangeInFlight = false
+                delegationError = RemoteLiveProject.DelegationError.staleViewer.localizedDescription
+                return
+            }
             delegationRequestGeneration &+= 1
             let generation = delegationRequestGeneration
             delegationChangeInFlight = true

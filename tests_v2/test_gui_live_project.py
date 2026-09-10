@@ -49,6 +49,10 @@ def main() -> int:
             assert authoritative["owner_delegation"] == "delegated", authoritative
             call("invalid_identity")
             wait(lambda s: s["identity_refusal"] is True)
+            call("stale_revision")
+            wait(lambda s: s["stale_revision_refusal"] is True)
+            call("stale_incarnation")
+            wait(lambda s: s["stale_incarnation_refusal"] is True)
             call("feed")
             wait(lambda s: s["matching_transcripts"] == 5)
             call("send")
