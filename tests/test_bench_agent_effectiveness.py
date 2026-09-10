@@ -371,6 +371,42 @@ end
                 self.assertNotEqual(target.read_text(), "candidate\n")
             self.assertEqual(target.read_text(), "candidate\n")
 
+    def test_hidden_test_overlay_appends_and_restores_candidate_tests(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            originals = {}
+            for target_relative, _ in fixture.hidden_tests:
+                target = checkout / target_relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(f"candidate test: {target.name}\n")
+                originals[target_relative] = target.read_bytes()
+
+            with module.hidden_test_overlay(fixture, checkout):
+                for target_relative, _ in fixture.hidden_tests:
+                    target = checkout / target_relative
+                    self.assertTrue(target.read_bytes().startswith(originals[target_relative]))
+                    self.assertGreater(len(target.read_bytes()), len(originals[target_relative]))
+
+            for target_relative, content in originals.items():
+                self.assertEqual((checkout / target_relative).read_bytes(), content)
+
+    def test_divider_fixture_uses_behavior_hidden_tests_not_solution_test_files(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        self.assertEqual(fixture.oracle_files, ())
+        self.assertEqual(len(fixture.hidden_tests), 3)
+        self.assertTrue(all(source.endswith(".swift.inc") for _, source in fixture.hidden_tests))
+
+    def test_xcode_failure_summary_keeps_actionable_diagnostics(self):
+        output = "\n".join((
+            "CompileSwift normal arm64",
+            "/tmp/run/Sources/View.swift:42:7: error: missing divider behavior",
+            "Testing cancelled because the build failed.",
+        ))
+        summary = module.xcode_failure_summary(output)
+        self.assertIn("View.swift:42:7: error: missing divider behavior", summary)
+        self.assertNotIn("Testing cancelled", summary)
+
     def test_build_info_is_generated_before_xcode_acceptance(self):
         source = SCRIPT.read_text()
         function = source[source.index("def run_divider_acceptance"):source.index("def run_acceptance")]

@@ -60,6 +60,7 @@ class Fixture:
     prompt: str
     oracle_files: tuple[str, ...]
     acceptance: str
+    hidden_tests: tuple[tuple[str, str], ...] = ()
 
 
 FIXTURES: dict[str, Fixture] = {
@@ -92,10 +93,20 @@ FIXTURES: dict[str, Fixture] = {
             "terminal surface가 divider를 가리지 않아도 overlay로 보여야 하고 기존 "
             "translucent separator의 occlusion 정책은 유지하라. 관련 unit test를 추가하라."
         ),
-        oracle_files=(
-            "termMeshTests/GhosttyConfigTests.swift",
-            "termMeshTests/GhosttyTerminalViewComposingTests.swift",
-            "termMeshTests/TerminalOverrideIsolationTests.swift",
+        oracle_files=(),
+        hidden_tests=(
+            (
+                "termMeshTests/TerminalOverrideIsolationTests.swift",
+                "tests/fixtures/effectiveness/split-divider-color/TerminalOverrideIsolationTests.swift.inc",
+            ),
+            (
+                "termMeshTests/TermMeshWebViewKeyEquivalentTests.swift",
+                "tests/fixtures/effectiveness/split-divider-color/TermMeshWebViewKeyEquivalentTests.swift.inc",
+            ),
+            (
+                "Sources/TerminalWindowPortal.swift",
+                "tests/fixtures/effectiveness/split-divider-color/TerminalWindowPortal.swift.inc",
+            ),
         ),
         acceptance="divider",
     ),
@@ -181,9 +192,13 @@ def validate_fixture_metadata() -> list[dict[str, Any]]:
         parent = git("rev-parse", f"{fixture.solution}^")
         for path in fixture.oracle_files:
             git("cat-file", "-e", f"{fixture.solution}:{path}")
+        for _, source in fixture.hidden_tests:
+            if not (ROOT / source).is_file():
+                raise RuntimeError(f"hidden acceptance source missing: {source}")
         rows.append({
             "fixture": fixture.name, "solution": solution, "base": parent,
             "oracle_files": list(fixture.oracle_files),
+            "hidden_tests": [source for _, source in fixture.hidden_tests],
         })
     return rows
 
@@ -317,6 +332,21 @@ def oracle_overlay(fixture: Fixture, checkout: Path) -> Iterator[None]:
                     target.chmod(mode)
 
 
+@contextlib.contextmanager
+def hidden_test_overlay(fixture: Fixture, checkout: Path) -> Iterator[None]:
+    backups: dict[str, bytes] = {}
+    try:
+        for target_relative, source_relative in fixture.hidden_tests:
+            target = checkout / target_relative
+            backups[target_relative] = target.read_bytes()
+            source = (ROOT / source_relative).read_bytes()
+            target.write_bytes(backups[target_relative] + source)
+        yield
+    finally:
+        for target_relative, content in backups.items():
+            (checkout / target_relative).write_bytes(content)
+
+
 def shell_full_only_lines(text: str) -> set[int]:
     """Return lines proven to execute only when SMOKE_TEST is ``full``.
 
@@ -425,14 +455,30 @@ def run_logged(
     return True, "passed"
 
 
+def xcode_failure_summary(output: str) -> str:
+    diagnostics: list[str] = []
+    patterns = (
+        re.compile(r"^.*?:\d+:\d+: (?:error|warning): .+$"),
+        re.compile(r"^.*?XCTAssert.* failed.*$"),
+        re.compile(r"^Test Case '.*' failed.*$"),
+    )
+    for raw in output.splitlines():
+        line = raw.strip()
+        if any(pattern.match(line) for pattern in patterns) and line not in diagnostics:
+            diagnostics.append(line)
+    if diagnostics:
+        return "\n".join(diagnostics[-20:])
+    return output[-1200:].replace("\x00", "")
+
+
 def run_divider_acceptance(
     checkout: Path, log: TextIO, timeout: float, xcode_host: str, run_id: str,
 ) -> tuple[bool, str]:
     tests = (
-        "termMeshTests/WorkspaceChromeThemeTests/testResolvedChromeColorsUsesExplicitSplitDividerColor",
-        "termMeshTests/GhosttyTerminalViewComposingTests/testDividerOverlayAlwaysRendersOpaqueUserColor",
-        "termMeshTests/GhosttyTerminalViewComposingTests/testDividerOverlayKeepsDefaultSeparatorOcclusionPolicy",
-        "termMeshTests/TerminalOverrideIsolationTests/test_configLines_setSplitDividerColorIsWritten",
+        "termMeshTests/HiddenSplitDividerBehaviorAcceptanceTests/testOverrideSerializationAndResetUseExistingSettingsBoundary",
+        "termMeshTests/HiddenSplitDividerBehaviorAcceptanceTests/testParsedDividerColorReachesBonsplitAppearance",
+        "termMeshTests/HiddenSplitDividerPortalAcceptanceTests/testOpaqueDividerRendersWithoutSurfaceOcclusion",
+        "termMeshTests/HiddenSplitDividerPortalAcceptanceTests/testTranslucentDividerKeepsOcclusionPolicy",
     )
     command = [
         "xcodebuild", "-project", "GhosttyTabs.xcodeproj", "-scheme", "term-mesh-unit",
@@ -476,7 +522,12 @@ def run_divider_acceptance(
         )
         result = run_command(("ssh", xcode_host, remote_command), timeout=timeout)
         log.write(redact_text(result.stdout + result.stderr, checkout))
-        return (result.returncode == 0, "passed" if result.returncode == 0 else f"remote Xcode acceptance failed: {(result.stdout + result.stderr)[-1200:]}")
+        return (
+            result.returncode == 0,
+            "passed" if result.returncode == 0
+            else "remote Xcode acceptance failed:\n"
+            + xcode_failure_summary(result.stdout + result.stderr),
+        )
     finally:
         # The target is an exact, controller-created /tmp path.  Never expand a remote variable.
         run_command(("ssh", xcode_host, "rm", "-rf", remote), timeout=30)
@@ -487,7 +538,7 @@ def run_acceptance(
     xcode_host: str, run_id: str,
 ) -> tuple[bool, int, str]:
     started = time.perf_counter()
-    with oracle_overlay(fixture, checkout):
+    with oracle_overlay(fixture, checkout), hidden_test_overlay(fixture, checkout):
         if fixture.acceptance == "homebrew":
             passed, reason = homebrew_acceptance(checkout)
             log.write(reason + "\n")
