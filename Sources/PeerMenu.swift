@@ -1724,6 +1724,13 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             var resolvedSock = sockPath
             if resolvedSock == nil {
                 _ = await PeerHostCoordinator.shared.setRunning(true)
+                // Launch-time auto-start may already own the transition. In
+                // that case setRunning observes .starting and returns before
+                // currentSocketPath is published; wait for that same bounded
+                // startup instead of racing it into a false no_host_socket.
+                for _ in 0..<40 where PeerHostCoordinator.shared.currentSocketPath == nil {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
                 resolvedSock = PeerHostCoordinator.shared.currentSocketPath
             }
             guard let hostSock = resolvedSock, !hostSock.isEmpty else {
