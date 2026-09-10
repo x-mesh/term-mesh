@@ -1724,6 +1724,13 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
             var resolvedSock = sockPath
             if resolvedSock == nil {
                 _ = await PeerHostCoordinator.shared.setRunning(true)
+                // Launch-time auto-start may already own the transition. In
+                // that case setRunning observes .starting and returns before
+                // currentSocketPath is published; wait for that same bounded
+                // startup instead of racing it into a false no_host_socket.
+                for _ in 0..<40 where PeerHostCoordinator.shared.currentSocketPath == nil {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
                 resolvedSock = PeerHostCoordinator.shared.currentSocketPath
             }
             guard let hostSock = resolvedSock, !hostSock.isEmpty else {
@@ -1846,7 +1853,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     #endif
 
     /// Snapshot of live-mirror state for e2e assertions.
-    func debugMirrorStatus() -> [String: Any] {
+    func debugMirrorStatus(includeInputLatency: Bool = false) -> [String: Any] {
         [
             "mirrors": openWorkspaceMirrors.map { mirror -> [String: Any] in
                 var entry: [String: Any] = [
@@ -1920,6 +1927,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                             "pane_torn_down": session?.isTorndown ?? true,
                         ]
                         row["io"] = session?.relaySession.ioSnapshot ?? [:]
+                        if includeInputLatency {
+                            row["input_latency"] = session?.relaySession.inputLatencySnapshot ?? [:]
+                        }
                         return row
                     }
                 return entry
@@ -1984,7 +1994,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
     #endif
 
     /// Snapshot of remote-pane state for e2e assertions.
-    func debugPaneStatus() -> [String: Any] {
+    func debugPaneStatus(includeInputLatency: Bool = false) -> [String: Any] {
         [
             "pane_sessions": openPaneSessions.map { session in
                 var row: [String: Any] = [
@@ -2001,6 +2011,9 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 // instead of by scraping logs after the fact: received==0
                 // means nothing ever arrived from the host.
                 row["io"] = session.relaySession.ioSnapshot
+                if includeInputLatency {
+                    row["input_latency"] = session.relaySession.inputLatencySnapshot
+                }
                 return row
             },
             "lease_count": PeerPaneHostRegistry.shared.activeLeaseCount,
