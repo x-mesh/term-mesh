@@ -2115,30 +2115,21 @@ extension TeamOrchestrator {
         return inferred
     }
 
-    /// The manifests a host lists under its own row in the Host axis.
-    ///
-    /// Deliberately the same rule the Project axis applies, because a machine's
-    /// projects appearing in one view and not the other is what made a Project
-    /// on a Mac peer look deleted: workspaces come from the serving GUI socket,
-    /// which publishes no manifest, so the Host axis had nothing to show and
-    /// said nothing about it. A manifest with no leader surface or a known-dead
-    /// leader is skipped because neither can be attached as live work. The raw
-    /// host roster remains intact so its owner can still repair that Project.
+    /// Host inventory includes stopped and already-open Projects so each record remains manageable.
     nonisolated static func hostAxisOfferedManifests(
         isConnected: Bool,
         teams: [RemoteTeamSummary],
         hostKey: String,
-        localTeamForName: (String) -> Team?
+        localTeamForName: (String) -> Team?,
+        includeInactiveAndOpen: Bool = false
     ) -> [RemoteTeamSummary] {
         guard isConnected else { return [] }
         return teams.filter { team in
+            if includeInactiveAndOpen { return !team.projectID.isEmpty || team.isGUILive }
             if team.isGUILive { return !team.leaderSurfaceID.isEmpty }
-            guard !team.leaderSurfaceID.isEmpty,
-                  remoteManifestLeaderIsAdoptable(team) else { return false }
+            guard !team.leaderSurfaceID.isEmpty, remoteManifestLeaderIsAdoptable(team) else { return false }
             return sidebarRemoteManifestState(
-                localTeam: localTeamForName(team.name),
-                remote: team,
-                hostKey: hostKey
+                localTeam: localTeamForName(team.name), remote: team, hostKey: hostKey
             ).shouldOffer
         }.sorted { lhs, rhs in
             let order = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
@@ -10736,6 +10727,44 @@ extension TeamOrchestrator {
             onRemoteAttach?(.settled)
         }
         return team
+    }
+
+    /// Delete the exact host record without requiring the Project to be open in this window.
+    func deleteHostProject(host: HostEntry, project: RemoteTeamSummary, tabManager: TabManager) async throws {
+        guard !project.isGUILive, !project.projectID.isEmpty, project.rosterVerified else {
+            throw RemoteAgentError.projectDeletionIncomplete("Refresh the host's project list before deleting.")
+        }
+        if let local = teams.values.first(where: {
+            let localHostKey: String?
+            if let stored = $0.remotePresentationHostKey {
+                localHostKey = stored
+            } else if case let .peer(key) = $0.leaderEndpoint {
+                localHostKey = key
+            } else {
+                localHostKey = nil
+            }
+            return Self.cleanupProjectMatchesLocalTeam(
+                projectID: project.projectID,
+                hostKey: host.id,
+                localProjectID: $0.remotePresentationProjectID
+                    ?? $0.teamUuid.map(Self.remoteProjectPresentationID(teamUUID:)) ?? "",
+                localHostKey: localHostKey
+            )
+        }) {
+            try await deleteProject(teamName: local.id, tabManager: tabManager, removalScope: .stateOnly)
+        } else {
+            do {
+                try await RemoteHostStore.shared.deleteOwnedProjectRecord(
+                    hostKey: host.id, projectID: project.projectID
+                )
+            } catch OwnedProjectRecordRemovalError.notOwner {
+                try await RemoteHostStore.shared.repairStaleProjectRecord(
+                    hostKey: host.id, projectID: project.projectID
+                )
+            }
+            removeProjectPresentationLayout(projectID: project.projectID)
+        }
+        RemoteHostStore.shared.resyncConnectedHost(host)
     }
 
     @MainActor

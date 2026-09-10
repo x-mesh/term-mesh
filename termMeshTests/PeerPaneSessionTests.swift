@@ -1140,7 +1140,7 @@ final class PeerPaneSessionTests: XCTestCase {
     /// project manifest, so the Host axis has to list the session owner's
     /// manifests itself or the machine that runs a Project shows no sign of it.
     @MainActor
-    func testHostAxisOffersManifestsTheProjectAxisWouldOffer() {
+    func testHostInventoryIncludesOpenAndLeaderlessProjects() {
         let adoptedUUID = "6D0BB300-6622-418F-97BC-AB81C92AF46B"
         let adopted = TeamOrchestrator.Team(
             id: "term-mesh2", leaderSessionId: "leader", leaderMode: "claude",
@@ -1164,8 +1164,7 @@ final class PeerPaneSessionTests: XCTestCase {
             leaderSurfaceID: Data(repeating: 4, count: 16),
             presentationRevision: 1, presentationOwnedByRequester: true
         )
-        // A manifest whose leader surface died is not attachable; the daemon
-        // stops reporting it, and a stale copy must not become a dead row.
+        // A leaderless record still belongs in the host inventory so it can be removed.
         let leaderless = RemoteTeamSummary(
             name: "term-mesh", teamUUID: "16890533-11D3-4FB9-B1F3-0C77E3341A6E",
             workingDirectory: "/Users/jinwoo", projectRootPath: nil,
@@ -1178,14 +1177,18 @@ final class PeerPaneSessionTests: XCTestCase {
 
         let offered = TeamOrchestrator.hostAxisOfferedManifests(
             isConnected: true, teams: teams, hostKey: "ssh:mac-sub",
-            localTeamForName: { localTeams[$0] }
+            localTeamForName: { localTeams[$0] }, includeInactiveAndOpen: true
         )
-        XCTAssertEqual(offered.map(\.name), ["term-mesh3"])
+        XCTAssertEqual(offered.map(\.name), ["term-mesh", "term-mesh2", "term-mesh3"])
+        XCTAssertEqual(TeamOrchestrator.hostAxisOfferedManifests(
+            isConnected: true, teams: teams, hostKey: "ssh:mac-sub",
+            localTeamForName: { localTeams[$0] }
+        ).map(\.name), ["term-mesh3"], "the Project axis must not duplicate an open Project")
 
         XCTAssertTrue(
             TeamOrchestrator.hostAxisOfferedManifests(
                 isConnected: false, teams: teams, hostKey: "ssh:mac-sub",
-                localTeamForName: { localTeams[$0] }
+                localTeamForName: { localTeams[$0] }, includeInactiveAndOpen: true
             ).isEmpty,
             "a disconnected host cannot attach anything it last reported"
         )
@@ -1201,12 +1204,12 @@ final class PeerPaneSessionTests: XCTestCase {
         )
         let sorted = TeamOrchestrator.hostAxisOfferedManifests(
             isConnected: true, teams: [notAdopted, second], hostKey: "ssh:mac-sub",
-            localTeamForName: { localTeams[$0] }
+            localTeamForName: { localTeams[$0] }, includeInactiveAndOpen: true
         )
         XCTAssertEqual(sorted.map(\.name), ["Alpha", "term-mesh3"])
     }
 
-    func testKnownInactiveRemoteManifestIsNeitherOfferedNorAdoptable() {
+    func testHostInventoryKeepsInactiveProjectsWithoutOfferingLiveAdoption() {
         func manifest(
             name: String, active: Bool, activeKnown: Bool
         ) -> RemoteTeamSummary {
@@ -1231,9 +1234,9 @@ final class PeerPaneSessionTests: XCTestCase {
         XCTAssertEqual(
             TeamOrchestrator.hostAxisOfferedManifests(
                 isConnected: true, teams: [unknown, inactive, live],
-                hostKey: "ssh:mac-sub", localTeamForName: { _ in nil }
+                hostKey: "ssh:mac-sub", localTeamForName: { _ in nil }, includeInactiveAndOpen: true
             ).map(\.name),
-            ["live", "unknown"]
+            ["inactive", "live", "unknown"]
         )
     }
 
