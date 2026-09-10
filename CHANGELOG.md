@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.240.0] - 2026-09-10
+
+### Changed
+
+- Delegated Projects can use up to ten workers for independent tasks. The configured limit and available roster still apply. Serial tasks use one worker. Leader policy v13 now gives local leaders, peer leaders, hooks, and the CLI the same execution contract.
+- The effectiveness benchmark now checks visible behavior instead of requiring the reference implementation's private helpers. It keeps candidate tests, waits for each worker estimate, and stops repeated corrections for the same failure.
+
+### Fixed
+
+- `tm-agent wait --task` and `--tasks` now keep the explicit task set closed. Unrelated active tasks can no longer delay the requested wait.
+- Canary route directives now use each Project's delegation level and exact worker limit. They no longer disagree with the app and leader hook.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.239.0] - 2026-09-10
 
 ### Added
