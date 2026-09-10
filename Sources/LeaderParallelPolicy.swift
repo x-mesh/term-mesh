@@ -176,7 +176,10 @@ struct ProjectRoutingDecision: Codable, Equatable, Sendable {
         // A cap of one is a deliberate "never fan out", not a small wave: two
         // is the smallest wave the policy recognises, so a cap below it has to
         // close the gate rather than emit a one-worker "parallel" run.
-        let cap = max(1, maxParallelWorkers)
+        let cap = min(
+            ProjectExecutionOptions.workerBounds.upperBound,
+            max(ProjectExecutionOptions.workerBounds.lowerBound, maxParallelWorkers)
+        )
         if let taskShape, taskShape.supportsParallelWave, workers >= 2, cap >= 2 {
             return Self(
                 route: .parallel, reasons: ["parallel_ready"],
@@ -203,6 +206,11 @@ struct ProjectRoutingDecision: Codable, Equatable, Sendable {
                 route: .probe, reasons: risks.map(\.rawValue).sorted(), workerCount: 1
             )
         case .delegated:
+            if taskShape == .singleUnit {
+                return Self(
+                    route: .delegated, reasons: ["delegated_serial_work"], workerCount: 1
+                )
+            }
             return Self(
                 route: .delegated, reasons: ["delegated_max_capacity"],
                 workerCount: min(cap, workers)

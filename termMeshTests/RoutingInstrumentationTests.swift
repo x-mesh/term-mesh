@@ -49,9 +49,11 @@ final class RoutingInstrumentationTests: XCTestCase {
         )
         XCTAssertEqual(
             ProjectRoutingDecision.decide(
-                level: .delegated, taskShape: .singleUnit, risks: [], availableWorkers: 1
+                level: .delegated, taskShape: .singleUnit, risks: [], availableWorkers: 8,
+                maxParallelWorkers: 10
             ),
-            .init(route: .delegated, reasons: ["delegated_max_capacity"], workerCount: 1)
+            .init(route: .delegated, reasons: ["delegated_serial_work"], workerCount: 1),
+            "a stated serial unit uses one worker even in delegated mode"
         )
         XCTAssertEqual(
             ProjectRoutingDecision.decide(
@@ -92,10 +94,10 @@ final class RoutingInstrumentationTests: XCTestCase {
         XCTAssertEqual(
             ProjectRoutingDecision.decide(
                 level: .delegated, taskShape: nil, risks: [],
-                availableWorkers: 12, maxParallelWorkers: 10
+                availableWorkers: 12, maxParallelWorkers: 99
             ),
             .init(route: .delegated, reasons: ["delegated_max_capacity"], workerCount: 10),
-            "delegated fills the configured capacity but never exceeds its limit"
+            "delegated fills useful capacity but never exceeds the global limit"
         )
         XCTAssertEqual(
             ProjectRoutingDecision.decide(
