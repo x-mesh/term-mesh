@@ -18133,7 +18133,7 @@ struct LeaderParticipationDirective {
     participation: &'static str,
     route: &'static str,
     reasons: Vec<&'static str>,
-    dispatch_bounds: &'static str,
+    dispatch_bounds: String,
 }
 
 impl LeaderParticipationDirective {
@@ -18141,6 +18141,8 @@ impl LeaderParticipationDirective {
         task_shape: Option<&str>,
         risk_reasons: &[String],
         available_workers: Option<u32>,
+        delegation_level: Option<&str>,
+        max_parallel_workers: Option<u32>,
     ) -> Self {
         let shape = task_shape.map(str::trim).map(str::to_ascii_lowercase);
         let Some(workers) = available_workers else {
@@ -18148,15 +18150,25 @@ impl LeaderParticipationDirective {
                 participation: "hands_on",
                 route: "direct",
                 reasons: vec!["unsupported_input"],
-                dispatch_bounds: "no required worker dispatch",
+                dispatch_bounds: "no required worker dispatch".into(),
             };
         };
+        let cap = max_parallel_workers.unwrap_or(3).clamp(1, 10);
+        let wave = workers.min(cap);
         if risk_reasons.iter().any(|reason| !reason.trim().is_empty()) {
             return Self {
                 participation: "balanced",
                 route: "probe",
                 reasons: vec!["high_risk"],
-                dispatch_bounds: "at most one read-only probe",
+                dispatch_bounds: "at most one read-only probe".into(),
+            };
+        }
+        if delegation_level == Some("delegated") && shape.as_deref() == Some("single_unit") {
+            return Self {
+                participation: "coordinator",
+                route: "delegated",
+                reasons: vec!["delegated_serial_work"],
+                dispatch_bounds: "exactly one implementation worker".into(),
             };
         }
         if workers >= 2
@@ -18169,7 +18181,19 @@ impl LeaderParticipationDirective {
                 participation: "coordinator",
                 route: "parallel",
                 reasons: vec!["parallel_ready"],
-                dispatch_bounds: "two to ten dependency-ready, ownership-disjoint tasks within the configured limit",
+                dispatch_bounds: format!(
+                    "two to {wave} dependency-ready, ownership-disjoint tasks"
+                ),
+            };
+        }
+        if delegation_level == Some("delegated") {
+            return Self {
+                participation: "coordinator",
+                route: "delegated",
+                reasons: vec!["delegated_max_capacity"],
+                dispatch_bounds: format!(
+                    "up to {wave} useful independent implementation tasks; one if serial"
+                ),
             };
         }
         if workers == 0 || shape.as_deref() == Some("single_unit") {
@@ -18177,16 +18201,37 @@ impl LeaderParticipationDirective {
                 participation: "hands_on",
                 route: "direct",
                 reasons: vec!["single_unit"],
-                dispatch_bounds: "no required worker dispatch",
+                dispatch_bounds: "no required worker dispatch".into(),
             };
         }
         Self {
             participation: "balanced",
             route: "probe",
             reasons: vec!["limited_capacity"],
-            dispatch_bounds: "at most one read-only probe",
+            dispatch_bounds: "at most one read-only probe".into(),
         }
     }
+}
+
+fn routing_options_from_control(value: &Value) -> (Option<String>, Option<u32>) {
+    let level = value["delegation_effective"]
+        .as_str()
+        .or_else(|| value["delegation_configured"].as_str())
+        .map(str::to_string);
+    let cap = value["max_parallel_workers"]
+        .as_u64()
+        .map(|value| value.clamp(1, 10) as u32);
+    (level, cap)
+}
+
+fn leader_control_routing_options() -> (Option<String>, Option<u32>) {
+    let Ok(path) = env::var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE") else {
+        return (None, None);
+    };
+    let Ok(data) = fs::read(path) else { return (None, None); };
+    if data.len() > 64 * 1024 { return (None, None); }
+    let Ok(value) = serde_json::from_slice::<Value>(&data) else { return (None, None); };
+    routing_options_from_control(&value)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18597,8 +18642,11 @@ fn turn_route_record_with_policy_input(
     if let Some(surface) = surface_id.filter(|v| !v.trim().is_empty()) {
         record["surface_id"] = json!(surface);
     }
-    let suggestion =
-        LeaderParticipationDirective::from_input(task_shape, risk_reasons, available_workers);
+    let (delegation_level, max_parallel_workers) = leader_control_routing_options();
+    let suggestion = LeaderParticipationDirective::from_input(
+        task_shape, risk_reasons, available_workers,
+        delegation_level.as_deref(), max_parallel_workers,
+    );
     let resolution = resolve_participation_from_env(available_workers.is_some(), Some(turn_id));
     record["suggested_participation"] = json!(suggestion.participation);
     record["suggested_route"] = json!(suggestion.route);
@@ -18852,28 +18900,70 @@ mod leader_turn_record_tests {
 
     #[test]
     fn evaluator_matches_observable_dispatch_contract() {
-        let parallel = LeaderParticipationDirective::from_input(Some("multi_unit"), &[], Some(2));
+        let parallel = LeaderParticipationDirective::from_input(
+            Some("multi_unit"), &[], Some(8), Some("delegated"), Some(5)
+        );
         assert_eq!(parallel.participation, "coordinator");
         assert_eq!(parallel.route, "parallel");
         assert_eq!(parallel.reasons, ["parallel_ready"]);
         assert_eq!(
             parallel.dispatch_bounds,
-            "two to ten dependency-ready, ownership-disjoint tasks within the configured limit"
+            "two to 5 dependency-ready, ownership-disjoint tasks"
         );
 
         let risk = LeaderParticipationDirective::from_input(
             Some("multi_unit"),
             &reasons(&["release"]),
             Some(3),
+            Some("delegated"),
+            Some(10),
         );
         assert_eq!(risk.participation, "balanced");
         assert_eq!(risk.route, "probe");
         assert_eq!(risk.dispatch_bounds, "at most one read-only probe");
 
-        let unknown = LeaderParticipationDirective::from_input(Some("multi_unit"), &[], None);
+        let unknown = LeaderParticipationDirective::from_input(
+            Some("multi_unit"), &[], None, Some("delegated"), Some(10)
+        );
         assert_eq!(unknown.participation, "hands_on");
         assert_eq!(unknown.route, "direct");
         assert_eq!(unknown.reasons, ["unsupported_input"]);
+
+        let delegated = LeaderParticipationDirective::from_input(
+            None, &[], Some(12), Some("delegated"), Some(7)
+        );
+        assert_eq!(delegated.route, "delegated");
+        assert_eq!(delegated.reasons, ["delegated_max_capacity"]);
+        assert_eq!(
+            delegated.dispatch_bounds,
+            "up to 7 useful independent implementation tasks; one if serial"
+        );
+
+        let serial = LeaderParticipationDirective::from_input(
+            Some("single_unit"), &[], Some(12), Some("delegated"), Some(10)
+        );
+        assert_eq!(serial.route, "delegated");
+        assert_eq!(serial.reasons, ["delegated_serial_work"]);
+        assert_eq!(serial.dispatch_bounds, "exactly one implementation worker");
+    }
+
+    #[test]
+    fn control_routing_options_preserve_mode_and_clamp_cap() {
+        assert_eq!(
+            routing_options_from_control(&json!({
+                "delegation_effective": "delegated",
+                "delegation_configured": "leaderFirst",
+                "max_parallel_workers": 99,
+            })),
+            (Some("delegated".into()), Some(10))
+        );
+        assert_eq!(
+            routing_options_from_control(&json!({
+                "delegation_configured": "guarded",
+                "max_parallel_workers": 0,
+            })),
+            (Some("guarded".into()), Some(1))
+        );
     }
 
     #[test]
