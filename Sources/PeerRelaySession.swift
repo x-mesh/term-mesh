@@ -31,6 +31,7 @@ private let kTypeAuth: UInt8     = 0xFE
 private let kRelayMaxFrameBytes = 1024 * 1024
 private let kRelayAuthMaxPayload = 256
 private typealias RelayFrame = (type: UInt8, payload: Data)
+private typealias TimedRelayFrame = (type: UInt8, payload: Data, readAtNs: UInt64)
 
 // ── Two-stage handshake result ─────────────────────────────────────
 
@@ -415,16 +416,18 @@ private final class RelayFrameReader: @unchecked Sendable {
         return yielded
     }
 
-    func frames() -> AsyncThrowingStream<RelayFrame, Error> {
+    func frames() -> AsyncThrowingStream<TimedRelayFrame, Error> {
         AsyncThrowingStream { continuation in
             queue.async {
                 while !self.isStopped {
                     do {
                         let frame = try self.relay.readFrame()
+                        // Local metadata only: never changes the helper wire format.
+                        let readAt = frame.type == kTypeKeyInput ? DispatchTime.now().uptimeNanoseconds : 0
                         self.lock.lock()
                         self.yielded &+= 1
                         self.lock.unlock()
-                        continuation.yield(frame)
+                        continuation.yield((frame.type, frame.payload, readAt))
                     } catch {
                         if self.isStopped {
                             continuation.finish()
@@ -1471,6 +1474,81 @@ private final class RelayIOStats: @unchecked Sendable {
     }
 }
 
+/// Recent helper-input timings. No payloads, per-key logging, tasks, or timers.
+/// A fixed ring bounds memory; sorting happens only when diagnostics are read,
+/// outside the lock. These are local handoff timings, NOT remote echo latency.
+final class RelayInputLatencyStats: @unchecked Sendable {
+    enum Outcome: String, CaseIterable {
+        case sent, failed, cancelled, noSession = "no_session"
+    }
+
+    struct Sample {
+        let queueNs: UInt64
+        let sessionAccessNs: UInt64?
+        let browseExitNs: UInt64?
+        let sendNs: UInt64?
+        let totalNs: UInt64
+        let outcome: Outcome
+    }
+
+    private let lock = NSLock()
+    private let capacity: Int
+    private var samples: [Sample] = []
+    private var nextIndex = 0
+    private var counts: [String: UInt64] = [:]
+
+    init(capacity: Int = 512) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+        samples.reserveCapacity(capacity)
+    }
+
+    func record(_ sample: Sample) {
+        lock.lock()
+        defer { lock.unlock() }
+        counts[sample.outcome.rawValue, default: 0] += 1
+        if samples.count < capacity {
+            samples.append(sample)
+        } else {
+            samples[nextIndex] = sample
+        }
+        nextIndex = (nextIndex + 1) % capacity
+    }
+
+    func snapshot() -> [String: Any] {
+        lock.lock()
+        let recent = samples
+        let totals = counts
+        lock.unlock()
+
+        func distribution(_ values: [UInt64]) -> [String: Any] {
+            let sorted = values.sorted()
+            guard !sorted.isEmpty else { return ["n": 0] }
+            func percentile(_ p: Int) -> Double {
+                // Nearest rank; n=1 has the same p50/p95/p99/max.
+                Double(sorted[(sorted.count * p + 99) / 100 - 1]) / 1_000_000
+            }
+            return ["n": sorted.count, "p50_ms": percentile(50),
+                    "p95_ms": percentile(95), "p99_ms": percentile(99),
+                    "max_ms": Double(sorted.last!) / 1_000_000]
+        }
+
+        return [
+            "scope": "relay_helper_local_handoff",
+            "window_capacity": capacity,
+            "window_samples": recent.count,
+            "outcomes_total": Dictionary(uniqueKeysWithValues: Outcome.allCases.map {
+                ($0.rawValue, totals[$0.rawValue, default: 0])
+            }),
+            "queue": distribution(recent.map(\.queueNs)),
+            "session_access": distribution(recent.compactMap(\.sessionAccessNs)),
+            "browse_exit": distribution(recent.compactMap(\.browseExitNs)),
+            "send": distribution(recent.compactMap(\.sendNs)),
+            "total": distribution(recent.map(\.totalNs)),
+        ]
+    }
+}
+
 /// Lock-boxed home for the `onPtyData` callback (t14 callback delivery).
 /// The pump reads it per chunk from a detached task while the owner
 /// (re)assigns it from the main actor — same NSLock-box shape as
@@ -1648,6 +1726,7 @@ final class PeerRelaySession {
     /// project's default isolation pins an internal type to MainActor, and
     /// these are written from the pump loop. Exposed through `ioSnapshot`.
     private let ioStats = RelayIOStats()
+    private let inputLatencyStats = RelayInputLatencyStats()
 
     /// Counter snapshot for `debugPaneStatus()` — lets a live probe tell
     /// "nothing ever arrived" from "arrived and was lost downstream".
@@ -1720,6 +1799,10 @@ final class PeerRelaySession {
             "last_delivered_byte_uptime_ns": c.lastDeliveredByteUptimeNs,
         ]
     }
+
+    /// Explicit diagnostics only: health polling of ioSnapshot must not sort
+    /// latency samples for every pane. No mutation of the measurement window.
+    var inputLatencySnapshot: [String: Any] { inputLatencyStats.snapshot() }
 
     /// One-line counter summary for the disconnect / watchdog log lines.
     var ioSummary: String {
@@ -2795,6 +2878,7 @@ final class PeerRelaySession {
         // Captured by the heal schedulers and both detached pumps below. It
         // must be bound before those closures are created.
         let resumeTransitionGate = self.resumeTransitionGate
+        let inputLatencyStats = self.inputLatencyStats
         // Gap-heal timing. The relay path hangs it off the resize coalescer
         // (which also owns resize forwarding and so needs the session);
         // callback delivery has no resize traffic, so a dedicated scheduler
@@ -3336,28 +3420,61 @@ final class PeerRelaySession {
                 do {
                     for try await frame in reader.frames() {
                         framesConsumed &+= 1
-                        if Task.isCancelled { break }
+                        if Task.isCancelled {
+                            if frame.type == kTypeKeyInput {
+                                let elapsed = DispatchTime.now().uptimeNanoseconds - frame.readAtNs
+                                inputLatencyStats.record(.init(
+                                    queueNs: elapsed, sessionAccessNs: nil, browseExitNs: nil,
+                                    sendNs: nil, totalNs: elapsed, outcome: .cancelled
+                                ))
+                            }
+                            break
+                        }
                         switch frame.type {
                         case kTypeKeyInput:
+                            let dequeuedAt = DispatchTime.now().uptimeNanoseconds
+                            var sessionAccessNs: UInt64?
+                            var browseExitNs: UInt64?
+                            var sendNs: UInt64?
+                            var completedAt: UInt64?
+                            var outcome: RelayInputLatencyStats.Outcome = .noSession
+                            defer {
+                                inputLatencyStats.record(.init(
+                                    queueNs: dequeuedAt - frame.readAtNs,
+                                    sessionAccessNs: sessionAccessNs, browseExitNs: browseExitNs,
+                                    sendNs: sendNs,
+                                    totalNs: (completedAt ?? DispatchTime.now().uptimeNanoseconds) - frame.readAtNs,
+                                    outcome: outcome
+                                ))
+                            }
                             // R3: read the CURRENT session, not the one captured
                             // when pumping started — a resume-heal may have
                             // swapped it out from under this pane transparently.
-                            guard let current = await self.session else { break }
+                            let accessStartedAt = DispatchTime.now().uptimeNanoseconds
+                            let currentSession = await self.session
+                            sessionAccessNs = DispatchTime.now().uptimeNanoseconds - accessStartedAt
+                            guard let current = currentSession else { break }
                             // Typing while browsing scrollback exits the
                             // browse first (offset-0 render restores the
                             // live screen), then the key goes through — the
                             // same "any input snaps back to live" rule as
                             // tmux copy-mode's q.
                             if let exit = scrollbackBrowse.requestForExit() {
+                                let browseStartedAt = DispatchTime.now().uptimeNanoseconds
                                 try? await current.requestScrollback(
                                     surfaceID: surfaceID,
                                     offsetRows: exit
                                 )
+                                browseExitNs = DispatchTime.now().uptimeNanoseconds - browseStartedAt
                             }
                             let sendStartedAt = DispatchTime.now().uptimeNanoseconds
                             do {
                                 try await current.sendInput(surfaceID: surfaceID, keys: frame.payload)
+                                completedAt = DispatchTime.now().uptimeNanoseconds
+                                outcome = .sent
                             } catch {
+                                completedAt = DispatchTime.now().uptimeNanoseconds
+                                outcome = error is CancellationError ? .cancelled : .failed
                                 // Don't tear down on a single dropped keystroke, but
                                 // make the loss visible instead of silently swallowing.
                                 #if DEBUG
@@ -3376,7 +3493,8 @@ final class PeerRelaySession {
                             // keys pile up in the reader's unbounded stream.
                             // This episode record is the only production trace
                             // that path leaves.
-                            let sendEndedAt = DispatchTime.now().uptimeNanoseconds
+                            let sendEndedAt = completedAt!
+                            sendNs = sendEndedAt - sendStartedAt
                             if inputStallGate.recordEpisode(
                                 durationNanos: sendEndedAt &- sendStartedAt, now: sendEndedAt
                             ) {

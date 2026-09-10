@@ -6455,12 +6455,86 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
     }
 }
 
+// MARK: - Relay input diagnostics
+final class RelayInputLatencyStatsTests: XCTestCase {
+    private func sample(_ ms: UInt64, outcome: RelayInputLatencyStats.Outcome = .sent)
+        -> RelayInputLatencyStats.Sample {
+        .init(queueNs: ms * 1_000_000, sessionAccessNs: ms * 2_000_000,
+              browseExitNs: nil, sendNs: ms * 3_000_000,
+              totalNs: ms * 6_000_000, outcome: outcome)
+    }
+
+    func testEmptyAndUnvisitedStagesHaveNoInventedZeroPercentiles() throws {
+        let stats = RelayInputLatencyStats()
+        let empty = try XCTUnwrap(stats.snapshot()["queue"] as? [String: Any])
+        XCTAssertEqual(empty["n"] as? Int, 0)
+        XCTAssertNil(empty["p50_ms"])
+        stats.record(sample(2))
+        let snapshot = stats.snapshot()
+        let browse = try XCTUnwrap(snapshot["browse_exit"] as? [String: Any])
+        XCTAssertEqual(browse["n"] as? Int, 0)
+        XCTAssertNil(browse["p50_ms"])
+        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: snapshot))
+    }
+
+    func testRecentWindowEvictsOldStallsButKeepsLifetimeOutcomes() throws {
+        let stats = RelayInputLatencyStats(capacity: 3)
+        stats.record(sample(900, outcome: .failed))
+        stats.record(sample(1))
+        stats.record(sample(2))
+        stats.record(sample(3))
+        let snapshot = stats.snapshot()
+        XCTAssertEqual(snapshot["window_samples"] as? Int, 3)
+        let queue = try XCTUnwrap(snapshot["queue"] as? [String: Any])
+        XCTAssertEqual(queue["p50_ms"] as? Double, 2)
+        XCTAssertEqual(queue["p95_ms"] as? Double, 3)
+        XCTAssertEqual(queue["max_ms"] as? Double, 3)
+        let totals = try XCTUnwrap(snapshot["outcomes_total"] as? [String: UInt64])
+        XCTAssertEqual(totals["sent"], 3)
+        XCTAssertEqual(totals["failed"], 1)
+    }
+
+    func testStageDistributionsRetainSubMillisecondPrecisionAndTails() throws {
+        let stats = RelayInputLatencyStats()
+        for n in 1...100 { stats.record(sample(UInt64(n))) }
+        let snapshot = stats.snapshot()
+        let queue = try XCTUnwrap(snapshot["queue"] as? [String: Any])
+        XCTAssertEqual(queue["p50_ms"] as? Double, 50)
+        XCTAssertEqual(queue["p95_ms"] as? Double, 95)
+        XCTAssertEqual(queue["p99_ms"] as? Double, 99)
+        let access = try XCTUnwrap(snapshot["session_access"] as? [String: Any])
+        XCTAssertEqual(access["p95_ms"] as? Double, 190)
+        let single = RelayInputLatencyStats()
+        single.record(.init(queueNs: 125_000, sessionAccessNs: nil, browseExitNs: nil,
+                            sendNs: nil, totalNs: 125_000, outcome: .cancelled))
+        let fraction = try XCTUnwrap(single.snapshot()["queue"] as? [String: Any])
+        XCTAssertEqual(fraction["p99_ms"] as? Double, 0.125)
+    }
+
+    func testUnsentFramesDoNotPolluteSendDistribution() throws {
+        let stats = RelayInputLatencyStats()
+        stats.record(.init(queueNs: 1, sessionAccessNs: nil, browseExitNs: nil,
+                           sendNs: nil, totalNs: 1, outcome: .cancelled))
+        stats.record(.init(queueNs: 1, sessionAccessNs: 2, browseExitNs: nil,
+                           sendNs: nil, totalNs: 3, outcome: .noSession))
+        stats.record(sample(4, outcome: .failed))
+        let snapshot = stats.snapshot()
+        let send = try XCTUnwrap(snapshot["send"] as? [String: Any])
+        XCTAssertEqual(send["n"] as? Int, 1)
+        let access = try XCTUnwrap(snapshot["session_access"] as? [String: Any])
+        XCTAssertEqual(access["n"] as? Int, 2)
+        let totals = try XCTUnwrap(snapshot["outcomes_total"] as? [String: UInt64])
+        XCTAssertEqual(totals["cancelled"], 1)
+        XCTAssertEqual(totals["no_session"], 1)
+        XCTAssertEqual(totals["failed"], 1)
+        XCTAssertEqual(totals["sent"], 0)
+    }
+}
+
 // MARK: - Relay stall production logging
 
-/// The gate behind the release-build stall lines. The DEBUG `dlog` edges
-/// vanish from release builds, so this gate is the only thing standing
-/// between "pane froze" and "every log is silent" — and the only thing
-/// standing between a stall storm and a log flood.
+/// The gate behind the release-build stall lines; sustained stalls remain
+/// visible without letting a stall storm become a log flood.
 final class RelayStallLogGateTests: XCTestCase {
     func testIgnoresJitterAndLogsTheFirstSustainedEpisode() {
         var gate = RelayStallLogGate(thresholdNanos: 100, minIntervalNanos: 1_000)

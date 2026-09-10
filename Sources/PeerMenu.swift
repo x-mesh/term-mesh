@@ -1920,6 +1920,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                             "pane_torn_down": session?.isTorndown ?? true,
                         ]
                         row["io"] = session?.relaySession.ioSnapshot ?? [:]
+                        row["input_latency"] = session?.relaySession.inputLatencySnapshot ?? [:]
                         return row
                     }
                 return entry
@@ -2001,6 +2002,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 // instead of by scraping logs after the fact: received==0
                 // means nothing ever arrived from the host.
                 row["io"] = session.relaySession.ioSnapshot
+                row["input_latency"] = session.relaySession.inputLatencySnapshot
                 return row
             },
             "lease_count": PeerPaneHostRegistry.shared.activeLeaseCount,

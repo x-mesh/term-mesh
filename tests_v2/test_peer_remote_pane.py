@@ -23,6 +23,9 @@ Covers:
      R2 lease-release contract; a leak here means dangling tunnels).
 """
 import sys
+import json
+import base64
+import uuid
 import time
 from pathlib import Path
 
@@ -93,6 +96,46 @@ def main() -> int:
         if not _wait(lambda: c.read_terminal_text(panel_id).strip() != "", timeout_s=20):
             raise termmeshError("remote pane never rendered any bytes")
 
+        # Exercise the real helper → pump → peer path. Diagnostic reads must
+        # expose timings without modifying, dropping, or logging typed content.
+        def _latency():
+            rows = c.peer_pane_status().get("pane_sessions") or []
+            return rows[0].get("input_latency", {}) if rows else {}
+
+        # The loopback picker may choose either initial local surface. Drive
+        # the exact attached host surface, and remove shell editing/line-wrap
+        # noise from the echo assertion with a raw, non-echoing cat PTY.
+        source_id = str(uuid.UUID(bytes=base64.b64decode(sessions[0]["surface_id"])))
+        ready = "TM_INPUT_READY"
+        c.send_surface(source_id, f"stty -icanon -echo; echo {ready}; cat\r")
+        if not _wait(lambda: ready in c.read_terminal_text(panel_id).splitlines(), timeout_s=10):
+            raise termmeshError("raw cat input fixture did not become ready")
+        before = _latency().get("outcomes_total", {}).get("sent", 0)
+        marker = "relaylatency" + str(time.time_ns())
+        for char in marker:
+            c.send_surface(panel_id, char)
+            time.sleep(0.02)
+        if not _wait(lambda: marker in c.read_terminal_text(panel_id), timeout_s=10):
+            raise termmeshError(
+                f"instrumented relay did not echo the complete input marker: "
+                f"latency={_latency()!r}, text={c.read_terminal_text(panel_id)[-512:]!r}"
+            )
+        if not _wait(lambda: _latency().get("outcomes_total", {}).get("sent", 0) > before):
+            raise termmeshError("helper input never populated input_latency")
+        latency = _latency()
+        for name in ("queue", "session_access", "send", "total"):
+            stage = latency.get(name, {})
+            if stage.get("n", 0) <= 0:
+                raise termmeshError(f"missing input stage {name}: {latency!r}")
+            values = [stage.get(k, -1) for k in ("p50_ms", "p95_ms", "p99_ms", "max_ms")]
+            if min(values) < 0 or values != sorted(values):
+                raise termmeshError(f"invalid percentiles for {name}: {stage!r}")
+        if marker in json.dumps(latency):
+            raise termmeshError("diagnostics exposed input contents")
+        if any(latency["outcomes_total"].get(k, 0) for k in ("failed", "cancelled", "no_session")):
+            raise termmeshError(f"healthy relay lost input: {latency!r}")
+        print("input_latency=" + json.dumps(latency, sort_keys=True))
+
         # --- 3. closing the pane releases session + lease
         c.close_surface(panel_id)
 
@@ -108,7 +151,7 @@ def main() -> int:
                 f"pane close did not release session/lease: {c.peer_pane_status()!r}"
             )
 
-        print("OK test_peer_remote_pane")
+        print("PASS: remote pane relays input, reports timings, and releases its lease")
         return 0
 
 
