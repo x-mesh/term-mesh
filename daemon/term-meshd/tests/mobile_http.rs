@@ -1550,3 +1550,54 @@ async fn a_resolved_pane_accepts_a_chat_turn() {
     assert_eq!(app.calls()[0].0, "surface.send_turn");
     assert_eq!(app.calls()[0].1["text"], "whole turn");
 }
+
+/// A third half of the same regression, this time for `/interrupt`: gating it
+/// on the raw `entry.chat_capable` instead of `state.chat_capable(&entry)`
+/// left the Interrupt button `/api/targets` had just told the page to show
+/// coming back `not_an_agent` for every terminal-backed chat. The resolved
+/// pane is not a native agent, so the stop must still reach it as a C-c key.
+#[tokio::test]
+async fn a_resolved_pane_forwards_interrupt_as_ctrl_c() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.reply("surface.send_key", json!({ "interrupted": true }));
+    let resolver: http_mobile::SessionResolver = Arc::new(|surface_id: &str| match surface_id {
+        "panel-4" => Some(http_mobile::PaneSession {
+            cli: "claude".into(),
+            session_id: "sess-int".into(),
+        }),
+        _ => None,
+    });
+    let h = start_with_resolver(AuthMode::Tailscale, &[LOGIN], Some(resolver)).await;
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "panel-4".into(),
+                kind: TargetKind::Pane,
+                app_socket: Some(app.path_str()),
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
+
+    let target = get(&h, "/api/targets").await.json()["targets"][0].clone();
+    assert_eq!(
+        target["chat_capable"], true,
+        "precondition: the page is offered Chat (and Interrupt) for this pane"
+    );
+
+    let stop = post(&h, "/api/targets/panel-4/interrupt", json!({})).await;
+    assert_eq!(stop.status, 200, "{}", stop.body);
+    assert_eq!(stop.json()["interrupted"], true);
+    assert_eq!(
+        app.calls()[0],
+        (
+            "surface.send_key".to_string(),
+            json!({ "surface_id": "panel-4", "key": "ctrl-c" })
+        ),
+        "a resolved pane is not a native agent, so the stop is a key, not team.interrupt"
+    );
+}
