@@ -1831,7 +1831,13 @@ async fn interrupt_handler(
     axum::Extension(caller): axum::Extension<Caller>,
 ) -> ApiResult {
     let entry = live_entry(&state, &surface_id).await?;
-    if !entry.chat_capable {
+    // Same capability answer `/api/targets` and `/text` already use: a
+    // terminal-backed pane running a hand-started CLI carries
+    // `chat_capable: false` on the raw record, and only the resolved session
+    // knows better. Reading the raw field here left the page's Interrupt
+    // button, which `/api/targets` had just told it to show, come back
+    // `not_an_agent` on every terminal-backed chat.
+    if !state.chat_capable(&entry) {
         return Err(ApiError::conflict(
             "not_an_agent",
             "interrupt exists only for native agent targets; send the C-c key instead",
