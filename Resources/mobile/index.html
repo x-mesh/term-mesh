@@ -12,17 +12,18 @@
 <body>
 <header class="bar">
   <div class="bar-row">
+    <span id="presence" class="presence" aria-hidden="true" hidden></span>
     <label class="target-label" for="target">
       <span class="brand">term-mesh</span>
       <select id="target" aria-label="target pane"></select>
     </label>
+    <div id="view-switch" class="view-switch" role="group" aria-label="view mode" hidden>
+      <button id="view-chat" type="button">Chat</button>
+      <button id="view-terminal" type="button">Term</button>
+    </div>
     <button id="refresh" type="button" class="icon" title="refresh" aria-label="refresh">↻</button>
   </div>
   <div id="status" class="status" role="status" aria-live="polite">connecting…</div>
-  <div id="view-switch" class="view-switch" role="group" aria-label="view mode" hidden>
-    <button id="view-chat" type="button">Chat</button>
-    <button id="view-terminal" type="button">Terminal</button>
-  </div>
 </header>
 
 <main id="main">
@@ -37,16 +38,6 @@
   </section>
 
   <section id="chat" class="chat" hidden>
-    <div class="chat-heading">
-      <div class="chat-identity">
-        <span class="presence" aria-hidden="true"></span>
-        <span>
-          <strong id="chat-title">Agent session</strong>
-          <small id="chat-subtitle">Live transcript</small>
-        </span>
-      </div>
-      <span class="live-badge">Live</span>
-    </div>
     <div id="chat-list" class="chat-list" role="log" aria-live="polite"></div>
     <div class="chat-foot">
       <span id="chat-state" class="muted"></span>
@@ -64,20 +55,23 @@
 </main>
 
 <footer id="composer" class="composer" hidden>
-  <div class="keys" id="keys" aria-label="quick keys">
-    <button type="button" data-key="Enter">Enter</button>
-    <button type="button" data-key="Escape">Esc</button>
-    <button type="button" data-key="y">y</button>
-    <button type="button" data-key="n">n</button>
-    <button type="button" data-key="1">1</button>
-    <button type="button" data-key="2">2</button>
-    <button type="button" data-key="3">3</button>
-    <button type="button" data-key="Up">↑</button>
-    <button type="button" data-key="Down">↓</button>
-    <button type="button" data-key="Tab">Tab</button>
-    <button type="button" data-key="Backspace">⌫</button>
-    <button type="button" data-key="C-c" class="danger">^C</button>
-  </div>
+  <details id="keys" class="keys-panel">
+    <summary>Quick keys</summary>
+    <div class="keys-row" aria-label="quick keys">
+      <button type="button" data-key="Enter">Enter</button>
+      <button type="button" data-key="Escape">Esc</button>
+      <button type="button" data-key="y">y</button>
+      <button type="button" data-key="n">n</button>
+      <button type="button" data-key="1">1</button>
+      <button type="button" data-key="2">2</button>
+      <button type="button" data-key="3">3</button>
+      <button type="button" data-key="Up">↑</button>
+      <button type="button" data-key="Down">↓</button>
+      <button type="button" data-key="Tab">Tab</button>
+      <button type="button" data-key="Backspace">⌫</button>
+      <button type="button" data-key="C-c" class="danger">^C</button>
+    </div>
+  </details>
   <form id="send-form" class="send-form">
     <textarea id="text" rows="2" placeholder="메시지…" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
     <button id="send" type="submit">보내기</button>

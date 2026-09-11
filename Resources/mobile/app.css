@@ -63,13 +63,13 @@ body {
   position: sticky;
   top: 0;
   z-index: 2;
-  padding: calc(var(--safe-top) + 8px) 12px 6px;
+  padding: calc(var(--safe-top) + 4px) 12px 4px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
 }
 
 body.chat-mode .bar {
-  padding-bottom: 9px;
+  padding-bottom: 4px;
   border-color: var(--line-soft);
   box-shadow: 0 1px 0 rgba(0,0,0,0.02);
 }
@@ -77,12 +77,12 @@ body.chat-mode .bar {
 body.chat-mode .brand { display: none; }
 body.chat-mode .target-label { gap: 0; }
 body.chat-mode select { border: 0; background: transparent; padding-left: 0; font-weight: 650; }
-body.chat-mode .status { display: none; }
 
 .bar-row {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-height: 44px;
 }
 
 .target-label {
@@ -102,7 +102,8 @@ select {
   flex: 1;
   min-width: 0;
   font: inherit;
-  padding: 6px 8px;
+  min-height: 44px;
+  padding: 4px 8px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--bg);
@@ -123,27 +124,45 @@ button:active { opacity: 0.6; }
 button:disabled { opacity: 0.4; }
 
 button.icon {
-  width: 40px;
+  width: 44px;
+  min-height: 44px;
   padding: 6px 0;
   font-size: 18px;
 }
 
 .status {
-  margin-top: 4px;
-  font-size: 12px;
-  color: var(--muted);
-  white-space: nowrap;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
   overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.status.error {
+  position: static;
+  width: auto;
+  height: auto;
+  margin: 3px 44px 0 2px;
+  padding: 2px 0;
+  overflow: hidden;
+  clip: auto;
+  color: var(--danger);
+  font-size: 12px;
+  white-space: nowrap;
   text-overflow: ellipsis;
 }
 
-.status.error { color: var(--danger); }
-
+/* In the bar row, not under it: the switch used to own a second line, and
+   with the session heading gone too the whole header is one row. */
 .view-switch {
   display: grid;
   grid-template-columns: 1fr 1fr;
+  flex: 0 0 auto;
   gap: 2px;
-  margin-top: 7px;
+  margin: 0;
   padding: 2px;
   border: 1px solid var(--line);
   border-radius: 9px;
@@ -151,18 +170,15 @@ button.icon {
 }
 
 body.chat-mode .view-switch {
-  width: fit-content;
-  min-width: 176px;
-  margin: 8px auto 0;
   border-color: transparent;
   background: var(--panel-2);
 }
 
 .view-switch button {
-  min-height: 32px;
+  min-height: 44px;
   border: 0;
   border-radius: 7px;
-  padding: 4px 12px;
+  padding: 4px 11px;
   color: var(--muted);
   background: transparent;
   font-size: 13px;
@@ -176,6 +192,13 @@ body.chat-mode .view-switch {
 }
 
 .view-switch button:disabled { opacity: 0.4; }
+
+/* Below ~360px the row runs out of room and the target select is what gives:
+   at 320 it clipped to "builder · ch". The switch keeps both labels but stops
+   padding them. */
+@media (max-width: 360px) {
+  .view-switch button { padding: 4px 7px; font-size: 0.75rem; }
+}
 
 #main {
   flex: 1;
@@ -236,30 +259,91 @@ body.chat-mode .view-switch {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
+/* Aurora — the chat view's own palette, scoped to `body.chat-mode` so the
+   terminal mirror keeps the system blue it shares with the rest of the app. */
+body.chat-mode {
+  --accent: #7c5cff;
+  --accent-soft: rgba(124, 92, 255, 0.14);
+  --chat-canvas: #f8f6ff;
+  /* A step darker than the shared --muted. Secondary text sits on the wash,
+     and at the strength below the default grey measured 3.7:1 against it. */
+  --muted: #5c5c66;
+}
+
+@media (prefers-color-scheme: dark) {
+  body.chat-mode {
+    --accent: #9d7bff;
+    --accent-soft: rgba(157, 123, 255, 0.22);
+    --chat-canvas: #14111f;
+    --panel: #1b1826;
+    --panel-2: #241f33;
+    --line: #332c47;
+    --muted: #a6a6ad;
+  }
+}
+
+/* The wash goes on `.chat`, never on `.chat-list`: the list is the scroller,
+   so a gradient painted there rides up with the transcript and the colour is
+   gone after one swipe. On the parent it stays pinned to the top of the view. */
 .chat {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--chat-canvas);
+  background-color: var(--chat-canvas);
+  /* Three blooms rather than one top-down fade: a single direction reads flat
+     because nothing ever meets. Violet from the top left, pink from the top
+     right, and a faint indigo rising from the composer — the overlaps are what
+     give the canvas its depth. */
+  background-image:
+    radial-gradient(72% 40% at 10% 0%, rgba(124, 92, 255, 0.48), transparent 72%),
+    radial-gradient(62% 34% at 94% 4%, rgba(236, 72, 153, 0.32), transparent 70%),
+    radial-gradient(95% 45% at 50% 100%, rgba(79, 70, 229, 0.16), transparent 76%);
 }
 
-.chat-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 13px 16px 11px;
-  border-bottom: 1px solid var(--line-soft);
-  background: var(--chat-canvas);
+@media (prefers-color-scheme: dark) {
+  .chat {
+    background-image:
+      radial-gradient(72% 40% at 10% 0%, rgba(157, 123, 255, 0.52), transparent 72%),
+      radial-gradient(62% 34% at 94% 4%, rgba(236, 72, 153, 0.34), transparent 70%),
+      radial-gradient(95% 45% at 50% 100%, rgba(99, 102, 241, 0.22), transparent 76%);
+  }
 }
 
-.chat-identity { display: flex; align-items: center; gap: 9px; min-width: 0; }
-.chat-identity > span:last-child { display: flex; flex-direction: column; min-width: 0; }
-.chat-identity strong { font-size: 0.875rem; line-height: 1.25; letter-spacing: -0.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chat-identity small { color: var(--muted); font-size: 0.6875rem; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* `said` and `said.leader` have to stay told apart, and the old pairing put
+   both on the same violet. The person keeps violet→indigo; the leader moves to
+   pink→violet. Both stops are darker than the hues they were picked from: at
+   #f472b6 the white label sat at 2.65:1, well under readable. */
+body.chat-mode .msg.said {
+  background-image: linear-gradient(135deg, #7c3aed, #4f46e5);
+  box-shadow: 0 2px 10px rgba(124, 92, 255, 0.24);
+}
+body.chat-mode .msg.said.leader { background-image: linear-gradient(135deg, #db2777, #9333ea); }
+body.chat-mode .msg.answered .msg-role { color: #6d3ff0; }
+
+@media (prefers-color-scheme: dark) {
+  body.chat-mode .msg.answered .msg-role { color: #b9a0ff; }
+}
+
+/* The send button takes the accent as a fill, and the dark accent is light
+   enough that white on it fell to 3.13:1. Dark type on the light fill is the
+   way round that reads. */
+body.chat-mode #send {
+  background-image: linear-gradient(135deg, #7c3aed, #5b4bd6);
+  color: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  body.chat-mode #send {
+    background-image: linear-gradient(135deg, #b9a0ff, #9d7bff);
+    color: #17122a;
+  }
+}
+
+/* The live dot is all that survives of the session heading strip: the name it
+   announced is the target select right beside it, and the working directory
+   moved to the foot line. */
 .presence { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: #30d158; box-shadow: 0 0 0 4px rgba(48,209,88,0.12); }
-.live-badge { color: var(--muted); font-size: 0.625rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
 
 .chat-list {
   flex: 1;
@@ -298,6 +382,77 @@ body.chat-mode .view-switch {
 .msg-role { font-size: 0.6875rem; font-weight: 700; letter-spacing: 0.02em; opacity: 0.72; }
 .msg-content { min-width: 0; }
 .msg.thought { align-self: flex-start; color: var(--muted); font-style: italic; font-size: 0.8125rem; padding: 4px 6px; }
+
+/* Markdown in agent answers. `renderMarkdown` in app.js builds every node
+   below by hand, so this is the complete vocabulary it can emit — the
+   container drops the `.msg` pre-wrap because block spacing now comes from
+   the gap, while paragraphs and list items keep it so a hard-wrapped answer
+   still breaks where the agent wrote it. */
+.msg-content.md { display: flex; flex-direction: column; gap: 9px; white-space: normal; }
+.md-p { margin: 0; white-space: pre-wrap; }
+.md-h { font-weight: 700; line-height: 1.3; }
+.md-h1 { font-size: 1.0625rem; }
+.md-h2 { font-size: 1rem; }
+.md-h3 { font-size: 0.9375rem; }
+.md-h4 { font-size: 0.875rem; color: var(--muted); }
+.md-list { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 5px; }
+.md-list li { white-space: pre-wrap; }
+.md-list li::marker { color: var(--muted); }
+.md-indent-1 { margin-left: 14px; }
+.md-indent-2 { margin-left: 28px; }
+.md-indent-3 { margin-left: 42px; }
+.md-quote { margin: 0; padding: 2px 0 2px 11px; border-left: 3px solid var(--line); color: var(--muted); }
+.md-rule { margin: 1px 0; border: 0; border-top: 1px solid var(--line); }
+.md-link { color: var(--accent); }
+
+.md-code-inline {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8125em;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--panel-2);
+  word-break: break-word;
+}
+
+/* Code and tables are the two blocks allowed to be wider than the column;
+   each scrolls inside its own box so the page itself never does. */
+.md-code {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--screen-bg);
+  color: var(--screen-fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  white-space: pre;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.md-table-wrap { max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+/* `width: max-content` is what makes the wrapper scroll instead of the table
+   folding: left to `auto`, the table squeezes itself into the column and the
+   inherited `word-break: break-word` then splits cells mid-word ("runnin g
+   우선"). Cells cap at 15rem so one long path widens its own column rather
+   than the whole table. */
+.md-table {
+  width: max-content;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+.md-table th, .md-table td {
+  max-width: 15rem;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+.md-table th { background: var(--panel-2); font-weight: 650; white-space: nowrap; }
+
 .msg.notice { align-self: center; color: var(--muted); font-size: 0.75rem; padding: 3px 8px; }
 .msg.turn { align-self: center; color: var(--muted); font-size: 0.6875rem; padding: 1px 8px; font-variant-numeric: tabular-nums; }
 .msg.turn.failed { color: var(--danger); }
@@ -334,9 +489,13 @@ body.chat-mode .view-switch {
 .tool .tool-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem; font-weight: 650; }
 .tool .tool-head { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tool-state { color: var(--muted); font-size: 0.6875rem; font-weight: 600; }
-.tool.running .tool-state { color: var(--accent); }
-.tool.failed .tool-name { color: var(--danger); }
-.tool.failed .tool-state { color: var(--danger); }
+/* `> summary` and not a descendant match: a bundle nests its tool rows, and a
+   descendant selector paints every child's name and state with the bundle's
+   own running/failed colour — a finished command inside a failed Activity came
+   out red while its own label still said Done. */
+.tool.running > summary .tool-state { color: var(--accent); }
+.tool.failed > summary .tool-name { color: var(--danger); }
+.tool.failed > summary .tool-state { color: var(--danger); }
 .tool .tool-change { grid-column: 1 / -1; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.6875rem; margin-top: 2px; }
 .tool .tool-change .add { color: #23d18b; }
 .tool .tool-change .del { color: var(--danger); }
@@ -366,7 +525,8 @@ body.chat-mode .view-switch {
   font-size: 0.75rem;
 }
 
-.chat-foot button.danger { color: var(--danger); padding: 4px 10px; font-size: 12px; }
+.chat-foot #chat-state { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-foot button.danger { flex: 0 0 auto; color: var(--danger); padding: 4px 10px; font-size: 12px; }
 
 .requests {
   border-top: 1px solid var(--line);
@@ -436,23 +596,52 @@ body.chat-mode textarea {
 body.chat-mode #send { min-height: 46px; border-radius: 12px; padding-inline: 15px; }
 body.chat-mode .send-status { margin-left: 2px; }
 
-.keys {
+.keys-panel {
+  margin: 0 0 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.keys-panel > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 44px;
+  padding: 0 12px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  user-select: none;
+}
+
+.keys-panel > summary::-webkit-details-marker { display: none; }
+.keys-panel > summary::after { content: "+"; color: var(--muted); font-size: 18px; font-weight: 400; }
+.keys-panel[open] > summary { color: var(--fg); border-bottom: 1px solid var(--line-soft); }
+.keys-panel[open] > summary::after { content: "−"; }
+.keys-panel > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.keys-row {
   display: flex;
   gap: 6px;
   overflow-x: auto;
-  padding-bottom: 8px;
+  padding: 4px 8px 8px;
   -webkit-overflow-scrolling: touch;
 }
 
-.keys button {
+.keys-row button {
   flex: 0 0 auto;
   min-width: 44px;
+  min-height: 44px;
   padding: 6px 10px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
 }
 
-.keys button.danger { color: var(--danger); }
+.keys-row button.danger { color: var(--danger); }
 
 .send-form {
   display: flex;
@@ -495,5 +684,4 @@ textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-c
 
 @media (min-width: 700px) {
   body.chat-mode .bar-row { max-width: 46rem; margin-inline: auto; }
-  body.chat-mode .view-switch { margin-top: 7px; }
 }

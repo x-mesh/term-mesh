@@ -1649,7 +1649,13 @@ async fn text_handler(
                     "terminal input is disabled with keys=none",
                 ));
             }
-            if chat_mode && !entry.chat_capable {
+            // Same capability answer the page was given by `target_json` and
+            // that `transcript_handler` reads by: a pane exposed with `/rc on`
+            // carries `chat_capable: false` on the record, and only the
+            // resolved session says the CLI is there. Reading the raw field
+            // here let the page show a Chat tab and a live transcript it could
+            // not send a turn into.
+            if chat_mode && !state.chat_capable(&entry) {
                 return Err(ApiError::conflict(
                     "chat_unavailable",
                     "this terminal has no supported CLI session",
@@ -1825,7 +1831,13 @@ async fn interrupt_handler(
     axum::Extension(caller): axum::Extension<Caller>,
 ) -> ApiResult {
     let entry = live_entry(&state, &surface_id).await?;
-    if !entry.chat_capable {
+    // Same capability answer `/api/targets` and `/text` already use: a
+    // terminal-backed pane running a hand-started CLI carries
+    // `chat_capable: false` on the raw record, and only the resolved session
+    // knows better. Reading the raw field here left the page's Interrupt
+    // button, which `/api/targets` had just told it to show, come back
+    // `not_an_agent` on every terminal-backed chat.
+    if !state.chat_capable(&entry) {
         return Err(ApiError::conflict(
             "not_an_agent",
             "interrupt exists only for native agent targets; send the C-c key instead",

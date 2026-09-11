@@ -37,8 +37,7 @@
     requestsCount: $('requests-count'),
     requestsList: $('requests-list'),
     chat: $('chat'),
-    chatTitle: $('chat-title'),
-    chatSubtitle: $('chat-subtitle'),
+    presence: $('presence'),
     chatList: $('chat-list'),
     chatState: $('chat-state'),
     interrupt: $('interrupt'),
@@ -61,6 +60,7 @@
     rowKeys: [],         // per-row render keys for incremental redraws
     rowNodes: [],
     chatNodes: {},       // entry id → {node, key} for the agent chat view
+    toolNodes: {},       // tool entry id → {node, key}; shared across Activity bundles
     chatRunning: false,
     mode: 'terminal',
   };
@@ -297,10 +297,12 @@
     el.viewTerminal.setAttribute('aria-pressed', String(!agent));
     document.body.classList.toggle('chat-mode', agent);
     el.interrupt.hidden = !agent || !state.chatRunning || paneReadOnly;
+    // The session identity used to sit in a heading strip of its own; it is
+    // the target select plus this dot now, so the bar is the only chrome above
+    // the transcript.
+    el.presence.hidden = !agent;
     if (agent) {
       var chatName = t.agent_name || t.agent_cli || 'agent';
-      el.chatTitle.textContent = chatName.charAt(0).toUpperCase() + chatName.slice(1) + ' session';
-      el.chatSubtitle.textContent = t.cwd ? compactPath(t.cwd) : 'Live transcript';
       setStatus('chat · ' + chatName + (t.team_name ? ' @ ' + t.team_name : ''));
       el.text.placeholder = chatName + '에게 보낼 턴…';
       if (paneReadOnly) { setStatus('chat transcript · read only (keys=none)'); }
@@ -328,13 +330,118 @@
   function resetChat() {
     el.chatList.textContent = '';
     state.chatNodes = {};
+    state.toolNodes = {};
     state.chatRunning = false;
     el.chatState.textContent = '';
     el.interrupt.hidden = true;
   }
 
+  // Folds runs of 2+ consecutive `tool` entries into one `activity` bundle,
+  // bounded by `turn_ended`. The turn's duration is shown on the bundle only
+  // when that turn produced exactly one: a `said`/`answered`/`thought` in the
+  // middle splits the run, and two bundles each labelled with the whole turn's
+  // time read as if they summed to it. A lone tool entry is left unwrapped —
+  // it already reads fine on its own, and wrapping it would add a second
+  // disclosure layer.
+  function groupChatEntries(entries) {
+    var items = [];
+    var pending = null;
+    var openGroups = [];
+    function flushPending() {
+      if (!pending) { return; }
+      if (pending.tools.length === 1) {
+        items.push(pending.tools[0]);
+      } else {
+        items.push(pending);
+        openGroups.push(pending);
+      }
+      pending = null;
+    }
+    entries.forEach(function (e) {
+      if (e.kind === 'tool') {
+        if (!pending) { pending = { kind: 'activity', id: 'activity:' + e.id, tools: [] }; }
+        pending.tools.push(e);
+        return;
+      }
+      flushPending();
+      if (e.kind === 'turn_ended') {
+        if (openGroups.length === 1) { openGroups[0].turnEnd = e; }
+        openGroups = [];
+      }
+      items.push(e);
+    });
+    flushPending();
+    return items;
+  }
+
+  function buildActivity(group) {
+    var tools = group.tools;
+    var running = tools.some(function (t) { return t.running; });
+    var failedTool = null;
+    var failedCount = 0;
+    for (var i = 0; i < tools.length; i++) {
+      if (tools[i].failed) {
+        failedCount += 1;
+        if (!failedTool) { failedTool = tools[i]; }
+      }
+    }
+    var failed = !!failedTool;
+    var node = document.createElement('details');
+    node.className = 'tool activity' + (running ? ' running' : '') + (failed ? ' failed' : '');
+    var summary = document.createElement('summary');
+    var marker = document.createElement('span'); marker.className = 'tool-marker'; marker.setAttribute('aria-hidden', 'true');
+    var body = document.createElement('span'); body.className = 'tool-summary-body';
+    var name = document.createElement('span'); name.className = 'tool-name'; name.textContent = 'Activity';
+    var head = document.createElement('span'); head.className = 'tool-head';
+    var count = tools.length;
+    var bits = [count + ' command' + (count === 1 ? '' : 's')];
+    if (group.turnEnd && group.turnEnd.duration) { bits.push(Math.round(group.turnEnd.duration) + 's'); }
+    head.textContent = bits.join(' · ');
+    var stateLabel = document.createElement('span'); stateLabel.className = 'tool-state';
+    // An agent usually keeps working after a command fails, so a bundle can be
+    // running and failed at once; "Failed" alone would read as finished.
+    if (running) {
+      stateLabel.textContent = failedCount ? 'Running · ' + failedCount + ' failed' : 'Running';
+    } else {
+      stateLabel.textContent = failedCount > 1 ? failedCount + ' failed' : (failed ? 'Failed' : 'Done');
+    }
+    body.appendChild(name); body.appendChild(head);
+    summary.appendChild(marker); summary.appendChild(body); summary.appendChild(stateLabel);
+    if (failed) {
+      var errText = (failedTool.headline || '').replace(/\s+/g, ' ').trim();
+      var err = document.createElement('span'); err.className = 'tool-change';
+      err.textContent = errText
+        ? toolLabel(failedTool.name) + ' failed: ' + errText.slice(0, 80)
+        : toolLabel(failedTool.name) + ' failed';
+      body.appendChild(err);
+    }
+    node.appendChild(summary);
+    var list = document.createElement('div');
+    list.style.borderTop = '1px solid var(--line-soft)';
+    list.style.padding = '8px';
+    list.style.display = 'flex';
+    list.style.flexDirection = 'column';
+    list.style.gap = '6px';
+    tools.forEach(function (t) {
+      var cached = state.toolNodes[t.id];
+      var key = JSON.stringify(t);
+      var toolNode;
+      if (cached && cached.key === key) {
+        toolNode = cached.node;
+      } else {
+        toolNode = buildEntry(t);
+        if (cached && cached.node.open) { toolNode.open = true; }
+      }
+      state.toolNodes[t.id] = { node: toolNode, key: key };
+      list.appendChild(toolNode);
+    });
+    node.appendChild(list);
+    return node;
+  }
+
   function buildEntry(e) {
     var node;
+    if (e.kind === 'activity') { return buildActivity(e); }
     if (e.kind === 'tool') {
       node = document.createElement('details');
       node.className = 'tool' + (e.running ? ' running' : '') + (e.failed ? ' failed' : '');
@@ -374,7 +481,7 @@
       node.className = 'msg said' + (e.speaker === 'leader' ? ' leader' : '');
       appendMessage(node, e.speaker === 'leader' ? 'Leader' : 'You', e.text || '');
     } else if (e.kind === 'answered') {
-      node.className = 'msg answered'; appendMessage(node, 'Agent', e.text || '');
+      node.className = 'msg answered'; appendMessage(node, 'Agent', e.text || '', true);
     } else if (e.kind === 'thought') {
       node.className = 'msg thought'; node.textContent = (e.text || '').slice(0, 400);
     } else if (e.kind === 'turn_ended') {
@@ -390,10 +497,240 @@
     return node;
   }
 
-  function appendMessage(node, label, text) {
+  function appendMessage(node, label, text, markdown) {
     var role = document.createElement('span'); role.className = 'msg-role'; role.textContent = label;
-    var content = document.createElement('span'); content.className = 'msg-content'; content.textContent = text;
+    var content = document.createElement('span'); content.className = 'msg-content';
+    if (markdown) {
+      content.className += ' md';
+      renderMarkdown(content, text || '');
+    } else {
+      content.textContent = text;
+    }
     node.appendChild(role); node.appendChild(content);
+  }
+
+  // ── markdown ─────────────────────────────────────────────────────────
+  //
+  // Agent answers are written in markdown, and a phone showed them raw:
+  // pipe-fenced tables and ``` blocks as literal characters. The page's CSP
+  // is `default-src 'none'` with no inline anything, so a parser library is
+  // out — and innerHTML is out regardless, since this text is model output.
+  // Every node below is created and filled through textContent, which makes
+  // markup impossible by construction. Anything the grammar does not
+  // recognise stays literal text, so an unsupported construct degrades to
+  // what the page showed before rather than disappearing.
+
+  var MD_FENCE = /^\s*```(\S*)\s*$/;
+  var MD_FENCE_END = /^\s*```\s*$/;
+  var MD_HEADING = /^(#{1,6})\s+(.*)$/;
+  var MD_RULE = /^\s*(?:-{3,}|_{3,}|\*{3,})\s*$/;
+  var MD_QUOTE = /^\s*>\s?(.*)$/;
+  var MD_ITEM = /^(\s*)(?:([-*+])|(\d{1,9})[.)])\s+(.*)$/;
+  // One alternation per inline form. Code comes first: its body must stay
+  // literal, so nothing inside a span may be re-scanned for emphasis.
+  var MD_INLINE = /`([^`]+)`|\*\*([\s\S]+?)\*\*|__([\s\S]+?)__|\*([^*\n]+)\*|_([^_\n]+)_|~~([\s\S]+?)~~|\[([^\]\n]+)\]\(([^()\s]+)\)/;
+
+  function isTableRow(line) { return /^\s*\|.*\|\s*$/.test(line); }
+  function isTableDelimiter(line) { return /^\s*\|(?:\s*:?-+:?\s*\|)+\s*$/.test(line); }
+
+  function splitRow(line) {
+    return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(function (cell) {
+      return cell.trim();
+    });
+  }
+
+  function columnAlign(line) {
+    return splitRow(line).map(function (cell) {
+      var left = cell.charAt(0) === ':';
+      var right = cell.charAt(cell.length - 1) === ':';
+      if (left && right) { return 'center'; }
+      if (right) { return 'right'; }
+      return '';
+    });
+  }
+
+  function buildLink(label, href) {
+    // Only the two schemes the listener itself speaks; anything else keeps
+    // its target visible as text instead of becoming a clickable unknown.
+    if (!/^https?:\/\//i.test(href)) {
+      var plain = document.createElement('span');
+      plain.textContent = label + ' (' + href + ')';
+      return plain;
+    }
+    var a = document.createElement('a');
+    a.className = 'md-link';
+    a.href = href;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = label;
+    return a;
+  }
+
+  function renderInline(parent, text) {
+    var rest = String(text);
+    while (rest) {
+      var m = MD_INLINE.exec(rest);
+      if (!m) { parent.appendChild(document.createTextNode(rest)); return; }
+      if (m.index) { parent.appendChild(document.createTextNode(rest.slice(0, m.index))); }
+      if (m[1] !== undefined) {
+        var code = document.createElement('code');
+        code.className = 'md-code-inline';
+        code.textContent = m[1];
+        parent.appendChild(code);
+      } else if (m[2] !== undefined || m[3] !== undefined) {
+        var strong = document.createElement('strong');
+        renderInline(strong, m[2] !== undefined ? m[2] : m[3]);
+        parent.appendChild(strong);
+      } else if (m[4] !== undefined || m[5] !== undefined) {
+        var em = document.createElement('em');
+        renderInline(em, m[4] !== undefined ? m[4] : m[5]);
+        parent.appendChild(em);
+      } else if (m[6] !== undefined) {
+        var del = document.createElement('del');
+        renderInline(del, m[6]);
+        parent.appendChild(del);
+      } else {
+        parent.appendChild(buildLink(m[7], m[8]));
+      }
+      rest = rest.slice(m.index + m[0].length);
+    }
+  }
+
+  function buildTable(rows, align) {
+    // The wrapper is what scrolls: a wide table must never widen the page.
+    var wrap = document.createElement('div');
+    wrap.className = 'md-table-wrap';
+    var table = document.createElement('table');
+    table.className = 'md-table';
+    var head = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    rows[0].forEach(function (cell, i) {
+      var th = document.createElement('th');
+      if (align[i]) { th.style.textAlign = align[i]; }
+      renderInline(th, cell);
+      headRow.appendChild(th);
+    });
+    head.appendChild(headRow);
+    table.appendChild(head);
+    var body = document.createElement('tbody');
+    rows.slice(1).forEach(function (cells) {
+      var tr = document.createElement('tr');
+      for (var i = 0; i < rows[0].length; i++) {
+        var td = document.createElement('td');
+        if (align[i]) { td.style.textAlign = align[i]; }
+        renderInline(td, cells[i] || '');
+        tr.appendChild(td);
+      }
+      body.appendChild(tr);
+    });
+    table.appendChild(body);
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function startsBlock(line, next) {
+    return MD_FENCE.test(line) || MD_HEADING.test(line) || MD_RULE.test(line)
+      || MD_QUOTE.test(line) || MD_ITEM.test(line)
+      || (isTableRow(line) && isTableDelimiter(next || ''));
+  }
+
+  function renderMarkdown(parent, text) {
+    var lines = String(text).replace(/\r\n?/g, '\n').split('\n');
+    var i = 0;
+    while (i < lines.length) {
+      var line = lines[i];
+      if (!line.trim()) { i++; continue; }
+
+      var fence = MD_FENCE.exec(line);
+      if (fence) {
+        var body = [];
+        i++;
+        while (i < lines.length && !MD_FENCE_END.test(lines[i])) { body.push(lines[i]); i++; }
+        i++;
+        var pre = document.createElement('pre');
+        pre.className = 'md-code';
+        if (fence[1]) { pre.setAttribute('data-lang', fence[1]); }
+        pre.textContent = body.join('\n');
+        parent.appendChild(pre);
+        continue;
+      }
+
+      if (isTableRow(line) && isTableDelimiter(lines[i + 1] || '')) {
+        var align = columnAlign(lines[i + 1]);
+        var rows = [splitRow(line)];
+        i += 2;
+        while (i < lines.length && isTableRow(lines[i])) { rows.push(splitRow(lines[i])); i++; }
+        parent.appendChild(buildTable(rows, align));
+        continue;
+      }
+
+      var heading = MD_HEADING.exec(line);
+      if (heading) {
+        var h = document.createElement('div');
+        h.className = 'md-h md-h' + Math.min(heading[1].length, 4);
+        renderInline(h, heading[2]);
+        parent.appendChild(h);
+        i++;
+        continue;
+      }
+
+      if (MD_RULE.test(line)) {
+        var rule = document.createElement('hr');
+        rule.className = 'md-rule';
+        parent.appendChild(rule);
+        i++;
+        continue;
+      }
+
+      if (MD_QUOTE.test(line)) {
+        var quoted = [];
+        while (i < lines.length && MD_QUOTE.test(lines[i])) {
+          quoted.push(MD_QUOTE.exec(lines[i])[1]);
+          i++;
+        }
+        var quote = document.createElement('blockquote');
+        quote.className = 'md-quote';
+        renderMarkdown(quote, quoted.join('\n'));
+        parent.appendChild(quote);
+        continue;
+      }
+
+      if (MD_ITEM.test(line)) {
+        var ordered = !!MD_ITEM.exec(line)[3];
+        var items = [];
+        while (i < lines.length && MD_ITEM.test(lines[i])) {
+          var item = MD_ITEM.exec(lines[i]);
+          items.push({ depth: Math.min(Math.floor(item[1].length / 2), 3), text: item[4] });
+          i++;
+          // A wrapped item continues on indented lines that start no block.
+          while (i < lines.length && lines[i].trim() && /^\s{2,}/.test(lines[i])
+                 && !startsBlock(lines[i], lines[i + 1])) {
+            items[items.length - 1].text += ' ' + lines[i].trim();
+            i++;
+          }
+        }
+        var list = document.createElement(ordered ? 'ol' : 'ul');
+        list.className = 'md-list';
+        items.forEach(function (entry) {
+          var li = document.createElement('li');
+          if (entry.depth) { li.className = 'md-indent-' + entry.depth; }
+          renderInline(li, entry.text);
+          list.appendChild(li);
+        });
+        parent.appendChild(list);
+        continue;
+      }
+
+      var paragraph = [];
+      while (i < lines.length && lines[i].trim() && !startsBlock(lines[i], lines[i + 1])) {
+        paragraph.push(lines[i]);
+        i++;
+      }
+      var p = document.createElement('p');
+      p.className = 'md-p';
+      renderInline(p, paragraph.join('\n'));
+      parent.appendChild(p);
+    }
   }
 
   function toolLabel(name) {
@@ -423,14 +760,17 @@
   // so each entry is re-rendered only when its serialized form changes.
   function renderChat(data) {
     var entries = (data && data.entries) || [];
+    var items = groupChatEntries(entries);
     var stick = isAtBottom(el.chatList);
     var seen = {};
+    var seenTools = {};
     var prev = null;
-    el.chatList.classList.toggle('empty', entries.length === 0);
-    el.chatList.setAttribute('data-empty', entries.length ? '' : 'No conversation yet');
-    entries.forEach(function (e) {
+    el.chatList.classList.toggle('empty', items.length === 0);
+    el.chatList.setAttribute('data-empty', items.length ? '' : 'No conversation yet');
+    items.forEach(function (e) {
       var id = e.id || (e.kind + ':' + (e.text || e.headline || ''));
       seen[id] = true;
+      if (e.kind === 'activity') { e.tools.forEach(function (t) { seenTools[t.id] = true; }); }
       var key = JSON.stringify(e);
       var cached = state.chatNodes[id];
       var node;
@@ -457,14 +797,18 @@
         delete state.chatNodes[id];
       }
     });
+    Object.keys(state.toolNodes).forEach(function (id) {
+      if (!seenTools[id]) { delete state.toolNodes[id]; }
+    });
     // `running` means the agent process is alive between turns; a turn in
     // progress is `in_flight` (or `thinking` while it reasons).
     state.chatRunning = !!(data && (data.in_flight || data.thinking));
     el.interrupt.hidden = !state.chatRunning || isPaneReadOnly(state.selected);
     var alive = !!(data && data.running);
-    el.chatState.textContent = state.chatRunning
+    var where = state.selected && state.selected.cwd ? ' · ' + compactPath(state.selected.cwd) : '';
+    el.chatState.textContent = (state.chatRunning
       ? (data.thinking ? '생각 중…' : '작업 중…') + (data.summary ? ' · ' + data.summary : '')
-      : (alive ? '대기 중' : '중지됨') + (data && data.summary ? ' · ' + data.summary : '');
+      : (alive ? '대기 중' : '중지됨') + (data && data.summary ? ' · ' + data.summary : '')) + where;
     if (stick) { el.chatList.scrollTop = el.chatList.scrollHeight; }
   }
 
