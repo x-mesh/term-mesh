@@ -259,12 +259,69 @@ body.chat-mode .view-switch {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
+/* Aurora — the chat view's own palette, scoped to `body.chat-mode` so the
+   terminal mirror keeps the system blue it shares with the rest of the app. */
+body.chat-mode {
+  --accent: #7c5cff;
+  --accent-soft: rgba(124, 92, 255, 0.14);
+  --chat-canvas: #f8f6ff;
+}
+
+@media (prefers-color-scheme: dark) {
+  body.chat-mode {
+    --accent: #9d7bff;
+    --accent-soft: rgba(157, 123, 255, 0.22);
+    --chat-canvas: #14111f;
+    --panel: #1b1826;
+    --panel-2: #241f33;
+    --line: #332c47;
+  }
+}
+
+/* The wash goes on `.chat`, never on `.chat-list`: the list is the scroller,
+   so a gradient painted there rides up with the transcript and the colour is
+   gone after one swipe. On the parent it stays pinned to the top of the view. */
 .chat {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--chat-canvas);
+  background-color: var(--chat-canvas);
+  background-image: linear-gradient(180deg, rgba(124, 92, 255, 0.11), rgba(124, 92, 255, 0) 44%);
+}
+
+@media (prefers-color-scheme: dark) {
+  .chat { background-image: linear-gradient(180deg, rgba(157, 123, 255, 0.17), rgba(157, 123, 255, 0) 46%); }
+}
+
+/* `said` and `said.leader` have to stay told apart, and the old pairing put
+   both on the same violet. The person keeps violet→indigo; the leader moves to
+   pink→violet. Both stops are darker than the hues they were picked from: at
+   #f472b6 the white label sat at 2.65:1, well under readable. */
+body.chat-mode .msg.said {
+  background-image: linear-gradient(135deg, #7c3aed, #4f46e5);
+  box-shadow: 0 2px 10px rgba(124, 92, 255, 0.24);
+}
+body.chat-mode .msg.said.leader { background-image: linear-gradient(135deg, #db2777, #9333ea); }
+body.chat-mode .msg.answered .msg-role { color: #6d3ff0; }
+
+@media (prefers-color-scheme: dark) {
+  body.chat-mode .msg.answered .msg-role { color: #b9a0ff; }
+}
+
+/* The send button takes the accent as a fill, and the dark accent is light
+   enough that white on it fell to 3.13:1. Dark type on the light fill is the
+   way round that reads. */
+body.chat-mode #send {
+  background-image: linear-gradient(135deg, #7c3aed, #5b4bd6);
+  color: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  body.chat-mode #send {
+    background-image: linear-gradient(135deg, #b9a0ff, #9d7bff);
+    color: #17122a;
+  }
 }
 
 /* The live dot is all that survives of the session heading strip: the name it
