@@ -1649,7 +1649,13 @@ async fn text_handler(
                     "terminal input is disabled with keys=none",
                 ));
             }
-            if chat_mode && !entry.chat_capable {
+            // Same capability answer the page was given by `target_json` and
+            // that `transcript_handler` reads by: a pane exposed with `/rc on`
+            // carries `chat_capable: false` on the record, and only the
+            // resolved session says the CLI is there. Reading the raw field
+            // here let the page show a Chat tab and a live transcript it could
+            // not send a turn into.
+            if chat_mode && !state.chat_capable(&entry) {
                 return Err(ApiError::conflict(
                     "chat_unavailable",
                     "this terminal has no supported CLI session",
