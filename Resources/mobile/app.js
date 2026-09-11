@@ -61,6 +61,7 @@
     rowKeys: [],         // per-row render keys for incremental redraws
     rowNodes: [],
     chatNodes: {},       // entry id → {node, key} for the agent chat view
+    toolNodes: {},       // tool entry id → {node, key}; shared across Activity bundles
     chatRunning: false,
     mode: 'terminal',
   };
@@ -328,13 +329,107 @@
   function resetChat() {
     el.chatList.textContent = '';
     state.chatNodes = {};
+    state.toolNodes = {};
     state.chatRunning = false;
     el.chatState.textContent = '';
     el.interrupt.hidden = true;
   }
 
+  // Folds runs of 2+ consecutive `tool` entries into one `activity` bundle,
+  // bounded by `turn_ended`: entries between two turn_ended markers (or from
+  // the start/previous marker up to the next one) share that turn's
+  // duration/cost even when a `said`/`answered`/`thought` splits the run into
+  // several bundles. A lone tool entry is left unwrapped — it already reads
+  // fine on its own, and wrapping it would add a second disclosure layer.
+  function groupChatEntries(entries) {
+    var items = [];
+    var pending = null;
+    var openGroups = [];
+    function flushPending() {
+      if (!pending) { return; }
+      if (pending.tools.length === 1) {
+        items.push(pending.tools[0]);
+      } else {
+        items.push(pending);
+        openGroups.push(pending);
+      }
+      pending = null;
+    }
+    entries.forEach(function (e) {
+      if (e.kind === 'tool') {
+        if (!pending) { pending = { kind: 'activity', id: 'activity:' + e.id, tools: [] }; }
+        pending.tools.push(e);
+        return;
+      }
+      flushPending();
+      if (e.kind === 'turn_ended') {
+        openGroups.forEach(function (g) { g.turnEnd = e; });
+        openGroups = [];
+      }
+      items.push(e);
+    });
+    flushPending();
+    return items;
+  }
+
+  function buildActivity(group) {
+    var tools = group.tools;
+    var running = tools.some(function (t) { return t.running; });
+    var failedTool = null;
+    for (var i = 0; i < tools.length; i++) {
+      if (tools[i].failed) { failedTool = tools[i]; break; }
+    }
+    var failed = !!failedTool;
+    var node = document.createElement('details');
+    node.className = 'tool activity' + (running ? ' running' : '') + (failed ? ' failed' : '');
+    var summary = document.createElement('summary');
+    var marker = document.createElement('span'); marker.className = 'tool-marker'; marker.setAttribute('aria-hidden', 'true');
+    var body = document.createElement('span'); body.className = 'tool-summary-body';
+    var name = document.createElement('span'); name.className = 'tool-name'; name.textContent = 'Activity';
+    var head = document.createElement('span'); head.className = 'tool-head';
+    var count = tools.length;
+    var bits = [count + ' command' + (count === 1 ? '' : 's')];
+    if (group.turnEnd && group.turnEnd.duration) { bits.push(Math.round(group.turnEnd.duration) + 's'); }
+    head.textContent = bits.join(' · ');
+    var stateLabel = document.createElement('span'); stateLabel.className = 'tool-state';
+    stateLabel.textContent = failed ? 'Failed' : (running ? 'Running' : 'Done');
+    body.appendChild(name); body.appendChild(head);
+    summary.appendChild(marker); summary.appendChild(body); summary.appendChild(stateLabel);
+    if (failed) {
+      var errText = (failedTool.headline || '').replace(/\s+/g, ' ').trim();
+      var err = document.createElement('span'); err.className = 'tool-change';
+      err.textContent = errText
+        ? toolLabel(failedTool.name) + ' failed: ' + errText.slice(0, 80)
+        : toolLabel(failedTool.name) + ' failed';
+      body.appendChild(err);
+    }
+    node.appendChild(summary);
+    var list = document.createElement('div');
+    list.style.borderTop = '1px solid var(--line-soft)';
+    list.style.padding = '8px';
+    list.style.display = 'flex';
+    list.style.flexDirection = 'column';
+    list.style.gap = '6px';
+    tools.forEach(function (t) {
+      var cached = state.toolNodes[t.id];
+      var key = JSON.stringify(t);
+      var toolNode;
+      if (cached && cached.key === key) {
+        toolNode = cached.node;
+      } else {
+        toolNode = buildEntry(t);
+        if (cached && cached.node.open) { toolNode.open = true; }
+      }
+      state.toolNodes[t.id] = { node: toolNode, key: key };
+      list.appendChild(toolNode);
+    });
+    node.appendChild(list);
+    return node;
+  }
+
   function buildEntry(e) {
     var node;
+    if (e.kind === 'activity') { return buildActivity(e); }
     if (e.kind === 'tool') {
       node = document.createElement('details');
       node.className = 'tool' + (e.running ? ' running' : '') + (e.failed ? ' failed' : '');
@@ -423,14 +518,17 @@
   // so each entry is re-rendered only when its serialized form changes.
   function renderChat(data) {
     var entries = (data && data.entries) || [];
+    var items = groupChatEntries(entries);
     var stick = isAtBottom(el.chatList);
     var seen = {};
+    var seenTools = {};
     var prev = null;
-    el.chatList.classList.toggle('empty', entries.length === 0);
-    el.chatList.setAttribute('data-empty', entries.length ? '' : 'No conversation yet');
-    entries.forEach(function (e) {
+    el.chatList.classList.toggle('empty', items.length === 0);
+    el.chatList.setAttribute('data-empty', items.length ? '' : 'No conversation yet');
+    items.forEach(function (e) {
       var id = e.id || (e.kind + ':' + (e.text || e.headline || ''));
       seen[id] = true;
+      if (e.kind === 'activity') { e.tools.forEach(function (t) { seenTools[t.id] = true; }); }
       var key = JSON.stringify(e);
       var cached = state.chatNodes[id];
       var node;
@@ -456,6 +554,9 @@
         if (gone.parentNode === el.chatList) { el.chatList.removeChild(gone); }
         delete state.chatNodes[id];
       }
+    });
+    Object.keys(state.toolNodes).forEach(function (id) {
+      if (!seenTools[id]) { delete state.toolNodes[id]; }
     });
     // `running` means the agent process is alive between turns; a turn in
     // progress is `in_flight` (or `thinking` while it reasons).
