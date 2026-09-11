@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.241.0] - 2026-09-11
+
+### Added
+
+- Review Board now works for Projects that run on a remote Mac. The viewer keeps the remote Project roster, native agent panes, live task state, and delegation controls after reconnect.
+
+### Changed
+
+- Relay input and output paths now record stage timings. These measurements make remote pane latency visible during diagnosis without changing the relay protocol.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.240.0] - 2026-09-10
 
 ### Changed
