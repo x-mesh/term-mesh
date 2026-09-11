@@ -37,8 +37,7 @@
     requestsCount: $('requests-count'),
     requestsList: $('requests-list'),
     chat: $('chat'),
-    chatTitle: $('chat-title'),
-    chatSubtitle: $('chat-subtitle'),
+    presence: $('presence'),
     chatList: $('chat-list'),
     chatState: $('chat-state'),
     interrupt: $('interrupt'),
@@ -298,10 +297,12 @@
     el.viewTerminal.setAttribute('aria-pressed', String(!agent));
     document.body.classList.toggle('chat-mode', agent);
     el.interrupt.hidden = !agent || !state.chatRunning || paneReadOnly;
+    // The session identity used to sit in a heading strip of its own; it is
+    // the target select plus this dot now, so the bar is the only chrome above
+    // the transcript.
+    el.presence.hidden = !agent;
     if (agent) {
       var chatName = t.agent_name || t.agent_cli || 'agent';
-      el.chatTitle.textContent = chatName.charAt(0).toUpperCase() + chatName.slice(1) + ' session';
-      el.chatSubtitle.textContent = t.cwd ? compactPath(t.cwd) : 'Live transcript';
       setStatus('chat · ' + chatName + (t.team_name ? ' @ ' + t.team_name : ''));
       el.text.placeholder = chatName + '에게 보낼 턴…';
       if (paneReadOnly) { setStatus('chat transcript · read only (keys=none)'); }
@@ -804,9 +805,10 @@
     state.chatRunning = !!(data && (data.in_flight || data.thinking));
     el.interrupt.hidden = !state.chatRunning || isPaneReadOnly(state.selected);
     var alive = !!(data && data.running);
-    el.chatState.textContent = state.chatRunning
+    var where = state.selected && state.selected.cwd ? ' · ' + compactPath(state.selected.cwd) : '';
+    el.chatState.textContent = (state.chatRunning
       ? (data.thinking ? '생각 중…' : '작업 중…') + (data.summary ? ' · ' + data.summary : '')
-      : (alive ? '대기 중' : '중지됨') + (data && data.summary ? ' · ' + data.summary : '');
+      : (alive ? '대기 중' : '중지됨') + (data && data.summary ? ' · ' + data.summary : '')) + where;
     if (stick) { el.chatList.scrollTop = el.chatList.scrollHeight; }
   }
 

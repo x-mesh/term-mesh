@@ -12,17 +12,18 @@
 <body>
 <header class="bar">
   <div class="bar-row">
+    <span id="presence" class="presence" aria-hidden="true" hidden></span>
     <label class="target-label" for="target">
       <span class="brand">term-mesh</span>
       <select id="target" aria-label="target pane"></select>
     </label>
+    <div id="view-switch" class="view-switch" role="group" aria-label="view mode" hidden>
+      <button id="view-chat" type="button">Chat</button>
+      <button id="view-terminal" type="button">Term</button>
+    </div>
     <button id="refresh" type="button" class="icon" title="refresh" aria-label="refresh">↻</button>
   </div>
   <div id="status" class="status" role="status" aria-live="polite">connecting…</div>
-  <div id="view-switch" class="view-switch" role="group" aria-label="view mode" hidden>
-    <button id="view-chat" type="button">Chat</button>
-    <button id="view-terminal" type="button">Terminal</button>
-  </div>
 </header>
 
 <main id="main">
@@ -37,16 +38,6 @@
   </section>
 
   <section id="chat" class="chat" hidden>
-    <div class="chat-heading">
-      <div class="chat-identity">
-        <span class="presence" aria-hidden="true"></span>
-        <span>
-          <strong id="chat-title">Agent session</strong>
-          <small id="chat-subtitle">Live transcript</small>
-        </span>
-      </div>
-      <span class="live-badge">Live</span>
-    </div>
     <div id="chat-list" class="chat-list" role="log" aria-live="polite"></div>
     <div class="chat-foot">
       <span id="chat-state" class="muted"></span>
