@@ -291,11 +291,23 @@ body.chat-mode {
   display: flex;
   flex-direction: column;
   background-color: var(--chat-canvas);
-  background-image: linear-gradient(180deg, rgba(124, 92, 255, 0.30), rgba(124, 92, 255, 0) 54%);
+  /* Three blooms rather than one top-down fade: a single direction reads flat
+     because nothing ever meets. Violet from the top left, pink from the top
+     right, and a faint indigo rising from the composer — the overlaps are what
+     give the canvas its depth. */
+  background-image:
+    radial-gradient(72% 40% at 10% 0%, rgba(124, 92, 255, 0.48), transparent 72%),
+    radial-gradient(62% 34% at 94% 4%, rgba(236, 72, 153, 0.32), transparent 70%),
+    radial-gradient(95% 45% at 50% 100%, rgba(79, 70, 229, 0.16), transparent 76%);
 }
 
 @media (prefers-color-scheme: dark) {
-  .chat { background-image: linear-gradient(180deg, rgba(157, 123, 255, 0.36), rgba(157, 123, 255, 0) 56%); }
+  .chat {
+    background-image:
+      radial-gradient(72% 40% at 10% 0%, rgba(157, 123, 255, 0.52), transparent 72%),
+      radial-gradient(62% 34% at 94% 4%, rgba(236, 72, 153, 0.34), transparent 70%),
+      radial-gradient(95% 45% at 50% 100%, rgba(99, 102, 241, 0.22), transparent 76%);
+  }
 }
 
 /* `said` and `said.leader` have to stay told apart, and the old pairing put
