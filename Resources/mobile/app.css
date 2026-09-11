@@ -77,7 +77,6 @@ body.chat-mode .bar {
 body.chat-mode .brand { display: none; }
 body.chat-mode .target-label { gap: 0; }
 body.chat-mode select { border: 0; background: transparent; padding-left: 0; font-weight: 650; }
-body.chat-mode .status { display: none; }
 
 .bar-row {
   display: flex;
@@ -103,7 +102,7 @@ select {
   flex: 1;
   min-width: 0;
   font: inherit;
-  min-height: 40px;
+  min-height: 44px;
   padding: 4px 8px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -148,10 +147,11 @@ button.icon {
   height: auto;
   margin: 3px 44px 0 2px;
   padding: 2px 0;
-  overflow: visible;
+  overflow: hidden;
   clip: auto;
   color: var(--danger);
   font-size: 12px;
+  white-space: nowrap;
   text-overflow: ellipsis;
 }
 
@@ -175,7 +175,7 @@ body.chat-mode .view-switch {
 }
 
 .view-switch button {
-  min-height: 40px;
+  min-height: 44px;
   border: 0;
   border-radius: 7px;
   padding: 4px 11px;
