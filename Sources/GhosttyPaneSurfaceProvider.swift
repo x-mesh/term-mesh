@@ -541,6 +541,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                 wire.projectRoot = team.gitRepoRoot ?? ""
                 wire.agentNames = team.agents.map(\.name)
                 wire.createdAtUnixSecs = UInt64(max(0, team.createdAt.timeIntervalSince1970))
+                wire.delegationConfigured = team.delegationState.configured.rawValue
+                wire.delegationEffective = team.delegationState.effective.rawValue
+                wire.delegationPending = team.delegationState.pending?.rawValue ?? ""
                 if case .local = team.leaderEndpoint,
                    !wire.teamUuid.isEmpty,
                    let workspace = AppDelegate.shared?.tabManagerFor(tabId: team.leaderWorkspaceId ?? team.workspaceId)?
@@ -552,7 +555,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                     wire.leaderSurfaceID = surfaceIDBytes(leader.surface.id)
                     wire.leaderCli = team.leaderCli ?? team.leaderMode
                     wire.leaderModel = team.leaderModel
-                    wire.presentationRevision = 1
+                    wire.presentationRevision = TeamDataStore.shared.projectDelegationRevision(
+                        teamName: team.id
+                    )
                     wire.members = team.agents.map { agent in
                         var member = Termmesh_Peer_V1_TeamMember()
                         member.name = agent.name
@@ -605,8 +610,12 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             params = dictionary
         }
 
-        let response = await MainActor.run {
-            TerminalController.shared.peerTeamCommand(method: method, params: params)
+        let response = if method == "team.delegation.configure" {
+            await TerminalController.shared.peerHumanDelegationConfigure(params: params)
+        } else {
+            await MainActor.run {
+                TerminalController.shared.peerTeamCommand(method: method, params: params)
+            }
         }
 
         // The dispatcher answers in JSON-RPC; unwrap it so the peer sees the

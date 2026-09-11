@@ -46,6 +46,9 @@ final class ReviewBoardViewModel: ObservableObject {
     /// screen. Nil means no team there, and the section hides itself.
     @Published private(set) var activeTeamName: String?
     @Published private(set) var delegation: DelegationPanel?
+    @Published private(set) var delegationChangeInFlight = false
+    @Published private(set) var delegationError: String?
+    private var delegationRequestGeneration: UInt64 = 0
     @Published private(set) var collaboration: CollaborationPanel?
     @Published private(set) var collaborationRepairOutcome: CollaborationRepairOutcome = .idle
 
@@ -65,6 +68,7 @@ final class ReviewBoardViewModel: ObservableObject {
 
     private var snapshotProvider: @MainActor () -> ReviewBoardSnapshot
     private var activeTeamProvider: @MainActor () -> String? = { nil }
+    private var remoteContextProvider: @MainActor () -> RemoteLiveProject.BoardContext? = { nil }
     /// Where the auto pilot policy is read and written. Injected so a test can
     /// exercise the toggle without arming unattended merging for whoever is
     /// running the tests.
@@ -412,6 +416,7 @@ final class ReviewBoardViewModel: ObservableObject {
         var options: ProjectExecutionOptions
         var workerCount: Int
         var workingCount: Int
+        var isRemoteViewer = false
 
         var idleCount: Int { max(0, workerCount - workingCount) }
         /// The state this whole feature exists to make visible: a roster that
@@ -453,6 +458,13 @@ final class ReviewBoardViewModel: ObservableObject {
         refreshDelegationPanel()
     }
 
+    func setRemoteContextProvider(
+        _ provider: @escaping @MainActor () -> RemoteLiveProject.BoardContext?
+    ) {
+        remoteContextProvider = provider
+        refreshDelegationPanel()
+    }
+
     func setActiveTeam(_ teamName: String?) {
         guard activeTeamName != teamName else { return }
         activeTeamName = teamName
@@ -460,8 +472,42 @@ final class ReviewBoardViewModel: ObservableObject {
         refreshDelegationPanel()
     }
 
+    func workspaceSelectionDidChange() {
+        delegationRequestGeneration &+= 1
+        delegationChangeInFlight = false
+        delegationError = nil
+        refreshDelegationPanel()
+    }
+
     func setDelegationLevel(_ level: ProjectDelegationLevel) {
-        guard let teamName = delegation?.teamName else { return }
+        guard let panel = delegation else { return }
+        if panel.isRemoteViewer {
+            guard let context = remoteContextProvider() else {
+                delegationChangeInFlight = false
+                delegationError = RemoteLiveProject.DelegationError.staleViewer.localizedDescription
+                return
+            }
+            delegationRequestGeneration &+= 1
+            let generation = delegationRequestGeneration
+            delegationChangeInFlight = true
+            delegationError = nil
+            Task { [weak self] in
+                do {
+                    _ = try await RemoteLiveProject.setDelegationLevel(
+                        workspaceID: context.workspaceID, level: level
+                    )
+                } catch {
+                    guard self?.delegationRequestGeneration == generation else { return }
+                    self?.delegationError = error.localizedDescription
+                }
+                guard self?.delegationRequestGeneration == generation else { return }
+                self?.delegationChangeInFlight = false
+                self?.refreshDelegationPanel()
+            }
+            return
+        }
+        let teamName = panel.teamName
+        delegationError = nil
         _ = TeamOrchestrator.shared.setProjectDelegationLevel(teamName: teamName, level: level)
         refreshDelegationPanel()
     }
@@ -493,6 +539,15 @@ final class ReviewBoardViewModel: ObservableObject {
             if !collaborationRepairInFlight { collaborationRepairOutcome = .idle }
         }
         let next = Self.delegationPanel(for: resolved)
+            ?? remoteContextProvider().map { context in
+                DelegationPanel(
+                    teamName: context.teamName,
+                    level: context.delegationState.effective,
+                    pending: context.delegationState.pending,
+                    options: .default, workerCount: context.workerCount,
+                    workingCount: 0, isRemoteViewer: true
+                )
+            }
         if delegation != next { delegation = next }
         let nextCollaboration = Self.collaborationPanel(
             for: resolved,

@@ -1125,6 +1125,7 @@ class TabManager {
         }
 
         sentryBreadcrumb("workspace.close", data: ["tabCount": max(0, tabs.count - 1)])
+        RemoteLiveProject.detach(workspaceID: workspace.id)
 
         // The declaration outlives the workspace otherwise: nothing ever
         // called `forget`, so the stored map kept every ID this install had

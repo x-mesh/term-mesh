@@ -48,6 +48,10 @@ public enum PeerTeamCall {
         "team.broadcast",
         "team.delegate",
         "team.message.post",
+        // A human-operated viewer can change the execution level of an
+        // existing Project. The host resolves the team and allowed enum; no
+        // path, process, command, or lifecycle operation crosses this call.
+        "team.delegation.configure",
         // Task board bookkeeping, all scoped to the team.
         "team.task.list",
         "team.task.get",

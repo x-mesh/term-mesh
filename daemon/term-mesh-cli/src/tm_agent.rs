@@ -5744,6 +5744,7 @@ fn remote_leader_method_allowed(method: &str) -> bool {
             | "team.broadcast"
             | "team.delegate"
             | "team.message.post"
+            | "team.delegation.configure"
             | "team.task.list"
             | "team.task.get"
             | "team.task.create"

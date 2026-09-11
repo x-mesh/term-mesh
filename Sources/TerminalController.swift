@@ -2463,6 +2463,13 @@ class TerminalController {
         return await processTeamUICommandAsync(method: method, params: params, id: 1)
     }
 
+    /// Human-operated peer twin of delegation configuration. Generic peer
+    /// access is restricted by `PeerTeamCall`; autonomous leaders still use
+    /// the token-gated scoped path below.
+    func peerHumanDelegationConfigure(params: [String: Any]) async -> String {
+        await asyncTeamDelegationConfigure(params: params, id: 1, humanPeer: true)
+    }
+
     private func dispatchTeamCommandAsync(
         method: String, params: [String: Any], id: Any?,
         callerTTYDevice: UInt32? = nil
@@ -4162,10 +4169,12 @@ class TerminalController {
     /// function's own switch, so the `team.*` cases still sitting there are
     /// unreachable. `team.delegation.configure` had no live handler on any
     /// route until this one: an allow-listed call died as `unknown_method`.
-    /// The gate is the same leader request token `v2TeamDelegationConfigure`
-    /// applies; only the UI hop differs, because this dispatcher is already
-    /// async and must not block on `v2MainSync`.
-    private func asyncTeamDelegationConfigure(params: [String: Any], id: Any?) async -> String {
+    /// Autonomous callers keep the leader request token gate. A human peer is
+    /// accepted only with the exact GUI Project UUID/project/revision tuple
+    /// that the owner currently publishes.
+    private func asyncTeamDelegationConfigure(
+        params: [String: Any], id: Any?, humanPeer: Bool = false
+    ) async -> String {
         guard let teamName = params["team_name"] as? String,
               let rawLevel = params["level"] as? String,
               let level = ProjectDelegationLevel(rawValue: rawLevel) else {
@@ -4174,10 +4183,36 @@ class TerminalController {
                 message: "level must be leaderFirst, guarded, or delegated"
             )
         }
-        guard TeamDataStore.shared.isAuthorizedLeaderRequestToken(
+        guard humanPeer || TeamDataStore.shared.isAuthorizedLeaderRequestToken(
             teamName: teamName, token: params["leader_request_token"] as? String
         ) else {
             return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
+        }
+        if humanPeer {
+            guard let teamUUID = params["team_uuid"] as? String,
+                  let projectID = params["project_id"] as? String,
+                  let liveWorkspaceRaw = params["live_workspace_id"] as? String,
+                  let leaderSurfaceRaw = params["leader_surface_id"] as? String,
+                  let liveWorkspaceID = Data(base64Encoded: liveWorkspaceRaw),
+                  let leaderSurfaceID = Data(base64Encoded: leaderSurfaceRaw),
+                  let revision = params["presentation_revision"] as? NSNumber,
+                  let team = TeamOrchestrator.shared.teams[teamName],
+                  team.teamUuid == teamUUID, projectID == "team:\(teamUUID)",
+                  let workspace = AppDelegate.shared?.tabManagerFor(
+                    tabId: team.leaderWorkspaceId ?? team.workspaceId
+                  )?.tabs.first(where: {
+                    $0.id == (team.leaderWorkspaceId ?? team.workspaceId)
+                  }),
+                  withUnsafeBytes(of: workspace.id.uuid, { Data($0) }) == liveWorkspaceID,
+                  let leader = workspace.panels[team.leaderPanelId] as? TerminalPanel,
+                  withUnsafeBytes(of: leader.surface.id.uuid, { Data($0) }) == leaderSurfaceID,
+                  revision.uint64Value == TeamDataStore.shared.projectDelegationRevision(
+                    teamName: teamName
+                  ), case .local = team.leaderEndpoint
+            else {
+                return v2Error(id: id, code: "identity_mismatch",
+                               message: "Exact GUI Project identity required")
+            }
         }
         let state = await MainActor.run {
             TeamOrchestrator.shared.setProjectDelegationLevel(teamName: teamName, level: level)

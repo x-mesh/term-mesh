@@ -696,6 +696,7 @@ extension ReviewBoardPanelView {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
+                .disabled(viewModel.delegationChangeInFlight)
                 .accessibilityIdentifier("reviewBoard.delegationLevel")
 
                 Text(panel.level.detail)
@@ -709,7 +710,16 @@ extension ReviewBoardPanelView {
                         .foregroundColor(.secondary)
                 }
 
-                HStack(spacing: 8) {
+                if let error = viewModel.delegationError {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("reviewBoard.delegationError")
+                }
+
+                if !panel.isRemoteViewer { HStack(spacing: 8) {
                     Text("Max parallel workers")
                         .font(.system(size: 11))
                     Spacer(minLength: 8)
@@ -724,9 +734,9 @@ extension ReviewBoardPanelView {
                             .font(.system(size: 11, design: .monospaced))
                     }
                     .accessibilityIdentifier("reviewBoard.maxParallelWorkers")
-                }
+                } }
 
-                Toggle(isOn: Binding(
+                if !panel.isRemoteViewer { Toggle(isOn: Binding(
                     get: { panel.options.injectDirective },
                     set: { viewModel.setInjectDirective($0) }
                 )) {
@@ -735,7 +745,7 @@ extension ReviewBoardPanelView {
                 }
                 .toggleStyle(.switch)
                 .controlSize(.mini)
-                .accessibilityIdentifier("reviewBoard.injectDirective")
+                .accessibilityIdentifier("reviewBoard.injectDirective") }
 
                 rosterText(panel)
                     .font(.system(size: 11))
