@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.242.0] - 2026-09-12
+
+### Added
+
+- Mobile remote control now presents a compact Chat and Terminal switch while keeping the target selector and controls usable on narrow screens.
+- Mobile agent answers now render Markdown and group consecutive tool calls into collapsible activity bundles.
+
+### Changed
+
+- The mobile header and quick-key controls use tighter layout and 44px touch targets.
+- Remote mobile status updates keep their live region, and resolved terminal-backed panes use the same capability resolver for chat and interrupt actions.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.241.0] - 2026-09-11
 
 ### Added
