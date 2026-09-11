@@ -265,6 +265,9 @@ body.chat-mode {
   --accent: #7c5cff;
   --accent-soft: rgba(124, 92, 255, 0.14);
   --chat-canvas: #f8f6ff;
+  /* A step darker than the shared --muted. Secondary text sits on the wash,
+     and at the strength below the default grey measured 3.7:1 against it. */
+  --muted: #5c5c66;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -275,6 +278,7 @@ body.chat-mode {
     --panel: #1b1826;
     --panel-2: #241f33;
     --line: #332c47;
+    --muted: #a6a6ad;
   }
 }
 
@@ -287,11 +291,11 @@ body.chat-mode {
   display: flex;
   flex-direction: column;
   background-color: var(--chat-canvas);
-  background-image: linear-gradient(180deg, rgba(124, 92, 255, 0.11), rgba(124, 92, 255, 0) 44%);
+  background-image: linear-gradient(180deg, rgba(124, 92, 255, 0.30), rgba(124, 92, 255, 0) 54%);
 }
 
 @media (prefers-color-scheme: dark) {
-  .chat { background-image: linear-gradient(180deg, rgba(157, 123, 255, 0.17), rgba(157, 123, 255, 0) 46%); }
+  .chat { background-image: linear-gradient(180deg, rgba(157, 123, 255, 0.36), rgba(157, 123, 255, 0) 56%); }
 }
 
 /* `said` and `said.leader` have to stay told apart, and the old pairing put
