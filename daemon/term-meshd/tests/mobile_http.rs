@@ -1500,3 +1500,104 @@ async fn an_unresolvable_pane_stays_terminal_only() {
     let target = get(&h, "/api/targets").await.json()["targets"][0].clone();
     assert_eq!(target["chat_capable"], false);
 }
+
+/// The other half of `a_pane_running_a_cli_is_chat_capable_even_when_the_record
+/// _is_not`: the page reads `chat_capable` off `/api/targets`, which the
+/// resolver answers, and then posts its turn to `/text`. Gating that POST on
+/// the raw record instead left the Chat tab and its live transcript on screen
+/// while every turn came back `chat_unavailable`.
+#[tokio::test]
+async fn a_resolved_pane_accepts_a_chat_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.reply("surface.send_turn", json!({ "submitted": true }));
+    let resolver: http_mobile::SessionResolver =
+        Arc::new(|surface_id: &str| match surface_id {
+            "panel-3" => Some(http_mobile::PaneSession {
+                cli: "claude".into(),
+                session_id: "sess-xyz".into(),
+            }),
+            _ => None,
+        });
+    let h = start_with_resolver(AuthMode::Tailscale, &[LOGIN], Some(resolver)).await;
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "panel-3".into(),
+                kind: TargetKind::Pane,
+                app_socket: Some(app.path_str()),
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
+
+    let target = get(&h, "/api/targets").await.json()["targets"][0].clone();
+    assert_eq!(
+        target["chat_capable"], true,
+        "precondition: the page is offered Chat for this pane"
+    );
+
+    let chat = post(
+        &h,
+        "/api/targets/panel-3/text",
+        json!({ "text": "whole turn", "mode": "chat", "request_id": "resolved-1" }),
+    )
+    .await;
+    assert_eq!(chat.status, 200, "{}", chat.body);
+    assert_eq!(app.calls()[0].0, "surface.send_turn");
+    assert_eq!(app.calls()[0].1["text"], "whole turn");
+}
+
+/// A third half of the same regression, this time for `/interrupt`: gating it
+/// on the raw `entry.chat_capable` instead of `state.chat_capable(&entry)`
+/// left the Interrupt button `/api/targets` had just told the page to show
+/// coming back `not_an_agent` for every terminal-backed chat. The resolved
+/// pane is not a native agent, so the stop must still reach it as a C-c key.
+#[tokio::test]
+async fn a_resolved_pane_forwards_interrupt_as_ctrl_c() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.reply("surface.send_key", json!({ "interrupted": true }));
+    let resolver: http_mobile::SessionResolver = Arc::new(|surface_id: &str| match surface_id {
+        "panel-4" => Some(http_mobile::PaneSession {
+            cli: "claude".into(),
+            session_id: "sess-int".into(),
+        }),
+        _ => None,
+    });
+    let h = start_with_resolver(AuthMode::Tailscale, &[LOGIN], Some(resolver)).await;
+    h.registry
+        .lock()
+        .await
+        .upsert(
+            EnableSpec {
+                surface_id: "panel-4".into(),
+                kind: TargetKind::Pane,
+                app_socket: Some(app.path_str()),
+                ..EnableSpec::default()
+            },
+            remote::now_unix(),
+        )
+        .unwrap();
+
+    let target = get(&h, "/api/targets").await.json()["targets"][0].clone();
+    assert_eq!(
+        target["chat_capable"], true,
+        "precondition: the page is offered Chat (and Interrupt) for this pane"
+    );
+
+    let stop = post(&h, "/api/targets/panel-4/interrupt", json!({})).await;
+    assert_eq!(stop.status, 200, "{}", stop.body);
+    assert_eq!(stop.json()["interrupted"], true);
+    assert_eq!(
+        app.calls()[0],
+        (
+            "surface.send_key".to_string(),
+            json!({ "surface_id": "panel-4", "key": "ctrl-c" })
+        ),
+        "a resolved pane is not a native agent, so the stop is a key, not team.interrupt"
+    );
+}
