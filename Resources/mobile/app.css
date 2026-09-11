@@ -351,9 +351,13 @@ body.chat-mode .view-switch {
 .tool .tool-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem; font-weight: 650; }
 .tool .tool-head { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tool-state { color: var(--muted); font-size: 0.6875rem; font-weight: 600; }
-.tool.running .tool-state { color: var(--accent); }
-.tool.failed .tool-name { color: var(--danger); }
-.tool.failed .tool-state { color: var(--danger); }
+/* `> summary` and not a descendant match: a bundle nests its tool rows, and a
+   descendant selector paints every child's name and state with the bundle's
+   own running/failed colour — a finished command inside a failed Activity came
+   out red while its own label still said Done. */
+.tool.running > summary .tool-state { color: var(--accent); }
+.tool.failed > summary .tool-name { color: var(--danger); }
+.tool.failed > summary .tool-state { color: var(--danger); }
 .tool .tool-change { grid-column: 1 / -1; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.6875rem; margin-top: 2px; }
 .tool .tool-change .add { color: #23d18b; }
 .tool .tool-change .del { color: var(--danger); }

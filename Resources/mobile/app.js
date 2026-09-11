@@ -336,11 +336,12 @@
   }
 
   // Folds runs of 2+ consecutive `tool` entries into one `activity` bundle,
-  // bounded by `turn_ended`: entries between two turn_ended markers (or from
-  // the start/previous marker up to the next one) share that turn's
-  // duration/cost even when a `said`/`answered`/`thought` splits the run into
-  // several bundles. A lone tool entry is left unwrapped — it already reads
-  // fine on its own, and wrapping it would add a second disclosure layer.
+  // bounded by `turn_ended`. The turn's duration is shown on the bundle only
+  // when that turn produced exactly one: a `said`/`answered`/`thought` in the
+  // middle splits the run, and two bundles each labelled with the whole turn's
+  // time read as if they summed to it. A lone tool entry is left unwrapped —
+  // it already reads fine on its own, and wrapping it would add a second
+  // disclosure layer.
   function groupChatEntries(entries) {
     var items = [];
     var pending = null;
@@ -363,7 +364,7 @@
       }
       flushPending();
       if (e.kind === 'turn_ended') {
-        openGroups.forEach(function (g) { g.turnEnd = e; });
+        if (openGroups.length === 1) { openGroups[0].turnEnd = e; }
         openGroups = [];
       }
       items.push(e);
@@ -376,8 +377,12 @@
     var tools = group.tools;
     var running = tools.some(function (t) { return t.running; });
     var failedTool = null;
+    var failedCount = 0;
     for (var i = 0; i < tools.length; i++) {
-      if (tools[i].failed) { failedTool = tools[i]; break; }
+      if (tools[i].failed) {
+        failedCount += 1;
+        if (!failedTool) { failedTool = tools[i]; }
+      }
     }
     var failed = !!failedTool;
     var node = document.createElement('details');
@@ -392,7 +397,13 @@
     if (group.turnEnd && group.turnEnd.duration) { bits.push(Math.round(group.turnEnd.duration) + 's'); }
     head.textContent = bits.join(' · ');
     var stateLabel = document.createElement('span'); stateLabel.className = 'tool-state';
-    stateLabel.textContent = failed ? 'Failed' : (running ? 'Running' : 'Done');
+    // An agent usually keeps working after a command fails, so a bundle can be
+    // running and failed at once; "Failed" alone would read as finished.
+    if (running) {
+      stateLabel.textContent = failedCount ? 'Running · ' + failedCount + ' failed' : 'Running';
+    } else {
+      stateLabel.textContent = failedCount > 1 ? failedCount + ' failed' : (failed ? 'Failed' : 'Done');
+    }
     body.appendChild(name); body.appendChild(head);
     summary.appendChild(marker); summary.appendChild(body); summary.appendChild(stateLabel);
     if (failed) {
