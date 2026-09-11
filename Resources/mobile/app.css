@@ -315,6 +315,77 @@ body.chat-mode .view-switch {
 .msg-role { font-size: 0.6875rem; font-weight: 700; letter-spacing: 0.02em; opacity: 0.72; }
 .msg-content { min-width: 0; }
 .msg.thought { align-self: flex-start; color: var(--muted); font-style: italic; font-size: 0.8125rem; padding: 4px 6px; }
+
+/* Markdown in agent answers. `renderMarkdown` in app.js builds every node
+   below by hand, so this is the complete vocabulary it can emit — the
+   container drops the `.msg` pre-wrap because block spacing now comes from
+   the gap, while paragraphs and list items keep it so a hard-wrapped answer
+   still breaks where the agent wrote it. */
+.msg-content.md { display: flex; flex-direction: column; gap: 9px; white-space: normal; }
+.md-p { margin: 0; white-space: pre-wrap; }
+.md-h { font-weight: 700; line-height: 1.3; }
+.md-h1 { font-size: 1.0625rem; }
+.md-h2 { font-size: 1rem; }
+.md-h3 { font-size: 0.9375rem; }
+.md-h4 { font-size: 0.875rem; color: var(--muted); }
+.md-list { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 5px; }
+.md-list li { white-space: pre-wrap; }
+.md-list li::marker { color: var(--muted); }
+.md-indent-1 { margin-left: 14px; }
+.md-indent-2 { margin-left: 28px; }
+.md-indent-3 { margin-left: 42px; }
+.md-quote { margin: 0; padding: 2px 0 2px 11px; border-left: 3px solid var(--line); color: var(--muted); }
+.md-rule { margin: 1px 0; border: 0; border-top: 1px solid var(--line); }
+.md-link { color: var(--accent); }
+
+.md-code-inline {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8125em;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--panel-2);
+  word-break: break-word;
+}
+
+/* Code and tables are the two blocks allowed to be wider than the column;
+   each scrolls inside its own box so the page itself never does. */
+.md-code {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--screen-bg);
+  color: var(--screen-fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  white-space: pre;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.md-table-wrap { max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+/* `width: max-content` is what makes the wrapper scroll instead of the table
+   folding: left to `auto`, the table squeezes itself into the column and the
+   inherited `word-break: break-word` then splits cells mid-word ("runnin g
+   우선"). Cells cap at 15rem so one long path widens its own column rather
+   than the whole table. */
+.md-table {
+  width: max-content;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+}
+.md-table th, .md-table td {
+  max-width: 15rem;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+.md-table th { background: var(--panel-2); font-weight: 650; white-space: nowrap; }
+
 .msg.notice { align-self: center; color: var(--muted); font-size: 0.75rem; padding: 3px 8px; }
 .msg.turn { align-self: center; color: var(--muted); font-size: 0.6875rem; padding: 1px 8px; font-variant-numeric: tabular-nums; }
 .msg.turn.failed { color: var(--danger); }

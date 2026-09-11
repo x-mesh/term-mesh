@@ -480,7 +480,7 @@
       node.className = 'msg said' + (e.speaker === 'leader' ? ' leader' : '');
       appendMessage(node, e.speaker === 'leader' ? 'Leader' : 'You', e.text || '');
     } else if (e.kind === 'answered') {
-      node.className = 'msg answered'; appendMessage(node, 'Agent', e.text || '');
+      node.className = 'msg answered'; appendMessage(node, 'Agent', e.text || '', true);
     } else if (e.kind === 'thought') {
       node.className = 'msg thought'; node.textContent = (e.text || '').slice(0, 400);
     } else if (e.kind === 'turn_ended') {
@@ -496,10 +496,240 @@
     return node;
   }
 
-  function appendMessage(node, label, text) {
+  function appendMessage(node, label, text, markdown) {
     var role = document.createElement('span'); role.className = 'msg-role'; role.textContent = label;
-    var content = document.createElement('span'); content.className = 'msg-content'; content.textContent = text;
+    var content = document.createElement('span'); content.className = 'msg-content';
+    if (markdown) {
+      content.className += ' md';
+      renderMarkdown(content, text || '');
+    } else {
+      content.textContent = text;
+    }
     node.appendChild(role); node.appendChild(content);
+  }
+
+  // ── markdown ─────────────────────────────────────────────────────────
+  //
+  // Agent answers are written in markdown, and a phone showed them raw:
+  // pipe-fenced tables and ``` blocks as literal characters. The page's CSP
+  // is `default-src 'none'` with no inline anything, so a parser library is
+  // out — and innerHTML is out regardless, since this text is model output.
+  // Every node below is created and filled through textContent, which makes
+  // markup impossible by construction. Anything the grammar does not
+  // recognise stays literal text, so an unsupported construct degrades to
+  // what the page showed before rather than disappearing.
+
+  var MD_FENCE = /^\s*```(\S*)\s*$/;
+  var MD_FENCE_END = /^\s*```\s*$/;
+  var MD_HEADING = /^(#{1,6})\s+(.*)$/;
+  var MD_RULE = /^\s*(?:-{3,}|_{3,}|\*{3,})\s*$/;
+  var MD_QUOTE = /^\s*>\s?(.*)$/;
+  var MD_ITEM = /^(\s*)(?:([-*+])|(\d{1,9})[.)])\s+(.*)$/;
+  // One alternation per inline form. Code comes first: its body must stay
+  // literal, so nothing inside a span may be re-scanned for emphasis.
+  var MD_INLINE = /`([^`]+)`|\*\*([\s\S]+?)\*\*|__([\s\S]+?)__|\*([^*\n]+)\*|_([^_\n]+)_|~~([\s\S]+?)~~|\[([^\]\n]+)\]\(([^()\s]+)\)/;
+
+  function isTableRow(line) { return /^\s*\|.*\|\s*$/.test(line); }
+  function isTableDelimiter(line) { return /^\s*\|(?:\s*:?-+:?\s*\|)+\s*$/.test(line); }
+
+  function splitRow(line) {
+    return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(function (cell) {
+      return cell.trim();
+    });
+  }
+
+  function columnAlign(line) {
+    return splitRow(line).map(function (cell) {
+      var left = cell.charAt(0) === ':';
+      var right = cell.charAt(cell.length - 1) === ':';
+      if (left && right) { return 'center'; }
+      if (right) { return 'right'; }
+      return '';
+    });
+  }
+
+  function buildLink(label, href) {
+    // Only the two schemes the listener itself speaks; anything else keeps
+    // its target visible as text instead of becoming a clickable unknown.
+    if (!/^https?:\/\//i.test(href)) {
+      var plain = document.createElement('span');
+      plain.textContent = label + ' (' + href + ')';
+      return plain;
+    }
+    var a = document.createElement('a');
+    a.className = 'md-link';
+    a.href = href;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = label;
+    return a;
+  }
+
+  function renderInline(parent, text) {
+    var rest = String(text);
+    while (rest) {
+      var m = MD_INLINE.exec(rest);
+      if (!m) { parent.appendChild(document.createTextNode(rest)); return; }
+      if (m.index) { parent.appendChild(document.createTextNode(rest.slice(0, m.index))); }
+      if (m[1] !== undefined) {
+        var code = document.createElement('code');
+        code.className = 'md-code-inline';
+        code.textContent = m[1];
+        parent.appendChild(code);
+      } else if (m[2] !== undefined || m[3] !== undefined) {
+        var strong = document.createElement('strong');
+        renderInline(strong, m[2] !== undefined ? m[2] : m[3]);
+        parent.appendChild(strong);
+      } else if (m[4] !== undefined || m[5] !== undefined) {
+        var em = document.createElement('em');
+        renderInline(em, m[4] !== undefined ? m[4] : m[5]);
+        parent.appendChild(em);
+      } else if (m[6] !== undefined) {
+        var del = document.createElement('del');
+        renderInline(del, m[6]);
+        parent.appendChild(del);
+      } else {
+        parent.appendChild(buildLink(m[7], m[8]));
+      }
+      rest = rest.slice(m.index + m[0].length);
+    }
+  }
+
+  function buildTable(rows, align) {
+    // The wrapper is what scrolls: a wide table must never widen the page.
+    var wrap = document.createElement('div');
+    wrap.className = 'md-table-wrap';
+    var table = document.createElement('table');
+    table.className = 'md-table';
+    var head = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    rows[0].forEach(function (cell, i) {
+      var th = document.createElement('th');
+      if (align[i]) { th.style.textAlign = align[i]; }
+      renderInline(th, cell);
+      headRow.appendChild(th);
+    });
+    head.appendChild(headRow);
+    table.appendChild(head);
+    var body = document.createElement('tbody');
+    rows.slice(1).forEach(function (cells) {
+      var tr = document.createElement('tr');
+      for (var i = 0; i < rows[0].length; i++) {
+        var td = document.createElement('td');
+        if (align[i]) { td.style.textAlign = align[i]; }
+        renderInline(td, cells[i] || '');
+        tr.appendChild(td);
+      }
+      body.appendChild(tr);
+    });
+    table.appendChild(body);
+    wrap.appendChild(table);
+    return wrap;
+  }
+
+  function startsBlock(line, next) {
+    return MD_FENCE.test(line) || MD_HEADING.test(line) || MD_RULE.test(line)
+      || MD_QUOTE.test(line) || MD_ITEM.test(line)
+      || (isTableRow(line) && isTableDelimiter(next || ''));
+  }
+
+  function renderMarkdown(parent, text) {
+    var lines = String(text).replace(/\r\n?/g, '\n').split('\n');
+    var i = 0;
+    while (i < lines.length) {
+      var line = lines[i];
+      if (!line.trim()) { i++; continue; }
+
+      var fence = MD_FENCE.exec(line);
+      if (fence) {
+        var body = [];
+        i++;
+        while (i < lines.length && !MD_FENCE_END.test(lines[i])) { body.push(lines[i]); i++; }
+        i++;
+        var pre = document.createElement('pre');
+        pre.className = 'md-code';
+        if (fence[1]) { pre.setAttribute('data-lang', fence[1]); }
+        pre.textContent = body.join('\n');
+        parent.appendChild(pre);
+        continue;
+      }
+
+      if (isTableRow(line) && isTableDelimiter(lines[i + 1] || '')) {
+        var align = columnAlign(lines[i + 1]);
+        var rows = [splitRow(line)];
+        i += 2;
+        while (i < lines.length && isTableRow(lines[i])) { rows.push(splitRow(lines[i])); i++; }
+        parent.appendChild(buildTable(rows, align));
+        continue;
+      }
+
+      var heading = MD_HEADING.exec(line);
+      if (heading) {
+        var h = document.createElement('div');
+        h.className = 'md-h md-h' + Math.min(heading[1].length, 4);
+        renderInline(h, heading[2]);
+        parent.appendChild(h);
+        i++;
+        continue;
+      }
+
+      if (MD_RULE.test(line)) {
+        var rule = document.createElement('hr');
+        rule.className = 'md-rule';
+        parent.appendChild(rule);
+        i++;
+        continue;
+      }
+
+      if (MD_QUOTE.test(line)) {
+        var quoted = [];
+        while (i < lines.length && MD_QUOTE.test(lines[i])) {
+          quoted.push(MD_QUOTE.exec(lines[i])[1]);
+          i++;
+        }
+        var quote = document.createElement('blockquote');
+        quote.className = 'md-quote';
+        renderMarkdown(quote, quoted.join('\n'));
+        parent.appendChild(quote);
+        continue;
+      }
+
+      if (MD_ITEM.test(line)) {
+        var ordered = !!MD_ITEM.exec(line)[3];
+        var items = [];
+        while (i < lines.length && MD_ITEM.test(lines[i])) {
+          var item = MD_ITEM.exec(lines[i]);
+          items.push({ depth: Math.min(Math.floor(item[1].length / 2), 3), text: item[4] });
+          i++;
+          // A wrapped item continues on indented lines that start no block.
+          while (i < lines.length && lines[i].trim() && /^\s{2,}/.test(lines[i])
+                 && !startsBlock(lines[i], lines[i + 1])) {
+            items[items.length - 1].text += ' ' + lines[i].trim();
+            i++;
+          }
+        }
+        var list = document.createElement(ordered ? 'ol' : 'ul');
+        list.className = 'md-list';
+        items.forEach(function (entry) {
+          var li = document.createElement('li');
+          if (entry.depth) { li.className = 'md-indent-' + entry.depth; }
+          renderInline(li, entry.text);
+          list.appendChild(li);
+        });
+        parent.appendChild(list);
+        continue;
+      }
+
+      var paragraph = [];
+      while (i < lines.length && lines[i].trim() && !startsBlock(lines[i], lines[i + 1])) {
+        paragraph.push(lines[i]);
+        i++;
+      }
+      var p = document.createElement('p');
+      p.className = 'md-p';
+      renderInline(p, paragraph.join('\n'));
+      parent.appendChild(p);
+    }
   }
 
   function toolLabel(name) {
