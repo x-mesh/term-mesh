@@ -123,6 +123,17 @@ def main() -> int:
         if not _wait(lambda: _latency().get("outcomes_total", {}).get("sent", 0) > before):
             raise termmeshError("helper input never populated input_latency")
         latency = _latency()
+        # Read-only local helper-stream counters: schema only, no input bytes.
+        backlog = latency.get("backlog", {})
+        if not all(isinstance(backlog.get(k), int) and backlog[k] >= 0
+                   for k in ("current_frames", "high_water_frames")):
+            raise termmeshError(f"invalid input backlog schema: {latency!r}")
+        if backlog["high_water_frames"] < backlog["current_frames"]:
+            raise termmeshError(f"input backlog high water regressed: {latency!r}")
+        if backlog["high_water_frames"] <= 0:
+            raise termmeshError(f"helper input never populated input backlog: {latency!r}")
+        if _latency().get("backlog", {}).get("high_water_frames") != backlog["high_water_frames"]:
+            raise termmeshError(f"input backlog diagnostic reset on read: {latency!r}")
         for name in ("queue", "session_access", "send", "total"):
             stage = latency.get(name, {})
             if stage.get("n", 0) <= 0:

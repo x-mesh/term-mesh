@@ -394,26 +394,54 @@ private final class RelayFrameWriter: @unchecked Sendable {
     }
 }
 
+/// Lock-boxed count of key-input frames that have entered the helper stream
+/// but have not yet been dequeued by the input pump. This observes the
+/// existing unbounded `AsyncThrowingStream`; it does not impose a limit.
+final class RelayInputBacklogTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var currentFrames: UInt64
+    private var highWaterFrames: UInt64
+
+    init(currentFrames: UInt64 = 0, highWaterFrames: UInt64 = 0) {
+        precondition(highWaterFrames >= currentFrames)
+        self.currentFrames = currentFrames
+        self.highWaterFrames = highWaterFrames
+    }
+
+    func noteEnqueued() {
+        lock.lock()
+        // Saturate rather than wrapping: diagnostics must never turn a large
+        // backlog into a misleading small one.
+        if currentFrames < UInt64.max { currentFrames += 1 }
+        highWaterFrames = max(highWaterFrames, currentFrames)
+        lock.unlock()
+    }
+
+    func noteDequeued() {
+        lock.lock()
+        // Teardown/cancellation can race a stream callback. Never underflow
+        // the observable count if a consumer sees no matching input frame.
+        if currentFrames > 0 { currentFrames -= 1 }
+        lock.unlock()
+    }
+
+    func snapshot() -> (currentFrames: UInt64, highWaterFrames: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (currentFrames, highWaterFrames)
+    }
+}
+
 private final class RelayFrameReader: @unchecked Sendable {
     private let relay: RelaySocket
     private let queue = DispatchQueue(label: "term-mesh.peer.relay.reader", qos: .userInitiated)
     private let lock = NSLock()
     private var stopped = false
-    private var yielded: UInt64 = 0
+    private let inputBacklog: RelayInputBacklogTracker
 
-    init(relay: RelaySocket) {
+    init(relay: RelaySocket, inputBacklog: RelayInputBacklogTracker) {
         self.relay = relay
-    }
-
-    /// Frames read off the relay socket so far. The stream below buffers
-    /// unboundedly (`AsyncThrowingStream`'s default policy), so against the
-    /// consumer's own count the difference is the backlog queued while frame
-    /// handling awaits a slow host — the number that says whether typed keys
-    /// piled up on this side.
-    var framesYielded: UInt64 {
-        lock.lock()
-        defer { lock.unlock() }
-        return yielded
+        self.inputBacklog = inputBacklog
     }
 
     func frames() -> AsyncThrowingStream<TimedRelayFrame, Error> {
@@ -424,10 +452,24 @@ private final class RelayFrameReader: @unchecked Sendable {
                         let frame = try self.relay.readFrame()
                         // Local metadata only: never changes the helper wire format.
                         let readAt = frame.type == kTypeKeyInput ? DispatchTime.now().uptimeNanoseconds : 0
-                        self.lock.lock()
-                        self.yielded &+= 1
-                        self.lock.unlock()
-                        continuation.yield((frame.type, frame.payload, readAt))
+                        // Account before yield: a waiting consumer may resume
+                        // inside `yield` and dequeue immediately. If the stream
+                        // rejects the frame, roll the provisional count back.
+                        let isKeyInput = frame.type == kTypeKeyInput
+                        if isKeyInput {
+                            self.inputBacklog.noteEnqueued()
+                        }
+                        let yieldResult = continuation.yield((frame.type, frame.payload, readAt))
+                        if isKeyInput {
+                            switch yieldResult {
+                            case .enqueued:
+                                break
+                            case .dropped, .terminated:
+                                self.inputBacklog.noteDequeued()
+                            @unknown default:
+                                self.inputBacklog.noteDequeued()
+                            }
+                        }
                     } catch {
                         if self.isStopped {
                             continuation.finish()
@@ -1516,7 +1558,9 @@ final class RelayInputLatencyStats: @unchecked Sendable {
         nextIndex = (nextIndex + 1) % capacity
     }
 
-    func snapshot() -> [String: Any] {
+    func snapshot(
+        backlog: (currentFrames: UInt64, highWaterFrames: UInt64) = (0, 0)
+    ) -> [String: Any] {
         lock.lock()
         let generation = samples.map(\.generation).max() ?? 0
         let recent = samples.filter { $0.generation == generation }
@@ -1537,6 +1581,10 @@ final class RelayInputLatencyStats: @unchecked Sendable {
 
         return [
             "scope": "relay_helper_local_handoff",
+            "backlog": [
+                "current_frames": backlog.currentFrames,
+                "high_water_frames": backlog.highWaterFrames,
+            ],
             "window_capacity": capacity,
             "window_samples": recent.count,
             "session_generation": generation,
@@ -1730,6 +1778,9 @@ final class PeerRelaySession {
     /// these are written from the pump loop. Exposed through `ioSnapshot`.
     private let ioStats = RelayIOStats()
     private let inputLatencyStats = RelayInputLatencyStats()
+    /// Shared by the helper reader and detached input pump. Callback delivery
+    /// has no helper reader, so its diagnostic stays at zero.
+    private let inputBacklog = RelayInputBacklogTracker()
 
     /// Counter snapshot for `debugPaneStatus()` — lets a live probe tell
     /// "nothing ever arrived" from "arrived and was lost downstream".
@@ -1805,7 +1856,9 @@ final class PeerRelaySession {
 
     /// Explicit diagnostics only: health polling of ioSnapshot must not sort
     /// latency samples for every pane. No mutation of the measurement window.
-    var inputLatencySnapshot: [String: Any] { inputLatencyStats.snapshot() }
+    var inputLatencySnapshot: [String: Any] {
+        inputLatencyStats.snapshot(backlog: inputBacklog.snapshot())
+    }
 
     /// One-line counter summary for the disconnect / watchdog log lines.
     var ioSummary: String {
@@ -2873,7 +2926,7 @@ final class PeerRelaySession {
             }
             relayFrameWriter = liveWriter
             writer = liveWriter
-            reader = RelayFrameReader(relay: relay)
+            reader = RelayFrameReader(relay: relay, inputBacklog: inputBacklog)
         } else {
             writer = nil
             reader = nil
@@ -2882,6 +2935,7 @@ final class PeerRelaySession {
         // must be bound before those closures are created.
         let resumeTransitionGate = self.resumeTransitionGate
         let inputLatencyStats = self.inputLatencyStats
+        let inputBacklog = self.inputBacklog
         // Gap-heal timing. The relay path hangs it off the resize coalescer
         // (which also owns resize forwarding and so needs the session);
         // callback delivery has no resize traffic, so a dedicated scheduler
@@ -3419,10 +3473,13 @@ final class PeerRelaySession {
                     minIntervalNanos: RelayStallLogGate.defaultMinIntervalNanos
                 )
                 var inputSendFailures: UInt64 = 0
-                var framesConsumed: UInt64 = 0
                 do {
                     for try await frame in reader.frames() {
-                        framesConsumed &+= 1
+                        if frame.type == kTypeKeyInput {
+                            // The frame has left the helper-stream backlog
+                            // before any MainActor/session work can suspend.
+                            inputBacklog.noteDequeued()
+                        }
                         // Classify the frame by the session generation that
                         // owned it when processing began. sendInput suspends;
                         // a resume-heal during that await must not relabel an
@@ -3508,7 +3565,7 @@ final class PeerRelaySession {
                             if inputStallGate.recordEpisode(
                                 durationNanos: sendEndedAt &- sendStartedAt, now: sendEndedAt
                             ) {
-                                let backlog = reader.framesYielded &- framesConsumed
+                                let backlog = inputBacklog.snapshot().currentFrames
                                 RemoteWorkLog.infoOffMain(
                                     "Peer input stalled — a key frame took \((sendEndedAt &- sendStartedAt) / 1_000_000)ms to send (\(backlog) frames queued behind it); typing lagged briefly"
                                 )

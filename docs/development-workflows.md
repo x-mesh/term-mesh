@@ -208,6 +208,13 @@ counted as cancelled, and an in-flight stall appears only after it completes.
 Callback delivery via `sendRemoteKeys` does not traverse the helper pump and
 therefore does not populate these measurements.
 
+`backlog.current_frames` is the current count of key-input frames yielded by
+the local relay helper but not yet dequeued by its input pump;
+`backlog.high_water_frames` is its non-resetting lifetime maximum. Both values
+are read-only local counters, preserve the existing unbounded helper-stream
+behavior, and contain no input bytes. Callback delivery has no helper stream,
+so both values remain zero there.
+
 No input contents are recorded. Memory is bounded, collection adds no tasks or
 timers, and percentiles are computed only on explicit diagnostic reads, outside
 the collection lock. Avoid polling on every key: read after a typing interval.

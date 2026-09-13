@@ -6456,6 +6456,61 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
 }
 
 // MARK: - Relay input diagnostics
+final class RelayInputBacklogTrackerTests: XCTestCase {
+    func testEmptyGrowDrainAndSnapshotDoesNotResetHighWater() {
+        let tracker = RelayInputBacklogTracker()
+        XCTAssertEqual(tracker.snapshot().currentFrames, 0)
+        XCTAssertEqual(tracker.snapshot().highWaterFrames, 0)
+        tracker.noteEnqueued()
+        tracker.noteEnqueued()
+        XCTAssertEqual(tracker.snapshot().currentFrames, 2)
+        XCTAssertEqual(tracker.snapshot().highWaterFrames, 2)
+        tracker.noteDequeued()
+        tracker.noteDequeued()
+        XCTAssertEqual(tracker.snapshot().currentFrames, 0)
+        XCTAssertEqual(tracker.snapshot().highWaterFrames, 2)
+        XCTAssertEqual(tracker.snapshot().highWaterFrames, 2, "reads must not reset high water")
+    }
+
+    func testUnderflowAndSaturationAreSafe() {
+        let empty = RelayInputBacklogTracker()
+        empty.noteDequeued()
+        XCTAssertEqual(empty.snapshot().currentFrames, 0)
+
+        let saturated = RelayInputBacklogTracker(
+            currentFrames: UInt64.max, highWaterFrames: UInt64.max
+        )
+        saturated.noteEnqueued()
+        XCTAssertEqual(saturated.snapshot().currentFrames, UInt64.max)
+        XCTAssertEqual(saturated.snapshot().highWaterFrames, UInt64.max)
+    }
+
+    func testRejectedYieldRollbackLeavesNoPermanentBacklog() {
+        let tracker = RelayInputBacklogTracker()
+        // This mirrors the reader's provisional increment followed by a
+        // dropped/terminated AsyncThrowingStream yield result.
+        tracker.noteEnqueued()
+        tracker.noteDequeued()
+        XCTAssertEqual(tracker.snapshot().currentFrames, 0)
+        XCTAssertEqual(tracker.snapshot().highWaterFrames, 1)
+    }
+
+    func testConcurrentProducerConsumerNeverUnderflowsAndRetainsHighWater() {
+        let tracker = RelayInputBacklogTracker()
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "RelayInputBacklogTrackerTests", attributes: .concurrent)
+        for _ in 0..<1_000 {
+            group.enter()
+            queue.async { tracker.noteEnqueued(); group.leave() }
+            group.enter()
+            queue.async { tracker.noteDequeued(); group.leave() }
+        }
+        XCTAssertEqual(group.wait(timeout: .now() + 5), .success)
+        let snapshot = tracker.snapshot()
+        XCTAssertGreaterThanOrEqual(snapshot.highWaterFrames, snapshot.currentFrames)
+    }
+}
+
 final class RelayInputLatencyStatsTests: XCTestCase {
     private func sample(_ ms: UInt64, outcome: RelayInputLatencyStats.Outcome = .sent)
         -> RelayInputLatencyStats.Sample {
@@ -6474,6 +6529,15 @@ final class RelayInputLatencyStatsTests: XCTestCase {
         let browse = try XCTUnwrap(snapshot["browse_exit"] as? [String: Any])
         XCTAssertEqual(browse["n"] as? Int, 0)
         XCTAssertNil(browse["p50_ms"])
+        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: snapshot))
+    }
+
+    func testSnapshotIncludesJSONSafeBacklogWithoutPayloads() throws {
+        let stats = RelayInputLatencyStats()
+        let snapshot = stats.snapshot(backlog: (currentFrames: 3, highWaterFrames: 7))
+        let backlog = try XCTUnwrap(snapshot["backlog"] as? [String: UInt64])
+        XCTAssertEqual(backlog["current_frames"], 3)
+        XCTAssertEqual(backlog["high_water_frames"], 7)
         XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: snapshot))
     }
 
