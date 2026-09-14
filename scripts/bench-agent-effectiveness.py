@@ -56,6 +56,7 @@ MODEL_PRICING_PER_MTOK = {
     "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_write": 3.75},
     "opus": {"input": 15.0, "output": 75.0, "cache_read": 1.50, "cache_write": 18.75},
 }
+REMOTE_BENCH_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
 @dataclass(frozen=True)
@@ -617,8 +618,18 @@ def run_divider_acceptance(
         if synced.returncode != 0:
             return False, f"remote sync failed: {synced.stderr[-1000:]}"
         build_info_step = "" if build_info_generated else " && ./scripts/generate-build-info.sh"
+        # macOS' /usr/bin/git is an xcrun shim and can fail with exit 69 when a
+        # newly installed Xcode license has not been accepted. The benchmark
+        # host has an independent Homebrew Git; prefer it explicitly and prove
+        # that Git works before interpreting guard output as missing fixture
+        # metadata.
+        expected_ghostty = git("rev-parse", "HEAD:ghostty", cwd=checkout)
+        fixture_preflight = remote_fixture_preflight_command(expected_ghostty)
         remote_command = (
-            "cd " + shlex.quote(remote)
+            "export PATH=" + shlex.quote(REMOTE_BENCH_PATH)
+            + " && git --version"
+            + " && cd " + shlex.quote(remote)
+            + " && " + fixture_preflight
             + " && ./scripts/check-ghostty-kit.sh"
             + build_info_step
             + " && " + shlex.join(command)
@@ -2744,13 +2755,65 @@ def worker_timing(task_rows: list[dict[str, Any]]) -> tuple[Optional[int], Optio
 def classify_infra_failure(reason: str) -> bool:
     return bool(re.search(
         r"provider|overloaded|rate limit|authentication|connection reset|network is unreachable|"
-        r"remote Xcode runner unavailable|CoreSimulator.*out[- ]of[- ]date|"
+        r"remote Xcode runner unavailable|remote sync failed|remote fixture metadata invalid|"
+        r"CoreSimulator.*out[- ]of[- ]date|"
         r"DVTCoreSimulatorAdditionsErrorDomain|Unable to load simulator devices|"
         r"snapshot setup failed|submodule failed|daemon.*unavailable|"
+        r"You have not agreed to the Xcode license agreements|"
+        r"parent ghostty pin\s*:\s*missing|submodule HEAD\s*:\s*missing|"
         r"team not found|socket.*(?:missing|unavailable|refused)|"
         r"BenchmarkTerminated|benchmark interrupted by signal",
         reason, re.IGNORECASE,
     ))
+
+
+def remote_fixture_preflight_command(expected_ghostty: str) -> str:
+    """Verify the rsynced parent gitlink and submodule before any Xcode work."""
+    expected = shlex.quote(expected_ghostty)
+    return (
+        "expected_ghostty=" + expected
+        + "; parent_ghostty=$(git rev-parse HEAD:ghostty) ||"
+        + " { echo 'remote fixture metadata invalid: parent gitlink unreadable' >&2; exit 86; }"
+        + "; submodule_ghostty=$(git -C ghostty rev-parse HEAD) ||"
+        + " { echo 'remote fixture metadata invalid: submodule HEAD unreadable' >&2; exit 86; }"
+        + "; if [ \"$parent_ghostty\" = \"$expected_ghostty\" ]"
+        + " && [ \"$submodule_ghostty\" = \"$expected_ghostty\" ]; then :;"
+        + " else echo 'remote fixture metadata invalid' >&2;"
+        + " echo \"expected=$expected_ghostty parent=$parent_ghostty submodule=$submodule_ghostty\" >&2;"
+        + " exit 86; fi"
+    )
+
+
+def remote_paid_study_preflight(xcode_host: str) -> tuple[bool, str]:
+    """Fail before experiment creation or provider calls on a broken Xcode host."""
+    command = (
+        "export PATH=" + shlex.quote(REMOTE_BENCH_PATH)
+        + " && git --version && xcode-select -p"
+        + " && xcodebuild -version && xcodebuild -checkFirstLaunchStatus"
+    )
+    result = run_command(("ssh", xcode_host, command), timeout=30)
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode == 0:
+        return True, output or "remote preflight passed"
+    failure = f"remote preflight exit {result.returncode}"
+    if result.returncode == 69:
+        failure += " (Xcode first-launch/license incomplete)"
+    if output:
+        failure += "\n" + output
+    return False, failure
+
+
+def record_acceptance_outcome(record: RunResult, passed: bool, reason: str) -> None:
+    """Keep external acceptance prerequisites out of product pass-rate data."""
+    record.acceptance_passed = passed
+    record.failure_reason = None if passed else safe_failure(reason)
+    if passed:
+        record.status = "passed"
+    elif classify_infra_failure(reason):
+        record.infra_invalid = True
+        record.status = "infra_invalid"
+    else:
+        record.status = "failed"
 
 
 def write_patch(checkout: Path, destination: Path) -> int:
@@ -3571,7 +3634,8 @@ def run_isolated_topology_one(
                 xcode_host=xcode_host, run_id=run_id, build_info_generated=True,
             )
             record.acceptance_ms = acceptance_ms
-            owner = isolated_correction_owner(reason, tasks) if not passed else None
+            acceptance_infra = not passed and classify_infra_failure(reason)
+            owner = isolated_correction_owner(reason, tasks) if not passed and not acceptance_infra else None
             if owner is not None and record.correction_count == 0:
                 correction_started = time.perf_counter()
                 record.correction_count = 1
@@ -3632,8 +3696,7 @@ def run_isolated_topology_one(
                         task=owner["id"], outcome=record.correction_outcome,
                         duration_ms=record.correction_ms,
                     )
-            record.acceptance_passed = passed
-            record.status = "passed" if passed else "failed"; record.failure_reason = None if passed else safe_failure(reason)
+            record_acceptance_outcome(record, passed, reason)
         record.active_task_ms = round((time.perf_counter() - active_started) * 1000)
         record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)
         collect_isolated_read_diagnostics(
@@ -5059,6 +5122,12 @@ def run_isolated_topology_experiment(args: argparse.Namespace) -> int:
     for index, spec in enumerate(specs, 1):
         print(f"  {index:02d}. {spec.fixture:<22} trial={spec.trial} order={spec.order} {spec.condition}")
     if args.dry_run: return 0
+    if args.xcode_host != "local":
+        ready, reason = remote_paid_study_preflight(args.xcode_host)
+        if not ready:
+            raise BenchmarkInfrastructureError(
+                "remote paid-study preflight failed before provider calls: " + safe_failure(reason)
+            )
     run_id = args.run_id or datetime.now().strftime("%Y%m%dT%H%M%S") + "-isolated-" + uuid.uuid4().hex[:6]
     experiment = args.results_dir / run_id; experiment.mkdir(parents=True, exist_ok=False); (experiment / "runs").mkdir()
     manifest = {

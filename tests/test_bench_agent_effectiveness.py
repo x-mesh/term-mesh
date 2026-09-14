@@ -1028,6 +1028,21 @@ end
         self.assertGreaterEqual(function.count("-clonedSourcePackagesDirPath"), 1)
         self.assertGreaterEqual(function.count("-disableAutomaticPackageResolution"), 1)
         self.assertGreaterEqual(function.count("-derivedDataPath"), 1)
+        self.assertIn("REMOTE_BENCH_PATH", function)
+        self.assertIn("git --version", function)
+        self.assertLess(function.index("fixture_preflight"), function.index("check-ghostty-kit.sh"))
+
+    def test_remote_fixture_preflight_checks_both_shas_against_expected(self):
+        command = module.remote_fixture_preflight_command("abc123")
+        self.assertIn("git rev-parse HEAD:ghostty", command)
+        self.assertIn("git -C ghostty rev-parse HEAD", command)
+        self.assertIn('[ \"$parent_ghostty\" = \"$expected_ghostty\" ]', command)
+        self.assertIn('[ \"$submodule_ghostty\" = \"$expected_ghostty\" ]', command)
+        self.assertIn("remote fixture metadata invalid", command)
+        syntax = subprocess.run(
+            ["/bin/sh", "-n"], input=command, text=True, capture_output=True,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
     def test_stream_parser_uses_result_usage_and_cost(self):
         stream = json.dumps({
@@ -1601,6 +1616,7 @@ end
             with unittest.mock.patch.object(module.tempfile, "mkdtemp", return_value=str(scratch)), \
                  unittest.mock.patch.object(module, "git", return_value="head"), \
                  unittest.mock.patch.object(module, "validate_fixture_metadata", return_value=[]), \
+                 unittest.mock.patch.object(module, "remote_paid_study_preflight", return_value=(True, "ready")), \
                  unittest.mock.patch.object(module, "run_isolated_topology_one", return_value=unsafe) as runner:
                 self.assertEqual(module.run_isolated_topology_experiment(args), 1)
             self.assertEqual(runner.call_count, 1)
@@ -1624,6 +1640,7 @@ end
             with unittest.mock.patch.object(module.tempfile, "mkdtemp", return_value=str(scratch)), \
                  unittest.mock.patch.object(module, "git", return_value="head"), \
                  unittest.mock.patch.object(module, "validate_fixture_metadata", return_value=[]), \
+                 unittest.mock.patch.object(module, "remote_paid_study_preflight", return_value=(True, "ready")), \
                  unittest.mock.patch.object(module, "run_isolated_topology_one", return_value=safe):
                 self.assertEqual(module.run_isolated_topology_experiment(args), 0)
             self.assertFalse(scratch.exists())
@@ -2122,6 +2139,54 @@ end
         self.assertFalse(module.classify_infra_failure(
             "remote Xcode acceptance failed: TerminalOverrideIsolationTests failed"
         ))
+
+    def test_remote_git_prerequisite_failures_are_infra_invalid(self):
+        self.assertTrue(module.classify_infra_failure(
+            "You have not agreed to the Xcode license agreements."
+        ))
+        self.assertTrue(module.classify_infra_failure(
+            "GhosttyKit does not match the ghostty commit pinned by this checkout. "
+            "parent ghostty pin : missing; submodule HEAD : missing"
+        ))
+        self.assertTrue(module.classify_infra_failure("remote sync failed: rsync exit 12"))
+        self.assertTrue(module.classify_infra_failure("remote fixture metadata invalid"))
+
+    def test_remote_paid_study_preflight_requires_xcode_first_launch_status(self):
+        completed = subprocess.CompletedProcess(
+            ["ssh"], 69, "git version 2.55.0\n",
+            "You have not agreed to the Xcode license agreements.",
+        )
+        with unittest.mock.patch.object(module, "run_command", return_value=completed) as run:
+            ready, reason = module.remote_paid_study_preflight("mac-sub")
+        self.assertFalse(ready)
+        self.assertIn("exit 69", reason)
+        self.assertIn("Xcode first-launch/license incomplete", reason)
+        self.assertIn("license agreements", reason)
+        remote_command = run.call_args.args[0][2]
+        self.assertIn(module.REMOTE_BENCH_PATH, remote_command)
+        self.assertIn("xcodebuild -checkFirstLaunchStatus", remote_command)
+
+    def test_remote_paid_study_preflight_preserves_silent_exit_code(self):
+        completed = subprocess.CompletedProcess(["ssh"], 69, "", "")
+        with unittest.mock.patch.object(module, "run_command", return_value=completed):
+            ready, reason = module.remote_paid_study_preflight("mac-sub")
+        self.assertFalse(ready)
+        self.assertEqual(
+            reason, "remote preflight exit 69 (Xcode first-launch/license incomplete)",
+        )
+
+    def test_acceptance_prerequisite_failure_is_excluded_from_product_results(self):
+        record = module.RunResult(
+            run_id="infra", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+        )
+        module.record_acceptance_outcome(
+            record, False,
+            "parent ghostty pin : missing; submodule HEAD : missing",
+        )
+        self.assertTrue(record.infra_invalid)
+        self.assertEqual(record.status, "infra_invalid")
+        self.assertFalse(record.acceptance_passed)
 
     def test_failure_redaction_masks_home_and_secrets(self):
         value = module.safe_failure(f"{Path.home()}/repo token=abc123")
