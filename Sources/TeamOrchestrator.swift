@@ -2736,6 +2736,9 @@ final class TeamOrchestrator: ObservableObject {
         /// invoke each agent CLI with `--resume <sid>`. Pane-mode resume passes
         /// this; fresh team creation leaves it nil.
         agentResumeSessionIds: [String: String]? = nil,
+        /// Pane-mode resume supplies the archived cwd for each roster entry.
+        /// A non-nil array reuses those checkouts instead of provisioning new ones.
+        agentWorkingDirectories: [String?]? = nil,
         /// Project creation holds this MainActor reservation from the conflict
         /// check through installation. Ordinary ad-hoc teams do not participate
         /// in that transaction and retain their existing lifecycle.
@@ -2746,6 +2749,29 @@ final class TeamOrchestrator: ObservableObject {
         projectCreationIdentity: ProjectCreationIdentity? = nil,
         tabManager: TabManager
     ) -> Team? {
+        let resumedWorkingDirectories: [String]? = {
+            guard let candidates = agentWorkingDirectories, candidates.count == agents.count else {
+                return nil
+            }
+            return Self.resumedAgentWorkingDirectories(
+                worktreeMode: worktreeMode,
+                archivedWorkingDirectories: candidates,
+                teamWorkingDirectory: workingDirectory,
+                isDirectory: { path in
+                    var isDirectory: ObjCBool = false
+                    return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+                        && isDirectory.boolValue
+                }
+            )
+        }()
+        let isolatedResumeDecision = Self.isolatedResumeDirectoryDecision(
+            suppliedDirectories: agentWorkingDirectories,
+            resolvedDirectories: resumedWorkingDirectories
+        )
+        if worktreeMode == "isolated", isolatedResumeDecision == .reject {
+            Logger.team.error("isolated resume requires one distinct existing directory per agent")
+            return nil
+        }
         // A team may start with no agents but its leader. That is the normal
         // opening state when someone enters a project to work in it: they talk
         // to the leader, and the leader adds whoever the work turns out to
@@ -3018,7 +3044,8 @@ final class TeamOrchestrator: ObservableObject {
         // starts. Partial success is rolled back, and isolated mode never falls
         // through to the source checkout: a failed sandbox is a failed team
         // creation, not permission to run two agents in the user's working tree.
-        if worktreeMode == "isolated", executionMode != "headless", !agents.isEmpty {
+        if worktreeMode == "isolated", executionMode != "headless", !agents.isEmpty,
+           isolatedResumeDecision == .provisionFresh {
             guard let repoRoot = gitRepoRoot else {
                 Logger.team.error("isolated worktrees require a Git repository")
                 tabManager.closeWorkspace(workspace)
@@ -3207,7 +3234,8 @@ final class TeamOrchestrator: ObservableObject {
                             (
                                 name: agent.name, instance: reservedAgentInstanceIds[index],
                                 branch: isolatedWorktrees[index]?.branch ?? sharedWtBranch,
-                                path: isolatedWorktrees[index]?.path ?? sharedWtPath ?? workingDirectory
+                                path: resumedWorkingDirectories?[index]
+                                    ?? isolatedWorktrees[index]?.path ?? sharedWtPath ?? workingDirectory
                             )
                         }
                     )
@@ -3545,6 +3573,14 @@ final class TeamOrchestrator: ObservableObject {
                 wtName = info.name
                 wtPath = info.path
                 wtBranch = info.branch
+            }
+            if case let .reuse(resumedDirectories) = isolatedResumeDecision,
+               index < resumedDirectories.count {
+                let resumedWorkDir = resumedDirectories[index]
+                agentWorkDir = resumedWorkDir
+                if worktreeMode == "isolated" {
+                    wtPath = resumedWorkDir
+                }
             }
 
             let agentCli = agent.cli.isEmpty ? "claude" : agent.cli
@@ -5410,6 +5446,47 @@ final class TeamOrchestrator: ObservableObject {
             if let value = candidate?.nilIfBlank { return value }
         }
         return nil
+    }
+
+    /// Resolve pane resume directories without guessing an isolated topology.
+    nonisolated static func resumedAgentWorkingDirectories(
+        worktreeMode: String,
+        archivedWorkingDirectories: [String?],
+        teamWorkingDirectory: String,
+        isDirectory: (String) -> Bool
+    ) -> [String]? {
+        if worktreeMode != "isolated" {
+            return archivedWorkingDirectories.map { $0?.nilIfBlank ?? teamWorkingDirectory }
+        }
+        let resolved = archivedWorkingDirectories.compactMap { $0?.nilIfBlank }
+        guard resolved.count == archivedWorkingDirectories.count,
+              Set(resolved).count == resolved.count,
+              resolved.allSatisfy(isDirectory) else {
+            return nil
+        }
+        return resolved
+    }
+
+    enum IsolatedResumeDirectoryDecision: Equatable {
+        case provisionFresh
+        case reuse([String])
+        case reject
+    }
+
+    nonisolated static func isolatedResumeDirectoryDecision(
+        suppliedDirectories: [String?]?, resolvedDirectories: [String]?
+    ) -> IsolatedResumeDirectoryDecision {
+        guard suppliedDirectories != nil else { return .provisionFresh }
+        guard let resolvedDirectories else { return .reject }
+        return .reuse(resolvedDirectories)
+    }
+
+    nonisolated static func resumedWorktreeMode(
+        persistedMode: String?, persistedWorktree: [String: Any]?
+    ) -> String {
+        if let mode = persistedMode?.nilIfBlank { return mode }
+        if let mode = (persistedWorktree?["mode"] as? String)?.nilIfBlank { return mode }
+        return "off"
     }
 
     /// Whether the shell behind this pane belongs to this machine or a peer.
@@ -8640,17 +8717,28 @@ final class TeamOrchestrator: ObservableObject {
         // worktree mode from archive (off / shared / isolated). If the archive
         // had a shared worktree, the createTeam path will reuse the same
         // configuration when laying out panes.
-        let archivedWorktreeMode: String = {
-            if let wt = result["worktree"] as? [String: Any],
-               let mode = wt["mode"] as? String, !mode.isEmpty {
-                return mode
-            }
-            return "off"
-        }()
+        let archivedWorktreeMode = Self.resumedWorktreeMode(
+            persistedMode: result["worktree_mode"] as? String,
+            persistedWorktree: result["worktree"] as? [String: Any]
+        )
 
         // Build agents tuple in createTeam's expected shape.
-        typealias AgentTuple = (name: String, cli: String, model: String, effort: String, agentType: String, color: String, instructions: String, customInstructions: String)
-        let agentTuples: [AgentTuple] = agentsArr.map { a in
+        typealias AgentTuple = (name: String, cli: String, model: String, effort: String, agentType: String, color: String, instructions: String, customInstructions: String, workingDirectory: String)
+        let archivedAgentWorkingDirectories = agentsArr.map { $0["working_directory"] as? String }
+        guard let resumedAgentWorkingDirectories = Self.resumedAgentWorkingDirectories(
+            worktreeMode: archivedWorktreeMode,
+            archivedWorkingDirectories: archivedAgentWorkingDirectories,
+            teamWorkingDirectory: workingDirectory,
+            isDirectory: { path in
+                var isDirectory: ObjCBool = false
+                return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+                    && isDirectory.boolValue
+            }
+        ) else {
+            Logger.team.error("[pane-resume] refusing incomplete isolated working-directory topology for '\(teamName, privacy: .public)'")
+            return nil
+        }
+        let agentTuples: [AgentTuple] = agentsArr.enumerated().map { index, a in
             (
                 name: (a["name"] as? String) ?? "agent",
                 cli: (a["cli"] as? String) ?? "claude",
@@ -8662,7 +8750,15 @@ final class TeamOrchestrator: ObservableObject {
                 // Resume archives already store the fully composed instructions
                 // (effective-prompt marker present), so re-applying custom
                 // instructions here would double-append. Always empty on resume.
-                customInstructions: ""
+                customInstructions: "",
+                workingDirectory: resumedAgentWorkingDirectories[index]
+            )
+        }
+        let createTeamAgents = agentTuples.map { agent in
+            (
+                name: agent.name, cli: agent.cli, model: agent.model, effort: agent.effort,
+                agentType: agent.agentType, color: agent.color, instructions: agent.instructions,
+                customInstructions: agent.customInstructions
             )
         }
 
@@ -8676,20 +8772,19 @@ final class TeamOrchestrator: ObservableObject {
         // `--resume` validity guard: a sid whose transcript jsonl is gone
         // would make the claude CLI error out at spawn. The leader always ran
         // in the team workdir; workers share it when worktreeMode == "off".
-        // Worktree-isolated workers can't be verified here (their transcripts
-        // live under each worktree's encoded dir), so their sids pass through
-        // and degrade at the CLI level in the worst case.
-        let sharedTranscriptDir = ClaudeSessionWatcher.encodedProjectDir(workDir: workingDirectory)
-        func transcriptExists(_ sid: String) -> Bool {
-            FileManager.default.fileExists(atPath: "\(sharedTranscriptDir)/\(sid).jsonl")
+        // Each worker is checked in its archived working directory. Legacy
+        // archives without that field retain the team directory fallback.
+        func transcriptExists(_ sid: String, workingDirectory: String) -> Bool {
+            let transcriptDir = ClaudeSessionWatcher.encodedProjectDir(workDir: workingDirectory)
+            return FileManager.default.fileExists(atPath: "\(transcriptDir)/\(sid).jsonl")
         }
 
         var agentResumeMap: [String: String] = [:]
-        for a in agentsArr {
+        for (index, a) in agentsArr.enumerated() {
             guard let name = a["name"] as? String,
                   let sid = a["session_id"] as? String,
                   !sid.isEmpty else { continue }
-            if archivedWorktreeMode == "off" && !transcriptExists(sid) {
+            if !transcriptExists(sid, workingDirectory: agentTuples[index].workingDirectory) {
                 Logger.team.info("[pane-resume] dropping stale sid for agent '\(name, privacy: .public)' — transcript missing, starting fresh")
                 continue
             }
@@ -8704,7 +8799,7 @@ final class TeamOrchestrator: ObservableObject {
         // as `--resume` re-attaches claude to its prior transcript.
         let leaderClaudeSid: String? = {
             guard !leaderSessionId.isEmpty else { return nil }
-            guard transcriptExists(leaderSessionId) else {
+            guard transcriptExists(leaderSessionId, workingDirectory: workingDirectory) else {
                 Logger.team.info("[pane-resume] dropping stale leader sid — transcript missing, starting fresh")
                 return nil
             }
@@ -8713,7 +8808,7 @@ final class TeamOrchestrator: ObservableObject {
 
         guard let team = createTeam(
             name: teamName,
-            agents: agentTuples,
+            agents: createTeamAgents,
             workingDirectory: workingDirectory,
             leaderSessionId: freshLeaderSessionId,
             leaderMode: leaderMode,
@@ -8724,6 +8819,7 @@ final class TeamOrchestrator: ObservableObject {
             worktreeMode: archivedWorktreeMode,
             executionMode: "pane",
             agentResumeSessionIds: agentResumeMap.isEmpty ? nil : agentResumeMap,
+            agentWorkingDirectories: agentTuples.map(\.workingDirectory),
             tabManager: tabManager
         ) else {
             Logger.team.error("[pane-resume] createTeam failed for '\(teamName, privacy: .public)'")
@@ -8786,7 +8882,7 @@ final class TeamOrchestrator: ObservableObject {
             )
         }
 
-        Logger.team.info("[pane-resume] adopted team '\(teamName, privacy: .public)' with \(agentTuples.count) agent(s); leader resumed via --resume, agents start fresh (per-agent --resume is a follow-up)")
+        Logger.team.info("[pane-resume] adopted team '\(teamName, privacy: .public)' with \(agentTuples.count) agent(s); available leader and agent sessions resumed via --resume")
         return teams[teamName]
     }
 
@@ -8997,10 +9093,15 @@ final class TeamOrchestrator: ObservableObject {
             "delegation_effective": team.delegationState.effective.rawValue,
             "delegation_pending": team.delegationState.pending?.rawValue as Any? ?? NSNull(),
             "working_directory": team.workingDirectory,
+            "worktree_mode": team.worktreeMode,
             "termmesh_app_version": appVersion,
             "agents": team.agents.map { a -> [String: Any] in
                 var row: [String: Any] = [
                     "name": a.name,
+                    "working_directory": Self.agentWorkingDirectory(
+                        worktreePath: a.worktreePath, originalAgentWorkDir: a.originalAgentWorkDir,
+                        teamWorkingDirectory: team.workingDirectory
+                    ) as Any? ?? NSNull(),
                     "agent_instance_id": a.agentInstanceId,
                     "cli": a.cli,
                     "model": a.model,
@@ -9046,7 +9147,6 @@ final class TeamOrchestrator: ObservableObject {
            let wtPath = team.sharedWorktreePath,
            let wtBranch = team.sharedWorktreeBranch,
            !wtName.isEmpty {
-            payload["worktree_mode"] = team.worktreeMode
             payload["worktree_path"] = wtPath
             payload["worktree_branch"] = wtBranch
         }
@@ -9201,12 +9301,17 @@ final class TeamOrchestrator: ObservableObject {
             "delegation_effective": team.delegationState.effective.rawValue,
             "delegation_pending": team.delegationState.pending?.rawValue as Any? ?? NSNull(),
             "working_directory": team.workingDirectory,
+            "worktree_mode": team.worktreeMode,
             "termmesh_app_version": appVersion,
             "layout_workspace_title": team.id,
             "app_socket_path": appSocketPath,
             "agents": team.agents.map { a -> [String: Any] in
                 var row: [String: Any] = [
                     "name": a.name,
+                    "working_directory": Self.agentWorkingDirectory(
+                        worktreePath: a.worktreePath, originalAgentWorkDir: a.originalAgentWorkDir,
+                        teamWorkingDirectory: team.workingDirectory
+                    ) as Any? ?? NSNull(),
                     "agent_instance_id": a.agentInstanceId,
                     "cli": a.cli,
                     "model": a.model,
@@ -9254,7 +9359,6 @@ final class TeamOrchestrator: ObservableObject {
            let wtPath = team.sharedWorktreePath,
            let wtBranch = team.sharedWorktreeBranch,
            !wtName.isEmpty {
-            payload["worktree_mode"] = team.worktreeMode
             payload["worktree_path"] = wtPath
             payload["worktree_branch"] = wtBranch
         }

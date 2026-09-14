@@ -39,6 +39,24 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         lock.__exit__.assert_called_once()
         runner.assert_called_once_with(args)
 
+    def test_main_dispatches_non_dry_studies_under_cleanup_and_lock(self):
+        for command, runner_name in (("orchestration-study", "run_orchestration_experiment"),
+                                     ("partition-study", "run_partition_experiment")):
+            cleanup = unittest.mock.MagicMock()
+            lock = unittest.mock.MagicMock()
+            with self.subTest(command=command), \
+                 unittest.mock.patch.object(sys, "argv", [str(SCRIPT), command]), \
+                 unittest.mock.patch.object(module, "benchmark_signal_cleanup", return_value=cleanup), \
+                 unittest.mock.patch.object(module, "benchmark_run_lock", return_value=lock) as lock_factory, \
+                 unittest.mock.patch.object(module, runner_name, return_value=23) as runner:
+                self.assertEqual(module.main(), 23)
+            cleanup.__enter__.assert_called_once_with()
+            cleanup.__exit__.assert_called_once()
+            lock.__enter__.assert_called_once_with()
+            lock.__exit__.assert_called_once()
+            runner.assert_called_once()
+            lock_factory.assert_called_once()
+
     def test_default_matrix_is_18_paired_counterbalanced_runs(self):
         specs = module.build_matrix(module.FIXTURES, 3, module.DEFAULT_SEED)
         self.assertEqual(len(specs), 18)
@@ -80,6 +98,20 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
             (2, "partitioned", 1), (2, "broad", 2),
             (3, "broad", 1), (3, "partitioned", 2),
         ])
+
+    def test_isolated_topology_matrix_alternates_only_leader_timing(self):
+        specs = module.build_isolated_topology_matrix(("split-divider-color",), 3)
+        self.assertEqual([(row.trial, row.condition, row.order) for row in specs], [
+            (1, "isolated-blocking", 1), (1, "isolated-overlap", 2),
+            (2, "isolated-overlap", 1), (2, "isolated-blocking", 2),
+            (3, "isolated-blocking", 1), (3, "isolated-overlap", 2),
+        ])
+
+    def test_isolated_topology_ownership_is_disjoint(self):
+        tasks = module.isolated_topology_tasks(module.FIXTURES["split-divider-color"])
+        worker_paths = set().union(*(set(task["owned"]) for task in tasks))
+        self.assertFalse(worker_paths & set(module.ISOLATED_LEADER_OWNED))
+        self.assertEqual(sum(task["mutates"] for task in tasks), 1)
 
     def test_partitioned_worker_capsules_have_disjoint_exact_paths(self):
         tasks = module.partitioned_worker_tasks(module.FIXTURES["split-divider-color"])
@@ -465,6 +497,11 @@ end
         source = SCRIPT.read_text()
         function = source[source.index("def run_divider_acceptance"):source.index("def run_acceptance")]
         self.assertGreaterEqual(function.count("scripts/generate-build-info.sh"), 2)
+        self.assertIn("scripts/check-ghostty-kit.sh", function)
+        self.assertNotIn("scripts/setup.sh", function)
+        self.assertGreaterEqual(function.count("-clonedSourcePackagesDirPath"), 1)
+        self.assertGreaterEqual(function.count("-disableAutomaticPackageResolution"), 1)
+        self.assertGreaterEqual(function.count("-derivedDataPath"), 1)
 
     def test_stream_parser_uses_result_usage_and_cost(self):
         stream = json.dumps({
@@ -753,15 +790,131 @@ end
                 json.dumps({"type": "assistant", "message": {"content": [
                     {"type": "tool_use", "name": "Bash", "input": {"command": "sed -n 1,20p Sources/A.swift"}},
                 ]}}),
+                json.dumps({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "sed -n '1,20p Sources/A.swift"}},
+                ]}}),
                 "not-json",
             )) + "\n")
             (checkout / "Sources").mkdir()
             (checkout / "Sources/A.swift").touch()
             result = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(result["status"], "censored")
             self.assertEqual(result["distinct_reads"], ["Sources/A.swift"])
             self.assertEqual(result["distinct_search_roots"], ["Sources", "Sources/A.swift"])
             self.assertEqual(result["malformed_rows"], 1)
             self.assertNotIn("/tmp/outside", json.dumps(result))
+            module.validate_access_scope(result, ("Sources", "Sources/A.swift"), "fixture")
+            with self.assertRaisesRegex(RuntimeError, "outside owned scope"):
+                module.validate_access_scope(result, ("Sources",), "fixture")
+
+    def test_read_telemetry_is_measured_only_with_complete_path_coverage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            (checkout / "Sources").mkdir(parents=True)
+            (checkout / "Sources/A.swift").touch()
+            transcript = Path(temporary) / "session.jsonl"
+            transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash",
+                 "input": {"command": "cd Sources && sed -n 1,20p A.swift"}},
+            ]}}) + "\n")
+            measured = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(measured["status"], "measured")
+            self.assertEqual(measured["distinct_access_paths"], ["Sources/A.swift"])
+            self.assertEqual(measured["path_extraction_coverage"], 1.0)
+
+            transcript.write_text("\n".join((
+                transcript.read_text().strip(),
+                json.dumps({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Bash",
+                     "input": {"command": "cd $TARGET && sed -n 1,20p *.swift"}},
+                    {"type": "tool_use", "name": "NotebookRead", "input": {}},
+                ]}}),
+            )) + "\n")
+            censored = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(censored["status"], "censored")
+            self.assertEqual(censored["unknown_tool_calls"], 1)
+            self.assertGreaterEqual(censored["unresolved_path_calls"], 2)
+            self.assertLess(censored["path_extraction_coverage"], 1.0)
+
+    def test_integrate_worker_patches_includes_untracked_binary_files_and_checks_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "leader"
+            worker = root / "worker"
+            subprocess.run(("git", "init", str(checkout)), check=True, capture_output=True)
+            (checkout / "base.txt").write_text("base\n")
+            subprocess.run(("git", "-C", str(checkout), "add", "base.txt"), check=True)
+            subprocess.run(("git", "-C", str(checkout), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.com", "commit", "-m", "base"),
+                           check=True, capture_output=True)
+            subprocess.run(("git", "clone", str(checkout), str(worker)), check=True, capture_output=True)
+            (worker / "asset.bin").write_bytes(b"\x00\xffbinary")
+            tasks = [{"worker": "executor", "owned": ["asset.bin"]}]
+            integrated = module.integrate_worker_patches(checkout, {"executor": worker}, tasks)
+            self.assertEqual(integrated, ["asset.bin"])
+            self.assertEqual((checkout / "asset.bin").read_bytes(), b"\x00\xffbinary")
+
+            (worker / "forbidden.txt").write_text("no\n")
+            with self.assertRaisesRegex(RuntimeError, "forbidden paths"):
+                module.integrate_worker_patches(checkout, {"executor": worker}, tasks)
+
+    def test_isolated_experiment_stops_and_preserves_scratch_after_unsafe_cleanup(self):
+        unsafe = module.RunResult(
+            run_id="unsafe", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-blocking", order=1, started_at=module.utc_now(),
+            cleanup_safe=False, cleanup_reason="collector alive",
+        )
+        args = unittest.mock.Mock(
+            fixtures="split-divider-color", conditions="isolated-blocking,isolated-overlap",
+            trials=1, timeout=60, dry_run=False, run_id="unsafe-run", results_dir=Path("unused"),
+            model="sonnet", effort="medium", seed=42, xcode_host="mac-sub", keep_checkouts=False,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            args.results_dir = Path(temporary) / "results"
+            scratch = Path(temporary) / "scratch"
+            scratch.mkdir()
+            with unittest.mock.patch.object(module.tempfile, "mkdtemp", return_value=str(scratch)), \
+                 unittest.mock.patch.object(module, "git", return_value="head"), \
+                 unittest.mock.patch.object(module, "validate_fixture_metadata", return_value=[]), \
+                 unittest.mock.patch.object(module, "run_isolated_topology_one", return_value=unsafe) as runner:
+                self.assertEqual(module.run_isolated_topology_experiment(args), 1)
+            self.assertEqual(runner.call_count, 1)
+            self.assertTrue(scratch.exists())
+
+    def test_isolated_experiment_removes_scratch_after_safe_result(self):
+        safe = module.RunResult(
+            run_id="safe", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-blocking", order=1, started_at=module.utc_now(),
+            status="passed", acceptance_passed=True, cleanup_safe=True, total_wall_ms=1,
+        )
+        args = unittest.mock.Mock(
+            fixtures="split-divider-color", conditions="isolated-blocking",
+            trials=1, timeout=60, dry_run=False, run_id="safe-run", results_dir=Path("unused"),
+            model="sonnet", effort="medium", seed=42, xcode_host="mac-sub", keep_checkouts=False,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            args.results_dir = Path(temporary) / "results"
+            scratch = Path(temporary) / "scratch"
+            scratch.mkdir()
+            with unittest.mock.patch.object(module.tempfile, "mkdtemp", return_value=str(scratch)), \
+                 unittest.mock.patch.object(module, "git", return_value="head"), \
+                 unittest.mock.patch.object(module, "validate_fixture_metadata", return_value=[]), \
+                 unittest.mock.patch.object(module, "run_isolated_topology_one", return_value=safe):
+                self.assertEqual(module.run_isolated_topology_experiment(args), 0)
+            self.assertFalse(scratch.exists())
+
+    def test_partial_isolated_worktree_creation_rolls_back(self):
+        checkout = Path("/tmp/integration")
+        calls = []
+        def run(args, **kwargs):
+            calls.append(tuple(args))
+            return subprocess.CompletedProcess(args, 1 if "executor" in str(args) else 0, "", "boom")
+        with unittest.mock.patch.object(module, "run_command", side_effect=run), \
+             unittest.mock.patch.object(module, "cleanup_isolated_worker_checkouts") as cleanup:
+            with self.assertRaisesRegex(RuntimeError, "worker worktree create failed"):
+                module.create_isolated_worker_checkouts(checkout)
+            cleanup.assert_called_once()
+            self.assertIn("explorer", cleanup.call_args.args[1])
 
     def test_orchestration_summary_requires_quality_before_promotion(self):
         rows = []
@@ -832,6 +985,8 @@ end
     def test_interval_overlap_uses_actual_start_and_end(self):
         self.assertEqual(module.interval_overlap_ms(10.0, 20.0, 15.0, 25.0), 5000)
         self.assertEqual(module.interval_overlap_ms(10.0, 12.0, 15.0, 25.0), 0)
+        with self.assertRaisesRegex(TimeoutError, "end-to-end timeout"):
+            module.require_time_remaining(time.perf_counter() - 1, 10)
 
     def test_trace_writer_serializes_concurrent_events(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -895,6 +1050,19 @@ end
             self.assertIn("--disable-slash-commands", agent["extra_args"])
             self.assertIn("--strict-mcp-config", agent["extra_args"])
         self.assertEqual(params["app_socket_path"], "/tmp/app.sock")
+
+    def test_benchmark_team_can_place_each_worker_in_a_distinct_checkout(self):
+        workdirs = {role: Path(f"/tmp/{role}") for role in ("explorer", "executor", "reviewer")}
+        with unittest.mock.patch.object(module, "tm_environment", return_value={
+            "TERMMESH_SOCKET": "/tmp/app.sock",
+        }), unittest.mock.patch.object(
+            module, "daemon_json", return_value={"team_name": "bench"},
+        ) as rpc:
+            module.create_benchmark_team("bench", Path("/tmp/integration"), "sonnet", workdirs)
+        agents = rpc.call_args.args[1]["agents"]
+        self.assertEqual({row["name"]: row["working_directory"] for row in agents}, {
+            role: str(path) for role, path in workdirs.items()
+        })
 
     def test_usage_delta_clamps_agent_resets(self):
         before = {key: 10 for key in module.TOKEN_KEYS}

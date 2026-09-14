@@ -146,6 +146,19 @@ python3 scripts/bench-agent-effectiveness.py partition-study \
 Compare wall time, acceptance pass rate, worker critical path, integration time, and read-set Jaccard.
 Do not compare results from different commits or mix blocking and overlap lifecycles.
 
+## Isolated Project topology study
+
+This study matches the Project topology. The leader owns the integration checkout.
+Each worker runs in a separate detached Git worktree. Leader and worker write scopes do not overlap.
+The conditions differ only in whether the leader implements its production slice before or after worker completion.
+
+```bash
+python3 scripts/bench-agent-effectiveness.py isolated-topology-study \
+  --fixtures split-divider-color --trials 3 --seed 20260814 --dry-run
+```
+
+Run the paid six-cell study only after the dry run and fixture validation pass.
+
 ## Project leader policy A/B
 
 The original matrix compares one session with a controller-dispatched three-worker team. It does

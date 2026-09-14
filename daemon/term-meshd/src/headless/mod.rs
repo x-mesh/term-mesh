@@ -471,6 +471,9 @@ pub struct WorktreeParam {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AgentSpec {
     pub name: String,
+    /// Optional per-agent checkout. Missing preserves the team directory.
+    #[serde(default)]
+    pub working_directory: Option<String>,
     #[serde(default = "default_cli")]
     pub cli: String,
     #[serde(default = "default_model")]
@@ -1185,6 +1188,13 @@ impl HeadlessManager {
         // Validate agent names early — BEFORE any subprocess spawn or disk write.
         for spec in &params.agents {
             meta::validate_agent_name(&spec.name)?;
+            if let Some(path) = spec.working_directory.as_deref() {
+                let metadata = std::fs::metadata(path)
+                    .map_err(|error| format!("invalid agent working_directory for {}: {error}", spec.name))?;
+                if !metadata.is_dir() {
+                    return Err(format!("invalid agent working_directory for {}: not a directory", spec.name));
+                }
+            }
         }
 
         let now = meta::now_unix();
@@ -1244,6 +1254,7 @@ impl HeadlessManager {
                 schema: meta::SCHEMA_VERSION,
                 team_uuid: team_uuid.clone(),
                 name: spec.name.clone(),
+                working_directory: spec.working_directory.clone(),
                 agent_instance_id: Some(meta::new_uuid()),
                 agent_type: spec.agent_type.clone().unwrap_or_else(|| spec.name.clone()),
                 cli: spec.cli.clone(),
@@ -1301,6 +1312,7 @@ impl HeadlessManager {
                 session_id: leader_session_id,
             },
             agents: params.agents.iter().map(|s| s.name.clone()).collect(),
+            worktree_mode: params.worktree.as_ref().map(|w| w.mode.clone()),
             worktree: params.worktree.as_ref().map(|w| meta::WorktreeMeta {
                 mode: w.mode.clone(),
                 path: w.path.clone(),
@@ -1348,7 +1360,8 @@ impl HeadlessManager {
                 cli: spec.cli.clone(),
                 model: spec.model.clone(),
                 effort: spec.effort.clone(),
-                working_directory: params.working_directory.clone(),
+                working_directory: spec.working_directory.clone()
+                    .unwrap_or_else(|| params.working_directory.clone()),
                 cli_path: spec.cli_path.clone(),
                 app_socket_path: params.app_socket_path.clone(),
                 instructions: instr_bytes,
@@ -1571,6 +1584,7 @@ impl HeadlessManager {
                 session_id: Some(params.leader_session_id.clone()).filter(|s| !s.is_empty()),
             },
             agents: params.agents.iter().map(|a| a.name.clone()).collect(),
+            worktree_mode: params.worktree_mode.clone(),
             worktree: match (
                 params.worktree_mode.as_deref(),
                 params.worktree_path.as_deref(),
@@ -1624,6 +1638,7 @@ impl HeadlessManager {
                 schema: meta::SCHEMA_VERSION,
                 team_uuid: team_uuid.clone(),
                 name: a.name.clone(),
+                working_directory: a.working_directory.clone(),
                 agent_instance_id: a
                     .agent_instance_id
                     .clone()
@@ -1738,6 +1753,7 @@ impl HeadlessManager {
                 schema: meta::SCHEMA_VERSION,
                 team_uuid: team_uuid.clone(),
                 name: a.name.clone(),
+                working_directory: a.working_directory.clone(),
                 agent_instance_id: a
                     .agent_instance_id
                     .clone()
@@ -1779,6 +1795,7 @@ impl HeadlessManager {
                 session_id: Some(params.leader_session_id.clone()).filter(|s| !s.is_empty()),
             },
             agents: params.agents.iter().map(|a| a.name.clone()).collect(),
+            worktree_mode: params.worktree_mode.clone(),
             worktree: match (
                 params.worktree_mode.as_deref(),
                 params.worktree_path.as_deref(),
@@ -1900,6 +1917,7 @@ impl HeadlessManager {
             };
             agents.push(ResumePaneAgent {
                 name: am.name,
+                working_directory: am.working_directory,
                 agent_instance_id: am.agent_instance_id,
                 agent_type: am.agent_type,
                 cli: am.cli,
@@ -1919,6 +1937,7 @@ impl HeadlessManager {
             git_root: team_meta.git_root,
             leader: team_meta.leader,
             agents,
+            worktree_mode: team_meta.worktree_mode,
             worktree: team_meta.worktree,
             delegation_configured: team_meta.delegation_configured,
             delegation_effective: team_meta.delegation_effective,
@@ -2202,6 +2221,7 @@ impl HeadlessManager {
                 schema: meta::SCHEMA_VERSION,
                 team_uuid: team_uuid.clone(),
                 name: spec.name.clone(),
+                working_directory: spec.working_directory.clone(),
                 agent_instance_id: Some(meta::new_uuid()),
                 agent_type: spec.agent_type.clone().unwrap_or_else(|| spec.name.clone()),
                 cli: spec.cli.clone(),
@@ -3124,7 +3144,8 @@ impl HeadlessManager {
                 cli: m.cli.clone(),
                 model: m.model.clone(),
                 effort: m.effort.clone(),
-                working_directory: team_meta.working_directory.clone(),
+                working_directory: m.working_directory.clone()
+                    .unwrap_or_else(|| team_meta.working_directory.clone()),
                 cli_path: m.cli_path_at_create.clone(),
                 app_socket_path: params.app_socket_path.clone(),
                 instructions: instr_bytes,
@@ -3276,6 +3297,8 @@ pub struct ArchivePaneParams {
 pub struct ArchivePaneAgent {
     pub name: String,
     #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
     pub agent_instance_id: Option<String>,
     pub cli: String,
     pub model: String,
@@ -3347,6 +3370,8 @@ pub struct SnapshotPaneParams {
 pub struct SnapshotPaneAgent {
     pub name: String,
     #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default)]
     pub agent_instance_id: Option<String>,
     pub cli: String,
     pub model: String,
@@ -3410,6 +3435,7 @@ pub struct ResumePaneResult {
     pub git_root: Option<String>,
     pub leader: meta::LeaderMeta,
     pub agents: Vec<ResumePaneAgent>,
+    pub worktree_mode: Option<String>,
     pub worktree: Option<meta::WorktreeMeta>,
     pub delegation_configured: String,
     pub delegation_effective: String,
@@ -3419,6 +3445,7 @@ pub struct ResumePaneResult {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ResumePaneAgent {
     pub name: String,
+    pub working_directory: Option<String>,
     pub agent_instance_id: Option<String>,
     pub agent_type: String,
     pub cli: String,
@@ -3543,6 +3570,7 @@ fn make_pre_phase2_stub(team: &HeadlessTeam, destroyed_at: u64) -> meta::TeamMet
             .iter()
             .filter_map(|id| id.split('@').next().map(String::from))
             .collect(),
+        worktree_mode: None,
         worktree: None,
         execution_mode: "headless".into(),
         claude_cli_version: None,
@@ -3822,6 +3850,47 @@ mod tests {
         let _ = mgr.destroy_team("f1-verify").await;
     }
 
+    #[tokio::test]
+    async fn create_and_resume_team_preserve_per_agent_working_directories() {
+        let root = scoped_root();
+        let root_path = root.path().to_path_buf();
+        let fake_cli = root_path.join("fake-cli.sh");
+        std::fs::write(&fake_cli, "#!/bin/sh\nexec cat >/dev/null 2>&1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let a = root_path.join("a");
+        let b = root_path.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let params: TeamCreateParams = serde_json::from_value(serde_json::json!({
+            "team_name": "per-agent-cwd", "working_directory": root_path,
+            "agents": [
+                {"name":"a","cli":"claude","model":"sonnet","cli_path":fake_cli,"working_directory":a},
+                {"name":"b","cli":"claude","model":"sonnet","cli_path":fake_cli,"working_directory":b}
+            ]
+        })).unwrap();
+        let mut mgr = HeadlessManager::new();
+        let team = mgr.create_team(params).await.unwrap();
+        let listed = mgr.list(Some("per-agent-cwd")).await;
+        assert_eq!(listed.iter().map(|row| row.working_directory.as_str()).collect::<std::collections::HashSet<_>>(),
+                   std::collections::HashSet::from([a.to_str().unwrap(), b.to_str().unwrap()]));
+        let uuid = team.team_uuid.clone();
+        assert_eq!(test_read_agent_meta(&uuid, "a").unwrap().working_directory.as_deref(), a.to_str());
+        assert_eq!(test_read_agent_meta(&uuid, "b").unwrap().working_directory.as_deref(), b.to_str());
+        let _ = mgr.destroy_team("per-agent-cwd").await.unwrap();
+        let resumed = mgr.resume_team(ResumeTeamParams {
+            team_uuid: uuid, team_name_override: Some("per-agent-cwd-2".into()),
+            app_socket_path: None, leader_session_id: String::new(),
+            accept_branch_drift: false,
+        }).await.unwrap();
+        let listed = mgr.list(Some(&resumed.team.name)).await;
+        assert_eq!(listed.iter().map(|row| row.working_directory.as_str()).collect::<std::collections::HashSet<_>>(),
+                   std::collections::HashSet::from([a.to_str().unwrap(), b.to_str().unwrap()]));
+        let _ = mgr.destroy_team(&resumed.team.name).await;
+    }
+
     #[test]
     fn set_idle_park_minutes_bounds() {
         let _scope = scoped_root();
@@ -3876,6 +3945,7 @@ mod tests {
             schema: meta::SCHEMA_VERSION,
             team_uuid: team_uuid.clone(),
             name: "explorer".into(),
+            working_directory: None,
             agent_instance_id: None,
             agent_type: "explorer".into(),
             cli: "claude".into(),
@@ -3916,6 +3986,7 @@ mod tests {
                 session_id: None,
             },
             agents: vec!["explorer".into()],
+            worktree_mode: None,
             worktree: None,
             execution_mode: "headless".into(),
             claude_cli_version: Some("1.2.3".into()),
@@ -3970,6 +4041,7 @@ mod tests {
             schema: meta::SCHEMA_VERSION,
             team_uuid: team_uuid.clone(),
             name: "explorer".into(),
+            working_directory: None,
             agent_instance_id: None,
             agent_type: "explorer".into(),
             cli: "claude".into(),
@@ -4010,6 +4082,7 @@ mod tests {
                 session_id: Some("leader-sid".into()),
             },
             agents: vec!["explorer".into()],
+            worktree_mode: None,
             worktree: None,
             execution_mode: "pane".into(),
             claude_cli_version: None,
@@ -4146,6 +4219,7 @@ mod tests {
             schema: meta::SCHEMA_VERSION,
             team_uuid: team_uuid.into(),
             name: "executor".into(),
+            working_directory: Some("/tmp/executor".into()),
             agent_instance_id: Some("instance-test".into()),
             agent_type: "executor".into(),
             cli: "claude".into(),
@@ -4234,6 +4308,7 @@ mod tests {
             worktree_branch: None,
             agents: vec![ArchivePaneAgent {
                 name: "explorer".into(),
+                working_directory: None,
                 agent_instance_id: None,
                 cli: "claude".into(),
                 model: "sonnet".into(),
@@ -4277,6 +4352,25 @@ mod tests {
     }
 
     #[test]
+    fn isolated_pane_mode_round_trips_without_team_worktree_path() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+        let team_uuid = "23232323-3434-4545-8666-787878787878";
+        let mut params = sample_archive_params(Some(team_uuid.into()));
+        params.worktree_mode = Some("isolated".into());
+        params.worktree_path = None;
+        params.worktree_branch = None;
+
+        mgr.archive_pane_team(params).expect("archive isolated pane team");
+        let resumed = mgr
+            .resume_pane(ResumePaneParams { team_uuid: team_uuid.into() })
+            .expect("resume isolated pane team");
+
+        assert_eq!(resumed.worktree_mode.as_deref(), Some("isolated"));
+        assert!(resumed.worktree.is_none());
+    }
+
+    #[test]
     fn archive_pane_grace_mode_assigns_uuid_when_missing() {
         let _scope = scoped_root();
         let mut mgr = HeadlessManager::new();
@@ -4311,6 +4405,7 @@ mod tests {
             agents: vec![
                 SnapshotPaneAgent {
                     name: "explorer".into(),
+                    working_directory: None,
                     agent_instance_id: None,
                     cli: "claude".into(),
                     model: "sonnet".into(),
@@ -4325,6 +4420,7 @@ mod tests {
                 },
                 SnapshotPaneAgent {
                     name: "reviewer".into(),
+                    working_directory: None,
                     agent_instance_id: None,
                     cli: "codex".into(),
                     model: "gpt".into(),
@@ -4582,6 +4678,7 @@ mod tests {
                 session_id: None,
             },
             agents: vec!["a".into()],
+            worktree_mode: None,
             worktree: None,
             execution_mode: "pane".into(),
             claude_cli_version: None,
@@ -4604,6 +4701,7 @@ mod tests {
             schema: meta::SCHEMA_VERSION,
             team_uuid: team_uuid.clone(),
             name: "a".into(),
+            working_directory: None,
             agent_instance_id: None,
             agent_type: "explorer".into(),
             cli: "claude".into(),
@@ -4678,6 +4776,7 @@ mod tests {
                 session_id: Some("lead-sid".into()),
             },
             agents: vec![],
+            worktree_mode: None,
             worktree: None,
             execution_mode: "pane".into(),
             claude_cli_version: None,

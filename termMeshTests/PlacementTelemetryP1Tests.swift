@@ -114,6 +114,116 @@ final class PlacementTelemetryP1Tests: XCTestCase {
         )
     }
 
+    func testPaneResumePrefersTheArchivedAgentDirectory() {
+        XCTAssertEqual(
+            TeamOrchestrator.resumedAgentWorkingDirectories(
+                worktreeMode: "isolated",
+                archivedWorkingDirectories: [worktree],
+                teamWorkingDirectory: teamRoot,
+                isDirectory: { $0 == self.worktree }
+            ),
+            [worktree]
+        )
+    }
+
+    func testPaneResumeFallsBackToTheTeamDirectoryForLegacyNonisolatedArchives() {
+        XCTAssertEqual(
+            TeamOrchestrator.resumedAgentWorkingDirectories(
+                worktreeMode: "off",
+                archivedWorkingDirectories: ["  "],
+                teamWorkingDirectory: teamRoot,
+                isDirectory: { _ in false }
+            ),
+            [teamRoot]
+        )
+    }
+
+    func testPaneResumeRejectsIncompleteIsolatedDirectories() {
+        XCTAssertNil(
+            TeamOrchestrator.resumedAgentWorkingDirectories(
+                worktreeMode: "isolated",
+                archivedWorkingDirectories: [worktree, nil],
+                teamWorkingDirectory: teamRoot,
+                isDirectory: { _ in true }
+            )
+        )
+    }
+
+    func testPaneResumeRejectsDuplicateOrMissingIsolatedDirectories() {
+        XCTAssertNil(
+            TeamOrchestrator.resumedAgentWorkingDirectories(
+                worktreeMode: "isolated",
+                archivedWorkingDirectories: [worktree, worktree],
+                teamWorkingDirectory: teamRoot,
+                isDirectory: { _ in true }
+            )
+        )
+        XCTAssertNil(
+            TeamOrchestrator.resumedAgentWorkingDirectories(
+                worktreeMode: "isolated",
+                archivedWorkingDirectories: [worktree, "/missing"],
+                teamWorkingDirectory: teamRoot,
+                isDirectory: { $0 != "/missing" }
+            )
+        )
+    }
+
+    func testPaneResumePreservesIsolatedModeWithoutATeamWorktreeObject() {
+        XCTAssertEqual(
+            TeamOrchestrator.resumedWorktreeMode(
+                persistedMode: "isolated", persistedWorktree: nil
+            ),
+            "isolated"
+        )
+    }
+
+    func testPaneResumeReadsLegacyWorktreeObjectMode() {
+        XCTAssertEqual(
+            TeamOrchestrator.resumedWorktreeMode(
+                persistedMode: nil, persistedWorktree: ["mode": "shared"]
+            ),
+            "shared"
+        )
+    }
+
+    func testIsolatedResumeDirectoryDecisionRejectsInvalidSuppliedTopology() {
+        XCTAssertEqual(
+            TeamOrchestrator.isolatedResumeDirectoryDecision(
+                suppliedDirectories: [nil], resolvedDirectories: nil
+            ),
+            .reject
+        )
+    }
+
+    func testIsolatedResumeDirectoryDecisionProvisionsOnlyWithoutSuppliedTopology() {
+        XCTAssertEqual(
+            TeamOrchestrator.isolatedResumeDirectoryDecision(
+                suppliedDirectories: nil, resolvedDirectories: nil
+            ),
+            .provisionFresh
+        )
+    }
+
+    func testIsolatedResumeDirectoryDecisionReusesValidTopology() {
+        XCTAssertEqual(
+            TeamOrchestrator.isolatedResumeDirectoryDecision(
+                suppliedDirectories: [worktree], resolvedDirectories: [worktree]
+            ),
+            .reuse([worktree])
+        )
+    }
+
+    func testInvalidIsolatedResumeDecisionCanRejectBeforeCreationSideEffects() {
+        var sideEffectRan = false
+        let decision = TeamOrchestrator.isolatedResumeDirectoryDecision(
+            suppliedDirectories: [nil], resolvedDirectories: nil
+        )
+        if decision != .reject { sideEffectRan = true }
+
+        XCTAssertEqual(decision, .reject)
+        XCTAssertFalse(sideEffectRan)
+    }
+
     // MARK: - locality
 
     /// Local pane creation never sets `hostKey` (`addAgentPaneToWorkspace`

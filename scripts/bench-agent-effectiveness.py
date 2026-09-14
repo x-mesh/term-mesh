@@ -33,7 +33,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional, TextIO
+from typing import Any, Callable, Iterable, Iterator, Optional, TextIO
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RESULTS = Path.home() / ".term-mesh" / "benchmarks" / "effectiveness"
@@ -44,6 +44,7 @@ CONDITIONS = ("single", "multi")
 ORCHESTRATION_CONDITIONS = ("single", "blocking", "overlap")
 PARTITION_CONDITIONS = ("broad", "partitioned")
 PARTITION_FIXTURES = ("split-divider-color",)
+ISOLATED_TOPOLOGY_CONDITIONS = ("isolated-blocking", "isolated-overlap")
 POLICIES = ("legacy", "adaptive")
 TOKEN_KEYS = (
     "input_tokens", "output_tokens", "reasoning_output_tokens",
@@ -171,6 +172,8 @@ class RunResult:
     cost_usd: Optional[float] = None
     cost_precision: str = "unavailable"
     changed_files: int = 0
+    cleanup_safe: bool = True
+    cleanup_reason: Optional[str] = None
     paths: dict[str, str] = field(default_factory=dict)
 
 
@@ -279,6 +282,19 @@ def build_partition_matrix(
                 for index, condition in enumerate(order, 1)
                 if condition in selected
             )
+    return specs
+
+
+def build_isolated_topology_matrix(
+    fixtures: Iterable[str], trials: int,
+    conditions: Iterable[str] = ISOLATED_TOPOLOGY_CONDITIONS,
+) -> list[RunSpec]:
+    selected = tuple(conditions)
+    specs = []
+    for fixture in fixtures:
+        for trial in range(1, trials + 1):
+            order = ISOLATED_TOPOLOGY_CONDITIONS if trial % 2 else tuple(reversed(ISOLATED_TOPOLOGY_CONDITIONS))
+            specs.extend(RunSpec(fixture, trial, condition, index) for index, condition in enumerate(order, 1) if condition in selected)
     return specs
 
 
@@ -531,9 +547,22 @@ def run_divider_acceptance(
         "termMeshTests/HiddenSplitDividerPortalAcceptanceTests/testOpaqueDividerRendersWithoutSurfaceOcclusion",
         "termMeshTests/HiddenSplitDividerPortalAcceptanceTests/testTranslucentDividerKeepsOcclusionPolicy",
     )
+    source_packages = os.environ.get(
+        "TERMMESH_BENCH_SOURCE_PACKAGES",
+        "/Users/jinwoo/Library/Caches/term-mesh/SourcePackages",
+    )
+    derived_data = os.environ.get(
+        "TERMMESH_BENCH_DERIVED_DATA",
+        "/Users/jinwoo/Library/Developer/Xcode/DerivedData/term-mesh-effectiveness",
+    )
+    package_flags = [
+        "-clonedSourcePackagesDirPath", source_packages,
+        "-disableAutomaticPackageResolution",
+        "-derivedDataPath", derived_data,
+    ]
     command = [
         "xcodebuild", "-project", "GhosttyTabs.xcodeproj", "-scheme", "term-mesh-unit",
-        "-configuration", "Debug", "-destination", "platform=macOS",
+        "-configuration", "Debug", "-destination", "platform=macOS", *package_flags,
     ]
     for test in tests:
         command.extend(("-only-testing:" + test,))
@@ -547,7 +576,8 @@ def run_divider_acceptance(
             return ok, reason
         return run_logged(
             ("xcodebuild", "-project", "GhosttyTabs.xcodeproj", "-scheme", "term-mesh",
-             "-configuration", "Debug", "-destination", "platform=macOS", "build"),
+             "-configuration", "Debug", "-destination", "platform=macOS",
+             *package_flags, "build"),
             checkout=checkout, log=log, timeout=timeout,
         )
     remote = f"/tmp/term-mesh-effectiveness-{re.sub(r'[^A-Za-z0-9_.-]', '-', run_id)}"
@@ -563,12 +593,13 @@ def run_divider_acceptance(
             return False, f"remote sync failed: {synced.stderr[-1000:]}"
         remote_command = (
             "cd " + shlex.quote(remote)
-            + " && ./scripts/setup.sh"
+            + " && ./scripts/check-ghostty-kit.sh"
             + " && ./scripts/generate-build-info.sh"
             + " && " + shlex.join(command)
             + " && " + shlex.join((
             "xcodebuild", "-project", "GhosttyTabs.xcodeproj", "-scheme", "term-mesh",
-            "-configuration", "Debug", "-destination", "platform=macOS", "build",
+            "-configuration", "Debug", "-destination", "platform=macOS",
+            *package_flags, "build",
             ))
         )
         result = run_command(("ssh", xcode_host, remote_command), timeout=timeout)
@@ -976,7 +1007,11 @@ def daemon_json(method: str, params: dict[str, Any], *, timeout: float = 10) -> 
     return parsed.get("result")
 
 
-def create_benchmark_team(team: str, checkout: Path, model: str) -> Any:
+def create_benchmark_team(
+    team: str, checkout: Path, model: str,
+    agent_workdirs: Optional[dict[str, Path]] = None,
+    timeout: float = 300,
+) -> Any:
     """Create three clean Claude workers without user/project customizations.
 
     ``tm-agent create`` intentionally applies the user's normal CLI profile.
@@ -990,6 +1025,7 @@ def create_benchmark_team(team: str, checkout: Path, model: str) -> Any:
     agents = [
         {
             "name": role,
+            **({"working_directory": str(agent_workdirs[role])} if agent_workdirs and role in agent_workdirs else {}),
             "agent_type": role,
             "cli": "claude",
             "model": model,
@@ -1014,8 +1050,68 @@ def create_benchmark_team(team: str, checkout: Path, model: str) -> Any:
             "agents": agents,
             "app_socket_path": app_socket,
         },
-        timeout=300,
+        timeout=timeout,
     )
+
+
+def create_isolated_worker_checkouts(
+    checkout: Path, timeout: Callable[[], float] = lambda: 120.0,
+) -> dict[str, Path]:
+    workdirs = {}
+    try:
+        for role in ("explorer", "executor", "reviewer"):
+            path = checkout.parent / f"{checkout.name}-worker-{role}"
+            result = run_command(
+                ("git", "worktree", "add", "--detach", str(path), "HEAD"),
+                cwd=checkout, timeout=min(120, timeout()),
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"worker worktree create failed for {role}: {result.stderr}")
+            workdirs[role] = path
+    except Exception:
+        cleanup_isolated_worker_checkouts(checkout, workdirs)
+        raise
+    return workdirs
+
+
+def integrate_worker_patches(
+    checkout: Path, workdirs: dict[str, Path], tasks: list[dict[str, Any]],
+    timeout: Callable[[], float] = lambda: 120.0,
+) -> list[str]:
+    integrated = []
+    by_worker = {task["worker"]: task for task in tasks}
+    leader_changed = set(git("diff", "--name-only", cwd=checkout).splitlines())
+    leader_changed.update(git("ls-files", "--others", "--exclude-standard", cwd=checkout).splitlines())
+    for role, path in workdirs.items():
+        tracked = set(git("diff", "--name-only", cwd=path).splitlines())
+        untracked = set(git("ls-files", "--others", "--exclude-standard", cwd=path).splitlines())
+        changed = tracked | untracked
+        if not changed:
+            continue
+        allowed = set(by_worker[role]["owned"])
+        outside = changed - allowed
+        if outside:
+            raise RuntimeError(f"isolated worker {role} changed forbidden paths: {sorted(outside)}")
+        overlap = changed & leader_changed
+        if overlap:
+            raise RuntimeError(f"isolated integration ownership overlap: {sorted(overlap)}")
+        if untracked:
+            staged = run_command(("git", "add", "-N", "--", *sorted(untracked)), cwd=path, timeout=timeout())
+            if staged.returncode != 0:
+                raise RuntimeError(f"isolated integration could not expose untracked files: {staged.stderr}")
+        patch = subprocess.run(
+            ("git", "diff", "--binary"), cwd=path, capture_output=True, check=True,
+            timeout=timeout(),
+        ).stdout
+        applied = subprocess.run(
+            ("git", "apply", "--binary", "-"), cwd=checkout, input=patch, capture_output=True,
+            timeout=timeout(),
+        )
+        if applied.returncode != 0:
+            raise RuntimeError(f"isolated integration failed for {role}: {applied.stderr.decode(errors='replace')}")
+        integrated.extend(sorted(changed))
+        leader_changed.update(changed)
+    return integrated
 
 
 def default_worker_tasks() -> list[dict[str, Any]]:
@@ -1079,6 +1175,44 @@ def partitioned_worker_tasks(fixture: Fixture) -> list[dict[str, Any]]:
             "mutates": False, "estimated_seconds": 300,
         },
     ]
+
+
+def isolated_topology_tasks(fixture: Fixture) -> list[dict[str, Any]]:
+    tasks = partitioned_worker_tasks(fixture)
+    executor = next(task for task in tasks if task["worker"] == "executor")
+    executor["owned"] = [path for path in executor["owned"] if path != "Sources/TerminalWindowPortal.swift"]
+    executor["goal"] = "Implement divider settings, reset, config, workspace propagation, and focused unit tests"
+    reviewer = next(task for task in tasks if task["worker"] == "reviewer")
+    reviewer["owned"] = [
+        path for path in reviewer["owned"]
+        if path != "termMeshTests/GhosttyTerminalViewComposingTests.swift"
+    ]
+    return tasks
+
+
+ISOLATED_LEADER_OWNED = (
+    "Sources/TerminalWindowPortal.swift",
+    "termMeshTests/GhosttyTerminalViewComposingTests.swift",
+)
+
+
+def isolated_leader_prompt(fixture: Fixture, *, final: bool, worker_headers: str = "") -> str:
+    phase = (
+        "Worker patches are now integrated. Run focused verification and fix only your owned paths."
+        if final else
+        "Workers are running in isolated checkouts. Implement the portal overlay behavior now."
+    )
+    return f"""
+Actual isolated-worktree benchmark. {phase}
+You own exactly: {json.dumps(ISOLATED_LEADER_OWNED)}. Do not read or modify any other repository path.
+Opaque configured divider colors must render without surface occlusion. Existing translucent occlusion behavior must remain.
+Do not use agents, tm-agent, background tasks, commits, pushes, releases, or external services.
+
+TASK: {fixture.prompt}
+
+WORKER RESULTS:
+{worker_headers or 'pending'}
+""".strip()
 
 
 def validate_routing_decision(
@@ -1363,12 +1497,14 @@ def claude_session_path(session_id: str, checkout: Path) -> Optional[Path]:
     return None
 
 
-def normalize_benchmark_path(value: Any, checkout: Path) -> Optional[str]:
+def normalize_benchmark_path(
+    value: Any, checkout: Path, *, base: Optional[Path] = None,
+) -> Optional[str]:
     if not isinstance(value, str) or not value:
         return None
     path = Path(value)
     if not path.is_absolute():
-        path = checkout / path
+        path = (base or checkout) / path
     try:
         relative = path.resolve(strict=False).relative_to(checkout.resolve(strict=False))
     except ValueError:
@@ -1381,7 +1517,8 @@ def claude_read_paths(transcript: Path, checkout: Path) -> dict[str, Any]:
     """Extract structured, repo-local read and search paths without commands."""
     reads: list[str] = []
     searches: list[str] = []
-    rows = malformed = tool_calls = 0
+    rows = malformed = tool_calls = unknown_tools = unresolved_paths = 0
+    path_calls = extracted_path_calls = 0
     with transcript.open(errors="replace") as handle:
         for line in handle:
             rows += 1
@@ -1401,31 +1538,107 @@ def claude_read_paths(transcript: Path, checkout: Path) -> dict[str, Any]:
                 name = str(block.get("name", "")).lower()
                 payload = block.get("input") if isinstance(block.get("input"), dict) else {}
                 if name == "read":
+                    path_calls += 1
                     normalized = normalize_benchmark_path(payload.get("file_path"), checkout)
                     if normalized:
                         reads.append(normalized)
+                        extracted_path_calls += 1
+                    else:
+                        unresolved_paths += 1
                 elif name in {"grep", "glob"}:
+                    path_calls += 1
                     normalized = normalize_benchmark_path(payload.get("path", "."), checkout)
                     if normalized:
                         searches.append(normalized)
+                        extracted_path_calls += 1
+                    else:
+                        unresolved_paths += 1
                 elif name == "bash":
                     command = payload.get("command")
                     if isinstance(command, str):
-                        for token in shlex.split(command, comments=True, posix=True):
+                        bash_path_calls_before = path_calls
+                        try:
+                            lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+                            lexer.whitespace_split = True
+                            lexer.commenters = "#"
+                            tokens = list(lexer)
+                        except ValueError:
+                            unresolved_paths += 1
+                            continue
+                        bash_base = checkout
+                        expect_cd = False
+                        for token in tokens:
+                            if token == "cd":
+                                expect_cd = True
+                                continue
+                            if expect_cd:
+                                path_calls += 1
+                                if "$" in token or any(mark in token for mark in "*?["):
+                                    unresolved_paths += 1
+                                elif token == ".":
+                                    extracted_path_calls += 1
+                                elif token == "..":
+                                    candidate_base = bash_base.parent.resolve(strict=False)
+                                    if candidate_base == checkout.resolve(strict=False) or checkout.resolve(strict=False) in candidate_base.parents:
+                                        bash_base = candidate_base
+                                        extracted_path_calls += 1
+                                    else:
+                                        unresolved_paths += 1
+                                else:
+                                    normalized = normalize_benchmark_path(token, checkout, base=bash_base)
+                                    if normalized and (checkout / normalized).is_dir():
+                                        bash_base = checkout / normalized
+                                        extracted_path_calls += 1
+                                    else:
+                                        unresolved_paths += 1
+                                expect_cd = False
+                                continue
                             candidate = token.rstrip(":,;")
                             if not ("/" in candidate or candidate.endswith((".swift", ".zig", ".md", "Makefile"))):
                                 continue
-                            normalized = normalize_benchmark_path(candidate, checkout)
+                            path_calls += 1
+                            if "$" in candidate or any(mark in candidate for mark in "*?["):
+                                unresolved_paths += 1
+                                continue
+                            normalized = normalize_benchmark_path(candidate, checkout, base=bash_base)
                             if normalized and (checkout / normalized).exists():
                                 searches.append(normalized)
+                                extracted_path_calls += 1
+                            else:
+                                unresolved_paths += 1
+                        if path_calls == bash_path_calls_before:
+                            path_calls += 1
+                            unresolved_paths += 1
+                    else:
+                        path_calls += 1
+                        unresolved_paths += 1
+                else:
+                    unknown_tools += 1
     distinct = sorted(set(reads + searches))
+    coverage_complete = malformed == 0 and unknown_tools == 0 and unresolved_paths == 0
     return {
+        "status": "measured" if coverage_complete else "censored",
+        "reason": None if coverage_complete else "incomplete transcript path coverage",
         "rows": rows, "malformed_rows": malformed, "tool_calls": tool_calls,
+        "unknown_tool_calls": unknown_tools, "path_calls": path_calls,
+        "extracted_path_calls": extracted_path_calls, "unresolved_path_calls": unresolved_paths,
+        "path_extraction_coverage": (round(extracted_path_calls / path_calls, 3) if path_calls else 1.0),
         "read_calls": len(reads), "search_calls": len(searches),
         "distinct_reads": sorted(set(reads)), "distinct_search_roots": sorted(set(searches)),
         "distinct_access_paths": distinct,
         "repeated_accesses": len(reads) + len(searches) - len(distinct),
     }
+
+
+def validate_access_scope(access: dict[str, Any], allowed: Iterable[str], owner: str) -> None:
+    observed = set(access.get("distinct_access_paths", []))
+    outside = {path for path in observed if path not in set(allowed)}
+    if outside:
+        raise RuntimeError(f"{owner} read outside owned scope: {sorted(outside)}")
+
+
+def access_scope_extras(access: dict[str, Any], allowed: Iterable[str]) -> list[str]:
+    return sorted(set(access.get("distinct_access_paths", [])) - set(allowed))
 
 
 def benchmark_read_overlap(team: str, checkout: Path) -> dict[str, Any]:
@@ -1438,14 +1651,15 @@ def benchmark_read_overlap(team: str, checkout: Path) -> dict[str, Any]:
             payload = json.loads(metadata.read_text())
             role = str(payload.get("name") or metadata.stem)
             session_id = payload.get("session_id")
-            transcript = claude_session_path(session_id, checkout) if isinstance(session_id, str) else None
+            agent_checkout = Path(payload.get("working_directory") or checkout)
+            transcript = claude_session_path(session_id, agent_checkout) if isinstance(session_id, str) else None
             roles[role] = (
-                claude_read_paths(transcript, checkout) if transcript else
+                claude_read_paths(transcript, agent_checkout) if transcript else
                 {"status": "unknown", "reason": "transcript unavailable"}
             )
-    complete = len(roles) == 3 and all("distinct_access_paths" in row for row in roles.values())
+    complete = len(roles) == 3 and all(row.get("status") == "measured" for row in roles.values())
     if not complete:
-        return {"status": "unknown", "reason": "incomplete transcript coverage", "roles": roles}
+        return {"status": "censored", "reason": "incomplete transcript coverage", "roles": roles}
     sets = {role: set(row["distinct_access_paths"]) for role, row in roles.items()}
     pairwise = {}
     for left, right in itertools.combinations(sorted(sets), 2):
@@ -1694,6 +1908,13 @@ def interval_overlap_ms(
     return round(max(0.0, min(left_end, right_end) - max(left_start, right_start)) * 1000)
 
 
+def require_time_remaining(deadline: float, timeout: int) -> float:
+    value = deadline - time.perf_counter()
+    if value <= 0:
+        raise TimeoutError(f"end-to-end timeout after {timeout}s")
+    return value
+
+
 def wait_for_first_worker_result(
     result_files: list[Path], *, timeout: float, trace: Optional[TraceWriter] = None,
 ) -> tuple[str, int, int]:
@@ -1809,6 +2030,27 @@ def write_patch(checkout: Path, destination: Path) -> int:
     destination.write_text(git("diff", "--binary", cwd=checkout))
     names = git("diff", "--name-only", cwd=checkout)
     return len([line for line in names.splitlines() if line])
+
+
+def checkout_content_digest(checkout: Path, excluded: Iterable[str]) -> dict[str, str]:
+    excluded_set = set(excluded)
+    files = run_command(("git", "ls-files", "-co", "--exclude-standard"), cwd=checkout, timeout=60)
+    if files.returncode != 0:
+        raise RuntimeError(files.stderr or "git ls-files failed")
+    digest = {}
+    for relative in files.stdout.splitlines():
+        if relative in excluded_set:
+            continue
+        path = checkout / relative
+        if path.is_file():
+            digest[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digest
+
+
+def cleanup_isolated_worker_checkouts(checkout: Path, workdirs: dict[str, Path]) -> None:
+    for path in workdirs.values():
+        run_command(("git", "worktree", "remove", "--force", str(path)), cwd=checkout, timeout=120)
+    run_command(("git", "worktree", "prune"), cwd=checkout, timeout=60)
 
 
 def run_one(
@@ -2321,6 +2563,8 @@ def run_orchestration_one(
                 record.status = "failed"
                 record.failure_reason = "worker collector did not stop before cleanup"
                 record.total_wall_ms = None
+        record.cleanup_safe = cleanup_safe
+        record.cleanup_reason = None if cleanup_safe else record.failure_reason
         if cleanup_safe and team and checkout.exists():
             with contextlib.suppress(Exception):
                 daemon_json("headless.destroy_team", {"team_name": team}, timeout=90)
@@ -2336,6 +2580,191 @@ def run_orchestration_one(
         if cleanup_safe:
             for result_file in result_files:
                 result_file.unlink(missing_ok=True)
+    return record
+
+
+def run_isolated_topology_one(
+    spec: RunSpec, *, experiment: Path, scratch: Path, model: str, effort: str,
+    timeout: int, xcode_host: str, keep_checkouts: bool,
+) -> RunResult:
+    fixture = FIXTURES[spec.fixture]
+    run_id = f"{fixture.name}-{spec.condition}-t{spec.trial}-{uuid.uuid4().hex[:8]}"
+    run_dir = experiment / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    checkout = scratch / run_id
+    relative = Path("runs") / run_id
+    paths = {name: str(relative / filename) for name, filename in {
+        "result": "result.json", "trace": "trace.jsonl", "patch": "candidate.patch",
+        "stdout": "stdout.log", "acceptance": "acceptance.log",
+    }.items()}
+    record = RunResult(
+        run_id=run_id, fixture=fixture.name, parallelism=fixture.parallelism, trial=spec.trial,
+        condition=spec.condition, order=spec.order, started_at=utc_now(), orchestration_schema=2,
+        tokens={key: 0 for key in TOKEN_KEYS}, paths=paths,
+    )
+    trace = TraceWriter(experiment / paths["trace"], run_id)
+    team = None
+    workdirs: dict[str, Path] = {}
+    result_files: list[Path] = []
+    guard_root = None
+    worker_thread: Optional[threading.Thread] = None
+    worker_box: dict[str, Any] = {}
+    cancel = threading.Event()
+    total_started = None
+    deadline = None
+    tasks = isolated_topology_tasks(fixture)
+    try:
+        create_snapshot(fixture, checkout)
+        total_started = time.perf_counter()
+        deadline = total_started + timeout
+        remaining = lambda: max(0.0, deadline - time.perf_counter())
+        require_remaining = lambda: require_time_remaining(deadline, timeout)
+        workdirs = create_isolated_worker_checkouts(checkout, timeout=require_remaining)
+        agent_env, guard_root = benchmark_agent_environment(checkout)
+        session_id = str(uuid.uuid4())
+        trace.write("session_start", condition=spec.condition, fixture=fixture.name, topology="isolated")
+        team = f"bench-isolated-{uuid.uuid4().hex[:8]}"
+        result_files = [Path(f"/tmp/term-mesh-bench-{team}-{role}.result") for role in ("explorer", "executor", "reviewer")]
+        create_benchmark_team(
+            team, checkout, model, agent_workdirs=workdirs,
+            timeout=min(300, require_remaining()),
+        )
+        record.worker_tasks = dispatch_benchmark_workers(
+            fixture, team, checkout, trace, timeout=min(120, require_remaining()), tasks=tasks
+        )
+        ready_times: dict[Path, int] = {}
+
+        def collect() -> None:
+            worker_box["started"] = time.perf_counter()
+            try:
+                worker_box["value"] = wait_for_worker_results(
+                    result_files, timeout=min(15 * 60, remaining()), trace=trace,
+                    estimated_seconds={path: 15 * 60 for path in result_files},
+                    ready_times=ready_times, cancel_event=cancel,
+                )
+            except Exception as error:
+                worker_box["error"] = error
+            finally:
+                worker_box["ended"] = time.perf_counter()
+
+        worker_thread = threading.Thread(target=collect, daemon=True)
+        worker_thread.start()
+        before_unowned = checkout_content_digest(checkout, ISOLATED_LEADER_OWNED)
+        if spec.condition == "isolated-overlap":
+            leader_started = time.perf_counter()
+            with (experiment / paths["stdout"]).open("w") as log:
+                completed, first_action, duration = run_stream(
+                    claude_command(
+                        isolated_leader_prompt(fixture, final=False), model=model, effort=effort,
+                        session_id=session_id, resume=False, condition="multi",
+                    ), cwd=checkout, timeout=require_remaining(), log=log, trace=trace,
+                    label="leader_implementation", env=agent_env,
+                )
+            record.time_to_first_action_ms = first_action
+            record.leader_preparation_ms = duration
+            parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
+            if completed.returncode != 0:
+                raise RuntimeError(completed.stderr or "leader implementation failed")
+            if checkout_content_digest(checkout, ISOLATED_LEADER_OWNED) != before_unowned:
+                raise RuntimeError("leader modified paths outside isolated ownership")
+            leader_ended = time.perf_counter()
+        worker_thread.join(timeout=remaining())
+        if worker_thread.is_alive():
+            raise RuntimeError("isolated worker collection timed out")
+        if worker_box.get("error"):
+            raise RuntimeError(f"isolated worker collection failed: {worker_box['error']}")
+        headers, waited_ms, ready = worker_box["value"]
+        if ready != len(result_files):
+            raise RuntimeError(f"isolated worker results {ready}/{len(result_files)}")
+        record.worker_active_critical_path_ms = waited_ms
+        record.first_worker_result_ms = min(ready_times.values())
+        record.last_worker_result_ms = max(ready_times.values())
+        if spec.condition == "isolated-overlap":
+            record.overlap_ms = interval_overlap_ms(
+                float(worker_box["started"]), float(worker_box["ended"]), leader_started, leader_ended
+            )
+            record.pure_worker_wait_ms = max(0, waited_ms - record.overlap_ms)
+        else:
+            record.overlap_ms = 0; record.pure_worker_wait_ms = waited_ms
+            before_unowned = checkout_content_digest(checkout, ISOLATED_LEADER_OWNED)
+            with (experiment / paths["stdout"]).open("w") as log:
+                completed, first_action, duration = run_stream(
+                    claude_command(
+                        isolated_leader_prompt(fixture, final=False), model=model, effort=effort,
+                        session_id=session_id, resume=False, condition="multi",
+                    ), cwd=checkout, timeout=require_remaining(), log=log, trace=trace,
+                    label="leader_implementation", env=agent_env,
+                )
+            record.time_to_first_action_ms = first_action; record.leader_preparation_ms = duration
+            parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
+            if completed.returncode != 0 or checkout_content_digest(checkout, ISOLATED_LEADER_OWNED) != before_unowned:
+                raise RuntimeError("blocking leader violated isolated ownership or failed")
+        integrated = integrate_worker_patches(checkout, workdirs, tasks, timeout=require_remaining)
+        trace.write("worker_patches_integrated", files=integrated)
+        active_started = time.perf_counter()
+        with (experiment / paths["stdout"]).open("a") as log, (experiment / paths["acceptance"]).open("w") as acceptance_log:
+            completed, _, duration = run_stream(
+                claude_command(
+                    isolated_leader_prompt(fixture, final=True, worker_headers=headers), model=model, effort=effort,
+                    session_id=session_id, resume=True, condition="multi",
+                ), cwd=checkout, timeout=require_remaining(),
+                log=log, trace=trace, label="integration_verification", env=agent_env,
+            )
+            record.leader_first_result_review_ms = duration
+            parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
+            if completed.returncode != 0:
+                raise RuntimeError(completed.stderr or "integration verification failed")
+            passed, acceptance_ms, reason = run_acceptance(
+                fixture, checkout, acceptance_log, require_remaining(),
+                xcode_host=xcode_host, run_id=run_id,
+            )
+            record.acceptance_ms = acceptance_ms; record.acceptance_passed = passed
+            record.status = "passed" if passed else "failed"; record.failure_reason = None if passed else safe_failure(reason)
+        record.active_task_ms = round((time.perf_counter() - active_started) * 1000)
+        record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)
+        record.read_overlap = benchmark_read_overlap(team, checkout)
+        if record.read_overlap.get("status") != "measured":
+            raise RuntimeError("isolated topology read coverage incomplete")
+        by_worker = {task["worker"]: task for task in tasks}
+        scope_extras = {}
+        for role, access in record.read_overlap["roles"].items():
+            scope_extras[role] = access_scope_extras(access, by_worker[role]["owned"])
+        leader_transcript = claude_session_path(session_id, checkout)
+        if leader_transcript is None:
+            raise RuntimeError("isolated leader transcript unavailable")
+        scope_extras["leader"] = access_scope_extras(
+            claude_read_paths(leader_transcript, checkout), ISOLATED_LEADER_OWNED
+        )
+        record.read_overlap["scope_extras"] = scope_extras
+        worker_tokens, _, observed, expected = team_usage(team, checkout); add_tokens(record.tokens, worker_tokens)
+        record.token_precision = "actual_all" if observed == expected else "leader_actual_workers_partial"
+        record.cost_usd = estimate_cost(record.tokens, model); record.cost_precision = "token_estimate"
+        record.changed_files = write_patch(checkout, experiment / paths["patch"])
+    except Exception as error:
+        record.failure_reason = safe_failure(f"{type(error).__name__}: {error}"); record.status = "failed"
+        if total_started is not None: record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)
+        with contextlib.suppress(Exception): record.changed_files = write_patch(checkout, experiment / paths["patch"])
+    finally:
+        cancel.set()
+        cleanup_safe = True
+        if worker_thread and worker_thread.is_alive():
+            worker_thread.join(timeout=2)
+            cleanup_safe = not worker_thread.is_alive()
+        record.cleanup_safe = cleanup_safe
+        record.cleanup_reason = None if cleanup_safe else "worker collector did not stop before cleanup"
+        if not cleanup_safe:
+            record.status = "failed"
+            record.failure_reason = record.cleanup_reason
+            record.total_wall_ms = None
+        if cleanup_safe and team:
+            with contextlib.suppress(Exception): daemon_json("headless.destroy_team", {"team_name": team}, timeout=90)
+        if cleanup_safe and workdirs and checkout.exists(): cleanup_isolated_worker_checkouts(checkout, workdirs)
+        record.finished_at = utc_now(); trace.write("session_end", status=record.status, total_wall_ms=record.total_wall_ms, tokens=record.tokens)
+        (experiment / paths["result"]).write_text(json.dumps(asdict(record), indent=2, ensure_ascii=False) + "\n")
+        if cleanup_safe and checkout.exists() and not keep_checkouts: shutil.rmtree(checkout, ignore_errors=True)
+        if cleanup_safe and guard_root is not None: shutil.rmtree(guard_root, ignore_errors=True)
+        if cleanup_safe:
+            for path in result_files: path.unlink(missing_ok=True)
     return record
 
 
@@ -3516,6 +3945,7 @@ def _run_experiment(args: argparse.Namespace) -> int:
         rpc_probes.append(run_rpc_probe(experiment, "preflight"))
     scratch = Path(tempfile.mkdtemp(prefix="term-mesh-effectiveness-"))
     completed = completed_spec_keys(rows)
+    preserve_scratch = False
     try:
         for index, spec in enumerate(specs, 1):
             if spec_key(spec) in completed:
@@ -3675,6 +4105,50 @@ def run_partition_experiment(args: argparse.Namespace) -> int:
     return 0 if len(effective_rows) == len(specs) and all(row["acceptance_passed"] for row in effective_rows) else 1
 
 
+def run_isolated_topology_experiment(args: argparse.Namespace) -> int:
+    fixtures = tuple(item for item in args.fixtures.split(",") if item)
+    conditions = tuple(item for item in args.conditions.split(",") if item)
+    unknown = set(fixtures) - set(PARTITION_FIXTURES)
+    unknown_conditions = set(conditions) - set(ISOLATED_TOPOLOGY_CONDITIONS)
+    if unknown or unknown_conditions or not conditions or args.trials < 1 or args.timeout < 1:
+        raise ValueError(f"invalid fixtures={sorted(unknown)} conditions={sorted(unknown_conditions)} trials={args.trials}")
+    specs = build_isolated_topology_matrix(fixtures, args.trials, conditions)
+    print(f"isolated topology matrix: {len(specs)} runs")
+    for index, spec in enumerate(specs, 1):
+        print(f"  {index:02d}. {spec.fixture:<22} trial={spec.trial} order={spec.order} {spec.condition}")
+    if args.dry_run: return 0
+    run_id = args.run_id or datetime.now().strftime("%Y%m%dT%H%M%S") + "-isolated-" + uuid.uuid4().hex[:6]
+    experiment = args.results_dir / run_id; experiment.mkdir(parents=True, exist_ok=False); (experiment / "runs").mkdir()
+    manifest = {
+        "schema": 1, "experiment_type": "isolated-leader-worker-topology", "run_id": run_id,
+        "created_at": utc_now(), "root_head": git("rev-parse", "HEAD"), "model": args.model,
+        "effort": args.effort, "workers": 3, "trials": args.trials, "seed": args.seed,
+        "timeout_seconds": args.timeout, "xcode_host": args.xcode_host,
+        "fixtures": [row for row in validate_fixture_metadata() if row["fixture"] in fixtures],
+        "matrix": [asdict(spec) for spec in specs],
+    }
+    (experiment / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    preserve_scratch = False
+    scratch = Path(tempfile.mkdtemp(prefix="term-mesh-isolated-topology-")); rows = []
+    try:
+        for index, spec in enumerate(specs, 1):
+            print(f"[{index}/{len(specs)}] {spec.fixture} {spec.condition} trial {spec.trial}", flush=True)
+            result = run_isolated_topology_one(
+                spec, experiment=experiment, scratch=scratch, model=args.model, effort=args.effort,
+                timeout=args.timeout, xcode_host=args.xcode_host, keep_checkouts=args.keep_checkouts,
+            )
+            rows.append(asdict(result)); print(f"  {result.status.upper()} {(result.total_wall_ms or 0)/1000:.1f}s {result.failure_reason or ''}")
+            if not result.cleanup_safe:
+                preserve_scratch = True
+                print(f"  STOPPED: unsafe cleanup; preserved scratch at {scratch}")
+                break
+    finally:
+        if not args.keep_checkouts and not preserve_scratch: shutil.rmtree(scratch, ignore_errors=True)
+    print(f"Saved: {experiment}")
+    effective = latest_effectiveness_rows(rows)
+    return 0 if len(effective) == len(specs) and all(row["acceptance_passed"] for row in effective) else 1
+
+
 def run_policy_experiment(args: argparse.Namespace) -> int:
     fixtures = tuple(item for item in args.fixtures.split(",") if item)
     policies = tuple(item for item in args.policies.split(",") if item)
@@ -3786,6 +4260,15 @@ def main() -> int:
     partition.add_argument("--run-id")
     partition.add_argument("--dry-run", action="store_true")
     partition.add_argument("--keep-checkouts", action="store_true")
+    isolated = sub.add_parser("isolated-topology-study", help="compare leader blocking and overlap with isolated worker checkouts")
+    isolated.add_argument("--fixtures", default=",".join(PARTITION_FIXTURES))
+    isolated.add_argument("--conditions", default=",".join(ISOLATED_TOPOLOGY_CONDITIONS))
+    isolated.add_argument("--trials", type=int, default=3); isolated.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    isolated.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT); isolated.add_argument("--model", default="sonnet")
+    isolated.add_argument("--effort", default="medium", choices=("low","medium","high","xhigh","max"))
+    isolated.add_argument("--xcode-host", default="mac-sub")
+    isolated.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS / "isolated-topology-study")
+    isolated.add_argument("--run-id"); isolated.add_argument("--dry-run", action="store_true"); isolated.add_argument("--keep-checkouts", action="store_true")
     policy = sub.add_parser("policy-ab", help="compare legacy delegate-first and adaptive Project leaders")
     policy.add_argument("--fixtures", default=",".join(FIXTURES))
     policy.add_argument("--policies", default=",".join(POLICIES))
@@ -3819,13 +4302,17 @@ def main() -> int:
     if args.command == "orchestration-study":
         if args.dry_run:
             return run_orchestration_experiment(args)
+        with benchmark_signal_cleanup(), benchmark_run_lock(args.results_dir):
+            return run_orchestration_experiment(args)
     if args.command == "partition-study":
         if args.dry_run:
             return run_partition_experiment(args)
         with benchmark_signal_cleanup(), benchmark_run_lock(args.results_dir):
             return run_partition_experiment(args)
+    if args.command == "isolated-topology-study":
+        if args.dry_run: return run_isolated_topology_experiment(args)
         with benchmark_signal_cleanup(), benchmark_run_lock(args.results_dir):
-            return run_orchestration_experiment(args)
+            return run_isolated_topology_experiment(args)
     if args.command == "policy-ab":
         with benchmark_signal_cleanup(), benchmark_run_lock(args.results_dir):
             return run_policy_experiment(args)
