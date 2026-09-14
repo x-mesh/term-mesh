@@ -60,6 +60,19 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         specs = module.build_matrix(("homebrew-smoke",), 1, 42, ("multi",))
         self.assertEqual(specs, [module.RunSpec("homebrew-smoke", 1, "multi", 2)])
 
+    def test_orchestration_matrix_is_27_counterbalanced_runs(self):
+        specs = module.build_orchestration_matrix(module.FIXTURES, 3, module.DEFAULT_SEED)
+        self.assertEqual(len(specs), 27)
+        for index in range(0, len(specs), 3):
+            block = specs[index:index + 3]
+            self.assertEqual({row.condition for row in block}, set(module.ORCHESTRATION_CONDITIONS))
+            self.assertEqual({row.fixture for row in block}, {block[0].fixture})
+            self.assertEqual({row.trial for row in block}, {block[0].trial})
+        for fixture in module.FIXTURES:
+            selected = [row for row in specs if row.fixture == fixture]
+            for condition in module.ORCHESTRATION_CONDITIONS:
+                self.assertEqual(sorted(row.order for row in selected if row.condition == condition), [1, 2, 3])
+
     def test_policy_matrix_counterbalances_legacy_and_adaptive(self):
         specs = module.build_policy_matrix(("homebrew-smoke",), 3, 42)
         self.assertEqual([(row.condition, row.order) for row in specs[:4]], [
@@ -667,6 +680,124 @@ end
             self.assertLess(elapsed_ms, 500)
             self.assertEqual(headers.count("STATUS: DONE"), 3)
             self.assertNotIn("STATUS: BLOCKED", headers)
+
+    def test_controller_returns_after_first_worker_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files = [root / "first.result", root / "second.result"]
+
+            def publish_result() -> None:
+                time.sleep(0.03)
+                files[0].write_text("STATUS: DONE\nNEXT: leader reviews\n")
+
+            publisher = threading.Thread(target=publish_result)
+            publisher.start()
+            headers, elapsed_ms, ready = module.wait_for_first_worker_result(files, timeout=1)
+            publisher.join()
+            self.assertEqual(ready, 1)
+            self.assertIn("STATUS: DONE", headers)
+            self.assertLess(elapsed_ms, 500)
+
+    def test_read_overlap_normalizes_repo_paths_and_reports_jaccard(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            checkout.mkdir()
+            transcript = Path(temporary) / "session.jsonl"
+            transcript.write_text("\n".join((
+                json.dumps({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": str(checkout / "Sources/A.swift")}},
+                    {"type": "tool_use", "name": "Grep", "input": {"path": str(checkout / "Sources")}},
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": "/tmp/outside"}},
+                ]}}),
+                "not-json",
+            )) + "\n")
+            result = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(result["distinct_reads"], ["Sources/A.swift"])
+            self.assertEqual(result["distinct_search_roots"], ["Sources"])
+            self.assertEqual(result["malformed_rows"], 1)
+            self.assertNotIn("/tmp/outside", json.dumps(result))
+
+    def test_orchestration_summary_requires_quality_before_promotion(self):
+        rows = []
+        for fixture in module.FIXTURES:
+            for trial in range(1, 4):
+                for condition, wall in (("single", 1200), ("blocking", 1100), ("overlap", 800)):
+                    rows.append({
+                        "run_id": f"{fixture}-{trial}-{condition}", "fixture": fixture,
+                        "trial": trial, "condition": condition, "total_wall_ms": wall,
+                        "acceptance_passed": True, "infra_invalid": False,
+                    })
+        summary = module.summarize_orchestration(rows, seed=7)
+        self.assertTrue(summary["latency_gate_ready"])
+        self.assertFalse(summary["promotion_ready"])
+        self.assertEqual(summary["comparisons"]["single_vs_overlap"]["median_speedup"], 1.5)
+        quality = {"comparisons": [
+            {"fixture": fixture, "trial": trial, "valid_judges": 3, "overlap_regression": False}
+            for fixture in module.FIXTURES for trial in range(1, 4)
+        ]}
+        promoted = module.summarize_orchestration(rows, seed=7, quality=quality)
+        self.assertTrue(promoted["quality_ready"])
+        self.assertTrue(promoted["promotion_ready"])
+        incomplete = module.summarize_orchestration(rows, seed=7, quality={"comparisons": quality["comparisons"][:1]})
+        self.assertFalse(incomplete["quality_ready"])
+        self.assertFalse(incomplete["promotion_ready"])
+        duplicate = module.summarize_orchestration(
+            rows, seed=7, quality={"comparisons": quality["comparisons"] + quality["comparisons"][:1]},
+        )
+        self.assertFalse(duplicate["quality_ready"])
+        degraded_rows = [dict(row) for row in rows]
+        degraded_rows[0]["protocol_degraded"] = True
+        degraded = module.summarize_orchestration(degraded_rows, seed=7, quality=quality)
+        self.assertFalse(degraded["complete_latency_pairs"])
+        self.assertFalse(degraded["latency_gate_ready"])
+
+    def test_read_only_tool_counter_allows_reads_but_rejects_unknown_tools(self):
+        stream = "\n".join((
+            json.dumps({"message": {"content": [
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "Sources/A.swift"}},
+            ]}}),
+            json.dumps({"message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "true"}},
+            ]}}),
+        ))
+        self.assertEqual(module.stream_disallowed_read_only_tool_count(stream), 1)
+        unknown = json.dumps({"message": {"content": [
+            {"type": "tool_use", "name": "EnterWorktree", "input": {}}
+        ]}})
+        self.assertEqual(module.stream_disallowed_read_only_tool_count(unknown), 1)
+
+    def test_worker_wait_can_be_cancelled_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cancel = threading.Event()
+            result = {}
+
+            def wait() -> None:
+                result["value"] = module.wait_for_worker_results(
+                    [Path(temporary) / "never.result"], timeout=10, cancel_event=cancel,
+                )
+
+            thread = threading.Thread(target=wait)
+            thread.start()
+            cancel.set()
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["value"][2], 0)
+
+    def test_interval_overlap_uses_actual_start_and_end(self):
+        self.assertEqual(module.interval_overlap_ms(10.0, 20.0, 15.0, 25.0), 5000)
+        self.assertEqual(module.interval_overlap_ms(10.0, 12.0, 15.0, 25.0), 0)
+
+    def test_trace_writer_serializes_concurrent_events(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "trace.jsonl"
+            trace = module.TraceWriter(path, "session")
+            threads = [threading.Thread(target=trace.write, args=("event",), kwargs={"worker": index}) for index in range(20)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual([row["seq"] for row in rows], list(range(1, 21)))
 
     def test_worker_instructions_partition_write_ownership(self):
         fixture = module.FIXTURES["homebrew-smoke"]

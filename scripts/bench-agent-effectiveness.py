@@ -13,6 +13,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import random
@@ -26,6 +27,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -39,6 +41,7 @@ DEFAULT_SEED = 20260814
 DEFAULT_TIMEOUT = 45 * 60
 DEFAULT_INFRA_RETRIES = 1
 CONDITIONS = ("single", "multi")
+ORCHESTRATION_CONDITIONS = ("single", "blocking", "overlap")
 POLICIES = ("legacy", "adaptive")
 TOKEN_KEYS = (
     "input_tokens", "output_tokens", "reasoning_output_tokens",
@@ -134,6 +137,7 @@ class RunResult:
     status: str = "failed"
     acceptance_passed: bool = False
     infra_invalid: bool = False
+    protocol_degraded: bool = False
     timed_out: bool = False
     failure_reason: Optional[str] = None
     total_wall_ms: Optional[int] = None
@@ -146,6 +150,14 @@ class RunResult:
     worker_tasks: int = 0
     worker_active_critical_path_ms: Optional[int] = None
     worker_utilization: Optional[float] = None
+    orchestration_schema: Optional[int] = None
+    leader_preparation_ms: Optional[int] = None
+    leader_first_result_review_ms: Optional[int] = None
+    first_worker_result_ms: Optional[int] = None
+    last_worker_result_ms: Optional[int] = None
+    pure_worker_wait_ms: Optional[int] = None
+    overlap_ms: Optional[int] = None
+    read_overlap: Optional[dict[str, Any]] = None
     coordination_commands: dict[str, int] = field(default_factory=dict)
     routing_decision: Optional[str] = None
     routing_reason: Optional[str] = None
@@ -228,6 +240,25 @@ def build_matrix(
                 RunSpec(fixture, trial, condition, index)
                 for index, condition in enumerate(order, 1)
                 if condition in selected_conditions
+            )
+    return specs
+
+
+def build_orchestration_matrix(
+    fixtures: Iterable[str], trials: int, seed: int,
+    conditions: Iterable[str] = ORCHESTRATION_CONDITIONS,
+) -> list[RunSpec]:
+    """Build counterbalanced single/blocking/overlap trial blocks."""
+    selected = tuple(conditions)
+    specs: list[RunSpec] = []
+    for fixture in fixtures:
+        for trial in range(1, trials + 1):
+            offset = (trial - 1) % len(ORCHESTRATION_CONDITIONS)
+            order = list(ORCHESTRATION_CONDITIONS[offset:] + ORCHESTRATION_CONDITIONS[:offset])
+            specs.extend(
+                RunSpec(fixture, trial, condition, index)
+                for index, condition in enumerate(order, 1)
+                if condition in selected
             )
     return specs
 
@@ -571,15 +602,17 @@ class TraceWriter:
         self.path = path
         self.session = session
         self.sequence = 0
+        self.lock = threading.Lock()
 
     def write(self, event_type: str, **fields: Any) -> None:
-        self.sequence += 1
-        entry = {
-            "v": 1, "seq": self.sequence, "session_id": self.session,
-            "timestamp": utc_now(), "type": event_type, **fields,
-        }
-        with self.path.open("a") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with self.lock:
+            self.sequence += 1
+            entry = {
+                "v": 1, "seq": self.sequence, "session_id": self.session,
+                "timestamp": utc_now(), "type": event_type, **fields,
+            }
+            with self.path.open("a") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def event_has_action(line: str) -> bool:
@@ -668,7 +701,23 @@ def parse_stream(text: str) -> dict[str, Any]:
     return {
         "session_id": final.get("session_id"), "turns": int(final.get("num_turns", 0) or 0),
         "tokens": tokens, "cost_usd": final.get("total_cost_usd"),
+        "result": final.get("result") if isinstance(final.get("result"), str) else "",
     }
+
+
+def stream_disallowed_read_only_tool_count(text: str) -> int:
+    count = 0
+    for line in text.splitlines():
+        with contextlib.suppress(json.JSONDecodeError):
+            event = json.loads(line)
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            content = message.get("content") if isinstance(message.get("content"), list) else []
+            count += sum(
+                isinstance(block, dict) and block.get("type") == "tool_use"
+                and str(block.get("name", "")).lower() not in {"read", "grep", "glob"}
+                for block in content
+            )
+    return count
 
 
 def count_worker_dispatches(text: str) -> int:
@@ -1212,6 +1261,114 @@ def team_usage(
     return totals, 0.0, observed, len(worker_names)
 
 
+def benchmark_team_directory(team: str) -> Optional[Path]:
+    root = Path(os.environ.get("TERMMESH_HEADLESS_ROOT", Path.home() / ".term-mesh/headless"))
+    for metadata in root.glob("*/team.json"):
+        with contextlib.suppress(OSError, json.JSONDecodeError):
+            if json.loads(metadata.read_text()).get("team_name") == team:
+                return metadata.parent
+    return None
+
+
+def claude_session_path(session_id: str, checkout: Path) -> Optional[Path]:
+    """Find one Claude transcript which belongs to this benchmark checkout."""
+    root = Path.home() / ".claude/projects"
+    for candidate in root.glob(f"**/{session_id}.jsonl"):
+        with contextlib.suppress(OSError):
+            scanned = 0
+            with candidate.open(errors="replace") as handle:
+                for line in handle:
+                    scanned += len(line)
+                    with contextlib.suppress(json.JSONDecodeError):
+                        if json.loads(line).get("cwd") == str(checkout):
+                            return candidate
+                    if scanned >= 128 * 1024:
+                        break
+    return None
+
+
+def normalize_benchmark_path(value: Any, checkout: Path) -> Optional[str]:
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        path = checkout / path
+    try:
+        relative = path.resolve(strict=False).relative_to(checkout.resolve(strict=False))
+    except ValueError:
+        return None
+    normalized = str(relative)
+    return None if normalized in {"", "."} or normalized.startswith(".git/") else normalized
+
+
+def claude_read_paths(transcript: Path, checkout: Path) -> dict[str, Any]:
+    """Extract structured, repo-local read and search paths without commands."""
+    reads: list[str] = []
+    searches: list[str] = []
+    rows = malformed = tool_calls = 0
+    with transcript.open(errors="replace") as handle:
+        for line in handle:
+            rows += 1
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                malformed += 1
+                continue
+            if event.get("type") != "assistant":
+                continue
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            content = message.get("content") if isinstance(message.get("content"), list) else []
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                tool_calls += 1
+                name = str(block.get("name", "")).lower()
+                payload = block.get("input") if isinstance(block.get("input"), dict) else {}
+                if name == "read":
+                    normalized = normalize_benchmark_path(payload.get("file_path"), checkout)
+                    if normalized:
+                        reads.append(normalized)
+                elif name in {"grep", "glob"}:
+                    normalized = normalize_benchmark_path(payload.get("path", "."), checkout)
+                    if normalized:
+                        searches.append(normalized)
+    distinct = sorted(set(reads + searches))
+    return {
+        "rows": rows, "malformed_rows": malformed, "tool_calls": tool_calls,
+        "read_calls": len(reads), "search_calls": len(searches),
+        "distinct_reads": sorted(set(reads)), "distinct_search_roots": sorted(set(searches)),
+        "distinct_access_paths": distinct,
+        "repeated_accesses": len(reads) + len(searches) - len(distinct),
+    }
+
+
+def benchmark_read_overlap(team: str, checkout: Path) -> dict[str, Any]:
+    team_dir = benchmark_team_directory(team)
+    if team_dir is None:
+        return {"status": "unknown", "reason": "team metadata unavailable", "roles": {}}
+    roles: dict[str, Any] = {}
+    for metadata in sorted((team_dir / "agents").glob("*.json")):
+        with contextlib.suppress(OSError, json.JSONDecodeError):
+            payload = json.loads(metadata.read_text())
+            role = str(payload.get("name") or metadata.stem)
+            session_id = payload.get("session_id")
+            transcript = claude_session_path(session_id, checkout) if isinstance(session_id, str) else None
+            roles[role] = (
+                claude_read_paths(transcript, checkout) if transcript else
+                {"status": "unknown", "reason": "transcript unavailable"}
+            )
+    complete = len(roles) == 3 and all("distinct_access_paths" in row for row in roles.values())
+    if not complete:
+        return {"status": "unknown", "reason": "incomplete transcript coverage", "roles": roles}
+    sets = {role: set(row["distinct_access_paths"]) for role, row in roles.items()}
+    pairwise = {}
+    for left, right in itertools.combinations(sorted(sets), 2):
+        union = sets[left] | sets[right]
+        pairwise[f"{left}:{right}"] = None if not union else round(len(sets[left] & sets[right]) / len(union), 3)
+    common = sorted(set.intersection(*sets.values())) if sets else []
+    return {"status": "measured", "roles": roles, "pairwise_jaccard": pairwise, "all_role_reads": common}
+
+
 def usage_delta(after: dict[str, int], before: dict[str, int]) -> dict[str, int]:
     return {key: max(0, int(after.get(key, 0)) - int(before.get(key, 0))) for key in TOKEN_KEYS}
 
@@ -1259,6 +1416,51 @@ worker envelopes:
 {headers}
 """.strip()
     return protocol + "\n\n" + common
+
+
+def orchestration_preparation_prompt(fixture: Fixture) -> str:
+    return f"""
+실제 개발 benchmark의 준비 단계다. worker가 동시에 작업 중이다. 현재 checkout에서 요구사항,
+관련 계약, 영향 경계, 기존 검증 명령만 읽어 통합 체크리스트를 작성하라. 파일을 만들거나
+수정하지 말고 git 상태도 바꾸지 마라. agent, background task, tm-agent 명령은 사용하지 마라.
+
+작업: {fixture.prompt}
+""".strip()
+
+
+def orchestration_review_prompt(fixture: Fixture, headers: str) -> str:
+    return f"""
+실제 개발 benchmark의 read-only 검토 단계다. 먼저 도착한 worker envelope만 검토하고 최종 통합
+체크리스트를 보완하라. 파일을 만들거나 수정하지 말고 git 상태도 바꾸지 마라. 아직 도착하지
+않은 worker를 기다리거나 조회하지 마라. agent, background task, tm-agent 명령은 사용하지 마라.
+
+작업: {fixture.prompt}
+
+준비된 worker envelope:
+{headers or 'none'}
+""".strip()
+
+
+def orchestration_integration_prompt(
+    fixture: Fixture, worker_headers: str, preparation: str, first_review: str,
+) -> str:
+    return f"""
+실제 개발 benchmark의 최종 통합 단계다. worker 실행은 끝났다. 아래 준비 메모와 worker envelope를
+사용하여 working tree를 통합·수정하고 관련 테스트와 가능한 검증을 실행하라. 아직 도착하지 않은
+worker를 기다리거나 조회하지 마라. agent, background task, tm-agent 명령은 사용하지 마라. commit,
+push, publish, release 및 외부 서비스 변경은 금지한다. 현재 checkout과 보이는 정보만 사용하라.
+
+작업: {fixture.prompt}
+
+리더 준비 메모:
+{preparation or 'none'}
+
+첫 결과 검토 메모:
+{first_review or 'none'}
+
+worker envelopes:
+{worker_headers}
+""".strip()
 
 
 LEGACY_POLICY = """
@@ -1328,6 +1530,8 @@ working tree에서 구현과 관련 테스트, 가능한 검증까지 완료하�
 def wait_for_worker_results(
     result_files: list[Path], *, timeout: float, trace: Optional[TraceWriter] = None,
     estimated_seconds: Optional[dict[Path, int]] = None, estimate_grace: float = 120.0,
+    ready_times: Optional[dict[Path, int]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> tuple[str, int, int]:
     """Wait for every result until its task estimate and grace expire."""
     started = time.perf_counter()
@@ -1341,10 +1545,16 @@ def wait_for_worker_results(
         for path in result_files
     }
     while time.perf_counter() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         ready_now = {
             path for path in result_files
             if path.is_file() and path.stat().st_size > 0
         }
+        if ready_times is not None:
+            elapsed = round((time.perf_counter() - started) * 1000)
+            for path in ready_now:
+                ready_times.setdefault(path, elapsed)
         if len(ready_now) == len(result_files):
             break
         now = time.perf_counter()
@@ -1354,8 +1564,16 @@ def wait_for_worker_results(
         next_deadline = min(
             [deadline] + [worker_deadlines[path] for path in pending]
         )
-        time.sleep(min(0.25, max(0, next_deadline - now)))
+        delay = min(0.25, max(0, next_deadline - now))
+        if cancel_event is not None:
+            cancel_event.wait(delay)
+        else:
+            time.sleep(delay)
     elapsed_ms = round((time.perf_counter() - started) * 1000)
+    if ready_times is not None:
+        for path in result_files:
+            if path.is_file() and path.stat().st_size > 0:
+                ready_times.setdefault(path, elapsed_ms)
     sections = []
     ready = 0
     for path in result_files:
@@ -1370,8 +1588,45 @@ def wait_for_worker_results(
     return "\n".join(sections), elapsed_ms, ready
 
 
+def worker_result_headers(result_files: Iterable[Path]) -> tuple[str, int]:
+    """Read the bounded worker envelopes which are available now."""
+    sections = []
+    ready = 0
+    for path in result_files:
+        if not path.is_file() or path.stat().st_size == 0:
+            continue
+        ready += 1
+        sections.append(f"=== {path.name} ===\n" + "\n".join(
+            path.read_text(errors="replace").splitlines()[:8]
+        ))
+    return "\n".join(sections), ready
+
+
+def interval_overlap_ms(
+    left_start: float, left_end: float, right_start: float, right_end: float,
+) -> int:
+    return round(max(0.0, min(left_end, right_end) - max(left_start, right_start)) * 1000)
+
+
+def wait_for_first_worker_result(
+    result_files: list[Path], *, timeout: float, trace: Optional[TraceWriter] = None,
+) -> tuple[str, int, int]:
+    """Wait only until one result is ready, then return every ready envelope."""
+    started = time.perf_counter()
+    deadline = started + max(0, timeout)
+    headers, ready = worker_result_headers(result_files)
+    while not ready and time.perf_counter() < deadline:
+        time.sleep(min(0.25, max(0, deadline - time.perf_counter())))
+        headers, ready = worker_result_headers(result_files)
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
+    if trace is not None:
+        trace.write("first_worker_result", ready=ready, expected=len(result_files), duration_ms=elapsed_ms)
+    return headers, elapsed_ms, ready
+
+
 def claude_command(
     prompt: str, *, model: str, effort: str, session_id: str, resume: bool, condition: str,
+    tool_free: bool = False,
 ) -> list[str]:
     command = [
         "claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
@@ -1381,7 +1636,11 @@ def claude_command(
         "--mcp-config", '{"mcpServers":{}}',
     ]
     command.extend(("--resume", session_id) if resume else ("--session-id", session_id))
-    disallowed = "Agent,Task" if condition == "single" else "Agent,Task,Monitor,ToolSearch"
+    disallowed = (
+        "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,ToolSearch"
+        if tool_free else
+        "Agent,Task" if condition == "single" else "Agent,Task,Monitor,ToolSearch"
+    )
     command.extend(("--disallowedTools", disallowed))
     return command
 
@@ -1678,6 +1937,305 @@ def run_one(
             shutil.rmtree(guard_root, ignore_errors=True)
         for result_file in result_files:
             result_file.unlink(missing_ok=True)
+    return record
+
+
+def run_orchestration_one(
+    spec: RunSpec, *, experiment: Path, scratch: Path, model: str, effort: str,
+    timeout: int, xcode_host: str, keep_checkouts: bool,
+) -> RunResult:
+    """Run one single, blocking, or overlapping orchestration cell."""
+    if spec.condition == "single":
+        result = run_one(
+            RunSpec(spec.fixture, spec.trial, "single", spec.order),
+            experiment=experiment, scratch=scratch, model=model, effort=effort, timeout=timeout,
+            xcode_host=xcode_host, keep_checkouts=keep_checkouts,
+        )
+        result.condition = "single"
+        result.orchestration_schema = 1
+        (experiment / result.paths["result"]).write_text(
+            json.dumps(asdict(result), indent=2, ensure_ascii=False) + "\n"
+        )
+        return result
+
+    fixture = FIXTURES[spec.fixture]
+    run_id = f"{fixture.name}-{spec.condition}-t{spec.trial}-{uuid.uuid4().hex[:8]}"
+    run_dir = experiment / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    checkout = scratch / run_id
+    relative_run = Path("runs") / run_id
+    paths = {
+        "result": str(relative_run / "result.json"), "trace": str(relative_run / "trace.jsonl"),
+        "patch": str(relative_run / "candidate.patch"), "stdout": str(relative_run / "stdout.log"),
+        "acceptance": str(relative_run / "acceptance.log"),
+    }
+    record = RunResult(
+        run_id=run_id, fixture=fixture.name, parallelism=fixture.parallelism, trial=spec.trial,
+        condition=spec.condition, order=spec.order, started_at=utc_now(), orchestration_schema=1,
+        tokens={key: 0 for key in TOKEN_KEYS}, paths=paths,
+    )
+    trace = TraceWriter(experiment / paths["trace"], run_id)
+    team: Optional[str] = None
+    result_files: list[Path] = []
+    guard_root: Optional[Path] = None
+    total_started: Optional[float] = None
+    worker_thread: Optional[threading.Thread] = None
+    worker_box: dict[str, Any] = {}
+    leader_checkout: Optional[Path] = None
+    collector_cancel = threading.Event()
+    try:
+        create_snapshot(fixture, checkout)
+        if spec.condition == "overlap":
+            leader_checkout = scratch / f"{run_id}-leader-lane"
+            create_snapshot(fixture, leader_checkout)
+        agent_env, guard_root = benchmark_agent_environment(checkout)
+        preparation_session_id = str(uuid.uuid4())
+        integration_session_id = str(uuid.uuid4())
+        total_started = time.perf_counter()
+        trace.write("session_start", condition=spec.condition, fixture=fixture.name, model=model, effort=effort)
+        team = f"bench-{uuid.uuid4().hex[:10]}"
+        result_files = [
+            Path(f"/tmp/term-mesh-bench-{team}-{worker}.result")
+            for worker in ("explorer", "executor", "reviewer")
+        ]
+        for result_file in result_files:
+            result_file.unlink(missing_ok=True)
+        init_started = time.perf_counter()
+        create_benchmark_team(team, checkout, model)
+        record.team_init_ms = round((time.perf_counter() - init_started) * 1000)
+        trace.write("team_ready", workers=3, duration_ms=record.team_init_ms)
+        record.worker_tasks = dispatch_benchmark_workers(
+            fixture, team, checkout, trace, timeout=min(timeout, 120),
+        )
+        remaining = timeout - (time.perf_counter() - total_started)
+        wait_timeout = min(15 * 60, max(0, remaining))
+        estimates = {
+            path: task["estimated_seconds"]
+            for path, task in zip(result_files, default_worker_tasks())
+        }
+        ready_times: dict[Path, int] = {}
+        preparation = first_review = ""
+
+        if spec.condition == "blocking":
+            worker_headers, waited_ms, worker_ready = wait_for_worker_results(
+                result_files, timeout=wait_timeout, trace=trace, estimated_seconds=estimates,
+                ready_times=ready_times,
+            )
+            record.worker_active_critical_path_ms = waited_ms
+            record.first_worker_result_ms = min(ready_times.values()) if ready_times else None
+            record.last_worker_result_ms = max(ready_times.values()) if ready_times else None
+            record.pure_worker_wait_ms = waited_ms
+            record.overlap_ms = 0
+        else:
+            def collect_workers() -> None:
+                worker_box["started"] = time.perf_counter()
+                try:
+                    worker_box["value"] = wait_for_worker_results(
+                        result_files, timeout=wait_timeout, trace=trace, estimated_seconds=estimates,
+                        ready_times=ready_times, cancel_event=collector_cancel,
+                    )
+                except Exception as error:
+                    worker_box["error"] = error
+                finally:
+                    worker_box["ended"] = time.perf_counter()
+
+            worker_thread = threading.Thread(
+                target=collect_workers, name=f"{run_id}-workers", daemon=True,
+            )
+            worker_thread.start()
+            leader_lane_started = time.perf_counter()
+            trace.write("leader_lane_start")
+            assert leader_checkout is not None
+            before = git("diff", "--binary", cwd=leader_checkout)
+            with (experiment / paths["stdout"]).open("w") as stdout_log:
+                completed, first_action, prep_ms = run_stream(
+                    claude_command(
+                        orchestration_preparation_prompt(fixture), model=model, effort=effort,
+                        session_id=preparation_session_id, resume=False, condition="multi", tool_free=True,
+                    ),
+                    cwd=leader_checkout, timeout=max(1, remaining), log=stdout_log, trace=trace,
+                    label="leader_preparation", env=agent_env,
+                )
+                parsed = parse_stream(completed.stdout)
+                preparation = parsed["result"]
+                add_tokens(record.tokens, parsed["tokens"])
+                record.leader_turns += parsed["turns"]
+                record.leader_preparation_ms = prep_ms
+                record.time_to_first_action_ms = first_action
+                if completed.returncode != 0:
+                    raise RuntimeError(safe_failure(completed.stderr or "leader preparation failed"))
+                if stream_disallowed_read_only_tool_count(completed.stdout):
+                    raise RuntimeError("overlap protocol violation: preparation used a non-read-only tool")
+                after = git("diff", "--binary", cwd=leader_checkout)
+                if after != before:
+                    raise RuntimeError("overlap protocol violation: preparation changed the checkout")
+
+                first_headers, _, first_ready = wait_for_first_worker_result(
+                    result_files, timeout=max(0, wait_timeout - prep_ms / 1000), trace=trace,
+                )
+                record.first_worker_result_ms = (
+                    min(ready_times.values()) if ready_times else
+                    round((time.perf_counter() - leader_lane_started) * 1000)
+                )
+                if first_ready:
+                    before = git("diff", "--binary", cwd=leader_checkout)
+                    completed, _, review_ms = run_stream(
+                        claude_command(
+                            orchestration_review_prompt(fixture, first_headers), model=model, effort=effort,
+                            session_id=preparation_session_id, resume=True, condition="multi", tool_free=True,
+                        ),
+                        cwd=leader_checkout, timeout=max(1, timeout - (time.perf_counter() - total_started)),
+                        log=stdout_log, trace=trace, label="leader_first_result_review", env=agent_env,
+                    )
+                    parsed = parse_stream(completed.stdout)
+                    first_review = parsed["result"]
+                    add_tokens(record.tokens, parsed["tokens"])
+                    record.leader_turns += parsed["turns"]
+                    record.leader_first_result_review_ms = review_ms
+                    if completed.returncode != 0:
+                        raise RuntimeError(safe_failure(completed.stderr or "leader review failed"))
+                    if stream_disallowed_read_only_tool_count(completed.stdout):
+                        raise RuntimeError("overlap protocol violation: first-result review used a non-read-only tool")
+                    if git("diff", "--binary", cwd=leader_checkout) != before:
+                        raise RuntimeError("overlap protocol violation: first-result review changed the checkout")
+            leader_lane_ended = time.perf_counter()
+            assert worker_thread is not None
+            worker_thread.join(timeout=max(0, timeout - (time.perf_counter() - total_started)))
+            if worker_thread.is_alive():
+                raise RuntimeError("worker collection exceeded the orchestration deadline")
+            if worker_box.get("error"):
+                raise RuntimeError(f"worker collection failed: {worker_box['error']}")
+            worker_headers, waited_ms, worker_ready = worker_box["value"]
+            record.worker_active_critical_path_ms = waited_ms
+            record.last_worker_result_ms = max(ready_times.values()) if ready_times else None
+            lane_ms = (record.leader_preparation_ms or 0) + (record.leader_first_result_review_ms or 0)
+            worker_started = float(worker_box["started"])
+            worker_ended = float(worker_box["ended"])
+            record.overlap_ms = interval_overlap_ms(
+                worker_started, worker_ended, leader_lane_started, leader_lane_ended,
+            )
+            worker_interval_ms = round((worker_ended - worker_started) * 1000)
+            record.pure_worker_wait_ms = max(0, worker_interval_ms - record.overlap_ms)
+            trace.write(
+                "leader_lane_end", duration_ms=lane_ms, overlap_ms=record.overlap_ms,
+                pure_wait_ms=record.pure_worker_wait_ms,
+            )
+        if worker_ready != len(result_files):
+            record.protocol_degraded = True
+            record.failure_reason = f"protocol degraded: worker results {worker_ready}/{len(result_files)}"
+
+        active_started = time.perf_counter()
+        trace.write("integration_start")
+        prompt = orchestration_integration_prompt(fixture, worker_headers, preparation, first_review)
+        with (experiment / paths["stdout"]).open("a") as stdout_log, (experiment / paths["acceptance"]).open("w") as acceptance_log:
+            acceptance_failures: set[str] = set()
+            integration_resume = False
+            while True:
+                remaining = timeout - (time.perf_counter() - total_started)
+                if remaining <= 0:
+                    record.timed_out = True
+                    record.failure_reason = f"end-to-end timeout after {timeout}s"
+                    break
+                completed, first_action, _ = run_stream(
+                    claude_command(
+                        prompt, model=model, effort=effort, session_id=integration_session_id,
+                        resume=integration_resume, condition="multi",
+                    ),
+                    cwd=checkout, timeout=max(1, remaining), log=stdout_log, trace=trace,
+                    label="correction" if integration_resume and record.correction_count else "integration",
+                    env=agent_env,
+                )
+                parsed = parse_stream(completed.stdout)
+                add_tokens(record.tokens, parsed["tokens"])
+                record.leader_turns += parsed["turns"]
+                if record.time_to_first_action_ms is None:
+                    record.time_to_first_action_ms = first_action
+                if completed.returncode != 0:
+                    raise RuntimeError(safe_failure(completed.stderr or "leader integration failed"))
+                remaining = timeout - (time.perf_counter() - total_started)
+                trace.write("acceptance_start", attempt=record.correction_count + 1)
+                passed, acceptance_ms, reason = run_acceptance(
+                    fixture, checkout, acceptance_log, remaining, xcode_host=xcode_host, run_id=run_id,
+                )
+                record.acceptance_ms += acceptance_ms
+                trace.write(
+                    "acceptance_end", attempt=record.correction_count + 1, duration_ms=acceptance_ms,
+                    status="passed" if passed else "failed",
+                )
+                if passed:
+                    record.acceptance_passed = True
+                    record.status = "passed"
+                    record.failure_reason = None
+                    break
+                record.failure_reason = safe_failure(reason)
+                if classify_infra_failure(record.failure_reason):
+                    record.infra_invalid = True
+                    record.status = "infra_invalid"
+                    break
+                fingerprint, repeated = note_acceptance_failure(record.failure_reason, acceptance_failures)
+                if repeated:
+                    record.failure_reason = f"repeated acceptance failure ({fingerprint}); correction stopped: {record.failure_reason}"
+                    break
+                record.correction_count += 1
+                prompt = (
+                    "숨은 acceptance가 실패했다. 같은 session에서 직접 수정하고 다시 검증하라. "
+                    "worker를 다시 시작하지 마라. 실패 항목:\n" + record.failure_reason
+                )
+                integration_resume = True
+        record.active_task_ms = round((time.perf_counter() - active_started) * 1000)
+        record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)
+        record.read_overlap = benchmark_read_overlap(team, checkout)
+        if record.read_overlap.get("status") != "measured":
+            record.protocol_degraded = True
+            record.failure_reason = (record.failure_reason + "; " if record.failure_reason else "") + (
+                "protocol degraded: read-overlap coverage incomplete"
+            )
+        worker_tokens, _, observed, expected = team_usage(team, checkout)
+        add_tokens(record.tokens, worker_tokens)
+        record.token_precision = "actual_all" if observed == expected else (
+            "leader_actual_workers_partial" if observed else "leader_actual_workers_unavailable"
+        )
+        record.cost_usd = estimate_cost(record.tokens, model)
+        record.cost_precision = "token_estimate" if record.cost_usd is not None else "unavailable"
+        record.changed_files = write_patch(checkout, experiment / paths["patch"])
+        if record.status != "passed":
+            record.status = "infra_invalid" if record.infra_invalid else (
+                "timeout" if record.timed_out else "failed"
+            )
+    except Exception as error:
+        record.failure_reason = safe_failure(f"{type(error).__name__}: {error}")
+        record.infra_invalid = classify_infra_failure(record.failure_reason)
+        record.status = "infra_invalid" if record.infra_invalid else "failed"
+        if total_started is not None:
+            record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)
+        with contextlib.suppress(Exception):
+            if checkout.exists():
+                record.changed_files = write_patch(checkout, experiment / paths["patch"])
+    finally:
+        cleanup_safe = True
+        if worker_thread and worker_thread.is_alive():
+            collector_cancel.set()
+            worker_thread.join(timeout=2)
+            if worker_thread.is_alive():
+                cleanup_safe = False
+                record.status = "failed"
+                record.failure_reason = "worker collector did not stop before cleanup"
+                record.total_wall_ms = None
+        if cleanup_safe and team and checkout.exists():
+            with contextlib.suppress(Exception):
+                daemon_json("headless.destroy_team", {"team_name": team}, timeout=90)
+        record.finished_at = utc_now()
+        trace.write("session_end", status=record.status, total_wall_ms=record.total_wall_ms, tokens=record.tokens)
+        (experiment / paths["result"]).write_text(json.dumps(asdict(record), indent=2, ensure_ascii=False) + "\n")
+        if cleanup_safe and checkout.exists() and not keep_checkouts:
+            shutil.rmtree(checkout, ignore_errors=True)
+        if cleanup_safe and leader_checkout and leader_checkout.exists() and not keep_checkouts:
+            shutil.rmtree(leader_checkout, ignore_errors=True)
+        if cleanup_safe and guard_root is not None:
+            shutil.rmtree(guard_root, ignore_errors=True)
+        if cleanup_safe:
+            for result_file in result_files:
+                result_file.unlink(missing_ok=True)
     return record
 
 
@@ -2032,6 +2590,99 @@ def pair_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return pairs
 
 
+def orchestration_pair_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    usable = latest_effectiveness_rows(rows)
+    grouped: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+    for row in usable:
+        if not row.get("infra_invalid") and not row.get("protocol_degraded"):
+            grouped.setdefault((row["fixture"], int(row["trial"])), {})[row["condition"]] = row
+    pairs = []
+    for (fixture, trial), conditions in sorted(grouped.items()):
+        for baseline in ("single", "blocking"):
+            if baseline not in conditions or "overlap" not in conditions:
+                continue
+            left, overlap = conditions[baseline], conditions["overlap"]
+            both_passed = bool(left.get("acceptance_passed") and overlap.get("acceptance_passed"))
+            speedup = None
+            if both_passed and left.get("total_wall_ms") and overlap.get("total_wall_ms"):
+                speedup = left["total_wall_ms"] / overlap["total_wall_ms"]
+            pairs.append({
+                "fixture": fixture, "trial": trial, "baseline": baseline,
+                "baseline_passed": bool(left.get("acceptance_passed")),
+                "overlap_passed": bool(overlap.get("acceptance_passed")),
+                "speedup": speedup, "baseline_run_id": left["run_id"],
+                "overlap_run_id": overlap["run_id"],
+            })
+    return pairs
+
+
+def summarize_orchestration(
+    rows: list[dict[str, Any]], *, seed: int, quality: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    usable = latest_effectiveness_rows(rows)
+    conditions = {}
+    for condition in ORCHESTRATION_CONDITIONS:
+        selected = [row for row in usable if row["condition"] == condition]
+        passed = [row for row in selected if row.get("acceptance_passed")]
+        walls = [float(row["total_wall_ms"]) for row in passed if row.get("total_wall_ms") is not None]
+        conditions[condition] = {
+            "runs": len(selected), "passed": len(passed),
+            "pass_rate": len(passed) / len(selected) if selected else None,
+            "median_wall_ms": statistics.median(walls) if walls else None,
+            "median_overlap_ms": statistics.median(
+                row["overlap_ms"] for row in passed if row.get("overlap_ms") is not None
+            ) if any(row.get("overlap_ms") is not None for row in passed) else None,
+            "median_pure_wait_ms": statistics.median(
+                row["pure_worker_wait_ms"] for row in passed if row.get("pure_worker_wait_ms") is not None
+            ) if any(row.get("pure_worker_wait_ms") is not None for row in passed) else None,
+        }
+    pairs = orchestration_pair_rows(usable)
+    comparisons = {}
+    for baseline in ("single", "blocking"):
+        selected = [row for row in pairs if row["baseline"] == baseline]
+        speedups = [float(row["speedup"]) for row in selected if row["speedup"] is not None]
+        comparisons[f"{baseline}_vs_overlap"] = {
+            "pairs": len(selected), "latency_pairs": len(speedups),
+            "median_speedup": statistics.median(speedups) if speedups else None,
+            "bootstrap_95ci": bootstrap_ci(speedups, seed=seed),
+        }
+    complete = all(conditions[name]["runs"] >= len(FIXTURES) * 3 for name in ORCHESTRATION_CONDITIONS)
+    no_pass_loss = all(
+        conditions["overlap"]["pass_rate"] is not None
+        and conditions[name]["pass_rate"] is not None
+        and conditions["overlap"]["pass_rate"] >= conditions[name]["pass_rate"]
+        for name in ("single", "blocking")
+    )
+    speed = comparisons["single_vs_overlap"]["median_speedup"]
+    quality_rows = quality.get("comparisons", []) if quality else []
+    quality_keys = {(row.get("fixture"), int(row.get("trial", 0))) for row in quality_rows}
+    expected_quality_keys = {(fixture, trial) for fixture in FIXTURES for trial in range(1, 4)}
+    quality_ready = len(quality_rows) == len(expected_quality_keys) and quality_keys == expected_quality_keys and all(
+        int(row.get("valid_judges", 0)) >= 3 and row.get("overlap_regression") is not None
+        for row in quality_rows
+    )
+    quality_regression = any(row.get("overlap_regression") is True for row in quality_rows)
+    expected_pairs = len(FIXTURES) * 3
+    complete_latency_pairs = all(
+        comparisons[name]["latency_pairs"] == expected_pairs
+        for name in ("single_vs_overlap", "blocking_vs_overlap")
+    )
+    latency_gate_ready = bool(
+        complete and complete_latency_pairs and no_pass_loss and speed is not None and speed >= 1.20
+    )
+    return {
+        "conditions": conditions, "pairs": pairs, "comparisons": comparisons,
+        "complete_experiment": complete, "no_pass_rate_loss": no_pass_loss,
+        "complete_latency_pairs": complete_latency_pairs,
+        "quality_ready": quality_ready,
+        "quality_regression": quality_regression if quality_ready else None,
+        "promotion_ready": bool(latency_gate_ready and quality_ready and not quality_regression),
+        "latency_gate_ready": latency_gate_ready,
+        "usable_runs": len(usable), "attempt_runs": len(rows),
+        "protocol_degraded_runs": sum(bool(row.get("protocol_degraded")) for row in usable),
+    }
+
+
 def quality_index(quality: Optional[dict[str, Any]]) -> dict[tuple[str, int], dict[str, Any]]:
     if not quality:
         return {}
@@ -2258,6 +2909,79 @@ def evaluate_quality(experiment: Path, rows: list[dict[str, Any]], seed: int) ->
     return result
 
 
+def evaluate_orchestration_quality(
+    experiment: Path, rows: list[dict[str, Any]], seed: int,
+) -> dict[str, Any]:
+    detect = run_command(("xm", "panel", "detect", "--auth", "--json"), timeout=60)
+    available: list[str] = []
+    if detect.returncode == 0:
+        with contextlib.suppress(Exception):
+            available = list(json.loads(detect.stdout).get("available", []))
+    cross_vendor = len(available) >= 2
+    if not available:
+        if not shutil.which("claude"):
+            raise RuntimeError("no ready quality judge CLI")
+        available = ["claude"]
+    judges = available[:3]
+    while len(judges) < 3:
+        judges.append(available[len(judges) % len(available)])
+    by_id = {row["run_id"]: row for row in rows}
+    rng = random.Random(seed)
+    comparisons = []
+    eval_dir = experiment / "quality"
+    eval_dir.mkdir(exist_ok=True)
+    for pair in orchestration_pair_rows(rows):
+        if pair["baseline"] != "single" or not (pair["baseline_passed"] and pair["overlap_passed"]):
+            continue
+        patches = {
+            "single": (experiment / by_id[pair["baseline_run_id"]]["paths"]["patch"]).read_text(),
+            "overlap": (experiment / by_id[pair["overlap_run_id"]]["paths"]["patch"]).read_text(),
+        }
+        results = []
+        first_order = ["single", "overlap"] if rng.random() < 0.5 else ["overlap", "single"]
+        for index, vendor in enumerate(judges):
+            order = first_order if index % 2 == 0 else list(reversed(first_order))
+            prompt_path = eval_dir / f"{pair['fixture']}-t{pair['trial']}-j{index + 1}.txt"
+            prompt_path.write_text(
+                quality_prompt(FIXTURES[pair["fixture"]], patches[order[0]], patches[order[1]])
+            )
+            judged = run_command((
+                "xm", "panel", "cross", "--models", vendor, "--prompt-file", str(prompt_path),
+                "--json", "--source", "eval:judge",
+                "--title", f"orchestration {pair['fixture']} t{pair['trial']}",
+            ), timeout=20 * 60)
+            raw = judged.stdout
+            with contextlib.suppress(Exception):
+                payload = json.loads(raw)
+                raw = payload.get("results", [{}])[0].get("output", raw)
+            if judged.returncode != 0:
+                results.append({"vendor": vendor, "ok": False, "error": safe_failure(judged.stderr)})
+                continue
+            parsed = parse_judge_output(raw)
+            scores = {condition: parsed[label] for label, condition in zip(("A", "B"), order)}
+            winner = parsed["winner"]
+            mapped = "tie" if winner == "tie" else order[0 if winner == "A" else 1]
+            results.append({"vendor": vendor, "ok": True, "order": order, "winner": mapped, "scores": scores})
+        good = [result for result in results if result.get("ok")]
+        def total(condition: str) -> float:
+            scores = [statistics.mean(float(value) for value in row["scores"][condition].values()) for row in good]
+            return statistics.mean(scores) if scores else 0.0
+        single_score, overlap_score = total("single"), total("overlap")
+        comparisons.append({
+            "fixture": pair["fixture"], "trial": pair["trial"], "judges": results,
+            "single_score": single_score, "overlap_score": overlap_score,
+            "valid_judges": len(good),
+            "overlap_regression": (overlap_score + 0.25 < single_score) if len(good) >= 3 else None,
+        })
+    result = {
+        "schema": 1, "evaluated_at": utc_now(), "cross_vendor": cross_vendor,
+        "vendors": judges, "fallback": None if cross_vendor else "fewer than two ready vendors",
+        "comparisons": comparisons,
+    }
+    (experiment / "quality-eval.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+    return result
+
+
 def load_experiment(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if path.is_file():
         path = path.parent
@@ -2350,6 +3074,47 @@ def render_report(experiment: Path, manifest: dict[str, Any], rows: list[dict[st
             f"censored {evidence['censored_pairs']}"
         )
     lines.extend(("", "Default multi adoption requires no pass-rate loss, median speedup ≥1.20x, and no blinded quality regression. Per-fixture routing requires ≥1.15x and the same quality gate.", ""))
+    report = "\n".join(lines)
+    (experiment / "report.md").write_text(report)
+    (experiment / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+    return report
+
+
+def render_orchestration_report(
+    experiment: Path, manifest: dict[str, Any], rows: list[dict[str, Any]], summary: dict[str, Any],
+) -> str:
+    def seconds(value: Optional[float]) -> str:
+        return "-" if value is None else f"{value / 1000:.1f}s"
+
+    lines = [
+        "# Leader-worker orchestration study", "",
+        f"- Experiment: `{manifest['run_id']}`",
+        f"- Usable cells: {summary['usable_runs']} / {len(manifest['matrix'])}",
+        f"- Protocol-degraded cells: {summary['protocol_degraded_runs']}", "",
+        "## Conditions", "",
+        "| condition | pass | median wall | median overlap | median pure wait |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for condition in ORCHESTRATION_CONDITIONS:
+        item = summary["conditions"][condition]
+        lines.append(
+            f"| {condition} | {item['passed']}/{item['runs']} | {seconds(item['median_wall_ms'])} | "
+            f"{seconds(item['median_overlap_ms'])} | {seconds(item['median_pure_wait_ms'])} |"
+        )
+    lines.extend(("", "## Paired comparisons", ""))
+    for name, comparison in summary["comparisons"].items():
+        speed = comparison["median_speedup"]
+        lines.append(
+            f"- `{name}`: {comparison['latency_pairs']}/{comparison['pairs']} latency pairs, "
+            f"median speedup {'-' if speed is None else f'{speed:.2f}x'}"
+        )
+    lines.extend((
+        "",
+        f"Latency gate ready: **{summary['latency_gate_ready']}**",
+        f"Quality ready: **{summary['quality_ready']}** (regression={summary['quality_regression']})",
+        f"Promotion ready: **{summary['promotion_ready']}**",
+        "",
+    ))
     report = "\n".join(lines)
     (experiment / "report.md").write_text(report)
     (experiment / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
@@ -2494,6 +3259,11 @@ def regenerate_experiment_report(
             experiment, manifest, rows,
             summarize_policy(rows, seed=int(manifest["seed"])),
         )
+    if manifest.get("experiment_type") == "leader-worker-orchestration":
+        return render_orchestration_report(
+            experiment, manifest, rows,
+            summarize_orchestration(rows, seed=int(manifest["seed"]), quality=quality),
+        )
     return render_report(
         experiment, manifest, rows,
         summarize(rows, seed=int(manifest["seed"]), quality=quality),
@@ -2613,6 +3383,62 @@ def run_experiment(args: argparse.Namespace) -> int:
         return _run_experiment(args)
 
 
+def run_orchestration_experiment(args: argparse.Namespace) -> int:
+    fixtures = tuple(item for item in args.fixtures.split(",") if item)
+    conditions = tuple(item for item in args.conditions.split(",") if item)
+    unknown = set(fixtures) - set(FIXTURES)
+    unknown_conditions = set(conditions) - set(ORCHESTRATION_CONDITIONS)
+    if unknown or unknown_conditions or not conditions or args.trials < 1 or args.timeout < 1:
+        raise ValueError(
+            f"invalid fixtures={sorted(unknown)} conditions={sorted(unknown_conditions)} "
+            f"trials={args.trials} timeout={args.timeout}"
+        )
+    specs = build_orchestration_matrix(fixtures, args.trials, args.seed, conditions)
+    print(f"orchestration matrix: {len(specs)} runs")
+    for index, spec in enumerate(specs, 1):
+        print(f"  {index:02d}. {spec.fixture:<22} trial={spec.trial} order={spec.order} {spec.condition}")
+    if args.dry_run:
+        return 0
+    if not shutil.which("claude") or not shutil.which("tm-agent"):
+        raise RuntimeError("claude and tm-agent CLIs are required")
+    run_id = args.run_id or datetime.now().strftime("%Y%m%dT%H%M%S") + "-orchestration-" + uuid.uuid4().hex[:6]
+    experiment = args.results_dir / run_id
+    experiment.mkdir(parents=True, exist_ok=False)
+    (experiment / "runs").mkdir()
+    manifest = {
+        "schema": 1, "experiment_type": "leader-worker-orchestration",
+        "orchestration_schema": 1, "run_id": run_id, "created_at": utc_now(),
+        "root_head": git("rev-parse", "HEAD"), "model": args.model, "effort": args.effort,
+        "workers": 3, "trials": args.trials, "seed": args.seed,
+        "timeout_seconds": args.timeout, "xcode_host": args.xcode_host,
+        "fixtures": [row for row in validate_fixture_metadata() if row["fixture"] in fixtures],
+        "matrix": [asdict(spec) for spec in specs],
+    }
+    manifest_path = experiment / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    manifest_path.chmod(0o444)
+    scratch = Path(tempfile.mkdtemp(prefix="term-mesh-orchestration-"))
+    rows = []
+    try:
+        for index, spec in enumerate(specs, 1):
+            print(f"[{index}/{len(specs)}] {spec.fixture} {spec.condition} trial {spec.trial}", flush=True)
+            result = run_orchestration_one(
+                spec, experiment=experiment, scratch=scratch, model=args.model, effort=args.effort,
+                timeout=args.timeout, xcode_host=args.xcode_host, keep_checkouts=args.keep_checkouts,
+            )
+            rows.append(asdict(result))
+            render_orchestration_report(
+                experiment, manifest, rows, summarize_orchestration(rows, seed=args.seed),
+            )
+            print(f"  {result.status.upper()} {(result.total_wall_ms or 0) / 1000:.1f}s {result.failure_reason or ''}")
+    finally:
+        if not args.keep_checkouts:
+            shutil.rmtree(scratch, ignore_errors=True)
+    print(f"Saved: {experiment}")
+    effective_rows = latest_effectiveness_rows(rows)
+    return 0 if len(effective_rows) == len(specs) and all(row["acceptance_passed"] for row in effective_rows) else 1
+
+
 def run_policy_experiment(args: argparse.Namespace) -> int:
     fixtures = tuple(item for item in args.fixtures.split(",") if item)
     policies = tuple(item for item in args.policies.split(",") if item)
@@ -2694,6 +3520,21 @@ def main() -> int:
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--keep-checkouts", action="store_true")
     run.add_argument("--skip-rpc-probe", action="store_true")
+    orchestration = sub.add_parser(
+        "orchestration-study", help="compare single, blocking, and overlapping leader-worker execution",
+    )
+    orchestration.add_argument("--fixtures", default=",".join(FIXTURES))
+    orchestration.add_argument("--conditions", default=",".join(ORCHESTRATION_CONDITIONS))
+    orchestration.add_argument("--trials", type=int, default=3)
+    orchestration.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    orchestration.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    orchestration.add_argument("--model", default="sonnet")
+    orchestration.add_argument("--effort", default="medium", choices=("low", "medium", "high", "xhigh", "max"))
+    orchestration.add_argument("--xcode-host", default="mac-sub")
+    orchestration.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS / "orchestration-study")
+    orchestration.add_argument("--run-id")
+    orchestration.add_argument("--dry-run", action="store_true")
+    orchestration.add_argument("--keep-checkouts", action="store_true")
     policy = sub.add_parser("policy-ab", help="compare legacy delegate-first and adaptive Project leaders")
     policy.add_argument("--fixtures", default=",".join(FIXTURES))
     policy.add_argument("--policies", default=",".join(POLICIES))
@@ -2724,12 +3565,21 @@ def main() -> int:
         return 0 if result["passed"] else 1
     if args.command == "run":
         return run_experiment(args)
+    if args.command == "orchestration-study":
+        if args.dry_run:
+            return run_orchestration_experiment(args)
+        with benchmark_signal_cleanup(), benchmark_run_lock(args.results_dir):
+            return run_orchestration_experiment(args)
     if args.command == "policy-ab":
         with benchmark_signal_cleanup(), benchmark_run_lock(args.results_dir):
             return run_policy_experiment(args)
     experiment = args.experiment if args.experiment.is_dir() else args.experiment.parent
     manifest, rows = load_experiment(experiment)
-    quality = evaluate_quality(experiment, rows, int(manifest["seed"])) if args.evaluate else None
+    quality = (
+        evaluate_orchestration_quality(experiment, rows, int(manifest["seed"]))
+        if args.evaluate and manifest.get("experiment_type") == "leader-worker-orchestration" else
+        evaluate_quality(experiment, rows, int(manifest["seed"])) if args.evaluate else None
+    )
     if quality is None and (experiment / "quality-eval.json").exists():
         quality = json.loads((experiment / "quality-eval.json").read_text())
     print(regenerate_experiment_report(experiment, manifest, rows, quality))

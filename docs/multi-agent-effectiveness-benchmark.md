@@ -74,6 +74,52 @@ per-run result/trace/log/patch files, `quality-eval.json`, `summary.json`, and `
 Trace JSONL contains metadata only. Judge inputs randomize A/B order; at least two ready vendors
 enable cross-vendor evaluation, otherwise the report records the single-vendor fallback.
 
+## Leader and worker overlap study
+
+Use the orchestration study to compare three conditions.
+
+- `single` runs one leader without workers.
+- `blocking` waits for all workers before the leader starts.
+- `overlap` runs a read-only leader lane while workers run.
+
+Inspect the 27-run matrix before any model call:
+
+```bash
+python3 scripts/bench-agent-effectiveness.py orchestration-study \
+  --fixtures homebrew-smoke,ghostty-kit-guard,split-divider-color \
+  --trials 3 --seed 20260814 --dry-run
+```
+
+Run the study only after you approve the provider cost:
+
+```bash
+python3 scripts/bench-agent-effectiveness.py orchestration-study \
+  --fixtures homebrew-smoke,ghostty-kit-guard,split-divider-color \
+  --trials 3 --seed 20260814
+```
+
+After the matrix passes, run the blinded quality evaluation:
+
+```bash
+python3 scripts/bench-agent-effectiveness.py report \
+  ~/.term-mesh/benchmarks/effectiveness/orchestration-study/<run-id> --evaluate
+```
+
+The overlap lane reads a separate history-free snapshot. It cannot use mutation-capable tools.
+The controller checks that snapshot before and after each overlap turn.
+The run fails if an overlap turn changes the snapshot.
+
+The report compares `single` with `overlap`. It also compares `blocking` with `overlap`.
+It records first-result time, last-result time, pure wait time, overlap time, and the critical path.
+
+The controller extracts structured `Read`, `Grep`, and `Glob` paths from Claude worker transcripts.
+It stores repository-relative paths and aggregate overlap values. It drops external paths and command bodies.
+If transcript coverage is incomplete, the report marks read overlap as unknown.
+
+Do not change the leader policy from latency results alone. Require the full matrix first.
+Require no pass-rate loss and a paired median speedup of at least 1.20x.
+Run a separate blinded quality evaluation before policy promotion.
+
 ## Project leader policy A/B
 
 The original matrix compares one session with a controller-dispatched three-worker team. It does
