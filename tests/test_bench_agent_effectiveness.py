@@ -26,6 +26,95 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
     def write_runtime_transcript(self, path, events):
         path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
 
+    def test_isolated_correction_owner_requires_one_exact_mutating_owner(self):
+        tasks = module.isolated_topology_tasks(module.FIXTURES["split-divider-color"])
+        reason = "/tmp/run/Sources/Workspace.swift:12:4: error: missing symbol"
+        self.assertEqual(module.isolated_correction_owner(reason, tasks)["worker"], "explorer")
+        self.assertIsNone(module.isolated_correction_owner("test failed without compile diagnostic", tasks))
+
+    def test_isolated_correction_owner_rejects_leader_and_ambiguous_paths(self):
+        tasks = module.isolated_topology_tasks(module.FIXTURES["split-divider-color"])
+        leader = "Sources/TerminalWindowPortal.swift:3:2: error: bad call"
+        mixed = (
+            "Sources/Workspace.swift:3:2: error: bad call\n"
+            "Sources/SettingsView.swift:4:2: error: other call"
+        )
+        self.assertIsNone(module.isolated_correction_owner(leader, tasks))
+        self.assertIsNone(module.isolated_correction_owner(mixed, tasks))
+
+    def test_isolated_correction_budget_is_bounded_by_remaining_deadline(self):
+        self.assertEqual(module.isolated_correction_budget(500), 180.0)
+        self.assertEqual(module.isolated_correction_budget(27.5), 27.5)
+        with self.assertRaises(TimeoutError):
+            module.isolated_correction_budget(0)
+
+    def test_replace_integrated_worker_patch_rolls_back_original_on_failure(self):
+        old_patch = b"old"
+        corrected_patch = b"corrected"
+        responses = [
+            unittest.mock.Mock(returncode=0, stderr=b""),
+            unittest.mock.Mock(returncode=1, stderr=b"bad corrected"),
+            unittest.mock.Mock(returncode=0, stderr=b""),
+        ]
+        with unittest.mock.patch.object(module.subprocess, "run", side_effect=responses) as run:
+            with self.assertRaisesRegex(RuntimeError, "original patch restored"):
+                module.replace_integrated_worker_patch(Path("/tmp/checkout"), old_patch, corrected_patch, 30)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args_list[0].kwargs["input"], old_patch)
+        self.assertEqual(run.call_args_list[1].kwargs["input"], corrected_patch)
+        self.assertEqual(run.call_args_list[2].kwargs["input"], old_patch)
+
+    def test_restore_original_worker_patch_promotes_rollback_failure(self):
+        with unittest.mock.patch.object(
+            module, "replace_integrated_worker_patch", side_effect=RuntimeError("cannot restore"),
+        ):
+            with self.assertRaises(module.BenchmarkCorrectionRollbackError):
+                module.restore_original_worker_patch(
+                    Path("/tmp/checkout"), b"corrected", b"original", 30,
+                )
+
+    def test_rollback_failed_state_is_cleanup_unsafe_and_has_no_candidate_artifact(self):
+        record = module.RunResult(
+            run_id="rollback", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            status="infra_invalid", infra_invalid=True,
+            correction_outcome="rollback_failed",
+        )
+        self.assertTrue(module.isolated_correction_state_is_unsafe(record))
+        self.assertFalse(module.isolated_candidate_artifact_allowed(record))
+
+    def test_retry_exception_and_restore_failure_stays_typed_infrastructure_error(self):
+        original = RuntimeError("retry acceptance crashed")
+        with unittest.mock.patch.object(
+            module, "replace_integrated_worker_patch",
+            side_effect=RuntimeError("rollback replacement crashed"),
+        ):
+            try:
+                raise original
+            except Exception:
+                with self.assertRaises(module.BenchmarkCorrectionRollbackError):
+                    module.restore_original_worker_patch(
+                        Path("/tmp/checkout"), b"corrected", b"original", 30,
+                    )
+
+    def test_correct_isolated_worker_rejects_corrected_scope_before_replacement(self):
+        task = module.isolated_topology_tasks(module.FIXTURES["split-divider-color"])[0]
+        with unittest.mock.patch.object(module, "run_command", return_value=unittest.mock.Mock(
+            returncode=0, stderr="", stdout="",
+        )), unittest.mock.patch.object(
+            module, "wait_for_worker_results", return_value=(["done"], 1, 1),
+        ), unittest.mock.patch.object(
+            module, "worker_patch_snapshot", return_value=(b"corrected", {"Sources/Workspace.swift"}),
+        ), unittest.mock.patch.object(module, "replace_integrated_worker_patch") as replace:
+            with self.assertRaisesRegex(RuntimeError, "forbidden paths"):
+                module.correct_isolated_worker(
+                    fixture=module.FIXTURES["split-divider-color"], team="bench", task=task,
+                    workdir=Path("/tmp/worker"), checkout=Path("/tmp/checkout"),
+                    original_error="error", result_file=Path("/tmp/result"), old_patch=b"old",
+                    trace=unittest.mock.Mock(), remaining=lambda: 30,
+                )
+        replace.assert_not_called()
+
     def test_runtime_metrics_pairs_requests_and_bash_by_structured_ids(self):
         with tempfile.TemporaryDirectory() as temporary:
             transcript = Path(temporary) / "session.jsonl"
@@ -262,6 +351,56 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
             (3, "isolated-blocking", 1), (3, "isolated-overlap", 2),
         ])
 
+    def test_isolated_execution_metadata_defaults_leader_to_worker_model(self):
+        self.assertEqual(
+            module.isolated_execution_metadata("sonnet", None),
+            {
+                "leader_execution": "controller_managed_claude_print_session",
+                "leader_model": "sonnet",
+                "worker_model": "sonnet",
+                "leader_session_resume": True,
+            },
+        )
+        self.assertEqual(
+            module.isolated_execution_metadata("haiku", "opus")["leader_model"],
+            "opus",
+        )
+
+    def test_split_model_cost_uses_each_models_pricing(self):
+        record = module.RunResult(
+            run_id="run", fixture="split-divider-color", parallelism="high",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            tokens={key: 0 for key in module.TOKEN_KEYS},
+            leader_tokens={key: 0 for key in module.TOKEN_KEYS},
+            worker_tokens={key: 0 for key in module.TOKEN_KEYS},
+            leader_model="opus", worker_model="haiku",
+        )
+        record.leader_tokens["input_tokens"] = 1_000_000
+        record.worker_tokens["input_tokens"] = 1_000_000
+        module.add_tokens(record.tokens, record.leader_tokens)
+        module.add_tokens(record.tokens, record.worker_tokens)
+        module.record_split_model_costs(record)
+        self.assertEqual(record.leader_cost_usd, 15.0)
+        self.assertEqual(record.worker_cost_usd, 0.8)
+        self.assertEqual(record.cost_usd, 15.8)
+        self.assertEqual(record.cost_precision, "split_model_token_estimate")
+
+    def test_same_model_split_cost_preserves_combined_estimate(self):
+        record = module.RunResult(
+            run_id="run", fixture="split-divider-color", parallelism="high",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            tokens={key: 0 for key in module.TOKEN_KEYS},
+            leader_tokens={key: 0 for key in module.TOKEN_KEYS},
+            worker_tokens={key: 0 for key in module.TOKEN_KEYS},
+            leader_model="sonnet", worker_model="sonnet",
+        )
+        record.leader_tokens["output_tokens"] = 1
+        record.worker_tokens["output_tokens"] = 1
+        module.add_tokens(record.tokens, record.leader_tokens)
+        module.add_tokens(record.tokens, record.worker_tokens)
+        module.record_split_model_costs(record)
+        self.assertEqual(record.cost_usd, module.estimate_cost(record.tokens, "sonnet"))
+
     def test_isolated_topology_ownership_is_disjoint(self):
         tasks = module.isolated_topology_tasks(module.FIXTURES["split-divider-color"])
         scopes = [set(task["owned"]) for task in tasks]
@@ -341,9 +480,15 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         )
         for prompt in prompts:
             self.assertIn("Keep the two split-divider behaviors independent", prompt)
-            self.assertIn("set borderHex only from an explicit GhosttyConfig.splitDividerColor", prompt)
+            self.assertIn("GhosttyConfig.splitDividerColor has type NSColor?", prompt)
+            self.assertIn("Preserve NSColor? across the config and Workspace boundary", prompt)
+            self.assertIn("parse an explicit hex value with NSColor(hex:)", prompt)
+            self.assertIn("Never replace it with String? or add a parallel raw divider-color property", prompt)
+            self.assertIn("convert the NSColor? value only when forming borderHex", prompt)
             self.assertIn("A reset or unconfigured value must produce nil", prompt)
             self.assertIn("pure helper for this mapping", prompt)
+            self.assertIn("let parsed: NSColor? = NSColor(hex: \"#336699\")", prompt)
+            self.assertIn("verifies the explicit mapping, reset mapping, and unconfigured mapping", prompt)
             self.assertIn("actual resolved NSSplitView divider color regardless of its source", prompt)
             self.assertIn("opaque resolved color must always render the overlay without surface occlusion", prompt)
             self.assertIn("translucent resolved color must preserve the existing occlusion-only policy", prompt)
@@ -1496,6 +1641,126 @@ end
             cleanup.assert_called_once()
             self.assertIn("explorer", cleanup.call_args.args[1])
 
+    def test_cleanup_isolated_worker_checkouts_reports_remove_failure(self):
+        responses = [
+            subprocess.CompletedProcess([], 1, "", "remove boom"),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with unittest.mock.patch.object(module, "run_command", side_effect=responses):
+            with self.assertRaisesRegex(module.BenchmarkWorktreeCleanupError, "remove boom"):
+                module.cleanup_isolated_worker_checkouts(
+                    Path("/tmp/integration"), {"executor": Path("/tmp/worker")},
+                )
+
+    def test_cleanup_isolated_worker_checkouts_reports_prune_failure(self):
+        responses = [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 1, "", "prune boom"),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with unittest.mock.patch.object(module, "run_command", side_effect=responses):
+            with self.assertRaisesRegex(module.BenchmarkWorktreeCleanupError, "prune boom"):
+                module.cleanup_isolated_worker_checkouts(
+                    Path("/tmp/integration"), {"executor": Path("/tmp/worker")},
+                )
+
+    def test_cleanup_rejects_successful_noop_when_worker_path_remains(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            worker = Path(temporary) / "worker"
+            worker.mkdir()
+            responses = [
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with unittest.mock.patch.object(module, "run_command", side_effect=responses):
+                with self.assertRaisesRegex(
+                    module.BenchmarkWorktreeCleanupError, "path remains after cleanup",
+                ):
+                    module.cleanup_isolated_worker_checkouts(Path(temporary), {"executor": worker})
+
+    def test_cleanup_rejects_worker_path_that_remains_registered(self):
+        worker = Path("/tmp/removed-worker").resolve(strict=False)
+        responses = [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, f"worktree {worker}\nHEAD abc\n", ""),
+        ]
+        with unittest.mock.patch.object(module, "run_command", side_effect=responses):
+            with self.assertRaisesRegex(
+                module.BenchmarkWorktreeCleanupError, "remains registered",
+            ):
+                module.cleanup_isolated_worker_checkouts(
+                    Path("/tmp/integration"), {"executor": worker},
+                )
+
+    def test_cleanup_rejects_broken_worker_symlink_after_successful_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            worker = Path(temporary) / "worker"
+            worker.symlink_to(Path(temporary) / "missing-target")
+            responses = [
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with unittest.mock.patch.object(module, "run_command", side_effect=responses):
+                with self.assertRaisesRegex(
+                    module.BenchmarkWorktreeCleanupError, "path remains after cleanup",
+                ):
+                    module.cleanup_isolated_worker_checkouts(
+                        Path(temporary), {"executor": worker},
+                    )
+
+    def test_cleanup_accepts_removed_and_unregistered_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            worker = Path(temporary) / "worker"
+            worker.mkdir()
+            calls = 0
+
+            def run(args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if tuple(args[:4]) == ("git", "worktree", "remove", "--force"):
+                    worker.rmdir()
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with unittest.mock.patch.object(module, "run_command", side_effect=run):
+                module.cleanup_isolated_worker_checkouts(
+                    Path(temporary), {"executor": worker},
+                )
+            self.assertEqual(calls, 3)
+
+    def test_partial_create_preserves_create_and_cleanup_failures(self):
+        checkout = Path("/tmp/integration")
+        with unittest.mock.patch.object(
+            module, "run_command",
+            return_value=subprocess.CompletedProcess([], 1, "", "create boom"),
+        ), unittest.mock.patch.object(
+            module, "cleanup_isolated_worker_checkouts",
+            side_effect=module.BenchmarkWorktreeCleanupError("cleanup boom"),
+        ):
+            with self.assertRaisesRegex(
+                module.BenchmarkWorktreeCleanupError, "create boom.*cleanup boom",
+            ):
+                module.create_isolated_worker_checkouts(checkout)
+
+    def test_worktree_cleanup_failure_marks_run_unsafe_and_preserves_artifacts(self):
+        record = module.RunResult(
+            run_id="cleanup", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-blocking", order=1, started_at=module.utc_now(),
+            status="passed", acceptance_passed=True, total_wall_ms=100,
+        )
+        module.mark_worktree_cleanup_failure(
+            record, module.BenchmarkWorktreeCleanupError("remove failed"),
+        )
+        self.assertFalse(record.cleanup_safe)
+        self.assertTrue(record.infra_invalid)
+        self.assertEqual(record.status, "infra_invalid")
+        self.assertIsNone(record.total_wall_ms)
+        self.assertIn("remove failed", record.cleanup_reason)
+        self.assertFalse(module.isolated_candidate_artifact_allowed(record))
+
     def test_orchestration_summary_requires_quality_before_promotion(self):
         rows = []
         for fixture in module.FIXTURES:
@@ -2056,6 +2321,15 @@ end
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("effectiveness matrix: 18 runs", result.stdout)
+
+    def test_isolated_cli_accepts_optional_leader_model(self):
+        result = subprocess.run(
+            (sys.executable, str(SCRIPT), "isolated-topology-study", "--dry-run",
+             "--model", "haiku", "--leader-model", "opus", "--trials", "1"),
+            cwd=ROOT, text=True, capture_output=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("isolated topology matrix: 2 runs", result.stdout)
 
     def test_rpc_probe_is_diagnostic_and_persists_exit_code(self):
         completed = subprocess.CompletedProcess([], 7, "stdout /Users/example", "stderr")

@@ -146,6 +146,10 @@ class RunResult:
     time_to_first_action_ms: Optional[int] = None
     acceptance_ms: int = 0
     correction_count: int = 0
+    correction_owner: Optional[str] = None
+    correction_outcome: Optional[str] = None
+    correction_ms: int = 0
+    correction_tasks: list[dict[str, Any]] = field(default_factory=list)
     leader_turns: int = 0
     worker_tasks: int = 0
     worker_active_critical_path_ms: Optional[int] = None
@@ -166,9 +170,17 @@ class RunResult:
     routing_tasks: list[dict[str, Any]] = field(default_factory=list)
     rework_count: int = 0
     tokens: dict[str, int] = field(default_factory=dict)
+    leader_tokens: dict[str, int] = field(default_factory=dict)
+    worker_tokens: dict[str, int] = field(default_factory=dict)
     token_precision: str = "actual"
     cost_usd: Optional[float] = None
+    leader_cost_usd: Optional[float] = None
+    worker_cost_usd: Optional[float] = None
     cost_precision: str = "unavailable"
+    leader_execution: Optional[str] = None
+    leader_model: Optional[str] = None
+    worker_model: Optional[str] = None
+    leader_session_resume: Optional[bool] = None
     changed_files: int = 0
     cleanup_safe: bool = True
     cleanup_reason: Optional[str] = None
@@ -181,6 +193,14 @@ class BenchmarkTerminated(RuntimeError):
 
 class BenchmarkInfrastructureError(RuntimeError):
     """Identify a controller prerequisite failure that invalidates a run."""
+
+
+class BenchmarkCorrectionRollbackError(BenchmarkInfrastructureError):
+    """Preserve all correction state when the original worker patch cannot be restored."""
+
+
+class BenchmarkWorktreeCleanupError(BenchmarkInfrastructureError):
+    """Preserve checkout state when linked worker worktree cleanup is incomplete."""
 
 
 def utc_now() -> str:
@@ -1077,8 +1097,13 @@ def create_isolated_worker_checkouts(
             if result.returncode != 0:
                 raise RuntimeError(f"worker worktree create failed for {role}: {result.stderr}")
             workdirs[role] = path
-    except Exception:
-        cleanup_isolated_worker_checkouts(checkout, workdirs)
+    except Exception as create_error:
+        try:
+            cleanup_isolated_worker_checkouts(checkout, workdirs)
+        except BenchmarkWorktreeCleanupError as cleanup_error:
+            raise BenchmarkWorktreeCleanupError(
+                f"{create_error}; partial worktree cleanup also failed: {cleanup_error}"
+            ) from create_error
         raise
     return workdirs
 
@@ -1086,6 +1111,7 @@ def create_isolated_worker_checkouts(
 def integrate_worker_patches(
     checkout: Path, workdirs: dict[str, Path], tasks: list[dict[str, Any]],
     timeout: Callable[[], float] = lambda: 120.0,
+    applied_patches: Optional[dict[str, bytes]] = None,
 ) -> list[str]:
     integrated = []
     by_worker = {task["worker"]: task for task in tasks}
@@ -1122,9 +1148,151 @@ def integrate_worker_patches(
         )
         if applied.returncode != 0:
             raise RuntimeError(f"isolated integration failed for {role}: {applied.stderr.decode(errors='replace')}")
+        if applied_patches is not None:
+            applied_patches[role] = patch
         integrated.extend(sorted(changed))
         leader_changed.update(changed)
     return integrated
+
+
+COMPILE_ERROR_PATH = re.compile(r"(?m)^\s*(.+?\.swift):\d+:\d+:\s+error:")
+
+
+def isolated_correction_owner(reason: str, tasks: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Select one mutating task only when all compile paths have one exact owner."""
+    raw_paths = COMPILE_ERROR_PATH.findall(reason)
+    if not raw_paths:
+        return None
+    mutating = [task for task in tasks if task.get("mutates")]
+    owner: Optional[dict[str, Any]] = None
+    for raw_path in raw_paths:
+        normalized = raw_path.strip().replace("\\", "/")
+        if any(normalized == path or normalized.endswith("/" + path) for path in ISOLATED_LEADER_OWNED):
+            return None
+        owners = [
+            task for task in mutating
+            if any(normalized == path or normalized.endswith("/" + path) for path in task["owned"])
+        ]
+        if len(owners) != 1 or (owner is not None and owner["id"] != owners[0]["id"]):
+            return None
+        owner = owners[0]
+    return owner
+
+
+def isolated_correction_budget(remaining: float) -> float:
+    if remaining <= 0:
+        raise TimeoutError("no end-to-end time remains for isolated worker correction")
+    return min(180.0, remaining)
+
+
+def worker_patch_snapshot(workdir: Path, timeout: float) -> tuple[bytes, set[str]]:
+    tracked = set(git("diff", "--name-only", cwd=workdir).splitlines())
+    untracked = set(git("ls-files", "--others", "--exclude-standard", cwd=workdir).splitlines())
+    if untracked:
+        staged = run_command(("git", "add", "-N", "--", *sorted(untracked)), cwd=workdir, timeout=timeout)
+        if staged.returncode != 0:
+            raise RuntimeError(f"could not expose corrected untracked files: {staged.stderr}")
+    patch = subprocess.run(
+        ("git", "diff", "--binary"), cwd=workdir, capture_output=True, check=True, timeout=timeout,
+    ).stdout
+    return patch, tracked | untracked
+
+
+def replace_integrated_worker_patch(
+    checkout: Path, old_patch: bytes, corrected_patch: bytes, timeout: float,
+) -> None:
+    """Replace one worker patch and restore the original on corrected apply failure."""
+    removed = subprocess.run(
+        ("git", "apply", "-R", "--binary", "-"), cwd=checkout, input=old_patch,
+        capture_output=True, timeout=timeout,
+    )
+    if removed.returncode != 0:
+        raise RuntimeError("could not remove original worker patch: " + removed.stderr.decode(errors="replace"))
+    applied = subprocess.run(
+        ("git", "apply", "--binary", "-"), cwd=checkout, input=corrected_patch,
+        capture_output=True, timeout=timeout,
+    )
+    if applied.returncode == 0:
+        return
+    restored = subprocess.run(
+        ("git", "apply", "--binary", "-"), cwd=checkout, input=old_patch,
+        capture_output=True, timeout=timeout,
+    )
+    if restored.returncode != 0:
+        raise BenchmarkCorrectionRollbackError(
+            "corrected patch and original rollback both failed: "
+            + restored.stderr.decode(errors="replace")
+        )
+    raise RuntimeError("corrected worker patch failed; original patch restored")
+
+
+def restore_original_worker_patch(
+    checkout: Path, corrected_patch: bytes, original_patch: bytes, timeout: float,
+) -> None:
+    try:
+        replace_integrated_worker_patch(checkout, corrected_patch, original_patch, timeout)
+    except BenchmarkCorrectionRollbackError:
+        raise
+    except Exception as error:
+        raise BenchmarkCorrectionRollbackError(
+            f"could not restore original worker patch after correction: {error}"
+        ) from error
+
+
+def isolated_correction_state_is_unsafe(record: RunResult) -> bool:
+    return record.infra_invalid and record.correction_outcome == "rollback_failed"
+
+
+def isolated_candidate_artifact_allowed(record: RunResult) -> bool:
+    return not record.infra_invalid and not isolated_correction_state_is_unsafe(record)
+
+
+def mark_worktree_cleanup_failure(record: RunResult, error: Exception) -> None:
+    record.cleanup_safe = False
+    record.cleanup_reason = safe_failure(f"worker worktree cleanup failed: {error}")
+    record.status = "infra_invalid"
+    record.infra_invalid = True
+    record.failure_reason = record.cleanup_reason
+    record.total_wall_ms = None
+
+
+def correct_isolated_worker(
+    *, fixture: Fixture, team: str, task: dict[str, Any], workdir: Path,
+    checkout: Path, original_error: str, result_file: Path, old_patch: bytes,
+    trace: "TraceWriter", remaining: Callable[[], float],
+) -> tuple[list[str], bytes]:
+    """Resume one persistent worker once and replace its full integrated patch."""
+    result_file.unlink(missing_ok=True)
+    prompt = (
+        "첫 hidden acceptance compile 실패만 수정하라. 같은 persistent session과 checkout을 사용하라.\n"
+        f"Original task: {task['id']}\n"
+        f"Original owned paths: {json.dumps(task['owned'], ensure_ascii=False)}\n"
+        f"Original acceptance error:\n{original_error}\n"
+        "owned exact path만 수정하라. commit하지 마라. 수정 후 아래 5줄을 stdout과 지정 파일에 "
+        f"atomic write하라: {result_file}\n"
+        "STATUS: DONE|BLOCKED|NEEDS_REVIEW\nFILES: <files or none>\n"
+        "VERIFY: <focused verification or n/a>\nNEXT: <one action or NONE>\nFULL_REPORT: <path or none>"
+    )
+    sent = run_command(
+        ("tm-agent", "send", task["worker"], prompt, "--no-report", "--team", team),
+        cwd=checkout, timeout=max(1, remaining()), env=tm_environment(),
+    )
+    if sent.returncode != 0:
+        raise RuntimeError("worker correction dispatch failed: " + safe_failure(sent.stderr or sent.stdout))
+    headers, _, ready = wait_for_worker_results(
+        [result_file], timeout=max(1, remaining()), trace=trace,
+        estimated_seconds={result_file: max(1, round(remaining()))}, respect_estimates=False,
+    )
+    if ready != 1:
+        raise RuntimeError("worker correction result missing")
+    corrected_patch, changed = worker_patch_snapshot(workdir, max(1, remaining()))
+    outside = changed - set(task["owned"])
+    if outside:
+        raise RuntimeError(f"corrected worker changed forbidden paths: {sorted(outside)}")
+    replace_integrated_worker_patch(
+        checkout, old_patch, corrected_patch, max(1, remaining()),
+    )
+    return headers, corrected_patch
 
 
 def default_worker_tasks() -> list[dict[str, Any]]:
@@ -1257,10 +1425,14 @@ SWIFT_ACTOR_TEST_CONTRACT = (
 )
 
 SPLIT_DIVIDER_RUNTIME_CONTRACT = (
-    "Keep the two split-divider behaviors independent. For Bonsplit appearance, set borderHex only "
-    "from an explicit GhosttyConfig.splitDividerColor. A reset or unconfigured value must produce nil. "
-    "Expose or reuse a pure helper for this mapping and add public tests for explicit, reset, and "
-    "unconfigured inputs. For portal overlay rendering, use the actual resolved NSSplitView divider "
+    "Keep the two split-divider behaviors independent. The existing base API "
+    "GhosttyConfig.splitDividerColor has type NSColor?. Preserve NSColor? across the config and "
+    "Workspace boundary, and parse an explicit hex value with NSColor(hex:). Never replace it with "
+    "String? or add a parallel raw divider-color property. For Bonsplit appearance, convert the "
+    "NSColor? value only when forming borderHex. A reset or unconfigured value must produce nil. "
+    "Expose or reuse a pure helper for this mapping. Add a public typed test that declares "
+    "let parsed: NSColor? = NSColor(hex: \"#336699\") and verifies the explicit mapping, reset "
+    "mapping, and unconfigured mapping. For portal overlay rendering, use the actual resolved NSSplitView divider "
     "color regardless of its source. An opaque resolved color must always render the overlay without "
     "surface occlusion. A translucent resolved color must preserve the existing occlusion-only policy. "
     "Expose or reuse a separate pure helper for this decision and add public tests for opaque and "
@@ -2213,6 +2385,33 @@ def estimate_cost(tokens: dict[str, int], model: str) -> Optional[float]:
     return round(total, 6)
 
 
+def record_split_model_costs(record: RunResult) -> None:
+    """Estimate isolated leader and worker costs with their actual models."""
+    if record.leader_model is None or record.worker_model is None:
+        return
+    record.leader_cost_usd = estimate_cost(record.leader_tokens, record.leader_model)
+    record.worker_cost_usd = estimate_cost(record.worker_tokens, record.worker_model)
+    if record.leader_cost_usd is None or record.worker_cost_usd is None:
+        record.cost_usd = None
+        record.cost_precision = "unavailable"
+        return
+    if record.leader_model == record.worker_model:
+        # Preserve the former same-model total, including its single final rounding.
+        record.cost_usd = estimate_cost(record.tokens, record.leader_model)
+    else:
+        record.cost_usd = round(record.leader_cost_usd + record.worker_cost_usd, 6)
+    record.cost_precision = "split_model_token_estimate"
+
+
+def isolated_execution_metadata(worker_model: str, leader_model: Optional[str]) -> dict[str, Any]:
+    return {
+        "leader_execution": "controller_managed_claude_print_session",
+        "leader_model": leader_model or worker_model,
+        "worker_model": worker_model,
+        "leader_session_resume": True,
+    }
+
+
 def leader_prompt(
     fixture: Fixture, condition: str, team: Optional[str], worker_headers: Optional[str] = None,
 ) -> str:
@@ -2644,9 +2843,37 @@ def checkout_content_digest(checkout: Path, excluded: Iterable[str]) -> dict[str
 
 
 def cleanup_isolated_worker_checkouts(checkout: Path, workdirs: dict[str, Path]) -> None:
+    failures = []
     for path in workdirs.values():
-        run_command(("git", "worktree", "remove", "--force", str(path)), cwd=checkout, timeout=120)
-    run_command(("git", "worktree", "prune"), cwd=checkout, timeout=60)
+        result = run_command(("git", "worktree", "remove", "--force", str(path)), cwd=checkout, timeout=120)
+        if result.returncode != 0:
+            failures.append(
+                f"remove {path}: {safe_failure(result.stderr or result.stdout or f'exit {result.returncode}')}"
+            )
+    pruned = run_command(("git", "worktree", "prune"), cwd=checkout, timeout=60)
+    if pruned.returncode != 0:
+        failures.append(
+            f"prune: {safe_failure(pruned.stderr or pruned.stdout or f'exit {pruned.returncode}')}"
+        )
+    listed = run_command(("git", "worktree", "list", "--porcelain"), cwd=checkout, timeout=60)
+    if listed.returncode != 0:
+        failures.append(
+            f"list: {safe_failure(listed.stderr or listed.stdout or f'exit {listed.returncode}')}"
+        )
+        registered: set[Path] = set()
+    else:
+        registered = {
+            Path(line.removeprefix("worktree ")).resolve(strict=False)
+            for line in listed.stdout.splitlines() if line.startswith("worktree ")
+        }
+    for path in workdirs.values():
+        normalized = path.resolve(strict=False)
+        if os.path.lexists(str(path)):
+            failures.append(f"path remains after cleanup: {normalized}")
+        if normalized in registered:
+            failures.append(f"worktree remains registered after cleanup: {normalized}")
+    if failures:
+        raise BenchmarkWorktreeCleanupError("; ".join(failures))
 
 
 def run_one(
@@ -3180,7 +3407,7 @@ def run_orchestration_one(
 
 
 def run_isolated_topology_one(
-    spec: RunSpec, *, experiment: Path, scratch: Path, model: str, effort: str,
+    spec: RunSpec, *, experiment: Path, scratch: Path, worker_model: str, leader_model: str, effort: str,
     timeout: int, xcode_host: str, keep_checkouts: bool,
 ) -> RunResult:
     fixture = FIXTURES[spec.fixture]
@@ -3193,10 +3420,15 @@ def run_isolated_topology_one(
         "result": "result.json", "trace": "trace.jsonl", "patch": "candidate.patch",
         "stdout": "stdout.log", "acceptance": "acceptance.log",
     }.items()}
+    execution = isolated_execution_metadata(worker_model, leader_model)
     record = RunResult(
         run_id=run_id, fixture=fixture.name, parallelism=fixture.parallelism, trial=spec.trial,
         condition=spec.condition, order=spec.order, started_at=utc_now(), orchestration_schema=2,
-        tokens={key: 0 for key in TOKEN_KEYS}, paths=paths,
+        tokens={key: 0 for key in TOKEN_KEYS},
+        leader_tokens={key: 0 for key in TOKEN_KEYS},
+        worker_tokens={key: 0 for key in TOKEN_KEYS},
+        **execution,
+        paths=paths,
     )
     trace = TraceWriter(experiment / paths["trace"], run_id)
     team = None
@@ -3211,6 +3443,7 @@ def run_isolated_topology_one(
     tasks = isolated_topology_tasks(fixture)
     initial_leader_stream = ""
     final_leader_stream = ""
+    applied_worker_patches: dict[str, bytes] = {}
     try:
         create_snapshot(fixture, checkout)
         require_isolated_base_api(checkout)
@@ -3221,11 +3454,11 @@ def run_isolated_topology_one(
         workdirs = create_isolated_worker_checkouts(checkout, timeout=require_remaining)
         agent_env, guard_root = benchmark_agent_environment(checkout)
         session_id = str(uuid.uuid4())
-        trace.write("session_start", condition=spec.condition, fixture=fixture.name, topology="isolated")
+        trace.write("session_start", condition=spec.condition, fixture=fixture.name, topology="isolated", **execution)
         team = f"bench-isolated-{uuid.uuid4().hex[:8]}"
         result_files = [Path(f"/tmp/term-mesh-bench-{team}-{role}.result") for role in ("explorer", "executor", "reviewer")]
         create_benchmark_team(
-            team, checkout, model, agent_workdirs=workdirs,
+            team, checkout, worker_model, agent_workdirs=workdirs,
             timeout=min(300, require_remaining()),
         )
         record.worker_tasks = dispatch_benchmark_workers(
@@ -3255,14 +3488,14 @@ def run_isolated_topology_one(
             with (experiment / paths["stdout"]).open("w") as log:
                 completed, first_action, duration = run_stream(
                     claude_command(
-                        isolated_leader_prompt(fixture, final=False), model=model, effort=effort,
+                        isolated_leader_prompt(fixture, final=False), model=leader_model, effort=effort,
                         session_id=session_id, resume=False, condition="multi",
                     ), cwd=checkout, timeout=require_remaining(), log=log, trace=trace,
                     label="leader_implementation", env=agent_env,
                 )
             record.time_to_first_action_ms = first_action
             record.leader_preparation_ms = duration
-            parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
+            parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); add_tokens(record.leader_tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
             initial_leader_stream = completed.stdout
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr or "leader implementation failed")
@@ -3291,17 +3524,20 @@ def run_isolated_topology_one(
             with (experiment / paths["stdout"]).open("w") as log:
                 completed, first_action, duration = run_stream(
                     claude_command(
-                        isolated_leader_prompt(fixture, final=False), model=model, effort=effort,
+                        isolated_leader_prompt(fixture, final=False), model=leader_model, effort=effort,
                         session_id=session_id, resume=False, condition="multi",
                     ), cwd=checkout, timeout=require_remaining(), log=log, trace=trace,
                     label="leader_implementation", env=agent_env,
                 )
             record.time_to_first_action_ms = first_action; record.leader_preparation_ms = duration
-            parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
+            parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); add_tokens(record.leader_tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
             initial_leader_stream = completed.stdout
             if completed.returncode != 0 or checkout_content_digest(checkout, ISOLATED_LEADER_OWNED) != before_unowned:
                 raise RuntimeError("blocking leader violated isolated ownership or failed")
-        integrated = integrate_worker_patches(checkout, workdirs, tasks, timeout=require_remaining)
+        integrated = integrate_worker_patches(
+            checkout, workdirs, tasks, timeout=require_remaining,
+            applied_patches=applied_worker_patches,
+        )
         trace.write("worker_patches_integrated", files=integrated)
         generated = run_command(
             ("bash", "scripts/generate-build-info.sh"), cwd=checkout, timeout=min(30, require_remaining()),
@@ -3316,13 +3552,13 @@ def run_isolated_topology_one(
         with (experiment / paths["stdout"]).open("a") as log, (experiment / paths["acceptance"]).open("w") as acceptance_log:
             completed, _, duration = run_stream(
                 claude_command(
-                    isolated_leader_prompt(fixture, final=True, worker_headers=headers), model=model, effort=effort,
+                    isolated_leader_prompt(fixture, final=True, worker_headers=headers), model=leader_model, effort=effort,
                     session_id=session_id, resume=True, condition="multi",
                 ), cwd=checkout, timeout=require_remaining(),
                 log=log, trace=trace, label="integration_verification", env=agent_env,
             )
             record.leader_first_result_review_ms = duration
-            parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
+            parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); add_tokens(record.leader_tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
             final_leader_stream = completed.stdout
             for diagnostic in isolated_leader_validation_diagnostics(
                 initial_leader_stream, final_leader_stream,
@@ -3334,7 +3570,69 @@ def run_isolated_topology_one(
                 fixture, checkout, acceptance_log, require_remaining(),
                 xcode_host=xcode_host, run_id=run_id, build_info_generated=True,
             )
-            record.acceptance_ms = acceptance_ms; record.acceptance_passed = passed
+            record.acceptance_ms = acceptance_ms
+            owner = isolated_correction_owner(reason, tasks) if not passed else None
+            if owner is not None and record.correction_count == 0:
+                correction_started = time.perf_counter()
+                record.correction_count = 1
+                record.correction_owner = owner["worker"]
+                record.correction_tasks.append({
+                    "task": owner["id"], "worker": owner["worker"],
+                    "owned": list(owner["owned"]), "original_error": safe_failure(reason),
+                })
+                trace.write(
+                    "worker_correction_started", worker=owner["worker"], task=owner["id"],
+                )
+                correction_deadline = time.perf_counter() + isolated_correction_budget(require_remaining())
+                correction_remaining = lambda: max(0.0, correction_deadline - time.perf_counter())
+                corrected_patch: Optional[bytes] = None
+                try:
+                    correction_file = Path(f"/tmp/term-mesh-bench-{team}-{owner['worker']}-correction.result")
+                    result_files.append(correction_file)
+                    _, corrected_patch = correct_isolated_worker(
+                        fixture=fixture, team=team, task=owner,
+                        workdir=workdirs[owner["worker"]], checkout=checkout,
+                        original_error=reason, result_file=correction_file,
+                        old_patch=applied_worker_patches[owner["worker"]], trace=trace,
+                        remaining=correction_remaining,
+                    )
+                    correction_file.unlink(missing_ok=True)
+                    retry_passed, retry_ms, retry_reason = run_acceptance(
+                        fixture, checkout, acceptance_log, require_remaining(),
+                        xcode_host=xcode_host, run_id=run_id + "-correction",
+                        build_info_generated=True,
+                    )
+                    record.acceptance_ms += retry_ms
+                    passed, reason = retry_passed, retry_reason
+                    record.correction_outcome = "passed" if retry_passed else "acceptance_failed"
+                    if not retry_passed:
+                        restore_original_worker_patch(
+                            checkout, corrected_patch, applied_worker_patches[owner["worker"]],
+                            max(1, require_remaining()),
+                        )
+                except BenchmarkCorrectionRollbackError:
+                    record.correction_outcome = "rollback_failed"
+                    raise
+                except Exception as error:
+                    if corrected_patch is not None:
+                        try:
+                            restore_original_worker_patch(
+                                checkout, corrected_patch, applied_worker_patches[owner["worker"]],
+                                max(1, require_remaining()),
+                            )
+                        except BenchmarkCorrectionRollbackError:
+                            record.correction_outcome = "rollback_failed"
+                            raise
+                    record.correction_outcome = "failed"
+                    reason = safe_failure(f"worker correction failed: {type(error).__name__}: {error}")
+                finally:
+                    record.correction_ms = round((time.perf_counter() - correction_started) * 1000)
+                    trace.write(
+                        "worker_correction_finished", worker=owner["worker"],
+                        task=owner["id"], outcome=record.correction_outcome,
+                        duration_ms=record.correction_ms,
+                    )
+            record.acceptance_passed = passed
             record.status = "passed" if passed else "failed"; record.failure_reason = None if passed else safe_failure(reason)
         record.active_task_ms = round((time.perf_counter() - active_started) * 1000)
         record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)
@@ -3344,44 +3642,63 @@ def run_isolated_topology_one(
         try:
             worker_tokens, _, observed, expected = team_usage(team, checkout)
             add_tokens(record.tokens, worker_tokens)
+            add_tokens(record.worker_tokens, worker_tokens)
             record.token_precision = "actual_all" if observed == expected else "leader_actual_workers_partial"
-            record.cost_usd = estimate_cost(record.tokens, model)
-            record.cost_precision = "token_estimate"
+            record_split_model_costs(record)
         except Exception as error:
             record.token_precision = "leader_actual_workers_unavailable"
             record.cost_precision = "unavailable"
             add_protocol_diagnostic(
                 record, f"worker usage telemetry unavailable: {type(error).__name__}: {error}",
             )
-        try:
-            record.changed_files = write_patch(checkout, experiment / paths["patch"])
-        except Exception as error:
-            add_protocol_diagnostic(
-                record, f"candidate patch unavailable: {type(error).__name__}: {error}",
-            )
+        if isolated_candidate_artifact_allowed(record):
+            try:
+                record.changed_files = write_patch(checkout, experiment / paths["patch"])
+            except Exception as error:
+                add_protocol_diagnostic(
+                    record, f"candidate patch unavailable: {type(error).__name__}: {error}",
+                )
     except Exception as error:
         record.failure_reason = safe_failure(f"{type(error).__name__}: {error}"); record.status = "failed"
         if isinstance(error, BenchmarkInfrastructureError):
             record.infra_invalid = True
             record.status = "infra_invalid"
         if total_started is not None: record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)
-        with contextlib.suppress(Exception): record.changed_files = write_patch(checkout, experiment / paths["patch"])
+        if isolated_candidate_artifact_allowed(record):
+            with contextlib.suppress(Exception): record.changed_files = write_patch(checkout, experiment / paths["patch"])
     finally:
         cancel.set()
-        cleanup_safe = True
+        rollback_unsafe = isolated_correction_state_is_unsafe(record)
+        cleanup_safe = not rollback_unsafe
         if worker_thread and worker_thread.is_alive():
             worker_thread.join(timeout=2)
-            cleanup_safe = not worker_thread.is_alive()
+            cleanup_safe = cleanup_safe and not worker_thread.is_alive()
         record.cleanup_safe = cleanup_safe
-        record.cleanup_reason = None if cleanup_safe else "worker collector did not stop before cleanup"
+        record.cleanup_reason = (
+            None if cleanup_safe else
+            record.failure_reason if rollback_unsafe else
+            "worker collector did not stop before cleanup"
+        )
         if not cleanup_safe:
-            record.status = "failed"
-            record.failure_reason = record.cleanup_reason
+            if not rollback_unsafe:
+                record.status = "failed"
+                record.failure_reason = record.cleanup_reason
             record.total_wall_ms = None
+        if cleanup_safe and workdirs and checkout.exists():
+            try:
+                cleanup_isolated_worker_checkouts(checkout, workdirs)
+            except BenchmarkWorktreeCleanupError as error:
+                cleanup_safe = False
+                mark_worktree_cleanup_failure(record, error)
         if cleanup_safe and team:
             with contextlib.suppress(Exception): daemon_json("headless.destroy_team", {"team_name": team}, timeout=90)
-        if cleanup_safe and workdirs and checkout.exists(): cleanup_isolated_worker_checkouts(checkout, workdirs)
-        record.finished_at = utc_now(); trace.write("session_end", status=record.status, total_wall_ms=record.total_wall_ms, tokens=record.tokens)
+        record.finished_at = utc_now(); trace.write(
+            "session_end", status=record.status, total_wall_ms=record.total_wall_ms, tokens=record.tokens,
+            leader_execution=record.leader_execution, leader_model=record.leader_model,
+            worker_model=record.worker_model, leader_session_resume=record.leader_session_resume,
+            leader_tokens=record.leader_tokens, worker_tokens=record.worker_tokens,
+            leader_cost_usd=record.leader_cost_usd, worker_cost_usd=record.worker_cost_usd,
+        )
         (experiment / paths["result"]).write_text(json.dumps(asdict(record), indent=2, ensure_ascii=False) + "\n")
         if cleanup_safe and checkout.exists() and not keep_checkouts: shutil.rmtree(checkout, ignore_errors=True)
         if cleanup_safe and guard_root is not None: shutil.rmtree(guard_root, ignore_errors=True)
@@ -4735,6 +5052,9 @@ def run_isolated_topology_experiment(args: argparse.Namespace) -> int:
     if unknown or unknown_conditions or not conditions or args.trials < 1 or args.timeout < 1:
         raise ValueError(f"invalid fixtures={sorted(unknown)} conditions={sorted(unknown_conditions)} trials={args.trials}")
     specs = build_isolated_topology_matrix(fixtures, args.trials, conditions)
+    worker_model = args.model
+    execution = isolated_execution_metadata(worker_model, vars(args).get("leader_model"))
+    leader_model = execution["leader_model"]
     print(f"isolated topology matrix: {len(specs)} runs")
     for index, spec in enumerate(specs, 1):
         print(f"  {index:02d}. {spec.fixture:<22} trial={spec.trial} order={spec.order} {spec.condition}")
@@ -4743,7 +5063,8 @@ def run_isolated_topology_experiment(args: argparse.Namespace) -> int:
     experiment = args.results_dir / run_id; experiment.mkdir(parents=True, exist_ok=False); (experiment / "runs").mkdir()
     manifest = {
         "schema": 1, "experiment_type": "isolated-leader-worker-topology", "run_id": run_id,
-        "created_at": utc_now(), "root_head": git("rev-parse", "HEAD"), "model": args.model,
+        "created_at": utc_now(), "root_head": git("rev-parse", "HEAD"), "model": worker_model,
+        **execution,
         "effort": args.effort, "workers": 3, "trials": args.trials, "seed": args.seed,
         "timeout_seconds": args.timeout, "xcode_host": args.xcode_host,
         "fixtures": [row for row in validate_fixture_metadata() if row["fixture"] in fixtures],
@@ -4756,7 +5077,8 @@ def run_isolated_topology_experiment(args: argparse.Namespace) -> int:
         for index, spec in enumerate(specs, 1):
             print(f"[{index}/{len(specs)}] {spec.fixture} {spec.condition} trial {spec.trial}", flush=True)
             result = run_isolated_topology_one(
-                spec, experiment=experiment, scratch=scratch, model=args.model, effort=args.effort,
+                spec, experiment=experiment, scratch=scratch, worker_model=worker_model,
+                leader_model=leader_model, effort=args.effort,
                 timeout=args.timeout, xcode_host=args.xcode_host, keep_checkouts=args.keep_checkouts,
             )
             rows.append(asdict(result)); print(f"  {result.status.upper()} {(result.total_wall_ms or 0)/1000:.1f}s {result.failure_reason or ''}")
@@ -4887,6 +5209,7 @@ def main() -> int:
     isolated.add_argument("--conditions", default=",".join(ISOLATED_TOPOLOGY_CONDITIONS))
     isolated.add_argument("--trials", type=int, default=3); isolated.add_argument("--seed", type=int, default=DEFAULT_SEED)
     isolated.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT); isolated.add_argument("--model", default="sonnet")
+    isolated.add_argument("--leader-model", default=None)
     isolated.add_argument("--effort", default="medium", choices=("low","medium","high","xhigh","max"))
     isolated.add_argument("--xcode-host", default="mac-sub")
     isolated.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS / "isolated-topology-study")
