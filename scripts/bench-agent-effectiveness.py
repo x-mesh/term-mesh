@@ -1212,12 +1212,23 @@ SWIFT_ACTOR_TEST_CONTRACT = (
     "nonisolated pure helper, such as Workspace.resolvedChromeColors."
 )
 
+SPLIT_DIVIDER_RUNTIME_CONTRACT = (
+    "GhosttyConfig.splitDividerColor is the canonical input. "
+    "Workspace.applyGhosttyChrome(from:), or the existing shared application boundary, must apply "
+    "and reset the existing Workspace Bonsplit border and portal projection in the same call. "
+    "A direct test of a separate store is not evidence that this runtime wiring works. "
+    "Add a public cross-boundary test that covers defaults to configLines to parse to an existing "
+    "Workspace apply/reset call, and verifies both the Bonsplit border and portal projection. "
+    "Do not inspect, infer, or disclose hidden acceptance test contents."
+)
+
 ISOLATED_LEADER_FOCUSED_TEST = (
     "xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh-unit "
     "-configuration Debug -destination platform=macOS "
     "-clonedSourcePackagesDirPath /Users/jinwoo/Library/Caches/term-mesh/SourcePackages "
     "-disableAutomaticPackageResolution "
     "-derivedDataPath /Users/jinwoo/Library/Developer/Xcode/DerivedData/term-mesh-effectiveness "
+    "-only-testing:termMeshTests/WorkspaceChromeThemeTests "
     "-only-testing:termMeshTests/GhosttyTerminalViewComposingTests test"
 )
 
@@ -1252,6 +1263,7 @@ Actual isolated-worktree benchmark. {phase}
 You own exactly: {json.dumps(ISOLATED_LEADER_OWNED)}. Do not read or modify any other repository path.
 Opaque configured divider colors must render without surface occlusion. Existing translucent occlusion behavior must remain.
 {SWIFT_ACTOR_TEST_CONTRACT}
+{SPLIT_DIVIDER_RUNTIME_CONTRACT if fixture.name == "split-divider-color" else ""}
 Do not use agents, tm-agent, background tasks, commits, pushes, releases, or external services.
 
 TASK: {fixture.prompt}
@@ -1280,20 +1292,32 @@ def stream_bash_commands(text: str) -> list[str]:
     return commands
 
 
+def is_exact_isolated_leader_focused_test(command: str) -> bool:
+    if command == ISOLATED_LEADER_FOCUSED_TEST:
+        return True
+    repo_path = r"(?:'[^']+'|\"(?:[^\"\\]|\\.)+\"|[^\s;&|]+)"
+    return re.fullmatch(
+        rf"cd\s+{repo_path}\s+&&\s+{re.escape(ISOLATED_LEADER_FOCUSED_TEST)}",
+        command,
+    ) is not None
+
+
 def isolated_leader_validation_diagnostics(initial_stream: str, final_stream: str) -> list[str]:
     diagnostics: list[str] = []
+    focused_total = 0
     for phase, stream in (("initial", initial_stream), ("final", final_stream)):
         for command in stream_bash_commands(stream):
             for name, pattern in ISOLATED_LEADER_FORBIDDEN_VALIDATION_PATTERNS:
                 if pattern.search(command):
                     diagnostics.append(f"isolated leader {phase} used forbidden command: {name}")
             xcode_count = len(re.findall(r"(?:^|[;&|\n])\s*xcodebuild\b", command))
-            focused_count = command.count(ISOLATED_LEADER_FOCUSED_TEST)
             if phase == "initial" and xcode_count:
                 diagnostics.append("isolated leader initial used forbidden command: xcodebuild")
-            if phase == "final" and xcode_count != focused_count:
-                diagnostics.append("isolated leader final used non-focused xcodebuild command")
-    focused_total = sum(command.count(ISOLATED_LEADER_FOCUSED_TEST) for command in stream_bash_commands(final_stream))
+            if phase == "final":
+                if is_exact_isolated_leader_focused_test(command):
+                    focused_total += 1
+                elif xcode_count or ISOLATED_LEADER_FOCUSED_TEST in command:
+                    diagnostics.append("isolated leader final used non-focused xcodebuild command")
     if focused_total == 0:
         diagnostics.append("isolated leader focused test did not run")
     if focused_total > 1:
@@ -1409,6 +1433,7 @@ time budget: {task['estimated_seconds']} seconds
 {mutation_rule}
 {read_rule}
 {SWIFT_ACTOR_TEST_CONTRACT if fixture.name == "split-divider-color" else ""}
+{SPLIT_DIVIDER_RUNTIME_CONTRACT if fixture.name == "split-divider-color" else ""}
 긴 세부 결과는 먼저 `{report_file}`에 작성하라. 마지막에 아래 정확한 5-line envelope를 stdout에
 출력하고, 같은 5줄을 `{result_file}.tmp.$$`에 쓴 뒤 atomic `mv`로 `{result_file}`에 저장하라.
 STATUS: DONE|BLOCKED|NEEDS_REVIEW

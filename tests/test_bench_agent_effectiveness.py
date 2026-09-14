@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -130,6 +131,31 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         )
         self.assertNotIn("Workspace.resolvedChromeColors", unrelated)
 
+    def test_split_divider_prompts_require_canonical_cross_boundary_runtime_wiring(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        executor_task = next(
+            task for task in module.isolated_topology_tasks(fixture)
+            if task["worker"] == "executor"
+        )
+        prompts = (
+            module.worker_instruction(fixture, "team", "executor", executor_task),
+            module.isolated_leader_prompt(fixture, final=False),
+            module.isolated_leader_prompt(fixture, final=True),
+        )
+        for prompt in prompts:
+            self.assertIn("GhosttyConfig.splitDividerColor is the canonical input", prompt)
+            self.assertIn("Workspace.applyGhosttyChrome(from:)", prompt)
+            self.assertIn("existing Workspace Bonsplit border and portal projection in the same call", prompt)
+            self.assertIn("direct test of a separate store is not evidence", prompt)
+            self.assertIn("defaults to configLines to parse to an existing Workspace apply/reset call", prompt)
+            self.assertIn("both the Bonsplit border and portal projection", prompt)
+            self.assertIn("Do not inspect, infer, or disclose hidden acceptance test contents", prompt)
+
+        unrelated = module.worker_instruction(
+            module.FIXTURES["homebrew-smoke"], "team", "executor"
+        )
+        self.assertNotIn("GhosttyConfig.splitDividerColor is the canonical input", unrelated)
+
     def test_isolated_initial_prompt_forbids_validation_and_final_allows_one_focused_test(self):
         fixture = module.FIXTURES["split-divider-color"]
         initial = module.isolated_leader_prompt(fixture, final=False)
@@ -141,10 +167,57 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         ):
             self.assertIn(forbidden, initial)
         self.assertEqual(final.count(module.ISOLATED_LEADER_FOCUSED_TEST), 1)
+        self.assertEqual(
+            module.ISOLATED_LEADER_FOCUSED_TEST.count(
+                "-only-testing:termMeshTests/WorkspaceChromeThemeTests"
+            ),
+            1,
+        )
+        self.assertEqual(
+            module.ISOLATED_LEADER_FOCUSED_TEST.count(
+                "-only-testing:termMeshTests/GhosttyTerminalViewComposingTests"
+            ),
+            1,
+        )
+        self.assertEqual(module.ISOLATED_LEADER_FOCUSED_TEST.count("xcodebuild"), 1)
         self.assertIn("Do not discover schemes", final)
         self.assertIn("Do not validate in this phase", initial)
 
-    def test_isolated_validation_checker_records_forbidden_and_repeated_focused_test(self):
+    def test_isolated_validation_checker_accepts_only_exact_top_level_focused_test(self):
+        def stream(command):
+            return json.dumps({
+                "type": "assistant", "message": {"content": [{
+                    "type": "tool_use", "name": "Bash",
+                    "input": {"command": command},
+                }]},
+            })
+
+        accepted = (
+            module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd /tmp/repo && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd '/tmp/repo with spaces' && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            'cd "/tmp/repo with spaces" && ' + module.ISOLATED_LEADER_FOCUSED_TEST,
+        )
+        for command in accepted:
+            with self.subTest(command=command):
+                self.assertEqual(module.isolated_leader_validation_diagnostics("", stream(command)), [])
+
+        rejected = (
+            "echo " + shlex.quote(module.ISOLATED_LEADER_FOCUSED_TEST),
+            "printf '%s\n' " + shlex.quote(module.ISOLATED_LEADER_FOCUSED_TEST),
+            "env CI=1 " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "bash -c " + shlex.quote(module.ISOLATED_LEADER_FOCUSED_TEST),
+            "true; " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            module.ISOLATED_LEADER_FOCUSED_TEST + "; true",
+            module.ISOLATED_LEADER_FOCUSED_TEST + "; " + module.ISOLATED_LEADER_FOCUSED_TEST,
+        )
+        for command in rejected:
+            with self.subTest(command=command):
+                diagnostics = module.isolated_leader_validation_diagnostics("", stream(command))
+                self.assertIn("isolated leader final used non-focused xcodebuild command", diagnostics)
+                self.assertIn("isolated leader focused test did not run", diagnostics)
+
+    def test_isolated_validation_checker_records_forbidden_initial_validation(self):
         initial = json.dumps({
             "type": "assistant", "message": {"content": [{
                 "type": "tool_use", "name": "Bash",
@@ -154,16 +227,12 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         final = json.dumps({
             "type": "assistant", "message": {"content": [{
                 "type": "tool_use", "name": "Bash",
-                "input": {"command": (
-                    module.ISOLATED_LEADER_FOCUSED_TEST + "; "
-                    + module.ISOLATED_LEADER_FOCUSED_TEST
-                )},
+                "input": {"command": module.ISOLATED_LEADER_FOCUSED_TEST},
             }]},
         })
         diagnostics = module.isolated_leader_validation_diagnostics(initial, final)
         self.assertIn("isolated leader initial used forbidden command: git-status", diagnostics)
         self.assertIn("isolated leader initial used forbidden command: xcodebuild-list", diagnostics)
-        self.assertIn("isolated leader focused test ran 2 times", diagnostics)
 
     def test_isolated_validation_diagnostic_does_not_replace_product_status(self):
         record = module.RunResult(
