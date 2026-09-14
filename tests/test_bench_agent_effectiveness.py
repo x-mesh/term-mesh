@@ -131,7 +131,7 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         )
         self.assertNotIn("Workspace.resolvedChromeColors", unrelated)
 
-    def test_split_divider_prompts_require_canonical_cross_boundary_runtime_wiring(self):
+    def test_split_divider_prompts_require_source_independent_behavior(self):
         fixture = module.FIXTURES["split-divider-color"]
         executor_task = next(
             task for task in module.isolated_topology_tasks(fixture)
@@ -143,18 +143,21 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
             module.isolated_leader_prompt(fixture, final=True),
         )
         for prompt in prompts:
-            self.assertIn("GhosttyConfig.splitDividerColor is the canonical input", prompt)
-            self.assertIn("Workspace.applyGhosttyChrome(from:)", prompt)
-            self.assertIn("existing Workspace Bonsplit border and portal projection in the same call", prompt)
-            self.assertIn("direct test of a separate store is not evidence", prompt)
-            self.assertIn("defaults to configLines to parse to an existing Workspace apply/reset call", prompt)
-            self.assertIn("both the Bonsplit border and portal projection", prompt)
+            self.assertIn("resolved divider color as the behavior input", prompt)
+            self.assertIn("regardless of where that color came from", prompt)
+            self.assertIn("alpha is at least the existing opaque threshold", prompt)
+            self.assertIn("render the portal divider overlay without requiring surface occlusion", prompt)
+            self.assertIn("preserve the existing surface occlusion policy", prompt)
+            self.assertIn("pure helper for this decision and add public tests", prompt)
+            self.assertIn("Do not require a separate store or a specific Workspace wiring design", prompt)
             self.assertIn("Do not inspect, infer, or disclose hidden acceptance test contents", prompt)
+            self.assertNotIn("GhosttyConfig.splitDividerColor is the canonical input", prompt)
+            self.assertNotIn("Workspace.applyGhosttyChrome(from:)", prompt)
 
         unrelated = module.worker_instruction(
             module.FIXTURES["homebrew-smoke"], "team", "executor"
         )
-        self.assertNotIn("GhosttyConfig.splitDividerColor is the canonical input", unrelated)
+        self.assertNotIn("resolved divider color as the behavior input", unrelated)
 
     def test_isolated_initial_prompt_forbids_validation_and_final_allows_one_focused_test(self):
         fixture = module.FIXTURES["split-divider-color"]
@@ -195,6 +198,7 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         accepted = (
             module.ISOLATED_LEADER_FOCUSED_TEST,
             "cd /tmp/repo && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd /tmp/repo-safe_123 && " + module.ISOLATED_LEADER_FOCUSED_TEST,
             "cd '/tmp/repo with spaces' && " + module.ISOLATED_LEADER_FOCUSED_TEST,
             'cd "/tmp/repo with spaces" && ' + module.ISOLATED_LEADER_FOCUSED_TEST,
         )
@@ -210,6 +214,17 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
             "true; " + module.ISOLATED_LEADER_FOCUSED_TEST,
             module.ISOLATED_LEADER_FOCUSED_TEST + "; true",
             module.ISOLATED_LEADER_FOCUSED_TEST + "; " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            'cd "$(pwd)" && ' + module.ISOLATED_LEADER_FOCUSED_TEST,
+            'cd "$(git rev-parse --show-prefix)" && ' + module.ISOLATED_LEADER_FOCUSED_TEST,
+            'cd "`git rev-parse --show-toplevel`" && ' + module.ISOLATED_LEADER_FOCUSED_TEST,
+            'cd /tmp/$(whoami) && ' + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd /tmp/* && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd /tmp/? && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd /tmp/[ab] && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd /tmp/{a,b} && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd ~ && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd '/tmp/$repo' && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd '/tmp/\\repo' && " + module.ISOLATED_LEADER_FOCUSED_TEST,
         )
         for command in rejected:
             with self.subTest(command=command):
@@ -1299,6 +1314,22 @@ end
             thread.join(timeout=1)
             self.assertFalse(thread.is_alive())
             self.assertEqual(result["value"][2], 0)
+
+    def test_isolated_worker_wait_uses_remaining_end_to_end_deadline(self):
+        source = SCRIPT.read_text()
+        function = source[
+            source.index("def run_isolated_topology_one"):
+            source.index("def run_policy_one")
+        ]
+        self.assertIn(
+            "result_files, timeout=require_remaining(), trace=trace", function,
+        )
+        self.assertNotIn("timeout=min(15 * 60, remaining())", function)
+
+        with unittest.mock.patch.object(module.time, "perf_counter", return_value=100.0):
+            self.assertEqual(module.require_time_remaining(1300.0, 1800), 1200.0)
+            with self.assertRaisesRegex(TimeoutError, "end-to-end timeout after 1800s"):
+                module.require_time_remaining(100.0, 1800)
 
     def test_interval_overlap_uses_actual_start_and_end(self):
         self.assertEqual(module.interval_overlap_ms(10.0, 20.0, 15.0, 25.0), 5000)

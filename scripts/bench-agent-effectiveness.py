@@ -1213,12 +1213,11 @@ SWIFT_ACTOR_TEST_CONTRACT = (
 )
 
 SPLIT_DIVIDER_RUNTIME_CONTRACT = (
-    "GhosttyConfig.splitDividerColor is the canonical input. "
-    "Workspace.applyGhosttyChrome(from:), or the existing shared application boundary, must apply "
-    "and reset the existing Workspace Bonsplit border and portal projection in the same call. "
-    "A direct test of a separate store is not evidence that this runtime wiring works. "
-    "Add a public cross-boundary test that covers defaults to configLines to parse to an existing "
-    "Workspace apply/reset call, and verifies both the Bonsplit border and portal projection. "
+    "Treat the resolved divider color as the behavior input, regardless of where that color came from. "
+    "If its alpha is at least the existing opaque threshold, render the portal divider overlay without "
+    "requiring surface occlusion. If its alpha is below that threshold, preserve the existing surface "
+    "occlusion policy. Expose or reuse a pure helper for this decision and add public tests for both "
+    "sides of the threshold. Do not require a separate store or a specific Workspace wiring design. "
     "Do not inspect, infer, or disclose hidden acceptance test contents."
 )
 
@@ -1295,11 +1294,17 @@ def stream_bash_commands(text: str) -> list[str]:
 def is_exact_isolated_leader_focused_test(command: str) -> bool:
     if command == ISOLATED_LEADER_FOCUSED_TEST:
         return True
-    repo_path = r"(?:'[^']+'|\"(?:[^\"\\]|\\.)+\"|[^\s;&|]+)"
-    return re.fullmatch(
-        rf"cd\s+{repo_path}\s+&&\s+{re.escape(ISOLATED_LEADER_FOCUSED_TEST)}",
-        command,
-    ) is not None
+    prefix = "cd "
+    suffix = " && " + ISOLATED_LEADER_FOCUSED_TEST
+    if not command.startswith(prefix) or not command.endswith(suffix):
+        return False
+    repo_path = command[len(prefix):-len(suffix)]
+    if len(repo_path) >= 2 and repo_path[0] == repo_path[-1] and repo_path[0] in "'\"":
+        return not any(character in repo_path[1:-1] for character in "$`\\")
+    unsafe_unquoted = set(";&|*?[]{}~$`()<>\\'\"")
+    return bool(repo_path) and not any(
+        character.isspace() or character in unsafe_unquoted for character in repo_path
+    )
 
 
 def isolated_leader_validation_diagnostics(initial_stream: str, final_stream: str) -> list[str]:
@@ -2940,7 +2945,7 @@ def run_isolated_topology_one(
             worker_box["started"] = time.perf_counter()
             try:
                 worker_box["value"] = wait_for_worker_results(
-                    result_files, timeout=min(15 * 60, remaining()), trace=trace,
+                    result_files, timeout=require_remaining(), trace=trace,
                     estimated_seconds={path: 15 * 60 for path in result_files},
                     ready_times=ready_times, cancel_event=cancel,
                 )
