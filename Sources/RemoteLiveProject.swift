@@ -65,6 +65,14 @@ final class RemoteLiveProject {
         viewers = viewers.filter { $0.value.workspaceID != workspaceID }
     }
 
+    /// Window closure bypasses TabManager.closeWorkspace. Retained SwiftUI
+    /// managers must not keep remote viewers selectable without a window.
+    static func closeViewers(in manager: TabManager) {
+        for workspace in manager.tabs where boardContexts[workspace.id] != nil {
+            manager.closeWorkspace(workspace)
+        }
+    }
+
     static func setDelegationLevel(
         workspaceID: UUID, level: ProjectDelegationLevel
     ) async throws -> ProjectDelegationState {
@@ -185,7 +193,10 @@ final class RemoteLiveProject {
               project.sourceEndpoint == host.paneHostSpec.hostKey else { return false }
         let key = "\(host.paneHostSpec.hostKey)|\(project.projectID)"
         if let viewer = viewers[key], let workspace = viewer.workspace,
-           let owner = viewer.tabManager, owner.tabs.contains(where: { $0 === workspace }) {
+           let owner = AppDelegate.shared?.tabManagerFor(tabId: workspace.id),
+           owner.tabs.contains(where: { $0 === workspace }) {
+            // A workspace may have moved to another live window.
+            viewer.tabManager = owner
             let result = await viewer.update(host: host, project: project)
             if select {
                 owner.selectWorkspace(workspace)
@@ -193,6 +204,14 @@ final class RemoteLiveProject {
             }
             return result
         }
+        if let stale = viewers[key] {
+            RemoteWorkLog.info("Discarding windowless Project viewer: \(project.name)")
+            detach(workspaceID: stale.workspaceID)
+            if let workspace = stale.workspace, let owner = stale.tabManager {
+                owner.closeWorkspace(workspace)
+            }
+        }
+        guard AppDelegate.shared?.windowId(for: tabManager) != nil else { return false }
         guard opening.insert(key).inserted else { return false }
         defer { opening.remove(key) }
         let existing = PeerClientCoordinator.shared.mirroredWorkspace(
@@ -243,13 +262,17 @@ final class RemoteLiveProject {
                 Task { _ = await open(host: host, project: project, tabManager: owner, select: false) }
             }
         }
-        for (key, viewer) in viewers {
-            guard let workspace = viewer.workspace, let owner = viewer.tabManager,
+        for viewer in Array(viewers.values) {
+            guard let workspace = viewer.workspace,
+                  let owner = AppDelegate.shared?.tabManagerFor(tabId: workspace.id),
                   owner.tabs.contains(where: { $0 === workspace }) else {
                 detach(workspaceID: viewer.workspaceID)
-                viewers.removeValue(forKey: key)
+                if let workspace = viewer.workspace, let owner = viewer.tabManager {
+                    owner.closeWorkspace(workspace)
+                }
                 continue
             }
+            viewer.tabManager = owner
             guard viewer.hostID == host.id else { continue }
             let project = host.teams.first(where: {
                 $0.isGUILive && $0.projectID == viewer.projectID
@@ -267,6 +290,7 @@ final class RemoteLiveProject {
     @discardableResult
     private func update(host: HostEntry, project: RemoteTeamSummary) async -> Bool {
         guard let workspace, let owner = tabManager,
+              AppDelegate.shared?.tabManagerFor(tabId: workspace.id) === owner,
               owner.tabs.contains(where: { $0 === workspace }),
               host.paneHostSpec.hostKey == endpoint,
               host.isConnected, project.rosterVerified else { return false }
@@ -278,6 +302,7 @@ final class RemoteLiveProject {
         guard let lease = try? await registry.acquire(host.paneHostSpec) else { return false }
         defer { registry.release(lease) }
         guard let surfaces = try? await PeerPaneSession.listSurfaces(on: lease) else { return false }
+        guard AppDelegate.shared?.tabManagerFor(tabId: workspace.id) === owner else { return false }
         // A different GUI-owner incarnation is authoritative only after the
         // current peer proves its exact leader surface exists. This separates
         // a real owner restart from a late roster belonging to the retired app.
@@ -300,7 +325,8 @@ final class RemoteLiveProject {
                 complete = false
                 continue
             }
-            guard owner.tabs.contains(where: { $0 === workspace }) else { return false }
+            guard AppDelegate.shared?.tabManagerFor(tabId: workspace.id) === owner,
+                  owner.tabs.contains(where: { $0 === workspace }) else { return false }
             if let id = workspace.panelID(forPeerSurfaceID: surfaceID) {
                 let session = workspace.remoteAgentPaneSessions[id]
                 if session == nil || (session?.isTorndown == false && session?.relayStartupState != .failed
@@ -310,7 +336,8 @@ final class RemoteLiveProject {
             guard let session = try? await PeerPaneSession.attach(
                 lease: lease, surface: surface, title: title, spec: host.paneHostSpec
             ) else { complete = false; continue }
-            guard owner.tabs.contains(where: { $0 === workspace }) else {
+            guard AppDelegate.shared?.tabManagerFor(tabId: workspace.id) === owner,
+                  owner.tabs.contains(where: { $0 === workspace }) else {
                 session.teardown()
                 return false
             }
@@ -353,8 +380,13 @@ enum RemoteLiveProjectFixture {
     private static var staleRevisionRefusal = false
     private static var staleIncarnationRefusal = false
     private static var savedBoardVisibility: Bool?
+    // Hold the closed window's manager, as SwiftUI does for the primary scene.
+    private static var retainedViewerManager: TabManager?
 
     static func command(_ params: [String: Any], tabManager: TabManager?) -> TerminalController.V2CallResult {
+        let tabManager = (params["source_window_id"] as? String)
+            .flatMap(UUID.init(uuidString:))
+            .flatMap { AppDelegate.shared?.tabManagerFor(windowId: $0) } ?? tabManager
         guard let tabManager else { return .err(code: "not_found", message: "window missing", data: nil) }
         let action = params["action"] as? String ?? "status"
         if action == "start", !starting, source == nil {
@@ -364,6 +396,9 @@ enum RemoteLiveProjectFixture {
             staleRevisionRefusal = false
             staleIncarnationRefusal = false
             savedBoardVisibility = ReviewBoardSettings.isVisible
+            retainedViewerManager = (params["viewer_window_id"] as? String)
+                .flatMap(UUID.init(uuidString:))
+                .flatMap { AppDelegate.shared?.tabManagerFor(windowId: $0) }
             ReviewBoardSettings.setVisible(false)
             Task { @MainActor in
                 defer { starting = false }
@@ -421,14 +456,15 @@ enum RemoteLiveProjectFixture {
                     let entry = HostEntry(id: path, displayName: "Live fixture", connectionState: .connected,
                         workspaces: [], teams: [summary], activeSockPath: path)
                     host = entry
+                    let viewerManager = retainedViewerManager ?? tabManager
                     if !(await RemoteLiveProject.open(host: entry, project: summary,
-                                                     tabManager: tabManager, select: true)) {
+                                                     tabManager: viewerManager, select: true)) {
                         failure = "not all project surfaces attached"
                     }
                     let model = ReviewBoardViewModel()
                     model.setActiveTeamProvider { nil }
                     model.setRemoteContextProvider {
-                        RemoteLiveProject.boardContext(for: tabManager.selectedTabId)
+                        RemoteLiveProject.boardContext(for: viewerManager.selectedTabId)
                     }
                     model.workspaceSelectionDidChange()
                     boardModel = model
@@ -529,7 +565,7 @@ enum RemoteLiveProjectFixture {
                 }
                 if let oldProject, let viewer = RemoteLiveProject.workspaceForTesting(
                     projectID: oldProject.projectID
-                ) { tabManager.closeWorkspace(viewer) }
+                ) { (AppDelegate.shared?.tabManagerFor(tabId: viewer.id) ?? tabManager).closeWorkspace(viewer) }
                 if let oldSource {
                     tabManager.unpinWorkspaceForSurfaceRealization(oldSource.id)
                     tabManager.closeWorkspace(oldSource)
@@ -540,6 +576,7 @@ enum RemoteLiveProjectFixture {
                 }
                 source = nil; server = nil; host = nil; project = nil; teamName = nil
                 boardModel = nil; savedBoardVisibility = nil; cleaning = false
+                retainedViewerManager = nil
             }
         }
         let viewer = project.flatMap { RemoteLiveProject.workspaceForTesting(projectID: $0.projectID) }
@@ -568,7 +605,11 @@ enum RemoteLiveProjectFixture {
                     "viewer_panels": viewer?.panels.count ?? 0,
                     "matching_transcripts": matching, "input_echoes": echoes,
                     "viewer_id": viewer?.id.uuidString ?? "",
+                    "viewer_window_id": viewer.flatMap { AppDelegate.shared?.tabManagerFor(tabId: $0.id) }
+                        .flatMap { AppDelegate.shared?.windowId(for: $0) }?.uuidString ?? "",
                     "source_id": source?.id.uuidString ?? "",
+                    "source_window_id": source.flatMap { AppDelegate.shared?.tabManagerFor(tabId: $0.id) }
+                        .flatMap { AppDelegate.shared?.windowId(for: $0) }?.uuidString ?? "",
                     "source_agent_ids": source?.panels.values.compactMap { ($0 as? AgentPanel)?.id.uuidString }.sorted() ?? [],
                     "viewer_agent_ids": viewer?.remoteAgentPaneSessions.keys.map(\.uuidString).sorted() ?? [],
                     "active_viewer_agents": viewer?.remoteAgentPaneSessions.keys.filter { viewer?.peerAgentPanelIsLive($0) == true }.count ?? 0,
