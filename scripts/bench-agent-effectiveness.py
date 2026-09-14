@@ -182,6 +182,10 @@ class BenchmarkTerminated(RuntimeError):
     """Turn SIGTERM into normal stack unwinding so teams and scratch are cleaned."""
 
 
+class BenchmarkInfrastructureError(RuntimeError):
+    """Identify a controller prerequisite failure that invalidates a run."""
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -540,6 +544,7 @@ def xcode_failure_summary(output: str) -> str:
 
 def run_divider_acceptance(
     checkout: Path, log: TextIO, timeout: float, xcode_host: str, run_id: str,
+    *, build_info_generated: bool = False,
 ) -> tuple[bool, str]:
     tests = (
         "termMeshTests/HiddenSplitDividerBehaviorAcceptanceTests/testOverrideSerializationAndResetUseExistingSettingsBoundary",
@@ -569,9 +574,10 @@ def run_divider_acceptance(
         command.extend(("-only-testing:" + test,))
     command.append("test")
     if xcode_host == "local":
-        generated = run_command(("bash", "scripts/generate-build-info.sh"), cwd=checkout, timeout=30)
-        if generated.returncode != 0:
-            return False, f"BuildInfo generation failed: {generated.stderr.strip()}"
+        if not build_info_generated:
+            generated = run_command(("bash", "scripts/generate-build-info.sh"), cwd=checkout, timeout=30)
+            if generated.returncode != 0:
+                return False, f"BuildInfo generation failed: {generated.stderr.strip()}"
         ok, reason = run_logged(tuple(command), checkout=checkout, log=log, timeout=timeout)
         if not ok:
             return ok, reason
@@ -592,10 +598,11 @@ def run_divider_acceptance(
         ), timeout=min(timeout, 15 * 60))
         if synced.returncode != 0:
             return False, f"remote sync failed: {synced.stderr[-1000:]}"
+        build_info_step = "" if build_info_generated else " && ./scripts/generate-build-info.sh"
         remote_command = (
             "cd " + shlex.quote(remote)
             + " && ./scripts/check-ghostty-kit.sh"
-            + " && ./scripts/generate-build-info.sh"
+            + build_info_step
             + " && " + shlex.join(command)
             + " && " + shlex.join((
             "xcodebuild", "-project", "GhosttyTabs.xcodeproj", "-scheme", "term-mesh",
@@ -618,7 +625,7 @@ def run_divider_acceptance(
 
 def run_acceptance(
     fixture: Fixture, checkout: Path, log: TextIO, timeout: float, *,
-    xcode_host: str, run_id: str,
+    xcode_host: str, run_id: str, build_info_generated: bool = False,
 ) -> tuple[bool, int, str]:
     started = time.perf_counter()
     with oracle_overlay(fixture, checkout), hidden_test_overlay(fixture, checkout):
@@ -644,7 +651,10 @@ def run_acceptance(
                 if missing or not wired:
                     passed, reason = False, f"guard boundary mismatch: missing={missing} wired={wired}"
         else:
-            passed, reason = run_divider_acceptance(checkout, log, timeout, xcode_host, run_id)
+            passed, reason = run_divider_acceptance(
+                checkout, log, timeout, xcode_host, run_id,
+                build_info_generated=build_info_generated,
+            )
     return passed, round((time.perf_counter() - started) * 1000), reason
 
 
@@ -1202,12 +1212,40 @@ SWIFT_ACTOR_TEST_CONTRACT = (
     "nonisolated pure helper, such as Workspace.resolvedChromeColors."
 )
 
+ISOLATED_LEADER_FOCUSED_TEST = (
+    "xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh-unit "
+    "-configuration Debug -destination platform=macOS "
+    "-clonedSourcePackagesDirPath /Users/jinwoo/Library/Caches/term-mesh/SourcePackages "
+    "-disableAutomaticPackageResolution "
+    "-derivedDataPath /Users/jinwoo/Library/Developer/Xcode/DerivedData/term-mesh-effectiveness "
+    "-only-testing:termMeshTests/GhosttyTerminalViewComposingTests test"
+)
+
+ISOLATED_LEADER_FORBIDDEN_VALIDATION_PATTERNS = (
+    ("build-info", re.compile(r"(?:^|[;&|\n])\s*(?:bash\s+)?(?:\./)?scripts/generate-build-info\.sh\b")),
+    ("xcodebuild-list", re.compile(r"\bxcodebuild\b[^\n;&|]*\s-list(?:\s|$)")),
+    ("xcodebuild-resolve", re.compile(r"\bxcodebuild\b[^\n;&|]*-resolvePackageDependencies\b")),
+    ("xcodebuild-build-for-testing", re.compile(r"\bxcodebuild\b[^\n;&|]*\bbuild-for-testing\b")),
+    ("xcodebuild-test-without-building", re.compile(r"\bxcodebuild\b[^\n;&|]*\btest-without-building\b")),
+    ("git-status", re.compile(r"(?:^|[;&|\n])\s*git\s+(?:-[A-Za-z]\s+\S+\s+)*status\b")),
+    ("git-diff", re.compile(r"(?:^|[;&|\n])\s*git\s+(?:-[A-Za-z]\s+\S+\s+)*diff\b")),
+    ("local-test", re.compile(
+        r"(?:^|[;&|\n])\s*(?:swift\s+test|cargo\s+test|pytest\b|python(?:3)?\s+-m\s+(?:pytest|unittest)\b|"
+        r"(?:\./)?scripts/(?:test|run-tests)[^\s;&|]*)"
+    )),
+)
+
 
 def isolated_leader_prompt(fixture: Fixture, *, final: bool, worker_headers: str = "") -> str:
     phase = (
-        "Worker patches are now integrated. Run focused verification and fix only your owned paths."
+        "Worker patches are now integrated. Fix only your owned paths, then run exactly this command once: "
+        + ISOLATED_LEADER_FOCUSED_TEST
+        + " Do not discover schemes, resolve packages, retry the test, or run any other validation command."
         if final else
-        "Workers are running in isolated checkouts. Implement the portal overlay behavior now."
+        "Workers are running in isolated checkouts. Implement the portal overlay behavior now. "
+        "Do not validate in this phase. Do not run xcodebuild, local tests, xcodebuild -list, "
+        "package resolution, build-for-testing, test-without-building, scripts/generate-build-info.sh, "
+        "git status, or git diff."
     )
     return f"""
 Actual isolated-worktree benchmark. {phase}
@@ -1221,6 +1259,46 @@ TASK: {fixture.prompt}
 WORKER RESULTS:
 {worker_headers or 'pending'}
 """.strip()
+
+
+def stream_bash_commands(text: str) -> list[str]:
+    commands: list[str] = []
+    for line in text.splitlines():
+        with contextlib.suppress(json.JSONDecodeError):
+            event = json.loads(line)
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            content = message.get("content") if isinstance(message.get("content"), list) else []
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                if str(block.get("name", "")).lower() != "bash":
+                    continue
+                payload = block.get("input") if isinstance(block.get("input"), dict) else {}
+                command = payload.get("command")
+                if isinstance(command, str):
+                    commands.append(command)
+    return commands
+
+
+def isolated_leader_validation_diagnostics(initial_stream: str, final_stream: str) -> list[str]:
+    diagnostics: list[str] = []
+    for phase, stream in (("initial", initial_stream), ("final", final_stream)):
+        for command in stream_bash_commands(stream):
+            for name, pattern in ISOLATED_LEADER_FORBIDDEN_VALIDATION_PATTERNS:
+                if pattern.search(command):
+                    diagnostics.append(f"isolated leader {phase} used forbidden command: {name}")
+            xcode_count = len(re.findall(r"(?:^|[;&|\n])\s*xcodebuild\b", command))
+            focused_count = command.count(ISOLATED_LEADER_FOCUSED_TEST)
+            if phase == "initial" and xcode_count:
+                diagnostics.append("isolated leader initial used forbidden command: xcodebuild")
+            if phase == "final" and xcode_count != focused_count:
+                diagnostics.append("isolated leader final used non-focused xcodebuild command")
+    focused_total = sum(command.count(ISOLATED_LEADER_FOCUSED_TEST) for command in stream_bash_commands(final_stream))
+    if focused_total == 0:
+        diagnostics.append("isolated leader focused test did not run")
+    if focused_total > 1:
+        diagnostics.append(f"isolated leader focused test ran {focused_total} times")
+    return list(dict.fromkeys(diagnostics))
 
 
 def validate_routing_decision(
@@ -2810,6 +2888,8 @@ def run_isolated_topology_one(
     total_started = None
     deadline = None
     tasks = isolated_topology_tasks(fixture)
+    initial_leader_stream = ""
+    final_leader_stream = ""
     try:
         create_snapshot(fixture, checkout)
         total_started = time.perf_counter()
@@ -2860,6 +2940,7 @@ def run_isolated_topology_one(
             record.time_to_first_action_ms = first_action
             record.leader_preparation_ms = duration
             parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
+            initial_leader_stream = completed.stdout
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr or "leader implementation failed")
             if checkout_content_digest(checkout, ISOLATED_LEADER_OWNED) != before_unowned:
@@ -2894,10 +2975,20 @@ def run_isolated_topology_one(
                 )
             record.time_to_first_action_ms = first_action; record.leader_preparation_ms = duration
             parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
+            initial_leader_stream = completed.stdout
             if completed.returncode != 0 or checkout_content_digest(checkout, ISOLATED_LEADER_OWNED) != before_unowned:
                 raise RuntimeError("blocking leader violated isolated ownership or failed")
         integrated = integrate_worker_patches(checkout, workdirs, tasks, timeout=require_remaining)
         trace.write("worker_patches_integrated", files=integrated)
+        generated = run_command(
+            ("bash", "scripts/generate-build-info.sh"), cwd=checkout, timeout=min(30, require_remaining()),
+        )
+        trace.write("isolated_leader_build_info", status="passed" if generated.returncode == 0 else "failed")
+        if generated.returncode != 0:
+            raise BenchmarkInfrastructureError(
+                "isolated leader BuildInfo generation failed: "
+                + (generated.stderr.strip() or generated.stdout.strip() or "unknown error")
+            )
         active_started = time.perf_counter()
         with (experiment / paths["stdout"]).open("a") as log, (experiment / paths["acceptance"]).open("w") as acceptance_log:
             completed, _, duration = run_stream(
@@ -2909,11 +3000,16 @@ def run_isolated_topology_one(
             )
             record.leader_first_result_review_ms = duration
             parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
+            final_leader_stream = completed.stdout
+            for diagnostic in isolated_leader_validation_diagnostics(
+                initial_leader_stream, final_leader_stream,
+            ):
+                add_protocol_diagnostic(record, diagnostic)
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr or "integration verification failed")
             passed, acceptance_ms, reason = run_acceptance(
                 fixture, checkout, acceptance_log, require_remaining(),
-                xcode_host=xcode_host, run_id=run_id,
+                xcode_host=xcode_host, run_id=run_id, build_info_generated=True,
             )
             record.acceptance_ms = acceptance_ms; record.acceptance_passed = passed
             record.status = "passed" if passed else "failed"; record.failure_reason = None if passed else safe_failure(reason)
@@ -2942,6 +3038,9 @@ def run_isolated_topology_one(
             )
     except Exception as error:
         record.failure_reason = safe_failure(f"{type(error).__name__}: {error}"); record.status = "failed"
+        if isinstance(error, BenchmarkInfrastructureError):
+            record.infra_invalid = True
+            record.status = "infra_invalid"
         if total_started is not None: record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)
         with contextlib.suppress(Exception): record.changed_files = write_patch(checkout, experiment / paths["patch"])
     finally:

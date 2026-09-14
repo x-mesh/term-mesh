@@ -130,6 +130,64 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         )
         self.assertNotIn("Workspace.resolvedChromeColors", unrelated)
 
+    def test_isolated_initial_prompt_forbids_validation_and_final_allows_one_focused_test(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        initial = module.isolated_leader_prompt(fixture, final=False)
+        final = module.isolated_leader_prompt(fixture, final=True)
+        for forbidden in (
+            "xcodebuild", "local tests", "xcodebuild -list",
+            "build-for-testing", "test-without-building",
+            "scripts/generate-build-info.sh", "git status", "git diff",
+        ):
+            self.assertIn(forbidden, initial)
+        self.assertEqual(final.count(module.ISOLATED_LEADER_FOCUSED_TEST), 1)
+        self.assertIn("Do not discover schemes", final)
+        self.assertIn("Do not validate in this phase", initial)
+
+    def test_isolated_validation_checker_records_forbidden_and_repeated_focused_test(self):
+        initial = json.dumps({
+            "type": "assistant", "message": {"content": [{
+                "type": "tool_use", "name": "Bash",
+                "input": {"command": "git status; xcodebuild -list"},
+            }]},
+        })
+        final = json.dumps({
+            "type": "assistant", "message": {"content": [{
+                "type": "tool_use", "name": "Bash",
+                "input": {"command": (
+                    module.ISOLATED_LEADER_FOCUSED_TEST + "; "
+                    + module.ISOLATED_LEADER_FOCUSED_TEST
+                )},
+            }]},
+        })
+        diagnostics = module.isolated_leader_validation_diagnostics(initial, final)
+        self.assertIn("isolated leader initial used forbidden command: git-status", diagnostics)
+        self.assertIn("isolated leader initial used forbidden command: xcodebuild-list", diagnostics)
+        self.assertIn("isolated leader focused test ran 2 times", diagnostics)
+
+    def test_isolated_validation_diagnostic_does_not_replace_product_status(self):
+        record = module.RunResult(
+            run_id="product", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-blocking", order=1, started_at=module.utc_now(),
+            status="failed", acceptance_passed=False, failure_reason="product failure",
+        )
+        module.add_protocol_diagnostic(record, "isolated leader focused test ran 2 times")
+        self.assertEqual(record.status, "failed")
+        self.assertEqual(record.failure_reason, "product failure")
+        self.assertTrue(record.protocol_degraded)
+
+    def test_isolated_harness_generates_build_info_once_immediately_before_final_prompt(self):
+        source = SCRIPT.read_text()
+        function = source[
+            source.index("def run_isolated_topology_one"):
+            source.index("def run_policy_one")
+        ]
+        self.assertEqual(function.count('("bash", "scripts/generate-build-info.sh")'), 1)
+        generated = function.index('("bash", "scripts/generate-build-info.sh")')
+        final_prompt = function.index("isolated_leader_prompt(fixture, final=True")
+        self.assertLess(generated, final_prompt)
+        self.assertIn("build_info_generated=True", function)
+
     def test_partitioned_worker_capsules_have_disjoint_exact_paths(self):
         tasks = module.partitioned_worker_tasks(module.FIXTURES["split-divider-color"])
         scopes = [set(task["owned"]) for task in tasks]
