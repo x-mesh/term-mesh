@@ -162,6 +162,7 @@ class RunResult:
     pure_worker_wait_ms: Optional[int] = None
     overlap_ms: Optional[int] = None
     read_overlap: Optional[dict[str, Any]] = None
+    worker_runtime_metrics: Optional[dict[str, Any]] = None
     coordination_commands: dict[str, int] = field(default_factory=dict)
     routing_decision: Optional[str] = None
     routing_reason: Optional[str] = None
@@ -1981,6 +1982,221 @@ def benchmark_read_overlap(team: str, checkout: Path) -> dict[str, Any]:
     return {"status": "measured", "roles": roles, "pairwise_jaccard": pairwise, "all_role_reads": common}
 
 
+RUNTIME_NATIVE_FIELDS = {
+    "queue_ms": ("queue_duration_ms", "queueDurationMs", "queue_ms", "queueMs"),
+    "ttft_ms": ("ttft_ms", "ttftMs", "time_to_first_token_ms", "timeToFirstTokenMs"),
+    "duration_ms": ("duration_ms", "durationMs"),
+    "api_duration_ms": ("api_duration_ms", "apiDurationMs"),
+}
+
+
+def parse_event_timestamp(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    with contextlib.suppress(ValueError):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return None
+
+
+def milliseconds_between(start: datetime, end: datetime) -> int:
+    return round((end - start).total_seconds() * 1000)
+
+
+def latency_summary(values: Iterable[float]) -> dict[str, Any]:
+    samples = [float(value) for value in values]
+    return {
+        "count": len(samples), "total_ms": round(sum(samples)),
+        "p50_ms": round(percentile(samples, 0.50)) if samples else None,
+        "p95_ms": round(percentile(samples, 0.95)) if samples else None,
+        "max_ms": round(max(samples)) if samples else None,
+    }
+
+
+def allowed_native_numeric_values(event: dict[str, Any], names: tuple[str, ...]) -> list[float]:
+    """Read provider timing fields only from explicit provider-owned paths."""
+    containers = [event]
+    message = event.get("message") if isinstance(event.get("message"), dict) else {}
+    for owner in (event, message):
+        for key in ("provider_metadata", "providerMetadata", "usage", "diagnostics"):
+            value = owner.get(key)
+            if isinstance(value, dict):
+                containers.append(value)
+    values: list[float] = []
+    for container in containers:
+        for name in names:
+            value = container.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                values.append(float(value))
+    return values
+
+
+def claude_runtime_metrics(transcript: Path) -> dict[str, Any]:
+    """Summarize only timestamped and provider-reported Claude runtime evidence."""
+    rows = malformed_rows = timestamped_rows = 0
+    events: list[tuple[int, dict[str, Any], Optional[datetime]]] = []
+    with transcript.open(errors="replace") as handle:
+        for index, line in enumerate(handle):
+            rows += 1
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                malformed_rows += 1
+                continue
+            if not isinstance(event, dict):
+                malformed_rows += 1
+                continue
+            timestamp = parse_event_timestamp(event.get("timestamp"))
+            timestamped_rows += int(timestamp is not None)
+            events.append((index, event, timestamp))
+
+    request_rows: dict[str, list[tuple[int, dict[str, Any], datetime]]] = {}
+    assistant_rows_without_request = 0
+    for index, event, timestamp in events:
+        if event.get("type") != "assistant":
+            continue
+        request_id = event.get("requestId")
+        if not isinstance(request_id, str) or not request_id:
+            assistant_rows_without_request += 1
+            continue
+        if timestamp is not None:
+            request_rows.setdefault(request_id, []).append((index, event, timestamp))
+        else:
+            request_rows.setdefault(request_id, [])
+
+    prompt_to_first: list[int] = []
+    response_spans: list[int] = []
+    request_starts: list[datetime] = []
+    missing_prompt_timestamp = missing_response_timestamp = 0
+    native_values: dict[str, list[float]] = {name: [] for name in RUNTIME_NATIVE_FIELDS}
+    native_ambiguous: dict[str, int] = {name: 0 for name in RUNTIME_NATIVE_FIELDS}
+    for _, grouped in sorted(request_rows.items(), key=lambda item: min(
+        (row[0] for row in item[1]), default=sys.maxsize,
+    )):
+        if not grouped:
+            missing_response_timestamp += 1
+            continue
+        first_index, _, first_at = min(grouped, key=lambda row: (row[2], row[0]))
+        last_at = max(row[2] for row in grouped)
+        request_starts.append(first_at)
+        response_spans.append(max(0, milliseconds_between(first_at, last_at)))
+        prior_user_times = [
+            timestamp for index, event, timestamp in events
+            if index < first_index and event.get("type") == "user" and timestamp is not None
+        ]
+        if prior_user_times:
+            prompt_to_first.append(max(0, milliseconds_between(max(prior_user_times), first_at)))
+        else:
+            missing_prompt_timestamp += 1
+        for metric, aliases in RUNTIME_NATIVE_FIELDS.items():
+            observed = {value for _, event, _ in grouped for value in allowed_native_numeric_values(event, aliases)}
+            if len(observed) == 1:
+                native_values[metric].append(observed.pop())
+            elif len(observed) > 1:
+                native_ambiguous[metric] += 1
+
+    ordered_starts = sorted(request_starts)
+    inter_request = [max(0, milliseconds_between(left, right)) for left, right in zip(ordered_starts, ordered_starts[1:])]
+    tool_starts: dict[str, list[datetime]] = {}
+    bash_without_id = 0
+    for _, event, timestamp in events:
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message.get("content"), list) else []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if event.get("type") == "assistant" and block.get("type") == "tool_use" and block.get("name") == "Bash":
+                tool_id = block.get("id")
+                if not isinstance(tool_id, str) or not tool_id or timestamp is None:
+                    bash_without_id += 1
+                else:
+                    tool_starts.setdefault(tool_id, []).append(timestamp)
+
+    tool_results: dict[str, list[datetime]] = {}
+    result_without_id = 0
+    for _, event, timestamp in events:
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content") if isinstance(message.get("content"), list) else []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if event.get("type") == "user" and block.get("type") == "tool_result":
+                tool_id = block.get("tool_use_id")
+                if not isinstance(tool_id, str) or not tool_id:
+                    result_without_id += 1
+                elif tool_id in tool_starts and timestamp is not None:
+                    tool_results.setdefault(tool_id, []).append(timestamp)
+
+    bash_durations: list[int] = []
+    duplicate_starts = sum(len(values) - 1 for values in tool_starts.values() if len(values) > 1)
+    duplicate_results = sum(len(values) - 1 for values in tool_results.values() if len(values) > 1)
+    missing_results = out_of_order = 0
+    for tool_id, starts in tool_starts.items():
+        results = tool_results.get(tool_id, [])
+        if len(starts) != 1 or len(results) != 1:
+            missing_results += int(not results)
+            continue
+        duration = milliseconds_between(starts[0], results[0])
+        if duration < 0:
+            out_of_order += 1
+        else:
+            bash_durations.append(duration)
+    unmatched_results = 0
+    request_count = len(request_rows)
+    native = {
+        metric: {
+            "requests_with_value": len(native_values[metric]),
+            "missing_requests": request_count - len(native_values[metric]) - native_ambiguous[metric],
+            "ambiguous_requests": native_ambiguous[metric],
+            "summary": latency_summary(native_values[metric]),
+        } for metric in RUNTIME_NATIVE_FIELDS
+    }
+    incomplete = bool(
+        malformed_rows or assistant_rows_without_request or missing_response_timestamp or missing_prompt_timestamp
+        or bash_without_id or duplicate_starts or duplicate_results or missing_results or unmatched_results
+        or result_without_id or out_of_order
+    )
+    return {
+        "status": "partial" if incomplete else "measured",
+        "rows": rows, "malformed_rows": malformed_rows,
+        "timestamp_coverage": round(timestamped_rows / rows, 3) if rows else 1.0,
+        "provider_requests": {
+            "count": request_count, "assistant_rows_without_request_id": assistant_rows_without_request,
+            "missing_response_timestamp": missing_response_timestamp,
+            "missing_prompt_timestamp": missing_prompt_timestamp,
+            "prompt_to_first_response_ms": latency_summary(prompt_to_first),
+            "inter_request_start_ms": latency_summary(inter_request),
+            "response_event_span_ms": latency_summary(response_spans), "native": native,
+        },
+        "bash_tools": {
+            "starts": len(tool_starts), "paired": len(bash_durations),
+            "coverage": round(len(bash_durations) / len(tool_starts), 3) if tool_starts else 1.0,
+            "missing_id": bash_without_id, "missing_results": missing_results,
+            "unmatched_results": unmatched_results, "result_missing_id": result_without_id,
+            "duplicate_starts": duplicate_starts, "duplicate_results": duplicate_results,
+            "out_of_order": out_of_order, "duration_ms": latency_summary(bash_durations),
+        },
+    }
+
+
+def benchmark_worker_runtime_metrics(team: str, checkout: Path) -> dict[str, Any]:
+    team_dir = benchmark_team_directory(team)
+    if team_dir is None:
+        return {"status": "unavailable", "reason": "team metadata unavailable", "roles": {}}
+    roles: dict[str, Any] = {}
+    for metadata in sorted((team_dir / "agents").glob("*.json")):
+        with contextlib.suppress(OSError, json.JSONDecodeError):
+            payload = json.loads(metadata.read_text())
+            role = str(payload.get("name") or metadata.stem)
+            session_id = payload.get("session_id")
+            agent_checkout = Path(payload.get("working_directory") or checkout)
+            transcript = claude_session_path(session_id, agent_checkout) if isinstance(session_id, str) else None
+            roles[role] = claude_runtime_metrics(transcript) if transcript else {"status": "unavailable", "reason": "transcript unavailable"}
+    if not roles:
+        return {"status": "unavailable", "reason": "agent metadata unavailable", "roles": {}}
+    status = "measured" if all(row.get("status") == "measured" for row in roles.values()) else "partial"
+    return {"status": status, "roles": roles}
+
+
 def usage_delta(after: dict[str, int], before: dict[str, int]) -> dict[str, int]:
     return {key: max(0, int(after.get(key, 0)) - int(before.get(key, 0))) for key in TOKEN_KEYS}
 
@@ -2367,6 +2583,19 @@ def collect_isolated_read_diagnostics(
     record: RunResult, *, team: str, checkout: Path, tasks: list[dict[str, Any]],
     session_id: str,
 ) -> None:
+    try:
+        worker_metrics = benchmark_worker_runtime_metrics(team, checkout)
+        leader_transcript = claude_session_path(session_id, checkout)
+        record.worker_runtime_metrics = {
+            **worker_metrics,
+            "leader": claude_runtime_metrics(leader_transcript) if leader_transcript else {"status": "unavailable", "reason": "transcript unavailable"},
+        }
+    except Exception as error:
+        record.worker_runtime_metrics = {
+            "status": "unavailable", "roles": {},
+            "diagnostics": [safe_failure(f"{type(error).__name__}: {error}")],
+        }
+
     try:
         record.read_overlap = benchmark_read_overlap(team, checkout)
     except Exception as error:

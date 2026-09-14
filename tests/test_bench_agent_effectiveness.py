@@ -23,6 +23,160 @@ SPEC.loader.exec_module(module)
 
 
 class EffectivenessBenchmarkTests(unittest.TestCase):
+    def write_runtime_transcript(self, path, events):
+        path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+    def test_runtime_metrics_pairs_requests_and_bash_by_structured_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "session.jsonl"
+            self.write_runtime_transcript(transcript, [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00.000Z", "message": {"content": "go"}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01.000Z",
+                 "requestId": "req-1", "queue_duration_ms": 80, "ttft_ms": 900,
+                 "durationMs": 2200, "message": {"content": [
+                     {"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {"command": "true"}},
+                 ]}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01.400Z",
+                 "requestId": "req-1", "queue_duration_ms": 80, "ttft_ms": 900,
+                 "durationMs": 2200, "message": {"content": []}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:03.000Z", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1"},
+                ]}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:04.500Z",
+                 "requestId": "req-2", "message": {"content": []}},
+            ])
+
+            result = module.claude_runtime_metrics(transcript)
+
+        self.assertEqual(result["status"], "measured")
+        requests = result["provider_requests"]
+        self.assertEqual(requests["count"], 2)
+        self.assertEqual(requests["prompt_to_first_response_ms"]["total_ms"], 2500)
+        self.assertEqual(requests["inter_request_start_ms"]["total_ms"], 3500)
+        self.assertEqual(requests["response_event_span_ms"]["total_ms"], 400)
+        self.assertEqual(requests["native"]["queue_ms"]["requests_with_value"], 1)
+        self.assertEqual(requests["native"]["queue_ms"]["missing_requests"], 1)
+        self.assertEqual(requests["native"]["ttft_ms"]["summary"]["p50_ms"], 900)
+        self.assertEqual(result["bash_tools"]["paired"], 1)
+        self.assertEqual(result["bash_tools"]["duration_ms"]["total_ms"], 2000)
+
+    def test_runtime_metrics_reads_native_fields_only_from_allowed_provider_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "session.jsonl"
+            self.write_runtime_transcript(transcript, [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"content": "go"}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01Z", "requestId": "req-1",
+                 "provider_metadata": {"queue_ms": 40},
+                 "message": {"usage": {"ttft_ms": 500}, "diagnostics": {"api_duration_ms": 900}, "content": [
+                     {"type": "tool_use", "id": "tool-1", "name": "Bash",
+                      "input": {"queue_ms": 9999, "duration_ms": 9999}},
+                 ]}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:02Z", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1"},
+                ]}},
+            ])
+            result = module.claude_runtime_metrics(transcript)
+
+        native = result["provider_requests"]["native"]
+        self.assertEqual(native["queue_ms"]["summary"]["total_ms"], 40)
+        self.assertEqual(native["ttft_ms"]["summary"]["total_ms"], 500)
+        self.assertEqual(native["api_duration_ms"]["summary"]["total_ms"], 900)
+        self.assertEqual(native["duration_ms"]["requests_with_value"], 0)
+        self.assertEqual(native["duration_ms"]["missing_requests"], 1)
+
+    def test_partial_runtime_telemetry_does_not_degrade_product_protocol(self):
+        record = module.RunResult(
+            run_id="passed", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            status="passed", acceptance_passed=True,
+        )
+        with unittest.mock.patch.object(
+            module, "benchmark_worker_runtime_metrics",
+            return_value={"status": "partial", "roles": {"executor": {"status": "partial"}}},
+        ), unittest.mock.patch.object(
+            module, "benchmark_read_overlap", return_value={"status": "measured", "roles": {}},
+        ), unittest.mock.patch.object(
+            module, "claude_session_path", return_value=Path("/tmp/session.jsonl"),
+        ), unittest.mock.patch.object(
+            module, "claude_runtime_metrics", return_value={"status": "partial"},
+        ), unittest.mock.patch.object(
+            module, "claude_read_paths", return_value={"status": "measured", "distinct_access_paths": []},
+        ):
+            module.collect_isolated_read_diagnostics(
+                record, team="team", checkout=Path("/tmp/checkout"), tasks=[], session_id="session",
+            )
+
+        self.assertEqual(record.status, "passed")
+        self.assertTrue(record.acceptance_passed)
+        self.assertFalse(record.protocol_degraded)
+        self.assertEqual(record.worker_runtime_metrics["status"], "partial")
+
+    def test_runtime_metrics_marks_missing_bash_result_as_partial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "session.jsonl"
+            self.write_runtime_transcript(transcript, [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"content": "go"}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01Z",
+                 "requestId": "req-1", "message": {"content": [
+                     {"type": "tool_use", "id": "tool-1", "name": "Bash"},
+                 ]}},
+            ])
+            result = module.claude_runtime_metrics(transcript)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["bash_tools"]["missing_results"], 1)
+        self.assertEqual(result["bash_tools"]["coverage"], 0.0)
+
+    def test_runtime_metrics_ignores_results_for_non_bash_tools(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "session.jsonl"
+            self.write_runtime_transcript(transcript, [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"content": "go"}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01Z", "requestId": "req-1",
+                 "message": {"content": [{"type": "tool_use", "id": "read-1", "name": "Read"}]}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:02Z",
+                 "message": {"content": [{"type": "tool_result", "tool_use_id": "read-1"}]}},
+            ])
+            result = module.claude_runtime_metrics(transcript)
+
+        self.assertEqual(result["status"], "measured")
+        self.assertEqual(result["bash_tools"]["starts"], 0)
+        self.assertEqual(result["bash_tools"]["unmatched_results"], 0)
+
+    def test_runtime_metrics_rejects_duplicate_bash_event_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "session.jsonl"
+            self.write_runtime_transcript(transcript, [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"content": "go"}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01Z", "requestId": "req-1",
+                 "message": {"content": [{"type": "tool_use", "id": "tool-1", "name": "Bash"}]}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:02Z", "requestId": "req-1",
+                 "message": {"content": [{"type": "tool_use", "id": "tool-1", "name": "Bash"}]}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:03Z",
+                 "message": {"content": [{"type": "tool_result", "tool_use_id": "tool-1"}]}},
+            ])
+            result = module.claude_runtime_metrics(transcript)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["bash_tools"]["duplicate_starts"], 1)
+        self.assertEqual(result["bash_tools"]["paired"], 0)
+
+    def test_runtime_metrics_rejects_out_of_order_bash_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "session.jsonl"
+            self.write_runtime_transcript(transcript, [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"content": "go"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:01Z",
+                 "message": {"content": [{"type": "tool_result", "tool_use_id": "tool-1"}]}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:02Z", "requestId": "req-1",
+                 "message": {"content": [{"type": "tool_use", "id": "tool-1", "name": "Bash"}]}},
+            ])
+            result = module.claude_runtime_metrics(transcript)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["bash_tools"]["out_of_order"], 1)
+        self.assertEqual(result["bash_tools"]["paired"], 0)
+
     def test_non_dry_run_experiment_executes_under_cleanup_and_lock(self):
         args = unittest.mock.Mock(dry_run=False, results_dir=Path("/tmp/results"))
         cleanup = unittest.mock.MagicMock()
