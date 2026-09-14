@@ -1213,11 +1213,14 @@ SWIFT_ACTOR_TEST_CONTRACT = (
 )
 
 SPLIT_DIVIDER_RUNTIME_CONTRACT = (
-    "Treat the resolved divider color as the behavior input, regardless of where that color came from. "
-    "If its alpha is at least the existing opaque threshold, render the portal divider overlay without "
-    "requiring surface occlusion. If its alpha is below that threshold, preserve the existing surface "
-    "occlusion policy. Expose or reuse a pure helper for this decision and add public tests for both "
-    "sides of the threshold. Do not require a separate store or a specific Workspace wiring design. "
+    "Keep the two split-divider behaviors independent. For Bonsplit appearance, set borderHex only "
+    "from an explicit GhosttyConfig.splitDividerColor. A reset or unconfigured value must produce nil. "
+    "Expose or reuse a pure helper for this mapping and add public tests for explicit, reset, and "
+    "unconfigured inputs. For portal overlay rendering, use the actual resolved NSSplitView divider "
+    "color regardless of its source. An opaque resolved color must always render the overlay without "
+    "surface occlusion. A translucent resolved color must preserve the existing occlusion-only policy. "
+    "Expose or reuse a separate pure helper for this decision and add public tests for opaque and "
+    "translucent colors. Do not require a separate store or a specific architecture or wiring design. "
     "Do not inspect, infer, or disclose hidden acceptance test contents."
 )
 
@@ -2083,15 +2086,19 @@ def wait_for_worker_results(
     estimated_seconds: Optional[dict[Path, int]] = None, estimate_grace: float = 120.0,
     ready_times: Optional[dict[Path, int]] = None,
     cancel_event: Optional[threading.Event] = None,
+    respect_estimates: bool = True,
 ) -> tuple[str, int, int]:
-    """Wait for every result until its task estimate and grace expire."""
+    """Wait for every result until its estimate or the shared timeout expires."""
     started = time.perf_counter()
     deadline = started + max(0, timeout)
     worker_deadlines = {
-        path: min(
-            deadline,
-            started + max(0, (estimated_seconds or {}).get(path, 0))
-            + max(0, estimate_grace),
+        path: (
+            min(
+                deadline,
+                started + max(0, (estimated_seconds or {}).get(path, 0))
+                + max(0, estimate_grace),
+            )
+            if respect_estimates else deadline
         )
         for path in result_files
     }
@@ -2948,6 +2955,7 @@ def run_isolated_topology_one(
                     result_files, timeout=require_remaining(), trace=trace,
                     estimated_seconds={path: 15 * 60 for path in result_files},
                     ready_times=ready_times, cancel_event=cancel,
+                    respect_estimates=False,
                 )
             except Exception as error:
                 worker_box["error"] = error

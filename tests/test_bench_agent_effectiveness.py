@@ -131,7 +131,7 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         )
         self.assertNotIn("Workspace.resolvedChromeColors", unrelated)
 
-    def test_split_divider_prompts_require_source_independent_behavior(self):
+    def test_split_divider_prompts_separate_config_mapping_from_portal_behavior(self):
         fixture = module.FIXTURES["split-divider-color"]
         executor_task = next(
             task for task in module.isolated_topology_tasks(fixture)
@@ -143,21 +143,22 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
             module.isolated_leader_prompt(fixture, final=True),
         )
         for prompt in prompts:
-            self.assertIn("resolved divider color as the behavior input", prompt)
-            self.assertIn("regardless of where that color came from", prompt)
-            self.assertIn("alpha is at least the existing opaque threshold", prompt)
-            self.assertIn("render the portal divider overlay without requiring surface occlusion", prompt)
-            self.assertIn("preserve the existing surface occlusion policy", prompt)
-            self.assertIn("pure helper for this decision and add public tests", prompt)
-            self.assertIn("Do not require a separate store or a specific Workspace wiring design", prompt)
+            self.assertIn("Keep the two split-divider behaviors independent", prompt)
+            self.assertIn("set borderHex only from an explicit GhosttyConfig.splitDividerColor", prompt)
+            self.assertIn("A reset or unconfigured value must produce nil", prompt)
+            self.assertIn("pure helper for this mapping", prompt)
+            self.assertIn("actual resolved NSSplitView divider color regardless of its source", prompt)
+            self.assertIn("opaque resolved color must always render the overlay without surface occlusion", prompt)
+            self.assertIn("translucent resolved color must preserve the existing occlusion-only policy", prompt)
+            self.assertIn("separate pure helper for this decision", prompt)
+            self.assertIn("Do not require a separate store or a specific architecture or wiring design", prompt)
             self.assertIn("Do not inspect, infer, or disclose hidden acceptance test contents", prompt)
-            self.assertNotIn("GhosttyConfig.splitDividerColor is the canonical input", prompt)
             self.assertNotIn("Workspace.applyGhosttyChrome(from:)", prompt)
 
         unrelated = module.worker_instruction(
             module.FIXTURES["homebrew-smoke"], "team", "executor"
         )
-        self.assertNotIn("resolved divider color as the behavior input", unrelated)
+        self.assertNotIn("Keep the two split-divider behaviors independent", unrelated)
 
     def test_isolated_initial_prompt_forbids_validation_and_final_allows_one_focused_test(self):
         fixture = module.FIXTURES["split-divider-color"]
@@ -1306,6 +1307,7 @@ end
             def wait() -> None:
                 result["value"] = module.wait_for_worker_results(
                     [Path(temporary) / "never.result"], timeout=10, cancel_event=cancel,
+                    respect_estimates=False,
                 )
 
             thread = threading.Thread(target=wait)
@@ -1314,6 +1316,50 @@ end
             thread.join(timeout=1)
             self.assertFalse(thread.is_alive())
             self.assertEqual(result["value"][2], 0)
+
+    def test_worker_wait_can_ignore_estimate_ceiling_until_global_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result_file = Path(temporary) / "late.result"
+            clock = {"now": 0.0, "sleeps": 0}
+
+            def advance(_: float) -> None:
+                clock["sleeps"] += 1
+                increments = (300.0, 300.0, 300.0, 120.0, 1.0)
+                clock["now"] += increments[min(clock["sleeps"] - 1, 4)]
+                if clock["now"] > 1020 and not result_file.exists():
+                    result_file.write_text("STATUS: DONE\nNEXT: leader integrates\n")
+
+            with unittest.mock.patch.object(
+                module.time, "perf_counter", side_effect=lambda: clock["now"]
+            ), unittest.mock.patch.object(module.time, "sleep", side_effect=advance):
+                headers, elapsed_ms, ready = module.wait_for_worker_results(
+                    [result_file], timeout=1200,
+                    estimated_seconds={result_file: 900}, estimate_grace=120,
+                    respect_estimates=False,
+                )
+
+            self.assertEqual(ready, 1)
+            self.assertGreater(elapsed_ms, 1020000)
+            self.assertIn("STATUS: DONE", headers)
+
+    def test_worker_wait_without_estimate_ceiling_stops_at_global_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            clock = {"now": 0.0}
+
+            def advance(_: float) -> None:
+                clock["now"] = 5.0
+
+            with unittest.mock.patch.object(
+                module.time, "perf_counter", side_effect=lambda: clock["now"]
+            ), unittest.mock.patch.object(module.time, "sleep", side_effect=advance):
+                _, elapsed_ms, ready = module.wait_for_worker_results(
+                    [Path(temporary) / "never.result"], timeout=5,
+                    estimated_seconds={Path(temporary) / "never.result": 1},
+                    estimate_grace=0, respect_estimates=False,
+                )
+
+            self.assertEqual(ready, 0)
+            self.assertEqual(elapsed_ms, 5000)
 
     def test_isolated_worker_wait_uses_remaining_end_to_end_deadline(self):
         source = SCRIPT.read_text()
@@ -1324,6 +1370,7 @@ end
         self.assertIn(
             "result_files, timeout=require_remaining(), trace=trace", function,
         )
+        self.assertIn("respect_estimates=False", function)
         self.assertNotIn("timeout=min(15 * 60, remaining())", function)
 
         with unittest.mock.patch.object(module.time, "perf_counter", return_value=100.0):
