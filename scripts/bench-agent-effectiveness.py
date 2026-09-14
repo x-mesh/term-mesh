@@ -1093,7 +1093,11 @@ def integrate_worker_patches(
     by_worker = {task["worker"]: task for task in tasks}
     leader_changed = set(git("diff", "--name-only", cwd=checkout).splitlines())
     leader_changed.update(git("ls-files", "--others", "--exclude-standard", cwd=checkout).splitlines())
-    for role, path in workdirs.items():
+    integration_order = [task["worker"] for task in tasks]
+    if set(integration_order) != set(workdirs):
+        raise RuntimeError("isolated integration workers do not match task workers")
+    for role in integration_order:
+        path = workdirs[role]
         tracked = set(git("diff", "--name-only", cwd=path).splitlines())
         untracked = set(git("ls-files", "--others", "--exclude-standard", cwd=path).splitlines())
         changed = tracked | untracked
@@ -1189,16 +1193,58 @@ def partitioned_worker_tasks(fixture: Fixture) -> list[dict[str, Any]]:
 
 
 def isolated_topology_tasks(fixture: Fixture) -> list[dict[str, Any]]:
-    tasks = partitioned_worker_tasks(fixture)
-    executor = next(task for task in tasks if task["worker"] == "executor")
-    executor["owned"] = [path for path in executor["owned"] if path != "Sources/TerminalWindowPortal.swift"]
-    executor["goal"] = "Implement divider settings, reset, config, workspace propagation, and focused unit tests"
-    reviewer = next(task for task in tasks if task["worker"] == "reviewer")
-    reviewer["owned"] = [
-        path for path in reviewer["owned"]
-        if path != "termMeshTests/GhosttyTerminalViewComposingTests.swift"
+    if fixture.name != "split-divider-color":
+        raise ValueError(f"isolated topology capsules are unavailable for {fixture.name}")
+    tasks = [
+        {
+            "id": "settings", "worker": "executor", "strict_scope": True,
+            "goal": "Implement divider settings, reset behavior, and focused override tests",
+            "owned": [
+                "Sources/SettingsView.swift",
+                "Sources/TerminalSettings.swift",
+                "termMeshTests/TerminalOverrideIsolationTests.swift",
+            ],
+            "forbidden": ["all other repository paths"],
+            "depends_on": [], "verify": "run the focused override unit tests",
+            "mutates": True, "estimated_seconds": 300,
+        },
+        {
+            "id": "runtime", "worker": "explorer", "strict_scope": True,
+            "goal": "Implement workspace runtime propagation and focused config tests",
+            "owned": [
+                "Sources/Workspace.swift",
+                "termMeshTests/GhosttyConfigTests.swift",
+            ],
+            "forbidden": ["all other repository paths"],
+            "depends_on": [], "verify": "run the focused config unit tests",
+            "mutates": True, "estimated_seconds": 300,
+        },
+        {
+            "id": "review", "worker": "reviewer", "strict_scope": True,
+            "goal": "Review build and key-equivalent regression coverage",
+            "owned": [
+                "Makefile",
+                "termMeshTests/TermMeshWebViewKeyEquivalentTests.swift",
+            ],
+            "forbidden": ["all other repository paths", "all repository writes"],
+            "depends_on": [], "verify": "report requirement-to-test coverage and P0-P3 risks",
+            "mutates": False, "estimated_seconds": 300,
+        },
     ]
+    for task in tasks:
+        validate_worker_mutation_capability(task, allow_task_mutators=True)
     return tasks
+
+
+def require_isolated_base_api(checkout: Path) -> None:
+    """Fail before dispatch when the fixture lacks the required base API."""
+    config = checkout / "Sources/GhosttyConfig.swift"
+    if not config.is_file() or not re.search(
+        r"\bvar\s+splitDividerColor\s*:\s*NSColor\?", config.read_text(),
+    ):
+        raise BenchmarkInfrastructureError(
+            "isolated topology requires base GhosttyConfig.splitDividerColor API"
+        )
 
 
 ISOLATED_LEADER_OWNED = (
@@ -1231,6 +1277,7 @@ ISOLATED_LEADER_FOCUSED_TEST = (
     "-disableAutomaticPackageResolution "
     "-derivedDataPath /Users/jinwoo/Library/Developer/Xcode/DerivedData/term-mesh-effectiveness "
     "-only-testing:termMeshTests/WorkspaceChromeThemeTests "
+    "-only-testing:termMeshTests/TerminalOverrideIsolationTests "
     "-only-testing:termMeshTests/GhosttyTerminalViewComposingTests test"
 )
 
@@ -1333,6 +1380,13 @@ def isolated_leader_validation_diagnostics(initial_stream: str, final_stream: st
     return list(dict.fromkeys(diagnostics))
 
 
+def validate_worker_mutation_capability(
+    task: dict[str, Any], *, allow_task_mutators: bool = False,
+) -> None:
+    if task["mutates"] and task["worker"] != "executor" and not allow_task_mutators:
+        raise ValueError(f"benchmark worker {task['worker']!r} is read-only")
+
+
 def validate_routing_decision(
     payload: Any, *, available_workers: Iterable[str] = ("explorer", "executor", "reviewer"),
 ) -> tuple[str, str, list[dict[str, Any]]]:
@@ -1388,8 +1442,7 @@ def validate_routing_decision(
             raise ValueError(f"task {index} estimated_seconds must be a positive integer")
         if route == "probe" and (task["mutates"] or not 60 <= estimate <= 90):
             raise ValueError("probe task must be read-only and estimated at 60..90 seconds")
-        if task["mutates"] and worker != "executor":
-            raise ValueError(f"benchmark worker {worker!r} is read-only")
+        validate_worker_mutation_capability(task)
         seen_ids.add(task_id)
         seen_workers.add(worker)
         normalized.append({key: task[key] for key in required_fields})
@@ -1401,6 +1454,7 @@ def worker_instruction(
 ) -> str:
     result_file = f"/tmp/term-mesh-bench-{team}-{role}.result"
     report_file = f"~/.term-mesh/results/{team}/{role}-{uuid.uuid4().hex[:8]}-full.md"
+    task = task or next(item for item in default_worker_tasks() if item["worker"] == role)
     role_work = {
         "explorer": (
             "read-only 조사 담당이다. 관련 파일과 현재 동작, 최소 수정 지점, 검증 방법을 "
@@ -1415,7 +1469,11 @@ def worker_instruction(
             "확인할 법한 조건과 검증 방법을 분석하되 어떤 repo 파일도 수정하지 마라."
         ),
     }[role]
-    task = task or next(item for item in default_worker_tasks() if item["worker"] == role)
+    if task["mutates"] and role != "executor":
+        role_work = (
+            "구현 담당이며 task의 owned 범위를 소유한다. 요구사항을 구현하고 관련 테스트를 "
+            "추가하며 가능한 검증을 실행하라. commit은 만들지 마라."
+        )
     mutation_rule = (
         "owned에 명시된 범위만 수정하고 forbidden 범위는 수정하지 마라."
         if task["mutates"] else "read-only task다. 어떤 repo 파일도 수정하지 마라."
@@ -2929,6 +2987,7 @@ def run_isolated_topology_one(
     final_leader_stream = ""
     try:
         create_snapshot(fixture, checkout)
+        require_isolated_base_api(checkout)
         total_started = time.perf_counter()
         deadline = total_started + timeout
         remaining = lambda: max(0.0, deadline - time.perf_counter())

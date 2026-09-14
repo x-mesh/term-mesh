@@ -110,9 +110,52 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
 
     def test_isolated_topology_ownership_is_disjoint(self):
         tasks = module.isolated_topology_tasks(module.FIXTURES["split-divider-color"])
-        worker_paths = set().union(*(set(task["owned"]) for task in tasks))
+        scopes = [set(task["owned"]) for task in tasks]
+        worker_paths = set().union(*scopes)
         self.assertFalse(worker_paths & set(module.ISOLATED_LEADER_OWNED))
-        self.assertEqual(sum(task["mutates"] for task in tasks), 1)
+        self.assertEqual([task["id"] for task in tasks], ["settings", "runtime", "review"])
+        self.assertEqual([task["worker"] for task in tasks], ["executor", "explorer", "reviewer"])
+        self.assertEqual(sum(task["mutates"] for task in tasks), 2)
+        for left in range(len(scopes)):
+            for right in range(left):
+                self.assertFalse(scopes[left] & scopes[right])
+        self.assertEqual(worker_paths, {
+            "Sources/SettingsView.swift",
+            "Sources/TerminalSettings.swift",
+            "Sources/Workspace.swift",
+            "termMeshTests/GhosttyConfigTests.swift",
+            "termMeshTests/TerminalOverrideIsolationTests.swift",
+            "Makefile",
+            "termMeshTests/TermMeshWebViewKeyEquivalentTests.swift",
+        })
+        self.assertTrue(all(
+            "all other repository paths" in task["forbidden"] for task in tasks
+        ))
+        self.assertIn("all repository writes", tasks[-1]["forbidden"])
+
+    def test_isolated_topology_conditions_use_the_same_task_order(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        blocking = module.isolated_topology_tasks(fixture)
+        overlap = module.isolated_topology_tasks(fixture)
+        self.assertEqual(blocking, overlap)
+        self.assertEqual(
+            [(task["id"], task["worker"]) for task in blocking],
+            [("settings", "executor"), ("runtime", "explorer"), ("review", "reviewer")],
+        )
+
+    def test_isolated_base_api_gate_requires_split_divider_color(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            sources = checkout / "Sources"
+            sources.mkdir()
+            config = sources / "GhosttyConfig.swift"
+            config.write_text("struct GhosttyConfig {}\n")
+            with self.assertRaisesRegex(
+                module.BenchmarkInfrastructureError, "GhosttyConfig.splitDividerColor",
+            ):
+                module.require_isolated_base_api(checkout)
+            config.write_text("struct GhosttyConfig { var splitDividerColor: NSColor? }\n")
+            module.require_isolated_base_api(checkout)
 
     def test_isolated_prompts_state_swift_actor_test_contract(self):
         fixture = module.FIXTURES["split-divider-color"]
@@ -180,6 +223,12 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             module.ISOLATED_LEADER_FOCUSED_TEST.count(
                 "-only-testing:termMeshTests/GhosttyTerminalViewComposingTests"
+            ),
+            1,
+        )
+        self.assertEqual(
+            module.ISOLATED_LEADER_FOCUSED_TEST.count(
+                "-only-testing:termMeshTests/TerminalOverrideIsolationTests"
             ),
             1,
         )
@@ -1123,6 +1172,31 @@ end
             (worker / "forbidden.txt").write_text("no\n")
             with self.assertRaisesRegex(RuntimeError, "forbidden paths"):
                 module.integrate_worker_patches(checkout, {"executor": worker}, tasks)
+
+    def test_integrate_worker_patches_uses_task_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "leader"
+            subprocess.run(("git", "init", str(checkout)), check=True, capture_output=True)
+            (checkout / "base.txt").write_text("base\n")
+            subprocess.run(("git", "-C", str(checkout), "add", "base.txt"), check=True)
+            subprocess.run((
+                "git", "-C", str(checkout), "-c", "user.name=Test",
+                "-c", "user.email=test@example.com", "commit", "-m", "base",
+            ), check=True, capture_output=True)
+            workdirs = {}
+            tasks = []
+            for worker, filename in (("executor", "a.txt"), ("explorer", "b.txt"), ("reviewer", "c.txt")):
+                path = root / worker
+                subprocess.run(("git", "clone", str(checkout), str(path)), check=True, capture_output=True)
+                (path / filename).write_text(worker + "\n")
+                workdirs[worker] = path
+                tasks.append({"worker": worker, "owned": [filename]})
+            reversed_workdirs = dict(reversed(tuple(workdirs.items())))
+            self.assertEqual(
+                module.integrate_worker_patches(checkout, reversed_workdirs, tasks),
+                ["a.txt", "b.txt", "c.txt"],
+            )
 
     def test_write_patch_preserves_eof_and_applies_to_clean_checkout(self):
         with tempfile.TemporaryDirectory() as temporary:
