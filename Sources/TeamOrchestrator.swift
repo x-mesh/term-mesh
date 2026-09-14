@@ -775,6 +775,10 @@ final class TeamOrchestrator: ObservableObject {
     /// Peer-owned workers a daemon restart killed, by team, awaiting one
     /// automatic Repair collaboration after their leader recovers.
     var peerAgentsAwaitingRespawn: [String: Set<String>] = [:]
+    /// Latest marked exit per team; a roster read older than it cannot prove
+    /// the restarted host is back.
+    var peerAgentRespawnMarkedAt: [String: Date] = [:]
+    var automaticCollaborationRepairAt: [String: Date] = [:]
     private var projectLayoutSaveTasks: [String: Task<Void, Never>] = [:]
     /// Same single-flight need as the two above, one level down: a rewound
     /// stream can drop the same peer-owned agent pane twice before the first
@@ -1452,10 +1456,15 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Read the exact local presentation that a peer-backed Project needs.
     /// Local teams do not use a replaceable viewer route and remain unchanged.
+    ///
+    /// `ignoringLeader` reports worker state alone. A daemon restart ends the
+    /// leader together with its workers, and the leader invariant is checked
+    /// first, so without it dead workers would never be reported.
     func collaborationPresentationState(
         teamName: String,
         requireLiveSessions: Bool,
-        repairableMissingAgentIDs: Set<String> = []
+        repairableMissingAgentIDs: Set<String> = [],
+        ignoringLeader: Bool = false
     ) -> CollaborationPresentationState {
         guard let team = teams[teamName] else { return .teamMissing }
         guard case .peer = team.leaderEndpoint else { return .ready }
@@ -1497,8 +1506,8 @@ final class TeamOrchestrator: ObservableObject {
         return Self.collaborationPresentationState(
             teamExists: true,
             workspaceExists: true,
-            leaderPanelExists: leaderPanel != nil,
-            leaderSessionReady: leaderSessionReady,
+            leaderPanelExists: ignoringLeader || leaderPanel != nil,
+            leaderSessionReady: ignoringLeader || leaderSessionReady,
             agents: probes,
             requireLiveSessions: requireLiveSessions,
             repairableMissingAgentIDs: repairableMissingAgentIDs
@@ -7355,6 +7364,8 @@ final class TeamOrchestrator: ObservableObject {
     func forgetTeamForTests(_ name: String) {
         teams.removeValue(forKey: name)
         peerAgentsAwaitingRespawn.removeValue(forKey: name)
+        peerAgentRespawnMarkedAt.removeValue(forKey: name)
+        automaticCollaborationRepairAt.removeValue(forKey: name)
     }
 #endif
 
@@ -7668,6 +7679,7 @@ final class TeamOrchestrator: ObservableObject {
             )
             if automatic {
                 peerAgentsAwaitingRespawn[teamName, default: []].insert(instanceID)
+                peerAgentRespawnMarkedAt[teamName] = Date()
             }
             RemoteWorkLog.info(
                 "Kept ended peer agent \(owner.agent.name) in \(teamName) for repair "

@@ -613,7 +613,7 @@ final class ReviewBoardViewModel: ObservableObject {
         ))
         panel.workerRepairNeeded = presentationNeedsWorkerRepair(
             TeamOrchestrator.shared.collaborationPresentationState(
-                teamName: teamName, requireLiveSessions: true
+                teamName: teamName, requireLiveSessions: true, ignoringLeader: true
             )
         )
         return panel

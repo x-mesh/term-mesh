@@ -9781,6 +9781,7 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             "Repair replaces a dead surface only while the roster still names it"
         )
         XCTAssertEqual(orchestrator.peerAgentsAwaitingRespawn[teamName], [member.agentInstanceId])
+        XCTAssertNotNil(orchestrator.peerAgentRespawnMarkedAt[teamName])
         XCTAssertNil(
             orchestrator.remoteAgentRouteKeepalives[member.agentInstanceId],
             "a kept member must not keep renewing its dead bearer"

@@ -184,6 +184,32 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertFalse(shows(.leaderOnly, workers: 0, dead: true), "no roster, nothing to repair")
     }
 
+    /// Measured on a peer daemon restart: the leader relay ends together with
+    /// both workers. With the leader invariant evaluated first the dead workers
+    /// were never reported, so the board reads worker state with the leader
+    /// treated as present.
+    @MainActor
+    func testDeadWorkersAreReportedWhenTheLeaderDiedWithThem() {
+        let dead = [
+            TeamOrchestrator.AgentPresentationProbe(
+                instanceID: "executor", panelPresent: true, sessionReady: false
+            ),
+        ]
+        let withLeader = TeamOrchestrator.collaborationPresentationState(
+            teamExists: true, workspaceExists: true,
+            leaderPanelExists: true, leaderSessionReady: false,
+            agents: dead, requireLiveSessions: true
+        )
+        XCTAssertFalse(ReviewBoardViewModel.presentationNeedsWorkerRepair(withLeader))
+
+        let ignoringLeader = TeamOrchestrator.collaborationPresentationState(
+            teamExists: true, workspaceExists: true,
+            leaderPanelExists: true, leaderSessionReady: true,
+            agents: dead, requireLiveSessions: true
+        )
+        XCTAssertTrue(ReviewBoardViewModel.presentationNeedsWorkerRepair(ignoringLeader))
+    }
+
     @MainActor
     func testOnlyWorkerPresentationStatesRequestRepair() {
         let expected: [(TeamOrchestrator.CollaborationPresentationState, Bool)] = [

@@ -2565,6 +2565,93 @@ extension TeamOrchestrator {
             && peerAgentRestartSignals.contains(exitCode - 128)
     }
 
+    /// A host that keeps killing every agent must not be answered with a
+    /// Repair on every roster poll; after one attempt the button takes over.
+    nonisolated static let automaticCollaborationRepairCooldown: TimeInterval = 300
+
+    /// A daemon restart ends the leader with its workers, and the leader's
+    /// preserved pane never reaches runtime-close recovery. Repair is what
+    /// brings both back, once the restarted host has answered a roster.
+    /// A lone worker killed under a live leader is left to the button, so a
+    /// worker that dies on every spawn cannot loop.
+    nonisolated static func shouldRunAutomaticCollaborationRepair(
+        pendingCount: Int,
+        markedAt: Date?,
+        rosterConfirmedAt: Date?,
+        rosterFailed: Bool,
+        leaderRelayLive: Bool,
+        busy: Bool,
+        isPlaceholder: Bool,
+        presentationReady: Bool,
+        lastAutomaticRepairAt: Date?,
+        now: Date
+    ) -> Bool {
+        guard pendingCount > 0, let markedAt, let rosterConfirmedAt,
+              rosterConfirmedAt > markedAt, !rosterFailed, !leaderRelayLive,
+              !busy, !isPlaceholder, presentationReady
+        else { return false }
+        guard let lastAutomaticRepairAt else { return true }
+        return now.timeIntervalSince(lastAutomaticRepairAt) >= automaticCollaborationRepairCooldown
+    }
+
+    @MainActor
+    func scheduleAutomaticCollaborationRepairIfNeeded(teamName: String, host: HostEntry) {
+        guard let marked = peerAgentsAwaitingRespawn[teamName], let team = teams[teamName]
+        else { return }
+        let workspace = AppDelegate.shared?.tabManagerFor(tabId: team.workspaceId)?
+            .tabs.first(where: { $0.id == team.workspaceId })
+        let pending = Set(team.agents.filter { agent in
+            marked.contains(agent.agentInstanceId)
+                && agent.panelId.map { workspace?.peerAgentPanelIsLive($0) == true } != true
+        }.map(\.agentInstanceId))
+        guard !pending.isEmpty else {
+            peerAgentsAwaitingRespawn.removeValue(forKey: teamName)
+            peerAgentRespawnMarkedAt.removeValue(forKey: teamName)
+            return
+        }
+        let leaderRelayLive = workspace?.terminalPanel(for: team.leaderPanelId)?
+            .peerPaneSession?.isRelayLive == true
+        let busy = collaborationRepairInFlight.contains(teamName)
+            || remoteLeaderRecoveryInFlight.contains(teamName)
+            || projectRestoreInFlight.contains(teamName)
+        // Repair falls back to restoreDetachedProjectPresentation, which can
+        // raise a window; an automatic run starts only on a presentation that
+        // needs no restore.
+        let presentationReady = collaborationPresentationState(
+            teamName: teamName, requireLiveSessions: false,
+            repairableMissingAgentIDs: pending
+        ) == .ready
+        guard Self.shouldRunAutomaticCollaborationRepair(
+            pendingCount: pending.count,
+            markedAt: peerAgentRespawnMarkedAt[teamName],
+            rosterConfirmedAt: host.teamsConfirmedAt,
+            rosterFailed: host.lastRosterFailure != nil,
+            leaderRelayLive: leaderRelayLive,
+            busy: busy,
+            isPlaceholder: team.isRemoteRepairPlaceholder,
+            presentationReady: presentationReady,
+            lastAutomaticRepairAt: automaticCollaborationRepairAt[teamName],
+            now: Date()
+        ) else { return }
+
+        peerAgentsAwaitingRespawn.removeValue(forKey: teamName)
+        peerAgentRespawnMarkedAt.removeValue(forKey: teamName)
+        automaticCollaborationRepairAt[teamName] = Date()
+        RemoteWorkLog.info(
+            "Automatic Repair collaboration for \(teamName): "
+                + "\(pending.count) worker(s) ended with their leader on \(host.displayName)"
+        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let report = await self.repairCollaboration(teamName: teamName)
+            RemoteWorkLog.info(
+                "Automatic Repair collaboration for \(teamName) finished: "
+                    + "leaderLive=\(report.leaderLive) replaced=\(report.replacedAgents) "
+                    + "failed=\(report.failedAgents)"
+            )
+        }
+    }
+
     /// Recreate owned Project viewers as soon as the session-owner roster is
     /// available. Persistence is useful only when relaunch does not require a
     /// hidden Projects-sidebar button to materialize it again.
@@ -2592,6 +2679,13 @@ extension TeamOrchestrator {
                     _ = await self.recoverRemoteLeaderIfNeeded(teamName: teamName)
                     self.remoteLeaderReconnectTasks.removeValue(forKey: teamName)
                 }
+            }
+
+            for teamName in peerAgentsAwaitingRespawn.keys.sorted() {
+                guard let team = teams[teamName],
+                      case let .peer(teamHostKey) = team.leaderEndpoint,
+                      teamHostKey == host.id else { continue }
+                scheduleAutomaticCollaborationRepairIfNeeded(teamName: teamName, host: host)
             }
 
             let teamNames = Set(host.teams.map(\.name))
