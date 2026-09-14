@@ -42,6 +42,8 @@ DEFAULT_TIMEOUT = 45 * 60
 DEFAULT_INFRA_RETRIES = 1
 CONDITIONS = ("single", "multi")
 ORCHESTRATION_CONDITIONS = ("single", "blocking", "overlap")
+PARTITION_CONDITIONS = ("broad", "partitioned")
+PARTITION_FIXTURES = ("split-divider-color",)
 POLICIES = ("legacy", "adaptive")
 TOKEN_KEYS = (
     "input_tokens", "output_tokens", "reasoning_output_tokens",
@@ -255,6 +257,23 @@ def build_orchestration_matrix(
         for trial in range(1, trials + 1):
             offset = (trial - 1) % len(ORCHESTRATION_CONDITIONS)
             order = list(ORCHESTRATION_CONDITIONS[offset:] + ORCHESTRATION_CONDITIONS[:offset])
+            specs.extend(
+                RunSpec(fixture, trial, condition, index)
+                for index, condition in enumerate(order, 1)
+                if condition in selected
+            )
+    return specs
+
+
+def build_partition_matrix(
+    fixtures: Iterable[str], trials: int, conditions: Iterable[str] = PARTITION_CONDITIONS,
+) -> list[RunSpec]:
+    """Build paired broad/partitioned trials with alternating order."""
+    selected = tuple(conditions)
+    specs: list[RunSpec] = []
+    for fixture in fixtures:
+        for trial in range(1, trials + 1):
+            order = PARTITION_CONDITIONS if trial % 2 else tuple(reversed(PARTITION_CONDITIONS))
             specs.extend(
                 RunSpec(fixture, trial, condition, index)
                 for index, condition in enumerate(order, 1)
@@ -1013,6 +1032,52 @@ def default_worker_tasks() -> list[dict[str, Any]]:
     ]
 
 
+def partitioned_worker_tasks(fixture: Fixture) -> list[dict[str, Any]]:
+    if fixture.name != "split-divider-color":
+        raise ValueError(f"partitioned worker capsules are unavailable for {fixture.name}")
+    return [
+        {
+            "id": "contract", "worker": "explorer",
+            "goal": "Report the Ghostty and Bonsplit divider contract from the listed paths",
+            "owned": [
+                "ghostty/src/config/Config.zig",
+                "ghostty/macos/Sources/Features/Splits/SplitView.Divider.swift",
+                "vendor/bonsplit/Sources/Bonsplit/Public/BonsplitConfiguration.swift",
+                "vendor/bonsplit/Sources/Bonsplit/Internal/Styling/TabBarColors.swift",
+                "vendor/bonsplit/Sources/Bonsplit/Internal/Views/SplitContainerView.swift",
+            ],
+            "forbidden": ["all other repository paths", "all repository writes"],
+            "depends_on": [], "verify": "report path:line contract evidence",
+            "mutates": False, "estimated_seconds": 300,
+        },
+        {
+            "id": "implementation", "worker": "executor",
+            "goal": "Implement divider color, reset, runtime propagation, and focused unit tests",
+            "owned": [
+                "Sources/GhosttyConfig.swift", "Sources/SettingsView.swift",
+                "Sources/TermMeshApp.swift", "Sources/TerminalSettings.swift",
+                "Sources/TerminalWindowPortal.swift", "Sources/Workspace.swift",
+                "Sources/WorkspaceContentView.swift", "termMeshTests/GhosttyConfigTests.swift",
+                "termMeshTests/TerminalOverrideIsolationTests.swift",
+            ],
+            "forbidden": ["all other repository paths"],
+            "depends_on": [], "verify": "run the focused settings and override unit tests",
+            "mutates": True, "estimated_seconds": 300,
+        },
+        {
+            "id": "acceptance", "worker": "reviewer",
+            "goal": "Build the divider acceptance matrix and report missing behavior",
+            "owned": [
+                "Makefile", "termMeshTests/GhosttyTerminalViewComposingTests.swift",
+                "termMeshTests/TermMeshWebViewKeyEquivalentTests.swift",
+            ],
+            "forbidden": ["all other repository paths", "all repository writes"],
+            "depends_on": [], "verify": "report requirement-to-test coverage and P0-P3 risks",
+            "mutates": False, "estimated_seconds": 300,
+        },
+    ]
+
+
 def validate_routing_decision(
     payload: Any, *, available_workers: Iterable[str] = ("explorer", "executor", "reviewer"),
 ) -> tuple[str, str, list[dict[str, Any]]]:
@@ -1114,6 +1179,7 @@ forbidden: {json.dumps(task['forbidden'], ensure_ascii=False)}
 verify: {task['verify']}
 time budget: {task['estimated_seconds']} seconds
 {mutation_rule}
+읽기와 검색도 owned에 나열된 exact path로 제한한다. forbidden 또는 다른 repository path를 읽지 마라.
 긴 세부 결과는 먼저 `{report_file}`에 작성하라. 마지막에 아래 정확한 5-line envelope를 stdout에
 출력하고, 같은 5줄을 `{result_file}.tmp.$$`에 쓴 뒤 atomic `mv`로 `{result_file}`에 저장하라.
 STATUS: DONE|BLOCKED|NEEDS_REVIEW
@@ -1947,6 +2013,7 @@ def run_one(
 def run_orchestration_one(
     spec: RunSpec, *, experiment: Path, scratch: Path, model: str, effort: str,
     timeout: int, xcode_host: str, keep_checkouts: bool,
+    worker_tasks: Optional[list[dict[str, Any]]] = None,
 ) -> RunResult:
     """Run one single, blocking, or overlapping orchestration cell."""
     if spec.condition == "single":
@@ -2008,14 +2075,15 @@ def run_orchestration_one(
         create_benchmark_team(team, checkout, model)
         record.team_init_ms = round((time.perf_counter() - init_started) * 1000)
         trace.write("team_ready", workers=3, duration_ms=record.team_init_ms)
+        selected_tasks = worker_tasks or default_worker_tasks()
         record.worker_tasks = dispatch_benchmark_workers(
-            fixture, team, checkout, trace, timeout=min(timeout, 120),
+            fixture, team, checkout, trace, timeout=min(timeout, 120), tasks=selected_tasks,
         )
         remaining = timeout - (time.perf_counter() - total_started)
         wait_timeout = min(15 * 60, max(0, remaining))
         estimates = {
             path: wait_timeout
-            for path, task in zip(result_files, default_worker_tasks())
+            for path, task in zip(result_files, selected_tasks)
         }
         ready_times: dict[Path, int] = {}
         preparation = first_review = ""
@@ -2697,6 +2765,44 @@ def summarize_orchestration(
     }
 
 
+def summarize_partition(rows: list[dict[str, Any]], *, seed: int) -> dict[str, Any]:
+    usable = latest_effectiveness_rows(rows)
+    conditions = {}
+    for condition in PARTITION_CONDITIONS:
+        selected = [row for row in usable if row["condition"] == condition]
+        passed = [row for row in selected if row.get("acceptance_passed") and not row.get("protocol_degraded")]
+        walls = [float(row["total_wall_ms"]) for row in passed if row.get("total_wall_ms") is not None]
+        critical = [float(row["worker_active_critical_path_ms"]) for row in passed if row.get("worker_active_critical_path_ms") is not None]
+        conditions[condition] = {
+            "runs": len(selected), "passed": len(passed),
+            "pass_rate": len(passed) / len(selected) if selected else None,
+            "median_wall_ms": statistics.median(walls) if walls else None,
+            "median_worker_critical_ms": statistics.median(critical) if critical else None,
+        }
+    grouped = {}
+    for row in usable:
+        if not row.get("infra_invalid") and not row.get("protocol_degraded"):
+            grouped.setdefault((row["fixture"], int(row["trial"])), {})[row["condition"]] = row
+    pairs = []
+    for (fixture, trial), pair in sorted(grouped.items()):
+        if set(pair) != set(PARTITION_CONDITIONS):
+            continue
+        broad, partitioned = pair["broad"], pair["partitioned"]
+        both_passed = bool(broad.get("acceptance_passed") and partitioned.get("acceptance_passed"))
+        speedup = None
+        if both_passed and broad.get("total_wall_ms") and partitioned.get("total_wall_ms"):
+            speedup = broad["total_wall_ms"] / partitioned["total_wall_ms"]
+        pairs.append({"fixture": fixture, "trial": trial, "speedup": speedup})
+    speedups = [float(pair["speedup"]) for pair in pairs if pair["speedup"] is not None]
+    return {
+        "conditions": conditions, "pairs": pairs,
+        "median_speedup": statistics.median(speedups) if speedups else None,
+        "bootstrap_95ci": bootstrap_ci(speedups, seed=seed),
+        "latency_pairs": len(speedups), "usable_runs": len(usable),
+        "protocol_degraded_runs": sum(bool(row.get("protocol_degraded")) for row in usable),
+    }
+
+
 def quality_index(quality: Optional[dict[str, Any]]) -> dict[tuple[str, int], dict[str, Any]]:
     if not quality:
         return {}
@@ -3135,6 +3241,37 @@ def render_orchestration_report(
     return report
 
 
+def render_partition_report(
+    experiment: Path, manifest: dict[str, Any], rows: list[dict[str, Any]], summary: dict[str, Any],
+) -> str:
+    def seconds(value: Optional[float]) -> str:
+        return "-" if value is None else f"{value / 1000:.1f}s"
+    lines = [
+        "# Worker task partition study", "",
+        f"- Experiment: `{manifest['run_id']}`",
+        f"- Usable cells: {summary['usable_runs']} / {len(manifest['matrix'])}",
+        f"- Protocol-degraded cells: {summary['protocol_degraded_runs']}", "",
+        "| condition | pass | median wall | median worker critical path |",
+        "|---|---:|---:|---:|",
+    ]
+    for condition in PARTITION_CONDITIONS:
+        item = summary["conditions"][condition]
+        lines.append(
+            f"| {condition} | {item['passed']}/{item['runs']} | {seconds(item['median_wall_ms'])} | "
+            f"{seconds(item['median_worker_critical_ms'])} |"
+        )
+    speed = summary["median_speedup"]
+    lines.extend((
+        "",
+        f"Paired broad/partitioned speedup: {'-' if speed is None else f'{speed:.2f}x'}",
+        f"Latency pairs: {summary['latency_pairs']} / {manifest['trials']}", "",
+    ))
+    report = "\n".join(lines)
+    (experiment / "report.md").write_text(report)
+    (experiment / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+    return report
+
+
 def policy_pair_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     usable = latest_effectiveness_rows(rows)
     grouped: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
@@ -3277,6 +3414,10 @@ def regenerate_experiment_report(
         return render_orchestration_report(
             experiment, manifest, rows,
             summarize_orchestration(rows, seed=int(manifest["seed"]), quality=quality),
+        )
+    if manifest.get("experiment_type") == "worker-task-partition":
+        return render_partition_report(
+            experiment, manifest, rows, summarize_partition(rows, seed=int(manifest["seed"])),
         )
     return render_report(
         experiment, manifest, rows,
@@ -3453,6 +3594,69 @@ def run_orchestration_experiment(args: argparse.Namespace) -> int:
     return 0 if len(effective_rows) == len(specs) and all(row["acceptance_passed"] for row in effective_rows) else 1
 
 
+def run_partition_experiment(args: argparse.Namespace) -> int:
+    fixtures = tuple(item for item in args.fixtures.split(",") if item)
+    conditions = tuple(item for item in args.conditions.split(",") if item)
+    unknown = set(fixtures) - set(PARTITION_FIXTURES)
+    unknown_conditions = set(conditions) - set(PARTITION_CONDITIONS)
+    if unknown or unknown_conditions or not conditions or args.trials < 1 or args.timeout < 1:
+        raise ValueError(
+            f"invalid fixtures={sorted(unknown)} conditions={sorted(unknown_conditions)} "
+            f"trials={args.trials} timeout={args.timeout}"
+        )
+    specs = build_partition_matrix(fixtures, args.trials, conditions)
+    print(f"partition matrix: {len(specs)} runs")
+    for index, spec in enumerate(specs, 1):
+        print(f"  {index:02d}. {spec.fixture:<22} trial={spec.trial} order={spec.order} {spec.condition}")
+    if args.dry_run:
+        return 0
+    if not shutil.which("claude") or not shutil.which("tm-agent"):
+        raise RuntimeError("claude and tm-agent CLIs are required")
+    run_id = args.run_id or datetime.now().strftime("%Y%m%dT%H%M%S") + "-partition-" + uuid.uuid4().hex[:6]
+    experiment = args.results_dir / run_id
+    experiment.mkdir(parents=True, exist_ok=False)
+    (experiment / "runs").mkdir()
+    manifest = {
+        "schema": 1, "experiment_type": "worker-task-partition",
+        "run_id": run_id, "created_at": utc_now(), "root_head": git("rev-parse", "HEAD"),
+        "model": args.model, "effort": args.effort, "workers": 3, "trials": args.trials,
+        "seed": args.seed, "timeout_seconds": args.timeout, "xcode_host": args.xcode_host,
+        "fixtures": [row for row in validate_fixture_metadata() if row["fixture"] in fixtures],
+        "matrix": [asdict(spec) for spec in specs],
+    }
+    manifest_path = experiment / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    manifest_path.chmod(0o444)
+    scratch = Path(tempfile.mkdtemp(prefix="term-mesh-partition-"))
+    rows = []
+    try:
+        for index, spec in enumerate(specs, 1):
+            print(f"[{index}/{len(specs)}] {spec.fixture} {spec.condition} trial {spec.trial}", flush=True)
+            fixture = FIXTURES[spec.fixture]
+            tasks = default_worker_tasks() if spec.condition == "broad" else partitioned_worker_tasks(fixture)
+            runtime_spec = RunSpec(spec.fixture, spec.trial, "blocking", spec.order)
+            result = run_orchestration_one(
+                runtime_spec, experiment=experiment, scratch=scratch, model=args.model, effort=args.effort,
+                timeout=args.timeout, xcode_host=args.xcode_host, keep_checkouts=args.keep_checkouts,
+                worker_tasks=tasks,
+            )
+            result.condition = spec.condition
+            (experiment / result.paths["result"]).write_text(
+                json.dumps(asdict(result), indent=2, ensure_ascii=False) + "\n"
+            )
+            rows.append(asdict(result))
+            render_partition_report(
+                experiment, manifest, rows, summarize_partition(rows, seed=args.seed),
+            )
+            print(f"  {result.status.upper()} {(result.total_wall_ms or 0) / 1000:.1f}s {result.failure_reason or ''}")
+    finally:
+        if not args.keep_checkouts:
+            shutil.rmtree(scratch, ignore_errors=True)
+    print(f"Saved: {experiment}")
+    effective_rows = latest_effectiveness_rows(rows)
+    return 0 if len(effective_rows) == len(specs) and all(row["acceptance_passed"] for row in effective_rows) else 1
+
+
 def run_policy_experiment(args: argparse.Namespace) -> int:
     fixtures = tuple(item for item in args.fixtures.split(",") if item)
     policies = tuple(item for item in args.policies.split(",") if item)
@@ -3549,6 +3753,21 @@ def main() -> int:
     orchestration.add_argument("--run-id")
     orchestration.add_argument("--dry-run", action="store_true")
     orchestration.add_argument("--keep-checkouts", action="store_true")
+    partition = sub.add_parser(
+        "partition-study", help="compare broad and exact-path worker task capsules",
+    )
+    partition.add_argument("--fixtures", default=",".join(PARTITION_FIXTURES))
+    partition.add_argument("--conditions", default=",".join(PARTITION_CONDITIONS))
+    partition.add_argument("--trials", type=int, default=3)
+    partition.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    partition.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    partition.add_argument("--model", default="sonnet")
+    partition.add_argument("--effort", default="medium", choices=("low", "medium", "high", "xhigh", "max"))
+    partition.add_argument("--xcode-host", default="mac-sub")
+    partition.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS / "partition-study")
+    partition.add_argument("--run-id")
+    partition.add_argument("--dry-run", action="store_true")
+    partition.add_argument("--keep-checkouts", action="store_true")
     policy = sub.add_parser("policy-ab", help="compare legacy delegate-first and adaptive Project leaders")
     policy.add_argument("--fixtures", default=",".join(FIXTURES))
     policy.add_argument("--policies", default=",".join(POLICIES))
@@ -3582,6 +3801,11 @@ def main() -> int:
     if args.command == "orchestration-study":
         if args.dry_run:
             return run_orchestration_experiment(args)
+    if args.command == "partition-study":
+        if args.dry_run:
+            return run_partition_experiment(args)
+        with benchmark_signal_cleanup(), benchmark_run_lock(args.results_dir):
+            return run_partition_experiment(args)
         with benchmark_signal_cleanup(), benchmark_run_lock(args.results_dir):
             return run_orchestration_experiment(args)
     if args.command == "policy-ab":

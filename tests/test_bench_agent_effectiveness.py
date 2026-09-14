@@ -73,6 +73,40 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
             for condition in module.ORCHESTRATION_CONDITIONS:
                 self.assertEqual(sorted(row.order for row in selected if row.condition == condition), [1, 2, 3])
 
+    def test_partition_matrix_alternates_paired_order(self):
+        specs = module.build_partition_matrix(("split-divider-color",), 3)
+        self.assertEqual([(row.trial, row.condition, row.order) for row in specs], [
+            (1, "broad", 1), (1, "partitioned", 2),
+            (2, "partitioned", 1), (2, "broad", 2),
+            (3, "broad", 1), (3, "partitioned", 2),
+        ])
+
+    def test_partitioned_worker_capsules_have_disjoint_exact_paths(self):
+        tasks = module.partitioned_worker_tasks(module.FIXTURES["split-divider-color"])
+        scopes = [set(task["owned"]) for task in tasks]
+        self.assertEqual(len(tasks), 3)
+        for left in range(len(scopes)):
+            for right in range(left):
+                self.assertFalse(scopes[left] & scopes[right])
+        self.assertEqual(sum(task["mutates"] for task in tasks), 1)
+        self.assertTrue(all("all other repository paths" in task["forbidden"] for task in tasks))
+
+    def test_partition_summary_uses_only_complete_pairs(self):
+        rows = []
+        for trial in range(1, 4):
+            for condition, wall in (("broad", 1200), ("partitioned", 800)):
+                rows.append({
+                    "run_id": f"{trial}-{condition}", "fixture": "split-divider-color",
+                    "trial": trial, "condition": condition, "total_wall_ms": wall,
+                    "worker_active_critical_path_ms": wall / 2, "acceptance_passed": True,
+                    "infra_invalid": False, "protocol_degraded": False,
+                })
+        summary = module.summarize_partition(rows, seed=7)
+        self.assertEqual(summary["latency_pairs"], 3)
+        self.assertEqual(summary["median_speedup"], 1.5)
+        rows[0]["protocol_degraded"] = True
+        self.assertEqual(module.summarize_partition(rows, seed=7)["latency_pairs"], 2)
+
     def test_policy_matrix_counterbalances_legacy_and_adaptive(self):
         specs = module.build_policy_matrix(("homebrew-smoke",), 3, 42)
         self.assertEqual([(row.condition, row.order) for row in specs[:4]], [

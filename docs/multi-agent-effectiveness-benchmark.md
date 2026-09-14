@@ -120,6 +120,32 @@ Do not change the leader policy from latency results alone. Require the full mat
 Require no pass-rate loss and a paired median speedup of at least 1.20x.
 Run a separate blinded quality evaluation before policy promotion.
 
+## Worker task partition study
+
+Use this study when the orchestration study finds high code-read overlap.
+The study keeps three workers and the blocking lifecycle in both conditions.
+It changes only the worker task capsules.
+
+- `broad` uses the existing role prompts and broad repository read scope.
+- `partitioned` assigns disjoint exact paths to contract, implementation, and acceptance roles.
+
+Inspect the six-run paired matrix first:
+
+```bash
+python3 scripts/bench-agent-effectiveness.py partition-study \
+  --fixtures split-divider-color --trials 3 --seed 20260814 --dry-run
+```
+
+Run the study only after you approve the provider cost:
+
+```bash
+python3 scripts/bench-agent-effectiveness.py partition-study \
+  --fixtures split-divider-color --trials 3 --seed 20260814
+```
+
+Compare wall time, acceptance pass rate, worker critical path, integration time, and read-set Jaccard.
+Do not compare results from different commits or mix blocking and overlap lifecycles.
+
 ## Project leader policy A/B
 
 The original matrix compares one session with a controller-dispatched three-worker team. It does
