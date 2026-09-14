@@ -2542,6 +2542,29 @@ extension TeamOrchestrator {
         teamHostKey == connectedHostKey && recoveryEligible
     }
 
+    /// Only a worker that exited on its own leaves the roster. A peer daemon
+    /// restart kills its agents too, and retiring those members discards the
+    /// surface id Repair collaboration needs to replace them.
+    nonisolated static func shouldRetireEndedPeerAgent(
+        exitCode: Int32, signal: Int32, reason: String
+    ) -> Bool {
+        signal == 0 && exitCode == 0 && reason == "exited"
+    }
+
+    /// Signals a restarting daemon or its service manager delivers to agents.
+    /// A CLI that traps one reports 128+N instead (claude exits 143 on SIGTERM).
+    nonisolated static let peerAgentRestartSignals: Set<Int32> = [1, 2, 9, 15]
+
+    /// Crashes and ordinary failures are left to the Repair button: an
+    /// automatic respawn would most likely fail the same way.
+    nonisolated static func shouldAutoRespawnEndedPeerAgent(
+        exitCode: Int32, signal: Int32, reason: String
+    ) -> Bool {
+        if signal != 0 { return peerAgentRestartSignals.contains(signal) }
+        return reason == "exited" && exitCode > 128
+            && peerAgentRestartSignals.contains(exitCode - 128)
+    }
+
     /// Recreate owned Project viewers as soon as the session-owner roster is
     /// available. Persistence is useful only when relaunch does not require a
     /// hidden Projects-sidebar button to materialize it again.

@@ -772,6 +772,9 @@ final class TeamOrchestrator: ObservableObject {
     var automaticProjectRestoreFailureAttempts: [String: Int] = [:]
     var automaticProjectRestoreRetryTasks: [String: Task<Void, Never>] = [:]
     var remoteLeaderReconnectTasks: [String: Task<Void, Never>] = [:]
+    /// Peer-owned workers a daemon restart killed, by team, awaiting one
+    /// automatic Repair collaboration after their leader recovers.
+    var peerAgentsAwaitingRespawn: [String: Set<String>] = [:]
     private var projectLayoutSaveTasks: [String: Task<Void, Never>] = [:]
     /// Same single-flight need as the two above, one level down: a rewound
     /// stream can drop the same peer-owned agent pane twice before the first
@@ -7351,6 +7354,7 @@ final class TeamOrchestrator: ObservableObject {
 
     func forgetTeamForTests(_ name: String) {
         teams.removeValue(forKey: name)
+        peerAgentsAwaitingRespawn.removeValue(forKey: name)
     }
 #endif
 
@@ -7635,22 +7639,47 @@ final class TeamOrchestrator: ObservableObject {
     /// process exits. These surfaces deliberately do not respawn because a
     /// fresh bridge would have no prior conversation. Keep the Project, retire
     /// only the ended member, and publish the reduced manifest.
+    ///
+    /// A member killed by a signal is not retired: its roster entry and pane
+    /// stay so Repair collaboration can replace the dead surface. The manifest
+    /// is left as published because a dead-leader repair placeholder reads
+    /// those members after an app relaunch.
     @MainActor
     func retireEndedPeerOwnedAgent(
         panelID: UUID,
         surfaceID: Data,
+        exitCode: Int32,
+        signal: Int32,
+        reason: String,
         workspace: Workspace
     ) {
         guard let owner = peerOwnedAgentMember(panelID: panelID, surfaceID: surfaceID)
         else { return }
         let teamName = owner.teamName
-        guard let current = teams[teamName], current.ownsRemotePresentation,
-              let result = Self.teamByRetiringEndedPeerOwnedAgent(
-                  current: current,
-                  agentInstanceID: owner.agent.agentInstanceId,
-                  surfaceID: surfaceID
-              )
-        else { return }
+        guard let current = teams[teamName], current.ownsRemotePresentation else { return }
+        guard Self.shouldRetireEndedPeerAgent(
+            exitCode: exitCode, signal: signal, reason: reason
+        ) else {
+            let instanceID = owner.agent.agentInstanceId
+            // The dead bearer must not be renewed; Repair mints a new grant.
+            stopRemoteAgentRouteKeepalive(agentInstanceID: instanceID, revoke: true)
+            let automatic = Self.shouldAutoRespawnEndedPeerAgent(
+                exitCode: exitCode, signal: signal, reason: reason
+            )
+            if automatic {
+                peerAgentsAwaitingRespawn[teamName, default: []].insert(instanceID)
+            }
+            RemoteWorkLog.info(
+                "Kept ended peer agent \(owner.agent.name) in \(teamName) for repair "
+                    + "(exit=\(exitCode) signal=\(signal) reason=\(reason) automatic=\(automatic))"
+            )
+            return
+        }
+        guard let result = Self.teamByRetiringEndedPeerOwnedAgent(
+            current: current,
+            agentInstanceID: owner.agent.agentInstanceId,
+            surfaceID: surfaceID
+        ) else { return }
 
         stopRemoteAgentRouteKeepalive(
             agentInstanceID: result.retired.agentInstanceId, revoke: true

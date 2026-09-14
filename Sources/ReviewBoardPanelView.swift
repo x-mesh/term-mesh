@@ -633,7 +633,11 @@ extension ReviewBoardPanelView {
 
     private var needsCollaborationRepair: Bool {
         guard let panel = viewModel.collaboration else { return false }
-        return panel.state != .healthy && panel.workerCount > 0
+        return ReviewBoardViewModel.shouldShowCollaborationRepair(
+            state: panel.state,
+            workerCount: panel.workerCount,
+            workerRepairNeeded: panel.workerRepairNeeded
+        )
     }
 
     private var collaborationRepairResult: (title: String, message: String, symbolName: String)? {
