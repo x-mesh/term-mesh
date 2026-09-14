@@ -1273,6 +1273,7 @@ def benchmark_team_directory(team: str) -> Optional[Path]:
 def claude_session_path(session_id: str, checkout: Path) -> Optional[Path]:
     """Find one Claude transcript which belongs to this benchmark checkout."""
     root = Path.home() / ".claude/projects"
+    expected = checkout.resolve(strict=False)
     for candidate in root.glob(f"**/{session_id}.jsonl"):
         with contextlib.suppress(OSError):
             scanned = 0
@@ -1280,7 +1281,8 @@ def claude_session_path(session_id: str, checkout: Path) -> Optional[Path]:
                 for line in handle:
                     scanned += len(line)
                     with contextlib.suppress(json.JSONDecodeError):
-                        if json.loads(line).get("cwd") == str(checkout):
+                        cwd = json.loads(line).get("cwd")
+                        if isinstance(cwd, str) and Path(cwd).resolve(strict=False) == expected:
                             return candidate
                     if scanned >= 128 * 1024:
                         break
@@ -1636,6 +1638,8 @@ def claude_command(
         "--mcp-config", '{"mcpServers":{}}',
     ]
     command.extend(("--resume", session_id) if resume else ("--session-id", session_id))
+    if tool_free:
+        command.extend(("--tools", "Read,Grep,Glob"))
     disallowed = (
         "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Agent,Task,Monitor,ToolSearch"
         if tool_free else
@@ -2010,7 +2014,7 @@ def run_orchestration_one(
         remaining = timeout - (time.perf_counter() - total_started)
         wait_timeout = min(15 * 60, max(0, remaining))
         estimates = {
-            path: task["estimated_seconds"]
+            path: wait_timeout
             for path, task in zip(result_files, default_worker_tasks())
         }
         ready_times: dict[Path, int] = {}
@@ -2043,11 +2047,11 @@ def run_orchestration_one(
                 target=collect_workers, name=f"{run_id}-workers", daemon=True,
             )
             worker_thread.start()
-            leader_lane_started = time.perf_counter()
             trace.write("leader_lane_start")
             assert leader_checkout is not None
             before = git("diff", "--binary", cwd=leader_checkout)
             with (experiment / paths["stdout"]).open("w") as stdout_log:
+                preparation_started = time.perf_counter()
                 completed, first_action, prep_ms = run_stream(
                     claude_command(
                         orchestration_preparation_prompt(fixture), model=model, effort=effort,
@@ -2069,16 +2073,18 @@ def run_orchestration_one(
                 after = git("diff", "--binary", cwd=leader_checkout)
                 if after != before:
                     raise RuntimeError("overlap protocol violation: preparation changed the checkout")
+                preparation_ended = time.perf_counter()
 
                 first_headers, _, first_ready = wait_for_first_worker_result(
                     result_files, timeout=max(0, wait_timeout - prep_ms / 1000), trace=trace,
                 )
                 record.first_worker_result_ms = (
                     min(ready_times.values()) if ready_times else
-                    round((time.perf_counter() - leader_lane_started) * 1000)
+                    round((time.perf_counter() - float(worker_box["started"])) * 1000)
                 )
                 if first_ready:
                     before = git("diff", "--binary", cwd=leader_checkout)
+                    review_started = time.perf_counter()
                     completed, _, review_ms = run_stream(
                         claude_command(
                             orchestration_review_prompt(fixture, first_headers), model=model, effort=effort,
@@ -2098,7 +2104,7 @@ def run_orchestration_one(
                         raise RuntimeError("overlap protocol violation: first-result review used a non-read-only tool")
                     if git("diff", "--binary", cwd=leader_checkout) != before:
                         raise RuntimeError("overlap protocol violation: first-result review changed the checkout")
-            leader_lane_ended = time.perf_counter()
+                    review_ended = time.perf_counter()
             assert worker_thread is not None
             worker_thread.join(timeout=max(0, timeout - (time.perf_counter() - total_started)))
             if worker_thread.is_alive():
@@ -2112,7 +2118,10 @@ def run_orchestration_one(
             worker_started = float(worker_box["started"])
             worker_ended = float(worker_box["ended"])
             record.overlap_ms = interval_overlap_ms(
-                worker_started, worker_ended, leader_lane_started, leader_lane_ended,
+                worker_started, worker_ended, preparation_started, preparation_ended,
+            ) + (
+                interval_overlap_ms(worker_started, worker_ended, review_started, review_ended)
+                if first_ready else 0
             )
             worker_interval_ms = round((worker_ended - worker_started) * 1000)
             record.pure_worker_wait_ms = max(0, worker_interval_ms - record.overlap_ms)
@@ -2123,6 +2132,11 @@ def run_orchestration_one(
         if worker_ready != len(result_files):
             record.protocol_degraded = True
             record.failure_reason = f"protocol degraded: worker results {worker_ready}/{len(result_files)}"
+            record.status = "failed"
+            record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)
+            record.read_overlap = benchmark_read_overlap(team, checkout)
+            record.changed_files = write_patch(checkout, experiment / paths["patch"])
+            return record
 
         active_started = time.perf_counter()
         trace.write("integration_start")

@@ -824,6 +824,14 @@ end
         config = command[command.index("--mcp-config") + 1]
         self.assertEqual(json.loads(config), {"mcpServers": {}})
 
+    def test_read_only_leader_command_exposes_only_read_tools(self):
+        command = module.claude_command(
+            "prompt", model="sonnet", effort="medium",
+            session_id="00000000-0000-0000-0000-000000000001",
+            resume=False, condition="multi", tool_free=True,
+        )
+        self.assertEqual(command[command.index("--tools") + 1], "Read,Grep,Glob")
+
     def test_benchmark_team_isolates_all_workers_from_customizations(self):
         with unittest.mock.patch.object(module, "tm_environment", return_value={
             "TERMMESH_SOCKET": "/tmp/app.sock",
