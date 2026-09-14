@@ -141,6 +141,7 @@ class RunResult:
     acceptance_passed: bool = False
     infra_invalid: bool = False
     protocol_degraded: bool = False
+    protocol_diagnostics: list[str] = field(default_factory=list)
     timed_out: bool = False
     failure_reason: Optional[str] = None
     total_wall_ms: Optional[int] = None
@@ -1195,6 +1196,12 @@ ISOLATED_LEADER_OWNED = (
     "termMeshTests/GhosttyTerminalViewComposingTests.swift",
 )
 
+SWIFT_ACTOR_TEST_CONTRACT = (
+    "Any XCTest that directly calls Workspace, AppKit, or Bonsplit runtime APIs must declare "
+    "@MainActor on the test type or method. A nonisolated XCTest may test only an existing "
+    "nonisolated pure helper, such as Workspace.resolvedChromeColors."
+)
+
 
 def isolated_leader_prompt(fixture: Fixture, *, final: bool, worker_headers: str = "") -> str:
     phase = (
@@ -1206,6 +1213,7 @@ def isolated_leader_prompt(fixture: Fixture, *, final: bool, worker_headers: str
 Actual isolated-worktree benchmark. {phase}
 You own exactly: {json.dumps(ISOLATED_LEADER_OWNED)}. Do not read or modify any other repository path.
 Opaque configured divider colors must render without surface occlusion. Existing translucent occlusion behavior must remain.
+{SWIFT_ACTOR_TEST_CONTRACT}
 Do not use agents, tm-agent, background tasks, commits, pushes, releases, or external services.
 
 TASK: {fixture.prompt}
@@ -1322,6 +1330,7 @@ verify: {task['verify']}
 time budget: {task['estimated_seconds']} seconds
 {mutation_rule}
 {read_rule}
+{SWIFT_ACTOR_TEST_CONTRACT if fixture.name == "split-divider-color" else ""}
 긴 세부 결과는 먼저 `{report_file}`에 작성하라. 마지막에 아래 정확한 5-line envelope를 stdout에
 출력하고, 같은 5줄을 `{result_file}.tmp.$$`에 쓴 뒤 atomic `mv`로 `{result_file}`에 저장하라.
 STATUS: DONE|BLOCKED|NEEDS_REVIEW
@@ -1513,11 +1522,174 @@ def normalize_benchmark_path(
     return None if normalized in {"", "."} or normalized.startswith(".git/") else normalized
 
 
+SHELL_READ_COMMANDS = {"cat", "sed", "head", "tail", "grep", "rg", "find", "ls", "wc"}
+SHELL_OPTION_VALUES = {
+    "sed": {"-e", "--expression", "-f", "--file"},
+    "head": {"-n", "--lines", "-c", "--bytes"},
+    "tail": {"-n", "--lines", "-c", "--bytes", "-s", "--sleep-interval", "--pid"},
+    "grep": {"-e", "--regexp", "-f", "--file", "-m", "--max-count", "-A", "-B", "-C", "--after-context", "--before-context", "--context", "--exclude", "--include", "--exclude-dir"},
+    "rg": {"-e", "--regexp", "-f", "--file", "-g", "--glob", "-t", "--type", "-T", "--type-not", "-A", "-B", "-C", "--after-context", "--before-context", "--context", "-m", "--max-count"},
+    "ls": {"--block-size", "--color", "--format", "--hide", "--ignore", "--quoting-style", "--time", "--time-style"},
+    "wc": {"--files0-from"},
+}
+
+
+def unsupported_shell_read_structure(command: str) -> bool:
+    """Return true when shell syntax can hide repository file reads."""
+    lowered = command.lower()
+    segment_prefix = r"(?:^|[;&|]\s*)"
+    dynamic_command = re.compile(
+        segment_prefix + r"(?:xargs|(?:g|m)?awk|source|\.)\b",
+        re.MULTILINE,
+    )
+    if dynamic_command.search(lowered):
+        return True
+
+    inline_interpreter = re.compile(
+        segment_prefix + r"(?:python(?:3(?:\.\d+)*)?|perl|ruby)\b[^\n;&|]*\s(?:-c|-e)\s",
+        re.MULTILINE,
+    )
+    file_api = re.compile(
+        r"\b(?:open|read_text|read_bytes|readlines?|file\.(?:read|open|foreach)|io\.read)\s*\("
+    )
+    if inline_interpreter.search(lowered) and file_api.search(lowered):
+        return True
+
+    read_command = re.compile(
+        r"(?:^|[;&|`(]\s*)(?:cat|sed|head|tail|grep|rg|find|ls|wc|xargs|(?:g|m)?awk|source|\.)\b",
+        re.MULTILINE,
+    )
+    loop = re.search(r"\b(?:for|while)\b[\s\S]*?\bdo\b[\s\S]*?\bdone\b", lowered)
+    loop_read_command = re.compile(
+        r"\b(?:cat|sed|head|tail|grep|rg|find|ls|wc|xargs|(?:g|m)?awk|source)\b|(?:^|[;&|]\s*)\.\s"
+    )
+    if loop and (loop_read_command.search(loop.group(0)) or re.search(r"(?:^|[^<])<(?![<>&])", loop.group(0))):
+        return True
+
+    substitutions = re.findall(r"\$\(([^)]*)\)|`([^`]*)`", command, flags=re.DOTALL)
+    return any(read_command.search(left or right) for left, right in substitutions)
+
+
+def shell_read_operands(command: str, checkout: Path) -> tuple[list[str], list[str], int]:
+    """Return concrete paths, glob patterns, and unresolved variable operands."""
+    if unsupported_shell_read_structure(command):
+        return [], [], 1
+    command = re.sub(r"\\\n", " ", command).replace("\n", " ; ")
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    tokens = list(lexer)
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in {";", "&&", "||", "|", "&"}:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(token)
+    if current:
+        segments.append(current)
+
+    concrete: list[str] = []
+    patterns: list[str] = []
+    unresolved = 0
+    base = checkout.resolve(strict=False)
+    assignment = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+    for raw_words in segments:
+        words: list[str] = []
+        skip_redirect = False
+        for word in raw_words:
+            if skip_redirect:
+                skip_redirect = False
+                continue
+            if word in {"<", "<<", "<<<", ">", ">>", "<>", "<>&", ">&"}:
+                skip_redirect = True
+                continue
+            if re.fullmatch(r"\d+", word) and not words:
+                continue
+            words.append(word)
+        while words and assignment.match(words[0]):
+            words.pop(0)
+        if not words:
+            continue
+        command_name = Path(words.pop(0)).name
+        if command_name == "cd":
+            target = next((word for word in words if not word.startswith("-")), None)
+            if target is None:
+                continue
+            if "$" in target:
+                unresolved += 1
+                continue
+            normalized = normalize_benchmark_path(target, checkout, base=base)
+            if normalized:
+                base = (checkout / normalized).resolve(strict=False)
+            elif target == ".":
+                pass
+            else:
+                unresolved += 1
+            continue
+        if command_name not in SHELL_READ_COMMANDS:
+            continue
+
+        if command_name == "find":
+            positionals = list(itertools.takewhile(
+                lambda word: not word.startswith("-") and word not in {"!", "(", ")"}, words,
+            ))
+            words = []
+        else:
+            positionals = []
+        option_supplied_pattern = False
+        option_values = SHELL_OPTION_VALUES.get(command_name, set())
+        index = 0
+        while index < len(words):
+            word = words[index]
+            if word == "--":
+                positionals.extend(words[index + 1:])
+                break
+            option = word.split("=", 1)[0]
+            if word.startswith("-") and word != "-":
+                takes_value = option in option_values
+                if command_name in {"sed", "grep", "rg"} and option in {"-e", "--expression", "--regexp", "-f", "--file"}:
+                    option_supplied_pattern = True
+                if takes_value and "=" not in word and index + 1 < len(words):
+                    index += 1
+                index += 1
+                continue
+            positionals.append(word)
+            index += 1
+
+        if command_name == "sed" and positionals and not option_supplied_pattern:
+            positionals = positionals[1:]
+        elif command_name in {"grep", "rg"} and positionals and not option_supplied_pattern:
+            positionals = positionals[1:]
+
+        for operand in positionals:
+            candidate = operand.rstrip(":,;")
+            if not candidate or candidate == "-" or candidate.isdigit():
+                continue
+            if "$" in candidate or "`" in candidate or candidate.startswith("~"):
+                unresolved += 1
+                continue
+            normalized = normalize_benchmark_path(candidate, checkout, base=base)
+            if not normalized:
+                continue
+            if any(mark in candidate for mark in "*?["):
+                patterns.append(normalized)
+            else:
+                concrete.append(normalized)
+    return concrete, patterns, unresolved
+
+
 def claude_read_paths(transcript: Path, checkout: Path) -> dict[str, Any]:
-    """Extract structured, repo-local read and search paths without commands."""
+    """Extract repo-local read paths without treating shell syntax as file access."""
     reads: list[str] = []
     searches: list[str] = []
-    rows = malformed = tool_calls = unknown_tools = unresolved_paths = 0
+    path_patterns: list[str] = []
+    write_paths: list[str] = []
+    rows = malformed = tool_calls = unknown_tools = 0
+    unresolved_paths = unresolved_shell_paths = write_path_unresolved = 0
     path_calls = extracted_path_calls = 0
     with transcript.open(errors="replace") as handle:
         for line in handle:
@@ -1556,72 +1728,43 @@ def claude_read_paths(transcript: Path, checkout: Path) -> dict[str, Any]:
                 elif name == "bash":
                     command = payload.get("command")
                     if isinstance(command, str):
-                        bash_path_calls_before = path_calls
                         try:
-                            lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
-                            lexer.whitespace_split = True
-                            lexer.commenters = "#"
-                            tokens = list(lexer)
+                            concrete, patterns, shell_unresolved = shell_read_operands(command, checkout)
                         except ValueError:
                             unresolved_paths += 1
                             continue
-                        bash_base = checkout
-                        expect_cd = False
-                        for token in tokens:
-                            if token == "cd":
-                                expect_cd = True
-                                continue
-                            if expect_cd:
-                                path_calls += 1
-                                if "$" in token or any(mark in token for mark in "*?["):
-                                    unresolved_paths += 1
-                                elif token == ".":
-                                    extracted_path_calls += 1
-                                elif token == "..":
-                                    candidate_base = bash_base.parent.resolve(strict=False)
-                                    if candidate_base == checkout.resolve(strict=False) or checkout.resolve(strict=False) in candidate_base.parents:
-                                        bash_base = candidate_base
-                                        extracted_path_calls += 1
-                                    else:
-                                        unresolved_paths += 1
-                                else:
-                                    normalized = normalize_benchmark_path(token, checkout, base=bash_base)
-                                    if normalized and (checkout / normalized).is_dir():
-                                        bash_base = checkout / normalized
-                                        extracted_path_calls += 1
-                                    else:
-                                        unresolved_paths += 1
-                                expect_cd = False
-                                continue
-                            candidate = token.rstrip(":,;")
-                            if not ("/" in candidate or candidate.endswith((".swift", ".zig", ".md", "Makefile"))):
-                                continue
-                            path_calls += 1
-                            if "$" in candidate or any(mark in candidate for mark in "*?["):
-                                unresolved_paths += 1
-                                continue
-                            normalized = normalize_benchmark_path(candidate, checkout, base=bash_base)
-                            if normalized and (checkout / normalized).exists():
-                                searches.append(normalized)
-                                extracted_path_calls += 1
-                            else:
-                                unresolved_paths += 1
-                        if path_calls == bash_path_calls_before:
-                            path_calls += 1
-                            unresolved_paths += 1
+                        searches.extend(concrete)
+                        path_patterns.extend(patterns)
+                        unresolved_shell_paths += shell_unresolved
+                        path_calls += len(concrete) + len(patterns) + shell_unresolved
+                        extracted_path_calls += len(concrete)
                     else:
                         path_calls += 1
                         unresolved_paths += 1
+                elif name in {"edit", "write"}:
+                    normalized = normalize_benchmark_path(payload.get("file_path"), checkout)
+                    if normalized:
+                        write_paths.append(normalized)
+                    else:
+                        write_path_unresolved += 1
                 else:
                     unknown_tools += 1
     distinct = sorted(set(reads + searches))
-    coverage_complete = malformed == 0 and unknown_tools == 0 and unresolved_paths == 0
+    coverage_complete = (
+        malformed == 0 and unknown_tools == 0 and unresolved_paths == 0
+        and unresolved_shell_paths == 0 and not path_patterns
+    )
     return {
         "status": "measured" if coverage_complete else "censored",
         "reason": None if coverage_complete else "incomplete transcript path coverage",
+        "confidence": "high" if coverage_complete else "partial",
         "rows": rows, "malformed_rows": malformed, "tool_calls": tool_calls,
         "unknown_tool_calls": unknown_tools, "path_calls": path_calls,
         "extracted_path_calls": extracted_path_calls, "unresolved_path_calls": unresolved_paths,
+        "unresolved_shell_paths": unresolved_shell_paths,
+        "path_patterns": sorted(set(path_patterns)),
+        "write_paths": sorted(set(write_paths)),
+        "write_path_unresolved": write_path_unresolved,
         "path_extraction_coverage": (round(extracted_path_calls / path_calls, 3) if path_calls else 1.0),
         "read_calls": len(reads), "search_calls": len(searches),
         "distinct_reads": sorted(set(reads)), "distinct_search_roots": sorted(set(searches)),
@@ -2026,10 +2169,64 @@ def classify_infra_failure(reason: str) -> bool:
 
 
 def write_patch(checkout: Path, destination: Path) -> int:
-    run_command(("git", "add", "-N", "."), cwd=checkout, timeout=60)
-    destination.write_text(git("diff", "--binary", cwd=checkout))
+    intent = run_command(("git", "add", "-N", "--all"), cwd=checkout, timeout=60)
+    if intent.returncode != 0:
+        raise RuntimeError(intent.stderr.strip() or "git add -N failed")
+    patch = subprocess.run(
+        ("git", "diff", "--binary", "--no-ext-diff", "--"),
+        cwd=checkout, capture_output=True, timeout=60, check=False,
+    )
+    if patch.returncode != 0:
+        raise RuntimeError(patch.stderr.decode(errors="replace").strip() or "git diff failed")
+    destination.write_bytes(patch.stdout)
     names = git("diff", "--name-only", cwd=checkout)
     return len([line for line in names.splitlines() if line])
+
+
+def add_protocol_diagnostic(record: RunResult, message: str) -> None:
+    record.protocol_degraded = True
+    diagnostic = safe_failure(message)
+    if diagnostic not in record.protocol_diagnostics:
+        record.protocol_diagnostics.append(diagnostic)
+
+
+def collect_isolated_read_diagnostics(
+    record: RunResult, *, team: str, checkout: Path, tasks: list[dict[str, Any]],
+    session_id: str,
+) -> None:
+    try:
+        record.read_overlap = benchmark_read_overlap(team, checkout)
+    except Exception as error:
+        record.read_overlap = {"status": "unavailable", "roles": {}}
+        add_protocol_diagnostic(record, f"read-overlap telemetry unavailable: {type(error).__name__}: {error}")
+        return
+
+    if record.read_overlap.get("status") != "measured":
+        add_protocol_diagnostic(record, "read-overlap coverage incomplete")
+
+    try:
+        by_worker = {task["worker"]: task for task in tasks}
+        scope_extras = {}
+        for role, access in record.read_overlap.get("roles", {}).items():
+            task = by_worker.get(role)
+            if task is None:
+                add_protocol_diagnostic(record, f"read-overlap telemetry has unknown role: {role}")
+                continue
+            scope_extras[role] = access_scope_extras(access, task["owned"])
+
+        leader_transcript = claude_session_path(session_id, checkout)
+        if leader_transcript is None:
+            add_protocol_diagnostic(record, "isolated leader transcript unavailable")
+        else:
+            leader_access = claude_read_paths(leader_transcript, checkout)
+            scope_extras["leader"] = access_scope_extras(leader_access, ISOLATED_LEADER_OWNED)
+            if leader_access.get("status") != "measured":
+                add_protocol_diagnostic(record, "isolated leader read coverage incomplete")
+        record.read_overlap["scope_extras"] = scope_extras
+    except Exception as error:
+        add_protocol_diagnostic(
+            record, f"read-overlap diagnostic analysis failed: {type(error).__name__}: {error}",
+        )
 
 
 def checkout_content_digest(checkout: Path, excluded: Iterable[str]) -> dict[str, str]:
@@ -2722,24 +2919,27 @@ def run_isolated_topology_one(
             record.status = "passed" if passed else "failed"; record.failure_reason = None if passed else safe_failure(reason)
         record.active_task_ms = round((time.perf_counter() - active_started) * 1000)
         record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)
-        record.read_overlap = benchmark_read_overlap(team, checkout)
-        if record.read_overlap.get("status") != "measured":
-            raise RuntimeError("isolated topology read coverage incomplete")
-        by_worker = {task["worker"]: task for task in tasks}
-        scope_extras = {}
-        for role, access in record.read_overlap["roles"].items():
-            scope_extras[role] = access_scope_extras(access, by_worker[role]["owned"])
-        leader_transcript = claude_session_path(session_id, checkout)
-        if leader_transcript is None:
-            raise RuntimeError("isolated leader transcript unavailable")
-        scope_extras["leader"] = access_scope_extras(
-            claude_read_paths(leader_transcript, checkout), ISOLATED_LEADER_OWNED
+        collect_isolated_read_diagnostics(
+            record, team=team, checkout=checkout, tasks=tasks, session_id=session_id,
         )
-        record.read_overlap["scope_extras"] = scope_extras
-        worker_tokens, _, observed, expected = team_usage(team, checkout); add_tokens(record.tokens, worker_tokens)
-        record.token_precision = "actual_all" if observed == expected else "leader_actual_workers_partial"
-        record.cost_usd = estimate_cost(record.tokens, model); record.cost_precision = "token_estimate"
-        record.changed_files = write_patch(checkout, experiment / paths["patch"])
+        try:
+            worker_tokens, _, observed, expected = team_usage(team, checkout)
+            add_tokens(record.tokens, worker_tokens)
+            record.token_precision = "actual_all" if observed == expected else "leader_actual_workers_partial"
+            record.cost_usd = estimate_cost(record.tokens, model)
+            record.cost_precision = "token_estimate"
+        except Exception as error:
+            record.token_precision = "leader_actual_workers_unavailable"
+            record.cost_precision = "unavailable"
+            add_protocol_diagnostic(
+                record, f"worker usage telemetry unavailable: {type(error).__name__}: {error}",
+            )
+        try:
+            record.changed_files = write_patch(checkout, experiment / paths["patch"])
+        except Exception as error:
+            add_protocol_diagnostic(
+                record, f"candidate patch unavailable: {type(error).__name__}: {error}",
+            )
     except Exception as error:
         record.failure_reason = safe_failure(f"{type(error).__name__}: {error}"); record.status = "failed"
         if total_started is not None: record.total_wall_ms = round((time.perf_counter() - total_started) * 1000)

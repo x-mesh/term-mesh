@@ -113,6 +113,23 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         self.assertFalse(worker_paths & set(module.ISOLATED_LEADER_OWNED))
         self.assertEqual(sum(task["mutates"] for task in tasks), 1)
 
+    def test_isolated_prompts_state_swift_actor_test_contract(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        executor_task = next(
+            task for task in module.isolated_topology_tasks(fixture)
+            if task["worker"] == "executor"
+        )
+        worker = module.worker_instruction(fixture, "team", "executor", executor_task)
+        leader = module.isolated_leader_prompt(fixture, final=False)
+        for prompt in (worker, leader):
+            self.assertIn("must declare @MainActor on the test type or method", prompt)
+            self.assertIn("Workspace.resolvedChromeColors", prompt)
+
+        unrelated = module.worker_instruction(
+            module.FIXTURES["homebrew-smoke"], "team", "executor"
+        )
+        self.assertNotIn("Workspace.resolvedChromeColors", unrelated)
+
     def test_partitioned_worker_capsules_have_disjoint_exact_paths(self):
         tasks = module.partitioned_worker_tasks(module.FIXTURES["split-divider-color"])
         scopes = [set(task["owned"]) for task in tasks]
@@ -833,8 +850,114 @@ end
             censored = module.claude_read_paths(transcript, checkout)
             self.assertEqual(censored["status"], "censored")
             self.assertEqual(censored["unknown_tool_calls"], 1)
-            self.assertGreaterEqual(censored["unresolved_path_calls"], 2)
+            self.assertGreaterEqual(censored["unresolved_shell_paths"], 1)
             self.assertLess(censored["path_extraction_coverage"], 1.0)
+
+    def test_write_tools_are_not_unknown_read_tools(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            checkout.mkdir()
+            transcript = Path(temporary) / "session.jsonl"
+            transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Edit", "input": {"file_path": str(checkout / "Sources/A.swift")}},
+                {"type": "tool_use", "name": "Write", "input": {"file_path": str(checkout / "Sources/B.swift")}},
+            ]}}) + "\n")
+            result = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(result["unknown_tool_calls"], 0)
+            self.assertEqual(result["write_paths"], ["Sources/A.swift", "Sources/B.swift"])
+            self.assertEqual(result["write_path_unresolved"], 0)
+
+    def test_bash_glob_and_shell_variable_are_not_concrete_reads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            checkout.mkdir()
+            transcript = Path(temporary) / "session.jsonl"
+            transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {
+                    "command": "grep -rn pattern Sources/*.swift && cd $TARGET && sed -n '1,2p' Sources/A.swift"
+                }},
+            ]}}) + "\n")
+            result = module.claude_read_paths(transcript, checkout)
+            self.assertIn("Sources/*.swift", result["path_patterns"])
+            self.assertGreaterEqual(result["unresolved_shell_paths"], 1)
+            self.assertNotIn("Sources/*.swift", result["distinct_access_paths"])
+
+    def test_bash_parser_uses_only_read_command_operands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            checkout.mkdir()
+            transcript = Path(temporary) / "session.jsonl"
+            commands = [
+                "cd Sources && sed -n '1,20p' Deleted.swift",
+                "rg -n --glob '*.swift' 'actor|Workspace' Sources termMeshTests",
+                "grep -rn -e needle --include '*.md' docs README.md",
+                "cat Makefile > /tmp/captured && head -n 3 README.md",
+                "find Sources -name '*.swift' -print",
+                "wc -l Sources/A.swift && ls -la tests",
+                "TARGET=Sources echo Sources/Fake.swift && printf '%s' docs/Fake.md",
+                "rg needle $TARGET && cat /tmp/outside",
+            ]
+            transcript.write_text("\n".join(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": command}},
+            ]}}) for command in commands) + "\n")
+            result = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(result["distinct_access_paths"], [
+                "Makefile", "README.md", "Sources", "Sources/A.swift",
+                "Sources/Deleted.swift", "docs", "termMeshTests", "tests",
+            ])
+            self.assertEqual(result["path_patterns"], [])
+            self.assertEqual(result["unresolved_shell_paths"], 1)
+            serialized = json.dumps(result)
+            self.assertNotIn("Fake.swift", serialized)
+            self.assertNotIn("Fake.md", serialized)
+            self.assertNotIn("captured", serialized)
+            self.assertNotIn("tmp/outside", serialized)
+
+    def test_bash_dynamic_file_read_structures_are_censored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            checkout.mkdir()
+            commands = [
+                "for file in Sources/*.swift; do sed -n '1p' \"$file\"; done",
+                "find Sources -name '*.swift' -print0 | xargs -0 cat",
+                "awk '{ print $1 }' Sources/A.swift",
+                "python3 -c \"print(open('Sources/A.swift').read())\"",
+                "files=$(find Sources -name '*.swift') && printf '%s' \"$files\"",
+                "first=`head -n 1 Sources/A.swift` && echo \"$first\"",
+                "source scripts/read-config.sh",
+            ]
+            for index, command in enumerate(commands):
+                with self.subTest(command=command):
+                    transcript = Path(temporary) / f"dynamic-{index}.jsonl"
+                    transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+                        {"type": "tool_use", "name": "Bash", "input": {"command": command}},
+                    ]}}) + "\n")
+                    result = module.claude_read_paths(transcript, checkout)
+                    self.assertEqual(result["status"], "censored")
+                    self.assertGreaterEqual(result["unresolved_shell_paths"], 1)
+
+    def test_bash_harmless_and_supported_commands_remain_measured(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            checkout.mkdir()
+            transcript = Path(temporary) / "harmless.jsonl"
+            commands = [
+                "true",
+                "echo Sources/Fake.swift",
+                "printf '%s\\n' Sources/Fake.swift > /tmp/output",
+                "python3 -m unittest tests.test_bench_agent_effectiveness",
+                "xcodebuild -scheme term-mesh -configuration Debug build",
+                "sed -n '1,2p' Sources/A.swift",
+            ]
+            transcript.write_text("\n".join(json.dumps({
+                "type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": command}},
+                ]},
+            }) for command in commands) + "\n")
+            result = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(result["status"], "measured")
+            self.assertEqual(result["unresolved_shell_paths"], 0)
+            self.assertEqual(result["distinct_access_paths"], ["Sources/A.swift"])
 
     def test_integrate_worker_patches_includes_untracked_binary_files_and_checks_scope(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -857,6 +980,74 @@ end
             (worker / "forbidden.txt").write_text("no\n")
             with self.assertRaisesRegex(RuntimeError, "forbidden paths"):
                 module.integrate_worker_patches(checkout, {"executor": worker}, tasks)
+
+    def test_write_patch_preserves_eof_and_applies_to_clean_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "candidate"
+            clean = root / "clean"
+            subprocess.run(("git", "init", str(checkout)), check=True, capture_output=True)
+            (checkout / "tracked.txt").write_bytes(b"base without newline")
+            subprocess.run(("git", "-C", str(checkout), "add", "tracked.txt"), check=True)
+            subprocess.run((
+                "git", "-C", str(checkout), "-c", "user.name=Test",
+                "-c", "user.email=test@example.com", "commit", "-m", "base",
+            ), check=True, capture_output=True)
+            subprocess.run(("git", "clone", str(checkout), str(clean)), check=True, capture_output=True)
+            (checkout / "tracked.txt").write_bytes(b"changed without newline")
+            (checkout / "new.bin").write_bytes(b"\x00\xffnew binary")
+            patch = root / "candidate.patch"
+
+            self.assertEqual(module.write_patch(checkout, patch), 2)
+            self.assertTrue(patch.read_bytes().endswith(b"\n"))
+            checked = subprocess.run(
+                ("git", "apply", "--check", "--binary", str(patch)),
+                cwd=clean, capture_output=True, text=True,
+            )
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_censored_read_telemetry_does_not_replace_acceptance_failure(self):
+        record = module.RunResult(
+            run_id="failed", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            status="failed", acceptance_passed=False, failure_reason="product compile error",
+        )
+        telemetry = {
+            "status": "censored",
+            "roles": {"executor": {"distinct_access_paths": ["Sources/A.swift"]}},
+        }
+        tasks = [{"worker": "executor", "owned": ["Sources/A.swift"]}]
+        with unittest.mock.patch.object(module, "benchmark_read_overlap", return_value=telemetry), \
+             unittest.mock.patch.object(module, "claude_session_path", return_value=None):
+            module.collect_isolated_read_diagnostics(
+                record, team="team", checkout=Path("/tmp/checkout"),
+                tasks=tasks, session_id="session",
+            )
+
+        self.assertEqual(record.status, "failed")
+        self.assertFalse(record.acceptance_passed)
+        self.assertEqual(record.failure_reason, "product compile error")
+        self.assertTrue(record.protocol_degraded)
+        self.assertIn("read-overlap coverage incomplete", record.protocol_diagnostics)
+
+    def test_censored_read_telemetry_does_not_fail_passed_product(self):
+        record = module.RunResult(
+            run_id="passed", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            status="passed", acceptance_passed=True,
+        )
+        with unittest.mock.patch.object(
+            module, "benchmark_read_overlap", return_value={"status": "censored", "roles": {}},
+        ), unittest.mock.patch.object(module, "claude_session_path", return_value=None):
+            module.collect_isolated_read_diagnostics(
+                record, team="team", checkout=Path("/tmp/checkout"),
+                tasks=[], session_id="session",
+            )
+
+        self.assertEqual(record.status, "passed")
+        self.assertTrue(record.acceptance_passed)
+        self.assertIsNone(record.failure_reason)
+        self.assertTrue(record.protocol_degraded)
 
     def test_isolated_experiment_stops_and_preserves_scratch_after_unsafe_cleanup(self):
         unsafe = module.RunResult(
