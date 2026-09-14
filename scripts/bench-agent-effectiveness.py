@@ -109,10 +109,6 @@ FIXTURES: dict[str, Fixture] = {
                 "termMeshTests/TermMeshWebViewKeyEquivalentTests.swift",
                 "tests/fixtures/effectiveness/split-divider-color/TermMeshWebViewKeyEquivalentTests.swift.inc",
             ),
-            (
-                "Sources/TerminalWindowPortal.swift",
-                "tests/fixtures/effectiveness/split-divider-color/TerminalWindowPortal.swift.inc",
-            ),
         ),
         acceptance="divider",
     ),
@@ -552,7 +548,8 @@ def run_divider_acceptance(
         "termMeshTests/HiddenSplitDividerBehaviorAcceptanceTests/testParsedDividerColorReachesBonsplitAppearance",
         "termMeshTests/HiddenSplitDividerBehaviorAcceptanceTests/testExistingWorkspaceAppliesConfiguredColorAndResetImmediately",
         "termMeshTests/HiddenSplitDividerPortalAcceptanceTests/testOpaqueDividerRendersWithoutSurfaceOcclusion",
-        "termMeshTests/HiddenSplitDividerPortalAcceptanceTests/testTranslucentDividerKeepsOcclusionPolicy",
+        "termMeshTests/HiddenSplitDividerPortalAcceptanceTests/testTranslucentDividerWithoutOcclusionUsesNativeRenderedColor",
+        "termMeshTests/HiddenSplitDividerPortalAcceptanceTests/testTranslucentDividerOverActualSurfaceUsesOverlayComposite",
     )
     source_packages = os.environ.get(
         "TERMMESH_BENCH_SOURCE_PACKAGES",

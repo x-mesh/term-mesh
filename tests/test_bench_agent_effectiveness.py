@@ -843,8 +843,26 @@ end
     def test_divider_fixture_uses_behavior_hidden_tests_not_solution_test_files(self):
         fixture = module.FIXTURES["split-divider-color"]
         self.assertEqual(fixture.oracle_files, ())
-        self.assertEqual(len(fixture.hidden_tests), 3)
+        self.assertEqual(len(fixture.hidden_tests), 2)
         self.assertTrue(all(source.endswith(".swift.inc") for _, source in fixture.hidden_tests))
+
+    def test_divider_fixture_never_appends_hidden_code_to_production_sources(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        self.assertTrue(
+            all(target.startswith("termMeshTests/") for target, _ in fixture.hidden_tests)
+        )
+        private_production_symbols = (
+            "SplitDividerOverlayView",
+            "DividerSegment",
+            "collectDividerSegments",
+            "hostedFramesLikelyToOccludeDividers",
+            "shouldRenderOverlay",
+            "overlayDividerColor",
+        )
+        for _, source in fixture.hidden_tests:
+            hidden_source = (ROOT / source).read_text()
+            for symbol in private_production_symbols:
+                self.assertNotIn(symbol, hidden_source)
 
     def test_xcode_failure_summary_keeps_actionable_diagnostics(self):
         output = "\n".join((
