@@ -90,6 +90,13 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
                 self.assertFalse(scopes[left] & scopes[right])
         self.assertEqual(sum(task["mutates"] for task in tasks), 1)
         self.assertTrue(all("all other repository paths" in task["forbidden"] for task in tasks))
+        self.assertTrue(all(task["strict_scope"] for task in tasks))
+        broad = module.worker_instruction(module.FIXTURES["split-divider-color"], "team", "explorer")
+        strict = module.worker_instruction(
+            module.FIXTURES["split-divider-color"], "team", "explorer", tasks[0],
+        )
+        self.assertIn("필요한 repository path를 읽고 검색할 수 있다", broad)
+        self.assertIn("exact path로 제한", strict)
 
     def test_partition_summary_uses_only_complete_pairs(self):
         rows = []
@@ -743,11 +750,16 @@ end
                     {"type": "tool_use", "name": "Grep", "input": {"path": str(checkout / "Sources")}},
                     {"type": "tool_use", "name": "Read", "input": {"file_path": "/tmp/outside"}},
                 ]}}),
+                json.dumps({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "sed -n 1,20p Sources/A.swift"}},
+                ]}}),
                 "not-json",
             )) + "\n")
+            (checkout / "Sources").mkdir()
+            (checkout / "Sources/A.swift").touch()
             result = module.claude_read_paths(transcript, checkout)
             self.assertEqual(result["distinct_reads"], ["Sources/A.swift"])
-            self.assertEqual(result["distinct_search_roots"], ["Sources"])
+            self.assertEqual(result["distinct_search_roots"], ["Sources", "Sources/A.swift"])
             self.assertEqual(result["malformed_rows"], 1)
             self.assertNotIn("/tmp/outside", json.dumps(result))
 

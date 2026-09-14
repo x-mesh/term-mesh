@@ -1038,6 +1038,7 @@ def partitioned_worker_tasks(fixture: Fixture) -> list[dict[str, Any]]:
     return [
         {
             "id": "contract", "worker": "explorer",
+            "strict_scope": True,
             "goal": "Report the Ghostty and Bonsplit divider contract from the listed paths",
             "owned": [
                 "ghostty/src/config/Config.zig",
@@ -1052,6 +1053,7 @@ def partitioned_worker_tasks(fixture: Fixture) -> list[dict[str, Any]]:
         },
         {
             "id": "implementation", "worker": "executor",
+            "strict_scope": True,
             "goal": "Implement divider color, reset, runtime propagation, and focused unit tests",
             "owned": [
                 "Sources/GhosttyConfig.swift", "Sources/SettingsView.swift",
@@ -1066,6 +1068,7 @@ def partitioned_worker_tasks(fixture: Fixture) -> list[dict[str, Any]]:
         },
         {
             "id": "acceptance", "worker": "reviewer",
+            "strict_scope": True,
             "goal": "Build the divider acceptance matrix and report missing behavior",
             "owned": [
                 "Makefile", "termMeshTests/GhosttyTerminalViewComposingTests.swift",
@@ -1165,6 +1168,11 @@ def worker_instruction(
         "owned에 명시된 범위만 수정하고 forbidden 범위는 수정하지 마라."
         if task["mutates"] else "read-only task다. 어떤 repo 파일도 수정하지 마라."
     )
+    read_rule = (
+        "읽기와 검색도 owned에 나열된 exact path로 제한한다. forbidden 또는 다른 repository path를 읽지 마라."
+        if task.get("strict_scope") else
+        "역할 수행에 필요한 repository path를 읽고 검색할 수 있다."
+    )
     return f"""
 실제 개발 benchmark worker다. 현재 checkout만 사용하고 git history, benchmark controller, solution
 commit, 외부 checkout에서 정답을 찾지 마라. 외부 remote에 push/publish/release하지 마라.
@@ -1179,7 +1187,7 @@ forbidden: {json.dumps(task['forbidden'], ensure_ascii=False)}
 verify: {task['verify']}
 time budget: {task['estimated_seconds']} seconds
 {mutation_rule}
-읽기와 검색도 owned에 나열된 exact path로 제한한다. forbidden 또는 다른 repository path를 읽지 마라.
+{read_rule}
 긴 세부 결과는 먼저 `{report_file}`에 작성하라. 마지막에 아래 정확한 5-line envelope를 stdout에
 출력하고, 같은 5줄을 `{result_file}.tmp.$$`에 쓴 뒤 atomic `mv`로 `{result_file}`에 저장하라.
 STATUS: DONE|BLOCKED|NEEDS_REVIEW
@@ -1400,6 +1408,16 @@ def claude_read_paths(transcript: Path, checkout: Path) -> dict[str, Any]:
                     normalized = normalize_benchmark_path(payload.get("path", "."), checkout)
                     if normalized:
                         searches.append(normalized)
+                elif name == "bash":
+                    command = payload.get("command")
+                    if isinstance(command, str):
+                        for token in shlex.split(command, comments=True, posix=True):
+                            candidate = token.rstrip(":,;")
+                            if not ("/" in candidate or candidate.endswith((".swift", ".zig", ".md", "Makefile"))):
+                                continue
+                            normalized = normalize_benchmark_path(candidate, checkout)
+                            if normalized and (checkout / normalized).exists():
+                                searches.append(normalized)
     distinct = sorted(set(reads + searches))
     return {
         "rows": rows, "malformed_rows": malformed, "tool_calls": tool_calls,
