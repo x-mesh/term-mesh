@@ -7024,6 +7024,7 @@ fn format_task_instruction(
     lines.push("[GOAL]".to_string());
     lines.push(instruction.trim().to_string());
     lines.push("[/GOAL]".to_string());
+    append_team_checkout_topology(sock, team, task, &mut lines);
     append_checkout_contract(&mut lines);
 
     // Inject Auto-Fix Budget rules when budget is set
@@ -7040,6 +7041,47 @@ fn format_task_instruction(
 
     let body = lines.join("\n");
     append_report_suffix(body.trim(), no_report)
+}
+
+fn append_team_checkout_topology(sock: &PathBuf, team: &str, task: &Value, lines: &mut Vec<String>) {
+    let Ok(status) = rpc_call(sock, "team.status", json!({ "team_name": team })) else { return };
+    let result = &status["result"];
+    lines.extend(team_checkout_topology_lines(result, task));
+}
+
+fn team_checkout_topology_lines(result: &Value, task: &Value) -> Vec<String> {
+    let Some(agents) = result["agents"].as_array() else { return Vec::new() };
+    let target_instance = task["agent_instance_id"].as_str();
+    let mode = result["worktree_mode"].as_str().unwrap_or("unknown");
+    let leader_path = result["working_directory"].as_str().unwrap_or("unknown");
+    let integration_target = result["integration_target_path"].as_str().unwrap_or(leader_path);
+    let mut lines = vec![
+        String::new(),
+        "## Team Checkout Topology".to_string(),
+        format!("TEAM_CHECKOUT_MODE: {mode}"),
+        format!("LEADER_CHECKOUT_PATH: {leader_path}"),
+        "LEADER_CHECKOUT_ROLE: integration-owner".to_string(),
+        format!("INTEGRATION_TARGET_PATH: {integration_target}"),
+    ];
+    for agent in agents {
+        if target_instance.is_some() && agent["agent_instance_id"].as_str() == target_instance {
+            continue;
+        }
+        lines.push(format!(
+            "PEER_CHECKOUT: name={} instance={} branch={} path={}",
+            agent["name"].as_str().unwrap_or("unknown"),
+            agent["agent_instance_id"].as_str().unwrap_or("unknown"),
+            agent["worktree_branch"].as_str().unwrap_or("shared-or-unknown"),
+            agent["worktree_path"].as_str().or_else(|| agent["working_directory"].as_str()).unwrap_or("unknown"),
+        ));
+    }
+    lines.push(match mode {
+        "isolated" => "TOPOLOGY_RULE: Isolated, ownership-disjoint write tasks may run concurrently. Integrate their branches serially.",
+        "shared" => "TOPOLOGY_RULE: Workers share one checkout. Serialize writes unless the paths are proven disjoint.",
+        "off" => "TOPOLOGY_RULE: No managed worktree isolation is active. Do not run concurrent writes without another verified isolation boundary.",
+        _ => "TOPOLOGY_RULE: Checkout isolation is unknown. Query team.status before concurrent writes.",
+    }.to_string());
+    lines
 }
 
 fn append_checkout_contract(lines: &mut Vec<String>) {
@@ -7079,6 +7121,29 @@ mod checkout_contract_tests {
         assert!(rendered.contains("Never block solely"));
         assert!(rendered.contains("inspect explicit refs directly"));
         assert!(rendered.contains("Do not checkout, reset, merge, or rebase"));
+    }
+
+    #[test]
+    fn task_topology_lists_isolated_peers_and_skips_self() {
+        let status = json!({"worktree_mode":"isolated","working_directory":"/repo","integration_target_path":"/repo","agents": [
+            {"name":"executor","agent_instance_id":"a","worktree_path":"/wt/a","worktree_branch":"team/a"},
+            {"name":"reviewer","agent_instance_id":"b","worktree_path":"/wt/b","worktree_branch":"team/b"}
+        ]});
+        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
+        assert!(rendered.contains("TEAM_CHECKOUT_MODE: isolated"));
+        assert!(rendered.contains("PEER_CHECKOUT: name=reviewer instance=b branch=team/b path=/wt/b"));
+        assert!(!rendered.contains("PEER_CHECKOUT: name=executor instance=a"));
+    }
+
+    #[test]
+    fn legacy_topology_does_not_guess_isolation_from_stale_paths() {
+        let status = json!({"agents": [
+            {"name":"a","agent_instance_id":"a","worktree_path":"/old/a"},
+            {"name":"b","agent_instance_id":"b","worktree_path":"/old/b"}
+        ]});
+        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
+        assert!(rendered.contains("TEAM_CHECKOUT_MODE: unknown"));
+        assert!(rendered.contains("Checkout isolation is unknown"));
     }
 }
 

@@ -3200,12 +3200,24 @@ final class TeamOrchestrator: ObservableObject {
                         roles: agents.map(\.agentType)
                     )
                     let tmAgent = Self.localTMAgentCommand()
+                    let topologySection = Self.checkoutTopologySection(
+                        worktreeMode: worktreeMode, leaderPath: leaderWorkDir,
+                        integrationTargetPath: workingDirectory,
+                        workers: agents.enumerated().map { index, agent in
+                            (
+                                name: agent.name, instance: reservedAgentInstanceIds[index],
+                                branch: isolatedWorktrees[index]?.branch ?? sharedWtBranch,
+                                path: isolatedWorktrees[index]?.path ?? sharedWtPath ?? workingDirectory
+                            )
+                        }
+                    )
                     let systemPrompt = Self.buildLeaderClaudeSystemPrompt(
                         teamName: name,
                         agentList: agentListStr,
                         runbookSection: runbookSection,
                         tmAgent: tmAgent,
-                        socketPath: socketPath
+                        socketPath: socketPath,
+                        topologySection: topologySection
                     )
                     // Escape single quotes for shell, same approach as buildClaudeCommand
                     let escaped = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
@@ -4660,7 +4672,8 @@ final class TeamOrchestrator: ObservableObject {
         agentList: String,
         runbookSection: String,
         tmAgent: String,
-        socketPath: String
+        socketPath: String,
+        topologySection: String = ""
     ) -> String {
         return """
         You are the TEAM LEADER for team '\(teamName)'. You direct a group of Claude agent workers running in terminal split panes.
@@ -4709,6 +4722,8 @@ final class TeamOrchestrator: ObservableObject {
 
         ## Your Agents
         \(agentList)
+
+        \(topologySection)
 
         Route duplicate names with the roster's durable selector:
         `\(tmAgent) delegate <agent_name> '<instruction>' --agent-instance-id <instance>`.
@@ -4885,7 +4900,14 @@ final class TeamOrchestrator: ObservableObject {
             agentList: agentList,
             runbookSection: remoteRunbooks,
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
-            socketPath: remoteSocketPath
+            socketPath: remoteSocketPath,
+            topologySection: checkoutTopologySection(
+                worktreeMode: "unknown", leaderPath: remoteWorkingDirectory,
+                integrationTargetPath: remoteWorkingDirectory,
+                workers: rows.map { row in
+                    (name: row.preset.name, instance: row.id.uuidString, branch: nil, path: row.hostDirectory.nilIfBlank)
+                }
+            )
         )
     }
 
@@ -4958,7 +4980,13 @@ final class TeamOrchestrator: ObservableObject {
             // Peer members get their own checkouts from PeerProjectBootstrap
             // rather than from this team's worktree mode, so there is no
             // worktree table to state here.
-            worktreeSection: "",
+            worktreeSection: checkoutTopologySection(
+                worktreeMode: "unknown", leaderPath: remoteWorkingDirectory,
+                integrationTargetPath: remoteWorkingDirectory,
+                workers: rows.map { row in
+                    (name: row.preset.name, instance: row.id.uuidString, branch: nil, path: row.hostDirectory.nilIfBlank)
+                }
+            ),
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath
         )
@@ -4984,7 +5012,13 @@ final class TeamOrchestrator: ObservableObject {
                 workingDirectory: remoteWorkingDirectory,
                 roles: agents.map(\.agentType)
             ),
-            worktreeSection: "",
+            worktreeSection: checkoutTopologySection(
+                worktreeMode: "unknown", leaderPath: remoteWorkingDirectory,
+                integrationTargetPath: remoteWorkingDirectory,
+                workers: agents.map { agent in
+                    (name: agent.name, instance: agent.agentInstanceId, branch: agent.worktreeBranch, path: agent.worktreePath ?? agent.originalAgentWorkDir)
+                }
+            ),
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath
         )
@@ -5010,7 +5044,14 @@ final class TeamOrchestrator: ObservableObject {
                 roles: agents.map(\.agentType)
             ),
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
-            socketPath: remoteSocketPath
+            socketPath: remoteSocketPath,
+            topologySection: checkoutTopologySection(
+                worktreeMode: "unknown", leaderPath: remoteWorkingDirectory,
+                integrationTargetPath: remoteWorkingDirectory,
+                workers: agents.map { agent in
+                    (name: agent.name, instance: agent.agentInstanceId, branch: agent.worktreeBranch, path: agent.worktreePath ?? agent.originalAgentWorkDir)
+                }
+            )
         )
     }
 
@@ -5033,6 +5074,17 @@ final class TeamOrchestrator: ObservableObject {
         let runbookSection = Self.runbookLeaderSection(
             workingDirectory: workingDirectory,
             roles: agents.map(\.agentType)
+        )
+        let topologySection = Self.checkoutTopologySection(
+            worktreeMode: worktreeMode, leaderPath: workingDirectory,
+            integrationTargetPath: teams[teamName]?.workingDirectory ?? workingDirectory,
+            workers: agents.map { agent in
+                (
+                    name: agent.name, instance: agent.agentInstanceId,
+                    branch: agent.worktreeBranch,
+                    path: agent.worktreePath ?? agent.originalAgentWorkDir
+                )
+            }
         )
 
         // Worktree info
@@ -5069,10 +5121,77 @@ final class TeamOrchestrator: ObservableObject {
             teamName: teamName,
             agentList: agentList,
             runbookSection: runbookSection,
-            worktreeSection: worktreeSection,
+            worktreeSection: topologySection + worktreeSection,
             tmAgent: tmAgent,
             socketPath: socketPath
         )
+    }
+
+    nonisolated static func checkoutTopologySection(
+        worktreeMode: String, leaderPath: String, integrationTargetPath: String,
+        workers: [(name: String, instance: String, branch: String?, path: String?)]
+    ) -> String {
+        var lines = [
+            "## Checkout Topology",
+            "TEAM_CHECKOUT_MODE: \(worktreeMode)",
+            "LEADER_CHECKOUT_PATH: \(leaderPath)",
+            "LEADER_CHECKOUT_ROLE: integration-owner",
+            "INTEGRATION_TARGET_PATH: \(integrationTargetPath)",
+        ]
+        for worker in workers {
+            lines.append("WORKER_CHECKOUT: name=\(worker.name) instance=\(worker.instance) branch=\(worker.branch ?? "shared-or-unknown") path=\(worker.path ?? "unknown")")
+        }
+        lines.append(checkoutTopologyRule(worktreeMode: worktreeMode))
+        return lines.joined(separator: "\n")
+    }
+
+    nonisolated static func checkoutTopologyRule(worktreeMode: String) -> String {
+        switch worktreeMode {
+        case "isolated":
+            return "TOPOLOGY_RULE: Isolated, ownership-disjoint write tasks may run concurrently. Integrate their branches serially."
+        case "shared":
+            return "TOPOLOGY_RULE: Workers share one checkout. Serialize writes unless the paths are proven disjoint."
+        case "off":
+            return "TOPOLOGY_RULE: No managed worktree isolation is active. Do not run concurrent writes without another verified isolation boundary."
+        default:
+            return "TOPOLOGY_RULE: Checkout isolation is unknown. Query team.status before concurrent writes."
+        }
+    }
+
+    private func workerCheckoutTopologyLines(teamName: String, target: AgentMember) -> [String] {
+        guard let team = teams[teamName] else { return [] }
+        return Self.workerCheckoutTopologyLines(
+            worktreeMode: team.worktreeMode,
+            leaderPath: team.sharedWorktreePath ?? team.workingDirectory,
+            integrationTargetPath: team.workingDirectory,
+            targetInstance: target.agentInstanceId,
+            workers: team.agents.map { agent in
+                (
+                    name: agent.name, instance: agent.agentInstanceId,
+                    branch: agent.worktreeBranch,
+                    path: agent.worktreePath ?? agent.originalAgentWorkDir
+                )
+            }
+        )
+    }
+
+    nonisolated static func workerCheckoutTopologyLines(
+        worktreeMode: String, leaderPath: String, integrationTargetPath: String,
+        targetInstance: String,
+        workers: [(name: String, instance: String, branch: String?, path: String?)]
+    ) -> [String] {
+        var lines = [
+            "", "## Team Checkout Topology",
+            "TEAM_CHECKOUT_MODE: \(worktreeMode)",
+            "LEADER_CHECKOUT_PATH: \(leaderPath)",
+            "LEADER_CHECKOUT_ROLE: integration-owner",
+            "INTEGRATION_TARGET_PATH: \(integrationTargetPath)",
+        ]
+        for peer in workers where peer.instance != targetInstance {
+            lines.append("PEER_CHECKOUT: name=\(peer.name) instance=\(peer.instance) branch=\(peer.branch ?? "shared-or-unknown") path=\(peer.path ?? "unknown")")
+        }
+        lines.append(checkoutTopologyRule(worktreeMode: worktreeMode))
+        return lines
     }
 
     /// The non-Claude leader contract, from parts its two callers assemble
@@ -5921,7 +6040,7 @@ final class TeamOrchestrator: ObservableObject {
         dlog("[team.notifyTaskCreated] task=\(task.id.prefix(8)) — suppressed leader stdin injection")
         #endif
         guard let assignee = task.assignee?.nilIfBlank else { return true }
-        let assigneeNotice = formatTaskAssignmentInstruction(task: task)
+        let assigneeNotice = formatTaskAssignmentInstruction(teamName: teamName, task: task)
         return sendToAgent(teamName: teamName, agentName: assignee,
                            agentInstanceId: task.assigneeInstanceId,
                            text: assigneeNotice, tabManager: tabManager)
@@ -6438,6 +6557,7 @@ final class TeamOrchestrator: ObservableObject {
             checkoutBranch: target.worktreeBranch,
             checkoutPath: target.worktreePath ?? target.originalAgentWorkDir
         ))
+        lines.append(contentsOf: workerCheckoutTopologyLines(teamName: teamName, target: target))
         lines.append(contentsOf: [
             "",
             "[HOW TO REPORT — required]",
@@ -6543,7 +6663,7 @@ final class TeamOrchestrator: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
-    private func formatTaskAssignmentInstruction(task: TeamTask) -> String {
+    private func formatTaskAssignmentInstruction(teamName: String, task: TeamTask) -> String {
         var lines = [
             "New assigned task: \(task.title)",
             "Task id: \(task.id)",
@@ -6561,6 +6681,14 @@ final class TeamOrchestrator: ObservableObject {
             }
             lines.append("WORKDIR_INSTRUCTION: Run commands from this worktree: cd \(path)")
             lines.append("NEXT_HINT: finish with `tm-agent task finish-worktree \(task.id) --to parent --cleanup` after reporting.")
+        }
+        if let assignee = task.assignee.flatMap({ name in
+            teams[teamName]?.agents.first { agent in
+                agent.name == name
+                    && (task.assigneeInstanceId == nil || agent.agentInstanceId == task.assigneeInstanceId)
+            }
+        }) {
+            lines.append(contentsOf: workerCheckoutTopologyLines(teamName: teamName, target: assignee))
         }
         lines.append("")
         lines.append("A new task has been assigned to you.")
@@ -7841,7 +7969,7 @@ final class TeamOrchestrator: ObservableObject {
         #if DEBUG
         dlog("[autoClaimNext] team=\(teamName) agent=\(agentName) claimed task=\(claimed.id.prefix(8)) title=\(claimed.title.prefix(40))")
         #endif
-        let instruction = formatTaskAssignmentInstruction(task: claimed)
+        let instruction = formatTaskAssignmentInstruction(teamName: teamName, task: claimed)
         let pushed = sendToAgentAutoLocate(
             teamName: teamName,
             agentName: agentName,
@@ -8236,6 +8364,9 @@ final class TeamOrchestrator: ObservableObject {
             "delegation_pending": team.delegationState.pending?.rawValue as Any? ?? NSNull(),
             "workspace_id": team.workspaceId.uuidString,
             "team_uuid": team.teamUuid as Any? ?? NSNull(),
+            "working_directory": team.sharedWorktreePath ?? team.workingDirectory,
+            "integration_target_path": team.workingDirectory,
+            "worktree_mode": team.worktreeMode,
             "remote_project_id": Self.effectiveRemotePresentationProjectID(
                 storedProjectID: team.remotePresentationProjectID,
                 teamUUID: team.teamUuid, teamName: team.id
@@ -8744,7 +8875,7 @@ final class TeamOrchestrator: ObservableObject {
             agents: members,
             createdAt: Date(),
             gitRepoRoot: nil,
-            worktreeMode: worktreePath == nil ? "off" : "isolated",
+            worktreeMode: (result["worktree_mode"] as? String)?.nilIfBlank ?? "unknown",
             sharedWorktreeName: nil,
             sharedWorktreePath: nil,
             sharedWorktreeBranch: nil,
