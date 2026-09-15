@@ -600,33 +600,46 @@ enum RemoteLiveProjectFixture {
                 }.count
             }
         }
-        return .ok(["starting": starting, "cleaning": cleaning, "failure": failure ?? "",
-                    "source_panels": source?.panels.count ?? 0,
-                    "viewer_panels": viewer?.panels.count ?? 0,
-                    "matching_transcripts": matching, "input_echoes": echoes,
-                    "viewer_id": viewer?.id.uuidString ?? "",
-                    "viewer_window_id": viewer.flatMap { AppDelegate.shared?.tabManagerFor(tabId: $0.id) }
-                        .flatMap { AppDelegate.shared?.windowId(for: $0) }?.uuidString ?? "",
-                    "source_id": source?.id.uuidString ?? "",
-                    "source_window_id": source.flatMap { AppDelegate.shared?.tabManagerFor(tabId: $0.id) }
-                        .flatMap { AppDelegate.shared?.windowId(for: $0) }?.uuidString ?? "",
-                    "source_agent_ids": source?.panels.values.compactMap { ($0 as? AgentPanel)?.id.uuidString }.sorted() ?? [],
-                    "viewer_agent_ids": viewer?.remoteAgentPaneSessions.keys.map(\.uuidString).sorted() ?? [],
-                    "active_viewer_agents": viewer?.remoteAgentPaneSessions.keys.filter { viewer?.peerAgentPanelIsLive($0) == true }.count ?? 0,
-                    "local_team_count": TeamOrchestrator.shared.teams.count,
-                    "review_board_visible": ReviewBoardSettings.isVisible,
-                    "board_team": board?.teamName ?? "",
-                    "source_team": teamName ?? "",
-                    "board_workspace": board?.workspaceID.uuidString ?? "",
-                    "board_workers": board?.workerCount ?? 0,
-                    "board_delegation": board?.delegationState.effective.rawValue ?? "",
-                    "owner_delegation": ownerDelegation,
-                    "panel_delegation": boardModel?.delegation?.level.rawValue ?? "",
-                    "panel_remote": boardModel?.delegation?.isRemoteViewer ?? false,
-                    "delegation_error": boardModel?.delegationError ?? "",
-                    "identity_refusal": identityRefusal,
-                    "stale_revision_refusal": staleRevisionRefusal,
-                    "stale_incarnation_refusal": staleIncarnationRefusal])
+        // Xcode 27 timed out type-checking this literal while these optional
+        // chains and closures were inline, so they are typed locals first.
+        func windowID(of workspace: Workspace?) -> String {
+            workspace.flatMap { AppDelegate.shared?.tabManagerFor(tabId: $0.id) }
+                .flatMap { AppDelegate.shared?.windowId(for: $0) }?.uuidString ?? ""
+        }
+        let sourceAgentIDs: [String] = source?.panels.values
+            .compactMap { ($0 as? AgentPanel)?.id.uuidString }.sorted() ?? []
+        let viewerAgentIDs: [String] = viewer?.remoteAgentPaneSessions.keys
+            .map(\.uuidString).sorted() ?? []
+        let activeViewerAgents: Int = viewer?.remoteAgentPaneSessions.keys
+            .filter { viewer?.peerAgentPanelIsLive($0) == true }.count ?? 0
+        let status: [String: Any] = [
+            "starting": starting, "cleaning": cleaning, "failure": failure ?? "",
+            "source_panels": source?.panels.count ?? 0,
+            "viewer_panels": viewer?.panels.count ?? 0,
+            "matching_transcripts": matching, "input_echoes": echoes,
+            "viewer_id": viewer?.id.uuidString ?? "",
+            "viewer_window_id": windowID(of: viewer),
+            "source_id": source?.id.uuidString ?? "",
+            "source_window_id": windowID(of: source),
+            "source_agent_ids": sourceAgentIDs,
+            "viewer_agent_ids": viewerAgentIDs,
+            "active_viewer_agents": activeViewerAgents,
+            "local_team_count": TeamOrchestrator.shared.teams.count,
+            "review_board_visible": ReviewBoardSettings.isVisible,
+            "board_team": board?.teamName ?? "",
+            "source_team": teamName ?? "",
+            "board_workspace": board?.workspaceID.uuidString ?? "",
+            "board_workers": board?.workerCount ?? 0,
+            "board_delegation": board?.delegationState.effective.rawValue ?? "",
+            "owner_delegation": ownerDelegation,
+            "panel_delegation": boardModel?.delegation?.level.rawValue ?? "",
+            "panel_remote": boardModel?.delegation?.isRemoteViewer ?? false,
+            "delegation_error": boardModel?.delegationError ?? "",
+            "identity_refusal": identityRefusal,
+            "stale_revision_refusal": staleRevisionRefusal,
+            "stale_incarnation_refusal": staleIncarnationRefusal,
+        ]
+        return .ok(status)
     }
 }
 #endif
