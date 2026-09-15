@@ -2403,7 +2403,7 @@ extension TerminalController {
                 detail = String(describing: error)
             }
             let elapsed = Date().timeIntervalSince(started)
-            await tunnel.stop()
+            await tunnel.stop().value
             payload = [
                 "ok": true,
                 "outcome": kind,

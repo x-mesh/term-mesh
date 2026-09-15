@@ -134,4 +134,45 @@ final class PeerSSHTunnelBudgetTests: XCTestCase {
         lock.unlock()
         XCTAssertTrue(coordinator.isTerminal)
     }
+
+    func test_adoptLaunchedProcessAfterStopReapsAndReturnsFalse() async throws {
+        let tunnel = PeerSSHTunnel(
+            sshTarget: "tester@example.invalid",
+            remoteSockPath: "/tmp/tm-test-remote.sock"
+        )
+        let shutdown = tunnel.stop()
+
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        child.arguments = ["30"]
+        addTeardownBlock {
+            if child.isRunning { child.terminate() }
+        }
+        try child.run()
+
+        XCTAssertFalse(tunnel.adoptLaunchedProcess(child))
+        // `adoptLaunchedProcess` reaps synchronously on the losing side, so
+        // the child must already be gone by the time it returns.
+        XCTAssertFalse(child.isRunning)
+        await shutdown.value
+    }
+
+    func test_adoptLaunchedProcessBeforeStopIsReapedByStop() async throws {
+        let tunnel = PeerSSHTunnel(
+            sshTarget: "tester@example.invalid",
+            remoteSockPath: "/tmp/tm-test-remote.sock"
+        )
+
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        child.arguments = ["30"]
+        addTeardownBlock {
+            if child.isRunning { child.terminate() }
+        }
+        try child.run()
+
+        XCTAssertTrue(tunnel.adoptLaunchedProcess(child))
+        await tunnel.stop().value
+        XCTAssertFalse(child.isRunning)
+    }
 }
