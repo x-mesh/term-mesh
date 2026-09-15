@@ -3295,12 +3295,12 @@ private struct LeaderParticipationSettingsRow: View {
                 .labelsHidden()
                 .pickerStyle(.segmented)
 
+                // The label is the only place the percent is shown, so it stays visible.
                 Stepper(value: canaryPercentBinding, in: 0...100, step: 1) {
                     Text(verbatim: "\(settings.canaryPercent)%")
                         .font(.system(.body, design: .monospaced))
                         .frame(minWidth: 44, alignment: .trailing)
                 }
-                .labelsHidden()
                 .disabled(settings.mode != .canary)
 
                 Toggle(isOn: killSwitchBinding) {
