@@ -129,6 +129,77 @@ private final class SSHPipeTail: @unchecked Sendable {
     }
 }
 
+/// Holds a terminal tunnel shutdown independently from the tunnel object.
+/// The detached task captures only the process, socket path and completion
+/// callback, so deinit can return while ssh is still being reaped.
+final class PeerSSHTunnelShutdownCoordinator: @unchecked Sendable {
+    typealias Reaper = @Sendable (Process?) -> Bool
+    typealias Unlink = @Sendable (String) -> Void
+    typealias TerminalEmitter = @Sendable (PeerSSHTunnelState) -> Void
+
+    private let lock = NSLock()
+    private let reap: Reaper
+    private let unlink: Unlink
+    private var task: Task<Void, Never>?
+    private var terminal = false
+
+    init(
+        reap: @escaping Reaper = { PeerSSHTunnel.reap($0) },
+        unlink: @escaping Unlink = { try? FileManager.default.removeItem(atPath: $0) }
+    ) {
+        self.reap = reap
+        self.unlink = unlink
+    }
+
+    var isTerminal: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return terminal
+    }
+
+    @discardableResult
+    func begin(
+        process: Process?,
+        localSockPath: String,
+        emit: @escaping TerminalEmitter
+    ) -> Task<Void, Never> {
+        lock.lock()
+        if let task {
+            lock.unlock()
+            return task
+        }
+        terminal = true
+        let reap = self.reap
+        let unlink = self.unlink
+        let task = Task.detached(priority: .userInitiated) {
+            if reap(process) {
+                unlink(localSockPath)
+                emit(.stopped)
+            } else {
+                emit(.failed(reason: "ssh did not exit after SIGTERM+SIGKILL; tunnel state leaked"))
+            }
+        }
+        self.task = task
+        lock.unlock()
+        return task
+    }
+}
+
+/// The bounded signal/reap sequence is separate from tunnel ownership so its
+/// ordering can be tested without launching ssh or waiting in real time.
+struct PeerSSHTunnelReaperPolicy: @unchecked Sendable {
+    let isRunning: (Process) -> Bool
+    let terminate: (Process) -> Void
+    let waitForExit: (Process, TimeInterval) -> Bool
+    let kill: (Process) -> Void
+
+    static let live = PeerSSHTunnelReaperPolicy(
+        isRunning: { $0.isRunning },
+        terminate: { $0.terminate() },
+        waitForExit: { PeerSSHTunnel.waitForExit($0, timeout: $1) },
+        kill: { Darwin.kill($0.processIdentifier, SIGKILL) }
+    )
+}
+
 final class PeerSSHTunnel: @unchecked Sendable {
     let sshTarget: String
     let remoteSockPath: String
@@ -153,6 +224,8 @@ final class PeerSSHTunnel: @unchecked Sendable {
     private var wantsRunning = false
     private var state: PeerSSHTunnelState = .stopped
     private var restartTask: Task<Void, Never>?
+    /// Terminal stop state and its reaper outlive this object when needed.
+    private let shutdown = PeerSSHTunnelShutdownCoordinator()
 
     /// Fired on every state transition. Always invoked on the main
     /// actor; observers can safely touch UI state directly.
@@ -270,7 +343,7 @@ final class PeerSSHTunnel: @unchecked Sendable {
     /// successful return, the auto-restart loop is armed.
     func start() async throws {
         lock.lock()
-        if process != nil {
+        if process != nil || shutdown.isTerminal {
             lock.unlock()
             throw PeerSSHTunnelError.alreadyRunning
         }
@@ -289,7 +362,7 @@ final class PeerSSHTunnel: @unchecked Sendable {
     /// stopped or already running.
     func retry() {
         lock.lock()
-        if process != nil || restartTask != nil {
+        if process != nil || restartTask != nil || shutdown.isTerminal {
             lock.unlock()
             return
         }
@@ -324,10 +397,10 @@ final class PeerSSHTunnel: @unchecked Sendable {
         var sshActuallyExited = (p == nil)
         if let p, p.isRunning {
             p.terminate()
-            sshActuallyExited = waitForExit(p, timeout: 2.0)
+            sshActuallyExited = Self.waitForExit(p, timeout: 2.0)
             if !sshActuallyExited {
                 kill(p.processIdentifier, SIGKILL)
-                sshActuallyExited = waitForExit(p, timeout: 1.0)
+                sshActuallyExited = Self.waitForExit(p, timeout: 1.0)
             }
         }
         if sshActuallyExited {
@@ -337,9 +410,10 @@ final class PeerSSHTunnel: @unchecked Sendable {
         return true
     }
 
-    /// Tears the ssh subprocess down and disarms auto-restart. Safe to
-    /// call repeatedly.
-    func stop() {
+    /// Tears ssh down without making a lease release poll Process or sleep on
+    /// MainActor. Repeated callers receive the same completion task.
+    @discardableResult
+    func stop() -> Task<Void, Never> {
         lock.lock()
         wantsRunning = false
         let p = process
@@ -347,40 +421,37 @@ final class PeerSSHTunnel: @unchecked Sendable {
         let task = restartTask
         restartTask = nil
         dashboardPort = nil
+        // Mark terminal before releasing the ownership lock. Otherwise a
+        // concurrent start could install a replacement process in the small
+        // interval before `begin` records this terminal shutdown.
+        let reapTask = shutdown.begin(process: p, localSockPath: localSockPath) { [weak self] state in
+            self?.emit(state)
+        }
         lock.unlock()
         task?.cancel()
-        // Only unlink the local socket once we've actually reaped ssh.
-        // If `p` is nil here, the terminationHandler already fired —
-        // ssh has exited and unlinking the path is safe. If `p` is
-        // alive but `terminate()` doesn't kill it within the grace
-        // window, we escalate to SIGKILL rather than blocking forever
-        // and we leave the socket file alone so a still-running ssh
-        // doesn't end up as a "ghost socket" (kernel-bound but path
-        // gone), which is exactly the corruption a mid-stop crash
-        // used to leave behind.
+        return reapTask
+    }
+
+    /// Runs only from the detached stop task. Keep the socket pathname until
+    /// Process has really exited: unlinking a live forward creates a ghost
+    /// socket which cannot be recovered by the next owner.
+    static func reap(_ p: Process?) -> Bool {
+        reap(p, policy: .live)
+    }
+
+    static func reap(_ p: Process?, policy: PeerSSHTunnelReaperPolicy) -> Bool {
         var sshActuallyExited = (p == nil)
-        if let p, p.isRunning {
-            p.terminate()
-            sshActuallyExited = waitForExit(p, timeout: 2.0)
+        if let p, policy.isRunning(p) {
+            policy.terminate(p)
+            sshActuallyExited = policy.waitForExit(p, 2.0)
             if !sshActuallyExited {
-                kill(p.processIdentifier, SIGKILL)
-                sshActuallyExited = waitForExit(p, timeout: 1.0)
+                policy.kill(p)
+                sshActuallyExited = policy.waitForExit(p, 1.0)
             }
         } else {
             sshActuallyExited = true
         }
-        if sshActuallyExited {
-            try? FileManager.default.removeItem(atPath: localSockPath)
-            emit(.stopped)
-        } else {
-            // SIGKILL didn't reap ssh (rare — typically a kernel-level
-            // hang or PID reuse). The socket file is intentionally not
-            // unlinked above so we don't ghost-socket a still-running
-            // process. Emit `.failed` instead of `.stopped` so UI
-            // listeners can surface the leak (banner, telemetry) and
-            // the next-launch sweep can clean up via owner-PID gating.
-            emit(.failed(reason: "ssh did not exit after SIGTERM+SIGKILL; tunnel state leaked"))
-        }
+        return sshActuallyExited
     }
 
     /// Polls `Process.isRunning` up to `timeout` seconds. Returns
@@ -388,7 +459,7 @@ final class PeerSSHTunnel: @unchecked Sendable {
     /// otherwise. Avoids `waitUntilExit()` which blocks indefinitely
     /// when ssh ignores SIGTERM (rare but observed during sleep/wake
     /// or with mis-configured ProxyCommand chains).
-    private func waitForExit(_ proc: Process, timeout: TimeInterval) -> Bool {
+    static func waitForExit(_ proc: Process, timeout: TimeInterval) -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while proc.isRunning {
             if Date() > deadline { return false }
@@ -398,7 +469,7 @@ final class PeerSSHTunnel: @unchecked Sendable {
     }
 
     deinit {
-        stop()
+        _ = stop()
     }
 
     // MARK: - Internals
