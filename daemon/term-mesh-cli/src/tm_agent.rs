@@ -2847,6 +2847,19 @@ enum LeaderTurnCommands {
         #[arg(long = "resource-health")]
         resource_health: Option<String>,
     },
+    /// Read-only report of one Project's leader turn health, built from the
+    /// same `leader_participation_health` gate the execution-host safety net
+    /// uses (`apply_participation_health_scope`). Touches no socket and no
+    /// daemon: it only reads `~/.term-mesh/logs/turns.log`, so it works when
+    /// the Project is a peer's execution host with nothing else running.
+    Health {
+        /// Project whose turns.log rows to measure.
+        #[arg(long)]
+        project: String,
+        /// Emit the report as JSON instead of one human-readable line.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -8588,6 +8601,21 @@ fn main() {
             *serial_integration,
             resource_health.as_deref(),
         ));
+        return;
+    }
+
+    // `leader turn health` is a read-only local report built from
+    // `leader_participation_health`; it returns before socket resolution for
+    // the same reason `leader turn route` does above — a peer's execution
+    // host may have no daemon running at all.
+    if let Commands::Leader(LeaderCommands::Turn(LeaderTurnCommands::Health { project, json })) =
+        &cli.command
+    {
+        let result = turn_log_path().map(|log_path| leader_turn_health_report(&log_path, project));
+        match &result {
+            Ok(report) if !*json => println!("{}", format_leader_turn_health_line(report)),
+            _ => print_result(result),
+        }
         return;
     }
 
@@ -18527,14 +18555,27 @@ struct LeaderParticipationHealth {
 }
 
 impl LeaderParticipationHealth {
-    fn passes_promotion_gate(&self) -> bool {
-        if self.supported_turns == 0 || self.malformed_lines > 0 {
-            return false;
+    /// Coverage, linkage, and unknown-route ratios. Zero supported turns
+    /// would otherwise divide by zero; (0, 0, 1) reads as "no coverage, no
+    /// linkage, every turn unknown" instead of NaN, and still fails the gate
+    /// below. Shared by `passes_promotion_gate` and the health report so the
+    /// two never drift apart.
+    fn ratios(&self) -> (f64, f64, f64) {
+        if self.supported_turns == 0 {
+            return (0.0, 0.0, 1.0);
         }
         let supported = self.supported_turns as f64;
         let coverage = (self.stated_turns + self.unstated_turns) as f64 / supported;
         let linkage = self.linked_turns as f64 / supported;
         let unknown_rate = (self.supported_turns - self.stated_turns) as f64 / supported;
+        (coverage, linkage, unknown_rate)
+    }
+
+    fn passes_promotion_gate(&self) -> bool {
+        if self.supported_turns == 0 || self.malformed_lines > 0 {
+            return false;
+        }
+        let (coverage, linkage, unknown_rate) = self.ratios();
         (self.supported_turns >= 500 || self.observed_days >= 7)
             && coverage >= 0.95
             && linkage >= 0.95
@@ -18672,6 +18713,52 @@ fn leader_participation_health(
         observed_days,
         malformed_lines,
     }
+}
+
+/// Read-only report behind `leader turn health`. Pure over an already
+/// resolved log path so its field stance is testable without touching the
+/// CLI dispatch or `$HOME`, the same reason `leader_participation_health`
+/// itself takes a path instead of resolving one.
+fn leader_turn_health_report(log_path: &Path, project_id: &str) -> Value {
+    let health = leader_participation_health(log_path, project_id, None);
+    let (coverage, linkage, unknown_rate) = health.ratios();
+    json!({
+        "schema_version": 1,
+        "project": project_id,
+        "scope": "execution_host_project",
+        "supported_turns": health.supported_turns,
+        "linked_turns": health.linked_turns,
+        "stated_turns": health.stated_turns,
+        "unstated_turns": health.unstated_turns,
+        "observed_days": health.observed_days,
+        "malformed_lines": health.malformed_lines,
+        "coverage": coverage,
+        "linkage": linkage,
+        "unknown_rate": unknown_rate,
+        "passes_promotion_gate": health.passes_promotion_gate(),
+    })
+}
+
+/// One human-readable line for `leader turn health` without `--json`. Reads
+/// the already-built report instead of recomputing anything, so the printed
+/// numbers cannot drift from the JSON output.
+fn format_leader_turn_health_line(report: &Value) -> String {
+    format!(
+        "project={} passes_promotion_gate={} supported_turns={} linked_turns={} \
+         stated_turns={} unstated_turns={} observed_days={} malformed_lines={} \
+         coverage={:.4} linkage={:.4} unknown_rate={:.4}",
+        report["project"].as_str().unwrap_or(""),
+        report["passes_promotion_gate"].as_bool().unwrap_or(false),
+        report["supported_turns"].as_u64().unwrap_or(0),
+        report["linked_turns"].as_u64().unwrap_or(0),
+        report["stated_turns"].as_u64().unwrap_or(0),
+        report["unstated_turns"].as_u64().unwrap_or(0),
+        report["observed_days"].as_u64().unwrap_or(0),
+        report["malformed_lines"].as_u64().unwrap_or(0),
+        report["coverage"].as_f64().unwrap_or(0.0),
+        report["linkage"].as_f64().unwrap_or(0.0),
+        report["unknown_rate"].as_f64().unwrap_or(0.0),
+    )
 }
 
 fn apply_participation_health_scope(
@@ -19905,6 +19992,146 @@ mod leader_turn_record_tests {
         apply_participation_health_scope(&mut config, Some("control_host"), None, None);
 
         assert!(config.healthy);
+    }
+
+    /// Safety net for peer leaders: an executionHost payload drops this Mac's aggregate
+    /// health (config.delegated_overlap_resolution starts true), so the
+    /// remote per-Project log is the only thing standing between a healthy
+    /// signal and a resolved overlap. `resolve_participation` must still AND
+    /// in `config.healthy`, whatever `apply_participation_health_scope`
+    /// derived it to be.
+    #[test]
+    fn execution_host_scope_gates_delegated_overlap_resolution_on_the_remote_log() {
+        let base = LeaderParticipationCanaryConfig {
+            project_id: "p".to_string(),
+            healthy: false,
+            delegated_overlap_resolution: true,
+            delegation_effective: Some("delegated".to_string()),
+            supported: true,
+            kill_switch: false,
+            ..canary_config(100)
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let passing_path = dir.path().join("passing.log");
+        fs::write(
+            &passing_path,
+            linked_turn("first", "2026-08-18T23:59:00Z")
+                + &linked_turn("last", "2026-08-24T00:01:00Z"),
+        )
+        .expect("write passing turns");
+        let mut passing = base.clone();
+        apply_participation_health_scope(
+            &mut passing, Some("execution_host"), Some(&passing_path), None,
+        );
+        assert!(resolve_participation(&passing, true).delegated_overlap_resolution);
+
+        let malformed_path = dir.path().join("malformed.log");
+        fs::write(&malformed_path, "{not-json}\n").expect("write malformed turns");
+        let mut malformed = base.clone();
+        apply_participation_health_scope(
+            &mut malformed, Some("execution_host"), Some(&malformed_path), None,
+        );
+        assert!(!resolve_participation(&malformed, true).delegated_overlap_resolution);
+
+        let mut missing = base.clone();
+        apply_participation_health_scope(&mut missing, Some("execution_host"), None, None);
+        assert!(!resolve_participation(&missing, true).delegated_overlap_resolution);
+    }
+
+    #[test]
+    fn leader_turn_health_report_matches_the_gate_on_the_seven_day_fixture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        let report = leader_turn_health_report(&path, "p");
+
+        assert_eq!(report["schema_version"], json!(1));
+        assert_eq!(report["project"], json!("p"));
+        assert_eq!(report["scope"], json!("execution_host_project"));
+        assert_eq!(report["supported_turns"], json!(health.supported_turns));
+        assert_eq!(report["linked_turns"], json!(health.linked_turns));
+        assert_eq!(report["stated_turns"], json!(health.stated_turns));
+        assert_eq!(report["unstated_turns"], json!(health.unstated_turns));
+        assert_eq!(report["observed_days"], json!(health.observed_days));
+        assert_eq!(report["malformed_lines"], json!(health.malformed_lines));
+        assert_eq!(
+            report["passes_promotion_gate"],
+            json!(health.passes_promotion_gate())
+        );
+        assert_eq!(report["passes_promotion_gate"], json!(true));
+    }
+
+    #[test]
+    fn leader_turn_health_report_flags_malformed_and_torn_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &linked_turn("last", "2026-08-24T00:01:00Z")
+            + "{not-json}\n"
+            + "{\"event\":\"turn_start\"";
+        fs::write(&path, records).expect("write turns");
+
+        let report = leader_turn_health_report(&path, "p");
+
+        assert_eq!(report["malformed_lines"], json!(2));
+        assert_eq!(report["passes_promotion_gate"], json!(false));
+    }
+
+    #[test]
+    fn leader_turn_health_report_is_scoped_to_the_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let other_team = linked_turn("first", "2026-08-18T23:59:00Z")
+            .replace("\"team\":\"p\"", "\"team\":\"other\"")
+            + &linked_turn("last", "2026-08-24T00:01:00Z")
+                .replace("\"team\":\"p\"", "\"team\":\"other\"");
+        fs::write(&path, other_team).expect("write turns");
+
+        let report = leader_turn_health_report(&path, "p");
+
+        assert_eq!(report["supported_turns"], json!(0));
+        assert_eq!(report["passes_promotion_gate"], json!(false));
+    }
+
+    #[test]
+    fn leader_turn_health_report_is_zero_for_an_empty_or_missing_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty_path = dir.path().join("empty.log");
+        fs::write(&empty_path, "").expect("write empty turns");
+        let missing_path = dir.path().join("missing.log");
+
+        for path in [&empty_path, &missing_path] {
+            let report = leader_turn_health_report(path, "p");
+            assert_eq!(report["supported_turns"], json!(0));
+            assert_eq!(report["linked_turns"], json!(0));
+            assert_eq!(report["stated_turns"], json!(0));
+            assert_eq!(report["unstated_turns"], json!(0));
+            assert_eq!(report["coverage"], json!(0.0));
+            assert_eq!(report["linkage"], json!(0.0));
+            assert_eq!(report["unknown_rate"], json!(1.0));
+            assert_eq!(report["passes_promotion_gate"], json!(false));
+        }
+    }
+
+    #[test]
+    fn leader_turn_health_cli_requires_project() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent", "leader", "turn", "health", "--project", "p", "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Commands::Leader(LeaderCommands::Turn(LeaderTurnCommands::Health { .. }))
+        ));
+
+        let missing_project =
+            Cli::try_parse_from(["tm-agent", "leader", "turn", "health", "--json"]);
+        assert!(missing_project.is_err());
     }
 
     #[test]
