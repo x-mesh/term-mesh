@@ -99,7 +99,8 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
 
     def test_correct_isolated_worker_rejects_corrected_scope_before_replacement(self):
         task = module.isolated_topology_tasks(module.FIXTURES["split-divider-color"])[0]
-        with unittest.mock.patch.object(module, "run_command", return_value=unittest.mock.Mock(
+        with unittest.mock.patch.object(module, "tm_environment", return_value={}), \
+             unittest.mock.patch.object(module, "run_command", return_value=unittest.mock.Mock(
             returncode=0, stderr="", stdout="",
         )), unittest.mock.patch.object(
             module, "wait_for_worker_results", return_value=(["done"], 1, 1),
@@ -502,7 +503,7 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         )
         self.assertNotIn("Keep the two split-divider behaviors independent", unrelated)
 
-    def test_isolated_initial_prompt_forbids_validation_and_final_allows_one_focused_test(self):
+    def test_isolated_prompts_forbid_validation_and_controller_owns_focused_test(self):
         fixture = module.FIXTURES["split-divider-color"]
         initial = module.isolated_leader_prompt(fixture, final=False)
         final = module.isolated_leader_prompt(fixture, final=True)
@@ -512,7 +513,9 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
             "scripts/generate-build-info.sh", "git status", "git diff",
         ):
             self.assertIn(forbidden, initial)
-        self.assertEqual(final.count(module.ISOLATED_LEADER_FOCUSED_TEST), 1)
+        self.assertNotIn(module.ISOLATED_LEADER_FOCUSED_TEST, final)
+        self.assertIn("controller runs the single fixed focused validation", final)
+        self.assertIn("Do not run xcodebuild, tests, build commands, or any validation", final)
         self.assertEqual(
             module.ISOLATED_LEADER_FOCUSED_TEST.count(
                 "-only-testing:termMeshTests/WorkspaceChromeThemeTests"
@@ -532,8 +535,66 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
             1,
         )
         self.assertEqual(module.ISOLATED_LEADER_FOCUSED_TEST.count("xcodebuild"), 1)
-        self.assertIn("Do not discover schemes", final)
         self.assertIn("Do not validate in this phase", initial)
+
+    def test_controller_focused_validation_runs_exact_argv_once(self):
+        trace = unittest.mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary, \
+             unittest.mock.patch.object(module, "run_logged", return_value=(True, "passed")) as run:
+            with (Path(temporary) / "validation.log").open("w") as log:
+                passed, duration, reason = module.run_controller_focused_validation(
+                    Path(temporary), log, 30, trace,
+                )
+        self.assertTrue(passed)
+        self.assertEqual(reason, "passed")
+        self.assertGreaterEqual(duration, 0)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(
+            run.call_args.args[0], tuple(shlex.split(module.ISOLATED_LEADER_FOCUSED_TEST)),
+        )
+        self.assertEqual(
+            [call.args[0] for call in trace.write.call_args_list],
+            ["controller_validation_start", "controller_validation_end"],
+        )
+
+    def test_controller_focused_validation_records_product_failure(self):
+        trace = unittest.mock.Mock()
+        reason = "Sources/Workspace.swift:12:4: error: cannot convert value"
+        with tempfile.TemporaryDirectory() as temporary, \
+             unittest.mock.patch.object(module, "run_logged", return_value=(False, reason)):
+            with (Path(temporary) / "validation.log").open("w") as log:
+                passed, _, observed = module.run_controller_focused_validation(
+                    Path(temporary), log, 30, trace,
+                )
+        self.assertFalse(passed)
+        self.assertEqual(observed, reason)
+        end = trace.write.call_args_list[-1]
+        self.assertEqual(end.kwargs["outcome"], "product_failed")
+        self.assertIsNotNone(end.kwargs["failure_fingerprint"])
+        self.assertIn("Workspace.swift", end.kwargs["failure"])
+        self.assertIsNone(end.kwargs["exit_code"])
+
+    def test_controller_focused_validation_records_exit_code(self):
+        trace = unittest.mock.Mock()
+        reason = "xcodebuild failed (65): compile failed"
+        with tempfile.TemporaryDirectory() as temporary, \
+             unittest.mock.patch.object(module, "run_logged", return_value=(False, reason)):
+            with (Path(temporary) / "validation.log").open("w") as log:
+                module.run_controller_focused_validation(Path(temporary), log, 30, trace)
+        self.assertEqual(trace.write.call_args_list[-1].kwargs["exit_code"], 65)
+
+    def test_controller_focused_validation_records_infra_and_timeout(self):
+        cases = (
+            ("You have not agreed to the Xcode license agreements", "infra_invalid"),
+            ("acceptance timeout: xcodebuild", "timeout"),
+        )
+        for reason, outcome in cases:
+            trace = unittest.mock.Mock()
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary, \
+                 unittest.mock.patch.object(module, "run_logged", return_value=(False, reason)):
+                with (Path(temporary) / "validation.log").open("w") as log:
+                    module.run_controller_focused_validation(Path(temporary), log, 30, trace)
+            self.assertEqual(trace.write.call_args_list[-1].kwargs["outcome"], outcome)
 
     def test_isolated_validation_checker_accepts_only_exact_top_level_focused_test(self):
         def stream(command):
@@ -597,6 +658,34 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         diagnostics = module.isolated_leader_validation_diagnostics(initial, final)
         self.assertIn("isolated leader initial used forbidden command: git-status", diagnostics)
         self.assertIn("isolated leader initial used forbidden command: xcodebuild-list", diagnostics)
+
+    def test_isolated_validation_checker_prefers_unsafe_wire_command(self):
+        event = {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use", "id": "tool-1", "name": "Bash",
+                "input": {"command": module.ISOLATED_LEADER_FOCUSED_TEST},
+            }]},
+            "wire_tool_inputs": {"tool-1": {
+                "command": module.ISOLATED_LEADER_FOCUSED_TEST + " 2>&1 | tail -20",
+            }},
+        }
+        diagnostics = module.isolated_leader_validation_diagnostics("", json.dumps(event))
+        self.assertIn("isolated leader final used non-focused xcodebuild command", diagnostics)
+        self.assertIn("isolated leader focused test did not run", diagnostics)
+
+    def test_isolated_validation_checker_falls_back_when_wire_map_is_malformed(self):
+        event = {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use", "id": "tool-1", "name": "Bash",
+                "input": {"command": module.ISOLATED_LEADER_FOCUSED_TEST},
+            }]},
+            "wire_tool_inputs": {"tool-1": "malformed"},
+        }
+        self.assertEqual(
+            module.isolated_leader_validation_diagnostics("", json.dumps(event)), [],
+        )
 
     def test_isolated_validation_diagnostic_does_not_replace_product_status(self):
         record = module.RunResult(
@@ -863,7 +952,8 @@ end
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary) / "checkout"
             checkout.mkdir()
-            env, guard_root = module.benchmark_agent_environment(checkout)
+            with unittest.mock.patch.object(module, "tm_environment", return_value={}):
+                env, guard_root = module.benchmark_agent_environment(checkout)
             hook = Path(env["GIT_TEMPLATE_DIR"]) / "hooks/pre-push"
             syntax = subprocess.run(
                 ("bash", "-n", str(hook)), capture_output=True, text=True, check=False,
@@ -889,7 +979,8 @@ end
             root = Path(temporary)
             checkout = root / "checkout"
             subprocess.run(("git", "init", "-q", str(checkout)), check=True)
-            env, _ = module.benchmark_agent_environment(checkout)
+            with unittest.mock.patch.object(module, "tm_environment", return_value={}):
+                env, _ = module.benchmark_agent_environment(checkout)
             configured = subprocess.run(
                 ("git", "config", "--get", "core.hooksPath"), cwd=checkout,
                 env=env, capture_output=True, text=True, check=True,
@@ -899,6 +990,8 @@ end
     def test_benchmark_environment_rejects_stale_socket_aliases(self):
         old = dict(module.os.environ)
         try:
+            for key in ("TERMMESH_SOCKET", "TERMMESH_DAEMON_SOCKET"):
+                module.os.environ.pop(key, None)
             module.os.environ.update({
                 "TERMMESH_SOCKET_PATH": "/tmp/gui.sock",
                 "TERMMESH_DAEMON_UNIX_PATH": "/tmp/daemon.sock",
@@ -913,17 +1006,19 @@ end
             module.os.environ.clear()
             module.os.environ.update(old)
 
-    def test_benchmark_agent_environment_routes_leader_to_headless_daemon(self):
+    def test_benchmark_agent_environment_routes_explicit_canonical_endpoints(self):
         old = dict(module.os.environ)
         try:
+            for key in ("TERMMESH_SOCKET", "TERMMESH_DAEMON_SOCKET"):
+                module.os.environ.pop(key, None)
             with tempfile.TemporaryDirectory() as temporary:
                 app = Path(temporary) / "gui-app.sock"
                 daemon = Path(temporary) / "headless-daemon.sock"
                 app.touch()
                 daemon.touch()
                 module.os.environ.update({
-                    "TERMMESH_SOCKET_PATH": str(app),
-                    "TERMMESH_DAEMON_UNIX_PATH": str(daemon),
+                    "TERMMESH_SOCKET": str(app),
+                    "TERMMESH_DAEMON_SOCKET": str(daemon),
                     "TERMMESH_WORKSPACE_ID": "gui-workspace",
                 })
                 checkout = Path(temporary) / "checkout"
@@ -1229,10 +1324,11 @@ end
         command = popen.call_args.args[0]
         self.assertEqual(command[2], "explorer")
         self.assertIn("task id: inspect", command[3])
-        self.assertEqual(module.dispatch_benchmark_workers(
-            module.FIXTURES["homebrew-smoke"], "bench-test", Path("/tmp/checkout"),
-            trace, tasks=[],
-        ), 0)
+        with unittest.mock.patch.object(module, "tm_environment", return_value={}):
+            self.assertEqual(module.dispatch_benchmark_workers(
+                module.FIXTURES["homebrew-smoke"], "bench-test", Path("/tmp/checkout"),
+                trace, tasks=[],
+            ), 0)
 
     def test_policy_run_declares_a_routing_decision_artifact(self):
         source = SCRIPT.read_text()
@@ -1576,8 +1672,8 @@ end
         self.assertEqual(record.status, "failed")
         self.assertFalse(record.acceptance_passed)
         self.assertEqual(record.failure_reason, "product compile error")
-        self.assertTrue(record.protocol_degraded)
-        self.assertIn("read-overlap coverage incomplete", record.protocol_diagnostics)
+        self.assertFalse(record.protocol_degraded)
+        self.assertEqual(record.read_overlap["status"], "censored")
 
     def test_censored_read_telemetry_does_not_fail_passed_product(self):
         record = module.RunResult(
@@ -1596,7 +1692,25 @@ end
         self.assertEqual(record.status, "passed")
         self.assertTrue(record.acceptance_passed)
         self.assertIsNone(record.failure_reason)
-        self.assertTrue(record.protocol_degraded)
+        self.assertFalse(record.protocol_degraded)
+
+    def test_unavailable_read_telemetry_stays_optional(self):
+        record = module.RunResult(
+            run_id="passed", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            status="passed", acceptance_passed=True,
+        )
+        with unittest.mock.patch.object(
+            module, "benchmark_worker_runtime_metrics", return_value={"status": "partial", "roles": {}},
+        ), unittest.mock.patch.object(
+            module, "benchmark_read_overlap", side_effect=RuntimeError("missing transcript"),
+        ):
+            module.collect_isolated_read_diagnostics(
+                record, team="team", checkout=Path("/tmp/checkout"), tasks=[], session_id="session",
+            )
+        self.assertFalse(record.protocol_degraded)
+        self.assertEqual(record.read_overlap["status"], "unavailable")
+        self.assertIn("missing transcript", record.read_overlap["diagnostics"][0])
 
     def test_isolated_experiment_stops_and_preserves_scratch_after_unsafe_cleanup(self):
         unsafe = module.RunResult(
@@ -1976,17 +2090,78 @@ end
         self.assertEqual(params["app_socket_path"], "/tmp/app.sock")
 
     def test_benchmark_team_can_place_each_worker_in_a_distinct_checkout(self):
-        workdirs = {role: Path(f"/tmp/{role}") for role in ("explorer", "executor", "reviewer")}
-        with unittest.mock.patch.object(module, "tm_environment", return_value={
-            "TERMMESH_SOCKET": "/tmp/app.sock",
-        }), unittest.mock.patch.object(
-            module, "daemon_json", return_value={"team_name": "bench"},
-        ) as rpc:
-            module.create_benchmark_team("bench", Path("/tmp/integration"), "sonnet", workdirs)
-        agents = rpc.call_args.args[1]["agents"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); checkout = root / "integration"; checkout.mkdir()
+            workdirs = {role: root / role for role in ("explorer", "executor", "reviewer")}
+            for path in workdirs.values(): path.mkdir()
+            team_dir = root / "uuid"; (team_dir / "agents").mkdir(parents=True)
+            (team_dir / "team.json").write_text(json.dumps({
+                "team_name": "bench", "working_directory": str(checkout),
+            }))
+            for role, path in workdirs.items():
+                (team_dir / "agents" / f"{role}.json").write_text(json.dumps({
+                    "working_directory": str(path),
+                }))
+            with unittest.mock.patch.dict(module.os.environ, {"TERMMESH_HEADLESS_ROOT": str(root)}), \
+                 unittest.mock.patch.object(module, "tm_environment", return_value={
+                     "TERMMESH_SOCKET": "/tmp/app.sock",
+                 }), unittest.mock.patch.object(
+                     module, "daemon_json", side_effect=[
+                         {"name": "bench", "team_uuid": "uuid"},
+                         [{"name": role, "working_directory": str(path)} for role, path in workdirs.items()],
+                     ],
+                 ) as rpc:
+                module.create_benchmark_team("bench", checkout, "sonnet", workdirs)
+        agents = rpc.call_args_list[0].args[1]["agents"]
         self.assertEqual({row["name"]: row["working_directory"] for row in agents}, {
             role: str(path) for role, path in workdirs.items()
         })
+        self.assertEqual(rpc.call_args_list[1].args[:2], (
+            "headless.list", {"team_name": "bench"},
+        ))
+
+    def test_benchmark_team_rejects_collapsed_worker_topology_before_dispatch(self):
+        workdirs = {role: Path(f"/tmp/{role}") for role in ("explorer", "executor", "reviewer")}
+        collapsed = [
+            {"name": role, "working_directory": "/tmp/integration"}
+            for role in workdirs
+        ]
+        with unittest.mock.patch.object(module, "tm_environment", return_value={
+            "TERMMESH_SOCKET": "/tmp/app.sock",
+        }), unittest.mock.patch.object(
+            module, "daemon_json", side_effect=[
+                {"name": "bench", "team_uuid": "uuid"}, collapsed,
+            ],
+        ):
+            with self.assertRaisesRegex(module.BenchmarkInfrastructureError, "topology mismatch"):
+                module.create_benchmark_team(
+                    "bench", Path("/tmp/integration"), "sonnet", workdirs,
+                )
+
+    def test_benchmark_team_rejects_persisted_cwd_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); checkout = root / "integration"; checkout.mkdir()
+            workdirs = {role: root / role for role in ("explorer", "executor", "reviewer")}
+            for path in workdirs.values(): path.mkdir()
+            team_dir = root / "uuid"; (team_dir / "agents").mkdir(parents=True)
+            (team_dir / "team.json").write_text(json.dumps({
+                "team_name": "bench", "working_directory": str(checkout),
+            }))
+            for role in workdirs:
+                (team_dir / "agents" / f"{role}.json").write_text(json.dumps({
+                    "working_directory": str(checkout),
+                }))
+            live = [{"name": role, "working_directory": str(path)} for role, path in workdirs.items()]
+            with unittest.mock.patch.dict(module.os.environ, {"TERMMESH_HEADLESS_ROOT": str(root)}), \
+                 unittest.mock.patch.object(module, "tm_environment", return_value={
+                     "TERMMESH_SOCKET": "/tmp/app.sock",
+                 }), unittest.mock.patch.object(
+                     module, "daemon_json", side_effect=[
+                         {"name": "bench", "team_uuid": "uuid"}, live,
+                     ],
+                 ):
+                with self.assertRaisesRegex(module.BenchmarkInfrastructureError, "persisted topology mismatch"):
+                    module.create_benchmark_team("bench", checkout, "sonnet", workdirs)
 
     def test_usage_delta_clamps_agent_resets(self):
         before = {key: 10 for key in module.TOKEN_KEYS}
@@ -2096,23 +2271,87 @@ end
         self.assertEqual(span, 15000)
         self.assertEqual(utilization, 0.667)
 
-    def test_headless_tm_environment_uses_daemon_not_gui_socket(self):
+    def test_headless_tm_environment_normalizes_aliases_to_canonical_endpoints(self):
         old = dict(module.os.environ)
         try:
+            for key in ("TERMMESH_SOCKET", "TERMMESH_DAEMON_SOCKET"):
+                module.os.environ.pop(key, None)
             with tempfile.TemporaryDirectory() as temporary:
                 app = Path(temporary) / "app.sock"
                 daemon = Path(temporary) / "daemon.sock"
                 app.touch()
                 daemon.touch()
                 module.os.environ.update({
-                    "TERMMESH_SOCKET_PATH": str(app),
-                    "TERMMESH_DAEMON_UNIX_PATH": str(daemon),
+                    "TERMMESH_SOCKET": str(app),
+                    "TERMMESH_DAEMON_SOCKET": str(daemon),
                     "TERMMESH_WORKSPACE_ID": "workspace",
                 })
                 env = module.tm_environment()
                 self.assertEqual(env["TERMMESH_SOCKET"], str(app))
                 self.assertEqual(env["TERMMESH_DAEMON_SOCKET"], str(daemon))
                 self.assertNotIn("TERMMESH_WORKSPACE_ID", env)
+        finally:
+            module.os.environ.clear()
+            module.os.environ.update(old)
+
+    def test_benchmark_canonical_sockets_override_inherited_aliases(self):
+        old = dict(module.os.environ)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                app = root / "tagged-app.sock"; app.touch()
+                daemon = root / "tagged-daemon.sock"; daemon.touch()
+                inherited_app = root / "parent-app.sock"; inherited_app.touch()
+                inherited_daemon = root / "parent-daemon.sock"; inherited_daemon.touch()
+                module.os.environ.update({
+                    "TERMMESH_SOCKET": str(app),
+                    "TERMMESH_SOCKET_PATH": str(inherited_app),
+                    "TERMMESH_DAEMON_SOCKET": str(daemon),
+                    "TERMMESH_DAEMON_UNIX_PATH": str(inherited_daemon),
+                })
+                env = module.tm_environment()
+                self.assertEqual(env["TERMMESH_SOCKET"], str(app))
+                self.assertEqual(env["TERMMESH_SOCKET_PATH"], str(app))
+                self.assertEqual(env["TERMMESH_DAEMON_SOCKET"], str(daemon))
+                self.assertEqual(env["TERMMESH_DAEMON_UNIX_PATH"], str(daemon))
+        finally:
+            module.os.environ.clear()
+            module.os.environ.update(old)
+
+    def test_missing_explicit_canonical_socket_does_not_fall_back_to_live_alias(self):
+        old = dict(module.os.environ)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                alias_app = root / "parent-app.sock"; alias_app.touch()
+                alias_daemon = root / "parent-daemon.sock"; alias_daemon.touch()
+                module.os.environ.update({
+                    "TERMMESH_SOCKET": str(root / "missing-tagged-app.sock"),
+                    "TERMMESH_SOCKET_PATH": str(alias_app),
+                    "TERMMESH_DAEMON_SOCKET": str(root / "missing-tagged-daemon.sock"),
+                    "TERMMESH_DAEMON_UNIX_PATH": str(alias_daemon),
+                })
+                with self.assertRaisesRegex(RuntimeError, "app socket"):
+                    module.tm_environment()
+        finally:
+            module.os.environ.clear()
+            module.os.environ.update(old)
+
+    def test_alias_only_environment_is_rejected_even_when_aliases_are_live(self):
+        old = dict(module.os.environ)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                alias_app = root / "parent-app.sock"; alias_app.touch()
+                alias_daemon = root / "parent-daemon.sock"; alias_daemon.touch()
+                for key in ("TERMMESH_SOCKET", "TERMMESH_DAEMON_SOCKET"):
+                    module.os.environ.pop(key, None)
+                module.os.environ.update({
+                    "TERMMESH_SOCKET_PATH": str(alias_app),
+                    "TERMMESH_DAEMON_UNIX_PATH": str(alias_daemon),
+                })
+                with self.assertRaisesRegex(RuntimeError, "app socket"):
+                    module.tm_environment()
         finally:
             module.os.environ.clear()
             module.os.environ.update(old)

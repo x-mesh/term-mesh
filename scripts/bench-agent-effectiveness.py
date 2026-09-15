@@ -158,6 +158,8 @@ class RunResult:
     orchestration_schema: Optional[int] = None
     leader_preparation_ms: Optional[int] = None
     leader_first_result_review_ms: Optional[int] = None
+    controller_validation_ms: Optional[int] = None
+    controller_validation_passed: Optional[bool] = None
     first_worker_result_ms: Optional[int] = None
     last_worker_result_ms: Optional[int] = None
     pure_worker_wait_ms: Optional[int] = None
@@ -912,12 +914,16 @@ def add_tokens(target: dict[str, int], addition: dict[str, int]) -> None:
 
 
 def tm_environment() -> dict[str, str]:
-    """Keep the matching app/task-board and headless-daemon endpoints."""
+    """Require explicit matching benchmark app and daemon endpoints."""
     env = os.environ.copy()
     for key in ("TERMMESH_WORKSPACE_ID", "TERMMESH_PANEL_ID", "TERMMESH_SURFACE_ID", "TERMMESH_TAB_ID"):
         env.pop(key, None)
-    app = env.get("TERMMESH_SOCKET_PATH") or env.get("TERMMESH_SOCKET")
-    daemon = env.get("TERMMESH_DAEMON_UNIX_PATH") or env.get("TERMMESH_DAEMON_SOCKET")
+    # Explicit benchmark endpoints are canonical. Interactive shells commonly
+    # inherit *_PATH aliases from their parent term-mesh instance; allowing
+    # those aliases to win silently routes an isolated study to the wrong
+    # daemon and collapses every worker into the integration checkout.
+    app = env.get("TERMMESH_SOCKET")
+    daemon = env.get("TERMMESH_DAEMON_SOCKET")
     if not app or not Path(app).exists():
         raise RuntimeError("connectable TERMMESH app socket is required")
     if not daemon or not Path(daemon).exists():
@@ -1079,7 +1085,7 @@ def create_benchmark_team(
         }
         for role in ("explorer", "executor", "reviewer")
     ]
-    return daemon_json(
+    created = daemon_json(
         "headless.create_team",
         {
             "team_name": team,
@@ -1092,6 +1098,61 @@ def create_benchmark_team(
         },
         timeout=timeout,
     )
+    if agent_workdirs:
+        verify_benchmark_team_workdirs(
+            team, checkout, agent_workdirs, created=created, timeout=timeout,
+        )
+    return created
+
+
+def verify_benchmark_team_workdirs(
+    team: str, checkout: Path, expected: dict[str, Path], *,
+    created: Any, timeout: float = 30,
+) -> None:
+    """Fail before dispatch unless live and persisted isolated cwd agree."""
+    if not isinstance(created, dict):
+        raise BenchmarkInfrastructureError("isolated team create response is not an object")
+    created_name = created.get("name") or created.get("team_name")
+    team_uuid = created.get("team_uuid")
+    if created_name != team or not isinstance(team_uuid, str) or not team_uuid:
+        raise BenchmarkInfrastructureError(
+            f"isolated team create identity mismatch: expected={team} actual={created_name}"
+        )
+    rows = daemon_json("headless.list", {"team_name": team}, timeout=min(30, timeout))
+    if not isinstance(rows, list):
+        raise BenchmarkInfrastructureError("isolated team topology unavailable from daemon")
+    actual = {
+        str(row.get("name")): Path(str(row.get("working_directory", ""))).resolve(strict=False)
+        for row in rows if isinstance(row, dict) and row.get("name")
+    }
+    wanted = {role: path.resolve(strict=False) for role, path in expected.items()}
+    if actual != wanted or len(set(actual.values())) != len(wanted):
+        raise BenchmarkInfrastructureError(
+            "isolated team topology mismatch before dispatch: "
+            f"expected={wanted} actual={actual}"
+        )
+    root = Path(os.environ.get("TERMMESH_HEADLESS_ROOT", Path.home() / ".term-mesh/headless"))
+    team_dir = root / team_uuid
+    try:
+        team_meta = json.loads((team_dir / "team.json").read_text())
+        persisted = {
+            role: Path(str(json.loads(
+                (team_dir / "agents" / f"{role}.json").read_text()
+            ).get("working_directory", ""))).resolve(strict=False)
+            for role in wanted
+        }
+    except (OSError, json.JSONDecodeError) as error:
+        raise BenchmarkInfrastructureError(
+            f"isolated team persisted topology unavailable: {type(error).__name__}: {error}"
+        ) from error
+    persisted_name = team_meta.get("team_name") or team_meta.get("name")
+    persisted_checkout = Path(str(team_meta.get("working_directory", ""))).resolve(strict=False)
+    if (persisted_name != team or persisted_checkout != checkout.resolve(strict=False)
+            or persisted != wanted or len(set(persisted.values())) != len(wanted)):
+        raise BenchmarkInfrastructureError(
+            "isolated team persisted topology mismatch before dispatch: "
+            f"expected={wanted} actual={persisted}"
+        )
 
 
 def create_isolated_worker_checkouts(
@@ -1479,9 +1540,9 @@ ISOLATED_LEADER_FORBIDDEN_VALIDATION_PATTERNS = (
 
 def isolated_leader_prompt(fixture: Fixture, *, final: bool, worker_headers: str = "") -> str:
     phase = (
-        "Worker patches are now integrated. Fix only your owned paths, then run exactly this command once: "
-        + ISOLATED_LEADER_FOCUSED_TEST
-        + " Do not discover schemes, resolve packages, retry the test, or run any other validation command."
+        "Worker patches are now integrated. Review the worker results and fix only your owned paths. "
+        "Do not run xcodebuild, tests, build commands, or any validation: the controller runs the "
+        "single fixed focused validation after this turn."
         if final else
         "Workers are running in isolated checkouts. Implement the portal overlay behavior now. "
         "Do not validate in this phase. Do not run xcodebuild, local tests, xcodebuild -list, "
@@ -1515,7 +1576,13 @@ def stream_bash_commands(text: str) -> list[str]:
                     continue
                 if str(block.get("name", "")).lower() != "bash":
                     continue
-                payload = block.get("input") if isinstance(block.get("input"), dict) else {}
+                tool_id = block.get("id")
+                wire = event.get("wire_tool_inputs")
+                wire_payload = wire.get(tool_id) if isinstance(wire, dict) and isinstance(tool_id, str) else None
+                payload = (
+                    wire_payload if isinstance(wire_payload, dict) else
+                    block.get("input") if isinstance(block.get("input"), dict) else {}
+                )
                 command = payload.get("command")
                 if isinstance(command, str):
                     commands.append(command)
@@ -1538,7 +1605,9 @@ def is_exact_isolated_leader_focused_test(command: str) -> bool:
     )
 
 
-def isolated_leader_validation_diagnostics(initial_stream: str, final_stream: str) -> list[str]:
+def isolated_leader_validation_diagnostics(
+    initial_stream: str, final_stream: str, *, require_focused: bool = True,
+) -> list[str]:
     diagnostics: list[str] = []
     focused_total = 0
     for phase, stream in (("initial", initial_stream), ("final", final_stream)):
@@ -1554,11 +1623,41 @@ def isolated_leader_validation_diagnostics(initial_stream: str, final_stream: st
                     focused_total += 1
                 elif xcode_count or ISOLATED_LEADER_FOCUSED_TEST in command:
                     diagnostics.append("isolated leader final used non-focused xcodebuild command")
-    if focused_total == 0:
+    if require_focused and focused_total == 0:
         diagnostics.append("isolated leader focused test did not run")
     if focused_total > 1:
         diagnostics.append(f"isolated leader focused test ran {focused_total} times")
     return list(dict.fromkeys(diagnostics))
+
+
+def run_controller_focused_validation(
+    checkout: Path, log: TextIO, timeout: float, trace: "TraceWriter",
+) -> tuple[bool, int, str]:
+    """Run the fixed validation as exact argv, outside model-controlled shell text."""
+    command = tuple(shlex.split(ISOLATED_LEADER_FOCUSED_TEST))
+    started = time.perf_counter()
+    trace.write(
+        "controller_validation_start", command=command_fingerprint(list(command)),
+        exact_command=ISOLATED_LEADER_FOCUSED_TEST,
+    )
+    passed, reason = run_logged(command, checkout=checkout, log=log, timeout=timeout)
+    duration = round((time.perf_counter() - started) * 1000)
+    outcome = (
+        "passed" if passed else
+        "infra_invalid" if classify_infra_failure(reason) else
+        "timeout" if "timeout" in reason.lower() else
+        "product_failed"
+    )
+    exit_match = re.search(r" failed \((\d+)\):", reason)
+    exit_code = int(exit_match.group(1)) if exit_match else None
+    trace.write(
+        "controller_validation_end", duration_ms=duration,
+        status="passed" if passed else "failed", outcome=outcome,
+        exit_code=exit_code,
+        failure_fingerprint=None if passed else acceptance_failure_fingerprint(reason),
+        failure=safe_failure(reason) if not passed else None,
+    )
+    return passed, duration, reason
 
 
 def validate_worker_mutation_capability(
@@ -2858,12 +2957,15 @@ def collect_isolated_read_diagnostics(
     try:
         record.read_overlap = benchmark_read_overlap(team, checkout)
     except Exception as error:
-        record.read_overlap = {"status": "unavailable", "roles": {}}
-        add_protocol_diagnostic(record, f"read-overlap telemetry unavailable: {type(error).__name__}: {error}")
+        record.read_overlap = {
+            "status": "unavailable", "roles": {},
+            "diagnostics": [safe_failure(f"{type(error).__name__}: {error}")],
+        }
         return
 
-    if record.read_overlap.get("status") != "measured":
-        add_protocol_diagnostic(record, "read-overlap coverage incomplete")
+    # Read/runtime telemetry is optional evidence. Dynamic shell operands and
+    # globs can make it partial without changing topology or product quality;
+    # preserve its own censored status rather than excluding a valid pair.
 
     try:
         by_worker = {task["worker"]: task for task in tasks}
@@ -2871,22 +2973,25 @@ def collect_isolated_read_diagnostics(
         for role, access in record.read_overlap.get("roles", {}).items():
             task = by_worker.get(role)
             if task is None:
-                add_protocol_diagnostic(record, f"read-overlap telemetry has unknown role: {role}")
+                record.read_overlap.setdefault("diagnostics", []).append(
+                    safe_failure(f"read-overlap telemetry has unknown role: {role}")
+                )
                 continue
             scope_extras[role] = access_scope_extras(access, task["owned"])
 
         leader_transcript = claude_session_path(session_id, checkout)
         if leader_transcript is None:
-            add_protocol_diagnostic(record, "isolated leader transcript unavailable")
+            record.read_overlap["leader"] = {
+                "status": "unavailable", "reason": "transcript unavailable",
+            }
         else:
             leader_access = claude_read_paths(leader_transcript, checkout)
             scope_extras["leader"] = access_scope_extras(leader_access, ISOLATED_LEADER_OWNED)
-            if leader_access.get("status") != "measured":
-                add_protocol_diagnostic(record, "isolated leader read coverage incomplete")
+            record.read_overlap["leader"] = leader_access
         record.read_overlap["scope_extras"] = scope_extras
     except Exception as error:
-        add_protocol_diagnostic(
-            record, f"read-overlap diagnostic analysis failed: {type(error).__name__}: {error}",
+        record.read_overlap.setdefault("diagnostics", []).append(
+            safe_failure(f"read-overlap diagnostic analysis failed: {type(error).__name__}: {error}")
         )
 
 
@@ -3481,7 +3586,8 @@ def run_isolated_topology_one(
     relative = Path("runs") / run_id
     paths = {name: str(relative / filename) for name, filename in {
         "result": "result.json", "trace": "trace.jsonl", "patch": "candidate.patch",
-        "stdout": "stdout.log", "acceptance": "acceptance.log",
+        "stdout": "stdout.log", "controller_validation": "controller-validation.log",
+        "acceptance": "acceptance.log",
     }.items()}
     execution = isolated_execution_metadata(worker_model, leader_model)
     record = RunResult(
@@ -3612,7 +3718,9 @@ def run_isolated_topology_one(
                 + (generated.stderr.strip() or generated.stdout.strip() or "unknown error")
             )
         active_started = time.perf_counter()
-        with (experiment / paths["stdout"]).open("a") as log, (experiment / paths["acceptance"]).open("w") as acceptance_log:
+        with (experiment / paths["stdout"]).open("a") as log, \
+             (experiment / paths["controller_validation"]).open("w") as validation_log, \
+             (experiment / paths["acceptance"]).open("w") as acceptance_log:
             completed, _, duration = run_stream(
                 claude_command(
                     isolated_leader_prompt(fixture, final=True, worker_headers=headers), model=leader_model, effort=effort,
@@ -3624,15 +3732,23 @@ def run_isolated_topology_one(
             parsed = parse_stream(completed.stdout); add_tokens(record.tokens, parsed["tokens"]); add_tokens(record.leader_tokens, parsed["tokens"]); record.leader_turns += parsed["turns"]
             final_leader_stream = completed.stdout
             for diagnostic in isolated_leader_validation_diagnostics(
-                initial_leader_stream, final_leader_stream,
+                initial_leader_stream, final_leader_stream, require_focused=False,
             ):
                 add_protocol_diagnostic(record, diagnostic)
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr or "integration verification failed")
-            passed, acceptance_ms, reason = run_acceptance(
-                fixture, checkout, acceptance_log, require_remaining(),
-                xcode_host=xcode_host, run_id=run_id, build_info_generated=True,
+            focused_passed, focused_ms, focused_reason = run_controller_focused_validation(
+                checkout, validation_log, require_remaining(), trace,
             )
+            record.controller_validation_ms = focused_ms
+            record.controller_validation_passed = focused_passed
+            if focused_passed:
+                passed, acceptance_ms, reason = run_acceptance(
+                    fixture, checkout, acceptance_log, require_remaining(),
+                    xcode_host=xcode_host, run_id=run_id, build_info_generated=True,
+                )
+            else:
+                passed, acceptance_ms, reason = False, 0, focused_reason
             record.acceptance_ms = acceptance_ms
             acceptance_infra = not passed and classify_infra_failure(reason)
             owner = isolated_correction_owner(reason, tasks) if not passed and not acceptance_infra else None
@@ -3661,15 +3777,25 @@ def run_isolated_topology_one(
                         remaining=correction_remaining,
                     )
                     correction_file.unlink(missing_ok=True)
-                    retry_passed, retry_ms, retry_reason = run_acceptance(
-                        fixture, checkout, acceptance_log, require_remaining(),
-                        xcode_host=xcode_host, run_id=run_id + "-correction",
-                        build_info_generated=True,
+                    correction_validation_passed, validation_ms, validation_reason = (
+                        run_controller_focused_validation(
+                            checkout, validation_log, correction_remaining(), trace,
+                        )
                     )
-                    record.acceptance_ms += retry_ms
-                    passed, reason = retry_passed, retry_reason
-                    record.correction_outcome = "passed" if retry_passed else "acceptance_failed"
-                    if not retry_passed:
+                    record.controller_validation_ms = (record.controller_validation_ms or 0) + validation_ms
+                    record.controller_validation_passed = correction_validation_passed
+                    if correction_validation_passed:
+                        retry_passed, retry_ms, retry_reason = run_acceptance(
+                            fixture, checkout, acceptance_log, require_remaining(),
+                            xcode_host=xcode_host, run_id=run_id + "-correction",
+                            build_info_generated=True,
+                        )
+                        record.acceptance_ms += retry_ms
+                        passed, reason = retry_passed, retry_reason
+                    else:
+                        passed, reason = False, validation_reason
+                    record.correction_outcome = "passed" if passed else "acceptance_failed"
+                    if not passed:
                         restore_original_worker_patch(
                             checkout, corrected_patch, applied_worker_patches[owner["worker"]],
                             max(1, require_remaining()),
@@ -3711,9 +3837,11 @@ def run_isolated_topology_one(
         except Exception as error:
             record.token_precision = "leader_actual_workers_unavailable"
             record.cost_precision = "unavailable"
-            add_protocol_diagnostic(
-                record, f"worker usage telemetry unavailable: {type(error).__name__}: {error}",
+            metrics = record.worker_runtime_metrics or {"status": "unavailable", "roles": {}}
+            metrics.setdefault("diagnostics", []).append(
+                safe_failure(f"worker usage telemetry unavailable: {type(error).__name__}: {error}")
             )
+            record.worker_runtime_metrics = metrics
         if isolated_candidate_artifact_allowed(record):
             try:
                 record.changed_files = write_patch(checkout, experiment / paths["patch"])
@@ -5122,6 +5250,11 @@ def run_isolated_topology_experiment(args: argparse.Namespace) -> int:
     for index, spec in enumerate(specs, 1):
         print(f"  {index:02d}. {spec.fixture:<22} trial={spec.trial} order={spec.order} {spec.condition}")
     if args.dry_run: return 0
+    # Match the daemon's effective default explicitly so persisted topology
+    # verification never depends on an unrelated caller HOME/root override.
+    os.environ.setdefault(
+        "TERMMESH_HEADLESS_ROOT", str(Path.home() / ".term-mesh/headless"),
+    )
     if args.xcode_host != "local":
         ready, reason = remote_paid_study_preflight(args.xcode_host)
         if not ready:
