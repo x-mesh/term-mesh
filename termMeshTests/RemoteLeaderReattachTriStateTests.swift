@@ -244,4 +244,42 @@ final class RemoteLeaderReattachTriStateTests: XCTestCase {
         XCTAssertTrue(orchestrator.beginRemoteLeaderAttach(teamName: teamName))
         orchestrator.endRemoteLeaderAttach(teamName: teamName)
     }
+
+    /// Measured on a peer daemon restart: workers exit, the tunnel drops, and
+    /// the host answers a roster again about four seconds later with the
+    /// leader relay still ended.
+    func testAutomaticCollaborationRepairRunsOnlyAfterTheRestartedHostAnswers() {
+        let exit = Date(timeIntervalSince1970: 1_000)
+        func runs(
+            pending: Int = 2,
+            markedAt: Date? = exit,
+            confirmedAt: Date? = exit.addingTimeInterval(4),
+            rosterFailed: Bool = false,
+            leaderRelayLive: Bool = false,
+            busy: Bool = false,
+            placeholder: Bool = false,
+            presentationReady: Bool = true,
+            lastRepairAt: Date? = nil
+        ) -> Bool {
+            TeamOrchestrator.shouldRunAutomaticCollaborationRepair(
+                pendingCount: pending, markedAt: markedAt,
+                rosterConfirmedAt: confirmedAt, rosterFailed: rosterFailed,
+                leaderRelayLive: leaderRelayLive, busy: busy,
+                isPlaceholder: placeholder, presentationReady: presentationReady,
+                lastAutomaticRepairAt: lastRepairAt, now: exit.addingTimeInterval(5)
+            )
+        }
+        XCTAssertTrue(runs())
+        XCTAssertFalse(runs(pending: 0))
+        XCTAssertFalse(runs(markedAt: nil))
+        XCTAssertFalse(runs(confirmedAt: nil))
+        XCTAssertFalse(runs(confirmedAt: exit), "a roster read at the exit predates the restarted host")
+        XCTAssertFalse(runs(rosterFailed: true))
+        XCTAssertFalse(runs(leaderRelayLive: true), "a lone worker death under a live leader waits for the button")
+        XCTAssertFalse(runs(busy: true))
+        XCTAssertFalse(runs(placeholder: true))
+        XCTAssertFalse(runs(presentationReady: false))
+        XCTAssertFalse(runs(lastRepairAt: exit.addingTimeInterval(-60)))
+        XCTAssertTrue(runs(lastRepairAt: exit.addingTimeInterval(-300)))
+    }
 }

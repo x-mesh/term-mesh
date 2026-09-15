@@ -166,6 +166,68 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertEqual(short(.leaderOnly), "no dispatch")
     }
 
+    /// A daemon restart kills every worker after dispatches were recorded, so
+    /// the turn-log verdict stays `healthy`; the dead presentation still needs
+    /// the Repair button.
+    @MainActor
+    func testRepairFollowsDeadWorkerPresentationEvenWhenEvidenceIsHealthy() {
+        func shows(
+            _ state: LeaderTurnLog.CollaborationState, workers: Int, dead: Bool
+        ) -> Bool {
+            ReviewBoardViewModel.shouldShowCollaborationRepair(
+                state: state, workerCount: workers, workerRepairNeeded: dead
+            )
+        }
+        XCTAssertTrue(shows(.healthy, workers: 5, dead: true))
+        XCTAssertFalse(shows(.healthy, workers: 5, dead: false))
+        XCTAssertTrue(shows(.leaderOnly, workers: 5, dead: false))
+        XCTAssertFalse(shows(.leaderOnly, workers: 0, dead: true), "no roster, nothing to repair")
+    }
+
+    /// Measured on a peer daemon restart: the leader relay ends together with
+    /// both workers. With the leader invariant evaluated first the dead workers
+    /// were never reported, so the board reads worker state with the leader
+    /// treated as present.
+    @MainActor
+    func testDeadWorkersAreReportedWhenTheLeaderDiedWithThem() {
+        let dead = [
+            TeamOrchestrator.AgentPresentationProbe(
+                instanceID: "executor", panelPresent: true, sessionReady: false
+            ),
+        ]
+        let withLeader = TeamOrchestrator.collaborationPresentationState(
+            teamExists: true, workspaceExists: true,
+            leaderPanelExists: true, leaderSessionReady: false,
+            agents: dead, requireLiveSessions: true
+        )
+        XCTAssertFalse(ReviewBoardViewModel.presentationNeedsWorkerRepair(withLeader))
+
+        let ignoringLeader = TeamOrchestrator.collaborationPresentationState(
+            teamExists: true, workspaceExists: true,
+            leaderPanelExists: true, leaderSessionReady: true,
+            agents: dead, requireLiveSessions: true
+        )
+        XCTAssertTrue(ReviewBoardViewModel.presentationNeedsWorkerRepair(ignoringLeader))
+    }
+
+    @MainActor
+    func testOnlyWorkerPresentationStatesRequestRepair() {
+        let expected: [(TeamOrchestrator.CollaborationPresentationState, Bool)] = [
+            (.ready, false),
+            (.teamMissing, false),
+            (.workspaceMissing, false),
+            (.leaderPanelMissing, false),
+            (.leaderSessionUnavailable, false),
+            (.agentPanelMissing("executor"), true),
+            (.agentSessionUnavailable("executor"), true),
+        ]
+        for (state, needsRepair) in expected {
+            XCTAssertEqual(
+                ReviewBoardViewModel.presentationNeedsWorkerRepair(state), needsRepair, "\(state)"
+            )
+        }
+    }
+
     // MARK: - Dispatch grouping
 
     private func groupTask(

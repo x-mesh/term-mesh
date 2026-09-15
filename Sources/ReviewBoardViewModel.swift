@@ -436,6 +436,31 @@ final class ReviewBoardViewModel: ObservableObject {
         let dispatchCount: Int
         let completionCount: Int
         let lastActivity: String?
+        /// Read from the live presentation, not the turn log: dispatch history
+        /// keeps the evidence `healthy` after a daemon restart killed every worker.
+        var workerRepairNeeded = false
+    }
+
+    /// Leader presentation states are left to the leader's own recovery, so a
+    /// relay reconnect does not flash Repair.
+    static func presentationNeedsWorkerRepair(
+        _ state: TeamOrchestrator.CollaborationPresentationState
+    ) -> Bool {
+        switch state {
+        case .agentPanelMissing, .agentSessionUnavailable:
+            return true
+        case .ready, .teamMissing, .workspaceMissing,
+             .leaderPanelMissing, .leaderSessionUnavailable:
+            return false
+        }
+    }
+
+    static func shouldShowCollaborationRepair(
+        state: LeaderTurnLog.CollaborationState,
+        workerCount: Int,
+        workerRepairNeeded: Bool
+    ) -> Bool {
+        workerCount > 0 && (state != .healthy || workerRepairNeeded)
     }
 
     enum CollaborationRepairOutcome: Equatable {
@@ -581,11 +606,17 @@ final class ReviewBoardViewModel: ObservableObject {
         let leaderSurfaceID = team.remoteLeaderSurfaceID?.map {
             String(format: "%02x", $0)
         }.joined()
-        return collaborationPanel(summary: LeaderTurnLog.collaborationSummary(
+        var panel = collaborationPanel(summary: LeaderTurnLog.collaborationSummary(
             records: records, team: teamName, teamUUID: team.teamUuid,
             leaderSessionID: team.leaderSessionId, leaderSurfaceID: leaderSurfaceID,
             workerCount: team.agents.count
         ))
+        panel.workerRepairNeeded = presentationNeedsWorkerRepair(
+            TeamOrchestrator.shared.collaborationPresentationState(
+                teamName: teamName, requireLiveSessions: true, ignoringLeader: true
+            )
+        )
+        return panel
     }
 
     /// Peer leader turns are written on the execution host while task events

@@ -9701,7 +9701,8 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
 
         orchestrator.installTeamForTests(name: teamName, agents: [member])
         orchestrator.retireEndedPeerOwnedAgent(
-            panelID: member.panelId!, surfaceID: surfaceID, workspace: workspace
+            panelID: member.panelId!, surfaceID: surfaceID,
+            exitCode: 0, signal: 0, reason: "exited", workspace: workspace
         )
         XCTAssertEqual(orchestrator.teams[teamName]?.agents.count, 1)
 
@@ -9710,9 +9711,126 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             name: teamName, agents: [member], ownsRemotePresentation: true
         )
         orchestrator.retireEndedPeerOwnedAgent(
-            panelID: member.panelId!, surfaceID: surfaceID, workspace: workspace
+            panelID: member.panelId!, surfaceID: surfaceID,
+            exitCode: 0, signal: 0, reason: "exited", workspace: workspace
         )
         XCTAssertEqual(orchestrator.teams[teamName]?.agents.count, 0)
+    }
+
+    /// Exit values as term-meshd reports them: a normal exit is
+    /// `(code, 0, "exited")`, a signal is `(0, sig, "signaled")`. Measured on a
+    /// daemon restart: codex `(0, 15, "signaled")`, claude `(143, 0, "exited")`.
+    func testEndedPeerAgentExitClassification() {
+        let cases: [(exitCode: Int32, signal: Int32, reason: String, retire: Bool, respawn: Bool)] = [
+            (0, 0, "exited", true, false),
+            (0, 15, "signaled", false, true),
+            (0, 9, "signaled", false, true),
+            (143, 0, "exited", false, true),
+            (129, 0, "exited", false, true),
+            (130, 0, "exited", false, true),
+            (137, 0, "exited", false, true),
+            (1, 0, "exited", false, false),
+            (139, 0, "exited", false, false),
+            (0, 11, "signaled", false, false),
+            (0, 0, "unknown", false, false),
+        ]
+        for c in cases {
+            XCTAssertEqual(
+                TeamOrchestrator.shouldRetireEndedPeerAgent(
+                    exitCode: c.exitCode, signal: c.signal, reason: c.reason
+                ),
+                c.retire, "retire \(c)"
+            )
+            XCTAssertEqual(
+                TeamOrchestrator.shouldAutoRespawnEndedPeerAgent(
+                    exitCode: c.exitCode, signal: c.signal, reason: c.reason
+                ),
+                c.respawn, "respawn \(c)"
+            )
+        }
+    }
+
+    @MainActor
+    func testSignalEndedPeerOwnedAgentStaysInRosterForRepair() {
+        let orchestrator = TeamOrchestrator.shared
+        let teamName = "ended-keep-\(UUID().uuidString.prefix(8))"
+        defer { orchestrator.forgetTeamForTests(teamName) }
+        let surfaceID = Data(repeating: 0x72, count: 16)
+        let workspace = Workspace(title: "keep-for-repair")
+        let member = TeamOrchestrator.AgentMember(
+            id: "executor@\(teamName)", agentInstanceId: "executor-keep",
+            name: "executor", teamName: teamName, cli: "codex",
+            launchCommand: "codex", model: "gpt", agentType: "executor",
+            color: "green", instructions: "", workspaceId: workspace.id,
+            panelId: UUID(), createdAt: Date(), remoteSurfaceID: surfaceID,
+            remoteSurfaceSpawned: true, remoteAgentSurface: true, hostKey: "ssh:peer"
+        )
+        orchestrator.installTeamForTests(
+            name: teamName, agents: [member], ownsRemotePresentation: true
+        )
+        orchestrator.remoteAgentRouteKeepalives[member.agentInstanceId] = .init(
+            teamName: teamName, task: Task {}
+        )
+
+        orchestrator.retireEndedPeerOwnedAgent(
+            panelID: member.panelId!, surfaceID: surfaceID,
+            exitCode: 0, signal: 15, reason: "signaled", workspace: workspace
+        )
+        XCTAssertEqual(
+            orchestrator.teams[teamName]?.agents.map(\.remoteSurfaceID), [surfaceID],
+            "Repair replaces a dead surface only while the roster still names it"
+        )
+        XCTAssertEqual(orchestrator.peerAgentsAwaitingRespawn[teamName], [member.agentInstanceId])
+        XCTAssertNotNil(orchestrator.peerAgentRespawnMarkedAt[teamName])
+        XCTAssertNil(
+            orchestrator.remoteAgentRouteKeepalives[member.agentInstanceId],
+            "a kept member must not keep renewing its dead bearer"
+        )
+
+        orchestrator.peerAgentsAwaitingRespawn.removeValue(forKey: teamName)
+        orchestrator.retireEndedPeerOwnedAgent(
+            panelID: member.panelId!, surfaceID: surfaceID,
+            exitCode: 1, signal: 0, reason: "exited", workspace: workspace
+        )
+        XCTAssertEqual(orchestrator.teams[teamName]?.agents.count, 1)
+        XCTAssertNil(
+            orchestrator.peerAgentsAwaitingRespawn[teamName],
+            "an ordinary failure waits for the Repair button"
+        )
+    }
+
+    /// A daemon restart ends every agent it owns; the replacement leader is
+    /// the only surface the host still lists.
+    @MainActor
+    func test_collaborationRecoveryPlanMarksEveryWorkerDeadAfterDaemonRestart() {
+        let workspaceID = UUID()
+        let leaderID = Data(repeating: 0x11, count: 16)
+        func agent(_ name: String, _ surface: Data) -> TeamOrchestrator.AgentMember {
+            TeamOrchestrator.AgentMember(
+                id: "\(name)@headroom", agentInstanceId: name, name: name,
+                teamName: "headroom", cli: name, launchCommand: name,
+                model: "", agentType: "executor", color: "blue",
+                instructions: "", workspaceId: workspaceID, panelId: UUID(),
+                createdAt: Date(), remoteSurfaceID: surface,
+                remoteSurfaceSpawned: true, remoteAgentSurface: true,
+                hostKey: "ssh:root@jw-server"
+            )
+        }
+        var leader = Termmesh_Peer_V1_SurfaceInfo()
+        leader.surfaceID = leaderID
+        leader.attachable = true
+
+        let plan = TeamOrchestrator.collaborationRecoveryPlan(
+            leaderSurfaceID: leaderID,
+            agents: [
+                agent("codex", Data(repeating: 0x12, count: 16)),
+                agent("claude", Data(repeating: 0x13, count: 16)),
+            ],
+            surfaces: [leader]
+        )
+        XCTAssertTrue(plan.leaderLive)
+        XCTAssertEqual(plan.liveAgentCount, 0)
+        XCTAssertEqual(Set(plan.deadAgentInstanceIDs), ["codex", "claude"])
     }
 
     /// The retry pass snapshots records, then awaits each terminate. In that
