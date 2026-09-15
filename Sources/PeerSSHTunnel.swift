@@ -472,6 +472,39 @@ final class PeerSSHTunnel: @unchecked Sendable {
         _ = stop()
     }
 
+    /// Installs a freshly-`run()` ssh process as the one `stop()` will reap —
+    /// unless a `stop()` already went terminal while the spawn was in flight.
+    /// `stop()` records `shutdown.isTerminal` under the same `lock` before
+    /// releasing it, so exactly one side ends up owning the process: whoever
+    /// observes/sets it first under this lock. A tunnel that lost the race is
+    /// retired — deinit's `stop()` only returns the existing shutdown task,
+    /// so nothing later would ever reap a process installed after that point.
+    ///
+    /// Returns `true` if `proc` is now owned by this tunnel. Returns `false`
+    /// if the tunnel is already terminal, in which case `proc` was reaped
+    /// here instead.
+    @discardableResult
+    func adoptLaunchedProcess(_ proc: Process) -> Bool {
+        lock.lock()
+        if !shutdown.isTerminal {
+            process = proc
+            lock.unlock()
+            return true
+        }
+        lock.unlock()
+
+        // Never reap while holding `lock` — reaping can block up to ~3s
+        // (SIGTERM wait + SIGKILL wait) and every other method blocks on
+        // this same lock.
+        if Self.reap(proc) {
+            // Same rule `stop()` follows: keep the socket path until the
+            // process is confirmed gone, so an unlink never races a still-live
+            // forward into a ghost socket.
+            try? FileManager.default.removeItem(atPath: localSockPath)
+        }
+        return false
+    }
+
     // MARK: - Internals
 
     /// Brings the tunnel up, forwarding the remote dashboard when one is
@@ -716,9 +749,10 @@ final class PeerSSHTunnel: @unchecked Sendable {
             throw PeerSSHTunnelError.spawnFailed(String(describing: error))
         }
 
-        lock.lock()
-        process = proc
-        lock.unlock()
+        // A `stop()` on another thread can go terminal between the caller's
+        // `wantsRunning` check (`start()` or the reconnect loop) and here. If
+        // it did, this ssh has no owner left and must be reaped, not installed.
+        guard adoptLaunchedProcess(proc) else { throw CancellationError() }
 
         let fm = FileManager.default
         let deadline = Date().addingTimeInterval(Self.forwardSocketDeadlineSeconds)
