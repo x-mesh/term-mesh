@@ -172,6 +172,26 @@ final class LeaderParticipationPolicyTests: XCTestCase {
         XCTAssertEqual(payload["available_workers"] as? Int, 2)
         XCTAssertEqual(payload["worker_names"] as? [String], ["executor", "reviewer"])
         XCTAssertEqual(payload["delegation_effective"] as? String, "delegated")
+        XCTAssertEqual(payload["overlap_canary_capability"] as? Bool, true)
+        XCTAssertEqual(
+            payload["overlap_canary_capability_version"] as? Int,
+            LeaderParticipationSettings.overlapCanaryCapabilityVersion
+        )
+    }
+
+    func testOverlapCanaryCapabilityIsDisabledOutsideDelegatedMode() {
+        let health = LeaderParticipationSettings.Health(
+            supportedTurns: 500, observedDays: 0, coverage: 1, linkage: 1, unknownRate: 0
+        )
+        let payload = LeaderParticipationSettings.default.controlPayload(
+            projectID: "p", sessionID: "s", supportedLeader: true, health: health,
+            delegationState: ProjectDelegationState(configured: .leaderFirst, effective: .leaderFirst)
+        )
+        XCTAssertEqual(payload["overlap_canary_capability"] as? Bool, false)
+        XCTAssertEqual(
+            payload["overlap_canary_capability_version"] as? Int,
+            LeaderParticipationSettings.overlapCanaryCapabilityVersion
+        )
     }
 
     func testUnsupportedLeaderControlPayloadCannotApplyCanary() {

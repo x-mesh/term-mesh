@@ -697,12 +697,20 @@ extension ReviewBoardPanelView {
                 .labelsHidden()
                 .pickerStyle(.segmented)
                 .disabled(viewModel.delegationChangeInFlight)
+                .help(panel.level.help)
                 .accessibilityIdentifier("reviewBoard.delegationLevel")
 
                 Text(panel.level.detail)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                if let explanation = panel.level.overlapExplanation {
+                    Text(explanation)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 if let pending = panel.pending {
                     Text("Current: \(Text(panel.level.displayName)) · Next request: \(Text(pending.displayName))")

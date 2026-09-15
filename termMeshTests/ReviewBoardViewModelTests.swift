@@ -7,6 +7,12 @@ import XCTest
 #endif
 
 final class ReviewBoardViewModelTests: XCTestCase {
+    func testDelegatedDetailAndHelpDescribeConditionalOverlap() {
+        XCTAssertTrue(ProjectDelegationLevel.delegated.overlapExplanation?.contains("opt-in overlap canary") == true)
+        XCTAssertTrue(ProjectDelegationLevel.delegated.helpText.contains("does not validate ownership automatically"))
+        XCTAssertEqual(ProjectDelegationLevel.allCases.count, 3)
+    }
+
     /// x-kit panel runs are part of what the board's snapshot reads, so a run
     /// arriving has to publish like every other change. Without this the board
     /// saw new runs only because its timer rebuilt the whole snapshot.

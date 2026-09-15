@@ -5,6 +5,7 @@ import Foundation
 /// changes a leader's behavior by itself.
 struct LeaderParticipationSettings: Equatable {
     static let e2eSuiteName = "com.termmesh.e2e"
+    static let overlapCanaryCapabilityVersion = 1
     enum Mode: String { case off, shadow, canary }
     enum Cohort: String { case staticPolicy = "static", shadow, canary, holdout }
     enum HealthScope: String { case controlHost = "control_host", executionHost = "execution_host" }
@@ -111,6 +112,8 @@ struct LeaderParticipationSettings: Equatable {
             "delegation_configured": delegationState.configured.rawValue,
             "delegation_effective": delegationState.effective.rawValue,
             "delegation_pending": delegationState.pending?.rawValue as Any? ?? NSNull(),
+            "overlap_canary_capability": delegationState.effective == .delegated,
+            "overlap_canary_capability_version": Self.overlapCanaryCapabilityVersion,
             "available_workers": max(0, availableWorkers),
             "worker_names": workerNames,
             "max_parallel_workers": executionOptions.maxParallelWorkers,

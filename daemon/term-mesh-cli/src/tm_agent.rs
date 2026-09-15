@@ -2825,6 +2825,27 @@ enum LeaderTurnCommands {
         /// the `--wave-id` passed to `delegate`.
         #[arg(long = "wave-id")]
         wave_id: Option<String>,
+        /// Checkout mode used by the candidate worker worktrees.
+        #[arg(long = "checkout-mode")]
+        checkout_mode: Option<String>,
+        /// Number of dependency-ready mutating slices.
+        #[arg(long = "ready-mutating-slices")]
+        ready_mutating_slices: Option<u32>,
+        /// Confirms that worker ownership sets are disjoint.
+        #[arg(long)]
+        ownership_disjoint: bool,
+        /// Confirms that the leader lane is disjoint from worker lanes.
+        #[arg(long)]
+        leader_lane_disjoint: bool,
+        /// Number of concurrent write overlaps observed for this turn.
+        #[arg(long = "concurrent-write-overlap")]
+        concurrent_write_overlap: Option<u32>,
+        /// Confirms that integration runs serially.
+        #[arg(long)]
+        serial_integration: bool,
+        /// Resource health result for the execution host.
+        #[arg(long = "resource-health")]
+        resource_health: Option<String>,
     },
 }
 
@@ -8534,6 +8555,13 @@ fn main() {
         available_workers,
         risk_reason,
         wave_id,
+        checkout_mode,
+        ready_mutating_slices,
+        ownership_disjoint,
+        leader_lane_disjoint,
+        concurrent_write_overlap,
+        serial_integration,
+        resource_health,
     })) = &cli.command
     {
         // An omitted --turn-id is filled from the hook's state stack. Falling
@@ -8544,7 +8572,7 @@ fn main() {
             .clone()
             .or_else(turn_id_from_hook_state)
             .unwrap_or_else(|| "unstated".to_string());
-        print_result(run_leader_turn_route(
+        print_result(run_leader_turn_route_with_evidence(
             &resolve_team_name_with_source(cli.team.as_deref()),
             &resolved_turn_id,
             route,
@@ -8552,6 +8580,13 @@ fn main() {
             *available_workers,
             risk_reason,
             wave_id.as_deref(),
+            checkout_mode.as_deref(),
+            *ready_mutating_slices,
+            *ownership_disjoint,
+            *leader_lane_disjoint,
+            *concurrent_write_overlap,
+            *serial_integration,
+            resource_health.as_deref(),
         ));
         return;
     }
@@ -18202,6 +18237,59 @@ struct LeaderParticipationDirective {
     dispatch_bounds: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OverlapCanaryAdmission {
+    eligible: bool,
+    reasons: Vec<&'static str>,
+}
+
+impl OverlapCanaryAdmission {
+    fn evaluate(
+        resolution_applied: bool,
+        capability: bool,
+        effective_delegation: Option<&str>,
+        route: &str,
+        suggested_route: Option<&str>,
+        checkout_mode: Option<&str>,
+        ready_mutating_slices: Option<u32>,
+        ownership_disjoint: bool,
+        leader_lane_disjoint: bool,
+        concurrent_write_overlap: Option<u32>,
+        serial_integration: bool,
+        resource_health: Option<&str>,
+    ) -> Self {
+        let mut reasons = Vec::new();
+        if !resolution_applied { reasons.push("resolution_not_applied"); }
+        if !capability { reasons.push("capability_missing_or_stale"); }
+        if effective_delegation != Some("delegated") {
+            reasons.push("delegation_not_delegated");
+        }
+        if route != "parallel" { reasons.push("route_not_parallel"); }
+        if suggested_route != Some("parallel") {
+            reasons.push("suggested_route_not_parallel");
+        }
+        if suggested_route != Some(route) {
+            reasons.push("route_deviation");
+        }
+        if checkout_mode.map(str::trim) != Some("isolated") {
+            reasons.push("checkout_not_isolated");
+        }
+        if ready_mutating_slices.map_or(true, |count| count < 2) {
+            reasons.push("fewer_than_two_ready_mutating_slices");
+        }
+        if !ownership_disjoint { reasons.push("worker_ownership_overlap"); }
+        if !leader_lane_disjoint { reasons.push("leader_lane_overlap"); }
+        if concurrent_write_overlap != Some(0) {
+            reasons.push("concurrent_write_overlap");
+        }
+        if !serial_integration { reasons.push("non_serial_integration"); }
+        if resource_health.map(str::trim) != Some("passed") {
+            reasons.push("resource_health_not_passed");
+        }
+        Self { eligible: reasons.is_empty(), reasons }
+    }
+}
+
 impl LeaderParticipationDirective {
     fn from_input(
         task_shape: Option<&str>,
@@ -18298,6 +18386,26 @@ fn leader_control_routing_options() -> (Option<String>, Option<u32>) {
     if data.len() > 64 * 1024 { return (None, None); }
     let Ok(value) = serde_json::from_slice::<Value>(&data) else { return (None, None); };
     routing_options_from_control(&value)
+}
+
+const OVERLAP_CANARY_CAPABILITY_VERSION: u64 = 1;
+
+fn leader_control_overlap_inputs() -> (Option<String>, bool) {
+    let Ok(path) = env::var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE") else {
+        return (None, false);
+    };
+    let Ok(data) = fs::read(path) else { return (None, false); };
+    if data.len() > 64 * 1024 { return (None, false); }
+    let Ok(value) = serde_json::from_slice::<Value>(&data) else {
+        return (None, false);
+    };
+    let effective = value["delegation_effective"]
+        .as_str()
+        .map(str::to_string);
+    let capability = value["overlap_canary_capability"].as_bool() == Some(true)
+        && value["overlap_canary_capability_version"].as_u64()
+            == Some(OVERLAP_CANARY_CAPABILITY_VERSION);
+    (effective, capability)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18867,7 +18975,7 @@ fn turn_route_marker_path(path: &Path, turn_id: &str) -> Option<PathBuf> {
     (!key.is_empty()).then(|| path.with_file_name(format!(".turn-route-{key}")))
 }
 
-fn run_leader_turn_route(
+fn run_leader_turn_route_with_evidence(
     team_resolution: &TeamNameResolution,
     turn_id: &str,
     route: &str,
@@ -18875,6 +18983,13 @@ fn run_leader_turn_route(
     available_workers: Option<u32>,
     risk_reasons: &[String],
     wave_id: Option<&str>,
+    checkout_mode: Option<&str>,
+    ready_mutating_slices: Option<u32>,
+    ownership_disjoint: bool,
+    leader_lane_disjoint: bool,
+    concurrent_write_overlap: Option<u32>,
+    serial_integration: bool,
+    resource_health: Option<&str>,
 ) -> Result<Value, String> {
     if turn_id.trim().is_empty() {
         return Err("--turn-id must not be blank".to_string());
@@ -18901,6 +19016,36 @@ fn run_leader_turn_route(
         env::var("TERMMESH_SURFACE_ID").ok().as_deref(),
         &iso8601_utc_now(),
     );
+    let (effective_delegation, overlap_capability) = leader_control_overlap_inputs();
+    let resolution = resolve_participation_from_env(available_workers.is_some(), Some(turn_id));
+    let admission = OverlapCanaryAdmission::evaluate(
+        resolution.applied,
+        overlap_capability,
+        effective_delegation.as_deref(),
+        route,
+        record.get("suggested_route").and_then(Value::as_str),
+        checkout_mode,
+        ready_mutating_slices,
+        ownership_disjoint,
+        leader_lane_disjoint,
+        concurrent_write_overlap,
+        serial_integration,
+        resource_health,
+    );
+    record["overlap_canary"] = json!(admission.eligible);
+    record["overlap_canary_reasons"] = json!(admission.reasons);
+    record["overlap_canary_evidence"] = json!({
+        "capability": overlap_capability,
+        "capability_version": OVERLAP_CANARY_CAPABILITY_VERSION,
+        "effective_delegation": effective_delegation,
+        "checkout_mode": checkout_mode,
+        "ready_mutating_slices": ready_mutating_slices,
+        "ownership_disjoint": ownership_disjoint,
+        "leader_lane_disjoint": leader_lane_disjoint,
+        "concurrent_write_overlap": concurrent_write_overlap,
+        "serial_integration": serial_integration,
+        "resource_health": resource_health,
+    });
     if let Some(route) = remote_leader_route() {
         record["team_uuid"] = json!(route.team_uuid);
     }
@@ -18921,11 +19066,20 @@ fn run_leader_turn_route(
         .as_bool()
         .unwrap_or(false)
         .then(|| {
-            json!({
+            let mut directive = json!({
                 "participation": record["suggested_participation"],
-                "route": record["suggested_route"],
+                "route": record["actual_route"],
                 "dispatch_bounds": record["dispatch_bounds"],
-            })
+                "overlap_canary": record["overlap_canary"],
+            });
+            if admission.eligible {
+                directive["execution"] = json!("overlap_canary");
+                directive["leader_lane_bounds"] =
+                    json!("one disjoint leader mutation lane");
+                directive["zero_write_overlap"] = json!(true);
+                directive["serial_integration"] = json!(true);
+            }
+            directive
         });
     let route_deviation = match record.get("suggested_route").and_then(Value::as_str) {
         Some(suggested) if suggested != record["actual_route"] => Some(json!({
@@ -18941,6 +19095,22 @@ fn run_leader_turn_route(
         "directive": directive,
         "route_deviation": route_deviation,
     }))
+}
+
+#[cfg(test)]
+fn run_leader_turn_route(
+    team_resolution: &TeamNameResolution,
+    turn_id: &str,
+    route: &str,
+    task_shape: Option<&str>,
+    available_workers: Option<u32>,
+    risk_reasons: &[String],
+    wave_id: Option<&str>,
+) -> Result<Value, String> {
+    run_leader_turn_route_with_evidence(
+        team_resolution, turn_id, route, task_shape, available_workers,
+        risk_reasons, wave_id, None, None, false, false, None, false, None,
+    )
 }
 
 #[cfg(test)]
@@ -19011,6 +19181,38 @@ mod leader_turn_record_tests {
         assert_eq!(serial.route, "delegated");
         assert_eq!(serial.reasons, ["delegated_serial_work"]);
         assert_eq!(serial.dispatch_bounds, "exactly one implementation worker");
+    }
+
+    #[test]
+    fn overlap_canary_requires_every_positive_admission_fact() {
+        let eligible = OverlapCanaryAdmission::evaluate(
+            true, true, Some("delegated"), "parallel", Some("parallel"),
+            Some("isolated"), Some(2), true, true, Some(0), true, Some("passed"),
+        );
+        assert!(eligible.eligible, "all positive evidence must admit overlap");
+
+        let cases: &[(&str, bool, bool, Option<&str>, &str, Option<&str>, Option<&str>, Option<u32>, bool, bool, Option<u32>, bool, Option<&str>)] = &[
+            ("resolution", false, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("capability", true, false, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("delegation", true, true, Some("guarded"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("route", true, true, Some("delegated"), "direct", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("suggested_route", true, true, Some("delegated"), "parallel", Some("direct"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("route_deviation", true, true, Some("delegated"), "parallel", Some("probe"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("checkout", true, true, Some("delegated"), "parallel", Some("parallel"), Some("shared"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("ready_units", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(1), true, true, Some(0), true, Some("passed")),
+            ("ownership", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), false, true, Some(0), true, Some("passed")),
+            ("leader_lane", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, false, Some(0), true, Some("passed")),
+            ("write_overlap", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(1), true, Some("passed")),
+            ("integration", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), false, Some("passed")),
+            ("resources", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("failed")),
+        ];
+        for &(name, resolution, capability, delegation, route, suggested_route, checkout, ready, ownership, lane, overlap, serial, resources) in cases {
+            let admission = OverlapCanaryAdmission::evaluate(
+                resolution, capability, delegation, route, suggested_route, checkout, ready, ownership, lane,
+                overlap, serial, resources,
+            );
+            assert!(!admission.eligible, "{name} must fail closed");
+        }
     }
 
     #[test]

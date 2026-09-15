@@ -9,13 +9,35 @@ from pathlib import Path
 from termmesh import termmeshError
 
 
-def route(cli: Path, env: dict, turn: str) -> dict:
+def route(cli: Path, env: dict, turn: str, *, route_name: str = "direct", evidence: bool = False, overrides: dict | None = None) -> dict:
     current = Path(env["HOME"]) / ".term-mesh/logs/.turn-current-surface-canary"
     current.parent.mkdir(parents=True, exist_ok=True)
     current.write_text(turn + "\n")
-    result = subprocess.run([str(cli), "leader", "turn", "route",
-        "--route", "direct", "--task-shape", "multi_unit",
-        "--available-workers", "3"], env=env, check=True, capture_output=True, text=True)
+    args = [str(cli), "leader", "turn", "route",
+        "--route", route_name, "--task-shape", "multi_unit",
+        "--available-workers", "3"]
+    if evidence:
+        values = {
+            "checkout_mode": "isolated",
+            "ready_mutating_slices": 2,
+            "ownership_disjoint": True,
+            "leader_lane_disjoint": True,
+            "concurrent_write_overlap": 0,
+            "serial_integration": True,
+            "resource_health": "passed",
+        }
+        values.update(overrides or {})
+        args.extend(["--checkout-mode", str(values["checkout_mode"])])
+        args.extend(["--ready-mutating-slices", str(values["ready_mutating_slices"])])
+        if values["ownership_disjoint"]:
+            args.append("--ownership-disjoint")
+        if values["leader_lane_disjoint"]:
+            args.append("--leader-lane-disjoint")
+        args.extend(["--concurrent-write-overlap", str(values["concurrent_write_overlap"])])
+        if values["serial_integration"]:
+            args.append("--serial-integration")
+        args.extend(["--resource-health", str(values["resource_health"])])
+    result = subprocess.run(args, env=env, check=True, capture_output=True, text=True)
     return json.loads(result.stdout)
 
 
@@ -42,20 +64,64 @@ def main() -> int:
         config = {"mode": "canary", "percent": 100, "kill_switch": False,
                   "supported": True, "healthy": False, "opt_in": True,
                   "health_scope": "execution_host",
-                  "project_id": "p", "session_id": "s"}
+                  "project_id": "p", "session_id": "s",
+                  "delegation_effective": "delegated",
+                  "overlap_canary_capability": True,
+                  "overlap_canary_capability_version": 1}
         control.write_text(json.dumps(config))
         control.chmod(0o600)
         env = os.environ.copy()
         env.update({"HOME": home, "TERMMESH_TEAM": "canary-e2e",
                     "TERMMESH_SURFACE_ID": "surface-canary",
                     "TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE": str(control)})
-        applied = route(cli, env, "turn-canary")
-        if not applied.get("directive") or not applied["record"].get("policy_applied"):
+        applied = route(cli, env, "turn-canary", route_name="parallel", evidence=True)
+        if (not applied.get("directive")
+                or not applied["record"].get("policy_applied")
+                or applied["record"].get("overlap_canary") is not True
+                or applied["directive"].get("execution") != "overlap_canary"):
             raise termmeshError(f"eligible canary did not apply: {applied}")
+
+        for field, value in ((
+            ("overlap_canary_capability", False),
+            ("overlap_canary_capability_version", 0),
+            ("delegation_effective", "leaderFirst"),
+        )):
+            config["overlap_canary_capability"] = True
+            config["overlap_canary_capability_version"] = 1
+            config["delegation_effective"] = "delegated"
+            config[field] = value
+            control.write_text(json.dumps(config))
+            boundary = route(cli, env, f"turn-boundary-{field}", route_name="parallel", evidence=True)
+            if (boundary["record"].get("overlap_canary") is not False
+                    or (boundary.get("directive") or {}).get("execution") == "overlap_canary"):
+                raise termmeshError(f"{field} enabled overlap: {boundary}")
+        config["overlap_canary_capability"] = True
+        config["overlap_canary_capability_version"] = 1
+        config["delegation_effective"] = "delegated"
+        deviation = route(cli, env, "turn-route-deviation", route_name="direct", evidence=True)
+        if deviation["record"].get("overlap_canary") is not False:
+            raise termmeshError(f"route deviation enabled overlap: {deviation}")
+
+        for field, value in ((
+            ("checkout_mode", "shared"),
+            ("ready_mutating_slices", 1),
+            ("ownership_disjoint", False),
+            ("leader_lane_disjoint", False),
+            ("concurrent_write_overlap", 1),
+            ("serial_integration", False),
+            ("resource_health", "failed"),
+        )):
+            control.write_text(json.dumps(config))
+            boundary = route(
+                cli, env, f"turn-evidence-{field}", route_name="parallel",
+                evidence=True, overrides={field: value}
+            )
+            if boundary["record"].get("overlap_canary") is not False:
+                raise termmeshError(f"{field} enabled overlap: {boundary}")
 
         config["mode"] = "shadow"
         control.write_text(json.dumps(config))
-        shadow = route(cli, env, "turn-shadow")
+        shadow = route(cli, env, "turn-shadow", route_name="parallel", evidence=True)
         if shadow.get("directive") is not None \
            or shadow["record"].get("policy_mode") != "shadow":
             raise termmeshError(f"Shadow mode changed the live route: {shadow}")
@@ -63,7 +129,7 @@ def main() -> int:
         config["mode"] = "canary"
         config["project_id"] = "missing-project"
         control.write_text(json.dumps(config))
-        unhealthy = route(cli, env, "turn-unhealthy")
+        unhealthy = route(cli, env, "turn-unhealthy", route_name="parallel", evidence=True)
         if unhealthy.get("directive") is not None \
            or unhealthy["record"].get("policy_applied"):
             raise termmeshError(
@@ -73,14 +139,14 @@ def main() -> int:
 
         config["kill_switch"] = True
         control.write_text(json.dumps(config))
-        killed = route(cli, env, "turn-killed")
+        killed = route(cli, env, "turn-killed", route_name="parallel", evidence=True)
         if killed.get("directive") is not None or killed["record"].get("policy_applied"):
             raise termmeshError(f"kill switch did not affect next turn: {killed}")
 
         config.update({"kill_switch": False, "percent": 0})
         control.write_text(json.dumps(config))
-        holdout1 = route(cli, env, "turn-holdout-1")
-        holdout2 = route(cli, env, "turn-holdout-2")
+        holdout1 = route(cli, env, "turn-holdout-1", route_name="parallel", evidence=True)
+        holdout2 = route(cli, env, "turn-holdout-2", route_name="parallel", evidence=True)
         cohorts = [holdout1["record"].get("cohort"), holdout2["record"].get("cohort")]
         if cohorts != ["holdout", "holdout"]:
             raise termmeshError(f"zero-percent holdout is not deterministic: {cohorts}")
