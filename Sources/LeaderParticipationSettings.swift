@@ -99,7 +99,11 @@ struct LeaderParticipationSettings: Equatable {
         workerNames: [String] = [],
         executionOptions: ProjectExecutionOptions = .default
     ) -> [String: Any] {
-        [
+        let delegatedOverlapResolution = delegationState.effective == .delegated
+            && supportedLeader
+            && health.passesPromotionGate
+            && !killSwitch
+        return [
             "schema_version": 1,
             "mode": mode.rawValue,
             "percent": min(100, max(0, canaryPercent)),
@@ -114,6 +118,7 @@ struct LeaderParticipationSettings: Equatable {
             "delegation_pending": delegationState.pending?.rawValue as Any? ?? NSNull(),
             "overlap_canary_capability": delegationState.effective == .delegated,
             "overlap_canary_capability_version": Self.overlapCanaryCapabilityVersion,
+            "delegated_overlap_resolution": delegatedOverlapResolution,
             "available_workers": max(0, availableWorkers),
             "worker_names": workerNames,
             "max_parallel_workers": executionOptions.maxParallelWorkers,
