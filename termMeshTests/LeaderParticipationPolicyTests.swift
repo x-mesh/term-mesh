@@ -172,6 +172,28 @@ final class LeaderParticipationPolicyTests: XCTestCase {
         XCTAssertEqual(payload["available_workers"] as? Int, 2)
         XCTAssertEqual(payload["worker_names"] as? [String], ["executor", "reviewer"])
         XCTAssertEqual(payload["delegation_effective"] as? String, "delegated")
+        XCTAssertEqual(payload["overlap_canary_capability"] as? Bool, true)
+        XCTAssertEqual(payload["delegated_overlap_resolution"] as? Bool, false)
+        XCTAssertEqual(
+            payload["overlap_canary_capability_version"] as? Int,
+            LeaderParticipationSettings.overlapCanaryCapabilityVersion
+        )
+    }
+
+    func testOverlapCanaryCapabilityIsDisabledOutsideDelegatedMode() {
+        let health = LeaderParticipationSettings.Health(
+            supportedTurns: 500, observedDays: 0, coverage: 1, linkage: 1, unknownRate: 0
+        )
+        let payload = LeaderParticipationSettings.default.controlPayload(
+            projectID: "p", sessionID: "s", supportedLeader: true, health: health,
+            delegationState: ProjectDelegationState(configured: .leaderFirst, effective: .leaderFirst)
+        )
+        XCTAssertEqual(payload["overlap_canary_capability"] as? Bool, false)
+        XCTAssertEqual(payload["delegated_overlap_resolution"] as? Bool, false)
+        XCTAssertEqual(
+            payload["overlap_canary_capability_version"] as? Int,
+            LeaderParticipationSettings.overlapCanaryCapabilityVersion
+        )
     }
 
     func testUnsupportedLeaderControlPayloadCannotApplyCanary() {
@@ -185,11 +207,47 @@ final class LeaderParticipationPolicyTests: XCTestCase {
             projectID: "p", sessionID: "s", supportedLeader: false, health: healthy
         )
         XCTAssertEqual(payload["supported"] as? Bool, false)
+        XCTAssertEqual(payload["delegated_overlap_resolution"] as? Bool, false)
         XCTAssertEqual(
             settings.resolve(
                 projectID: "p", sessionID: "s", supportedLeader: false, health: healthy
             ),
             .staticPolicy(.staticPolicy)
         )
+    }
+
+    func testDelegatedOverlapResolutionIsIndependentOfGeneralCanarySettings() {
+        let healthy = LeaderParticipationSettings.Health(
+            supportedTurns: 500, observedDays: 0, coverage: 1, linkage: 1, unknownRate: 0
+        )
+        let delegated = LeaderParticipationSettings.default.controlPayload(
+            projectID: "review-board", sessionID: "s", supportedLeader: true, health: healthy,
+            delegationState: ProjectDelegationState(configured: .delegated, effective: .delegated)
+        )
+        XCTAssertEqual(delegated["mode"] as? String, "shadow")
+        XCTAssertEqual(delegated["percent"] as? Int, 0)
+        XCTAssertEqual(delegated["opt_in"] as? Bool, false)
+        XCTAssertEqual(delegated["delegated_overlap_resolution"] as? Bool, true)
+
+        let unhealthy = LeaderParticipationSettings.default.controlPayload(
+            projectID: "review-board", sessionID: "s", supportedLeader: true,
+            health: .init(supportedTurns: 1, observedDays: 0, coverage: 1, linkage: 1, unknownRate: 0),
+            delegationState: ProjectDelegationState(configured: .delegated, effective: .delegated)
+        )
+        XCTAssertEqual(unhealthy["delegated_overlap_resolution"] as? Bool, false)
+
+        let unsupported = LeaderParticipationSettings.default.controlPayload(
+            projectID: "review-board", sessionID: "s", supportedLeader: false, health: healthy,
+            delegationState: ProjectDelegationState(configured: .delegated, effective: .delegated)
+        )
+        XCTAssertEqual(unsupported["delegated_overlap_resolution"] as? Bool, false)
+
+        let killed = LeaderParticipationSettings(
+            mode: .shadow, canaryPercent: 0, killSwitch: true, optInProjects: []
+        ).controlPayload(
+            projectID: "review-board", sessionID: "s", supportedLeader: true, health: healthy,
+            delegationState: ProjectDelegationState(configured: .delegated, effective: .delegated)
+        )
+        XCTAssertEqual(killed["delegated_overlap_resolution"] as? Bool, false)
     }
 }

@@ -40,6 +40,24 @@ enum ProjectDelegationLevel: String, CaseIterable, Codable, Sendable {
             return "Workers take as many independent units as the configured limit allows; the leader integrates and verifies."
         }
     }
+
+    var helpText: String {
+        switch self {
+        case .leaderFirst:
+            return "The leader keeps serial work and delegates only independent parallel units."
+        case .guarded:
+            return "The leader keeps serial work and adds one read-only probe when risk requires it."
+        case .delegated:
+            return "Delegated is an opt-in cohort. The overlap canary does not validate ownership automatically. Missing or unsafe evidence keeps current Policy v13 behavior."
+        }
+    }
+
+    var help: Text { Text(helpText) }
+
+    var overlapExplanation: String? {
+        guard self == .delegated else { return nil }
+        return "The opt-in overlap canary applies only to healthy isolated parallel turns with reported disjoint ownership, a disjoint leader lane, zero write overlap, and serial integration. Otherwise, current Policy v13 behavior remains."
+    }
 }
 
 /// Per-Project execution options that only need to reach the turn hook.

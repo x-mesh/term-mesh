@@ -74,6 +74,161 @@ per-run result/trace/log/patch files, `quality-eval.json`, `summary.json`, and `
 Trace JSONL contains metadata only. Judge inputs randomize A/B order; at least two ready vendors
 enable cross-vendor evaluation, otherwise the report records the single-vendor fallback.
 
+## Leader and worker overlap study
+
+Use the orchestration study to compare three conditions.
+
+- `single` runs one leader without workers.
+- `blocking` waits for all workers before the leader starts.
+- `overlap` runs a read-only leader lane while workers run.
+
+Inspect the 27-run matrix before any model call:
+
+```bash
+python3 scripts/bench-agent-effectiveness.py orchestration-study \
+  --fixtures homebrew-smoke,ghostty-kit-guard,split-divider-color \
+  --trials 3 --seed 20260814 --dry-run
+```
+
+Run the study only after you approve the provider cost:
+
+```bash
+python3 scripts/bench-agent-effectiveness.py orchestration-study \
+  --fixtures homebrew-smoke,ghostty-kit-guard,split-divider-color \
+  --trials 3 --seed 20260814
+```
+
+After the matrix passes, run the blinded quality evaluation:
+
+```bash
+python3 scripts/bench-agent-effectiveness.py report \
+  ~/.term-mesh/benchmarks/effectiveness/orchestration-study/<run-id> --evaluate
+```
+
+The overlap lane reads a separate history-free snapshot. It cannot use mutation-capable tools.
+The controller checks that snapshot before and after each overlap turn.
+The run fails if an overlap turn changes the snapshot.
+
+The report compares `single` with `overlap`. It also compares `blocking` with `overlap`.
+It records first-result time, last-result time, pure wait time, overlap time, and the critical path.
+
+The controller extracts structured `Read`, `Grep`, and `Glob` paths from Claude worker transcripts.
+It stores repository-relative paths and aggregate overlap values. It drops external paths and command bodies.
+If transcript coverage is incomplete, the report marks read overlap as unknown.
+
+Do not change the leader policy from latency results alone. Require the full matrix first.
+Require no pass-rate loss and a paired median speedup of at least 1.20x.
+Run a separate blinded quality evaluation before policy promotion.
+
+## Worker task partition study
+
+Use this study when the orchestration study finds high code-read overlap.
+The study keeps three workers and the blocking lifecycle in both conditions.
+It changes only the worker task capsules.
+
+- `broad` uses the existing role prompts and broad repository read scope.
+- `partitioned` assigns disjoint exact paths to contract, implementation, and acceptance roles.
+
+Inspect the six-run paired matrix first:
+
+```bash
+python3 scripts/bench-agent-effectiveness.py partition-study \
+  --fixtures split-divider-color --trials 3 --seed 20260814 --dry-run
+```
+
+Run the study only after you approve the provider cost:
+
+```bash
+python3 scripts/bench-agent-effectiveness.py partition-study \
+  --fixtures split-divider-color --trials 3 --seed 20260814
+```
+
+Compare wall time, acceptance pass rate, worker critical path, integration time, and read-set Jaccard.
+Do not compare results from different commits or mix blocking and overlap lifecycles.
+
+## Isolated Project topology study
+
+This study matches the Project topology. The leader owns the integration checkout.
+Each worker runs in a separate detached Git worktree. Leader and worker write scopes do not overlap.
+The conditions differ only in whether the leader implements its production slice before or after worker completion.
+
+```bash
+python3 scripts/bench-agent-effectiveness.py isolated-topology-study \
+  --fixtures split-divider-color --trials 3 --seed 20260814 --dry-run
+```
+
+Run the paid six-cell study only after the dry run and fixture validation pass.
+
+### Validity gates
+
+Use explicit canonical app and daemon sockets. Reject inherited socket aliases.
+Before dispatch, verify each worker directory in live daemon state and persisted agent metadata.
+Require three distinct worker directories and one separate leader integration checkout.
+Apply worker patches to the leader checkout in task order.
+
+The controller runs one fixed focused validation command after leader integration.
+The remote runner verifies the parent Ghostty pin and submodule HEAD before Xcode starts.
+Product acceptance requires six hidden behavior tests and the full Debug build.
+Incomplete read and runtime telemetry remains optional evidence. It does not change product or pair validity.
+
+### Clean-disk Opus leader results
+
+The study used commit `ce0ddc42ef552b3a8082da3d25e0440e938c7b7c`.
+It used one Opus leader and three Sonnet workers on the `split-divider-color` fixture.
+The two pairs used opposite orders. The local disk had at least 183 GiB free before each cell.
+
+| Order | Blocking wall | Overlap wall | Speedup | Blocking cost | Overlap cost | Acceptance |
+|---|---:|---:|---:|---:|---:|---|
+| Blocking → overlap | 824.941 s | 459.384 s | 1.796x | $12.376824 | $8.250547 | Both passed |
+| Overlap → blocking | 667.740 s | 452.924 s | 1.474x | $8.731640 | $8.718598 | Both passed |
+
+The paired median speedup was 1.635x. The geometric mean was 1.627x.
+Both orders exceeded the 1.20x latency gate. All four cells passed acceptance.
+No cell used a correction. Every cell preserved isolated worker ownership and serial integration.
+Overlap reduced measured wall time by 32.17% in reverse order and 44.31% in forward order.
+
+Evidence is stored in these experiment directories:
+
+- `~/.term-mesh/benchmarks/effectiveness/isolated-topology-study/pr546-opus-sonnet-disk-normal-reverse-overlap-ce0ddc42`
+- `~/.term-mesh/benchmarks/effectiveness/isolated-topology-study/pr546-opus-sonnet-disk-normal-reverse-blocking-ce0ddc42`
+- `~/.term-mesh/benchmarks/effectiveness/isolated-topology-study/pr546-opus-sonnet-clean-forward-blocking-ce0ddc42`
+- `~/.term-mesh/benchmarks/effectiveness/isolated-topology-study/pr546-opus-sonnet-clean-forward-overlap-ce0ddc42`
+
+The result is strong evidence of an overlap benefit for this fixture and model topology.
+It does not prove a global routing policy. Provider queue and TTFT values were unavailable.
+The worker critical path also varied between cells. Do not attribute all saved time to measured leader overlap.
+
+### Excluded runs
+
+| Run class | Failure | Treatment |
+|---|---|---|
+| Low-disk blocking → overlap | The local disk had about 3.7 GiB free and reached 100% use. The measured speedup was 0.851x. | Keep as a resource-censored reference. Do not pool it with clean-disk pairs. |
+| Missing Ghostty pins | Xcode first-launch and license state caused Git and Xcode to return exit 69. The pin fields appeared missing. | Mark infra-invalid. Exclude latency and quality. |
+| Socket alias topology | Inherited socket aliases selected the wrong daemon. Workers wrote in the leader checkout. | Mark infra-invalid. Exclude the pair. |
+| Daemon prerequisite | The canonical daemon was unavailable before provider work. | Mark infra-invalid. Exclude the run. |
+| Candidate compile or acceptance failure | Candidate code failed a product gate. | Count against pass rate. Exclude paired latency. |
+
+`parent ghostty pin: missing` and `submodule HEAD: missing` were infrastructure symptoms.
+They were not candidate or model failures. Black-box portal acceptance replaced the earlier private-helper-coupled fixture.
+
+### Promotion status and next gate
+
+Keep Leader Adaptive Execution Policy version 13 unchanged. Do not enable overlap globally yet.
+Run one final clean-disk trial 3 in blocking → overlap order. Keep the same commit, fixture, models, host, and acceptance.
+This trial closes the predefined three-trial gate without adding a new fixture implementation variable.
+
+If trial 3 passes, permit only an explicit opt-in canary with all of these conditions:
+
+- Use isolated worker worktrees and one leader integration checkout.
+- Require at least two dependency-ready, ownership-disjoint mutation slices.
+- Give the leader a separate owned production slice.
+- Require zero write ownership overlap and serial patch integration.
+- Pass disk, socket, daemon, Git, Xcode, focused validation, and product acceptance gates.
+- Fall back to the version 13 route for every other task.
+
+Require trial 3 to preserve pass rate, correction rate, and a three-pair median speedup of at least 1.20x.
+Require another fixture and blinded quality evaluation before overlap becomes a global default.
+
 ## Project leader policy A/B
 
 The original matrix compares one session with a controller-dispatched three-worker team. It does

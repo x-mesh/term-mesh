@@ -5103,6 +5103,7 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
                     Ok(effort) => {
                     let spec = crate::headless::AgentSpec {
                         name: p.name,
+                        working_directory: None,
                         cli: p.cli,
                         model: p.model,
                         effort,

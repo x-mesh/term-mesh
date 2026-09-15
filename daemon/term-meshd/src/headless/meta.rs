@@ -43,6 +43,9 @@ pub struct TeamMeta {
     pub git_branch_at_create: Option<String>,
     pub leader: LeaderMeta,
     pub agents: Vec<String>,
+    /// Team topology survives even when isolated mode has no team-level path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_mode: Option<String>,
     pub worktree: Option<WorktreeMeta>,
     pub execution_mode: String,
     pub claude_cli_version: Option<String>,
@@ -97,6 +100,9 @@ pub struct AgentMeta {
     pub schema: u32,
     pub team_uuid: String,
     pub name: String,
+    /// Agent-specific checkout. Legacy metadata falls back to team directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
     /// Durable, team-scoped identity. Absent only in legacy metadata and
     /// migrated on the next persistence/resume write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
