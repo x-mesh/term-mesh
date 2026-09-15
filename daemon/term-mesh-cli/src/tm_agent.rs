@@ -4409,7 +4409,24 @@ mod runbook_tests {
         let dir = env::temp_dir().join(format!("tm-agent-runbook-drift-{unique}"));
         let role = selected_runbook_roles(Some("reviewer")).unwrap().remove(0);
         let source_path = runbook_source_path(&dir, &role);
-        let projection_path = runbook_projection_path(&dir, RunbookTool::Codex, &role);
+        // The Codex projection resolves under `HOME`. Without this the test
+        // rewrote the developer's real `~/.codex/skills/term-mesh-reviewer`.
+        let projection_path = {
+            let _env = ProcessEnvGuard::acquire();
+            let prev_home = env::var_os("HOME");
+            env::set_var("HOME", dir.join("home"));
+            let path = runbook_projection_path(&dir, RunbookTool::Codex, &role);
+            match prev_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+            path
+        };
+        assert!(
+            projection_path.starts_with(&dir),
+            "projection must stay in the temp dir: {}",
+            projection_path.display()
+        );
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
         fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
 
@@ -5281,12 +5298,45 @@ struct RemoteLeaderRoute {
     target_peer_id_hex: String,
 }
 
+/// Serializes every test that mutates process-global environment, or reads a
+/// variable another test mutates (`HOME` above all). Separate per-test locks
+/// did not exclude one another: a test resolved `~/.term-mesh/logs` under a
+/// temporary `HOME` that a concurrent test had already removed.
 #[cfg(test)]
 static REMOTE_LEADER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 thread_local! {
     static REMOTE_LEADER_ENV_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Holds `REMOTE_LEADER_ENV_LOCK` for a test body and marks it held, so code
+/// under test that calls `remote_leader_route()` does not deadlock on the
+/// non-reentrant mutex.
+#[cfg(test)]
+struct ProcessEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl ProcessEnvGuard {
+    fn acquire() -> Self {
+        REMOTE_LEADER_ENV_LOCK_HELD.with(|held| {
+            assert!(!held.get(), "ProcessEnvGuard cannot be nested");
+        });
+        let lock = REMOTE_LEADER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        REMOTE_LEADER_ENV_LOCK_HELD.with(|held| held.set(true));
+        Self { _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProcessEnvGuard {
+    fn drop(&mut self) {
+        REMOTE_LEADER_ENV_LOCK_HELD.with(|held| held.set(false));
+    }
 }
 
 /// Names the file holding this process's scoped route. The value is a path,
@@ -19522,8 +19572,7 @@ mod leader_turn_record_tests {
 
     #[test]
     fn route_requires_a_nonblank_leader_session_before_using_control_snapshot() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = ENV_LOCK.lock().expect("participation env lock");
+        let _env = ProcessEnvGuard::acquire();
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path().to_path_buf();
         fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create log directory");
@@ -20512,6 +20561,7 @@ mod leader_turn_record_tests {
     /// `log`, so a `.jsonl` sink would never be offered for rotation.
     #[test]
     fn sink_is_a_dot_log_file_under_the_term_mesh_logs_dir() {
+        let _env = ProcessEnvGuard::acquire();
         let path = turn_log_path().expect("HOME is set in the test environment");
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("log"));
         assert_eq!(path.file_name().and_then(|f| f.to_str()), Some("turns.log"));
@@ -20527,6 +20577,7 @@ mod leader_turn_record_tests {
     /// the turn already running; later lines are prompts absorbed into it.
     #[test]
     fn omitted_turn_id_comes_from_the_first_line_of_the_hook_state_stack() {
+        let _env = ProcessEnvGuard::acquire();
         let home = std::env::temp_dir().join(format!("tm-turnid-{}", std::process::id()));
         let logs = home.join(".term-mesh/logs");
         fs::create_dir_all(&logs).expect("create temp logs dir");
@@ -20579,6 +20630,7 @@ mod leader_turn_record_tests {
     /// no-news case.
     #[test]
     fn route_deviation_is_null_when_stated_route_matches_the_suggestion() {
+        let _env = ProcessEnvGuard::acquire();
         let home = std::env::temp_dir().join(format!("tm-routedev-match-{}", std::process::id()));
         fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create temp home");
         let prev_home = env::var("HOME").ok();
@@ -20611,6 +20663,7 @@ mod leader_turn_record_tests {
     /// leader they diverged.
     #[test]
     fn route_deviation_reports_suggested_and_stated_when_they_differ() {
+        let _env = ProcessEnvGuard::acquire();
         let home = std::env::temp_dir().join(format!("tm-routedev-diff-{}", std::process::id()));
         fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create temp home");
         let prev_home = env::var("HOME").ok();
@@ -23745,8 +23798,9 @@ mod watcher_spec_tests {
     /// the other's cleared state. Observed once as
     /// `daemon_socket_candidates_cover_both_linux_install_scopes` failing in a
     /// full-suite run that passed on the next four. Serialize them; a flake
-    /// that rare is worse than one that always fails.
-    static SOCKET_DISCOVERY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// that rare is worse than one that always fails. The guard is the
+    /// suite-wide one because these tests also clear `HOME`, which the leader
+    /// turn tests read.
     const SOCKET_ENV_KEYS: [&str; 6] = [
         "TERMMESH_DAEMON_SOCKET",
         "TERMMESH_DAEMON_UNIX_PATH",
@@ -23757,13 +23811,11 @@ mod watcher_spec_tests {
     ];
     struct SocketDiscoveryEnv {
         saved: Vec<(&'static str, Option<OsString>)>,
-        _guard: std::sync::MutexGuard<'static, ()>,
+        _guard: ProcessEnvGuard,
     }
     impl SocketDiscoveryEnv {
         fn isolated() -> Self {
-            let guard = SOCKET_DISCOVERY_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let guard = ProcessEnvGuard::acquire();
             let saved = SOCKET_ENV_KEYS
                 .iter()
                 .map(|&key| {
