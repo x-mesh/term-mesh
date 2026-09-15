@@ -33,6 +33,42 @@ private let kRelayAuthMaxPayload = 256
 private typealias RelayFrame = (type: UInt8, payload: Data)
 private typealias TimedRelayFrame = (type: UInt8, payload: Data, readAtNs: UInt64)
 
+/// The relay input reader is deliberately detached from `PeerRelaySession`'s
+/// MainActor.  It needs the current connection for every key (a resume-heal
+/// can replace it between frames), but must not pay a MainActor hop per key.
+/// Replacement and terminal clear still happen on MainActor; this lock makes
+/// those identity changes visible as one operation to the input pump.
+/// Internal for deterministic `@testable` concurrency tests.
+final class PeerRelayCurrentSessionSlot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var session: PeerSession?
+    private var isTerminal = false
+
+    init(_ session: PeerSession) {
+        self.session = session
+    }
+
+    func snapshot() -> PeerSession? {
+        lock.lock(); defer { lock.unlock() }
+        return session
+    }
+
+    /// A terminal clear wins over every late reconnect result.
+    @discardableResult
+    func replace(_ replacement: PeerSession) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !isTerminal else { return false }
+        session = replacement
+        return true
+    }
+
+    func clear() {
+        lock.lock(); defer { lock.unlock() }
+        isTerminal = true
+        session = nil
+    }
+}
+
 // ── Two-stage handshake result ─────────────────────────────────────
 
 /// Carries an open PeerSession and the surface list from a host. Yielded
@@ -1922,6 +1958,8 @@ final class PeerRelaySession {
     private var listenerFd: Int32 = -1
     private var relaySocket: RelaySocket?
     private var session: PeerSession?
+    /// Off-main identity snapshot for the relay key-input hot path.
+    private let currentSessionSlot: PeerRelayCurrentSessionSlot
     private var transport: UnixSocketTransport?
     private var pumpTask: Task<Void, Never>?
     private var isTorndown = false
@@ -2536,6 +2574,7 @@ final class PeerRelaySession {
         self.remoteCols = remoteCols
         self.remoteRows = remoteRows
         self.session = session
+        self.currentSessionSlot = PeerRelayCurrentSessionSlot(session)
         self.transport = transport
         self.ownsSession = ownsSession
         self.ptyStream = ptyStream
@@ -3518,7 +3557,7 @@ final class PeerRelaySession {
                             // when pumping started — a resume-heal may have
                             // swapped it out from under this pane transparently.
                             let accessStartedAt = DispatchTime.now().uptimeNanoseconds
-                            let currentSession = await self.session
+                            let currentSession = self.currentSessionSlot.snapshot()
                             sessionAccessNs = DispatchTime.now().uptimeNanoseconds - accessStartedAt
                             guard let current = currentSession else { break }
                             // Typing while browsing scrollback exits the
@@ -3828,6 +3867,13 @@ final class PeerRelaySession {
         }
         resumeHealCount += 1
         let retiredTag = Self.sessionTag(oldSession)
+        // The slot is the detached input pump's source of truth. Do not let a
+        // late resume result install only the MainActor copy after teardown
+        // terminally cleared the slot.
+        guard currentSessionSlot.replace(newConnection.session) else {
+            await newConnection.cancel()
+            return
+        }
         session = newConnection.session
         transport = newConnection.transport
         attachInitialSeq = outcome.initialByteSeq
@@ -4010,6 +4056,10 @@ final class PeerRelaySession {
         // Old-session chunks already read by the detached pump carry the retired
         // generation and are rejected; the first new-session chunk carries this
         // generation and sees an idle gate.
+        guard currentSessionSlot.replace(connection.session) else {
+            await connection.cancel()
+            return false
+        }
         session = connection.session
         transport = connection.transport
         attachInitialSeq = outcome.initialByteSeq
@@ -4139,6 +4189,10 @@ final class PeerRelaySession {
         relaySocket = nil
         let transport = self.transport
         let session = self.session
+        // Clear before closing the owned transport. A detached input pump may
+        // have captured an earlier session, but no later frame can start on a
+        // session this teardown retired.
+        currentSessionSlot.clear()
         self.session = nil
         self.transport = nil
         if ownsSession {

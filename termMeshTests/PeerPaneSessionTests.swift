@@ -17,6 +17,78 @@ private actor AsyncFlag {
     func read() -> Bool { value }
 }
 
+final class PeerRelayCurrentSessionSlotTests: XCTestCase {
+    private func makeSession() -> PeerSession {
+        PeerSession(read: { throw CancellationError() }, write: { _ in })
+    }
+
+    func test_initialReplaceClearAndTerminalNoResurrection() {
+        let initial = makeSession()
+        let replacement = makeSession()
+        let lateReplacement = makeSession()
+        let slot = PeerRelayCurrentSessionSlot(initial)
+
+        XCTAssertTrue(slot.snapshot() === initial)
+        XCTAssertTrue(slot.replace(replacement))
+        XCTAssertTrue(slot.snapshot() === replacement)
+        slot.clear()
+        XCTAssertNil(slot.snapshot())
+        XCTAssertFalse(slot.replace(lateReplacement))
+        XCTAssertNil(slot.snapshot())
+    }
+
+    func test_concurrentSnapshotsNeverExposeClearedOrUnknownIdentity() {
+        let initial = makeSession()
+        let replacement = makeSession()
+        let slot = PeerRelayCurrentSessionSlot(initial)
+        let lock = NSLock()
+        var observedOnlyKnownIdentity = true
+
+        DispatchQueue.concurrentPerform(iterations: 1_000) { index in
+            if index == 400 {
+                _ = slot.replace(replacement)
+            }
+            let snapshot = slot.snapshot()
+            if let snapshot, snapshot !== initial && snapshot !== replacement {
+                lock.lock(); observedOnlyKnownIdentity = false; lock.unlock()
+            }
+        }
+        XCTAssertTrue(observedOnlyKnownIdentity)
+        XCTAssertTrue(slot.snapshot() === replacement)
+    }
+
+    func test_replaceClearRaceAlwaysEndsTerminallyNilWithoutResurrection() {
+        for _ in 0..<200 {
+            let slot = PeerRelayCurrentSessionSlot(makeSession())
+            let replacement = makeSession()
+            let start = DispatchSemaphore(value: 0)
+            let group = DispatchGroup()
+            let lock = NSLock()
+            var replaceResult: Bool?
+            group.enter()
+            DispatchQueue.global().async {
+                start.wait()
+                let result = slot.replace(replacement)
+                lock.lock(); replaceResult = result; lock.unlock()
+                group.leave()
+            }
+            group.enter()
+            DispatchQueue.global().async {
+                start.wait()
+                slot.clear()
+                group.leave()
+            }
+            start.signal(); start.signal()
+            XCTAssertEqual(group.wait(timeout: .now() + 1), .success)
+            XCTAssertNil(slot.snapshot())
+            XCTAssertFalse(slot.replace(makeSession()))
+            lock.lock()
+            XCTAssertNotNil(replaceResult)
+            lock.unlock()
+        }
+    }
+}
+
 final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
     func testOnlyReadyRecoveryMayClearTheDegradedOverlay() {
         XCTAssertTrue(PeerMirrorLayoutRecoveryState.ready.presentsAsReady)
