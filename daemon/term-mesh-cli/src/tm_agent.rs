@@ -18568,10 +18568,18 @@ fn leader_participation_health(
                 malformed_lines += 1;
                 continue;
             };
-            let valid = matches!(
-                record["event"].as_str(),
-                Some("turn_start" | "turn_route" | "turn_end")
-            ) && record["turn_id"]
+            let event = record["event"].as_str();
+            if event.is_none() {
+                // `event` missing or not a string: the record is malformed.
+                malformed_lines += 1;
+                continue;
+            }
+            if !matches!(event, Some("turn_start" | "turn_route" | "turn_end")) {
+                // turns.log also carries non-turn entries (task_dispatch, task_lifecycle)
+                // written by tm-agent and the leader turn hook; skip, not malformed.
+                continue;
+            }
+            let valid = record["turn_id"]
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
                 && record["ts"].as_str().and_then(iso8601_day_number).is_some()
@@ -19693,6 +19701,85 @@ mod leader_turn_record_tests {
 
         let health = leader_participation_health(&path, "p", None);
         assert_eq!(health.malformed_lines, 2);
+        assert!(!health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
+    fn execution_host_health_skips_interleaved_non_turn_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let task_dispatch = serde_json::to_string(&json!({
+            "event": "task_dispatch",
+            "team": "p",
+            "ts": "2026-08-20T00:00:00Z"
+        }))
+        .expect("serialize task_dispatch");
+        let task_lifecycle = serde_json::to_string(&json!({
+            "event": "task_lifecycle",
+            "team": "p",
+            "ts": "2026-08-21T00:00:00Z"
+        }))
+        .expect("serialize task_lifecycle");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &task_dispatch
+            + "\n"
+            + &task_lifecycle
+            + "\n"
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.malformed_lines, 0);
+        assert_eq!(health.supported_turns, 2);
+        assert!(health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
+    fn execution_host_health_flags_missing_or_non_string_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let missing_event = serde_json::to_string(&json!({
+            "team": "p",
+            "ts": "2026-08-20T00:00:00Z"
+        }))
+        .expect("serialize missing event");
+        let numeric_event = serde_json::to_string(&json!({
+            "event": 1,
+            "team": "p",
+            "ts": "2026-08-21T00:00:00Z"
+        }))
+        .expect("serialize numeric event");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &missing_event
+            + "\n"
+            + &numeric_event
+            + "\n"
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.malformed_lines, 2);
+        assert!(!health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
+    fn execution_host_health_flags_turn_event_missing_required_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let missing_ts = serde_json::to_string(&json!({
+            "event": "turn_start",
+            "turn_id": "broken",
+            "team": "p"
+        }))
+        .expect("serialize turn_start without ts");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &missing_ts
+            + "\n"
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.malformed_lines, 1);
         assert!(!health.passes_promotion_gate(), "health was {health:?}");
     }
 
