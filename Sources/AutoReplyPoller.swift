@@ -61,9 +61,9 @@ final class AutoReplyPoller {
         weak var panel: TerminalPanel?
         /// When this pane last printed anything.
         var lastOutputAt: Date?
-        /// Whether a first-run prompt has already been answered here. Once
-        /// only: a CLI asking twice is not a first run.
-        var answeredStartupPrompt = false
+        /// Progress toward answering a first-run prompt here. Bounded: a
+        /// prompt that keeps coming back is not a first run.
+        var startupPrompt = AgentStartupPrompt.Responder()
         /// When stray mouse reports were last cleared here, so a pane whose
         /// scrollback still holds the old evidence is not reset every tick.
         var healedMouseModesAt: Date?
@@ -516,24 +516,24 @@ final class AutoReplyPoller {
     ///
     /// This poller is already reading every agent pane once a second, which
     /// makes it the one place that can see a prompt nobody is sitting in front
-    /// of. Answered at most once per pane: if the CLI asks again, something
-    /// other than a first run is going on and a person should look.
+    /// of. One step per read through `Responder`, which stops after a few
+    /// steps: if the prompt keeps coming back, a person should look.
     private func answerStartupPromptIfNeeded(
         panelId: UUID,
         state: PanelState,
         text: String,
         agentName: String
     ) {
-        guard !state.answeredStartupPrompt else { return }
-        guard let answer = AgentStartupPrompt.answer(in: text) else { return }
+        guard AgentStartupPrompt.detect(in: text) != nil else { return }
         guard let located = AppDelegate.shared?.locateSurface(surfaceId: panelId),
               let workspace = located.tabManager.tabs.first(where: { $0.id == located.workspaceId }),
-              let panel = workspace.terminalPanel(for: panelId) else { return }
-        state.answeredStartupPrompt = true
-        NSLog("[auto-reply] answered startup prompt agent=%@ prompt=%@ keys=%@",
-              agentName, String(describing: answer.prompt), answer.keys.joined(separator: ","))
+              let panel = workspace.terminalPanel(for: panelId),
+              let answer = state.startupPrompt.nextKeys(in: text) else { return }
+        NSLog("[auto-reply] answered startup prompt agent=%@ prompt=%@ keys=%@ step=%ld",
+              agentName, String(describing: answer.prompt), answer.keys.joined(separator: ","),
+              state.startupPrompt.steps)
 #if DEBUG
-        dlog("startupPrompt.answered agent=\(agentName) panel=\(panelId.uuidString.prefix(8)) prompt=\(answer.prompt) keys=\(answer.keys.joined(separator: ","))")
+        dlog("startupPrompt.answered agent=\(agentName) panel=\(panelId.uuidString.prefix(8)) prompt=\(answer.prompt) keys=\(answer.keys.joined(separator: ",")) step=\(state.startupPrompt.steps)")
 #endif
         // Key events, not text. The prompt is a TUI selection list waiting on
         // Return; writing a carriage return into the composer looks like typing
@@ -542,16 +542,11 @@ final class AutoReplyPoller {
         TerminalController.shared.sendNamedKeysWithRetry(
             on: panel.surface,
             keyNames: answer.keys
-        ) { delivered, landed, reason in
+        ) { delivered, _, reason in
+            // An undelivered step needs no rollback: the next read shows where
+            // the caret really is and `Responder` sends the step that fits it.
             guard !delivered else { return }
             NSLog("[auto-reply] startup prompt answer not delivered: %@", reason)
-            // The latch exists so a repeated prompt reaches a person, not so an
-            // undelivered answer silences the pane forever. Release it only
-            // when no key landed at all: after a partial sequence the selection
-            // has already moved, and repeating it would answer a question the
-            // pane is no longer asking.
-            guard landed == 0 else { return }
-            state.answeredStartupPrompt = false
         }
     }
 
