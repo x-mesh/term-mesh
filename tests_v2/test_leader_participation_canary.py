@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Installed CLI proves canary, deterministic holdout, and next-turn kill-switch rollback."""
+# The mac-sub runner uses Python 3.9, which cannot evaluate `dict | None` at def time.
+from __future__ import annotations
+
 import json
 import os
 import subprocess
