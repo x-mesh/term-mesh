@@ -2866,6 +2866,7 @@ final class TeamOrchestrator: ObservableObject {
             } else {
                 Logger.team.info("cleaning up stale team '\(name, privacy: .public)' (workspace closed)")
                 stopRemoteLeaderGrantKeepalive(teamName: name, revoke: true)
+                forgetAutomaticCollaborationRepair(teamName: name)
                 teams.removeValue(forKey: name)
             }
         }
@@ -4145,6 +4146,7 @@ final class TeamOrchestrator: ObservableObject {
             // Last agent — remove the team entry. The adopted leader pane is
             // the caller's own pane (external ownership) and must not be closed.
             stopRemoteLeaderGrantKeepalive(teamName: teamName, revoke: true)
+            forgetAutomaticCollaborationRepair(teamName: teamName)
             teams.removeValue(forKey: teamName)
             TeamDataStore.shared.unregisterTeam(teamName)
             syncTeamStateToDaemon()
@@ -5493,6 +5495,25 @@ final class TeamOrchestrator: ObservableObject {
         guard suppliedDirectories != nil else { return .provisionFresh }
         guard let resolvedDirectories else { return .reject }
         return .reuse(resolvedDirectories)
+    }
+
+    /// Shared-mode workers run in the checkout `createTeam` re-creates for the
+    /// team. An archived per-agent path must not move them: a legacy archive
+    /// has none and resolves to the team directory, the source checkout.
+    nonisolated static func paneResumePlacementDirectories(
+        worktreeMode: String, resolvedDirectories: [String]
+    ) -> [String]? {
+        worktreeMode == "shared" ? nil : resolvedDirectories
+    }
+
+    /// Where a resumed worker's transcript is checked, or nil when the archive
+    /// cannot say. A legacy shared-mode archive has no per-agent path, and its
+    /// team directory fallback is not where that worker ran.
+    nonisolated static func paneResumeTranscriptDirectory(
+        worktreeMode: String, archivedWorkingDirectory: String?, resolvedWorkingDirectory: String
+    ) -> String? {
+        guard worktreeMode == "shared" else { return resolvedWorkingDirectory }
+        return archivedWorkingDirectory?.nilIfBlank
     }
 
     nonisolated static func resumedWorktreeMode(
@@ -7570,9 +7591,7 @@ final class TeamOrchestrator: ObservableObject {
 
     func forgetTeamForTests(_ name: String) {
         teams.removeValue(forKey: name)
-        peerAgentsAwaitingRespawn.removeValue(forKey: name)
-        peerAgentRespawnMarkedAt.removeValue(forKey: name)
-        automaticCollaborationRepairAt.removeValue(forKey: name)
+        forgetAutomaticCollaborationRepair(teamName: name)
     }
 #endif
 
@@ -8568,6 +8587,15 @@ final class TeamOrchestrator: ObservableObject {
         return status
     }
 
+    /// Every path that removes a team calls this. The state is keyed by team
+    /// name, so a later team with the same name would otherwise inherit its
+    /// pending respawn marks and automatic Repair cooldown.
+    func forgetAutomaticCollaborationRepair(teamName: String) {
+        peerAgentsAwaitingRespawn.removeValue(forKey: teamName)
+        peerAgentRespawnMarkedAt.removeValue(forKey: teamName)
+        automaticCollaborationRepairAt.removeValue(forKey: teamName)
+    }
+
     /// Destroy a team — send Ctrl-C to all agents and close the workspace.
     func destroyTeam(
         name: String,
@@ -8576,6 +8604,7 @@ final class TeamOrchestrator: ObservableObject {
         removalScope: ProjectRemovalScope = .fullDelete
     ) -> Bool {
         guard let team = teams[name] else { return false }
+        forgetAutomaticCollaborationRepair(teamName: name)
         remoteProjectManifestTasks.removeValue(forKey: name)?.cancel()
         remoteProjectManifestSignatures.removeValue(forKey: name)
         publishedRemoteProjectAgentSurfaceIDs.removeValue(forKey: name)
@@ -8815,8 +8844,8 @@ final class TeamOrchestrator: ObservableObject {
         // `--resume` validity guard: a sid whose transcript jsonl is gone
         // would make the claude CLI error out at spawn. The leader always ran
         // in the team workdir; workers share it when worktreeMode == "off".
-        // Each worker is checked in its archived working directory. Legacy
-        // archives without that field retain the team directory fallback.
+        // Each worker is checked where the archive says it ran. A shared-mode
+        // legacy archive does not say, so its sid passes through unchecked.
         func transcriptExists(_ sid: String, workingDirectory: String) -> Bool {
             let transcriptDir = ClaudeSessionWatcher.encodedProjectDir(workDir: workingDirectory)
             return FileManager.default.fileExists(atPath: "\(transcriptDir)/\(sid).jsonl")
@@ -8827,7 +8856,11 @@ final class TeamOrchestrator: ObservableObject {
             guard let name = a["name"] as? String,
                   let sid = a["session_id"] as? String,
                   !sid.isEmpty else { continue }
-            if !transcriptExists(sid, workingDirectory: agentTuples[index].workingDirectory) {
+            if let transcriptDirectory = Self.paneResumeTranscriptDirectory(
+                worktreeMode: archivedWorktreeMode,
+                archivedWorkingDirectory: archivedAgentWorkingDirectories[index],
+                resolvedWorkingDirectory: agentTuples[index].workingDirectory
+            ), !transcriptExists(sid, workingDirectory: transcriptDirectory) {
                 Logger.team.info("[pane-resume] dropping stale sid for agent '\(name, privacy: .public)' — transcript missing, starting fresh")
                 continue
             }
@@ -8862,7 +8895,10 @@ final class TeamOrchestrator: ObservableObject {
             worktreeMode: archivedWorktreeMode,
             executionMode: "pane",
             agentResumeSessionIds: agentResumeMap.isEmpty ? nil : agentResumeMap,
-            agentWorkingDirectories: agentTuples.map(\.workingDirectory),
+            agentWorkingDirectories: Self.paneResumePlacementDirectories(
+                worktreeMode: archivedWorktreeMode,
+                resolvedDirectories: agentTuples.map(\.workingDirectory)
+            ),
             tabManager: tabManager
         ) else {
             Logger.team.error("[pane-resume] createTeam failed for '\(teamName, privacy: .public)'")

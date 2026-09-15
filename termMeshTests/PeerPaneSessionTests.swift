@@ -9799,6 +9799,33 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
         )
     }
 
+    /// Removing a team must not leave its automatic Repair state behind: a
+    /// later team with the same name would inherit the 300 s cooldown.
+    @MainActor
+    func testForgettingAutomaticCollaborationRepairClearsOnlyThatTeam() {
+        let orchestrator = TeamOrchestrator.shared
+        let teamName = "repair-forget-\(UUID().uuidString.prefix(8))"
+        let otherName = "repair-keep-\(UUID().uuidString.prefix(8))"
+        defer {
+            orchestrator.forgetAutomaticCollaborationRepair(teamName: teamName)
+            orchestrator.forgetAutomaticCollaborationRepair(teamName: otherName)
+        }
+        for name in [teamName, otherName] {
+            orchestrator.peerAgentsAwaitingRespawn[name] = ["executor"]
+            orchestrator.peerAgentRespawnMarkedAt[name] = Date()
+            orchestrator.automaticCollaborationRepairAt[name] = Date()
+        }
+
+        orchestrator.forgetAutomaticCollaborationRepair(teamName: teamName)
+
+        XCTAssertNil(orchestrator.peerAgentsAwaitingRespawn[teamName])
+        XCTAssertNil(orchestrator.peerAgentRespawnMarkedAt[teamName])
+        XCTAssertNil(orchestrator.automaticCollaborationRepairAt[teamName])
+        XCTAssertEqual(orchestrator.peerAgentsAwaitingRespawn[otherName], ["executor"])
+        XCTAssertNotNil(orchestrator.peerAgentRespawnMarkedAt[otherName])
+        XCTAssertNotNil(orchestrator.automaticCollaborationRepairAt[otherName])
+    }
+
     /// A daemon restart ends every agent it owns; the replacement leader is
     /// the only surface the host still lists.
     @MainActor

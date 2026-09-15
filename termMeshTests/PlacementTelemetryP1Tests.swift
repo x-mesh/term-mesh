@@ -224,6 +224,68 @@ final class PlacementTelemetryP1Tests: XCTestCase {
         XCTAssertFalse(sideEffectRan)
     }
 
+    /// A shared-mode archive written before per-agent paths existed resolves
+    /// every worker to the team directory. Resume then placed the workers in
+    /// the source checkout while the leader ran in the shared worktree.
+    func testSharedPaneResumeKeepsWorkersInTheRecreatedSharedCheckout() {
+        let resolved = TeamOrchestrator.resumedAgentWorkingDirectories(
+            worktreeMode: "shared",
+            archivedWorkingDirectories: [nil],
+            teamWorkingDirectory: teamRoot,
+            isDirectory: { _ in true }
+        )
+        XCTAssertEqual(resolved, [teamRoot])
+        let supplied = TeamOrchestrator.paneResumePlacementDirectories(
+            worktreeMode: "shared", resolvedDirectories: resolved ?? []
+        )
+        XCTAssertNil(supplied)
+        XCTAssertEqual(
+            TeamOrchestrator.isolatedResumeDirectoryDecision(
+                suppliedDirectories: supplied, resolvedDirectories: supplied
+            ),
+            .provisionFresh
+        )
+    }
+
+    func testNonSharedPaneResumeStillPlacesWorkersInArchivedDirectories() {
+        XCTAssertEqual(
+            TeamOrchestrator.paneResumePlacementDirectories(
+                worktreeMode: "isolated", resolvedDirectories: [worktree]
+            ),
+            [worktree]
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.paneResumePlacementDirectories(
+                worktreeMode: "off", resolvedDirectories: [agentCheckout]
+            ),
+            [agentCheckout]
+        )
+    }
+
+    func testPaneResumeChecksTranscriptsWhereTheWorkerRan() {
+        XCTAssertNil(
+            TeamOrchestrator.paneResumeTranscriptDirectory(
+                worktreeMode: "shared", archivedWorkingDirectory: nil,
+                resolvedWorkingDirectory: teamRoot
+            ),
+            "a legacy shared archive cannot say where the worker ran"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.paneResumeTranscriptDirectory(
+                worktreeMode: "shared", archivedWorkingDirectory: worktree,
+                resolvedWorkingDirectory: worktree
+            ),
+            worktree
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.paneResumeTranscriptDirectory(
+                worktreeMode: "off", archivedWorkingDirectory: nil,
+                resolvedWorkingDirectory: teamRoot
+            ),
+            teamRoot
+        )
+    }
+
     // MARK: - locality
 
     /// Local pane creation never sets `hostKey` (`addAgentPaneToWorkspace`
