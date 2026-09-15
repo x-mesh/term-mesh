@@ -2993,6 +2993,8 @@ final class TeamOrchestrator: ObservableObject {
         if Self.supportsLeaderTurnMeasurement(cli: leaderMode) {
             let participationControlFile = Self.leaderParticipationControlFile(teamName: name)
             leaderEnv["TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE"] = participationControlFile
+            // tm-agent accepts the control file only when its session_id matches this value.
+            leaderEnv["TERMMESH_LEADER_SESSION_ID"] = leaderSessionId
             Self.writeLeaderParticipationControl(
                 teamName: name, sessionID: leaderSessionId,
                 supportedLeader: leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil
