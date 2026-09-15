@@ -4384,14 +4384,7 @@ final class TeamOrchestrator: ObservableObject {
         defaults: UserDefaults = LeaderParticipationSettings.defaultsForCurrentProcess()
     ) -> Data? {
         let settings = LeaderParticipationSettings.load(from: defaults)
-        let measurement = LeaderTurnLog.health()
-        let unknown = max(0, measurement.supportedTurns - measurement.statedTurns)
-        let health = LeaderParticipationSettings.Health(
-            supportedTurns: measurement.supportedTurns, observedDays: measurement.observedDays,
-            coverage: measurement.coverage, linkage: measurement.linkage,
-            unknownRate: measurement.supportedTurns == 0 ? 1
-                : Double(unknown) / Double(measurement.supportedTurns)
-        )
+        let health = LeaderParticipationSettings.Health(measurement: LeaderTurnLog.health())
         // Read the roster here rather than at each call site: every writer of
         // this file needs the same count, and `agentNames(for:)` already takes
         // the store's lock. A team with no registered roster yields zero, which
@@ -4403,11 +4396,10 @@ final class TeamOrchestrator: ObservableObject {
             delegationState: delegationState,
             availableWorkers: workerNames.count,
             workerNames: workerNames,
-            executionOptions: ProjectExecutionOptions.load(teamName: teamName)
+            executionOptions: ProjectExecutionOptions.load(teamName: teamName),
+            healthScope: healthScope
         )
-        var scopedPayload = payload
-        scopedPayload["health_scope"] = healthScope.rawValue
-        return try? JSONSerialization.data(withJSONObject: scopedPayload, options: [.sortedKeys])
+        return try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
     }
 
     private static func writeLeaderParticipationControlData(_ data: Data, to file: URL) {
@@ -4505,6 +4497,23 @@ final class TeamOrchestrator: ObservableObject {
                 Task { await self.drainLeaderParticipationControl(teamID) }
             }
         }
+    }
+
+    /// Loads fresh settings, applies `mutate`, saves, and refreshes every
+    /// team's control file. Settings, the review board's opt-in toggle, and
+    /// `debug.leader_participation.configure` all go through this one path so
+    /// none of them can save a stale snapshot and erase a field the others
+    /// just wrote.
+    @discardableResult
+    func updateLeaderParticipationSettings(
+        defaults: UserDefaults = LeaderParticipationSettings.defaultsForCurrentProcess(),
+        _ mutate: (inout LeaderParticipationSettings) -> Void
+    ) -> LeaderParticipationSettings {
+        var settings = LeaderParticipationSettings.load(from: defaults)
+        mutate(&settings)
+        settings.save(to: defaults)
+        refreshLeaderParticipationControls()
+        return settings
     }
 
     /// Write this team's queued control payloads until none is left.
@@ -10108,7 +10117,7 @@ final class TeamOrchestrator: ObservableObject {
         ]
     }
 
-    private func leaderMeasurementCapability(for team: Team) -> LeaderTurnLog.MeasurementCapability {
+    func leaderMeasurementCapability(for team: Team) -> LeaderTurnLog.MeasurementCapability {
         // Created Claude leaders have the only lifecycle hook integrated in
         // this release. Adopted and non-Claude leaders remain visible,
         // explicitly unsupported cohorts rather than silently lowering the

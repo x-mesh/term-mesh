@@ -763,8 +763,77 @@ extension ReviewBoardPanelView {
                     .font(.system(size: 11))
                     .foregroundColor(panel.everyWorkerIdle ? .orange : .secondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                if !panel.isRemoteViewer {
+                    overlapCanarySection(panel)
+                }
             }
             .accessibilityIdentifier("reviewBoard.workDistribution")
+        }
+    }
+
+    /// The Overlap canary's own status, separate from `collaborationEvidence`
+    /// below: that shows whether dispatch is happening at all, this shows
+    /// whether the opt-in overlap gate would currently resolve a turn. Broken
+    /// out as its own function, not inlined in `delegationControls`, so
+    /// Xcode 27 does not have to type-check one giant `[String: Any]`-adjacent
+    /// expression that also builds a `Binding` and a multi-case switch.
+    @ViewBuilder
+    private func overlapCanarySection(_ panel: ReviewBoardViewModel.DelegationPanel) -> some View {
+        let status = ReviewBoardViewModel.overlapCanaryStatus(
+            level: panel.level, supportedLeader: panel.supportedLeader,
+            killSwitch: panel.killSwitch, reading: viewModel.overlapHealthReading
+        )
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                Image(systemName: overlapCanarySymbol(panel))
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(status.line)
+                        .font(.system(size: 11))
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let caption = status.scopeCaption {
+                        Text(caption)
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("reviewBoard.overlapCanaryStatus")
+
+            Divider()
+
+            Toggle(isOn: Binding(
+                get: { panel.canaryOptIn },
+                set: { viewModel.setCanaryOptIn($0, teamName: panel.teamName) }
+            )) {
+                Text("Include in Leader Participation canary")
+                    .font(.system(size: 11))
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .help("Applies only when Mode is Canary. It does not change the Overlap canary status.")
+            .accessibilityIdentifier("reviewBoard.canaryOptIn")
+        }
+    }
+
+    /// Icon only — the gate order it reads is a visual shortcut for what
+    /// `overlapCanaryStatus` already decided from the same three fields, not
+    /// a second decision. Kept apart from the localized `status.line` because
+    /// that line can render in Korean, and matching an SF Symbol to a
+    /// translated prefix would be the fragile part, not this.
+    private func overlapCanarySymbol(_ panel: ReviewBoardViewModel.DelegationPanel) -> String {
+        guard panel.level == .delegated, panel.supportedLeader, !panel.killSwitch else {
+            return "pause.circle"
+        }
+        switch viewModel.overlapHealthReading {
+        case .checking:
+            return "arrow.triangle.2.circlepath"
+        case .notReported, .unavailable:
+            return "questionmark.circle"
+        case let .measured(_, _, _, _, _, _, passesGate, _):
+            return passesGate ? "checkmark.circle.fill" : "hourglass"
         }
     }
 

@@ -41,9 +41,19 @@ struct LeaderParticipationSettings: Equatable {
         var linkage: Double
         var unknownRate: Double
 
+        // Named so the review board formatter that explains a failing gate reads the
+        // same thresholds this gate enforces, instead of copying the literals.
+        static let minPromotableTurns = 500
+        static let minPromotableObservedDays = 7
+        static let minPromotableCoverage = 0.95
+        static let minPromotableLinkage = 0.95
+        static let maxPromotableUnknownRate = 0.02
+
         var passesPromotionGate: Bool {
-            (supportedTurns >= 500 || observedDays >= 7)
-                && coverage >= 0.95 && linkage >= 0.95 && unknownRate <= 0.02
+            (supportedTurns >= Self.minPromotableTurns || observedDays >= Self.minPromotableObservedDays)
+                && coverage >= Self.minPromotableCoverage
+                && linkage >= Self.minPromotableLinkage
+                && unknownRate <= Self.maxPromotableUnknownRate
         }
     }
 
@@ -97,12 +107,17 @@ struct LeaderParticipationSettings: Equatable {
         delegationState: ProjectDelegationState = .default,
         availableWorkers: Int = 0,
         workerNames: [String] = [],
-        executionOptions: ProjectExecutionOptions = .default
+        executionOptions: ProjectExecutionOptions = .default,
+        healthScope: HealthScope = .controlHost
     ) -> [String: Any] {
+        // The remote tm-agent re-checks this Project's own turns.log per Project
+        // when health_scope is execution_host (apply_participation_health_scope),
+        // so an executionHost payload can skip this Mac's aggregate health here
+        // without losing the health gate for peer leaders.
         let delegatedOverlapResolution = delegationState.effective == .delegated
             && supportedLeader
-            && health.passesPromotionGate
             && !killSwitch
+            && (healthScope == .executionHost || health.passesPromotionGate)
         return [
             "schema_version": 1,
             "mode": mode.rawValue,
@@ -123,6 +138,23 @@ struct LeaderParticipationSettings: Equatable {
             "worker_names": workerNames,
             "max_parallel_workers": executionOptions.maxParallelWorkers,
             "inject_directive": executionOptions.injectDirective,
+            "health_scope": healthScope.rawValue,
         ]
+    }
+}
+
+extension LeaderParticipationSettings.Health {
+    /// Moves the unknown-rate math out of `TeamOrchestrator.leaderParticipationControlData`
+    /// so the review board's status formatter reads the same numbers this gate uses.
+    init(measurement: LeaderTurnLog.Health) {
+        let unknown = max(0, measurement.supportedTurns - measurement.statedTurns)
+        self.init(
+            supportedTurns: measurement.supportedTurns,
+            observedDays: measurement.observedDays,
+            coverage: measurement.coverage,
+            linkage: measurement.linkage,
+            unknownRate: measurement.supportedTurns == 0 ? 1
+                : Double(unknown) / Double(measurement.supportedTurns)
+        )
     }
 }
