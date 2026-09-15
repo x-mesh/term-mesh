@@ -59,28 +59,72 @@ final class AgentStartupPromptTests: XCTestCase {
         XCTAssertEqual(AgentStartupPrompt.detect(in: currentTrustPrompt), .claudeFolderTrust)
     }
 
-    func test_moves_the_caret_onto_yes_before_committing() {
+    private var currentTrustPromptOnYes: String {
+        currentTrustPrompt
+            .replacingOccurrences(of: "❯ No, exit", with: "  No, exit")
+            .replacingOccurrences(of: "  Yes, I trust this folder", with: "❯ Yes, I trust this folder")
+    }
+
+    func test_moves_the_caret_onto_yes_without_committing_in_the_same_step() {
         XCTAssertEqual(
             AgentStartupPrompt.answer(in: currentTrustPrompt)?.keys,
-            ["down", "return"],
-            "committing without moving first answers No, which quits the CLI"
+            ["down"],
+            "a Return behind a dropped arrow answers No, which quits the CLI"
         )
     }
 
     func test_commits_directly_when_the_caret_already_sits_on_yes() {
         XCTAssertEqual(AgentStartupPrompt.answer(in: trustPrompt)?.keys, ["return"])
-
-        let moved = currentTrustPrompt
-            .replacingOccurrences(of: "❯ No, exit", with: "  No, exit")
-            .replacingOccurrences(of: "  Yes, I trust this folder", with: "❯ Yes, I trust this folder")
-        XCTAssertEqual(AgentStartupPrompt.answer(in: moved)?.keys, ["return"])
+        XCTAssertEqual(AgentStartupPrompt.answer(in: currentTrustPromptOnYes)?.keys, ["return"])
     }
 
     func test_moves_up_when_the_affirmative_is_above_the_caret() {
         let moved = codexTrustPrompt
             .replacingOccurrences(of: "› 1. Yes", with: "  1. Yes")
             .replacingOccurrences(of: "  2. No, quit", with: "› 2. No, quit")
-        XCTAssertEqual(AgentStartupPrompt.answer(in: moved)?.keys, ["up", "return"])
+        XCTAssertEqual(AgentStartupPrompt.answer(in: moved)?.keys, ["up"])
+    }
+
+    /// Claude Code 2.1.272 drops a Down sent as soon as the trust prompt
+    /// appears. Reproduced in a PTY: Down then Return right away exited with
+    /// code 1, and the leader pane closed with it. Waiting 1.5 s first let the
+    /// same keys accept the prompt.
+    func test_responder_never_commits_while_the_caret_is_on_no() {
+        var responder = AgentStartupPrompt.Responder()
+        let start = Date(timeIntervalSince1970: 1_000)
+
+        XCTAssertEqual(responder.nextKeys(in: currentTrustPrompt, now: start)?.keys, ["down"])
+        XCTAssertNil(
+            responder.nextKeys(in: currentTrustPrompt, now: start.addingTimeInterval(0.25)),
+            "the arrow has not settled yet"
+        )
+        XCTAssertEqual(
+            responder.nextKeys(in: currentTrustPrompt, now: start.addingTimeInterval(0.8))?.keys,
+            ["down"],
+            "the caret never moved, so the lost arrow is sent again without Return"
+        )
+        XCTAssertEqual(
+            responder.nextKeys(in: currentTrustPromptOnYes, now: start.addingTimeInterval(1.6))?.keys,
+            ["return"]
+        )
+        XCTAssertEqual(responder.steps, 3)
+    }
+
+    func test_responder_leaves_a_prompt_that_keeps_coming_back_to_a_person() {
+        var responder = AgentStartupPrompt.Responder()
+        var now = Date(timeIntervalSince1970: 1_000)
+        for _ in 0..<AgentStartupPrompt.Responder.maxSteps {
+            XCTAssertNotNil(responder.nextKeys(in: currentTrustPromptOnYes, now: now))
+            now = now.addingTimeInterval(AgentStartupPrompt.Responder.settleInterval)
+        }
+        XCTAssertNil(responder.nextKeys(in: currentTrustPromptOnYes, now: now))
+    }
+
+    func test_responder_spends_no_step_on_a_pane_without_a_prompt() {
+        var responder = AgentStartupPrompt.Responder()
+        XCTAssertNil(responder.nextKeys(in: "STATUS: DONE\nFILES: none\n"))
+        XCTAssertEqual(responder.steps, 0)
+        XCTAssertEqual(responder.nextKeys(in: currentTrustPrompt)?.keys, ["down"])
     }
 
     func test_ignores_a_list_whose_options_are_not_adjacent() {

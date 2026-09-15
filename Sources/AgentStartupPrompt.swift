@@ -28,9 +28,9 @@ import Foundation
 /// Still deliberately narrow. It matches one prompt per CLI, requires the two
 /// options to be adjacent lines with the caret on one of them, and answers with
 /// the key the prompt itself documents. Anything else in the pane is left
-/// alone: it stalls visibly rather than being answered wrongly. `AutoReplyPoller`
-/// answers at most once per pane, so a CLI that asks twice still reaches a
-/// person.
+/// alone: it stalls visibly rather than being answered wrongly. Every caller
+/// answers through `Responder`, which gives up after a few steps, so a prompt
+/// that keeps coming back still reaches a person.
 enum AgentStartupPrompt: Equatable, CaseIterable {
     case claudeFolderTrust
     case codexDirectoryTrust
@@ -74,8 +74,10 @@ enum AgentStartupPrompt: Equatable, CaseIterable {
         answer(in: text) != nil
     }
 
-    /// The keys that answer this prompt in `text`, in send order: the caret
-    /// movements needed to reach the affirmative option, then the commit key.
+    /// The keys for the next step toward answering this prompt in `text`: the
+    /// caret movements that reach the affirmative option, or the commit key
+    /// once the caret already sits there. Never both in one step; see
+    /// `Responder` for why.
     func answer(in text: String) -> [String]? {
         guard text.contains(commitHint), text.contains(affirmative) else { return nil }
         let lines = text
@@ -97,8 +99,9 @@ enum AgentStartupPrompt: Equatable, CaseIterable {
         guard let caret = [yes, no].first(where: { isCaretLine(lines[$0]) }) else { return nil }
 
         let moves = yes - caret
+        guard moves != 0 else { return [answerKey] }
         let arrow = moves > 0 ? "down" : "up"
-        return Array(repeating: arrow, count: abs(moves)) + [answerKey]
+        return Array(repeating: arrow, count: abs(moves))
     }
 
     /// The bytes one answer key is on a remote pane.
@@ -121,11 +124,49 @@ enum AgentStartupPrompt: Equatable, CaseIterable {
         allCases.first { $0.matches(text) }
     }
 
-    /// The prompt showing in `text` together with the keys that answer it.
+    /// The prompt showing in `text` together with the keys for its next step.
     static func answer(in text: String) -> (prompt: AgentStartupPrompt, keys: [String])? {
         for prompt in allCases {
             if let keys = prompt.answer(in: text) { return (prompt, keys) }
         }
         return nil
+    }
+
+    /// Walks one pane's prompt to its answer, one observation at a time.
+    ///
+    /// A CLI can draw the prompt before it reads input. Claude Code 2.1.272
+    /// drops a Down sent as soon as the trust prompt appears, and a Return
+    /// sent behind that lost Down commits the default "No, exit" and quits the
+    /// CLI; a leader launched with `exec` takes its pane with it. Sending the
+    /// whole sequence at once confirmed only that each key reached the surface,
+    /// never that the caret moved. So arrows go out alone, the pane is read
+    /// again, and Return goes out only when a later read shows the caret on the
+    /// affirmative option. A lost arrow is sent again on a later read.
+    struct Responder: Equatable, Sendable {
+        /// Time for a sent key to be processed or dropped before the pane is
+        /// judged again. A read sooner than this can miss an arrow still in
+        /// flight and send another one past the affirmative option.
+        static let settleInterval: TimeInterval = 0.75
+        /// A prompt still showing after this many steps is not a first run
+        /// being walked through, so it is left for a person.
+        static let maxSteps = 8
+
+        private(set) var steps = 0
+        private var lastStepAt: Date?
+
+        /// The keys to send now for the prompt in `text`, or nil when there is
+        /// no prompt, the last step has not settled, or the step limit is spent.
+        mutating func nextKeys(
+            in text: String, now: Date = Date()
+        ) -> (prompt: AgentStartupPrompt, keys: [String])? {
+            guard steps < Self.maxSteps else { return nil }
+            if let lastStepAt, now.timeIntervalSince(lastStepAt) < Self.settleInterval {
+                return nil
+            }
+            guard let answer = AgentStartupPrompt.answer(in: text) else { return nil }
+            steps += 1
+            lastStepAt = now
+            return answer
+        }
     }
 }

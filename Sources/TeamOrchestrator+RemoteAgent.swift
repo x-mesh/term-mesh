@@ -5019,7 +5019,7 @@ extension TeamOrchestrator {
     ) async throws {
         guard Self.remoteLeaderNeedsForegroundConfirmation(leaderMode: leaderMode) else { return }
         var stableObservations = 0
-        var answeredStartupPrompt = false
+        var startupPrompt = AgentStartupPrompt.Responder()
         while true {
             try Task.checkCancellation()
             let hostLease = try? await PeerPaneHostRegistry.shared.acquire(
@@ -5053,13 +5053,11 @@ extension TeamOrchestrator {
                 // remote checkout sat on the trust screen until this loop timed
                 // out at 180s and the whole Project failed to start.
                 //
-                // The keys are a sequence, not one Return. Claude now defaults
-                // its selection to "No, exit", so committing without moving the
-                // caret first quits the CLI — the failure this is meant to
-                // prevent, delivered faster.
-                if !answeredStartupPrompt,
-                   let answer = text.flatMap(AgentStartupPrompt.answer(in:)) {
-                    answeredStartupPrompt = true
+                // One step per read, not the whole sequence. Claude defaults
+                // its selection to "No, exit" and can drop an arrow sent before
+                // it reads input, so Return goes out only on a read that shows
+                // the caret on the affirmative option. See `Responder`.
+                if let text, let answer = startupPrompt.nextKeys(in: text) {
                     guard let peerSession = panel.peerPaneSession else {
                         throw RemoteAgentError.paneCreationFailed
                     }

@@ -5951,7 +5951,7 @@ final class TeamOrchestrator: ObservableObject {
         teamName: String, leaderMode: String,
         workspaceId: UUID, panelId: UUID, tabManager: TabManager,
         deadline: Date, readyObservations: Int,
-        answeredStartupPrompt: Bool = false
+        startupPrompt: AgentStartupPrompt.Responder = AgentStartupPrompt.Responder()
     ) {
         guard let team = teams[teamName], team.leaderPanelId == panelId, !team.leaderReady else { return }
         guard Date() < deadline else {
@@ -5971,7 +5971,7 @@ final class TeamOrchestrator: ObservableObject {
                     teamName: teamName, leaderMode: leaderMode,
                     workspaceId: workspaceId, panelId: panelId,
                     tabManager: tabManager, deadline: deadline, readyObservations: 0,
-                    answeredStartupPrompt: answeredStartupPrompt
+                    startupPrompt: startupPrompt
                 )
             }
             return
@@ -5986,15 +5986,19 @@ final class TeamOrchestrator: ObservableObject {
                 // sees this pane. Without answering here, a first-run trust
                 // prompt just reads as "not ready" until the deadline and the
                 // Project fails to start with no idea why.
-                if !answeredStartupPrompt, let snap = snapshot,
-                   let answer = AgentStartupPrompt.answer(in: snap),
-                   let leaderPanel = panel {
-                    NSLog("[leader] answered startup prompt team=%@ prompt=%@ keys=%@",
+                var responder = startupPrompt
+                if let leaderPanel = panel, let snap = snapshot,
+                   let answer = responder.nextKeys(in: snap) {
+                    NSLog("[leader] answered startup prompt team=%@ prompt=%@ keys=%@ step=%ld",
                           teamName, String(describing: answer.prompt),
-                          answer.keys.joined(separator: ","))
+                          answer.keys.joined(separator: ","), responder.steps)
+                    #if DEBUG
+                    dlog("leader.startupPrompt.step team=\(teamName) prompt=\(answer.prompt) keys=\(answer.keys.joined(separator: ",")) step=\(responder.steps)")
+                    #endif
                     TerminalController.shared.sendNamedKeysWithRetry(
                         on: leaderPanel.surface, keyNames: answer.keys
                     )
+                    let nextResponder = responder
                     DispatchQueue.main.asyncAfter(
                         deadline: .now() + Self.localLeaderReadinessPollInterval
                     ) { [weak self] in
@@ -6002,7 +6006,7 @@ final class TeamOrchestrator: ObservableObject {
                             teamName: teamName, leaderMode: leaderMode,
                             workspaceId: workspaceId, panelId: panelId,
                             tabManager: tabManager, deadline: deadline,
-                            readyObservations: 0, answeredStartupPrompt: true
+                            readyObservations: 0, startupPrompt: nextResponder
                         )
                     }
                     return
@@ -6027,7 +6031,7 @@ final class TeamOrchestrator: ObservableObject {
                             workspaceId: workspaceId, panelId: panelId,
                             tabManager: tabManager, deadline: deadline,
                             readyObservations: nextReadyObservations,
-                            answeredStartupPrompt: answeredStartupPrompt
+                            startupPrompt: startupPrompt
                         )
                     }
                 }
