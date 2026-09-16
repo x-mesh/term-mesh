@@ -1261,12 +1261,22 @@
         "ko": { "stringUnit": { "state": "translated", "value": "신중" } }
       }
     },
-    "How many Projects follow the leader's suggested route. It uses the mode above, each Project opts in from its Review Board, and Leader Overlap ignores this percentage.": {
+    "How many Projects follow the leader's suggested route. It uses Leader Participation above, each Project opts in from its Review Board, and overlap ignores this percentage.": {
       "localizations": {
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "리더가 제안한 경로를 따르는 프로젝트의 비율입니다. 위의 모드를 따르며, 프로젝트별 포함은 각 리뷰 보드에서 켭니다. 리더 동시 진행은 이 비율을 보지 않습니다."
+            "value": "리더가 제안한 경로를 따르는 프로젝트의 비율입니다. 위의 리더 참여 방식을 따르며, 프로젝트별 포함은 각 리뷰 보드에서 켭니다. 리더 동시 진행은 이 비율을 보지 않습니다."
+          }
+        }
+      }
+    },
+    "How the leader takes part while its workers run. Not used turns the whole feature off — no overlap, and no delegation guidance in the leader's turns. Overlap also needs Work Distribution set to Delegated, which this setting does not change.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "워커가 실행되는 동안 리더가 참여하는 방식입니다. 사용 안 함을 고르면 리더 동시 진행과 리더 턴의 위임 안내가 함께 멈춥니다. 동시 진행에는 작업 분배가 \"위임 우선\"이어야 하며, 이 설정이 작업 분배를 바꾸지는 않습니다."
           }
         }
       }
@@ -1287,16 +1297,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "리더 동시 진행이 기록만으로 설정됨"
-          }
-        }
-      }
-    },
-    "Leader Overlap": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "리더 동시 진행"
           }
         }
       }
@@ -1491,16 +1491,6 @@
         "ko": { "stringUnit": { "state": "translated", "value": "pane이 끊겼다가 다시 붙습니다. 호스트에서 실행 중인 에이전트와 셸 프로세스는 그대로 유지됩니다. 이미 종료된 프로세스가 남긴 셸 기록은 지워집니다 — Clean Up Panes가 닫지 못한다고 표시하는 항목을 없애는 방법입니다." } }
       }
     },
-    "Pause leader experiments": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "리더 실험 일시 중지"
-          }
-        }
-      }
-    },
     "Record only": {
       "localizations": {
         "ko": {
@@ -1579,16 +1569,6 @@
     "The leader handles serial work and delegates only independent parallel units.": {
       "localizations": {
         "ko": { "stringUnit": { "state": "translated", "value": "리더가 직렬 작업을 맡고, 서로 독립적인 병렬 단위만 위임합니다." } }
-      }
-    },
-    "The leader keeps working while its workers run, instead of waiting for them. It needs Work Distribution set to Delegated, and it does not change that setting.": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "리더가 워커에게 일을 맡긴 뒤 기다리지 않고 자기 일도 이어서 합니다. 작업 분배가 \"위임 우선\"이어야 하며, 이 설정이 작업 분배를 바꾸지는 않습니다."
-          }
-        }
       }
     },
     "This removes the worktree and its git registration:\n%@\n\nA worktree with uncommitted changes is kept — you will be asked again before anything is discarded.": {
