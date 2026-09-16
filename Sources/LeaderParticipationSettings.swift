@@ -40,6 +40,11 @@ struct LeaderParticipationSettings: Equatable {
         var coverage: Double
         var linkage: Double
         var unknownRate: Double
+        /// Lines of this Project's own turn log that could not be read. The
+        /// execution-host gate in `tm-agent` has always refused to promote on a
+        /// damaged measurement; this Mac's gate silently did not, so the same
+        /// log promoted or not depending on which host evaluated it.
+        var malformedLines: Int = 0
 
         // Named so the review board formatter that explains a failing gate reads the
         // same thresholds this gate enforces, instead of copying the literals.
@@ -50,7 +55,8 @@ struct LeaderParticipationSettings: Equatable {
         static let maxPromotableUnknownRate = 0.02
 
         var passesPromotionGate: Bool {
-            (supportedTurns >= Self.minPromotableTurns || observedDays >= Self.minPromotableObservedDays)
+            malformedLines == 0
+                && (supportedTurns >= Self.minPromotableTurns || observedDays >= Self.minPromotableObservedDays)
                 && coverage >= Self.minPromotableCoverage
                 && linkage >= Self.minPromotableLinkage
                 && unknownRate <= Self.maxPromotableUnknownRate
@@ -154,7 +160,8 @@ extension LeaderParticipationSettings.Health {
             coverage: measurement.coverage,
             linkage: measurement.linkage,
             unknownRate: measurement.supportedTurns == 0 ? 1
-                : Double(unknown) / Double(measurement.supportedTurns)
+                : Double(unknown) / Double(measurement.supportedTurns),
+            malformedLines: measurement.malformedLines
         )
     }
 }

@@ -962,15 +962,14 @@ final class ReviewBoardViewModel: ObservableObject {
         let expectedUUID = team.teamUuid
         localOverlapHealthFetchedAt[teamName] = Date()
         localOverlapHealthFetches[teamName] = Task.detached { [weak self] in
-            let measurement = LeaderTurnLog.health()
+            let measurement = LeaderTurnLog.health(team: teamName)
             let health = LeaderParticipationSettings.Health(measurement: measurement)
             let reading = OverlapHealthReading.measured(
                 supportedTurns: health.supportedTurns, observedDays: health.observedDays,
                 coverage: health.coverage, linkage: health.linkage, unknownRate: health.unknownRate,
-                // This Mac's gate (`Health.passesPromotionGate`) never reads malformed
-                // lines, so naming them as the reason would hide the check that
-                // actually failed.
-                malformedLines: nil, passesGate: health.passesPromotionGate,
+                // This Mac's gate now refuses a damaged measurement exactly as the
+                // execution-host gate does, so the count is a reason to show.
+                malformedLines: health.malformedLines, passesGate: health.passesPromotionGate,
                 scope: .thisMac
             )
             await self?.publishLocalOverlapHealthReading(reading, teamName: teamName, expectedUUID: expectedUUID)

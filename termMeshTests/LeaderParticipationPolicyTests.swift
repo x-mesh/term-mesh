@@ -85,6 +85,32 @@ final class LeaderParticipationPolicyTests: XCTestCase {
         XCTAssertEqual(canary.resolve(projectID: "p", sessionID: "s", supportedLeader: true, health: unhealthy), .staticPolicy(.staticPolicy))
     }
 
+    /// `tm-agent`'s execution-host gate has always refused to promote on a
+    /// damaged measurement. This Mac's gate did not, so the same log promoted
+    /// or not depending on which host read it.
+    func testDamagedMeasurementFailsTheGateOnEveryOtherwisePassingNumber() {
+        let passing = LeaderParticipationSettings.Health(
+            supportedTurns: 500, observedDays: 7, coverage: 1, linkage: 1, unknownRate: 0
+        )
+        XCTAssertTrue(passing.passesPromotionGate)
+
+        var damaged = passing
+        damaged.malformedLines = 1
+        XCTAssertFalse(damaged.passesPromotionGate)
+
+        let settings = LeaderParticipationSettings(
+            mode: .canary, canaryPercent: 100, killSwitch: false, optInProjects: ["p"]
+        )
+        XCTAssertEqual(
+            settings.resolve(projectID: "p", sessionID: "s", supportedLeader: true, health: damaged),
+            .staticPolicy(.staticPolicy)
+        )
+        let payload = settings.controlPayload(
+            projectID: "p", sessionID: "s", supportedLeader: true, health: damaged
+        )
+        XCTAssertEqual(payload["healthy"] as? Bool, false)
+    }
+
     func testControlPayloadFailsClosedAndCarriesImmediateKillSwitch() {
         let healthy = LeaderParticipationSettings.Health(
             supportedTurns: 500, observedDays: 0, coverage: 0.95, linkage: 0.95, unknownRate: 0.02

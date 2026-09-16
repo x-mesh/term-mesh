@@ -18670,6 +18670,17 @@ fn leader_participation_health(
                 // written by tm-agent and the leader turn hook; skip, not malformed.
                 continue;
             }
+            // One host's turns.log carries every Project that ran on it. A turn
+            // record naming another Project is not this Project's measurement,
+            // broken fields included: counting it here let one Project's damaged
+            // line close another Project's gate for as long as the line stayed
+            // in the file. Lines that name no Project at all are still counted,
+            // since an unattributable line means the log itself is damaged.
+            if let Some(team) = record["team"].as_str() {
+                if team != project_id {
+                    continue;
+                }
+            }
             let valid = record["turn_id"]
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
@@ -18679,9 +18690,7 @@ fn leader_participation_health(
                 malformed_lines += 1;
                 continue;
             }
-            if record["team"].as_str() == Some(project_id) {
-                records.push(record);
-            }
+            records.push(record);
         }
     }
 
@@ -19932,6 +19941,31 @@ mod leader_turn_record_tests {
         let health = leader_participation_health(&path, "p", None);
         assert_eq!(health.supported_turns, 0);
         assert!(!health.passes_promotion_gate());
+    }
+
+    /// A host runs many Projects through one turns.log. A damaged record that
+    /// names another Project used to count here, which closed this Project's
+    /// gate for as long as that line stayed in the file.
+    #[test]
+    fn execution_host_health_ignores_another_projects_damaged_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let foreign_without_ts = serde_json::to_string(&json!({
+            "event": "turn_start",
+            "turn_id": "broken",
+            "team": "other"
+        }))
+        .expect("serialize foreign turn_start without ts");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &foreign_without_ts
+            + "\n"
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.malformed_lines, 0);
+        assert_eq!(health.supported_turns, 2);
+        assert!(health.passes_promotion_gate(), "health was {health:?}");
     }
 
     #[test]
