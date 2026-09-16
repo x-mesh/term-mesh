@@ -135,6 +135,34 @@ final class LeaderTurnLogTests: XCTestCase {
         XCTAssertEqual(LeaderTurnLog.health(from: log).observedDays, 7)
     }
 
+    /// One host's log carries every Project that ran on it, so the per-Project
+    /// gate has to read only its own turns. A line that does not decode names
+    /// no Project at all and still counts for whoever asks: the log is damaged.
+    func testHealthScopedToTeamCountsOnlyThatProjectsTurns() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_start","turn_id":"a","ts":"2026-08-24T00:00:00Z","team":"mine","surface_id":"s"}
+        {"event":"turn_route","turn_id":"a","ts":"2026-08-24T00:00:01Z","team":"mine","route_status":"stated"}
+        {"event":"turn_end","turn_id":"a","ts":"2026-08-24T00:00:02Z","team":"mine","route_status":"stated"}
+        {"event":"turn_start","turn_id":"b","ts":"2026-08-24T00:00:03Z","team":"other","surface_id":"s"}
+        {"event":"turn_end","turn_id":"b","ts":"2026-08-24T00:00:04Z","team":"other","route_status":"unstated"}
+        {not-json}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        let mine = LeaderTurnLog.health(from: log, team: "mine")
+        XCTAssertEqual(mine.supportedTurns, 1)
+        XCTAssertEqual(mine.statedTurns, 1)
+        XCTAssertEqual(mine.malformedLines, 1)
+
+        let hostWide = LeaderTurnLog.health(from: log)
+        XCTAssertEqual(hostWide.supportedTurns, 2)
+        XCTAssertEqual(hostWide.malformedLines, 1)
+    }
+
     /// `readAll` backs `policyReport` and `countsByEvent`, which `fleet.state`
     /// rebuilds on the main actor every three seconds. Its cache must follow
     /// `readRecent` backs the delegation panel, which refreshes on every
