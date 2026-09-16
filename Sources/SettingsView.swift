@@ -3301,8 +3301,12 @@ private struct LeaderParticipationSettingsRow: View {
                     .labelsHidden()
                     .pickerStyle(.segmented)
 
+                    // A toggle takes a noun, not an order: "Stop all leader
+                    // experiments: Off" made the switch read as a double
+                    // negative. The stored kill switch is unchanged — on still
+                    // means the experiments are held.
                     Toggle(isOn: killSwitchBinding) {
-                        Text("Stop all leader experiments")
+                        Text("Pause leader experiments")
                     }
                     .controlSize(.small)
                 }

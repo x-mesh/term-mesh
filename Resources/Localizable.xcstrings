@@ -1491,6 +1491,16 @@
         "ko": { "stringUnit": { "state": "translated", "value": "pane이 끊겼다가 다시 붙습니다. 호스트에서 실행 중인 에이전트와 셸 프로세스는 그대로 유지됩니다. 이미 종료된 프로세스가 남긴 셸 기록은 지워집니다 — Clean Up Panes가 닫지 못한다고 표시하는 항목을 없애는 방법입니다." } }
       }
     },
+    "Pause leader experiments": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더 실험 일시 중지"
+          }
+        }
+      }
+    },
     "Record only": {
       "localizations": {
         "ko": {
