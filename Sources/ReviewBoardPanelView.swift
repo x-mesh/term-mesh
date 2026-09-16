@@ -780,27 +780,48 @@ extension ReviewBoardPanelView {
     /// expression that also builds a `Binding` and a multi-case switch.
     @ViewBuilder
     private func overlapCanarySection(_ panel: ReviewBoardViewModel.DelegationPanel) -> some View {
-        let status = ReviewBoardViewModel.overlapCanaryStatus(
+        let checklist = ReviewBoardViewModel.overlapCanaryChecklist(
             level: panel.level, supportedLeader: panel.supportedLeader,
             killSwitch: panel.killSwitch, mode: panel.mode,
             reading: viewModel.overlapHealthReading
         )
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 7) {
-                Image(systemName: overlapCanarySymbol(panel))
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(status.line)
+            // The four conditions at once. One line naming the first blocker
+            // made a four-condition feature take four rounds to switch on.
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Image(systemName: overlapCanarySymbol(panel))
+                        .accessibilityHidden(true)
+                    Text(checklist.headline)
                         .font(.system(size: 11))
                         .fixedSize(horizontal: false, vertical: true)
-                    if let caption = status.scopeCaption {
-                        Text(caption)
+                }
+                .accessibilityElement(children: .combine)
+
+                ForEach(Array(checklist.items.enumerated()), id: \.offset) { _, item in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: overlapChecklistSymbol(item.state))
+                            .font(.system(size: 9))
+                            .foregroundColor(overlapChecklistColor(item.state))
+                            .accessibilityHidden(true)
+                        Text(item.label)
                             .font(.system(size: 10))
                             .foregroundColor(.secondary)
+                        Spacer(minLength: 6)
+                        Text(item.value)
+                            .font(.system(size: 10))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .multilineTextAlignment(.trailing)
                     }
+                    .accessibilityElement(children: .combine)
+                }
+
+                if let caption = checklist.scopeCaption {
+                    Text(caption)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
                 }
             }
-            .accessibilityElement(children: .combine)
             .accessibilityIdentifier("reviewBoard.overlapCanaryStatus")
 
             Divider()
@@ -809,7 +830,7 @@ extension ReviewBoardPanelView {
                 get: { panel.canaryOptIn },
                 set: { viewModel.setCanaryOptIn($0, teamName: panel.teamName) }
             )) {
-                Text("Include in Leader Participation canary")
+                Text("Include this Project in the route suggestion experiment")
                     .font(.system(size: 11))
             }
             .toggleStyle(.switch)
@@ -824,6 +845,26 @@ extension ReviewBoardPanelView {
     /// a second decision. Kept apart from the localized `status.line` because
     /// that line can render in Korean, and matching an SF Symbol to a
     /// translated prefix would be the fragile part, not this.
+    private func overlapChecklistSymbol(
+        _ state: ReviewBoardViewModel.OverlapCanaryChecklist.ItemState
+    ) -> String {
+        switch state {
+        case .met: return "checkmark.circle.fill"
+        case .blocked: return "xmark.circle"
+        case .pending: return "clock"
+        }
+    }
+
+    private func overlapChecklistColor(
+        _ state: ReviewBoardViewModel.OverlapCanaryChecklist.ItemState
+    ) -> Color {
+        switch state {
+        case .met: return .green
+        case .blocked: return .secondary
+        case .pending: return .secondary
+        }
+    }
+
     private func overlapCanarySymbol(_ panel: ReviewBoardViewModel.DelegationPanel) -> String {
         guard panel.level == .delegated, panel.supportedLeader, !panel.killSwitch else {
             return "pause.circle"

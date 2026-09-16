@@ -371,6 +371,16 @@
         }
       }
     },
+    "All leader experiments are stopped": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "모든 리더 실험이 중지됨"
+          }
+        }
+      }
+    },
     "Allow any local process and user to connect with no auth. Unsafe.": {
       "localizations": {
         "ko": {
@@ -1251,6 +1261,56 @@
         "ko": { "stringUnit": { "state": "translated", "value": "신중" } }
       }
     },
+    "Leader Overlap is turned off": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더 동시 진행이 꺼져 있음"
+          }
+        }
+      }
+    },
+    "Leader Overlap is set to record only": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더 동시 진행이 기록만으로 설정됨"
+          }
+        }
+      }
+    },
+    "Leader Overlap": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더 동시 진행"
+          }
+        }
+      }
+    },
+    "Include this Project in the route suggestion experiment": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 프로젝트를 경로 제안 실험에 포함"
+          }
+        }
+      }
+    },
+    "In use": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "사용"
+          }
+        }
+      }
+    },
     "Leader first": {
       "localizations": {
         "ko": { "stringUnit": { "state": "translated", "value": "리더 우선" } }
@@ -1266,9 +1326,39 @@
         "ko": { "stringUnit": { "state": "translated", "value": "기본 작업 분배" } }
       }
     },
+    "Leader turn measurement": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더 턴 측정"
+          }
+        }
+      }
+    },
     "Max parallel workers": {
       "localizations": {
         "ko": { "stringUnit": { "state": "translated", "value": "최대 병렬 워커" } }
+      }
+    },
+    "Measurement": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "측정량"
+          }
+        }
+      }
+    },
+    "Measured": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "측정됨"
+          }
+        }
       }
     },
     "Mobile Remote Control": {
@@ -1346,9 +1436,49 @@
         "ko": { "stringUnit": { "state": "translated", "value": "이 프로젝트에는 아직 워커가 없어서 모든 작업을 리더가 직접 처리합니다." } }
       }
     },
+    "On": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "켬"
+          }
+        }
+      }
+    },
+    "Not used": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "사용 안 함"
+          }
+        }
+      }
+    },
+    "Not measured": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "측정되지 않음"
+          }
+        }
+      }
+    },
     "Panes disconnect and reattach. Agent and shell processes on the host keep running. Shell records left behind by processes that already exited are cleared — this is the way to remove the ones Clean Up Panes reports it cannot close.": {
       "localizations": {
         "ko": { "stringUnit": { "state": "translated", "value": "pane이 끊겼다가 다시 붙습니다. 호스트에서 실행 중인 에이전트와 셸 프로세스는 그대로 유지됩니다. 이미 종료된 프로세스가 남긴 셸 기록은 지워집니다 — Clean Up Panes가 닫지 못한다고 표시하는 항목을 없애는 방법입니다." } }
+      }
+    },
+    "Record only": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "기록만"
+          }
+        }
       }
     },
     "Restart failed": {
@@ -1396,9 +1526,29 @@
         "ko": { "stringUnit": { "state": "translated", "value": "매 턴 하한선 알리기" } }
       }
     },
+    "Stop all leader experiments": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "모든 리더 실험 중지"
+          }
+        }
+      }
+    },
     "The leader handles serial work and delegates only independent parallel units.": {
       "localizations": {
         "ko": { "stringUnit": { "state": "translated", "value": "리더가 직렬 작업을 맡고, 서로 독립적인 병렬 단위만 위임합니다." } }
+      }
+    },
+    "The leader keeps working while its workers run, instead of waiting for them. It needs Work Distribution set to Delegated, and it does not change that setting.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더가 워커에게 일을 맡긴 뒤 기다리지 않고 자기 일도 이어서 합니다. 작업 분배가 \"위임 우선\"이어야 하며, 이 설정이 작업 분배를 바꾸지는 않습니다."
+          }
+        }
       }
     },
     "This removes the worktree and its git registration:\n%@\n\nA worktree with uncommitted changes is kept — you will be asked again before anything is discarded.": {
@@ -2909,6 +3059,16 @@
     "Work Distribution": {
       "localizations": {
         "ko": { "stringUnit": { "state": "translated", "value": "작업 분배" } }
+      }
+    },
+    "Work Distribution must be Delegated": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "작업 분배가 \"위임 우선\"이어야 함"
+          }
+        }
       }
     },
     "Work distribution for %@": {
