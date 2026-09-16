@@ -238,14 +238,17 @@ def main() -> int:
             if boundary["record"].get("overlap_canary") is not False:
                 raise termmeshError(f"{field} enabled overlap: {boundary}")
 
+        # Shadow observes and changes nothing: the ordinary canary does not
+        # apply, and overlap follows the mode, so it does not resolve either.
+        # The turn is still recorded, so `policy_mode` stays shadow.
         config["mode"] = "shadow"
         control.write_text(json.dumps(config))
         shadow = route(cli, env, "turn-shadow", route_name="parallel", evidence=True)
-        if (not shadow.get("directive")
+        if (shadow.get("directive")
                 or shadow["record"].get("policy_mode") != "shadow"
                 or shadow["record"].get("policy_applied")
-                or shadow["record"].get("overlap_canary") is not True):
-            raise termmeshError(f"Shadow mode changed the live route: {shadow}")
+                or shadow["record"].get("overlap_canary") is not False):
+            raise termmeshError(f"Shadow mode did not stay observation-only: {shadow}")
 
         config["mode"] = "canary"
         config["project_id"] = "missing-project"
