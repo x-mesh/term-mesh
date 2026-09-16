@@ -452,15 +452,23 @@ enum LeaderTurnLog {
     /// Pure cross-process identity: first 16 lowercase hex characters of
     /// SHA-256(UTF8(discriminator + ":" + prompt_sha256)).
     ///
-    /// The discriminator MUST match `scripts/leader-turn-hook.sh`, which is the
-    /// writer that actually produces `turn_start`/`turn_end` today: it prefers
-    /// the CLI session ID from the hook payload and falls back to the surface
-    /// ID only when the payload carries none. An implementation here that hard-
-    /// coded the surface ID would derive a different ID for the same turn, and
-    /// because the join is by `turn_id` alone the two records would simply
-    /// never meet — no error, just a start with no route. Take the
-    /// discriminator as a parameter so a caller cannot silently pick the wrong
-    /// one, and let it carry the same preference order the hook uses.
+    /// No longer the hook's derivation, and no longer able to reproduce one.
+    /// `scripts/leader-turn-hook.sh` now mixes the clock and its own pid into
+    /// the hash, because this content-only form gave one id to every repetition
+    /// of the same prompt: `leader_participation_health` counts the second
+    /// `turn_start` under an id as a damaged line, so repeating a short prompt
+    /// held the gate shut and folded two turns into one measurement.
+    ///
+    /// That leaves this function for content-addressed identity alone — two
+    /// callers naming the same turn by the same inputs. Do NOT write
+    /// `turn_start`/`turn_end` through it: the hook is the writer of those
+    /// records, its ids carry a nonce this cannot guess, and the join is by
+    /// `turn_id` alone, so the two record streams would never meet — no error,
+    /// just a start with no route. Nothing in `Sources/` calls it today.
+    ///
+    /// The discriminator stays a parameter so a caller cannot silently pick
+    /// the wrong one: the hook prefers the CLI session ID from its payload and
+    /// falls back to the surface ID only when the payload carries none.
     static func turnID(sessionID: String?, surfaceID: String, promptSHA256: String) -> String {
         let discriminator = (sessionID?.isEmpty == false) ? sessionID! : surfaceID
         let input = Data("\(discriminator):\(promptSHA256)".utf8)

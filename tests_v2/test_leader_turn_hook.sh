@@ -52,6 +52,7 @@ import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
+seen_turn_ids = []
 raw = path.read_text(encoding="utf-8")
 for secret in sys.argv[2:]:
     if secret in raw:
@@ -65,21 +66,61 @@ for offset in (0, 2):
         raise SystemExit("FAIL: wrong event ordering")
     if start["turn_id"] != end["turn_id"] or start["turn_id"] == "unknown":
         raise SystemExit("FAIL: start/end turn IDs do not correlate")
+    seen_turn_ids.append(start["turn_id"])
     if len(start["turn_id"]) != 16:
         raise SystemExit("FAIL: turn ID is not 16 hex characters")
     prompt = sys.argv[2 + offset // 2]
-    session_id = sys.argv[4 + offset // 2]
     expected_prompt_sha = hashlib.sha256(prompt.encode()).hexdigest()
-    expected_turn_id = hashlib.sha256(
-        f'{session_id}:{expected_prompt_sha}'.encode()
-    ).hexdigest()[:16]
-    if start["turn_id"] != expected_turn_id:
-        raise SystemExit("FAIL: turn ID does not match the specified derivation")
+    # The id carries a clock and a pid now, so it cannot be recomputed here.
+    # What it must still be: lowercase hex of the stated width, correlated
+    # start-to-end, and never shared by two turns.
+    if start["turn_id"].strip("0123456789abcdef"):
+        raise SystemExit("FAIL: turn ID is not lowercase hex")
     if start["prompt_bytes"] != len(prompt.encode()):
         raise SystemExit("FAIL: wrong prompt byte count")
     if start["prompt_sha256"] != expected_prompt_sha:
         raise SystemExit("FAIL: wrong prompt SHA-256")
+if len(set(seen_turn_ids)) != len(seen_turn_ids):
+    raise SystemExit(f"FAIL: two turns share one id: {seen_turn_ids}")
 PY
+
+# The same prompt twice in one session is ordinary — a repeated "continue" —
+# and it used to hash to one id, which tm-agent counts as a damaged log line
+# (`leader_participation_health`) rather than as two turns. Measured on a real
+# host: an intact turns.log reported "malformed log line 1" and held the
+# promotion gate shut.
+REPEAT_HOME="$TEST_TMP/repeat"
+mkdir -p "$REPEAT_HOME" || exit 1
+repeat_hook() {
+    HOME="$REPEAT_HOME" \
+        TERMMESH_TEAM=turn-test \
+        TERMMESH_SURFACE_ID=66666666-7777-8888-9999-000000000000 \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        "$HOOK" "$@"
+}
+for _ in 1 2; do
+    repeat_hook --start '{"session_id":"repeat-session","prompt":"continue"}' \
+        || fail "repeat start returned nonzero"
+    repeat_hook --end '{"hook_event_name":"Stop","session_id":"repeat-session","stop_hook_active":false}' \
+        || fail "repeat end returned nonzero"
+done
+python3 - "$REPEAT_HOME/.term-mesh/logs/turns.log" <<'REPEATPY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+starts = [r for r in records if r["event"] == "turn_start"]
+if len(starts) != 2:
+    raise SystemExit("FAIL: expected two starts, got %d" % len(starts))
+if starts[0]["prompt_sha256"] != starts[1]["prompt_sha256"]:
+    raise SystemExit("FAIL: the two repetitions were not the same prompt")
+if starts[0]["turn_id"] == starts[1]["turn_id"]:
+    raise SystemExit("FAIL: one prompt sent twice produced one turn id")
+ends = [r for r in records if r["event"] == "turn_end"]
+if sorted(r["turn_id"] for r in ends) != sorted(r["turn_id"] for r in starts):
+    raise SystemExit("FAIL: ends did not close the two distinct starts")
+REPEATPY
 
 # Route status is an outcome, not a reconstruction from timestamps. A stated
 # route leaves a short-lived per-turn marker; Stop consumes it and records the
@@ -315,6 +356,19 @@ cat > "$FLOOR_CTL/killed.json" <<'JSON' || exit 1
 {"schema_version":1,"delegation_effective":"delegated","available_workers":3,"kill_switch":true,
  "project_id":"floor-test"}
 JSON
+# Settings shows the mode and no longer shows the kill switch, so "off" has to
+# silence this hook exactly as the kill switch does. "Record only" must not: it
+# changes what is measured, not what the turn is told.
+cat > "$FLOOR_CTL/mode-off.json" <<'JSON' || exit 1
+{"schema_version":1,"delegation_effective":"delegated","available_workers":3,
+ "worker_names":["executor","architect","reviewer"],"kill_switch":false,
+ "mode":"off","project_id":"floor-test"}
+JSON
+cat > "$FLOOR_CTL/mode-shadow.json" <<'JSON' || exit 1
+{"schema_version":1,"delegation_effective":"delegated","available_workers":3,
+ "worker_names":["executor","architect","reviewer"],"kill_switch":false,
+ "mode":"shadow","project_id":"floor-test"}
+JSON
 printf 'not json {{{' > "$FLOOR_CTL/broken.json" || exit 1
 
 FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"first","session_id":"floor-1"}') \
@@ -337,11 +391,18 @@ FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-1
     || fail "delegated end returned nonzero"
 [ -z "$FLOOR_OUT" ] || fail "--end wrote to stdout: $FLOOR_OUT"
 
-for quiet in leader-first-solo killed broken missing; do
+for quiet in leader-first-solo killed mode-off broken missing; do
     FLOOR_OUT=$(floor_hook "$FLOOR_CTL/$quiet.json" --start "{\"prompt\":\"$quiet\"}") \
         || fail "$quiet start returned nonzero"
     [ -z "$FLOOR_OUT" ] || fail "$quiet should inject nothing, got: $FLOOR_OUT"
 done
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/mode-shadow.json" --start '{"prompt":"shadow","session_id":"floor-s"}') \
+    || fail "shadow start returned nonzero"
+case "$FLOOR_OUT" in
+    *"level: delegated"*) ;;
+    *) fail "record-only must still inject the floor: $FLOOR_OUT" ;;
+esac
+
 FLOOR_OUT=$(env -u TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE HOME="$FLOOR_HOME" \
     TERMMESH_TEAM=floor-test TERMMESH_SURFACE_ID=99999999-8888-7777-6666-555555555555 \
     TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token "$HOOK" --start '{"prompt":"no control"}') \
@@ -389,6 +450,33 @@ actual = [r.get("delegation_floor") for r in ends[-3:]]
 if actual != expected:
     raise SystemExit(f"FAIL: delegation floors were {actual}, expected {expected}")
 PY
+
+# Off also stops the floor record, the half the kill switch used to own alone.
+# Run it after the positional check above so that check keeps its last-three
+# window.
+floor_hook "$FLOOR_CTL/mode-off.json" --start '{"prompt":"off turn","session_id":"floor-off"}' >/dev/null \
+    || fail "mode-off start returned nonzero"
+floor_hook "$FLOOR_CTL/mode-off.json" --end '{"session_id":"floor-off"}' >/dev/null \
+    || fail "mode-off end returned nonzero"
+
+python3 - "$FLOOR_LOG" <<'OFFPY' || exit 1
+import json
+import pathlib
+import sys
+
+records = []
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if line:
+        records.append(json.loads(line))
+
+ends = [r for r in records if r["event"] == "turn_end"]
+if not ends:
+    raise SystemExit("FAIL: no turn_end records")
+last = ends[-1]
+if "delegation_floor" in last:
+    raise SystemExit("FAIL: off recorded a floor: %s" % last.get("delegation_floor"))
+OFFPY
 
 # The per-Project execution options, which only reach the hook through this
 # file: a cap of one means waves are off rather than small, and the injection
