@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.246.0] - 2026-09-16
+
+### Fixed
+
+- Drag selection in Claude Code's `/tui fullscreen` now stays aligned with the pointer when the pane is viewed through a peer relay. Relay resize handling preserves the terminal grid's padding so the viewer and host use the same rows and columns.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.245.0] - 2026-09-16
 
 ### Changed
