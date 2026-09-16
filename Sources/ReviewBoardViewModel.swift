@@ -504,19 +504,19 @@ final class ReviewBoardViewModel: ObservableObject {
         defaults: UserDefaults = .standard
     ) -> OverlapCanaryStatus {
         guard level == .delegated else {
-            return catalogLine("Off", "Work Distribution is not Delegated", defaults: defaults)
+            return catalogLine("Off", "Work Distribution must be Delegated", defaults: defaults)
         }
         guard supportedLeader else {
             return catalogLine("Off", "Leader turns are not measured", defaults: defaults)
         }
         guard !killSwitch else {
-            return catalogLine("Off", "Kill switch is on", defaults: defaults)
+            return catalogLine("Off", "All leader experiments are stopped", defaults: defaults)
         }
         switch mode {
         case .off:
-            return catalogLine("Off", "Leader Participation is Off", defaults: defaults)
+            return catalogLine("Off", "Leader Overlap is turned off", defaults: defaults)
         case .shadow:
-            return catalogLine("Off", "Leader Participation is in shadow mode", defaults: defaults)
+            return catalogLine("Off", "Leader Overlap is set to record only", defaults: defaults)
         case .canary:
             break
         }
@@ -558,6 +558,106 @@ final class ReviewBoardViewModel: ObservableObject {
                 scopeCaption: caption
             )
         }
+    }
+
+    /// Every gate at once, instead of only the first one that blocks.
+    ///
+    /// The single line above names one reason, so a Project that fixes it
+    /// learns of the next reason only when that one appears — four rounds to
+    /// discover a four-condition feature. The verdict is still decided in one
+    /// place: `headline` comes from `overlapCanaryStatus`, and each row only
+    /// restates the input it names.
+    struct OverlapCanaryChecklist: Equatable {
+        enum ItemState: Equatable { case met, blocked, pending }
+
+        struct Item: Equatable {
+            let label: String
+            let value: String
+            let state: ItemState
+        }
+
+        let headline: String
+        let items: [Item]
+        let scopeCaption: String?
+    }
+
+    static func overlapCanaryChecklist(
+        level: ProjectDelegationLevel,
+        supportedLeader: Bool,
+        killSwitch: Bool,
+        mode: LeaderParticipationSettings.Mode = .canary,
+        reading: OverlapHealthReading,
+        defaults: UserDefaults = .standard
+    ) -> OverlapCanaryChecklist {
+        let status = overlapCanaryStatus(
+            level: level, supportedLeader: supportedLeader, killSwitch: killSwitch,
+            mode: mode, reading: reading, defaults: defaults
+        )
+        func text(_ key: String) -> String { LanguageSettings.localized(key, defaults: defaults) }
+        let levelValue: String
+        switch level {
+        case .delegated: levelValue = text("Delegated")
+        case .guarded: levelValue = text("Guarded")
+        case .leaderFirst: levelValue = text("Leader first")
+        }
+        let modeValue: String
+        switch mode {
+        case .canary: modeValue = text("In use")
+        case .shadow: modeValue = text("Record only")
+        case .off: modeValue = text("Not used")
+        }
+        let measurement: OverlapCanaryChecklist.Item
+        switch reading {
+        case .checking:
+            measurement = .init(
+                label: text("Measurement"), value: text("Checking"), state: .pending
+            )
+        case .notReported:
+            measurement = .init(
+                label: text("Measurement"), value: text("Remote does not report health"), state: .pending
+            )
+        case let .unavailable(reason):
+            measurement = .init(label: text("Measurement"), value: reason, state: .pending)
+        case let .measured(
+            supportedTurns, observedDays, coverage, linkage, unknownRate, malformedLines, passesGate, _
+        ):
+            measurement = .init(
+                label: text("Measurement"),
+                value: passesGate
+                    ? text("Ready")
+                    : waitingDetail(
+                        supportedTurns: supportedTurns, observedDays: observedDays,
+                        coverage: coverage, linkage: linkage, unknownRate: unknownRate,
+                        malformedLines: malformedLines, defaults: defaults
+                    ),
+                state: passesGate ? .met : .blocked
+            )
+        }
+        return OverlapCanaryChecklist(
+            headline: status.line,
+            items: [
+                .init(
+                    label: text("Work Distribution"), value: levelValue,
+                    state: level == .delegated ? .met : .blocked
+                ),
+                .init(
+                    label: text("Leader turn measurement"),
+                    value: text(supportedLeader ? "Measured" : "Not measured"),
+                    state: supportedLeader ? .met : .blocked
+                ),
+                .init(
+                    label: text("Stop all leader experiments"),
+                    value: text(killSwitch ? "On" : "Off"),
+                    state: killSwitch ? .blocked : .met
+                ),
+                .init(
+                    label: text("Leader Overlap"), value: modeValue,
+                    state: mode == .canary ? .met : .blocked
+                ),
+                measurement,
+            ],
+            scopeCaption: status.scopeCaption
+        )
     }
 
     private static func catalogLine(

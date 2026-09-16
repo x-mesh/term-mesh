@@ -3282,15 +3282,15 @@ private struct LeaderParticipationSettingsRow: View {
 
     var body: some View {
         SettingsCardRow(
-            "Leader Participation",
-            subtitle: "Measurement rollout for the leader turn hook. It does not change Work Distribution.",
+            "Leader Overlap",
+            subtitle: "The leader keeps working while its workers run, instead of waiting for them. It needs Work Distribution set to Delegated, and it does not change that setting.",
             controlWidth: controlWidth
         ) {
             VStack(alignment: .trailing, spacing: 6) {
                 Picker("", selection: modeBinding) {
-                    Text("Off").tag(LeaderParticipationSettings.Mode.off)
-                    Text("Shadow").tag(LeaderParticipationSettings.Mode.shadow)
-                    Text("Canary").tag(LeaderParticipationSettings.Mode.canary)
+                    Text("Not used").tag(LeaderParticipationSettings.Mode.off)
+                    Text("Record only").tag(LeaderParticipationSettings.Mode.shadow)
+                    Text("In use").tag(LeaderParticipationSettings.Mode.canary)
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
@@ -3304,7 +3304,7 @@ private struct LeaderParticipationSettingsRow: View {
                 .disabled(settings.mode != .canary)
 
                 Toggle(isOn: killSwitchBinding) {
-                    Text("Kill Switch")
+                    Text("Stop all leader experiments")
                 }
                 .controlSize(.small)
             }
