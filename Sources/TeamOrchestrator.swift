@@ -8821,6 +8821,18 @@ final class TeamOrchestrator: ObservableObject {
             }
         ) else {
             Logger.team.error("[pane-resume] refusing incomplete isolated working-directory topology for '\(teamName, privacy: .public)'")
+            // Refusing is right — a resumed isolated Project must not silently
+            // put two workers in one checkout — but the caller discards this
+            // return, so Resume did nothing at all and said nothing either.
+            let alert = NSAlert()
+            alert.messageText = "Resume Failed"
+            alert.informativeText = "Project '\(teamName)' was archived with isolated worker checkouts, "
+                + "and at least one of them is missing, duplicated, or blank. "
+                + "Resuming would put workers in the wrong checkout, so nothing was started. "
+                + "Create the Project again to provision fresh checkouts."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.presentAsSheet()
             return nil
         }
         let agentTuples: [AgentTuple] = agentsArr.enumerated().map { index, a in
@@ -8915,6 +8927,15 @@ final class TeamOrchestrator: ObservableObject {
             tabManager: tabManager
         ) else {
             Logger.team.error("[pane-resume] createTeam failed for '\(teamName, privacy: .public)'")
+            // Same reason as the topology refusal above: the caller discards
+            // this return, so without a word here Resume looks like a no-op.
+            let alert = NSAlert()
+            alert.messageText = "Resume Failed"
+            alert.informativeText = "Project '\(teamName)' could not be recreated from its archive. "
+                + "Check Console for `[pane-resume]` entries."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.presentAsSheet()
             return nil
         }
 
