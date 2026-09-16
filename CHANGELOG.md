@@ -4,6 +4,36 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.243.0] - 2026-09-16
+
+### Added
+
+- The Review Board shows whether a Project's Overlap canary is running, and why it is not. The line names the reason the gate itself uses: work distribution level, leader measurement, kill switch, participation mode, or the turn-health numbers that are still short.
+- Settings has Leader Participation controls: mode, canary percent, and the kill switch. A Project can opt into the canary from its Review Board.
+- Relay panes record input stage timings and backlog depth, so remote typing latency can be read during diagnosis.
+
+### Changed
+
+- The Overlap canary now follows the Leader Participation mode. Off and shadow stop it; only canary mode runs it. A Project that relied on overlap while the mode was off or shadow must move the mode to canary.
+- Leader turn health is measured per Project. One host's turn log carries every Project that ran on it, so turn counts, observed days, and unreadable lines are now counted for the Project being checked. A Mac that ran several Projects may show fewer turns than before, and a damaged measurement now blocks promotion on this Mac exactly as it already did on an execution host.
+
+### Fixed
+
+- Typing in a remote relay pane no longer stalls. Key input no longer waits on the main actor, and stopping an SSH tunnel no longer blocks the roster poll, so the periodic 60–80 ms pauses are gone.
+- An SSH tunnel that was stopped while it was still starting could leave its ssh process and socket behind. The late process is now reaped by whichever side owns it.
+- A leader no longer exits at startup. The trust prompt is answered one verified step at a time instead of sending every key at once.
+- Remote Projects reopen after their viewer window closes, and remote workers recover after a peer daemon restarts.
+- Resuming a Project with shared panes restores each worker's directory, and a resume that cannot start now says why instead of doing nothing.
+- Leader turn health no longer counts task records as damaged lines, so an execution host with task history can pass the promotion gate.
+- The canary percent value is visible in Settings again.
+
+### Internal
+
+- Unit tests that change process environment now share one lock, so full-suite runs no longer fail at random, and the test suite no longer rewrites the developer's own Codex runbook file.
+- Build and test fixes for Xcode 27 and for the Python 3.9 runner on mac-sub.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.242.0] - 2026-09-12
 
 ### Added
