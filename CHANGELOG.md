@@ -4,6 +4,17 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.244.0] - 2026-09-16
+
+### Changed
+
+- The leader's overlap feature now has a name on screen: Leader Overlap. Settings uses that name, and its three states read Not used, Record only, and In use instead of Off, Shadow, and Canary.
+- The Review Board lists every condition Leader Overlap needs at once — work distribution, leader turn measurement, the stop switch, the mode, and the measurement so far — instead of naming only the first one that blocks. Fixing one condition no longer hides the next one.
+- The kill switch now says what it stops: Stop all leader experiments.
+- The Review Board toggle that adds a Project to the route suggestion experiment now says so. It sits beside the Leader Overlap status but never controlled it.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.243.0] - 2026-09-16
 
 ### Added
