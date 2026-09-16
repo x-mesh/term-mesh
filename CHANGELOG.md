@@ -4,6 +4,28 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.245.0] - 2026-09-16
+
+### Changed
+
+- Settings separates the route suggestion experiment from Leader Overlap. The percentage sat inside the Leader Overlap card, but Leader Overlap never read it. It now has its own card, and that card says the mode and the stop switch still gate both.
+- The stop switch names what it is instead of reading as an order: Pause leader experiments. The matching Review Board row reads Leader experiments: Running or Stopped.
+- A repeated leader turn now counts as a damaged measurement line and blocks promotion on this Mac, as it already did on an execution host. One session that sends the same prompt twice produces the same turn id, and this Mac used to count it as a second turn — so the same history could read Ready here and Waiting there.
+
+### Fixed
+
+- Leader turn health counts the history that survives a log rotation again. The turn log is rotated once it passes 10 MB, and this Mac read only the newest file, so every rotation dropped the turn count and could hold the promotion gate shut while an execution host passed on the same history. A turn whose start and end fell either side of a rotation is also linked again.
+- The waiting reason no longer shows an unknown-route percentage that reads as already met: 2.5% printed "2% (needs 2% or less)", and now prints 3%.
+- The Review Board and the fleet view no longer re-read the rotated turn log on every refresh, so a Mac whose log has rotated no longer pays that cost on the main thread.
+
+### Internal
+
+- The reconnect path a remote pane takes when it loses its transport has its first test, covering a teardown that lands while a reconnect is still attaching. The test is verified by mutation.
+- Daemon archive and resume now pin that an agent's own working directory survives the round trip.
+- A wall-clock assertion that could fail on a loaded machine was removed from the SSH tunnel tests.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.244.0] - 2026-09-16
 
 ### Changed
