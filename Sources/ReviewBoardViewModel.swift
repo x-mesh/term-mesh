@@ -688,9 +688,11 @@ final class ReviewBoardViewModel: ObservableObject {
 
     /// Malformed lines outrank every ratio — they mean the count itself is
     /// suspect. Otherwise: the unmet volume part, then the first failing
-    /// ratio in gate order (coverage, linkage, unknown routes). Percentages
-    /// are floor-rounded so a value just under a threshold cannot print as
-    /// the threshold itself. A gate failure with no displayed part failing
+    /// ratio in gate order (coverage, linkage, unknown routes). A percentage
+    /// rounds away from the threshold it is measured against, so a failing
+    /// value can never print as one that satisfies the printed bound: the
+    /// three minimums floor, and the unknown-rate allowance ceils.
+    /// A gate failure with no displayed part failing
     /// (thresholds shared with `passesPromotionGate` disagreeing on the exact
     /// same inputs) falls back to a generic line rather than implying a
     /// reason that is not there.

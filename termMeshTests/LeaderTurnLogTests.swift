@@ -305,6 +305,62 @@ final class LeaderTurnLogTests: XCTestCase {
         try FileManager.default.removeItem(at: rotated)
         XCTAssertEqual(LeaderTurnLog.health(from: log, team: "t").supportedTurns, 1)
     }
+
+    /// `turn_id` is SHA256(session|surface : prompt), so one session sending an
+    /// identical prompt twice writes the same id twice. `tm-agent` counts the
+    /// repeat as a damaged line and drops it, failing the gate closed
+    /// (`execution_host_health_fails_closed_for_duplicate_turn_starts`).
+    /// Counting it as a second supported turn instead let this Mac read Ready
+    /// off a log the execution host read as Waiting.
+    func testDuplicateTurnStartCountsAsMalformedRatherThanASecondTurn() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_start","turn_id":"first","ts":"2026-08-18T23:59:00Z","team":"t"}
+        {"event":"turn_route","turn_id":"first","ts":"2026-08-18T23:59:01Z","team":"t","route_status":"stated"}
+        {"event":"turn_end","turn_id":"first","ts":"2026-08-18T23:59:02Z","team":"t","route_status":"stated"}
+        {"event":"turn_start","turn_id":"first","ts":"2026-08-18T23:59:03Z","team":"t"}
+        {"event":"turn_start","turn_id":"last","ts":"2026-08-24T00:01:00Z","team":"t"}
+        {"event":"turn_route","turn_id":"last","ts":"2026-08-24T00:01:01Z","team":"t","route_status":"stated"}
+        {"event":"turn_end","turn_id":"last","ts":"2026-08-24T00:01:02Z","team":"t","route_status":"stated"}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        let health = LeaderTurnLog.health(from: log, team: "t")
+        XCTAssertEqual(health.supportedTurns, 2, "the repeated start is not a third turn")
+        XCTAssertEqual(health.malformedLines, 1)
+        // Malformed outranks every ratio, so the gate stays shut on it.
+        XCTAssertEqual(health.linkedTurns, 2)
+        XCTAssertEqual(health.coverage, 1)
+    }
+
+    /// The case folding the rotated generation in creates: the same prompt
+    /// either side of a rotation. Read one file at a time these were two
+    /// separate readings of one turn each; read together they are a duplicate,
+    /// and only the merged reading can see it.
+    func testDuplicateTurnStartIsCaughtAcrossTheRotationBoundary() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let rotated = LeaderTurnLog.rotatedLogFile(for: log)
+        let older = """
+        {"event":"turn_start","turn_id":"repeat","ts":"2026-08-24T00:00:00Z","team":"t"}
+        {"event":"turn_route","turn_id":"repeat","ts":"2026-08-24T00:00:01Z","team":"t","route_status":"stated"}
+        {"event":"turn_end","turn_id":"repeat","ts":"2026-08-24T00:00:02Z","team":"t","route_status":"stated"}
+        """ + "\n"
+        try Data(older.utf8).write(to: rotated)
+        let live = """
+        {"event":"turn_start","turn_id":"repeat","ts":"2026-08-25T00:00:00Z","team":"t"}
+        """ + "\n"
+        try Data(live.utf8).write(to: log)
+
+        let health = LeaderTurnLog.health(from: log, team: "t")
+        XCTAssertEqual(health.supportedTurns, 1, "one turn seen twice is still one turn")
+        XCTAssertEqual(health.malformedLines, 1)
+    }
     func testRouteRecordWinsMarkerRaceAndCoverageNeverExceedsOne() throws {
         let log = try temporaryLog()
         try FileManager.default.createDirectory(

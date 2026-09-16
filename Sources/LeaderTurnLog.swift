@@ -786,9 +786,15 @@ enum LeaderTurnLog {
         }
     }
 
-    /// Both generations in one key. Rotation renames the live file onto the
-    /// rotated path and starts an empty one, so either file's stamp alone can
-    /// look unchanged across a rotation that moved every byte.
+    /// Both generations in one key.
+    ///
+    /// Not for `gc.rotate_log` itself: that unlinks any prior `.1` and renames
+    /// the live file onto it, so the next append creates a live file with a new
+    /// inode, a new birthtime and size 0 — the live stamp always changes. What
+    /// the live stamp alone cannot see is the rotated file changing underneath
+    /// an unchanged live one: a retained descriptor still writing to the
+    /// rotated inode, or the file being removed or restored out of band. Both
+    /// change this Mac's reading, and both are invisible to a one-file key.
     private struct GenerationStamp: Equatable {
         let live: LogFileStamp
         /// `nil` until a first rotation creates the file.
@@ -798,6 +804,15 @@ enum LeaderTurnLog {
     private static let logCacheLock = NSLock()
     private static var healthCache: (stamp: GenerationStamp, team: String?, value: FileDerivedHealth)?
     private static var recordCache: (stamp: LogFileStamp, records: [Record])?
+    /// The rotated generation is frozen until the next rotation, and `.1` is
+    /// not itself rotated (`gc.rs` only rotates `.log`), so on a host that has
+    /// rotated once it stays at the 10 MiB threshold for good. Re-parsing it on
+    /// every reading put that whole file back on the main actor each time the
+    /// single-slot `healthCache` was evicted — which the Review Board does on
+    /// its own beat, since it asks per Project while the fleet asks host-wide.
+    /// Decode it once and key it on its own stamp. Records are kept unfiltered
+    /// so one decode serves every Project.
+    private static var rotatedRecordsCache: (stamp: LogFileStamp, decoded: DecodedGeneration)?
     private static var recentCache: (stamp: LogFileStamp, entries: [RecentKey: [Record]])?
     private static var policyCache: (stamp: LogFileStamp, entries: [String: PolicyReport])?
 
@@ -842,29 +857,84 @@ enum LeaderTurnLog {
         return GenerationStamp(live: live, rotated: LogFileStamp(path: rotated.path))
     }
 
-    private static func computeFileDerivedHealth(from logFile: URL, team: String?) -> FileDerivedHealth {
-        let decoder = JSONDecoder()
-        var malformed = 0
+    /// One generation's decoded contents, before any Project scoping. A line
+    /// that does not decode names no Project, so it counts against whichever
+    /// Project asks: the log itself is damaged.
+    private struct DecodedGeneration {
         var records: [Record] = []
+        var malformedLines = 0
+    }
+
+    private static func decodeGeneration(_ url: URL) -> DecodedGeneration {
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return DecodedGeneration() }
+        var rawLines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+        if data.last == 0x0A { rawLines.removeLast() }
+        let decoder = JSONDecoder()
+        var decoded = DecodedGeneration()
+        decoded.records.reserveCapacity(rawLines.count)
+        for line in rawLines where !line.isEmpty {
+            guard let record = try? decoder.decode(Record.self, from: Data(line)) else {
+                decoded.malformedLines += 1
+                continue
+            }
+            decoded.records.append(record)
+        }
+        return decoded
+    }
+
+    /// The rotated generation, decoded at most once per rotation.
+    private static func decodeRotatedGeneration(_ url: URL) -> DecodedGeneration {
+        let stamp = LogFileStamp(path: url.path)
+        guard let stamp else { return DecodedGeneration() }
+        logCacheLock.lock()
+        let cached = rotatedRecordsCache
+        logCacheLock.unlock()
+        if let cached, cached.stamp == stamp { return cached.decoded }
+        let decoded = decodeGeneration(url)
+        // Same rule as every other cache here: only keep it when the file did
+        // not change while it was being read.
+        if let after = LogFileStamp(path: url.path), after == stamp {
+            logCacheLock.lock()
+            rotatedRecordsCache = (stamp, decoded)
+            logCacheLock.unlock()
+        }
+        return decoded
+    }
+
+    private static func computeFileDerivedHealth(from logFile: URL, team: String?) -> FileDerivedHealth {
         // Oldest generation first, the order `tm-agent` reads them in: a turn's
         // start can sit in the rotated file with its route and end in the live
         // one, and linkage is decided by grouping those together.
-        for generation in [rotatedLogFile(for: logFile), logFile] {
-            guard let data = try? Data(contentsOf: generation), !data.isEmpty else { continue }
-            var rawLines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
-            if data.last == 0x0A { rawLines.removeLast() }
-            for line in rawLines where !line.isEmpty {
-                guard let record = try? decoder.decode(Record.self, from: Data(line)) else {
-                    // A line that does not decode names no Project, so it counts
-                    // against whichever Project asks: the log itself is damaged.
-                    malformed += 1
-                    continue
-                }
+        let rotated = decodeRotatedGeneration(rotatedLogFile(for: logFile))
+        let live = decodeGeneration(logFile)
+        var malformed = rotated.malformedLines + live.malformedLines
+        var records: [Record] = []
+        records.reserveCapacity(rotated.records.count + live.records.count)
+        for generation in [rotated.records, live.records] {
+            for record in generation {
                 // A turn another Project ran on this host is not part of this
-                // Project's measurement, so it never reaches the gate either way.
+                // Project's measurement, so it never reaches the gate either
+                // way. `tm-agent` scopes by Project before it dedupes, so this
+                // has to come first here too.
                 if let team, record.team != team { continue }
                 records.append(record)
             }
+        }
+        // A repeated turn_start is a damaged line, not a second turn: the id is
+        // SHA256(session|surface : prompt), so one session sending an identical
+        // prompt twice reuses it. `tm-agent` counts the repeat as malformed and
+        // drops it, failing the gate closed; counting it as another supported
+        // turn instead let this Mac read Ready off a log the execution host read
+        // as Waiting. Folding the rotated generation in is what first brings a
+        // pair either side of a rotation into one reading.
+        var seenStartIDs = Set<String>()
+        records = records.filter { record in
+            guard record.event == .turnStart else { return true }
+            guard seenStartIDs.insert(record.turnID).inserted else {
+                malformed += 1
+                return false
+            }
+            return true
         }
         let grouped = Dictionary(grouping: records, by: \.turnID)
         let absorbedTurnIDs = Set(records.compactMap { record in
