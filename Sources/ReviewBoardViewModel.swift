@@ -728,9 +728,12 @@ final class ReviewBoardViewModel: ObservableObject {
                 String(floorPercent(linkage)), String(floorPercent(minLinkage))
             ))
         } else if unknownRate > maxUnknownRate {
+            // This is the one "or less" threshold, so the value rounds the
+            // other way: flooring 2.5% printed "2% (needs 2% or less)", a
+            // reason that reads as though it were already met.
             parts.append(String(
                 format: LanguageSettings.localized("unknown routes %@%% (needs %@%% or less)", defaults: defaults),
-                String(floorPercent(unknownRate)), String(floorPercent(maxUnknownRate))
+                String(ceilPercent(unknownRate)), String(floorPercent(maxUnknownRate))
             ))
         }
         guard !parts.isEmpty else {
@@ -741,6 +744,13 @@ final class ReviewBoardViewModel: ObservableObject {
 
     private static func floorPercent(_ value: Double) -> Int {
         Int((value * 100).rounded(.down))
+    }
+
+    /// For a value measured against an "or less" allowance. Flooring it can
+    /// print a number that satisfies the printed allowance while the gate it
+    /// explains is failing.
+    private static func ceilPercent(_ value: Double) -> Int {
+        Int((value * 100).rounded(.up))
     }
 
     // MARK: - Peer leader health over SSH

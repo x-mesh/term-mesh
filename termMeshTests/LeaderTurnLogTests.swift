@@ -257,6 +257,54 @@ final class LeaderTurnLogTests: XCTestCase {
         try FileManager.default.removeItem(at: log)
         XCTAssertEqual(LeaderTurnLog.health(from: log).supportedTurns, 0)
     }
+
+    /// `gc.rotate_log` renames the live file to `turns.log.1` and starts an
+    /// empty one, and `tm-agent` reads both. Reading only the live file made
+    /// this side's count collapse at every rotation and split any turn that
+    /// straddled the boundary, so the same history disagreed across hosts.
+    func testHealthFoldsTheRotatedGenerationAndLinksTurnsAcrossIt() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let live = """
+        {"event":"turn_route","turn_id":"split","ts":"2026-08-25T00:00:00Z","team":"t","route_status":"stated"}
+        {"event":"turn_end","turn_id":"split","ts":"2026-08-25T00:00:01Z","team":"t","route_status":"stated"}
+        {"event":"turn_start","turn_id":"new","ts":"2026-08-25T00:00:02Z","team":"t","surface_id":"s"}
+        """ + "\n"
+        try Data(live.utf8).write(to: log)
+
+        // Only the live file exists yet: the rotated half of "split" is missing,
+        // so its start is not there to count.
+        XCTAssertEqual(LeaderTurnLog.health(from: log, team: "t").supportedTurns, 1)
+
+        let rotated = LeaderTurnLog.rotatedLogFile(for: log)
+        let older = """
+        {"event":"turn_start","turn_id":"old","ts":"2026-08-24T00:00:00Z","team":"t","surface_id":"s"}
+        {"event":"turn_route","turn_id":"old","ts":"2026-08-24T00:00:01Z","team":"t","route_status":"stated"}
+        {"event":"turn_end","turn_id":"old","ts":"2026-08-24T00:00:02Z","team":"t","route_status":"stated"}
+        {"event":"turn_start","turn_id":"split","ts":"2026-08-24T00:00:03Z","team":"t","surface_id":"s"}
+        """ + "\n"
+        try Data(older.utf8).write(to: rotated)
+
+        // The live file did not change, so a cache keyed on it alone would
+        // still answer 1 here.
+        let health = LeaderTurnLog.health(from: log, team: "t")
+        XCTAssertEqual(health.supportedTurns, 3)
+        // "split" starts in the rotated file and ends in the live one. Grouping
+        // both generations together is what lets it link at all.
+        XCTAssertEqual(health.linkedTurns, 2)
+        XCTAssertEqual(health.statedTurns, 2)
+        XCTAssertEqual(health.unstatedTurns, 0)
+        XCTAssertEqual(health.malformedLines, 0)
+        // Starts span two UTC dates across the two generations.
+        XCTAssertEqual(health.observedDays, 2)
+
+        // Losing the rotated generation drops its turns rather than serving the
+        // wider aggregate the cache last saw.
+        try FileManager.default.removeItem(at: rotated)
+        XCTAssertEqual(LeaderTurnLog.health(from: log, team: "t").supportedTurns, 1)
+    }
     func testRouteRecordWinsMarkerRaceAndCoverageNeverExceedsOne() throws {
         let log = try temporaryLog()
         try FileManager.default.createDirectory(
