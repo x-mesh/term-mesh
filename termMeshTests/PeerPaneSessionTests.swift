@@ -9208,6 +9208,15 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         host.holdNextAttach { attachHeld.fulfill() }
         try await relay.start()
 
+        // The two guards on the install differ in exactly one observable. If
+        // `stillEligible()` catches the teardown, `replaceSession` is never
+        // reached and the gate generation stands still; if it were removed and
+        // the `currentSessionSlot.replace` backstop caught instead, the CAS
+        // would already have advanced it. Both cancel and install nothing, so
+        // without this the test cannot tell which guard did the work — and
+        // would keep passing with `stillEligible()` deleted.
+        let generationBeforeDrop = relay.resumeGenerationForTesting
+
         XCTAssertTrue(relay.debugDropOwnedTransport())
         await fulfillment(of: [reconnecting, attachHeld], timeout: 15)
 
@@ -9215,6 +9224,11 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         host.releaseHeldAttach()
 
         await fulfillment(of: [connectionsClosed], timeout: 15)
+        XCTAssertEqual(
+            relay.resumeGenerationForTesting, generationBeforeDrop,
+            "the attempt got as far as committing a replacement generation, so "
+                + "the eligibility re-check after the attach did not stop it"
+        )
         XCTAssertEqual(
             reconnectedCount, 0,
             "a reconnect completed against a session torn down before it finished"
@@ -10620,6 +10634,13 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
     /// Hold the reply to the next `attachSurface` until `releaseHeldAttach()`,
     /// so a caller can tear down while an attach is genuinely in flight. Off
     /// unless armed, so every other test here is unaffected.
+    ///
+    /// This parks the serving loop, not just the one reply: `serve(client:)`
+    /// runs inline on the single accept task, so nothing new is accepted while
+    /// a hold is in place. A caller needing another connection during the hold
+    /// would watch it time out instead — and the park cap here and the
+    /// handshake read timeout in `PeerRelaySession.connect` are both 10s, so
+    /// they must not be relied on to overlap in any useful order.
     private var holdsNextAttach = false
     private let attachReleased = DispatchSemaphore(value: 0)
     /// Fired from the serving thread when a held attach parks, and when a
@@ -10653,6 +10674,9 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
     }
 
     func holdNextAttach(onHeld: @escaping @Sendable () -> Void) {
+        // Drop a permit left behind by a release that arrived with nothing
+        // parked; otherwise this arming would sail straight through it.
+        while attachReleased.wait(timeout: .now()) == .success {}
         lock.lock(); holdsNextAttach = true; onAttachHeld = onHeld; lock.unlock()
     }
 
@@ -10729,7 +10753,15 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
         let fd = listenerFD
         listenerFD = -1
         let clients = clientFDs
+        // Drop the test's callbacks before the socket goes. A held attach
+        // releases on its own timeout well after a failing test has returned,
+        // and fulfilling that test's expectation then is an API violation that
+        // would surface as a failure in whatever runs next.
+        onAttachHeld = nil
+        onConnectionClosed = nil
         lock.unlock()
+        // Unpark anything still holding, so teardown does not wait out the cap.
+        attachReleased.signal()
         for client in clients { Darwin.shutdown(client, SHUT_RDWR) }
         if fd >= 0 {
             Darwin.shutdown(fd, SHUT_RDWR)
