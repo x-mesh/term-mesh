@@ -257,6 +257,110 @@ final class LeaderTurnLogTests: XCTestCase {
         try FileManager.default.removeItem(at: log)
         XCTAssertEqual(LeaderTurnLog.health(from: log).supportedTurns, 0)
     }
+
+    /// `gc.rotate_log` renames the live file to `turns.log.1` and starts an
+    /// empty one, and `tm-agent` reads both. Reading only the live file made
+    /// this side's count collapse at every rotation and split any turn that
+    /// straddled the boundary, so the same history disagreed across hosts.
+    func testHealthFoldsTheRotatedGenerationAndLinksTurnsAcrossIt() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let live = """
+        {"event":"turn_route","turn_id":"split","ts":"2026-08-25T00:00:00Z","team":"t","route_status":"stated"}
+        {"event":"turn_end","turn_id":"split","ts":"2026-08-25T00:00:01Z","team":"t","route_status":"stated"}
+        {"event":"turn_start","turn_id":"new","ts":"2026-08-25T00:00:02Z","team":"t","surface_id":"s"}
+        """ + "\n"
+        try Data(live.utf8).write(to: log)
+
+        // Only the live file exists yet: the rotated half of "split" is missing,
+        // so its start is not there to count.
+        XCTAssertEqual(LeaderTurnLog.health(from: log, team: "t").supportedTurns, 1)
+
+        let rotated = LeaderTurnLog.rotatedLogFile(for: log)
+        let older = """
+        {"event":"turn_start","turn_id":"old","ts":"2026-08-24T00:00:00Z","team":"t","surface_id":"s"}
+        {"event":"turn_route","turn_id":"old","ts":"2026-08-24T00:00:01Z","team":"t","route_status":"stated"}
+        {"event":"turn_end","turn_id":"old","ts":"2026-08-24T00:00:02Z","team":"t","route_status":"stated"}
+        {"event":"turn_start","turn_id":"split","ts":"2026-08-24T00:00:03Z","team":"t","surface_id":"s"}
+        """ + "\n"
+        try Data(older.utf8).write(to: rotated)
+
+        // The live file did not change, so a cache keyed on it alone would
+        // still answer 1 here.
+        let health = LeaderTurnLog.health(from: log, team: "t")
+        XCTAssertEqual(health.supportedTurns, 3)
+        // "split" starts in the rotated file and ends in the live one. Grouping
+        // both generations together is what lets it link at all.
+        XCTAssertEqual(health.linkedTurns, 2)
+        XCTAssertEqual(health.statedTurns, 2)
+        XCTAssertEqual(health.unstatedTurns, 0)
+        XCTAssertEqual(health.malformedLines, 0)
+        // Starts span two UTC dates across the two generations.
+        XCTAssertEqual(health.observedDays, 2)
+
+        // Losing the rotated generation drops its turns rather than serving the
+        // wider aggregate the cache last saw.
+        try FileManager.default.removeItem(at: rotated)
+        XCTAssertEqual(LeaderTurnLog.health(from: log, team: "t").supportedTurns, 1)
+    }
+
+    /// `turn_id` is SHA256(session|surface : prompt), so one session sending an
+    /// identical prompt twice writes the same id twice. `tm-agent` counts the
+    /// repeat as a damaged line and drops it, failing the gate closed
+    /// (`execution_host_health_fails_closed_for_duplicate_turn_starts`).
+    /// Counting it as a second supported turn instead let this Mac read Ready
+    /// off a log the execution host read as Waiting.
+    func testDuplicateTurnStartCountsAsMalformedRatherThanASecondTurn() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_start","turn_id":"first","ts":"2026-08-18T23:59:00Z","team":"t"}
+        {"event":"turn_route","turn_id":"first","ts":"2026-08-18T23:59:01Z","team":"t","route_status":"stated"}
+        {"event":"turn_end","turn_id":"first","ts":"2026-08-18T23:59:02Z","team":"t","route_status":"stated"}
+        {"event":"turn_start","turn_id":"first","ts":"2026-08-18T23:59:03Z","team":"t"}
+        {"event":"turn_start","turn_id":"last","ts":"2026-08-24T00:01:00Z","team":"t"}
+        {"event":"turn_route","turn_id":"last","ts":"2026-08-24T00:01:01Z","team":"t","route_status":"stated"}
+        {"event":"turn_end","turn_id":"last","ts":"2026-08-24T00:01:02Z","team":"t","route_status":"stated"}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        let health = LeaderTurnLog.health(from: log, team: "t")
+        XCTAssertEqual(health.supportedTurns, 2, "the repeated start is not a third turn")
+        XCTAssertEqual(health.malformedLines, 1)
+        // Malformed outranks every ratio, so the gate stays shut on it.
+        XCTAssertEqual(health.linkedTurns, 2)
+        XCTAssertEqual(health.coverage, 1)
+    }
+
+    /// The case folding the rotated generation in creates: the same prompt
+    /// either side of a rotation. Read one file at a time these were two
+    /// separate readings of one turn each; read together they are a duplicate,
+    /// and only the merged reading can see it.
+    func testDuplicateTurnStartIsCaughtAcrossTheRotationBoundary() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let rotated = LeaderTurnLog.rotatedLogFile(for: log)
+        let older = """
+        {"event":"turn_start","turn_id":"repeat","ts":"2026-08-24T00:00:00Z","team":"t"}
+        {"event":"turn_route","turn_id":"repeat","ts":"2026-08-24T00:00:01Z","team":"t","route_status":"stated"}
+        {"event":"turn_end","turn_id":"repeat","ts":"2026-08-24T00:00:02Z","team":"t","route_status":"stated"}
+        """ + "\n"
+        try Data(older.utf8).write(to: rotated)
+        let live = """
+        {"event":"turn_start","turn_id":"repeat","ts":"2026-08-25T00:00:00Z","team":"t"}
+        """ + "\n"
+        try Data(live.utf8).write(to: log)
+
+        let health = LeaderTurnLog.health(from: log, team: "t")
+        XCTAssertEqual(health.supportedTurns, 1, "one turn seen twice is still one turn")
+        XCTAssertEqual(health.malformedLines, 1)
+    }
     func testRouteRecordWinsMarkerRaceAndCoverageNeverExceedsOne() throws {
         let log = try temporaryLog()
         try FileManager.default.createDirectory(

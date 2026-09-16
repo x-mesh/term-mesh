@@ -688,9 +688,11 @@ final class ReviewBoardViewModel: ObservableObject {
 
     /// Malformed lines outrank every ratio — they mean the count itself is
     /// suspect. Otherwise: the unmet volume part, then the first failing
-    /// ratio in gate order (coverage, linkage, unknown routes). Percentages
-    /// are floor-rounded so a value just under a threshold cannot print as
-    /// the threshold itself. A gate failure with no displayed part failing
+    /// ratio in gate order (coverage, linkage, unknown routes). A percentage
+    /// rounds away from the threshold it is measured against, so a failing
+    /// value can never print as one that satisfies the printed bound: the
+    /// three minimums floor, and the unknown-rate allowance ceils.
+    /// A gate failure with no displayed part failing
     /// (thresholds shared with `passesPromotionGate` disagreeing on the exact
     /// same inputs) falls back to a generic line rather than implying a
     /// reason that is not there.
@@ -728,9 +730,12 @@ final class ReviewBoardViewModel: ObservableObject {
                 String(floorPercent(linkage)), String(floorPercent(minLinkage))
             ))
         } else if unknownRate > maxUnknownRate {
+            // This is the one "or less" threshold, so the value rounds the
+            // other way: flooring 2.5% printed "2% (needs 2% or less)", a
+            // reason that reads as though it were already met.
             parts.append(String(
                 format: LanguageSettings.localized("unknown routes %@%% (needs %@%% or less)", defaults: defaults),
-                String(floorPercent(unknownRate)), String(floorPercent(maxUnknownRate))
+                String(ceilPercent(unknownRate)), String(floorPercent(maxUnknownRate))
             ))
         }
         guard !parts.isEmpty else {
@@ -741,6 +746,13 @@ final class ReviewBoardViewModel: ObservableObject {
 
     private static func floorPercent(_ value: Double) -> Int {
         Int((value * 100).rounded(.down))
+    }
+
+    /// For a value measured against an "or less" allowance. Flooring it can
+    /// print a number that satisfies the printed allowance while the gate it
+    /// explains is failing.
+    private static func ceilPercent(_ value: Double) -> Int {
+        Int((value * 100).rounded(.up))
     }
 
     // MARK: - Peer leader health over SSH

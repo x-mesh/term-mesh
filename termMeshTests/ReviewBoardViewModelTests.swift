@@ -1134,6 +1134,25 @@ final class ReviewBoardViewModelTests: XCTestCase {
         )
     }
 
+    /// The unknown rate is the one threshold stated as "or less", so flooring
+    /// it contradicts the gate: 2.5% printed "2% (needs 2% or less)", a reason
+    /// whose own numbers say it is already met.
+    @MainActor
+    func testOverlapCanaryStatusCeilsTheUnknownRateAgainstItsOrLessThreshold() {
+        let english = englishDefaults()
+        let reading = ReviewBoardViewModel.OverlapHealthReading.measured(
+            supportedTurns: 500, observedDays: 8, coverage: 1, linkage: 1,
+            unknownRate: 0.025, malformedLines: 0, passesGate: false, scope: .thisMac
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: true, killSwitch: false,
+                reading: reading, defaults: english
+            ).line,
+            "Waiting · unknown routes 3% (needs 2% or less)"
+        )
+    }
+
     /// Malformed lines mean the count itself is suspect, so they outrank
     /// every ratio even when the volume and every ratio would otherwise pass.
     @MainActor
