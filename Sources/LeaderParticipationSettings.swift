@@ -114,7 +114,12 @@ struct LeaderParticipationSettings: Equatable {
         // when health_scope is execution_host (apply_participation_health_scope),
         // so an executionHost payload can skip this Mac's aggregate health here
         // without losing the health gate for peer leaders.
-        let delegatedOverlapResolution = delegationState.effective == .delegated
+        // Off means off. Overlap used to read only the delegation level, the
+        // kill switch and health, so a leader whose participation mode the user
+        // had turned off kept resolving overlap anyway and the board still read
+        // Ready. Shadow observes without changing a turn, so it stops here too.
+        let delegatedOverlapResolution = mode == .canary
+            && delegationState.effective == .delegated
             && supportedLeader
             && !killSwitch
             && (healthScope == .executionHost || health.passesPromotionGate)

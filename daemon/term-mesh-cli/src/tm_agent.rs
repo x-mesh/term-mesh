@@ -18890,7 +18890,11 @@ fn resolve_participation(
     config: &LeaderParticipationCanaryConfig,
     known_input: bool,
 ) -> LeaderParticipationResolution {
-    let delegated_overlap_resolution = config.delegated_overlap_resolution
+    // Overlap ignores the cohort below — opt-in and the percent bucket decide
+    // the ordinary canary, not this one — but it does follow the mode. A leader
+    // the user switched off, or left in shadow, is not running experiments.
+    let delegated_overlap_resolution = config.mode == "canary"
+        && config.delegated_overlap_resolution
         && config.delegation_effective.as_deref() == Some("delegated")
         && config.supported
         && config.healthy
@@ -19507,9 +19511,12 @@ mod leader_turn_record_tests {
     }
 
     fn control_snapshot_value() -> Value {
+        // Overlap follows the mode, so a fixture meant to resolve overlap names
+        // canary. `opt_in` stays false, which keeps the ordinary canary off and
+        // the recorded policy_mode/cohort at off/static.
         json!({
             "schema_version": 1,
-            "mode": "shadow",
+            "mode": "canary",
             "percent": 0,
             "kill_switch": false,
             "supported": true,
@@ -19746,14 +19753,25 @@ mod leader_turn_record_tests {
         assert!(!resolve_participation(&eligible, false).applied);
     }
 
+    /// Overlap ignores the cohort — opt-in and the percent bucket decide the
+    /// ordinary canary, not this one — but it does follow the mode: a leader the
+    /// user switched off, or left in shadow, is not running experiments.
     #[test]
-    fn delegated_overlap_resolution_is_independent_of_general_canary_resolution() {
+    fn delegated_overlap_resolution_ignores_the_cohort_but_follows_the_mode() {
         let mut config = canary_config(0);
-        config.mode = "shadow".to_string();
         config.opt_in = false;
         let resolution = resolve_participation(&config, true);
         assert!(!resolution.applied);
         assert!(resolution.delegated_overlap_resolution);
+
+        for mode in ["shadow", "off"] {
+            let mut stopped = config.clone();
+            stopped.mode = mode.to_string();
+            assert!(
+                !resolve_participation(&stopped, true).delegated_overlap_resolution,
+                "mode {mode} kept overlap resolving"
+            );
+        }
 
         let cases: &[(&str, fn(&mut LeaderParticipationCanaryConfig))] = &[
             ("nondelegated", |config: &mut LeaderParticipationCanaryConfig| {

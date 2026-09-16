@@ -64,7 +64,7 @@ def main() -> int:
             ])
         log.write_text("".join(json.dumps(record) + "\n" for record in linked))
         control = Path(home) / "control.json"
-        config = {"schema_version": 1, "mode": "shadow", "percent": 0, "kill_switch": False,
+        config = {"schema_version": 1, "mode": "canary", "percent": 0, "kill_switch": False,
                   "supported": True, "healthy": False, "opt_in": False,
                   "health_scope": "execution_host",
                   "project_id": "p", "session_id": "s",
@@ -86,6 +86,19 @@ def main() -> int:
                 or applied["record"].get("overlap_canary") is not True
                 or applied["directive"].get("execution") != "overlap_canary"):
             raise termmeshError(f"eligible canary did not apply: {applied}")
+
+        # Overlap follows the participation mode: a leader the user switched
+        # off, or left in shadow, is not running experiments.
+        for stopped_mode in ("shadow", "off"):
+            control.write_text(json.dumps(dict(config, mode=stopped_mode)))
+            control.chmod(0o600)
+            stopped = route(
+                cli, env, f"turn-{stopped_mode}-overlap", route_name="parallel", evidence=True
+            )
+            if stopped["record"].get("overlap_canary") is not False or stopped.get("directive"):
+                raise termmeshError(f"mode {stopped_mode} kept overlap running: {stopped}")
+        control.write_text(json.dumps(config))
+        control.chmod(0o600)
 
         env.update({"TERMMESH_LEADER_PARTICIPATION_MODE": "canary",
                     "TERMMESH_LEADER_PARTICIPATION_PERCENT": "100",

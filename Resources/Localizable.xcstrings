@@ -5418,6 +5418,26 @@
         }
       }
     },
+    "Leader Participation is Off": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더 참여 모드가 꺼짐"
+          }
+        }
+      }
+    },
+    "Leader Participation is in shadow mode": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더 참여 모드가 관찰 전용"
+          }
+        }
+      }
+    },
     "Leader turns are not measured": {
       "localizations": {
         "ko": {

@@ -782,7 +782,8 @@ extension ReviewBoardPanelView {
     private func overlapCanarySection(_ panel: ReviewBoardViewModel.DelegationPanel) -> some View {
         let status = ReviewBoardViewModel.overlapCanaryStatus(
             level: panel.level, supportedLeader: panel.supportedLeader,
-            killSwitch: panel.killSwitch, reading: viewModel.overlapHealthReading
+            killSwitch: panel.killSwitch, mode: panel.mode,
+            reading: viewModel.overlapHealthReading
         )
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 7) {
