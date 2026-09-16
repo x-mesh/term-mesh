@@ -1024,14 +1024,14 @@ final class ReviewBoardViewModelTests: XCTestCase {
                 level: .leaderFirst, supportedLeader: true, killSwitch: false,
                 reading: ready, defaults: english
             ).line,
-            "Off · Work Distribution is not Delegated"
+            "Off · Work Distribution must be Delegated"
         )
         XCTAssertEqual(
             ReviewBoardViewModel.overlapCanaryStatus(
                 level: .guarded, supportedLeader: true, killSwitch: false,
                 reading: ready, defaults: english
             ).line,
-            "Off · Work Distribution is not Delegated"
+            "Off · Work Distribution must be Delegated"
         )
         XCTAssertEqual(
             ReviewBoardViewModel.overlapCanaryStatus(
@@ -1045,21 +1045,21 @@ final class ReviewBoardViewModelTests: XCTestCase {
                 level: .delegated, supportedLeader: true, killSwitch: true,
                 reading: ready, defaults: english
             ).line,
-            "Off · Kill switch is on"
+            "Off · All leader experiments are stopped"
         )
         XCTAssertEqual(
             ReviewBoardViewModel.overlapCanaryStatus(
                 level: .delegated, supportedLeader: true, killSwitch: false,
                 mode: .off, reading: ready, defaults: english
             ).line,
-            "Off · Leader Participation is Off"
+            "Off · Leader Overlap is turned off"
         )
         XCTAssertEqual(
             ReviewBoardViewModel.overlapCanaryStatus(
                 level: .delegated, supportedLeader: true, killSwitch: false,
                 mode: .shadow, reading: ready, defaults: english
             ).line,
-            "Off · Leader Participation is in shadow mode"
+            "Off · Leader Overlap is set to record only"
         )
         let checkingStatus = ReviewBoardViewModel.overlapCanaryStatus(
             level: .delegated, supportedLeader: true, killSwitch: false,
@@ -1193,6 +1193,57 @@ final class ReviewBoardViewModelTests: XCTestCase {
             defaults: english
         )
         XCTAssertEqual(remote.scopeCaption, "Measured on mac-sub for this Project")
+    }
+
+    /// The checklist says what the single line cannot: how many conditions
+    /// are left. Its verdict still comes from `overlapCanaryStatus`, so the
+    /// headline and the rows can never disagree about whether it runs.
+    @MainActor
+    func testOverlapCanaryChecklistNamesEveryConditionAtOnce() {
+        let english = englishDefaults()
+        let ready = ReviewBoardViewModel.OverlapHealthReading.measured(
+            supportedTurns: 500, observedDays: 8, coverage: 0.99, linkage: 0.99,
+            unknownRate: 0, malformedLines: 0, passesGate: true, scope: .thisMac
+        )
+
+        let blocked = ReviewBoardViewModel.overlapCanaryChecklist(
+            level: .leaderFirst, supportedLeader: false, killSwitch: true,
+            mode: .shadow, reading: ready, defaults: english
+        )
+        XCTAssertEqual(blocked.headline, "Off · Work Distribution must be Delegated")
+        XCTAssertEqual(
+            blocked.items.map(\.label),
+            ["Work Distribution", "Leader turn measurement", "Stop all leader experiments",
+             "Leader Overlap", "Measurement"]
+        )
+        XCTAssertEqual(
+            blocked.items.map(\.value),
+            ["Leader first", "Not measured", "On", "Record only", "Ready"]
+        )
+        XCTAssertEqual(
+            blocked.items.map(\.state),
+            [.blocked, .blocked, .blocked, .blocked, .met],
+            "every unmet condition has to show, not just the first one"
+        )
+
+        let running = ReviewBoardViewModel.overlapCanaryChecklist(
+            level: .delegated, supportedLeader: true, killSwitch: false,
+            mode: .canary, reading: ready, defaults: english
+        )
+        XCTAssertTrue(running.headline.hasPrefix("Ready"))
+        XCTAssertEqual(running.items.map(\.state), [.met, .met, .met, .met, .met])
+        XCTAssertEqual(running.scopeCaption, "Measured on this Mac across all Projects")
+
+        let waiting = ReviewBoardViewModel.overlapCanaryChecklist(
+            level: .delegated, supportedLeader: true, killSwitch: false, mode: .canary,
+            reading: .measured(
+                supportedTurns: 120, observedDays: 2, coverage: 0.99, linkage: 0.99,
+                unknownRate: 0, malformedLines: 0, passesGate: false, scope: .thisMac
+            ),
+            defaults: english
+        )
+        XCTAssertEqual(waiting.items.last?.value, "120/500 turns or 2/7 days")
+        XCTAssertEqual(waiting.items.last?.state, .blocked)
     }
 
     /// Ready is never a second decision: it has to agree with the exact
