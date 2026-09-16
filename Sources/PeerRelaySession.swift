@@ -3870,6 +3870,15 @@ final class PeerRelaySession {
         // The slot is the detached input pump's source of truth. Do not let a
         // late resume result install only the MainActor copy after teardown
         // terminally cleared the slot.
+        //
+        // No test drives the false branch, and none can as the code stands:
+        // `clear()` is called only by `disconnect()`, which sets `isTorndown`
+        // in the same synchronous body, and both that and this function are
+        // MainActor-isolated. The `!isTorndown` guard above and this line have
+        // no `await` between them, so teardown cannot interleave here and
+        // `replace` cannot return false. Kept rather than deleted: one
+        // suspension point added to that window makes it reachable again, and
+        // this is the case it exists for.
         guard currentSessionSlot.replace(newConnection.session) else {
             await newConnection.cancel()
             return
@@ -4056,6 +4065,15 @@ final class PeerRelaySession {
         // Old-session chunks already read by the detached pump carry the retired
         // generation and are rejected; the first new-session chunk carries this
         // generation and sees an idle gate.
+        //
+        // Unreachable for the same reason as the twin guard in
+        // `performResumeHealExclusively`: `stillEligible()` above already tests
+        // `isTorndown`, the only writer of the slot's terminal state is the
+        // MainActor-isolated `disconnect()`, and no `await` separates that
+        // check from this line. What teardown during a reconnect actually trips
+        // is `stillEligible()`, which is the path
+        // `test_ownedReconnectTornDownDuringAttachCancelsWithoutInstalling`
+        // covers. This stays as the backstop for a future suspension point.
         guard currentSessionSlot.replace(connection.session) else {
             await connection.cancel()
             return false
