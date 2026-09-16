@@ -4653,8 +4653,13 @@ mod tests {
             .expect("reviewer present");
         assert_eq!(
             reviewer.working_directory, None,
-            "an agent with no checkout of its own must stay None here; the fall \
-             back to the team directory belongs to the reader, not the record"
+            "a record with no per-agent checkout must read back as None: resume \
+             must not substitute the team directory, or a value that was lost on \
+             the way in becomes indistinguishable from one that was inherited. \
+             Note this is not the common shape — the app resolves the team \
+             directory into this field before it archives (see \
+             TeamOrchestrator.agentWorkingDirectory), so None reaches the daemon \
+             only from legacy metadata or an agent with nothing resolvable"
         );
         // The team directory is a separate field and keeps its own value.
         assert_eq!(res.working_directory, "/tmp/iso");
