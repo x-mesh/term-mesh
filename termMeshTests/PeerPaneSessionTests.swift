@@ -17,6 +17,78 @@ private actor AsyncFlag {
     func read() -> Bool { value }
 }
 
+final class PeerRelayCurrentSessionSlotTests: XCTestCase {
+    private func makeSession() -> PeerSession {
+        PeerSession(read: { throw CancellationError() }, write: { _ in })
+    }
+
+    func test_initialReplaceClearAndTerminalNoResurrection() {
+        let initial = makeSession()
+        let replacement = makeSession()
+        let lateReplacement = makeSession()
+        let slot = PeerRelayCurrentSessionSlot(initial)
+
+        XCTAssertTrue(slot.snapshot() === initial)
+        XCTAssertTrue(slot.replace(replacement))
+        XCTAssertTrue(slot.snapshot() === replacement)
+        slot.clear()
+        XCTAssertNil(slot.snapshot())
+        XCTAssertFalse(slot.replace(lateReplacement))
+        XCTAssertNil(slot.snapshot())
+    }
+
+    func test_concurrentSnapshotsNeverExposeClearedOrUnknownIdentity() {
+        let initial = makeSession()
+        let replacement = makeSession()
+        let slot = PeerRelayCurrentSessionSlot(initial)
+        let lock = NSLock()
+        var observedOnlyKnownIdentity = true
+
+        DispatchQueue.concurrentPerform(iterations: 1_000) { index in
+            if index == 400 {
+                _ = slot.replace(replacement)
+            }
+            let snapshot = slot.snapshot()
+            if let snapshot, snapshot !== initial && snapshot !== replacement {
+                lock.lock(); observedOnlyKnownIdentity = false; lock.unlock()
+            }
+        }
+        XCTAssertTrue(observedOnlyKnownIdentity)
+        XCTAssertTrue(slot.snapshot() === replacement)
+    }
+
+    func test_replaceClearRaceAlwaysEndsTerminallyNilWithoutResurrection() {
+        for _ in 0..<200 {
+            let slot = PeerRelayCurrentSessionSlot(makeSession())
+            let replacement = makeSession()
+            let start = DispatchSemaphore(value: 0)
+            let group = DispatchGroup()
+            let lock = NSLock()
+            var replaceResult: Bool?
+            group.enter()
+            DispatchQueue.global().async {
+                start.wait()
+                let result = slot.replace(replacement)
+                lock.lock(); replaceResult = result; lock.unlock()
+                group.leave()
+            }
+            group.enter()
+            DispatchQueue.global().async {
+                start.wait()
+                slot.clear()
+                group.leave()
+            }
+            start.signal(); start.signal()
+            XCTAssertEqual(group.wait(timeout: .now() + 1), .success)
+            XCTAssertNil(slot.snapshot())
+            XCTAssertFalse(slot.replace(makeSession()))
+            lock.lock()
+            XCTAssertNotNil(replaceResult)
+            lock.unlock()
+        }
+    }
+}
+
 final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
     func testOnlyReadyRecoveryMayClearTheDegradedOverlay() {
         XCTAssertTrue(PeerMirrorLayoutRecoveryState.ready.presentsAsReady)
@@ -6456,6 +6528,61 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
 }
 
 // MARK: - Relay input diagnostics
+final class RelayInputBacklogTrackerTests: XCTestCase {
+    func testEmptyGrowDrainAndSnapshotDoesNotResetHighWater() {
+        let tracker = RelayInputBacklogTracker()
+        XCTAssertEqual(tracker.snapshot().currentFrames, 0)
+        XCTAssertEqual(tracker.snapshot().highWaterFrames, 0)
+        tracker.noteEnqueued()
+        tracker.noteEnqueued()
+        XCTAssertEqual(tracker.snapshot().currentFrames, 2)
+        XCTAssertEqual(tracker.snapshot().highWaterFrames, 2)
+        tracker.noteDequeued()
+        tracker.noteDequeued()
+        XCTAssertEqual(tracker.snapshot().currentFrames, 0)
+        XCTAssertEqual(tracker.snapshot().highWaterFrames, 2)
+        XCTAssertEqual(tracker.snapshot().highWaterFrames, 2, "reads must not reset high water")
+    }
+
+    func testUnderflowAndSaturationAreSafe() {
+        let empty = RelayInputBacklogTracker()
+        empty.noteDequeued()
+        XCTAssertEqual(empty.snapshot().currentFrames, 0)
+
+        let saturated = RelayInputBacklogTracker(
+            currentFrames: UInt64.max, highWaterFrames: UInt64.max
+        )
+        saturated.noteEnqueued()
+        XCTAssertEqual(saturated.snapshot().currentFrames, UInt64.max)
+        XCTAssertEqual(saturated.snapshot().highWaterFrames, UInt64.max)
+    }
+
+    func testRejectedYieldRollbackLeavesNoPermanentBacklog() {
+        let tracker = RelayInputBacklogTracker()
+        // This mirrors the reader's provisional increment followed by a
+        // dropped/terminated AsyncThrowingStream yield result.
+        tracker.noteEnqueued()
+        tracker.noteDequeued()
+        XCTAssertEqual(tracker.snapshot().currentFrames, 0)
+        XCTAssertEqual(tracker.snapshot().highWaterFrames, 1)
+    }
+
+    func testConcurrentProducerConsumerNeverUnderflowsAndRetainsHighWater() {
+        let tracker = RelayInputBacklogTracker()
+        let group = DispatchGroup()
+        let queue = DispatchQueue(label: "RelayInputBacklogTrackerTests", attributes: .concurrent)
+        for _ in 0..<1_000 {
+            group.enter()
+            queue.async { tracker.noteEnqueued(); group.leave() }
+            group.enter()
+            queue.async { tracker.noteDequeued(); group.leave() }
+        }
+        XCTAssertEqual(group.wait(timeout: .now() + 5), .success)
+        let snapshot = tracker.snapshot()
+        XCTAssertGreaterThanOrEqual(snapshot.highWaterFrames, snapshot.currentFrames)
+    }
+}
+
 final class RelayInputLatencyStatsTests: XCTestCase {
     private func sample(_ ms: UInt64, outcome: RelayInputLatencyStats.Outcome = .sent)
         -> RelayInputLatencyStats.Sample {
@@ -6474,6 +6601,15 @@ final class RelayInputLatencyStatsTests: XCTestCase {
         let browse = try XCTUnwrap(snapshot["browse_exit"] as? [String: Any])
         XCTAssertEqual(browse["n"] as? Int, 0)
         XCTAssertNil(browse["p50_ms"])
+        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: snapshot))
+    }
+
+    func testSnapshotIncludesJSONSafeBacklogWithoutPayloads() throws {
+        let stats = RelayInputLatencyStats()
+        let snapshot = stats.snapshot(backlog: (currentFrames: 3, highWaterFrames: 7))
+        let backlog = try XCTUnwrap(snapshot["backlog"] as? [String: UInt64])
+        XCTAssertEqual(backlog["current_frames"], 3)
+        XCTAssertEqual(backlog["high_water_frames"], 7)
         XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: snapshot))
     }
 
@@ -9637,7 +9773,8 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
 
         orchestrator.installTeamForTests(name: teamName, agents: [member])
         orchestrator.retireEndedPeerOwnedAgent(
-            panelID: member.panelId!, surfaceID: surfaceID, workspace: workspace
+            panelID: member.panelId!, surfaceID: surfaceID,
+            exitCode: 0, signal: 0, reason: "exited", workspace: workspace
         )
         XCTAssertEqual(orchestrator.teams[teamName]?.agents.count, 1)
 
@@ -9646,9 +9783,153 @@ final class PeerOwnedAgentLifecycleTests: XCTestCase {
             name: teamName, agents: [member], ownsRemotePresentation: true
         )
         orchestrator.retireEndedPeerOwnedAgent(
-            panelID: member.panelId!, surfaceID: surfaceID, workspace: workspace
+            panelID: member.panelId!, surfaceID: surfaceID,
+            exitCode: 0, signal: 0, reason: "exited", workspace: workspace
         )
         XCTAssertEqual(orchestrator.teams[teamName]?.agents.count, 0)
+    }
+
+    /// Exit values as term-meshd reports them: a normal exit is
+    /// `(code, 0, "exited")`, a signal is `(0, sig, "signaled")`. Measured on a
+    /// daemon restart: codex `(0, 15, "signaled")`, claude `(143, 0, "exited")`.
+    func testEndedPeerAgentExitClassification() {
+        let cases: [(exitCode: Int32, signal: Int32, reason: String, retire: Bool, respawn: Bool)] = [
+            (0, 0, "exited", true, false),
+            (0, 15, "signaled", false, true),
+            (0, 9, "signaled", false, true),
+            (143, 0, "exited", false, true),
+            (129, 0, "exited", false, true),
+            (130, 0, "exited", false, true),
+            (137, 0, "exited", false, true),
+            (1, 0, "exited", false, false),
+            (139, 0, "exited", false, false),
+            (0, 11, "signaled", false, false),
+            (0, 0, "unknown", false, false),
+        ]
+        for c in cases {
+            XCTAssertEqual(
+                TeamOrchestrator.shouldRetireEndedPeerAgent(
+                    exitCode: c.exitCode, signal: c.signal, reason: c.reason
+                ),
+                c.retire, "retire \(c)"
+            )
+            XCTAssertEqual(
+                TeamOrchestrator.shouldAutoRespawnEndedPeerAgent(
+                    exitCode: c.exitCode, signal: c.signal, reason: c.reason
+                ),
+                c.respawn, "respawn \(c)"
+            )
+        }
+    }
+
+    @MainActor
+    func testSignalEndedPeerOwnedAgentStaysInRosterForRepair() {
+        let orchestrator = TeamOrchestrator.shared
+        let teamName = "ended-keep-\(UUID().uuidString.prefix(8))"
+        defer { orchestrator.forgetTeamForTests(teamName) }
+        let surfaceID = Data(repeating: 0x72, count: 16)
+        let workspace = Workspace(title: "keep-for-repair")
+        let member = TeamOrchestrator.AgentMember(
+            id: "executor@\(teamName)", agentInstanceId: "executor-keep",
+            name: "executor", teamName: teamName, cli: "codex",
+            launchCommand: "codex", model: "gpt", agentType: "executor",
+            color: "green", instructions: "", workspaceId: workspace.id,
+            panelId: UUID(), createdAt: Date(), remoteSurfaceID: surfaceID,
+            remoteSurfaceSpawned: true, remoteAgentSurface: true, hostKey: "ssh:peer"
+        )
+        orchestrator.installTeamForTests(
+            name: teamName, agents: [member], ownsRemotePresentation: true
+        )
+        orchestrator.remoteAgentRouteKeepalives[member.agentInstanceId] = .init(
+            teamName: teamName, task: Task {}
+        )
+
+        orchestrator.retireEndedPeerOwnedAgent(
+            panelID: member.panelId!, surfaceID: surfaceID,
+            exitCode: 0, signal: 15, reason: "signaled", workspace: workspace
+        )
+        XCTAssertEqual(
+            orchestrator.teams[teamName]?.agents.map(\.remoteSurfaceID), [surfaceID],
+            "Repair replaces a dead surface only while the roster still names it"
+        )
+        XCTAssertEqual(orchestrator.peerAgentsAwaitingRespawn[teamName], [member.agentInstanceId])
+        XCTAssertNotNil(orchestrator.peerAgentRespawnMarkedAt[teamName])
+        XCTAssertNil(
+            orchestrator.remoteAgentRouteKeepalives[member.agentInstanceId],
+            "a kept member must not keep renewing its dead bearer"
+        )
+
+        orchestrator.peerAgentsAwaitingRespawn.removeValue(forKey: teamName)
+        orchestrator.retireEndedPeerOwnedAgent(
+            panelID: member.panelId!, surfaceID: surfaceID,
+            exitCode: 1, signal: 0, reason: "exited", workspace: workspace
+        )
+        XCTAssertEqual(orchestrator.teams[teamName]?.agents.count, 1)
+        XCTAssertNil(
+            orchestrator.peerAgentsAwaitingRespawn[teamName],
+            "an ordinary failure waits for the Repair button"
+        )
+    }
+
+    /// Removing a team must not leave its automatic Repair state behind: a
+    /// later team with the same name would inherit the 300 s cooldown.
+    @MainActor
+    func testForgettingAutomaticCollaborationRepairClearsOnlyThatTeam() {
+        let orchestrator = TeamOrchestrator.shared
+        let teamName = "repair-forget-\(UUID().uuidString.prefix(8))"
+        let otherName = "repair-keep-\(UUID().uuidString.prefix(8))"
+        defer {
+            orchestrator.forgetAutomaticCollaborationRepair(teamName: teamName)
+            orchestrator.forgetAutomaticCollaborationRepair(teamName: otherName)
+        }
+        for name in [teamName, otherName] {
+            orchestrator.peerAgentsAwaitingRespawn[name] = ["executor"]
+            orchestrator.peerAgentRespawnMarkedAt[name] = Date()
+            orchestrator.automaticCollaborationRepairAt[name] = Date()
+        }
+
+        orchestrator.forgetAutomaticCollaborationRepair(teamName: teamName)
+
+        XCTAssertNil(orchestrator.peerAgentsAwaitingRespawn[teamName])
+        XCTAssertNil(orchestrator.peerAgentRespawnMarkedAt[teamName])
+        XCTAssertNil(orchestrator.automaticCollaborationRepairAt[teamName])
+        XCTAssertEqual(orchestrator.peerAgentsAwaitingRespawn[otherName], ["executor"])
+        XCTAssertNotNil(orchestrator.peerAgentRespawnMarkedAt[otherName])
+        XCTAssertNotNil(orchestrator.automaticCollaborationRepairAt[otherName])
+    }
+
+    /// A daemon restart ends every agent it owns; the replacement leader is
+    /// the only surface the host still lists.
+    @MainActor
+    func test_collaborationRecoveryPlanMarksEveryWorkerDeadAfterDaemonRestart() {
+        let workspaceID = UUID()
+        let leaderID = Data(repeating: 0x11, count: 16)
+        func agent(_ name: String, _ surface: Data) -> TeamOrchestrator.AgentMember {
+            TeamOrchestrator.AgentMember(
+                id: "\(name)@headroom", agentInstanceId: name, name: name,
+                teamName: "headroom", cli: name, launchCommand: name,
+                model: "", agentType: "executor", color: "blue",
+                instructions: "", workspaceId: workspaceID, panelId: UUID(),
+                createdAt: Date(), remoteSurfaceID: surface,
+                remoteSurfaceSpawned: true, remoteAgentSurface: true,
+                hostKey: "ssh:root@jw-server"
+            )
+        }
+        var leader = Termmesh_Peer_V1_SurfaceInfo()
+        leader.surfaceID = leaderID
+        leader.attachable = true
+
+        let plan = TeamOrchestrator.collaborationRecoveryPlan(
+            leaderSurfaceID: leaderID,
+            agents: [
+                agent("codex", Data(repeating: 0x12, count: 16)),
+                agent("claude", Data(repeating: 0x13, count: 16)),
+            ],
+            surfaces: [leader]
+        )
+        XCTAssertTrue(plan.leaderLive)
+        XCTAssertEqual(plan.liveAgentCount, 0)
+        XCTAssertEqual(Set(plan.deadAgentInstanceIDs), ["codex", "claude"])
     }
 
     /// The retry pass snapshots records, then awaits each terminate. In that

@@ -87,7 +87,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .terminal: return ["terminal", "font", "size", "theme", "monospace", "family"]
         case .workspaceColors: return ["workspace", "color", "indicator", "palette", "custom"]
         case .automation: return ["automation", "socket", "claude", "port", "integration", "password"]
-        case .agentTeams: return ["agent", "team", "leader", "model", "directory", "rendering", "interval", "refresh", "recycle", "auto", "delegation", "distribution", "worker"]
+        case .agentTeams: return ["agent", "team", "leader", "model", "directory", "rendering", "interval", "refresh", "recycle", "auto", "delegation", "distribution", "worker", "participation", "canary", "shadow", "kill switch"]
         case .agentRunbooks: return ["agent", "runbook", "skill", "claude", "codex", "opencode", "install", "role"]
         case .agentCLIPaths: return ["cli", "path", "binary", "agent"] + AgentRolePreset.knownCLIs
         case .agentModels: return ["model", "custom", "version", "gemini", "codex", "kiro", "claude", "preview"]
@@ -157,11 +157,15 @@ struct SettingsView: View {
     @AppStorage(ReviewBoardSettings.enabledKey)
     private var reviewBoardEnabled = ReviewBoardSettings.defaultEnabled
     @AppStorage("teamDefaultLeaderMode") private var teamDefaultLeaderMode = "claude"
-    /// The shadow/canary rollout controls that used to sit here were a
-    /// measurement experiment, not a participation dial, and reading them as
-    /// one is what made the settings page misleading. They keep their defaults
-    /// keys and their `debug.leader_participation.configure` RPC, which the E2E
-    /// suite drives; only the user-facing cards are gone.
+    /// The three global controls (Mode, Canary percent, Kill switch) are back
+    /// as a measurement rollout for the leader turn hook — see
+    /// `LeaderParticipationSettingsRow`, placed after Default Work
+    /// Distribution below. Per-Project opt-in lives on the review board, not
+    /// here, and the removed Canary Projects text field stays removed. This
+    /// card, the board's toggle, and the `debug.leader_participation.configure`
+    /// socket method all write through
+    /// `TeamOrchestrator.updateLeaderParticipationSettings`, so none of them
+    /// can save a stale snapshot over a field another one just wrote.
     @AppStorage(ProjectDelegationLevel.defaultLevelKey)
     private var teamDefaultDelegationLevel = ProjectDelegationLevel.leaderFirst.rawValue
 
@@ -1503,6 +1507,13 @@ struct SettingsView: View {
                             .labelsHidden()
                             .pickerStyle(.segmented)
                         }
+                        }
+
+                        if settingsMatch("leader", "participation", "shadow", "canary", "kill switch",
+                                         "agent", "team", "리더", "카나리") {
+                        SettingsCardDivider()
+
+                        LeaderParticipationSettingsRow(controlWidth: pickerColumnWidth)
                         }
 
                         if settingsMatch("directory", "working", "path", "agent", "team") {
@@ -3254,6 +3265,80 @@ struct SettingsCardDivider: View {
         Rectangle()
             .fill(Color(nsColor: NSColor.separatorColor).opacity(0.5))
             .frame(height: 1)
+    }
+}
+
+/// Loads its own snapshot from `LeaderParticipationSettings` instead of
+/// binding to `@AppStorage`. Settings, the review board's opt-in toggle, and
+/// `debug.leader_participation.configure` all have to write through
+/// `TeamOrchestrator.updateLeaderParticipationSettings`, which reloads fresh
+/// values before applying a mutation — an `@AppStorage` snapshot taken when
+/// this row last appeared could otherwise overwrite a field one of the others
+/// wrote in the meantime.
+private struct LeaderParticipationSettingsRow: View {
+    let controlWidth: CGFloat?
+
+    @State private var settings = LeaderParticipationSettings.default
+
+    var body: some View {
+        SettingsCardRow(
+            "Leader Participation",
+            subtitle: "Measurement rollout for the leader turn hook. It does not change Work Distribution.",
+            controlWidth: controlWidth
+        ) {
+            VStack(alignment: .trailing, spacing: 6) {
+                Picker("", selection: modeBinding) {
+                    Text("Off").tag(LeaderParticipationSettings.Mode.off)
+                    Text("Shadow").tag(LeaderParticipationSettings.Mode.shadow)
+                    Text("Canary").tag(LeaderParticipationSettings.Mode.canary)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+
+                // The label is the only place the percent is shown, so it stays visible.
+                Stepper(value: canaryPercentBinding, in: 0...100, step: 1) {
+                    Text(verbatim: "\(settings.canaryPercent)%")
+                        .font(.system(.body, design: .monospaced))
+                        .frame(minWidth: 44, alignment: .trailing)
+                }
+                .disabled(settings.mode != .canary)
+
+                Toggle(isOn: killSwitchBinding) {
+                    Text("Kill Switch")
+                }
+                .controlSize(.small)
+            }
+        }
+        .onAppear {
+            settings = LeaderParticipationSettings.load(from: LeaderParticipationSettings.defaultsForCurrentProcess())
+        }
+    }
+
+    private var modeBinding: Binding<LeaderParticipationSettings.Mode> {
+        Binding(
+            get: { settings.mode },
+            set: { newMode in
+                settings = TeamOrchestrator.shared.updateLeaderParticipationSettings { $0.mode = newMode }
+            }
+        )
+    }
+
+    private var canaryPercentBinding: Binding<Int> {
+        Binding(
+            get: { settings.canaryPercent },
+            set: { newPercent in
+                settings = TeamOrchestrator.shared.updateLeaderParticipationSettings { $0.canaryPercent = newPercent }
+            }
+        )
+    }
+
+    private var killSwitchBinding: Binding<Bool> {
+        Binding(
+            get: { settings.killSwitch },
+            set: { newValue in
+                settings = TeamOrchestrator.shared.updateLeaderParticipationSettings { $0.killSwitch = newValue }
+            }
+        )
     }
 }
 

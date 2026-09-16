@@ -33,6 +33,42 @@ private let kRelayAuthMaxPayload = 256
 private typealias RelayFrame = (type: UInt8, payload: Data)
 private typealias TimedRelayFrame = (type: UInt8, payload: Data, readAtNs: UInt64)
 
+/// The relay input reader is deliberately detached from `PeerRelaySession`'s
+/// MainActor.  It needs the current connection for every key (a resume-heal
+/// can replace it between frames), but must not pay a MainActor hop per key.
+/// Replacement and terminal clear still happen on MainActor; this lock makes
+/// those identity changes visible as one operation to the input pump.
+/// Internal for deterministic `@testable` concurrency tests.
+final class PeerRelayCurrentSessionSlot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var session: PeerSession?
+    private var isTerminal = false
+
+    init(_ session: PeerSession) {
+        self.session = session
+    }
+
+    func snapshot() -> PeerSession? {
+        lock.lock(); defer { lock.unlock() }
+        return session
+    }
+
+    /// A terminal clear wins over every late reconnect result.
+    @discardableResult
+    func replace(_ replacement: PeerSession) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !isTerminal else { return false }
+        session = replacement
+        return true
+    }
+
+    func clear() {
+        lock.lock(); defer { lock.unlock() }
+        isTerminal = true
+        session = nil
+    }
+}
+
 // ── Two-stage handshake result ─────────────────────────────────────
 
 /// Carries an open PeerSession and the surface list from a host. Yielded
@@ -394,26 +430,54 @@ private final class RelayFrameWriter: @unchecked Sendable {
     }
 }
 
+/// Lock-boxed count of key-input frames that have entered the helper stream
+/// but have not yet been dequeued by the input pump. This observes the
+/// existing unbounded `AsyncThrowingStream`; it does not impose a limit.
+final class RelayInputBacklogTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var currentFrames: UInt64
+    private var highWaterFrames: UInt64
+
+    init(currentFrames: UInt64 = 0, highWaterFrames: UInt64 = 0) {
+        precondition(highWaterFrames >= currentFrames)
+        self.currentFrames = currentFrames
+        self.highWaterFrames = highWaterFrames
+    }
+
+    func noteEnqueued() {
+        lock.lock()
+        // Saturate rather than wrapping: diagnostics must never turn a large
+        // backlog into a misleading small one.
+        if currentFrames < UInt64.max { currentFrames += 1 }
+        highWaterFrames = max(highWaterFrames, currentFrames)
+        lock.unlock()
+    }
+
+    func noteDequeued() {
+        lock.lock()
+        // Teardown/cancellation can race a stream callback. Never underflow
+        // the observable count if a consumer sees no matching input frame.
+        if currentFrames > 0 { currentFrames -= 1 }
+        lock.unlock()
+    }
+
+    func snapshot() -> (currentFrames: UInt64, highWaterFrames: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (currentFrames, highWaterFrames)
+    }
+}
+
 private final class RelayFrameReader: @unchecked Sendable {
     private let relay: RelaySocket
     private let queue = DispatchQueue(label: "term-mesh.peer.relay.reader", qos: .userInitiated)
     private let lock = NSLock()
     private var stopped = false
-    private var yielded: UInt64 = 0
+    private let inputBacklog: RelayInputBacklogTracker
 
-    init(relay: RelaySocket) {
+    init(relay: RelaySocket, inputBacklog: RelayInputBacklogTracker) {
         self.relay = relay
-    }
-
-    /// Frames read off the relay socket so far. The stream below buffers
-    /// unboundedly (`AsyncThrowingStream`'s default policy), so against the
-    /// consumer's own count the difference is the backlog queued while frame
-    /// handling awaits a slow host — the number that says whether typed keys
-    /// piled up on this side.
-    var framesYielded: UInt64 {
-        lock.lock()
-        defer { lock.unlock() }
-        return yielded
+        self.inputBacklog = inputBacklog
     }
 
     func frames() -> AsyncThrowingStream<TimedRelayFrame, Error> {
@@ -424,10 +488,24 @@ private final class RelayFrameReader: @unchecked Sendable {
                         let frame = try self.relay.readFrame()
                         // Local metadata only: never changes the helper wire format.
                         let readAt = frame.type == kTypeKeyInput ? DispatchTime.now().uptimeNanoseconds : 0
-                        self.lock.lock()
-                        self.yielded &+= 1
-                        self.lock.unlock()
-                        continuation.yield((frame.type, frame.payload, readAt))
+                        // Account before yield: a waiting consumer may resume
+                        // inside `yield` and dequeue immediately. If the stream
+                        // rejects the frame, roll the provisional count back.
+                        let isKeyInput = frame.type == kTypeKeyInput
+                        if isKeyInput {
+                            self.inputBacklog.noteEnqueued()
+                        }
+                        let yieldResult = continuation.yield((frame.type, frame.payload, readAt))
+                        if isKeyInput {
+                            switch yieldResult {
+                            case .enqueued:
+                                break
+                            case .dropped, .terminated:
+                                self.inputBacklog.noteDequeued()
+                            @unknown default:
+                                self.inputBacklog.noteDequeued()
+                            }
+                        }
                     } catch {
                         if self.isStopped {
                             continuation.finish()
@@ -1516,7 +1594,9 @@ final class RelayInputLatencyStats: @unchecked Sendable {
         nextIndex = (nextIndex + 1) % capacity
     }
 
-    func snapshot() -> [String: Any] {
+    func snapshot(
+        backlog: (currentFrames: UInt64, highWaterFrames: UInt64) = (0, 0)
+    ) -> [String: Any] {
         lock.lock()
         let generation = samples.map(\.generation).max() ?? 0
         let recent = samples.filter { $0.generation == generation }
@@ -1537,6 +1617,10 @@ final class RelayInputLatencyStats: @unchecked Sendable {
 
         return [
             "scope": "relay_helper_local_handoff",
+            "backlog": [
+                "current_frames": backlog.currentFrames,
+                "high_water_frames": backlog.highWaterFrames,
+            ],
             "window_capacity": capacity,
             "window_samples": recent.count,
             "session_generation": generation,
@@ -1730,6 +1814,9 @@ final class PeerRelaySession {
     /// these are written from the pump loop. Exposed through `ioSnapshot`.
     private let ioStats = RelayIOStats()
     private let inputLatencyStats = RelayInputLatencyStats()
+    /// Shared by the helper reader and detached input pump. Callback delivery
+    /// has no helper reader, so its diagnostic stays at zero.
+    private let inputBacklog = RelayInputBacklogTracker()
 
     /// Counter snapshot for `debugPaneStatus()` — lets a live probe tell
     /// "nothing ever arrived" from "arrived and was lost downstream".
@@ -1805,7 +1892,9 @@ final class PeerRelaySession {
 
     /// Explicit diagnostics only: health polling of ioSnapshot must not sort
     /// latency samples for every pane. No mutation of the measurement window.
-    var inputLatencySnapshot: [String: Any] { inputLatencyStats.snapshot() }
+    var inputLatencySnapshot: [String: Any] {
+        inputLatencyStats.snapshot(backlog: inputBacklog.snapshot())
+    }
 
     /// One-line counter summary for the disconnect / watchdog log lines.
     var ioSummary: String {
@@ -1869,6 +1958,8 @@ final class PeerRelaySession {
     private var listenerFd: Int32 = -1
     private var relaySocket: RelaySocket?
     private var session: PeerSession?
+    /// Off-main identity snapshot for the relay key-input hot path.
+    private let currentSessionSlot: PeerRelayCurrentSessionSlot
     private var transport: UnixSocketTransport?
     private var pumpTask: Task<Void, Never>?
     private var isTorndown = false
@@ -2483,6 +2574,7 @@ final class PeerRelaySession {
         self.remoteCols = remoteCols
         self.remoteRows = remoteRows
         self.session = session
+        self.currentSessionSlot = PeerRelayCurrentSessionSlot(session)
         self.transport = transport
         self.ownsSession = ownsSession
         self.ptyStream = ptyStream
@@ -2873,7 +2965,7 @@ final class PeerRelaySession {
             }
             relayFrameWriter = liveWriter
             writer = liveWriter
-            reader = RelayFrameReader(relay: relay)
+            reader = RelayFrameReader(relay: relay, inputBacklog: inputBacklog)
         } else {
             writer = nil
             reader = nil
@@ -2882,6 +2974,7 @@ final class PeerRelaySession {
         // must be bound before those closures are created.
         let resumeTransitionGate = self.resumeTransitionGate
         let inputLatencyStats = self.inputLatencyStats
+        let inputBacklog = self.inputBacklog
         // Gap-heal timing. The relay path hangs it off the resize coalescer
         // (which also owns resize forwarding and so needs the session);
         // callback delivery has no resize traffic, so a dedicated scheduler
@@ -3419,10 +3512,13 @@ final class PeerRelaySession {
                     minIntervalNanos: RelayStallLogGate.defaultMinIntervalNanos
                 )
                 var inputSendFailures: UInt64 = 0
-                var framesConsumed: UInt64 = 0
                 do {
                     for try await frame in reader.frames() {
-                        framesConsumed &+= 1
+                        if frame.type == kTypeKeyInput {
+                            // The frame has left the helper-stream backlog
+                            // before any MainActor/session work can suspend.
+                            inputBacklog.noteDequeued()
+                        }
                         // Classify the frame by the session generation that
                         // owned it when processing began. sendInput suspends;
                         // a resume-heal during that await must not relabel an
@@ -3461,7 +3557,7 @@ final class PeerRelaySession {
                             // when pumping started — a resume-heal may have
                             // swapped it out from under this pane transparently.
                             let accessStartedAt = DispatchTime.now().uptimeNanoseconds
-                            let currentSession = await self.session
+                            let currentSession = self.currentSessionSlot.snapshot()
                             sessionAccessNs = DispatchTime.now().uptimeNanoseconds - accessStartedAt
                             guard let current = currentSession else { break }
                             // Typing while browsing scrollback exits the
@@ -3508,7 +3604,7 @@ final class PeerRelaySession {
                             if inputStallGate.recordEpisode(
                                 durationNanos: sendEndedAt &- sendStartedAt, now: sendEndedAt
                             ) {
-                                let backlog = reader.framesYielded &- framesConsumed
+                                let backlog = inputBacklog.snapshot().currentFrames
                                 RemoteWorkLog.infoOffMain(
                                     "Peer input stalled — a key frame took \((sendEndedAt &- sendStartedAt) / 1_000_000)ms to send (\(backlog) frames queued behind it); typing lagged briefly"
                                 )
@@ -3771,6 +3867,13 @@ final class PeerRelaySession {
         }
         resumeHealCount += 1
         let retiredTag = Self.sessionTag(oldSession)
+        // The slot is the detached input pump's source of truth. Do not let a
+        // late resume result install only the MainActor copy after teardown
+        // terminally cleared the slot.
+        guard currentSessionSlot.replace(newConnection.session) else {
+            await newConnection.cancel()
+            return
+        }
         session = newConnection.session
         transport = newConnection.transport
         attachInitialSeq = outcome.initialByteSeq
@@ -3953,6 +4056,10 @@ final class PeerRelaySession {
         // Old-session chunks already read by the detached pump carry the retired
         // generation and are rejected; the first new-session chunk carries this
         // generation and sees an idle gate.
+        guard currentSessionSlot.replace(connection.session) else {
+            await connection.cancel()
+            return false
+        }
         session = connection.session
         transport = connection.transport
         attachInitialSeq = outcome.initialByteSeq
@@ -4082,6 +4189,10 @@ final class PeerRelaySession {
         relaySocket = nil
         let transport = self.transport
         let session = self.session
+        // Clear before closing the owned transport. A detached input pump may
+        // have captured an earlier session, but no later frame can start on a
+        // session this teardown retired.
+        currentSessionSlot.clear()
         self.session = nil
         self.transport = nil
         if ownsSession {

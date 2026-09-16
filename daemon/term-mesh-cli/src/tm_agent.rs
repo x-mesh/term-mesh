@@ -2825,6 +2825,40 @@ enum LeaderTurnCommands {
         /// the `--wave-id` passed to `delegate`.
         #[arg(long = "wave-id")]
         wave_id: Option<String>,
+        /// Checkout mode used by the candidate worker worktrees.
+        #[arg(long = "checkout-mode")]
+        checkout_mode: Option<String>,
+        /// Number of dependency-ready mutating slices.
+        #[arg(long = "ready-mutating-slices")]
+        ready_mutating_slices: Option<u32>,
+        /// Confirms that worker ownership sets are disjoint.
+        #[arg(long)]
+        ownership_disjoint: bool,
+        /// Confirms that the leader lane is disjoint from worker lanes.
+        #[arg(long)]
+        leader_lane_disjoint: bool,
+        /// Number of concurrent write overlaps observed for this turn.
+        #[arg(long = "concurrent-write-overlap")]
+        concurrent_write_overlap: Option<u32>,
+        /// Confirms that integration runs serially.
+        #[arg(long)]
+        serial_integration: bool,
+        /// Resource health result for the execution host.
+        #[arg(long = "resource-health")]
+        resource_health: Option<String>,
+    },
+    /// Read-only report of one Project's leader turn health, built from the
+    /// same `leader_participation_health` gate the execution-host safety net
+    /// uses (`apply_participation_health_scope`). Touches no socket and no
+    /// daemon: it only reads `~/.term-mesh/logs/turns.log`, so it works when
+    /// the Project is a peer's execution host with nothing else running.
+    Health {
+        /// Project whose turns.log rows to measure.
+        #[arg(long)]
+        project: String,
+        /// Emit the report as JSON instead of one human-readable line.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -4375,7 +4409,24 @@ mod runbook_tests {
         let dir = env::temp_dir().join(format!("tm-agent-runbook-drift-{unique}"));
         let role = selected_runbook_roles(Some("reviewer")).unwrap().remove(0);
         let source_path = runbook_source_path(&dir, &role);
-        let projection_path = runbook_projection_path(&dir, RunbookTool::Codex, &role);
+        // The Codex projection resolves under `HOME`. Without this the test
+        // rewrote the developer's real `~/.codex/skills/term-mesh-reviewer`.
+        let projection_path = {
+            let _env = ProcessEnvGuard::acquire();
+            let prev_home = env::var_os("HOME");
+            env::set_var("HOME", dir.join("home"));
+            let path = runbook_projection_path(&dir, RunbookTool::Codex, &role);
+            match prev_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+            path
+        };
+        assert!(
+            projection_path.starts_with(&dir),
+            "projection must stay in the temp dir: {}",
+            projection_path.display()
+        );
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
         fs::create_dir_all(projection_path.parent().unwrap()).unwrap();
 
@@ -5247,12 +5298,45 @@ struct RemoteLeaderRoute {
     target_peer_id_hex: String,
 }
 
+/// Serializes every test that mutates process-global environment, or reads a
+/// variable another test mutates (`HOME` above all). Separate per-test locks
+/// did not exclude one another: a test resolved `~/.term-mesh/logs` under a
+/// temporary `HOME` that a concurrent test had already removed.
 #[cfg(test)]
 static REMOTE_LEADER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 thread_local! {
     static REMOTE_LEADER_ENV_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Holds `REMOTE_LEADER_ENV_LOCK` for a test body and marks it held, so code
+/// under test that calls `remote_leader_route()` does not deadlock on the
+/// non-reentrant mutex.
+#[cfg(test)]
+struct ProcessEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl ProcessEnvGuard {
+    fn acquire() -> Self {
+        REMOTE_LEADER_ENV_LOCK_HELD.with(|held| {
+            assert!(!held.get(), "ProcessEnvGuard cannot be nested");
+        });
+        let lock = REMOTE_LEADER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        REMOTE_LEADER_ENV_LOCK_HELD.with(|held| held.set(true));
+        Self { _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProcessEnvGuard {
+    fn drop(&mut self) {
+        REMOTE_LEADER_ENV_LOCK_HELD.with(|held| held.set(false));
+    }
 }
 
 /// Names the file holding this process's scoped route. The value is a path,
@@ -7024,6 +7108,7 @@ fn format_task_instruction(
     lines.push("[GOAL]".to_string());
     lines.push(instruction.trim().to_string());
     lines.push("[/GOAL]".to_string());
+    append_team_checkout_topology(sock, team, task, &mut lines);
     append_checkout_contract(&mut lines);
 
     // Inject Auto-Fix Budget rules when budget is set
@@ -7040,6 +7125,47 @@ fn format_task_instruction(
 
     let body = lines.join("\n");
     append_report_suffix(body.trim(), no_report)
+}
+
+fn append_team_checkout_topology(sock: &PathBuf, team: &str, task: &Value, lines: &mut Vec<String>) {
+    let Ok(status) = rpc_call(sock, "team.status", json!({ "team_name": team })) else { return };
+    let result = &status["result"];
+    lines.extend(team_checkout_topology_lines(result, task));
+}
+
+fn team_checkout_topology_lines(result: &Value, task: &Value) -> Vec<String> {
+    let Some(agents) = result["agents"].as_array() else { return Vec::new() };
+    let target_instance = task["agent_instance_id"].as_str();
+    let mode = result["worktree_mode"].as_str().unwrap_or("unknown");
+    let leader_path = result["working_directory"].as_str().unwrap_or("unknown");
+    let integration_target = result["integration_target_path"].as_str().unwrap_or(leader_path);
+    let mut lines = vec![
+        String::new(),
+        "## Team Checkout Topology".to_string(),
+        format!("TEAM_CHECKOUT_MODE: {mode}"),
+        format!("LEADER_CHECKOUT_PATH: {leader_path}"),
+        "LEADER_CHECKOUT_ROLE: integration-owner".to_string(),
+        format!("INTEGRATION_TARGET_PATH: {integration_target}"),
+    ];
+    for agent in agents {
+        if target_instance.is_some() && agent["agent_instance_id"].as_str() == target_instance {
+            continue;
+        }
+        lines.push(format!(
+            "PEER_CHECKOUT: name={} instance={} branch={} path={}",
+            agent["name"].as_str().unwrap_or("unknown"),
+            agent["agent_instance_id"].as_str().unwrap_or("unknown"),
+            agent["worktree_branch"].as_str().unwrap_or("shared-or-unknown"),
+            agent["worktree_path"].as_str().or_else(|| agent["working_directory"].as_str()).unwrap_or("unknown"),
+        ));
+    }
+    lines.push(match mode {
+        "isolated" => "TOPOLOGY_RULE: Isolated, ownership-disjoint write tasks may run concurrently. Integrate their branches serially.",
+        "shared" => "TOPOLOGY_RULE: Workers share one checkout. Serialize writes unless the paths are proven disjoint.",
+        "off" => "TOPOLOGY_RULE: No managed worktree isolation is active. Do not run concurrent writes without another verified isolation boundary.",
+        _ => "TOPOLOGY_RULE: Checkout isolation is unknown. Query team.status before concurrent writes.",
+    }.to_string());
+    lines
 }
 
 fn append_checkout_contract(lines: &mut Vec<String>) {
@@ -7079,6 +7205,29 @@ mod checkout_contract_tests {
         assert!(rendered.contains("Never block solely"));
         assert!(rendered.contains("inspect explicit refs directly"));
         assert!(rendered.contains("Do not checkout, reset, merge, or rebase"));
+    }
+
+    #[test]
+    fn task_topology_lists_isolated_peers_and_skips_self() {
+        let status = json!({"worktree_mode":"isolated","working_directory":"/repo","integration_target_path":"/repo","agents": [
+            {"name":"executor","agent_instance_id":"a","worktree_path":"/wt/a","worktree_branch":"team/a"},
+            {"name":"reviewer","agent_instance_id":"b","worktree_path":"/wt/b","worktree_branch":"team/b"}
+        ]});
+        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
+        assert!(rendered.contains("TEAM_CHECKOUT_MODE: isolated"));
+        assert!(rendered.contains("PEER_CHECKOUT: name=reviewer instance=b branch=team/b path=/wt/b"));
+        assert!(!rendered.contains("PEER_CHECKOUT: name=executor instance=a"));
+    }
+
+    #[test]
+    fn legacy_topology_does_not_guess_isolation_from_stale_paths() {
+        let status = json!({"agents": [
+            {"name":"a","agent_instance_id":"a","worktree_path":"/old/a"},
+            {"name":"b","agent_instance_id":"b","worktree_path":"/old/b"}
+        ]});
+        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
+        assert!(rendered.contains("TEAM_CHECKOUT_MODE: unknown"));
+        assert!(rendered.contains("Checkout isolation is unknown"));
     }
 }
 
@@ -8469,6 +8618,13 @@ fn main() {
         available_workers,
         risk_reason,
         wave_id,
+        checkout_mode,
+        ready_mutating_slices,
+        ownership_disjoint,
+        leader_lane_disjoint,
+        concurrent_write_overlap,
+        serial_integration,
+        resource_health,
     })) = &cli.command
     {
         // An omitted --turn-id is filled from the hook's state stack. Falling
@@ -8479,7 +8635,7 @@ fn main() {
             .clone()
             .or_else(turn_id_from_hook_state)
             .unwrap_or_else(|| "unstated".to_string());
-        print_result(run_leader_turn_route(
+        print_result(run_leader_turn_route_with_evidence(
             &resolve_team_name_with_source(cli.team.as_deref()),
             &resolved_turn_id,
             route,
@@ -8487,7 +8643,29 @@ fn main() {
             *available_workers,
             risk_reason,
             wave_id.as_deref(),
+            checkout_mode.as_deref(),
+            *ready_mutating_slices,
+            *ownership_disjoint,
+            *leader_lane_disjoint,
+            *concurrent_write_overlap,
+            *serial_integration,
+            resource_health.as_deref(),
         ));
+        return;
+    }
+
+    // `leader turn health` is a read-only local report built from
+    // `leader_participation_health`; it returns before socket resolution for
+    // the same reason `leader turn route` does above — a peer's execution
+    // host may have no daemon running at all.
+    if let Commands::Leader(LeaderCommands::Turn(LeaderTurnCommands::Health { project, json })) =
+        &cli.command
+    {
+        let result = turn_log_path().map(|log_path| leader_turn_health_report(&log_path, project));
+        match &result {
+            Ok(report) if !*json => println!("{}", format_leader_turn_health_line(report)),
+            _ => print_result(result),
+        }
         return;
     }
 
@@ -18137,6 +18315,59 @@ struct LeaderParticipationDirective {
     dispatch_bounds: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OverlapCanaryAdmission {
+    eligible: bool,
+    reasons: Vec<&'static str>,
+}
+
+impl OverlapCanaryAdmission {
+    fn evaluate(
+        delegated_overlap_resolution: bool,
+        capability: bool,
+        effective_delegation: Option<&str>,
+        route: &str,
+        suggested_route: Option<&str>,
+        checkout_mode: Option<&str>,
+        ready_mutating_slices: Option<u32>,
+        ownership_disjoint: bool,
+        leader_lane_disjoint: bool,
+        concurrent_write_overlap: Option<u32>,
+        serial_integration: bool,
+        resource_health: Option<&str>,
+    ) -> Self {
+        let mut reasons = Vec::new();
+        if !delegated_overlap_resolution { reasons.push("delegated_overlap_not_resolved"); }
+        if !capability { reasons.push("capability_missing_or_stale"); }
+        if effective_delegation != Some("delegated") {
+            reasons.push("delegation_not_delegated");
+        }
+        if route != "parallel" { reasons.push("route_not_parallel"); }
+        if suggested_route != Some("parallel") {
+            reasons.push("suggested_route_not_parallel");
+        }
+        if suggested_route != Some(route) {
+            reasons.push("route_deviation");
+        }
+        if checkout_mode.map(str::trim) != Some("isolated") {
+            reasons.push("checkout_not_isolated");
+        }
+        if ready_mutating_slices.map_or(true, |count| count < 2) {
+            reasons.push("fewer_than_two_ready_mutating_slices");
+        }
+        if !ownership_disjoint { reasons.push("worker_ownership_overlap"); }
+        if !leader_lane_disjoint { reasons.push("leader_lane_overlap"); }
+        if concurrent_write_overlap != Some(0) {
+            reasons.push("concurrent_write_overlap");
+        }
+        if !serial_integration { reasons.push("non_serial_integration"); }
+        if resource_health.map(str::trim) != Some("passed") {
+            reasons.push("resource_health_not_passed");
+        }
+        Self { eligible: reasons.is_empty(), reasons }
+    }
+}
+
 impl LeaderParticipationDirective {
     fn from_input(
         task_shape: Option<&str>,
@@ -18214,25 +18445,126 @@ impl LeaderParticipationDirective {
     }
 }
 
-fn routing_options_from_control(value: &Value) -> (Option<String>, Option<u32>) {
-    let level = value["delegation_effective"]
-        .as_str()
-        .or_else(|| value["delegation_configured"].as_str())
-        .map(str::to_string);
-    let cap = value["max_parallel_workers"]
-        .as_u64()
-        .map(|value| value.clamp(1, 10) as u32);
-    (level, cap)
+const OVERLAP_CANARY_CAPABILITY_VERSION: u64 = 1;
+
+const LEADER_CONTROL_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LeaderParticipationControlSnapshot {
+    mode: String,
+    percent: u8,
+    kill_switch: bool,
+    supported: bool,
+    healthy: bool,
+    opt_in: bool,
+    project_id: String,
+    session_id: String,
+    delegation_level: Option<String>,
+    delegation_effective: Option<String>,
+    max_parallel_workers: Option<u32>,
+    overlap_canary_capability: bool,
+    overlap_canary_capability_version: Option<u64>,
+    delegated_overlap_resolution: bool,
+    health_scope: Option<String>,
 }
 
-fn leader_control_routing_options() -> (Option<String>, Option<u32>) {
-    let Ok(path) = env::var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE") else {
-        return (None, None);
+impl LeaderParticipationControlSnapshot {
+    fn overlap_canary_capability(&self) -> bool {
+        self.overlap_canary_capability
+            && self.overlap_canary_capability_version
+                == Some(OVERLAP_CANARY_CAPABILITY_VERSION)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LeaderParticipationControlState {
+    NotRequested,
+    Invalid,
+    Valid(LeaderParticipationControlSnapshot),
+}
+
+impl LeaderParticipationControlState {
+    fn snapshot(&self) -> Option<&LeaderParticipationControlSnapshot> {
+        match self {
+            Self::Valid(snapshot) => Some(snapshot),
+            Self::NotRequested | Self::Invalid => None,
+        }
+    }
+
+    fn is_invalid(&self) -> bool {
+        matches!(self, Self::Invalid)
+    }
+}
+
+fn parse_leader_control_snapshot(
+    data: &[u8],
+    project_id: &str,
+    expected_session_id: &str,
+) -> Option<LeaderParticipationControlSnapshot> {
+    let value = serde_json::from_slice::<Value>(data).ok()?;
+    if value["schema_version"].as_u64() != Some(1)
+        || value["project_id"].as_str() != Some(project_id)
+    {
+        return None;
+    }
+    let session_id = value["session_id"].as_str()?.to_string();
+    if expected_session_id.trim().is_empty() || session_id != expected_session_id {
+        return None;
+    }
+    let max_parallel_workers = match value.get("max_parallel_workers") {
+        Some(value) => Some(value.as_u64()?.clamp(1, 10) as u32),
+        None => None,
     };
-    let Ok(data) = fs::read(path) else { return (None, None); };
-    if data.len() > 64 * 1024 { return (None, None); }
-    let Ok(value) = serde_json::from_slice::<Value>(&data) else { return (None, None); };
-    routing_options_from_control(&value)
+    let delegation_effective = value["delegation_effective"]
+        .as_str()
+        .map(str::to_string);
+    let delegation_level = delegation_effective
+        .clone()
+        .or_else(|| value["delegation_configured"].as_str().map(str::to_string));
+    Some(LeaderParticipationControlSnapshot {
+        mode: value["mode"].as_str()?.trim().to_ascii_lowercase(),
+        percent: value["percent"].as_u64()?.min(100) as u8,
+        kill_switch: value["kill_switch"].as_bool()?,
+        supported: value["supported"].as_bool()?,
+        healthy: value["healthy"].as_bool()?,
+        opt_in: value["opt_in"].as_bool()?,
+        project_id: project_id.to_string(),
+        session_id,
+        delegation_level,
+        delegation_effective,
+        max_parallel_workers,
+        overlap_canary_capability: value["overlap_canary_capability"].as_bool() == Some(true),
+        overlap_canary_capability_version: value["overlap_canary_capability_version"].as_u64(),
+        delegated_overlap_resolution: value["delegated_overlap_resolution"].as_bool()
+            == Some(true),
+        health_scope: value["health_scope"].as_str().map(str::to_string),
+    })
+}
+
+fn read_leader_control_snapshot(
+    path: &Path,
+    project_id: &str,
+    expected_session_id: &str,
+) -> Option<LeaderParticipationControlSnapshot> {
+    use std::os::unix::fs::MetadataExt;
+
+    let file = fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > LEADER_CONTROL_MAX_BYTES as u64
+    {
+        return None;
+    }
+    let mut data = Vec::with_capacity(LEADER_CONTROL_MAX_BYTES);
+    file.take((LEADER_CONTROL_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut data)
+        .ok()?;
+    if data.len() > LEADER_CONTROL_MAX_BYTES {
+        return None;
+    }
+    parse_leader_control_snapshot(&data, project_id, expected_session_id)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18240,6 +18572,7 @@ struct LeaderParticipationResolution {
     mode: &'static str,
     cohort: &'static str,
     applied: bool,
+    delegated_overlap_resolution: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18252,6 +18585,13 @@ struct LeaderParticipationCanaryConfig {
     opt_in: bool,
     project_id: String,
     session_id: String,
+    delegation_level: Option<String>,
+    delegation_effective: Option<String>,
+    max_parallel_workers: Option<u32>,
+    overlap_canary_capability: bool,
+    overlap_canary_capability_version: Option<u64>,
+    delegated_overlap_resolution: bool,
+    health_scope: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -18265,14 +18605,27 @@ struct LeaderParticipationHealth {
 }
 
 impl LeaderParticipationHealth {
-    fn passes_promotion_gate(&self) -> bool {
-        if self.supported_turns == 0 || self.malformed_lines > 0 {
-            return false;
+    /// Coverage, linkage, and unknown-route ratios. Zero supported turns
+    /// would otherwise divide by zero; (0, 0, 1) reads as "no coverage, no
+    /// linkage, every turn unknown" instead of NaN, and still fails the gate
+    /// below. Shared by `passes_promotion_gate` and the health report so the
+    /// two never drift apart.
+    fn ratios(&self) -> (f64, f64, f64) {
+        if self.supported_turns == 0 {
+            return (0.0, 0.0, 1.0);
         }
         let supported = self.supported_turns as f64;
         let coverage = (self.stated_turns + self.unstated_turns) as f64 / supported;
         let linkage = self.linked_turns as f64 / supported;
         let unknown_rate = (self.supported_turns - self.stated_turns) as f64 / supported;
+        (coverage, linkage, unknown_rate)
+    }
+
+    fn passes_promotion_gate(&self) -> bool {
+        if self.supported_turns == 0 || self.malformed_lines > 0 {
+            return false;
+        }
+        let (coverage, linkage, unknown_rate) = self.ratios();
         (self.supported_turns >= 500 || self.observed_days >= 7)
             && coverage >= 0.95
             && linkage >= 0.95
@@ -18306,10 +18659,29 @@ fn leader_participation_health(
                 malformed_lines += 1;
                 continue;
             };
-            let valid = matches!(
-                record["event"].as_str(),
-                Some("turn_start" | "turn_route" | "turn_end")
-            ) && record["turn_id"]
+            let event = record["event"].as_str();
+            if event.is_none() {
+                // `event` missing or not a string: the record is malformed.
+                malformed_lines += 1;
+                continue;
+            }
+            if !matches!(event, Some("turn_start" | "turn_route" | "turn_end")) {
+                // turns.log also carries non-turn entries (task_dispatch, task_lifecycle)
+                // written by tm-agent and the leader turn hook; skip, not malformed.
+                continue;
+            }
+            // One host's turns.log carries every Project that ran on it. A turn
+            // record naming another Project is not this Project's measurement,
+            // broken fields included: counting it here let one Project's damaged
+            // line close another Project's gate for as long as the line stayed
+            // in the file. Lines that name no Project at all are still counted,
+            // since an unattributable line means the log itself is damaged.
+            if let Some(team) = record["team"].as_str() {
+                if team != project_id {
+                    continue;
+                }
+            }
+            let valid = record["turn_id"]
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
                 && record["ts"].as_str().and_then(iso8601_day_number).is_some()
@@ -18318,9 +18690,7 @@ fn leader_participation_health(
                 malformed_lines += 1;
                 continue;
             }
-            if record["team"].as_str() == Some(project_id) {
-                records.push(record);
-            }
+            records.push(record);
         }
     }
 
@@ -18404,6 +18774,52 @@ fn leader_participation_health(
     }
 }
 
+/// Read-only report behind `leader turn health`. Pure over an already
+/// resolved log path so its field stance is testable without touching the
+/// CLI dispatch or `$HOME`, the same reason `leader_participation_health`
+/// itself takes a path instead of resolving one.
+fn leader_turn_health_report(log_path: &Path, project_id: &str) -> Value {
+    let health = leader_participation_health(log_path, project_id, None);
+    let (coverage, linkage, unknown_rate) = health.ratios();
+    json!({
+        "schema_version": 1,
+        "project": project_id,
+        "scope": "execution_host_project",
+        "supported_turns": health.supported_turns,
+        "linked_turns": health.linked_turns,
+        "stated_turns": health.stated_turns,
+        "unstated_turns": health.unstated_turns,
+        "observed_days": health.observed_days,
+        "malformed_lines": health.malformed_lines,
+        "coverage": coverage,
+        "linkage": linkage,
+        "unknown_rate": unknown_rate,
+        "passes_promotion_gate": health.passes_promotion_gate(),
+    })
+}
+
+/// One human-readable line for `leader turn health` without `--json`. Reads
+/// the already-built report instead of recomputing anything, so the printed
+/// numbers cannot drift from the JSON output.
+fn format_leader_turn_health_line(report: &Value) -> String {
+    format!(
+        "project={} passes_promotion_gate={} supported_turns={} linked_turns={} \
+         stated_turns={} unstated_turns={} observed_days={} malformed_lines={} \
+         coverage={:.4} linkage={:.4} unknown_rate={:.4}",
+        report["project"].as_str().unwrap_or(""),
+        report["passes_promotion_gate"].as_bool().unwrap_or(false),
+        report["supported_turns"].as_u64().unwrap_or(0),
+        report["linked_turns"].as_u64().unwrap_or(0),
+        report["stated_turns"].as_u64().unwrap_or(0),
+        report["unstated_turns"].as_u64().unwrap_or(0),
+        report["observed_days"].as_u64().unwrap_or(0),
+        report["malformed_lines"].as_u64().unwrap_or(0),
+        report["coverage"].as_f64().unwrap_or(0.0),
+        report["linkage"].as_f64().unwrap_or(0.0),
+        report["unknown_rate"].as_f64().unwrap_or(0.0),
+    )
+}
+
 fn apply_participation_health_scope(
     config: &mut LeaderParticipationCanaryConfig,
     health_scope: Option<&str>,
@@ -18483,11 +18899,21 @@ fn resolve_participation(
     config: &LeaderParticipationCanaryConfig,
     known_input: bool,
 ) -> LeaderParticipationResolution {
+    // Overlap ignores the cohort below — opt-in and the percent bucket decide
+    // the ordinary canary, not this one — but it does follow the mode. A leader
+    // the user switched off, or left in shadow, is not running experiments.
+    let delegated_overlap_resolution = config.mode == "canary"
+        && config.delegated_overlap_resolution
+        && config.delegation_effective.as_deref() == Some("delegated")
+        && config.supported
+        && config.healthy
+        && !config.kill_switch;
     if config.mode == "shadow" {
         return LeaderParticipationResolution {
             mode: "shadow",
             cohort: "shadow",
             applied: false,
+            delegated_overlap_resolution,
         };
     }
     if config.mode != "canary"
@@ -18501,6 +18927,7 @@ fn resolve_participation(
             mode: "off",
             cohort: "static",
             applied: false,
+            delegated_overlap_resolution,
         };
     }
     if config.percent == 0 {
@@ -18508,6 +18935,7 @@ fn resolve_participation(
             mode: "canary",
             cohort: "holdout",
             applied: false,
+            delegated_overlap_resolution,
         };
     }
     if config.project_id.trim().is_empty() || config.session_id.trim().is_empty() {
@@ -18515,6 +18943,7 @@ fn resolve_participation(
             mode: "off",
             cohort: "static",
             applied: false,
+            delegated_overlap_resolution,
         };
     }
     if stable_canary_bucket(&config.project_id, &config.session_id) < config.percent {
@@ -18522,12 +18951,14 @@ fn resolve_participation(
             mode: "canary",
             cohort: "canary",
             applied: true,
+            delegated_overlap_resolution,
         }
     } else {
         LeaderParticipationResolution {
             mode: "canary",
             cohort: "holdout",
             applied: false,
+            delegated_overlap_resolution,
         }
     }
 }
@@ -18535,7 +18966,17 @@ fn resolve_participation(
 fn resolve_participation_from_env(
     known_input: bool,
     pending_turn_id: Option<&str>,
+    control: Option<&LeaderParticipationControlSnapshot>,
+    control_file_invalid: bool,
 ) -> LeaderParticipationResolution {
+    if control_file_invalid {
+        return LeaderParticipationResolution {
+            mode: "off",
+            cohort: "static",
+            applied: false,
+            delegated_overlap_resolution: false,
+        };
+    }
     let mut config = LeaderParticipationCanaryConfig {
         mode: env::var("TERMMESH_LEADER_PARTICIPATION_MODE")
             .unwrap_or_else(|_| "shadow".to_string())
@@ -18552,45 +18993,33 @@ fn resolve_participation_from_env(
         opt_in: parse_bool_env("TERMMESH_LEADER_PARTICIPATION_OPT_IN"),
         project_id: env::var("TERMMESH_LEADER_PARTICIPATION_PROJECT_ID").unwrap_or_default(),
         session_id: env::var("TERMMESH_LEADER_PARTICIPATION_SESSION_ID").unwrap_or_default(),
+        delegation_level: None,
+        delegation_effective: None,
+        max_parallel_workers: None,
+        overlap_canary_capability: false,
+        overlap_canary_capability_version: None,
+        delegated_overlap_resolution: false,
+        health_scope: None,
     };
     let mut health_scope = None;
-    // The app rewrites this owner-only file whenever controls or health
-    // change. Reading it per route call makes a global kill switch affect the
-    // next evaluated turn without restarting the leader. Missing, malformed,
-    // or over-permissive files fail closed to the env/default snapshot.
-    if let Ok(path) = env::var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE") {
-        if let Ok(text) = fs::read_to_string(path) {
-            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                if let Some(mode) = value["mode"].as_str() {
-                    config.mode = mode.to_ascii_lowercase();
-                }
-                if let Some(percent) = value["percent"].as_u64() {
-                    config.percent = percent.min(100) as u8;
-                }
-                if let Some(flag) = value["kill_switch"].as_bool() {
-                    config.kill_switch = flag;
-                }
-                if let Some(flag) = value["supported"].as_bool() {
-                    config.supported = flag;
-                }
-                if let Some(flag) = value["healthy"].as_bool() {
-                    config.healthy = flag;
-                }
-                health_scope = value["health_scope"].as_str().map(str::to_string);
-                if health_scope.as_deref() == Some("execution_host") {
-                    config.healthy = false;
-                }
-                if let Some(flag) = value["opt_in"].as_bool() {
-                    config.opt_in = flag;
-                }
-                if let Some(id) = value["project_id"].as_str() {
-                    config.project_id = id.to_string();
-                }
-                if let Some(id) = value["session_id"].as_str() {
-                    config.session_id = id.to_string();
-                }
-            }
-        }
+    if let Some(control) = control {
+        config.mode = control.mode.clone();
+        config.percent = control.percent;
+        config.kill_switch |= control.kill_switch;
+        config.supported = control.supported;
+        config.healthy = control.healthy;
+        config.opt_in = control.opt_in;
+        config.project_id = control.project_id.clone();
+        config.session_id = control.session_id.clone();
+        config.delegation_level = control.delegation_level.clone();
+        config.delegation_effective = control.delegation_effective.clone();
+        config.max_parallel_workers = control.max_parallel_workers;
+        config.overlap_canary_capability = control.overlap_canary_capability;
+        config.overlap_canary_capability_version = control.overlap_canary_capability_version;
+        config.delegated_overlap_resolution = control.delegated_overlap_resolution;
+    }
+    if let Some(control) = control {
+        health_scope = control.health_scope.clone();
     }
     let log_path = turn_log_path().ok();
     apply_participation_health_scope(
@@ -18612,6 +19041,8 @@ fn turn_route_record_with_policy_input(
     team: &str,
     surface_id: Option<&str>,
     ts: &str,
+    control: Option<&LeaderParticipationControlSnapshot>,
+    control_file_invalid: bool,
 ) -> Value {
     let mut record = json!({
         "event": "turn_route",
@@ -18643,12 +19074,14 @@ fn turn_route_record_with_policy_input(
     if let Some(surface) = surface_id.filter(|v| !v.trim().is_empty()) {
         record["surface_id"] = json!(surface);
     }
-    let (delegation_level, max_parallel_workers) = leader_control_routing_options();
     let suggestion = LeaderParticipationDirective::from_input(
         task_shape, risk_reasons, available_workers,
-        delegation_level.as_deref(), max_parallel_workers,
+        control.and_then(|snapshot| snapshot.delegation_level.as_deref()),
+        control.and_then(|snapshot| snapshot.max_parallel_workers),
     );
-    let resolution = resolve_participation_from_env(available_workers.is_some(), Some(turn_id));
+    let resolution = resolve_participation_from_env(
+        available_workers.is_some(), Some(turn_id), control, control_file_invalid,
+    );
     record["suggested_participation"] = json!(suggestion.participation);
     record["suggested_route"] = json!(suggestion.route);
     record["policy_reasons"] = json!(suggestion.reasons);
@@ -18656,6 +19089,7 @@ fn turn_route_record_with_policy_input(
     record["policy_mode"] = json!(resolution.mode);
     record["policy_applied"] = json!(resolution.applied);
     record["cohort"] = json!(resolution.cohort);
+    record["delegated_overlap_resolution"] = json!(resolution.delegated_overlap_resolution);
     record
 }
 
@@ -18680,6 +19114,8 @@ fn turn_route_record(
         team,
         surface_id,
         ts,
+        None,
+        false,
     )
 }
 
@@ -18802,7 +19238,7 @@ fn turn_route_marker_path(path: &Path, turn_id: &str) -> Option<PathBuf> {
     (!key.is_empty()).then(|| path.with_file_name(format!(".turn-route-{key}")))
 }
 
-fn run_leader_turn_route(
+fn run_leader_turn_route_with_evidence(
     team_resolution: &TeamNameResolution,
     turn_id: &str,
     route: &str,
@@ -18810,6 +19246,13 @@ fn run_leader_turn_route(
     available_workers: Option<u32>,
     risk_reasons: &[String],
     wave_id: Option<&str>,
+    checkout_mode: Option<&str>,
+    ready_mutating_slices: Option<u32>,
+    ownership_disjoint: bool,
+    leader_lane_disjoint: bool,
+    concurrent_write_overlap: Option<u32>,
+    serial_integration: bool,
+    resource_health: Option<&str>,
 ) -> Result<Value, String> {
     if turn_id.trim().is_empty() {
         return Err("--turn-id must not be blank".to_string());
@@ -18825,6 +19268,26 @@ fn run_leader_turn_route(
         );
     }
     let path = turn_log_path()?;
+    let expected_session_id = env::var("TERMMESH_LEADER_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let control_state = match env::var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE") {
+        Err(_) => LeaderParticipationControlState::NotRequested,
+        Ok(control_path) if control_path.trim().is_empty() => {
+            LeaderParticipationControlState::Invalid
+        }
+        Ok(control_path) => match expected_session_id.as_deref() {
+            Some(session_id) => read_leader_control_snapshot(
+                Path::new(&control_path),
+                &team_resolution.name,
+                session_id,
+            )
+            .map(LeaderParticipationControlState::Valid)
+            .unwrap_or(LeaderParticipationControlState::Invalid),
+            None => LeaderParticipationControlState::Invalid,
+        },
+    };
+    let control = control_state.snapshot();
     let mut record = turn_route_record_with_policy_input(
         turn_id,
         route,
@@ -18835,11 +19298,57 @@ fn run_leader_turn_route(
         &team_resolution.name,
         env::var("TERMMESH_SURFACE_ID").ok().as_deref(),
         &iso8601_utc_now(),
+        control,
+        control_state.is_invalid(),
     );
+    let resolution = resolve_participation_from_env(
+        available_workers.is_some(),
+        Some(turn_id),
+        control,
+        control_state.is_invalid(),
+    );
+    let effective_delegation = control
+        .as_ref()
+        .and_then(|snapshot| snapshot.delegation_effective.clone());
+    let overlap_capability = control
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.overlap_canary_capability());
+    let admission = OverlapCanaryAdmission::evaluate(
+        resolution.delegated_overlap_resolution,
+        overlap_capability,
+        effective_delegation.as_deref(),
+        route,
+        record.get("suggested_route").and_then(Value::as_str),
+        checkout_mode,
+        ready_mutating_slices,
+        ownership_disjoint,
+        leader_lane_disjoint,
+        concurrent_write_overlap,
+        serial_integration,
+        resource_health,
+    );
+    record["overlap_canary"] = json!(admission.eligible);
+    record["overlap_canary_reasons"] = json!(admission.reasons);
+    record["overlap_canary_evidence"] = json!({
+        "capability": overlap_capability,
+        "capability_version": OVERLAP_CANARY_CAPABILITY_VERSION,
+        "delegated_overlap_resolution": resolution.delegated_overlap_resolution,
+        "effective_delegation": effective_delegation,
+        "checkout_mode": checkout_mode,
+        "ready_mutating_slices": ready_mutating_slices,
+        "ownership_disjoint": ownership_disjoint,
+        "leader_lane_disjoint": leader_lane_disjoint,
+        "concurrent_write_overlap": concurrent_write_overlap,
+        "serial_integration": serial_integration,
+        "resource_health": resource_health,
+    });
     if let Some(route) = remote_leader_route() {
         record["team_uuid"] = json!(route.team_uuid);
     }
-    if let Some(session) = current_leader_session_id() {
+    if let Some(session) = control
+        .map(|snapshot| snapshot.session_id.as_str())
+        .or(expected_session_id.as_deref())
+    {
         record["leader_session_id"] = json!(session);
     }
     mark_turn_route_stated(&path, turn_id)?;
@@ -18852,15 +19361,22 @@ fn run_leader_turn_route(
         }
         return Err(error);
     }
-    let directive = record["policy_applied"]
-        .as_bool()
-        .unwrap_or(false)
+    let directive = (record["policy_applied"].as_bool().unwrap_or(false) || admission.eligible)
         .then(|| {
-            json!({
+            let mut directive = json!({
                 "participation": record["suggested_participation"],
-                "route": record["suggested_route"],
+                "route": record["actual_route"],
                 "dispatch_bounds": record["dispatch_bounds"],
-            })
+                "overlap_canary": record["overlap_canary"],
+            });
+            if admission.eligible {
+                directive["execution"] = json!("overlap_canary");
+                directive["leader_lane_bounds"] =
+                    json!("one disjoint leader mutation lane");
+                directive["zero_write_overlap"] = json!(true);
+                directive["serial_integration"] = json!(true);
+            }
+            directive
         });
     let route_deviation = match record.get("suggested_route").and_then(Value::as_str) {
         Some(suggested) if suggested != record["actual_route"] => Some(json!({
@@ -18876,6 +19392,22 @@ fn run_leader_turn_route(
         "directive": directive,
         "route_deviation": route_deviation,
     }))
+}
+
+#[cfg(test)]
+fn run_leader_turn_route(
+    team_resolution: &TeamNameResolution,
+    turn_id: &str,
+    route: &str,
+    task_shape: Option<&str>,
+    available_workers: Option<u32>,
+    risk_reasons: &[String],
+    wave_id: Option<&str>,
+) -> Result<Value, String> {
+    run_leader_turn_route_with_evidence(
+        team_resolution, turn_id, route, task_shape, available_workers,
+        risk_reasons, wave_id, None, None, false, false, None, false, None,
+    )
 }
 
 #[cfg(test)]
@@ -18896,6 +19428,13 @@ mod leader_turn_record_tests {
             opt_in: true,
             project_id: "project-a".to_string(),
             session_id: "session-a".to_string(),
+            delegation_level: Some("delegated".to_string()),
+            max_parallel_workers: Some(3),
+            delegation_effective: Some("delegated".to_string()),
+            overlap_canary_capability: true,
+            overlap_canary_capability_version: Some(OVERLAP_CANARY_CAPABILITY_VERSION),
+            delegated_overlap_resolution: true,
+            health_scope: Some("control_host".to_string()),
         }
     }
 
@@ -18949,22 +19488,243 @@ mod leader_turn_record_tests {
     }
 
     #[test]
-    fn control_routing_options_preserve_mode_and_clamp_cap() {
-        assert_eq!(
-            routing_options_from_control(&json!({
-                "delegation_effective": "delegated",
-                "delegation_configured": "leaderFirst",
-                "max_parallel_workers": 99,
-            })),
-            (Some("delegated".into()), Some(10))
+    fn overlap_canary_requires_every_positive_admission_fact() {
+        let eligible = OverlapCanaryAdmission::evaluate(
+            true, true, Some("delegated"), "parallel", Some("parallel"),
+            Some("isolated"), Some(2), true, true, Some(0), true, Some("passed"),
         );
-        assert_eq!(
-            routing_options_from_control(&json!({
-                "delegation_configured": "guarded",
-                "max_parallel_workers": 0,
-            })),
-            (Some("guarded".into()), Some(1))
+        assert!(eligible.eligible, "all positive evidence must admit overlap");
+
+        let cases: &[(&str, bool, bool, Option<&str>, &str, Option<&str>, Option<&str>, Option<u32>, bool, bool, Option<u32>, bool, Option<&str>)] = &[
+            ("resolution", false, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("capability", true, false, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("delegation", true, true, Some("guarded"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("route", true, true, Some("delegated"), "direct", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("suggested_route", true, true, Some("delegated"), "parallel", Some("direct"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("route_deviation", true, true, Some("delegated"), "parallel", Some("probe"), Some("isolated"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("checkout", true, true, Some("delegated"), "parallel", Some("parallel"), Some("shared"), Some(2), true, true, Some(0), true, Some("passed")),
+            ("ready_units", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(1), true, true, Some(0), true, Some("passed")),
+            ("ownership", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), false, true, Some(0), true, Some("passed")),
+            ("leader_lane", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, false, Some(0), true, Some("passed")),
+            ("write_overlap", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(1), true, Some("passed")),
+            ("integration", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), false, Some("passed")),
+            ("resources", true, true, Some("delegated"), "parallel", Some("parallel"), Some("isolated"), Some(2), true, true, Some(0), true, Some("failed")),
+        ];
+        for &(name, resolution, capability, delegation, route, suggested_route, checkout, ready, ownership, lane, overlap, serial, resources) in cases {
+            let admission = OverlapCanaryAdmission::evaluate(
+                resolution, capability, delegation, route, suggested_route, checkout, ready, ownership, lane,
+                overlap, serial, resources,
+            );
+            assert!(!admission.eligible, "{name} must fail closed");
+        }
+    }
+
+    fn control_snapshot_value() -> Value {
+        // Overlap follows the mode, so a fixture meant to resolve overlap names
+        // canary. `opt_in` stays false, which keeps the ordinary canary off and
+        // the recorded policy_mode/cohort at off/static.
+        json!({
+            "schema_version": 1,
+            "mode": "canary",
+            "percent": 0,
+            "kill_switch": false,
+            "supported": true,
+            "healthy": true,
+            "opt_in": false,
+            "project_id": "project-a",
+            "session_id": "session-a",
+            "delegation_configured": "delegated",
+            "delegation_effective": "delegated",
+            "max_parallel_workers": 99,
+            "health_scope": "control_host",
+            "overlap_canary_capability": true,
+            "overlap_canary_capability_version": 1,
+            "delegated_overlap_resolution": true,
+        })
+    }
+
+    #[test]
+    fn control_snapshot_validates_identity_schema_and_routing_fields() {
+        let value = control_snapshot_value();
+        let data = serde_json::to_vec(&value).expect("serialize control snapshot");
+        let snapshot = parse_leader_control_snapshot(&data, "project-a", "session-a")
+            .expect("valid control snapshot");
+        assert_eq!(snapshot.delegation_level.as_deref(), Some("delegated"));
+        assert_eq!(snapshot.max_parallel_workers, Some(10));
+        assert!(snapshot.overlap_canary_capability());
+        assert!(snapshot.delegated_overlap_resolution);
+
+        for (field, replacement) in [
+            ("schema_version", json!(2)),
+            ("project_id", json!("foreign-project")),
+            ("session_id", json!("other-session")),
+        ] {
+            let mut invalid = value.clone();
+            invalid[field] = replacement;
+            let data = serde_json::to_vec(&invalid).expect("serialize invalid snapshot");
+            assert!(
+                parse_leader_control_snapshot(&data, "project-a", "session-a").is_none(),
+                "{field} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn control_snapshot_requires_owner_only_regular_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("control.json");
+        let data = serde_json::to_vec(&control_snapshot_value()).expect("serialize snapshot");
+        fs::write(&path, data).expect("write snapshot");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("set permissive mode");
+        assert!(read_leader_control_snapshot(&path, "project-a", "session-a").is_none());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("set owner-only mode");
+        assert!(read_leader_control_snapshot(&path, "project-a", "session-a").is_some());
+    }
+
+    #[test]
+    fn route_requires_a_nonblank_leader_session_before_using_control_snapshot() {
+        let _env = ProcessEnvGuard::acquire();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().to_path_buf();
+        fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create log directory");
+        let control_path = home.join("control.json");
+        let mut control = control_snapshot_value();
+        control["project_id"] = json!("project-a");
+        control["session_id"] = json!("session-a");
+        fs::write(&control_path, serde_json::to_vec(&control).expect("serialize control"))
+            .expect("write control");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&control_path, fs::Permissions::from_mode(0o600))
+            .expect("set control mode");
+
+        let keys = [
+            "HOME",
+            "TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE",
+            "TERMMESH_LEADER_SESSION_ID",
+            "TERMMESH_LEADER_PARTICIPATION_KILL_SWITCH",
+            "TERMMESH_LEADER_PARTICIPATION_MODE",
+            "TERMMESH_LEADER_PARTICIPATION_PERCENT",
+            "TERMMESH_LEADER_PARTICIPATION_SUPPORTED",
+            "TERMMESH_LEADER_PARTICIPATION_HEALTHY",
+            "TERMMESH_LEADER_PARTICIPATION_OPT_IN",
+            "TERMMESH_LEADER_PARTICIPATION_PROJECT_ID",
+            "TERMMESH_LEADER_PARTICIPATION_SESSION_ID",
+        ];
+        let saved = keys
+            .iter()
+            .map(|key| (*key, env::var_os(key)))
+            .collect::<Vec<_>>();
+        for key in keys {
+            env::remove_var(key);
+        }
+        env::set_var("HOME", &home);
+        env::set_var(
+            "TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE",
+            &control_path,
         );
+        env::set_var("TERMMESH_LEADER_PARTICIPATION_KILL_SWITCH", "false");
+
+        let team = TeamNameResolution {
+            name: "project-a".to_string(),
+            source: TeamNameSource::Explicit,
+        };
+        for (session, expected_overlap) in [(Some("session-a"), true), (None, false), (Some("   "), false)] {
+            match session {
+                Some(value) => env::set_var("TERMMESH_LEADER_SESSION_ID", value),
+                None => env::remove_var("TERMMESH_LEADER_SESSION_ID"),
+            }
+            let result = run_leader_turn_route_with_evidence(
+                &team,
+                &format!("turn-session-{}", expected_overlap),
+                "parallel",
+                Some("multi_unit"),
+                Some(3),
+                &[],
+                None,
+                Some("isolated"),
+                Some(2),
+                true,
+                true,
+                Some(0),
+                true,
+                Some("passed"),
+            )
+            .expect("route evaluation");
+            assert_eq!(result["record"]["overlap_canary"], expected_overlap);
+            if expected_overlap {
+                assert_eq!(result["directive"]["execution"], "overlap_canary");
+            } else {
+                assert!(result["directive"].is_null());
+                assert_eq!(result["record"]["policy_mode"], "off");
+                assert_eq!(result["record"]["cohort"], "static");
+            }
+        }
+
+        env::set_var("TERMMESH_LEADER_SESSION_ID", "session-a");
+        env::set_var("TERMMESH_LEADER_PARTICIPATION_MODE", "canary");
+        env::set_var("TERMMESH_LEADER_PARTICIPATION_PERCENT", "100");
+        env::set_var("TERMMESH_LEADER_PARTICIPATION_SUPPORTED", "true");
+        env::set_var("TERMMESH_LEADER_PARTICIPATION_HEALTHY", "true");
+        env::set_var("TERMMESH_LEADER_PARTICIPATION_OPT_IN", "true");
+        fs::write(&control_path, b"not-json").expect("write invalid control");
+        let invalid_configured = run_leader_turn_route_with_evidence(
+            &team,
+            "turn-invalid-configured-control",
+            "parallel",
+            Some("multi_unit"),
+            Some(3),
+            &[],
+            None,
+            Some("isolated"),
+            Some(2),
+            true,
+            true,
+            Some(0),
+            true,
+            Some("passed"),
+        )
+        .expect("route evaluation");
+        assert_eq!(invalid_configured["record"]["policy_applied"], false);
+        assert_eq!(invalid_configured["record"]["policy_mode"], "off");
+        assert_eq!(invalid_configured["record"]["cohort"], "static");
+        assert_eq!(invalid_configured["record"]["overlap_canary"], false);
+        assert!(invalid_configured["directive"].is_null());
+
+        env::set_var("TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE", "   ");
+        let blank_configured = run_leader_turn_route_with_evidence(
+            &team,
+            "turn-blank-configured-control",
+            "parallel",
+            Some("multi_unit"),
+            Some(3),
+            &[],
+            None,
+            Some("isolated"),
+            Some(2),
+            true,
+            true,
+            Some(0),
+            true,
+            Some("passed"),
+        )
+        .expect("route evaluation");
+        assert_eq!(blank_configured["record"]["policy_applied"], false);
+        assert_eq!(blank_configured["record"]["policy_mode"], "off");
+        assert_eq!(blank_configured["record"]["cohort"], "static");
+        assert_eq!(blank_configured["record"]["overlap_canary"], false);
+        assert!(blank_configured["directive"].is_null());
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
     }
 
     #[test]
@@ -18975,7 +19735,8 @@ mod leader_turn_record_tests {
             LeaderParticipationResolution {
                 mode: "canary",
                 cohort: "canary",
-                applied: true
+                applied: true,
+                delegated_overlap_resolution: true,
             }
         );
 
@@ -18999,6 +19760,53 @@ mod leader_turn_record_tests {
             );
         }
         assert!(!resolve_participation(&eligible, false).applied);
+    }
+
+    /// Overlap ignores the cohort — opt-in and the percent bucket decide the
+    /// ordinary canary, not this one — but it does follow the mode: a leader the
+    /// user switched off, or left in shadow, is not running experiments.
+    #[test]
+    fn delegated_overlap_resolution_ignores_the_cohort_but_follows_the_mode() {
+        let mut config = canary_config(0);
+        config.opt_in = false;
+        let resolution = resolve_participation(&config, true);
+        assert!(!resolution.applied);
+        assert!(resolution.delegated_overlap_resolution);
+
+        for mode in ["shadow", "off"] {
+            let mut stopped = config.clone();
+            stopped.mode = mode.to_string();
+            assert!(
+                !resolve_participation(&stopped, true).delegated_overlap_resolution,
+                "mode {mode} kept overlap resolving"
+            );
+        }
+
+        let cases: &[(&str, fn(&mut LeaderParticipationCanaryConfig))] = &[
+            ("nondelegated", |config: &mut LeaderParticipationCanaryConfig| {
+                config.delegation_effective = Some("leaderFirst".to_string());
+            }),
+            ("unsupported", |config: &mut LeaderParticipationCanaryConfig| {
+                config.supported = false;
+            }),
+            ("unhealthy", |config: &mut LeaderParticipationCanaryConfig| {
+                config.healthy = false;
+            }),
+            ("killed", |config: &mut LeaderParticipationCanaryConfig| {
+                config.kill_switch = true;
+            }),
+            ("missing signal", |config: &mut LeaderParticipationCanaryConfig| {
+                config.delegated_overlap_resolution = false;
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut boundary = config.clone();
+            mutate(&mut boundary);
+            assert!(
+                !resolve_participation(&boundary, true).delegated_overlap_resolution,
+                "{name} must fail closed"
+            );
+        }
     }
 
     fn linked_turn(turn_id: &str, timestamp: &str) -> String {
@@ -19060,6 +19868,85 @@ mod leader_turn_record_tests {
     }
 
     #[test]
+    fn execution_host_health_skips_interleaved_non_turn_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let task_dispatch = serde_json::to_string(&json!({
+            "event": "task_dispatch",
+            "team": "p",
+            "ts": "2026-08-20T00:00:00Z"
+        }))
+        .expect("serialize task_dispatch");
+        let task_lifecycle = serde_json::to_string(&json!({
+            "event": "task_lifecycle",
+            "team": "p",
+            "ts": "2026-08-21T00:00:00Z"
+        }))
+        .expect("serialize task_lifecycle");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &task_dispatch
+            + "\n"
+            + &task_lifecycle
+            + "\n"
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.malformed_lines, 0);
+        assert_eq!(health.supported_turns, 2);
+        assert!(health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
+    fn execution_host_health_flags_missing_or_non_string_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let missing_event = serde_json::to_string(&json!({
+            "team": "p",
+            "ts": "2026-08-20T00:00:00Z"
+        }))
+        .expect("serialize missing event");
+        let numeric_event = serde_json::to_string(&json!({
+            "event": 1,
+            "team": "p",
+            "ts": "2026-08-21T00:00:00Z"
+        }))
+        .expect("serialize numeric event");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &missing_event
+            + "\n"
+            + &numeric_event
+            + "\n"
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.malformed_lines, 2);
+        assert!(!health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
+    fn execution_host_health_flags_turn_event_missing_required_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let missing_ts = serde_json::to_string(&json!({
+            "event": "turn_start",
+            "turn_id": "broken",
+            "team": "p"
+        }))
+        .expect("serialize turn_start without ts");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &missing_ts
+            + "\n"
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.malformed_lines, 1);
+        assert!(!health.passes_promotion_gate(), "health was {health:?}");
+    }
+
+    #[test]
     fn execution_host_health_is_scoped_to_the_project() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("turns.log");
@@ -19072,6 +19959,31 @@ mod leader_turn_record_tests {
         let health = leader_participation_health(&path, "p", None);
         assert_eq!(health.supported_turns, 0);
         assert!(!health.passes_promotion_gate());
+    }
+
+    /// A host runs many Projects through one turns.log. A damaged record that
+    /// names another Project used to count here, which closed this Project's
+    /// gate for as long as that line stayed in the file.
+    #[test]
+    fn execution_host_health_ignores_another_projects_damaged_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let foreign_without_ts = serde_json::to_string(&json!({
+            "event": "turn_start",
+            "turn_id": "broken",
+            "team": "other"
+        }))
+        .expect("serialize foreign turn_start without ts");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &foreign_without_ts
+            + "\n"
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.malformed_lines, 0);
+        assert_eq!(health.supported_turns, 2);
+        assert!(health.passes_promotion_gate(), "health was {health:?}");
     }
 
     #[test]
@@ -19181,6 +20093,146 @@ mod leader_turn_record_tests {
         apply_participation_health_scope(&mut config, Some("control_host"), None, None);
 
         assert!(config.healthy);
+    }
+
+    /// Safety net for peer leaders: an executionHost payload drops this Mac's aggregate
+    /// health (config.delegated_overlap_resolution starts true), so the
+    /// remote per-Project log is the only thing standing between a healthy
+    /// signal and a resolved overlap. `resolve_participation` must still AND
+    /// in `config.healthy`, whatever `apply_participation_health_scope`
+    /// derived it to be.
+    #[test]
+    fn execution_host_scope_gates_delegated_overlap_resolution_on_the_remote_log() {
+        let base = LeaderParticipationCanaryConfig {
+            project_id: "p".to_string(),
+            healthy: false,
+            delegated_overlap_resolution: true,
+            delegation_effective: Some("delegated".to_string()),
+            supported: true,
+            kill_switch: false,
+            ..canary_config(100)
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let passing_path = dir.path().join("passing.log");
+        fs::write(
+            &passing_path,
+            linked_turn("first", "2026-08-18T23:59:00Z")
+                + &linked_turn("last", "2026-08-24T00:01:00Z"),
+        )
+        .expect("write passing turns");
+        let mut passing = base.clone();
+        apply_participation_health_scope(
+            &mut passing, Some("execution_host"), Some(&passing_path), None,
+        );
+        assert!(resolve_participation(&passing, true).delegated_overlap_resolution);
+
+        let malformed_path = dir.path().join("malformed.log");
+        fs::write(&malformed_path, "{not-json}\n").expect("write malformed turns");
+        let mut malformed = base.clone();
+        apply_participation_health_scope(
+            &mut malformed, Some("execution_host"), Some(&malformed_path), None,
+        );
+        assert!(!resolve_participation(&malformed, true).delegated_overlap_resolution);
+
+        let mut missing = base.clone();
+        apply_participation_health_scope(&mut missing, Some("execution_host"), None, None);
+        assert!(!resolve_participation(&missing, true).delegated_overlap_resolution);
+    }
+
+    #[test]
+    fn leader_turn_health_report_matches_the_gate_on_the_seven_day_fixture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        let report = leader_turn_health_report(&path, "p");
+
+        assert_eq!(report["schema_version"], json!(1));
+        assert_eq!(report["project"], json!("p"));
+        assert_eq!(report["scope"], json!("execution_host_project"));
+        assert_eq!(report["supported_turns"], json!(health.supported_turns));
+        assert_eq!(report["linked_turns"], json!(health.linked_turns));
+        assert_eq!(report["stated_turns"], json!(health.stated_turns));
+        assert_eq!(report["unstated_turns"], json!(health.unstated_turns));
+        assert_eq!(report["observed_days"], json!(health.observed_days));
+        assert_eq!(report["malformed_lines"], json!(health.malformed_lines));
+        assert_eq!(
+            report["passes_promotion_gate"],
+            json!(health.passes_promotion_gate())
+        );
+        assert_eq!(report["passes_promotion_gate"], json!(true));
+    }
+
+    #[test]
+    fn leader_turn_health_report_flags_malformed_and_torn_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &linked_turn("last", "2026-08-24T00:01:00Z")
+            + "{not-json}\n"
+            + "{\"event\":\"turn_start\"";
+        fs::write(&path, records).expect("write turns");
+
+        let report = leader_turn_health_report(&path, "p");
+
+        assert_eq!(report["malformed_lines"], json!(2));
+        assert_eq!(report["passes_promotion_gate"], json!(false));
+    }
+
+    #[test]
+    fn leader_turn_health_report_is_scoped_to_the_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let other_team = linked_turn("first", "2026-08-18T23:59:00Z")
+            .replace("\"team\":\"p\"", "\"team\":\"other\"")
+            + &linked_turn("last", "2026-08-24T00:01:00Z")
+                .replace("\"team\":\"p\"", "\"team\":\"other\"");
+        fs::write(&path, other_team).expect("write turns");
+
+        let report = leader_turn_health_report(&path, "p");
+
+        assert_eq!(report["supported_turns"], json!(0));
+        assert_eq!(report["passes_promotion_gate"], json!(false));
+    }
+
+    #[test]
+    fn leader_turn_health_report_is_zero_for_an_empty_or_missing_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty_path = dir.path().join("empty.log");
+        fs::write(&empty_path, "").expect("write empty turns");
+        let missing_path = dir.path().join("missing.log");
+
+        for path in [&empty_path, &missing_path] {
+            let report = leader_turn_health_report(path, "p");
+            assert_eq!(report["supported_turns"], json!(0));
+            assert_eq!(report["linked_turns"], json!(0));
+            assert_eq!(report["stated_turns"], json!(0));
+            assert_eq!(report["unstated_turns"], json!(0));
+            assert_eq!(report["coverage"], json!(0.0));
+            assert_eq!(report["linkage"], json!(0.0));
+            assert_eq!(report["unknown_rate"], json!(1.0));
+            assert_eq!(report["passes_promotion_gate"], json!(false));
+        }
+    }
+
+    #[test]
+    fn leader_turn_health_cli_requires_project() {
+        let parsed = Cli::try_parse_from([
+            "tm-agent", "leader", "turn", "health", "--project", "p", "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Commands::Leader(LeaderCommands::Turn(LeaderTurnCommands::Health { .. }))
+        ));
+
+        let missing_project =
+            Cli::try_parse_from(["tm-agent", "leader", "turn", "health", "--json"]);
+        assert!(missing_project.is_err());
     }
 
     #[test]
@@ -19534,6 +20586,7 @@ mod leader_turn_record_tests {
             [
                 "actual_route",
                 "cohort",
+                "delegated_overlap_resolution",
                 "dispatch_bounds",
                 "event",
                 "policy_applied",
@@ -19560,6 +20613,7 @@ mod leader_turn_record_tests {
     /// `log`, so a `.jsonl` sink would never be offered for rotation.
     #[test]
     fn sink_is_a_dot_log_file_under_the_term_mesh_logs_dir() {
+        let _env = ProcessEnvGuard::acquire();
         let path = turn_log_path().expect("HOME is set in the test environment");
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("log"));
         assert_eq!(path.file_name().and_then(|f| f.to_str()), Some("turns.log"));
@@ -19575,6 +20629,7 @@ mod leader_turn_record_tests {
     /// the turn already running; later lines are prompts absorbed into it.
     #[test]
     fn omitted_turn_id_comes_from_the_first_line_of_the_hook_state_stack() {
+        let _env = ProcessEnvGuard::acquire();
         let home = std::env::temp_dir().join(format!("tm-turnid-{}", std::process::id()));
         let logs = home.join(".term-mesh/logs");
         fs::create_dir_all(&logs).expect("create temp logs dir");
@@ -19627,6 +20682,7 @@ mod leader_turn_record_tests {
     /// no-news case.
     #[test]
     fn route_deviation_is_null_when_stated_route_matches_the_suggestion() {
+        let _env = ProcessEnvGuard::acquire();
         let home = std::env::temp_dir().join(format!("tm-routedev-match-{}", std::process::id()));
         fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create temp home");
         let prev_home = env::var("HOME").ok();
@@ -19659,6 +20715,7 @@ mod leader_turn_record_tests {
     /// leader they diverged.
     #[test]
     fn route_deviation_reports_suggested_and_stated_when_they_differ() {
+        let _env = ProcessEnvGuard::acquire();
         let home = std::env::temp_dir().join(format!("tm-routedev-diff-{}", std::process::id()));
         fs::create_dir_all(home.join(".term-mesh").join("logs")).expect("create temp home");
         let prev_home = env::var("HOME").ok();
@@ -22793,8 +23850,9 @@ mod watcher_spec_tests {
     /// the other's cleared state. Observed once as
     /// `daemon_socket_candidates_cover_both_linux_install_scopes` failing in a
     /// full-suite run that passed on the next four. Serialize them; a flake
-    /// that rare is worse than one that always fails.
-    static SOCKET_DISCOVERY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// that rare is worse than one that always fails. The guard is the
+    /// suite-wide one because these tests also clear `HOME`, which the leader
+    /// turn tests read.
     const SOCKET_ENV_KEYS: [&str; 6] = [
         "TERMMESH_DAEMON_SOCKET",
         "TERMMESH_DAEMON_UNIX_PATH",
@@ -22805,13 +23863,11 @@ mod watcher_spec_tests {
     ];
     struct SocketDiscoveryEnv {
         saved: Vec<(&'static str, Option<OsString>)>,
-        _guard: std::sync::MutexGuard<'static, ()>,
+        _guard: ProcessEnvGuard,
     }
     impl SocketDiscoveryEnv {
         fn isolated() -> Self {
-            let guard = SOCKET_DISCOVERY_ENV_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let guard = ProcessEnvGuard::acquire();
             let saved = SOCKET_ENV_KEYS
                 .iter()
                 .map(|&key| {

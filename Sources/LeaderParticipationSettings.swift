@@ -5,6 +5,7 @@ import Foundation
 /// changes a leader's behavior by itself.
 struct LeaderParticipationSettings: Equatable {
     static let e2eSuiteName = "com.termmesh.e2e"
+    static let overlapCanaryCapabilityVersion = 1
     enum Mode: String { case off, shadow, canary }
     enum Cohort: String { case staticPolicy = "static", shadow, canary, holdout }
     enum HealthScope: String { case controlHost = "control_host", executionHost = "execution_host" }
@@ -39,10 +40,26 @@ struct LeaderParticipationSettings: Equatable {
         var coverage: Double
         var linkage: Double
         var unknownRate: Double
+        /// Lines of this Project's own turn log that could not be read. The
+        /// execution-host gate in `tm-agent` has always refused to promote on a
+        /// damaged measurement; this Mac's gate silently did not, so the same
+        /// log promoted or not depending on which host evaluated it.
+        var malformedLines: Int = 0
+
+        // Named so the review board formatter that explains a failing gate reads the
+        // same thresholds this gate enforces, instead of copying the literals.
+        static let minPromotableTurns = 500
+        static let minPromotableObservedDays = 7
+        static let minPromotableCoverage = 0.95
+        static let minPromotableLinkage = 0.95
+        static let maxPromotableUnknownRate = 0.02
 
         var passesPromotionGate: Bool {
-            (supportedTurns >= 500 || observedDays >= 7)
-                && coverage >= 0.95 && linkage >= 0.95 && unknownRate <= 0.02
+            malformedLines == 0
+                && (supportedTurns >= Self.minPromotableTurns || observedDays >= Self.minPromotableObservedDays)
+                && coverage >= Self.minPromotableCoverage
+                && linkage >= Self.minPromotableLinkage
+                && unknownRate <= Self.maxPromotableUnknownRate
         }
     }
 
@@ -96,9 +113,23 @@ struct LeaderParticipationSettings: Equatable {
         delegationState: ProjectDelegationState = .default,
         availableWorkers: Int = 0,
         workerNames: [String] = [],
-        executionOptions: ProjectExecutionOptions = .default
+        executionOptions: ProjectExecutionOptions = .default,
+        healthScope: HealthScope = .controlHost
     ) -> [String: Any] {
-        [
+        // The remote tm-agent re-checks this Project's own turns.log per Project
+        // when health_scope is execution_host (apply_participation_health_scope),
+        // so an executionHost payload can skip this Mac's aggregate health here
+        // without losing the health gate for peer leaders.
+        // Off means off. Overlap used to read only the delegation level, the
+        // kill switch and health, so a leader whose participation mode the user
+        // had turned off kept resolving overlap anyway and the board still read
+        // Ready. Shadow observes without changing a turn, so it stops here too.
+        let delegatedOverlapResolution = mode == .canary
+            && delegationState.effective == .delegated
+            && supportedLeader
+            && !killSwitch
+            && (healthScope == .executionHost || health.passesPromotionGate)
+        return [
             "schema_version": 1,
             "mode": mode.rawValue,
             "percent": min(100, max(0, canaryPercent)),
@@ -111,10 +142,31 @@ struct LeaderParticipationSettings: Equatable {
             "delegation_configured": delegationState.configured.rawValue,
             "delegation_effective": delegationState.effective.rawValue,
             "delegation_pending": delegationState.pending?.rawValue as Any? ?? NSNull(),
+            "overlap_canary_capability": delegationState.effective == .delegated,
+            "overlap_canary_capability_version": Self.overlapCanaryCapabilityVersion,
+            "delegated_overlap_resolution": delegatedOverlapResolution,
             "available_workers": max(0, availableWorkers),
             "worker_names": workerNames,
             "max_parallel_workers": executionOptions.maxParallelWorkers,
             "inject_directive": executionOptions.injectDirective,
+            "health_scope": healthScope.rawValue,
         ]
+    }
+}
+
+extension LeaderParticipationSettings.Health {
+    /// Moves the unknown-rate math out of `TeamOrchestrator.leaderParticipationControlData`
+    /// so the review board's status formatter reads the same numbers this gate uses.
+    init(measurement: LeaderTurnLog.Health) {
+        let unknown = max(0, measurement.supportedTurns - measurement.statedTurns)
+        self.init(
+            supportedTurns: measurement.supportedTurns,
+            observedDays: measurement.observedDays,
+            coverage: measurement.coverage,
+            linkage: measurement.linkage,
+            unknownRate: measurement.supportedTurns == 0 ? 1
+                : Double(unknown) / Double(measurement.supportedTurns),
+            malformedLines: measurement.malformedLines
+        )
     }
 }

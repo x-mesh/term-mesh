@@ -718,11 +718,16 @@ enum LeaderTurnLog {
     /// only from `turn_start`; unsupported and degraded leader cohorts are
     /// supplied from runtime capability inventory and never dilute coverage.
     /// A linked turn owns start + route + end with the same non-placeholder id.
+    /// `team` scopes the aggregate to one Project. One host's log carries every
+    /// Project that ran on it, so a host-wide aggregate answers a different
+    /// question than the per-Project gate asks. `nil` keeps the host-wide
+    /// reading the fleet instrument reports.
     static func health(
         from logFile: URL = logFile,
+        team: String? = nil,
         capabilities: [MeasurementCapability] = []
     ) -> Health {
-        let derived = fileDerivedHealth(from: logFile)
+        let derived = fileDerivedHealth(from: logFile, team: team)
         return Health(
             supportedTurns: derived.supportedTurns,
             linkedTurns: derived.linkedTurns,
@@ -782,7 +787,7 @@ enum LeaderTurnLog {
     }
 
     private static let logCacheLock = NSLock()
-    private static var healthCache: (stamp: LogFileStamp, value: FileDerivedHealth)?
+    private static var healthCache: (stamp: LogFileStamp, team: String?, value: FileDerivedHealth)?
     private static var recordCache: (stamp: LogFileStamp, records: [Record])?
     private static var recentCache: (stamp: LogFileStamp, entries: [RecentKey: [Record]])?
     private static var policyCache: (stamp: LogFileStamp, entries: [String: PolicyReport])?
@@ -793,27 +798,28 @@ enum LeaderTurnLog {
     /// so key it on the file's identity and never decode an unchanged file
     /// twice. A file that grows keeps paying the full decode; only repeats of
     /// identical bytes become free.
-    private static func fileDerivedHealth(from logFile: URL) -> FileDerivedHealth {
+    private static func fileDerivedHealth(from logFile: URL, team: String?) -> FileDerivedHealth {
         let path = logFile.path
         let stamp = LogFileStamp(path: path)
         if let stamp {
             logCacheLock.lock()
             let cached = healthCache
             logCacheLock.unlock()
-            if let cached, cached.stamp == stamp { return cached.value }
+            // The same bytes read for another Project are a different aggregate.
+            if let cached, cached.stamp == stamp, cached.team == team { return cached.value }
         }
-        let value = computeFileDerivedHealth(from: logFile)
+        let value = computeFileDerivedHealth(from: logFile, team: team)
         // Cache only when the file did not change while it was being read.
         // Otherwise the aggregate describes bytes the stamp no longer names.
         if let stamp, let after = LogFileStamp(path: path), after == stamp {
             logCacheLock.lock()
-            healthCache = (stamp, value)
+            healthCache = (stamp, team, value)
             logCacheLock.unlock()
         }
         return value
     }
 
-    private static func computeFileDerivedHealth(from logFile: URL) -> FileDerivedHealth {
+    private static func computeFileDerivedHealth(from logFile: URL, team: String?) -> FileDerivedHealth {
         guard let data = try? Data(contentsOf: logFile), !data.isEmpty else {
             return .empty
         }
@@ -824,9 +830,14 @@ enum LeaderTurnLog {
         var records: [Record] = []
         for line in rawLines where !line.isEmpty {
             guard let record = try? decoder.decode(Record.self, from: Data(line)) else {
+                // A line that does not decode names no Project, so it counts
+                // against whichever Project asks: the log itself is damaged.
                 malformed += 1
                 continue
             }
+            // A turn another Project ran on this host is not part of this
+            // Project's measurement, so it never reaches the gate either way.
+            if let team, record.team != team { continue }
             records.append(record)
         }
         let grouped = Dictionary(grouping: records, by: \.turnID)

@@ -90,6 +90,22 @@ final class ReviewBoardViewModel: ObservableObject {
     private var remoteCollaborationFetches: [String: Task<Void, Never>] = [:]
     private var remoteCollaborationFetchedAt: [String: Date] = [:]
 
+    /// The Overlap canary health reading for the active team, kept apart from
+    /// `delegation` because it lands on its own throttled schedule (see
+    /// `refreshLocalOverlapHealthIfNeeded`) rather than every refresh tick.
+    @Published private(set) var overlapHealthReading: OverlapHealthReading = .checking
+    private var localOverlapHealthReadings: [String: OverlapHealthReading] = [:]
+    private var localOverlapHealthFetches: [String: Task<Void, Never>] = [:]
+    private var localOverlapHealthFetchedAt: [String: Date] = [:]
+    /// Same shape as the three above, for `.peer` leaders. Kept in its own
+    /// dictionaries rather than shared ones: a local and a peer reading for
+    /// the same team name can never coexist (a team has exactly one
+    /// `leaderEndpoint`), but sharing storage would still leave a stale
+    /// remote reading readable after a team's endpoint changed identity.
+    private var remoteOverlapHealthReadings: [String: OverlapHealthReading] = [:]
+    private var remoteOverlapHealthFetches: [String: Task<Void, Never>] = [:]
+    private var remoteOverlapHealthFetchedAt: [String: Date] = [:]
+
     init(
         initialSnapshot: ReviewBoardSnapshot = .empty,
         selectedTaskID: String? = UserDefaults.standard.string(forKey: ReviewBoardSettings.selectedTaskIDKey),
@@ -417,11 +433,331 @@ final class ReviewBoardViewModel: ObservableObject {
         var workerCount: Int
         var workingCount: Int
         var isRemoteViewer = false
+        /// The inputs `overlapCanaryStatus` needs besides the health reading,
+        /// read fresh from the same sources `controlPayload` uses so the status
+        /// line cannot claim a reason the gate does not share.
+        var supportedLeader = false
+        var killSwitch = false
+        var canaryOptIn = false
+        /// Overlap runs only in canary mode, so the line has to be able to name
+        /// the mode as the reason. A panel built without one (the remote viewer
+        /// path) reports the mode of nothing, so it never blames the mode.
+        var mode: LeaderParticipationSettings.Mode = .canary
 
         var idleCount: Int { max(0, workerCount - workingCount) }
         /// The state this whole feature exists to make visible: a roster that
         /// is present, and doing nothing.
         var everyWorkerIdle: Bool { workerCount > 0 && workingCount == 0 }
+    }
+
+    /// What the Overlap canary status line has to explain, in gate order.
+    /// `.checking` is the state before the first health read resolves: the
+    /// local read for a `.local` leader (`refreshLocalOverlapHealthIfNeeded`),
+    /// or the remote SSH read for a `.peer` leader
+    /// (`refreshRemoteOverlapHealthIfNeeded`). Peer teams never read this
+    /// Mac's health — their reading comes only from
+    /// `parseRemoteLeaderHealth`, scoped `.remoteProject`.
+    enum OverlapHealthReading: Equatable {
+        enum Scope: Equatable {
+            case thisMac
+            case remoteProject(String)
+        }
+
+        case checking
+        case measured(
+            supportedTurns: Int, observedDays: Int, coverage: Double, linkage: Double,
+            unknownRate: Double, malformedLines: Int?, passesGate: Bool, scope: Scope
+        )
+        case notReported
+        case unavailable(String)
+    }
+
+    /// What the Delegation area shows for the Overlap canary: one line
+    /// stating the first blocking reason (or Ready), and — only once a health
+    /// reading names a scope — a caption stating whose turns it counted.
+    struct OverlapCanaryStatus: Equatable {
+        let line: String
+        let scopeCaption: String?
+    }
+
+    /// Pure and fed by exactly the inputs `controlPayload` uses
+    /// (`delegationState.effective`, `leaderMeasurementCapability(for:) ==
+    /// .supported`, `settings.killSwitch`), so a passing gate and a Ready line
+    /// cannot drift apart. It only explains a result; it never recomputes
+    /// one — `reading.passesGate` already came from
+    /// `Health.passesPromotionGate` (local) or the remote's
+    /// `passes_promotion_gate` (peer, from the same Rust function the
+    /// read-only tm-agent health command wraps).
+    ///
+    /// Returns a plain `String`, not `Text`: the gate order branches through
+    /// several templates with runtime-computed numbers, which the
+    /// `Text("literal \(x)")` catalog trick cannot express outside a View.
+    /// `LanguageSettings.localized` is this codebase's established way to
+    /// reach the string catalog from exactly that situation (see
+    /// `AgentRunbookSettingsView.swift`'s `sourceSummary` and siblings).
+    static func overlapCanaryStatus(
+        level: ProjectDelegationLevel,
+        supportedLeader: Bool,
+        killSwitch: Bool,
+        mode: LeaderParticipationSettings.Mode = .canary,
+        reading: OverlapHealthReading,
+        defaults: UserDefaults = .standard
+    ) -> OverlapCanaryStatus {
+        guard level == .delegated else {
+            return catalogLine("Off", "Work Distribution is not Delegated", defaults: defaults)
+        }
+        guard supportedLeader else {
+            return catalogLine("Off", "Leader turns are not measured", defaults: defaults)
+        }
+        guard !killSwitch else {
+            return catalogLine("Off", "Kill switch is on", defaults: defaults)
+        }
+        switch mode {
+        case .off:
+            return catalogLine("Off", "Leader Participation is Off", defaults: defaults)
+        case .shadow:
+            return catalogLine("Off", "Leader Participation is in shadow mode", defaults: defaults)
+        case .canary:
+            break
+        }
+        switch reading {
+        case .checking:
+            return catalogLine("Checking", "Measuring leader turn health", defaults: defaults)
+        case .notReported:
+            return catalogLine("Unknown", "Remote does not report health", defaults: defaults)
+        case let .unavailable(reason):
+            let detail = String(
+                format: LanguageSettings.localized("Remote health unavailable: %@", defaults: defaults),
+                reason
+            )
+            return OverlapCanaryStatus(
+                line: LanguageSettings.localized("Unknown", defaults: defaults) + " · " + detail,
+                scopeCaption: nil
+            )
+        case let .measured(
+            supportedTurns, observedDays, coverage, linkage, unknownRate, malformedLines, passesGate, scope
+        ):
+            let caption = scopeCaption(scope, defaults: defaults)
+            guard passesGate else {
+                let detail = waitingDetail(
+                    supportedTurns: supportedTurns, observedDays: observedDays,
+                    coverage: coverage, linkage: linkage, unknownRate: unknownRate,
+                    malformedLines: malformedLines, defaults: defaults
+                )
+                return OverlapCanaryStatus(
+                    line: LanguageSettings.localized("Waiting", defaults: defaults) + " · " + detail,
+                    scopeCaption: caption
+                )
+            }
+            let readyDetail = LanguageSettings.localized(
+                "Applies to a turn only when the leader reports isolated, disjoint work",
+                defaults: defaults
+            )
+            return OverlapCanaryStatus(
+                line: LanguageSettings.localized("Ready", defaults: defaults) + " · " + readyDetail,
+                scopeCaption: caption
+            )
+        }
+    }
+
+    private static func catalogLine(
+        _ prefix: String, _ detail: String, defaults: UserDefaults
+    ) -> OverlapCanaryStatus {
+        OverlapCanaryStatus(
+            line: LanguageSettings.localized(prefix, defaults: defaults) + " · "
+                + LanguageSettings.localized(detail, defaults: defaults),
+            scopeCaption: nil
+        )
+    }
+
+    private static func scopeCaption(
+        _ scope: OverlapHealthReading.Scope, defaults: UserDefaults
+    ) -> String {
+        switch scope {
+        case .thisMac:
+            return LanguageSettings.localized("Measured on this Mac across all Projects", defaults: defaults)
+        case let .remoteProject(host):
+            return String(
+                format: LanguageSettings.localized("Measured on %@ for this Project", defaults: defaults),
+                host
+            )
+        }
+    }
+
+    /// Malformed lines outrank every ratio — they mean the count itself is
+    /// suspect. Otherwise: the unmet volume part, then the first failing
+    /// ratio in gate order (coverage, linkage, unknown routes). Percentages
+    /// are floor-rounded so a value just under a threshold cannot print as
+    /// the threshold itself. A gate failure with no displayed part failing
+    /// (thresholds shared with `passesPromotionGate` disagreeing on the exact
+    /// same inputs) falls back to a generic line rather than implying a
+    /// reason that is not there.
+    private static func waitingDetail(
+        supportedTurns: Int, observedDays: Int, coverage: Double, linkage: Double,
+        unknownRate: Double, malformedLines: Int?, defaults: UserDefaults
+    ) -> String {
+        if let malformedLines, malformedLines > 0 {
+            return String(
+                format: LanguageSettings.localized("%@ malformed log lines (needs 0)", defaults: defaults),
+                String(malformedLines)
+            )
+        }
+        let minTurns = LeaderParticipationSettings.Health.minPromotableTurns
+        let minDays = LeaderParticipationSettings.Health.minPromotableObservedDays
+        let minCoverage = LeaderParticipationSettings.Health.minPromotableCoverage
+        let minLinkage = LeaderParticipationSettings.Health.minPromotableLinkage
+        let maxUnknownRate = LeaderParticipationSettings.Health.maxPromotableUnknownRate
+
+        var parts: [String] = []
+        if supportedTurns < minTurns, observedDays < minDays {
+            parts.append(String(
+                format: LanguageSettings.localized("%@/%@ turns or %@/%@ days", defaults: defaults),
+                String(supportedTurns), String(minTurns), String(observedDays), String(minDays)
+            ))
+        }
+        if coverage < minCoverage {
+            parts.append(String(
+                format: LanguageSettings.localized("coverage %@%% (needs %@%%)", defaults: defaults),
+                String(floorPercent(coverage)), String(floorPercent(minCoverage))
+            ))
+        } else if linkage < minLinkage {
+            parts.append(String(
+                format: LanguageSettings.localized("linkage %@%% (needs %@%%)", defaults: defaults),
+                String(floorPercent(linkage)), String(floorPercent(minLinkage))
+            ))
+        } else if unknownRate > maxUnknownRate {
+            parts.append(String(
+                format: LanguageSettings.localized("unknown routes %@%% (needs %@%% or less)", defaults: defaults),
+                String(floorPercent(unknownRate)), String(floorPercent(maxUnknownRate))
+            ))
+        }
+        guard !parts.isEmpty else {
+            return LanguageSettings.localized("Health gate not passed", defaults: defaults)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private static func floorPercent(_ value: Double) -> Int {
+        Int((value * 100).rounded(.down))
+    }
+
+    // MARK: - Peer leader health over SSH
+
+    /// The remote command line for `refreshRemoteOverlapHealthIfNeeded`,
+    /// built so a tm-agent failure lands in the script's own stdout instead
+    /// of throwing `sshFailed`: the script itself always exits 0, and `rc=`
+    /// carries tm-agent's real exit status for `parseRemoteLeaderHealth` to
+    /// read. Both arguments pass through `TeamOrchestrator.shellQuoted`
+    /// before this runs inside `RemotePasteTransfer.serviceAccountCommand`,
+    /// which quotes the whole body again for its own `/bin/sh -c`.
+    static func remoteLeaderHealthScript(tmAgent: String, project: String) -> String {
+        let quotedAgent = TeamOrchestrator.shellQuoted(tmAgent)
+        let quotedProject = TeamOrchestrator.shellQuoted(project)
+        return "out=$(\(quotedAgent) leader turn health --project \(quotedProject) --json 2>&1); "
+            + "rc=$?; printf 'rc=%s\\n' \"$rc\"; printf '%s\\n' \"$out\""
+    }
+
+    /// The exact stderr clap prints for an execution host whose tm-agent
+    /// predates the `leader turn health` subcommand (observed on tm-agent
+    /// 0.242.0). Matched literally rather than by rc alone, so an rc 2 from
+    /// some other cause — a bad flag, say — falls through to the generic
+    /// "exited <rc>" reading instead of being read as "does not report
+    /// health".
+    private static let unrecognizedHealthSubcommandText = "unrecognized subcommand 'health'"
+
+    /// Turns one `remoteLeaderHealthScript` transcript into a reading. Pure
+    /// over the captured text so every rc and body shape below is fixed by a
+    /// test instead of a live SSH round trip. `output` never reaches here for
+    /// a thrown SSH error — the caller reports that directly, since the
+    /// script never ran far enough to print an `rc=` line.
+    static func parseRemoteLeaderHealth(
+        output: String, project: String, host: String
+    ) -> OverlapHealthReading {
+        let lines = output.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let statusLine = lines.first, statusLine.hasPrefix("rc="),
+              let rc = Int(statusLine.dropFirst(3))
+        else {
+            return .unavailable("invalid response")
+        }
+        let body = lines.dropFirst().joined(separator: "\n")
+        switch rc {
+        case 0:
+            return parseRemoteLeaderHealthReport(body, project: project, host: host)
+        case 2 where body.contains(unrecognizedHealthSubcommandText):
+            return .notReported
+        case 127:
+            return .unavailable("tm-agent not found on remote")
+        default:
+            return .unavailable("remote tm-agent exited \(rc)")
+        }
+    }
+
+    /// Fields read straight off the `leader turn health --json` report
+    /// (`leader_turn_health_report` in tm_agent.rs). Any field this reading
+    /// needs that is absent, mistyped, or the report of another Project
+    /// fails decoding or the match below, so a partial number can never
+    /// reach the board.
+    private struct RemoteLeaderHealthReport: Decodable {
+        let project: String
+        let supportedTurns: Int
+        let observedDays: Int
+        let coverage: Double
+        let linkage: Double
+        let unknownRate: Double
+        let malformedLines: Int
+        let passesPromotionGate: Bool
+
+        private enum CodingKeys: String, CodingKey {
+            case project
+            case supportedTurns = "supported_turns"
+            case observedDays = "observed_days"
+            case coverage
+            case linkage
+            case unknownRate = "unknown_rate"
+            case malformedLines = "malformed_lines"
+            case passesPromotionGate = "passes_promotion_gate"
+        }
+    }
+
+    private static func parseRemoteLeaderHealthReport(
+        _ body: String, project: String, host: String
+    ) -> OverlapHealthReading {
+        guard let data = body.data(using: .utf8),
+              let report = try? JSONDecoder().decode(RemoteLeaderHealthReport.self, from: data),
+              report.project == project
+        else {
+            return .unavailable("invalid health response")
+        }
+        return .measured(
+            supportedTurns: report.supportedTurns, observedDays: report.observedDays,
+            coverage: report.coverage, linkage: report.linkage, unknownRate: report.unknownRate,
+            malformedLines: report.malformedLines, passesGate: report.passesPromotionGate,
+            scope: .remoteProject(host)
+        )
+    }
+
+    /// The first line of an error description, for a thrown SSH failure
+    /// whose detail can carry a joined stdout/stderr blob
+    /// (`PeerHostReadinessError.sshFailed`). One line is enough to name what
+    /// happened without spilling a multi-line transcript into the status row.
+    private static func firstLine(of message: String) -> String {
+        guard let newline = message.firstIndex(of: "\n") else { return message }
+        return String(message[..<newline])
+    }
+
+    private static let remoteOverlapHealthThrottleSeconds: TimeInterval = 60
+
+    /// The 60 s-per-team throttle for `refreshRemoteOverlapHealthIfNeeded`,
+    /// pulled out pure so its edges — exactly 60 s, and an in-flight fetch
+    /// overriding any elapsed time — are fixed by a test. A failed attempt
+    /// does not reset `lastAttempt`: the caller records it once, before the
+    /// SSH round trip starts, and never rewrites it afterward, so a
+    /// repeatedly failing host is retried no faster than a healthy one.
+    static func shouldFetchRemoteLeaderHealth(
+        lastAttempt: Date?, now: Date, inFlight: Bool
+    ) -> Bool {
+        guard !inFlight else { return false }
+        return now.timeIntervalSince(lastAttempt ?? .distantPast) >= remoteOverlapHealthThrottleSeconds
     }
 
     struct CollaborationPanel: Equatable {
@@ -436,6 +772,31 @@ final class ReviewBoardViewModel: ObservableObject {
         let dispatchCount: Int
         let completionCount: Int
         let lastActivity: String?
+        /// Read from the live presentation, not the turn log: dispatch history
+        /// keeps the evidence `healthy` after a daemon restart killed every worker.
+        var workerRepairNeeded = false
+    }
+
+    /// Leader presentation states are left to the leader's own recovery, so a
+    /// relay reconnect does not flash Repair.
+    static func presentationNeedsWorkerRepair(
+        _ state: TeamOrchestrator.CollaborationPresentationState
+    ) -> Bool {
+        switch state {
+        case .agentPanelMissing, .agentSessionUnavailable:
+            return true
+        case .ready, .teamMissing, .workspaceMissing,
+             .leaderPanelMissing, .leaderSessionUnavailable:
+            return false
+        }
+    }
+
+    static func shouldShowCollaborationRepair(
+        state: LeaderTurnLog.CollaborationState,
+        workerCount: Int,
+        workerRepairNeeded: Bool
+    ) -> Bool {
+        workerCount > 0 && (state != .healthy || workerRepairNeeded)
     }
 
     enum CollaborationRepairOutcome: Equatable {
@@ -554,7 +915,158 @@ final class ReviewBoardViewModel: ObservableObject {
             remoteRecords: resolved.flatMap { remoteCollaborationRecords[$0] } ?? []
         )
         if collaboration != nextCollaboration { collaboration = nextCollaboration }
+        // Read only the dictionary matching the team's *current*
+        // `leaderEndpoint`, rather than falling back from local to remote: a
+        // Project whose leader moved from this Mac to a peer (or back) keeps
+        // its old dictionary entry around with nothing to clear it, and
+        // reading both indiscriminately could surface that stale,
+        // wrong-scoped reading — this Mac's health captioned onto a team
+        // that is now a peer's, or the reverse.
+        let nextOverlapHealthReading: OverlapHealthReading = resolved.flatMap { name in
+            switch TeamOrchestrator.shared.teams[name]?.leaderEndpoint {
+            case .local: return localOverlapHealthReadings[name]
+            case .peer: return remoteOverlapHealthReadings[name]
+            case nil: return nil
+            }
+        } ?? .checking
+        if overlapHealthReading != nextOverlapHealthReading { overlapHealthReading = nextOverlapHealthReading }
         refreshRemoteCollaborationIfNeeded(for: resolved)
+        refreshLocalOverlapHealthIfNeeded(for: resolved)
+        refreshRemoteOverlapHealthIfNeeded(for: resolved)
+    }
+
+    /// Include or drop this Project from the canary opt-in set. Goes through
+    /// the one shared save path used by Settings and the debug socket method,
+    /// so a stale Settings snapshot elsewhere cannot overwrite this write, or
+    /// vice versa.
+    func setCanaryOptIn(_ included: Bool, teamName: String) {
+        TeamOrchestrator.shared.updateLeaderParticipationSettings { settings in
+            if included {
+                settings.optInProjects.insert(teamName)
+            } else {
+                settings.optInProjects.remove(teamName)
+            }
+        }
+        refreshDelegationPanel()
+    }
+
+    private static let localOverlapHealthThrottleSeconds: TimeInterval = 10
+
+    /// Only `.local` leaders read this Mac's turns.log — a peer leader's
+    /// Overlap canary reason must never come from an aggregate this Mac
+    /// cannot vouch for. Gated on the same three checks the status line
+    /// shows first, so a team that would show "Off" never pays for a read
+    /// whose result nothing displays.
+    ///
+    /// `LeaderTurnLog.health()` reads the log file synchronously, so this
+    /// runs inside a detached task rather than the plain `Task` the
+    /// collaboration fetch above uses: a plain `Task` created from this
+    /// MainActor-isolated method still runs on the main actor until its first
+    /// `await`, which would put the file read back on the main thread.
+    private func refreshLocalOverlapHealthIfNeeded(for teamName: String?) {
+        guard let teamName, let panel = delegation, panel.teamName == teamName, !panel.isRemoteViewer,
+              panel.level == .delegated, panel.supportedLeader, !panel.killSwitch,
+              let team = TeamOrchestrator.shared.teams[teamName],
+              team.leaderEndpoint == .local,
+              localOverlapHealthFetches[teamName] == nil,
+              Date().timeIntervalSince(localOverlapHealthFetchedAt[teamName] ?? .distantPast)
+                >= Self.localOverlapHealthThrottleSeconds
+        else { return }
+        let expectedUUID = team.teamUuid
+        localOverlapHealthFetchedAt[teamName] = Date()
+        localOverlapHealthFetches[teamName] = Task.detached { [weak self] in
+            let measurement = LeaderTurnLog.health(team: teamName)
+            let health = LeaderParticipationSettings.Health(measurement: measurement)
+            let reading = OverlapHealthReading.measured(
+                supportedTurns: health.supportedTurns, observedDays: health.observedDays,
+                coverage: health.coverage, linkage: health.linkage, unknownRate: health.unknownRate,
+                // This Mac's gate now refuses a damaged measurement exactly as the
+                // execution-host gate does, so the count is a reason to show.
+                malformedLines: health.malformedLines, passesGate: health.passesPromotionGate,
+                scope: .thisMac
+            )
+            await self?.publishLocalOverlapHealthReading(reading, teamName: teamName, expectedUUID: expectedUUID)
+        }
+    }
+
+    /// Same publish guard the remote collaboration fetch uses: a reading for
+    /// a team that has been recreated under the same name (new `teamUuid`),
+    /// or that is no longer the active team, must not land on screen.
+    private func publishLocalOverlapHealthReading(
+        _ reading: OverlapHealthReading, teamName: String, expectedUUID: String?
+    ) {
+        localOverlapHealthFetches[teamName] = nil
+        guard TeamOrchestrator.shared.teams[teamName]?.teamUuid == expectedUUID else { return }
+        localOverlapHealthReadings[teamName] = reading
+        guard Self.shouldPublishRemoteCollaboration(
+            fetchedTeam: teamName, activeTeam: activeTeamProvider() ?? activeTeamName
+        ) else { return }
+        overlapHealthReading = reading
+    }
+
+    /// Only `.peer` leaders reach here — the counterpart to
+    /// `refreshLocalOverlapHealthIfNeeded` above, and the only place a peer
+    /// team's Overlap canary reading comes from. Gated on the same three
+    /// checks the status line shows first, so a team that would show "Off"
+    /// never pays for an SSH round trip whose result nothing displays, plus
+    /// `ReviewBoardSettings.isVisible` and `shouldFetchRemoteLeaderHealth`'s
+    /// 60 s-per-team throttle.
+    ///
+    /// `lastAttempt` is recorded once, right here, before the SSH round trip
+    /// starts — not in the completion handler — so a failure never resets the
+    /// clock the way the collaboration fetch's failure path does.
+    /// `PeerHostReadinessChecker.runScript` is already `async`, so the plain
+    /// `Task` below never blocks the main actor waiting on it.
+    private func refreshRemoteOverlapHealthIfNeeded(for teamName: String?) {
+        guard let teamName, let panel = delegation, panel.teamName == teamName, !panel.isRemoteViewer,
+              panel.level == .delegated, panel.supportedLeader, !panel.killSwitch,
+              let team = TeamOrchestrator.shared.teams[teamName],
+              case let .peer(hostKey) = team.leaderEndpoint,
+              ReviewBoardSettings.isVisible,
+              Self.shouldFetchRemoteLeaderHealth(
+                  lastAttempt: remoteOverlapHealthFetchedAt[teamName], now: Date(),
+                  inFlight: remoteOverlapHealthFetches[teamName] != nil
+              ),
+              let host = RemoteHostStore.shared.sortedHosts.first(where: { $0.id == hostKey }),
+              let sshTarget = host.sshTarget, !sshTarget.isEmpty
+        else { return }
+        let expectedUUID = team.teamUuid
+        let hostDisplayName = host.displayName
+        let sshPort = host.sshPort
+        let identityFile = host.identityFile
+        let tmAgent = TeamOrchestrator.remoteTMAgentCommand(hostCLIBinDirs: host.hostCLIBinDirs)
+        let script = RemotePasteTransfer.serviceAccountCommand(
+            Self.remoteLeaderHealthScript(tmAgent: tmAgent, project: teamName)
+        )
+        remoteOverlapHealthFetchedAt[teamName] = Date()
+        remoteOverlapHealthFetches[teamName] = Task { [weak self] in
+            let reading: OverlapHealthReading
+            do {
+                let output = try await PeerHostReadinessChecker.runScript(
+                    sshTarget: sshTarget, port: sshPort, identityFile: identityFile,
+                    script: script, timeoutSeconds: 10
+                )
+                reading = Self.parseRemoteLeaderHealth(output: output, project: teamName, host: hostDisplayName)
+            } catch {
+                reading = .unavailable(Self.firstLine(of: error.localizedDescription))
+            }
+            await self?.publishRemoteOverlapHealthReading(reading, teamName: teamName, expectedUUID: expectedUUID)
+        }
+    }
+
+    /// Same publish guard `publishLocalOverlapHealthReading` uses: a reading
+    /// for a team that has been recreated under the same name, or that is no
+    /// longer the active team, must not land on screen.
+    private func publishRemoteOverlapHealthReading(
+        _ reading: OverlapHealthReading, teamName: String, expectedUUID: String?
+    ) {
+        remoteOverlapHealthFetches[teamName] = nil
+        guard TeamOrchestrator.shared.teams[teamName]?.teamUuid == expectedUUID else { return }
+        remoteOverlapHealthReadings[teamName] = reading
+        guard Self.shouldPublishRemoteCollaboration(
+            fetchedTeam: teamName, activeTeam: activeTeamProvider() ?? activeTeamName
+        ) else { return }
+        overlapHealthReading = reading
     }
 
     private static func delegationPanel(for teamName: String?) -> DelegationPanel? {
@@ -562,13 +1074,20 @@ final class ReviewBoardViewModel: ObservableObject {
               let team = TeamOrchestrator.shared.teams[teamName] else { return nil }
         let rosterNames = Set(team.agents.map(\.name))
         let working = runningAgentNames().intersection(rosterNames)
+        let settings = LeaderParticipationSettings.load(
+            from: LeaderParticipationSettings.defaultsForCurrentProcess()
+        )
         return DelegationPanel(
             teamName: teamName,
             level: team.delegationState.effective,
             pending: team.delegationState.pending,
             options: ProjectExecutionOptions.load(teamName: teamName),
             workerCount: team.agents.count,
-            workingCount: working.count
+            workingCount: working.count,
+            supportedLeader: TeamOrchestrator.shared.leaderMeasurementCapability(for: team) == .supported,
+            killSwitch: settings.killSwitch,
+            canaryOptIn: settings.optInProjects.contains(teamName),
+            mode: settings.mode
         )
     }
 
@@ -581,11 +1100,17 @@ final class ReviewBoardViewModel: ObservableObject {
         let leaderSurfaceID = team.remoteLeaderSurfaceID?.map {
             String(format: "%02x", $0)
         }.joined()
-        return collaborationPanel(summary: LeaderTurnLog.collaborationSummary(
+        var panel = collaborationPanel(summary: LeaderTurnLog.collaborationSummary(
             records: records, team: teamName, teamUUID: team.teamUuid,
             leaderSessionID: team.leaderSessionId, leaderSurfaceID: leaderSurfaceID,
             workerCount: team.agents.count
         ))
+        panel.workerRepairNeeded = presentationNeedsWorkerRepair(
+            TeamOrchestrator.shared.collaborationPresentationState(
+                teamName: teamName, requireLiveSessions: true, ignoringLeader: true
+            )
+        )
+        return panel
     }
 
     /// Peer leader turns are written on the execution host while task events

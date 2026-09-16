@@ -581,6 +581,34 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(contract.contains("Do not checkout, reset, merge, or rebase"))
     }
 
+    func testCheckoutTopologyMakesLeaderAndPeerIsolationExplicit() {
+        let workers: [(name: String, instance: String, branch: String?, path: String?)] = [
+            ("executor", "instance-a", "team/t/executor/a", "/wt/a"),
+            ("reviewer", "instance-b", "team/t/reviewer/b", "/wt/b"),
+        ]
+        let leader = TeamOrchestrator.checkoutTopologySection(
+            worktreeMode: "isolated", leaderPath: "/repo",
+            integrationTargetPath: "/repo", workers: workers
+        )
+        XCTAssertTrue(leader.contains("TEAM_CHECKOUT_MODE: isolated"))
+        XCTAssertTrue(leader.contains("LEADER_CHECKOUT_PATH: /repo"))
+        XCTAssertTrue(leader.contains("LEADER_CHECKOUT_ROLE: integration-owner"))
+        XCTAssertTrue(leader.contains("branch=team/t/executor/a path=/wt/a"))
+        XCTAssertTrue(leader.contains("ownership-disjoint write tasks may run concurrently"))
+
+        let worker = TeamOrchestrator.workerCheckoutTopologyLines(
+            worktreeMode: "isolated", leaderPath: "/repo",
+            integrationTargetPath: "/repo", targetInstance: "instance-a",
+            workers: workers
+        ).joined(separator: "\n")
+        XCTAssertTrue(worker.contains("PEER_CHECKOUT: name=reviewer instance=instance-b"))
+        XCTAssertFalse(worker.contains("PEER_CHECKOUT: name=executor instance=instance-a"))
+        XCTAssertTrue(worker.contains("ownership-disjoint write tasks may run concurrently"))
+        XCTAssertTrue(TeamOrchestrator.checkoutTopologyRule(worktreeMode: "shared").contains("Serialize writes"))
+        XCTAssertTrue(TeamOrchestrator.checkoutTopologyRule(worktreeMode: "off").contains("No managed worktree isolation"))
+        XCTAssertTrue(TeamOrchestrator.checkoutTopologyRule(worktreeMode: "unknown").contains("is unknown"))
+    }
+
     func testRemoteClaudeLaunchUsesSSHAndKeepsRemoteDirectoryOutOfLocalProcess() {
         let launch = AgentSession.remoteClaudeLaunch(
             sshTarget: "root@jw-server",

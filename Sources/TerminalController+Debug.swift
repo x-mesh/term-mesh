@@ -1323,7 +1323,7 @@ extension TerminalController {
 
     func v2DebugLeaderParticipationConfigure(params: [String: Any]) -> V2CallResult {
         guard let modeRaw = params["mode"] as? String,
-              LeaderParticipationSettings.Mode(rawValue: modeRaw) != nil else {
+              let mode = LeaderParticipationSettings.Mode(rawValue: modeRaw) else {
             return .err(
                 code: "invalid_params", message: "mode must be off, shadow, or canary", data: nil
             )
@@ -1333,16 +1333,12 @@ extension TerminalController {
         let projects = (params["projects"] as? [String] ?? [])
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        let defaults = LeaderParticipationSettings.defaultsForCurrentProcess()
-        defaults.set(modeRaw, forKey: LeaderParticipationSettings.modeKey)
-        defaults.set(percent, forKey: LeaderParticipationSettings.canaryPercentKey)
-        defaults.set(killSwitch, forKey: LeaderParticipationSettings.killSwitchKey)
-        defaults.set(projects, forKey: LeaderParticipationSettings.optInProjectsKey)
-        defaults.set(
-            projects.joined(separator: ", "),
-            forKey: LeaderParticipationSettings.optInProjectsCSVKey
-        )
-        TeamOrchestrator.shared.refreshLeaderParticipationControls()
+        TeamOrchestrator.shared.updateLeaderParticipationSettings { settings in
+            settings.mode = mode
+            settings.canaryPercent = percent
+            settings.killSwitch = killSwitch
+            settings.optInProjects = Set(projects)
+        }
         return .ok([
             "mode": modeRaw, "percent": percent,
             "kill_switch": killSwitch, "projects": projects,
@@ -2407,7 +2403,7 @@ extension TerminalController {
                 detail = String(describing: error)
             }
             let elapsed = Date().timeIntervalSince(started)
-            await tunnel.stop()
+            await tunnel.stop().value
             payload = [
                 "ok": true,
                 "outcome": kind,

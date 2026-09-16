@@ -7,6 +7,12 @@ import XCTest
 #endif
 
 final class ReviewBoardViewModelTests: XCTestCase {
+    func testDelegatedDetailAndHelpDescribeConditionalOverlap() {
+        XCTAssertTrue(ProjectDelegationLevel.delegated.overlapExplanation?.contains("opt-in overlap canary") == true)
+        XCTAssertTrue(ProjectDelegationLevel.delegated.helpText.contains("does not validate ownership automatically"))
+        XCTAssertEqual(ProjectDelegationLevel.allCases.count, 3)
+    }
+
     /// x-kit panel runs are part of what the board's snapshot reads, so a run
     /// arriving has to publish like every other change. Without this the board
     /// saw new runs only because its timer rebuilt the whole snapshot.
@@ -164,6 +170,68 @@ final class ReviewBoardViewModelTests: XCTestCase {
             XCTAssertLessThanOrEqual(phrase.count, 20, phrase)
         }
         XCTAssertEqual(short(.leaderOnly), "no dispatch")
+    }
+
+    /// A daemon restart kills every worker after dispatches were recorded, so
+    /// the turn-log verdict stays `healthy`; the dead presentation still needs
+    /// the Repair button.
+    @MainActor
+    func testRepairFollowsDeadWorkerPresentationEvenWhenEvidenceIsHealthy() {
+        func shows(
+            _ state: LeaderTurnLog.CollaborationState, workers: Int, dead: Bool
+        ) -> Bool {
+            ReviewBoardViewModel.shouldShowCollaborationRepair(
+                state: state, workerCount: workers, workerRepairNeeded: dead
+            )
+        }
+        XCTAssertTrue(shows(.healthy, workers: 5, dead: true))
+        XCTAssertFalse(shows(.healthy, workers: 5, dead: false))
+        XCTAssertTrue(shows(.leaderOnly, workers: 5, dead: false))
+        XCTAssertFalse(shows(.leaderOnly, workers: 0, dead: true), "no roster, nothing to repair")
+    }
+
+    /// Measured on a peer daemon restart: the leader relay ends together with
+    /// both workers. With the leader invariant evaluated first the dead workers
+    /// were never reported, so the board reads worker state with the leader
+    /// treated as present.
+    @MainActor
+    func testDeadWorkersAreReportedWhenTheLeaderDiedWithThem() {
+        let dead = [
+            TeamOrchestrator.AgentPresentationProbe(
+                instanceID: "executor", panelPresent: true, sessionReady: false
+            ),
+        ]
+        let withLeader = TeamOrchestrator.collaborationPresentationState(
+            teamExists: true, workspaceExists: true,
+            leaderPanelExists: true, leaderSessionReady: false,
+            agents: dead, requireLiveSessions: true
+        )
+        XCTAssertFalse(ReviewBoardViewModel.presentationNeedsWorkerRepair(withLeader))
+
+        let ignoringLeader = TeamOrchestrator.collaborationPresentationState(
+            teamExists: true, workspaceExists: true,
+            leaderPanelExists: true, leaderSessionReady: true,
+            agents: dead, requireLiveSessions: true
+        )
+        XCTAssertTrue(ReviewBoardViewModel.presentationNeedsWorkerRepair(ignoringLeader))
+    }
+
+    @MainActor
+    func testOnlyWorkerPresentationStatesRequestRepair() {
+        let expected: [(TeamOrchestrator.CollaborationPresentationState, Bool)] = [
+            (.ready, false),
+            (.teamMissing, false),
+            (.workspaceMissing, false),
+            (.leaderPanelMissing, false),
+            (.leaderSessionUnavailable, false),
+            (.agentPanelMissing("executor"), true),
+            (.agentSessionUnavailable("executor"), true),
+        ]
+        for (state, needsRepair) in expected {
+            XCTAssertEqual(
+                ReviewBoardViewModel.presentationNeedsWorkerRepair(state), needsRepair, "\(state)"
+            )
+        }
     }
 
     // MARK: - Dispatch grouping
@@ -925,6 +993,493 @@ final class ReviewBoardViewModelTests: XCTestCase {
         model.reloadAutoPilotJournals()
         XCTAssertTrue(model.autoPilotAudit.isEmpty)
         XCTAssertTrue(model.autoPilotUndoPoints.isEmpty)
+    }
+
+    // MARK: - Overlap canary status
+
+    /// `LanguageSettings.localized` negotiates the real macOS language when
+    /// nothing overrides it, which would make an exact-string assertion
+    /// depend on the host's System Settings. Forcing English through an
+    /// isolated suite is deterministic because the app ships no `en.lproj`
+    /// for its own source language — the catalog lookup always falls back to
+    /// the key unchanged, regardless of the run host's locale.
+    private func englishDefaults() -> UserDefaults {
+        let suite = "overlap-canary-status.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.set(AppLanguage.english.rawValue, forKey: LanguageSettings.languageModeKey)
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        return defaults
+    }
+
+    @MainActor
+    func testOverlapCanaryStatusReasonOrderFollowsTheGateBeforeConsultingTheReading() {
+        let english = englishDefaults()
+        let ready = ReviewBoardViewModel.OverlapHealthReading.measured(
+            supportedTurns: 500, observedDays: 8, coverage: 0.99, linkage: 0.99,
+            unknownRate: 0.0, malformedLines: 0, passesGate: true, scope: .thisMac
+        )
+
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .leaderFirst, supportedLeader: true, killSwitch: false,
+                reading: ready, defaults: english
+            ).line,
+            "Off · Work Distribution is not Delegated"
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .guarded, supportedLeader: true, killSwitch: false,
+                reading: ready, defaults: english
+            ).line,
+            "Off · Work Distribution is not Delegated"
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: false, killSwitch: false,
+                reading: ready, defaults: english
+            ).line,
+            "Off · Leader turns are not measured"
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: true, killSwitch: true,
+                reading: ready, defaults: english
+            ).line,
+            "Off · Kill switch is on"
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: true, killSwitch: false,
+                mode: .off, reading: ready, defaults: english
+            ).line,
+            "Off · Leader Participation is Off"
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: true, killSwitch: false,
+                mode: .shadow, reading: ready, defaults: english
+            ).line,
+            "Off · Leader Participation is in shadow mode"
+        )
+        let checkingStatus = ReviewBoardViewModel.overlapCanaryStatus(
+            level: .delegated, supportedLeader: true, killSwitch: false,
+            reading: .checking, defaults: english
+        )
+        XCTAssertEqual(checkingStatus.line, "Checking · Measuring leader turn health")
+        XCTAssertNil(checkingStatus.scopeCaption)
+
+        let readyStatus = ReviewBoardViewModel.overlapCanaryStatus(
+            level: .delegated, supportedLeader: true, killSwitch: false,
+            reading: ready, defaults: english
+        )
+        XCTAssertEqual(
+            readyStatus.line,
+            "Ready · Applies to a turn only when the leader reports isolated, disjoint work"
+        )
+        XCTAssertEqual(readyStatus.scopeCaption, "Measured on this Mac across all Projects")
+    }
+
+    @MainActor
+    func testOverlapCanaryStatusNotReportedAndUnavailableLines() {
+        let english = englishDefaults()
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: true, killSwitch: false,
+                reading: .notReported, defaults: english
+            ).line,
+            "Unknown · Remote does not report health"
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: true, killSwitch: false,
+                reading: .unavailable("tm-agent not found on remote"), defaults: english
+            ).line,
+            "Unknown · Remote health unavailable: tm-agent not found on remote"
+        )
+    }
+
+    /// The exact line the plan pins: the unmet volume part first, then the
+    /// first failing ratio — coverage here — each against its own threshold.
+    @MainActor
+    func testOverlapCanaryStatusWaitingLineListsUnmetVolumeThenFirstFailingRatio() {
+        let english = englishDefaults()
+        let reading = ReviewBoardViewModel.OverlapHealthReading.measured(
+            supportedTurns: 120, observedDays: 2, coverage: 0.93, linkage: 0.99,
+            unknownRate: 0.0, malformedLines: 0, passesGate: false, scope: .thisMac
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: true, killSwitch: false,
+                reading: reading, defaults: english
+            ).line,
+            "Waiting · 120/500 turns or 2/7 days · coverage 93% (needs 95%)"
+        )
+    }
+
+    @MainActor
+    func testOverlapCanaryStatusFloorRoundsPercentagesRatherThanRounding() {
+        let english = englishDefaults()
+        // Volume passes (500 supported turns) so only the failing ratio shows.
+        // 0.9496 must print 94%, not round up to the passing 95% threshold.
+        let reading = ReviewBoardViewModel.OverlapHealthReading.measured(
+            supportedTurns: 500, observedDays: 8, coverage: 0.9496, linkage: 0.99,
+            unknownRate: 0.0, malformedLines: 0, passesGate: false, scope: .thisMac
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: true, killSwitch: false,
+                reading: reading, defaults: english
+            ).line,
+            "Waiting · coverage 94% (needs 95%)"
+        )
+    }
+
+    /// Malformed lines mean the count itself is suspect, so they outrank
+    /// every ratio even when the volume and every ratio would otherwise pass.
+    @MainActor
+    func testOverlapCanaryStatusMalformedLinesOutrankEveryRatio() {
+        let english = englishDefaults()
+        let reading = ReviewBoardViewModel.OverlapHealthReading.measured(
+            supportedTurns: 500, observedDays: 8, coverage: 1, linkage: 1,
+            unknownRate: 0, malformedLines: 2, passesGate: false, scope: .thisMac
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: true, killSwitch: false,
+                reading: reading, defaults: english
+            ).line,
+            "Waiting · 2 malformed log lines (needs 0)"
+        )
+    }
+
+    /// A gate failure whose displayed parts all individually pass — a
+    /// contradiction the formatter must never paper over by implying a reason
+    /// that is not there.
+    @MainActor
+    func testOverlapCanaryStatusFallsBackWhenNoDisplayedPartFails() {
+        let english = englishDefaults()
+        let reading = ReviewBoardViewModel.OverlapHealthReading.measured(
+            supportedTurns: 500, observedDays: 8, coverage: 1, linkage: 1,
+            unknownRate: 0, malformedLines: 0, passesGate: false, scope: .thisMac
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: true, killSwitch: false,
+                reading: reading, defaults: english
+            ).line,
+            "Waiting · Health gate not passed"
+        )
+    }
+
+    @MainActor
+    func testOverlapCanaryStatusCaptionsNameTheScope() {
+        let english = englishDefaults()
+        let thisMac = ReviewBoardViewModel.overlapCanaryStatus(
+            level: .delegated, supportedLeader: true, killSwitch: false,
+            reading: .measured(
+                supportedTurns: 500, observedDays: 8, coverage: 0.5, linkage: 0.99,
+                unknownRate: 0, malformedLines: 0, passesGate: false, scope: .thisMac
+            ),
+            defaults: english
+        )
+        XCTAssertEqual(thisMac.scopeCaption, "Measured on this Mac across all Projects")
+
+        let remote = ReviewBoardViewModel.overlapCanaryStatus(
+            level: .delegated, supportedLeader: true, killSwitch: false,
+            reading: .measured(
+                supportedTurns: 500, observedDays: 8, coverage: 0.5, linkage: 0.99,
+                unknownRate: 0, malformedLines: 0, passesGate: false, scope: .remoteProject("mac-sub")
+            ),
+            defaults: english
+        )
+        XCTAssertEqual(remote.scopeCaption, "Measured on mac-sub for this Project")
+    }
+
+    /// Ready is never a second decision: it has to agree with the exact
+    /// boolean `controlPayload` would carry for the corresponding scope,
+    /// across every combination of the three "Off" inputs.
+    @MainActor
+    func testOverlapCanaryStatusReadyMatchesControlPayloadAcrossEveryGateCombination() {
+        let english = englishDefaults()
+        let passingHealth = LeaderParticipationSettings.Health(
+            supportedTurns: 500, observedDays: 8, coverage: 0.99, linkage: 0.99, unknownRate: 0.0
+        )
+        let failingHealth = LeaderParticipationSettings.Health(
+            supportedTurns: 0, observedDays: 0, coverage: 0, linkage: 0, unknownRate: 1
+        )
+        let settings = LeaderParticipationSettings.default
+
+        for level in ProjectDelegationLevel.allCases {
+            for supportedLeader in [true, false] {
+                for killSwitch in [true, false] {
+                    for health in [passingHealth, failingHealth] {
+                        let delegationState = ProjectDelegationState(configured: level, effective: level)
+                        var scopedSettings = settings
+                        scopedSettings.killSwitch = killSwitch
+                        // Overlap runs only in canary mode. The matrix below
+                        // varies the other three inputs; `off` and `shadow` are
+                        // pinned separately in the status-line test above.
+                        scopedSettings.mode = .canary
+                        let context = "level=\(level) supported=\(supportedLeader) " +
+                            "kill=\(killSwitch) gatePasses=\(health.passesPromotionGate)"
+
+                        let controlHostPayload = scopedSettings.controlPayload(
+                            projectID: "p", sessionID: "s", supportedLeader: supportedLeader,
+                            health: health, delegationState: delegationState, healthScope: .controlHost
+                        )
+                        let localReading = ReviewBoardViewModel.OverlapHealthReading.measured(
+                            supportedTurns: health.supportedTurns, observedDays: health.observedDays,
+                            coverage: health.coverage, linkage: health.linkage,
+                            unknownRate: health.unknownRate, malformedLines: 0,
+                            passesGate: health.passesPromotionGate, scope: .thisMac
+                        )
+                        let localReady = ReviewBoardViewModel.overlapCanaryStatus(
+                            level: level, supportedLeader: supportedLeader, killSwitch: killSwitch,
+                            mode: scopedSettings.mode, reading: localReading, defaults: english
+                        ).line.hasPrefix("Ready")
+                        XCTAssertEqual(
+                            localReady, controlHostPayload["delegated_overlap_resolution"] as? Bool,
+                            "local Ready must match controlHost resolution: \(context)"
+                        )
+
+                        let executionHostPayload = scopedSettings.controlPayload(
+                            projectID: "p", sessionID: "s", supportedLeader: supportedLeader,
+                            health: health, delegationState: delegationState, healthScope: .executionHost
+                        )
+                        let executionHostResolution =
+                            executionHostPayload["delegated_overlap_resolution"] as? Bool ?? false
+                        for remotePassesGate in [true, false] {
+                            let peerReading = ReviewBoardViewModel.OverlapHealthReading.measured(
+                                supportedTurns: 500, observedDays: 8, coverage: 0.99, linkage: 0.99,
+                                unknownRate: 0.0, malformedLines: 0, passesGate: remotePassesGate,
+                                scope: .remoteProject("mac-sub")
+                            )
+                            let peerReady = ReviewBoardViewModel.overlapCanaryStatus(
+                                level: level, supportedLeader: supportedLeader, killSwitch: killSwitch,
+                                mode: scopedSettings.mode, reading: peerReading, defaults: english
+                            ).line.hasPrefix("Ready")
+                            XCTAssertEqual(
+                                peerReady, executionHostResolution && remotePassesGate,
+                                "peer Ready must match executionHost resolution AND the remote gate: "
+                                    + "\(context) remotePasses=\(remotePassesGate)"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Peer leader health over SSH
+
+    @MainActor
+    func testRemoteLeaderHealthScriptQuotesTheTMAgentAndProjectArguments() {
+        let script = ReviewBoardViewModel.remoteLeaderHealthScript(tmAgent: "tm-agent", project: "a'b")
+        let quotedAgent = TeamOrchestrator.shellQuoted("tm-agent")
+        let quotedProject = TeamOrchestrator.shellQuoted("a'b")
+        XCTAssertEqual(
+            script,
+            "out=$(\(quotedAgent) leader turn health --project \(quotedProject) --json 2>&1); "
+                + "rc=$?; printf 'rc=%s\\n' \"$rc\"; printf '%s\\n' \"$out\""
+        )
+        XCTAssertTrue(script.contains("--project 'a'\\''b'"))
+    }
+
+    private func remoteHealthReportJSON(
+        project: String = "p", supportedTurns: Int = 620, observedDays: Int = 9,
+        coverage: Double = 0.99, linkage: Double = 0.97, unknownRate: Double = 0.01,
+        malformedLines: Int = 0, passesPromotionGate: Bool = true
+    ) -> String {
+        """
+        {
+          "schema_version": 1,
+          "project": "\(project)",
+          "scope": "execution_host_project",
+          "supported_turns": \(supportedTurns),
+          "linked_turns": 600,
+          "stated_turns": 610,
+          "unstated_turns": 5,
+          "observed_days": \(observedDays),
+          "malformed_lines": \(malformedLines),
+          "coverage": \(coverage),
+          "linkage": \(linkage),
+          "unknown_rate": \(unknownRate),
+          "passes_promotion_gate": \(passesPromotionGate)
+        }
+        """
+    }
+
+    @MainActor
+    func testParseRemoteLeaderHealthReportsAMeasuredReadingOnRcZero() {
+        let output = "rc=0\n" + remoteHealthReportJSON()
+        XCTAssertEqual(
+            ReviewBoardViewModel.parseRemoteLeaderHealth(output: output, project: "p", host: "mac-sub"),
+            .measured(
+                supportedTurns: 620, observedDays: 9, coverage: 0.99, linkage: 0.97,
+                unknownRate: 0.01, malformedLines: 0, passesGate: true, scope: .remoteProject("mac-sub")
+            )
+        )
+    }
+
+    /// The exact stderr text clap prints on tm-agent 0.242.0 for an
+    /// execution host that predates `leader turn health`, captured with
+    /// `tm-agent leader turn bogus --project p --json` against the release
+    /// binary (clap reports the same shape for any unrecognized subcommand).
+    @MainActor
+    func testParseRemoteLeaderHealthMapsTheExactOldTMAgentStderrTextToNotReported() {
+        let output = "rc=2\n"
+            + "error: unrecognized subcommand 'health'\n\n"
+            + "Usage: tm-agent leader turn [OPTIONS] <COMMAND>\n\n"
+            + "For more information, try '--help'.\n"
+        XCTAssertEqual(
+            ReviewBoardViewModel.parseRemoteLeaderHealth(output: output, project: "p", host: "mac-sub"),
+            .notReported
+        )
+    }
+
+    /// rc 2 alone is not enough — only the exact clap message reads as "does
+    /// not report health". Anything else at rc 2 falls to the generic line.
+    @MainActor
+    func testParseRemoteLeaderHealthMapsRcTwoWithoutTheClapMessageToGenericUnavailable() {
+        let output = "rc=2\nsome other failure\n"
+        XCTAssertEqual(
+            ReviewBoardViewModel.parseRemoteLeaderHealth(output: output, project: "p", host: "mac-sub"),
+            .unavailable("remote tm-agent exited 2")
+        )
+    }
+
+    @MainActor
+    func testParseRemoteLeaderHealthMapsRc127ToTMAgentNotFound() {
+        let output = "rc=127\n/bin/sh: tm-agent: command not found\n"
+        XCTAssertEqual(
+            ReviewBoardViewModel.parseRemoteLeaderHealth(output: output, project: "p", host: "mac-sub"),
+            .unavailable("tm-agent not found on remote")
+        )
+    }
+
+    @MainActor
+    func testParseRemoteLeaderHealthMapsAnyOtherRcToAGenericUnavailableReason() {
+        let output = "rc=1\nsomething went wrong\n"
+        XCTAssertEqual(
+            ReviewBoardViewModel.parseRemoteLeaderHealth(output: output, project: "p", host: "mac-sub"),
+            .unavailable("remote tm-agent exited 1")
+        )
+    }
+
+    @MainActor
+    func testParseRemoteLeaderHealthMapsInvalidJSONToUnavailable() {
+        let output = "rc=0\nnot json at all\n"
+        XCTAssertEqual(
+            ReviewBoardViewModel.parseRemoteLeaderHealth(output: output, project: "p", host: "mac-sub"),
+            .unavailable("invalid health response")
+        )
+    }
+
+    @MainActor
+    func testParseRemoteLeaderHealthMapsAnotherProjectsReportToUnavailable() {
+        let output = "rc=0\n" + remoteHealthReportJSON(project: "other")
+        XCTAssertEqual(
+            ReviewBoardViewModel.parseRemoteLeaderHealth(output: output, project: "p", host: "mac-sub"),
+            .unavailable("invalid health response")
+        )
+    }
+
+    @MainActor
+    func testParseRemoteLeaderHealthMapsAMissingFieldToUnavailable() {
+        // "coverage" is left out of an otherwise complete report.
+        let json = """
+        {
+          "project": "p",
+          "supported_turns": 620,
+          "observed_days": 9,
+          "malformed_lines": 0,
+          "linkage": 0.97,
+          "unknown_rate": 0.01,
+          "passes_promotion_gate": true
+        }
+        """
+        let output = "rc=0\n" + json
+        XCTAssertEqual(
+            ReviewBoardViewModel.parseRemoteLeaderHealth(output: output, project: "p", host: "mac-sub"),
+            .unavailable("invalid health response")
+        )
+    }
+
+    @MainActor
+    func testParseRemoteLeaderHealthMapsAMissingOrInvalidRcLineToInvalidResponse() {
+        XCTAssertEqual(
+            ReviewBoardViewModel.parseRemoteLeaderHealth(output: "", project: "p", host: "mac-sub"),
+            .unavailable("invalid response")
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.parseRemoteLeaderHealth(
+                output: remoteHealthReportJSON(), project: "p", host: "mac-sub"
+            ),
+            .unavailable("invalid response")
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.parseRemoteLeaderHealth(
+                output: "rc=not-a-number\n{}", project: "p", host: "mac-sub"
+            ),
+            .unavailable("invalid response")
+        )
+    }
+
+    @MainActor
+    func testShouldFetchRemoteLeaderHealthWaits60SecondsAndIgnoresElapsedTimeWhileInFlight() {
+        let lastAttempt = Date(timeIntervalSince1970: 1_000)
+        XCTAssertFalse(ReviewBoardViewModel.shouldFetchRemoteLeaderHealth(
+            lastAttempt: lastAttempt, now: lastAttempt.addingTimeInterval(59), inFlight: false
+        ))
+        XCTAssertTrue(ReviewBoardViewModel.shouldFetchRemoteLeaderHealth(
+            lastAttempt: lastAttempt, now: lastAttempt.addingTimeInterval(60), inFlight: false
+        ))
+        // A previous attempt's own failure never rewrites `lastAttempt`, so the
+        // same 60 s rule keeps applying to the timestamp recorded when that
+        // attempt started — this is only re-asserting the 59 s case against
+        // that unchanged timestamp.
+        XCTAssertFalse(ReviewBoardViewModel.shouldFetchRemoteLeaderHealth(
+            lastAttempt: lastAttempt, now: lastAttempt.addingTimeInterval(59), inFlight: false
+        ))
+        XCTAssertFalse(ReviewBoardViewModel.shouldFetchRemoteLeaderHealth(
+            lastAttempt: lastAttempt, now: lastAttempt.addingTimeInterval(3_600), inFlight: true
+        ))
+        XCTAssertTrue(ReviewBoardViewModel.shouldFetchRemoteLeaderHealth(
+            lastAttempt: nil, now: Date(), inFlight: false
+        ))
+    }
+
+    @MainActor
+    func testOverlapCanaryStatusNotReportedAndUnavailableNeverReachReady() {
+        let english = englishDefaults()
+        let notReported = ReviewBoardViewModel.overlapCanaryStatus(
+            level: .delegated, supportedLeader: true, killSwitch: false,
+            reading: .notReported, defaults: english
+        )
+        XCTAssertFalse(notReported.line.hasPrefix("Ready"))
+        let unavailable = ReviewBoardViewModel.overlapCanaryStatus(
+            level: .delegated, supportedLeader: true, killSwitch: false,
+            reading: .unavailable("remote tm-agent exited 1"), defaults: english
+        )
+        XCTAssertFalse(unavailable.line.hasPrefix("Ready"))
+    }
+
+    /// The peer reading alone decides Ready — this Mac's own turns.log never
+    /// enters the picture, so a passing remote reading reaches Ready with a
+    /// zero-turn local machine exactly as it would with a busy one.
+    @MainActor
+    func testOverlapCanaryStatusRemotePassingReadingReachesReadyRegardlessOfThisMacsTurns() {
+        let english = englishDefaults()
+        let reading = ReviewBoardViewModel.OverlapHealthReading.measured(
+            supportedTurns: 500, observedDays: 8, coverage: 0.99, linkage: 0.99,
+            unknownRate: 0.0, malformedLines: 0, passesGate: true, scope: .remoteProject("mac-sub")
+        )
+        let status = ReviewBoardViewModel.overlapCanaryStatus(
+            level: .delegated, supportedLeader: true, killSwitch: false,
+            reading: reading, defaults: english
+        )
+        XCTAssertTrue(status.line.hasPrefix("Ready"))
+        XCTAssertEqual(status.scopeCaption, "Measured on mac-sub for this Project")
     }
 
 }

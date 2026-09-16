@@ -3837,6 +3837,9 @@ final class Workspace: Identifiable {
             TeamOrchestrator.shared.retireEndedPeerOwnedAgent(
                 panelID: panelId,
                 surfaceID: boundSurfaceID,
+                exitCode: exitCode,
+                signal: signal,
+                reason: reason,
                 workspace: self
             )
         }

@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,250 @@ SPEC.loader.exec_module(module)
 
 
 class EffectivenessBenchmarkTests(unittest.TestCase):
+    def write_runtime_transcript(self, path, events):
+        path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+
+    def test_isolated_correction_owner_requires_one_exact_mutating_owner(self):
+        tasks = module.isolated_topology_tasks(module.FIXTURES["split-divider-color"])
+        reason = "/tmp/run/Sources/Workspace.swift:12:4: error: missing symbol"
+        self.assertEqual(module.isolated_correction_owner(reason, tasks)["worker"], "explorer")
+        self.assertIsNone(module.isolated_correction_owner("test failed without compile diagnostic", tasks))
+
+    def test_isolated_correction_owner_rejects_leader_and_ambiguous_paths(self):
+        tasks = module.isolated_topology_tasks(module.FIXTURES["split-divider-color"])
+        leader = "Sources/TerminalWindowPortal.swift:3:2: error: bad call"
+        mixed = (
+            "Sources/Workspace.swift:3:2: error: bad call\n"
+            "Sources/SettingsView.swift:4:2: error: other call"
+        )
+        self.assertIsNone(module.isolated_correction_owner(leader, tasks))
+        self.assertIsNone(module.isolated_correction_owner(mixed, tasks))
+
+    def test_isolated_correction_budget_is_bounded_by_remaining_deadline(self):
+        self.assertEqual(module.isolated_correction_budget(500), 180.0)
+        self.assertEqual(module.isolated_correction_budget(27.5), 27.5)
+        with self.assertRaises(TimeoutError):
+            module.isolated_correction_budget(0)
+
+    def test_replace_integrated_worker_patch_rolls_back_original_on_failure(self):
+        old_patch = b"old"
+        corrected_patch = b"corrected"
+        responses = [
+            unittest.mock.Mock(returncode=0, stderr=b""),
+            unittest.mock.Mock(returncode=1, stderr=b"bad corrected"),
+            unittest.mock.Mock(returncode=0, stderr=b""),
+        ]
+        with unittest.mock.patch.object(module.subprocess, "run", side_effect=responses) as run:
+            with self.assertRaisesRegex(RuntimeError, "original patch restored"):
+                module.replace_integrated_worker_patch(Path("/tmp/checkout"), old_patch, corrected_patch, 30)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args_list[0].kwargs["input"], old_patch)
+        self.assertEqual(run.call_args_list[1].kwargs["input"], corrected_patch)
+        self.assertEqual(run.call_args_list[2].kwargs["input"], old_patch)
+
+    def test_restore_original_worker_patch_promotes_rollback_failure(self):
+        with unittest.mock.patch.object(
+            module, "replace_integrated_worker_patch", side_effect=RuntimeError("cannot restore"),
+        ):
+            with self.assertRaises(module.BenchmarkCorrectionRollbackError):
+                module.restore_original_worker_patch(
+                    Path("/tmp/checkout"), b"corrected", b"original", 30,
+                )
+
+    def test_rollback_failed_state_is_cleanup_unsafe_and_has_no_candidate_artifact(self):
+        record = module.RunResult(
+            run_id="rollback", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            status="infra_invalid", infra_invalid=True,
+            correction_outcome="rollback_failed",
+        )
+        self.assertTrue(module.isolated_correction_state_is_unsafe(record))
+        self.assertFalse(module.isolated_candidate_artifact_allowed(record))
+
+    def test_retry_exception_and_restore_failure_stays_typed_infrastructure_error(self):
+        original = RuntimeError("retry acceptance crashed")
+        with unittest.mock.patch.object(
+            module, "replace_integrated_worker_patch",
+            side_effect=RuntimeError("rollback replacement crashed"),
+        ):
+            try:
+                raise original
+            except Exception:
+                with self.assertRaises(module.BenchmarkCorrectionRollbackError):
+                    module.restore_original_worker_patch(
+                        Path("/tmp/checkout"), b"corrected", b"original", 30,
+                    )
+
+    def test_correct_isolated_worker_rejects_corrected_scope_before_replacement(self):
+        task = module.isolated_topology_tasks(module.FIXTURES["split-divider-color"])[0]
+        with unittest.mock.patch.object(module, "tm_environment", return_value={}), \
+             unittest.mock.patch.object(module, "run_command", return_value=unittest.mock.Mock(
+            returncode=0, stderr="", stdout="",
+        )), unittest.mock.patch.object(
+            module, "wait_for_worker_results", return_value=(["done"], 1, 1),
+        ), unittest.mock.patch.object(
+            module, "worker_patch_snapshot", return_value=(b"corrected", {"Sources/Workspace.swift"}),
+        ), unittest.mock.patch.object(module, "replace_integrated_worker_patch") as replace:
+            with self.assertRaisesRegex(RuntimeError, "forbidden paths"):
+                module.correct_isolated_worker(
+                    fixture=module.FIXTURES["split-divider-color"], team="bench", task=task,
+                    workdir=Path("/tmp/worker"), checkout=Path("/tmp/checkout"),
+                    original_error="error", result_file=Path("/tmp/result"), old_patch=b"old",
+                    trace=unittest.mock.Mock(), remaining=lambda: 30,
+                )
+        replace.assert_not_called()
+
+    def test_runtime_metrics_pairs_requests_and_bash_by_structured_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "session.jsonl"
+            self.write_runtime_transcript(transcript, [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00.000Z", "message": {"content": "go"}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01.000Z",
+                 "requestId": "req-1", "queue_duration_ms": 80, "ttft_ms": 900,
+                 "durationMs": 2200, "message": {"content": [
+                     {"type": "tool_use", "id": "tool-1", "name": "Bash", "input": {"command": "true"}},
+                 ]}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01.400Z",
+                 "requestId": "req-1", "queue_duration_ms": 80, "ttft_ms": 900,
+                 "durationMs": 2200, "message": {"content": []}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:03.000Z", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1"},
+                ]}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:04.500Z",
+                 "requestId": "req-2", "message": {"content": []}},
+            ])
+
+            result = module.claude_runtime_metrics(transcript)
+
+        self.assertEqual(result["status"], "measured")
+        requests = result["provider_requests"]
+        self.assertEqual(requests["count"], 2)
+        self.assertEqual(requests["prompt_to_first_response_ms"]["total_ms"], 2500)
+        self.assertEqual(requests["inter_request_start_ms"]["total_ms"], 3500)
+        self.assertEqual(requests["response_event_span_ms"]["total_ms"], 400)
+        self.assertEqual(requests["native"]["queue_ms"]["requests_with_value"], 1)
+        self.assertEqual(requests["native"]["queue_ms"]["missing_requests"], 1)
+        self.assertEqual(requests["native"]["ttft_ms"]["summary"]["p50_ms"], 900)
+        self.assertEqual(result["bash_tools"]["paired"], 1)
+        self.assertEqual(result["bash_tools"]["duration_ms"]["total_ms"], 2000)
+
+    def test_runtime_metrics_reads_native_fields_only_from_allowed_provider_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "session.jsonl"
+            self.write_runtime_transcript(transcript, [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"content": "go"}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01Z", "requestId": "req-1",
+                 "provider_metadata": {"queue_ms": 40},
+                 "message": {"usage": {"ttft_ms": 500}, "diagnostics": {"api_duration_ms": 900}, "content": [
+                     {"type": "tool_use", "id": "tool-1", "name": "Bash",
+                      "input": {"queue_ms": 9999, "duration_ms": 9999}},
+                 ]}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:02Z", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "tool-1"},
+                ]}},
+            ])
+            result = module.claude_runtime_metrics(transcript)
+
+        native = result["provider_requests"]["native"]
+        self.assertEqual(native["queue_ms"]["summary"]["total_ms"], 40)
+        self.assertEqual(native["ttft_ms"]["summary"]["total_ms"], 500)
+        self.assertEqual(native["api_duration_ms"]["summary"]["total_ms"], 900)
+        self.assertEqual(native["duration_ms"]["requests_with_value"], 0)
+        self.assertEqual(native["duration_ms"]["missing_requests"], 1)
+
+    def test_partial_runtime_telemetry_does_not_degrade_product_protocol(self):
+        record = module.RunResult(
+            run_id="passed", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            status="passed", acceptance_passed=True,
+        )
+        with unittest.mock.patch.object(
+            module, "benchmark_worker_runtime_metrics",
+            return_value={"status": "partial", "roles": {"executor": {"status": "partial"}}},
+        ), unittest.mock.patch.object(
+            module, "benchmark_read_overlap", return_value={"status": "measured", "roles": {}},
+        ), unittest.mock.patch.object(
+            module, "claude_session_path", return_value=Path("/tmp/session.jsonl"),
+        ), unittest.mock.patch.object(
+            module, "claude_runtime_metrics", return_value={"status": "partial"},
+        ), unittest.mock.patch.object(
+            module, "claude_read_paths", return_value={"status": "measured", "distinct_access_paths": []},
+        ):
+            module.collect_isolated_read_diagnostics(
+                record, team="team", checkout=Path("/tmp/checkout"), tasks=[], session_id="session",
+            )
+
+        self.assertEqual(record.status, "passed")
+        self.assertTrue(record.acceptance_passed)
+        self.assertFalse(record.protocol_degraded)
+        self.assertEqual(record.worker_runtime_metrics["status"], "partial")
+
+    def test_runtime_metrics_marks_missing_bash_result_as_partial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "session.jsonl"
+            self.write_runtime_transcript(transcript, [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"content": "go"}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01Z",
+                 "requestId": "req-1", "message": {"content": [
+                     {"type": "tool_use", "id": "tool-1", "name": "Bash"},
+                 ]}},
+            ])
+            result = module.claude_runtime_metrics(transcript)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["bash_tools"]["missing_results"], 1)
+        self.assertEqual(result["bash_tools"]["coverage"], 0.0)
+
+    def test_runtime_metrics_ignores_results_for_non_bash_tools(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "session.jsonl"
+            self.write_runtime_transcript(transcript, [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"content": "go"}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01Z", "requestId": "req-1",
+                 "message": {"content": [{"type": "tool_use", "id": "read-1", "name": "Read"}]}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:02Z",
+                 "message": {"content": [{"type": "tool_result", "tool_use_id": "read-1"}]}},
+            ])
+            result = module.claude_runtime_metrics(transcript)
+
+        self.assertEqual(result["status"], "measured")
+        self.assertEqual(result["bash_tools"]["starts"], 0)
+        self.assertEqual(result["bash_tools"]["unmatched_results"], 0)
+
+    def test_runtime_metrics_rejects_duplicate_bash_event_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "session.jsonl"
+            self.write_runtime_transcript(transcript, [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"content": "go"}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01Z", "requestId": "req-1",
+                 "message": {"content": [{"type": "tool_use", "id": "tool-1", "name": "Bash"}]}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:02Z", "requestId": "req-1",
+                 "message": {"content": [{"type": "tool_use", "id": "tool-1", "name": "Bash"}]}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:03Z",
+                 "message": {"content": [{"type": "tool_result", "tool_use_id": "tool-1"}]}},
+            ])
+            result = module.claude_runtime_metrics(transcript)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["bash_tools"]["duplicate_starts"], 1)
+        self.assertEqual(result["bash_tools"]["paired"], 0)
+
+    def test_runtime_metrics_rejects_out_of_order_bash_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            transcript = Path(temporary) / "session.jsonl"
+            self.write_runtime_transcript(transcript, [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {"content": "go"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:01Z",
+                 "message": {"content": [{"type": "tool_result", "tool_use_id": "tool-1"}]}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:02Z", "requestId": "req-1",
+                 "message": {"content": [{"type": "tool_use", "id": "tool-1", "name": "Bash"}]}},
+            ])
+            result = module.claude_runtime_metrics(transcript)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["bash_tools"]["out_of_order"], 1)
+        self.assertEqual(result["bash_tools"]["paired"], 0)
+
     def test_non_dry_run_experiment_executes_under_cleanup_and_lock(self):
         args = unittest.mock.Mock(dry_run=False, results_dir=Path("/tmp/results"))
         cleanup = unittest.mock.MagicMock()
@@ -38,6 +283,24 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
         lock.__enter__.assert_called_once_with()
         lock.__exit__.assert_called_once()
         runner.assert_called_once_with(args)
+
+    def test_main_dispatches_non_dry_studies_under_cleanup_and_lock(self):
+        for command, runner_name in (("orchestration-study", "run_orchestration_experiment"),
+                                     ("partition-study", "run_partition_experiment")):
+            cleanup = unittest.mock.MagicMock()
+            lock = unittest.mock.MagicMock()
+            with self.subTest(command=command), \
+                 unittest.mock.patch.object(sys, "argv", [str(SCRIPT), command]), \
+                 unittest.mock.patch.object(module, "benchmark_signal_cleanup", return_value=cleanup), \
+                 unittest.mock.patch.object(module, "benchmark_run_lock", return_value=lock) as lock_factory, \
+                 unittest.mock.patch.object(module, runner_name, return_value=23) as runner:
+                self.assertEqual(module.main(), 23)
+            cleanup.__enter__.assert_called_once_with()
+            cleanup.__exit__.assert_called_once()
+            lock.__enter__.assert_called_once_with()
+            lock.__exit__.assert_called_once()
+            runner.assert_called_once()
+            lock_factory.assert_called_once()
 
     def test_default_matrix_is_18_paired_counterbalanced_runs(self):
         specs = module.build_matrix(module.FIXTURES, 3, module.DEFAULT_SEED)
@@ -59,6 +322,426 @@ class EffectivenessBenchmarkTests(unittest.TestCase):
     def test_matrix_can_select_multi_only_for_protocol_smoke(self):
         specs = module.build_matrix(("homebrew-smoke",), 1, 42, ("multi",))
         self.assertEqual(specs, [module.RunSpec("homebrew-smoke", 1, "multi", 2)])
+
+    def test_orchestration_matrix_is_27_counterbalanced_runs(self):
+        specs = module.build_orchestration_matrix(module.FIXTURES, 3, module.DEFAULT_SEED)
+        self.assertEqual(len(specs), 27)
+        for index in range(0, len(specs), 3):
+            block = specs[index:index + 3]
+            self.assertEqual({row.condition for row in block}, set(module.ORCHESTRATION_CONDITIONS))
+            self.assertEqual({row.fixture for row in block}, {block[0].fixture})
+            self.assertEqual({row.trial for row in block}, {block[0].trial})
+        for fixture in module.FIXTURES:
+            selected = [row for row in specs if row.fixture == fixture]
+            for condition in module.ORCHESTRATION_CONDITIONS:
+                self.assertEqual(sorted(row.order for row in selected if row.condition == condition), [1, 2, 3])
+
+    def test_partition_matrix_alternates_paired_order(self):
+        specs = module.build_partition_matrix(("split-divider-color",), 3)
+        self.assertEqual([(row.trial, row.condition, row.order) for row in specs], [
+            (1, "broad", 1), (1, "partitioned", 2),
+            (2, "partitioned", 1), (2, "broad", 2),
+            (3, "broad", 1), (3, "partitioned", 2),
+        ])
+
+    def test_isolated_topology_matrix_alternates_only_leader_timing(self):
+        specs = module.build_isolated_topology_matrix(("split-divider-color",), 3)
+        self.assertEqual([(row.trial, row.condition, row.order) for row in specs], [
+            (1, "isolated-blocking", 1), (1, "isolated-overlap", 2),
+            (2, "isolated-overlap", 1), (2, "isolated-blocking", 2),
+            (3, "isolated-blocking", 1), (3, "isolated-overlap", 2),
+        ])
+
+    def test_isolated_execution_metadata_defaults_leader_to_worker_model(self):
+        self.assertEqual(
+            module.isolated_execution_metadata("sonnet", None),
+            {
+                "leader_execution": "controller_managed_claude_print_session",
+                "leader_model": "sonnet",
+                "worker_model": "sonnet",
+                "leader_session_resume": True,
+            },
+        )
+        self.assertEqual(
+            module.isolated_execution_metadata("haiku", "opus")["leader_model"],
+            "opus",
+        )
+
+    def test_split_model_cost_uses_each_models_pricing(self):
+        record = module.RunResult(
+            run_id="run", fixture="split-divider-color", parallelism="high",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            tokens={key: 0 for key in module.TOKEN_KEYS},
+            leader_tokens={key: 0 for key in module.TOKEN_KEYS},
+            worker_tokens={key: 0 for key in module.TOKEN_KEYS},
+            leader_model="opus", worker_model="haiku",
+        )
+        record.leader_tokens["input_tokens"] = 1_000_000
+        record.worker_tokens["input_tokens"] = 1_000_000
+        module.add_tokens(record.tokens, record.leader_tokens)
+        module.add_tokens(record.tokens, record.worker_tokens)
+        module.record_split_model_costs(record)
+        self.assertEqual(record.leader_cost_usd, 15.0)
+        self.assertEqual(record.worker_cost_usd, 0.8)
+        self.assertEqual(record.cost_usd, 15.8)
+        self.assertEqual(record.cost_precision, "split_model_token_estimate")
+
+    def test_same_model_split_cost_preserves_combined_estimate(self):
+        record = module.RunResult(
+            run_id="run", fixture="split-divider-color", parallelism="high",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            tokens={key: 0 for key in module.TOKEN_KEYS},
+            leader_tokens={key: 0 for key in module.TOKEN_KEYS},
+            worker_tokens={key: 0 for key in module.TOKEN_KEYS},
+            leader_model="sonnet", worker_model="sonnet",
+        )
+        record.leader_tokens["output_tokens"] = 1
+        record.worker_tokens["output_tokens"] = 1
+        module.add_tokens(record.tokens, record.leader_tokens)
+        module.add_tokens(record.tokens, record.worker_tokens)
+        module.record_split_model_costs(record)
+        self.assertEqual(record.cost_usd, module.estimate_cost(record.tokens, "sonnet"))
+
+    def test_isolated_topology_ownership_is_disjoint(self):
+        tasks = module.isolated_topology_tasks(module.FIXTURES["split-divider-color"])
+        scopes = [set(task["owned"]) for task in tasks]
+        worker_paths = set().union(*scopes)
+        self.assertFalse(worker_paths & set(module.ISOLATED_LEADER_OWNED))
+        self.assertEqual([task["id"] for task in tasks], ["settings", "runtime", "review"])
+        self.assertEqual([task["worker"] for task in tasks], ["executor", "explorer", "reviewer"])
+        self.assertEqual(sum(task["mutates"] for task in tasks), 2)
+        for left in range(len(scopes)):
+            for right in range(left):
+                self.assertFalse(scopes[left] & scopes[right])
+        self.assertEqual(worker_paths, {
+            "Sources/SettingsView.swift",
+            "Sources/TerminalSettings.swift",
+            "Sources/Workspace.swift",
+            "termMeshTests/GhosttyConfigTests.swift",
+            "termMeshTests/TerminalOverrideIsolationTests.swift",
+            "Makefile",
+            "termMeshTests/TermMeshWebViewKeyEquivalentTests.swift",
+        })
+        self.assertTrue(all(
+            "all other repository paths" in task["forbidden"] for task in tasks
+        ))
+        self.assertIn("all repository writes", tasks[-1]["forbidden"])
+
+    def test_isolated_topology_conditions_use_the_same_task_order(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        blocking = module.isolated_topology_tasks(fixture)
+        overlap = module.isolated_topology_tasks(fixture)
+        self.assertEqual(blocking, overlap)
+        self.assertEqual(
+            [(task["id"], task["worker"]) for task in blocking],
+            [("settings", "executor"), ("runtime", "explorer"), ("review", "reviewer")],
+        )
+
+    def test_isolated_base_api_gate_requires_split_divider_color(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            sources = checkout / "Sources"
+            sources.mkdir()
+            config = sources / "GhosttyConfig.swift"
+            config.write_text("struct GhosttyConfig {}\n")
+            with self.assertRaisesRegex(
+                module.BenchmarkInfrastructureError, "GhosttyConfig.splitDividerColor",
+            ):
+                module.require_isolated_base_api(checkout)
+            config.write_text("struct GhosttyConfig { var splitDividerColor: NSColor? }\n")
+            module.require_isolated_base_api(checkout)
+
+    def test_isolated_prompts_state_swift_actor_test_contract(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        executor_task = next(
+            task for task in module.isolated_topology_tasks(fixture)
+            if task["worker"] == "executor"
+        )
+        worker = module.worker_instruction(fixture, "team", "executor", executor_task)
+        leader = module.isolated_leader_prompt(fixture, final=False)
+        for prompt in (worker, leader):
+            self.assertIn("must declare @MainActor on the test type or method", prompt)
+            self.assertIn("Workspace.resolvedChromeColors", prompt)
+
+        unrelated = module.worker_instruction(
+            module.FIXTURES["homebrew-smoke"], "team", "executor"
+        )
+        self.assertNotIn("Workspace.resolvedChromeColors", unrelated)
+
+    def test_split_divider_prompts_separate_config_mapping_from_portal_behavior(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        executor_task = next(
+            task for task in module.isolated_topology_tasks(fixture)
+            if task["worker"] == "executor"
+        )
+        prompts = (
+            module.worker_instruction(fixture, "team", "executor", executor_task),
+            module.isolated_leader_prompt(fixture, final=False),
+            module.isolated_leader_prompt(fixture, final=True),
+        )
+        for prompt in prompts:
+            self.assertIn("Keep the two split-divider behaviors independent", prompt)
+            self.assertIn("GhosttyConfig.splitDividerColor has type NSColor?", prompt)
+            self.assertIn("Preserve NSColor? across the config and Workspace boundary", prompt)
+            self.assertIn("parse an explicit hex value with NSColor(hex:)", prompt)
+            self.assertIn("Never replace it with String? or add a parallel raw divider-color property", prompt)
+            self.assertIn("convert the NSColor? value only when forming borderHex", prompt)
+            self.assertIn("A reset or unconfigured value must produce nil", prompt)
+            self.assertIn("pure helper for this mapping", prompt)
+            self.assertIn("let parsed: NSColor? = NSColor(hex: \"#336699\")", prompt)
+            self.assertIn("verifies the explicit mapping, reset mapping, and unconfigured mapping", prompt)
+            self.assertIn("actual resolved NSSplitView divider color regardless of its source", prompt)
+            self.assertIn("opaque resolved color must always render the overlay without surface occlusion", prompt)
+            self.assertIn("translucent resolved color must preserve the existing occlusion-only policy", prompt)
+            self.assertIn("separate pure helper for this decision", prompt)
+            self.assertIn("Do not require a separate store or a specific architecture or wiring design", prompt)
+            self.assertIn("Do not inspect, infer, or disclose hidden acceptance test contents", prompt)
+            self.assertNotIn("Workspace.applyGhosttyChrome(from:)", prompt)
+
+        unrelated = module.worker_instruction(
+            module.FIXTURES["homebrew-smoke"], "team", "executor"
+        )
+        self.assertNotIn("Keep the two split-divider behaviors independent", unrelated)
+
+    def test_isolated_prompts_forbid_validation_and_controller_owns_focused_test(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        initial = module.isolated_leader_prompt(fixture, final=False)
+        final = module.isolated_leader_prompt(fixture, final=True)
+        for forbidden in (
+            "xcodebuild", "local tests", "xcodebuild -list",
+            "build-for-testing", "test-without-building",
+            "scripts/generate-build-info.sh", "git status", "git diff",
+        ):
+            self.assertIn(forbidden, initial)
+        self.assertNotIn(module.ISOLATED_LEADER_FOCUSED_TEST, final)
+        self.assertIn("controller runs the single fixed focused validation", final)
+        self.assertIn("Do not run xcodebuild, tests, build commands, or any validation", final)
+        self.assertEqual(
+            module.ISOLATED_LEADER_FOCUSED_TEST.count(
+                "-only-testing:termMeshTests/WorkspaceChromeThemeTests"
+            ),
+            1,
+        )
+        self.assertEqual(
+            module.ISOLATED_LEADER_FOCUSED_TEST.count(
+                "-only-testing:termMeshTests/GhosttyTerminalViewComposingTests"
+            ),
+            1,
+        )
+        self.assertEqual(
+            module.ISOLATED_LEADER_FOCUSED_TEST.count(
+                "-only-testing:termMeshTests/TerminalOverrideIsolationTests"
+            ),
+            1,
+        )
+        self.assertEqual(module.ISOLATED_LEADER_FOCUSED_TEST.count("xcodebuild"), 1)
+        self.assertIn("Do not validate in this phase", initial)
+
+    def test_controller_focused_validation_runs_exact_argv_once(self):
+        trace = unittest.mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary, \
+             unittest.mock.patch.object(module, "run_logged", return_value=(True, "passed")) as run:
+            with (Path(temporary) / "validation.log").open("w") as log:
+                passed, duration, reason = module.run_controller_focused_validation(
+                    Path(temporary), log, 30, trace,
+                )
+        self.assertTrue(passed)
+        self.assertEqual(reason, "passed")
+        self.assertGreaterEqual(duration, 0)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(
+            run.call_args.args[0], tuple(shlex.split(module.ISOLATED_LEADER_FOCUSED_TEST)),
+        )
+        self.assertEqual(
+            [call.args[0] for call in trace.write.call_args_list],
+            ["controller_validation_start", "controller_validation_end"],
+        )
+
+    def test_controller_focused_validation_records_product_failure(self):
+        trace = unittest.mock.Mock()
+        reason = "Sources/Workspace.swift:12:4: error: cannot convert value"
+        with tempfile.TemporaryDirectory() as temporary, \
+             unittest.mock.patch.object(module, "run_logged", return_value=(False, reason)):
+            with (Path(temporary) / "validation.log").open("w") as log:
+                passed, _, observed = module.run_controller_focused_validation(
+                    Path(temporary), log, 30, trace,
+                )
+        self.assertFalse(passed)
+        self.assertEqual(observed, reason)
+        end = trace.write.call_args_list[-1]
+        self.assertEqual(end.kwargs["outcome"], "product_failed")
+        self.assertIsNotNone(end.kwargs["failure_fingerprint"])
+        self.assertIn("Workspace.swift", end.kwargs["failure"])
+        self.assertIsNone(end.kwargs["exit_code"])
+
+    def test_controller_focused_validation_records_exit_code(self):
+        trace = unittest.mock.Mock()
+        reason = "xcodebuild failed (65): compile failed"
+        with tempfile.TemporaryDirectory() as temporary, \
+             unittest.mock.patch.object(module, "run_logged", return_value=(False, reason)):
+            with (Path(temporary) / "validation.log").open("w") as log:
+                module.run_controller_focused_validation(Path(temporary), log, 30, trace)
+        self.assertEqual(trace.write.call_args_list[-1].kwargs["exit_code"], 65)
+
+    def test_controller_focused_validation_records_infra_and_timeout(self):
+        cases = (
+            ("You have not agreed to the Xcode license agreements", "infra_invalid"),
+            ("acceptance timeout: xcodebuild", "timeout"),
+        )
+        for reason, outcome in cases:
+            trace = unittest.mock.Mock()
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary, \
+                 unittest.mock.patch.object(module, "run_logged", return_value=(False, reason)):
+                with (Path(temporary) / "validation.log").open("w") as log:
+                    module.run_controller_focused_validation(Path(temporary), log, 30, trace)
+            self.assertEqual(trace.write.call_args_list[-1].kwargs["outcome"], outcome)
+
+    def test_isolated_validation_checker_accepts_only_exact_top_level_focused_test(self):
+        def stream(command):
+            return json.dumps({
+                "type": "assistant", "message": {"content": [{
+                    "type": "tool_use", "name": "Bash",
+                    "input": {"command": command},
+                }]},
+            })
+
+        accepted = (
+            module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd /tmp/repo && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd /tmp/repo-safe_123 && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd '/tmp/repo with spaces' && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            'cd "/tmp/repo with spaces" && ' + module.ISOLATED_LEADER_FOCUSED_TEST,
+        )
+        for command in accepted:
+            with self.subTest(command=command):
+                self.assertEqual(module.isolated_leader_validation_diagnostics("", stream(command)), [])
+
+        rejected = (
+            "echo " + shlex.quote(module.ISOLATED_LEADER_FOCUSED_TEST),
+            "printf '%s\n' " + shlex.quote(module.ISOLATED_LEADER_FOCUSED_TEST),
+            "env CI=1 " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "bash -c " + shlex.quote(module.ISOLATED_LEADER_FOCUSED_TEST),
+            "true; " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            module.ISOLATED_LEADER_FOCUSED_TEST + "; true",
+            module.ISOLATED_LEADER_FOCUSED_TEST + "; " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            'cd "$(pwd)" && ' + module.ISOLATED_LEADER_FOCUSED_TEST,
+            'cd "$(git rev-parse --show-prefix)" && ' + module.ISOLATED_LEADER_FOCUSED_TEST,
+            'cd "`git rev-parse --show-toplevel`" && ' + module.ISOLATED_LEADER_FOCUSED_TEST,
+            'cd /tmp/$(whoami) && ' + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd /tmp/* && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd /tmp/? && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd /tmp/[ab] && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd /tmp/{a,b} && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd ~ && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd '/tmp/$repo' && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+            "cd '/tmp/\\repo' && " + module.ISOLATED_LEADER_FOCUSED_TEST,
+        )
+        for command in rejected:
+            with self.subTest(command=command):
+                diagnostics = module.isolated_leader_validation_diagnostics("", stream(command))
+                self.assertIn("isolated leader final used non-focused xcodebuild command", diagnostics)
+                self.assertIn("isolated leader focused test did not run", diagnostics)
+
+    def test_isolated_validation_checker_records_forbidden_initial_validation(self):
+        initial = json.dumps({
+            "type": "assistant", "message": {"content": [{
+                "type": "tool_use", "name": "Bash",
+                "input": {"command": "git status; xcodebuild -list"},
+            }]},
+        })
+        final = json.dumps({
+            "type": "assistant", "message": {"content": [{
+                "type": "tool_use", "name": "Bash",
+                "input": {"command": module.ISOLATED_LEADER_FOCUSED_TEST},
+            }]},
+        })
+        diagnostics = module.isolated_leader_validation_diagnostics(initial, final)
+        self.assertIn("isolated leader initial used forbidden command: git-status", diagnostics)
+        self.assertIn("isolated leader initial used forbidden command: xcodebuild-list", diagnostics)
+
+    def test_isolated_validation_checker_prefers_unsafe_wire_command(self):
+        event = {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use", "id": "tool-1", "name": "Bash",
+                "input": {"command": module.ISOLATED_LEADER_FOCUSED_TEST},
+            }]},
+            "wire_tool_inputs": {"tool-1": {
+                "command": module.ISOLATED_LEADER_FOCUSED_TEST + " 2>&1 | tail -20",
+            }},
+        }
+        diagnostics = module.isolated_leader_validation_diagnostics("", json.dumps(event))
+        self.assertIn("isolated leader final used non-focused xcodebuild command", diagnostics)
+        self.assertIn("isolated leader focused test did not run", diagnostics)
+
+    def test_isolated_validation_checker_falls_back_when_wire_map_is_malformed(self):
+        event = {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use", "id": "tool-1", "name": "Bash",
+                "input": {"command": module.ISOLATED_LEADER_FOCUSED_TEST},
+            }]},
+            "wire_tool_inputs": {"tool-1": "malformed"},
+        }
+        self.assertEqual(
+            module.isolated_leader_validation_diagnostics("", json.dumps(event)), [],
+        )
+
+    def test_isolated_validation_diagnostic_does_not_replace_product_status(self):
+        record = module.RunResult(
+            run_id="product", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-blocking", order=1, started_at=module.utc_now(),
+            status="failed", acceptance_passed=False, failure_reason="product failure",
+        )
+        module.add_protocol_diagnostic(record, "isolated leader focused test ran 2 times")
+        self.assertEqual(record.status, "failed")
+        self.assertEqual(record.failure_reason, "product failure")
+        self.assertTrue(record.protocol_degraded)
+
+    def test_isolated_harness_generates_build_info_once_immediately_before_final_prompt(self):
+        source = SCRIPT.read_text()
+        function = source[
+            source.index("def run_isolated_topology_one"):
+            source.index("def run_policy_one")
+        ]
+        self.assertEqual(function.count('("bash", "scripts/generate-build-info.sh")'), 1)
+        generated = function.index('("bash", "scripts/generate-build-info.sh")')
+        final_prompt = function.index("isolated_leader_prompt(fixture, final=True")
+        self.assertLess(generated, final_prompt)
+        self.assertIn("build_info_generated=True", function)
+
+    def test_partitioned_worker_capsules_have_disjoint_exact_paths(self):
+        tasks = module.partitioned_worker_tasks(module.FIXTURES["split-divider-color"])
+        scopes = [set(task["owned"]) for task in tasks]
+        self.assertEqual(len(tasks), 3)
+        for left in range(len(scopes)):
+            for right in range(left):
+                self.assertFalse(scopes[left] & scopes[right])
+        self.assertEqual(sum(task["mutates"] for task in tasks), 1)
+        self.assertTrue(all("all other repository paths" in task["forbidden"] for task in tasks))
+        self.assertTrue(all(task["strict_scope"] for task in tasks))
+        broad = module.worker_instruction(module.FIXTURES["split-divider-color"], "team", "explorer")
+        strict = module.worker_instruction(
+            module.FIXTURES["split-divider-color"], "team", "explorer", tasks[0],
+        )
+        self.assertIn("필요한 repository path를 읽고 검색할 수 있다", broad)
+        self.assertIn("exact path로 제한", strict)
+
+    def test_partition_summary_uses_only_complete_pairs(self):
+        rows = []
+        for trial in range(1, 4):
+            for condition, wall in (("broad", 1200), ("partitioned", 800)):
+                rows.append({
+                    "run_id": f"{trial}-{condition}", "fixture": "split-divider-color",
+                    "trial": trial, "condition": condition, "total_wall_ms": wall,
+                    "worker_active_critical_path_ms": wall / 2, "acceptance_passed": True,
+                    "infra_invalid": False, "protocol_degraded": False,
+                })
+        summary = module.summarize_partition(rows, seed=7)
+        self.assertEqual(summary["latency_pairs"], 3)
+        self.assertEqual(summary["median_speedup"], 1.5)
+        rows[0]["protocol_degraded"] = True
+        self.assertEqual(module.summarize_partition(rows, seed=7)["latency_pairs"], 2)
 
     def test_policy_matrix_counterbalances_legacy_and_adaptive(self):
         specs = module.build_policy_matrix(("homebrew-smoke",), 3, 42)
@@ -269,7 +952,8 @@ end
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary) / "checkout"
             checkout.mkdir()
-            env, guard_root = module.benchmark_agent_environment(checkout)
+            with unittest.mock.patch.object(module, "tm_environment", return_value={}):
+                env, guard_root = module.benchmark_agent_environment(checkout)
             hook = Path(env["GIT_TEMPLATE_DIR"]) / "hooks/pre-push"
             syntax = subprocess.run(
                 ("bash", "-n", str(hook)), capture_output=True, text=True, check=False,
@@ -295,7 +979,8 @@ end
             root = Path(temporary)
             checkout = root / "checkout"
             subprocess.run(("git", "init", "-q", str(checkout)), check=True)
-            env, _ = module.benchmark_agent_environment(checkout)
+            with unittest.mock.patch.object(module, "tm_environment", return_value={}):
+                env, _ = module.benchmark_agent_environment(checkout)
             configured = subprocess.run(
                 ("git", "config", "--get", "core.hooksPath"), cwd=checkout,
                 env=env, capture_output=True, text=True, check=True,
@@ -305,6 +990,8 @@ end
     def test_benchmark_environment_rejects_stale_socket_aliases(self):
         old = dict(module.os.environ)
         try:
+            for key in ("TERMMESH_SOCKET", "TERMMESH_DAEMON_SOCKET"):
+                module.os.environ.pop(key, None)
             module.os.environ.update({
                 "TERMMESH_SOCKET_PATH": "/tmp/gui.sock",
                 "TERMMESH_DAEMON_UNIX_PATH": "/tmp/daemon.sock",
@@ -319,17 +1006,19 @@ end
             module.os.environ.clear()
             module.os.environ.update(old)
 
-    def test_benchmark_agent_environment_routes_leader_to_headless_daemon(self):
+    def test_benchmark_agent_environment_routes_explicit_canonical_endpoints(self):
         old = dict(module.os.environ)
         try:
+            for key in ("TERMMESH_SOCKET", "TERMMESH_DAEMON_SOCKET"):
+                module.os.environ.pop(key, None)
             with tempfile.TemporaryDirectory() as temporary:
                 app = Path(temporary) / "gui-app.sock"
                 daemon = Path(temporary) / "headless-daemon.sock"
                 app.touch()
                 daemon.touch()
                 module.os.environ.update({
-                    "TERMMESH_SOCKET_PATH": str(app),
-                    "TERMMESH_DAEMON_UNIX_PATH": str(daemon),
+                    "TERMMESH_SOCKET": str(app),
+                    "TERMMESH_DAEMON_SOCKET": str(daemon),
                     "TERMMESH_WORKSPACE_ID": "gui-workspace",
                 })
                 checkout = Path(temporary) / "checkout"
@@ -394,8 +1083,26 @@ end
     def test_divider_fixture_uses_behavior_hidden_tests_not_solution_test_files(self):
         fixture = module.FIXTURES["split-divider-color"]
         self.assertEqual(fixture.oracle_files, ())
-        self.assertEqual(len(fixture.hidden_tests), 3)
+        self.assertEqual(len(fixture.hidden_tests), 2)
         self.assertTrue(all(source.endswith(".swift.inc") for _, source in fixture.hidden_tests))
+
+    def test_divider_fixture_never_appends_hidden_code_to_production_sources(self):
+        fixture = module.FIXTURES["split-divider-color"]
+        self.assertTrue(
+            all(target.startswith("termMeshTests/") for target, _ in fixture.hidden_tests)
+        )
+        private_production_symbols = (
+            "SplitDividerOverlayView",
+            "DividerSegment",
+            "collectDividerSegments",
+            "hostedFramesLikelyToOccludeDividers",
+            "shouldRenderOverlay",
+            "overlayDividerColor",
+        )
+        for _, source in fixture.hidden_tests:
+            hidden_source = (ROOT / source).read_text()
+            for symbol in private_production_symbols:
+                self.assertNotIn(symbol, hidden_source)
 
     def test_xcode_failure_summary_keeps_actionable_diagnostics(self):
         output = "\n".join((
@@ -411,6 +1118,26 @@ end
         source = SCRIPT.read_text()
         function = source[source.index("def run_divider_acceptance"):source.index("def run_acceptance")]
         self.assertGreaterEqual(function.count("scripts/generate-build-info.sh"), 2)
+        self.assertIn("scripts/check-ghostty-kit.sh", function)
+        self.assertNotIn("scripts/setup.sh", function)
+        self.assertGreaterEqual(function.count("-clonedSourcePackagesDirPath"), 1)
+        self.assertGreaterEqual(function.count("-disableAutomaticPackageResolution"), 1)
+        self.assertGreaterEqual(function.count("-derivedDataPath"), 1)
+        self.assertIn("REMOTE_BENCH_PATH", function)
+        self.assertIn("git --version", function)
+        self.assertLess(function.index("fixture_preflight"), function.index("check-ghostty-kit.sh"))
+
+    def test_remote_fixture_preflight_checks_both_shas_against_expected(self):
+        command = module.remote_fixture_preflight_command("abc123")
+        self.assertIn("git rev-parse HEAD:ghostty", command)
+        self.assertIn("git -C ghostty rev-parse HEAD", command)
+        self.assertIn('[ \"$parent_ghostty\" = \"$expected_ghostty\" ]', command)
+        self.assertIn('[ \"$submodule_ghostty\" = \"$expected_ghostty\" ]', command)
+        self.assertIn("remote fixture metadata invalid", command)
+        syntax = subprocess.run(
+            ["/bin/sh", "-n"], input=command, text=True, capture_output=True,
+        )
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
 
     def test_stream_parser_uses_result_usage_and_cost(self):
         stream = json.dumps({
@@ -597,10 +1324,11 @@ end
         command = popen.call_args.args[0]
         self.assertEqual(command[2], "explorer")
         self.assertIn("task id: inspect", command[3])
-        self.assertEqual(module.dispatch_benchmark_workers(
-            module.FIXTURES["homebrew-smoke"], "bench-test", Path("/tmp/checkout"),
-            trace, tasks=[],
-        ), 0)
+        with unittest.mock.patch.object(module, "tm_environment", return_value={}):
+            self.assertEqual(module.dispatch_benchmark_workers(
+                module.FIXTURES["homebrew-smoke"], "bench-test", Path("/tmp/checkout"),
+                trace, tasks=[],
+            ), 0)
 
     def test_policy_run_declares_a_routing_decision_artifact(self):
         source = SCRIPT.read_text()
@@ -668,6 +1396,648 @@ end
             self.assertEqual(headers.count("STATUS: DONE"), 3)
             self.assertNotIn("STATUS: BLOCKED", headers)
 
+    def test_controller_returns_after_first_worker_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files = [root / "first.result", root / "second.result"]
+
+            def publish_result() -> None:
+                time.sleep(0.03)
+                files[0].write_text("STATUS: DONE\nNEXT: leader reviews\n")
+
+            publisher = threading.Thread(target=publish_result)
+            publisher.start()
+            headers, elapsed_ms, ready = module.wait_for_first_worker_result(files, timeout=1)
+            publisher.join()
+            self.assertEqual(ready, 1)
+            self.assertIn("STATUS: DONE", headers)
+            self.assertLess(elapsed_ms, 500)
+
+    def test_read_overlap_normalizes_repo_paths_and_reports_jaccard(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            checkout.mkdir()
+            transcript = Path(temporary) / "session.jsonl"
+            transcript.write_text("\n".join((
+                json.dumps({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": str(checkout / "Sources/A.swift")}},
+                    {"type": "tool_use", "name": "Grep", "input": {"path": str(checkout / "Sources")}},
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": "/tmp/outside"}},
+                ]}}),
+                json.dumps({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "sed -n 1,20p Sources/A.swift"}},
+                ]}}),
+                json.dumps({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "sed -n '1,20p Sources/A.swift"}},
+                ]}}),
+                "not-json",
+            )) + "\n")
+            (checkout / "Sources").mkdir()
+            (checkout / "Sources/A.swift").touch()
+            result = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(result["status"], "censored")
+            self.assertEqual(result["distinct_reads"], ["Sources/A.swift"])
+            self.assertEqual(result["distinct_search_roots"], ["Sources", "Sources/A.swift"])
+            self.assertEqual(result["malformed_rows"], 1)
+            self.assertNotIn("/tmp/outside", json.dumps(result))
+            module.validate_access_scope(result, ("Sources", "Sources/A.swift"), "fixture")
+            with self.assertRaisesRegex(RuntimeError, "outside owned scope"):
+                module.validate_access_scope(result, ("Sources",), "fixture")
+
+    def test_read_telemetry_is_measured_only_with_complete_path_coverage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            (checkout / "Sources").mkdir(parents=True)
+            (checkout / "Sources/A.swift").touch()
+            transcript = Path(temporary) / "session.jsonl"
+            transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash",
+                 "input": {"command": "cd Sources && sed -n 1,20p A.swift"}},
+            ]}}) + "\n")
+            measured = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(measured["status"], "measured")
+            self.assertEqual(measured["distinct_access_paths"], ["Sources/A.swift"])
+            self.assertEqual(measured["path_extraction_coverage"], 1.0)
+
+            transcript.write_text("\n".join((
+                transcript.read_text().strip(),
+                json.dumps({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Bash",
+                     "input": {"command": "cd $TARGET && sed -n 1,20p *.swift"}},
+                    {"type": "tool_use", "name": "NotebookRead", "input": {}},
+                ]}}),
+            )) + "\n")
+            censored = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(censored["status"], "censored")
+            self.assertEqual(censored["unknown_tool_calls"], 1)
+            self.assertGreaterEqual(censored["unresolved_shell_paths"], 1)
+            self.assertLess(censored["path_extraction_coverage"], 1.0)
+
+    def test_write_tools_are_not_unknown_read_tools(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            checkout.mkdir()
+            transcript = Path(temporary) / "session.jsonl"
+            transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Edit", "input": {"file_path": str(checkout / "Sources/A.swift")}},
+                {"type": "tool_use", "name": "Write", "input": {"file_path": str(checkout / "Sources/B.swift")}},
+            ]}}) + "\n")
+            result = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(result["unknown_tool_calls"], 0)
+            self.assertEqual(result["write_paths"], ["Sources/A.swift", "Sources/B.swift"])
+            self.assertEqual(result["write_path_unresolved"], 0)
+
+    def test_bash_glob_and_shell_variable_are_not_concrete_reads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            checkout.mkdir()
+            transcript = Path(temporary) / "session.jsonl"
+            transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {
+                    "command": "grep -rn pattern Sources/*.swift && cd $TARGET && sed -n '1,2p' Sources/A.swift"
+                }},
+            ]}}) + "\n")
+            result = module.claude_read_paths(transcript, checkout)
+            self.assertIn("Sources/*.swift", result["path_patterns"])
+            self.assertGreaterEqual(result["unresolved_shell_paths"], 1)
+            self.assertNotIn("Sources/*.swift", result["distinct_access_paths"])
+
+    def test_bash_parser_uses_only_read_command_operands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            checkout.mkdir()
+            transcript = Path(temporary) / "session.jsonl"
+            commands = [
+                "cd Sources && sed -n '1,20p' Deleted.swift",
+                "rg -n --glob '*.swift' 'actor|Workspace' Sources termMeshTests",
+                "grep -rn -e needle --include '*.md' docs README.md",
+                "cat Makefile > /tmp/captured && head -n 3 README.md",
+                "find Sources -name '*.swift' -print",
+                "wc -l Sources/A.swift && ls -la tests",
+                "TARGET=Sources echo Sources/Fake.swift && printf '%s' docs/Fake.md",
+                "rg needle $TARGET && cat /tmp/outside",
+            ]
+            transcript.write_text("\n".join(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": command}},
+            ]}}) for command in commands) + "\n")
+            result = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(result["distinct_access_paths"], [
+                "Makefile", "README.md", "Sources", "Sources/A.swift",
+                "Sources/Deleted.swift", "docs", "termMeshTests", "tests",
+            ])
+            self.assertEqual(result["path_patterns"], [])
+            self.assertEqual(result["unresolved_shell_paths"], 1)
+            serialized = json.dumps(result)
+            self.assertNotIn("Fake.swift", serialized)
+            self.assertNotIn("Fake.md", serialized)
+            self.assertNotIn("captured", serialized)
+            self.assertNotIn("tmp/outside", serialized)
+
+    def test_bash_dynamic_file_read_structures_are_censored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            checkout.mkdir()
+            commands = [
+                "for file in Sources/*.swift; do sed -n '1p' \"$file\"; done",
+                "find Sources -name '*.swift' -print0 | xargs -0 cat",
+                "awk '{ print $1 }' Sources/A.swift",
+                "python3 -c \"print(open('Sources/A.swift').read())\"",
+                "files=$(find Sources -name '*.swift') && printf '%s' \"$files\"",
+                "first=`head -n 1 Sources/A.swift` && echo \"$first\"",
+                "source scripts/read-config.sh",
+            ]
+            for index, command in enumerate(commands):
+                with self.subTest(command=command):
+                    transcript = Path(temporary) / f"dynamic-{index}.jsonl"
+                    transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+                        {"type": "tool_use", "name": "Bash", "input": {"command": command}},
+                    ]}}) + "\n")
+                    result = module.claude_read_paths(transcript, checkout)
+                    self.assertEqual(result["status"], "censored")
+                    self.assertGreaterEqual(result["unresolved_shell_paths"], 1)
+
+    def test_bash_harmless_and_supported_commands_remain_measured(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "repo"
+            checkout.mkdir()
+            transcript = Path(temporary) / "harmless.jsonl"
+            commands = [
+                "true",
+                "echo Sources/Fake.swift",
+                "printf '%s\\n' Sources/Fake.swift > /tmp/output",
+                "python3 -m unittest tests.test_bench_agent_effectiveness",
+                "xcodebuild -scheme term-mesh -configuration Debug build",
+                "sed -n '1,2p' Sources/A.swift",
+            ]
+            transcript.write_text("\n".join(json.dumps({
+                "type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": command}},
+                ]},
+            }) for command in commands) + "\n")
+            result = module.claude_read_paths(transcript, checkout)
+            self.assertEqual(result["status"], "measured")
+            self.assertEqual(result["unresolved_shell_paths"], 0)
+            self.assertEqual(result["distinct_access_paths"], ["Sources/A.swift"])
+
+    def test_integrate_worker_patches_includes_untracked_binary_files_and_checks_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "leader"
+            worker = root / "worker"
+            subprocess.run(("git", "init", str(checkout)), check=True, capture_output=True)
+            (checkout / "base.txt").write_text("base\n")
+            subprocess.run(("git", "-C", str(checkout), "add", "base.txt"), check=True)
+            subprocess.run(("git", "-C", str(checkout), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.com", "commit", "-m", "base"),
+                           check=True, capture_output=True)
+            subprocess.run(("git", "clone", str(checkout), str(worker)), check=True, capture_output=True)
+            (worker / "asset.bin").write_bytes(b"\x00\xffbinary")
+            tasks = [{"worker": "executor", "owned": ["asset.bin"]}]
+            integrated = module.integrate_worker_patches(checkout, {"executor": worker}, tasks)
+            self.assertEqual(integrated, ["asset.bin"])
+            self.assertEqual((checkout / "asset.bin").read_bytes(), b"\x00\xffbinary")
+
+            (worker / "forbidden.txt").write_text("no\n")
+            with self.assertRaisesRegex(RuntimeError, "forbidden paths"):
+                module.integrate_worker_patches(checkout, {"executor": worker}, tasks)
+
+    def test_integrate_worker_patches_uses_task_order(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "leader"
+            subprocess.run(("git", "init", str(checkout)), check=True, capture_output=True)
+            (checkout / "base.txt").write_text("base\n")
+            subprocess.run(("git", "-C", str(checkout), "add", "base.txt"), check=True)
+            subprocess.run((
+                "git", "-C", str(checkout), "-c", "user.name=Test",
+                "-c", "user.email=test@example.com", "commit", "-m", "base",
+            ), check=True, capture_output=True)
+            workdirs = {}
+            tasks = []
+            for worker, filename in (("executor", "a.txt"), ("explorer", "b.txt"), ("reviewer", "c.txt")):
+                path = root / worker
+                subprocess.run(("git", "clone", str(checkout), str(path)), check=True, capture_output=True)
+                (path / filename).write_text(worker + "\n")
+                workdirs[worker] = path
+                tasks.append({"worker": worker, "owned": [filename]})
+            reversed_workdirs = dict(reversed(tuple(workdirs.items())))
+            self.assertEqual(
+                module.integrate_worker_patches(checkout, reversed_workdirs, tasks),
+                ["a.txt", "b.txt", "c.txt"],
+            )
+
+    def test_write_patch_preserves_eof_and_applies_to_clean_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "candidate"
+            clean = root / "clean"
+            subprocess.run(("git", "init", str(checkout)), check=True, capture_output=True)
+            (checkout / "tracked.txt").write_bytes(b"base without newline")
+            subprocess.run(("git", "-C", str(checkout), "add", "tracked.txt"), check=True)
+            subprocess.run((
+                "git", "-C", str(checkout), "-c", "user.name=Test",
+                "-c", "user.email=test@example.com", "commit", "-m", "base",
+            ), check=True, capture_output=True)
+            subprocess.run(("git", "clone", str(checkout), str(clean)), check=True, capture_output=True)
+            (checkout / "tracked.txt").write_bytes(b"changed without newline")
+            (checkout / "new.bin").write_bytes(b"\x00\xffnew binary")
+            patch = root / "candidate.patch"
+
+            self.assertEqual(module.write_patch(checkout, patch), 2)
+            self.assertTrue(patch.read_bytes().endswith(b"\n"))
+            checked = subprocess.run(
+                ("git", "apply", "--check", "--binary", str(patch)),
+                cwd=clean, capture_output=True, text=True,
+            )
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_censored_read_telemetry_does_not_replace_acceptance_failure(self):
+        record = module.RunResult(
+            run_id="failed", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            status="failed", acceptance_passed=False, failure_reason="product compile error",
+        )
+        telemetry = {
+            "status": "censored",
+            "roles": {"executor": {"distinct_access_paths": ["Sources/A.swift"]}},
+        }
+        tasks = [{"worker": "executor", "owned": ["Sources/A.swift"]}]
+        with unittest.mock.patch.object(module, "benchmark_read_overlap", return_value=telemetry), \
+             unittest.mock.patch.object(module, "claude_session_path", return_value=None):
+            module.collect_isolated_read_diagnostics(
+                record, team="team", checkout=Path("/tmp/checkout"),
+                tasks=tasks, session_id="session",
+            )
+
+        self.assertEqual(record.status, "failed")
+        self.assertFalse(record.acceptance_passed)
+        self.assertEqual(record.failure_reason, "product compile error")
+        self.assertFalse(record.protocol_degraded)
+        self.assertEqual(record.read_overlap["status"], "censored")
+
+    def test_censored_read_telemetry_does_not_fail_passed_product(self):
+        record = module.RunResult(
+            run_id="passed", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            status="passed", acceptance_passed=True,
+        )
+        with unittest.mock.patch.object(
+            module, "benchmark_read_overlap", return_value={"status": "censored", "roles": {}},
+        ), unittest.mock.patch.object(module, "claude_session_path", return_value=None):
+            module.collect_isolated_read_diagnostics(
+                record, team="team", checkout=Path("/tmp/checkout"),
+                tasks=[], session_id="session",
+            )
+
+        self.assertEqual(record.status, "passed")
+        self.assertTrue(record.acceptance_passed)
+        self.assertIsNone(record.failure_reason)
+        self.assertFalse(record.protocol_degraded)
+
+    def test_unavailable_read_telemetry_stays_optional(self):
+        record = module.RunResult(
+            run_id="passed", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+            status="passed", acceptance_passed=True,
+        )
+        with unittest.mock.patch.object(
+            module, "benchmark_worker_runtime_metrics", return_value={"status": "partial", "roles": {}},
+        ), unittest.mock.patch.object(
+            module, "benchmark_read_overlap", side_effect=RuntimeError("missing transcript"),
+        ):
+            module.collect_isolated_read_diagnostics(
+                record, team="team", checkout=Path("/tmp/checkout"), tasks=[], session_id="session",
+            )
+        self.assertFalse(record.protocol_degraded)
+        self.assertEqual(record.read_overlap["status"], "unavailable")
+        self.assertIn("missing transcript", record.read_overlap["diagnostics"][0])
+
+    def test_isolated_experiment_stops_and_preserves_scratch_after_unsafe_cleanup(self):
+        unsafe = module.RunResult(
+            run_id="unsafe", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-blocking", order=1, started_at=module.utc_now(),
+            cleanup_safe=False, cleanup_reason="collector alive",
+        )
+        args = unittest.mock.Mock(
+            fixtures="split-divider-color", conditions="isolated-blocking,isolated-overlap",
+            trials=1, timeout=60, dry_run=False, run_id="unsafe-run", results_dir=Path("unused"),
+            model="sonnet", effort="medium", seed=42, xcode_host="mac-sub", keep_checkouts=False,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            args.results_dir = Path(temporary) / "results"
+            scratch = Path(temporary) / "scratch"
+            scratch.mkdir()
+            with unittest.mock.patch.object(module.tempfile, "mkdtemp", return_value=str(scratch)), \
+                 unittest.mock.patch.object(module, "git", return_value="head"), \
+                 unittest.mock.patch.object(module, "validate_fixture_metadata", return_value=[]), \
+                 unittest.mock.patch.object(module, "remote_paid_study_preflight", return_value=(True, "ready")), \
+                 unittest.mock.patch.object(module, "run_isolated_topology_one", return_value=unsafe) as runner:
+                self.assertEqual(module.run_isolated_topology_experiment(args), 1)
+            self.assertEqual(runner.call_count, 1)
+            self.assertTrue(scratch.exists())
+
+    def test_isolated_experiment_removes_scratch_after_safe_result(self):
+        safe = module.RunResult(
+            run_id="safe", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-blocking", order=1, started_at=module.utc_now(),
+            status="passed", acceptance_passed=True, cleanup_safe=True, total_wall_ms=1,
+        )
+        args = unittest.mock.Mock(
+            fixtures="split-divider-color", conditions="isolated-blocking",
+            trials=1, timeout=60, dry_run=False, run_id="safe-run", results_dir=Path("unused"),
+            model="sonnet", effort="medium", seed=42, xcode_host="mac-sub", keep_checkouts=False,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            args.results_dir = Path(temporary) / "results"
+            scratch = Path(temporary) / "scratch"
+            scratch.mkdir()
+            with unittest.mock.patch.object(module.tempfile, "mkdtemp", return_value=str(scratch)), \
+                 unittest.mock.patch.object(module, "git", return_value="head"), \
+                 unittest.mock.patch.object(module, "validate_fixture_metadata", return_value=[]), \
+                 unittest.mock.patch.object(module, "remote_paid_study_preflight", return_value=(True, "ready")), \
+                 unittest.mock.patch.object(module, "run_isolated_topology_one", return_value=safe):
+                self.assertEqual(module.run_isolated_topology_experiment(args), 0)
+            self.assertFalse(scratch.exists())
+
+    def test_partial_isolated_worktree_creation_rolls_back(self):
+        checkout = Path("/tmp/integration")
+        calls = []
+        def run(args, **kwargs):
+            calls.append(tuple(args))
+            return subprocess.CompletedProcess(args, 1 if "executor" in str(args) else 0, "", "boom")
+        with unittest.mock.patch.object(module, "run_command", side_effect=run), \
+             unittest.mock.patch.object(module, "cleanup_isolated_worker_checkouts") as cleanup:
+            with self.assertRaisesRegex(RuntimeError, "worker worktree create failed"):
+                module.create_isolated_worker_checkouts(checkout)
+            cleanup.assert_called_once()
+            self.assertIn("explorer", cleanup.call_args.args[1])
+
+    def test_cleanup_isolated_worker_checkouts_reports_remove_failure(self):
+        responses = [
+            subprocess.CompletedProcess([], 1, "", "remove boom"),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with unittest.mock.patch.object(module, "run_command", side_effect=responses):
+            with self.assertRaisesRegex(module.BenchmarkWorktreeCleanupError, "remove boom"):
+                module.cleanup_isolated_worker_checkouts(
+                    Path("/tmp/integration"), {"executor": Path("/tmp/worker")},
+                )
+
+    def test_cleanup_isolated_worker_checkouts_reports_prune_failure(self):
+        responses = [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 1, "", "prune boom"),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+        with unittest.mock.patch.object(module, "run_command", side_effect=responses):
+            with self.assertRaisesRegex(module.BenchmarkWorktreeCleanupError, "prune boom"):
+                module.cleanup_isolated_worker_checkouts(
+                    Path("/tmp/integration"), {"executor": Path("/tmp/worker")},
+                )
+
+    def test_cleanup_rejects_successful_noop_when_worker_path_remains(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            worker = Path(temporary) / "worker"
+            worker.mkdir()
+            responses = [
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with unittest.mock.patch.object(module, "run_command", side_effect=responses):
+                with self.assertRaisesRegex(
+                    module.BenchmarkWorktreeCleanupError, "path remains after cleanup",
+                ):
+                    module.cleanup_isolated_worker_checkouts(Path(temporary), {"executor": worker})
+
+    def test_cleanup_rejects_worker_path_that_remains_registered(self):
+        worker = Path("/tmp/removed-worker").resolve(strict=False)
+        responses = [
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, f"worktree {worker}\nHEAD abc\n", ""),
+        ]
+        with unittest.mock.patch.object(module, "run_command", side_effect=responses):
+            with self.assertRaisesRegex(
+                module.BenchmarkWorktreeCleanupError, "remains registered",
+            ):
+                module.cleanup_isolated_worker_checkouts(
+                    Path("/tmp/integration"), {"executor": worker},
+                )
+
+    def test_cleanup_rejects_broken_worker_symlink_after_successful_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            worker = Path(temporary) / "worker"
+            worker.symlink_to(Path(temporary) / "missing-target")
+            responses = [
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ]
+            with unittest.mock.patch.object(module, "run_command", side_effect=responses):
+                with self.assertRaisesRegex(
+                    module.BenchmarkWorktreeCleanupError, "path remains after cleanup",
+                ):
+                    module.cleanup_isolated_worker_checkouts(
+                        Path(temporary), {"executor": worker},
+                    )
+
+    def test_cleanup_accepts_removed_and_unregistered_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            worker = Path(temporary) / "worker"
+            worker.mkdir()
+            calls = 0
+
+            def run(args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if tuple(args[:4]) == ("git", "worktree", "remove", "--force"):
+                    worker.rmdir()
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with unittest.mock.patch.object(module, "run_command", side_effect=run):
+                module.cleanup_isolated_worker_checkouts(
+                    Path(temporary), {"executor": worker},
+                )
+            self.assertEqual(calls, 3)
+
+    def test_partial_create_preserves_create_and_cleanup_failures(self):
+        checkout = Path("/tmp/integration")
+        with unittest.mock.patch.object(
+            module, "run_command",
+            return_value=subprocess.CompletedProcess([], 1, "", "create boom"),
+        ), unittest.mock.patch.object(
+            module, "cleanup_isolated_worker_checkouts",
+            side_effect=module.BenchmarkWorktreeCleanupError("cleanup boom"),
+        ):
+            with self.assertRaisesRegex(
+                module.BenchmarkWorktreeCleanupError, "create boom.*cleanup boom",
+            ):
+                module.create_isolated_worker_checkouts(checkout)
+
+    def test_worktree_cleanup_failure_marks_run_unsafe_and_preserves_artifacts(self):
+        record = module.RunResult(
+            run_id="cleanup", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-blocking", order=1, started_at=module.utc_now(),
+            status="passed", acceptance_passed=True, total_wall_ms=100,
+        )
+        module.mark_worktree_cleanup_failure(
+            record, module.BenchmarkWorktreeCleanupError("remove failed"),
+        )
+        self.assertFalse(record.cleanup_safe)
+        self.assertTrue(record.infra_invalid)
+        self.assertEqual(record.status, "infra_invalid")
+        self.assertIsNone(record.total_wall_ms)
+        self.assertIn("remove failed", record.cleanup_reason)
+        self.assertFalse(module.isolated_candidate_artifact_allowed(record))
+
+    def test_orchestration_summary_requires_quality_before_promotion(self):
+        rows = []
+        for fixture in module.FIXTURES:
+            for trial in range(1, 4):
+                for condition, wall in (("single", 1200), ("blocking", 1100), ("overlap", 800)):
+                    rows.append({
+                        "run_id": f"{fixture}-{trial}-{condition}", "fixture": fixture,
+                        "trial": trial, "condition": condition, "total_wall_ms": wall,
+                        "acceptance_passed": True, "infra_invalid": False,
+                    })
+        summary = module.summarize_orchestration(rows, seed=7)
+        self.assertTrue(summary["latency_gate_ready"])
+        self.assertFalse(summary["promotion_ready"])
+        self.assertEqual(summary["comparisons"]["single_vs_overlap"]["median_speedup"], 1.5)
+        quality = {"comparisons": [
+            {"fixture": fixture, "trial": trial, "valid_judges": 3, "overlap_regression": False}
+            for fixture in module.FIXTURES for trial in range(1, 4)
+        ]}
+        promoted = module.summarize_orchestration(rows, seed=7, quality=quality)
+        self.assertTrue(promoted["quality_ready"])
+        self.assertTrue(promoted["promotion_ready"])
+        incomplete = module.summarize_orchestration(rows, seed=7, quality={"comparisons": quality["comparisons"][:1]})
+        self.assertFalse(incomplete["quality_ready"])
+        self.assertFalse(incomplete["promotion_ready"])
+        duplicate = module.summarize_orchestration(
+            rows, seed=7, quality={"comparisons": quality["comparisons"] + quality["comparisons"][:1]},
+        )
+        self.assertFalse(duplicate["quality_ready"])
+        degraded_rows = [dict(row) for row in rows]
+        degraded_rows[0]["protocol_degraded"] = True
+        degraded = module.summarize_orchestration(degraded_rows, seed=7, quality=quality)
+        self.assertFalse(degraded["complete_latency_pairs"])
+        self.assertFalse(degraded["latency_gate_ready"])
+
+    def test_read_only_tool_counter_allows_reads_but_rejects_unknown_tools(self):
+        stream = "\n".join((
+            json.dumps({"message": {"content": [
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "Sources/A.swift"}},
+            ]}}),
+            json.dumps({"message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "true"}},
+            ]}}),
+        ))
+        self.assertEqual(module.stream_disallowed_read_only_tool_count(stream), 1)
+        unknown = json.dumps({"message": {"content": [
+            {"type": "tool_use", "name": "EnterWorktree", "input": {}}
+        ]}})
+        self.assertEqual(module.stream_disallowed_read_only_tool_count(unknown), 1)
+
+    def test_worker_wait_can_be_cancelled_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cancel = threading.Event()
+            result = {}
+
+            def wait() -> None:
+                result["value"] = module.wait_for_worker_results(
+                    [Path(temporary) / "never.result"], timeout=10, cancel_event=cancel,
+                    respect_estimates=False,
+                )
+
+            thread = threading.Thread(target=wait)
+            thread.start()
+            cancel.set()
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["value"][2], 0)
+
+    def test_worker_wait_can_ignore_estimate_ceiling_until_global_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result_file = Path(temporary) / "late.result"
+            clock = {"now": 0.0, "sleeps": 0}
+
+            def advance(_: float) -> None:
+                clock["sleeps"] += 1
+                increments = (300.0, 300.0, 300.0, 120.0, 1.0)
+                clock["now"] += increments[min(clock["sleeps"] - 1, 4)]
+                if clock["now"] > 1020 and not result_file.exists():
+                    result_file.write_text("STATUS: DONE\nNEXT: leader integrates\n")
+
+            with unittest.mock.patch.object(
+                module.time, "perf_counter", side_effect=lambda: clock["now"]
+            ), unittest.mock.patch.object(module.time, "sleep", side_effect=advance):
+                headers, elapsed_ms, ready = module.wait_for_worker_results(
+                    [result_file], timeout=1200,
+                    estimated_seconds={result_file: 900}, estimate_grace=120,
+                    respect_estimates=False,
+                )
+
+            self.assertEqual(ready, 1)
+            self.assertGreater(elapsed_ms, 1020000)
+            self.assertIn("STATUS: DONE", headers)
+
+    def test_worker_wait_without_estimate_ceiling_stops_at_global_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            clock = {"now": 0.0}
+
+            def advance(_: float) -> None:
+                clock["now"] = 5.0
+
+            with unittest.mock.patch.object(
+                module.time, "perf_counter", side_effect=lambda: clock["now"]
+            ), unittest.mock.patch.object(module.time, "sleep", side_effect=advance):
+                _, elapsed_ms, ready = module.wait_for_worker_results(
+                    [Path(temporary) / "never.result"], timeout=5,
+                    estimated_seconds={Path(temporary) / "never.result": 1},
+                    estimate_grace=0, respect_estimates=False,
+                )
+
+            self.assertEqual(ready, 0)
+            self.assertEqual(elapsed_ms, 5000)
+
+    def test_isolated_worker_wait_uses_remaining_end_to_end_deadline(self):
+        source = SCRIPT.read_text()
+        function = source[
+            source.index("def run_isolated_topology_one"):
+            source.index("def run_policy_one")
+        ]
+        self.assertIn(
+            "result_files, timeout=require_remaining(), trace=trace", function,
+        )
+        self.assertIn("respect_estimates=False", function)
+        self.assertNotIn("timeout=min(15 * 60, remaining())", function)
+
+        with unittest.mock.patch.object(module.time, "perf_counter", return_value=100.0):
+            self.assertEqual(module.require_time_remaining(1300.0, 1800), 1200.0)
+            with self.assertRaisesRegex(TimeoutError, "end-to-end timeout after 1800s"):
+                module.require_time_remaining(100.0, 1800)
+
+    def test_interval_overlap_uses_actual_start_and_end(self):
+        self.assertEqual(module.interval_overlap_ms(10.0, 20.0, 15.0, 25.0), 5000)
+        self.assertEqual(module.interval_overlap_ms(10.0, 12.0, 15.0, 25.0), 0)
+        with self.assertRaisesRegex(TimeoutError, "end-to-end timeout"):
+            module.require_time_remaining(time.perf_counter() - 1, 10)
+
+    def test_trace_writer_serializes_concurrent_events(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "trace.jsonl"
+            trace = module.TraceWriter(path, "session")
+            threads = [threading.Thread(target=trace.write, args=("event",), kwargs={"worker": index}) for index in range(20)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual([row["seq"] for row in rows], list(range(1, 21)))
+
     def test_worker_instructions_partition_write_ownership(self):
         fixture = module.FIXTURES["homebrew-smoke"]
         explorer = module.worker_instruction(fixture, "bench-test", "explorer")
@@ -693,6 +2063,14 @@ end
         config = command[command.index("--mcp-config") + 1]
         self.assertEqual(json.loads(config), {"mcpServers": {}})
 
+    def test_read_only_leader_command_exposes_only_read_tools(self):
+        command = module.claude_command(
+            "prompt", model="sonnet", effort="medium",
+            session_id="00000000-0000-0000-0000-000000000001",
+            resume=False, condition="multi", tool_free=True,
+        )
+        self.assertEqual(command[command.index("--tools") + 1], "Read,Grep,Glob")
+
     def test_benchmark_team_isolates_all_workers_from_customizations(self):
         with unittest.mock.patch.object(module, "tm_environment", return_value={
             "TERMMESH_SOCKET": "/tmp/app.sock",
@@ -710,6 +2088,80 @@ end
             self.assertIn("--disable-slash-commands", agent["extra_args"])
             self.assertIn("--strict-mcp-config", agent["extra_args"])
         self.assertEqual(params["app_socket_path"], "/tmp/app.sock")
+
+    def test_benchmark_team_can_place_each_worker_in_a_distinct_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); checkout = root / "integration"; checkout.mkdir()
+            workdirs = {role: root / role for role in ("explorer", "executor", "reviewer")}
+            for path in workdirs.values(): path.mkdir()
+            team_dir = root / "uuid"; (team_dir / "agents").mkdir(parents=True)
+            (team_dir / "team.json").write_text(json.dumps({
+                "team_name": "bench", "working_directory": str(checkout),
+            }))
+            for role, path in workdirs.items():
+                (team_dir / "agents" / f"{role}.json").write_text(json.dumps({
+                    "working_directory": str(path),
+                }))
+            with unittest.mock.patch.dict(module.os.environ, {"TERMMESH_HEADLESS_ROOT": str(root)}), \
+                 unittest.mock.patch.object(module, "tm_environment", return_value={
+                     "TERMMESH_SOCKET": "/tmp/app.sock",
+                 }), unittest.mock.patch.object(
+                     module, "daemon_json", side_effect=[
+                         {"name": "bench", "team_uuid": "uuid"},
+                         [{"name": role, "working_directory": str(path)} for role, path in workdirs.items()],
+                     ],
+                 ) as rpc:
+                module.create_benchmark_team("bench", checkout, "sonnet", workdirs)
+        agents = rpc.call_args_list[0].args[1]["agents"]
+        self.assertEqual({row["name"]: row["working_directory"] for row in agents}, {
+            role: str(path) for role, path in workdirs.items()
+        })
+        self.assertEqual(rpc.call_args_list[1].args[:2], (
+            "headless.list", {"team_name": "bench"},
+        ))
+
+    def test_benchmark_team_rejects_collapsed_worker_topology_before_dispatch(self):
+        workdirs = {role: Path(f"/tmp/{role}") for role in ("explorer", "executor", "reviewer")}
+        collapsed = [
+            {"name": role, "working_directory": "/tmp/integration"}
+            for role in workdirs
+        ]
+        with unittest.mock.patch.object(module, "tm_environment", return_value={
+            "TERMMESH_SOCKET": "/tmp/app.sock",
+        }), unittest.mock.patch.object(
+            module, "daemon_json", side_effect=[
+                {"name": "bench", "team_uuid": "uuid"}, collapsed,
+            ],
+        ):
+            with self.assertRaisesRegex(module.BenchmarkInfrastructureError, "topology mismatch"):
+                module.create_benchmark_team(
+                    "bench", Path("/tmp/integration"), "sonnet", workdirs,
+                )
+
+    def test_benchmark_team_rejects_persisted_cwd_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); checkout = root / "integration"; checkout.mkdir()
+            workdirs = {role: root / role for role in ("explorer", "executor", "reviewer")}
+            for path in workdirs.values(): path.mkdir()
+            team_dir = root / "uuid"; (team_dir / "agents").mkdir(parents=True)
+            (team_dir / "team.json").write_text(json.dumps({
+                "team_name": "bench", "working_directory": str(checkout),
+            }))
+            for role in workdirs:
+                (team_dir / "agents" / f"{role}.json").write_text(json.dumps({
+                    "working_directory": str(checkout),
+                }))
+            live = [{"name": role, "working_directory": str(path)} for role, path in workdirs.items()]
+            with unittest.mock.patch.dict(module.os.environ, {"TERMMESH_HEADLESS_ROOT": str(root)}), \
+                 unittest.mock.patch.object(module, "tm_environment", return_value={
+                     "TERMMESH_SOCKET": "/tmp/app.sock",
+                 }), unittest.mock.patch.object(
+                     module, "daemon_json", side_effect=[
+                         {"name": "bench", "team_uuid": "uuid"}, live,
+                     ],
+                 ):
+                with self.assertRaisesRegex(module.BenchmarkInfrastructureError, "persisted topology mismatch"):
+                    module.create_benchmark_team("bench", checkout, "sonnet", workdirs)
 
     def test_usage_delta_clamps_agent_resets(self):
         before = {key: 10 for key in module.TOKEN_KEYS}
@@ -819,23 +2271,87 @@ end
         self.assertEqual(span, 15000)
         self.assertEqual(utilization, 0.667)
 
-    def test_headless_tm_environment_uses_daemon_not_gui_socket(self):
+    def test_headless_tm_environment_normalizes_aliases_to_canonical_endpoints(self):
         old = dict(module.os.environ)
         try:
+            for key in ("TERMMESH_SOCKET", "TERMMESH_DAEMON_SOCKET"):
+                module.os.environ.pop(key, None)
             with tempfile.TemporaryDirectory() as temporary:
                 app = Path(temporary) / "app.sock"
                 daemon = Path(temporary) / "daemon.sock"
                 app.touch()
                 daemon.touch()
                 module.os.environ.update({
-                    "TERMMESH_SOCKET_PATH": str(app),
-                    "TERMMESH_DAEMON_UNIX_PATH": str(daemon),
+                    "TERMMESH_SOCKET": str(app),
+                    "TERMMESH_DAEMON_SOCKET": str(daemon),
                     "TERMMESH_WORKSPACE_ID": "workspace",
                 })
                 env = module.tm_environment()
                 self.assertEqual(env["TERMMESH_SOCKET"], str(app))
                 self.assertEqual(env["TERMMESH_DAEMON_SOCKET"], str(daemon))
                 self.assertNotIn("TERMMESH_WORKSPACE_ID", env)
+        finally:
+            module.os.environ.clear()
+            module.os.environ.update(old)
+
+    def test_benchmark_canonical_sockets_override_inherited_aliases(self):
+        old = dict(module.os.environ)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                app = root / "tagged-app.sock"; app.touch()
+                daemon = root / "tagged-daemon.sock"; daemon.touch()
+                inherited_app = root / "parent-app.sock"; inherited_app.touch()
+                inherited_daemon = root / "parent-daemon.sock"; inherited_daemon.touch()
+                module.os.environ.update({
+                    "TERMMESH_SOCKET": str(app),
+                    "TERMMESH_SOCKET_PATH": str(inherited_app),
+                    "TERMMESH_DAEMON_SOCKET": str(daemon),
+                    "TERMMESH_DAEMON_UNIX_PATH": str(inherited_daemon),
+                })
+                env = module.tm_environment()
+                self.assertEqual(env["TERMMESH_SOCKET"], str(app))
+                self.assertEqual(env["TERMMESH_SOCKET_PATH"], str(app))
+                self.assertEqual(env["TERMMESH_DAEMON_SOCKET"], str(daemon))
+                self.assertEqual(env["TERMMESH_DAEMON_UNIX_PATH"], str(daemon))
+        finally:
+            module.os.environ.clear()
+            module.os.environ.update(old)
+
+    def test_missing_explicit_canonical_socket_does_not_fall_back_to_live_alias(self):
+        old = dict(module.os.environ)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                alias_app = root / "parent-app.sock"; alias_app.touch()
+                alias_daemon = root / "parent-daemon.sock"; alias_daemon.touch()
+                module.os.environ.update({
+                    "TERMMESH_SOCKET": str(root / "missing-tagged-app.sock"),
+                    "TERMMESH_SOCKET_PATH": str(alias_app),
+                    "TERMMESH_DAEMON_SOCKET": str(root / "missing-tagged-daemon.sock"),
+                    "TERMMESH_DAEMON_UNIX_PATH": str(alias_daemon),
+                })
+                with self.assertRaisesRegex(RuntimeError, "app socket"):
+                    module.tm_environment()
+        finally:
+            module.os.environ.clear()
+            module.os.environ.update(old)
+
+    def test_alias_only_environment_is_rejected_even_when_aliases_are_live(self):
+        old = dict(module.os.environ)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                alias_app = root / "parent-app.sock"; alias_app.touch()
+                alias_daemon = root / "parent-daemon.sock"; alias_daemon.touch()
+                for key in ("TERMMESH_SOCKET", "TERMMESH_DAEMON_SOCKET"):
+                    module.os.environ.pop(key, None)
+                module.os.environ.update({
+                    "TERMMESH_SOCKET_PATH": str(alias_app),
+                    "TERMMESH_DAEMON_UNIX_PATH": str(alias_daemon),
+                })
+                with self.assertRaisesRegex(RuntimeError, "app socket"):
+                    module.tm_environment()
         finally:
             module.os.environ.clear()
             module.os.environ.update(old)
@@ -862,6 +2378,54 @@ end
         self.assertFalse(module.classify_infra_failure(
             "remote Xcode acceptance failed: TerminalOverrideIsolationTests failed"
         ))
+
+    def test_remote_git_prerequisite_failures_are_infra_invalid(self):
+        self.assertTrue(module.classify_infra_failure(
+            "You have not agreed to the Xcode license agreements."
+        ))
+        self.assertTrue(module.classify_infra_failure(
+            "GhosttyKit does not match the ghostty commit pinned by this checkout. "
+            "parent ghostty pin : missing; submodule HEAD : missing"
+        ))
+        self.assertTrue(module.classify_infra_failure("remote sync failed: rsync exit 12"))
+        self.assertTrue(module.classify_infra_failure("remote fixture metadata invalid"))
+
+    def test_remote_paid_study_preflight_requires_xcode_first_launch_status(self):
+        completed = subprocess.CompletedProcess(
+            ["ssh"], 69, "git version 2.55.0\n",
+            "You have not agreed to the Xcode license agreements.",
+        )
+        with unittest.mock.patch.object(module, "run_command", return_value=completed) as run:
+            ready, reason = module.remote_paid_study_preflight("mac-sub")
+        self.assertFalse(ready)
+        self.assertIn("exit 69", reason)
+        self.assertIn("Xcode first-launch/license incomplete", reason)
+        self.assertIn("license agreements", reason)
+        remote_command = run.call_args.args[0][2]
+        self.assertIn(module.REMOTE_BENCH_PATH, remote_command)
+        self.assertIn("xcodebuild -checkFirstLaunchStatus", remote_command)
+
+    def test_remote_paid_study_preflight_preserves_silent_exit_code(self):
+        completed = subprocess.CompletedProcess(["ssh"], 69, "", "")
+        with unittest.mock.patch.object(module, "run_command", return_value=completed):
+            ready, reason = module.remote_paid_study_preflight("mac-sub")
+        self.assertFalse(ready)
+        self.assertEqual(
+            reason, "remote preflight exit 69 (Xcode first-launch/license incomplete)",
+        )
+
+    def test_acceptance_prerequisite_failure_is_excluded_from_product_results(self):
+        record = module.RunResult(
+            run_id="infra", fixture="split-divider-color", parallelism="multi_unit",
+            trial=1, condition="isolated-overlap", order=1, started_at=module.utc_now(),
+        )
+        module.record_acceptance_outcome(
+            record, False,
+            "parent ghostty pin : missing; submodule HEAD : missing",
+        )
+        self.assertTrue(record.infra_invalid)
+        self.assertEqual(record.status, "infra_invalid")
+        self.assertFalse(record.acceptance_passed)
 
     def test_failure_redaction_masks_home_and_secrets(self):
         value = module.safe_failure(f"{Path.home()}/repo token=abc123")
@@ -1061,6 +2625,15 @@ end
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("effectiveness matrix: 18 runs", result.stdout)
+
+    def test_isolated_cli_accepts_optional_leader_model(self):
+        result = subprocess.run(
+            (sys.executable, str(SCRIPT), "isolated-topology-study", "--dry-run",
+             "--model", "haiku", "--leader-model", "opus", "--trials", "1"),
+            cwd=ROOT, text=True, capture_output=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("isolated topology matrix: 2 runs", result.stdout)
 
     def test_rpc_probe_is_diagnostic_and_persists_exit_code(self):
         completed = subprocess.CompletedProcess([], 7, "stdout /Users/example", "stderr")

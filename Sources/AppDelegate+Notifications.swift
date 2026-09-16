@@ -247,6 +247,7 @@ extension AppDelegate {
             preserved: projectWorkspaceIDs,
             remaining: removed.tabManager.tabs.map(\.id)
         )
+        RemoteLiveProject.closeViewers(in: removed.tabManager)
 
         // Avoid stale notifications that can no longer be opened once the owning window is gone.
         if let store = notificationStore {
