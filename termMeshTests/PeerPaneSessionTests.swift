@@ -9157,6 +9157,85 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         _ = hostTask
     }
 
+    /// Teardown landing in the middle of a reconnect's attach.
+    ///
+    /// `attemptOwnedSessionReconnect` re-reads `isTorndown` through
+    /// `stillEligible()` after every await inside the attempt, so a `stop()`
+    /// that arrives while the host is still deciding the attach must cancel
+    /// the new connection instead of installing a session onto a pane the user
+    /// already closed. Nothing covered that: the whole reconnect path had no
+    /// test at all, because reaching it needs a host to dial.
+    ///
+    /// The `currentSessionSlot.replace` guard further down is NOT what this
+    /// exercises — teardown can never interleave there (see the comment at that
+    /// guard). `stillEligible()` is the guard that really catches this race,
+    /// and it is the one pinned here.
+    @MainActor
+    func test_ownedReconnectTornDownDuringAttachCancelsWithoutInstalling() async throws {
+        let socketPath = "/tmp/peer-reconnect-teardown-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(socketPath: socketPath, capabilities: [])
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: socketPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = host.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(
+            connection, surface: surface, ptyDelivery: .callback
+        )
+
+        let reconnecting = expectation(description: "reconnect attempt started")
+        reconnecting.assertForOverFulfill = false
+        var reconnectedCount = 0
+        relay.onReconnecting = { _ in reconnecting.fulfill() }
+        relay.onReconnected = { reconnectedCount += 1 }
+
+        // Every wait below is an await, never a blocking one. The reconnect is
+        // MainActor-isolated and so is this test, so blocking here would stall
+        // the work being waited for instead of observing it.
+        let attachHeld = expectation(description: "reconnect attach parked on the host")
+        attachHeld.assertForOverFulfill = false
+        let connectionsClosed = expectation(description: "reconnect connection closed")
+        // The dropped original and the reconnect's cancelled connection each end
+        // a conversation; the second one is the attempt finishing its unwind.
+        connectionsClosed.expectedFulfillmentCount = 2
+        connectionsClosed.assertForOverFulfill = false
+        host.setOnConnectionClosed { connectionsClosed.fulfill() }
+        // The pane's own attach already happened above, so the armed one is the
+        // reconnect's — parked so teardown lands inside the attempt.
+        host.holdNextAttach { attachHeld.fulfill() }
+        try await relay.start()
+
+        // The two guards on the install differ in exactly one observable. If
+        // `stillEligible()` catches the teardown, `replaceSession` is never
+        // reached and the gate generation stands still; if it were removed and
+        // the `currentSessionSlot.replace` backstop caught instead, the CAS
+        // would already have advanced it. Both cancel and install nothing, so
+        // without this the test cannot tell which guard did the work — and
+        // would keep passing with `stillEligible()` deleted.
+        let generationBeforeDrop = relay.resumeGenerationForTesting
+
+        XCTAssertTrue(relay.debugDropOwnedTransport())
+        await fulfillment(of: [reconnecting, attachHeld], timeout: 15)
+
+        await relay.stop()
+        host.releaseHeldAttach()
+
+        await fulfillment(of: [connectionsClosed], timeout: 15)
+        XCTAssertEqual(
+            relay.resumeGenerationForTesting, generationBeforeDrop,
+            "the attempt got as far as committing a replacement generation, so "
+                + "the eligibility re-check after the attach did not stop it"
+        )
+        XCTAssertEqual(
+            reconnectedCount, 0,
+            "a reconnect completed against a session torn down before it finished"
+        )
+        _ = hostTask
+    }
+
     /// Best effort, both ways: an unreachable host and an empty id are
     /// no-ops rather than a second failure stacked on the one being unwound.
     @MainActor
@@ -10552,6 +10631,24 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
     /// matters: the ensure has committed a child on the host and the attach
     /// then fails.
     var redirectsAttach = false
+    /// Hold the reply to the next `attachSurface` until `releaseHeldAttach()`,
+    /// so a caller can tear down while an attach is genuinely in flight. Off
+    /// unless armed, so every other test here is unaffected.
+    ///
+    /// This parks the serving loop, not just the one reply: `serve(client:)`
+    /// runs inline on the single accept task, so nothing new is accepted while
+    /// a hold is in place. A caller needing another connection during the hold
+    /// would watch it time out instead — and the park cap here and the
+    /// handshake read timeout in `PeerRelaySession.connect` are both 10s, so
+    /// they must not be relied on to overlap in any useful order.
+    private var holdsNextAttach = false
+    private let attachReleased = DispatchSemaphore(value: 0)
+    /// Fired from the serving thread when a held attach parks, and when a
+    /// connection's conversation ends. Callers await these instead of blocking:
+    /// what they wait for is MainActor-isolated, so a blocking wait taken on the
+    /// main actor would stall the very work it is waiting for.
+    private var onAttachHeld: (@Sendable () -> Void)?
+    private var onConnectionClosed: (@Sendable () -> Void)?
     private let capabilities: [String]
     private let lock = NSLock()
     private var listenerFD: Int32 = -1
@@ -10574,6 +10671,21 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
     func terminatedIDs() -> [Data] {
         lock.lock(); defer { lock.unlock() }
         return terminated
+    }
+
+    func holdNextAttach(onHeld: @escaping @Sendable () -> Void) {
+        // Drop a permit left behind by a release that arrived with nothing
+        // parked; otherwise this arming would sail straight through it.
+        while attachReleased.wait(timeout: .now()) == .success {}
+        lock.lock(); holdsNextAttach = true; onAttachHeld = onHeld; lock.unlock()
+    }
+
+    func setOnConnectionClosed(_ handler: @escaping @Sendable () -> Void) {
+        lock.lock(); onConnectionClosed = handler; lock.unlock()
+    }
+
+    func releaseHeldAttach() {
+        attachReleased.signal()
     }
 
     func start() throws -> Task<Void, Error> {
@@ -10630,6 +10742,8 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
                 // A closed connection is how every one of these ends; the
                 // conversation itself is what the tests assert on.
                 try? serve(client: client)
+                lock.lock(); let closed = onConnectionClosed; lock.unlock()
+                closed?()
             }
         }
     }
@@ -10639,7 +10753,15 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
         let fd = listenerFD
         listenerFD = -1
         let clients = clientFDs
+        // Drop the test's callbacks before the socket goes. A held attach
+        // releases on its own timeout well after a failing test has returned,
+        // and fulfilling that test's expectation then is an API violation that
+        // would surface as a failure in whatever runs next.
+        onAttachHeld = nil
+        onConnectionClosed = nil
         lock.unlock()
+        // Unpark anything still holding, so teardown does not wait out the cap.
+        attachReleased.signal()
         for client in clients { Darwin.shutdown(client, SHUT_RDWR) }
         if fd >= 0 {
             Darwin.shutdown(fd, SHUT_RDWR)
@@ -10704,6 +10826,17 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
                 response.specHash = Data(repeating: 0x73, count: 32)
                 try send(client) { $0.ensureSurfaceResponse = response }
             case .attachSurface(let attach):
+                lock.lock()
+                let holding = holdsNextAttach
+                holdsNextAttach = false
+                lock.unlock()
+                if holding {
+                    // Announce first, then park: the caller needs to know the
+                    // attach is in flight before it tears anything down.
+                    lock.lock(); let held = onAttachHeld; lock.unlock()
+                    held?()
+                    _ = attachReleased.wait(timeout: .now() + 10)
+                }
                 var attached = Termmesh_Peer_V1_AttachResult()
                 attached.accepted = true
                 attached.surfaceID = redirectsAttach

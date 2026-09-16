@@ -3870,6 +3870,17 @@ final class PeerRelaySession {
         // The slot is the detached input pump's source of truth. Do not let a
         // late resume result install only the MainActor copy after teardown
         // terminally cleared the slot.
+        //
+        // Nothing drives THIS call site's false branch, and nothing can as the
+        // code stands: `clear()` is called only by `disconnect()`, which sets
+        // `isTorndown` in the same synchronous body, and both that and this
+        // function are MainActor-isolated. The `!isTorndown` guard above and
+        // this line have no `await` between them, so teardown cannot interleave
+        // here and `replace` cannot return false. (The slot's own false branch
+        // is covered directly by `PeerRelayCurrentSessionSlotTests`; what has no
+        // coverage is arriving at it from here.) Kept rather than deleted: one
+        // suspension point added to that window makes it reachable again, and
+        // this is the case it exists for.
         guard currentSessionSlot.replace(newConnection.session) else {
             await newConnection.cancel()
             return
@@ -4056,6 +4067,18 @@ final class PeerRelaySession {
         // Old-session chunks already read by the detached pump carry the retired
         // generation and are rejected; the first new-session chunk carries this
         // generation and sees an idle gate.
+        //
+        // Unreachable for the same reason as the twin guard in
+        // `performResumeHealExclusively`: `stillEligible()` above already tests
+        // `isTorndown`, the only writer of the slot's terminal state is the
+        // MainActor-isolated `disconnect()`, and no `await` separates that
+        // check from this line. What teardown during a reconnect actually trips
+        // is `stillEligible()`, which
+        // `test_ownedReconnectTornDownDuringAttachCancelsWithoutInstalling`
+        // covers. Both guards end in "cancel, install nothing", so the outcome
+        // alone cannot say which one ran; that test tells them apart by the gate
+        // generation, which advances only once `replaceSession` below has run.
+        // This stays as the backstop for a future suspension point.
         guard currentSessionSlot.replace(connection.session) else {
             await connection.cancel()
             return false
@@ -4134,6 +4157,12 @@ final class PeerRelaySession {
     func beginResumeTransitionForTesting() -> RelayResumeTransitionGate.Transition {
         resumeTransitionGate.begin()
     }
+
+    /// The gate generation, which advances only once `replaceSession` has
+    /// committed a replacement. The reconnect path guards the install twice and
+    /// both guards end in "cancel, install nothing", so the outcome alone
+    /// cannot say which one ran — this can.
+    var resumeGenerationForTesting: UInt64 { resumeTransitionGate.currentGeneration() }
 
     /// Reproduce an unexpected owned transport EOF without tearing down the
     /// pane, relay helper, or host surface. The ordinary pump must reconnect
