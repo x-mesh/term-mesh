@@ -433,12 +433,16 @@ final class ReviewBoardViewModel: ObservableObject {
         var workerCount: Int
         var workingCount: Int
         var isRemoteViewer = false
-        /// The three inputs `overlapCanaryStatus` needs besides the health
-        /// reading, read fresh from the same sources `controlPayload` uses so
-        /// the status line cannot claim a reason the gate does not share.
+        /// The inputs `overlapCanaryStatus` needs besides the health reading,
+        /// read fresh from the same sources `controlPayload` uses so the status
+        /// line cannot claim a reason the gate does not share.
         var supportedLeader = false
         var killSwitch = false
         var canaryOptIn = false
+        /// Overlap runs only in canary mode, so the line has to be able to name
+        /// the mode as the reason. A panel built without one (the remote viewer
+        /// path) reports the mode of nothing, so it never blames the mode.
+        var mode: LeaderParticipationSettings.Mode = .canary
 
         var idleCount: Int { max(0, workerCount - workingCount) }
         /// The state this whole feature exists to make visible: a roster that
@@ -495,6 +499,7 @@ final class ReviewBoardViewModel: ObservableObject {
         level: ProjectDelegationLevel,
         supportedLeader: Bool,
         killSwitch: Bool,
+        mode: LeaderParticipationSettings.Mode = .canary,
         reading: OverlapHealthReading,
         defaults: UserDefaults = .standard
     ) -> OverlapCanaryStatus {
@@ -506,6 +511,14 @@ final class ReviewBoardViewModel: ObservableObject {
         }
         guard !killSwitch else {
             return catalogLine("Off", "Kill switch is on", defaults: defaults)
+        }
+        switch mode {
+        case .off:
+            return catalogLine("Off", "Leader Participation is Off", defaults: defaults)
+        case .shadow:
+            return catalogLine("Off", "Leader Participation is in shadow mode", defaults: defaults)
+        case .canary:
+            break
         }
         switch reading {
         case .checking:
@@ -962,15 +975,14 @@ final class ReviewBoardViewModel: ObservableObject {
         let expectedUUID = team.teamUuid
         localOverlapHealthFetchedAt[teamName] = Date()
         localOverlapHealthFetches[teamName] = Task.detached { [weak self] in
-            let measurement = LeaderTurnLog.health()
+            let measurement = LeaderTurnLog.health(team: teamName)
             let health = LeaderParticipationSettings.Health(measurement: measurement)
             let reading = OverlapHealthReading.measured(
                 supportedTurns: health.supportedTurns, observedDays: health.observedDays,
                 coverage: health.coverage, linkage: health.linkage, unknownRate: health.unknownRate,
-                // This Mac's gate (`Health.passesPromotionGate`) never reads malformed
-                // lines, so naming them as the reason would hide the check that
-                // actually failed.
-                malformedLines: nil, passesGate: health.passesPromotionGate,
+                // This Mac's gate now refuses a damaged measurement exactly as the
+                // execution-host gate does, so the count is a reason to show.
+                malformedLines: health.malformedLines, passesGate: health.passesPromotionGate,
                 scope: .thisMac
             )
             await self?.publishLocalOverlapHealthReading(reading, teamName: teamName, expectedUUID: expectedUUID)
@@ -1074,7 +1086,8 @@ final class ReviewBoardViewModel: ObservableObject {
             workingCount: working.count,
             supportedLeader: TeamOrchestrator.shared.leaderMeasurementCapability(for: team) == .supported,
             killSwitch: settings.killSwitch,
-            canaryOptIn: settings.optInProjects.contains(teamName)
+            canaryOptIn: settings.optInProjects.contains(teamName),
+            mode: settings.mode
         )
     }
 

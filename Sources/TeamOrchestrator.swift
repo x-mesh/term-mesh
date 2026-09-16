@@ -4384,7 +4384,7 @@ final class TeamOrchestrator: ObservableObject {
         defaults: UserDefaults = LeaderParticipationSettings.defaultsForCurrentProcess()
     ) -> Data? {
         let settings = LeaderParticipationSettings.load(from: defaults)
-        let health = LeaderParticipationSettings.Health(measurement: LeaderTurnLog.health())
+        let health = LeaderParticipationSettings.Health(measurement: LeaderTurnLog.health(team: teamName))
         // Read the roster here rather than at each call site: every writer of
         // this file needs the same count, and `agentNames(for:)` already takes
         // the store's lock. A team with no registered roster yields zero, which

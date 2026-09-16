@@ -1047,6 +1047,20 @@ final class ReviewBoardViewModelTests: XCTestCase {
             ).line,
             "Off · Kill switch is on"
         )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: true, killSwitch: false,
+                mode: .off, reading: ready, defaults: english
+            ).line,
+            "Off · Leader Participation is Off"
+        )
+        XCTAssertEqual(
+            ReviewBoardViewModel.overlapCanaryStatus(
+                level: .delegated, supportedLeader: true, killSwitch: false,
+                mode: .shadow, reading: ready, defaults: english
+            ).line,
+            "Off · Leader Participation is in shadow mode"
+        )
         let checkingStatus = ReviewBoardViewModel.overlapCanaryStatus(
             level: .delegated, supportedLeader: true, killSwitch: false,
             reading: .checking, defaults: english
@@ -1202,6 +1216,10 @@ final class ReviewBoardViewModelTests: XCTestCase {
                         let delegationState = ProjectDelegationState(configured: level, effective: level)
                         var scopedSettings = settings
                         scopedSettings.killSwitch = killSwitch
+                        // Overlap runs only in canary mode. The matrix below
+                        // varies the other three inputs; `off` and `shadow` are
+                        // pinned separately in the status-line test above.
+                        scopedSettings.mode = .canary
                         let context = "level=\(level) supported=\(supportedLeader) " +
                             "kill=\(killSwitch) gatePasses=\(health.passesPromotionGate)"
 
@@ -1217,7 +1235,7 @@ final class ReviewBoardViewModelTests: XCTestCase {
                         )
                         let localReady = ReviewBoardViewModel.overlapCanaryStatus(
                             level: level, supportedLeader: supportedLeader, killSwitch: killSwitch,
-                            reading: localReading, defaults: english
+                            mode: scopedSettings.mode, reading: localReading, defaults: english
                         ).line.hasPrefix("Ready")
                         XCTAssertEqual(
                             localReady, controlHostPayload["delegated_overlap_resolution"] as? Bool,
@@ -1238,7 +1256,7 @@ final class ReviewBoardViewModelTests: XCTestCase {
                             )
                             let peerReady = ReviewBoardViewModel.overlapCanaryStatus(
                                 level: level, supportedLeader: supportedLeader, killSwitch: killSwitch,
-                                reading: peerReading, defaults: english
+                                mode: scopedSettings.mode, reading: peerReading, defaults: english
                             ).line.hasPrefix("Ready")
                             XCTAssertEqual(
                                 peerReady, executionHostResolution && remotePassesGate,

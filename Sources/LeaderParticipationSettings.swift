@@ -40,6 +40,11 @@ struct LeaderParticipationSettings: Equatable {
         var coverage: Double
         var linkage: Double
         var unknownRate: Double
+        /// Lines of this Project's own turn log that could not be read. The
+        /// execution-host gate in `tm-agent` has always refused to promote on a
+        /// damaged measurement; this Mac's gate silently did not, so the same
+        /// log promoted or not depending on which host evaluated it.
+        var malformedLines: Int = 0
 
         // Named so the review board formatter that explains a failing gate reads the
         // same thresholds this gate enforces, instead of copying the literals.
@@ -50,7 +55,8 @@ struct LeaderParticipationSettings: Equatable {
         static let maxPromotableUnknownRate = 0.02
 
         var passesPromotionGate: Bool {
-            (supportedTurns >= Self.minPromotableTurns || observedDays >= Self.minPromotableObservedDays)
+            malformedLines == 0
+                && (supportedTurns >= Self.minPromotableTurns || observedDays >= Self.minPromotableObservedDays)
                 && coverage >= Self.minPromotableCoverage
                 && linkage >= Self.minPromotableLinkage
                 && unknownRate <= Self.maxPromotableUnknownRate
@@ -114,7 +120,12 @@ struct LeaderParticipationSettings: Equatable {
         // when health_scope is execution_host (apply_participation_health_scope),
         // so an executionHost payload can skip this Mac's aggregate health here
         // without losing the health gate for peer leaders.
-        let delegatedOverlapResolution = delegationState.effective == .delegated
+        // Off means off. Overlap used to read only the delegation level, the
+        // kill switch and health, so a leader whose participation mode the user
+        // had turned off kept resolving overlap anyway and the board still read
+        // Ready. Shadow observes without changing a turn, so it stops here too.
+        let delegatedOverlapResolution = mode == .canary
+            && delegationState.effective == .delegated
             && supportedLeader
             && !killSwitch
             && (healthScope == .executionHost || health.passesPromotionGate)
@@ -154,7 +165,8 @@ extension LeaderParticipationSettings.Health {
             coverage: measurement.coverage,
             linkage: measurement.linkage,
             unknownRate: measurement.supportedTurns == 0 ? 1
-                : Double(unknown) / Double(measurement.supportedTurns)
+                : Double(unknown) / Double(measurement.supportedTurns),
+            malformedLines: measurement.malformedLines
         )
     }
 }

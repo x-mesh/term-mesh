@@ -18670,6 +18670,17 @@ fn leader_participation_health(
                 // written by tm-agent and the leader turn hook; skip, not malformed.
                 continue;
             }
+            // One host's turns.log carries every Project that ran on it. A turn
+            // record naming another Project is not this Project's measurement,
+            // broken fields included: counting it here let one Project's damaged
+            // line close another Project's gate for as long as the line stayed
+            // in the file. Lines that name no Project at all are still counted,
+            // since an unattributable line means the log itself is damaged.
+            if let Some(team) = record["team"].as_str() {
+                if team != project_id {
+                    continue;
+                }
+            }
             let valid = record["turn_id"]
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
@@ -18679,9 +18690,7 @@ fn leader_participation_health(
                 malformed_lines += 1;
                 continue;
             }
-            if record["team"].as_str() == Some(project_id) {
-                records.push(record);
-            }
+            records.push(record);
         }
     }
 
@@ -18890,7 +18899,11 @@ fn resolve_participation(
     config: &LeaderParticipationCanaryConfig,
     known_input: bool,
 ) -> LeaderParticipationResolution {
-    let delegated_overlap_resolution = config.delegated_overlap_resolution
+    // Overlap ignores the cohort below — opt-in and the percent bucket decide
+    // the ordinary canary, not this one — but it does follow the mode. A leader
+    // the user switched off, or left in shadow, is not running experiments.
+    let delegated_overlap_resolution = config.mode == "canary"
+        && config.delegated_overlap_resolution
         && config.delegation_effective.as_deref() == Some("delegated")
         && config.supported
         && config.healthy
@@ -19507,9 +19520,12 @@ mod leader_turn_record_tests {
     }
 
     fn control_snapshot_value() -> Value {
+        // Overlap follows the mode, so a fixture meant to resolve overlap names
+        // canary. `opt_in` stays false, which keeps the ordinary canary off and
+        // the recorded policy_mode/cohort at off/static.
         json!({
             "schema_version": 1,
-            "mode": "shadow",
+            "mode": "canary",
             "percent": 0,
             "kill_switch": false,
             "supported": true,
@@ -19746,14 +19762,25 @@ mod leader_turn_record_tests {
         assert!(!resolve_participation(&eligible, false).applied);
     }
 
+    /// Overlap ignores the cohort — opt-in and the percent bucket decide the
+    /// ordinary canary, not this one — but it does follow the mode: a leader the
+    /// user switched off, or left in shadow, is not running experiments.
     #[test]
-    fn delegated_overlap_resolution_is_independent_of_general_canary_resolution() {
+    fn delegated_overlap_resolution_ignores_the_cohort_but_follows_the_mode() {
         let mut config = canary_config(0);
-        config.mode = "shadow".to_string();
         config.opt_in = false;
         let resolution = resolve_participation(&config, true);
         assert!(!resolution.applied);
         assert!(resolution.delegated_overlap_resolution);
+
+        for mode in ["shadow", "off"] {
+            let mut stopped = config.clone();
+            stopped.mode = mode.to_string();
+            assert!(
+                !resolve_participation(&stopped, true).delegated_overlap_resolution,
+                "mode {mode} kept overlap resolving"
+            );
+        }
 
         let cases: &[(&str, fn(&mut LeaderParticipationCanaryConfig))] = &[
             ("nondelegated", |config: &mut LeaderParticipationCanaryConfig| {
@@ -19932,6 +19959,31 @@ mod leader_turn_record_tests {
         let health = leader_participation_health(&path, "p", None);
         assert_eq!(health.supported_turns, 0);
         assert!(!health.passes_promotion_gate());
+    }
+
+    /// A host runs many Projects through one turns.log. A damaged record that
+    /// names another Project used to count here, which closed this Project's
+    /// gate for as long as that line stayed in the file.
+    #[test]
+    fn execution_host_health_ignores_another_projects_damaged_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("turns.log");
+        let foreign_without_ts = serde_json::to_string(&json!({
+            "event": "turn_start",
+            "turn_id": "broken",
+            "team": "other"
+        }))
+        .expect("serialize foreign turn_start without ts");
+        let records = linked_turn("first", "2026-08-18T23:59:00Z")
+            + &foreign_without_ts
+            + "\n"
+            + &linked_turn("last", "2026-08-24T00:01:00Z");
+        fs::write(&path, records).expect("write turns");
+
+        let health = leader_participation_health(&path, "p", None);
+        assert_eq!(health.malformed_lines, 0);
+        assert_eq!(health.supported_turns, 2);
+        assert!(health.passes_promotion_gate(), "health was {health:?}");
     }
 
     #[test]
