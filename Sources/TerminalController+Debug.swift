@@ -1994,14 +1994,24 @@ extension TerminalController {
             var gridText: String = ""
             var cols: Int = 0
             var rows: Int = 0
+            var paddingLeft: Double = 0
+            var paddingTop: Double = 0
+            var paddingMetricsValid = false
         }
         let sem = DispatchSemaphore(value: 0)
         var out = ReadResult()
         Self.debugReadGridQueue.async {
             let ptr = box.lease.surface
             let size = ghostty_surface_size(ptr)
+            var metrics = ghostty_surface_grid_metrics_s()
+            let hasMetrics = ghostty_surface_grid_metrics(ptr, &metrics)
             out.cols = Int(size.columns)
             out.rows = Int(size.rows)
+            out.paddingMetricsValid = hasMetrics
+            if hasMetrics {
+                out.paddingLeft = metrics.padding_left
+                out.paddingTop = metrics.padding_top
+            }
             out.gridText = Self.readViewportGridText(ptr) ?? ""
             box.lease.release()
             sem.signal()
@@ -2015,6 +2025,9 @@ extension TerminalController {
             "grid_text": out.gridText,
             "rows": out.rows,
             "cols": out.cols,
+            "padding_left": out.paddingLeft,
+            "padding_top": out.paddingTop,
+            "padding_metrics_valid": out.paddingMetricsValid,
         ])
     }
 
