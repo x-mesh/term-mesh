@@ -645,9 +645,11 @@ final class ReviewBoardViewModel: ObservableObject {
                     value: text(supportedLeader ? "Measured" : "Not measured"),
                     state: supportedLeader ? .met : .blocked
                 ),
+                // The row names the thing, not the switch: "Stop all leader
+                // experiments: Off" read as though the stopping were off.
                 .init(
-                    label: text("Stop all leader experiments"),
-                    value: text(killSwitch ? "On" : "Off"),
+                    label: text("Leader experiments"),
+                    value: text(killSwitch ? "Stopped" : "Running"),
                     state: killSwitch ? .blocked : .met
                 ),
                 .init(

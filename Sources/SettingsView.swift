@@ -1510,7 +1510,8 @@ struct SettingsView: View {
                         }
 
                         if settingsMatch("leader", "participation", "shadow", "canary", "kill switch",
-                                         "agent", "team", "리더", "카나리") {
+                                         "overlap", "route", "experiment", "suggestion",
+                                         "agent", "team", "리더", "카나리", "동시 진행", "경로 제안", "실험") {
                         SettingsCardDivider()
 
                         LeaderParticipationSettingsRow(controlWidth: pickerColumnWidth)
@@ -3281,20 +3282,39 @@ private struct LeaderParticipationSettingsRow: View {
     @State private var settings = LeaderParticipationSettings.default
 
     var body: some View {
-        SettingsCardRow(
-            "Leader Overlap",
-            subtitle: "The leader keeps working while its workers run, instead of waiting for them. It needs Work Distribution set to Delegated, and it does not change that setting.",
-            controlWidth: controlWidth
-        ) {
-            VStack(alignment: .trailing, spacing: 6) {
-                Picker("", selection: modeBinding) {
-                    Text("Not used").tag(LeaderParticipationSettings.Mode.off)
-                    Text("Record only").tag(LeaderParticipationSettings.Mode.shadow)
-                    Text("In use").tag(LeaderParticipationSettings.Mode.canary)
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
+        // Two cards, one stored setting. `mode` and the kill switch gate both
+        // experiments, but the percentage is the route suggestion cohort only —
+        // Leader Overlap never reads it. Showing it under the Overlap card made
+        // a control that does nothing there look like one of its dials.
+        VStack(spacing: 0) {
+            SettingsCardRow(
+                "Leader Overlap",
+                subtitle: "The leader keeps working while its workers run, instead of waiting for them. It needs Work Distribution set to Delegated, and it does not change that setting.",
+                controlWidth: controlWidth
+            ) {
+                VStack(alignment: .trailing, spacing: 6) {
+                    Picker("", selection: modeBinding) {
+                        Text("Not used").tag(LeaderParticipationSettings.Mode.off)
+                        Text("Record only").tag(LeaderParticipationSettings.Mode.shadow)
+                        Text("In use").tag(LeaderParticipationSettings.Mode.canary)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
 
+                    Toggle(isOn: killSwitchBinding) {
+                        Text("Stop all leader experiments")
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            SettingsCardDivider()
+
+            SettingsCardRow(
+                "Route suggestion experiment",
+                subtitle: "How many Projects follow the leader's suggested route. It uses the mode above, each Project opts in from its Review Board, and Leader Overlap ignores this percentage.",
+                controlWidth: controlWidth
+            ) {
                 // The label is the only place the percent is shown, so it stays visible.
                 Stepper(value: canaryPercentBinding, in: 0...100, step: 1) {
                     Text(verbatim: "\(settings.canaryPercent)%")
@@ -3302,11 +3322,6 @@ private struct LeaderParticipationSettingsRow: View {
                         .frame(minWidth: 44, alignment: .trailing)
                 }
                 .disabled(settings.mode != .canary)
-
-                Toggle(isOn: killSwitchBinding) {
-                    Text("Stop all leader experiments")
-                }
-                .controlSize(.small)
             }
         }
         .onAppear {
