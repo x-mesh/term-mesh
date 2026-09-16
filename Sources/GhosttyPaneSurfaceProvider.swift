@@ -1061,14 +1061,35 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                 await MainActor.run {
                     guard let terminalSurface = weakTS.value,
                           let ptr = terminalSurface.surface else { return }
-                    // ghostty_surface_set_size takes pixel dimensions.
-                    // Use current cell size to convert cols×rows → pixels.
+                    // ghostty_surface_set_size takes the full surface pixel
+                    // dimensions, including the pixels outside the terminal
+                    // grid. Preserve those live insets when converting the
+                    // viewer's logical cols×rows request. Passing only
+                    // cols×cell_width and rows×cell_height makes Ghostty
+                    // subtract its padding from an already grid-only size,
+                    // shrinking (for example) 40×12 to 39×11.
                     let curSz = ghostty_surface_size(ptr)
                     guard curSz.cell_width_px > 0, curSz.cell_height_px > 0 else { return }
                     let safeCols = min(cols, 1000)
                     let safeRows = min(rows, 1000)
-                    let (w, wOverflow) = safeCols.multipliedReportingOverflow(by: UInt32(curSz.cell_width_px))
-                    let (h, hOverflow) = safeRows.multipliedReportingOverflow(by: UInt32(curSz.cell_height_px))
+                    let (currentGridWidth, currentGridWidthOverflow) =
+                        UInt32(curSz.columns).multipliedReportingOverflow(
+                            by: UInt32(curSz.cell_width_px))
+                    let (currentGridHeight, currentGridHeightOverflow) =
+                        UInt32(curSz.rows).multipliedReportingOverflow(
+                            by: UInt32(curSz.cell_height_px))
+                    guard !currentGridWidthOverflow, !currentGridHeightOverflow,
+                          curSz.width_px >= currentGridWidth,
+                          curSz.height_px >= currentGridHeight else { return }
+                    let horizontalInsets = curSz.width_px - currentGridWidth
+                    let verticalInsets = curSz.height_px - currentGridHeight
+                    let (gridWidth, gridWidthOverflow) = safeCols.multipliedReportingOverflow(
+                        by: UInt32(curSz.cell_width_px))
+                    let (gridHeight, gridHeightOverflow) = safeRows.multipliedReportingOverflow(
+                        by: UInt32(curSz.cell_height_px))
+                    guard !gridWidthOverflow, !gridHeightOverflow else { return }
+                    let (w, wOverflow) = gridWidth.addingReportingOverflow(horizontalInsets)
+                    let (h, hOverflow) = gridHeight.addingReportingOverflow(verticalInsets)
                     guard !wOverflow, !hOverflow else { return }
 
                     // The host pane and each remote viewer are two windows onto
