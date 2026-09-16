@@ -1213,12 +1213,12 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertEqual(blocked.headline, "Off · Work Distribution must be Delegated")
         XCTAssertEqual(
             blocked.items.map(\.label),
-            ["Work Distribution", "Leader turn measurement", "Stop all leader experiments",
+            ["Work Distribution", "Leader turn measurement", "Leader experiments",
              "Leader Overlap", "Measurement"]
         )
         XCTAssertEqual(
             blocked.items.map(\.value),
-            ["Leader first", "Not measured", "On", "Record only", "Ready"]
+            ["Leader first", "Not measured", "Stopped", "Record only", "Ready"]
         )
         XCTAssertEqual(
             blocked.items.map(\.state),

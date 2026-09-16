@@ -1261,6 +1261,16 @@
         "ko": { "stringUnit": { "state": "translated", "value": "신중" } }
       }
     },
+    "How many Projects follow the leader's suggested route. It uses the mode above, each Project opts in from its Review Board, and Leader Overlap ignores this percentage.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더가 제안한 경로를 따르는 프로젝트의 비율입니다. 위의 모드를 따르며, 프로젝트별 포함은 각 리뷰 보드에서 켭니다. 리더 동시 진행은 이 비율을 보지 않습니다."
+          }
+        }
+      }
+    },
     "Leader Overlap is turned off": {
       "localizations": {
         "ko": {
@@ -1307,6 +1317,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "사용"
+          }
+        }
+      }
+    },
+    "Leader experiments": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더 실험"
           }
         }
       }
@@ -1471,6 +1491,16 @@
         "ko": { "stringUnit": { "state": "translated", "value": "pane이 끊겼다가 다시 붙습니다. 호스트에서 실행 중인 에이전트와 셸 프로세스는 그대로 유지됩니다. 이미 종료된 프로세스가 남긴 셸 기록은 지워집니다 — Clean Up Panes가 닫지 못한다고 표시하는 항목을 없애는 방법입니다." } }
       }
     },
+    "Pause leader experiments": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "리더 실험 일시 중지"
+          }
+        }
+      }
+    },
     "Record only": {
       "localizations": {
         "ko": {
@@ -1499,6 +1529,16 @@
     "Restart Host Daemon…": {
       "localizations": {
         "ko": { "stringUnit": { "state": "translated", "value": "Restart Host Daemon…" } }
+      }
+    },
+    "Route suggestion experiment": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "경로 제안 실험"
+          }
+        }
       }
     },
     "Scanning %@…": {
