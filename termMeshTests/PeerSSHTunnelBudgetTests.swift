@@ -110,14 +110,18 @@ final class PeerSSHTunnelBudgetTests: XCTestCase {
             },
             unlink: { _ in lock.lock(); unlinks += 1; lock.unlock() }
         )
-        let startedAt = Date()
         let first = coordinator.begin(process: nil, localSockPath: "/tmp/test.sock") { state in
             lock.lock(); terminalStates.append(state); lock.unlock()
         }
         let second = coordinator.begin(process: nil, localSockPath: "/tmp/test.sock") { state in
             lock.lock(); terminalStates.append(state); lock.unlock()
         }
-        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.1)
+        // That begin() did not wait is read off the reap's own state, not off a
+        // stopwatch: the assertions below run while reap is still parked on
+        // `release`, and a begin() that waited for it could only return once
+        // reap had returned true — leaving unlinks at 1 and terminalStates at
+        // [.stopped]. A wall-clock bound would claim the same thing but fail on
+        // a loaded machine for reasons that have nothing to do with blocking.
         XCTAssertEqual(started.wait(timeout: .now() + 1), .success)
         lock.lock()
         XCTAssertEqual(reaps, 1)

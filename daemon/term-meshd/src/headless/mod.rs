@@ -4604,6 +4604,95 @@ mod tests {
         assert!(m.live);
     }
 
+    /// Per-agent `working_directory` is optional in the metadata
+    /// (`skip_serializing_if = "Option::is_none"`), so a break in its round trip
+    /// is silent: the key is simply absent. Every other fixture here leaves it
+    /// `None` — the same value a dropped field produces — so nothing so far
+    /// distinguishes "carried through" from "lost". These two pin a real value
+    /// across both paths that persist it.
+    #[test]
+    fn resume_pane_restores_per_agent_working_directory_from_archive() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+        let team_uuid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+
+        let mut params = sample_archive_params(Some(team_uuid.into()));
+        params.agents[0].working_directory = Some("/tmp/iso/explorer".into());
+        params.agents.push(ArchivePaneAgent {
+            name: "reviewer".into(),
+            working_directory: None,
+            agent_instance_id: None,
+            cli: "codex".into(),
+            model: "gpt".into(),
+            agent_type: "reviewer".into(),
+            color: None,
+            session_id: None,
+            instructions: None,
+        });
+        mgr.archive_pane_team(params).expect("archive");
+
+        let res = mgr
+            .resume_pane(ResumePaneParams {
+                team_uuid: team_uuid.into(),
+            })
+            .expect("resume from archive");
+        let explorer = res
+            .agents
+            .iter()
+            .find(|a| a.name == "explorer")
+            .expect("explorer present");
+        assert_eq!(
+            explorer.working_directory.as_deref(),
+            Some("/tmp/iso/explorer"),
+            "an agent's own checkout must survive archive -> resume"
+        );
+        let reviewer = res
+            .agents
+            .iter()
+            .find(|a| a.name == "reviewer")
+            .expect("reviewer present");
+        assert_eq!(
+            reviewer.working_directory, None,
+            "an agent with no checkout of its own must stay None here; the fall \
+             back to the team directory belongs to the reader, not the record"
+        );
+        // The team directory is a separate field and keeps its own value.
+        assert_eq!(res.working_directory, "/tmp/iso");
+    }
+
+    #[test]
+    fn resume_pane_restores_per_agent_working_directory_from_live_snapshot() {
+        let _scope = scoped_root();
+        let mut mgr = HeadlessManager::new();
+        let team_uuid = "cccccccc-dddd-4eee-8fff-000000000000";
+
+        let mut params = sample_snapshot_params(team_uuid);
+        params.agents[0].working_directory = Some("/tmp/iso/explorer".into());
+        mgr.snapshot_pane_team(params).expect("live snapshot");
+
+        let res = mgr
+            .resume_pane(ResumePaneParams {
+                team_uuid: team_uuid.into(),
+            })
+            .expect("resume from live snapshot");
+        let explorer = res
+            .agents
+            .iter()
+            .find(|a| a.name == "explorer")
+            .expect("explorer present");
+        assert_eq!(
+            explorer.working_directory.as_deref(),
+            Some("/tmp/iso/explorer"),
+            "an agent's own checkout must survive snapshot -> resume"
+        );
+        let reviewer = res
+            .agents
+            .iter()
+            .find(|a| a.name == "reviewer")
+            .expect("reviewer present");
+        assert_eq!(reviewer.working_directory, None);
+    }
+
     #[test]
     fn archive_after_snapshot_clears_live_dir() {
         let _scope = scoped_root();
