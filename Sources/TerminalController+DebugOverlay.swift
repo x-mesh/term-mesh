@@ -32,6 +32,48 @@ extension TerminalController {
         return "\(x) \(y)"
     }
 
+    /// Synthesize a click at a point in the main window, in window coordinates
+    /// with a top-left origin. Temporary probe for titlebar hit routing.
+    func v2DebugWindowClick(params: [String: Any]) -> V2CallResult {
+        func number(_ key: String) -> Double? {
+            if let value = params[key] as? Double { return value }
+            if let value = params[key] as? Int { return Double(value) }
+            if let value = params[key] as? NSNumber { return value.doubleValue }
+            if let value = params[key] as? String { return Double(value) }
+            return nil
+        }
+        guard let x = number("x"), let y = number("y") else {
+            return .err(code: "invalid_params", message: "Missing x/y", data: nil)
+        }
+
+        var outcome: [String: Any] = [:]
+        _ = v2MainExec(timeout: 5) {
+            guard let window = self.debugMainTerminalWindow() else { return }
+            let location = NSPoint(x: x, y: window.frame.height - y)
+            let hit = window.contentView?.superview?.hitTest(location)
+            outcome["hit"] = hit.map { String(describing: type(of: $0)) } ?? "none"
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                guard let event = NSEvent.mouseEvent(
+                    with: type,
+                    location: location,
+                    modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime,
+                    windowNumber: window.windowNumber,
+                    context: nil,
+                    eventNumber: 0,
+                    clickCount: 1,
+                    pressure: type == .leftMouseDown ? 1 : 0
+                ) else { continue }
+                window.sendEvent(event)
+            }
+            outcome["sent"] = true
+        }
+        guard !outcome.isEmpty else {
+            return .err(code: "internal_error", message: "no window", data: nil)
+        }
+        return .ok(outcome)
+    }
+
     func v2DebugDragSimulateFileDrop(params: [String: Any]) -> V2CallResult {
         guard let surfaceId = v2String(params, "surface_id"),
               let paths = v2String(params, "paths") else {
