@@ -125,6 +125,11 @@ Canonical details: [team lifecycle](.claude/commands/team.md),
 - Release only through `/release`. `CHANGELOG.md` is the sole changelog; cover
   every commit since the last tag in user-facing language and upload the dSYM.
   The complete workflow is [`.claude/commands/release.md`](.claude/commands/release.md).
+- Build `-configuration Release` once before you release. A Debug build compiles
+  code the Release build cannot: `dlog` and anything else behind `#if DEBUG` does
+  not exist there. v0.247.0 published its tag and its Linux assets before the
+  macOS build failed on one such call, and a tag that is already public cannot be
+  moved.
 - When adding a leader command, update its Claude command, Codex prompt,
   Codex skill (`Resources/CodexSkills/<name>/SKILL.md`, so `$<name>` works in
   Codex), installer managed-name lists, and IME alias map together.
