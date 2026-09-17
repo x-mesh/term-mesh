@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.247.1] - 2026-09-17
+
+### Fixed
+
+- The macOS app builds again. 0.247.0 reached its tag and published its Linux daemon assets before the macOS build failed on a logging call that exists only in debug builds, so that version carries no DMG and Homebrew was never moved to it. Everything listed under 0.247.0 arrives here instead.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.247.0] - 2026-09-17
 
 ### Fixed
