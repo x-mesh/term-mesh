@@ -6527,6 +6527,171 @@ final class PeerRelaySessionCallbackDeliveryTests: XCTestCase {
     }
 }
 
+private final class RelayFrameSuspendedSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var shouldSuspend = true
+    private var values: [(UInt8, Data)] = []
+    let started = DispatchSemaphore(value: 0)
+    let released = DispatchSemaphore(value: 0)
+    let wrote = DispatchSemaphore(value: 0)
+
+    func write(type: UInt8, payload: Data) {
+        lock.lock()
+        values.append((type, payload))
+        let suspend = shouldSuspend
+        shouldSuspend = false
+        lock.unlock()
+        wrote.signal()
+        if suspend {
+            started.signal()
+            released.wait()
+        }
+    }
+
+    func frames() -> [(UInt8, Data)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+}
+
+final class RelayFrameByteBudgetTests: XCTestCase {
+    private let frameHeaderBytes = 5
+    private let payloadPer64KiBFrame = 64 * 1024 - 5
+
+    private func waitForWaiters(
+        _ budget: RelayFrameByteBudget,
+        count: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        for _ in 0..<100 {
+            if await budget.snapshot().waitingCount == count { return }
+            await Task.yield()
+        }
+        XCTFail("expected \(count) waiting frame(s)", file: file, line: line)
+    }
+
+    func testFour64KiBFramesAdmitAndFifthWaitsForRelease() async throws {
+        let budget = RelayFrameByteBudget()
+        let frameBytes = payloadPer64KiBFrame + frameHeaderBytes
+        var reservations: [UUID] = []
+        for _ in 0..<4 {
+            reservations.append(try await budget.acquire(bytes: frameBytes))
+        }
+        let saturated = await budget.snapshot()
+        XCTAssertEqual(saturated.reservedBytes, 256 * 1024)
+
+        let fifth = Task { try await budget.acquire(bytes: frameBytes) }
+        await waitForWaiters(budget, count: 1)
+        let pending = await budget.snapshot()
+        XCTAssertEqual(pending.reservedBytes, 256 * 1024)
+
+        await budget.release(reservations[0])
+        _ = try await fifth.value
+        let resumed = await budget.snapshot()
+        XCTAssertEqual(resumed.reservedBytes, 256 * 1024)
+    }
+
+    func testMixedFramesDrainInFIFOOrderWithoutLossOrDuplication() async throws {
+        let budget = RelayFrameByteBudget()
+        let sink = RelayFrameSuspendedSink()
+        let writer = RelayFrameWriter(
+            writeFrame: { type, payload in sink.write(type: type, payload: payload) },
+            onFailure: { _ in },
+            budget: budget
+        )
+        let payloads = [
+            Data(repeating: 0x01, count: payloadPer64KiBFrame),
+            Data(repeating: 0x02, count: 80_000),
+            Data(repeating: 0x03, count: 20_000),
+            Data(repeating: 0x04, count: 90_000),
+            Data(repeating: 0x05, count: 10_000),
+        ]
+
+        for (index, payload) in payloads.prefix(4).enumerated() {
+            try await writer.enqueue(type: UInt8(index), payload: payload)
+        }
+        XCTAssertEqual(sink.started.wait(timeout: .now() + 1), .success)
+
+        let fifth = Task { try await writer.enqueue(type: 4, payload: payloads[4]) }
+        await waitForWaiters(budget, count: 1)
+        sink.released.signal()
+        _ = try await fifth.value
+        for _ in 0..<4 {
+            XCTAssertEqual(sink.wrote.wait(timeout: .now() + 1), .success)
+        }
+
+        let frames = sink.frames()
+        XCTAssertEqual(frames.map { $0.0 }, [0, 1, 2, 3, 4])
+        XCTAssertEqual(frames.map { $0.1 }, payloads)
+    }
+
+    func testOversizeFrameProgressesAloneBeforeLaterFrames() async throws {
+        let budget = RelayFrameByteBudget()
+        let oversize = try await budget.acquire(bytes: 256 * 1024 + 1)
+        let later = Task { try await budget.acquire(bytes: 1) }
+        await waitForWaiters(budget, count: 1)
+        let blocked = await budget.snapshot()
+        XCTAssertEqual(blocked.reservedBytes, 256 * 1024 + 1)
+
+        await budget.release(oversize)
+        let small = try await later.value
+        let resumed = await budget.snapshot()
+        XCTAssertEqual(resumed.reservedBytes, 1)
+        await budget.release(small)
+    }
+
+    func testStopReleasesAdmittedAndFailsWaitersWithoutDoubleRelease() async throws {
+        let budget = RelayFrameByteBudget()
+        let frameBytes = payloadPer64KiBFrame + frameHeaderBytes
+        var reservations: [UUID] = []
+        for _ in 0..<4 {
+            reservations.append(try await budget.acquire(bytes: frameBytes))
+        }
+        let waiting = Task { () -> Bool in
+            do {
+                _ = try await budget.acquire(bytes: 1)
+                return false
+            } catch {
+                return true
+            }
+        }
+        await waitForWaiters(budget, count: 1)
+        await budget.stop(error: RelayError.ioError("stopped"))
+        let didFail = await waiting.value
+        XCTAssertTrue(didFail)
+        for reservation in reservations {
+            await budget.release(reservation)
+            await budget.release(reservation)
+        }
+        let stopped = await budget.snapshot()
+        XCTAssertEqual(stopped.reservedBytes, 0)
+        XCTAssertEqual(stopped.waitingCount, 0)
+    }
+
+    func testInputCallbackProgressesWhileOutputBudgetIsSaturated() async throws {
+        let budget = RelayFrameByteBudget()
+        let sink = RelayFrameSuspendedSink()
+        let writer = RelayFrameWriter(
+            writeFrame: { type, payload in sink.write(type: type, payload: payload) },
+            onFailure: { _ in },
+            budget: budget
+        )
+        let payload = Data(repeating: 0xAA, count: payloadPer64KiBFrame)
+        for _ in 0..<4 {
+            try await writer.enqueue(type: 1, payload: payload)
+        }
+        XCTAssertEqual(sink.started.wait(timeout: .now() + 1), .success)
+
+        let inputCallback = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { inputCallback.signal() }
+        XCTAssertEqual(inputCallback.wait(timeout: .now() + 1), .success)
+
+        sink.released.signal()
+    }
+}
+
 // MARK: - Relay input diagnostics
 final class RelayInputBacklogTrackerTests: XCTestCase {
     func testEmptyGrowDrainAndSnapshotDoesNotResetHighWater() {
