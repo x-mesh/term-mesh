@@ -629,7 +629,10 @@ struct TermMeshApp: App {
                 } label: {
                     commandLabel("Toggle Review Board")
                 }
-                .keyboardShortcut("b", modifiers: [.command, .control])
+                .keyboardShortcut(
+                    ReviewBoardSettings.toggleShortcutKey,
+                    modifiers: ReviewBoardSettings.toggleShortcutModifiers
+                )
 
                 Button {
                     AppDelegate.shared?.tabManager?.selectedWorkspace?
