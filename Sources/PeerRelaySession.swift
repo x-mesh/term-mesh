@@ -1599,6 +1599,54 @@ private final class RelayIOStats: @unchecked Sendable {
     }
 }
 
+final class RelayTelemetryStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var remote: Termmesh_Peer_V1_RelaySurfaceTelemetry?
+    private var remoteReceivedAtNs: UInt64 = 0
+    private var gapCount: UInt64 = 0
+    private var gapBytes: UInt64 = 0
+
+    func record(_ sample: Termmesh_Peer_V1_RelayTelemetry, surfaceID: Data) {
+        guard let matching = sample.surfaces.first(where: { $0.surfaceID == surfaceID }) else { return }
+        lock.lock()
+        remote = matching
+        remoteReceivedAtNs = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+    }
+
+    func noteGap(bytes: UInt64) {
+        lock.lock()
+        gapCount &+= 1
+        gapBytes &+= bytes
+        lock.unlock()
+    }
+
+    func resetRemote() {
+        lock.lock()
+        remote = nil
+        remoteReceivedAtNs = 0
+        lock.unlock()
+    }
+
+    func status() -> [String: Any] {
+        lock.lock(); defer { lock.unlock() }
+        let now = DispatchTime.now().uptimeNanoseconds
+        var result: [String: Any] = [
+            "receiver_gap_count": gapCount,
+            "receiver_gap_bytes_total": gapBytes,
+            "remote_supported": remote != nil,
+        ]
+        if let remote {
+            result["remote_sample_age_ns"] = now &- remoteReceivedAtNs
+            result["host_produced_chunks"] = remote.producedChunks
+            result["host_produced_bytes"] = remote.producedBytes
+            result["host_aggregate_dropped_chunks"] = remote.hostAggregateDroppedChunks
+            result["host_aggregate_dropped_bytes"] = remote.hostAggregateDroppedBytes
+        }
+        return result
+    }
+}
+
 /// Recent helper-input timings. No payloads, per-key logging, tasks, or timers.
 /// A fixed ring bounds memory; sorting happens only when diagnostics are read,
 /// outside the lock. These are local handoff timings, NOT remote echo latency.
@@ -1860,6 +1908,7 @@ final class PeerRelaySession {
     /// project's default isolation pins an internal type to MainActor, and
     /// these are written from the pump loop. Exposed through `ioSnapshot`.
     private let ioStats = RelayIOStats()
+    private let relayTelemetry = RelayTelemetryStore()
     private let inputLatencyStats = RelayInputLatencyStats()
     /// Shared by the helper reader and detached input pump. Callback delivery
     /// has no helper reader, so its diagnostic stays at zero.
@@ -1936,6 +1985,8 @@ final class PeerRelaySession {
             "last_delivered_byte_uptime_ns": c.lastDeliveredByteUptimeNs,
         ]
     }
+
+    var relayTelemetrySnapshot: [String: Any] { relayTelemetry.status() }
 
     /// Explicit diagnostics only: health polling of ioSnapshot must not sort
     /// latency samples for every pane. No mutation of the measurement window.
@@ -3107,6 +3158,7 @@ final class PeerRelaySession {
         let ownsSession = self.ownsSession
         let mySurfaceID = surfaceID
         let scrollbackBrowse = self.scrollbackBrowse
+        let telemetryStore = self.relayTelemetry
 
         pumpTask = Task.detached(priority: .userInitiated) {
             // Host → relay: deliver PtyData frames to the relay socket.
@@ -3133,6 +3185,7 @@ final class PeerRelaySession {
                             let gap = chunk.byteSeq - expected
                             gapBytesTotal += gap
                             gapCount += 1
+                            telemetryStore.noteGap(bytes: gap)
                             // Rate-limited like the owned path: one line per
                             // 500 gaps keeps a flood from wiping the ring.
                             if gapCount == 1 || gapCount % 500 == 0 {
@@ -3310,6 +3363,7 @@ final class PeerRelaySession {
                             let gap = byteSeq - expected
                             gapBytesTotal += gap
                             gapCount += 1
+                            telemetryStore.noteGap(bytes: gap)
                             // Rate-limited: a heavy flood drops thousands of
                             // chunks/sec; logging every one floods the debug
                             // ring (opening its circuit breaker and dropping
@@ -3519,6 +3573,8 @@ final class PeerRelaySession {
                                 PeerHostStatsStore.shared.record(stats, for: hostKey)
                             }
                         }
+                    case .relayTelemetry(let sample):
+                        telemetryStore.record(sample, surfaceID: mySurfaceID)
                     case .goodbye:
                         if let writer {
                             try? await writer.enqueue(type: kTypeGoodbye, payload: Data("host-goodbye".utf8))
@@ -3932,6 +3988,7 @@ final class PeerRelaySession {
             await newConnection.cancel()
             return
         }
+        relayTelemetry.resetRemote()
         session = newConnection.session
         transport = newConnection.transport
         attachInitialSeq = outcome.initialByteSeq
@@ -4130,6 +4187,7 @@ final class PeerRelaySession {
             await connection.cancel()
             return false
         }
+        relayTelemetry.resetRemote()
         session = connection.session
         transport = connection.transport
         attachInitialSeq = outcome.initialByteSeq
@@ -4269,6 +4327,7 @@ final class PeerRelaySession {
         // have captured an earlier session, but no later frame can start on a
         // session this teardown retired.
         currentSessionSlot.clear()
+        relayTelemetry.resetRemote()
         self.session = nil
         self.transport = nil
         if ownsSession {

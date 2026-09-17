@@ -180,6 +180,14 @@ Rules learned the hard way:
 - Driving the app calls `debug.app.activate`, which **steals focus from the
   user**. Batch the probes, and stop once verified.
 
+## Relay telemetry after release
+
+`peer.pane.status` exposes `relay_telemetry` only after both viewer and GUI host
+advertise `relay.telemetry.v1`. `host_aggregate_dropped_*` is host-wide across
+all attachments, not a per-viewer causal counter; compare it with the current
+viewer's `receiver_gap_*` and transport waits in the same time window. Do not restart
+or update a production host solely to enable an in-development measurement.
+
 ## Measuring "the app feels slow" (`scripts/perf-sample.sh`)
 
 ### Relay input latency

@@ -92,6 +92,9 @@ pub mod capability {
     /// client is what decides whether it wants the traffic — a host sends
     /// these only to connections that asked.
     pub const HOST_STATS_V1: &str = "host.stats.v1";
+    /// Numeric-only relay fan-out and transport diagnostics. Advertised by
+    /// the client to opt into the host's bounded telemetry push.
+    pub const RELAY_TELEMETRY_V1: &str = "relay.telemetry.v1";
     /// The peer understands the typed `GridSnapshot` message (`ansi` form)
     /// on a fresh attach. Advertised by the CLIENT — like `host.stats.v1`,
     /// the client is what decides whether it can consume the typed form. A
@@ -591,6 +594,35 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn relay_telemetry_roundtrips_numeric_surface_counters() {
+        let env = Envelope {
+            seq: 43,
+            correlation_id: 0,
+            payload: Some(envelope::Payload::RelayTelemetry(RelayTelemetry {
+                monotonic_time_ns: 123,
+                transport_eagain_count: 2,
+                transport_wait_ns_total: 9,
+                transport_wait_ns_max: 7,
+                transport_timeout_count: 1,
+                surfaces: vec![RelaySurfaceTelemetry {
+                    surface_id: vec![0xA5; 16],
+                    produced_chunks: 5,
+                    produced_bytes: 80,
+                    host_aggregate_dropped_chunks: 1,
+                    host_aggregate_dropped_bytes: 16,
+                }],
+            })),
+        };
+        let decoded = Envelope::decode(env.encode_to_vec().as_slice()).expect("decode");
+        let Some(envelope::Payload::RelayTelemetry(sample)) = decoded.payload else {
+            panic!("wrong variant")
+        };
+        assert_eq!(sample.transport_eagain_count, 2);
+        assert_eq!(sample.surfaces[0].host_aggregate_dropped_bytes, 16);
+        assert!(!capability::SUPPORTED.contains(&capability::RELAY_TELEMETRY_V1));
     }
 
     #[test]

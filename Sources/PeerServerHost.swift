@@ -436,6 +436,9 @@ final class PeerHostCoordinator: NSObject {
             guard let snapshot = await TermMeshDaemon.shared.monitorSnapshot() else { return nil }
             return LocalHostStatsSample.make(from: snapshot)
         }
+        config.relayTelemetryProvider = {
+            await provider.relayTelemetrySnapshot()
+        }
 
         let server = PeerServer(socketPath: path, provider: provider, config: config)
         do {

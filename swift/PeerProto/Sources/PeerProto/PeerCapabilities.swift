@@ -76,6 +76,9 @@ public enum PeerCapability {
     /// so a host sends them only to a client that asked. Mirrors
     /// `HOST_STATS_V1` on the Rust side.
     public static let hostStatsV1 = "host.stats.v1"
+    /// Numeric-only host relay diagnostics. Client-advertised so hosts do
+    /// not sample or push unless a viewer explicitly opted in.
+    public static let relayTelemetryV1 = "relay.telemetry.v1"
     /// The typed fresh-attach screen keyframe (`GridSnapshot.ansi`).
     /// Client-advertised: a host that sees it sends the fresh-attach
     /// screen as a `GridSnapshot` envelope instead of untyped `PtyData`,
@@ -111,7 +114,7 @@ public enum PeerCapability {
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, gridSnapshotV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, projectPresentationRepairV1, teamRouteFileV1, projectPresentationLiveV1, agentPresentationV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, relayTelemetryV1, gridSnapshotV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, projectPresentationRepairV1, teamRouteFileV1, projectPresentationLiveV1, agentPresentationV1]
 }
 
 /// Strict validation for host-controlled Hello.cli_bin_dirs. Invalid input

@@ -2011,6 +2011,7 @@ final class PeerClientCoordinator: NSObject, NSMenuDelegate {
                 // instead of by scraping logs after the fact: received==0
                 // means nothing ever arrived from the host.
                 row["io"] = session.relaySession.ioSnapshot
+                row["relay_telemetry"] = session.relaySession.relayTelemetrySnapshot
                 if includeInputLatency {
                     row["input_latency"] = session.relaySession.inputLatencySnapshot
                 }
