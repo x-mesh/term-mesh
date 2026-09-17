@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import Bonsplit
 import CoreServices
+import os
 import UserNotifications
 import PeerProto
 import Sentry
@@ -650,13 +651,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
             // A line no reader can decode fails the leader-participation gate
             // for every Project on this Mac, and the log is append-only, so it
-            // never clears itself. Queued behind the debug log's own setup so
-            // the repair leaves a trace; off the main thread because it reads
-            // the whole history.
+            // never clears itself. Off the main thread because it reads the
+            // whole history. The trace goes to the unified log rather than the
+            // debug one: a shipped build is where this repair matters, and
+            // `dlog` does not exist outside DEBUG.
             DispatchQueue.global(qos: .utility).async {
                 let moved = LeaderTurnLog.quarantineMalformedLines()
                 if moved > 0 {
-                    dlog("turnLog.quarantine moved=\(moved)")
+                    Logger.app.info(
+                        "turn log quarantine moved \(moved, privacy: .public) line(s)"
+                    )
                 }
             }
         }
