@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.247.2] - 2026-09-17
+
+### Fixed
+
+- Peer relay output now applies a FIFO byte budget so sustained remote output cannot leave an unbounded stale tail queued behind a slow renderer. Cancelled output waiters no longer leave later frames blocked.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.247.1] - 2026-09-17
 
 ### Fixed
