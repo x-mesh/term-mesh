@@ -4,6 +4,16 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.249.0] - 2026-09-18
+
+### Added
+
+- Add opt-in relay telemetry for correlating remote PTY buffer drops, transport backpressure, and viewer-side output gaps.
+
+### Fixed
+
+- Keep relay diagnostics payload-free, bounded, and disabled for peers that do not opt in.
+
 ## [0.248.0] - 2026-09-17
 
 ### Fixed
