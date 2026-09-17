@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.248.0] - 2026-09-17
+
+### Fixed
+
+- Remote Project roster polling now keeps the session-owner SSH tunnel alive across refreshes instead of tearing it down and recreating it every 15 seconds. Route changes and failed handshakes still invalidate the lease.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.247.2] - 2026-09-17
 
 ### Fixed
