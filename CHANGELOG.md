@@ -4,6 +4,23 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.247.0] - 2026-09-17
+
+### Fixed
+
+- Titlebar buttons answer clicks again. The invisible view that lets you drag the window by its titlebar covered the whole strip, and since the buttons beside it are drawn by SwiftUI rather than as AppKit views of their own, every click in the titlebar went to that drag handle instead. The handle now takes only the gap between the two groups of controls, so dragging the window still works where there is nothing to press.
+- The update banner no longer covers the controls at the trailing end of the titlebar. It was a separate titlebar element drawn on top of them; it now sits in the row and competes for space like everything else there.
+- The Review Board toggle keeps a place of its own at the end of the titlebar. That row is clipped when the window is narrow and the toggle was last, so the only way back to a panel you dismissed could disappear. Hold Command to see its shortcut.
+- Closing the Review Board no longer switches distributed workspaces off. The panel and the coordinator integration shared one stored setting, so dismissing the panel turned the feature off with no notice and left the Settings row reading as an opt-out you never made. A store left that way is repaired at launch, unless the Settings switch itself was used.
+- One damaged line in the leader turn log no longer holds the promotion gate shut for every Project on the Mac. The turn hook could write a record with an empty value spliced into it, and because the log is append-only that line failed the gate until the log rotated away. The hook can no longer produce one, and lines no reader can decode are moved aside to `turns.log.corrupt` at launch so the readable history is measured on its own. Repeated turn starts left behind by the id collision fixed in 0.246.0 move with them.
+- A leader session that sends the same short prompt twice is measured as two turns again. The turn id hashed only the session and the prompt, so the repeat reused one id and was counted as a damaged line instead of a second turn.
+
+### Changed
+
+- Settings drops the leader kill switch that duplicated the mode's Not used option. The two controls resolved to the same policy and were indistinguishable on screen; the mode now owns that behaviour and silences the turn hook's delegation directive as well. The switch remains available to `debug.leader_participation.configure`.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.246.0] - 2026-09-16
 
 ### Fixed
