@@ -338,6 +338,62 @@ final class PeerServerTests: XCTestCase {
         await transport.close()
     }
 
+    func testRelayTelemetryIsSilentWithoutClientOptIn() async throws {
+        actor CallCount {
+            var value = 0
+            func increment() { value += 1 }
+        }
+        let calls = CallCount()
+        var config = PeerServerConfig(relayTelemetryProvider: {
+            await calls.increment()
+            return Termmesh_Peer_V1_RelayTelemetry()
+        })
+        config.relayTelemetryInterval = .milliseconds(10)
+        let socket = "/tmp/tm-peer-relay-telemetry-gate-\(UUID().uuidString.prefix(8)).sock"
+        let server = PeerServer(socketPath: socket, provider: StaticSurfaceProvider(surfaces: []), config: config)
+        try await server.start()
+        defer { Task { await server.stop() } }
+        let transport = try await UnixSocketTransport.connect(socketPath: socket)
+        let session = PeerSession(transport: transport)
+        var options = PeerSessionOptions()
+        options.capabilities = []
+        _ = try await session.handshake(options: options)
+        try await Task.sleep(for: .milliseconds(80))
+        let count = await calls.value
+        XCTAssertEqual(count, 0)
+        try await session.sendGoodbye(reason: "relay telemetry gate test done")
+        await transport.close()
+    }
+
+    func testRelayTelemetryPushesNumericSurfaceCountersToCapableClient() async throws {
+        var expected = Termmesh_Peer_V1_RelayTelemetry()
+        expected.monotonicTimeNs = 42
+        var surface = Termmesh_Peer_V1_RelaySurfaceTelemetry()
+        surface.surfaceID = Data(repeating: 0xA5, count: 16)
+        surface.producedChunks = 7
+        surface.producedBytes = 99
+        surface.hostAggregateDroppedChunks = 2
+        surface.hostAggregateDroppedBytes = 48
+        expected.surfaces = [surface]
+        let expectedSample = expected
+        var config = PeerServerConfig(relayTelemetryProvider: { expectedSample })
+        config.relayTelemetryInterval = .milliseconds(10)
+        let socket = "/tmp/tm-peer-relay-telemetry-push-\(UUID().uuidString.prefix(8)).sock"
+        let server = PeerServer(socketPath: socket, provider: StaticSurfaceProvider(surfaces: []), config: config)
+        try await server.start()
+        defer { Task { await server.stop() } }
+        let transport = try await UnixSocketTransport.connect(socketPath: socket)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+        guard case .relayTelemetry(let received) = try await session.receiveNextMessage() else {
+            return XCTFail("capable client must receive relay telemetry")
+        }
+        XCTAssertEqual(received.monotonicTimeNs, 42)
+        XCTAssertEqual(received.surfaces, [surface])
+        try await session.sendGoodbye(reason: "relay telemetry push test done")
+        await transport.close()
+    }
+
     /// A provider that cannot sample must not be retried at the full cadence
     /// forever — an app whose daemon is down answers nil indefinitely.
     func testUnavailableProviderBacksOffInsteadOfRetryingEveryTick() async throws {

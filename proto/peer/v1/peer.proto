@@ -106,6 +106,9 @@ message Envelope {
     // capability "project.presentation.repair.v1".
     RepairStaleProjectPresentationRequest repair_stale_project_presentation_request = 64;
     RepairStaleProjectPresentationResponse repair_stale_project_presentation_response = 65;
+    // Host-pushed, client-opt-in relay diagnostics. Gated behind
+    // capability "relay.telemetry.v1" (Hello.capabilities).
+    RelayTelemetry relay_telemetry = 66;
 
     Error error = 99;
   }
@@ -926,6 +929,34 @@ message HostStats {
   // nothing rather than a peer that looks 100% full.
   uint64 disk_total_bytes = 12;
   uint64 disk_available_bytes = 13;
+}
+
+// ============================================================
+// Relay telemetry (capability "relay.telemetry.v1")
+// ============================================================
+//
+// A bounded, numeric-only diagnostic sample for correlating host-side PTY
+// fan-out loss with transport backpressure and viewer-side sequence gaps.
+// `monotonic_time_ns` is meaningful only as an ordering/age value on the
+// reporting host; it is never a wall-clock timestamp.
+message RelaySurfaceTelemetry {
+  bytes surface_id = 1;
+  uint64 produced_chunks = 2;
+  uint64 produced_bytes = 3;
+  // Aggregate across every host attachment for this surface. These are not
+  // attributable to this receiving viewer; correlate a viewer's own loss only
+  // with its receiver_gap_* counters.
+  uint64 host_aggregate_dropped_chunks = 4;
+  uint64 host_aggregate_dropped_bytes = 5;
+}
+
+message RelayTelemetry {
+  uint64 monotonic_time_ns = 1;
+  uint64 transport_eagain_count = 2;
+  uint64 transport_wait_ns_total = 3;
+  uint64 transport_wait_ns_max = 4;
+  uint64 transport_timeout_count = 5;
+  repeated RelaySurfaceTelemetry surfaces = 6;
 }
 
 // ============================================================

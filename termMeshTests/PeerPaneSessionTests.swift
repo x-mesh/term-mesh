@@ -89,6 +89,34 @@ final class PeerRelayCurrentSessionSlotTests: XCTestCase {
     }
 }
 
+final class RelayTelemetryStoreTests: XCTestCase {
+    func testHostAggregateDropsStaySeparateFromViewerGapsAndResetOnReconnect() {
+        let store = RelayTelemetryStore()
+        let surfaceID = Data(repeating: 0xA5, count: 16)
+        var surface = Termmesh_Peer_V1_RelaySurfaceTelemetry()
+        surface.surfaceID = surfaceID
+        surface.producedChunks = 7
+        surface.hostAggregateDroppedBytes = 48
+        var sample = Termmesh_Peer_V1_RelayTelemetry()
+        sample.surfaces = [surface]
+
+        store.record(sample, surfaceID: surfaceID)
+        store.noteGap(bytes: 12)
+        let mapped = store.status()
+        XCTAssertEqual(mapped["remote_supported"] as? Bool, true)
+        XCTAssertEqual(mapped["host_aggregate_dropped_bytes"] as? UInt64, 48)
+        XCTAssertEqual(mapped["receiver_gap_bytes_total"] as? UInt64, 12)
+
+        store.resetRemote()
+        let afterReplacement = store.status()
+        XCTAssertEqual(afterReplacement["remote_supported"] as? Bool, false)
+        XCTAssertNil(afterReplacement["host_aggregate_dropped_bytes"])
+
+        store.record(sample, surfaceID: Data(repeating: 0xB6, count: 16))
+        XCTAssertEqual(store.status()["remote_supported"] as? Bool, false)
+    }
+}
+
 final class PeerMirrorLayoutRecoveryPolicyTests: XCTestCase {
     func testOnlyReadyRecoveryMayClearTheDegradedOverlay() {
         XCTAssertTrue(PeerMirrorLayoutRecoveryState.ready.presentsAsReady)

@@ -125,6 +125,9 @@ public struct PeerWorkspaceMeta: Sendable, Equatable {
 public protocol PeerSurfaceProvider: AnyObject, Sendable {
     func supportsLivePresentation() async -> Bool
     func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo]
+    /// A bounded, payload-free snapshot. Implementations must not sample
+    /// unless a capable client is interested; PeerServer enforces that gate.
+    func relayTelemetrySnapshot() async -> Termmesh_Peer_V1_RelayTelemetry?
     /// Return an attachment for `surfaceID`, or `nil` if unknown. The
     /// server sends an `AttachResult(accepted: false)` back to the
     /// client on `nil`.
@@ -236,6 +239,7 @@ public struct PeerTeamCallFailure: Error, Sendable, Equatable {
 
 public extension PeerSurfaceProvider {
     func supportsLivePresentation() async -> Bool { false }
+    func relayTelemetrySnapshot() async -> Termmesh_Peer_V1_RelayTelemetry? { nil }
     func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace] { [] }
     func terminateSurface(
         surfaceID: Data
@@ -431,13 +435,19 @@ public struct PeerServerConfig: Sendable {
     /// returns the loop to `hostStatsInterval`.
     public var hostStatsMaxInterval: Duration = .seconds(30)
 
+    /// Optional host-side relay counters. Its presence enables host support;
+    /// the server calls it only after finding an interested client.
+    public var relayTelemetryProvider: (@Sendable () async -> Termmesh_Peer_V1_RelayTelemetry?)?
+    public var relayTelemetryInterval: Duration = .seconds(2)
+
     public init(
         hostDisplayName: String = "term-mesh",
         hostAppVersion: String = "0.0.0",
         protocolVersion: String = "1.0.0",
         hostCLIBinDirs: [String] = [],
         resolveSessionHostSocket: @escaping @Sendable () -> String = { "" },
-        hostStatsProvider: (@Sendable () async -> Termmesh_Peer_V1_HostStats?)? = nil
+        hostStatsProvider: (@Sendable () async -> Termmesh_Peer_V1_HostStats?)? = nil,
+        relayTelemetryProvider: (@Sendable () async -> Termmesh_Peer_V1_RelayTelemetry?)? = nil
     ) {
         self.hostDisplayName = hostDisplayName
         self.hostAppVersion = hostAppVersion
@@ -445,6 +455,7 @@ public struct PeerServerConfig: Sendable {
         self.hostCLIBinDirs = PeerHostCLIBinDirs.validated(hostCLIBinDirs)
         self.resolveSessionHostSocket = resolveSessionHostSocket
         self.hostStatsProvider = hostStatsProvider
+        self.relayTelemetryProvider = relayTelemetryProvider
     }
 }
 
@@ -458,6 +469,7 @@ public actor PeerServer {
     /// The machine-load push loop, present only when `config` carries a
     /// provider. See `startHostStatsLoopIfConfigured()`.
     private var hostStatsTask: Task<Void, Never>?
+    private var relayTelemetryTask: Task<Void, Never>?
     // Internal (not private) so `@testable import PeerProto` tests can
     // inspect a live session's `hasClientCapability(_:)` after a real
     // handshake — see PeerServerTests.swift. No visibility change outside
@@ -575,6 +587,7 @@ public actor PeerServer {
             )
         }
         startHostStatsLoopIfConfigured()
+        startRelayTelemetryLoopIfConfigured()
     }
 
     /// Starts the machine-load push loop, or does nothing when this host has
@@ -605,6 +618,18 @@ public actor PeerServer {
                 case .unavailable:
                     delay = min(maxInterval, delay * 2)
                 }
+            }
+        }
+    }
+
+    private func startRelayTelemetryLoopIfConfigured() {
+        guard config.relayTelemetryProvider != nil else { return }
+        let interval = config.relayTelemetryInterval
+        relayTelemetryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                guard !Task.isCancelled, let self else { return }
+                await self.pushRelayTelemetrySample()
             }
         }
     }
@@ -645,6 +670,8 @@ public actor PeerServer {
     public func stop() async {
         hostStatsTask?.cancel()
         hostStatsTask = nil
+        relayTelemetryTask?.cancel()
+        relayTelemetryTask = nil
         acceptTask?.cancel()
         acceptTask = nil
         if listenerFd >= 0 {
@@ -730,6 +757,24 @@ public actor PeerServer {
             try? await session.pushHostStats(stats)
         }
         return .pushed
+    }
+
+    private func pushRelayTelemetrySample() async {
+        guard let provider = config.relayTelemetryProvider else { return }
+        var interested: [PeerServerSession] = []
+        for session in activeSessions where await session.hasClientCapability(PeerCapability.relayTelemetryV1) {
+            interested.append(session)
+        }
+        guard !interested.isEmpty, let hostSample = await provider() else { return }
+        for session in interested {
+            var sample = hostSample
+            let transport = await session.relayTransportSnapshot()
+            sample.transportEagainCount = transport.eagainCount
+            sample.transportWaitNsTotal = transport.waitNsTotal
+            sample.transportWaitNsMax = transport.waitNsMax
+            sample.transportTimeoutCount = transport.timeoutCount
+            try? await session.pushRelayTelemetry(sample)
+        }
     }
 
     /// Publish one complete roster to sidebar-only subscribers. This is kept
@@ -954,12 +999,19 @@ final class UnixFdHolder: @unchecked Sendable {
 /// The fd is owned by a `UnixFdHolder` so dropping this actor without
 /// an explicit close still reclaims the descriptor.
 actor AcceptedUnixConnection {
+    struct RelayTransportSnapshot: Sendable, Equatable {
+        var eagainCount: UInt64 = 0
+        var waitNsTotal: UInt64 = 0
+        var waitNsMax: UInt64 = 0
+        var timeoutCount: UInt64 = 0
+    }
     private let holder: UnixFdHolder
     private let queue: DispatchQueue
     private var readSource: DispatchSourceRead?
     private var writeSource: DispatchSourceWrite?
     private let maxPendingWrites: Int
     private let writeTimeoutSeconds: TimeInterval
+    private var relayTransport = RelayTransportSnapshot()
 
     init(
         fd: Int32,
@@ -1097,6 +1149,7 @@ actor AcceptedUnixConnection {
             try Task.checkCancellation()
             if holder.isClosed { return }
             guard ProcessInfo.processInfo.systemUptime < deadline else {
+                relayTransport.timeoutCount &+= 1
                 holder.close()
                 throw PeerServerError.writeTimedOut
             }
@@ -1113,13 +1166,20 @@ actor AcceptedUnixConnection {
                 // Suspension point. Safe only because `acquireWriteSlot`
                 // above guarantees this task owns the socket until the
                 // frame is fully written — see the note on that method.
+                relayTransport.eagainCount &+= 1
+                let waitStart = DispatchTime.now().uptimeNanoseconds
                 try await Task.sleep(nanoseconds: 1_000_000)
+                let elapsed = DispatchTime.now().uptimeNanoseconds &- waitStart
+                relayTransport.waitNsTotal &+= elapsed
+                relayTransport.waitNsMax = max(relayTransport.waitNsMax, elapsed)
                 continue
             }
             if n < 0 && errno == EINTR { continue }
             throw PeerServerError.acceptFailed(errno: errno)
         }
     }
+
+    func relayTransportSnapshot() -> RelayTransportSnapshot { relayTransport }
 
     func close() {
         holder.close()
@@ -1552,6 +1612,17 @@ actor PeerServerSession {
         }
     }
 
+    func pushRelayTelemetry(_ telemetry: Termmesh_Peer_V1_RelayTelemetry) async throws {
+        guard state == .ready else { return }
+        try await sendEnvelope { env in
+            env.relayTelemetry = telemetry
+        }
+    }
+
+    func relayTransportSnapshot() async -> AcceptedUnixConnection.RelayTransportSnapshot {
+        await connection.relayTransportSnapshot()
+    }
+
     /// Push a full workspace roster to an explicitly subscribed client. Full
     /// snapshots make reconnect and deletion convergence idempotent: clients
     /// replace their cached roster rather than merging deltas from a possibly
@@ -1617,6 +1688,9 @@ actor PeerServerSession {
             }
             if config.hostStatsProvider == nil {
                 advertisedCapabilities.removeAll { $0 == PeerCapability.hostStatsV1 }
+            }
+            if config.relayTelemetryProvider == nil {
+                advertisedCapabilities.removeAll { $0 == PeerCapability.relayTelemetryV1 }
             }
             // Host/client asymmetry: `surface.agent.v1` in
             // `PeerCapability.supported` says this BUILD can *render* agent

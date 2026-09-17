@@ -155,6 +155,13 @@ struct PeerTerminalReplayBuffer {
 
 /// One Ghostty PTY callback per surface, fan-out to bounded per-peer streams.
 final class PtyTapHub: @unchecked Sendable {
+    struct RelayTelemetrySnapshot: Sendable, Equatable {
+        let surfaceID: UUID
+        let producedChunks: UInt64
+        let producedBytes: UInt64
+        let hostAggregateDroppedChunks: UInt64
+        let hostAggregateDroppedBytes: UInt64
+    }
     /// Bytes of recent PTY output retained for attach-time replay. Mirrors
     /// the Rust `REPLAY_CAPACITY_BYTES` constant exactly
     /// (`daemon/term-meshd/src/peer/surface.rs:43`).
@@ -192,7 +199,10 @@ final class PtyTapHub: @unchecked Sendable {
     /// directly rather than approximating via a separate push/consume
     /// tally (R11 phase 1: counter + dlog; phase 2 auto-resnapshot is
     /// out of scope here).
-    private var dropCount: UInt64 = 0
+    private var hostAggregateDropCount: UInt64 = 0
+    private var producedChunks: UInt64 = 0
+    private var producedBytes: UInt64 = 0
+    private var hostAggregateDroppedBytes: UInt64 = 0
 
     let surfaceID: UUID
     let surfacePtr: ghostty_surface_t
@@ -418,6 +428,8 @@ final class PtyTapHub: @unchecked Sendable {
         // and `tapSeq` counts what actually goes out, so a stripped query
         // consumes no offsets and gap detection stays exact.
         replay.push(bytes)
+        producedChunks &+= 1
+        producedBytes &+= UInt64(bytes.count)
         // Stamp BEFORE fan-out and advance unconditionally: a dropped
         // yield must still consume tap offsets, or the drop is invisible
         // in the seq stream (see `tapSeq` doc).
@@ -426,8 +438,9 @@ final class PtyTapHub: @unchecked Sendable {
         var droppedCount: UInt64?
         for continuation in continuations.values {
             if case .dropped = continuation.yield(chunk) {
-                dropCount &+= 1
-                droppedCount = dropCount
+                hostAggregateDropCount &+= 1
+                hostAggregateDroppedBytes &+= UInt64(bytes.count)
+                droppedCount = hostAggregateDropCount
             }
         }
         lock.unlock()
@@ -441,6 +454,19 @@ final class PtyTapHub: @unchecked Sendable {
             dlog("peer.broadcast.drop count=\(droppedCount) surface=\(surfaceID.uuidString.prefix(8))")
         }
         #endif
+    }
+
+    func relayTelemetrySnapshot() -> RelayTelemetrySnapshot {
+        lock.lock()
+        let snapshot = RelayTelemetrySnapshot(
+            surfaceID: surfaceID,
+            producedChunks: producedChunks,
+            producedBytes: producedBytes,
+            hostAggregateDroppedChunks: hostAggregateDropCount,
+            hostAggregateDroppedBytes: hostAggregateDroppedBytes
+        )
+        lock.unlock()
+        return snapshot
     }
 
     /// Attach-time replay decision (Phase P4): a locked snapshot of the
@@ -478,6 +504,38 @@ final class PtyTapHub: @unchecked Sendable {
     }
 }
 
+private final class PtyTapTelemetryRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var hubs: [UUID: PtyTapHub] = [:]
+
+    func insert(_ hub: PtyTapHub) {
+        lock.lock(); hubs[hub.surfaceID] = hub; lock.unlock()
+    }
+
+    func remove(_ surfaceID: UUID) {
+        lock.lock(); hubs.removeValue(forKey: surfaceID); lock.unlock()
+    }
+
+    func wireSnapshot() -> Termmesh_Peer_V1_RelayTelemetry {
+        lock.lock()
+        let values = Array(hubs.values)
+        lock.unlock()
+        var sample = Termmesh_Peer_V1_RelayTelemetry()
+        sample.monotonicTimeNs = DispatchTime.now().uptimeNanoseconds
+        sample.surfaces = values.map { hub in
+            let source = hub.relayTelemetrySnapshot()
+            var surface = Termmesh_Peer_V1_RelaySurfaceTelemetry()
+            surface.surfaceID = withUnsafeBytes(of: source.surfaceID.uuid) { Data($0) }
+            surface.producedChunks = source.producedChunks
+            surface.producedBytes = source.producedBytes
+            surface.hostAggregateDroppedChunks = source.hostAggregateDroppedChunks
+            surface.hostAggregateDroppedBytes = source.hostAggregateDroppedBytes
+            return surface
+        }
+        return sample
+    }
+}
+
 // MARK: - GhosttyPaneSurfaceProvider
 
 /// PeerSurfaceProvider backed by the app's live terminal panes.
@@ -486,11 +544,13 @@ final class PtyTapHub: @unchecked Sendable {
 @MainActor
 final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     private var tapHubs: [UUID: PtyTapHub] = [:]
+    nonisolated private let telemetryRegistry = PtyTapTelemetryRegistry()
 
     /// Called when a terminal panel closes. Shuts down the hub (finishes all
     /// peer streams + drops TerminalSurface ref) without waiting for peer detach.
     func invalidateTapHub(forSurfaceId surfaceId: UUID) {
         guard let hub = tapHubs.removeValue(forKey: surfaceId) else { return }
+        telemetryRegistry.remove(surfaceId)
         hub.shutdown()
         #if DEBUG
         dlog("tapHub.invalidate surfaceId=\(surfaceId.uuidString.prefix(8))")
@@ -500,6 +560,10 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     // MARK: PeerSurfaceProvider
 
     func supportsLivePresentation() async -> Bool { true }
+
+    nonisolated func relayTelemetrySnapshot() async -> Termmesh_Peer_V1_RelayTelemetry? {
+        telemetryRegistry.wireSnapshot()
+    }
 
     func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] {
         // Background panes have a lazy `ghostty_surface_t` — newly opened
@@ -881,6 +945,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         } else {
             hub = PtyTapHub(surfaceID: ts.id, surfacePtr: sfcPtr, surfaceRef: ts)
             tapHubs[ts.id] = hub
+            telemetryRegistry.insert(hub)
             // Register the C tap under renderer_state.mutex in Ghostty.
             let hubPtr = Unmanaged.passUnretained(hub).toOpaque()
             ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, hubPtr)
@@ -1041,6 +1106,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                         // left and takes its own size back.
                         ts.clearRemoteViewerPixelSize()
                         provider.value?.tapHubs.removeValue(forKey: ts.id)
+                        provider.value?.telemetryRegistry.remove(ts.id)
                     }
                 }
                 // FIX A: release pending escape-sequence tail on last client detach
@@ -2196,6 +2262,7 @@ extension GhosttyPaneSurfaceProvider {
         } else {
             hub = PtyTapHub(surfaceID: ts.id, surfacePtr: sfcPtr, surfaceRef: ts)
             tapHubs[ts.id] = hub
+            telemetryRegistry.insert(hub)
             let hubPtr = Unmanaged.passUnretained(hub).toOpaque()
             ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, hubPtr)
         }

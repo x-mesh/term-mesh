@@ -123,6 +123,7 @@ public enum PeerIncomingMessage: Sendable {
     /// cadence. Gated behind capability "host.stats.v1", so a host that
     /// predates it simply never sends one.
     case hostStats(Termmesh_Peer_V1_HostStats)
+    case relayTelemetry(Termmesh_Peer_V1_RelayTelemetry)
     /// Reverse request emitted by a remote host's local `tm-agent` proxy.
     /// `correlationID` is the host envelope sequence and must be echoed by
     /// `sendTeamLeaderCommandResponse`.
@@ -1489,6 +1490,8 @@ public actor PeerSession {
             return .workspaceListChanged(changed.workspaces)
         case .hostStats(let s):
             return .hostStats(s)
+        case .relayTelemetry(let telemetry):
+            return .relayTelemetry(telemetry)
         case .teamLeaderCommandRequest(let request):
             return .teamLeaderCommandRequest(request, correlationID: env.seq)
         case .error(let e):
@@ -1671,7 +1674,7 @@ public actor PeerSession {
         while true {
             let env = try await readAnyFrame()
             switch env.payload {
-            case .hostStats, .workspaceUpdate, .workspaceListChanged:
+            case .hostStats, .relayTelemetry, .workspaceUpdate, .workspaceListChanged:
                 continue
             default:
                 return env
