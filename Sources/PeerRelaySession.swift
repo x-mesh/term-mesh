@@ -283,57 +283,98 @@ final class RelayStallLogGateBox: @unchecked Sendable {
     }
 }
 
-private actor RelayFrameSlots {
+actor RelayFrameByteBudget {
+    static let normalLimit = 256 * 1024
+
+    private struct Waiter {
+        let id: UUID
+        let bytes: Int
+        let continuation: CheckedContinuation<UUID, Error>
+    }
+
     private let limit: Int
-    private var available: Int
-    private var waiters: [CheckedContinuation<Void, Error>] = []
+    private var reservedBytes = 0
+    private var reservations: [UUID: Int] = [:]
+    private var waiters: [Waiter] = []
     private var stoppedError: Error?
     /// Uptime at the 0→1 waiter edge; nil while writes flow freely.
     private var stallStartedAt: UInt64?
     private var stallLogGate = RelayStallLogGate()
 
-    init(limit: Int) {
+    init(limit: Int = normalLimit) {
         self.limit = limit
-        self.available = limit
     }
 
-    func acquire() async throws {
+    func acquire(bytes: Int) async throws -> UUID {
+        precondition(bytes >= 0)
         if let stoppedError {
             throw stoppedError
         }
-        if available > 0 {
-            available -= 1
-            return
+        let id = UUID()
+        if waiters.isEmpty, canReserve(bytes) {
+            reserve(id: id, bytes: bytes)
+            return id
         }
-        // Slots exhausted: the relay socket write side is backed up (relay
-        // not draining → its stdout to Ghostty is blocked). Track only the
-        // onset edge (0→1 waiter) so a sustained stall is one episode, not
-        // one per frame. This is the app→relay choke point in the "heavy
-        // output → truncate → pane closes" chain.
-        if waiters.isEmpty {
-            stallStartedAt = DispatchTime.now().uptimeNanoseconds
-            #if DEBUG
-            dlog("peer.relay.backpressure.stall limit=\(limit) — relay socket write side backed up")
-            #endif
-        }
-        try await withCheckedThrowingContinuation { continuation in
-            waiters.append(continuation)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if let stoppedError {
+                    continuation.resume(throwing: stoppedError)
+                    return
+                }
+                if waiters.isEmpty, canReserve(bytes) {
+                    reserve(id: id, bytes: bytes)
+                    continuation.resume(returning: id)
+                    return
+                }
+                if waiters.isEmpty {
+                    stallStartedAt = DispatchTime.now().uptimeNanoseconds
+                    #if DEBUG
+                    dlog("peer.relay.backpressure.stall limit=\(limit) — relay socket write side backed up")
+                    #endif
+                }
+                waiters.append(Waiter(id: id, bytes: bytes, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: id) }
         }
     }
 
-    func release() {
-        if stoppedError != nil {
-            available = min(limit, available + 1)
-            return
-        }
+    func release(_ id: UUID) {
+        guard let bytes = reservations.removeValue(forKey: id) else { return }
+        reservedBytes -= bytes
+        guard stoppedError == nil else { return }
+        resumeWaiters()
+    }
+
+    func snapshot() -> (reservedBytes: Int, waitingCount: Int) {
+        (reservedBytes, waiters.count)
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(throwing: CancellationError())
         if waiters.isEmpty {
-            available = min(limit, available + 1)
+            stallStartedAt = nil
         } else {
-            // Drain edge: last waiter about to be resumed → backpressure
-            // cleared. Unlike the DEBUG lines this episode record survives
-            // into release builds — it is the only trace a production
-            // output-freeze leaves.
-            if waiters.count == 1, let startedAt = stallStartedAt {
+            resumeWaiters()
+        }
+    }
+
+    private func canReserve(_ bytes: Int) -> Bool {
+        bytes <= limit ? reservedBytes + bytes <= limit : reservedBytes == 0
+    }
+
+    private func reserve(id: UUID, bytes: Int) {
+        reservations[id] = bytes
+        reservedBytes += bytes
+    }
+
+    private func resumeWaiters() {
+        while let waiter = waiters.first, canReserve(waiter.bytes) {
+            waiters.removeFirst()
+            reserve(id: waiter.id, bytes: waiter.bytes)
+            if waiters.isEmpty, let startedAt = stallStartedAt {
                 stallStartedAt = nil
                 let now = DispatchTime.now().uptimeNanoseconds
                 if stallLogGate.recordEpisode(durationNanos: now &- startedAt, now: now) {
@@ -345,61 +386,67 @@ private actor RelayFrameSlots {
                 dlog("peer.relay.backpressure.drained")
                 #endif
             }
-            waiters.removeFirst().resume()
+            waiter.continuation.resume(returning: waiter.id)
         }
     }
 
     func stop(error: Error) {
         guard stoppedError == nil else { return }
         stoppedError = error
-        // Teardown ends any open episode without a log line — the disconnect
-        // path already reports why the session went away.
         stallStartedAt = nil
         let pending = waiters
         waiters.removeAll()
-        available = 0
+        reservations.removeAll()
+        reservedBytes = 0
         for waiter in pending {
-            waiter.resume(throwing: error)
+            waiter.continuation.resume(throwing: error)
         }
     }
 }
 
-private final class RelayFrameWriter: @unchecked Sendable {
-    private let relay: RelaySocket
+final class RelayFrameWriter: @unchecked Sendable {
+    private let writeFrame: @Sendable (UInt8, Data) throws -> Void
     private let queue = DispatchQueue(label: "term-mesh.peer.relay.writer", qos: .userInitiated)
-    // 32 (was 256): a smaller app→relay writer window pushes backpressure to
-    // the host sooner, so an output flood cannot pile up MBs of stale bytes
-    // that keep rendering after the user hits Ctrl+C. Measured on a jw-server
-    // relay pane: 588 KB burst drain 997ms → 660ms; combined with the host's
-    // larger READ_BUF coalescing, 3.4 MB drain went ~9s → ~1s. No throughput
-    // regression observed (drain stayed linear at ~10 MB/s).
-    private let slots = RelayFrameSlots(limit: 32)
+    private let budget: RelayFrameByteBudget
     private let lock = NSLock()
     private var stopped = false
     private let onFailure: @Sendable (Error) -> Void
 
     init(relay: RelaySocket, onFailure: @escaping @Sendable (Error) -> Void) {
-        self.relay = relay
+        self.writeFrame = { type, payload in
+            try relay.writeFrame(type: type, payload: payload)
+        }
         self.onFailure = onFailure
+        self.budget = RelayFrameByteBudget()
+    }
+
+    init(
+        writeFrame: @escaping @Sendable (UInt8, Data) throws -> Void,
+        onFailure: @escaping @Sendable (Error) -> Void,
+        budget: RelayFrameByteBudget = RelayFrameByteBudget()
+    ) {
+        self.writeFrame = writeFrame
+        self.onFailure = onFailure
+        self.budget = budget
     }
 
     func enqueue(type: UInt8, payload: Data) async throws {
         let framePayload = payload
-        try await slots.acquire()
+        let reservation = try await budget.acquire(bytes: payload.count + 5)
         guard !isStopped else {
-            await slots.release()
+            await budget.release(reservation)
             throw RelayError.ioError("relay writer stopped")
         }
 
         queue.async {
-            defer { Task { await self.slots.release() } }
+            defer { Task { await self.budget.release(reservation) } }
             guard !self.isStopped else { return }
             do {
-                try self.relay.writeFrame(type: type, payload: framePayload)
+                try self.writeFrame(type, framePayload)
             } catch {
                 if self.markStopped() {
                     Task {
-                        await self.slots.stop(error: RelayError.ioError("relay writer stopped"))
+                        await self.budget.stop(error: RelayError.ioError("relay writer stopped"))
                     }
                     self.onFailure(error)
                 }
@@ -410,7 +457,7 @@ private final class RelayFrameWriter: @unchecked Sendable {
     func stop() {
         if markStopped() {
             Task {
-                await self.slots.stop(error: RelayError.ioError("relay writer stopped"))
+                await self.budget.stop(error: RelayError.ioError("relay writer stopped"))
             }
         }
     }
