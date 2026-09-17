@@ -79,4 +79,82 @@ final class ReviewBoardVisibilityTests: XCTestCase {
         XCTAssertTrue(ReviewBoardSettings.isVisible)
         XCTAssertFalse(UserDefaults.standard.bool(forKey: ReviewBoardSettings.isClosedKey))
     }
+
+    /// Dismissing the panel must not switch a feature off.
+    ///
+    /// `enabledKey` is the review-board half of the coordinator gate, so a
+    /// close that wrote it false turned distributed workspaces off with no
+    /// notice and no visible way back.
+    func testClosingKeepsTheCoordinatorGateUp() {
+        ReviewBoardSettings.setVisible(true)
+        XCTAssertTrue(UserDefaults.standard.bool(forKey: ReviewBoardSettings.enabledKey))
+
+        ReviewBoardSettings.setVisible(false)
+
+        XCTAssertFalse(ReviewBoardSettings.isVisible)
+        XCTAssertTrue(
+            UserDefaults.standard.bool(forKey: ReviewBoardSettings.enabledKey),
+            "closing the panel must leave the coordinator gate alone"
+        )
+    }
+}
+
+/// Getting back a gate an older build lowered on close.
+final class ReviewBoardLegacyCloseRepairTests: XCTestCase {
+    private var defaults: UserDefaults!
+    private var suiteName: String!
+
+    override func setUp() {
+        super.setUp()
+        suiteName = "term-mesh.tests.reviewBoardRepair.\(UUID().uuidString)"
+        defaults = UserDefaults(suiteName: suiteName)
+    }
+
+    override func tearDown() {
+        defaults.removePersistentDomain(forName: suiteName)
+        defaults = nil
+        suiteName = nil
+        super.tearDown()
+    }
+
+    func testRepairRaisesAGateThatOnlyACloseCouldHaveLowered() {
+        defaults.set(false, forKey: ReviewBoardSettings.enabledKey)
+        defaults.set(true, forKey: ReviewBoardSettings.isClosedKey)
+
+        ReviewBoardSettings.repairLegacyCloseState(defaults: defaults)
+
+        XCTAssertTrue(defaults.bool(forKey: ReviewBoardSettings.enabledKey))
+        XCTAssertTrue(
+            defaults.bool(forKey: ReviewBoardSettings.isClosedKey),
+            "repair restores the gate, not the panel the user dismissed"
+        )
+    }
+
+    /// A user who switched the feature off in Settings stays switched off.
+    func testRepairLeavesADeliberateOptOutAlone() {
+        defaults.set(false, forKey: ReviewBoardSettings.enabledKey)
+        defaults.set(false, forKey: ReviewBoardCoordinatorSettings.distributedFeatureKey)
+
+        ReviewBoardSettings.repairLegacyCloseState(defaults: defaults)
+
+        XCTAssertFalse(defaults.bool(forKey: ReviewBoardSettings.enabledKey))
+    }
+
+    /// Repair is a migration, not a policy: a later close stays closed.
+    func testRepairRunsOnlyOnce() {
+        defaults.set(false, forKey: ReviewBoardSettings.enabledKey)
+        ReviewBoardSettings.repairLegacyCloseState(defaults: defaults)
+        XCTAssertTrue(defaults.bool(forKey: ReviewBoardSettings.enabledKey))
+
+        defaults.set(false, forKey: ReviewBoardSettings.enabledKey)
+        ReviewBoardSettings.repairLegacyCloseState(defaults: defaults)
+
+        XCTAssertFalse(defaults.bool(forKey: ReviewBoardSettings.enabledKey))
+    }
+
+    func testRepairDoesNothingWhenTheGateWasNeverWritten() {
+        ReviewBoardSettings.repairLegacyCloseState(defaults: defaults)
+
+        XCTAssertNil(defaults.object(forKey: ReviewBoardSettings.enabledKey))
+    }
 }

@@ -459,6 +459,20 @@ struct TitlebarLeadingInsetReader: NSViewRepresentable {
     }
 }
 
+/// Space the custom titlebar strip holds back at its trailing edge.
+///
+/// The info row is one `HStack` of fixed-size groups: when it outgrows the
+/// strip the overflow is clipped, and whatever sits last goes first. The
+/// Review Board toggle is last and is the only way back to a panel the user
+/// dismissed, so it gets a lane of its own that the row cannot spend.
+enum TitlebarInsetPolicy {
+    /// Gap between the last control and the strip's edge.
+    static let trailingBaseInset: CGFloat = 8
+
+    /// Separator, spacing and icon of the Review Board toggle.
+    static let reviewBoardToggleLane: CGFloat = 30
+}
+
 // MARK: - Worktree Manager Table
 
 enum WorktreeAssocKeys {

@@ -30,15 +30,55 @@ enum ReviewBoardSettings {
         return defaults.bool(forKey: enabledKey)
     }
 
+    /// Showing and hiding are deliberately not symmetric.
+    ///
+    /// `enabledKey` is also the review-board half of the coordinator gate that
+    /// `ReviewBoardCoordinatorSettings.isIntegrationEnabled` reads, so writing
+    /// it false on a dismissal turned distributed workspaces off as a side
+    /// effect of closing a panel — and nothing said so. Hiding therefore only
+    /// records the dismissal. Showing still clears a gate that a dismissal may
+    /// have left down, because a button that reports "Show Review Board" has
+    /// to actually show it.
     static func setVisible(_ visible: Bool) {
         let defaults = UserDefaults.standard
-        defaults.set(visible, forKey: enabledKey)
+        if visible {
+            defaults.set(true, forKey: enabledKey)
+        }
         defaults.set(!visible, forKey: isClosedKey)
     }
 
     static func toggleVisible() {
         setVisible(!isVisible)
     }
+
+    static let legacyCloseRepairKey = "reviewBoard.legacyCloseRepaired"
+
+    /// Raise a gate that an older build lowered on close.
+    ///
+    /// Until the asymmetry above, dismissing the board cleared `enabledKey`,
+    /// which also switched the coordinator integration off and made the
+    /// Settings row read as an opt-out the user never made. Repair runs once.
+    ///
+    /// A deliberate opt-out is left alone: the Settings switch writes
+    /// `distributedFeatureKey` as well, so a store that has never held that
+    /// key and still has `enabledKey` false can only be the old close path.
+    static func repairLegacyCloseState(defaults: UserDefaults = .standard) {
+        guard !defaults.bool(forKey: legacyCloseRepairKey) else { return }
+        defaults.set(true, forKey: legacyCloseRepairKey)
+        guard defaults.object(forKey: enabledKey) != nil,
+              !defaults.bool(forKey: enabledKey),
+              defaults.object(forKey: ReviewBoardCoordinatorSettings.distributedFeatureKey) == nil
+        else { return }
+        defaults.set(true, forKey: enabledKey)
+    }
+
+    /// The toggle's key equivalent, in one place.
+    ///
+    /// The menu item, the titlebar tooltip and the hint that appears while ⌘
+    /// is held all name this shortcut; three literals would drift.
+    static let toggleShortcutKey: KeyEquivalent = "b"
+    static let toggleShortcutModifiers: SwiftUI.EventModifiers = [.command, .control]
+    static let toggleShortcutDisplay = "\u{2303}\u{2318}B"
     static let defaultWidth: CGFloat = 320
     /// How narrow the board may be dragged.
     ///

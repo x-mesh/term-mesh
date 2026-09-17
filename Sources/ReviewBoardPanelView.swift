@@ -866,7 +866,11 @@ extension ReviewBoardPanelView {
     }
 
     private func overlapCanarySymbol(_ panel: ReviewBoardViewModel.DelegationPanel) -> String {
-        guard panel.level == .delegated, panel.supportedLeader, !panel.killSwitch else {
+        // The mode belongs in this guard, not only in the headline: without it
+        // a Project the user switched off still drew a green check next to a
+        // line that says overlap is off.
+        guard panel.level == .delegated, panel.supportedLeader, !panel.killSwitch,
+              panel.mode == .canary else {
             return "pause.circle"
         }
         switch viewModel.overlapHealthReading {

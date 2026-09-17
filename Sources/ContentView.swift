@@ -803,10 +803,6 @@ struct ContentView: View {
 
     private var customTitlebar: some View {
         ZStack {
-            // Enable window dragging from the titlebar strip without making the entire content
-            // view draggable (which breaks drag gestures like tab reordering).
-            WindowDragHandleView()
-
             TitlebarLeadingInsetReader(inset: $titlebarLeadingInset)
                 .allowsHitTesting(false)
 
@@ -818,15 +814,34 @@ struct ContentView: View {
 
                 // Git branch + directory basename
                 titlebarBranchAndDirectory
+                    .background(WindowDragHandleView())
 
-                Spacer()
+                // The drag handle takes the gap instead of sitting under the
+                // whole strip.
+                //
+                // It is an `NSView`; the controls beside it are not — SwiftUI
+                // draws them inside the hosting view without a platform view
+                // of their own. AppKit's hit test finds subviews first, so a
+                // handle spanning the strip answered for every point in it and
+                // no titlebar button could be clicked at all. Bounded to the
+                // gap, it can only claim space that has nothing in it.
+                WindowDragHandleView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 titlebarRightInfo
             }
             .frame(height: 28)
             .padding(.top, 2)
             .padding(.leading, (isFullScreen && !sidebarState.isVisible) ? 8 : (sidebarState.isVisible ? 12 : titlebarLeadingInset + CGFloat(debugTitlebarLeadingExtra)))
-            .padding(.trailing, 8)
+            .padding(.trailing, TitlebarInsetPolicy.trailingBaseInset + TitlebarInsetPolicy.reviewBoardToggleLane)
+
+            HStack(spacing: 0) {
+                Spacer(minLength: 0)
+                titlebarReviewBoardToggle
+            }
+            .frame(height: 28)
+            .padding(.top, 2)
+            .padding(.trailing, TitlebarInsetPolicy.trailingBaseInset)
         }
         .frame(height: titlebarPadding)
         .frame(maxWidth: .infinity)
@@ -1080,6 +1095,13 @@ struct ContentView: View {
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(titlebarColor(opacity: 0.4))
 
+            // The pill used to be a `.right` titlebar accessory. The window is
+            // `.fullSizeContentView`, so that AppKit view drew over this strip
+            // and swallowed the clicks meant for whatever the strip had put at
+            // its own trailing edge — the Review Board toggle. In the row it
+            // competes for space by the same rules as everything else.
+            UpdatePill(model: updateViewModel)
+
             // Somewhere to click. The board's close button was the only
             // control it had and closing was one-way; a menu item and a
             // shortcut fix that for anyone who goes looking, which is not how
@@ -1091,19 +1113,27 @@ struct ContentView: View {
             // another thing about agents. Shown whether or not a team exists,
             // because someone who closed the board needs the way back
             // regardless of what is running.
-            titlebarInfoSeparator
-            Button(action: { ReviewBoardSettings.toggleVisible() }) {
-                Image(systemName: isReviewBoardShowing ? "sidebar.right" : "sidebar.squares.right")
-                    .font(.system(size: 11))
-                    .foregroundColor(isReviewBoardShowing
-                        ? .accentColor.opacity(0.9)
-                        : titlebarColor(opacity: 0.5))
-            }
-            .buttonStyle(.plain)
-            .help(isReviewBoardShowing ? "Hide Review Board (⌃⌘B)" : "Show Review Board (⌃⌘B)")
-            .accessibilityIdentifier("titlebar.reviewBoardToggle")
         }
         .lineLimit(1)
+    }
+
+    /// The Review Board toggle, kept out of `titlebarRightInfo`.
+    ///
+    /// That row is a single `HStack` of fixed-size groups: when it outgrows
+    /// the strip the overflow is simply clipped, and the toggle — last in the
+    /// row — went first. Anything else in the row can be lost to a narrow
+    /// window without stranding the user; the way back to a dismissed panel
+    /// cannot.
+    private var titlebarReviewBoardToggle: some View {
+        HStack(spacing: 8) {
+            Spacer(minLength: 0)
+            titlebarInfoSeparator
+            ReviewBoardTitlebarToggle(
+                isShowing: isReviewBoardShowing,
+                inactiveColor: titlebarColor(opacity: 0.5)
+            )
+        }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     /// Whether the board is on screen, read from the same two keys
@@ -5194,4 +5224,64 @@ struct ContentView: View {
 private struct SidebarOverlayWidthPreferenceKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+/// The titlebar's Review Board toggle.
+///
+/// Its own view so the ⌘-hold hint can keep a key monitor whose lifetime is
+/// the button's, instead of adding a third one to `ContentView`. The left-hand
+/// titlebar accessory shows the same kind of hint for its own buttons; this
+/// one lives in the custom strip, which that accessory cannot reach.
+private struct ReviewBoardTitlebarToggle: View {
+    let isShowing: Bool
+    let inactiveColor: Color
+
+    @StateObject private var commandKeyMonitor = SidebarCommandKeyMonitor()
+    @AppStorage(ShortcutHintDebugSettings.alwaysShowHintsKey)
+    private var alwaysShowShortcutHints = ShortcutHintDebugSettings.defaultAlwaysShowHints
+
+    private var showsHint: Bool {
+        alwaysShowShortcutHints || commandKeyMonitor.isCommandPressed
+    }
+
+    private var helpText: String {
+        let shortcut = ReviewBoardSettings.toggleShortcutDisplay
+        return isShowing ? "Hide Review Board (\(shortcut))" : "Show Review Board (\(shortcut))"
+    }
+
+    var body: some View {
+        Button(action: { ReviewBoardSettings.toggleVisible() }) {
+            Image(systemName: isShowing ? "sidebar.right" : "sidebar.squares.right")
+                .font(.system(size: 11))
+                .foregroundColor(isShowing ? .accentColor.opacity(0.9) : inactiveColor)
+        }
+        .buttonStyle(.plain)
+        .help(helpText)
+        .accessibilityIdentifier("titlebar.reviewBoardToggle")
+        .overlay(alignment: .top) {
+            if showsHint {
+                Text(ReviewBoardSettings.toggleShortcutDisplay)
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+                    .fixedSize()
+                    .foregroundColor(.primary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(ShortcutHintPillBackground())
+                    .offset(y: 15)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+                    .accessibilityIdentifier("titlebarShortcutHint.toggleReviewBoard")
+            }
+        }
+        .animation(.easeInOut(duration: 0.14), value: showsHint)
+        .background(
+            WindowAccessor { window in
+                commandKeyMonitor.setHostWindow(window)
+            }
+            .frame(width: 0, height: 0)
+        )
+        .onAppear { commandKeyMonitor.start() }
+        .onDisappear { commandKeyMonitor.stop() }
+    }
 }

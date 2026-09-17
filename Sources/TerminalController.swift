@@ -1541,6 +1541,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPanelSnapshotReset(params: params))
         case "debug.window.screenshot":
             return v2Result(id: id, self.v2DebugScreenshot(params: params))
+        case "debug.window.click":
+            return v2Result(id: id, self.v2DebugWindowClick(params: params))
         case "debug.drag.simulate_file_drop":
             return v2Result(id: id, self.v2DebugDragSimulateFileDrop(params: params))
         case "debug.drag.seed_pasteboard", "debug.drag_pasteboard.seed":

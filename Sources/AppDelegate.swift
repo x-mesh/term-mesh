@@ -413,7 +413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var browserAddressBarBlurObserver: NSObjectProtocol?
     let updateViewModel = UpdateViewModel()
     let brewSelfUpdater = BrewSelfUpdater()
-    private lazy var titlebarAccessoryController = UpdateTitlebarAccessoryController(viewModel: updateViewModel)
+    private lazy var titlebarAccessoryController = UpdateTitlebarAccessoryController()
     let windowDecorationsController = WindowDecorationsController()
     var menuBarExtraController: MenuBarExtraController?
     static let serviceErrorNoPath = NSString(string: "Could not load any folder path from the clipboard.")
@@ -635,6 +635,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let env = ProcessInfo.processInfo.environment
         let isRunningUnderXCTest = isRunningUnderXCTest(env)
 
+        // Older builds cleared the review-board half of the coordinator gate
+        // whenever the panel was dismissed, so a close read as a feature
+        // opt-out. Repair before anything reads the gate.
+        ReviewBoardSettings.repairLegacyCloseState()
+
         DispatchQueue.main.async {
             TeamTemplateManager.shared.ensureSeeded()
             XmOpToastChecker.checkOnLaunch()
@@ -642,6 +647,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             // get auto-reply via the daemon's PTY reader; GUI agents need this
             // scrollback-polling path because ghostty owns their PTY.
             AutoReplyPoller.shared.ensureRunning()
+
+            // A line no reader can decode fails the leader-participation gate
+            // for every Project on this Mac, and the log is append-only, so it
+            // never clears itself. Queued behind the debug log's own setup so
+            // the repair leaves a trace; off the main thread because it reads
+            // the whole history.
+            DispatchQueue.global(qos: .utility).async {
+                let moved = LeaderTurnLog.quarantineMalformedLines()
+                if moved > 0 {
+                    dlog("turnLog.quarantine moved=\(moved)")
+                }
+            }
         }
 
 #if DEBUG

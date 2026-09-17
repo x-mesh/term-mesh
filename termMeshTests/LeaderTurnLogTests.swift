@@ -92,6 +92,152 @@ final class LeaderTurnLogTests: XCTestCase {
         XCTAssertEqual(records.first?.routeStatus, "unstated")
     }
 
+    /// The stuck state this repairs: one undecodable line, written months ago,
+    /// failing the gate for every Project on the machine with no way to clear
+    /// it from the UI.
+    func testQuarantineMovesUndecodableLinesOutOfTheLog() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_start","turn_id":"a","ts":"2026-08-24T00:00:00Z","team":"t","surface_id":"s"}
+        {"event":"turn_start","turn_id":"b","ts":"2026-08-24T00:00:01Z","team":"t","surface_id":"s","leader_session_id":}
+        {"event":"turn_end","turn_id":"a","ts":"2026-08-24T00:00:02Z","team":"t","route_status":"stated"}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        XCTAssertEqual(LeaderTurnLog.quarantineMalformedLines(in: log), 1)
+
+        let remaining = LeaderTurnLog.readAll(from: log)
+        XCTAssertEqual(remaining.map(\.turnID), ["a", "a"])
+        let corrupt = try String(
+            contentsOf: LeaderTurnLog.corruptLogFile(for: log), encoding: .utf8
+        )
+        XCTAssertTrue(
+            corrupt.contains("\"leader_session_id\":}"),
+            "the damaged bytes are kept as evidence"
+        )
+        XCTAssertTrue(corrupt.hasSuffix("\n"))
+    }
+
+    func testQuarantineLeavesACleanLogUntouched() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_start","turn_id":"a","ts":"2026-08-24T00:00:00Z","team":"t","surface_id":"s"}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+        let before = try Data(contentsOf: log)
+
+        XCTAssertEqual(LeaderTurnLog.quarantineMalformedLines(in: log), 0)
+
+        XCTAssertEqual(try Data(contentsOf: log), before)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: LeaderTurnLog.corruptLogFile(for: log).path),
+            "a clean log creates no sidecar"
+        )
+    }
+
+    /// A repeat decodes, but both readers already drop it and count it
+    /// malformed, so an older hook's leftovers shut the gate for good.
+    func testQuarantineMovesRepeatedStartsAndKeepsTheFirst() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_start","turn_id":"a","ts":"2026-08-24T00:00:00Z","team":"t","surface_id":"s"}
+        {"event":"turn_start","turn_id":"a","ts":"2026-08-24T00:00:01Z","team":"t","surface_id":"s"}
+        {"event":"turn_end","turn_id":"a","ts":"2026-08-24T00:00:02Z","team":"t","route_status":"stated"}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        XCTAssertEqual(LeaderTurnLog.quarantineMalformedLines(in: log), 1)
+
+        let remaining = LeaderTurnLog.readAll(from: log)
+        XCTAssertEqual(remaining.map(\.event), [.turnStart, .turnEnd])
+        XCTAssertEqual(
+            remaining.first?.timestamp, "2026-08-24T00:00:00Z",
+            "the first start is the one the reading already used"
+        )
+    }
+
+    /// Turn ids carry no Project, so a repeat is only a repeat within one.
+    func testQuarantineKeepsTheSameTurnIDUnderAnotherProject() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let payload = """
+        {"event":"turn_start","turn_id":"a","ts":"2026-08-24T00:00:00Z","team":"one","surface_id":"s"}
+        {"event":"turn_start","turn_id":"a","ts":"2026-08-24T00:00:01Z","team":"two","surface_id":"s"}
+        """ + "\n"
+        try Data(payload.utf8).write(to: log)
+
+        XCTAssertEqual(LeaderTurnLog.quarantineMalformedLines(in: log), 0)
+        XCTAssertEqual(LeaderTurnLog.readAll(from: log).map(\.team), ["one", "two"])
+    }
+
+    /// The health reading folds both generations together, so a pair either
+    /// side of a rotation is one repeat and has to be seen as one here too.
+    func testQuarantineSeesARepeatAcrossARotation() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let rotatedPayload = """
+        {"event":"turn_start","turn_id":"a","ts":"2026-08-24T00:00:00Z","team":"t","surface_id":"s"}
+        """ + "\n"
+        try Data(rotatedPayload.utf8).write(to: LeaderTurnLog.rotatedLogFile(for: log))
+        let livePayload = """
+        {"event":"turn_start","turn_id":"a","ts":"2026-08-24T00:00:05Z","team":"t","surface_id":"s"}
+        """ + "\n"
+        try Data(livePayload.utf8).write(to: log)
+
+        XCTAssertEqual(LeaderTurnLog.quarantineMalformedLines(in: log), 1)
+
+        XCTAssertEqual(
+            LeaderTurnLog.readAll(from: LeaderTurnLog.rotatedLogFile(for: log)).count, 1,
+            "the older generation keeps the first start"
+        )
+        XCTAssertTrue(LeaderTurnLog.readAll(from: log).isEmpty)
+    }
+
+    /// The rotated generation is part of the same reading, so it is repaired
+    /// with the live one and both sets of evidence land in one sidecar.
+    func testQuarantineAlsoRepairsTheRotatedGeneration() throws {
+        let log = try temporaryLog()
+        try FileManager.default.createDirectory(
+            at: log.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let rotatedPayload = """
+        {"event":"turn_start","turn_id":"old","ts":"2026-08-24T00:00:00Z","team":"t","surface_id":"s"}
+        {rotated-damage}
+        """ + "\n"
+        try Data(rotatedPayload.utf8).write(to: LeaderTurnLog.rotatedLogFile(for: log))
+        let livePayload = """
+        {"event":"turn_start","turn_id":"live","ts":"2026-08-24T00:00:02Z","team":"t","surface_id":"s"}
+        {live-damage}
+        """ + "\n"
+        try Data(livePayload.utf8).write(to: log)
+
+        XCTAssertEqual(LeaderTurnLog.quarantineMalformedLines(in: log), 2)
+
+        XCTAssertEqual(LeaderTurnLog.readAll(from: log).map(\.turnID), ["live"])
+        XCTAssertEqual(
+            LeaderTurnLog.readAll(from: LeaderTurnLog.rotatedLogFile(for: log)).map(\.turnID),
+            ["old"]
+        )
+        let corrupt = try String(
+            contentsOf: LeaderTurnLog.corruptLogFile(for: log), encoding: .utf8
+        )
+        XCTAssertTrue(corrupt.contains("{rotated-damage}"))
+        XCTAssertTrue(corrupt.contains("{live-damage}"))
+    }
+
     func testHealthUsesSupportedStartsAsDenominatorAndSeparatesCapabilities() throws {
         let log = try temporaryLog()
         try FileManager.default.createDirectory(

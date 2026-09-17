@@ -155,17 +155,31 @@ hash_stream() {
     esac
 }
 
+# Always emits a quoted JSON string, the way `hash_stream` always emits a hash
+# or the word `unavailable`: the caller splices the result straight into a
+# record, so anything else breaks the line it lands in.
+#
+# Piping to python3 and falling back on a non-zero exit was not enough. An
+# interpreter that exits 0 without writing anything leaves the substitution
+# empty, and the record gets `"leader_session_id":}` — one line that no reader
+# can decode, which fails the leader-participation health gate for every
+# Project on the machine until the log rotates away. Check the shape, not the
+# exit status.
 json_string() {
+    _turn_json=""
     if command -v python3 >/dev/null 2>&1; then
-        printf '%s' "$1" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read(), ensure_ascii=False), end="")' 2>/dev/null \
-            || printf '%s' '""'
-    else
-        # All generated values are ASCII-safe. Team names are normally simple
-        # identifiers; strip JSON syntax/control bytes in the rare no-python
-        # fallback rather than risk emitting malformed JSON.
-        _turn_safe="$(printf '%s' "$1" | tr -cd 'A-Za-z0-9 ._@:/+-' 2>/dev/null || true)"
-        printf '"%s"' "$_turn_safe"
+        _turn_json="$(printf '%s' "$1" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read(), ensure_ascii=False), end="")' 2>/dev/null || true)"
     fi
+    case "$_turn_json" in
+        '"'*'"') printf '%s' "$_turn_json" ;;
+        *)
+            # All generated values are ASCII-safe. Team names are normally
+            # simple identifiers; strip JSON syntax/control bytes rather than
+            # risk emitting malformed JSON.
+            _turn_safe="$(printf '%s' "$1" | tr -cd 'A-Za-z0-9 ._@:/+-' 2>/dev/null || true)"
+            printf '"%s"' "$_turn_safe"
+            ;;
+    esac
 }
 
 PROMPT_BYTES=0
@@ -235,7 +249,23 @@ sys.stdout.buffer.write(prompt.encode("utf-8"))
 
     if [ "$PROMPT_SHA" != unavailable ]; then
         _turn_discriminator=${SESSION_ID:-$SURFACE_ID}
-        _turn_full_hash="$(printf '%s:%s' "$_turn_discriminator" "$PROMPT_SHA" | hash_stream)"
+        # The id has to separate turns, not prompts. Hashing only the session
+        # and the prompt gave one id to every repetition of the same text, and
+        # repeating a short prompt is ordinary rather than an error. The second
+        # `turn_start` under that id is what `leader_participation_health`
+        # counts as a damaged line, so an intact log closed its own gate and
+        # the board reported "malformed log line" about a file with nothing
+        # wrong in it.
+        #
+        # The clock separates the repetitions. The pid separates two starts
+        # inside the same second, since each hook invocation is its own
+        # process. Neither has to be reproducible: `--end` reads the id back
+        # from the state stack rather than deriving it again, and tm-agent
+        # reads it from `.turn-current-<surface>` (`turn_id_from_hook_state`),
+        # so nothing recomputes this value.
+        _turn_nonce="$(date -u '+%Y%m%dT%H%M%S' 2>/dev/null || true)"
+        _turn_full_hash="$(printf '%s:%s:%s:%s' \
+            "$_turn_discriminator" "$PROMPT_SHA" "$_turn_nonce" "$$" | hash_stream)"
         if [ "$_turn_full_hash" != unavailable ]; then
             TURN_ID="$(printf '%.16s' "$_turn_full_hash")"
         fi
@@ -388,6 +418,12 @@ except Exception:
     sys.exit(0)
 
 if not isinstance(control, dict) or control.get("kill_switch") is True:
+    sys.exit(0)
+
+# Off is the one Settings control now that the kill switch is debug-only, so it
+# has to stop the whole feature, not only the overlap route. Record-only keeps
+# measuring and keeps the floor below: observing a turn is not steering it.
+if control.get("mode") == "off":
     sys.exit(0)
 
 level = control.get("delegation_effective") or control.get("delegation_configured")
@@ -557,6 +593,11 @@ except Exception:
     sys.exit(0)
 
 if not isinstance(control, dict) or control.get("kill_switch") is True:
+    sys.exit(0)
+
+# Same reason as the floor block above: off means the leader decides unaided.
+# Record-only still injects, because it changes what is measured, not the turn.
+if control.get("mode") == "off":
     sys.exit(0)
 
 # Refuse an unrecognized schema or another Project's control file rather than inject its floor here.

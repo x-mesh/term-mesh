@@ -633,32 +633,38 @@ final class ReviewBoardViewModel: ObservableObject {
                 state: passesGate ? .met : .blocked
             )
         }
+        var items: [OverlapCanaryChecklist.Item] = [
+            .init(
+                label: text("Work Distribution"), value: levelValue,
+                state: level == .delegated ? .met : .blocked
+            ),
+            .init(
+                label: text("Leader turn measurement"),
+                value: text(supportedLeader ? "Measured" : "Not measured"),
+                state: supportedLeader ? .met : .blocked
+            ),
+        ]
+        // The kill switch left Settings, where it duplicated `mode == .off`. A
+        // row that reads "Running" on every install is one more thing to
+        // reconcile with the row below it, so it appears only while something
+        // — the debug socket, a peer's control file — actually set it.
+        if killSwitch {
+            items.append(
+                .init(
+                    label: text("Leader experiments"), value: text("Stopped"), state: .blocked
+                )
+            )
+        }
+        // Named for the setting the reader can go change, not for the feature.
+        items.append(
+            .init(
+                label: text("Leader Participation"), value: modeValue,
+                state: mode == .canary ? .met : .blocked
+            )
+        )
+        items.append(measurement)
         return OverlapCanaryChecklist(
-            headline: status.line,
-            items: [
-                .init(
-                    label: text("Work Distribution"), value: levelValue,
-                    state: level == .delegated ? .met : .blocked
-                ),
-                .init(
-                    label: text("Leader turn measurement"),
-                    value: text(supportedLeader ? "Measured" : "Not measured"),
-                    state: supportedLeader ? .met : .blocked
-                ),
-                // The row names the thing, not the switch: "Stop all leader
-                // experiments: Off" read as though the stopping were off.
-                .init(
-                    label: text("Leader experiments"),
-                    value: text(killSwitch ? "Stopped" : "Running"),
-                    state: killSwitch ? .blocked : .met
-                ),
-                .init(
-                    label: text("Leader Overlap"), value: modeValue,
-                    state: mode == .canary ? .met : .blocked
-                ),
-                measurement,
-            ],
-            scopeCaption: status.scopeCaption
+            headline: status.line, items: items, scopeCaption: status.scopeCaption
         )
     }
 

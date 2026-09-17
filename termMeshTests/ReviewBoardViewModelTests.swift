@@ -1233,7 +1233,7 @@ final class ReviewBoardViewModelTests: XCTestCase {
         XCTAssertEqual(
             blocked.items.map(\.label),
             ["Work Distribution", "Leader turn measurement", "Leader experiments",
-             "Leader Overlap", "Measurement"]
+             "Leader Participation", "Measurement"]
         )
         XCTAssertEqual(
             blocked.items.map(\.value),
@@ -1250,7 +1250,14 @@ final class ReviewBoardViewModelTests: XCTestCase {
             mode: .canary, reading: ready, defaults: english
         )
         XCTAssertTrue(running.headline.hasPrefix("Ready"))
-        XCTAssertEqual(running.items.map(\.state), [.met, .met, .met, .met, .met])
+        // The kill switch is debug-only now, so its row is present only while
+        // something set it. A cleared switch drops the row instead of showing a
+        // fourth "Running" line that no Settings control can explain.
+        XCTAssertEqual(
+            running.items.map(\.label),
+            ["Work Distribution", "Leader turn measurement", "Leader Participation", "Measurement"]
+        )
+        XCTAssertEqual(running.items.map(\.state), [.met, .met, .met, .met])
         XCTAssertEqual(running.scopeCaption, "Measured on this Mac across all Projects")
 
         let waiting = ReviewBoardViewModel.overlapCanaryChecklist(
