@@ -155,17 +155,31 @@ hash_stream() {
     esac
 }
 
+# Always emits a quoted JSON string, the way `hash_stream` always emits a hash
+# or the word `unavailable`: the caller splices the result straight into a
+# record, so anything else breaks the line it lands in.
+#
+# Piping to python3 and falling back on a non-zero exit was not enough. An
+# interpreter that exits 0 without writing anything leaves the substitution
+# empty, and the record gets `"leader_session_id":}` — one line that no reader
+# can decode, which fails the leader-participation health gate for every
+# Project on the machine until the log rotates away. Check the shape, not the
+# exit status.
 json_string() {
+    _turn_json=""
     if command -v python3 >/dev/null 2>&1; then
-        printf '%s' "$1" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read(), ensure_ascii=False), end="")' 2>/dev/null \
-            || printf '%s' '""'
-    else
-        # All generated values are ASCII-safe. Team names are normally simple
-        # identifiers; strip JSON syntax/control bytes in the rare no-python
-        # fallback rather than risk emitting malformed JSON.
-        _turn_safe="$(printf '%s' "$1" | tr -cd 'A-Za-z0-9 ._@:/+-' 2>/dev/null || true)"
-        printf '"%s"' "$_turn_safe"
+        _turn_json="$(printf '%s' "$1" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read(), ensure_ascii=False), end="")' 2>/dev/null || true)"
     fi
+    case "$_turn_json" in
+        '"'*'"') printf '%s' "$_turn_json" ;;
+        *)
+            # All generated values are ASCII-safe. Team names are normally
+            # simple identifiers; strip JSON syntax/control bytes rather than
+            # risk emitting malformed JSON.
+            _turn_safe="$(printf '%s' "$1" | tr -cd 'A-Za-z0-9 ._@:/+-' 2>/dev/null || true)"
+            printf '"%s"' "$_turn_safe"
+            ;;
+    esac
 }
 
 PROMPT_BYTES=0

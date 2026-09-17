@@ -832,6 +832,129 @@ enum LeaderTurnLog {
         logFile.appendingPathExtension("1")
     }
 
+    /// Where lines no reader can decode are kept once they leave the log.
+    static func corruptLogFile(for logFile: URL) -> URL {
+        logFile.appendingPathExtension("corrupt")
+    }
+
+    /// Move undecodable lines out of the log and into a sidecar.
+    ///
+    /// The health gate demands zero malformed lines, because a damaged log
+    /// makes every count taken from it suspect. The log is append-only, so a
+    /// single bad write — a hook that spliced an empty value into a record —
+    /// held every Project on this Mac at Waiting until rotation aged the line
+    /// out, with nothing in the UI that could clear it. Quarantine keeps the
+    /// damaged bytes as evidence in `turns.log.corrupt` and lets the readable
+    /// history be measured on its own.
+    ///
+    /// Repeated `turn_start` lines move too. They decode, but the gate counts
+    /// them malformed for the same reason: a turn id is
+    /// `SHA256(session|surface : prompt)`, so an older hook gave one id to
+    /// every repetition of a short prompt, and both readers already drop the
+    /// repeat instead of counting a second turn. Moving it changes no total —
+    /// only whether a fixed hook's leftovers keep the gate shut forever.
+    ///
+    /// Generations are walked oldest first, the order the health reading folds
+    /// them in, so a pair either side of a rotation is seen as one repeat.
+    /// Identity is `(team, turn id)`: one Project's repeat must not remove
+    /// another Project's record.
+    @discardableResult
+    static func quarantineMalformedLines(in logFile: URL = Self.logFile) -> Int {
+        let corrupt = corruptLogFile(for: logFile)
+        var moved = 0
+        var seenStarts = Set<String>()
+        for generation in [rotatedLogFile(for: logFile), logFile] {
+            moved += quarantineGeneration(generation, into: corrupt, seenStarts: &seenStarts)
+        }
+        guard moved > 0 else { return 0 }
+        logCacheLock.lock()
+        healthCache = nil
+        rotatedRecordsCache = nil
+        recentCache = nil
+        policyCache = nil
+        logCacheLock.unlock()
+        return moved
+    }
+
+    private static func quarantineGeneration(
+        _ url: URL, into corrupt: URL, seenStarts: inout Set<String>
+    ) -> Int {
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return 0 }
+        var rawLines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
+        if data.last == 0x0A { rawLines.removeLast() }
+        let decoder = JSONDecoder()
+        var kept = Data()
+        var damaged = Data()
+        for line in rawLines where !line.isEmpty {
+            guard let record = try? decoder.decode(Record.self, from: Data(line)) else {
+                damaged.append(contentsOf: line)
+                damaged.append(0x0A)
+                continue
+            }
+            if record.event == .turnStart,
+               !seenStarts.insert(startIdentity(of: record)).inserted {
+                damaged.append(contentsOf: line)
+                damaged.append(0x0A)
+                continue
+            }
+            kept.append(contentsOf: line)
+            kept.append(0x0A)
+        }
+        guard !damaged.isEmpty else { return 0 }
+
+        // A hook may have appended while this was being read. Those bytes were
+        // never examined, so carry them over untouched rather than drop them.
+        if let handle = try? FileHandle(forReadingFrom: url) {
+            defer { try? handle.close() }
+            if (try? handle.seek(toOffset: UInt64(data.count))) != nil,
+               let tail = try? handle.readToEnd(), !tail.isEmpty {
+                kept.append(tail)
+            }
+        }
+
+        guard appendPrivate(damaged, to: corrupt) else { return 0 }
+        guard replacePrivate(url, with: kept) else { return 0 }
+        return damaged.split(separator: 0x0A, omittingEmptySubsequences: true).count
+    }
+
+    /// A turn id is unique within a Project, not across the host's log.
+    /// NUL cannot appear in either field, so it cannot forge a collision.
+    private static func startIdentity(of record: Record) -> String {
+        record.team + "\u{0}" + record.turnID
+    }
+
+    /// The log is 0600 and its sidecars carry the same prompts and team names,
+    /// so they are created the same way rather than with the default mask.
+    private static func appendPrivate(_ data: Data, to url: URL) -> Bool {
+        let manager = FileManager.default
+        if !manager.fileExists(atPath: url.path) {
+            guard manager.createFile(
+                atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]
+            ) else { return false }
+        }
+        guard let handle = try? FileHandle(forWritingTo: url) else { return false }
+        defer { try? handle.close() }
+        guard (try? handle.seekToEnd()) != nil, (try? handle.write(contentsOf: data)) != nil
+        else { return false }
+        return true
+    }
+
+    private static func replacePrivate(_ url: URL, with data: Data) -> Bool {
+        let temporary = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(url.lastPathComponent).quarantine-\(UUID().uuidString)")
+        let manager = FileManager.default
+        guard manager.createFile(
+            atPath: temporary.path, contents: data, attributes: [.posixPermissions: 0o600]
+        ) else { return false }
+        do {
+            _ = try manager.replaceItemAt(url, withItemAt: temporary)
+            return true
+        } catch {
+            try? manager.removeItem(at: temporary)
+            return false
+        }
+    }
+
     /// Decoding the whole append-only history is the dominant main-thread cost
     /// of `fleet.state`, `team.status` and the dashboard's three-second tick.
     /// All three ask for this aggregate far more often than a turn is written,
