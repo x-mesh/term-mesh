@@ -143,4 +143,119 @@ final class RemoteHostResyncTests: XCTestCase {
         idle.isRefreshing = true
         XCTAssertEqual(idle, running, "equal entries stay equal once both are set")
     }
+
+    func testRedirectedDurableRosterLeaseReusesUntilSubscriptionStops() async {
+        let store = RemoteHostStore.shared
+        let registry = PeerPaneHostRegistry.shared
+        let hostID = "roster-reuse-\(UUID())"
+        let servingPath = "/tmp/rhr-serving-\(UUID()).sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/rhr-owner-\(UUID()).sock")
+        let before = registry.teardownCountForTests
+        store.installDurableRosterLeaseFixture(hostID: hostID, servingSockPath: servingPath)
+
+        let acquiredFirst = await store.acquireDurableRosterLeaseForTesting(
+            hostID: hostID, servingSockPath: servingPath, spec: spec
+        )
+        XCTAssertTrue(acquiredFirst)
+        let first = registry.activeLease(forKey: spec.hostKey)
+        let acquiredAgain = await store.acquireDurableRosterLeaseForTesting(
+            hostID: hostID, servingSockPath: servingPath, spec: spec
+        )
+        XCTAssertTrue(acquiredAgain)
+        XCTAssertTrue(registry.activeLease(forKey: spec.hostKey) === first)
+        XCTAssertEqual(registry.teardownCountForTests, before)
+
+        store.invalidateDurableRosterLeaseForTesting(hostID: hostID)
+        XCTAssertNil(registry.activeLease(forKey: spec.hostKey))
+        XCTAssertEqual(registry.teardownCountForTests, before + 1)
+    }
+
+    func testDurableRosterLeaseRouteReplacementAndInvalidationAreExact() async {
+        let store = RemoteHostStore.shared
+        let registry = PeerPaneHostRegistry.shared
+        let hostID = "roster-replace-\(UUID())"
+        let servingPath = "/tmp/rhr-serving-\(UUID()).sock"
+        let old = PeerPaneHostSpec.direct(sockPath: "/tmp/rhr-old-\(UUID()).sock")
+        let replacement = PeerPaneHostSpec.direct(sockPath: "/tmp/rhr-new-\(UUID()).sock")
+        let before = registry.teardownCountForTests
+        store.installDurableRosterLeaseFixture(hostID: hostID, servingSockPath: servingPath)
+
+        let acquiredOld = await store.acquireDurableRosterLeaseForTesting(
+            hostID: hostID, servingSockPath: servingPath, spec: old
+        )
+        XCTAssertTrue(acquiredOld)
+        let acquiredReplacement = await store.acquireDurableRosterLeaseForTesting(
+            hostID: hostID, servingSockPath: servingPath, spec: replacement
+        )
+        XCTAssertTrue(acquiredReplacement)
+        XCTAssertNil(registry.activeLease(forKey: old.hostKey))
+        XCTAssertNotNil(registry.activeLease(forKey: replacement.hostKey))
+        XCTAssertEqual(registry.teardownCountForTests, before + 1)
+
+        store.invalidateDurableRosterLeaseForTesting(hostID: hostID)
+        store.invalidateDurableRosterLeaseForTesting(hostID: hostID)
+        XCTAssertNil(registry.activeLease(forKey: replacement.hostKey))
+        XCTAssertEqual(registry.teardownCountForTests, before + 2)
+    }
+
+    func testStaleDurableRosterLeaseAcquireIsReleased() async {
+        let store = RemoteHostStore.shared
+        let registry = PeerPaneHostRegistry.shared
+        let hostID = "roster-stale-\(UUID())"
+        let activePath = "/tmp/rhr-active-\(UUID()).sock"
+        let stalePath = "/tmp/rhr-stale-\(UUID()).sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/rhr-owner-\(UUID()).sock")
+        let before = registry.teardownCountForTests
+        store.installDurableRosterLeaseFixture(hostID: hostID, servingSockPath: activePath)
+
+        let acquired = await store.acquireDurableRosterLeaseForTesting(
+            hostID: hostID, servingSockPath: stalePath, spec: spec
+        )
+        XCTAssertFalse(acquired)
+        XCTAssertFalse(store.hasDurableRosterLeaseForTesting(hostID: hostID))
+        XCTAssertNil(registry.activeLease(forKey: spec.hostKey))
+        XCTAssertEqual(registry.teardownCountForTests, before + 1)
+    }
+
+    func testHandshakeFailureEvictsButListTeamsFailureCanPreserveDurableLease() async {
+        let store = RemoteHostStore.shared
+        let registry = PeerPaneHostRegistry.shared
+        let hostID = "roster-failure-\(UUID())"
+        let servingPath = "/tmp/rhr-serving-\(UUID()).sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/rhr-owner-\(UUID()).sock")
+        let before = registry.teardownCountForTests
+        store.installDurableRosterLeaseFixture(hostID: hostID, servingSockPath: servingPath)
+        let acquiredFirst = await store.acquireDurableRosterLeaseForTesting(
+            hostID: hostID, servingSockPath: servingPath, spec: spec
+        )
+        XCTAssertTrue(acquiredFirst)
+
+        XCTAssertTrue(store.hasDurableRosterLeaseForTesting(hostID: hostID))
+        XCTAssertEqual(registry.teardownCountForTests, before)
+        store.invalidateDurableRosterLeaseForTesting(hostID: hostID)
+        XCTAssertEqual(registry.teardownCountForTests, before + 1)
+        let reacquired = await store.acquireDurableRosterLeaseForTesting(
+            hostID: hostID, servingSockPath: servingPath, spec: spec
+        )
+        XCTAssertTrue(reacquired)
+        store.setDebugRosterFailure(hostKey: hostID, reason: "ListTeams failed")
+        XCTAssertTrue(store.hasDurableRosterLeaseForTesting(hostID: hostID))
+        store.invalidateDurableRosterLeaseForTesting(hostID: hostID)
+    }
+
+    func testDirectHostDoesNotAllocateDurableRosterLease() async {
+        let store = RemoteHostStore.shared
+        let registry = PeerPaneHostRegistry.shared
+        let hostID = "roster-direct-\(UUID())"
+        let servingPath = "/tmp/rhr-serving-\(UUID()).sock"
+        let spec = PeerPaneHostSpec.direct(sockPath: "/tmp/rhr-owner-\(UUID()).sock")
+        store.installDurableRosterLeaseFixture(hostID: hostID, servingSockPath: servingPath)
+
+        let acquired = await store.acquireDurableRosterLeaseForTesting(
+            hostID: hostID, servingSockPath: servingPath, spec: spec, redirected: false
+        )
+        XCTAssertFalse(acquired)
+        XCTAssertFalse(store.hasDurableRosterLeaseForTesting(hostID: hostID))
+        XCTAssertNil(registry.activeLease(forKey: spec.hostKey))
+    }
 }

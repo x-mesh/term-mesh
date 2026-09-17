@@ -1137,6 +1137,14 @@ final class RemoteHostStore: ObservableObject {
     /// every workspace snapshot used to strand cancelled transports and SSH
     /// leases under a busy or unresponsive session owner.
     private var teamRosterRefreshDirtyKeys = Set<String>()
+    private struct DurableRosterLease {
+        let servingSockPath: String
+        let endpoint: PeerPaneHostKey
+        let lease: PeerPaneHostLease
+    }
+    /// One session-owner tunnel ref per connected sidebar route. The roster
+    /// RPC itself remains deliberately short-lived.
+    private var durableRosterLeases: [String: DurableRosterLease] = [:]
     /// Sidebar-held lease per host key: one ref that keeps the tunnel
     /// alive while the user browses workspaces. Panes/mirrors opened
     /// from here hold their own refs, so a sidebar disconnect never
@@ -2292,7 +2300,97 @@ final class RemoteHostStore: ObservableObject {
         teamRosterRefreshDirtyKeys.remove(key)
         teamRosterPollTasks[key]?.cancel()
         teamRosterPollTasks[key] = nil
+        releaseDurableRosterLease(for: key)
     }
+
+    private func releaseDurableRosterLease(
+        for key: String, matching lease: PeerPaneHostLease? = nil
+    ) {
+        guard let held = durableRosterLeases[key], lease == nil || held.lease === lease else { return }
+        durableRosterLeases[key] = nil
+        PeerPaneHostRegistry.shared.release(held.lease)
+    }
+
+    private func durableRosterLease(
+        for key: String, servingSockPath: String, spec: PeerPaneHostSpec
+    ) async -> PeerPaneHostLease? {
+        if let held = durableRosterLeases[key] {
+            if held.servingSockPath == servingSockPath, held.endpoint == spec.hostKey {
+                return held.lease
+            }
+            releaseDurableRosterLease(for: key)
+        }
+
+        let acquired: PeerPaneHostLease
+        do {
+            acquired = try await PeerPaneHostRegistry.shared.acquire(spec)
+        } catch {
+            return nil
+        }
+        guard !Task.isCancelled,
+              let host = hosts[key],
+              host.isConnected,
+              host.activeSockPath == servingSockPath,
+              host.teamHostSpec?.hostKey == spec.hostKey
+        else {
+            PeerPaneHostRegistry.shared.release(acquired)
+            return nil
+        }
+        if let held = durableRosterLeases[key] {
+            if held.servingSockPath == servingSockPath, held.endpoint == spec.hostKey {
+                PeerPaneHostRegistry.shared.release(acquired)
+                return held.lease
+            }
+            releaseDurableRosterLease(for: key)
+        }
+        durableRosterLeases[key] = DurableRosterLease(
+            servingSockPath: servingSockPath, endpoint: spec.hostKey, lease: acquired
+        )
+        return acquired
+    }
+
+    #if DEBUG
+    func installDurableRosterLeaseFixture(
+        hostID: String, servingSockPath: String
+    ) {
+        hosts[hostID] = HostEntry(
+            id: hostID, displayName: hostID, connectionState: .connected,
+            workspaces: [], activeSockPath: servingSockPath,
+            sshTarget: nil, remoteSockPath: nil
+        )
+    }
+
+    func acquireDurableRosterLeaseForTesting(
+        hostID: String, servingSockPath: String, spec: PeerPaneHostSpec, redirected: Bool = true
+    ) async -> Bool {
+        guard redirected else { return false }
+        if let held = durableRosterLeases[hostID] {
+            if held.servingSockPath == servingSockPath, held.endpoint == spec.hostKey {
+                return true
+            }
+            releaseDurableRosterLease(for: hostID)
+        }
+        guard let acquired = try? await PeerPaneHostRegistry.shared.acquire(spec) else { return false }
+        guard !Task.isCancelled,
+              hosts[hostID]?.activeSockPath == servingSockPath
+        else {
+            PeerPaneHostRegistry.shared.release(acquired)
+            return false
+        }
+        durableRosterLeases[hostID] = DurableRosterLease(
+            servingSockPath: servingSockPath, endpoint: spec.hostKey, lease: acquired
+        )
+        return true
+    }
+
+    func invalidateDurableRosterLeaseForTesting(hostID: String) {
+        releaseDurableRosterLease(for: hostID)
+    }
+
+    func hasDurableRosterLeaseForTesting(hostID: String) -> Bool {
+        durableRosterLeases[hostID] != nil
+    }
+    #endif
 
     private func startTeamRosterPolling(for path: String, key: String) {
         teamRosterPollTasks[key]?.cancel()
@@ -2741,9 +2839,9 @@ final class RemoteHostStore: ObservableObject {
             return nil
         }
 
-        var lease: PeerPaneHostLease?
         let rosterSockPath: String
         let teamEndpoint: PeerPaneHostKey
+        let rosterLease: PeerPaneHostLease?
         let redirected = host.redirectsTeamWorkToSessionHost
         if host.redirectsTeamWorkToSessionHost {
             guard let spec = host.teamHostSpec else {
@@ -2753,11 +2851,10 @@ final class RemoteHostStore: ObservableObject {
             RemoteWorkLog.info(
                 "Probing session-owner daemon for \(host.displayName): \(spec.hostKey)"
             )
-            let acquired: PeerPaneHostLease
-            do {
-                acquired = try await PeerPaneHostRegistry.shared.acquire(spec)
-            } catch {
-                noteRosterFailure(key, "the session-owner tunnel failed: \(error)")
+            guard let lease = await durableRosterLease(
+                for: key, servingSockPath: servingSockPath, spec: spec
+            ) else {
+                noteRosterFailure(key, "the session-owner tunnel failed")
                 if let endpoint = host.teamHostSpec?.hostKey,
                    hosts[key]?.activeSockPath == servingSockPath,
                    hosts[key]?.teamHostReadiness.endpoint == endpoint {
@@ -2765,21 +2862,23 @@ final class RemoteHostStore: ObservableObject {
                 }
                 return nil
             }
-            lease = acquired
-            rosterSockPath = acquired.hostSockPath
+            rosterSockPath = lease.hostSockPath
             teamEndpoint = spec.hostKey
+            rosterLease = lease
         } else {
             rosterSockPath = servingSockPath
             teamEndpoint = host.paneHostSpec.hostKey
+            rosterLease = nil
         }
-        defer { lease.map { PeerPaneHostRegistry.shared.release($0) } }
-
         guard !Task.isCancelled else { return nil }
         let connection: PeerRelayConnection
         do {
             connection = try await PeerRelaySession.connect(hostSockPath: rosterSockPath)
         } catch {
             noteRosterFailure(key, "the session-owner handshake failed: \(error)")
+            if let rosterLease {
+                releaseDurableRosterLease(for: key, matching: rosterLease)
+            }
             if redirected,
                hosts[key]?.activeSockPath == servingSockPath,
                hosts[key]?.teamHostReadiness.endpoint == teamEndpoint {
