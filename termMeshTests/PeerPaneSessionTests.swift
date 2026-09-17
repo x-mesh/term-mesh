@@ -6618,7 +6618,7 @@ final class RelayFrameByteBudgetTests: XCTestCase {
         await waitForWaiters(budget, count: 1)
         sink.released.signal()
         _ = try await fifth.value
-        for _ in 0..<4 {
+        for _ in 0..<5 {
             XCTAssertEqual(sink.wrote.wait(timeout: .now() + 1), .success)
         }
 
@@ -6670,25 +6670,26 @@ final class RelayFrameByteBudgetTests: XCTestCase {
         XCTAssertEqual(stopped.waitingCount, 0)
     }
 
-    func testInputCallbackProgressesWhileOutputBudgetIsSaturated() async throws {
+    func testCancellingHeadWaiterWakesNextFittingWaiter() async throws {
         let budget = RelayFrameByteBudget()
-        let sink = RelayFrameSuspendedSink()
-        let writer = RelayFrameWriter(
-            writeFrame: { type, payload in sink.write(type: type, payload: payload) },
-            onFailure: { _ in },
-            budget: budget
-        )
-        let payload = Data(repeating: 0xAA, count: payloadPer64KiBFrame)
-        for _ in 0..<4 {
-            try await writer.enqueue(type: 1, payload: payload)
+        let admitted = try await budget.acquire(bytes: 200 * 1024)
+        let head = Task { try await budget.acquire(bytes: 100 * 1024) }
+        await waitForWaiters(budget, count: 1)
+        let next = Task { try await budget.acquire(bytes: 50 * 1024) }
+        await waitForWaiters(budget, count: 2)
+
+        head.cancel()
+        do {
+            _ = try await head.value
+            XCTFail("cancelled waiter unexpectedly acquired a reservation")
+        } catch is CancellationError {
         }
-        XCTAssertEqual(sink.started.wait(timeout: .now() + 1), .success)
 
-        let inputCallback = DispatchSemaphore(value: 0)
-        DispatchQueue.global().async { inputCallback.signal() }
-        XCTAssertEqual(inputCallback.wait(timeout: .now() + 1), .success)
-
-        sink.released.signal()
+        let resumed = try await next.value
+        let resumedSnapshot = await budget.snapshot()
+        XCTAssertEqual(resumedSnapshot.reservedBytes, 250 * 1024)
+        await budget.release(resumed)
+        await budget.release(admitted)
     }
 }
 

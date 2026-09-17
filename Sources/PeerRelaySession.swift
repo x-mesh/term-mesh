@@ -356,6 +356,8 @@ actor RelayFrameByteBudget {
         waiter.continuation.resume(throwing: CancellationError())
         if waiters.isEmpty {
             stallStartedAt = nil
+        } else {
+            resumeWaiters()
         }
     }
 
