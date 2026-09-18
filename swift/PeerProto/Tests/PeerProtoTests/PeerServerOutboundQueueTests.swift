@@ -170,6 +170,33 @@ final class PeerServerOutboundQueueTests: XCTestCase {
         XCTAssertEqual(delivered, PeerServerOutboundQueue.maxPendingItems + 1)
     }
 
+    func testOverflowAdmissionRequiresTransportReconnect() async {
+        let queue = PeerServerOutboundQueue()
+        let payload = Data(repeating: 0x61, count: PeerServerOutboundQueue.maxEntryBytes)
+
+        for index in 0...PeerServerOutboundQueue.maxPendingItems {
+            let admission = await queue.enqueue(
+                payload,
+                startSeq: UInt64(index * PeerServerOutboundQueue.maxEntryBytes)
+            )
+            if PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
+                for: admission,
+                attachmentCount: 1
+            ) {
+                XCTAssertTrue(PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
+                    for: admission,
+                    attachmentCount: 1
+                ))
+                XCTAssertFalse(PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
+                    for: admission,
+                    attachmentCount: 2
+                ))
+                return
+            }
+        }
+        XCTFail("bounded outbound queue never reported an overflow")
+    }
+
     func testAbortWakesWriterAndRejectsLaterAdmission() async {
         let queue = PeerServerOutboundQueue()
         let writer = Task { await queue.next() }

@@ -1455,6 +1455,16 @@ enum PeerServerOutboundQueueAdmission: Sendable, Equatable {
     case aborted
 }
 
+enum PeerServerOutboundOverflowPolicy {
+    static func requiresTransportReconnect(
+        for admission: PeerServerOutboundQueueAdmission,
+        attachmentCount: Int
+    ) -> Bool {
+        guard case .accepted(let drop) = admission else { return false }
+        return attachmentCount == 1 && drop.bytes > 0
+    }
+}
+
 private final class PeerServerOutboundQueueDiagnostics: @unchecked Sendable {
     private let lock = NSLock()
     private var lastEmission = Date.distantPast
@@ -2519,7 +2529,16 @@ actor PeerServerSession {
                             continue
                         }
                         let startSeq = chunk.seq &- boundary
-                        switch await queue.enqueue(chunk.bytes, startSeq: startSeq) {
+                        let admission = await queue.enqueue(chunk.bytes, startSeq: startSeq)
+                        guard !PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
+                            for: admission,
+                            attachmentCount: attachments.count
+                        ) else {
+                            await queue.abort()
+                            await connection.close()
+                            return false
+                        }
+                        switch admission {
                         case .accepted(let drops) where drops.bytes == 0:
                             lastTapEnd = chunkEnd
                             continue
@@ -2560,7 +2579,16 @@ actor PeerServerSession {
                     lastTapEnd = chunk.seq &+ UInt64(chunk.bytes.count)
                     let startSeq = wireSeq
                     wireSeq &+= UInt64(chunk.bytes.count)
-                    switch await queue.enqueue(chunk.bytes, startSeq: startSeq) {
+                    let admission = await queue.enqueue(chunk.bytes, startSeq: startSeq)
+                    guard !PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
+                        for: admission,
+                        attachmentCount: attachments.count
+                    ) else {
+                        await queue.abort()
+                        await connection.close()
+                        return false
+                    }
+                    switch admission {
                     case .accepted(let drops) where drops.bytes == 0:
                         continue
                     case .accepted:
