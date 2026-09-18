@@ -989,6 +989,91 @@ final class PeerTerminalReplayBufferTests: XCTestCase {
             )
         )
     }
+
+    func testRawToFilteredCheckpointPreservesEmptyFilteredCallbackBoundary() {
+        var checkpoints = RawToFilteredCheckpointStore()
+        checkpoints.append(rawEnd: 10, rawByteCount: 0, filteredEnd: 0)
+        checkpoints.append(rawEnd: 15, rawByteCount: 5, filteredEnd: 3)
+        checkpoints.append(rawEnd: 22, rawByteCount: 7, filteredEnd: 3)
+
+        XCTAssertEqual(checkpoints.filteredEnd(forRawEnd: 15), 3)
+        XCTAssertEqual(checkpoints.filteredEnd(forRawEnd: 22), 3)
+    }
+
+    func testRawToFilteredCheckpointFailsClosedForDiscontinuousOrEvictedBoundaries() {
+        var discontinuous = RawToFilteredCheckpointStore()
+        discontinuous.append(rawEnd: 10, rawByteCount: 0, filteredEnd: 0)
+        discontinuous.append(rawEnd: 15, rawByteCount: 4, filteredEnd: 4)
+        XCTAssertNil(discontinuous.filteredEnd(forRawEnd: 15))
+
+        var bounded = RawToFilteredCheckpointStore()
+        bounded.append(rawEnd: 0, rawByteCount: 0, filteredEnd: 0)
+        for rawEnd in 1...1_025 {
+            bounded.append(rawEnd: UInt64(rawEnd), rawByteCount: 1, filteredEnd: UInt64(rawEnd))
+        }
+        XCTAssertNil(bounded.filteredEnd(forRawEnd: 0))
+        XCTAssertEqual(bounded.filteredEnd(forRawEnd: 1_025), 1_025)
+    }
+
+    func testRawToFilteredCheckpointRejectsDuplicateWrappedBoundary() {
+        var checkpoints = RawToFilteredCheckpointStore()
+        checkpoints.append(rawEnd: UInt64.max, rawByteCount: 0, filteredEnd: 0)
+        checkpoints.append(rawEnd: 0, rawByteCount: 1, filteredEnd: 1)
+        XCTAssertEqual(checkpoints.filteredEnd(forRawEnd: 0), 1)
+
+        checkpoints.append(rawEnd: 0, rawByteCount: 0, filteredEnd: 1)
+        XCTAssertNil(checkpoints.filteredEnd(forRawEnd: 0))
+    }
+
+    func testRawOutputDrainBufferBatchesInOrderAndPreservesFinalWatermark() {
+        var buffer = RawOutputDrainBuffer()
+        XCTAssertTrue(appendRawOutput("one", rawEnd: 3, into: &buffer))
+        XCTAssertTrue(appendRawOutput("two", rawEnd: 6, into: &buffer))
+
+        let first = buffer.take()
+        XCTAssertEqual(first?.bytes, Data("onetwo".utf8))
+        XCTAssertEqual(first?.rawEnd, 6)
+
+        XCTAssertTrue(appendRawOutput("!", rawEnd: 7, into: &buffer))
+        let second = buffer.take()
+        XCTAssertEqual(second?.bytes, Data("!".utf8))
+        XCTAssertEqual(second?.rawEnd, 7)
+        XCTAssertNil(buffer.take())
+    }
+
+    func testRawOutputDrainBufferRejectsInputBeyondItsBound() {
+        var buffer = RawOutputDrainBuffer()
+        let oversized = Data(repeating: 0x78, count: RawOutputDrainBuffer.byteLimit + 1)
+        let accepted = oversized.withUnsafeBytes { bytes in
+            buffer.append(
+                bytes.bindMemory(to: UInt8.self).baseAddress!,
+                count: bytes.count,
+                rawEnd: UInt64(bytes.count)
+            )
+        }
+
+        XCTAssertFalse(accepted)
+        XCTAssertNil(buffer.take())
+
+        buffer.discard()
+        XCTAssertTrue(appendRawOutput("ok", rawEnd: UInt64(oversized.count) + 2, into: &buffer))
+        XCTAssertEqual(buffer.take()?.bytes, Data("ok".utf8))
+    }
+
+    private func appendRawOutput(
+        _ text: String,
+        rawEnd: UInt64,
+        into buffer: inout RawOutputDrainBuffer
+    ) -> Bool {
+        let data = Data(text.utf8)
+        return data.withUnsafeBytes { bytes in
+            buffer.append(
+                bytes.bindMemory(to: UInt8.self).baseAddress!,
+                count: bytes.count,
+                rawEnd: rawEnd
+            )
+        }
+    }
 }
 
 final class RelayResizeCoalescerHealTests: XCTestCase {

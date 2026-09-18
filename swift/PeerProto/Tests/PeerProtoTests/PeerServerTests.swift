@@ -47,6 +47,62 @@ private actor LivePresentationTestProvider: PeerSurfaceProvider {
     private func recordInput() { inputs += 1 }
 }
 
+private actor GapResyncTestProvider: PeerSurfaceProvider {
+    let surfaceID = Data(repeating: 0xA7, count: 16)
+    private var continuation: AsyncStream<PtyTapChunk>.Continuation?
+    private var captures = 0
+
+    func supportsAtomicResync() async -> Bool { true }
+
+    func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo] {
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = surfaceID
+        surface.title = "gap-resync"
+        surface.cols = 80
+        surface.rows = 24
+        surface.attachable = true
+        return [surface]
+    }
+
+    func attach(
+        surfaceID: Data,
+        clientCols: UInt32,
+        clientRows: UInt32,
+        resumeFromSeq: UInt64
+    ) async -> PeerSurfaceAttachment? {
+        guard surfaceID == self.surfaceID else { return nil }
+        let pair = AsyncStream<PtyTapChunk>.makeStream()
+        continuation = pair.continuation
+        return PeerSurfaceAttachment(
+            byteStream: pair.stream,
+            input: { _ in },
+            resync: { [weak self] in
+                guard let self else { return nil }
+                return await self.capture()
+            },
+            detach: { pair.continuation.finish() }
+        )
+    }
+
+    func emit(_ chunk: PtyTapChunk) {
+        continuation?.yield(chunk)
+    }
+
+    func finish() {
+        continuation?.finish()
+    }
+
+    func captureCount() -> Int { captures }
+
+    private func capture() -> PeerSurfaceResync {
+        captures += 1
+        return PeerSurfaceResync(
+            ansi: Data("\u{1b}[2Jresynced-\(captures)".utf8),
+            hostByteSeq: UInt64(10 + captures * 10)
+        )
+    }
+}
+
 final class PeerServerTests: XCTestCase {
     func testLiveAgentNegotiationAndReadOnlyInputAreEnforcedByHost() async throws {
         let provider = LivePresentationTestProvider()
@@ -870,6 +926,58 @@ final class PeerServerTests: XCTestCase {
         )
 
         try await session.sendGoodbye(reason: "c3c3.2 done")
+        await transport.close()
+        await server.stop()
+    }
+
+    func testUpstreamSequenceGapReplacesQueuedTailWithAtomicSnapshot() async throws {
+        let sockPath = "/tmp/tm-peer-gap-resync-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let provider = GapResyncTestProvider()
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let deadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: sockPath) {
+            if Date() > deadline { return XCTFail("no socket") }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+        let surfaceID = await provider.surfaceID
+        _ = try await session.attachSurface(id: surfaceID, cols: 80, rows: 24)
+
+        await provider.emit(PtyTapChunk(bytes: Data("before".utf8), seq: 0))
+        await provider.emit(PtyTapChunk(bytes: Data("after-gap".utf8), seq: 10))
+        await provider.emit(PtyTapChunk(bytes: Data("after-second-gap".utf8), seq: 30))
+        await provider.finish()
+
+        var snapshot: (seq: UInt64, ansi: Data)?
+        let received = try await Task {
+            for _ in 0..<5 {
+                switch try await session.receiveNextMessage() {
+                case .gridSnapshot(_, let byteSeq, _, let ansi):
+                    snapshot = (byteSeq, ansi)
+                    if byteSeq == 30 { return true }
+                case .goodbye, .error:
+                    return false
+                default:
+                    continue
+                }
+            }
+            return false
+        }.value
+
+        XCTAssertTrue(received)
+        XCTAssertEqual(snapshot?.seq, 30)
+        XCTAssertEqual(snapshot?.ansi, Data("\u{1b}[2Jresynced-2".utf8))
+        let captureCount = await provider.captureCount()
+        XCTAssertEqual(captureCount, 2)
+
+        try await session.sendGoodbye(reason: "gap resync done")
         await transport.close()
         await server.stop()
     }
