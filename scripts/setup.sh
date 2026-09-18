@@ -193,10 +193,12 @@ else
             exit 1
         fi
 
-        GETTEXT_BIN="$(brew --prefix gettext 2>/dev/null || true)/bin"
-        if [ ! -x "$GETTEXT_BIN/msgfmt" ]; then
-            GETTEXT_BIN=""
-        fi
+        GETTEXT_BIN=""
+        for cand in \
+            /opt/homebrew/opt/gettext/bin /usr/local/opt/gettext/bin \
+            /opt/homebrew/Cellar/gettext/*/bin /usr/local/Cellar/gettext/*/bin; do
+            [ -x "$cand/msgfmt" ] && { GETTEXT_BIN="$cand"; break; }
+        done
 
         # Pin the macOS SDK explicitly. A standalone zig tarball can latch onto
         # a stale/broken CommandLineTools SDK during auto-detection and fail to
