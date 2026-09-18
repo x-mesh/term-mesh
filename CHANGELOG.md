@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.252.0] - 2026-09-18
+
+### Fixed
+
+- Relay session lifecycle now records connection identity, peer/session state, attachment count, unexpected EOF/read errors, writer failures, tunnel refreshes, and reconnect attempts so heavy-output stalls can be diagnosed across host and viewer logs.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.251.1] - 2026-09-18
 
 ### Fixed
