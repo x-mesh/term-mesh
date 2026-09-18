@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::Duration;
 
 use peer_proto::v1::SurfaceInfo;
 use sha2::{Digest, Sha256};
@@ -53,6 +54,8 @@ impl AsRawFd for BorrowedMasterFd {
 // is unaffected (read returns only what is already available, no batching
 // delay) and peak host RSS rose ~30 MB under a 35 MB flood, reclaimed after.
 const READ_BUF_SIZE: usize = 65536;
+const BROADCAST_BATCH_MAX_BYTES: usize = READ_BUF_SIZE;
+const BROADCAST_BATCH_WINDOW: Duration = Duration::from_millis(50);
 /// Upper bound on one AGENT-surface chunk. The PTY path is structurally
 /// bounded by `READ_BUF_SIZE`; an agent line has no such physics — a single
 /// NDJSON event (a huge tool_result) can exceed the wire's
@@ -218,6 +221,66 @@ pub fn set_replay_capacity(bytes: usize) -> Result<(usize, usize), String> {
 pub struct PtyChunk {
     pub seq: u64,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct PtyBroadcastBatch {
+    pending: Option<PtyChunk>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl PtyBroadcastBatch {
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+
+    fn submit(&mut self, chunk: PtyChunk) -> Option<PtyChunk> {
+        let now = tokio::time::Instant::now();
+        if self.deadline.is_none() {
+            self.deadline = Some(now + BROADCAST_BATCH_WINDOW);
+            return Some(chunk);
+        }
+
+        let Some(pending) = self.pending.as_mut() else {
+            if chunk.bytes.len() >= BROADCAST_BATCH_MAX_BYTES {
+                self.deadline = Some(now + BROADCAST_BATCH_WINDOW);
+                return Some(chunk);
+            }
+            self.pending = Some(chunk);
+            return None;
+        };
+
+        let pending_end = pending.seq + pending.bytes.len() as u64;
+        if chunk.seq != pending_end
+            || pending.bytes.len() + chunk.bytes.len() > BROADCAST_BATCH_MAX_BYTES
+        {
+            let flushed = self.pending.replace(chunk);
+            self.deadline = Some(now + BROADCAST_BATCH_WINDOW);
+            return flushed;
+        }
+
+        pending.bytes.extend_from_slice(&chunk.bytes);
+        if pending.bytes.len() < BROADCAST_BATCH_MAX_BYTES {
+            return None;
+        }
+
+        let flushed = self.pending.take();
+        self.deadline = Some(now + BROADCAST_BATCH_WINDOW);
+        flushed
+    }
+
+    fn flush_due(&mut self) -> Option<PtyChunk> {
+        let flushed = self.pending.take();
+        self.deadline = flushed
+            .as_ref()
+            .map(|_| tokio::time::Instant::now() + BROADCAST_BATCH_WINDOW);
+        flushed
+    }
+
+    fn flush_remaining(&mut self) -> Option<PtyChunk> {
+        self.deadline = None;
+        self.pending.take()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1049,8 +1112,22 @@ impl PtySurface {
 
             let mut buf = vec![0u8; READ_BUF_SIZE];
             let mut filter = QueryFilter::default();
+            let mut broadcast_batch = PtyBroadcastBatch::default();
             loop {
-                let mut guard = match async_fd.readable().await {
+                let ready = if let Some(deadline) = broadcast_batch.deadline() {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => {
+                            if let Some(chunk) = broadcast_batch.flush_due() {
+                                let _ = tx.send(chunk);
+                            }
+                            continue;
+                        }
+                        ready = async_fd.readable() => ready,
+                    }
+                } else {
+                    async_fd.readable().await
+                };
+                let mut guard = match ready {
                     Ok(g) => g,
                     Err(e) => {
                         tracing::warn!(
@@ -1153,8 +1230,10 @@ impl PtySurface {
                         if let Ok(mut replay) = reader_surface.replay.lock() {
                             replay.push(chunk.clone());
                         }
-                        // Err only means "no subscribers", which is fine.
-                        let _ = tx.send(chunk);
+                        if let Some(chunk) = broadcast_batch.submit(chunk) {
+                            // Err only means "no subscribers", which is fine.
+                            let _ = tx.send(chunk);
+                        }
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(
@@ -1165,6 +1244,9 @@ impl PtySurface {
                     }
                     Err(_would_block) => continue,
                 }
+            }
+            if let Some(chunk) = broadcast_batch.flush_remaining() {
+                let _ = tx.send(chunk);
             }
             // Final bytes are in replay+broadcast before death becomes
             // observable. Reap off the async worker so EOF cannot leave a
@@ -3661,6 +3743,142 @@ fn hex_short(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_broadcast_batch_keeps_the_leading_edge_and_merges_the_burst() {
+        let mut batch = PtyBroadcastBatch::default();
+        assert_eq!(
+            batch.submit(PtyChunk {
+                seq: 0,
+                bytes: b"a".to_vec(),
+            }),
+            Some(PtyChunk {
+                seq: 0,
+                bytes: b"a".to_vec(),
+            })
+        );
+        assert_eq!(
+            batch.submit(PtyChunk {
+                seq: 1,
+                bytes: b"b".to_vec(),
+            }),
+            None
+        );
+        assert_eq!(
+            batch.submit(PtyChunk {
+                seq: 2,
+                bytes: b"c".to_vec(),
+            }),
+            None
+        );
+        assert_eq!(
+            batch.flush_due(),
+            Some(PtyChunk {
+                seq: 1,
+                bytes: b"bc".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn pty_broadcast_batch_does_not_merge_across_a_byte_gap() {
+        let mut batch = PtyBroadcastBatch::default();
+        let _ = batch.submit(PtyChunk {
+            seq: 0,
+            bytes: b"a".to_vec(),
+        });
+        assert!(batch
+            .submit(PtyChunk {
+                seq: 1,
+                bytes: b"b".to_vec(),
+            })
+            .is_none());
+        assert_eq!(
+            batch.submit(PtyChunk {
+                seq: 3,
+                bytes: b"d".to_vec(),
+            }),
+            Some(PtyChunk {
+                seq: 1,
+                bytes: b"b".to_vec(),
+            })
+        );
+        assert_eq!(
+            batch.flush_remaining(),
+            Some(PtyChunk {
+                seq: 3,
+                bytes: b"d".to_vec(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_reader_batches_a_small_chunk_flood_before_broadcast() {
+        const TOTAL_BYTES: usize = 4 * 1024 * 1024;
+        let surface = PtySurface::spawn(
+            surface_id_from_name("broadcast-batch-flood"),
+            "broadcast-batch-flood".into(),
+            "/bin/sh",
+            &["-c", "stty raw -echo; exec cat"],
+            80,
+            24,
+            None,
+        )
+        .expect("spawn PTY flood source");
+        let mut receiver = surface.subscribe();
+        let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::channel(128);
+        let forwarder = tokio::spawn(async move {
+            loop {
+                let chunk = match receiver.recv().await {
+                    Ok(chunk) => chunk,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        return Err(missed);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                };
+                if outgoing_tx.send(chunk).await.is_err() {
+                    return Ok(());
+                }
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let input = vec![b'x'; TOTAL_BYTES];
+        let writer = surface.clone();
+        tokio::task::spawn_blocking(move || writer.write_all(&input))
+            .await
+            .expect("writer task completes")
+            .expect("write flood to PTY");
+
+        let mut bytes = Vec::with_capacity(TOTAL_BYTES);
+        let mut frames = 0;
+        while bytes.len() < TOTAL_BYTES {
+            let chunk = match tokio::time::timeout(Duration::from_secs(5), outgoing_rx.recv()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => match forwarder.await.expect("forwarder task completes") {
+                    Err(missed) => panic!(
+                        "broadcast lagged by {missed} chunks after {} bytes in {frames} frames",
+                        bytes.len()
+                    ),
+                    Ok(()) => panic!(
+                        "forwarder closed after {} bytes in {frames} frames",
+                        bytes.len()
+                    ),
+                },
+                Err(_) => panic!(
+                    "outgoing queue timed out after {} bytes in {frames} frames",
+                    bytes.len()
+                ),
+            };
+            bytes.extend_from_slice(&chunk.bytes);
+            frames += 1;
+        }
+        forwarder.abort();
+        assert_eq!(bytes.len(), TOTAL_BYTES);
+        assert!(bytes.iter().all(|byte| *byte == b'x'));
+        assert!(frames < 128, "{frames} frames exceed the outgoing queue budget");
+        surface.hangup();
+    }
 
     fn ensure_spec() -> SurfaceSpec {
         SurfaceSpec {

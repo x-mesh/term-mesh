@@ -5,8 +5,9 @@
 // (TerminalSurface) → ghostty_surface_t.
 //
 // Input forwarding: ghostty_surface_text() on MainActor.
-// Output tapping:   ghostty_surface_set_pty_data_callback() registers a C
-//                   callback that yields raw PTY bytes into an AsyncStream.
+// Output tapping:   ghostty_surface_set_pty_data_callback_with_output_sequence()
+//                   registers a callback that yields raw PTY bytes and its
+//                   processed-output boundary into an AsyncStream.
 //                   The callback is invoked on Ghostty's IO reader thread
 //                   under renderer_state.mutex, so it must be non-blocking.
 //
@@ -23,14 +24,15 @@ import PeerProto
 
 // MARK: - C callback (top-level; @convention(c) cannot capture)
 
-private func ptyTapCallback(
+private func ptyTapCallbackWithRawOutputSequence(
     userdata: UnsafeMutableRawPointer?,
     data: UnsafePointer<UInt8>?,
-    len: UInt
+    len: UInt,
+    rawEnd: UInt64
 ) {
-    guard let userdata, let data, len > 0 else { return }
+    guard let userdata else { return }
     let hub = Unmanaged<PtyTapHub>.fromOpaque(userdata).takeUnretainedValue()
-    hub.broadcast(Data(bytes: data, count: Int(len)))
+    hub.enqueueRawOutput(data, length: Int(len), rawEnd: rawEnd)
 }
 
 // MARK: - PtyTapHub
@@ -153,8 +155,119 @@ struct PeerTerminalReplayBuffer {
     }
 }
 
+struct RawToFilteredCheckpointStore {
+    private struct Checkpoint {
+        let rawEnd: UInt64
+        let filteredEnd: UInt64
+    }
+
+    private static let capacity = 1_024
+    private var checkpoints = Array<Checkpoint?>(repeating: nil, count: capacity)
+    private var positions: [UInt64: Int]
+    private var nextIndex = 0
+    private var count = 0
+    private var lastRawEnd: UInt64?
+    private var isValid = true
+
+    init() {
+        positions = [:]
+        positions.reserveCapacity(Self.capacity)
+    }
+
+    mutating func append(rawEnd: UInt64, rawByteCount: Int, filteredEnd: UInt64) {
+        guard isValid else { return }
+        let rawStart = rawEnd &- UInt64(rawByteCount)
+        if let lastRawEnd {
+            guard lastRawEnd == rawStart else {
+                isValid = false
+                positions.removeAll(keepingCapacity: true)
+                checkpoints = Array(repeating: nil, count: Self.capacity)
+                nextIndex = 0
+                count = 0
+                return
+            }
+        } else if rawByteCount != 0 {
+            isValid = false
+            return
+        }
+        guard positions[rawEnd] == nil else {
+            isValid = false
+            positions.removeAll(keepingCapacity: true)
+            checkpoints = Array(repeating: nil, count: Self.capacity)
+            nextIndex = 0
+            count = 0
+            return
+        }
+        self.lastRawEnd = rawEnd
+        if let evicted = checkpoints[nextIndex] {
+            positions.removeValue(forKey: evicted.rawEnd)
+        } else {
+            count += 1
+        }
+        checkpoints[nextIndex] = .init(rawEnd: rawEnd, filteredEnd: filteredEnd)
+        positions[rawEnd] = nextIndex
+        nextIndex = (nextIndex + 1) % Self.capacity
+    }
+
+    func filteredEnd(forRawEnd rawEnd: UInt64) -> UInt64? {
+        guard isValid else { return nil }
+        guard let index = positions[rawEnd], let checkpoint = checkpoints[index],
+              checkpoint.rawEnd == rawEnd else { return nil }
+        return checkpoint.filteredEnd
+    }
+}
+
+struct RawOutputDrainBatch {
+    let bytes: Data
+    let rawEnd: UInt64
+}
+
+struct RawOutputDrainBuffer {
+    static let byteLimit = 8 * 1024 * 1024
+
+    private var bytes = Data()
+    private var rawEnd: UInt64?
+
+    init() {
+        bytes.reserveCapacity(64 * 1024)
+    }
+
+    mutating func append(
+        _ source: UnsafePointer<UInt8>,
+        count: Int,
+        rawEnd: UInt64
+    ) -> Bool {
+        guard count <= Self.byteLimit - bytes.count else { return false }
+        bytes.append(source, count: count)
+        self.rawEnd = rawEnd
+        return true
+    }
+
+    mutating func take() -> RawOutputDrainBatch? {
+        guard let rawEnd else { return nil }
+        let batch = RawOutputDrainBatch(bytes: bytes, rawEnd: rawEnd)
+        bytes.removeAll(keepingCapacity: true)
+        self.rawEnd = nil
+        return batch
+    }
+
+    mutating func discard() {
+        bytes.removeAll(keepingCapacity: true)
+        rawEnd = nil
+    }
+}
+
+private enum RawOutputDrainStep {
+    case batch(RawOutputDrainBatch)
+    case closed
+    case overflowed
+    case idle
+}
+
 /// One Ghostty PTY callback per surface, fan-out to bounded per-peer streams.
 final class PtyTapHub: @unchecked Sendable {
+    private static let rawDrainBatchWindowNanoseconds: UInt64 = 2_000_000
+
     struct RelayTelemetrySnapshot: Sendable, Equatable {
         let surfaceID: UUID
         let producedChunks: UInt64
@@ -168,6 +281,7 @@ final class PtyTapHub: @unchecked Sendable {
     static let replayCapacityBytes = 64 * 1024
 
     private let lock = NSLock()
+    private let rawDrainLock = NSLock()
     /// Serializes the stateful query filter without extending the shared hub
     /// lock across a scan/allocation of every PTY chunk. The handoff in
     /// `broadcast(_:)` acquires `lock` before releasing this lock, preserving
@@ -182,6 +296,11 @@ final class PtyTapHub: @unchecked Sendable {
     /// reads has to reassemble once. Mutated only under `filterLock` on
     /// Ghostty's IO reader thread.
     private var queryStripper = PeerTerminalQueryStripper()
+    private var rawToFilteredCheckpoints = RawToFilteredCheckpointStore()
+    private var rawDrainBuffer = RawOutputDrainBuffer()
+    private var rawDrainScheduled = false
+    private var rawDrainOverflowed = false
+    private var rawDrainClosed = false
     /// Cumulative bytes ever broadcast through this hub. Advanced under
     /// `lock` for EVERY chunk — including ones a consumer's bounded
     /// buffer then drops — and stamped onto each `PtyTapChunk.seq`, so a
@@ -219,6 +338,10 @@ final class PtyTapHub: @unchecked Sendable {
     /// Call when the backing panel closes (not on normal peer detach).
     /// Finishes all streams and drops the TerminalSurface strong reference.
     func shutdown() {
+        rawDrainLock.lock()
+        rawDrainClosed = true
+        rawDrainBuffer.discard()
+        rawDrainLock.unlock()
         finishAll()
         surfaceRef = nil
     }
@@ -456,6 +579,144 @@ final class PtyTapHub: @unchecked Sendable {
         #endif
     }
 
+    func enqueueRawOutput(
+        _ source: UnsafePointer<UInt8>?,
+        length: Int,
+        rawEnd: UInt64
+    ) {
+        guard length > 0 else {
+            consumeRawOutput(Data(), rawEnd: rawEnd)
+            return
+        }
+        guard let source else { return }
+
+        rawDrainLock.lock()
+        guard !rawDrainClosed else {
+            rawDrainLock.unlock()
+            return
+        }
+        if !rawDrainBuffer.append(source, count: length, rawEnd: rawEnd) {
+            rawDrainOverflowed = true
+        }
+        let shouldSchedule = !rawDrainScheduled
+        rawDrainScheduled = true
+        rawDrainLock.unlock()
+
+        if shouldSchedule {
+            Task.detached(priority: .userInitiated) { [weak self] in
+                await self?.drainRawOutput()
+            }
+        }
+    }
+
+    private func drainRawOutput() async {
+        while true {
+            do {
+                try await Task.sleep(nanoseconds: Self.rawDrainBatchWindowNanoseconds)
+            } catch {
+                return
+            }
+            switch nextRawOutputDrainStep() {
+            case .closed, .idle:
+                return
+            case .overflowed:
+                finishAll()
+                continue
+            case .batch(let batch):
+                consumeRawOutput(batch.bytes, rawEnd: batch.rawEnd)
+            }
+        }
+    }
+
+    private func nextRawOutputDrainStep() -> RawOutputDrainStep {
+        rawDrainLock.lock()
+        defer { rawDrainLock.unlock() }
+        if rawDrainClosed {
+            rawDrainBuffer.discard()
+            rawDrainScheduled = false
+            return .closed
+        }
+        if rawDrainOverflowed {
+            rawDrainBuffer.discard()
+            rawDrainOverflowed = false
+            return .overflowed
+        }
+        guard let batch = rawDrainBuffer.take() else {
+            rawDrainScheduled = false
+            return .idle
+        }
+        return .batch(batch)
+    }
+
+    private func consumeRawOutput(_ rawBytes: Data, rawEnd: UInt64) {
+        filterLock.lock()
+        let bytes = queryStripper.strip(rawBytes)
+        lock.lock()
+        filterLock.unlock()
+
+        if !bytes.isEmpty {
+            replay.push(bytes)
+            producedChunks &+= 1
+            producedBytes &+= UInt64(bytes.count)
+            let chunk = PtyTapChunk(bytes: bytes, seq: tapSeq)
+            tapSeq &+= UInt64(bytes.count)
+            var droppedCount: UInt64?
+            for continuation in continuations.values {
+                if case .dropped = continuation.yield(chunk) {
+                    hostAggregateDropCount &+= 1
+                    hostAggregateDroppedBytes &+= UInt64(bytes.count)
+                    droppedCount = hostAggregateDropCount
+                }
+            }
+            rawToFilteredCheckpoints.append(
+                rawEnd: rawEnd,
+                rawByteCount: rawBytes.count,
+                filteredEnd: tapSeq
+            )
+            lock.unlock()
+            #if DEBUG
+            if let droppedCount, droppedCount == 1 || droppedCount % 500 == 0 {
+                dlog("peer.broadcast.drop count=\(droppedCount) surface=\(surfaceID.uuidString.prefix(8))")
+            }
+            #endif
+            return
+        }
+
+        rawToFilteredCheckpoints.append(
+            rawEnd: rawEnd,
+            rawByteCount: rawBytes.count,
+            filteredEnd: tapSeq
+        )
+        lock.unlock()
+    }
+
+    func filteredSequence(forRawEnd rawEnd: UInt64) -> UInt64? {
+        lock.lock()
+        let filteredEnd = rawToFilteredCheckpoints.filteredEnd(forRawEnd: rawEnd)
+        lock.unlock()
+        return filteredEnd
+    }
+
+    func atomicResyncSnapshot(surface: ghostty_surface_t) async -> PeerSurfaceResync? {
+        let retryPeriod: UInt64 = 5_000_000
+        let deadline = ProcessInfo.processInfo.systemUptime + 12
+        let snapshot = await MainActor.run {
+            readPaneSnapshotWithRawOutputSequence(surface)
+        }
+        guard let snapshot else { return nil }
+        while ProcessInfo.processInfo.systemUptime < deadline {
+            if let boundary = filteredSequence(forRawEnd: snapshot.rawEnd) {
+                return PeerSurfaceResync(ansi: snapshot.bytes, hostByteSeq: boundary)
+            }
+            do {
+                try await Task.sleep(nanoseconds: retryPeriod)
+            } catch {
+                return nil
+            }
+        }
+        return nil
+    }
+
     func relayTelemetrySnapshot() -> RelayTelemetrySnapshot {
         lock.lock()
         let snapshot = RelayTelemetrySnapshot(
@@ -560,6 +821,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
     // MARK: PeerSurfaceProvider
 
     func supportsLivePresentation() async -> Bool { true }
+    func supportsAtomicResync() async -> Bool { true }
 
     nonisolated func relayTelemetrySnapshot() async -> Termmesh_Peer_V1_RelayTelemetry? {
         telemetryRegistry.wireSnapshot()
@@ -948,7 +1210,9 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             telemetryRegistry.insert(hub)
             // Register the C tap under renderer_state.mutex in Ghostty.
             let hubPtr = Unmanaged.passUnretained(hub).toOpaque()
-            ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, hubPtr)
+            ghostty_surface_set_pty_data_callback_with_output_sequence(
+                sfcPtr, ptyTapCallbackWithRawOutputSequence, hubPtr
+            )
         }
 
         // Phase P4: prefer the hub ring's replay (raw PTY bytes — ANSI/
@@ -1099,7 +1363,7 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                     GhosttyPaneSurfaceProvider.decrementPeerAttach(for: ts)
                     if hubEmpty {
                         if let ptr = ts.surface {
-                            ghostty_surface_clear_pty_data_callback(ptr)
+                            ghostty_surface_clear_pty_data_callback_with_output_sequence(ptr)
                         }
                         // Nobody is looking from elsewhere any more, so the
                         // local pane stops accommodating a viewer that has
@@ -1207,6 +1471,10 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             },
             workspaceMeta: meta,
             initialByteSeq: initialSeq,
+            resync: { [weak hub] in
+                guard let hub else { return nil }
+                return await hub.atomicResyncSnapshot(surface: sfcPtr)
+            },
             detach: detach
         )
     }
@@ -2264,7 +2532,9 @@ extension GhosttyPaneSurfaceProvider {
             tapHubs[ts.id] = hub
             telemetryRegistry.insert(hub)
             let hubPtr = Unmanaged.passUnretained(hub).toOpaque()
-            ghostty_surface_set_pty_data_callback(sfcPtr, ptyTapCallback, hubPtr)
+            ghostty_surface_set_pty_data_callback_with_output_sequence(
+                sfcPtr, ptyTapCallbackWithRawOutputSequence, hubPtr
+            )
         }
         let snap = hub.replaySnapshot()
         return (
@@ -3273,6 +3543,25 @@ private func readPaneSnapshot(_ surface: ghostty_surface_t) -> Data? {
     snapshot.append(contentsOf: [0x1b, 0x5b, 0x48])       // ESC [ H   — cursor home
     snapshot.append(body)
     return snapshot
+}
+
+@MainActor
+private func readPaneSnapshotWithRawOutputSequence(
+    _ surface: ghostty_surface_t
+) -> (bytes: Data, rawEnd: UInt64)? {
+    var out = ghostty_text_s()
+    var rawEnd: UInt64 = 0
+    guard ghostty_surface_read_screen_tail_vt_with_output_sequence(
+        surface, 1_024, 512 * 1_024, &out, &rawEnd
+    ) else {
+        return nil
+    }
+    defer { ghostty_surface_free_text(surface, &out) }
+    var snapshot = Data([0x1B, 0x5B, 0x32, 0x4A, 0x1B, 0x5B, 0x48])
+    if let text = out.text, out.text_len > 0 {
+        snapshot.append(Data(bytes: text, count: Int(out.text_len)))
+    }
+    return (snapshot, rawEnd)
 }
 
 /// Recreates the source pane's default terminal colors before replaying its

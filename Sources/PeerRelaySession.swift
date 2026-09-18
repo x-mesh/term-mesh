@@ -3495,7 +3495,7 @@ final class PeerRelaySession {
                         }
                         endReason = "host-error code=\(code) message=\(message)"
                         break pumpLoop
-                    case .gridSnapshot(let sid, _, _, let ansi) where sid == mySurfaceID:
+                    case .gridSnapshot(let sid, let hostByteSeq, _, let ansi) where sid == mySurfaceID:
                         guard let writer else {
                             // Callback (agent) delivery: the wire contract says
                             // an agent surface never emits GridSnapshot, and
@@ -3506,6 +3506,7 @@ final class PeerRelaySession {
                             // wire-seq space after this message, so skipping
                             // the reset would misread the next live chunk as a
                             // gap and schedule a needless heal.
+                            await MainActor.run { self.attachInitialSeq = hostByteSeq }
                             expectedByteSeq = 0
                             _ = resumeTransitionGate.resetWireSeq(
                                 generation: currentGeneration
@@ -3531,11 +3532,13 @@ final class PeerRelaySession {
                         // lives in the per-attach wire space, and a host on
                         // the typed path spends no wire seq on the snapshot —
                         // the first live PtyData after this message starts at
-                        // byte_seq 0 (its host-absolute anchor arrives as
-                        // AttachResult.initial_seq, which equals this
-                        // message's byte_seq). Without the reset every attach
+                        // byte_seq 0. This mid-stream keyframe moves the
+                        // absolute anchor, so retain it for a later resume
+                        // before resetting the wire baseline. Without the
+                        // reset every attach
                         // would read as a jump, fire a spurious gap log, and
                         // schedule a needless redraw heal.
+                        await MainActor.run { self.attachInitialSeq = hostByteSeq }
                         expectedByteSeq = 0
                         _ = resumeTransitionGate.resetWireSeq(
                             generation: currentGeneration

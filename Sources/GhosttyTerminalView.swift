@@ -2517,6 +2517,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         // serialized with callback dispatch, so once it returns no further
         // callback can run.
         ghostty_surface_clear_pty_data_callback(surface)
+        ghostty_surface_clear_pty_data_callback_with_output_sequence(surface)
 
         // Keep the actual free asynchronous to avoid re-entrant close/deinit loops.
         // Route through the coordinator so that ghostty_surface_free() is deferred
@@ -2558,6 +2559,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
         if let s = capturedSurface {
             ghostty_surface_clear_pty_data_callback(s)
+            ghostty_surface_clear_pty_data_callback_with_output_sequence(s)
         }
 
         Task { @MainActor in

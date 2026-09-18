@@ -118,6 +118,28 @@ final class PeerServerOutboundQueueTests: XCTestCase {
         XCTAssertEqual(entries.count, PeerServerOutboundQueue.maxPendingItems)
     }
 
+    func testInstallSnapshotDiscardsUnsentPayloadAndKeepsOnlyExactTail() async {
+        let queue = PeerServerOutboundQueue()
+        _ = await queue.enqueue(Data("obsolete".utf8), startSeq: 7)
+        let snapshot = PeerSurfaceResync(ansi: Data("screen".utf8), hostByteSeq: 99)
+        let installed = await queue.installSnapshot(snapshot)
+        XCTAssertTrue(installed)
+        _ = await queue.enqueue(Data("tail".utf8), startSeq: 0)
+        await queue.finish()
+
+        guard let first = await queue.next(), case .snapshot(let actual) = first.kind else {
+            return XCTFail("expected replacement snapshot")
+        }
+        XCTAssertEqual(actual, snapshot)
+        guard let second = await queue.next(), case .pty(let bytes, let startSeq) = second.kind else {
+            return XCTFail("expected post-snapshot tail")
+        }
+        XCTAssertEqual(bytes, Data("tail".utf8))
+        XCTAssertEqual(startSeq, 0)
+        let terminalEntry = await queue.next()
+        XCTAssertNil(terminalEntry)
+    }
+
     func testProducerContinuesPastItemLimitWhileWriterIsBackpressured() async {
         let queue = PeerServerOutboundQueue()
         let gate = OutboundQueueGate()
@@ -167,7 +189,8 @@ final class PeerServerOutboundQueueTests: XCTestCase {
         let coalescer = PtyDataCoalescer { _, _ in false }
         let writer = Task { () -> Bool in
             while let entry = await queue.next() {
-                guard await coalescer.submit(entry.bytes, startSeq: entry.startSeq) else {
+                guard case .pty(let bytes, let startSeq) = entry.kind,
+                      await coalescer.submit(bytes, startSeq: startSeq) else {
                     await queue.abort()
                     return false
                 }

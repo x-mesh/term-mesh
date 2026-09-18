@@ -1697,6 +1697,26 @@ void ghostty_surface_set_pty_data_callback(
 );
 void ghostty_surface_clear_pty_data_callback(ghostty_surface_t);
 
+// PTY data tap with raw processed-output sequence boundaries. Registration
+// invokes cb once under renderer_state.mutex with data=NULL, len=0, and the
+// current raw_end. Each later callback is invoked under the same mutex after
+// its bytes have been applied to the terminal and raw_end has advanced.
+// The callback MUST be non-blocking.
+typedef void (*ghostty_surface_pty_data_with_output_sequence_cb)(
+    void* userdata,
+    const uint8_t* data,
+    uintptr_t len,
+    uint64_t raw_end
+);
+GHOSTTY_API void ghostty_surface_set_pty_data_callback_with_output_sequence(
+    ghostty_surface_t,
+    ghostty_surface_pty_data_with_output_sequence_cb cb,
+    void* userdata
+);
+GHOSTTY_API void ghostty_surface_clear_pty_data_callback_with_output_sequence(
+    ghostty_surface_t
+);
+
 // APIs I'd like to get rid of eventually but are still needed for now.
 // Don't use these unless you know what you're doing.
 GHOSTTY_API void ghostty_set_window_background_blur(ghostty_app_t, void*);

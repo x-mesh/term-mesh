@@ -77,6 +77,10 @@ public struct PeerSurfaceAttachment: Sendable {
     /// back as `AttachSurface.resumeFromSeq` — see
     /// `PeerServerSession.handleAttach`'s doc comment for the full mapping.
     public let initialByteSeq: UInt64
+    /// A one-shot keyframe supplier used only after this attachment's
+    /// outbound queue evicts data. The returned host boundary is the exact
+    /// filtered sequence immediately after the rendered ANSI screen.
+    public let resync: (@Sendable () async -> PeerSurfaceResync?)?
     /// Called by the session when the client detaches, the connection
     /// closes, or the session is shut down. Providers should stop
     /// yielding to `byteStream` and release per-attach resources.
@@ -88,6 +92,7 @@ public struct PeerSurfaceAttachment: Sendable {
         resize: @escaping @Sendable (UInt32, UInt32) async -> Void = { _, _ in },
         workspaceMeta: PeerWorkspaceMeta? = nil,
         initialByteSeq: UInt64 = 0,
+        resync: (@Sendable () async -> PeerSurfaceResync?)? = nil,
         detach: @escaping @Sendable () async -> Void = {}
     ) {
         self.byteStream = byteStream
@@ -95,7 +100,21 @@ public struct PeerSurfaceAttachment: Sendable {
         self.resize = resize
         self.workspaceMeta = workspaceMeta
         self.initialByteSeq = initialByteSeq
+        self.resync = resync
         self.detach = detach
+    }
+}
+
+/// A rendered replacement screen anchored in the provider's host-absolute
+/// filtered byte sequence. It is internal attachment plumbing: it reuses the
+/// established `GridSnapshot` wire message and adds no protocol fields.
+public struct PeerSurfaceResync: Sendable, Equatable {
+    public let ansi: Data
+    public let hostByteSeq: UInt64
+
+    public init(ansi: Data, hostByteSeq: UInt64) {
+        self.ansi = ansi
+        self.hostByteSeq = hostByteSeq
     }
 }
 
@@ -124,6 +143,7 @@ public struct PeerWorkspaceMeta: Sendable, Equatable {
 /// for list-only scenarios and `EchoSurfaceProvider` for round-trip.
 public protocol PeerSurfaceProvider: AnyObject, Sendable {
     func supportsLivePresentation() async -> Bool
+    func supportsAtomicResync() async -> Bool
     func listSurfaces() async -> [Termmesh_Peer_V1_SurfaceInfo]
     /// A bounded, payload-free snapshot. Implementations must not sample
     /// unless a capable client is interested; PeerServer enforces that gate.
@@ -238,6 +258,7 @@ public struct PeerTeamCallFailure: Error, Sendable, Equatable {
 }
 
 public extension PeerSurfaceProvider {
+    func supportsAtomicResync() async -> Bool { false }
     func supportsLivePresentation() async -> Bool { false }
     func relayTelemetrySnapshot() async -> Termmesh_Peer_V1_RelayTelemetry? { nil }
     func listWorkspaces() async -> [Termmesh_Peer_V1_Workspace] { [] }
@@ -1390,8 +1411,31 @@ public actor PtyDataCoalescer {
 }
 
 struct PeerServerOutboundQueueEntry: Sendable, Equatable {
-    let bytes: Data
-    let startSeq: UInt64
+    enum Kind: Sendable, Equatable {
+        case pty(bytes: Data, startSeq: UInt64)
+        case snapshot(PeerSurfaceResync)
+    }
+
+    let kind: Kind
+
+    var bytes: Data {
+        guard case .pty(let bytes, _) = kind else {
+            preconditionFailure("snapshot entries do not have PTY bytes")
+        }
+        return bytes
+    }
+
+    var startSeq: UInt64 {
+        guard case .pty(_, let startSeq) = kind else {
+            preconditionFailure("snapshot entries do not have a PTY sequence")
+        }
+        return startSeq
+    }
+
+    var byteCount: Int {
+        if case .pty(let bytes, _) = kind { return bytes.count }
+        return 0
+    }
 }
 
 struct PeerServerOutboundQueueDrop: Sendable, Equatable {
@@ -1464,8 +1508,10 @@ actor PeerServerOutboundQueue {
         while offset < bytes.count {
             let length = min(Self.maxEntryBytes, bytes.count - offset)
             let entry = PeerServerOutboundQueueEntry(
-                bytes: bytes.subdata(in: offset..<(offset + length)),
-                startSeq: startSeq &+ UInt64(offset)
+                kind: .pty(
+                    bytes: bytes.subdata(in: offset..<(offset + length)),
+                    startSeq: startSeq &+ UInt64(offset)
+                )
             )
             offset += length
             admit(entry, callDrops: &callDrops)
@@ -1494,6 +1540,23 @@ actor PeerServerOutboundQueue {
         resumeWaiterIfNeeded()
     }
 
+    /// Replaces every unsent payload with a keyframe. A writer may already
+    /// be inside one socket write; the subsequent snapshot deliberately
+    /// resets that viewer's state before any newly admitted tail.
+    func installSnapshot(_ snapshot: PeerSurfaceResync) -> Bool {
+        guard case .open = state else { return false }
+        pending.removeAll(keepingCapacity: true)
+        pendingBytes = 0
+        let entry = PeerServerOutboundQueueEntry(kind: .snapshot(snapshot))
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: entry)
+        } else {
+            pending.append(entry)
+        }
+        return true
+    }
+
     func abort() {
         guard case .aborted = state else {
             state = .aborted
@@ -1513,9 +1576,9 @@ actor PeerServerOutboundQueue {
     }
 
     private func admit(_ entry: PeerServerOutboundQueueEntry, callDrops: inout PeerServerOutboundQueueDrop) {
-        while pending.count >= Self.maxPendingItems || pendingBytes + entry.bytes.count > Self.maxPendingBytes {
+        while pending.count >= Self.maxPendingItems || pendingBytes + entry.byteCount > Self.maxPendingBytes {
             guard let evicted = takeFirst() else { break }
-            let drop = PeerServerOutboundQueueDrop(chunks: 1, bytes: evicted.bytes.count)
+            let drop = PeerServerOutboundQueueDrop(chunks: 1, bytes: evicted.byteCount)
             dropped.chunks += drop.chunks
             dropped.bytes += drop.bytes
             callDrops.chunks += drop.chunks
@@ -1527,14 +1590,14 @@ actor PeerServerOutboundQueue {
             waiter.resume(returning: entry)
         } else {
             pending.append(entry)
-            pendingBytes += entry.bytes.count
+            pendingBytes += entry.byteCount
         }
     }
 
     private func takeFirst() -> PeerServerOutboundQueueEntry? {
         guard !pending.isEmpty else { return nil }
         let entry = pending.removeFirst()
-        pendingBytes -= entry.bytes.count
+        pendingBytes -= entry.byteCount
         return entry
     }
 
@@ -1856,6 +1919,9 @@ actor PeerServerSession {
                 advertisedCapabilities.removeAll {
                     $0 == PeerCapability.agentPresentationV1 || $0 == PeerCapability.projectPresentationLiveV1
                 }
+            }
+            if !(await provider.supportsAtomicResync()) {
+                advertisedCapabilities.removeAll { $0 == PeerCapability.gridSnapshotV1 }
             }
             if config.hostStatsProvider == nil {
                 advertisedCapabilities.removeAll { $0 == PeerCapability.hostStatsV1 }
@@ -2368,6 +2434,10 @@ actor PeerServerSession {
         // contiguous and truncation was undetectable downstream.
         var wireSeq: UInt64 = 0
         var lastTapEnd: UInt64?
+        var resyncBoundary: UInt64?
+        var resyncStarted = false
+        let canResync = hasClientCapability(PeerCapability.gridSnapshotV1)
+            && attachment.resync != nil
         let diagnostics = PeerServerOutboundQueueDiagnostics()
         let queue = PeerServerOutboundQueue { drop in
             diagnostics.record(drop)
@@ -2393,9 +2463,29 @@ actor PeerServerSession {
         await withTaskCancellationHandler(operation: {
             async let writer: Bool = {
                 while let entry = await queue.next() {
-                    guard await coalescer.submit(entry.bytes, startSeq: entry.startSeq) else {
-                        await queue.abort()
-                        return false
+                    switch entry.kind {
+                    case .pty(let bytes, let startSeq):
+                        guard await coalescer.submit(bytes, startSeq: startSeq) else {
+                            await queue.abort()
+                            return false
+                        }
+                    case .snapshot(let snapshot):
+                        guard await coalescer.flushRemaining() else {
+                            await queue.abort()
+                            return false
+                        }
+                        do {
+                            try await self.sendEnvelope { env in
+                                var grid = Termmesh_Peer_V1_GridSnapshot()
+                                grid.surfaceID = surfaceID
+                                grid.byteSeq = snapshot.hostByteSeq
+                                grid.ansi = snapshot.ansi
+                                env.gridSnapshot = grid
+                            }
+                        } catch {
+                            await queue.abort()
+                            return false
+                        }
                     }
                 }
                 return await coalescer.flushRemaining()
@@ -2405,14 +2495,92 @@ actor PeerServerSession {
                 for await chunk in attachment.byteStream {
                     if Task.isCancelled { return false }
                     if chunk.bytes.isEmpty { continue }
+                    if let boundary = resyncBoundary {
+                        let chunkEnd = chunk.seq &+ UInt64(chunk.bytes.count)
+                        if chunkEnd <= boundary { continue }
+                        // Atomic Ghostty snapshots land only on callback
+                        // boundaries. A crossing chunk would therefore mean
+                        // a producer violated the bridge contract; never
+                        // guess a filtered slice.
+                        guard chunk.seq >= boundary else {
+                            await queue.abort()
+                            return false
+                        }
+                        if let prevEnd = lastTapEnd, chunk.seq > prevEnd {
+                            guard let capture = attachment.resync,
+                                  let snapshot = await capture(),
+                                  await queue.installSnapshot(snapshot) else {
+                                await queue.abort()
+                                return false
+                            }
+                            resyncBoundary = snapshot.hostByteSeq
+                            wireSeq = 0
+                            lastTapEnd = snapshot.hostByteSeq
+                            continue
+                        }
+                        let startSeq = chunk.seq &- boundary
+                        switch await queue.enqueue(chunk.bytes, startSeq: startSeq) {
+                        case .accepted(let drops) where drops.bytes == 0:
+                            lastTapEnd = chunkEnd
+                            continue
+                        case .accepted, .finished, .aborted:
+                            await queue.abort()
+                            return false
+                        }
+                    }
                     if let prevEnd = lastTapEnd, chunk.seq > prevEnd {
-                        wireSeq &+= (chunk.seq - prevEnd)
+                        guard canResync else {
+                            wireSeq &+= (chunk.seq - prevEnd)
+                            lastTapEnd = chunk.seq &+ UInt64(chunk.bytes.count)
+                            let startSeq = wireSeq
+                            wireSeq &+= UInt64(chunk.bytes.count)
+                            switch await queue.enqueue(chunk.bytes, startSeq: startSeq) {
+                            case .accepted:
+                                continue
+                            case .finished, .aborted:
+                                return false
+                            }
+                        }
+                        guard !resyncStarted,
+                              let capture = attachment.resync else {
+                            await queue.abort()
+                            return false
+                        }
+                        resyncStarted = true
+                        guard let snapshot = await capture(),
+                              await queue.installSnapshot(snapshot) else {
+                            await queue.abort()
+                            return false
+                        }
+                        resyncBoundary = snapshot.hostByteSeq
+                        wireSeq = 0
+                        lastTapEnd = snapshot.hostByteSeq
+                        continue
                     }
                     lastTapEnd = chunk.seq &+ UInt64(chunk.bytes.count)
                     let startSeq = wireSeq
                     wireSeq &+= UInt64(chunk.bytes.count)
                     switch await queue.enqueue(chunk.bytes, startSeq: startSeq) {
+                    case .accepted(let drops) where drops.bytes == 0:
+                        continue
                     case .accepted:
+                        guard canResync else {
+                            continue
+                        }
+                        guard !resyncStarted,
+                              let capture = attachment.resync else {
+                            await queue.abort()
+                            return false
+                        }
+                        resyncStarted = true
+                        guard let snapshot = await capture(),
+                              await queue.installSnapshot(snapshot) else {
+                            await queue.abort()
+                            return false
+                        }
+                        resyncBoundary = snapshot.hostByteSeq
+                        wireSeq = 0
+                        lastTapEnd = snapshot.hostByteSeq
                         continue
                     case .finished, .aborted:
                         return false

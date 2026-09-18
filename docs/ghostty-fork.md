@@ -28,6 +28,22 @@ When we change the fork, update this document and the parent submodule SHA.
 This list has fallen behind before. Trust the diff against `upstream/main`
 over this summary.
 
+### PTY tap output-sequence bridge
+
+- Commit: `f33047ed9` (refactor: add PTY output sequence callback)
+- Files: `include/ghostty.h`, `src/apprt/embedded.zig`, `src/termio/Termio.zig`, `src/renderer/State.zig`
+- Adds `ghostty_surface_set_pty_data_callback_with_output_sequence` and its
+  paired clear function. Registration holds `renderer_state.mutex`, installs
+  the tap, then emits a zero-length baseline carrying
+  `processed_output_bytes`; later callbacks run under the same lock after
+  their bytes are applied. This gives embedders an exact modulo-`uint64` raw
+  output boundary without an output gap between baseline and callback.
+- The callback is on Ghostty's reader path under the renderer lock and must
+  remain bounded and nonblocking. The term-mesh bridge records every callback
+  boundary, including output fully removed by its query filter, before mapping
+  an atomic VT-tail sequence to its filtered byte space.
+- Parent `ghostty.h` is a synchronized copy of `ghostty/include/ghostty.h`.
+
 ### 1) OSC 99 (kitty) notification parser
 
 - Commit: `4713b7e23` (Add OSC 99 notification parser)

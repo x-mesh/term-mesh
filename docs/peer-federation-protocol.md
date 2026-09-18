@@ -397,7 +397,13 @@ Clients MUST treat unknown error codes as fatal-for-this-surface, not fatal-for-
 
 1. Phase 1 relies on TCP/SSH transport backpressure for correctness. Senders MUST NOT buffer unbounded PtyData if the transport stalls.
 2. `DataAck` is advisory: clients MAY send it every N PtyData frames for RTT measurement and to let hosts trim the reconnect ring buffer early.
-3. If a host detects `unacked_bytes > 8 MiB` on a single surface, it MAY drop the oldest queued PtyData and emit an `Error { code: ERR_INTERNAL, message: "slow consumer" }` after which the client MUST re-request a `GridSnapshot` to re-sync.
+3. A host that negotiated `grid.snapshot.v1` MAY replace one attachment's
+   obsolete unsent `PtyData` with one `GridSnapshot` after its bounded
+   outbound queue overflows. The snapshot's host-absolute `byte_seq` is the
+   exact boundary for the first following `PtyData { byte_seq: 0 }`; the
+   client resets only that attachment's wire-gap baseline. Hosts must not send
+   this mid-stream replacement to an unnegotiated client, which retains the
+   established visible sequence-hole behavior.
 4. Higher-order credit-based flow control is Phase N+ work; not needed for LAN.
 
 ## Reconnection Protocol
