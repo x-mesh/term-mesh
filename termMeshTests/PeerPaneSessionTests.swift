@@ -99,6 +99,18 @@ final class RelayTelemetryStoreTests: XCTestCase {
         surface.hostAggregateDroppedBytes = 48
         var sample = Termmesh_Peer_V1_RelayTelemetry()
         sample.surfaces = [surface]
+        sample.transportEagainCount = 3
+        sample.transportWaitNsTotal = 240
+        sample.transportWaitNsMax = 96
+        sample.transportTimeoutCount = 2
+
+        store.record(sample, surfaceID: Data(repeating: 0xB6, count: 16))
+        let mismatched = store.status()
+        XCTAssertEqual(mismatched["remote_supported"] as? Bool, false)
+        XCTAssertNil(mismatched["transport_eagain_count"])
+        XCTAssertNil(mismatched["transport_wait_ns_total"])
+        XCTAssertNil(mismatched["transport_wait_ns_max"])
+        XCTAssertNil(mismatched["transport_timeout_count"])
 
         store.record(sample, surfaceID: surfaceID)
         store.noteGap(bytes: 12)
@@ -106,14 +118,21 @@ final class RelayTelemetryStoreTests: XCTestCase {
         XCTAssertEqual(mapped["remote_supported"] as? Bool, true)
         XCTAssertEqual(mapped["host_aggregate_dropped_bytes"] as? UInt64, 48)
         XCTAssertEqual(mapped["receiver_gap_bytes_total"] as? UInt64, 12)
+        XCTAssertEqual(mapped["transport_eagain_count"] as? UInt64, 3)
+        XCTAssertEqual(mapped["transport_wait_ns_total"] as? UInt64, 240)
+        XCTAssertEqual(mapped["transport_wait_ns_max"] as? UInt64, 96)
+        XCTAssertEqual(mapped["transport_timeout_count"] as? UInt64, 2)
 
         store.resetRemote()
         let afterReplacement = store.status()
         XCTAssertEqual(afterReplacement["remote_supported"] as? Bool, false)
         XCTAssertNil(afterReplacement["host_aggregate_dropped_bytes"])
+        XCTAssertNil(afterReplacement["transport_eagain_count"])
+        XCTAssertNil(afterReplacement["transport_wait_ns_total"])
+        XCTAssertNil(afterReplacement["transport_wait_ns_max"])
+        XCTAssertNil(afterReplacement["transport_timeout_count"])
+        XCTAssertEqual(afterReplacement["receiver_gap_bytes_total"] as? UInt64, 12)
 
-        store.record(sample, surfaceID: Data(repeating: 0xB6, count: 16))
-        XCTAssertEqual(store.status()["remote_supported"] as? Bool, false)
     }
 }
 

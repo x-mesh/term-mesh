@@ -1600,8 +1600,16 @@ private final class RelayIOStats: @unchecked Sendable {
 }
 
 final class RelayTelemetryStore: @unchecked Sendable {
+    private struct RemoteTransportSnapshot {
+        let eagainCount: UInt64
+        let waitNsTotal: UInt64
+        let waitNsMax: UInt64
+        let timeoutCount: UInt64
+    }
+
     private let lock = NSLock()
     private var remote: Termmesh_Peer_V1_RelaySurfaceTelemetry?
+    private var remoteTransport: RemoteTransportSnapshot?
     private var remoteReceivedAtNs: UInt64 = 0
     private var gapCount: UInt64 = 0
     private var gapBytes: UInt64 = 0
@@ -1610,6 +1618,12 @@ final class RelayTelemetryStore: @unchecked Sendable {
         guard let matching = sample.surfaces.first(where: { $0.surfaceID == surfaceID }) else { return }
         lock.lock()
         remote = matching
+        remoteTransport = RemoteTransportSnapshot(
+            eagainCount: sample.transportEagainCount,
+            waitNsTotal: sample.transportWaitNsTotal,
+            waitNsMax: sample.transportWaitNsMax,
+            timeoutCount: sample.transportTimeoutCount
+        )
         remoteReceivedAtNs = DispatchTime.now().uptimeNanoseconds
         lock.unlock()
     }
@@ -1624,6 +1638,7 @@ final class RelayTelemetryStore: @unchecked Sendable {
     func resetRemote() {
         lock.lock()
         remote = nil
+        remoteTransport = nil
         remoteReceivedAtNs = 0
         lock.unlock()
     }
@@ -1636,12 +1651,16 @@ final class RelayTelemetryStore: @unchecked Sendable {
             "receiver_gap_bytes_total": gapBytes,
             "remote_supported": remote != nil,
         ]
-        if let remote {
+        if let remote, let remoteTransport {
             result["remote_sample_age_ns"] = now &- remoteReceivedAtNs
             result["host_produced_chunks"] = remote.producedChunks
             result["host_produced_bytes"] = remote.producedBytes
             result["host_aggregate_dropped_chunks"] = remote.hostAggregateDroppedChunks
             result["host_aggregate_dropped_bytes"] = remote.hostAggregateDroppedBytes
+            result["transport_eagain_count"] = remoteTransport.eagainCount
+            result["transport_wait_ns_total"] = remoteTransport.waitNsTotal
+            result["transport_wait_ns_max"] = remoteTransport.waitNsMax
+            result["transport_timeout_count"] = remoteTransport.timeoutCount
         }
         return result
     }
