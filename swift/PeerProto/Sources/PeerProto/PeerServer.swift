@@ -1249,6 +1249,7 @@ public actor PtyDataCoalescer {
     private let windowNs: UInt64
     private let maxBytes: Int
     private let send: @Sendable (Data, UInt64) async -> Bool
+    private let onFailure: @Sendable () async -> Void
 
     private var armed = false
     private var pending = Data()
@@ -1266,11 +1267,13 @@ public actor PtyDataCoalescer {
     public init(
         windowMs: UInt64 = PtyDataCoalescer.defaultWindowMs,
         maxBytes: Int = PtyDataCoalescer.defaultMaxBytes,
-        send: @escaping @Sendable (Data, UInt64) async -> Bool
+        send: @escaping @Sendable (Data, UInt64) async -> Bool,
+        onFailure: @escaping @Sendable () async -> Void = {}
     ) {
         self.windowNs = windowMs * 1_000_000
         self.maxBytes = maxBytes
         self.send = send
+        self.onFailure = onFailure
     }
 
     /// Submit one chunk as it arrives from the byte producer. `startSeq`
@@ -1296,7 +1299,7 @@ public actor PtyDataCoalescer {
             // isolated write incurs zero coalescing delay, then arm the
             // window to catch whatever follows within it.
             guard await send(bytes, startSeq) else {
-                stopped = true
+                await fail()
                 return false
             }
             arm()
@@ -1329,11 +1332,13 @@ public actor PtyDataCoalescer {
     /// coalesced bytes are never silently lost on pane/session teardown —
     /// see `pumpByteStream`'s call site for why this alone covers every
     /// teardown path.
-    public func flushRemaining() async {
+    @discardableResult
+    public func flushRemaining() async -> Bool {
+        guard !stopped else { return false }
         flushTask?.cancel()
         flushTask = nil
         armed = false
-        _ = await flushLocked()
+        return await flushLocked()
     }
 
     private func arm() {
@@ -1371,10 +1376,176 @@ public actor PtyDataCoalescer {
         let seq = pendingStartSeq
         pending = Data()
         guard await send(payload, seq) else {
-            stopped = true
+            await fail()
             return false
         }
         return true
+    }
+
+    private func fail() async {
+        guard !stopped else { return }
+        stopped = true
+        await onFailure()
+    }
+}
+
+struct PeerServerOutboundQueueEntry: Sendable, Equatable {
+    let bytes: Data
+    let startSeq: UInt64
+}
+
+struct PeerServerOutboundQueueDrop: Sendable, Equatable {
+    var chunks: Int = 0
+    var bytes: Int = 0
+}
+
+struct PeerServerOutboundQueueSnapshot: Sendable, Equatable {
+    let pendingItems: Int
+    let pendingBytes: Int
+    let dropped: PeerServerOutboundQueueDrop
+}
+
+enum PeerServerOutboundQueueAdmission: Sendable, Equatable {
+    case accepted(PeerServerOutboundQueueDrop)
+    case finished
+    case aborted
+}
+
+private final class PeerServerOutboundQueueDiagnostics: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastEmission = Date.distantPast
+
+    func record(_ drop: PeerServerOutboundQueueDrop) {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = Date()
+        guard now.timeIntervalSince(lastEmission) >= 1 else { return }
+        lastEmission = now
+        NSLog("term-mesh peer outbound queue evicted %d chunks / %d bytes", drop.chunks, drop.bytes)
+    }
+}
+
+/// The socket writer is allowed to suspend, but the PTY tap producer is not.
+/// This queue is the explicit, observable loss boundary between those two
+/// lifecycles. Entries retain their original sequence offsets so an eviction
+/// remains a receiver-detectable hole rather than silent terminal corruption.
+actor PeerServerOutboundQueue {
+    static let maxPendingBytes = 1 * 1024 * 1024
+    static let maxPendingItems = 256
+    static let maxEntryBytes = PtyDataCoalescer.defaultMaxBytes
+
+    private enum State {
+        case open
+        case finished
+        case aborted
+    }
+
+    private var state: State = .open
+    private var pending: [PeerServerOutboundQueueEntry] = []
+    private var pendingBytes = 0
+    private var dropped = PeerServerOutboundQueueDrop()
+    private var waiter: CheckedContinuation<PeerServerOutboundQueueEntry?, Never>?
+    private let onDrop: @Sendable (PeerServerOutboundQueueDrop) -> Void
+
+    init(onDrop: @escaping @Sendable (PeerServerOutboundQueueDrop) -> Void = { _ in }) {
+        self.onDrop = onDrop
+    }
+
+    func enqueue(_ bytes: Data, startSeq: UInt64) async -> PeerServerOutboundQueueAdmission {
+        switch state {
+        case .finished: return .finished
+        case .aborted: return .aborted
+        case .open: break
+        }
+        guard !bytes.isEmpty else { return .accepted(PeerServerOutboundQueueDrop()) }
+
+        var callDrops = PeerServerOutboundQueueDrop()
+        var offset = 0
+        while offset < bytes.count {
+            let length = min(Self.maxEntryBytes, bytes.count - offset)
+            let entry = PeerServerOutboundQueueEntry(
+                bytes: bytes.subdata(in: offset..<(offset + length)),
+                startSeq: startSeq &+ UInt64(offset)
+            )
+            offset += length
+            admit(entry, callDrops: &callDrops)
+        }
+        if callDrops.bytes > 0 {
+            onDrop(callDrops)
+        }
+        return .accepted(callDrops)
+    }
+
+    func next() async -> PeerServerOutboundQueueEntry? {
+        if let entry = takeFirst() { return entry }
+        switch state {
+        case .open:
+            return await withCheckedContinuation { continuation in
+                waiter = continuation
+            }
+        case .finished, .aborted:
+            return nil
+        }
+    }
+
+    func finish() {
+        guard case .open = state else { return }
+        state = .finished
+        resumeWaiterIfNeeded()
+    }
+
+    func abort() {
+        guard case .aborted = state else {
+            state = .aborted
+            pending.removeAll(keepingCapacity: false)
+            pendingBytes = 0
+            resumeWaiterIfNeeded()
+            return
+        }
+    }
+
+    func snapshot() -> PeerServerOutboundQueueSnapshot {
+        PeerServerOutboundQueueSnapshot(
+            pendingItems: pending.count,
+            pendingBytes: pendingBytes,
+            dropped: dropped
+        )
+    }
+
+    private func admit(_ entry: PeerServerOutboundQueueEntry, callDrops: inout PeerServerOutboundQueueDrop) {
+        while pending.count >= Self.maxPendingItems || pendingBytes + entry.bytes.count > Self.maxPendingBytes {
+            guard let evicted = takeFirst() else { break }
+            let drop = PeerServerOutboundQueueDrop(chunks: 1, bytes: evicted.bytes.count)
+            dropped.chunks += drop.chunks
+            dropped.bytes += drop.bytes
+            callDrops.chunks += drop.chunks
+            callDrops.bytes += drop.bytes
+        }
+
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: entry)
+        } else {
+            pending.append(entry)
+            pendingBytes += entry.bytes.count
+        }
+    }
+
+    private func takeFirst() -> PeerServerOutboundQueueEntry? {
+        guard !pending.isEmpty else { return nil }
+        let entry = pending.removeFirst()
+        pendingBytes -= entry.bytes.count
+        return entry
+    }
+
+    private func resumeWaiterIfNeeded() {
+        guard let waiter else { return }
+        self.waiter = nil
+        if let entry = takeFirst() {
+            waiter.resume(returning: entry)
+        } else {
+            waiter.resume(returning: nil)
+        }
     }
 }
 
@@ -2180,9 +2351,9 @@ actor PeerServerSession {
         relayTasks[surfaceID] = relayTask
     }
 
-    /// Phase P7: pumps `attachment.byteStream` through a `PtyDataCoalescer`
-    /// instead of sending one `PtyData` per chunk 1:1 — see that type's
-    /// doc comment for the leading-edge/window/cap design.
+    /// The producer only computes sequence offsets and admits chunks to its
+    /// attachment-local bounded queue. A paired writer owns coalescing and
+    /// socket writes, so a full Unix socket cannot stop source consumption.
     private func pumpByteStream(
         surfaceID: Data,
         attachment: PeerSurfaceAttachment
@@ -2197,7 +2368,10 @@ actor PeerServerSession {
         // contiguous and truncation was undetectable downstream.
         var wireSeq: UInt64 = 0
         var lastTapEnd: UInt64?
-        var sendFailed = false
+        let diagnostics = PeerServerOutboundQueueDiagnostics()
+        let queue = PeerServerOutboundQueue { drop in
+            diagnostics.record(drop)
+        }
         let coalescer = PtyDataCoalescer { [weak self] payload, seq in
             guard let self else { return false }
             do {
@@ -2212,48 +2386,56 @@ actor PeerServerSession {
             } catch {
                 return false
             }
+        } onFailure: {
+            await queue.abort()
         }
 
-        for await chunk in attachment.byteStream {
-            if Task.isCancelled { break }
-            if chunk.bytes.isEmpty { continue }
-            if let prevEnd = lastTapEnd, chunk.seq > prevEnd {
-                // Producer-side drop between the previous chunk and this
-                // one — forward the hole to the wire. (A `seq` at or below
-                // `prevEnd` — synthetic snapshot stamps, wrap — is treated
-                // as contiguous; only forward jumps are meaningful.)
-                wireSeq &+= (chunk.seq - prevEnd)
+        await withTaskCancellationHandler(operation: {
+            async let writer: Bool = {
+                while let entry = await queue.next() {
+                    guard await coalescer.submit(entry.bytes, startSeq: entry.startSeq) else {
+                        await queue.abort()
+                        return false
+                    }
+                }
+                return await coalescer.flushRemaining()
+            }()
+
+            let producerFinished = await withTaskCancellationHandler(operation: {
+                for await chunk in attachment.byteStream {
+                    if Task.isCancelled { return false }
+                    if chunk.bytes.isEmpty { continue }
+                    if let prevEnd = lastTapEnd, chunk.seq > prevEnd {
+                        wireSeq &+= (chunk.seq - prevEnd)
+                    }
+                    lastTapEnd = chunk.seq &+ UInt64(chunk.bytes.count)
+                    let startSeq = wireSeq
+                    wireSeq &+= UInt64(chunk.bytes.count)
+                    switch await queue.enqueue(chunk.bytes, startSeq: startSeq) {
+                    case .accepted:
+                        continue
+                    case .finished, .aborted:
+                        return false
+                    }
+                }
+                return true
+            }, onCancel: {
+                Task { await queue.abort() }
+            })
+
+            if producerFinished && !Task.isCancelled {
+                await queue.finish()
+            } else {
+                await queue.abort()
             }
-            lastTapEnd = chunk.seq &+ UInt64(chunk.bytes.count)
-            let startSeq = wireSeq
-            wireSeq &+= UInt64(chunk.bytes.count)
-            if await coalescer.submit(chunk.bytes, startSeq: startSeq) == false {
-                sendFailed = true
-                break
+
+            let sendSucceeded = await writer
+            if !sendSucceeded && !Task.isCancelled {
+                await detachSurface(id: surfaceID)
             }
-        }
-        // Stream ended (natural finish, cancellation, or a send failure
-        // broke the loop above) — flush whatever the coalescer is still
-        // holding. Every pane-teardown path funnels through here: a
-        // peer-initiated detach finishes this specific stream via
-        // `PtyTapHub.finish(attachID:)`, and a host-side close
-        // (closeWorkspace / didCloseTab / didClosePane) finishes ALL of a
-        // surface's streams via `invalidateTapHub` -> `hub.shutdown()` ->
-        // `finishAll()` — either way `for await` above exits and this
-        // flush runs, so no separate hook is needed at those three call
-        // sites. This is what keeps in-flight coalesced bytes from being
-        // lost on close (P7 proposal audit note; hard regression gate:
-        // test_peer_input_bracketed_paste_split_close.py).
-        await coalescer.flushRemaining()
-        // A send failure means this attach can never deliver another byte,
-        // but the attach registry still lists it — the host keeps the pane
-        // "attached" while the stream is permanently dead (zombie pane:
-        // heartbeat fine, output frozen forever). Detach so the provider
-        // releases per-attach resources and the client's next attach starts
-        // a live pump instead of piling onto a corpse.
-        if sendFailed {
-            await detachSurface(id: surfaceID)
-        }
+        }, onCancel: {
+            Task { await queue.abort() }
+        })
     }
 
     private func detachSurface(id: Data) async {
