@@ -4,6 +4,12 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.250.0] - 2026-09-18
+
+### Added
+
+- Expose relay transport backpressure counters alongside remote output-drop and viewer-gap telemetry.
+
 ## [0.249.0] - 2026-09-18
 
 ### Added
