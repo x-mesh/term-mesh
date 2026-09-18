@@ -4,6 +4,18 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.251.0] - 2026-09-18
+
+### Fixed
+
+- Remote relay output under sustained PTY flood no longer loses bytes when small PTY reads overrun the host broadcast queue.
+- Relay reattach and snapshot healing now preserve exact output boundaries and recover from bounded queue pressure without replaying stale output.
+
+### Changed
+
+- PTY relay delivery batches contiguous output at the daemon boundary while keeping filtered, screen, replay, and sequence state exact.
+- Ghostty PTY taps now expose atomic raw-output sequence boundaries for reliable relay resynchronization.
+
 ## [0.250.0] - 2026-09-18
 
 ### Added
