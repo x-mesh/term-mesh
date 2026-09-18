@@ -2226,10 +2226,17 @@ final class PeerRelaySession {
 
     func refreshOwnedTransportForReconnect(reason: String) async {
         guard ownsSession, let ownedTransportRecovery else { return }
+        let hostLabel = hostKey?.description ?? hostDisplayName
+        let surfaceLabel = surfaceID.base64EncodedString().prefix(12)
+        let sessionGeneration = resumeTransitionGate.currentGeneration()
+        let transportGeneration = ownedTransportGeneration
+        RemoteWorkLog.infoOffMain(
+            "Peer transport refresh start host=\(hostLabel) surface=\(surfaceLabel) sessionGen=\(sessionGeneration) transportGen=\(transportGeneration) reason=\(reason)"
+        )
         ownedTransportGeneration = await ownedTransportRecovery(ownedTransportGeneration)
-        #if DEBUG
-        dlog("peer.relay.transport.refreshed reason=\(reason) generation=\(ownedTransportGeneration)")
-        #endif
+        RemoteWorkLog.infoOffMain(
+            "Peer transport refresh end host=\(hostLabel) surface=\(surfaceLabel) sessionGen=\(resumeTransitionGate.currentGeneration()) transportGen=\(ownedTransportGeneration) reason=\(reason)"
+        )
     }
 
     /// How many resume-heals this pane has performed. A pane that dies
@@ -3178,6 +3185,8 @@ final class PeerRelaySession {
         let mySurfaceID = surfaceID
         let scrollbackBrowse = self.scrollbackBrowse
         let telemetryStore = self.relayTelemetry
+        let hostLabel = self.hostKey?.description ?? self.hostDisplayName
+        let surfaceLabel = self.surfaceID.base64EncodedString().prefix(12)
 
         pumpTask = Task.detached(priority: .userInitiated) {
             // Host → relay: deliver PtyData frames to the relay socket.
@@ -3276,6 +3285,9 @@ final class PeerRelaySession {
                         msg = try await currentSession.receiveNextMessage()
                     } catch {
                         let failedTag = Self.sessionTag(currentSession)
+                        RemoteWorkLog.warningOffMain(
+                            "Peer receive failed host=\(hostLabel) surface=\(surfaceLabel) session=\(failedTag) sessionGen=\(currentGeneration) error=\(error)"
+                        )
                         if let swapped = await self.session, swapped !== currentSession {
                             #if DEBUG
                             // The benign case: a resume-heal retired this
@@ -4061,6 +4073,9 @@ final class PeerRelaySession {
         // a pane instead of respawning it.
         reconnectInFlight = true
         defer { reconnectInFlight = false }
+        RemoteWorkLog.infoOffMain(
+            "Peer reconnect start host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) failedSession=\(Self.sessionTag(failedSession)) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
+        )
         await failedSession.stopHeartbeat()
         await refreshOwnedTransportForReconnect(reason: "owned peer session lost")
         guard Self.shouldReconnectOwnedSession(
@@ -4092,19 +4107,24 @@ final class PeerRelaySession {
                 isCurrentSession: session === failedSession,
                 hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
             ) else { break }
-            #if DEBUG
-            dlog("peer.relay.reconnect.attempt n=\(attempt) delay=\(delay)")
-            #endif
+            RemoteWorkLog.infoOffMain(
+                "Peer reconnect attempt host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) n=\(attempt) delay=\(delay) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
+            )
             onReconnecting?(attempt)
             if await attemptOwnedSessionReconnect(
                 from: failedSession, generation: failedGeneration
             ) {
                 onReconnected?()
                 RemoteWorkLog.infoOffMain("Remote pane reconnected on attempt \(attempt)")
+                RemoteWorkLog.infoOffMain(
+                    "Peer reconnect success host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) n=\(attempt) sessionGen=\(resumeTransitionGate.currentGeneration()) transportGen=\(ownedTransportGeneration)"
+                )
                 return true
             }
             if attempt <= 3 || attempt % 10 == 0 {
-                RemoteWorkLog.debugOffMain("Remote pane reconnect attempt \(attempt) failed")
+                RemoteWorkLog.warningOffMain(
+                    "Peer reconnect failed host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) n=\(attempt) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
+                )
             }
         }
         return session !== failedSession

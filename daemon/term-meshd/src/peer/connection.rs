@@ -43,6 +43,7 @@ use crate::monitor::SystemSnapshot;
 
 pub const PROTOCOL_VERSION: &str = "1.0.0";
 pub const HOST_DISPLAY_NAME_ENV: &str = "TERMMESH_PEER_DISPLAY_NAME";
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, PartialEq, Eq)]
 enum HandshakeState {
@@ -253,21 +254,26 @@ fn repair_stale_project_presentation(
 }
 
 pub async fn run(stream: UnixStream, host: Arc<PeerHost>) -> anyhow::Result<()> {
+    let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
     let (reader, writer) = stream.into_split();
     let (outgoing_tx, outgoing_rx) = mpsc::channel::<Envelope>(128);
     let seq_counter = Arc::new(AtomicU64::new(0));
 
-    let writer_task = tokio::spawn(writer_loop(writer, outgoing_rx));
-    let result = reader_loop(reader, outgoing_tx.clone(), seq_counter, host).await;
+    let writer_task = tokio::spawn(writer_loop(writer, outgoing_rx, connection_id));
+    let result = reader_loop(reader, outgoing_tx.clone(), seq_counter, host, connection_id).await;
     drop(outgoing_tx);
     let _ = writer_task.await;
     result
 }
 
-async fn writer_loop(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<Envelope>) {
+async fn writer_loop(
+    mut writer: OwnedWriteHalf,
+    mut rx: mpsc::Receiver<Envelope>,
+    connection_id: u64,
+) {
     while let Some(env) = rx.recv().await {
         if let Err(e) = write_envelope(&mut writer, &env).await {
-            tracing::debug!("peer writer error: {e}");
+            tracing::warn!(connection_id, error = %e, "peer writer failed");
             break;
         }
     }
@@ -278,6 +284,7 @@ async fn reader_loop(
     outgoing_tx: mpsc::Sender<Envelope>,
     seq_counter: Arc<AtomicU64>,
     host: Arc<PeerHost>,
+    connection_id: u64,
 ) -> anyhow::Result<()> {
     let manager = host.pty.clone();
     let mut state = HandshakeState::Init;
@@ -349,11 +356,24 @@ async fn reader_loop(
         let env = match read_envelope(&mut reader).await {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                tracing::debug!("peer closed connection");
+                tracing::info!(
+                    connection_id,
+                    state = ?state,
+                    peer_id = %hex::encode(&peer_id),
+                    attachments = attached.len(),
+                    "peer session closed: unexpected_eof"
+                );
                 break;
             }
             Err(e) => {
-                tracing::warn!("peer read error: {e}");
+                tracing::warn!(
+                    connection_id,
+                    state = ?state,
+                    peer_id = %hex::encode(&peer_id),
+                    attachments = attached.len(),
+                    error = %e,
+                    "peer session closed: read_error"
+                );
                 break;
             }
         };
@@ -378,6 +398,7 @@ async fn reader_loop(
                     break;
                 }
                 tracing::info!(
+                    connection_id,
                     "peer connected: name={:?} app_version={:?}",
                     hello.display_name,
                     hello.app_version
@@ -477,7 +498,11 @@ async fn reader_loop(
                     outgoing_tx.clone(),
                     seq_counter.clone(),
                 );
-                tracing::info!("peer authenticated (ssh-passthrough)");
+                tracing::info!(
+                    connection_id,
+                    peer_id = %hex::encode(&peer_id),
+                    "peer authenticated (ssh-passthrough)"
+                );
             }
 
             (HandshakeState::AuthSent, _) => {
@@ -1497,7 +1522,13 @@ async fn reader_loop(
             }
 
             (HandshakeState::Ready, Payload::Goodbye(g)) => {
-                tracing::info!("peer said goodbye: {}", g.reason);
+                tracing::info!(
+                    connection_id,
+                    peer_id = %hex::encode(&peer_id),
+                    attachments = attached.len(),
+                    "peer said goodbye: {}",
+                    g.reason
+                );
                 break;
             }
 

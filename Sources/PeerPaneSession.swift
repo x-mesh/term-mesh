@@ -169,7 +169,10 @@ final class PeerPaneHostLease {
     /// Direct Unix sockets have no owned transport to refresh.
     func refreshTransport(after observedGeneration: UInt64, reason: String) async -> UInt64 {
         guard !isTornDown, let tunnel else { return transportGeneration }
-        return await transportRecovery.refresh(after: observedGeneration) {
+        RemoteWorkLog.infoOffMain(
+            "Peer tunnel refresh start host=\(key) observedGen=\(observedGeneration) transportGen=\(transportGeneration) reason=\(reason)"
+        )
+        let generation = await transportRecovery.refresh(after: observedGeneration) {
             guard !self.isTornDown, !Task.isCancelled else { return false }
             // `forceReconnect` may spend up to three seconds reaping a stuck
             // ssh process. Never make that wait on the main actor.
@@ -199,6 +202,10 @@ final class PeerPaneHostLease {
                 }
             }
         }
+        RemoteWorkLog.infoOffMain(
+            "Peer tunnel refresh end host=\(key) observedGen=\(observedGeneration) transportGen=\(generation) reason=\(reason)"
+        )
+        return generation
     }
 
     /// Whether a pooled lease is still worth handing out.
