@@ -204,7 +204,7 @@ else
         [ -n "$SDKROOT_VAL" ] && echo "==> Using SDKROOT=$SDKROOT_VAL"
         (
             cd ghostty
-            export PATH="$LLVM_BIN:$PATH"
+            export PATH="$(dirname "$ZIG_BIN"):$LLVM_BIN:$PATH"
             [ -n "$SDKROOT_VAL" ] && export SDKROOT="$SDKROOT_VAL"
             [ -n "$DEVDIR_VAL" ] && export DEVELOPER_DIR="$DEVDIR_VAL"
             "$ZIG_BIN" build -Demit-xcframework=true -Doptimize=ReleaseFast
