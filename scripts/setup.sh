@@ -193,6 +193,11 @@ else
             exit 1
         fi
 
+        GETTEXT_BIN="$(brew --prefix gettext 2>/dev/null || true)/bin"
+        if [ ! -x "$GETTEXT_BIN/msgfmt" ]; then
+            GETTEXT_BIN=""
+        fi
+
         # Pin the macOS SDK explicitly. A standalone zig tarball can latch onto
         # a stale/broken CommandLineTools SDK during auto-detection and fail to
         # link libSystem (undefined _free / _dispatch_queue_create / ...). Force
@@ -204,7 +209,7 @@ else
         [ -n "$SDKROOT_VAL" ] && echo "==> Using SDKROOT=$SDKROOT_VAL"
         (
             cd ghostty
-            export PATH="$(dirname "$ZIG_BIN"):$LLVM_BIN:$PATH"
+            export PATH="$(dirname "$ZIG_BIN"):$LLVM_BIN${GETTEXT_BIN:+:$GETTEXT_BIN}:$PATH"
             [ -n "$SDKROOT_VAL" ] && export SDKROOT="$SDKROOT_VAL"
             [ -n "$DEVDIR_VAL" ] && export DEVELOPER_DIR="$DEVDIR_VAL"
             "$ZIG_BIN" build -Demit-xcframework=true -Doptimize=ReleaseFast
