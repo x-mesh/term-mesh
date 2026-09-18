@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.251.1] - 2026-09-18
+
+### Fixed
+
+- A single relay pane no longer remains stalled after sustained output overflows its outbound queue; the transport reconnects so the viewer can recover through the existing fresh-session path.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.251.0] - 2026-09-18
 
 ### Fixed
