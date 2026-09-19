@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.252.2] - 2026-09-19
+
+### Fixed
+
+- Relay socket writes now wait for kernel write readiness instead of polling every millisecond under backpressure, while preserving the write timeout so stalled peers still reconnect safely.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.252.1] - 2026-09-19
 
 ### Fixed
