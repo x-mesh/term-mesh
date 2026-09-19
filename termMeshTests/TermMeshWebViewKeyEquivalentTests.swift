@@ -3403,6 +3403,31 @@ final class TabManagerChildExitCloseTests: XCTestCase {
         )
     }
 
+    func testRemoteOriginIncludesPaneDuringSessionReplacement() {
+        XCTAssertTrue(
+            TerminalPanel.isRemoteOrigin(
+                peerPaneSessionPresent: false,
+                remotePaneIDPresent: true
+            )
+        )
+        XCTAssertTrue(
+            TerminalPanel.isRemoteOrigin(
+                peerPaneSessionPresent: true,
+                remotePaneIDPresent: false
+            )
+        )
+        XCTAssertFalse(
+            TerminalPanel.isRemoteOrigin(
+                peerPaneSessionPresent: false,
+                remotePaneIDPresent: false
+            )
+        )
+        XCTAssertTrue(
+            TabManager.shouldPreservePanelAfterChildExit(isRemoteRelay: true),
+            "A remote-origin pane must survive helper exit while its session is being replaced."
+        )
+    }
+
     func testChildExitPolicyDoesNotPreserveOrdinaryTerminalPanel() {
         XCTAssertFalse(
             TabManager.shouldPreservePanelAfterChildExit(isRemoteRelay: false)
