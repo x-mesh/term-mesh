@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.252.1] - 2026-09-19
+
+### Fixed
+
+- Relay panes now recover with a fresh transport after a single attachment's outbound queue overflows during sustained output, instead of repeatedly healing a stalled connection.
+- SSH relay forwarding now runs without allocating a pseudo-terminal.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.252.0] - 2026-09-18
 
 ### Fixed
