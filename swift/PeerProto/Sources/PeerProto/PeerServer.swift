@@ -27,6 +27,38 @@ import SwiftProtobuf
 // attach churn well under the kernel's accept budget.
 private let maxPeerServerSessions = 64
 
+private enum PeerServerDiagnostics {
+    private static let queue = DispatchQueue(label: "term-mesh.peer.server.diagnostics")
+    private static let path = "/tmp/term-mesh-peer-server.log"
+    private static let maxBytes = 256 * 1024
+
+    static func record(_ message: String) {
+        NSLog("term-mesh.peer %@", message)
+        let line = "\(String(format: "%.3f", Date().timeIntervalSince1970)) \(message)\n"
+        queue.async {
+            let data = Data(line.utf8)
+            let url = URL(fileURLWithPath: path)
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+               let size = (attributes[.size] as? NSNumber)?.intValue,
+               size >= maxBytes {
+                try? data.write(to: url, options: .atomic)
+                return
+            }
+            if let handle = try? FileHandle(forWritingTo: url) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                try? handle.close()
+            } else {
+                FileManager.default.createFile(atPath: path, contents: data)
+            }
+        }
+    }
+
+    static func shortSurfaceID(_ id: Data) -> String {
+        id.prefix(6).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
 // MARK: - PeerSurfaceProvider
 
 /// One host→client PTY chunk plus its offset in the producer's cumulative
@@ -1171,6 +1203,9 @@ actor AcceptedUnixConnection {
             if holder.isClosed { return }
             guard ProcessInfo.processInfo.systemUptime < deadline else {
                 relayTransport.timeoutCount &+= 1
+                PeerServerDiagnostics.record(
+                    "write-timeout fd=\(holder.fd) bytes=\(bytes.count) eagain=\(relayTransport.eagainCount)"
+                )
                 holder.close()
                 throw PeerServerError.writeTimedOut
             }
@@ -1196,7 +1231,11 @@ actor AcceptedUnixConnection {
                 continue
             }
             if n < 0 && errno == EINTR { continue }
-            throw PeerServerError.acceptFailed(errno: errno)
+            let writeErrno = errno
+            PeerServerDiagnostics.record(
+                "write-error fd=\(holder.fd) bytes=\(bytes.count) errno=\(writeErrno)"
+            )
+            throw PeerServerError.acceptFailed(errno: writeErrno)
         }
     }
 
@@ -1458,16 +1497,24 @@ enum PeerServerOutboundQueueAdmission: Sendable, Equatable {
 enum PeerServerOutboundOverflowPolicy {
     static func requiresTransportReconnect(
         for admission: PeerServerOutboundQueueAdmission,
-        attachmentCount: Int
+        attachmentCount: Int,
+        canResync: Bool,
+        snapshotInstalled: Bool = false
     ) -> Bool {
         guard case .accepted(let drop) = admission else { return false }
-        return attachmentCount == 1 && drop.bytes > 0
+        guard attachmentCount == 1, drop.bytes > 0 else { return false }
+        return !canResync || snapshotInstalled
     }
 }
 
 private final class PeerServerOutboundQueueDiagnostics: @unchecked Sendable {
     private let lock = NSLock()
     private var lastEmission = Date.distantPast
+    private let surface: String
+
+    init(surfaceID: Data) {
+        self.surface = PeerServerDiagnostics.shortSurfaceID(surfaceID)
+    }
 
     func record(_ drop: PeerServerOutboundQueueDrop) {
         lock.lock()
@@ -1475,7 +1522,9 @@ private final class PeerServerOutboundQueueDiagnostics: @unchecked Sendable {
         let now = Date()
         guard now.timeIntervalSince(lastEmission) >= 1 else { return }
         lastEmission = now
-        NSLog("term-mesh peer outbound queue evicted %d chunks / %d bytes", drop.chunks, drop.bytes)
+        PeerServerDiagnostics.record(
+            "queue-drop surface=\(surface) chunks=\(drop.chunks) bytes=\(drop.bytes)"
+        )
     }
 }
 
@@ -1690,16 +1739,26 @@ actor PeerServerSession {
     }
 
     func run() async {
+        var endReason = "loop-ended"
         do {
             while !Task.isCancelled {
                 let env = try await readFrame()
                 try await dispatch(env)
-                if case .goodbye = env.payload { break }
+                if case .goodbye = env.payload {
+                    endReason = "goodbye"
+                    break
+                }
             }
+            if Task.isCancelled { endReason = "cancelled" }
         } catch is CancellationError {
-            // graceful
+            endReason = "cancelled"
         } catch {
-            // Stream ended or protocol error — session terminates.
+            endReason = "error=\(String(describing: error))"
+        }
+        if !attachments.isEmpty || !endReason.hasPrefix("goodbye") {
+            PeerServerDiagnostics.record(
+                "session-end reason=\(endReason) attachments=\(attachments.count)"
+            )
         }
         failPendingLeaderCalls(with: PeerServerError.leaderSessionClosed)
         await teardownAttachments()
@@ -2445,10 +2504,10 @@ actor PeerServerSession {
         var wireSeq: UInt64 = 0
         var lastTapEnd: UInt64?
         var resyncBoundary: UInt64?
-        var resyncStarted = false
         let canResync = hasClientCapability(PeerCapability.gridSnapshotV1)
             && attachment.resync != nil
-        let diagnostics = PeerServerOutboundQueueDiagnostics()
+        let diagnostics = PeerServerOutboundQueueDiagnostics(surfaceID: surfaceID)
+        var snapshotCount = 0
         let queue = PeerServerOutboundQueue { drop in
             diagnostics.record(drop)
         }
@@ -2464,6 +2523,9 @@ actor PeerServerSession {
                 }
                 return true
             } catch {
+                PeerServerDiagnostics.record(
+                    "pty-write-error surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) error=\(String(describing: error))"
+                )
                 return false
             }
         } onFailure: {
@@ -2493,6 +2555,9 @@ actor PeerServerSession {
                                 env.gridSnapshot = grid
                             }
                         } catch {
+                            PeerServerDiagnostics.record(
+                                "snapshot-write-error surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) error=\(String(describing: error))"
+                            )
                             await queue.abort()
                             return false
                         }
@@ -2523,6 +2588,8 @@ actor PeerServerSession {
                                 await queue.abort()
                                 return false
                             }
+                            snapshotCount += 1
+                            PeerServerDiagnostics.record("snapshot-heal surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) count=\(snapshotCount) host_seq=\(snapshot.hostByteSeq) reason=gap")
                             resyncBoundary = snapshot.hostByteSeq
                             wireSeq = 0
                             lastTapEnd = snapshot.hostByteSeq
@@ -2530,19 +2597,33 @@ actor PeerServerSession {
                         }
                         let startSeq = chunk.seq &- boundary
                         let admission = await queue.enqueue(chunk.bytes, startSeq: startSeq)
-                        guard !PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
-                            for: admission,
-                            attachmentCount: attachments.count
-                        ) else {
-                            await queue.abort()
-                            await connection.close()
-                            return false
-                        }
                         switch admission {
                         case .accepted(let drops) where drops.bytes == 0:
                             lastTapEnd = chunkEnd
                             continue
-                        case .accepted, .finished, .aborted:
+                        case .accepted:
+                            if snapshotCount > 0 && attachments.count == 1 {
+                                PeerServerDiagnostics.record(
+                                    "transport-close reason=second-overflow-after-snapshot surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) attachments=\(attachments.count)"
+                                )
+                                await queue.abort()
+                                await connection.close()
+                                return false
+                            }
+                            guard canResync,
+                                  let capture = attachment.resync,
+                                  let snapshot = await capture(),
+                                  await queue.installSnapshot(snapshot) else {
+                                await queue.abort()
+                                return false
+                            }
+                            snapshotCount += 1
+                            PeerServerDiagnostics.record("snapshot-heal surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) count=\(snapshotCount) host_seq=\(snapshot.hostByteSeq) reason=overflow")
+                            resyncBoundary = snapshot.hostByteSeq
+                            wireSeq = 0
+                            lastTapEnd = snapshot.hostByteSeq
+                            continue
+                        case .finished, .aborted:
                             await queue.abort()
                             return false
                         }
@@ -2560,17 +2641,17 @@ actor PeerServerSession {
                                 return false
                             }
                         }
-                        guard !resyncStarted,
-                              let capture = attachment.resync else {
+                        guard let capture = attachment.resync else {
                             await queue.abort()
                             return false
                         }
-                        resyncStarted = true
                         guard let snapshot = await capture(),
                               await queue.installSnapshot(snapshot) else {
                             await queue.abort()
                             return false
                         }
+                        snapshotCount += 1
+                        PeerServerDiagnostics.record("snapshot-heal surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) count=\(snapshotCount) host_seq=\(snapshot.hostByteSeq) reason=gap")
                         resyncBoundary = snapshot.hostByteSeq
                         wireSeq = 0
                         lastTapEnd = snapshot.hostByteSeq
@@ -2580,10 +2661,21 @@ actor PeerServerSession {
                     let startSeq = wireSeq
                     wireSeq &+= UInt64(chunk.bytes.count)
                     let admission = await queue.enqueue(chunk.bytes, startSeq: startSeq)
-                    guard !PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
+                    if PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
                         for: admission,
-                        attachmentCount: attachments.count
-                    ) else {
+                        attachmentCount: attachments.count,
+                        canResync: canResync,
+                        snapshotInstalled: snapshotCount > 0
+                    ) {
+                        if case .accepted(let drop) = admission {
+                            let snapshot = await queue.snapshot()
+                            let reason = snapshotCount > 0
+                                ? "second-overflow-after-snapshot"
+                                : "outbound-overflow"
+                            PeerServerDiagnostics.record(
+                                "transport-close reason=\(reason) surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) attachments=\(attachments.count) dropped_chunks=\(drop.chunks) dropped_bytes=\(drop.bytes) pending_items=\(snapshot.pendingItems) pending_bytes=\(snapshot.pendingBytes) resync=\(canResync)"
+                            )
+                        }
                         await queue.abort()
                         await connection.close()
                         return false
@@ -2595,17 +2687,22 @@ actor PeerServerSession {
                         guard canResync else {
                             continue
                         }
-                        guard !resyncStarted,
-                              let capture = attachment.resync else {
+                        guard let capture = attachment.resync else {
+                            if case .accepted(let drop) = admission {
+                                PeerServerDiagnostics.record(
+                                    "queue-drop-no-resync surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) attachments=\(attachments.count) dropped_chunks=\(drop.chunks) dropped_bytes=\(drop.bytes)"
+                                )
+                            }
                             await queue.abort()
                             return false
                         }
-                        resyncStarted = true
                         guard let snapshot = await capture(),
                               await queue.installSnapshot(snapshot) else {
                             await queue.abort()
                             return false
                         }
+                        snapshotCount += 1
+                        PeerServerDiagnostics.record("snapshot-heal surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) count=\(snapshotCount) host_seq=\(snapshot.hostByteSeq) reason=overflow")
                         resyncBoundary = snapshot.hostByteSeq
                         wireSeq = 0
                         lastTapEnd = snapshot.hostByteSeq
@@ -2626,6 +2723,11 @@ actor PeerServerSession {
             }
 
             let sendSucceeded = await writer
+            if !sendSucceeded {
+                PeerServerDiagnostics.record(
+                    "pty-writer-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) cancelled=\(Task.isCancelled)"
+                )
+            }
             if !sendSucceeded && !Task.isCancelled {
                 await detachSurface(id: surfaceID)
             }

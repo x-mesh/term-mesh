@@ -170,7 +170,7 @@ final class PeerServerOutboundQueueTests: XCTestCase {
         XCTAssertEqual(delivered, PeerServerOutboundQueue.maxPendingItems + 1)
     }
 
-    func testOverflowAdmissionRequiresTransportReconnect() async {
+    func testOverflowAdmissionRequiresTransportReconnectOnlyWithoutResync() async {
         let queue = PeerServerOutboundQueue()
         let payload = Data(repeating: 0x61, count: PeerServerOutboundQueue.maxEntryBytes)
 
@@ -181,15 +181,29 @@ final class PeerServerOutboundQueueTests: XCTestCase {
             )
             if PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
                 for: admission,
-                attachmentCount: 1
+                attachmentCount: 1,
+                canResync: false
             ) {
                 XCTAssertTrue(PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
                     for: admission,
-                    attachmentCount: 1
+                    attachmentCount: 1,
+                    canResync: false
                 ))
                 XCTAssertFalse(PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
                     for: admission,
-                    attachmentCount: 2
+                    attachmentCount: 1,
+                    canResync: true
+                ))
+                XCTAssertFalse(PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
+                    for: admission,
+                    attachmentCount: 2,
+                    canResync: false
+                ))
+                XCTAssertTrue(PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
+                    for: admission,
+                    attachmentCount: 1,
+                    canResync: true,
+                    snapshotInstalled: true
                 ))
                 return
             }
