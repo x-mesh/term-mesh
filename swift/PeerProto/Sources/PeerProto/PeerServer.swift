@@ -1135,6 +1135,50 @@ actor AcceptedUnixConnection {
         }
     }
 
+    private func waitForWritable(until deadline: TimeInterval) async throws {
+        guard !holder.isClosed else { return }
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0 else { throw PeerServerError.writeTimedOut }
+        let source = DispatchSource.makeWriteSource(fileDescriptor: holder.fd, queue: queue)
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        let resumed = AtomicFlag()
+        writeSource = source
+        defer {
+            source.cancel()
+            timer.cancel()
+            if writeSource === source { writeSource = nil }
+        }
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                source.setEventHandler {
+                    if resumed.setOnce() {
+                        timer.cancel()
+                        cont.resume()
+                    }
+                }
+                source.setCancelHandler {
+                    if resumed.setOnce() {
+                        timer.cancel()
+                        cont.resume()
+                    }
+                }
+                let nanoseconds = UInt64(min(remaining * 1_000_000_000, Double(Int.max)))
+                timer.schedule(deadline: .now() + .nanoseconds(Int(nanoseconds)))
+                timer.setEventHandler {
+                    if resumed.setOnce() {
+                        source.cancel()
+                        cont.resume(throwing: PeerServerError.writeTimedOut)
+                    }
+                }
+                source.resume()
+                timer.resume()
+            }
+        }, onCancel: {
+            source.cancel()
+            timer.cancel()
+        })
+    }
+
     /// Serializes whole frames across concurrent writers.
     ///
     /// This is not an optimization — it is what keeps the wire parseable.
@@ -1148,7 +1192,9 @@ actor AcceptedUnixConnection {
     ///
     /// EAGAIN needs a full socket buffer, so this only bites under a heavy
     /// output flood — where several writers (PTY data, Pong, HostStats)
-    /// are also most likely to overlap.
+    /// are also most likely to overlap. Wait on kernel write readiness
+    /// instead of polling so a busy host does not add scheduler delay to
+    /// every blocked frame.
     private var writeInFlight = false
     private var writeWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -1224,7 +1270,16 @@ actor AcceptedUnixConnection {
                 // frame is fully written — see the note on that method.
                 relayTransport.eagainCount &+= 1
                 let waitStart = DispatchTime.now().uptimeNanoseconds
-                try await Task.sleep(nanoseconds: 1_000_000)
+                do {
+                    try await waitForWritable(until: deadline)
+                } catch PeerServerError.writeTimedOut {
+                    relayTransport.timeoutCount &+= 1
+                    PeerServerDiagnostics.record(
+                        "write-timeout fd=\(holder.fd) bytes=\(bytes.count) eagain=\(relayTransport.eagainCount)"
+                    )
+                    holder.close()
+                    throw PeerServerError.writeTimedOut
+                }
                 let elapsed = DispatchTime.now().uptimeNanoseconds &- waitStart
                 relayTransport.waitNsTotal &+= elapsed
                 relayTransport.waitNsMax = max(relayTransport.waitNsMax, elapsed)
@@ -1243,6 +1298,7 @@ actor AcceptedUnixConnection {
 
     func close() {
         holder.close()
+        writeSource?.cancel()
         // A closed fd makes every queued frame obsolete. Wake all bounded
         // waiters now instead of handing the slot through one by one; each
         // observes holder.isClosed before touching the wire.
