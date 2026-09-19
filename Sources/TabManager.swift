@@ -1525,11 +1525,14 @@ class TabManager {
 
         // A remote pane's local child is only the relay helper. Its exit says
         // the peer connection was interrupted; it does not say the pane (or
-        // its team member) was intentionally closed. PeerRelaySession has
-        // already installed a disconnect banner with Reconnect / Close
-        // actions, so keep the slot alive instead of routing this through the
-        // ordinary shell child-exit path and silently deleting the leader.
-        let isRemoteRelay = (panel as? TerminalPanel)?.peerPaneSession != nil
+        // its team member) was intentionally closed. `isRemoteOrigin` also
+        // covers the short session-replacement window where the panel still
+        // has its stable remote identity but the old session has been detached.
+        // PeerRelaySession has already installed a disconnect banner with
+        // Reconnect / Close actions, so keep the slot alive instead of routing
+        // this through the ordinary shell child-exit path and silently deleting
+        // the leader.
+        let isRemoteRelay = (panel as? TerminalPanel)?.isRemoteOrigin == true
         if Self.shouldPreservePanelAfterChildExit(isRemoteRelay: isRemoteRelay) {
 #if DEBUG
             dlog(

@@ -46,7 +46,19 @@ final class TerminalPanel: Panel, ObservableObject {
     /// A → B → A attach loop and gives a remote UUID a misleading local
     /// identity.  `remotePaneID` covers the brief lifecycle window after a
     /// binding is registered while a reconnect is replacing its session.
-    var isRemoteOrigin: Bool { peerPaneSession != nil || remotePaneID != nil }
+    var isRemoteOrigin: Bool {
+        Self.isRemoteOrigin(
+            peerPaneSessionPresent: peerPaneSession != nil,
+            remotePaneIDPresent: remotePaneID != nil
+        )
+    }
+
+    nonisolated static func isRemoteOrigin(
+        peerPaneSessionPresent: Bool,
+        remotePaneIDPresent: Bool
+    ) -> Bool {
+        peerPaneSessionPresent || remotePaneIDPresent
+    }
 
     /// Injected daemon service (defaults to singleton for backward compatibility).
     var daemon: any DaemonService = TermMeshDaemon.shared
