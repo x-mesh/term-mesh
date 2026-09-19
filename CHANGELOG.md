@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.252.3] - 2026-09-20
+
+### Fixed
+
+- Relay panes now remain open when a relay helper exits during session replacement, preserving the remote pane identity so the existing reconnect path can recover it instead of closing the pane.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.252.2] - 2026-09-19
 
 ### Fixed
