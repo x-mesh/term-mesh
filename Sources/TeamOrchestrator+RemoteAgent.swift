@@ -5979,6 +5979,7 @@ extension TeamOrchestrator {
             systemPrompt = Self.remoteLeaderClaudeRecoverySystemPrompt(
                 teamName: teamName,
                 agents: team.agents,
+                worktreeMode: team.worktreeMode,
                 remoteWorkingDirectory: workingDirectory,
                 remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET",
                 hostCLIBinDirs: host.hostCLIBinDirs
@@ -5989,6 +5990,7 @@ extension TeamOrchestrator {
             systemPrompt = Self.remoteLeaderNonClaudeRecoverySystemPrompt(
                 teamName: teamName,
                 agents: team.agents,
+                worktreeMode: team.worktreeMode,
                 remoteWorkingDirectory: workingDirectory,
                 remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET",
                 hostCLIBinDirs: host.hostCLIBinDirs

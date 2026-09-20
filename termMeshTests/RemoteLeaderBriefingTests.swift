@@ -287,6 +287,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         let prompt = TeamOrchestrator.remoteLeaderNonClaudeRecoverySystemPrompt(
             teamName: "xm",
             agents: agents,
+            worktreeMode: "isolated",
             remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
             remoteSocketPath: "/tmp/term-mesh.sock"
         )
@@ -295,6 +296,78 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         XCTAssertTrue(prompt.contains("executor"))
         XCTAssertTrue(prompt.contains("reviewer"))
         XCTAssertTrue(prompt.contains("tm-agent delegate"))
+    }
+
+    /// A peer leader attaches before PeerProjectBootstrap creates the worker
+    /// checkouts, so the creation prompt cannot name them. It used to claim
+    /// `unknown`, which the isolation rule reads as a reason to serialize
+    /// every write — and the prompt is injected once, so that verdict stood
+    /// for the life of the leader even after the checkouts appeared.
+    func test_creationPromptMarksCheckoutsPendingAndNamesTheAuthority() {
+        let prompts = [
+            nonClaudePrompt(),
+            TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
+                teamName: "xm",
+                rows: rows,
+                remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+                remoteSocketPath: "/tmp/term-mesh.sock"
+            ),
+        ]
+        for prompt in prompts {
+            XCTAssertTrue(prompt.contains("TEAM_CHECKOUT_MODE: pending-bootstrap"))
+            XCTAssertFalse(prompt.contains("TEAM_CHECKOUT_MODE: unknown"))
+            XCTAssertTrue(prompt.contains("branch=pending"))
+            XCTAssertFalse(prompt.contains("branch=shared-or-unknown"))
+            XCTAssertTrue(
+                prompt.contains("worktree_mode") && prompt.contains("worktree_branch")
+                    && prompt.contains("worktree_path"),
+                "the leader was not told which team.status fields are authoritative"
+            )
+        }
+    }
+
+    /// By recovery time the checkouts exist and the team record knows its
+    /// mode, so both recovery prompts state it instead of repeating the
+    /// creation-time placeholder.
+    func test_recoveryPromptsCarryTheRealWorktreeMode() {
+        let agents = ["executor", "reviewer"].map { name in
+            TeamOrchestrator.AgentMember(
+                id: "\(name)@xm",
+                name: name,
+                teamName: "xm",
+                cli: "codex",
+                launchCommand: "codex",
+                model: "gpt-5.6-sol",
+                agentType: name,
+                color: "blue",
+                instructions: "",
+                workspaceId: UUID(),
+                panelId: nil,
+                createdAt: Date(),
+                hostKey: "ssh:peer"
+            )
+        }
+        let prompts = [
+            TeamOrchestrator.remoteLeaderNonClaudeRecoverySystemPrompt(
+                teamName: "xm",
+                agents: agents,
+                worktreeMode: "isolated",
+                remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+                remoteSocketPath: "/tmp/term-mesh.sock"
+            ),
+            TeamOrchestrator.remoteLeaderClaudeRecoverySystemPrompt(
+                teamName: "xm",
+                agents: agents,
+                worktreeMode: "isolated",
+                remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+                remoteSocketPath: "/tmp/term-mesh.sock"
+            ),
+        ]
+        for prompt in prompts {
+            XCTAssertTrue(prompt.contains("TEAM_CHECKOUT_MODE: isolated"))
+            XCTAssertFalse(prompt.contains("TEAM_CHECKOUT_MODE: unknown"))
+            XCTAssertTrue(prompt.contains("ownership-disjoint write tasks may run concurrently"))
+        }
     }
 }
 

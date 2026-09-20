@@ -4963,10 +4963,10 @@ final class TeamOrchestrator: ObservableObject {
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath,
             topologySection: checkoutTopologySection(
-                worktreeMode: "unknown", leaderPath: remoteWorkingDirectory,
+                worktreeMode: "pending-bootstrap", leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
                 workers: rows.map { row in
-                    (name: row.preset.name, instance: row.id.uuidString, branch: nil, path: row.hostDirectory.nilIfBlank)
+                    (name: row.preset.name, instance: row.id.uuidString, branch: "pending", path: row.hostDirectory.nilIfBlank)
                 }
             )
         )
@@ -5039,13 +5039,13 @@ final class TeamOrchestrator: ObservableObject {
             agentList: agentList,
             runbookSection: remoteRunbooks,
             // Peer members get their own checkouts from PeerProjectBootstrap
-            // rather than from this team's worktree mode, so there is no
-            // worktree table to state here.
+            // rather than from this team's worktree mode, and that runs after
+            // this prompt — hence pending rather than a table of guesses.
             worktreeSection: checkoutTopologySection(
-                worktreeMode: "unknown", leaderPath: remoteWorkingDirectory,
+                worktreeMode: "pending-bootstrap", leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
                 workers: rows.map { row in
-                    (name: row.preset.name, instance: row.id.uuidString, branch: nil, path: row.hostDirectory.nilIfBlank)
+                    (name: row.preset.name, instance: row.id.uuidString, branch: "pending", path: row.hostDirectory.nilIfBlank)
                 }
             ),
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
@@ -5060,6 +5060,7 @@ final class TeamOrchestrator: ObservableObject {
     static func remoteLeaderNonClaudeRecoverySystemPrompt(
         teamName: String,
         agents: [AgentMember],
+        worktreeMode: String,
         remoteWorkingDirectory: String,
         remoteSocketPath: String,
         hostCLIBinDirs: [String] = []
@@ -5074,7 +5075,7 @@ final class TeamOrchestrator: ObservableObject {
                 roles: agents.map(\.agentType)
             ),
             worktreeSection: checkoutTopologySection(
-                worktreeMode: "unknown", leaderPath: remoteWorkingDirectory,
+                worktreeMode: worktreeMode, leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
                 workers: agents.map { agent in
                     (name: agent.name, instance: agent.agentInstanceId, branch: agent.worktreeBranch, path: agent.worktreePath ?? agent.originalAgentWorkDir)
@@ -5091,6 +5092,7 @@ final class TeamOrchestrator: ObservableObject {
     static func remoteLeaderClaudeRecoverySystemPrompt(
         teamName: String,
         agents: [AgentMember],
+        worktreeMode: String,
         remoteWorkingDirectory: String,
         remoteSocketPath: String,
         hostCLIBinDirs: [String] = []
@@ -5107,7 +5109,7 @@ final class TeamOrchestrator: ObservableObject {
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath,
             topologySection: checkoutTopologySection(
-                worktreeMode: "unknown", leaderPath: remoteWorkingDirectory,
+                worktreeMode: worktreeMode, leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
                 workers: agents.map { agent in
                     (name: agent.name, instance: agent.agentInstanceId, branch: agent.worktreeBranch, path: agent.worktreePath ?? agent.originalAgentWorkDir)
@@ -5214,6 +5216,12 @@ final class TeamOrchestrator: ObservableObject {
             return "TOPOLOGY_RULE: Workers share one checkout. Serialize writes unless the paths are proven disjoint."
         case "off":
             return "TOPOLOGY_RULE: No managed worktree isolation is active. Do not run concurrent writes without another verified isolation boundary."
+        case "pending-bootstrap":
+            // A peer leader attaches before its workers have checkouts, so the
+            // rendered table cannot name them. Saying "unknown" here read as
+            // "no isolation" and suppressed delegation for the life of the
+            // leader, because the prompt is injected once and never rebuilt.
+            return "TOPOLOGY_RULE: Worker checkouts do not exist yet. The bootstrap creates them after this prompt, so read team.status — worktree_mode, worktree_branch, and worktree_path — as the authoritative topology before you plan concurrent writes."
         default:
             return "TOPOLOGY_RULE: Checkout isolation is unknown. Query team.status before concurrent writes."
         }
