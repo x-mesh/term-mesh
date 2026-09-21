@@ -71,19 +71,26 @@ private enum PeerServerDiagnostics {
 /// viewer's gap detection (P9, `PeerRelaySession.swift`) mathematically
 /// never fires: silent truncation with no heal. A producer with no drop
 /// path (e.g. `EchoSurfaceProvider`) just counts delivered bytes.
+public struct PtyTapCallback: Sendable, Equatable {
+    public let boundary: UInt64
+    public let atNs: UInt64
+
+    public init(boundary: UInt64, atNs: UInt64) {
+        self.boundary = boundary
+        self.atNs = atNs
+    }
+}
+
 public struct PtyTapChunk: Sendable {
     public let bytes: Data
     public let seq: UInt64
-    /// Host raw-output callback boundary and monotonic timestamp. Both are
-    /// zero for providers that do not implement GUI input-path telemetry.
-    public let callbackBoundary: UInt64
-    public let callbackAtNs: UInt64
+    /// Host raw-output callbacks that contributed to this filtered chunk.
+    public let callbackEvents: [PtyTapCallback]
 
-    public init(bytes: Data, seq: UInt64, callbackBoundary: UInt64 = 0, callbackAtNs: UInt64 = 0) {
+    public init(bytes: Data, seq: UInt64, callbackEvents: [PtyTapCallback] = []) {
         self.bytes = bytes
         self.seq = seq
-        self.callbackBoundary = callbackBoundary
-        self.callbackAtNs = callbackAtNs
+        self.callbackEvents = callbackEvents
     }
 }
 
@@ -1387,13 +1394,13 @@ public actor PtyDataCoalescer {
 
     private let windowNs: UInt64
     private let maxBytes: Int
-    private let send: @Sendable (Data, UInt64, UInt64) async -> Bool
+    private let send: @Sendable (Data, UInt64, [PtyTapCallback]) async -> Bool
     private let onFailure: @Sendable () async -> Void
 
     private var armed = false
     private var pending = Data()
     private var pendingStartSeq: UInt64 = 0
-    private var pendingCallbackBoundary: UInt64 = 0
+    private var pendingCallbackEvents: [PtyTapCallback] = []
     private var flushTask: Task<Void, Never>?
     private var stopped = false
 
@@ -1407,7 +1414,7 @@ public actor PtyDataCoalescer {
     public init(
         windowMs: UInt64 = PtyDataCoalescer.defaultWindowMs,
         maxBytes: Int = PtyDataCoalescer.defaultMaxBytes,
-        send: @escaping @Sendable (Data, UInt64, UInt64) async -> Bool,
+        send: @escaping @Sendable (Data, UInt64, [PtyTapCallback]) async -> Bool,
         onFailure: @escaping @Sendable () async -> Void = {}
     ) {
         self.windowNs = windowMs * 1_000_000
@@ -1440,7 +1447,11 @@ public actor PtyDataCoalescer {
     /// Returns `false` once the coalescer has permanently stopped (a
     /// prior send failed) — the caller should stop pumping.
     @discardableResult
-    public func submit(_ bytes: Data, startSeq: UInt64, callbackBoundary: UInt64 = 0) async -> Bool {
+    public func submit(
+        _ bytes: Data,
+        startSeq: UInt64,
+        callbackEvents: [PtyTapCallback] = []
+    ) async -> Bool {
         guard !stopped else { return false }
         guard !bytes.isEmpty else { return true }
 
@@ -1448,7 +1459,7 @@ public actor PtyDataCoalescer {
             // Idle → active: send unbuffered (leading edge) so an
             // isolated write incurs zero coalescing delay, then arm the
             // window to catch whatever follows within it.
-            guard await send(bytes, startSeq, callbackBoundary) else {
+            guard await send(bytes, startSeq, callbackEvents) else {
                 await fail()
                 return false
             }
@@ -1457,7 +1468,7 @@ public actor PtyDataCoalescer {
         }
 
         if pending.isEmpty { pendingStartSeq = startSeq }
-        pendingCallbackBoundary = max(pendingCallbackBoundary, callbackBoundary)
+        pendingCallbackEvents.append(contentsOf: callbackEvents)
         pending.append(bytes)
         guard pending.count >= maxBytes else { return true }
 
@@ -1525,10 +1536,10 @@ public actor PtyDataCoalescer {
         guard !pending.isEmpty else { return true }
         let payload = pending
         let seq = pendingStartSeq
-        let callbackBoundary = pendingCallbackBoundary
+        let callbackEvents = pendingCallbackEvents
         pending = Data()
-        pendingCallbackBoundary = 0
-        guard await send(payload, seq, callbackBoundary) else {
+        pendingCallbackEvents.removeAll(keepingCapacity: true)
+        guard await send(payload, seq, callbackEvents) else {
             await fail()
             return false
         }
@@ -1549,13 +1560,11 @@ struct PeerServerOutboundQueueEntry: Sendable, Equatable {
     }
 
     let kind: Kind
-    let callbackBoundary: UInt64
-    let callbackAtNs: UInt64
+    let callbackEvents: [PtyTapCallback]
 
-    init(kind: Kind, callbackBoundary: UInt64 = 0, callbackAtNs: UInt64 = 0) {
+    init(kind: Kind, callbackEvents: [PtyTapCallback] = []) {
         self.kind = kind
-        self.callbackBoundary = callbackBoundary
-        self.callbackAtNs = callbackAtNs
+        self.callbackEvents = callbackEvents
     }
 
     var bytes: Data {
@@ -1655,7 +1664,11 @@ actor PeerServerOutboundQueue {
         self.onDrop = onDrop
     }
 
-    func enqueue(_ bytes: Data, startSeq: UInt64, callbackBoundary: UInt64 = 0, callbackAtNs: UInt64 = 0) async -> PeerServerOutboundQueueAdmission {
+    func enqueue(
+        _ bytes: Data,
+        startSeq: UInt64,
+        callbackEvents: [PtyTapCallback] = []
+    ) async -> PeerServerOutboundQueueAdmission {
         switch state {
         case .finished: return .finished
         case .aborted: return .aborted
@@ -1667,11 +1680,12 @@ actor PeerServerOutboundQueue {
         var offset = 0
         while offset < bytes.count {
             let length = min(Self.maxEntryBytes, bytes.count - offset)
+            let isFinalEntry = offset + length == bytes.count
             let entry = PeerServerOutboundQueueEntry(
                 kind: .pty(
                     bytes: bytes.subdata(in: offset..<(offset + length)),
                     startSeq: startSeq &+ UInt64(offset)
-                ), callbackBoundary: callbackBoundary, callbackAtNs: callbackAtNs)
+                ), callbackEvents: isFinalEntry ? callbackEvents : [])
             offset += length
             admit(entry, callDrops: &callDrops)
         }
@@ -2627,7 +2641,7 @@ actor PeerServerSession {
                 attachment.invalidateInputPath()
             }
         }
-        let coalescer = PtyDataCoalescer { [weak self] payload, seq, boundary in
+        let coalescer = PtyDataCoalescer { [weak self] payload, seq, callbackEvents in
             guard let self else { return false }
             do {
                 try await self.sendEnvelope { env in
@@ -2637,8 +2651,9 @@ actor PeerServerSession {
                     p.payload = payload
                     env.ptyData = p
                 }
-                if boundary != 0 {
-                    attachment.observeInputPathDelivery(boundary, DispatchTime.now().uptimeNanoseconds)
+                let deliveredAtNs = DispatchTime.now().uptimeNanoseconds
+                for callback in callbackEvents {
+                    attachment.observeInputPathDelivery(callback.boundary, deliveredAtNs)
                 }
                 return true
             } catch {
@@ -2660,12 +2675,14 @@ actor PeerServerSession {
                         // A zero stamp means the host is not measuring, so
                         // the whole input-path branch drops out here rather
                         // than being paid for and discarded downstream.
-                        let callbackAtNs = entry.callbackAtNs
-                        let boundary = callbackAtNs == 0 ? 0 : entry.callbackBoundary
-                        if boundary != 0 {
-                            attachment.observeInputPathRawCallback(boundary, callbackAtNs)
+                        for callback in entry.callbackEvents {
+                            attachment.observeInputPathRawCallback(callback.boundary, callback.atNs)
                         }
-                        guard await coalescer.submit(bytes, startSeq: startSeq, callbackBoundary: boundary) else {
+                        guard await coalescer.submit(
+                            bytes,
+                            startSeq: startSeq,
+                            callbackEvents: entry.callbackEvents
+                        ) else {
                             await queue.abort()
                             return false
                         }
@@ -2725,7 +2742,11 @@ actor PeerServerSession {
                             continue
                         }
                         let startSeq = chunk.seq &- boundary
-                        let admission = await queue.enqueue(chunk.bytes, startSeq: startSeq, callbackBoundary: chunk.callbackBoundary, callbackAtNs: chunk.callbackAtNs)
+                        let admission = await queue.enqueue(
+                            chunk.bytes,
+                            startSeq: startSeq,
+                            callbackEvents: chunk.callbackEvents
+                        )
                         switch admission {
                         case .accepted(let drops) where drops.bytes == 0:
                             lastTapEnd = chunkEnd
@@ -2764,7 +2785,11 @@ actor PeerServerSession {
                             lastTapEnd = chunk.seq &+ UInt64(chunk.bytes.count)
                             let startSeq = wireSeq
                             wireSeq &+= UInt64(chunk.bytes.count)
-                            switch await queue.enqueue(chunk.bytes, startSeq: startSeq, callbackBoundary: chunk.callbackBoundary, callbackAtNs: chunk.callbackAtNs) {
+                            switch await queue.enqueue(
+                                chunk.bytes,
+                                startSeq: startSeq,
+                                callbackEvents: chunk.callbackEvents
+                            ) {
                             case .accepted:
                                 continue
                             case .finished, .aborted:
@@ -2791,7 +2816,11 @@ actor PeerServerSession {
                     lastTapEnd = chunk.seq &+ UInt64(chunk.bytes.count)
                     let startSeq = wireSeq
                     wireSeq &+= UInt64(chunk.bytes.count)
-                    let admission = await queue.enqueue(chunk.bytes, startSeq: startSeq, callbackBoundary: chunk.callbackBoundary, callbackAtNs: chunk.callbackAtNs)
+                    let admission = await queue.enqueue(
+                        chunk.bytes,
+                        startSeq: startSeq,
+                        callbackEvents: chunk.callbackEvents
+                    )
                     if PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
                         for: admission,
                         attachmentCount: attachments.count,

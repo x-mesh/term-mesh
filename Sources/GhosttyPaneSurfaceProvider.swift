@@ -21,6 +21,7 @@
 import AppKit
 import Bonsplit
 import PeerProto
+import Darwin
 
 // MARK: - C callback (top-level; @convention(c) cannot capture)
 
@@ -217,10 +218,16 @@ struct RawToFilteredCheckpointStore {
     }
 }
 
+struct RawOutputDrainEvent {
+    let callback: PtyTapCallback?
+    let byteCount: Int
+    let rawEnd: UInt64
+}
+
 struct RawOutputDrainBatch {
     let bytes: Data
     let rawEnd: UInt64
-    let callbackAtNs: UInt64
+    let events: [RawOutputDrainEvent]
 }
 
 struct RawOutputDrainBuffer {
@@ -228,7 +235,9 @@ struct RawOutputDrainBuffer {
 
     private var bytes = Data()
     private var rawEnd: UInt64?
-    private var callbackAtNs: UInt64 = 0
+    private var lastAppendedRawEnd: UInt64?
+    private var events: [RawOutputDrainEvent] = []
+    private var coveredByteCount = 0
 
     init() {
         bytes.reserveCapacity(64 * 1024)
@@ -238,28 +247,63 @@ struct RawOutputDrainBuffer {
         _ source: UnsafePointer<UInt8>,
         count: Int,
         rawEnd: UInt64,
-        callbackAtNs: UInt64 = 0
+        callback: PtyTapCallback? = nil
     ) -> Bool {
         guard count <= Self.byteLimit - bytes.count else { return false }
+        let previousByteCount = bytes.count
         bytes.append(source, count: count)
         self.rawEnd = rawEnd
-        if self.callbackAtNs == 0 { self.callbackAtNs = callbackAtNs }
+        if let callback {
+            if coveredByteCount < previousByteCount {
+                events.append(
+                    RawOutputDrainEvent(
+                        callback: nil,
+                        byteCount: previousByteCount - coveredByteCount,
+                        rawEnd: lastAppendedRawEnd ?? callback.boundary &- UInt64(count)
+                    )
+                )
+                coveredByteCount = previousByteCount
+            }
+            events.append(
+                RawOutputDrainEvent(
+                    callback: callback,
+                    byteCount: count,
+                    rawEnd: callback.boundary
+                )
+            )
+            coveredByteCount += count
+        }
+        lastAppendedRawEnd = rawEnd
         return true
     }
 
     mutating func take() -> RawOutputDrainBatch? {
         guard let rawEnd else { return nil }
-        let batch = RawOutputDrainBatch(bytes: bytes, rawEnd: rawEnd, callbackAtNs: callbackAtNs)
+        var finalEvents = events
+        if !finalEvents.isEmpty, coveredByteCount < bytes.count {
+            finalEvents.append(
+                RawOutputDrainEvent(
+                    callback: nil,
+                    byteCount: bytes.count - coveredByteCount,
+                    rawEnd: rawEnd
+                )
+            )
+        }
+        let batch = RawOutputDrainBatch(bytes: bytes, rawEnd: rawEnd, events: finalEvents)
         bytes.removeAll(keepingCapacity: true)
         self.rawEnd = nil
-        callbackAtNs = 0
+        lastAppendedRawEnd = nil
+        events.removeAll(keepingCapacity: true)
+        coveredByteCount = 0
         return batch
     }
 
     mutating func discard() {
         bytes.removeAll(keepingCapacity: true)
         rawEnd = nil
-        callbackAtNs = 0
+        lastAppendedRawEnd = nil
+        events.removeAll(keepingCapacity: true)
+        coveredByteCount = 0
     }
 }
 
@@ -296,6 +340,7 @@ final class PeerInputPathLatencyTracker: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private var enabledFastPath: Int32 = 0
     private var enabled = false
     private var pending: [Pending] = []
     private var samples: [Sample] = []
@@ -314,9 +359,15 @@ final class PeerInputPathLatencyTracker: @unchecked Sendable {
         expired = 0
         overflow = 0
         invalidated = 0
+        _ = OSAtomicCompareAndSwap32Barrier(
+            nowEnabled ? 0 : 1,
+            nowEnabled ? 1 : 0,
+            &enabledFastPath
+        )
     }
 
     func recordReceived(at now: UInt64) {
+        guard OSAtomicAdd32Barrier(0, &enabledFastPath) != 0 else { return }
         lock.lock(); defer { lock.unlock() }
         guard enabled else { return }
         expire(now)
@@ -325,6 +376,7 @@ final class PeerInputPathLatencyTracker: @unchecked Sendable {
     }
 
     func recordInjected(afterRawBoundary boundary: UInt64, at now: UInt64) {
+        guard OSAtomicAdd32Barrier(0, &enabledFastPath) != 0 else { return }
         lock.lock(); defer { lock.unlock() }
         guard enabled else { return }
         expire(now)
@@ -335,6 +387,7 @@ final class PeerInputPathLatencyTracker: @unchecked Sendable {
 
     func observeRawCallback(boundary: UInt64, at now: UInt64) {
         guard boundary != 0 else { return }
+        guard OSAtomicAdd32Barrier(0, &enabledFastPath) != 0 else { return }
         lock.lock(); defer { lock.unlock() }
         guard enabled else { return }
         expire(now)
@@ -348,6 +401,7 @@ final class PeerInputPathLatencyTracker: @unchecked Sendable {
 
     func observeDelivery(boundary: UInt64, at now: UInt64) {
         guard boundary != 0 else { return }
+        guard OSAtomicAdd32Barrier(0, &enabledFastPath) != 0 else { return }
         lock.lock(); defer { lock.unlock() }
         guard enabled else { return }
         expire(now)
@@ -366,6 +420,7 @@ final class PeerInputPathLatencyTracker: @unchecked Sendable {
     }
 
     func invalidate() {
+        guard OSAtomicAdd32Barrier(0, &enabledFastPath) != 0 else { return }
         lock.lock(); defer { lock.unlock() }
         guard enabled else { return }
         invalidated &+= UInt64(pending.count)
@@ -373,6 +428,7 @@ final class PeerInputPathLatencyTracker: @unchecked Sendable {
     }
 
     func snapshot() -> Termmesh_Peer_V1_InputPathTelemetry? {
+        guard OSAtomicAdd32Barrier(0, &enabledFastPath) != 0 else { return nil }
         lock.lock()
         guard enabled else { lock.unlock(); return nil }
         let snapshot = samples
@@ -760,8 +816,12 @@ final class PtyTapHub: @unchecked Sendable {
         latestRawOutputBoundary = rawEnd
         if !rawDrainBuffer.append(
             source, count: length, rawEnd: rawEnd,
-            callbackAtNs: inputPathTelemetryEnabled
-                ? DispatchTime.now().uptimeNanoseconds : 0
+            callback: inputPathTelemetryEnabled
+                ? PtyTapCallback(
+                    boundary: rawEnd,
+                    atNs: DispatchTime.now().uptimeNanoseconds
+                )
+                : nil
         ) {
             rawDrainOverflowed = true
         }
@@ -806,7 +866,24 @@ final class PtyTapHub: @unchecked Sendable {
                 finishAll()
                 continue
             case .batch(let batch):
-                consumeRawOutput(batch.bytes, rawEnd: batch.rawEnd, callbackAtNs: batch.callbackAtNs)
+                if batch.events.isEmpty {
+                    consumeRawOutput(
+                        batch.bytes,
+                        rawEnd: batch.rawEnd
+                    )
+                    continue
+                }
+                var offset = 0
+                for event in batch.events {
+                    let end = offset + event.byteCount
+                    let part = batch.bytes.subdata(in: offset..<end)
+                    consumeRawOutput(
+                        part,
+                        rawEnd: event.rawEnd,
+                        callbackEvents: event.callback.map { [$0] } ?? []
+                    )
+                    offset = end
+                }
             }
         }
     }
@@ -831,7 +908,11 @@ final class PtyTapHub: @unchecked Sendable {
         return .batch(batch)
     }
 
-    private func consumeRawOutput(_ rawBytes: Data, rawEnd: UInt64, callbackAtNs: UInt64 = 0) {
+    private func consumeRawOutput(
+        _ rawBytes: Data,
+        rawEnd: UInt64,
+        callbackEvents: [PtyTapCallback] = []
+    ) {
         filterLock.lock()
         let bytes = queryStripper.strip(rawBytes)
         lock.lock()
@@ -842,8 +923,9 @@ final class PtyTapHub: @unchecked Sendable {
             producedChunks &+= 1
             producedBytes &+= UInt64(bytes.count)
             let chunk = PtyTapChunk(
-                bytes: bytes, seq: tapSeq, callbackBoundary: rawEnd,
-                callbackAtNs: callbackAtNs
+                bytes: bytes,
+                seq: tapSeq,
+                callbackEvents: callbackEvents
             )
             tapSeq &+= UInt64(bytes.count)
             var droppedCount: UInt64?

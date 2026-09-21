@@ -1027,12 +1027,17 @@ final class PeerTerminalReplayBufferTests: XCTestCase {
 
     func testRawOutputDrainBufferBatchesInOrderAndPreservesFinalWatermark() {
         var buffer = RawOutputDrainBuffer()
-        XCTAssertTrue(appendRawOutput("one", rawEnd: 3, into: &buffer))
-        XCTAssertTrue(appendRawOutput("two", rawEnd: 6, into: &buffer))
+        let firstCallback = PtyTapCallback(boundary: 3, atNs: 10)
+        let secondCallback = PtyTapCallback(boundary: 6, atNs: 20)
+        XCTAssertTrue(appendRawOutput("one", rawEnd: 3, callback: firstCallback, into: &buffer))
+        XCTAssertTrue(appendRawOutput("two", rawEnd: 6, callback: secondCallback, into: &buffer))
 
         let first = buffer.take()
         XCTAssertEqual(first?.bytes, Data("onetwo".utf8))
         XCTAssertEqual(first?.rawEnd, 6)
+        XCTAssertEqual(first?.events.count, 2)
+        XCTAssertEqual(first?.events[0].callback, firstCallback)
+        XCTAssertEqual(first?.events[1].callback, secondCallback)
 
         XCTAssertTrue(appendRawOutput("!", rawEnd: 7, into: &buffer))
         let second = buffer.take()
@@ -1063,6 +1068,7 @@ final class PeerTerminalReplayBufferTests: XCTestCase {
     private func appendRawOutput(
         _ text: String,
         rawEnd: UInt64,
+        callback: PtyTapCallback? = nil,
         into buffer: inout RawOutputDrainBuffer
     ) -> Bool {
         let data = Data(text.utf8)
@@ -1070,7 +1076,8 @@ final class PeerTerminalReplayBufferTests: XCTestCase {
             buffer.append(
                 bytes.bindMemory(to: UInt8.self).baseAddress!,
                 count: bytes.count,
-                rawEnd: rawEnd
+                rawEnd: rawEnd,
+                callback: callback
             )
         }
     }
