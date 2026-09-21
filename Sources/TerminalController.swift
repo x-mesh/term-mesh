@@ -4113,7 +4113,9 @@ class TerminalController {
             // fully isolated, so a worker briefed off it is told not to write
             // where its leader just sent it.
             "checkout_mode": TeamOrchestrator.effectiveCheckoutMode(
-                checkoutMode: teamInfo.checkoutMode, worktreeMode: teamInfo.worktreeMode
+                checkoutMode: teamInfo.checkoutMode,
+                worktreeMode: teamInfo.worktreeMode,
+                hasPeerMembers: teamInfo.agents.contains { $0.hostKey != nil }
             ),
             "agent_count": teamInfo.agents.count,
             "agents": agents,

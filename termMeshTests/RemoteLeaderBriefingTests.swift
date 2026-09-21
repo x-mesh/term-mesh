@@ -370,6 +370,32 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         XCTAssertFalse(recovery.contains("CHECKOUT_PATHS_ASOF"))
     }
 
+    /// A local member's `hostDirectory` is the peer default the form filled
+    /// in and names a directory on the wrong machine, so the peer leader is
+    /// not pointed at it.
+    func test_creationPromptDoesNotGiveAPeerLeaderALocalMembersPath() {
+        var mixed = rows
+        mixed[0].hostKey = nil
+        mixed[0].hostDirectory = "/Users/jinwoo/local-only/xm"
+        mixed[0].hostBranch = "agent/local"
+        for index in mixed.indices where mixed[index].hostKey != nil {
+            mixed[index].hostDirectory = "/Users/jinwoo/work/tm-projects/xm-\(mixed[index].preset.name)"
+            mixed[index].hostBranch = "agent/\(mixed[index].preset.name)"
+        }
+        let prompt = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
+            teamName: "xm",
+            rows: mixed,
+            checkoutMode: "isolated",
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        XCTAssertFalse(prompt.contains("/Users/jinwoo/local-only/xm"))
+        XCTAssertTrue(prompt.contains("name=executor instance="))
+        XCTAssertTrue(prompt.contains("path=unknown"))
+        // the peer members keep theirs
+        XCTAssertTrue(prompt.contains("path=/Users/jinwoo/work/tm-projects/xm-reviewer"))
+    }
+
     /// A project created without isolation keeps its warning: every member
     /// sits in the leader's own checkout.
     func test_creationPromptCarriesTheSharedWarningWhenThatIsTheLayout() {

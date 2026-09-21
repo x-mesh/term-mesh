@@ -614,12 +614,10 @@ final class TeamOrchestrator: ObservableObject {
         /// How the members' checkouts are actually laid out: "isolated",
         /// "shared", "off", or "unknown" when nobody recorded it.
         ///
-        /// `worktreeMode` answers a different question — whether this team
-        /// asked for LOCAL git worktrees — and `NewProjectView` records "off"
-        /// for it whenever the roster has no local member, which is every
-        /// all-peer project. Briefing a leader or a worker off that flag told
-        /// them there was no isolation to work in while every peer member sat
-        /// in its own bootstrap checkout.
+        /// Distinct from `worktreeMode`, which says whether this team asked
+        /// for LOCAL git worktrees and is "off" for any roster without a local
+        /// member — including an all-peer project whose members each hold
+        /// their own bootstrap checkout.
         var checkoutMode: String = "unknown"
         var sharedWorktreeName: String?
         var sharedWorktreePath: String?
@@ -2749,6 +2747,11 @@ final class TeamOrchestrator: ObservableObject {
         /// callers that do not create checkouts; readers then fall back to
         /// `worktreeMode`.
         checkoutMode: String = "unknown",
+        /// Whether the team has members on a peer. `agents` here is the local
+        /// half of the roster, so this cannot be read off it, and without it an
+        /// unrecorded layout would be answered from `worktreeMode` — which
+        /// describes local worktrees and says "off" for every peer team.
+        hasPeerMembers: Bool = false,
         executionMode: String = "pane",
         leaderEndpoint: LeaderEndpoint = .local,
         launchLeaderLocally: Bool = true,
@@ -3258,7 +3261,8 @@ final class TeamOrchestrator: ObservableObject {
                     let tmAgent = Self.localTMAgentCommand()
                     let topologySection = Self.checkoutTopologySection(
                         worktreeMode: Self.effectiveCheckoutMode(
-                            checkoutMode: checkoutMode, worktreeMode: worktreeMode
+                            checkoutMode: checkoutMode, worktreeMode: worktreeMode,
+                            hasPeerMembers: hasPeerMembers
                         ),
                         leaderPath: leaderWorkDir,
                         integrationTargetPath: workingDirectory,
@@ -3792,7 +3796,8 @@ final class TeamOrchestrator: ObservableObject {
                 scriptDir: scriptDir,
                 worktreeMode: worktreeMode,
                 topologyMode: Self.effectiveCheckoutMode(
-                    checkoutMode: checkoutMode, worktreeMode: worktreeMode
+                    checkoutMode: checkoutMode, worktreeMode: worktreeMode,
+                    hasPeerMembers: hasPeerMembers
                 ),
                 sharedWorktreeBranch: sharedWtBranch,
                 sharedWorktreePath: sharedWtPath
@@ -5178,7 +5183,7 @@ final class TeamOrchestrator: ObservableObject {
         /// The checkout layout for the topology table. Separate from
         /// `worktreeMode`, which drives the local Worktree Isolation section
         /// below and means local git worktrees only.
-        topologyMode: String = "off",
+        topologyMode: String = "unknown",
         sharedWorktreeBranch: String? = nil,
         sharedWorktreePath: String? = nil
     ) -> String {
@@ -5293,7 +5298,7 @@ final class TeamOrchestrator: ObservableObject {
     /// predates the record, or a resumed headless one, keeps answering from
     /// `worktreeMode` exactly as before.
     nonisolated static func effectiveCheckoutMode(
-        checkoutMode: String, worktreeMode: String, hasPeerMembers: Bool = false
+        checkoutMode: String, worktreeMode: String, hasPeerMembers: Bool
     ) -> String {
         let recorded = checkoutMode.trimmingCharacters(in: .whitespacesAndNewlines)
         if !recorded.isEmpty, recorded != "unknown" { return recorded }
@@ -8675,8 +8680,9 @@ final class TeamOrchestrator: ObservableObject {
                 if let branch = agent.worktreeBranch {
                     info["worktree_branch"] = branch
                 }
-                // Kept to the worktree lifecycle: present only when a task made
-                // one. `working_directory` below is where the pane actually is,
+                // A member's own checkout: the one a task made, or the
+                // bootstrap checkout a peer member was attached into.
+                // `working_directory` below is where the pane actually is,
                 // which is a different question and is always answerable.
                 if let path = agent.worktreePath {
                     info["worktree_path"] = path
@@ -8915,6 +8921,9 @@ final class TeamOrchestrator: ObservableObject {
         // worktree mode from archive (off / shared / isolated). If the archive
         // had a shared worktree, the createTeam path will reuse the same
         // configuration when laying out panes.
+        let archivedCheckoutMode = (result["checkout_mode"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfBlank ?? "unknown"
         let archivedWorktreeMode = Self.resumedWorktreeMode(
             persistedMode: result["worktree_mode"] as? String,
             persistedWorktree: result["worktree"] as? [String: Any]
@@ -9031,6 +9040,7 @@ final class TeamOrchestrator: ObservableObject {
             delegationLevel: restoredDelegation.configured,
             resumeSessionId: leaderClaudeSid,
             worktreeMode: archivedWorktreeMode,
+            checkoutMode: archivedCheckoutMode,
             executionMode: "pane",
             agentResumeSessionIds: agentResumeMap.isEmpty ? nil : agentResumeMap,
             agentWorkingDirectories: Self.paneResumePlacementDirectories(
@@ -9198,6 +9208,7 @@ final class TeamOrchestrator: ObservableObject {
             createdAt: Date(),
             gitRepoRoot: nil,
             worktreeMode: (result["worktree_mode"] as? String)?.nilIfBlank ?? "unknown",
+            checkoutMode: (result["checkout_mode"] as? String)?.nilIfBlank ?? "unknown",
             sharedWorktreeName: nil,
             sharedWorktreePath: nil,
             sharedWorktreeBranch: nil,
@@ -9320,6 +9331,9 @@ final class TeamOrchestrator: ObservableObject {
             "delegation_pending": team.delegationState.pending?.rawValue as Any? ?? NSNull(),
             "working_directory": team.workingDirectory,
             "worktree_mode": team.worktreeMode,
+            // Carried so a resumed team does not come back describing itself
+            // with the local-worktree flag alone.
+            "checkout_mode": team.checkoutMode,
             "termmesh_app_version": appVersion,
             "agents": team.agents.map { a -> [String: Any] in
                 var row: [String: Any] = [
@@ -9528,6 +9542,9 @@ final class TeamOrchestrator: ObservableObject {
             "delegation_pending": team.delegationState.pending?.rawValue as Any? ?? NSNull(),
             "working_directory": team.workingDirectory,
             "worktree_mode": team.worktreeMode,
+            // Carried so a resumed team does not come back describing itself
+            // with the local-worktree flag alone.
+            "checkout_mode": team.checkoutMode,
             "termmesh_app_version": appVersion,
             "layout_workspace_title": team.id,
             "app_socket_path": appSocketPath,

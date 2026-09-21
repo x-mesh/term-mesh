@@ -618,7 +618,7 @@ final class AgentSessionTests: XCTestCase {
     func testEffectiveCheckoutModePrefersTheRecordedLayout() {
         func mode(_ checkout: String, _ worktree: String) -> String {
             TeamOrchestrator.effectiveCheckoutMode(
-                checkoutMode: checkout, worktreeMode: worktree
+                checkoutMode: checkout, worktreeMode: worktree, hasPeerMembers: false
             )
         }
         // The all-peer project this exists for.
@@ -627,12 +627,11 @@ final class AgentSessionTests: XCTestCase {
         // No record: a resumed headless team keeps answering from its flag,
         // which for it is accurate.
         XCTAssertEqual(mode("unknown", "isolated"), "isolated")
-        XCTAssertEqual(mode("unknown", "off"), "off")
-        XCTAssertEqual(mode("", "shared"), "shared")
-        XCTAssertEqual(mode("   ", "isolated"), "isolated")
         // An all-local team records nothing, so "off" — the strictest rule —
         // still reaches the prompt through the flag that is accurate for it.
         XCTAssertEqual(mode("unknown", "off"), "off")
+        XCTAssertEqual(mode("", "shared"), "shared")
+        XCTAssertEqual(mode("   ", "isolated"), "isolated")
         // A peer team whose layout nobody recorded keeps hedging rather than
         // asserting "no isolation" from a flag that only describes local
         // worktrees.
