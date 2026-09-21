@@ -609,6 +609,53 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(TeamOrchestrator.checkoutTopologyRule(worktreeMode: "unknown").contains("is unknown"))
     }
 
+    /// `worktreeMode` answers whether this team asked for LOCAL git
+    /// worktrees, and `NewProjectView` records "off" for it whenever the
+    /// roster has no local member — every all-peer project. Briefing off that
+    /// flag told those leaders and their workers there was no isolation to
+    /// work in. The recorded layout answers instead, and a team that predates
+    /// the record keeps its old answer.
+    func testEffectiveCheckoutModePrefersTheRecordedLayout() {
+        func mode(_ checkout: String, _ worktree: String) -> String {
+            TeamOrchestrator.effectiveCheckoutMode(
+                checkoutMode: checkout, worktreeMode: worktree, hasPeerMembers: false
+            )
+        }
+        // The all-peer project this exists for.
+        XCTAssertEqual(mode("isolated", "off"), "isolated")
+        XCTAssertEqual(mode("shared", "off"), "shared")
+        // No record: a resumed headless team keeps answering from its flag,
+        // which for it is accurate.
+        XCTAssertEqual(mode("unknown", "isolated"), "isolated")
+        // An all-local team records nothing, so "off" — the strictest rule —
+        // still reaches the prompt through the flag that is accurate for it.
+        XCTAssertEqual(mode("unknown", "off"), "off")
+        XCTAssertEqual(mode("", "shared"), "shared")
+        XCTAssertEqual(mode("   ", "isolated"), "isolated")
+        // A peer team whose layout nobody recorded keeps hedging rather than
+        // asserting "no isolation" from a flag that only describes local
+        // worktrees.
+        XCTAssertEqual(
+            TeamOrchestrator.effectiveCheckoutMode(
+                checkoutMode: "unknown", worktreeMode: "off", hasPeerMembers: true
+            ),
+            "unknown"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.effectiveCheckoutMode(
+                checkoutMode: "isolated", worktreeMode: "off", hasPeerMembers: true
+            ),
+            "isolated"
+        )
+        // Newlines trim like every neighbouring call does.
+        XCTAssertEqual(mode("isolated\n", "off"), "isolated")
+        XCTAssertEqual(mode("\n", "shared"), "shared")
+        XCTAssertTrue(
+            TeamOrchestrator.checkoutTopologyRule(worktreeMode: mode("off", "isolated"))
+                .contains("No managed worktree isolation")
+        )
+    }
+
     func testRemoteClaudeLaunchUsesSSHAndKeepsRemoteDirectoryOutOfLocalProcess() {
         let launch = AgentSession.remoteClaudeLaunch(
             sshTarget: "root@jw-server",

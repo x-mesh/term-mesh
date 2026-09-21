@@ -101,6 +101,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         TeamOrchestrator.remoteLeaderNonClaudeSystemPrompt(
             teamName: "xm",
             rows: rows,
+            checkoutMode: "isolated",
             remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
             remoteSocketPath: "/tmp/term-mesh.sock"
         )
@@ -119,6 +120,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         let exactRows = rows
         let prompt = TeamOrchestrator.remoteLeaderNonClaudeSystemPrompt(
             teamName: "xm", rows: exactRows,
+            checkoutMode: "isolated",
             remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
             remoteSocketPath: "/tmp/term-mesh.sock"
         )
@@ -167,6 +169,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
             teamName: "xm",
             rows: rows,
+            checkoutMode: "isolated",
             remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
             remoteSocketPath: "/tmp/term-mesh.sock"
         )
@@ -206,6 +209,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
             teamName: "xm",
             rows: rows,
+            checkoutMode: "isolated",
             remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
             remoteSocketPath: "/tmp/term-mesh.sock"
         )
@@ -233,6 +237,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
             teamName: "xm",
             rows: rows,
+            checkoutMode: "isolated",
             remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
             remoteSocketPath: "/tmp/term-mesh.sock"
         )
@@ -249,6 +254,7 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
             teamName: "xm",
             rows: rows,
+            checkoutMode: "isolated",
             remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
             remoteSocketPath: "/tmp/term-mesh.sock"
         )
@@ -266,8 +272,8 @@ final class RemoteLeaderBriefingTests: XCTestCase {
 
     /// Recovery restarts a leader whose team already exists, so it reads the
     /// durable roster instead of the creation rows — and had the same hole.
-    func test_recoveryBriefsANonClaudeLeaderToo() {
-        let agents = ["executor", "reviewer"].map { name in
+    private func recoveryAgents() -> [TeamOrchestrator.AgentMember] {
+        ["executor", "reviewer"].map { name in
             TeamOrchestrator.AgentMember(
                 id: "\(name)@xm",
                 name: name,
@@ -284,9 +290,14 @@ final class RemoteLeaderBriefingTests: XCTestCase {
                 hostKey: "ssh:peer"
             )
         }
+    }
+
+    func test_recoveryBriefsANonClaudeLeaderToo() {
+        let agents = recoveryAgents()
         let prompt = TeamOrchestrator.remoteLeaderNonClaudeRecoverySystemPrompt(
             teamName: "xm",
             agents: agents,
+            checkoutMode: "isolated",
             remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
             remoteSocketPath: "/tmp/term-mesh.sock"
         )
@@ -296,6 +307,140 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         XCTAssertTrue(prompt.contains("reviewer"))
         XCTAssertTrue(prompt.contains("tm-agent delegate"))
     }
+
+    /// The bootstrap decides the layout and `createTeam` records it, so the
+    /// prompt states it rather than inferring it from whatever fields happen
+    /// to be populated. It used to render a hardcoded `unknown`, which
+    /// `same-checkout-isolation` reads as a reason to serialize every write —
+    /// for the life of the leader, because a system prompt is injected once.
+    func test_creationPromptStatesTheRecordedLayoutAndBranches() {
+        var isolated = rows
+        for index in isolated.indices {
+            let name = isolated[index].preset.name
+            isolated[index].hostDirectory = "/Users/jinwoo/work/tm-projects/xm-\(name)-a1b2"
+            isolated[index].hostBranch = "agent/\(name)-a1b2"
+        }
+        let prompts = [
+            TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
+                teamName: "xm",
+                rows: isolated,
+                checkoutMode: "isolated",
+                remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+                remoteSocketPath: "/tmp/term-mesh.sock"
+            ),
+            TeamOrchestrator.remoteLeaderNonClaudeSystemPrompt(
+                teamName: "xm",
+                rows: isolated,
+                checkoutMode: "isolated",
+                remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+                remoteSocketPath: "/tmp/term-mesh.sock"
+            ),
+        ]
+        for prompt in prompts {
+            XCTAssertTrue(prompt.contains("TEAM_CHECKOUT_MODE: isolated"))
+            XCTAssertFalse(prompt.contains("TEAM_CHECKOUT_MODE: unknown"))
+            XCTAssertTrue(prompt.contains("branch=agent/executor-a1b2"))
+            XCTAssertFalse(prompt.contains("branch=shared-or-unknown"))
+            XCTAssertTrue(prompt.contains("ownership-disjoint write tasks may run concurrently"))
+        }
+    }
+
+    /// The creation table cannot be corrected later, and attach mints its
+    /// own instance-tagged checkout, so the prompt says what its paths are
+    /// as of and where the current answer lives. Recovery reads the members'
+    /// own checkouts and needs no such caveat.
+    func test_creationPromptDatesItsPathsAndNamesTheLiveSource() {
+        let creation = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
+            teamName: "xm",
+            rows: rows,
+            checkoutMode: "isolated",
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        XCTAssertTrue(creation.contains("CHECKOUT_PATHS_ASOF: creation"))
+        XCTAssertTrue(creation.contains("tm-agent status"))
+
+        let recovery = TeamOrchestrator.remoteLeaderClaudeRecoverySystemPrompt(
+            teamName: "xm",
+            agents: recoveryAgents(),
+            checkoutMode: "isolated",
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        XCTAssertFalse(recovery.contains("CHECKOUT_PATHS_ASOF"))
+    }
+
+    /// A local member's `hostDirectory` is the peer default the form filled
+    /// in and names a directory on the wrong machine, so the peer leader is
+    /// not pointed at it.
+    func test_creationPromptDoesNotGiveAPeerLeaderALocalMembersPath() {
+        var mixed = rows
+        mixed[0].hostKey = nil
+        mixed[0].hostDirectory = "/Users/jinwoo/local-only/xm"
+        mixed[0].hostBranch = "agent/local"
+        for index in mixed.indices where mixed[index].hostKey != nil {
+            mixed[index].hostDirectory = "/Users/jinwoo/work/tm-projects/xm-\(mixed[index].preset.name)"
+            mixed[index].hostBranch = "agent/\(mixed[index].preset.name)"
+        }
+        let prompt = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
+            teamName: "xm",
+            rows: mixed,
+            checkoutMode: "isolated",
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        XCTAssertFalse(prompt.contains("/Users/jinwoo/local-only/xm"))
+        XCTAssertTrue(prompt.contains("name=executor instance="))
+        XCTAssertTrue(prompt.contains("path=unknown"))
+        // the peer members keep theirs
+        XCTAssertTrue(prompt.contains("path=/Users/jinwoo/work/tm-projects/xm-reviewer"))
+    }
+
+    /// A project created without isolation keeps its warning: every member
+    /// sits in the leader's own checkout.
+    func test_creationPromptCarriesTheSharedWarningWhenThatIsTheLayout() {
+        let prompt = TeamOrchestrator.remoteLeaderNonClaudeSystemPrompt(
+            teamName: "xm",
+            rows: rows,
+            checkoutMode: "shared",
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        XCTAssertTrue(prompt.contains("TEAM_CHECKOUT_MODE: shared"))
+        XCTAssertTrue(prompt.contains("Serialize writes unless the paths are proven disjoint"))
+    }
+
+    /// Recovery reads the same record, so a restarted leader is not told
+    /// something different from what it was told the first time.
+    func test_recoveryPromptsStateTheRecordedLayout() {
+        var agents = recoveryAgents()
+        for index in agents.indices {
+            agents[index].originalAgentWorkDir =
+                "/Users/jinwoo/work/tm-projects/xm-\(agents[index].name)-a1b2"
+        }
+        let prompts = [
+            TeamOrchestrator.remoteLeaderNonClaudeRecoverySystemPrompt(
+                teamName: "xm",
+                agents: agents,
+                checkoutMode: "isolated",
+                remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+                remoteSocketPath: "/tmp/term-mesh.sock"
+            ),
+            TeamOrchestrator.remoteLeaderClaudeRecoverySystemPrompt(
+                teamName: "xm",
+                agents: agents,
+                checkoutMode: "isolated",
+                remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+                remoteSocketPath: "/tmp/term-mesh.sock"
+            ),
+        ]
+        for prompt in prompts {
+            XCTAssertTrue(prompt.contains("TEAM_CHECKOUT_MODE: isolated"))
+            XCTAssertFalse(prompt.contains("TEAM_CHECKOUT_MODE: unknown"))
+            XCTAssertTrue(prompt.contains("path=/Users/jinwoo/work/tm-projects/xm-executor-a1b2"))
+        }
+    }
+
 }
 
 /// A peer leader's whole job is `tm-agent`, and `tm-agent` reaches the app
@@ -481,6 +626,7 @@ extension RemoteLeaderBriefingTests {
         let prompt = TeamOrchestrator.remoteLeaderNonClaudeSystemPrompt(
             teamName: "xm",
             rows: rows,
+            checkoutMode: "isolated",
             remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
             remoteSocketPath: "/tmp/term-mesh.sock",
             hostCLIBinDirs: ["/Applications/term-mesh.app/Contents/Resources/bin"]
@@ -503,11 +649,11 @@ extension RemoteLeaderBriefingTests {
     func test_bothLeaderKindsGetTheSameAbsolutePath() {
         let dirs = ["/opt/term-mesh/bin"]
         let claude = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
-            teamName: "xm", rows: rows,
+            teamName: "xm", rows: rows, checkoutMode: "isolated",
             remoteWorkingDirectory: "/w", remoteSocketPath: "/s", hostCLIBinDirs: dirs
         )
         let other = TeamOrchestrator.remoteLeaderNonClaudeSystemPrompt(
-            teamName: "xm", rows: rows,
+            teamName: "xm", rows: rows, checkoutMode: "isolated",
             remoteWorkingDirectory: "/w", remoteSocketPath: "/s", hostCLIBinDirs: dirs
         )
         for prompt in [claude, other] {

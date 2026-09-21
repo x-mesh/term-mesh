@@ -975,6 +975,7 @@ extension TerminalController {
                                 var row = TeamAgentRow(preset: preset, customInstructions: "")
                                 row.hostKey = hostKey
                                 row.hostDirectory = checkout.path
+                                row.hostBranch = checkout.branch
                                 return row
                             }
                             precondition(rows.count == plan.agentCheckouts.count)
@@ -997,6 +998,8 @@ extension TerminalController {
                                 // how a caller says the same thing here.
                                 leaderWorkingDirectory: (params["leader_directory"] as? String)
                                     .flatMap { $0.isEmpty ? nil : $0 } ?? remotePath,
+                                checkoutMode: (params["isolate"] as? Bool) ?? true
+                                    ? "isolated" : "shared",
                                 projectSource: ProjectSource(
                                     hostKey: hostKey,
                                     projectPath: remotePath,

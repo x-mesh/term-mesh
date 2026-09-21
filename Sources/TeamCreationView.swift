@@ -182,6 +182,9 @@ struct TeamAgentRow: Identifiable, Equatable {
     /// Where on that machine. Two machines rarely lay a checkout out the same
     /// way, so the local path is not an answer for the remote one.
     var hostDirectory: String = ""
+    /// The branch `PeerProjectBootstrap` put that checkout on. Empty when the
+    /// members share one checkout, or before a bootstrap has run.
+    var hostBranch: String = ""
 
     enum ProviderBadge: Equatable {
         case none
