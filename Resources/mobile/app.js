@@ -180,7 +180,14 @@
   // typing feel slow on a phone. Colors go through the CSSOM, which the
   // page's CSP allows; attribute classes carry bold/dim/italic/underline/
   // inverse. The cursor cell gets a marker.
-  function renderStyled(rows, cursor) {
+  function renderStyled(rows, cursor, columns) {
+    var columnCount = Number(columns);
+    if (Number.isFinite(columnCount) && columnCount > 0) {
+      var boundedColumns = Math.min(Math.floor(columnCount), 1000);
+      el.screen.style.setProperty('--terminal-width', boundedColumns + 'ch');
+    } else {
+      el.screen.style.removeProperty('--terminal-width');
+    }
     var cursorRow = cursor ? cursor.row : -1;
     for (var i = 0; i < rows.length; i++) {
       var key = JSON.stringify(rows[i]) + (i === cursorRow ? '|c' + cursor.col : '');
@@ -203,6 +210,7 @@
 
   function resetScreen() {
     el.screen.textContent = '';
+    el.screen.style.removeProperty('--terminal-width');
     state.rowKeys = [];
     state.rowNodes = [];
   }
@@ -227,7 +235,6 @@
     if (cursor && cursor.row === rowIndex && cursor.col >= col) {
       appendSpan(row, ' ', {}, true);
     }
-    row.appendChild(document.createTextNode('\n'));
     return row;
   }
 
@@ -848,11 +855,11 @@
         if (!isCurrentTarget(t)) { return; }
         var styled = data && Array.isArray(data.rows);
         // Compare the serialized frame so an unchanged screen is not redrawn.
-        var key = styled ? JSON.stringify([data.rows, data.cursor]) : ((data && data.text) || '');
+        var key = styled ? JSON.stringify([data.columns, data.rows, data.cursor]) : ((data && data.text) || '');
         if (key !== state.lastText) {
           state.lastText = key;
           if (styled) {
-            renderStyled(data.rows, data.cursor || null);
+            renderStyled(data.rows, data.cursor || null, data.columns);
           } else {
             resetScreen();
             el.screen.textContent = (data && data.text) || '';
