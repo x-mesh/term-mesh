@@ -221,15 +221,23 @@ body.chat-mode .view-switch {
 .screen-wrap {
   position: relative;
   flex: 1;
+  width: 100%;
+  max-width: 100%;
   min-height: 0;
+  min-width: 0;
   display: flex;
+  overflow: hidden;
 }
 
 .screen {
-  flex: 1;
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   margin: 0;
   padding: 10px 12px;
   overflow: auto;
+  overscroll-behavior-x: contain;
   -webkit-overflow-scrolling: touch;
   background: var(--screen-bg);
   color: var(--screen-fg);
@@ -238,7 +246,13 @@ body.chat-mode .view-switch {
   tab-size: 4;
 }
 
-.screen .row { display: inline; }
+/* Preserve the source terminal grid. Relay columns can exceed a phone width,
+   so horizontal overflow stays inside this scroller. */
+.screen .row {
+  display: block;
+  width: max-content;
+  min-width: max(100%, var(--terminal-width, 0px));
+}
 .screen .b { font-weight: 700; }
 .screen .d { opacity: 0.55; }
 .screen .i { font-style: italic; }
