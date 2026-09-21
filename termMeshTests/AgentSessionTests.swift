@@ -630,9 +630,27 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertEqual(mode("unknown", "off"), "off")
         XCTAssertEqual(mode("", "shared"), "shared")
         XCTAssertEqual(mode("   ", "isolated"), "isolated")
-        // "off" stays reachable: it is the strictest rule and the one a
-        // derivation could never produce.
-        XCTAssertEqual(mode("off", "isolated"), "off")
+        // An all-local team records nothing, so "off" — the strictest rule —
+        // still reaches the prompt through the flag that is accurate for it.
+        XCTAssertEqual(mode("unknown", "off"), "off")
+        // A peer team whose layout nobody recorded keeps hedging rather than
+        // asserting "no isolation" from a flag that only describes local
+        // worktrees.
+        XCTAssertEqual(
+            TeamOrchestrator.effectiveCheckoutMode(
+                checkoutMode: "unknown", worktreeMode: "off", hasPeerMembers: true
+            ),
+            "unknown"
+        )
+        XCTAssertEqual(
+            TeamOrchestrator.effectiveCheckoutMode(
+                checkoutMode: "isolated", worktreeMode: "off", hasPeerMembers: true
+            ),
+            "isolated"
+        )
+        // Newlines trim like every neighbouring call does.
+        XCTAssertEqual(mode("isolated\n", "off"), "isolated")
+        XCTAssertEqual(mode("\n", "shared"), "shared")
         XCTAssertTrue(
             TeamOrchestrator.checkoutTopologyRule(worktreeMode: mode("off", "isolated"))
                 .contains("No managed worktree isolation")

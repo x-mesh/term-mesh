@@ -7141,6 +7141,7 @@ fn team_checkout_topology_lines(result: &Value, task: &Value) -> Vec<String> {
     // every all-peer team. Falling back keeps an older app working.
     let mode = result["checkout_mode"]
         .as_str()
+        .map(str::trim)
         .filter(|mode| !mode.is_empty() && *mode != "unknown")
         .or_else(|| result["worktree_mode"].as_str())
         .unwrap_or("unknown");

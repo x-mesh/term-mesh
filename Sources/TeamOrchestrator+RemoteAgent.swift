@@ -7334,6 +7334,9 @@ extension TeamOrchestrator {
                 agentName: agentName,
                 agentInstanceId: agentInstanceId,
                 workingDirectory: workingDirectory,
+                isolatedCheckout: isolatedCheckout.map {
+                    (path: $0, branch: isolatedBranch)
+                },
                 agentType: agentType,
                 model: model,
                 effort: effort,

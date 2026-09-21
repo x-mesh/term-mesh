@@ -4857,10 +4857,14 @@ enum ProjectCreationFlow {
                 && prepared.rows.contains(where: { $0.hostKey == nil })
                 ? "isolated"
                 : "off",
-            // The layout every member actually got, which is not the same
-            // question: the flag above is about LOCAL git worktrees and reads
-            // "off" for an all-peer roster that the bootstrap fully isolated.
-            checkoutMode: source.isolateAgents ? "isolated" : "shared",
+            // Only for a roster with peer members: `worktreeMode` above is
+            // about LOCAL git worktrees and reads "off" for a peer roster the
+            // bootstrap fully isolated. An all-local team is already described
+            // by that flag, including the "off" its members really are in, so
+            // recording a second answer for it would only loosen the rule.
+            checkoutMode: prepared.rows.contains(where: { $0.hostKey != nil })
+                ? (source.isolateAgents ? "isolated" : "shared")
+                : "unknown",
             delegationLevel: leader.delegationLevel,
             projectSource: source,
             createdPaths: prepared.createdPaths,
