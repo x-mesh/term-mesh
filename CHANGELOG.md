@@ -4,6 +4,11 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.254.1] - 2026-09-21
+
+- Added opt-in peer input-latency lifecycle diagnostics for SSH tunnel EOF, shared transport refresh, reconnect generations, and pane recovery, without recording terminal input contents.
+- Added bounded lifecycle logging to make shared peer reconnect waves diagnosable.
+
 ## [0.254.0] - 2026-09-21
 
 ### Added
