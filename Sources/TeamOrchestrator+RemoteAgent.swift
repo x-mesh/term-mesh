@@ -5979,6 +5979,11 @@ extension TeamOrchestrator {
             systemPrompt = Self.remoteLeaderClaudeRecoverySystemPrompt(
                 teamName: teamName,
                 agents: team.agents,
+                checkoutMode: Self.effectiveCheckoutMode(
+                    checkoutMode: team.checkoutMode,
+                    worktreeMode: team.worktreeMode,
+                    hasPeerMembers: team.agents.contains { $0.hostKey != nil }
+                ),
                 remoteWorkingDirectory: workingDirectory,
                 remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET",
                 hostCLIBinDirs: host.hostCLIBinDirs
@@ -5989,6 +5994,11 @@ extension TeamOrchestrator {
             systemPrompt = Self.remoteLeaderNonClaudeRecoverySystemPrompt(
                 teamName: teamName,
                 agents: team.agents,
+                checkoutMode: Self.effectiveCheckoutMode(
+                    checkoutMode: team.checkoutMode,
+                    worktreeMode: team.worktreeMode,
+                    hasPeerMembers: team.agents.contains { $0.hostKey != nil }
+                ),
                 remoteWorkingDirectory: workingDirectory,
                 remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET",
                 hostCLIBinDirs: host.hostCLIBinDirs
@@ -7203,6 +7213,9 @@ extension TeamOrchestrator {
         )
         let workingDirectory: String
         var isolatedCheckout: String?
+        /// The branch the isolated checkout is on, recorded on the member so
+        /// the topology can name it.
+        var isolatedBranch: String?
         if team.remoteProjectLocations.containsLocation(
             hostKey: hostKey, path: requestedDirectory
         ) {
@@ -7214,6 +7227,8 @@ extension TeamOrchestrator {
             )
             workingDirectory = isolated.path
             isolatedCheckout = isolated.path
+            let branch = isolated.branch.trimmingCharacters(in: .whitespacesAndNewlines)
+            isolatedBranch = branch.isEmpty ? nil : branch
         } else {
             workingDirectory = requestedDirectory
         }
@@ -7322,6 +7337,9 @@ extension TeamOrchestrator {
                 agentName: agentName,
                 agentInstanceId: agentInstanceId,
                 workingDirectory: workingDirectory,
+                isolatedCheckout: isolatedCheckout.map {
+                    (path: $0, branch: isolatedBranch)
+                },
                 agentType: agentType,
                 model: model,
                 effort: effort,
@@ -7384,6 +7402,9 @@ extension TeamOrchestrator {
                     agentName: agentName,
                     agentInstanceId: agentInstanceId,
                     workingDirectory: workingDirectory,
+                    isolatedCheckout: isolatedCheckout.map {
+                        (path: $0, branch: isolatedBranch)
+                    },
                     agentType: agentType,
                     model: model,
                     effort: effort,
@@ -7595,11 +7616,14 @@ extension TeamOrchestrator {
             workspaceId: workspace.id,
             panelId: panel.id,
             createdAt: Date(),
+            worktreePath: isolatedCheckout,
+            worktreeBranch: isolatedBranch,
             remoteSurfaceID: attachedSurfaceID,
             remoteSurfaceSpawned: spawnedSurface,
             hostKey: hostKey,
             originalAgentWorkDir: workingDirectory
         )
+
         // Last gate before the member becomes part of the team. A deletion that
         // began while this was attaching has already decided the roster; adding
         // to it here is the orphan.
@@ -8993,6 +9017,10 @@ extension TeamOrchestrator {
         agentName: String,
         agentInstanceId: String,
         workingDirectory: String,
+        /// The isolated checkout this agent was placed in, when there is one.
+        /// Recorded on the member so the topology names where the worker
+        /// actually is rather than where the creation plan said it would be.
+        isolatedCheckout: (path: String, branch: String?)?,
         agentType: String,
         model: String,
         effort: String = "",
@@ -9135,6 +9163,8 @@ extension TeamOrchestrator {
             workspaceId: workspace.id,
             panelId: panel.id,
             createdAt: Date(),
+            worktreePath: isolatedCheckout?.path,
+            worktreeBranch: isolatedCheckout?.branch,
             remoteSurfaceID: surfaceID,
             remoteSurfaceSpawned: true,
             remoteAgentSurface: true,
@@ -9145,6 +9175,7 @@ extension TeamOrchestrator {
             hostKey: host.id,
             originalAgentWorkDir: workingDirectory
         )
+
         // Last gate before the member becomes part of the team, for the same
         // reason the terminal path has one: adding to a roster a deletion has
         // already finished with is what orphans the peer's bridge.
@@ -9470,6 +9501,10 @@ extension TeamOrchestrator {
         agentName: String,
         agentInstanceId: String,
         workingDirectory: String,
+        /// The isolated checkout this agent was placed in, when there is one.
+        /// Recorded on the member so the topology names where the worker
+        /// actually is rather than where the creation plan said it would be.
+        isolatedCheckout: (path: String, branch: String?)?,
         agentType: String,
         model: String,
         effort: String = "",
@@ -9638,9 +9673,12 @@ extension TeamOrchestrator {
             workspaceId: workspace.id,
             panelId: panel.id,
             createdAt: Date(),
+            worktreePath: isolatedCheckout?.path,
+            worktreeBranch: isolatedCheckout?.branch,
             hostKey: host.id,
             originalAgentWorkDir: workingDirectory
         )
+
         guard adoptAgentMember(member, teamName: team.id) else {
             _ = workspace.closePanel(panel.id, force: true)
             throw RemoteAgentError.duplicateInstance(member.agentInstanceId)
@@ -10491,6 +10529,8 @@ extension TeamOrchestrator {
         leaderEndpoint: LeaderEndpoint = .local,
         leaderWorkingDirectory: String? = nil,
         worktreeMode: String = "off",
+        /// The layout `prepareCheckouts` produced, for the members' briefs.
+        checkoutMode: String = "unknown",
         executionMode: String = "pane",
         resumeSessionId: String? = nil,
         pairMode: String = "none",
@@ -10561,6 +10601,11 @@ extension TeamOrchestrator {
                 remoteLeaderSystemPrompt = Self.remoteLeaderClaudeSystemPrompt(
                     teamName: teamName,
                     rows: rows,
+                    checkoutMode: Self.effectiveCheckoutMode(
+                        checkoutMode: checkoutMode,
+                        worktreeMode: worktreeMode,
+                        hasPeerMembers: rows.contains { $0.hostKey != nil }
+                    ),
                     remoteWorkingDirectory: resolvedRemoteLeaderWorkingDirectory,
                     remoteSocketPath: remoteSocketPath,
                     hostCLIBinDirs: remoteLeaderBinDirs
@@ -10576,6 +10621,11 @@ extension TeamOrchestrator {
                 remoteLeaderSystemPrompt = Self.remoteLeaderNonClaudeSystemPrompt(
                     teamName: teamName,
                     rows: rows,
+                    checkoutMode: Self.effectiveCheckoutMode(
+                        checkoutMode: checkoutMode,
+                        worktreeMode: worktreeMode,
+                        hasPeerMembers: rows.contains { $0.hostKey != nil }
+                    ),
                     remoteWorkingDirectory: resolvedRemoteLeaderWorkingDirectory,
                     remoteSocketPath: remoteSocketPath,
                     hostCLIBinDirs: remoteLeaderBinDirs
@@ -10623,6 +10673,8 @@ extension TeamOrchestrator {
             delegationLevel: delegationLevel,
             resumeSessionId: resumeSessionId,
             worktreeMode: worktreeMode,
+            checkoutMode: checkoutMode,
+            hasPeerMembers: rows.contains { $0.hostKey != nil },
             executionMode: executionMode,
             leaderEndpoint: initialLeaderEndpoint,
             launchLeaderLocally: launchLeaderLocally,

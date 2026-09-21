@@ -4857,6 +4857,14 @@ enum ProjectCreationFlow {
                 && prepared.rows.contains(where: { $0.hostKey == nil })
                 ? "isolated"
                 : "off",
+            // Only for a roster with peer members: `worktreeMode` above is
+            // about LOCAL git worktrees and reads "off" for a peer roster the
+            // bootstrap fully isolated. An all-local team is already described
+            // by that flag, including the "off" its members really are in, so
+            // recording a second answer for it would only loosen the rule.
+            checkoutMode: prepared.rows.contains(where: { $0.hostKey != nil })
+                ? (source.isolateAgents ? "isolated" : "shared")
+                : "unknown",
             delegationLevel: leader.delegationLevel,
             projectSource: source,
             createdPaths: prepared.createdPaths,
@@ -5177,6 +5185,7 @@ enum ProjectCreationFlow {
                         where offset < plan.agentCheckouts.count {
                         prepared[rowIndex].hostKey = hostKey
                         prepared[rowIndex].hostDirectory = plan.agentCheckouts[offset].path
+                        prepared[rowIndex].hostBranch = plan.agentCheckouts[offset].branch
                     }
                     RemoteProjectPaths.shared.remember(
                         host: hostKey,

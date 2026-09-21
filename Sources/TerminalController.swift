@@ -4016,7 +4016,7 @@ class TerminalController {
         // and `checkout` falling back to a workspace UUID. Derived here, on the
         // actor that owns the member, so both status implementations answer
         // with the same value.
-        let teamInfo: (leaderSessionId: String, leaderEffort: String, workspaceId: String, workingDirectory: String, integrationTargetPath: String, worktreeMode: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, effort: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?, workingDirectory: String?)], createdAt: String, policyState: String, policyFailure: String?, measurement: [String: Any])? = await MainActor.run {
+        let teamInfo: (leaderSessionId: String, leaderEffort: String, workspaceId: String, workingDirectory: String, integrationTargetPath: String, worktreeMode: String, checkoutMode: String, agents: [(name: String, id: String, instanceId: String, cli: String, model: String, effort: String, agentType: String, color: String, workspaceId: String, panelId: String?, completedTaskCount: Int, worktreeBranch: String?, worktreePath: String?, hostKey: String?, workingDirectory: String?)], createdAt: String, policyState: String, policyFailure: String?, measurement: [String: Any])? = await MainActor.run {
             guard let team = TeamOrchestrator.shared.teamStruct(name: teamName) else { return nil }
             return (
                 leaderSessionId: team.leaderSessionId,
@@ -4025,6 +4025,7 @@ class TerminalController {
                 workingDirectory: team.sharedWorktreePath ?? team.workingDirectory,
                 integrationTargetPath: team.workingDirectory,
                 worktreeMode: team.worktreeMode,
+                checkoutMode: team.checkoutMode,
                 agents: team.agents.map { a in
                     (name: a.name, id: a.id, instanceId: a.agentInstanceId, cli: a.cli, model: a.model, effort: a.effort, agentType: a.agentType, color: a.color,
                      workspaceId: a.workspaceId.uuidString, panelId: a.panelId?.uuidString,
@@ -4107,6 +4108,15 @@ class TerminalController {
             "working_directory": teamInfo.workingDirectory,
             "integration_target_path": teamInfo.integrationTargetPath,
             "worktree_mode": teamInfo.worktreeMode,
+            // What to brief an agent with. `worktree_mode` is about local git
+            // worktrees and reads "off" for an all-peer roster the bootstrap
+            // fully isolated, so a worker briefed off it is told not to write
+            // where its leader just sent it.
+            "checkout_mode": TeamOrchestrator.effectiveCheckoutMode(
+                checkoutMode: teamInfo.checkoutMode,
+                worktreeMode: teamInfo.worktreeMode,
+                hasPeerMembers: teamInfo.agents.contains { $0.hostKey != nil }
+            ),
             "agent_count": teamInfo.agents.count,
             "agents": agents,
             "attention_count": inboxCount,

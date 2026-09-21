@@ -7136,7 +7136,17 @@ fn append_team_checkout_topology(sock: &PathBuf, team: &str, task: &Value, lines
 fn team_checkout_topology_lines(result: &Value, task: &Value) -> Vec<String> {
     let Some(agents) = result["agents"].as_array() else { return Vec::new() };
     let target_instance = task["agent_instance_id"].as_str();
-    let mode = result["worktree_mode"].as_str().unwrap_or("unknown");
+    // `checkout_mode` is what the leader was briefed with, already resolved
+    // by the app — including a deliberate "unknown" for a peer team whose
+    // layout nobody recorded. Only its ABSENCE means an older app, so only
+    // absence falls back to `worktree_mode`, which says whether local git
+    // worktrees were requested and is "off" for every all-peer team.
+    let mode = result["checkout_mode"]
+        .as_str()
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .or_else(|| result["worktree_mode"].as_str())
+        .unwrap_or("unknown");
     let leader_path = result["working_directory"].as_str().unwrap_or("unknown");
     let integration_target = result["integration_target_path"].as_str().unwrap_or(leader_path);
     let mut lines = vec![
@@ -7217,6 +7227,45 @@ mod checkout_contract_tests {
         assert!(rendered.contains("TEAM_CHECKOUT_MODE: isolated"));
         assert!(rendered.contains("PEER_CHECKOUT: name=reviewer instance=b branch=team/b path=/wt/b"));
         assert!(!rendered.contains("PEER_CHECKOUT: name=executor instance=a"));
+    }
+
+    #[test]
+    fn topology_prefers_the_recorded_checkout_mode() {
+        // `worktree_mode` is "off" for every all-peer team even when the
+        // bootstrap isolated every member, so the worker brief would tell an
+        // agent not to write where its leader had just sent it.
+        let status = json!({"checkout_mode":"isolated","worktree_mode":"off","working_directory":"/repo","integration_target_path":"/repo","agents": [
+            {"name":"executor","agent_instance_id":"a","worktree_path":"/wt/a","worktree_branch":"team/a"},
+            {"name":"reviewer","agent_instance_id":"b","worktree_path":"/wt/b","worktree_branch":"team/b"}
+        ]});
+        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
+        assert!(rendered.contains("TEAM_CHECKOUT_MODE: isolated"));
+        assert!(rendered.contains("ownership-disjoint write tasks may run concurrently"));
+    }
+
+    #[test]
+    fn topology_falls_back_only_when_the_key_is_absent() {
+        // An older app does not send the key at all; then `worktree_mode` is
+        // all there is.
+        let status = json!({"worktree_mode":"isolated","working_directory":"/repo","integration_target_path":"/repo","agents": [
+            {"name":"executor","agent_instance_id":"a","worktree_path":"/wt/a","worktree_branch":"team/a"}
+        ]});
+        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"b"})).join("\n");
+        assert!(rendered.contains("TEAM_CHECKOUT_MODE: isolated"));
+    }
+
+    #[test]
+    fn topology_keeps_a_published_unknown_as_the_hedge() {
+        // The app resolves before publishing: "unknown" is its answer for a
+        // peer team with nothing recorded. Re-resolving it here briefed the
+        // worker "no isolation is active" while its leader was told to query
+        // team.status.
+        let status = json!({"checkout_mode":"unknown","worktree_mode":"off","working_directory":"/repo","integration_target_path":"/repo","agents": [
+            {"name":"executor","agent_instance_id":"a"}
+        ]});
+        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"b"})).join("\n");
+        assert!(rendered.contains("TEAM_CHECKOUT_MODE: unknown"));
+        assert!(rendered.contains("Checkout isolation is unknown"));
     }
 
     #[test]
