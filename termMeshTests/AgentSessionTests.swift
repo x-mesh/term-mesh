@@ -609,6 +609,34 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(TeamOrchestrator.checkoutTopologyRule(worktreeMode: "unknown").contains("is unknown"))
     }
 
+    /// The mode is read off the checkouts because the stored flag answers a
+    /// different question: an all-peer roster records "off" while every peer
+    /// member still gets its own bootstrap checkout.
+    func testCheckoutModeIsDerivedFromTheCheckoutsThemselves() {
+        typealias Worker = (name: String, instance: String, branch: String?, path: String?)
+        func mode(_ workers: [Worker]) -> String {
+            TeamOrchestrator.derivedCheckoutMode(leaderPath: "/repo", workers: workers)
+        }
+        XCTAssertEqual(
+            mode([("executor", "a", "team/a", "/wt/a"), ("reviewer", "b", "team/b", "/wt/b")]),
+            "isolated"
+        )
+        // Everyone in the leader's own checkout: the shared-write hazard.
+        XCTAssertEqual(mode([("executor", "a", nil, "/repo"), ("reviewer", "b", nil, "/repo")]), "shared")
+        // One checkout that is not the leader's is still one checkout.
+        XCTAssertEqual(mode([("executor", "a", nil, "/wt/x"), ("reviewer", "b", nil, "/wt/x")]), "shared")
+        // A member whose path is unknown makes the whole layout unknown.
+        XCTAssertEqual(mode([("executor", "a", nil, "/wt/a"), ("reviewer", "b", nil, nil)]), "unknown")
+        // Partly shared is neither rule.
+        XCTAssertEqual(
+            mode([("executor", "a", nil, "/wt/a"), ("reviewer", "b", nil, "/wt/a"), ("ai", "c", nil, "/wt/c")]),
+            "unknown"
+        )
+        XCTAssertEqual(mode([]), "unknown")
+        // A lone worker outside the integration checkout is isolated.
+        XCTAssertEqual(mode([("executor", "a", "team/a", "/wt/a")]), "isolated")
+    }
+
     func testRemoteClaudeLaunchUsesSSHAndKeepsRemoteDirectoryOutOfLocalProcess() {
         let launch = AgentSession.remoteClaudeLaunch(
             sshTarget: "root@jw-server",

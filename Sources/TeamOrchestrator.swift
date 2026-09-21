@@ -4956,6 +4956,12 @@ final class TeamOrchestrator: ObservableObject {
         tm-agent runbook install --tool all
         ```
         """
+        let workers = rows.map { row in
+            (
+                name: row.preset.name, instance: row.id.uuidString,
+                branch: row.hostBranch.nilIfBlank, path: row.hostDirectory.nilIfBlank
+            )
+        }
         return buildLeaderClaudeSystemPrompt(
             teamName: teamName,
             agentList: agentList,
@@ -4963,11 +4969,12 @@ final class TeamOrchestrator: ObservableObject {
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath,
             topologySection: checkoutTopologySection(
-                worktreeMode: "pending-bootstrap", leaderPath: remoteWorkingDirectory,
+                worktreeMode: derivedCheckoutMode(
+                    leaderPath: remoteWorkingDirectory, workers: workers
+                ),
+                leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
-                workers: rows.map { row in
-                    (name: row.preset.name, instance: row.id.uuidString, branch: "pending", path: row.hostDirectory.nilIfBlank)
-                }
+                workers: workers
             )
         )
     }
@@ -5034,19 +5041,26 @@ final class TeamOrchestrator: ObservableObject {
         tm-agent runbook install --tool all
         ```
         """
+        let workers = rows.map { row in
+            (
+                name: row.preset.name, instance: row.id.uuidString,
+                branch: row.hostBranch.nilIfBlank, path: row.hostDirectory.nilIfBlank
+            )
+        }
         return renderNonClaudeLeaderPrompt(
             teamName: teamName,
             agentList: agentList,
             runbookSection: remoteRunbooks,
-            // Peer members get their own checkouts from PeerProjectBootstrap
-            // rather than from this team's worktree mode, and that runs after
-            // this prompt — hence pending rather than a table of guesses.
+            // Peer members get their own checkouts from PeerProjectBootstrap,
+            // not from this team's worktree mode, so the mode is read back off
+            // the checkouts the bootstrap just produced.
             worktreeSection: checkoutTopologySection(
-                worktreeMode: "pending-bootstrap", leaderPath: remoteWorkingDirectory,
+                worktreeMode: derivedCheckoutMode(
+                    leaderPath: remoteWorkingDirectory, workers: workers
+                ),
+                leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
-                workers: rows.map { row in
-                    (name: row.preset.name, instance: row.id.uuidString, branch: "pending", path: row.hostDirectory.nilIfBlank)
-                }
+                workers: workers
             ),
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath
@@ -5060,7 +5074,6 @@ final class TeamOrchestrator: ObservableObject {
     static func remoteLeaderNonClaudeRecoverySystemPrompt(
         teamName: String,
         agents: [AgentMember],
-        worktreeMode: String,
         remoteWorkingDirectory: String,
         remoteSocketPath: String,
         hostCLIBinDirs: [String] = []
@@ -5075,11 +5088,13 @@ final class TeamOrchestrator: ObservableObject {
                 roles: agents.map(\.agentType)
             ),
             worktreeSection: checkoutTopologySection(
-                worktreeMode: worktreeMode, leaderPath: remoteWorkingDirectory,
+                worktreeMode: derivedCheckoutMode(
+                    leaderPath: remoteWorkingDirectory,
+                    workers: recoveryWorkers(agents)
+                ),
+                leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
-                workers: agents.map { agent in
-                    (name: agent.name, instance: agent.agentInstanceId, branch: agent.worktreeBranch, path: agent.worktreePath ?? agent.originalAgentWorkDir)
-                }
+                workers: recoveryWorkers(agents)
             ),
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath
@@ -5092,7 +5107,6 @@ final class TeamOrchestrator: ObservableObject {
     static func remoteLeaderClaudeRecoverySystemPrompt(
         teamName: String,
         agents: [AgentMember],
-        worktreeMode: String,
         remoteWorkingDirectory: String,
         remoteSocketPath: String,
         hostCLIBinDirs: [String] = []
@@ -5109,11 +5123,13 @@ final class TeamOrchestrator: ObservableObject {
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath,
             topologySection: checkoutTopologySection(
-                worktreeMode: worktreeMode, leaderPath: remoteWorkingDirectory,
+                worktreeMode: derivedCheckoutMode(
+                    leaderPath: remoteWorkingDirectory,
+                    workers: recoveryWorkers(agents)
+                ),
+                leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
-                workers: agents.map { agent in
-                    (name: agent.name, instance: agent.agentInstanceId, branch: agent.worktreeBranch, path: agent.worktreePath ?? agent.originalAgentWorkDir)
-                }
+                workers: recoveryWorkers(agents)
             )
         )
     }
@@ -5208,6 +5224,53 @@ final class TeamOrchestrator: ObservableObject {
         return lines.joined(separator: "\n")
     }
 
+    /// The mode a rendered topology actually has, read from the checkout
+    /// paths rather than from `Team.worktreeMode`.
+    ///
+    /// That field answers a different question — whether this team asked for
+    /// local git worktrees — and `NewProjectView` records "off" for it
+    /// whenever the roster has no local member, which is every all-peer
+    /// project. Meanwhile `PeerProjectBootstrap` gave each peer member its own
+    /// checkout and branch. Rendering the stored flag told those leaders they
+    /// had no isolation and left five idle workers beside a leader that ran
+    /// every turn itself.
+    nonisolated static func derivedCheckoutMode(
+        leaderPath: String,
+        workers: [(name: String, instance: String, branch: String?, path: String?)]
+    ) -> String {
+        guard !workers.isEmpty else { return "unknown" }
+        let paths = workers.compactMap { $0.path?.nilIfBlank }
+        guard paths.count == workers.count else { return "unknown" }
+        let distinct = Set(paths)
+        // Every member somewhere of its own, and none of them where the
+        // leader integrates.
+        if distinct.count == workers.count, !distinct.contains(leaderPath) {
+            return "isolated"
+        }
+        // One checkout for everyone, whether or not it is the leader's: the
+        // hazard is the same and the rule is the same.
+        if distinct.count == 1 { return "shared" }
+        // Partly shared. Neither rule is true of the whole roster, so say so
+        // rather than pick the more permissive one.
+        return "unknown"
+    }
+
+    /// A recovered member's own checkout. `worktreePath` is set only when a
+    /// task made a worktree; a peer member carries its bootstrap checkout in
+    /// `originalAgentWorkDir` instead, and that is the path the leader has to
+    /// reason about.
+    nonisolated static func recoveryWorkers(
+        _ agents: [AgentMember]
+    ) -> [(name: String, instance: String, branch: String?, path: String?)] {
+        agents.map { agent in
+            (
+                name: agent.name, instance: agent.agentInstanceId,
+                branch: agent.worktreeBranch,
+                path: agent.worktreePath ?? agent.originalAgentWorkDir
+            )
+        }
+    }
+
     nonisolated static func checkoutTopologyRule(worktreeMode: String) -> String {
         switch worktreeMode {
         case "isolated":
@@ -5216,12 +5279,6 @@ final class TeamOrchestrator: ObservableObject {
             return "TOPOLOGY_RULE: Workers share one checkout. Serialize writes unless the paths are proven disjoint."
         case "off":
             return "TOPOLOGY_RULE: No managed worktree isolation is active. Do not run concurrent writes without another verified isolation boundary."
-        case "pending-bootstrap":
-            // A peer leader attaches before its workers have checkouts, so the
-            // rendered table cannot name them. Saying "unknown" here read as
-            // "no isolation" and suppressed delegation for the life of the
-            // leader, because the prompt is injected once and never rebuilt.
-            return "TOPOLOGY_RULE: Worker checkouts do not exist yet. The bootstrap creates them after this prompt, so read team.status — worktree_mode, worktree_branch, and worktree_path — as the authoritative topology before you plan concurrent writes."
         default:
             return "TOPOLOGY_RULE: Checkout isolation is unknown. Query team.status before concurrent writes."
         }

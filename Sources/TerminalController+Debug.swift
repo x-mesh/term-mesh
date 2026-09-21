@@ -975,6 +975,7 @@ extension TerminalController {
                                 var row = TeamAgentRow(preset: preset, customInstructions: "")
                                 row.hostKey = hostKey
                                 row.hostDirectory = checkout.path
+                                row.hostBranch = checkout.branch
                                 return row
                             }
                             precondition(rows.count == plan.agentCheckouts.count)

@@ -5177,6 +5177,7 @@ enum ProjectCreationFlow {
                         where offset < plan.agentCheckouts.count {
                         prepared[rowIndex].hostKey = hostKey
                         prepared[rowIndex].hostDirectory = plan.agentCheckouts[offset].path
+                        prepared[rowIndex].hostBranch = plan.agentCheckouts[offset].branch
                     }
                     RemoteProjectPaths.shared.remember(
                         host: hostKey,
