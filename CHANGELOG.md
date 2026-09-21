@@ -4,6 +4,22 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.254.0] - 2026-09-21
+
+### Added
+
+- Relay input telemetry records bounded latency percentiles and backlog depth when the peer federation input-path setting is enabled. The measurement helps diagnose remote typing delay without recording keystroke content.
+
+### Changed
+
+- Mobile terminal rendering preserves the remote terminal grid width and keeps horizontal overflow inside the terminal screen. Narrow mobile viewports no longer expand the page width.
+
+### Fixed
+
+- Mobile Markdown quote borders use a thinner line for a tighter layout.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.253.0] - 2026-09-21
 
 ### Fixed
