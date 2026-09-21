@@ -7209,6 +7209,10 @@ extension TeamOrchestrator {
         )
         let workingDirectory: String
         var isolatedCheckout: String?
+        // The branch that checkout is on. Dropped here for a long time, which
+        // is why a leader's WORKER_CHECKOUT line said `branch=shared-or-unknown`
+        // about a worker sitting on `agent/<role>-<tag>`.
+        var isolatedBranch: String?
         if team.remoteProjectLocations.containsLocation(
             hostKey: hostKey, path: requestedDirectory
         ) {
@@ -7220,6 +7224,8 @@ extension TeamOrchestrator {
             )
             workingDirectory = isolated.path
             isolatedCheckout = isolated.path
+            isolatedBranch = isolated.branch.trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty ? nil : isolated.branch
         } else {
             workingDirectory = requestedDirectory
         }
@@ -7390,6 +7396,9 @@ extension TeamOrchestrator {
                     agentName: agentName,
                     agentInstanceId: agentInstanceId,
                     workingDirectory: workingDirectory,
+                    isolatedCheckout: isolatedCheckout.map {
+                        (path: $0, branch: isolatedBranch)
+                    },
                     agentType: agentType,
                     model: model,
                     effort: effort,
@@ -7586,7 +7595,7 @@ extension TeamOrchestrator {
             title: "\(Self.colorEmoji(agentColor)) \(agentName) @\(host.displayName)"
         )
 
-        let member = AgentMember(
+        var member = AgentMember(
             id: "\(agentName)@\(teamName)",
             agentInstanceId: agentInstanceId,
             name: agentName,
@@ -7606,6 +7615,11 @@ extension TeamOrchestrator {
             hostKey: hostKey,
             originalAgentWorkDir: workingDirectory
         )
+        // AgentMember's memberwise initializer orders these well before
+        // `originalAgentWorkDir`, so they are set here rather than threaded
+        // through every call site.
+        member.worktreePath = isolatedCheckout
+        member.worktreeBranch = isolatedBranch
         // Last gate before the member becomes part of the team. A deletion that
         // began while this was attaching has already decided the roster; adding
         // to it here is the orphan.
@@ -8999,6 +9013,10 @@ extension TeamOrchestrator {
         agentName: String,
         agentInstanceId: String,
         workingDirectory: String,
+        /// The isolated checkout this agent was placed in, when there is one.
+        /// Recorded on the member so the topology names where the worker
+        /// actually is rather than where the creation plan said it would be.
+        isolatedCheckout: (path: String, branch: String?)? = nil,
         agentType: String,
         model: String,
         effort: String = "",
@@ -9126,7 +9144,7 @@ extension TeamOrchestrator {
             try? panel.session.send(briefing, from: .leader)
         }
 
-        let member = AgentMember(
+        var member = AgentMember(
             id: "\(agentName)@\(team.id)",
             agentInstanceId: agentInstanceId,
             name: agentName,
@@ -9151,6 +9169,11 @@ extension TeamOrchestrator {
             hostKey: host.id,
             originalAgentWorkDir: workingDirectory
         )
+        // AgentMember's memberwise initializer orders these well before
+        // `originalAgentWorkDir`, so they are set here rather than threaded
+        // through every call site.
+        member.worktreePath = isolatedCheckout?.path
+        member.worktreeBranch = isolatedCheckout?.branch
         // Last gate before the member becomes part of the team, for the same
         // reason the terminal path has one: adding to a roster a deletion has
         // already finished with is what orphans the peer's bridge.
@@ -9476,6 +9499,10 @@ extension TeamOrchestrator {
         agentName: String,
         agentInstanceId: String,
         workingDirectory: String,
+        /// The isolated checkout this agent was placed in, when there is one.
+        /// Recorded on the member so the topology names where the worker
+        /// actually is rather than where the creation plan said it would be.
+        isolatedCheckout: (path: String, branch: String?)? = nil,
         agentType: String,
         model: String,
         effort: String = "",
@@ -9629,7 +9656,7 @@ extension TeamOrchestrator {
             title: "\(Self.colorEmoji(color)) \(agentName) @\(host.displayName)"
         )
 
-        let member = AgentMember(
+        var member = AgentMember(
             id: "\(agentName)@\(team.id)",
             agentInstanceId: agentInstanceId,
             name: agentName,
@@ -9647,6 +9674,11 @@ extension TeamOrchestrator {
             hostKey: host.id,
             originalAgentWorkDir: workingDirectory
         )
+        // AgentMember's memberwise initializer orders these well before
+        // `originalAgentWorkDir`, so they are set here rather than threaded
+        // through every call site.
+        member.worktreePath = isolatedCheckout?.path
+        member.worktreeBranch = isolatedCheckout?.branch
         guard adoptAgentMember(member, teamName: team.id) else {
             _ = workspace.closePanel(panel.id, force: true)
             throw RemoteAgentError.duplicateInstance(member.agentInstanceId)
