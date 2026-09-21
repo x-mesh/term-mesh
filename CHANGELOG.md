@@ -4,6 +4,17 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.253.0] - 2026-09-21
+
+### Fixed
+
+- A Project leader on a peer host no longer treats its workers' isolated checkouts as if they did not exist. The leader's briefing stated that checkout isolation was unknown, which its scheduling rules read as a reason to serialize every write, so it did the work itself while its workers stayed idle. The leader is now told the isolation the project actually has, and may hand out independent work again.
+- Workers are briefed with the same checkout layout as their leader. A leader could be told its members held separate worktrees while each worker was told no isolation was active, so work the leader parallelized was refused or serialized on the other side.
+- A worker's own checkout path and branch now appear in `tm-agent status`, so a leader that asks where a member is gets the directory the worker is really in rather than nothing.
+- A leader's checkout table now says its paths are as of project creation and points at `tm-agent status` for the current ones. A worker that joins later takes its own checkout, and the leader's briefing cannot be rewritten afterwards.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.252.3] - 2026-09-20
 
 ### Fixed
