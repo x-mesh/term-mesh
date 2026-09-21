@@ -2483,9 +2483,164 @@ public nonisolated struct Termmesh_Peer_V1_RelaySurfaceTelemetry: Sendable {
 
   public var hostAggregateDroppedBytes: UInt64 = 0
 
+  public var inputPath: Termmesh_Peer_V1_InputPathTelemetry {
+    get {_inputPath ?? Termmesh_Peer_V1_InputPathTelemetry()}
+    set {_inputPath = newValue}
+  }
+  /// Returns true if `inputPath` has been explicitly set.
+  public var hasInputPath: Bool {self._inputPath != nil}
+  /// Clears the value of `inputPath`. Subsequent reads from it will return its default value.
+  public mutating func clearInputPath() {self._inputPath = nil}
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
+
+  fileprivate var _inputPath: Termmesh_Peer_V1_InputPathTelemetry? = nil
+}
+
+/// Bounded, payload-free timing for the GUI-host input path. A zero schema
+/// version means the reporting host does not implement this extension.
+public nonisolated struct Termmesh_Peer_V1_InputPathTelemetry: @unchecked Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var schemaVersion: UInt32 {
+    get {_storage._schemaVersion}
+    set {_uniqueStorage()._schemaVersion = newValue}
+  }
+
+  public var completedCount: UInt64 {
+    get {_storage._completedCount}
+    set {_uniqueStorage()._completedCount = newValue}
+  }
+
+  public var pendingCount: UInt64 {
+    get {_storage._pendingCount}
+    set {_uniqueStorage()._pendingCount = newValue}
+  }
+
+  public var expiredCount: UInt64 {
+    get {_storage._expiredCount}
+    set {_uniqueStorage()._expiredCount = newValue}
+  }
+
+  public var overflowCount: UInt64 {
+    get {_storage._overflowCount}
+    set {_uniqueStorage()._overflowCount = newValue}
+  }
+
+  public var invalidatedCount: UInt64 {
+    get {_storage._invalidatedCount}
+    set {_uniqueStorage()._invalidatedCount = newValue}
+  }
+
+  public var receiveToInjectN: UInt64 {
+    get {_storage._receiveToInjectN}
+    set {_uniqueStorage()._receiveToInjectN = newValue}
+  }
+
+  public var receiveToInjectP50Ns: UInt64 {
+    get {_storage._receiveToInjectP50Ns}
+    set {_uniqueStorage()._receiveToInjectP50Ns = newValue}
+  }
+
+  public var receiveToInjectP95Ns: UInt64 {
+    get {_storage._receiveToInjectP95Ns}
+    set {_uniqueStorage()._receiveToInjectP95Ns = newValue}
+  }
+
+  public var receiveToInjectP99Ns: UInt64 {
+    get {_storage._receiveToInjectP99Ns}
+    set {_uniqueStorage()._receiveToInjectP99Ns = newValue}
+  }
+
+  public var receiveToInjectMaxNs: UInt64 {
+    get {_storage._receiveToInjectMaxNs}
+    set {_uniqueStorage()._receiveToInjectMaxNs = newValue}
+  }
+
+  public var injectToRawCallbackN: UInt64 {
+    get {_storage._injectToRawCallbackN}
+    set {_uniqueStorage()._injectToRawCallbackN = newValue}
+  }
+
+  public var injectToRawCallbackP50Ns: UInt64 {
+    get {_storage._injectToRawCallbackP50Ns}
+    set {_uniqueStorage()._injectToRawCallbackP50Ns = newValue}
+  }
+
+  public var injectToRawCallbackP95Ns: UInt64 {
+    get {_storage._injectToRawCallbackP95Ns}
+    set {_uniqueStorage()._injectToRawCallbackP95Ns = newValue}
+  }
+
+  public var injectToRawCallbackP99Ns: UInt64 {
+    get {_storage._injectToRawCallbackP99Ns}
+    set {_uniqueStorage()._injectToRawCallbackP99Ns = newValue}
+  }
+
+  public var injectToRawCallbackMaxNs: UInt64 {
+    get {_storage._injectToRawCallbackMaxNs}
+    set {_uniqueStorage()._injectToRawCallbackMaxNs = newValue}
+  }
+
+  public var rawCallbackToPtyDataSendN: UInt64 {
+    get {_storage._rawCallbackToPtyDataSendN}
+    set {_uniqueStorage()._rawCallbackToPtyDataSendN = newValue}
+  }
+
+  public var rawCallbackToPtyDataSendP50Ns: UInt64 {
+    get {_storage._rawCallbackToPtyDataSendP50Ns}
+    set {_uniqueStorage()._rawCallbackToPtyDataSendP50Ns = newValue}
+  }
+
+  public var rawCallbackToPtyDataSendP95Ns: UInt64 {
+    get {_storage._rawCallbackToPtyDataSendP95Ns}
+    set {_uniqueStorage()._rawCallbackToPtyDataSendP95Ns = newValue}
+  }
+
+  public var rawCallbackToPtyDataSendP99Ns: UInt64 {
+    get {_storage._rawCallbackToPtyDataSendP99Ns}
+    set {_uniqueStorage()._rawCallbackToPtyDataSendP99Ns = newValue}
+  }
+
+  public var rawCallbackToPtyDataSendMaxNs: UInt64 {
+    get {_storage._rawCallbackToPtyDataSendMaxNs}
+    set {_uniqueStorage()._rawCallbackToPtyDataSendMaxNs = newValue}
+  }
+
+  public var receiveToPtyDataSendN: UInt64 {
+    get {_storage._receiveToPtyDataSendN}
+    set {_uniqueStorage()._receiveToPtyDataSendN = newValue}
+  }
+
+  public var receiveToPtyDataSendP50Ns: UInt64 {
+    get {_storage._receiveToPtyDataSendP50Ns}
+    set {_uniqueStorage()._receiveToPtyDataSendP50Ns = newValue}
+  }
+
+  public var receiveToPtyDataSendP95Ns: UInt64 {
+    get {_storage._receiveToPtyDataSendP95Ns}
+    set {_uniqueStorage()._receiveToPtyDataSendP95Ns = newValue}
+  }
+
+  public var receiveToPtyDataSendP99Ns: UInt64 {
+    get {_storage._receiveToPtyDataSendP99Ns}
+    set {_uniqueStorage()._receiveToPtyDataSendP99Ns = newValue}
+  }
+
+  public var receiveToPtyDataSendMaxNs: UInt64 {
+    get {_storage._receiveToPtyDataSendMaxNs}
+    set {_uniqueStorage()._receiveToPtyDataSendMaxNs = newValue}
+  }
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+
+  fileprivate var _storage = _StorageClass.defaultInstance
 }
 
 public nonisolated struct Termmesh_Peer_V1_RelayTelemetry: Sendable {
@@ -6688,7 +6843,7 @@ nonisolated extension Termmesh_Peer_V1_HostStats: SwiftProtobuf.Message, SwiftPr
 
 nonisolated extension Termmesh_Peer_V1_RelaySurfaceTelemetry: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".RelaySurfaceTelemetry"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}produced_chunks\0\u{3}produced_bytes\0\u{3}host_aggregate_dropped_chunks\0\u{3}host_aggregate_dropped_bytes\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}surface_id\0\u{3}produced_chunks\0\u{3}produced_bytes\0\u{3}host_aggregate_dropped_chunks\0\u{3}host_aggregate_dropped_bytes\0\u{3}input_path\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6701,12 +6856,17 @@ nonisolated extension Termmesh_Peer_V1_RelaySurfaceTelemetry: SwiftProtobuf.Mess
       case 3: try { try decoder.decodeSingularUInt64Field(value: &self.producedBytes) }()
       case 4: try { try decoder.decodeSingularUInt64Field(value: &self.hostAggregateDroppedChunks) }()
       case 5: try { try decoder.decodeSingularUInt64Field(value: &self.hostAggregateDroppedBytes) }()
+      case 6: try { try decoder.decodeSingularMessageField(value: &self._inputPath) }()
       default: break
       }
     }
   }
 
   public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
     if !self.surfaceID.isEmpty {
       try visitor.visitSingularBytesField(value: self.surfaceID, fieldNumber: 1)
     }
@@ -6722,6 +6882,9 @@ nonisolated extension Termmesh_Peer_V1_RelaySurfaceTelemetry: SwiftProtobuf.Mess
     if self.hostAggregateDroppedBytes != 0 {
       try visitor.visitSingularUInt64Field(value: self.hostAggregateDroppedBytes, fieldNumber: 5)
     }
+    try { if let v = self._inputPath {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 6)
+    } }()
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -6731,6 +6894,248 @@ nonisolated extension Termmesh_Peer_V1_RelaySurfaceTelemetry: SwiftProtobuf.Mess
     if lhs.producedBytes != rhs.producedBytes {return false}
     if lhs.hostAggregateDroppedChunks != rhs.hostAggregateDroppedChunks {return false}
     if lhs.hostAggregateDroppedBytes != rhs.hostAggregateDroppedBytes {return false}
+    if lhs._inputPath != rhs._inputPath {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Termmesh_Peer_V1_InputPathTelemetry: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".InputPathTelemetry"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}schema_version\0\u{3}completed_count\0\u{3}pending_count\0\u{3}expired_count\0\u{3}overflow_count\0\u{3}invalidated_count\0\u{4}\u{4}receive_to_inject_n\0\u{3}receive_to_inject_p50_ns\0\u{3}receive_to_inject_p95_ns\0\u{3}receive_to_inject_p99_ns\0\u{3}receive_to_inject_max_ns\0\u{4}\u{6}inject_to_raw_callback_n\0\u{3}inject_to_raw_callback_p50_ns\0\u{3}inject_to_raw_callback_p95_ns\0\u{3}inject_to_raw_callback_p99_ns\0\u{3}inject_to_raw_callback_max_ns\0\u{4}\u{6}raw_callback_to_pty_data_send_n\0\u{3}raw_callback_to_pty_data_send_p50_ns\0\u{3}raw_callback_to_pty_data_send_p95_ns\0\u{3}raw_callback_to_pty_data_send_p99_ns\0\u{3}raw_callback_to_pty_data_send_max_ns\0\u{4}\u{6}receive_to_pty_data_send_n\0\u{3}receive_to_pty_data_send_p50_ns\0\u{3}receive_to_pty_data_send_p95_ns\0\u{3}receive_to_pty_data_send_p99_ns\0\u{3}receive_to_pty_data_send_max_ns\0")
+
+  fileprivate class _StorageClass {
+    var _schemaVersion: UInt32 = 0
+    var _completedCount: UInt64 = 0
+    var _pendingCount: UInt64 = 0
+    var _expiredCount: UInt64 = 0
+    var _overflowCount: UInt64 = 0
+    var _invalidatedCount: UInt64 = 0
+    var _receiveToInjectN: UInt64 = 0
+    var _receiveToInjectP50Ns: UInt64 = 0
+    var _receiveToInjectP95Ns: UInt64 = 0
+    var _receiveToInjectP99Ns: UInt64 = 0
+    var _receiveToInjectMaxNs: UInt64 = 0
+    var _injectToRawCallbackN: UInt64 = 0
+    var _injectToRawCallbackP50Ns: UInt64 = 0
+    var _injectToRawCallbackP95Ns: UInt64 = 0
+    var _injectToRawCallbackP99Ns: UInt64 = 0
+    var _injectToRawCallbackMaxNs: UInt64 = 0
+    var _rawCallbackToPtyDataSendN: UInt64 = 0
+    var _rawCallbackToPtyDataSendP50Ns: UInt64 = 0
+    var _rawCallbackToPtyDataSendP95Ns: UInt64 = 0
+    var _rawCallbackToPtyDataSendP99Ns: UInt64 = 0
+    var _rawCallbackToPtyDataSendMaxNs: UInt64 = 0
+    var _receiveToPtyDataSendN: UInt64 = 0
+    var _receiveToPtyDataSendP50Ns: UInt64 = 0
+    var _receiveToPtyDataSendP95Ns: UInt64 = 0
+    var _receiveToPtyDataSendP99Ns: UInt64 = 0
+    var _receiveToPtyDataSendMaxNs: UInt64 = 0
+
+      // This property is used as the initial default value for new instances of the type.
+      // The type itself is protecting the reference to its storage via CoW semantics.
+      // This will force a copy to be made of this reference when the first mutation occurs;
+      // hence, it is safe to mark this as `nonisolated(unsafe)`.
+      static nonisolated(unsafe) let defaultInstance = _StorageClass()
+
+    private init() {}
+
+    init(copying source: _StorageClass) {
+      _schemaVersion = source._schemaVersion
+      _completedCount = source._completedCount
+      _pendingCount = source._pendingCount
+      _expiredCount = source._expiredCount
+      _overflowCount = source._overflowCount
+      _invalidatedCount = source._invalidatedCount
+      _receiveToInjectN = source._receiveToInjectN
+      _receiveToInjectP50Ns = source._receiveToInjectP50Ns
+      _receiveToInjectP95Ns = source._receiveToInjectP95Ns
+      _receiveToInjectP99Ns = source._receiveToInjectP99Ns
+      _receiveToInjectMaxNs = source._receiveToInjectMaxNs
+      _injectToRawCallbackN = source._injectToRawCallbackN
+      _injectToRawCallbackP50Ns = source._injectToRawCallbackP50Ns
+      _injectToRawCallbackP95Ns = source._injectToRawCallbackP95Ns
+      _injectToRawCallbackP99Ns = source._injectToRawCallbackP99Ns
+      _injectToRawCallbackMaxNs = source._injectToRawCallbackMaxNs
+      _rawCallbackToPtyDataSendN = source._rawCallbackToPtyDataSendN
+      _rawCallbackToPtyDataSendP50Ns = source._rawCallbackToPtyDataSendP50Ns
+      _rawCallbackToPtyDataSendP95Ns = source._rawCallbackToPtyDataSendP95Ns
+      _rawCallbackToPtyDataSendP99Ns = source._rawCallbackToPtyDataSendP99Ns
+      _rawCallbackToPtyDataSendMaxNs = source._rawCallbackToPtyDataSendMaxNs
+      _receiveToPtyDataSendN = source._receiveToPtyDataSendN
+      _receiveToPtyDataSendP50Ns = source._receiveToPtyDataSendP50Ns
+      _receiveToPtyDataSendP95Ns = source._receiveToPtyDataSendP95Ns
+      _receiveToPtyDataSendP99Ns = source._receiveToPtyDataSendP99Ns
+      _receiveToPtyDataSendMaxNs = source._receiveToPtyDataSendMaxNs
+    }
+  }
+
+  fileprivate mutating func _uniqueStorage() -> _StorageClass {
+    if !isKnownUniquelyReferenced(&_storage) {
+      _storage = _StorageClass(copying: _storage)
+    }
+    return _storage
+  }
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    _ = _uniqueStorage()
+    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
+      while let fieldNumber = try decoder.nextFieldNumber() {
+        // The use of inline closures is to circumvent an issue where the compiler
+        // allocates stack space for every case branch when no optimizations are
+        // enabled. https://github.com/apple/swift-protobuf/issues/1034
+        switch fieldNumber {
+        case 1: try { try decoder.decodeSingularUInt32Field(value: &_storage._schemaVersion) }()
+        case 2: try { try decoder.decodeSingularUInt64Field(value: &_storage._completedCount) }()
+        case 3: try { try decoder.decodeSingularUInt64Field(value: &_storage._pendingCount) }()
+        case 4: try { try decoder.decodeSingularUInt64Field(value: &_storage._expiredCount) }()
+        case 5: try { try decoder.decodeSingularUInt64Field(value: &_storage._overflowCount) }()
+        case 6: try { try decoder.decodeSingularUInt64Field(value: &_storage._invalidatedCount) }()
+        case 10: try { try decoder.decodeSingularUInt64Field(value: &_storage._receiveToInjectN) }()
+        case 11: try { try decoder.decodeSingularUInt64Field(value: &_storage._receiveToInjectP50Ns) }()
+        case 12: try { try decoder.decodeSingularUInt64Field(value: &_storage._receiveToInjectP95Ns) }()
+        case 13: try { try decoder.decodeSingularUInt64Field(value: &_storage._receiveToInjectP99Ns) }()
+        case 14: try { try decoder.decodeSingularUInt64Field(value: &_storage._receiveToInjectMaxNs) }()
+        case 20: try { try decoder.decodeSingularUInt64Field(value: &_storage._injectToRawCallbackN) }()
+        case 21: try { try decoder.decodeSingularUInt64Field(value: &_storage._injectToRawCallbackP50Ns) }()
+        case 22: try { try decoder.decodeSingularUInt64Field(value: &_storage._injectToRawCallbackP95Ns) }()
+        case 23: try { try decoder.decodeSingularUInt64Field(value: &_storage._injectToRawCallbackP99Ns) }()
+        case 24: try { try decoder.decodeSingularUInt64Field(value: &_storage._injectToRawCallbackMaxNs) }()
+        case 30: try { try decoder.decodeSingularUInt64Field(value: &_storage._rawCallbackToPtyDataSendN) }()
+        case 31: try { try decoder.decodeSingularUInt64Field(value: &_storage._rawCallbackToPtyDataSendP50Ns) }()
+        case 32: try { try decoder.decodeSingularUInt64Field(value: &_storage._rawCallbackToPtyDataSendP95Ns) }()
+        case 33: try { try decoder.decodeSingularUInt64Field(value: &_storage._rawCallbackToPtyDataSendP99Ns) }()
+        case 34: try { try decoder.decodeSingularUInt64Field(value: &_storage._rawCallbackToPtyDataSendMaxNs) }()
+        case 40: try { try decoder.decodeSingularUInt64Field(value: &_storage._receiveToPtyDataSendN) }()
+        case 41: try { try decoder.decodeSingularUInt64Field(value: &_storage._receiveToPtyDataSendP50Ns) }()
+        case 42: try { try decoder.decodeSingularUInt64Field(value: &_storage._receiveToPtyDataSendP95Ns) }()
+        case 43: try { try decoder.decodeSingularUInt64Field(value: &_storage._receiveToPtyDataSendP99Ns) }()
+        case 44: try { try decoder.decodeSingularUInt64Field(value: &_storage._receiveToPtyDataSendMaxNs) }()
+        default: break
+        }
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    try withExtendedLifetime(_storage) { (_storage: _StorageClass) in
+      if _storage._schemaVersion != 0 {
+        try visitor.visitSingularUInt32Field(value: _storage._schemaVersion, fieldNumber: 1)
+      }
+      if _storage._completedCount != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._completedCount, fieldNumber: 2)
+      }
+      if _storage._pendingCount != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._pendingCount, fieldNumber: 3)
+      }
+      if _storage._expiredCount != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._expiredCount, fieldNumber: 4)
+      }
+      if _storage._overflowCount != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._overflowCount, fieldNumber: 5)
+      }
+      if _storage._invalidatedCount != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._invalidatedCount, fieldNumber: 6)
+      }
+      if _storage._receiveToInjectN != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._receiveToInjectN, fieldNumber: 10)
+      }
+      if _storage._receiveToInjectP50Ns != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._receiveToInjectP50Ns, fieldNumber: 11)
+      }
+      if _storage._receiveToInjectP95Ns != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._receiveToInjectP95Ns, fieldNumber: 12)
+      }
+      if _storage._receiveToInjectP99Ns != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._receiveToInjectP99Ns, fieldNumber: 13)
+      }
+      if _storage._receiveToInjectMaxNs != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._receiveToInjectMaxNs, fieldNumber: 14)
+      }
+      if _storage._injectToRawCallbackN != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._injectToRawCallbackN, fieldNumber: 20)
+      }
+      if _storage._injectToRawCallbackP50Ns != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._injectToRawCallbackP50Ns, fieldNumber: 21)
+      }
+      if _storage._injectToRawCallbackP95Ns != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._injectToRawCallbackP95Ns, fieldNumber: 22)
+      }
+      if _storage._injectToRawCallbackP99Ns != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._injectToRawCallbackP99Ns, fieldNumber: 23)
+      }
+      if _storage._injectToRawCallbackMaxNs != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._injectToRawCallbackMaxNs, fieldNumber: 24)
+      }
+      if _storage._rawCallbackToPtyDataSendN != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._rawCallbackToPtyDataSendN, fieldNumber: 30)
+      }
+      if _storage._rawCallbackToPtyDataSendP50Ns != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._rawCallbackToPtyDataSendP50Ns, fieldNumber: 31)
+      }
+      if _storage._rawCallbackToPtyDataSendP95Ns != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._rawCallbackToPtyDataSendP95Ns, fieldNumber: 32)
+      }
+      if _storage._rawCallbackToPtyDataSendP99Ns != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._rawCallbackToPtyDataSendP99Ns, fieldNumber: 33)
+      }
+      if _storage._rawCallbackToPtyDataSendMaxNs != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._rawCallbackToPtyDataSendMaxNs, fieldNumber: 34)
+      }
+      if _storage._receiveToPtyDataSendN != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._receiveToPtyDataSendN, fieldNumber: 40)
+      }
+      if _storage._receiveToPtyDataSendP50Ns != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._receiveToPtyDataSendP50Ns, fieldNumber: 41)
+      }
+      if _storage._receiveToPtyDataSendP95Ns != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._receiveToPtyDataSendP95Ns, fieldNumber: 42)
+      }
+      if _storage._receiveToPtyDataSendP99Ns != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._receiveToPtyDataSendP99Ns, fieldNumber: 43)
+      }
+      if _storage._receiveToPtyDataSendMaxNs != 0 {
+        try visitor.visitSingularUInt64Field(value: _storage._receiveToPtyDataSendMaxNs, fieldNumber: 44)
+      }
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Termmesh_Peer_V1_InputPathTelemetry, rhs: Termmesh_Peer_V1_InputPathTelemetry) -> Bool {
+    if lhs._storage !== rhs._storage {
+      let storagesAreEqual: Bool = withExtendedLifetime((lhs._storage, rhs._storage)) { (_args: (_StorageClass, _StorageClass)) in
+        let _storage = _args.0
+        let rhs_storage = _args.1
+        if _storage._schemaVersion != rhs_storage._schemaVersion {return false}
+        if _storage._completedCount != rhs_storage._completedCount {return false}
+        if _storage._pendingCount != rhs_storage._pendingCount {return false}
+        if _storage._expiredCount != rhs_storage._expiredCount {return false}
+        if _storage._overflowCount != rhs_storage._overflowCount {return false}
+        if _storage._invalidatedCount != rhs_storage._invalidatedCount {return false}
+        if _storage._receiveToInjectN != rhs_storage._receiveToInjectN {return false}
+        if _storage._receiveToInjectP50Ns != rhs_storage._receiveToInjectP50Ns {return false}
+        if _storage._receiveToInjectP95Ns != rhs_storage._receiveToInjectP95Ns {return false}
+        if _storage._receiveToInjectP99Ns != rhs_storage._receiveToInjectP99Ns {return false}
+        if _storage._receiveToInjectMaxNs != rhs_storage._receiveToInjectMaxNs {return false}
+        if _storage._injectToRawCallbackN != rhs_storage._injectToRawCallbackN {return false}
+        if _storage._injectToRawCallbackP50Ns != rhs_storage._injectToRawCallbackP50Ns {return false}
+        if _storage._injectToRawCallbackP95Ns != rhs_storage._injectToRawCallbackP95Ns {return false}
+        if _storage._injectToRawCallbackP99Ns != rhs_storage._injectToRawCallbackP99Ns {return false}
+        if _storage._injectToRawCallbackMaxNs != rhs_storage._injectToRawCallbackMaxNs {return false}
+        if _storage._rawCallbackToPtyDataSendN != rhs_storage._rawCallbackToPtyDataSendN {return false}
+        if _storage._rawCallbackToPtyDataSendP50Ns != rhs_storage._rawCallbackToPtyDataSendP50Ns {return false}
+        if _storage._rawCallbackToPtyDataSendP95Ns != rhs_storage._rawCallbackToPtyDataSendP95Ns {return false}
+        if _storage._rawCallbackToPtyDataSendP99Ns != rhs_storage._rawCallbackToPtyDataSendP99Ns {return false}
+        if _storage._rawCallbackToPtyDataSendMaxNs != rhs_storage._rawCallbackToPtyDataSendMaxNs {return false}
+        if _storage._receiveToPtyDataSendN != rhs_storage._receiveToPtyDataSendN {return false}
+        if _storage._receiveToPtyDataSendP50Ns != rhs_storage._receiveToPtyDataSendP50Ns {return false}
+        if _storage._receiveToPtyDataSendP95Ns != rhs_storage._receiveToPtyDataSendP95Ns {return false}
+        if _storage._receiveToPtyDataSendP99Ns != rhs_storage._receiveToPtyDataSendP99Ns {return false}
+        if _storage._receiveToPtyDataSendMaxNs != rhs_storage._receiveToPtyDataSendMaxNs {return false}
+        return true
+      }
+      if !storagesAreEqual {return false}
+    }
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

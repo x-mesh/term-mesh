@@ -948,6 +948,42 @@ message RelaySurfaceTelemetry {
   // with its receiver_gap_* counters.
   uint64 host_aggregate_dropped_chunks = 4;
   uint64 host_aggregate_dropped_bytes = 5;
+  InputPathTelemetry input_path = 6;
+}
+
+// Bounded, payload-free timing for the GUI-host input path. A zero schema
+// version means the reporting host does not implement this extension.
+message InputPathTelemetry {
+  uint32 schema_version = 1;
+  uint64 completed_count = 2;
+  uint64 pending_count = 3;
+  uint64 expired_count = 4;
+  uint64 overflow_count = 5;
+  uint64 invalidated_count = 6;
+
+  uint64 receive_to_inject_n = 10;
+  uint64 receive_to_inject_p50_ns = 11;
+  uint64 receive_to_inject_p95_ns = 12;
+  uint64 receive_to_inject_p99_ns = 13;
+  uint64 receive_to_inject_max_ns = 14;
+
+  uint64 inject_to_raw_callback_n = 20;
+  uint64 inject_to_raw_callback_p50_ns = 21;
+  uint64 inject_to_raw_callback_p95_ns = 22;
+  uint64 inject_to_raw_callback_p99_ns = 23;
+  uint64 inject_to_raw_callback_max_ns = 24;
+
+  uint64 raw_callback_to_pty_data_send_n = 30;
+  uint64 raw_callback_to_pty_data_send_p50_ns = 31;
+  uint64 raw_callback_to_pty_data_send_p95_ns = 32;
+  uint64 raw_callback_to_pty_data_send_p99_ns = 33;
+  uint64 raw_callback_to_pty_data_send_max_ns = 34;
+
+  uint64 receive_to_pty_data_send_n = 40;
+  uint64 receive_to_pty_data_send_p50_ns = 41;
+  uint64 receive_to_pty_data_send_p95_ns = 42;
+  uint64 receive_to_pty_data_send_p99_ns = 43;
+  uint64 receive_to_pty_data_send_max_ns = 44;
 }
 
 message RelayTelemetry {

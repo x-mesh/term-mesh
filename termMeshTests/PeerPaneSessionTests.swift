@@ -90,6 +90,28 @@ final class PeerRelayCurrentSessionSlotTests: XCTestCase {
 }
 
 final class RelayTelemetryStoreTests: XCTestCase {
+    func testHostInputPathTelemetryMapsOnlyWhenSchemaIsPresent() {
+        let store = RelayTelemetryStore()
+        let surfaceID = Data(repeating: 0xA5, count: 16)
+        var surface = Termmesh_Peer_V1_RelaySurfaceTelemetry()
+        surface.surfaceID = surfaceID
+        surface.inputPath.schemaVersion = 1
+        surface.inputPath.completedCount = 3
+        surface.inputPath.receiveToInjectN = 3
+        surface.inputPath.receiveToInjectP50Ns = 2_000_000
+        surface.inputPath.receiveToInjectP95Ns = 4_000_000
+        surface.inputPath.receiveToInjectP99Ns = 5_000_000
+        surface.inputPath.receiveToInjectMaxNs = 6_000_000
+        var sample = Termmesh_Peer_V1_RelayTelemetry()
+        sample.surfaces = [surface]
+        store.record(sample, surfaceID: surfaceID)
+
+        let path = store.status()["host_input_path"] as? [String: Any]
+        XCTAssertEqual(path?["scope"] as? String, "next_raw_output_after_input")
+        XCTAssertEqual(path?["completed_count"] as? UInt64, 3)
+        XCTAssertEqual((path?["receive_to_inject"] as? [String: Any])?["p50_ms"] as? Double, 2)
+    }
+
     func testHostAggregateDropsStaySeparateFromViewerGapsAndResetOnReconnect() {
         let store = RelayTelemetryStore()
         let surfaceID = Data(repeating: 0xA5, count: 16)
@@ -133,6 +155,73 @@ final class RelayTelemetryStoreTests: XCTestCase {
         XCTAssertNil(afterReplacement["transport_timeout_count"])
         XCTAssertEqual(afterReplacement["receiver_gap_bytes_total"] as? UInt64, 12)
 
+    }
+}
+
+final class PeerInputPathTelemetrySettingTests: XCTestCase {
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: PeerFederationSettings.inputPathTelemetryKey)
+        super.tearDown()
+    }
+
+    func testMeasurementIsOffUnlessTheUserTurnsItOn() {
+        UserDefaults.standard.removeObject(forKey: PeerFederationSettings.inputPathTelemetryKey)
+        XCTAssertFalse(PeerFederationSettings.inputPathTelemetryEnabled)
+        UserDefaults.standard.set(true, forKey: PeerFederationSettings.inputPathTelemetryKey)
+        XCTAssertTrue(PeerFederationSettings.inputPathTelemetryEnabled)
+    }
+}
+
+final class PeerInputPathLatencyTrackerTests: XCTestCase {
+    func testDisabledTrackerRecordsNothing() {
+        let tracker = PeerInputPathLatencyTracker()
+        tracker.recordReceived(at: 100)
+        tracker.recordInjected(afterRawBoundary: 10, at: 120)
+        tracker.observeRawCallback(boundary: 11, at: 150)
+        tracker.observeDelivery(boundary: 11, at: 190)
+        XCTAssertNil(tracker.snapshot())
+    }
+
+    func testEnablingClearsTheWindowMeasuredWhileDisabled() {
+        let tracker = PeerInputPathLatencyTracker()
+        tracker.refresh(enabled: true)
+        tracker.recordReceived(at: 100)
+        tracker.refresh(enabled: false)
+        tracker.refresh(enabled: true)
+        XCTAssertEqual(tracker.snapshot()?.pendingCount, 0)
+    }
+
+    func testOrderedTimingCompletesAndInvalidationClearsPending() {
+        let tracker = PeerInputPathLatencyTracker()
+        tracker.refresh(enabled: true)
+        tracker.recordReceived(at: 100)
+        tracker.recordInjected(afterRawBoundary: 10, at: 120)
+        tracker.observeRawCallback(boundary: 11, at: 150)
+        tracker.observeDelivery(boundary: 11, at: 190)
+        var snapshot = tracker.snapshot()
+        XCTAssertEqual(snapshot?.completedCount, 1)
+        XCTAssertEqual(snapshot?.receiveToInjectP50Ns, 20)
+        XCTAssertEqual(snapshot?.injectToRawCallbackP50Ns, 30)
+        XCTAssertEqual(snapshot?.rawCallbackToPtyDataSendP50Ns, 40)
+        XCTAssertEqual(snapshot?.receiveToPtyDataSendP50Ns, 90)
+
+        tracker.recordReceived(at: 200)
+        tracker.recordInjected(afterRawBoundary: 11, at: 210)
+        tracker.invalidate()
+        snapshot = tracker.snapshot()
+        XCTAssertEqual(snapshot?.pendingCount, 0)
+        XCTAssertEqual(snapshot?.invalidatedCount, 1)
+    }
+
+    func testCapacityOverflowIsBounded() {
+        let tracker = PeerInputPathLatencyTracker()
+        tracker.refresh(enabled: true)
+        for value in 0...512 {
+            tracker.recordReceived(at: UInt64(value))
+        }
+        let snapshot = tracker.snapshot()
+        XCTAssertEqual(snapshot?.pendingCount, 512)
+        XCTAssertEqual(snapshot?.overflowCount, 1)
     }
 }
 

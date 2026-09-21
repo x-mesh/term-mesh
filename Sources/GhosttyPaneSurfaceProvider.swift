@@ -220,6 +220,7 @@ struct RawToFilteredCheckpointStore {
 struct RawOutputDrainBatch {
     let bytes: Data
     let rawEnd: UInt64
+    let callbackAtNs: UInt64
 }
 
 struct RawOutputDrainBuffer {
@@ -227,6 +228,7 @@ struct RawOutputDrainBuffer {
 
     private var bytes = Data()
     private var rawEnd: UInt64?
+    private var callbackAtNs: UInt64 = 0
 
     init() {
         bytes.reserveCapacity(64 * 1024)
@@ -235,25 +237,29 @@ struct RawOutputDrainBuffer {
     mutating func append(
         _ source: UnsafePointer<UInt8>,
         count: Int,
-        rawEnd: UInt64
+        rawEnd: UInt64,
+        callbackAtNs: UInt64 = 0
     ) -> Bool {
         guard count <= Self.byteLimit - bytes.count else { return false }
         bytes.append(source, count: count)
         self.rawEnd = rawEnd
+        if self.callbackAtNs == 0 { self.callbackAtNs = callbackAtNs }
         return true
     }
 
     mutating func take() -> RawOutputDrainBatch? {
         guard let rawEnd else { return nil }
-        let batch = RawOutputDrainBatch(bytes: bytes, rawEnd: rawEnd)
+        let batch = RawOutputDrainBatch(bytes: bytes, rawEnd: rawEnd, callbackAtNs: callbackAtNs)
         bytes.removeAll(keepingCapacity: true)
         self.rawEnd = nil
+        callbackAtNs = 0
         return batch
     }
 
     mutating func discard() {
         bytes.removeAll(keepingCapacity: true)
         rawEnd = nil
+        callbackAtNs = 0
     }
 }
 
@@ -262,6 +268,157 @@ private enum RawOutputDrainStep {
     case closed
     case overflowed
     case idle
+}
+
+/// Bounded stage timing for one attachment's input path, off unless the
+/// user turns `PeerFederationSettings.inputPathTelemetryEnabled` on.
+///
+/// Every entry point returns immediately while disabled, and the flag is
+/// re-read on the telemetry tick, so the setting can be flipped on a host
+/// that is already mirroring.
+final class PeerInputPathLatencyTracker: @unchecked Sendable {
+    private static let capacity = 512
+    private static let expiryNs: UInt64 = 10_000_000_000
+
+    private struct Pending {
+        let receivedAtNs: UInt64
+        var injectedAtNs: UInt64 = 0
+        var minimumRawBoundary: UInt64 = 0
+        var rawAtNs: UInt64 = 0
+        var rawBoundary: UInt64 = 0
+    }
+
+    private struct Sample {
+        let receiveToInject: UInt64
+        let injectToRaw: UInt64
+        let rawToSend: UInt64
+        let receiveToSend: UInt64
+    }
+
+    private let lock = NSLock()
+    private var enabled = false
+    private var pending: [Pending] = []
+    private var samples: [Sample] = []
+    private var expired: UInt64 = 0
+    private var overflow: UInt64 = 0
+    private var invalidated: UInt64 = 0
+
+    /// Adopt the current setting. Switching either way drops the accumulated
+    /// window: percentiles spanning a gap in measurement describe nothing.
+    func refresh(enabled nowEnabled: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        guard enabled != nowEnabled else { return }
+        enabled = nowEnabled
+        pending.removeAll(keepingCapacity: false)
+        samples.removeAll(keepingCapacity: false)
+        expired = 0
+        overflow = 0
+        invalidated = 0
+    }
+
+    func recordReceived(at now: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        guard enabled else { return }
+        expire(now)
+        guard pending.count < Self.capacity else { overflow &+= 1; return }
+        pending.append(Pending(receivedAtNs: now))
+    }
+
+    func recordInjected(afterRawBoundary boundary: UInt64, at now: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        guard enabled else { return }
+        expire(now)
+        guard let index = pending.firstIndex(where: { $0.injectedAtNs == 0 }) else { return }
+        pending[index].injectedAtNs = now
+        pending[index].minimumRawBoundary = boundary
+    }
+
+    func observeRawCallback(boundary: UInt64, at now: UInt64) {
+        guard boundary != 0 else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard enabled else { return }
+        expire(now)
+        guard let index = pending.firstIndex(where: {
+            $0.injectedAtNs != 0 && $0.rawAtNs == 0 && boundary > $0.minimumRawBoundary
+        }) else { return }
+        guard now >= pending[index].injectedAtNs else { invalidated &+= 1; return }
+        pending[index].rawAtNs = now
+        pending[index].rawBoundary = boundary
+    }
+
+    func observeDelivery(boundary: UInt64, at now: UInt64) {
+        guard boundary != 0 else { return }
+        lock.lock(); defer { lock.unlock() }
+        guard enabled else { return }
+        expire(now)
+        guard let index = pending.firstIndex(where: { $0.rawBoundary == boundary }) else { return }
+        let item = pending.remove(at: index)
+        guard now >= item.rawAtNs, item.rawAtNs >= item.injectedAtNs,
+              item.injectedAtNs >= item.receivedAtNs else { invalidated &+= 1; return }
+        let sample = Sample(
+            receiveToInject: item.injectedAtNs - item.receivedAtNs,
+            injectToRaw: item.rawAtNs - item.injectedAtNs,
+            rawToSend: now - item.rawAtNs,
+            receiveToSend: now - item.receivedAtNs
+        )
+        if samples.count == Self.capacity { samples.removeFirst(); overflow &+= 1 }
+        samples.append(sample)
+    }
+
+    func invalidate() {
+        lock.lock(); defer { lock.unlock() }
+        guard enabled else { return }
+        invalidated &+= UInt64(pending.count)
+        pending.removeAll(keepingCapacity: true)
+    }
+
+    func snapshot() -> Termmesh_Peer_V1_InputPathTelemetry? {
+        lock.lock()
+        guard enabled else { lock.unlock(); return nil }
+        let snapshot = samples
+        let pendingCount = pending.count
+        let expired = expired
+        let overflow = overflow
+        let invalidated = invalidated
+        lock.unlock()
+        var result = Termmesh_Peer_V1_InputPathTelemetry()
+        result.schemaVersion = 1
+        result.completedCount = UInt64(snapshot.count)
+        result.pendingCount = UInt64(pendingCount)
+        result.expiredCount = expired
+        result.overflowCount = overflow
+        result.invalidatedCount = invalidated
+        apply(snapshot.map(\.receiveToInject), to: &result, stage: 0)
+        apply(snapshot.map(\.injectToRaw), to: &result, stage: 1)
+        apply(snapshot.map(\.rawToSend), to: &result, stage: 2)
+        apply(snapshot.map(\.receiveToSend), to: &result, stage: 3)
+        return result
+    }
+
+    private func expire(_ now: UInt64) {
+        let before = pending.count
+        pending.removeAll { now >= $0.receivedAtNs && now - $0.receivedAtNs >= Self.expiryNs }
+        expired &+= UInt64(before - pending.count)
+    }
+
+    private func apply(_ values: [UInt64], to result: inout Termmesh_Peer_V1_InputPathTelemetry, stage: Int) {
+        let sorted = values.sorted()
+        let n = UInt64(sorted.count)
+        let p: (Int) -> UInt64 = { percent in
+            guard !sorted.isEmpty else { return 0 }
+            return sorted[(sorted.count * percent + 99) / 100 - 1]
+        }
+        switch stage {
+        case 0:
+            result.receiveToInjectN = n; result.receiveToInjectP50Ns = p(50); result.receiveToInjectP95Ns = p(95); result.receiveToInjectP99Ns = p(99); result.receiveToInjectMaxNs = sorted.last ?? 0
+        case 1:
+            result.injectToRawCallbackN = n; result.injectToRawCallbackP50Ns = p(50); result.injectToRawCallbackP95Ns = p(95); result.injectToRawCallbackP99Ns = p(99); result.injectToRawCallbackMaxNs = sorted.last ?? 0
+        case 2:
+            result.rawCallbackToPtyDataSendN = n; result.rawCallbackToPtyDataSendP50Ns = p(50); result.rawCallbackToPtyDataSendP95Ns = p(95); result.rawCallbackToPtyDataSendP99Ns = p(99); result.rawCallbackToPtyDataSendMaxNs = sorted.last ?? 0
+        default:
+            result.receiveToPtyDataSendN = n; result.receiveToPtyDataSendP50Ns = p(50); result.receiveToPtyDataSendP95Ns = p(95); result.receiveToPtyDataSendP99Ns = p(99); result.receiveToPtyDataSendMaxNs = sorted.last ?? 0
+        }
+    }
 }
 
 /// One Ghostty PTY callback per surface, fan-out to bounded per-peer streams.
@@ -301,6 +458,11 @@ final class PtyTapHub: @unchecked Sendable {
     private var rawDrainScheduled = false
     private var rawDrainOverflowed = false
     private var rawDrainClosed = false
+    private var latestRawOutputBoundary: UInt64 = 0
+    /// Guarded by `rawDrainLock` so the raw-output callback reads it inside
+    /// the critical section it already holds: measurement costs one branch
+    /// per callback while off, not a second lock.
+    private var inputPathTelemetryEnabled = false
     /// Cumulative bytes ever broadcast through this hub. Advanced under
     /// `lock` for EVERY chunk — including ones a consumer's bounded
     /// buffer then drops — and stamped onto each `PtyTapChunk.seq`, so a
@@ -595,7 +757,12 @@ final class PtyTapHub: @unchecked Sendable {
             rawDrainLock.unlock()
             return
         }
-        if !rawDrainBuffer.append(source, count: length, rawEnd: rawEnd) {
+        latestRawOutputBoundary = rawEnd
+        if !rawDrainBuffer.append(
+            source, count: length, rawEnd: rawEnd,
+            callbackAtNs: inputPathTelemetryEnabled
+                ? DispatchTime.now().uptimeNanoseconds : 0
+        ) {
             rawDrainOverflowed = true
         }
         let shouldSchedule = !rawDrainScheduled
@@ -607,6 +774,22 @@ final class PtyTapHub: @unchecked Sendable {
                 await self?.drainRawOutput()
             }
         }
+    }
+
+    /// A zero `callbackAtNs` on every chunk is what makes the relay send
+    /// path skip its own input-path work, so this flag gates the whole
+    /// measurement, not just the timestamp.
+    func setInputPathTelemetry(enabled: Bool) {
+        rawDrainLock.lock()
+        inputPathTelemetryEnabled = enabled
+        rawDrainLock.unlock()
+    }
+
+    func rawOutputBoundary() -> UInt64 {
+        rawDrainLock.lock()
+        let boundary = latestRawOutputBoundary
+        rawDrainLock.unlock()
+        return boundary
     }
 
     private func drainRawOutput() async {
@@ -623,7 +806,7 @@ final class PtyTapHub: @unchecked Sendable {
                 finishAll()
                 continue
             case .batch(let batch):
-                consumeRawOutput(batch.bytes, rawEnd: batch.rawEnd)
+                consumeRawOutput(batch.bytes, rawEnd: batch.rawEnd, callbackAtNs: batch.callbackAtNs)
             }
         }
     }
@@ -648,7 +831,7 @@ final class PtyTapHub: @unchecked Sendable {
         return .batch(batch)
     }
 
-    private func consumeRawOutput(_ rawBytes: Data, rawEnd: UInt64) {
+    private func consumeRawOutput(_ rawBytes: Data, rawEnd: UInt64, callbackAtNs: UInt64 = 0) {
         filterLock.lock()
         let bytes = queryStripper.strip(rawBytes)
         lock.lock()
@@ -658,7 +841,10 @@ final class PtyTapHub: @unchecked Sendable {
             replay.push(bytes)
             producedChunks &+= 1
             producedBytes &+= UInt64(bytes.count)
-            let chunk = PtyTapChunk(bytes: bytes, seq: tapSeq)
+            let chunk = PtyTapChunk(
+                bytes: bytes, seq: tapSeq, callbackBoundary: rawEnd,
+                callbackAtNs: callbackAtNs
+            )
             tapSeq &+= UInt64(bytes.count)
             var droppedCount: UInt64?
             for continuation in continuations.values {
@@ -1320,10 +1506,15 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
         // FIX A: capture key at attach time so the detach closure can clean up
         // peerPendingInputTail even if the TerminalSurface is already freed.
         let sfcPtrKey = UInt(bitPattern: sfcPtr)
+        let inputPathTracker = PeerInputPathLatencyTracker()
+        let inputPathEnabled = PeerFederationSettings.inputPathTelemetryEnabled
+        inputPathTracker.refresh(enabled: inputPathEnabled)
+        hub.setInputPathTelemetry(enabled: inputPathEnabled)
 
         let inputStallGate = RelayStallLogGateBox()
         let input: @Sendable (Data) async -> Void = { [weakTS] bytes in
             let arrivedAt = DispatchTime.now().uptimeNanoseconds
+            inputPathTracker.recordReceived(at: arrivedAt)
             let wrote = await MainActor.run { () -> Bool in
                 guard let terminalSurface = weakTS.value,
                       let ptr = terminalSurface.surface else { return false }
@@ -1334,6 +1525,10 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
                 // Track a weak surface ref so a deferred lone-Escape tail can be
                 // flushed later without capturing the raw (non-Sendable) pointer.
                 peerSurfaceRefForKey[UInt(bitPattern: ptr)] = weakTS
+                inputPathTracker.recordInjected(
+                    afterRawBoundary: hub.rawOutputBoundary(),
+                    at: DispatchTime.now().uptimeNanoseconds
+                )
                 sendPeerInputBytes(ptr, bytes: bytes)
                 return true
             }
@@ -1474,6 +1669,25 @@ final class GhosttyPaneSurfaceProvider: PeerSurfaceProvider {
             resync: { [weak hub] in
                 guard let hub else { return nil }
                 return await hub.atomicResyncSnapshot(surface: sfcPtr)
+            },
+            observeInputPathRawCallback: { boundary, timestamp in
+                inputPathTracker.observeRawCallback(boundary: boundary, at: timestamp)
+            },
+            observeInputPathDelivery: { boundary, timestamp in
+                inputPathTracker.observeDelivery(boundary: boundary, at: timestamp)
+            },
+            invalidateInputPath: {
+                inputPathTracker.invalidate()
+            },
+            inputPathTelemetry: { [weak hub] in
+                // The telemetry tick is the refresh point: it already runs
+                // per attached surface every couple of seconds, and it is
+                // the only place off the hot path that both the tracker and
+                // the hub can be reached.
+                let enabled = PeerFederationSettings.inputPathTelemetryEnabled
+                hub?.setInputPathTelemetry(enabled: enabled)
+                inputPathTracker.refresh(enabled: enabled)
+                return inputPathTracker.snapshot()
             },
             detach: detach
         )

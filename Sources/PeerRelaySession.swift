@@ -1661,6 +1661,28 @@ final class RelayTelemetryStore: @unchecked Sendable {
             result["transport_wait_ns_total"] = remoteTransport.waitNsTotal
             result["transport_wait_ns_max"] = remoteTransport.waitNsMax
             result["transport_timeout_count"] = remoteTransport.timeoutCount
+            if remote.inputPath.schemaVersion != 0 {
+                func distribution(
+                    _ n: UInt64, _ p50: UInt64, _ p95: UInt64, _ p99: UInt64, _ max: UInt64
+                ) -> [String: Any] {
+                    ["n": n, "p50_ms": Double(p50) / 1_000_000,
+                     "p95_ms": Double(p95) / 1_000_000, "p99_ms": Double(p99) / 1_000_000,
+                     "max_ms": Double(max) / 1_000_000]
+                }
+                let inputPath = remote.inputPath
+                result["host_input_path"] = [
+                    "scope": "next_raw_output_after_input",
+                    "completed_count": inputPath.completedCount,
+                    "pending_count": inputPath.pendingCount,
+                    "expired_count": inputPath.expiredCount,
+                    "overflow_count": inputPath.overflowCount,
+                    "invalidated_count": inputPath.invalidatedCount,
+                    "receive_to_inject": distribution(inputPath.receiveToInjectN, inputPath.receiveToInjectP50Ns, inputPath.receiveToInjectP95Ns, inputPath.receiveToInjectP99Ns, inputPath.receiveToInjectMaxNs),
+                    "inject_to_raw_callback": distribution(inputPath.injectToRawCallbackN, inputPath.injectToRawCallbackP50Ns, inputPath.injectToRawCallbackP95Ns, inputPath.injectToRawCallbackP99Ns, inputPath.injectToRawCallbackMaxNs),
+                    "raw_callback_to_pty_data_send": distribution(inputPath.rawCallbackToPtyDataSendN, inputPath.rawCallbackToPtyDataSendP50Ns, inputPath.rawCallbackToPtyDataSendP95Ns, inputPath.rawCallbackToPtyDataSendP99Ns, inputPath.rawCallbackToPtyDataSendMaxNs),
+                    "receive_to_pty_data_send": distribution(inputPath.receiveToPtyDataSendN, inputPath.receiveToPtyDataSendP50Ns, inputPath.receiveToPtyDataSendP95Ns, inputPath.receiveToPtyDataSendP99Ns, inputPath.receiveToPtyDataSendMaxNs),
+                ]
+            }
         }
         return result
     }
