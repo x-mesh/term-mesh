@@ -7141,6 +7141,7 @@ fn team_checkout_topology_lines(result: &Value, task: &Value) -> Vec<String> {
     // every all-peer team. Falling back keeps an older app working.
     let mode = result["checkout_mode"]
         .as_str()
+        .filter(|mode| !mode.is_empty() && *mode != "unknown")
         .or_else(|| result["worktree_mode"].as_str())
         .unwrap_or("unknown");
     let leader_path = result["working_directory"].as_str().unwrap_or("unknown");
@@ -7223,6 +7224,31 @@ mod checkout_contract_tests {
         assert!(rendered.contains("TEAM_CHECKOUT_MODE: isolated"));
         assert!(rendered.contains("PEER_CHECKOUT: name=reviewer instance=b branch=team/b path=/wt/b"));
         assert!(!rendered.contains("PEER_CHECKOUT: name=executor instance=a"));
+    }
+
+    #[test]
+    fn topology_prefers_the_recorded_checkout_mode() {
+        // `worktree_mode` is "off" for every all-peer team even when the
+        // bootstrap isolated every member, so the worker brief would tell an
+        // agent not to write where its leader had just sent it.
+        let status = json!({"checkout_mode":"isolated","worktree_mode":"off","working_directory":"/repo","integration_target_path":"/repo","agents": [
+            {"name":"executor","agent_instance_id":"a","worktree_path":"/wt/a","worktree_branch":"team/a"},
+            {"name":"reviewer","agent_instance_id":"b","worktree_path":"/wt/b","worktree_branch":"team/b"}
+        ]});
+        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"a"})).join("\n");
+        assert!(rendered.contains("TEAM_CHECKOUT_MODE: isolated"));
+        assert!(rendered.contains("ownership-disjoint write tasks may run concurrently"));
+    }
+
+    #[test]
+    fn topology_falls_back_when_the_record_says_nothing() {
+        // An older app, or a resumed headless team whose flag is the accurate
+        // answer: an "unknown" record must not shadow it.
+        let status = json!({"checkout_mode":"unknown","worktree_mode":"isolated","working_directory":"/repo","integration_target_path":"/repo","agents": [
+            {"name":"executor","agent_instance_id":"a","worktree_path":"/wt/a","worktree_branch":"team/a"}
+        ]});
+        let rendered = team_checkout_topology_lines(&status, &json!({"agent_instance_id":"b"})).join("\n");
+        assert!(rendered.contains("TEAM_CHECKOUT_MODE: isolated"));
     }
 
     #[test]

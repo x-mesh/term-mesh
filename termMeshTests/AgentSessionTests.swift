@@ -609,69 +609,33 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(TeamOrchestrator.checkoutTopologyRule(worktreeMode: "unknown").contains("is unknown"))
     }
 
-    /// The mode is read off the checkouts because the stored flag answers a
-    /// different question: an all-peer roster records "off" while every peer
-    /// member still gets its own bootstrap checkout.
-    func testCheckoutModeIsDerivedFromTheCheckoutsThemselves() {
-        typealias Worker = (name: String, instance: String, branch: String?, path: String?)
-        func mode(_ workers: [Worker], hosts: [String?]? = nil) -> String {
-            TeamOrchestrator.derivedCheckoutMode(
-                leaderPath: "/repo",
-                workers: workers,
-                hostKeys: hosts ?? Array(repeating: "ssh:peer", count: workers.count)
+    /// `worktreeMode` answers whether this team asked for LOCAL git
+    /// worktrees, and `NewProjectView` records "off" for it whenever the
+    /// roster has no local member — every all-peer project. Briefing off that
+    /// flag told those leaders and their workers there was no isolation to
+    /// work in. The recorded layout answers instead, and a team that predates
+    /// the record keeps its old answer.
+    func testEffectiveCheckoutModePrefersTheRecordedLayout() {
+        func mode(_ checkout: String, _ worktree: String) -> String {
+            TeamOrchestrator.effectiveCheckoutMode(
+                checkoutMode: checkout, worktreeMode: worktree
             )
         }
-        XCTAssertEqual(
-            mode([("executor", "a", "team/a", "/wt/a"), ("reviewer", "b", "team/b", "/wt/b")]),
-            "isolated"
-        )
-        // Everyone in the leader's own checkout: the shared-write hazard.
-        XCTAssertEqual(
-            mode([("executor", "a", "team/a", "/repo"), ("reviewer", "b", "team/b", "/repo")]),
-            "shared"
-        )
-        // One checkout that is not the leader's is still one checkout.
-        XCTAssertEqual(mode([("executor", "a", nil, "/wt/x"), ("reviewer", "b", nil, "/wt/x")]), "shared")
-        // A member whose path is unknown makes the whole layout unknown.
-        XCTAssertEqual(mode([("executor", "a", "team/a", "/wt/a"), ("reviewer", "b", "team/b", nil)]), "unknown")
-        // Partly shared is neither rule.
-        XCTAssertEqual(
-            mode([("executor", "a", "t/a", "/wt/a"), ("reviewer", "b", "t/b", "/wt/a"), ("ai", "c", "t/c", "/wt/c")]),
-            "unknown"
-        )
-        XCTAssertEqual(mode([]), "unknown")
-        // A lone worker outside the integration checkout is isolated.
-        XCTAssertEqual(mode([("executor", "a", "team/a", "/wt/a")]), "isolated")
-        // Distinct directories with no branch of their own are not worktrees.
-        // PeerProjectBootstrap leaves the branch empty exactly when it was
-        // asked not to isolate.
-        XCTAssertEqual(mode([("executor", "a", nil, "/wt/a"), ("reviewer", "b", nil, "/wt/b")]), "unknown")
-        // The same path on two machines is two checkouts, not one.
-        XCTAssertEqual(
-            mode(
-                [("executor", "a", "team/a", "/p/x-executor"), ("executor", "b", "team/b", "/p/x-executor")],
-                hosts: ["ssh:one", "ssh:two"]
-            ),
-            "isolated"
-        )
-        // A trailing slash or an unstandardized leader path is still the
-        // leader's checkout.
-        XCTAssertEqual(
-            TeamOrchestrator.derivedCheckoutMode(
-                leaderPath: "/repo/",
-                workers: [("executor", "a", "team/a", "/repo")],
-                hostKeys: ["ssh:peer"]
-            ),
-            "shared"
-        )
-        // Host keys that do not line up with the roster answer nothing.
-        XCTAssertEqual(
-            TeamOrchestrator.derivedCheckoutMode(
-                leaderPath: "/repo",
-                workers: [("executor", "a", "team/a", "/wt/a")],
-                hostKeys: []
-            ),
-            "unknown"
+        // The all-peer project this exists for.
+        XCTAssertEqual(mode("isolated", "off"), "isolated")
+        XCTAssertEqual(mode("shared", "off"), "shared")
+        // No record: a resumed headless team keeps answering from its flag,
+        // which for it is accurate.
+        XCTAssertEqual(mode("unknown", "isolated"), "isolated")
+        XCTAssertEqual(mode("unknown", "off"), "off")
+        XCTAssertEqual(mode("", "shared"), "shared")
+        XCTAssertEqual(mode("   ", "isolated"), "isolated")
+        // "off" stays reachable: it is the strictest rule and the one a
+        // derivation could never produce.
+        XCTAssertEqual(mode("off", "isolated"), "off")
+        XCTAssertTrue(
+            TeamOrchestrator.checkoutTopologyRule(worktreeMode: mode("off", "isolated"))
+                .contains("No managed worktree isolation")
         )
     }
 

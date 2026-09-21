@@ -5979,6 +5979,9 @@ extension TeamOrchestrator {
             systemPrompt = Self.remoteLeaderClaudeRecoverySystemPrompt(
                 teamName: teamName,
                 agents: team.agents,
+                checkoutMode: Self.effectiveCheckoutMode(
+                    checkoutMode: team.checkoutMode, worktreeMode: team.worktreeMode
+                ),
                 remoteWorkingDirectory: workingDirectory,
                 remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET",
                 hostCLIBinDirs: host.hostCLIBinDirs
@@ -5989,6 +5992,9 @@ extension TeamOrchestrator {
             systemPrompt = Self.remoteLeaderNonClaudeRecoverySystemPrompt(
                 teamName: teamName,
                 agents: team.agents,
+                checkoutMode: Self.effectiveCheckoutMode(
+                    checkoutMode: team.checkoutMode, worktreeMode: team.worktreeMode
+                ),
                 remoteWorkingDirectory: workingDirectory,
                 remoteSocketPath: host.remoteSockPath ?? "inherited from TERMMESH_SOCKET",
                 hostCLIBinDirs: host.hostCLIBinDirs
@@ -10491,6 +10497,8 @@ extension TeamOrchestrator {
         leaderEndpoint: LeaderEndpoint = .local,
         leaderWorkingDirectory: String? = nil,
         worktreeMode: String = "off",
+        /// The layout `prepareCheckouts` produced, for the members' briefs.
+        checkoutMode: String = "unknown",
         executionMode: String = "pane",
         resumeSessionId: String? = nil,
         pairMode: String = "none",
@@ -10561,6 +10569,7 @@ extension TeamOrchestrator {
                 remoteLeaderSystemPrompt = Self.remoteLeaderClaudeSystemPrompt(
                     teamName: teamName,
                     rows: rows,
+                    checkoutMode: checkoutMode,
                     remoteWorkingDirectory: resolvedRemoteLeaderWorkingDirectory,
                     remoteSocketPath: remoteSocketPath,
                     hostCLIBinDirs: remoteLeaderBinDirs
@@ -10576,6 +10585,7 @@ extension TeamOrchestrator {
                 remoteLeaderSystemPrompt = Self.remoteLeaderNonClaudeSystemPrompt(
                     teamName: teamName,
                     rows: rows,
+                    checkoutMode: checkoutMode,
                     remoteWorkingDirectory: resolvedRemoteLeaderWorkingDirectory,
                     remoteSocketPath: remoteSocketPath,
                     hostCLIBinDirs: remoteLeaderBinDirs
@@ -10623,6 +10633,7 @@ extension TeamOrchestrator {
             delegationLevel: delegationLevel,
             resumeSessionId: resumeSessionId,
             worktreeMode: worktreeMode,
+            checkoutMode: checkoutMode,
             executionMode: executionMode,
             leaderEndpoint: initialLeaderEndpoint,
             launchLeaderLocally: launchLeaderLocally,
