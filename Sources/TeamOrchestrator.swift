@@ -3273,7 +3273,8 @@ final class TeamOrchestrator: ObservableObject {
                                 path: resumedWorkingDirectories?[index]
                                     ?? isolatedWorktrees[index]?.path ?? sharedWtPath ?? workingDirectory
                             )
-                        }
+                        },
+                        pathsAreCreationTime: true
                     )
                     let systemPrompt = Self.buildLeaderClaudeSystemPrompt(
                         teamName: name,
@@ -5204,7 +5205,8 @@ final class TeamOrchestrator: ObservableObject {
                     branch: agent.worktreeBranch,
                     path: agent.worktreePath ?? agent.originalAgentWorkDir
                 )
-            }
+            },
+            pathsAreCreationTime: true
         )
 
         // Worktree info
