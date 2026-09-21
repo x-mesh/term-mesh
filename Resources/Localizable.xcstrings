@@ -5737,6 +5737,36 @@
           }
         }
       }
+    },
+    "Peer input & tunnel diagnostics": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "피어 입력·터널 진단"
+          }
+        }
+      }
+    },
+    "This Mac times each peer keystroke through inject, PTY callback and send, and logs shared-tunnel EOF, refresh ownership and generation changes. Takes effect within a couple of seconds; no keystroke content is recorded.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "피어에서 온 키 입력이 전달되는 단계마다 걸린 시간을 재고, 공유 터널이 끊기거나 소유권과 세대가 바뀐 기록을 남깁니다. 몇 초 안에 적용되며 입력한 내용은 저장하지 않습니다."
+          }
+        }
+      }
+    },
+    "Off: peer keystrokes are relayed untimed and shared-tunnel lifecycle incidents are not captured. Turn on only while investigating slow remote typing or reconnects.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "키 입력 시간과 공유 터널의 상태 변화를 기록하지 않습니다. 원격 입력이 느리거나 연결이 자꾸 끊길 때만 켜세요."
+          }
+        }
+      }
     }
   },
   "version": "1.0"
