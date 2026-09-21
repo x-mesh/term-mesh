@@ -415,7 +415,7 @@ body.chat-mode #send {
 .md-indent-1 { margin-left: 14px; }
 .md-indent-2 { margin-left: 28px; }
 .md-indent-3 { margin-left: 42px; }
-.md-quote { margin: 0; padding: 2px 0 2px 11px; border-left: 3px solid var(--line); color: var(--muted); }
+.md-quote { margin: 0; padding: 2px 0 2px 11px; border-left: 1px solid var(--line); color: var(--muted); }
 .md-rule { margin: 1px 0; border: 0; border-top: 1px solid var(--line); }
 .md-link { color: var(--accent); }
 
