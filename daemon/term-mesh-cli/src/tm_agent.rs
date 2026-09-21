@@ -7136,7 +7136,13 @@ fn append_team_checkout_topology(sock: &PathBuf, team: &str, task: &Value, lines
 fn team_checkout_topology_lines(result: &Value, task: &Value) -> Vec<String> {
     let Some(agents) = result["agents"].as_array() else { return Vec::new() };
     let target_instance = task["agent_instance_id"].as_str();
-    let mode = result["worktree_mode"].as_str().unwrap_or("unknown");
+    // `checkout_mode` is the layout the leader was briefed on; `worktree_mode`
+    // only says whether local git worktrees were requested, and is "off" for
+    // every all-peer team. Falling back keeps an older app working.
+    let mode = result["checkout_mode"]
+        .as_str()
+        .or_else(|| result["worktree_mode"].as_str())
+        .unwrap_or("unknown");
     let leader_path = result["working_directory"].as_str().unwrap_or("unknown");
     let integration_target = result["integration_target_path"].as_str().unwrap_or(leader_path);
     let mut lines = vec![

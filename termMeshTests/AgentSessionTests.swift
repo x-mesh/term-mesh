@@ -614,27 +614,65 @@ final class AgentSessionTests: XCTestCase {
     /// member still gets its own bootstrap checkout.
     func testCheckoutModeIsDerivedFromTheCheckoutsThemselves() {
         typealias Worker = (name: String, instance: String, branch: String?, path: String?)
-        func mode(_ workers: [Worker]) -> String {
-            TeamOrchestrator.derivedCheckoutMode(leaderPath: "/repo", workers: workers)
+        func mode(_ workers: [Worker], hosts: [String?]? = nil) -> String {
+            TeamOrchestrator.derivedCheckoutMode(
+                leaderPath: "/repo",
+                workers: workers,
+                hostKeys: hosts ?? Array(repeating: "ssh:peer", count: workers.count)
+            )
         }
         XCTAssertEqual(
             mode([("executor", "a", "team/a", "/wt/a"), ("reviewer", "b", "team/b", "/wt/b")]),
             "isolated"
         )
         // Everyone in the leader's own checkout: the shared-write hazard.
-        XCTAssertEqual(mode([("executor", "a", nil, "/repo"), ("reviewer", "b", nil, "/repo")]), "shared")
+        XCTAssertEqual(
+            mode([("executor", "a", "team/a", "/repo"), ("reviewer", "b", "team/b", "/repo")]),
+            "shared"
+        )
         // One checkout that is not the leader's is still one checkout.
         XCTAssertEqual(mode([("executor", "a", nil, "/wt/x"), ("reviewer", "b", nil, "/wt/x")]), "shared")
         // A member whose path is unknown makes the whole layout unknown.
-        XCTAssertEqual(mode([("executor", "a", nil, "/wt/a"), ("reviewer", "b", nil, nil)]), "unknown")
+        XCTAssertEqual(mode([("executor", "a", "team/a", "/wt/a"), ("reviewer", "b", "team/b", nil)]), "unknown")
         // Partly shared is neither rule.
         XCTAssertEqual(
-            mode([("executor", "a", nil, "/wt/a"), ("reviewer", "b", nil, "/wt/a"), ("ai", "c", nil, "/wt/c")]),
+            mode([("executor", "a", "t/a", "/wt/a"), ("reviewer", "b", "t/b", "/wt/a"), ("ai", "c", "t/c", "/wt/c")]),
             "unknown"
         )
         XCTAssertEqual(mode([]), "unknown")
         // A lone worker outside the integration checkout is isolated.
         XCTAssertEqual(mode([("executor", "a", "team/a", "/wt/a")]), "isolated")
+        // Distinct directories with no branch of their own are not worktrees.
+        // PeerProjectBootstrap leaves the branch empty exactly when it was
+        // asked not to isolate.
+        XCTAssertEqual(mode([("executor", "a", nil, "/wt/a"), ("reviewer", "b", nil, "/wt/b")]), "unknown")
+        // The same path on two machines is two checkouts, not one.
+        XCTAssertEqual(
+            mode(
+                [("executor", "a", "team/a", "/p/x-executor"), ("executor", "b", "team/b", "/p/x-executor")],
+                hosts: ["ssh:one", "ssh:two"]
+            ),
+            "isolated"
+        )
+        // A trailing slash or an unstandardized leader path is still the
+        // leader's checkout.
+        XCTAssertEqual(
+            TeamOrchestrator.derivedCheckoutMode(
+                leaderPath: "/repo/",
+                workers: [("executor", "a", "team/a", "/repo")],
+                hostKeys: ["ssh:peer"]
+            ),
+            "shared"
+        )
+        // Host keys that do not line up with the roster answer nothing.
+        XCTAssertEqual(
+            TeamOrchestrator.derivedCheckoutMode(
+                leaderPath: "/repo",
+                workers: [("executor", "a", "team/a", "/wt/a")],
+                hostKeys: []
+            ),
+            "unknown"
+        )
     }
 
     func testRemoteClaudeLaunchUsesSSHAndKeepsRemoteDirectoryOutOfLocalProcess() {

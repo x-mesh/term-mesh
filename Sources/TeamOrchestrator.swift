@@ -4957,11 +4957,18 @@ final class TeamOrchestrator: ObservableObject {
         ```
         """
         let workers = rows.map { row in
-            (
+            // A local member's `hostDirectory` is the peer default the form
+            // filled in, and the local branch of prepareCheckouts never
+            // overwrites it — so it names a directory on the wrong machine.
+            // Report it as unknown rather than point the leader at it.
+            let directory = row.hostKey == nil ? nil : row.hostDirectory.nilIfBlank
+            return (
                 name: row.preset.name, instance: row.id.uuidString,
-                branch: row.hostBranch.nilIfBlank, path: row.hostDirectory.nilIfBlank
+                branch: row.hostKey == nil ? nil : row.hostBranch.nilIfBlank,
+                path: directory
             )
         }
+        let workerHosts = rows.map(\.hostKey)
         return buildLeaderClaudeSystemPrompt(
             teamName: teamName,
             agentList: agentList,
@@ -4970,7 +4977,9 @@ final class TeamOrchestrator: ObservableObject {
             socketPath: remoteSocketPath,
             topologySection: checkoutTopologySection(
                 worktreeMode: derivedCheckoutMode(
-                    leaderPath: remoteWorkingDirectory, workers: workers
+                    leaderPath: remoteWorkingDirectory,
+                    workers: workers,
+                    hostKeys: workerHosts
                 ),
                 leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
@@ -5042,11 +5051,18 @@ final class TeamOrchestrator: ObservableObject {
         ```
         """
         let workers = rows.map { row in
-            (
+            // A local member's `hostDirectory` is the peer default the form
+            // filled in, and the local branch of prepareCheckouts never
+            // overwrites it — so it names a directory on the wrong machine.
+            // Report it as unknown rather than point the leader at it.
+            let directory = row.hostKey == nil ? nil : row.hostDirectory.nilIfBlank
+            return (
                 name: row.preset.name, instance: row.id.uuidString,
-                branch: row.hostBranch.nilIfBlank, path: row.hostDirectory.nilIfBlank
+                branch: row.hostKey == nil ? nil : row.hostBranch.nilIfBlank,
+                path: directory
             )
         }
+        let workerHosts = rows.map(\.hostKey)
         return renderNonClaudeLeaderPrompt(
             teamName: teamName,
             agentList: agentList,
@@ -5056,7 +5072,9 @@ final class TeamOrchestrator: ObservableObject {
             // the checkouts the bootstrap just produced.
             worktreeSection: checkoutTopologySection(
                 worktreeMode: derivedCheckoutMode(
-                    leaderPath: remoteWorkingDirectory, workers: workers
+                    leaderPath: remoteWorkingDirectory,
+                    workers: workers,
+                    hostKeys: workerHosts
                 ),
                 leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
@@ -5080,6 +5098,7 @@ final class TeamOrchestrator: ObservableObject {
     ) -> String {
         let agentList = agents.enumerated().map { leaderRosterLine(index: $0.offset, agent: $0.element) }
             .joined(separator: "\n")
+        let workers = recoveryWorkers(agents)
         return renderNonClaudeLeaderPrompt(
             teamName: teamName,
             agentList: agentList,
@@ -5090,11 +5109,12 @@ final class TeamOrchestrator: ObservableObject {
             worktreeSection: checkoutTopologySection(
                 worktreeMode: derivedCheckoutMode(
                     leaderPath: remoteWorkingDirectory,
-                    workers: recoveryWorkers(agents)
+                    workers: workers,
+                    hostKeys: agents.map(\.hostKey)
                 ),
                 leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
-                workers: recoveryWorkers(agents)
+                workers: workers
             ),
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath
@@ -5113,6 +5133,7 @@ final class TeamOrchestrator: ObservableObject {
     ) -> String {
         let agentList = agents.enumerated().map { leaderRosterLine(index: $0.offset, agent: $0.element) }
             .joined(separator: "\n")
+        let workers = recoveryWorkers(agents)
         return buildLeaderClaudeSystemPrompt(
             teamName: teamName,
             agentList: agentList,
@@ -5125,11 +5146,12 @@ final class TeamOrchestrator: ObservableObject {
             topologySection: checkoutTopologySection(
                 worktreeMode: derivedCheckoutMode(
                     leaderPath: remoteWorkingDirectory,
-                    workers: recoveryWorkers(agents)
+                    workers: workers,
+                    hostKeys: agents.map(\.hostKey)
                 ),
                 leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
-                workers: recoveryWorkers(agents)
+                workers: workers
             )
         )
     }
@@ -5236,21 +5258,39 @@ final class TeamOrchestrator: ObservableObject {
     /// every turn itself.
     nonisolated static func derivedCheckoutMode(
         leaderPath: String,
-        workers: [(name: String, instance: String, branch: String?, path: String?)]
+        workers: [(name: String, instance: String, branch: String?, path: String?)],
+        hostKeys: [String?]
     ) -> String {
-        guard !workers.isEmpty else { return "unknown" }
-        let paths = workers.compactMap { $0.path?.nilIfBlank }
-        guard paths.count == workers.count else { return "unknown" }
-        let distinct = Set(paths)
-        // Every member somewhere of its own, and none of them where the
-        // leader integrates.
-        if distinct.count == workers.count, !distinct.contains(leaderPath) {
+        guard !workers.isEmpty, hostKeys.count == workers.count else { return "unknown" }
+        // A path only identifies a checkout together with the machine it is
+        // on. Two hosts lay a project out the same way far more often than
+        // not, so comparing bare strings merges an executor on A with an
+        // executor on B and calls two private worktrees one shared one.
+        func key(_ host: String?, _ path: String) -> String {
+            (host ?? "local") + "\u{0}" + (path as NSString).standardizingPath
+        }
+        var identities: [String] = []
+        for (worker, host) in zip(workers, hostKeys) {
+            guard let path = worker.path?.nilIfBlank else { return "unknown" }
+            identities.append(key(host, path))
+        }
+        let distinct = Set(identities)
+        let leaderIdentities = Set(hostKeys.map { key($0, leaderPath) })
+        // Every member somewhere of its own, none of them where the leader
+        // integrates, and every one of them on a branch of its own. The
+        // bootstrap leaves `branch` empty exactly when it was asked not to
+        // isolate, so an empty one is a positive answer, not a missing value.
+        let allBranched = workers.allSatisfy { $0.branch?.nilIfBlank != nil }
+        if distinct.count == workers.count,
+           distinct.isDisjoint(with: leaderIdentities),
+           allBranched {
             return "isolated"
         }
         // One checkout for everyone, whether or not it is the leader's: the
         // hazard is the same and the rule is the same.
         if distinct.count == 1 { return "shared" }
-        // Partly shared. Neither rule is true of the whole roster, so say so
+        // Partly shared, or distinct directories that are not separate
+        // worktrees. Neither rule is true of the whole roster, so say so
         // rather than pick the more permissive one.
         return "unknown"
     }
@@ -5265,8 +5305,8 @@ final class TeamOrchestrator: ObservableObject {
         agents.map { agent in
             (
                 name: agent.name, instance: agent.agentInstanceId,
-                branch: agent.worktreeBranch,
-                path: agent.worktreePath ?? agent.originalAgentWorkDir
+                branch: agent.worktreeBranch?.nilIfBlank,
+                path: (agent.worktreePath ?? agent.originalAgentWorkDir)?.nilIfBlank
             )
         }
     }
@@ -5286,18 +5326,22 @@ final class TeamOrchestrator: ObservableObject {
 
     private func workerCheckoutTopologyLines(teamName: String, target: AgentMember) -> [String] {
         guard let team = teams[teamName] else { return [] }
+        let leaderPath = team.sharedWorktreePath ?? team.workingDirectory
+        let workers = Self.recoveryWorkers(team.agents)
+        // The same derivation the leader's own prompt uses. Reading
+        // `team.worktreeMode` here instead is how a leader came to be told
+        // "isolated, run these concurrently" while every worker it dispatched
+        // to was told "no isolation is active, do not".
         return Self.workerCheckoutTopologyLines(
-            worktreeMode: team.worktreeMode,
-            leaderPath: team.sharedWorktreePath ?? team.workingDirectory,
+            worktreeMode: Self.derivedCheckoutMode(
+                leaderPath: leaderPath,
+                workers: workers,
+                hostKeys: team.agents.map(\.hostKey)
+            ),
+            leaderPath: leaderPath,
             integrationTargetPath: team.workingDirectory,
             targetInstance: target.agentInstanceId,
-            workers: team.agents.map { agent in
-                (
-                    name: agent.name, instance: agent.agentInstanceId,
-                    branch: agent.worktreeBranch,
-                    path: agent.worktreePath ?? agent.originalAgentWorkDir
-                )
-            }
+            workers: workers
         )
     }
 
@@ -8584,6 +8628,16 @@ final class TeamOrchestrator: ObservableObject {
             "working_directory": team.sharedWorktreePath ?? team.workingDirectory,
             "integration_target_path": team.workingDirectory,
             "worktree_mode": team.worktreeMode,
+            // `worktree_mode` answers whether this team asked for local git
+            // worktrees; it is "off" for every all-peer roster even when the
+            // bootstrap gave each member its own checkout. Readers that brief
+            // an agent need the layout instead, so it is published beside it
+            // rather than in place of it.
+            "checkout_mode": Self.derivedCheckoutMode(
+                leaderPath: team.sharedWorktreePath ?? team.workingDirectory,
+                workers: Self.recoveryWorkers(team.agents),
+                hostKeys: team.agents.map(\.hostKey)
+            ),
             "remote_project_id": Self.effectiveRemotePresentationProjectID(
                 storedProjectID: team.remotePresentationProjectID,
                 teamUUID: team.teamUuid, teamName: team.id
