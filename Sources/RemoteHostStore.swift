@@ -2240,7 +2240,6 @@ final class RemoteHostStore: ObservableObject {
             // working; only SSH-backed rows can replace an owned transport.
             let lease = self.sidebarLeases[key]
             guard lease == nil || lease?.hostSockPath == path else { return }
-            let transportGeneration = lease?.transportGeneration
             do {
                 let connection = try await PeerRelaySession.connect(hostSockPath: path)
                 guard connection.hostCapabilities.has(PeerCapability.workspaceListSubscribeV1) else {
@@ -2282,7 +2281,7 @@ final class RemoteHostStore: ObservableObject {
                 // socket path stale.
             } catch {
                 await self.workspaceSubscriptionLost(
-                    key: key, path: path, transportGeneration: transportGeneration, error: error
+                    key: key, path: path, error: error
                 )
             }
         }
@@ -2970,13 +2969,12 @@ final class RemoteHostStore: ObservableObject {
     }
 
     /// A dead subscription is a stale sidebar, not an empty remote machine.
-    /// Refresh the pooled SSH generation and rebuild the roster stream while
-    /// preserving the latest snapshot. Direct sockets cannot be refreshed, so
-    /// their normal fetch failure still surfaces the host as unreachable.
+    /// Rebuild only the roster stream: the pane relays own the shared tunnel's
+    /// refresh decision, so a sidebar read failure must not tear down every
+    /// attached pane.
     private func workspaceSubscriptionLost(
         key: String,
         path: String,
-        transportGeneration: UInt64?,
         error: Error
     ) async {
         guard hosts[key]?.activeSockPath == path,
@@ -2988,19 +2986,13 @@ final class RemoteHostStore: ObservableObject {
         RemoteWorkLog.info(
             "Workspace roster stream stopped for \(hosts[key]?.displayName ?? key): \(error.localizedDescription) — reconnecting"
         )
-        if let lease = sidebarLeases[key], let transportGeneration {
-            guard sidebarLeases[key] === lease, lease.hostSockPath == path else { return }
-            _ = await lease.refreshTransport(
-                after: transportGeneration,
-                reason: "sidebar workspace roster stopped responding"
-            )
-            guard !Task.isCancelled,
-                  sidebarLeases[key] === lease,
+        if let lease = sidebarLeases[key] {
+            guard sidebarLeases[key] === lease,
+                  lease.hostSockPath == path,
                   hosts[key]?.activeSockPath == path,
                   hosts[key]?.isConnected == true
             else { return }
-            // Re-run the normal authenticated fetch. It rebuilds the snapshot,
-            // team metadata and a fresh subscription on the replacement tunnel.
+            // Re-run the normal authenticated fetch on the existing tunnel.
             fetchWorkspaces(
                 for: lease.hostSockPath,
                 key: key,
