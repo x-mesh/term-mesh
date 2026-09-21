@@ -4995,7 +4995,8 @@ final class TeamOrchestrator: ObservableObject {
                 worktreeMode: checkoutMode,
                 leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
-                workers: workers
+                workers: workers,
+                pathsAreCreationTime: true
             )
         )
     }
@@ -5086,7 +5087,8 @@ final class TeamOrchestrator: ObservableObject {
                 worktreeMode: checkoutMode,
                 leaderPath: remoteWorkingDirectory,
                 integrationTargetPath: remoteWorkingDirectory,
-                workers: workers
+                workers: workers,
+                pathsAreCreationTime: true
             ),
             tmAgent: remoteTMAgentCommand(hostCLIBinDirs: hostCLIBinDirs),
             socketPath: remoteSocketPath
@@ -5232,7 +5234,8 @@ final class TeamOrchestrator: ObservableObject {
 
     nonisolated static func checkoutTopologySection(
         worktreeMode: String, leaderPath: String, integrationTargetPath: String,
-        workers: [(name: String, instance: String, branch: String?, path: String?)]
+        workers: [(name: String, instance: String, branch: String?, path: String?)],
+        pathsAreCreationTime: Bool = false
     ) -> String {
         var lines = [
             "## Checkout Topology",
@@ -5245,6 +5248,18 @@ final class TeamOrchestrator: ObservableObject {
             lines.append("WORKER_CHECKOUT: name=\(worker.name) instance=\(worker.instance) branch=\(worker.branch ?? "shared-or-unknown") path=\(worker.path ?? "unknown")")
         }
         lines.append(checkoutTopologyRule(worktreeMode: worktreeMode))
+        if pathsAreCreationTime {
+            // A member that attaches takes its own instance-tagged checkout
+            // from `prepareLateAgentCheckout`, which is not the path the
+            // creation plan named. A system prompt is injected once, so this
+            // table cannot be corrected later — say what it is as of.
+            lines.append(
+                "CHECKOUT_PATHS_ASOF: creation. A member that attaches later takes its own"
+                    + " instance-tagged checkout, so read `tm-agent status`"
+                    + " (worktree_path, worktree_branch) for where a member is now"
+                    + " before you name a path in a task."
+            )
+        }
         return lines.joined(separator: "\n")
     }
 

@@ -345,6 +345,31 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         }
     }
 
+    /// The creation table cannot be corrected later, and attach mints its
+    /// own instance-tagged checkout, so the prompt says what its paths are
+    /// as of and where the current answer lives. Recovery reads the members'
+    /// own checkouts and needs no such caveat.
+    func test_creationPromptDatesItsPathsAndNamesTheLiveSource() {
+        let creation = TeamOrchestrator.remoteLeaderClaudeSystemPrompt(
+            teamName: "xm",
+            rows: rows,
+            checkoutMode: "isolated",
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        XCTAssertTrue(creation.contains("CHECKOUT_PATHS_ASOF: creation"))
+        XCTAssertTrue(creation.contains("tm-agent status"))
+
+        let recovery = TeamOrchestrator.remoteLeaderClaudeRecoverySystemPrompt(
+            teamName: "xm",
+            agents: recoveryAgents(),
+            checkoutMode: "isolated",
+            remoteWorkingDirectory: "/Users/jinwoo/work/tm-projects/xm",
+            remoteSocketPath: "/tmp/term-mesh.sock"
+        )
+        XCTAssertFalse(recovery.contains("CHECKOUT_PATHS_ASOF"))
+    }
+
     /// A project created without isolation keeps its warning: every member
     /// sits in the leader's own checkout.
     func test_creationPromptCarriesTheSharedWarningWhenThatIsTheLayout() {
