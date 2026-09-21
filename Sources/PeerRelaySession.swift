@@ -2255,9 +2255,15 @@ final class PeerRelaySession {
         RemoteWorkLog.infoOffMain(
             "Peer transport refresh start host=\(hostLabel) surface=\(surfaceLabel) sessionGen=\(sessionGeneration) transportGen=\(transportGeneration) reason=\(reason)"
         )
+        PeerFederationSettings.logInputLatencyLifecycle(
+            "event=pane_refresh_start host=\(hostLabel) surface=\(surfaceLabel) session_gen=\(sessionGeneration) transport_gen=\(transportGeneration) reason=\(reason)"
+        )
         ownedTransportGeneration = await ownedTransportRecovery(ownedTransportGeneration)
         RemoteWorkLog.infoOffMain(
             "Peer transport refresh end host=\(hostLabel) surface=\(surfaceLabel) sessionGen=\(resumeTransitionGate.currentGeneration()) transportGen=\(ownedTransportGeneration) reason=\(reason)"
+        )
+        PeerFederationSettings.logInputLatencyLifecycle(
+            "event=pane_refresh_end host=\(hostLabel) surface=\(surfaceLabel) session_gen=\(resumeTransitionGate.currentGeneration()) transport_gen=\(ownedTransportGeneration) reason=\(reason)"
         )
     }
 

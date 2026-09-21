@@ -172,6 +172,9 @@ final class PeerPaneHostLease {
         RemoteWorkLog.infoOffMain(
             "Peer tunnel refresh start host=\(key) observedGen=\(observedGeneration) transportGen=\(transportGeneration) reason=\(reason)"
         )
+        PeerFederationSettings.logInputLatencyLifecycle(
+            "event=tunnel_refresh_start host=\(key) observed_gen=\(observedGeneration) transport_gen=\(transportGeneration) reason=\(reason)"
+        )
         let generation = await transportRecovery.refresh(after: observedGeneration) {
             guard !self.isTornDown, !Task.isCancelled else { return false }
             // `forceReconnect` may spend up to three seconds reaping a stuck
@@ -204,6 +207,9 @@ final class PeerPaneHostLease {
         }
         RemoteWorkLog.infoOffMain(
             "Peer tunnel refresh end host=\(key) observedGen=\(observedGeneration) transportGen=\(generation) reason=\(reason)"
+        )
+        PeerFederationSettings.logInputLatencyLifecycle(
+            "event=tunnel_refresh_end host=\(key) observed_gen=\(observedGeneration) transport_gen=\(generation) reason=\(reason)"
         )
         return generation
     }
