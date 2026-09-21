@@ -71,13 +71,26 @@ private enum PeerServerDiagnostics {
 /// viewer's gap detection (P9, `PeerRelaySession.swift`) mathematically
 /// never fires: silent truncation with no heal. A producer with no drop
 /// path (e.g. `EchoSurfaceProvider`) just counts delivered bytes.
+public struct PtyTapCallback: Sendable, Equatable {
+    public let boundary: UInt64
+    public let atNs: UInt64
+
+    public init(boundary: UInt64, atNs: UInt64) {
+        self.boundary = boundary
+        self.atNs = atNs
+    }
+}
+
 public struct PtyTapChunk: Sendable {
     public let bytes: Data
     public let seq: UInt64
+    /// Host raw-output callbacks that contributed to this filtered chunk.
+    public let callbackEvents: [PtyTapCallback]
 
-    public init(bytes: Data, seq: UInt64) {
+    public init(bytes: Data, seq: UInt64, callbackEvents: [PtyTapCallback] = []) {
         self.bytes = bytes
         self.seq = seq
+        self.callbackEvents = callbackEvents
     }
 }
 
@@ -113,6 +126,15 @@ public struct PeerSurfaceAttachment: Sendable {
     /// outbound queue evicts data. The returned host boundary is the exact
     /// filtered sequence immediately after the rendered ANSI screen.
     public let resync: (@Sendable () async -> PeerSurfaceResync?)?
+    /// Payload-free input-path telemetry hooks. They are attachment-local so
+    /// one viewer can never complete another viewer's timing sample.
+    public let observeInputPathRawCallback: @Sendable (UInt64, UInt64) -> Void
+    public let observeInputPathDelivery: @Sendable (UInt64, UInt64) -> Void
+    public let invalidateInputPath: @Sendable () -> Void
+    /// `nil` while the provider is not measuring, which is also what a
+    /// provider without the extension returns — the relay sample then
+    /// carries no `input_path` and the viewer omits it entirely.
+    public let inputPathTelemetry: @Sendable () -> Termmesh_Peer_V1_InputPathTelemetry?
     /// Called by the session when the client detaches, the connection
     /// closes, or the session is shut down. Providers should stop
     /// yielding to `byteStream` and release per-attach resources.
@@ -125,6 +147,10 @@ public struct PeerSurfaceAttachment: Sendable {
         workspaceMeta: PeerWorkspaceMeta? = nil,
         initialByteSeq: UInt64 = 0,
         resync: (@Sendable () async -> PeerSurfaceResync?)? = nil,
+        observeInputPathRawCallback: @escaping @Sendable (UInt64, UInt64) -> Void = { _, _ in },
+        observeInputPathDelivery: @escaping @Sendable (UInt64, UInt64) -> Void = { _, _ in },
+        invalidateInputPath: @escaping @Sendable () -> Void = {},
+        inputPathTelemetry: @escaping @Sendable () -> Termmesh_Peer_V1_InputPathTelemetry? = { nil },
         detach: @escaping @Sendable () async -> Void = {}
     ) {
         self.byteStream = byteStream
@@ -133,6 +159,10 @@ public struct PeerSurfaceAttachment: Sendable {
         self.workspaceMeta = workspaceMeta
         self.initialByteSeq = initialByteSeq
         self.resync = resync
+        self.observeInputPathRawCallback = observeInputPathRawCallback
+        self.observeInputPathDelivery = observeInputPathDelivery
+        self.invalidateInputPath = invalidateInputPath
+        self.inputPathTelemetry = inputPathTelemetry
         self.detach = detach
     }
 }
@@ -820,7 +850,7 @@ public actor PeerServer {
         }
         guard !interested.isEmpty, let hostSample = await provider() else { return }
         for session in interested {
-            var sample = hostSample
+            var sample = await session.overlayInputPathTelemetry(hostSample)
             let transport = await session.relayTransportSnapshot()
             sample.transportEagainCount = transport.eagainCount
             sample.transportWaitNsTotal = transport.waitNsTotal
@@ -1364,12 +1394,13 @@ public actor PtyDataCoalescer {
 
     private let windowNs: UInt64
     private let maxBytes: Int
-    private let send: @Sendable (Data, UInt64) async -> Bool
+    private let send: @Sendable (Data, UInt64, [PtyTapCallback]) async -> Bool
     private let onFailure: @Sendable () async -> Void
 
     private var armed = false
     private var pending = Data()
     private var pendingStartSeq: UInt64 = 0
+    private var pendingCallbackEvents: [PtyTapCallback] = []
     private var flushTask: Task<Void, Never>?
     private var stopped = false
 
@@ -1383,13 +1414,23 @@ public actor PtyDataCoalescer {
     public init(
         windowMs: UInt64 = PtyDataCoalescer.defaultWindowMs,
         maxBytes: Int = PtyDataCoalescer.defaultMaxBytes,
-        send: @escaping @Sendable (Data, UInt64) async -> Bool,
+        send: @escaping @Sendable (Data, UInt64, [PtyTapCallback]) async -> Bool,
         onFailure: @escaping @Sendable () async -> Void = {}
     ) {
         self.windowNs = windowMs * 1_000_000
         self.maxBytes = maxBytes
         self.send = send
         self.onFailure = onFailure
+    }
+
+    public init(
+        windowMs: UInt64 = PtyDataCoalescer.defaultWindowMs,
+        maxBytes: Int = PtyDataCoalescer.defaultMaxBytes,
+        send: @escaping @Sendable (Data, UInt64) async -> Bool,
+        onFailure: @escaping @Sendable () async -> Void = {}
+    ) {
+        self.init(windowMs: windowMs, maxBytes: maxBytes,
+                  send: { bytes, seq, _ in await send(bytes, seq) }, onFailure: onFailure)
     }
 
     /// Submit one chunk as it arrives from the byte producer. `startSeq`
@@ -1406,7 +1447,11 @@ public actor PtyDataCoalescer {
     /// Returns `false` once the coalescer has permanently stopped (a
     /// prior send failed) — the caller should stop pumping.
     @discardableResult
-    public func submit(_ bytes: Data, startSeq: UInt64) async -> Bool {
+    public func submit(
+        _ bytes: Data,
+        startSeq: UInt64,
+        callbackEvents: [PtyTapCallback] = []
+    ) async -> Bool {
         guard !stopped else { return false }
         guard !bytes.isEmpty else { return true }
 
@@ -1414,7 +1459,7 @@ public actor PtyDataCoalescer {
             // Idle → active: send unbuffered (leading edge) so an
             // isolated write incurs zero coalescing delay, then arm the
             // window to catch whatever follows within it.
-            guard await send(bytes, startSeq) else {
+            guard await send(bytes, startSeq, callbackEvents) else {
                 await fail()
                 return false
             }
@@ -1423,6 +1468,7 @@ public actor PtyDataCoalescer {
         }
 
         if pending.isEmpty { pendingStartSeq = startSeq }
+        pendingCallbackEvents.append(contentsOf: callbackEvents)
         pending.append(bytes)
         guard pending.count >= maxBytes else { return true }
 
@@ -1490,8 +1536,10 @@ public actor PtyDataCoalescer {
         guard !pending.isEmpty else { return true }
         let payload = pending
         let seq = pendingStartSeq
+        let callbackEvents = pendingCallbackEvents
         pending = Data()
-        guard await send(payload, seq) else {
+        pendingCallbackEvents.removeAll(keepingCapacity: true)
+        guard await send(payload, seq, callbackEvents) else {
             await fail()
             return false
         }
@@ -1512,6 +1560,12 @@ struct PeerServerOutboundQueueEntry: Sendable, Equatable {
     }
 
     let kind: Kind
+    let callbackEvents: [PtyTapCallback]
+
+    init(kind: Kind, callbackEvents: [PtyTapCallback] = []) {
+        self.kind = kind
+        self.callbackEvents = callbackEvents
+    }
 
     var bytes: Data {
         guard case .pty(let bytes, _) = kind else {
@@ -1610,7 +1664,11 @@ actor PeerServerOutboundQueue {
         self.onDrop = onDrop
     }
 
-    func enqueue(_ bytes: Data, startSeq: UInt64) async -> PeerServerOutboundQueueAdmission {
+    func enqueue(
+        _ bytes: Data,
+        startSeq: UInt64,
+        callbackEvents: [PtyTapCallback] = []
+    ) async -> PeerServerOutboundQueueAdmission {
         switch state {
         case .finished: return .finished
         case .aborted: return .aborted
@@ -1622,12 +1680,12 @@ actor PeerServerOutboundQueue {
         var offset = 0
         while offset < bytes.count {
             let length = min(Self.maxEntryBytes, bytes.count - offset)
+            let isFinalEntry = offset + length == bytes.count
             let entry = PeerServerOutboundQueueEntry(
                 kind: .pty(
                     bytes: bytes.subdata(in: offset..<(offset + length)),
                     startSeq: startSeq &+ UInt64(offset)
-                )
-            )
+                ), callbackEvents: isFinalEntry ? callbackEvents : [])
             offset += length
             admit(entry, callDrops: &callDrops)
         }
@@ -1976,6 +2034,19 @@ actor PeerServerSession {
         try await sendEnvelope { env in
             env.relayTelemetry = telemetry
         }
+    }
+
+    func overlayInputPathTelemetry(
+        _ hostSample: Termmesh_Peer_V1_RelayTelemetry
+    ) async -> Termmesh_Peer_V1_RelayTelemetry {
+        var sample = hostSample
+        for index in sample.surfaces.indices {
+            guard let attachment = attachments[sample.surfaces[index].surfaceID],
+                  let inputPath = attachment.inputPathTelemetry()
+            else { continue }
+            sample.surfaces[index].inputPath = inputPath
+        }
+        return sample
     }
 
     func relayTransportSnapshot() async -> AcceptedUnixConnection.RelayTransportSnapshot {
@@ -2566,8 +2637,11 @@ actor PeerServerSession {
         var snapshotCount = 0
         let queue = PeerServerOutboundQueue { drop in
             diagnostics.record(drop)
+            if drop.bytes > 0 {
+                attachment.invalidateInputPath()
+            }
         }
-        let coalescer = PtyDataCoalescer { [weak self] payload, seq in
+        let coalescer = PtyDataCoalescer { [weak self] payload, seq, callbackEvents in
             guard let self else { return false }
             do {
                 try await self.sendEnvelope { env in
@@ -2576,6 +2650,10 @@ actor PeerServerSession {
                     p.byteSeq = seq
                     p.payload = payload
                     env.ptyData = p
+                }
+                let deliveredAtNs = DispatchTime.now().uptimeNanoseconds
+                for callback in callbackEvents {
+                    attachment.observeInputPathDelivery(callback.boundary, deliveredAtNs)
                 }
                 return true
             } catch {
@@ -2586,6 +2664,7 @@ actor PeerServerSession {
             }
         } onFailure: {
             await queue.abort()
+            attachment.invalidateInputPath()
         }
 
         await withTaskCancellationHandler(operation: {
@@ -2593,7 +2672,17 @@ actor PeerServerSession {
                 while let entry = await queue.next() {
                     switch entry.kind {
                     case .pty(let bytes, let startSeq):
-                        guard await coalescer.submit(bytes, startSeq: startSeq) else {
+                        // A zero stamp means the host is not measuring, so
+                        // the whole input-path branch drops out here rather
+                        // than being paid for and discarded downstream.
+                        for callback in entry.callbackEvents {
+                            attachment.observeInputPathRawCallback(callback.boundary, callback.atNs)
+                        }
+                        guard await coalescer.submit(
+                            bytes,
+                            startSeq: startSeq,
+                            callbackEvents: entry.callbackEvents
+                        ) else {
                             await queue.abort()
                             return false
                         }
@@ -2638,6 +2727,7 @@ actor PeerServerSession {
                             return false
                         }
                         if let prevEnd = lastTapEnd, chunk.seq > prevEnd {
+                            attachment.invalidateInputPath()
                             guard let capture = attachment.resync,
                                   let snapshot = await capture(),
                                   await queue.installSnapshot(snapshot) else {
@@ -2652,7 +2742,11 @@ actor PeerServerSession {
                             continue
                         }
                         let startSeq = chunk.seq &- boundary
-                        let admission = await queue.enqueue(chunk.bytes, startSeq: startSeq)
+                        let admission = await queue.enqueue(
+                            chunk.bytes,
+                            startSeq: startSeq,
+                            callbackEvents: chunk.callbackEvents
+                        )
                         switch admission {
                         case .accepted(let drops) where drops.bytes == 0:
                             lastTapEnd = chunkEnd
@@ -2666,6 +2760,7 @@ actor PeerServerSession {
                                 await connection.close()
                                 return false
                             }
+                            attachment.invalidateInputPath()
                             guard canResync,
                                   let capture = attachment.resync,
                                   let snapshot = await capture(),
@@ -2690,13 +2785,18 @@ actor PeerServerSession {
                             lastTapEnd = chunk.seq &+ UInt64(chunk.bytes.count)
                             let startSeq = wireSeq
                             wireSeq &+= UInt64(chunk.bytes.count)
-                            switch await queue.enqueue(chunk.bytes, startSeq: startSeq) {
+                            switch await queue.enqueue(
+                                chunk.bytes,
+                                startSeq: startSeq,
+                                callbackEvents: chunk.callbackEvents
+                            ) {
                             case .accepted:
                                 continue
                             case .finished, .aborted:
                                 return false
                             }
                         }
+                        attachment.invalidateInputPath()
                         guard let capture = attachment.resync else {
                             await queue.abort()
                             return false
@@ -2716,7 +2816,11 @@ actor PeerServerSession {
                     lastTapEnd = chunk.seq &+ UInt64(chunk.bytes.count)
                     let startSeq = wireSeq
                     wireSeq &+= UInt64(chunk.bytes.count)
-                    let admission = await queue.enqueue(chunk.bytes, startSeq: startSeq)
+                    let admission = await queue.enqueue(
+                        chunk.bytes,
+                        startSeq: startSeq,
+                        callbackEvents: chunk.callbackEvents
+                    )
                     if PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
                         for: admission,
                         attachmentCount: attachments.count,
@@ -2796,6 +2900,7 @@ actor PeerServerSession {
         writableAttachments.remove(id)
         relayTasks.removeValue(forKey: id)?.cancel()
         if let attachment = attachments.removeValue(forKey: id) {
+            attachment.invalidateInputPath()
             await attachment.detach()
         }
     }

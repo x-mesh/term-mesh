@@ -221,6 +221,7 @@ struct SettingsView: View {
     @AppStorage(PeerFederationSettings.socketPathKey) private var peerFederationSocketPath = PeerFederationSettings.defaultSocketPath
     @AppStorage(PeerFederationSettings.displayNameKey) private var peerFederationDisplayName = ""
     @AppStorage(PeerFederationSettings.forceRedrawKey) private var peerFederationForceRedraw = false
+    @AppStorage(PeerFederationSettings.inputPathTelemetryKey) private var peerFederationInputPathTelemetry = false
     /// Mirrors `PeerHostCoordinator.shared.isRunning`. Refreshed on
     /// section appear and after every toggle change since the
     /// coordinator state is held outside SwiftUI.
@@ -2532,6 +2533,19 @@ struct SettingsView: View {
                     : "Initial-attach snapshot is plain text; full-screen TUIs keep their text but lose styling until they redraw on their own."
             ) {
                 Toggle("", isOn: $peerFederationForceRedraw)
+                    .labelsHidden()
+                    .controlSize(.small)
+            }
+
+            SettingsCardDivider()
+
+            SettingsCardRow(
+                "Measure input latency",
+                subtitle: peerFederationInputPathTelemetry
+                    ? "This Mac times each peer keystroke through inject, PTY callback and send, and reports percentiles in the relay telemetry a viewer already receives. Takes effect within a couple of seconds; no keystroke content is recorded."
+                    : "Off: peer keystrokes are relayed untimed. Turn on only while investigating slow remote typing — measuring costs a timestamp on every PTY callback."
+            ) {
+                Toggle("", isOn: $peerFederationInputPathTelemetry)
                     .labelsHidden()
                     .controlSize(.small)
             }

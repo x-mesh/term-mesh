@@ -263,6 +263,55 @@ final class PeerServerOutboundQueueTests: XCTestCase {
         XCTAssertTrue(flushed)
     }
 
+    func testQueueKeepsCallbackEventsOnTheFinalSplitEntry() async {
+        let queue = PeerServerOutboundQueue()
+        let callback = PtyTapCallback(boundary: 99, atNs: 123)
+        let payload = Data(repeating: 0x61, count: PeerServerOutboundQueue.maxEntryBytes + 1)
+        _ = await queue.enqueue(payload, startSeq: 0, callbackEvents: [callback])
+        await queue.finish()
+
+        let entries = await drain(queue)
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertTrue(entries[0].callbackEvents.isEmpty)
+        XCTAssertEqual(entries[1].callbackEvents, [callback])
+    }
+
+    func testCoalescerPreservesEveryCallbackEventInOneSend() async {
+        let sent = XCTestExpectation(description: "coalesced callbacks sent")
+        let first = PtyTapCallback(boundary: 10, atNs: 100)
+        let second = PtyTapCallback(boundary: 20, atNs: 200)
+        let recorder = CallbackEventRecorder()
+        let coalescer = PtyDataCoalescer(windowMs: 100) { payload, _, callbacks in
+            recorder.record(payload: payload, callbacks: callbacks)
+            if callbacks == [first, second] {
+                sent.fulfill()
+            }
+            return true
+        }
+
+        let firstAccepted = await coalescer.submit(Data([1]), startSeq: 0)
+        let secondAccepted = await coalescer.submit(
+            Data([2]),
+            startSeq: 1,
+            callbackEvents: [first]
+        )
+        let thirdAccepted = await coalescer.submit(
+            Data([3]),
+            startSeq: 2,
+            callbackEvents: [second]
+        )
+        let flushed = await coalescer.flushRemaining()
+        XCTAssertTrue(firstAccepted)
+        XCTAssertTrue(secondAccepted)
+        XCTAssertTrue(thirdAccepted)
+        XCTAssertTrue(flushed)
+        await fulfillment(of: [sent], timeout: 1)
+
+        let records = recorder.snapshot()
+        XCTAssertEqual(records.map { $0.callbacks }, [[], [first, second]])
+        XCTAssertEqual(records.map { $0.payload }, [Data([1]), Data([2, 3])])
+    }
+
     func testCancellingAfterProducerFinishAbortsAndJoinsBlockedWriter() async {
         let queue = PeerServerOutboundQueue()
         let gate = OutboundQueueGate()
@@ -320,5 +369,27 @@ final class PeerServerOutboundQueueTests: XCTestCase {
         XCTAssertNil(terminalEntry)
         XCTAssertFalse(flushed)
         await queue.abort()
+    }
+}
+
+private final class CallbackEventRecorder: @unchecked Sendable {
+    struct Record: Sendable {
+        let payload: Data
+        let callbacks: [PtyTapCallback]
+    }
+
+    private let lock = NSLock()
+    private var records: [Record] = []
+
+    func record(payload: Data, callbacks: [PtyTapCallback]) {
+        lock.lock()
+        records.append(Record(payload: payload, callbacks: callbacks))
+        lock.unlock()
+    }
+
+    func snapshot() -> [Record] {
+        lock.lock()
+        defer { lock.unlock() }
+        return records
     }
 }

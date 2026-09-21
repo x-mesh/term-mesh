@@ -16,6 +16,7 @@ enum PeerFederationSettings {
     static let displayNameKey    = "peerFederationDisplayName"
     static let recentHostsKey    = "peerFederationRecentHosts"
     static let forceRedrawKey    = "peerFederationForceRedrawOnAttach"
+    static let inputPathTelemetryKey = "peerFederationInputPathTelemetry"
     static let forwardDashboardKey = "peerFederationForwardDashboard"
     static let remoteDashboardPortKey = "peerFederationRemoteDashboardPort"
 
@@ -139,6 +140,22 @@ enum PeerFederationSettings {
     /// host's local viewer too.
     static var forceRedrawOnAttach: Bool {
         UserDefaults.standard.bool(forKey: forceRedrawKey)
+    }
+
+    /// When on, the host measures the peer input path (receive → inject →
+    /// raw PTY callback → ptyData send) and reports bounded percentiles in
+    /// the relay telemetry sample. Off by default: every enabled stage adds
+    /// a timestamp on the raw-output callback and a bounded scan on the
+    /// relay send path, and the numbers are only useful while an input
+    /// latency incident is being investigated.
+    ///
+    /// Re-read on each telemetry tick rather than at attach, so a host that
+    /// is already mirroring can be switched mid-incident — including from
+    /// another machine with
+    /// `ssh <host> defaults write <bundle id> peerFederationInputPathTelemetry -bool true`.
+    /// The bundle identifier differs for Debug and `--tag` builds.
+    static var inputPathTelemetryEnabled: Bool {
+        UserDefaults.standard.bool(forKey: inputPathTelemetryKey)
     }
 
     /// The remote host's HTTP dashboard port. `term-meshd` binds it to
