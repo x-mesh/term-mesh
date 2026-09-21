@@ -911,12 +911,21 @@ final class PeerSSHTunnel: @unchecked Sendable {
             RemoteWorkLog.infoOffMain("Tunnel up → \(sshTarget)")
         case .down(let reason):
             RemoteWorkLog.infoOffMain("Tunnel down → \(sshTarget): \(reason)")
+            PeerFederationSettings.logInputLatencyLifecycle(
+                "event=tunnel_down target=\(sshTarget) reason=\(reason)"
+            )
         case .reconnecting(let attempt):
             RemoteWorkLog.infoOffMain(
                 "Reconnecting to \(sshTarget) — attempt \(attempt) of \(Self.maxReconnectAttempts)"
             )
+            PeerFederationSettings.logInputLatencyLifecycle(
+                "event=tunnel_reconnecting target=\(sshTarget) attempt=\(attempt)"
+            )
         case .failed(let reason):
             RemoteWorkLog.infoOffMain("Tunnel failed → \(sshTarget): \(reason)")
+            PeerFederationSettings.logInputLatencyLifecycle(
+                "event=tunnel_failed target=\(sshTarget) reason=\(reason)"
+            )
         case .stopped:
             RemoteWorkLog.debugOffMain("Tunnel stopped → \(sshTarget)")
         }

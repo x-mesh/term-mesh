@@ -2542,8 +2542,8 @@ struct SettingsView: View {
             SettingsCardRow(
                 "Measure input latency",
                 subtitle: peerFederationInputPathTelemetry
-                    ? "This Mac times each peer keystroke through inject, PTY callback and send, and reports percentiles in the relay telemetry a viewer already receives. Takes effect within a couple of seconds; no keystroke content is recorded."
-                    : "Off: peer keystrokes are relayed untimed. Turn on only while investigating slow remote typing — measuring costs a timestamp on every PTY callback."
+                    ? "This Mac times each peer keystroke through inject, PTY callback and send, and logs shared-tunnel EOF, refresh ownership and generation changes. Takes effect within a couple of seconds; no keystroke content is recorded."
+                    : "Off: peer keystrokes are relayed untimed and shared-tunnel lifecycle incidents are not captured. Turn on only while investigating slow remote typing or reconnects."
             ) {
                 Toggle("", isOn: $peerFederationInputPathTelemetry)
                     .labelsHidden()

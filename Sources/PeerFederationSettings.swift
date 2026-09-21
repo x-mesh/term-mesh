@@ -158,6 +158,11 @@ enum PeerFederationSettings {
         UserDefaults.standard.bool(forKey: inputPathTelemetryKey)
     }
 
+    static func logInputLatencyLifecycle(_ event: String) {
+        guard inputPathTelemetryEnabled else { return }
+        RemoteWorkLog.infoOffMain("peer.input-latency.lifecycle \(event)")
+    }
+
     /// The remote host's HTTP dashboard port. `term-meshd` binds it to
     /// 127.0.0.1:9876 by default, so it is unreachable from off-box —
     /// the SSH tunnel is what makes it viewable here.
