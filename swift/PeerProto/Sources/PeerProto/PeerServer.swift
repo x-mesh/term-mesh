@@ -58,12 +58,15 @@ enum PeerServerDiagnostics {
             : "/tmp/term-mesh-peer-server-\(tag).log"
     }
 
-    private static var path: String {
-        logPath(
-            environment: ProcessInfo.processInfo.environment,
-            processName: ProcessInfo.processInfo.processName
-        )
-    }
+    /// Resolved once. `record` runs per log line, and reading
+    /// `ProcessInfo.environment` is not a lookup — it rebuilds the whole
+    /// environment into a Dictionary each time. Nothing here can change while
+    /// the process runs, so a computed property would pay that on every line
+    /// for an answer that never moves.
+    private static let path = logPath(
+        environment: ProcessInfo.processInfo.environment,
+        processName: ProcessInfo.processInfo.processName
+    )
 
     static func record(_ message: String) {
         NSLog("term-mesh.peer %@", message)
