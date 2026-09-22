@@ -29,16 +29,50 @@ private let maxPeerServerSessions = 64
 
 enum PeerServerDiagnostics {
     private static let queue = DispatchQueue(label: "term-mesh.peer.server.diagnostics")
-    private static let path = "/tmp/term-mesh-peer-server.log"
     private static let maxBytes = 256 * 1024
+
+    /// Which file a process's peer diagnostics belong in.
+    ///
+    /// One hardcoded path put three writers in the same file: the installed
+    /// app, every tagged dev build, and the unit suite — whose mock hosts and
+    /// synthetic surface ids then sat in the middle of the log someone was
+    /// reading to diagnose a live machine. `TERMMESH_TAG` separates a tagged
+    /// build, but no test sets one, so a test run is recognized instead.
+    ///
+    /// It takes four signals because the two runners this package is driven by
+    /// share none: `xcodebuild` hosts the bundle in an app and exports
+    /// `XCTestConfigurationFilePath`, while `swift test` execs Xcode's own
+    /// `xctest` binary, which exports neither of the `XCTest*` paths and is
+    /// identifiable only by its process name and `SWIFT_TESTING_ENABLED`.
+    static func logPath(environment: [String: String], processName: String) -> String {
+        if environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+            || environment["SWIFT_TESTING_ENABLED"] != nil
+            || processName == "xctest" {
+            return "/tmp/term-mesh-peer-server-tests.log"
+        }
+        let tag = environment["TERMMESH_TAG"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return tag.isEmpty
+            ? "/tmp/term-mesh-peer-server.log"
+            : "/tmp/term-mesh-peer-server-\(tag).log"
+    }
+
+    private static var path: String {
+        logPath(
+            environment: ProcessInfo.processInfo.environment,
+            processName: ProcessInfo.processInfo.processName
+        )
+    }
 
     static func record(_ message: String) {
         NSLog("term-mesh.peer %@", message)
         let line = "\(String(format: "%.3f", Date().timeIntervalSince1970)) \(message)\n"
         queue.async {
+            let logPath = path
             let data = Data(line.utf8)
-            let url = URL(fileURLWithPath: path)
-            if let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+            let url = URL(fileURLWithPath: logPath)
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: logPath),
                let size = (attributes[.size] as? NSNumber)?.intValue,
                size >= maxBytes {
                 try? data.write(to: url, options: .atomic)
@@ -49,7 +83,7 @@ enum PeerServerDiagnostics {
                 handle.write(data)
                 try? handle.close()
             } else {
-                FileManager.default.createFile(atPath: path, contents: data)
+                FileManager.default.createFile(atPath: logPath, contents: data)
             }
         }
     }

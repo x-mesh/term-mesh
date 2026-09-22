@@ -1774,6 +1774,51 @@ final class PeerServerTests: XCTestCase {
         )
         XCTAssertEqual(label.filter { $0 == "\"" }.count, 2, "only the delimiters remain")
     }
+
+    /// The installed app's diagnostics are read to debug live machines, so a
+    /// test run and a tagged dev build must not write into them.
+    func testDiagnosticsLogIsSeparatePerWriter() {
+        let tests = "/tmp/term-mesh-peer-server-tests.log"
+        let production = PeerServerDiagnostics.logPath(environment: [:], processName: "term-mesh")
+        XCTAssertEqual(production, "/tmp/term-mesh-peer-server.log")
+
+        for environment in [
+            ["XCTestConfigurationFilePath": "/x/y.plist"],
+            ["XCTestBundlePath": "/x/y.xctest"],
+            ["SWIFT_TESTING_ENABLED": "1"],
+        ] {
+            XCTAssertEqual(
+                PeerServerDiagnostics.logPath(environment: environment, processName: "term-mesh"),
+                tests,
+                "\(environment.keys.first ?? "") must mark a test run"
+            )
+        }
+        XCTAssertEqual(
+            PeerServerDiagnostics.logPath(environment: [:], processName: "xctest"),
+            tests,
+            "swift test execs xctest and exports none of the XCTest paths"
+        )
+        XCTAssertEqual(
+            PeerServerDiagnostics.logPath(
+                environment: ["TERMMESH_TAG": "attachfix"], processName: "term-mesh DEV"
+            ),
+            "/tmp/term-mesh-peer-server-attachfix.log"
+        )
+        XCTAssertEqual(
+            PeerServerDiagnostics.logPath(
+                environment: ["TERMMESH_TAG": "  "], processName: "term-mesh"
+            ),
+            production,
+            "a blank tag is not a tag"
+        )
+        XCTAssertEqual(
+            PeerServerDiagnostics.logPath(
+                environment: ["TERMMESH_TAG": "t"], processName: "xctest"
+            ),
+            tests,
+            "a suite run inside a tagged shell is still a suite run"
+        )
+    }
 }
 
 /// Test-only `PeerSurfaceProvider` that records the `resumeFromSeq` it was
