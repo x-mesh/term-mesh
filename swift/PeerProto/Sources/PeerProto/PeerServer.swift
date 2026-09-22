@@ -2581,6 +2581,17 @@ actor PeerServerSession {
             }
         }()
 
+        // `provider.attach` has already taken the surface's attach reference
+        // (teal ring, viewer size arbitration), and only an attachment this
+        // dictionary holds is reached by `teardownAttachments`. So it has to
+        // be registered before the first write that can throw: a send failure
+        // on a dying socket ends the session, and an attachment registered
+        // after that point was never detached. The host pane then kept a ring
+        // nobody was behind and went on sizing its grid for a viewer that died
+        // mid-handshake.
+        attachments[req.surfaceID] = attachment
+        if grantedMode == .coWrite { writableAttachments.insert(req.surfaceID) }
+
         try await sendEnvelopeWithCorrelation(correlationID) { inner in
             var r = Termmesh_Peer_V1_AttachResult()
             r.accepted = true
@@ -2603,8 +2614,6 @@ actor PeerServerSession {
             }
         }
 
-        attachments[req.surfaceID] = attachment
-        if grantedMode == .coWrite { writableAttachments.insert(req.surfaceID) }
         let surfaceID = req.surfaceID
         let relayTask: Task<Void, Never> = Task { [weak self] in
             guard let self else { return }
