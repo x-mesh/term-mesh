@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.255.0] - 2026-09-22
+
+### Fixed
+
+- A terminal pane no longer keeps its peer indicator and a shrunken grid after the remote viewer is gone. A connection that dropped while the host was still answering its attach was never accounted as closed, so the pane went on sizing its grid for a viewer that had already left and the screen looked clipped.
+- Peer session diagnostics name the client that connected and its peer id. Repeated dropped connections can now be traced to the machine causing them.
+- Development builds and the test suite write their peer diagnostics to their own files instead of the installed app's log.
+
+### Changed
+
+- The peer federation setting "Measure input latency" is now "Peer input & tunnel diagnostics". The old name covered only half of what the setting records, since it also logs shared-tunnel lifecycle events. The setting and both of its descriptions now appear in Korean.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.254.2] - 2026-09-21
 
 - Fixed sidebar workspace-roster failures so they rebuild only the roster subscription instead of tearing down the shared SSH tunnel and reconnecting every remote pane.
