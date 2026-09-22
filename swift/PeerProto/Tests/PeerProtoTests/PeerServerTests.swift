@@ -1741,6 +1741,84 @@ final class PeerServerTests: XCTestCase {
             "a GUI host cannot stage transferable worker route files"
         )
     }
+
+    /// The diagnostics log is line-oriented and the client supplies its own
+    /// name, so a name carrying a newline could otherwise append a record that
+    /// reads exactly like one the host wrote.
+    func testClientLabelCannotForgeALogRecord() {
+        let forged = "evil\nsession-end reason=goodbye attachments=0"
+        let label = PeerServerDiagnostics.clientLabel(
+            name: forged, peerID: Data([0xDE, 0xAD, 0xBE, 0xEF, 0x01])
+        )
+        XCTAssertFalse(label.contains("\n"), "a newline would start a forged record")
+        XCTAssertTrue(label.contains("peer_id=deadbeef"), "id is the first four bytes")
+    }
+
+    func testClientLabelKeepsOrdinaryNamesAndBoundsLongOnes() {
+        XCTAssertEqual(
+            PeerServerDiagnostics.clientLabel(name: "맥스튜디오 t", peerID: Data([0x01, 0x02])),
+            "peer=\"맥스튜디오 t\" peer_id=0102",
+            "a non-ASCII name is not the threat and must stay readable"
+        )
+        let label = PeerServerDiagnostics.clientLabel(
+            name: String(repeating: "x", count: 500), peerID: Data()
+        )
+        XCTAssertTrue(label.contains(String(repeating: "x", count: 64)))
+        XCTAssertFalse(label.contains(String(repeating: "x", count: 65)), "bounded at 64")
+        XCTAssertTrue(label.contains("peer_id=-"), "a session that never said Hello is still named")
+    }
+
+    func testClientLabelNeutralizesTheQuoteThatDelimitsIt() {
+        let label = PeerServerDiagnostics.clientLabel(
+            name: "a\" peer_id=0000 reason=goodbye", peerID: Data([0xAB])
+        )
+        XCTAssertEqual(label.filter { $0 == "\"" }.count, 2, "only the delimiters remain")
+    }
+
+    /// The installed app's diagnostics are read to debug live machines, so a
+    /// test run and a tagged dev build must not write into them.
+    func testDiagnosticsLogIsSeparatePerWriter() {
+        let tests = "/tmp/term-mesh-peer-server-tests.log"
+        let production = PeerServerDiagnostics.logPath(environment: [:], processName: "term-mesh")
+        XCTAssertEqual(production, "/tmp/term-mesh-peer-server.log")
+
+        for environment in [
+            ["XCTestConfigurationFilePath": "/x/y.plist"],
+            ["XCTestBundlePath": "/x/y.xctest"],
+            ["SWIFT_TESTING_ENABLED": "1"],
+        ] {
+            XCTAssertEqual(
+                PeerServerDiagnostics.logPath(environment: environment, processName: "term-mesh"),
+                tests,
+                "\(environment.keys.first ?? "") must mark a test run"
+            )
+        }
+        XCTAssertEqual(
+            PeerServerDiagnostics.logPath(environment: [:], processName: "xctest"),
+            tests,
+            "swift test execs xctest and exports none of the XCTest paths"
+        )
+        XCTAssertEqual(
+            PeerServerDiagnostics.logPath(
+                environment: ["TERMMESH_TAG": "attachfix"], processName: "term-mesh DEV"
+            ),
+            "/tmp/term-mesh-peer-server-attachfix.log"
+        )
+        XCTAssertEqual(
+            PeerServerDiagnostics.logPath(
+                environment: ["TERMMESH_TAG": "  "], processName: "term-mesh"
+            ),
+            production,
+            "a blank tag is not a tag"
+        )
+        XCTAssertEqual(
+            PeerServerDiagnostics.logPath(
+                environment: ["TERMMESH_TAG": "t"], processName: "xctest"
+            ),
+            tests,
+            "a suite run inside a tagged shell is still a suite run"
+        )
+    }
 }
 
 /// Test-only `PeerSurfaceProvider` that records the `resumeFromSeq` it was

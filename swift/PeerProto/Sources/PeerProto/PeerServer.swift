@@ -27,18 +27,55 @@ import SwiftProtobuf
 // attach churn well under the kernel's accept budget.
 private let maxPeerServerSessions = 64
 
-private enum PeerServerDiagnostics {
+enum PeerServerDiagnostics {
     private static let queue = DispatchQueue(label: "term-mesh.peer.server.diagnostics")
-    private static let path = "/tmp/term-mesh-peer-server.log"
     private static let maxBytes = 256 * 1024
+
+    /// Which file a process's peer diagnostics belong in.
+    ///
+    /// One hardcoded path put three writers in the same file: the installed
+    /// app, every tagged dev build, and the unit suite — whose mock hosts and
+    /// synthetic surface ids then sat in the middle of the log someone was
+    /// reading to diagnose a live machine. `TERMMESH_TAG` separates a tagged
+    /// build, but no test sets one, so a test run is recognized instead.
+    ///
+    /// It takes four signals because the two runners this package is driven by
+    /// share none: `xcodebuild` hosts the bundle in an app and exports
+    /// `XCTestConfigurationFilePath`, while `swift test` execs Xcode's own
+    /// `xctest` binary, which exports neither of the `XCTest*` paths and is
+    /// identifiable only by its process name and `SWIFT_TESTING_ENABLED`.
+    static func logPath(environment: [String: String], processName: String) -> String {
+        if environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+            || environment["SWIFT_TESTING_ENABLED"] != nil
+            || processName == "xctest" {
+            return "/tmp/term-mesh-peer-server-tests.log"
+        }
+        let tag = environment["TERMMESH_TAG"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return tag.isEmpty
+            ? "/tmp/term-mesh-peer-server.log"
+            : "/tmp/term-mesh-peer-server-\(tag).log"
+    }
+
+    /// Resolved once. `record` runs per log line, and reading
+    /// `ProcessInfo.environment` is not a lookup — it rebuilds the whole
+    /// environment into a Dictionary each time. Nothing here can change while
+    /// the process runs, so a computed property would pay that on every line
+    /// for an answer that never moves.
+    private static let path = logPath(
+        environment: ProcessInfo.processInfo.environment,
+        processName: ProcessInfo.processInfo.processName
+    )
 
     static func record(_ message: String) {
         NSLog("term-mesh.peer %@", message)
         let line = "\(String(format: "%.3f", Date().timeIntervalSince1970)) \(message)\n"
         queue.async {
+            let logPath = path
             let data = Data(line.utf8)
-            let url = URL(fileURLWithPath: path)
-            if let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+            let url = URL(fileURLWithPath: logPath)
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: logPath),
                let size = (attributes[.size] as? NSNumber)?.intValue,
                size >= maxBytes {
                 try? data.write(to: url, options: .atomic)
@@ -49,13 +86,31 @@ private enum PeerServerDiagnostics {
                 handle.write(data)
                 try? handle.close()
             } else {
-                FileManager.default.createFile(atPath: path, contents: data)
+                FileManager.default.createFile(atPath: logPath, contents: data)
             }
         }
     }
 
     static func shortSurfaceID(_ id: Data) -> String {
         id.prefix(6).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Names the party on the other end of a session.
+    ///
+    /// `name` is whatever the client put in its Hello — untrusted text headed
+    /// for a line-oriented log, so anything that could forge a record (a
+    /// newline, a control character, the quote that delimits it) is replaced
+    /// rather than escaped, and the whole field is bounded. The peer id rides
+    /// along because it is what stays the same when a machine is renamed, and
+    /// because an empty name still has to be attributable.
+    static func clientLabel(name: String, peerID: Data) -> String {
+        let safe = String(name.prefix(64).map { character in
+            character.isNewline || character == "\"" || character == "\\"
+                || character.unicodeScalars.contains { $0.value < 0x20 }
+                ? "?" : character
+        })
+        let id = peerID.prefix(4).map { String(format: "%02x", $0) }.joined()
+        return "peer=\"\(safe)\" peer_id=\(id.isEmpty ? "-" : id)"
     }
 }
 
@@ -1823,6 +1878,11 @@ actor PeerServerSession {
     /// leader grants are bound to it so reconnects from the same install work
     /// while another peer cannot replay a captured grant.
     private var clientPeerID = Data()
+    /// What the client called itself in its Hello, kept so `session-end` can
+    /// name who the session belonged to. A host that logs only the outcome
+    /// cannot answer "who kept connecting" after the fact, which is the one
+    /// question a burst of dropped sessions raises.
+    private var clientDisplayName = ""
     private var pendingLeaderCalls: [
         UInt64: CheckedContinuation<Termmesh_Peer_V1_TeamLeaderCommandResponse, Error>
     ] = [:]
@@ -1871,7 +1931,10 @@ actor PeerServerSession {
         }
         if !attachments.isEmpty || !endReason.hasPrefix("goodbye") {
             PeerServerDiagnostics.record(
-                "session-end reason=\(endReason) attachments=\(attachments.count)"
+                "session-end reason=\(endReason) attachments=\(attachments.count) "
+                    + PeerServerDiagnostics.clientLabel(
+                        name: clientDisplayName, peerID: clientPeerID
+                    )
             )
         }
         failPendingLeaderCalls(with: PeerServerError.leaderSessionClosed)
@@ -2098,6 +2161,7 @@ actor PeerServerSession {
             }
             clientCapabilities = PeerCapabilities(clientHello.capabilities)
             clientPeerID = clientHello.peerID
+            clientDisplayName = clientHello.displayName
             // Capabilities describe implemented protocol support, not whether
             // the current team roster happens to contain any rows.
             //
@@ -2581,6 +2645,17 @@ actor PeerServerSession {
             }
         }()
 
+        // `provider.attach` has already taken the surface's attach reference
+        // (teal ring, viewer size arbitration), and only an attachment this
+        // dictionary holds is reached by `teardownAttachments`. So it has to
+        // be registered before the first write that can throw: a send failure
+        // on a dying socket ends the session, and an attachment registered
+        // after that point was never detached. The host pane then kept a ring
+        // nobody was behind and went on sizing its grid for a viewer that died
+        // mid-handshake.
+        attachments[req.surfaceID] = attachment
+        if grantedMode == .coWrite { writableAttachments.insert(req.surfaceID) }
+
         try await sendEnvelopeWithCorrelation(correlationID) { inner in
             var r = Termmesh_Peer_V1_AttachResult()
             r.accepted = true
@@ -2603,8 +2678,6 @@ actor PeerServerSession {
             }
         }
 
-        attachments[req.surfaceID] = attachment
-        if grantedMode == .coWrite { writableAttachments.insert(req.surfaceID) }
         let surfaceID = req.surfaceID
         let relayTask: Task<Void, Never> = Task { [weak self] in
             guard let self else { return }

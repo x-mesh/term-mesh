@@ -2540,7 +2540,7 @@ struct SettingsView: View {
             SettingsCardDivider()
 
             SettingsCardRow(
-                "Measure input latency",
+                "Peer input & tunnel diagnostics",
                 subtitle: peerFederationInputPathTelemetry
                     ? "This Mac times each peer keystroke through inject, PTY callback and send, and logs shared-tunnel EOF, refresh ownership and generation changes. Takes effect within a couple of seconds; no keystroke content is recorded."
                     : "Off: peer keystrokes are relayed untimed and shared-tunnel lifecycle incidents are not captured. Turn on only while investigating slow remote typing or reconnects."
