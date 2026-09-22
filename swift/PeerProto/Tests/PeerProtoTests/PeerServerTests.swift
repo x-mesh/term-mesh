@@ -1741,6 +1741,39 @@ final class PeerServerTests: XCTestCase {
             "a GUI host cannot stage transferable worker route files"
         )
     }
+
+    /// The diagnostics log is line-oriented and the client supplies its own
+    /// name, so a name carrying a newline could otherwise append a record that
+    /// reads exactly like one the host wrote.
+    func testClientLabelCannotForgeALogRecord() {
+        let forged = "evil\nsession-end reason=goodbye attachments=0"
+        let label = PeerServerDiagnostics.clientLabel(
+            name: forged, peerID: Data([0xDE, 0xAD, 0xBE, 0xEF, 0x01])
+        )
+        XCTAssertFalse(label.contains("\n"), "a newline would start a forged record")
+        XCTAssertTrue(label.contains("peer_id=deadbeef"), "id is the first four bytes")
+    }
+
+    func testClientLabelKeepsOrdinaryNamesAndBoundsLongOnes() {
+        XCTAssertEqual(
+            PeerServerDiagnostics.clientLabel(name: "맥스튜디오 t", peerID: Data([0x01, 0x02])),
+            "peer=\"맥스튜디오 t\" peer_id=0102",
+            "a non-ASCII name is not the threat and must stay readable"
+        )
+        let label = PeerServerDiagnostics.clientLabel(
+            name: String(repeating: "x", count: 500), peerID: Data()
+        )
+        XCTAssertTrue(label.contains(String(repeating: "x", count: 64)))
+        XCTAssertFalse(label.contains(String(repeating: "x", count: 65)), "bounded at 64")
+        XCTAssertTrue(label.contains("peer_id=-"), "a session that never said Hello is still named")
+    }
+
+    func testClientLabelNeutralizesTheQuoteThatDelimitsIt() {
+        let label = PeerServerDiagnostics.clientLabel(
+            name: "a\" peer_id=0000 reason=goodbye", peerID: Data([0xAB])
+        )
+        XCTAssertEqual(label.filter { $0 == "\"" }.count, 2, "only the delimiters remain")
+    }
 }
 
 /// Test-only `PeerSurfaceProvider` that records the `resumeFromSeq` it was

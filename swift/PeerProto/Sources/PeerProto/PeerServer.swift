@@ -27,7 +27,7 @@ import SwiftProtobuf
 // attach churn well under the kernel's accept budget.
 private let maxPeerServerSessions = 64
 
-private enum PeerServerDiagnostics {
+enum PeerServerDiagnostics {
     private static let queue = DispatchQueue(label: "term-mesh.peer.server.diagnostics")
     private static let path = "/tmp/term-mesh-peer-server.log"
     private static let maxBytes = 256 * 1024
@@ -56,6 +56,24 @@ private enum PeerServerDiagnostics {
 
     static func shortSurfaceID(_ id: Data) -> String {
         id.prefix(6).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Names the party on the other end of a session.
+    ///
+    /// `name` is whatever the client put in its Hello — untrusted text headed
+    /// for a line-oriented log, so anything that could forge a record (a
+    /// newline, a control character, the quote that delimits it) is replaced
+    /// rather than escaped, and the whole field is bounded. The peer id rides
+    /// along because it is what stays the same when a machine is renamed, and
+    /// because an empty name still has to be attributable.
+    static func clientLabel(name: String, peerID: Data) -> String {
+        let safe = String(name.prefix(64).map { character in
+            character.isNewline || character == "\"" || character == "\\"
+                || character.unicodeScalars.contains { $0.value < 0x20 }
+                ? "?" : character
+        })
+        let id = peerID.prefix(4).map { String(format: "%02x", $0) }.joined()
+        return "peer=\"\(safe)\" peer_id=\(id.isEmpty ? "-" : id)"
     }
 }
 
@@ -1823,6 +1841,11 @@ actor PeerServerSession {
     /// leader grants are bound to it so reconnects from the same install work
     /// while another peer cannot replay a captured grant.
     private var clientPeerID = Data()
+    /// What the client called itself in its Hello, kept so `session-end` can
+    /// name who the session belonged to. A host that logs only the outcome
+    /// cannot answer "who kept connecting" after the fact, which is the one
+    /// question a burst of dropped sessions raises.
+    private var clientDisplayName = ""
     private var pendingLeaderCalls: [
         UInt64: CheckedContinuation<Termmesh_Peer_V1_TeamLeaderCommandResponse, Error>
     ] = [:]
@@ -1871,7 +1894,10 @@ actor PeerServerSession {
         }
         if !attachments.isEmpty || !endReason.hasPrefix("goodbye") {
             PeerServerDiagnostics.record(
-                "session-end reason=\(endReason) attachments=\(attachments.count)"
+                "session-end reason=\(endReason) attachments=\(attachments.count) "
+                    + PeerServerDiagnostics.clientLabel(
+                        name: clientDisplayName, peerID: clientPeerID
+                    )
             )
         }
         failPendingLeaderCalls(with: PeerServerError.leaderSessionClosed)
@@ -2098,6 +2124,7 @@ actor PeerServerSession {
             }
             clientCapabilities = PeerCapabilities(clientHello.capabilities)
             clientPeerID = clientHello.peerID
+            clientDisplayName = clientHello.displayName
             // Capabilities describe implemented protocol support, not whether
             // the current team roster happens to contain any rows.
             //
