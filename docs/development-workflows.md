@@ -55,6 +55,29 @@ socket plus a distinct daemon session-owner socket. A daemon-only endpoint is a 
 not a Project-capable GUI route, and must fail that gate. The result records the app PID and binary,
 GUI peer socket ownership, state directory, serving/session-owner endpoints, Project/workspace/pane/
 surface identities, relay counters, FD bounds, and cleanup receipt.
+Set `TERMMESH_E2E_PEER_RELAY_READ_DELAY_MS=5` in the remote shell for a controlled reader stall.
+The Debug app forwards this value to `term-mesh-peer-relay`.
+The helper adds the delay before each frame read.
+The helper adds no delay when the variable is absent.
+
+The delay does not guarantee that the GUI output queue reaches capacity. Read the queue measurements
+in the receipt before you claim overflow recovery.
+
+Set `TERMMESH_E2E_PEER_SERVER_WRITE_DELAY_MS=1000` for the Debug GUI loopback host.
+The peer server delays writes for the first second of output, then resumes normal writes.
+The gate requires an outbound queue watermark and output completion.
+The completion marker is absent from the echoed command.
+The gate also holds the exact remote Project leader attachment for 15 seconds.
+The leader pane runs an agent CLI. Do not send shell commands to it.
+
+For the strict session-owner gate, set `TERMMESH_E2E_GUI_SESSION_OWNER_FIXTURE=1` and
+`TERMMESH_E2E_REMOTE_FIXTURE_SSH_TARGET=mac-studio-t`.
+The runner stages the candidate GUI app and daemon on that Mac host.
+The GUI app serves the peer socket and claims its paired daemon.
+
+The peer-server log records queue watermarks and one final observation per attachment.
+`queue-watermark` reports current and peak queue bytes and items at capacity thresholds.
+`queue-observation` reports peak items, peak bytes, dropped totals, and snapshot count.
 
 `reload` = kill and launch the Debug app only (tag required):
 

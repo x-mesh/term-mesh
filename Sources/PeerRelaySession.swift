@@ -2067,6 +2067,9 @@ final class PeerRelaySession {
             "TERMMESH_PEER_RELAY_SECRET": relaySecret,
         ]
         #if DEBUG
+        if let readDelay = ProcessInfo.processInfo.environment["TERMMESH_E2E_PEER_RELAY_READ_DELAY_MS"] {
+            env["TERMMESH_E2E_PEER_RELAY_READ_DELAY_MS"] = readDelay
+        }
         // The helper logs cumulative output and its exit cause with errno,
         // but `rlog` is inert unless this is set (or a marker file was created
         // beforehand) — so that instrumentation was dark exactly when it was

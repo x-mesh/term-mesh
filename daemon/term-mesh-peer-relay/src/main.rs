@@ -32,6 +32,8 @@ const TYPE_RESIZE: u8 = 0x03;
 const TYPE_STALL: u8 = 0x04;
 const TYPE_GOODBYE: u8 = 0xFF;
 const TYPE_AUTH: u8 = 0xFE;
+const TEST_READ_DELAY_ENV: &str = "TERMMESH_E2E_PEER_RELAY_READ_DELAY_MS";
+const MAX_TEST_READ_DELAY_MS: u64 = 100;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_PENDING: usize = 256;
 const RESIZE_COALESCE_MS: u64 = 16;
@@ -310,6 +312,19 @@ fn read_frame(sock: &mut UnixStream) -> io::Result<(u8, Vec<u8>)> {
         sock.read_exact(&mut payload)?;
     }
     Ok((typ, payload))
+}
+
+fn parse_test_read_delay_ms(value: Option<&str>) -> Result<u64, String> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let delay_ms = value
+        .parse::<u64>()
+        .map_err(|_| "value must be an integer from 0 to 100".to_string())?;
+    if delay_ms > MAX_TEST_READ_DELAY_MS {
+        return Err("value must be an integer from 0 to 100".to_string());
+    }
+    Ok(delay_ms)
 }
 
 // ── Terminal-response filter ───────────────────────────────────────
@@ -763,6 +778,22 @@ fn is_terminal_osc_response(seq_without_terminator: &[u8]) -> bool {
 // ── Main ────────────────────────────────────────────────────────────
 
 fn main() {
+    let delay_value = match env::var(TEST_READ_DELAY_ENV) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => {
+            eprintln!("[relay] cannot read {TEST_READ_DELAY_ENV}: {error}");
+            std::process::exit(2);
+        }
+    };
+    let test_read_delay_ms = match parse_test_read_delay_ms(delay_value.as_deref()) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("[relay] invalid {TEST_READ_DELAY_ENV}: {error}");
+            std::process::exit(2);
+        }
+    };
+
     let socket_path = env::var("TERMMESH_PEER_RELAY_SOCKET").unwrap_or_else(|_| {
         eprintln!("[relay] TERMMESH_PEER_RELAY_SOCKET not set");
         std::process::exit(1);
@@ -781,6 +812,9 @@ fn main() {
         std::process::exit(1);
     }
     rlog(&format!("started: connected + authed to {socket_path}"));
+    if test_read_delay_ms > 0 {
+        rlog(&format!("test-read-delay active ms={test_read_delay_ms}"));
+    }
 
     // Put stdin in raw mode so each keystroke (Tab, Ctrl-C, arrow keys)
     // is forwarded immediately instead of waiting for a newline flush.
@@ -990,6 +1024,9 @@ fn main() {
     let mut next_mark: u64 = 1 << 20; // log cumulative throughput every 1 MiB
     let mut last_stall_report: Option<Instant> = None;
     loop {
+        if test_read_delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(test_read_delay_ms));
+        }
         match read_frame(&mut sock) {
             Err(e) => {
                 rlog(&format!(
@@ -1090,6 +1127,23 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_read_delay_defaults_to_disabled() {
+        assert_eq!(super::parse_test_read_delay_ms(None), Ok(0));
+    }
+
+    #[test]
+    fn test_read_delay_accepts_bounded_milliseconds() {
+        assert_eq!(super::parse_test_read_delay_ms(Some("5")), Ok(5));
+        assert_eq!(super::parse_test_read_delay_ms(Some("100")), Ok(100));
+    }
+
+    #[test]
+    fn test_read_delay_rejects_invalid_or_unbounded_values() {
+        assert!(super::parse_test_read_delay_ms(Some("five")).is_err());
+        assert!(super::parse_test_read_delay_ms(Some("101")).is_err());
+    }
+
     /// Concurrent writers must not shred each other's lines.
     ///
     /// Every relay process on the machine appends to one shared file, and the

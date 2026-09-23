@@ -106,6 +106,7 @@ DAEMON_BIN="$PWD/daemon/target/release/term-meshd"
 E2E_RUN_ID="$$"
 APP_SOCK_PATH="${TMPDIR:-/tmp}/term-mesh-e2e-app-${E2E_RUN_ID}.sock"
 DAEMON_SOCK_PATH="${TMPDIR:-/tmp}/term-meshd-e2e-${E2E_RUN_ID}.sock"
+APP_PEER_SOCKET_PATH="${DAEMON_SOCK_PATH%.sock}-app-peer.sock"
 DAEMON_LOG_PATH="/tmp/term-meshd-e2e-${E2E_RUN_ID}.log"
 # Mobile remote-control listener (docs/mobile-remote-control.md §9 T7): the
 # e2e daemon exposes it on a per-run loopback port in loopback auth mode so
@@ -136,8 +137,18 @@ stage_remote_relay_fixture() {
     echo "ERROR: TERMMESH_E2E_REMOTE_FIXTURE_SSH_TARGET is required" >&2
     exit 1
   fi
+  local gui_session_owner_fixture="${TERMMESH_E2E_GUI_SESSION_OWNER_FIXTURE:-0}"
+  case "$gui_session_owner_fixture" in
+    0|1) ;;
+    *) echo "ERROR: TERMMESH_E2E_GUI_SESSION_OWNER_FIXTURE must be 0 or 1" >&2; exit 1 ;;
+  esac
+  if [ "$gui_session_owner_fixture" = "1" ] \
+      && [ "${TERMMESH_E2E_REQUIRE_SESSION_OWNER_REDIRECT:-}" != "1" ]; then
+    echo "ERROR: GUI session-owner fixture requires the strict route gate" >&2
+    exit 1
+  fi
 
-  local candidate_sha expected_sha fixture_id remote_version remote_socket remote_dir
+  local candidate_sha expected_sha fixture_id remote_version remote_socket remote_dir profile_socket
   candidate_sha="${TERMMESH_E2E_CANDIDATE_SHA:-}"
   expected_sha="$(git rev-parse HEAD)"
   if [ -z "$candidate_sha" ] || [ "$candidate_sha" != "$expected_sha" ]; then
@@ -145,25 +156,30 @@ stage_remote_relay_fixture() {
     echo "expected=$expected_sha supplied=${candidate_sha:-<empty>}" >&2
     exit 1
   fi
-  if ! git diff --quiet -- daemon Proto || ! git diff --cached --quiet -- daemon Proto; then
+  # The read-delay hook changes only the local viewer relay, not the staged daemon packages.
+  if ! git diff --quiet -- daemon Proto ':(exclude)daemon/term-mesh-peer-relay/src/main.rs' \
+    || ! git diff --cached --quiet -- daemon Proto ':(exclude)daemon/term-mesh-peer-relay/src/main.rs'; then
     echo "ERROR: daemon/proto must be clean so the remote fixture proves candidate_sha" >&2
     exit 1
   fi
 
-  # The staged daemon runs with XDG_DATA_HOME inside the fixture, so the agent
-  # CLI installs a copy of itself there and repoints ~/.local/bin/claude at it.
-  # The fixture is deleted on exit, which left that link dangling and the next
-  # run could not start a leader at all: "claude is not installed". Remember
+  # The fixture daemon can repoint the agent CLI link into state that cleanup removes.
   fixture_id="${candidate_sha:0:12}-$E2E_RUN_ID"
   REMOTE_FIXTURE_ROOT="/tmp/term-mesh-release-relay-$fixture_id"
   REMOTE_AGENT_CLI_BACKUP="/tmp/term-mesh-release-relay-cli-$fixture_id"
-  if ssh "$REMOTE_FIXTURE_SSH_TARGET" 'test -e "$HOME/.local/bin/claude" || test -L "$HOME/.local/bin/claude"'; then
-    REMOTE_AGENT_CLI_PRESENT=1
-    ssh "$REMOTE_FIXTURE_SSH_TARGET" \
-      "rm -rf '$REMOTE_AGENT_CLI_BACKUP'; mkdir -p '$REMOTE_AGENT_CLI_BACKUP'; cp -a \"\$HOME/.local/bin/claude\" '$REMOTE_AGENT_CLI_BACKUP/claude'"
+  if ! ssh "$REMOTE_FIXTURE_SSH_TARGET" 'test -x "$HOME/.local/bin/claude"'; then
+    echo "ERROR: peer agent CLI must be executable before staging the fixture" >&2
+    exit 1
   fi
+  REMOTE_AGENT_CLI_PRESENT=1
+  ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+    "rm -rf '$REMOTE_AGENT_CLI_BACKUP'; mkdir -p '$REMOTE_AGENT_CLI_BACKUP'; cp -a \"\$HOME/.local/bin/claude\" '$REMOTE_AGENT_CLI_BACKUP/claude'"
   remote_socket="$REMOTE_FIXTURE_ROOT/term-meshd-peer.sock"
   remote_dir="$REMOTE_FIXTURE_ROOT/src"
+  profile_socket="$remote_socket"
+  if [ "$gui_session_owner_fixture" = "1" ]; then
+    profile_socket="$REMOTE_FIXTURE_ROOT/gui-peer.sock"
+  fi
   echo "== stage remote candidate fixture ($REMOTE_FIXTURE_SSH_TARGET) =="
   ssh "$REMOTE_FIXTURE_SSH_TARGET" "mkdir -p '$remote_dir'"
   git archive HEAD \
@@ -173,7 +189,7 @@ stage_remote_relay_fixture() {
        commit -qm candidate"
   ssh "$REMOTE_FIXTURE_SSH_TARGET" \
     "cd '$REMOTE_FIXTURE_ROOT/src/daemon' && \
-     PATH=\"\$HOME/.cargo/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:\$PATH\" \
+     PATH=\"\$HOME/.cargo/bin:\$HOME/.local/bin:/opt/homebrew/opt/rust/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:\$PATH\" \
      CARGO_TARGET_DIR=/tmp/term-mesh-release-relay-target \
      cargo build --release --locked -p term-meshd -p term-mesh-cli -p tm-agent-bridge"
   remote_version="$(ssh "$REMOTE_FIXTURE_SSH_TARGET" \
@@ -186,48 +202,53 @@ stage_remote_relay_fixture() {
     "mkdir -p '$REMOTE_FIXTURE_ROOT/state' '$REMOTE_FIXTURE_ROOT/runtime'; \
      chmod 700 '$REMOTE_FIXTURE_ROOT' '$REMOTE_FIXTURE_ROOT/state' '$REMOTE_FIXTURE_ROOT/runtime'; \
      env XDG_DATA_HOME='$REMOTE_FIXTURE_ROOT/state' XDG_RUNTIME_DIR='$REMOTE_FIXTURE_ROOT/runtime' \
-       PATH=/tmp/term-mesh-release-relay-target/release:\$HOME/.cargo/bin:\$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:\$PATH \
+       PATH=/tmp/term-mesh-release-relay-target/release:\$HOME/.cargo/bin:\$HOME/.local/bin:/opt/homebrew/opt/rust/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:\$PATH \
        TERMMESH_PEER_SOCKET='$remote_socket' \
        TERMMESH_DAEMON_UNIX_PATH='$REMOTE_FIXTURE_ROOT/term-meshd.sock' \
        nohup /tmp/term-mesh-release-relay-target/release/term-meshd \
        >'$REMOTE_FIXTURE_ROOT/daemon.log' 2>&1 & echo \$! >'$REMOTE_FIXTURE_ROOT/pid'"
   for _ in {1..120}; do
-    if ssh "$REMOTE_FIXTURE_SSH_TARGET" "test -S '$remote_socket'"; then break; fi
+    if ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+      "test -S '$remote_socket' && test -S '$REMOTE_FIXTURE_ROOT/term-meshd.sock'"; then break; fi
     sleep 0.25
   done
-  if ! ssh "$REMOTE_FIXTURE_SSH_TARGET" "test -S '$remote_socket'"; then
-    echo "ERROR: staged remote peer socket did not become ready" >&2
+  if ! ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+    "test -S '$remote_socket' && test -S '$REMOTE_FIXTURE_ROOT/term-meshd.sock'"; then
+    echo "ERROR: staged remote daemon sockets did not become ready" >&2
     ssh "$REMOTE_FIXTURE_SSH_TARGET" "tail -100 '$REMOTE_FIXTURE_ROOT/daemon.log'" >&2 || true
     exit 1
   fi
-
   export TERMMESH_E2E_REMOTE_LEADER_HOST="ssh:$REMOTE_FIXTURE_SSH_TARGET"
   export TERMMESH_E2E_REMOTE_LEADER_DIR="$remote_dir"
   export TERMMESH_E2E_REMOTE_FIXTURE_CANDIDATE_SHA="$candidate_sha"
   export TERMMESH_E2E_REMOTE_FIXTURE_VERSION="v$remote_version"
   export TERMMESH_E2E_REMOTE_LEADER_HOST_PROFILE_JSON
-  TERMMESH_E2E_REMOTE_LEADER_HOST_PROFILE_JSON="[{\"id\":\"11111111-1111-4111-8111-111111111111\",\"displayName\":\"release-candidate-relay\",\"sshTarget\":\"$REMOTE_FIXTURE_SSH_TARGET\",\"remoteSocket\":\"$remote_socket\",\"createdAt\":0}]"
+  TERMMESH_E2E_REMOTE_LEADER_HOST_PROFILE_JSON="[{\"id\":\"11111111-1111-4111-8111-111111111111\",\"displayName\":\"release-candidate-relay\",\"sshTarget\":\"$REMOTE_FIXTURE_SSH_TARGET\",\"remoteSocket\":\"$profile_socket\",\"createdAt\":0}]"
 }
 
 cleanup_remote_relay_fixture() {
   [ -n "$REMOTE_FIXTURE_SSH_TARGET" ] || return 0
   [ -n "$REMOTE_FIXTURE_ROOT" ] || return 0
-  # Restore the exact original entry before deleting the fixture, but only
-  # when this run still owns the current fixture-target symlink.
-  if [ -n "$REMOTE_AGENT_CLI_BACKUP" ]; then
-    ssh "$REMOTE_FIXTURE_SSH_TARGET" \
-      "current=\$(readlink \"\$HOME/.local/bin/claude\" 2>/dev/null || true); \
-       case \"\$current\" in \
-         '$REMOTE_FIXTURE_ROOT'/*) \
-           rm -f \"\$HOME/.local/bin/claude\"; \
-           if [ '$REMOTE_AGENT_CLI_PRESENT' = '1' ]; then \
-             cp -a '$REMOTE_AGENT_CLI_BACKUP/claude' \"\$HOME/.local/bin/claude\"; \
-           fi;; \
-       esac" \
-      >/dev/null 2>&1 || true
-  fi
   ssh "$REMOTE_FIXTURE_SSH_TARGET" \
-    "if test -f '$REMOTE_FIXTURE_ROOT/pid'; then kill \$(cat '$REMOTE_FIXTURE_ROOT/pid') 2>/dev/null || true; fi; rm -rf '$REMOTE_FIXTURE_ROOT' '$REMOTE_AGENT_CLI_BACKUP'" \
+    "for pidfile in '$REMOTE_FIXTURE_ROOT/gui.pid' '$REMOTE_FIXTURE_ROOT/pid'; do \
+       if test -f \"\$pidfile\"; then kill \$(cat \"\$pidfile\") 2>/dev/null || true; fi; \
+     done; \
+     for _ in \$(seq 1 50); do \
+       alive=0; \
+       for pidfile in '$REMOTE_FIXTURE_ROOT/gui.pid' '$REMOTE_FIXTURE_ROOT/pid'; do \
+         if test -f \"\$pidfile\" && kill -0 \$(cat \"\$pidfile\") 2>/dev/null; then alive=1; fi; \
+       done; \
+       test \"\$alive\" -eq 0 && break; sleep .1; \
+     done; \
+     current=\$(readlink \"\$HOME/.local/bin/claude\" 2>/dev/null || true); \
+     case \"\$current\" in \
+       '$REMOTE_FIXTURE_ROOT'/*) \
+         rm -f \"\$HOME/.local/bin/claude\"; \
+         if [ '$REMOTE_AGENT_CLI_PRESENT' = '1' ]; then \
+           cp -a '$REMOTE_AGENT_CLI_BACKUP/claude' \"\$HOME/.local/bin/claude\"; \
+         fi;; \
+     esac; \
+     rm -rf '$REMOTE_FIXTURE_ROOT' '$REMOTE_AGENT_CLI_BACKUP'" \
     >/dev/null 2>&1 || true
 }
 
@@ -311,6 +332,41 @@ fi
 export TERMMESH_CLI="$CLI"
 export TERMMESH_CLI_BIN="$CLI"
 
+stage_remote_gui_fixture() {
+  [ "${TERMMESH_E2E_GUI_SESSION_OWNER_FIXTURE:-0}" = "1" ] || return 0
+  local archive="${TMPDIR:-/tmp}/term-mesh-e2e-gui-$E2E_RUN_ID.zip"
+  /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP" "$archive"
+  scp -q "$archive" "$REMOTE_FIXTURE_SSH_TARGET:$REMOTE_FIXTURE_ROOT/gui.zip"
+  rm -f "$archive"
+  ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+    "mkdir -p '$REMOTE_FIXTURE_ROOT/gui-bundle' '$REMOTE_FIXTURE_ROOT/gui-state'; \
+     /usr/bin/ditto -x -k '$REMOTE_FIXTURE_ROOT/gui.zip' '$REMOTE_FIXTURE_ROOT/gui-bundle'; \
+     mv '$REMOTE_FIXTURE_ROOT/gui-bundle/term-mesh DEV.app' '$REMOTE_FIXTURE_ROOT/gui.app'; \
+     rm -f '$REMOTE_FIXTURE_ROOT/gui.zip'; \
+     /usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier com.termmesh.e2e.release.$E2E_RUN_ID' '$REMOTE_FIXTURE_ROOT/gui.app/Contents/Info.plist'; \
+     /usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der '$REMOTE_FIXTURE_ROOT/gui.app' >/dev/null; \
+     env PROJECT_DIR='$REMOTE_FIXTURE_ROOT/src' \
+       DAEMON_BINARY_PATH=/tmp/term-mesh-release-relay-target/release/term-meshd \
+       TERMMESH_DAEMON_UNIX_PATH='$REMOTE_FIXTURE_ROOT/term-meshd.sock' \
+       TERMMESH_PEER_SERVER_PATH='$REMOTE_FIXTURE_ROOT/gui-peer.sock' \
+       TERMMESH_SOCKET_PATH='$REMOTE_FIXTURE_ROOT/gui-control.sock' \
+       TERMMESH_ALLOW_SOCKET_OVERRIDE=1 TERMMESH_UI_TEST_MODE=1 \
+       TERMMESH_E2E_STATE_DIR='$REMOTE_FIXTURE_ROOT/gui-state' \
+       TERMMESH_E2E_PEER_RELAY_READ_DELAY_MS='${TERMMESH_E2E_PEER_RELAY_READ_DELAY_MS:-0}' \
+       nohup '$REMOTE_FIXTURE_ROOT/gui.app/Contents/MacOS/term-mesh DEV' \
+       >'$REMOTE_FIXTURE_ROOT/gui.log' 2>&1 </dev/null & echo \$! >'$REMOTE_FIXTURE_ROOT/gui.pid'"
+  for _ in {1..120}; do
+    if ssh "$REMOTE_FIXTURE_SSH_TARGET" \
+      "test -S '$REMOTE_FIXTURE_ROOT/gui-peer.sock' && test -S '$REMOTE_FIXTURE_ROOT/gui-control.sock'"; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "ERROR: staged GUI sockets did not become ready" >&2
+  ssh "$REMOTE_FIXTURE_SSH_TARGET" "tail -100 '$REMOTE_FIXTURE_ROOT/gui.log'" >&2 || true
+  return 1
+}
+
 cleanup() {
   local app_descendants=""
   local relaunched_app_pid=""
@@ -372,7 +428,8 @@ cleanup() {
   done
   E2E_APP_PID=""
   E2E_DAEMON_PID=""
-  rm -f "$APP_SOCK_PATH" "$DAEMON_SOCK_PATH" "$E2E_APP_PID_FILE" || true
+  rm -f "$DAEMON_SOCK_PATH"
+  rm -f "$APP_SOCK_PATH" "$E2E_APP_PID_FILE" || true
 }
 
 # State a test is allowed to destroy. `SessionRestoreSettings.sessionFilePath` is
@@ -400,6 +457,7 @@ export TERMMESH_E2E_MOBILE_ADDR="$MOBILE_LISTENER_ADDR"
 export TERMMESH_APP_BIN="$APP/Contents/MacOS/term-mesh DEV"
 export TERMMESH_E2E_APP_PID_FILE="$E2E_APP_PID_FILE"
 trap 'cleanup; cleanup_remote_relay_fixture; rm -rf "$E2E_STATE_DIR"; defaults delete com.termmesh.e2e >/dev/null 2>&1 || true' EXIT
+stage_remote_gui_fixture
 
 launch_and_wait() {
   local preserve_state="${1:-0}"
@@ -418,19 +476,19 @@ launch_and_wait() {
   defaults write com.termmesh.app.debug socketControlMode -string full >/dev/null 2>&1 || true
 
   TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
-  TERMMESH_PEER_SOCKET="${DAEMON_SOCK_PATH%.sock}-peer.sock" \
-  TERM_MESH_HTTP_DISABLED=1 \
-  TERM_MESH_MOBILE_ENABLED=1 \
-  TERM_MESH_MOBILE_AUTH=loopback \
-  TERM_MESH_MOBILE_ADDR="$MOBILE_LISTENER_ADDR" \
-  "$DAEMON_BIN" >>"$DAEMON_LOG_PATH" 2>&1 &
+    TERMMESH_PEER_SOCKET="${DAEMON_SOCK_PATH%.sock}-peer.sock" \
+    TERM_MESH_HTTP_DISABLED=1 \
+    TERM_MESH_MOBILE_ENABLED=1 \
+    TERM_MESH_MOBILE_AUTH=loopback \
+    TERM_MESH_MOBILE_ADDR="$MOBILE_LISTENER_ADDR" \
+    "$DAEMON_BIN" >>"$DAEMON_LOG_PATH" 2>&1 &
   E2E_DAEMON_PID=$!
 
   # Launch directly with UI test mode enabled so startup follows deterministic test codepaths.
   PROJECT_DIR="$PWD" \
   DAEMON_BINARY_PATH="$PWD/daemon/target/release/term-meshd" \
   TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK_PATH" \
-  TERMMESH_PEER_SERVER_PATH="${DAEMON_SOCK_PATH%.sock}-app-peer.sock" \
+  TERMMESH_PEER_SERVER_PATH="$APP_PEER_SOCKET_PATH" \
   TERMMESH_SOCKET_PATH="$APP_SOCK_PATH" \
   TERMMESH_ALLOW_SOCKET_OVERRIDE=1 \
   TERMMESH_UI_TEST_MODE=1 \
@@ -468,8 +526,9 @@ launch_and_wait() {
     sleep 0.1
   done
   if [ -n "$DAEMON_SOCK" ]; then
-    export TERMMESH_DAEMON_SOCKET="$DAEMON_SOCK"
-    export TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK"
+  export TERMMESH_DAEMON_SOCKET="$DAEMON_SOCK"
+  export TERMMESH_DAEMON_UNIX_PATH="$DAEMON_SOCK"
+  export TERMMESH_PEER_SERVER_PATH="$APP_PEER_SOCKET_PATH"
   else
     echo "ERROR: daemon socket not ready: $DAEMON_SOCK_PATH" >&2
     exit 1
@@ -618,6 +677,9 @@ PY
 run_test_with_retry() {
   local f="$1"
   local attempts=3
+  if [ "$f" = "tests_v2/test_peer_output_backpressure_recovery.py" ]; then
+    attempts=1
+  fi
   local n=1
   local output_file
   output_file=$(mktemp "${TMPDIR:-/tmp}/term-mesh-e2e-output.XXXXXX")
