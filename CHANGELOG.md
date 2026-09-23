@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.256.0] - 2026-09-23
+
+### Fixed
+
+- Peer relay output stalls now use bounded reconnects, with diagnostics for queue overflow and recovery.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.255.0] - 2026-09-22
 
 ### Fixed
