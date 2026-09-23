@@ -35,7 +35,27 @@ Accepted forms:
      ./scripts/run-tests-v2.sh tests_v2/test_remote_project_restart_reattach.py'
    ```
 
-   All six are required. `STAGE_REMOTE_FIXTURE` and `REMOTE_FIXTURE_SSH_TARGET` are what
+   Run the incident-shaped bounded-output gate on the same staged candidate. It
+   requires the GUI serving socket, the daemon session-owner route, the exact
+   Project manifest, and the exact leader/member surfaces independently. A
+   daemon-only route is reported as such and fails when
+   `TERMMESH_E2E_REQUIRE_SESSION_OWNER_REDIRECT=1`; it is never accepted as a
+   GUI Project route.
+
+   ```bash
+   ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && \
+     TERMMESH_E2E_REQUIRE_REMOTE_PROJECT=1 \
+     TERMMESH_E2E_REATTACH_PHASE=full \
+     TERMMESH_E2E_STAGE_REMOTE_FIXTURE=1 \
+     TERMMESH_E2E_REQUIRE_SESSION_OWNER_REDIRECT=1 \
+     TERMMESH_E2E_REMOTE_FIXTURE_SSH_TARGET=root@jw-server \
+     TERMMESH_E2E_CANDIDATE_SHA=<pinned-sha> \
+     TERMMESH_E2E_BACKPRESSURE_RECEIPT=<backpressure-receipt-path> \
+     ./scripts/run-tests-v2.sh tests_v2/test_peer_output_backpressure_recovery.py'
+   ```
+
+   All six are required for the lifecycle command. The backpressure command adds the
+   session-owner gate and receipt path. `STAGE_REMOTE_FIXTURE` and `REMOTE_FIXTURE_SSH_TARGET` are what
    make the run prove the candidate: the runner stages that SHA's daemon on the peer and
    refuses to start without them, so a stale production daemon cannot be mistaken for the
    candidate. `TERMMESH_E2E_REMOTE_LEADER_HOST`, `_DIR` and `_HOST_PROFILE_JSON` are derived
