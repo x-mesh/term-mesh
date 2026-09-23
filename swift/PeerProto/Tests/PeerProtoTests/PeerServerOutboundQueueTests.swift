@@ -43,6 +43,23 @@ private final class OutboundQueueDropRecorder: @unchecked Sendable {
     }
 }
 
+private final class OutboundQueueWatermarkRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var records: [(percent: Int, snapshot: PeerServerOutboundQueueSnapshot)] = []
+
+    func record(percent: Int, snapshot: PeerServerOutboundQueueSnapshot) {
+        lock.lock()
+        defer { lock.unlock() }
+        records.append((percent, snapshot))
+    }
+
+    func snapshot() -> [(percent: Int, snapshot: PeerServerOutboundQueueSnapshot)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return records
+    }
+}
+
 private actor OutboundQueueSendCounter {
     private var count = 0
 
@@ -129,9 +146,9 @@ final class PeerServerOutboundQueueTests: XCTestCase {
 
     func testOverflowEvictsOldestPendingEntriesAndLeavesAnExactSequenceGap() async {
         let recorder = OutboundQueueDropRecorder()
-        let queue = PeerServerOutboundQueue { drop in
+        let queue = PeerServerOutboundQueue(onDrop: { drop in
             recorder.record(drop)
-        }
+        })
         let width = 4 * 1024
         let entryCount = PeerServerOutboundQueue.maxPendingItems + 37
         for index in 0..<entryCount {
@@ -196,12 +213,41 @@ final class PeerServerOutboundQueueTests: XCTestCase {
         let blockedSnapshot = await queue.snapshot()
         XCTAssertEqual(blockedSnapshot.pendingItems, PeerServerOutboundQueue.maxPendingItems)
         XCTAssertEqual(blockedSnapshot.pendingBytes, PeerServerOutboundQueue.maxPendingBytes)
+        XCTAssertEqual(blockedSnapshot.highWaterItems, PeerServerOutboundQueue.maxPendingItems)
+        XCTAssertEqual(blockedSnapshot.highWaterBytes, PeerServerOutboundQueue.maxPendingBytes)
         XCTAssertEqual(blockedSnapshot.dropped.chunks, produced - 1 - PeerServerOutboundQueue.maxPendingItems)
 
         await queue.finish()
         await gate.release()
         let delivered = await writer.value
         XCTAssertEqual(delivered, PeerServerOutboundQueue.maxPendingItems + 1)
+    }
+
+    func testQueueReportsQuarterCapacityWatermarksAndRetainsPeakAfterDrain() async {
+        let recorder = OutboundQueueWatermarkRecorder()
+        let queue = PeerServerOutboundQueue(onWatermark: { snapshot, percent in
+            recorder.record(percent: percent, snapshot: snapshot)
+        })
+        let width = 1024
+        for index in 0..<PeerServerOutboundQueue.maxPendingItems {
+            _ = await queue.enqueue(
+                Data(repeating: UInt8(index & 0xFF), count: width),
+                startSeq: UInt64(index * width)
+            )
+        }
+
+        let full = await queue.snapshot()
+        XCTAssertEqual(full.highWaterItems, PeerServerOutboundQueue.maxPendingItems)
+        XCTAssertEqual(full.highWaterBytes, PeerServerOutboundQueue.maxPendingItems * width)
+        XCTAssertEqual(recorder.snapshot().map(\.percent), [25, 50, 75, 100])
+
+        await queue.finish()
+        _ = await drain(queue)
+        let drained = await queue.snapshot()
+        XCTAssertEqual(drained.pendingItems, 0)
+        XCTAssertEqual(drained.pendingBytes, 0)
+        XCTAssertEqual(drained.highWaterItems, full.highWaterItems)
+        XCTAssertEqual(drained.highWaterBytes, full.highWaterBytes)
     }
 
     func testOverflowAdmissionRequiresTransportReconnectOnlyWithoutResync() async {

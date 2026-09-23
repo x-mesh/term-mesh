@@ -1729,6 +1729,8 @@ struct PeerServerOutboundQueueDrop: Sendable, Equatable {
 struct PeerServerOutboundQueueSnapshot: Sendable, Equatable {
     let pendingItems: Int
     let pendingBytes: Int
+    let highWaterItems: Int
+    let highWaterBytes: Int
     let dropped: PeerServerOutboundQueueDrop
 }
 
@@ -1753,7 +1755,9 @@ enum PeerServerOutboundOverflowPolicy {
 
 private final class PeerServerOutboundQueueDiagnostics: @unchecked Sendable {
     private let lock = NSLock()
-    private var lastEmission = Date.distantPast
+    private var lastDropEmission = Date.distantPast
+    private var lastOverflowEmission = Date.distantPast
+    private var lastWatermarkPercent = 0
     private let surface: String
     private var counters = PeerServerOutboundEpisodeCounters()
 
@@ -1765,10 +1769,36 @@ private final class PeerServerOutboundQueueDiagnostics: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let now = Date()
-        guard now.timeIntervalSince(lastEmission) >= 1 else { return }
-        lastEmission = now
+        guard now.timeIntervalSince(lastDropEmission) >= 1 else { return }
+        lastDropEmission = now
         PeerServerDiagnostics.record(
             "queue-drop surface=\(surface) chunks=\(drop.chunks) bytes=\(drop.bytes)"
+        )
+    }
+
+    func recordQueueWatermark(_ snapshot: PeerServerOutboundQueueSnapshot, percent: Int) {
+        lock.lock()
+        guard percent > lastWatermarkPercent else {
+            lock.unlock()
+            return
+        }
+        lastWatermarkPercent = percent
+        lock.unlock()
+        PeerServerDiagnostics.record(
+            "queue-watermark surface=\(surface) percent=\(percent) "
+                + "pending_items=\(snapshot.pendingItems) pending_bytes=\(snapshot.pendingBytes) "
+                + "peak_items=\(snapshot.highWaterItems) peak_bytes=\(snapshot.highWaterBytes)"
+        )
+    }
+
+    func recordQueueObservation(
+        _ snapshot: PeerServerOutboundQueueSnapshot,
+        snapshotCount: Int
+    ) {
+        PeerServerDiagnostics.record(
+            "queue-observation surface=\(surface) peak_items=\(snapshot.highWaterItems) "
+                + "peak_bytes=\(snapshot.highWaterBytes) dropped_chunks=\(snapshot.dropped.chunks) "
+                + "dropped_bytes=\(snapshot.dropped.bytes) snapshots=\(snapshotCount)"
         )
     }
 
@@ -1779,8 +1809,8 @@ private final class PeerServerOutboundQueueDiagnostics: @unchecked Sendable {
         )
         let snapshot = counters
         let now = Date()
-        let shouldEmit = now.timeIntervalSince(lastEmission) >= 1
-        if shouldEmit { lastEmission = now }
+        let shouldEmit = now.timeIntervalSince(lastOverflowEmission) >= 1
+        if shouldEmit { lastOverflowEmission = now }
         lock.unlock()
         guard shouldEmit else { return }
         PeerServerDiagnostics.record(
@@ -1820,11 +1850,19 @@ actor PeerServerOutboundQueue {
     private var state: State = .open
     private var pending: [PeerServerOutboundQueueEntry] = []
     private var pendingBytes = 0
+    private var highWaterItems = 0
+    private var highWaterBytes = 0
+    private var reportedWatermarkPercent = 0
     private var dropped = PeerServerOutboundQueueDrop()
     private var waiter: CheckedContinuation<PeerServerOutboundQueueEntry?, Never>?
+    private let onWatermark: @Sendable (PeerServerOutboundQueueSnapshot, Int) -> Void
     private let onDrop: @Sendable (PeerServerOutboundQueueDrop) -> Void
 
-    init(onDrop: @escaping @Sendable (PeerServerOutboundQueueDrop) -> Void = { _ in }) {
+    init(
+        onWatermark: @escaping @Sendable (PeerServerOutboundQueueSnapshot, Int) -> Void = { _, _ in },
+        onDrop: @escaping @Sendable (PeerServerOutboundQueueDrop) -> Void = { _ in }
+    ) {
+        self.onWatermark = onWatermark
         self.onDrop = onDrop
     }
 
@@ -1891,6 +1929,7 @@ actor PeerServerOutboundQueue {
         } else {
             pending.append(entry)
         }
+        updateHighWater()
         return true
     }
 
@@ -1908,8 +1947,22 @@ actor PeerServerOutboundQueue {
         PeerServerOutboundQueueSnapshot(
             pendingItems: pending.count,
             pendingBytes: pendingBytes,
+            highWaterItems: highWaterItems,
+            highWaterBytes: highWaterBytes,
             dropped: dropped
         )
+    }
+
+    private func updateHighWater() {
+        highWaterItems = max(highWaterItems, pending.count)
+        highWaterBytes = max(highWaterBytes, pendingBytes)
+        let itemPercent = highWaterItems * 100 / Self.maxPendingItems
+        let bytePercent = highWaterBytes * 100 / Self.maxPendingBytes
+        let percent = max(itemPercent, bytePercent)
+        let watermarkPercent = min(100, percent / 25 * 25)
+        guard watermarkPercent >= 25, watermarkPercent > reportedWatermarkPercent else { return }
+        reportedWatermarkPercent = watermarkPercent
+        onWatermark(snapshot(), watermarkPercent)
     }
 
     private func admit(_ entry: PeerServerOutboundQueueEntry, callDrops: inout PeerServerOutboundQueueDrop) {
@@ -1928,6 +1981,7 @@ actor PeerServerOutboundQueue {
         } else {
             pending.append(entry)
             pendingBytes += entry.byteCount
+            updateHighWater()
         }
     }
 
@@ -1958,6 +2012,9 @@ actor PeerServerSession {
     private enum LifecycleRequestAdmission {
         case accepted, invalid, duplicate, exhausted
     }
+    #if DEBUG
+    private static let testWriteDelayDeadline = ProcessInfo.processInfo.systemUptime + 1
+    #endif
 
     private let connection: AcceptedUnixConnection
     private let config: PeerServerConfig
@@ -2817,15 +2874,38 @@ actor PeerServerSession {
             && attachment.resync != nil
         let diagnostics = PeerServerOutboundQueueDiagnostics(surfaceID: surfaceID)
         var snapshotCount = 0
-        let queue = PeerServerOutboundQueue { drop in
-            diagnostics.record(drop)
-            if drop.bytes > 0 {
-                attachment.invalidateInputPath()
+        let queue = PeerServerOutboundQueue(
+            onWatermark: { snapshot, percent in
+                diagnostics.recordQueueWatermark(snapshot, percent: percent)
+            },
+            onDrop: { drop in
+                diagnostics.record(drop)
+                if drop.bytes > 0 {
+                    attachment.invalidateInputPath()
+                }
             }
+        )
+        #if DEBUG
+        let writeDelayMs: UInt64 = {
+            guard let raw = ProcessInfo.processInfo.environment["TERMMESH_E2E_PEER_SERVER_WRITE_DELAY_MS"],
+                  let value = UInt64(raw),
+                  (1...1000).contains(value) else { return 0 }
+            return value
+        }()
+        if writeDelayMs > 0 && ProcessInfo.processInfo.systemUptime < Self.testWriteDelayDeadline {
+            PeerServerDiagnostics.record(
+                "test-write-delay active ms=\(writeDelayMs) surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID))"
+            )
         }
+        #endif
         let coalescer = PtyDataCoalescer { [weak self] payload, seq, callbackEvents in
             guard let self else { return false }
             do {
+                #if DEBUG
+                if writeDelayMs > 0 && ProcessInfo.processInfo.systemUptime < Self.testWriteDelayDeadline {
+                    try await Task.sleep(nanoseconds: writeDelayMs * 1_000_000)
+                }
+                #endif
                 try await self.sendEnvelope { env in
                     var p = Termmesh_Peer_V1_PtyData()
                     p.surfaceID = surfaceID
@@ -3076,6 +3156,10 @@ actor PeerServerSession {
             }
 
             let sendSucceeded = await writer
+            diagnostics.recordQueueObservation(
+                await queue.snapshot(),
+                snapshotCount: snapshotCount
+            )
             if !sendSucceeded {
                 PeerServerDiagnostics.record(
                     "pty-writer-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) cancelled=\(Task.isCancelled)"
