@@ -344,6 +344,23 @@ def gh_json_optional(*args: str, repo: str = REPO) -> tuple[Any, str | None]:
     return json.loads(raw), None
 
 
+def github_release_reading(tag: str) -> tuple[dict[str, Any] | None, str | None]:
+    release, error = gh_json_optional("api", f"repos/{REPO}/releases/tags/{tag}")
+    if error or release is None:
+        return None, error
+    assets, error = gh_json_optional(
+        "api", f"repos/{REPO}/releases/{release['id']}/assets?per_page=100"
+    )
+    if error or assets is None:
+        return None, error or f"could not read the asset list on {tag}"
+    return {
+        "url": release["html_url"],
+        "isDraft": release["draft"],
+        "isPrerelease": release["prerelease"],
+        "assets": assets,
+    }, None
+
+
 def release_assets(tag: str) -> list[str]:
     """Asset names currently attached to a tag's GitHub Release.
 
@@ -354,7 +371,7 @@ def release_assets(tag: str) -> list[str]:
     release that succeeded fails on an invented loss. A tag with no release at
     all still answers honestly with an empty list.
     """
-    release, error = gh_json_optional("release", "view", tag, "--repo", REPO, "--json", "assets")
+    release, error = github_release_reading(tag)
     if error:
         raise ReleaseError(f"could not read the assets on {tag}: {error}")
     return [item["name"] for item in (release or {}).get("assets", [])]
@@ -399,9 +416,7 @@ def observe(state: dict[str, Any]) -> dict[str, Any]:
         facts["tag_commit"] = line.split()[0] if line else None
     except ReleaseError as exc:
         facts["unreadable"]["tag_commit"] = str(exc)
-    release, error = gh_json_optional(
-        "release", "view", tag, "--repo", REPO, "--json", "url,isDraft,isPrerelease,assets"
-    )
+    release, error = github_release_reading(tag)
     if error:
         facts["unreadable"]["release"] = error
     else:
@@ -1200,7 +1215,9 @@ def publish(args: argparse.Namespace, state: dict[str, Any] | None = None) -> di
         required = {f"term-mesh-macos-{state['version']}.dmg", "term-meshd-linux-aarch64.tar.gz", "term-meshd-linux-x86_64.tar.gz"}
         deadline = time.monotonic() + 1200
         while True:
-            release = gh_json("release", "view", tag, "--repo", REPO, "--json", "url,isDraft,isPrerelease,assets")
+            release, error = github_release_reading(tag)
+            if error or release is None:
+                raise ReleaseError(f"could not read GitHub Release {tag}: {error or 'not found'}")
             assets = [item["name"] for item in release["assets"]]
             runs = gh_json("run", "list", "--repo", REPO, "--workflow", "release-linux.yml",
                            "--commit", merge_sha, "--event", "push", "--limit", "1",

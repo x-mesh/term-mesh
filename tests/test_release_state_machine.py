@@ -467,6 +467,36 @@ class ReleaseStateMachineTests(unittest.TestCase):
         with unittest.mock.patch.object(release, "gh_json_optional", return_value=(None, None)):
             self.assertEqual(release.release_assets("v9.9.9"), [])
 
+    def test_release_assets_reads_the_release_asset_endpoint(self):
+        release_row = {
+            "id": 42, "html_url": "https://github.com/x-mesh/term-mesh/releases/tag/v0.226.4",
+            "draft": False, "prerelease": False, "assets": [],
+        }
+        with unittest.mock.patch.object(
+            release, "gh_json_optional",
+            side_effect=[(release_row, None), ([{"name": "term-mesh-macos-0.226.4.dmg"}], None)],
+        ) as read:
+            self.assertEqual(
+                release.release_assets("v0.226.4"),
+                ["term-mesh-macos-0.226.4.dmg"],
+            )
+        self.assertEqual(read.call_args_list, [
+            unittest.mock.call("api", "repos/x-mesh/term-mesh/releases/tags/v0.226.4"),
+            unittest.mock.call("api", "repos/x-mesh/term-mesh/releases/42/assets?per_page=100"),
+        ])
+
+    def test_unreadable_release_asset_endpoint_fails_visibly(self):
+        release_row = {
+            "id": 42, "html_url": "https://github.com/x-mesh/term-mesh/releases/tag/v0.226.4",
+            "draft": False, "prerelease": False,
+        }
+        with unittest.mock.patch.object(
+            release, "gh_json_optional",
+            side_effect=[(release_row, None), (None, "could not connect to api.github.com")],
+        ):
+            with self.assertRaisesRegex(release.ReleaseError, "could not read the assets"):
+                release.release_assets("v0.226.4")
+
     def test_a_mismatch_stops_being_reported_once_its_stage_completes(self):
         """The observation is taken once, at load. A stage that has completed
         since has resolved whatever its mismatch was, and printing it beside
