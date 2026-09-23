@@ -43,6 +43,19 @@ Run build and test commands so their own exit status is visible. Do not use pipe
 `cargo` as exit 0. Check tool availability (including `~/.cargo/bin`) and the build/test command's
 exit code directly before reporting success.
 
+## Relay prevention gate
+
+The incident-shaped output gate is a required mac-sub check for a staged candidate. Run its contract
+path locally with `python3 tests_v2/test_peer_output_backpressure_recovery.py --dry-run`; the real
+path must use `scripts/run-tests-v2.sh` over `ssh mac-sub`, with
+`TERMMESH_E2E_REQUIRE_REMOTE_PROJECT=1`, `TERMMESH_E2E_REATTACH_PHASE=full`,
+`TERMMESH_E2E_STAGE_REMOTE_FIXTURE=1`, an exact candidate SHA, and a receipt path. Set
+`TERMMESH_E2E_REQUIRE_SESSION_OWNER_REDIRECT=1` when the topology is expected to be a GUI serving
+socket plus a distinct daemon session-owner socket. A daemon-only endpoint is a diagnostic route,
+not a Project-capable GUI route, and must fail that gate. The result records the app PID and binary,
+GUI peer socket ownership, state directory, serving/session-owner endpoints, Project/workspace/pane/
+surface identities, relay counters, FD bounds, and cleanup receipt.
+
 `reload` = kill and launch the Debug app only (tag required):
 
 ```bash
