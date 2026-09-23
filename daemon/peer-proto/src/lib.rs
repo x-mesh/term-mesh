@@ -609,6 +609,10 @@ mod tests {
                 transport_timeout_count: 1,
                 surfaces: vec![RelaySurfaceTelemetry {
                     surface_id: vec![0xA5; 16],
+                    input_path: Some(InputPathTelemetry {
+                        schema_version: 1,
+                        ..Default::default()
+                    }),
                     produced_chunks: 5,
                     produced_bytes: 80,
                     host_aggregate_dropped_chunks: 1,

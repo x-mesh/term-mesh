@@ -89,10 +89,22 @@ enum PeerHostControlRPCStatus: Equatable {
     case probeUnavailable
 }
 
+enum PeerHostListenerStatus: String, Equatable {
+    case notApplicable
+    case healthy
+    case unavailable
+    case connectEOF
+    case connectTimeout
+    case fdPressure
+    case daemonOnly
+    case unknown
+}
+
 /// A measured Linux-peer baseline. A peer handshake alone is insufficient:
 /// the daemon control plane must also have a reachable pathname, and recent
 /// protocol mismatches must be absent.
 struct PeerHostHealthBaseline: Equatable {
+    var hostKind: PeerHostKind = .daemon
     var serviceActive = false
     /// The `root` field of the daemon's own `/tmp` mount, read from
     /// `/proc/<pid>/mountinfo`.
@@ -119,8 +131,39 @@ struct PeerHostHealthBaseline: Equatable {
     var relayLagCount = 0
     var resumeHealCount = 0
     var protocolMismatchCount = 0
+    var appPID: Int?
+    var appBinaryPath = ""
+    var appFDCount = 0
+    var peerSessionCount = 0
+    var guiPeerSocketPath = ""
+    var guiListenerOwned = false
+    var daemonPeerSocketPath = ""
+    var daemonPeerReachable = false
+    var listenerStatus: PeerHostListenerStatus = .notApplicable
+    var connectThenEOFCount = 0
+    var connectThenTimeoutCount = 0
+    var acceptFDPressureCount = 0
+    var lastPeerServerFailure = ""
 
     var verdict: PeerHostHealthVerdict {
+        if hostKind == .app {
+            guard appPID != nil, !appBinaryPath.isEmpty, !guiPeerSocketPath.isEmpty else {
+                return daemonPeerReachable ? .degraded : .unhealthy
+            }
+            switch listenerStatus {
+            case .fdPressure, .unavailable, .connectEOF, .connectTimeout:
+                return .unhealthy
+            case .daemonOnly:
+                return .degraded
+            case .unknown:
+                return .unknown
+            case .healthy:
+                return acceptFDPressureCount > 0 || !lastPeerServerFailure.isEmpty
+                    ? .degraded : .healthy
+            case .notApplicable:
+                return .unknown
+            }
+        }
         guard serviceActive, controlPathPresent, peerPathPresent else {
             return .unhealthy
         }
@@ -132,6 +175,24 @@ struct PeerHostHealthBaseline: Equatable {
 
     var unhealthyReasons: [String] {
         var reasons: [String] = []
+        if hostKind == .app {
+            if appPID == nil { reasons.append(daemonPeerReachable ? "daemon reachable but GUI app is not running" : "GUI app not running") }
+            if appBinaryPath.isEmpty { reasons.append("GUI app binary path unavailable") }
+            if guiPeerSocketPath.isEmpty { reasons.append("GUI peer socket unavailable") }
+            if !guiListenerOwned { reasons.append("GUI peer listener is not owned by the app") }
+            switch listenerStatus {
+            case .connectEOF: reasons.append("connect-then-EOF")
+            case .connectTimeout: reasons.append("connect-then-timeout")
+            case .fdPressure: reasons.append("EMFILE/ENFILE accept pressure")
+            case .daemonOnly: reasons.append("daemon-only route; GUI Project authority unavailable")
+            case .unavailable: reasons.append("GUI peer listener unavailable")
+            default: break
+            }
+            if connectThenEOFCount > 0 { reasons.append("connect-then-EOF count=\(connectThenEOFCount)") }
+            if connectThenTimeoutCount > 0 { reasons.append("connect-then-timeout count=\(connectThenTimeoutCount)") }
+            if acceptFDPressureCount > 0 { reasons.append("accept FD pressure count=\(acceptFDPressureCount)") }
+            return reasons
+        }
         if !serviceActive { reasons.append("service inactive") }
         if !controlPathPresent {
             reasons.append("control socket missing at \(controlPath)")
@@ -436,7 +497,7 @@ enum PeerHostDoctor {
     }
 
     private static let healthBaselineCommandTemplate =
-        #"sh -c 'if [ "$(uname -s)" != Linux ]; then exit 44; fi; u=$(systemctl --user is-active term-meshd 2>/dev/null); s=$(systemctl is-active term-meshd 2>/dev/null); if [ "$s" = active ] || [ "$u" = active ]; then active=1; else active=0; fi; control=${TERMMESH_DAEMON_UNIX_PATH:-}; if [ -z "$control" ]; then control=$(sed -n "s/^TERMMESH_DAEMON_UNIX_PATH=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$control" ] || control=/tmp/term-meshd.sock; peer=${TERMMESH_PEER_SOCKET:-}; if [ -z "$peer" ]; then peer=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$peer" ] || peer=/run/term-mesh/tm-peer.sock; [ -S "$control" ] && cpresent=1 || cpresent=0; [ -S "$peer" ] && ppresent=1 || ppresent=0; cli=$(command -v tm-agent 2>/dev/null); [ -x "$cli" ] || cli=$HOME/.local/bin/tm-agent; if [ ! -x "$cli" ]; then crpc=unknown; elif TERMMESH_DAEMON_UNIX_PATH="$control" "$cli" daemon replay-capacity >/dev/null 2>&1; then crpc=1; else crpc=0; fi; if [ "$s" = active ]; then logs=$(journalctl -u term-meshd --since=-5min --no-pager 2>/dev/null); else logs=$(journalctl --user -u term-meshd --since=-5min --no-pager 2>/dev/null); fi; lag=$(printf "%s\n" "$logs" | grep -c "attach relay lagged"); heal=$(printf "%s\n" "$logs" | grep -c "resume-heal reconnect"); proto=$(printf "%s\n" "$logs" | grep -c "frame length .* exceeds"); dpid=$(systemctl show -p MainPID --value term-meshd 2>/dev/null); if [ -z "$dpid" ] || [ "$dpid" = 0 ]; then dpid=$(systemctl --user show -p MainPID --value term-meshd 2>/dev/null); fi; tmproot=$(grep " /tmp " /proc/$dpid/mountinfo 2>/dev/null | head -1 | cut -d" " -f4); echo "health-service-active=$active"; echo "health-daemon-tmp-root=$tmproot"; echo "health-control-path=$control"; echo "health-control-present=$cpresent"; echo "health-control-rpc=$crpc"; echo "health-peer-path=$peer"; echo "health-peer-present=$ppresent"; echo "health-relay-lag-5m=$lag"; echo "health-resume-heal-5m=$heal"; echo "health-protocol-mismatch-5m=$proto"'"#
+        #"sh -c 'os=$(uname -s 2>/dev/null); if [ "$os" = Darwin ]; then app=$(pgrep -f "term-mesh.app/Contents/MacOS/term-mesh" | head -1); appbin=; fds=0; sessions=0; gui=; owned=0; connect=unavailable; dpeer=; dreach=0; if [ -n "$app" ]; then appbin=$(lsof -a -p "$app" -d txt -F n 2>/dev/null | sed -n "s/^n//p" | head -1); raw=$(lsof -a -p "$app" -U -F fn 2>/dev/null); fds=$(printf "%s\n" "$raw" | grep -c "^f"); sessions=$(printf "%s\n" "$raw" | grep -c "^n.*peer"); gui=$(printf "%s\n" "$raw" | sed -n "s/^n\(.*peer.*\)/\1/p" | head -1); if [ -n "$gui" ] && [ -S "$gui" ]; then owned=1; nc -U -z -w 2 "$gui" >/dev/null 2>&1; rc=$?; if [ "$rc" = 0 ]; then connect=healthy; elif [ "$rc" = 1 ]; then connect=timeout; else connect=eof; fi; fi; fi; dp=$(pgrep -f "Resources/bin/term-meshd" | head -1); if [ -n "$dp" ]; then dpeer=$(lsof -a -p "$dp" -U -F n 2>/dev/null | sed -n "s/^n\(.*peer.*\)/\1/p" | head -1); fi; if [ -n "$dpeer" ] && [ -S "$dpeer" ]; then nc -U -z -w 2 "$dpeer" >/dev/null 2>&1 && dreach=1; fi; log=/tmp/term-mesh-peer-server.log; fdpressure=$(grep -E -c "accept-error.*fd-pressure|EMFILE|ENFILE" "$log" 2>/dev/null); eof=$(grep -E -c "unexpectedEof|connect-then-EOF" "$log" 2>/dev/null); timeout=$(grep -E -c "connect-then-timeout|read-timeout|timed-out" "$log" 2>/dev/null); failure=$(grep -E "accept-error|write-timeout|write-error|session-end" "$log" 2>/dev/null | tail -1 | tr "\n" " " ); [ "$fdpressure" = 0 ] || [ -z "$fdpressure" ] && fdpressure=0; [ "$eof" = 0 ] || [ -z "$eof" ] && eof=0; [ "$timeout" = 0 ] || [ -z "$timeout" ] && timeout=0; echo "health-host-kind=app"; echo "health-service-active=$([ -n "$app" ] && echo 1 || echo 0)"; echo "health-daemon-tmp-root="; echo "health-control-path=$dpeer"; echo "health-control-present=$([ -n "$dpeer" ] && echo 1 || echo 0)"; echo "health-control-rpc=unknown"; echo "health-peer-path=$gui"; echo "health-peer-present=$([ -n "$gui" ] && [ -S "$gui" ] && echo 1 || echo 0)"; echo "health-relay-lag-5m=0"; echo "health-resume-heal-5m=0"; echo "health-protocol-mismatch-5m=0"; echo "health-app-pid=${app:-0}"; echo "health-app-binary=$appbin"; echo "health-app-fd-count=$fds"; echo "health-peer-session-count=$sessions"; echo "health-gui-listener-owned=$owned"; echo "health-daemon-peer-path=$dpeer"; echo "health-daemon-peer-reachable=$dreach"; echo "health-peer-connect-status=$connect"; echo "health-connect-eof-5m=$eof"; echo "health-connect-timeout-5m=$timeout"; echo "health-accept-fd-pressure-5m=$fdpressure"; echo "health-peer-server-failure=$failure"; else u=$(systemctl --user is-active term-meshd 2>/dev/null); s=$(systemctl is-active term-meshd 2>/dev/null); if [ "$s" = active ] || [ "$u" = active ]; then active=1; else active=0; fi; control=${TERMMESH_DAEMON_UNIX_PATH:-}; if [ -z "$control" ]; then control=$(sed -n "s/^TERMMESH_DAEMON_UNIX_PATH=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$control" ] || control=/tmp/term-meshd.sock; peer=${TERMMESH_PEER_SOCKET:-}; if [ -z "$peer" ]; then peer=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -1 | tr -d "\""); fi; [ -n "$peer" ] || peer=/run/term-mesh/tm-peer.sock; [ -S "$control" ] && cpresent=1 || cpresent=0; [ -S "$peer" ] && ppresent=1 || ppresent=0; cli=$(command -v tm-agent 2>/dev/null); [ -x "$cli" ] || cli=$HOME/.local/bin/tm-agent; if [ ! -x "$cli" ]; then crpc=unknown; elif TERMMESH_DAEMON_UNIX_PATH="$control" "$cli" daemon replay-capacity >/dev/null 2>&1; then crpc=1; else crpc=0; fi; if [ "$s" = active ]; then logs=$(journalctl -u term-meshd --since=-5min --no-pager 2>/dev/null); else logs=$(journalctl --user -u term-meshd --since=-5min --no-pager 2>/dev/null); fi; lag=$(printf "%s\n" "$logs" | grep -c "attach relay lagged"); heal=$(printf "%s\n" "$logs" | grep -c "resume-heal reconnect"); proto=$(printf "%s\n" "$logs" | grep -c "frame length .* exceeds"); dpid=$(systemctl show -p MainPID --value term-meshd 2>/dev/null); if [ -z "$dpid" ] || [ "$dpid" = 0 ]; then dpid=$(systemctl --user show -p MainPID --value term-meshd 2>/dev/null); fi; tmproot=$(grep " /tmp " /proc/$dpid/mountinfo 2>/dev/null | head -1 | cut -d" " -f4); echo "health-host-kind=daemon"; echo "health-service-active=$active"; echo "health-daemon-tmp-root=$tmproot"; echo "health-control-path=$control"; echo "health-control-present=$cpresent"; echo "health-control-rpc=$crpc"; echo "health-peer-path=$peer"; echo "health-peer-present=$ppresent"; echo "health-relay-lag-5m=$lag"; echo "health-resume-heal-5m=$heal"; echo "health-protocol-mismatch-5m=$proto"; fi'"#
 
     /// Sentinel exit code for "no term-meshd binary found" — distinct
     /// from PeerSocketProber.noSocketExitCode (43) so the two probes'
@@ -1612,7 +1673,7 @@ enum PeerHostDoctor {
             let text = line.trimmingCharacters(in: .whitespaces)
             guard let split = text.firstIndex(of: "=") else { continue }
             let key = String(text[..<split])
-            guard expectedKeys.contains(key) else { continue }
+            guard expectedKeys.contains(key) || key.hasPrefix("health-") else { continue }
             // Login output may contain a stale-looking sentinel before the
             // fixed probe runs. The probe block is last, matching the version
             // parser's established "last valid line wins" contract.
@@ -1625,7 +1686,26 @@ enum PeerHostDoctor {
         case "unknown": controlRPC = .probeUnavailable
         default: controlRPC = .unavailable
         }
+        let hostKind: PeerHostKind = fields["health-host-kind"] == "app" ? .app : .daemon
+        var listenerStatus: PeerHostListenerStatus
+        switch fields["health-peer-connect-status"] {
+        case "healthy": listenerStatus = .healthy
+        case "eof": listenerStatus = .connectEOF
+        case "timeout": listenerStatus = .connectTimeout
+        case "unavailable":
+            listenerStatus = hostKind == .app
+                && fields["health-daemon-peer-reachable"] == "1"
+                && (fields["health-peer-path"] ?? "").isEmpty
+                ? .daemonOnly : .unavailable
+        default:
+            listenerStatus = hostKind == .app && fields["health-daemon-peer-reachable"] == "1"
+                ? .daemonOnly : .unknown
+        }
+        if hostKind == .app, Int(fields["health-accept-fd-pressure-5m"] ?? "") ?? 0 > 0 {
+            listenerStatus = .fdPressure
+        }
         return PeerHostHealthBaseline(
+            hostKind: hostKind,
             serviceActive: fields["health-service-active"] == "1",
             // Not in `expectedKeys`: a host that could not read the daemon's
             // mountinfo still has a perfectly good baseline, and losing the
@@ -1639,7 +1719,20 @@ enum PeerHostDoctor {
             peerPathPresent: fields["health-peer-present"] == "1",
             relayLagCount: Int(fields["health-relay-lag-5m"] ?? "") ?? 0,
             resumeHealCount: Int(fields["health-resume-heal-5m"] ?? "") ?? 0,
-            protocolMismatchCount: Int(fields["health-protocol-mismatch-5m"] ?? "") ?? 0
+            protocolMismatchCount: Int(fields["health-protocol-mismatch-5m"] ?? "") ?? 0,
+            appPID: Int(fields["health-app-pid"] ?? "").flatMap { $0 == 0 ? nil : $0 },
+            appBinaryPath: fields["health-app-binary"] ?? "",
+            appFDCount: Int(fields["health-app-fd-count"] ?? "") ?? 0,
+            peerSessionCount: Int(fields["health-peer-session-count"] ?? "") ?? 0,
+            guiPeerSocketPath: fields["health-peer-path"] ?? "",
+            guiListenerOwned: fields["health-gui-listener-owned"] == "1",
+            daemonPeerSocketPath: fields["health-daemon-peer-path"] ?? "",
+            daemonPeerReachable: fields["health-daemon-peer-reachable"] == "1",
+            listenerStatus: listenerStatus,
+            connectThenEOFCount: Int(fields["health-connect-eof-5m"] ?? "") ?? 0,
+            connectThenTimeoutCount: Int(fields["health-connect-timeout-5m"] ?? "") ?? 0,
+            acceptFDPressureCount: Int(fields["health-accept-fd-pressure-5m"] ?? "") ?? 0,
+            lastPeerServerFailure: fields["health-peer-server-failure"] ?? ""
         )
     }
 

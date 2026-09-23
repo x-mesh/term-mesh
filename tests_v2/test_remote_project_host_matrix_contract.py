@@ -84,6 +84,8 @@ def main() -> int:
             rejects(lambda row=row: _assert_session_owner_route(row))
             for row in broken_routes
         )
+        daemon_only = {**valid_route, "session_host_socket": "", "team_host_readiness": "unresolved"}
+        assert rejects(lambda: _assert_session_owner_route(daemon_only))
 
         # Release topology must fail before Project creation when the exact
         # team endpoint cannot report foreground process liveness. A connected
@@ -99,6 +101,24 @@ def main() -> int:
             lambda: __import__("test_remote_project_restart_reattach")._connect(
                 type("Client", (), {
                     "peer_host_list": lambda self: [stale],
+                    "peer_host_connect": lambda self, host: None,
+                })(), "fixture"
+            )
+        )
+        os.environ.pop("TERMMESH_E2E_REQUIRE_REMOTE_PROJECT", None)
+        os.environ.pop("TERMMESH_E2E_REMOTE_FIXTURE_VERSION", None)
+
+        capability_ready_old_version = {
+            **stale,
+            "authoritative_leader_liveness": True,
+            "serving_app_version": "v0.213.0",
+        }
+        os.environ["TERMMESH_E2E_REQUIRE_REMOTE_PROJECT"] = "1"
+        os.environ["TERMMESH_E2E_REMOTE_FIXTURE_VERSION"] = "v0.214.0"
+        assert rejects(
+            lambda: __import__("test_remote_project_restart_reattach")._connect(
+                type("Client", (), {
+                    "peer_host_list": lambda self: [capability_ready_old_version],
                     "peer_host_connect": lambda self, host: None,
                 })(), "fixture"
             )

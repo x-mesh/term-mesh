@@ -514,6 +514,76 @@ public enum PeerServerError: Error, Equatable {
     case leaderSessionClosed
 }
 
+public enum PeerReconnectCircuitState: String, Sendable, Equatable {
+    case closed
+    case cooldown
+    case open
+}
+
+public struct PeerReconnectCircuit: Sendable, Equatable {
+    public static let maxAttempts = 8
+
+    public private(set) var attempts = 0
+    public private(set) var cooldowns = 0
+    public private(set) var recoveries = 0
+    public private(set) var state: PeerReconnectCircuitState = .closed
+
+    public init() {}
+
+    public mutating func nextAttempt() -> (attempt: Int, delaySeconds: Double)? {
+        guard state != .open, attempts < Self.maxAttempts else {
+            state = .open
+            return nil
+        }
+        attempts += 1
+        let delay = attempts == 1 ? 0 : min(30, pow(2, Double(min(attempts - 1, 5))))
+        if delay > 0 {
+            cooldowns += 1
+            state = .cooldown
+        }
+        return (attempts, delay)
+    }
+
+    public mutating func recordFailure() {
+        if attempts >= Self.maxAttempts {
+            state = .open
+        } else if attempts > 0 {
+            state = .cooldown
+        }
+    }
+
+    public mutating func recordRecovery() {
+        guard attempts > 0 else { return }
+        attempts = 0
+        state = .closed
+        recoveries += 1
+    }
+}
+
+public struct PeerServerOutboundEpisodeCounters: Sendable, Equatable {
+    public private(set) var overflowEpisodes = 0
+    public private(set) var firstOverflow = 0
+    public private(set) var secondOverflow = 0
+    public private(set) var noResync = 0
+    public private(set) var attachmentAborts = 0
+
+    public init() {}
+
+    public mutating func recordOverflow(canResync: Bool, snapshotInstalled: Bool) {
+        overflowEpisodes += 1
+        if snapshotInstalled {
+            secondOverflow += 1
+        } else {
+            firstOverflow += 1
+        }
+        if !canResync { noResync += 1 }
+    }
+
+    public mutating func recordAttachmentAbort() {
+        attachmentAborts += 1
+    }
+}
+
 public struct PeerServerConfig: Sendable {
     public var hostDisplayName: String
     public var hostAppVersion: String
@@ -978,7 +1048,16 @@ public actor PeerServer {
                 }
             }
             if clientFd < 0 {
-                if errno == EAGAIN || errno == EWOULDBLOCK { continue }
+                let acceptErrno = errno
+                if acceptErrno == EAGAIN || acceptErrno == EWOULDBLOCK { continue }
+                let fdPressure = acceptErrno == EMFILE || acceptErrno == ENFILE
+                PeerServerDiagnostics.record(
+                    "accept-error errno=\(acceptErrno) class=\(fdPressure ? "fd-pressure" : "listener")"
+                )
+                if fdPressure {
+                    try? await Task.sleep(for: .milliseconds(100))
+                    continue
+                }
                 break
             }
             // Gate on uid + server existence before allocating a Connection;
@@ -1650,6 +1729,8 @@ struct PeerServerOutboundQueueDrop: Sendable, Equatable {
 struct PeerServerOutboundQueueSnapshot: Sendable, Equatable {
     let pendingItems: Int
     let pendingBytes: Int
+    let highWaterItems: Int
+    let highWaterBytes: Int
     let dropped: PeerServerOutboundQueueDrop
 }
 
@@ -1674,8 +1755,11 @@ enum PeerServerOutboundOverflowPolicy {
 
 private final class PeerServerOutboundQueueDiagnostics: @unchecked Sendable {
     private let lock = NSLock()
-    private var lastEmission = Date.distantPast
+    private var lastDropEmission = Date.distantPast
+    private var lastOverflowEmission = Date.distantPast
+    private var lastWatermarkPercent = 0
     private let surface: String
+    private var counters = PeerServerOutboundEpisodeCounters()
 
     init(surfaceID: Data) {
         self.surface = PeerServerDiagnostics.shortSurfaceID(surfaceID)
@@ -1685,10 +1769,65 @@ private final class PeerServerOutboundQueueDiagnostics: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let now = Date()
-        guard now.timeIntervalSince(lastEmission) >= 1 else { return }
-        lastEmission = now
+        guard now.timeIntervalSince(lastDropEmission) >= 1 else { return }
+        lastDropEmission = now
         PeerServerDiagnostics.record(
             "queue-drop surface=\(surface) chunks=\(drop.chunks) bytes=\(drop.bytes)"
+        )
+    }
+
+    func recordQueueWatermark(_ snapshot: PeerServerOutboundQueueSnapshot, percent: Int) {
+        lock.lock()
+        guard percent > lastWatermarkPercent else {
+            lock.unlock()
+            return
+        }
+        lastWatermarkPercent = percent
+        lock.unlock()
+        PeerServerDiagnostics.record(
+            "queue-watermark surface=\(surface) percent=\(percent) "
+                + "pending_items=\(snapshot.pendingItems) pending_bytes=\(snapshot.pendingBytes) "
+                + "peak_items=\(snapshot.highWaterItems) peak_bytes=\(snapshot.highWaterBytes)"
+        )
+    }
+
+    func recordQueueObservation(
+        _ snapshot: PeerServerOutboundQueueSnapshot,
+        snapshotCount: Int
+    ) {
+        PeerServerDiagnostics.record(
+            "queue-observation surface=\(surface) peak_items=\(snapshot.highWaterItems) "
+                + "peak_bytes=\(snapshot.highWaterBytes) dropped_chunks=\(snapshot.dropped.chunks) "
+                + "dropped_bytes=\(snapshot.dropped.bytes) snapshots=\(snapshotCount)"
+        )
+    }
+
+    func recordOverflow(canResync: Bool, snapshotInstalled: Bool) {
+        lock.lock()
+        counters.recordOverflow(
+            canResync: canResync, snapshotInstalled: snapshotInstalled
+        )
+        let snapshot = counters
+        let now = Date()
+        let shouldEmit = now.timeIntervalSince(lastOverflowEmission) >= 1
+        if shouldEmit { lastOverflowEmission = now }
+        lock.unlock()
+        guard shouldEmit else { return }
+        PeerServerDiagnostics.record(
+            "overflow-episode surface=\(surface) episode=\(snapshot.overflowEpisodes) "
+                + "first=\(snapshot.firstOverflow) second=\(snapshot.secondOverflow) "
+                + "no_resync=\(snapshot.noResync) resync=\(canResync) "
+                + "snapshot_installed=\(snapshotInstalled)"
+        )
+    }
+
+    func recordAttachmentAbort() {
+        lock.lock()
+        counters.recordAttachmentAbort()
+        let count = counters.attachmentAborts
+        lock.unlock()
+        PeerServerDiagnostics.record(
+            "attachment-abort surface=\(surface) count=\(count)"
         )
     }
 }
@@ -1711,11 +1850,19 @@ actor PeerServerOutboundQueue {
     private var state: State = .open
     private var pending: [PeerServerOutboundQueueEntry] = []
     private var pendingBytes = 0
+    private var highWaterItems = 0
+    private var highWaterBytes = 0
+    private var reportedWatermarkPercent = 0
     private var dropped = PeerServerOutboundQueueDrop()
     private var waiter: CheckedContinuation<PeerServerOutboundQueueEntry?, Never>?
+    private let onWatermark: @Sendable (PeerServerOutboundQueueSnapshot, Int) -> Void
     private let onDrop: @Sendable (PeerServerOutboundQueueDrop) -> Void
 
-    init(onDrop: @escaping @Sendable (PeerServerOutboundQueueDrop) -> Void = { _ in }) {
+    init(
+        onWatermark: @escaping @Sendable (PeerServerOutboundQueueSnapshot, Int) -> Void = { _, _ in },
+        onDrop: @escaping @Sendable (PeerServerOutboundQueueDrop) -> Void = { _ in }
+    ) {
+        self.onWatermark = onWatermark
         self.onDrop = onDrop
     }
 
@@ -1782,6 +1929,7 @@ actor PeerServerOutboundQueue {
         } else {
             pending.append(entry)
         }
+        updateHighWater()
         return true
     }
 
@@ -1799,8 +1947,22 @@ actor PeerServerOutboundQueue {
         PeerServerOutboundQueueSnapshot(
             pendingItems: pending.count,
             pendingBytes: pendingBytes,
+            highWaterItems: highWaterItems,
+            highWaterBytes: highWaterBytes,
             dropped: dropped
         )
+    }
+
+    private func updateHighWater() {
+        highWaterItems = max(highWaterItems, pending.count)
+        highWaterBytes = max(highWaterBytes, pendingBytes)
+        let itemPercent = highWaterItems * 100 / Self.maxPendingItems
+        let bytePercent = highWaterBytes * 100 / Self.maxPendingBytes
+        let percent = max(itemPercent, bytePercent)
+        let watermarkPercent = min(100, percent / 25 * 25)
+        guard watermarkPercent >= 25, watermarkPercent > reportedWatermarkPercent else { return }
+        reportedWatermarkPercent = watermarkPercent
+        onWatermark(snapshot(), watermarkPercent)
     }
 
     private func admit(_ entry: PeerServerOutboundQueueEntry, callDrops: inout PeerServerOutboundQueueDrop) {
@@ -1819,6 +1981,7 @@ actor PeerServerOutboundQueue {
         } else {
             pending.append(entry)
             pendingBytes += entry.byteCount
+            updateHighWater()
         }
     }
 
@@ -1849,6 +2012,9 @@ actor PeerServerSession {
     private enum LifecycleRequestAdmission {
         case accepted, invalid, duplicate, exhausted
     }
+    #if DEBUG
+    private static let testWriteDelayDeadline = ProcessInfo.processInfo.systemUptime + 1
+    #endif
 
     private let connection: AcceptedUnixConnection
     private let config: PeerServerConfig
@@ -2708,15 +2874,38 @@ actor PeerServerSession {
             && attachment.resync != nil
         let diagnostics = PeerServerOutboundQueueDiagnostics(surfaceID: surfaceID)
         var snapshotCount = 0
-        let queue = PeerServerOutboundQueue { drop in
-            diagnostics.record(drop)
-            if drop.bytes > 0 {
-                attachment.invalidateInputPath()
+        let queue = PeerServerOutboundQueue(
+            onWatermark: { snapshot, percent in
+                diagnostics.recordQueueWatermark(snapshot, percent: percent)
+            },
+            onDrop: { drop in
+                diagnostics.record(drop)
+                if drop.bytes > 0 {
+                    attachment.invalidateInputPath()
+                }
             }
+        )
+        #if DEBUG
+        let writeDelayMs: UInt64 = {
+            guard let raw = ProcessInfo.processInfo.environment["TERMMESH_E2E_PEER_SERVER_WRITE_DELAY_MS"],
+                  let value = UInt64(raw),
+                  (1...1000).contains(value) else { return 0 }
+            return value
+        }()
+        if writeDelayMs > 0 && ProcessInfo.processInfo.systemUptime < Self.testWriteDelayDeadline {
+            PeerServerDiagnostics.record(
+                "test-write-delay active ms=\(writeDelayMs) surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID))"
+            )
         }
+        #endif
         let coalescer = PtyDataCoalescer { [weak self] payload, seq, callbackEvents in
             guard let self else { return false }
             do {
+                #if DEBUG
+                if writeDelayMs > 0 && ProcessInfo.processInfo.systemUptime < Self.testWriteDelayDeadline {
+                    try await Task.sleep(nanoseconds: writeDelayMs * 1_000_000)
+                }
+                #endif
                 try await self.sendEnvelope { env in
                     var p = Termmesh_Peer_V1_PtyData()
                     p.surfaceID = surfaceID
@@ -2826,19 +3015,29 @@ actor PeerServerSession {
                             continue
                         case .accepted:
                             if snapshotCount > 0 && attachments.count == 1 {
+                                diagnostics.recordOverflow(
+                                    canResync: canResync,
+                                    snapshotInstalled: true
+                                )
                                 PeerServerDiagnostics.record(
                                     "transport-close reason=second-overflow-after-snapshot surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) attachments=\(attachments.count)"
                                 )
                                 await queue.abort()
+                                diagnostics.recordAttachmentAbort()
                                 await connection.close()
                                 return false
                             }
+                            diagnostics.recordOverflow(
+                                canResync: canResync,
+                                snapshotInstalled: snapshotCount > 0
+                            )
                             attachment.invalidateInputPath()
                             guard canResync,
                                   let capture = attachment.resync,
                                   let snapshot = await capture(),
                                   await queue.installSnapshot(snapshot) else {
                                 await queue.abort()
+                                diagnostics.recordAttachmentAbort()
                                 return false
                             }
                             snapshotCount += 1
@@ -2849,6 +3048,7 @@ actor PeerServerSession {
                             continue
                         case .finished, .aborted:
                             await queue.abort()
+                            diagnostics.recordAttachmentAbort()
                             return false
                         }
                     }
@@ -2956,6 +3156,10 @@ actor PeerServerSession {
             }
 
             let sendSucceeded = await writer
+            diagnostics.recordQueueObservation(
+                await queue.snapshot(),
+                snapshotCount: snapshotCount
+            )
             if !sendSucceeded {
                 PeerServerDiagnostics.record(
                     "pty-writer-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) cancelled=\(Task.isCancelled)"

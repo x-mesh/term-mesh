@@ -1029,7 +1029,29 @@ struct PeerHostEditorView: View {
     @ViewBuilder
     private var healthBaselineLine: some View {
         if let health = healthBaseline {
-            switch health.verdict {
+            if health.hostKind == .app {
+                let detail = "GUI PID \(health.appPID.map(String.init) ?? "none") · FD \(health.appFDCount) · peer sessions \(health.peerSessionCount)"
+                let route = health.daemonPeerReachable && health.listenerStatus != .healthy
+                    ? "daemon reachable / GUI listener \(health.listenerStatus.rawValue)"
+                    : "GUI listener \(health.listenerStatus.rawValue)"
+                Label("\(route) · \(detail)", systemImage: health.verdict == .healthy ? "checkmark.shield" : "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(health.verdict == .healthy ? .green : .orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                if !health.lastPeerServerFailure.isEmpty {
+                    Text("last peer failure: \(health.lastPeerServerFailure)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if health.connectThenEOFCount > 0 || health.connectThenTimeoutCount > 0 || health.acceptFDPressureCount > 0 {
+                    Text("listener evidence: EOF \(health.connectThenEOFCount) · timeout \(health.connectThenTimeoutCount) · FD pressure \(health.acceptFDPressureCount)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                switch health.verdict {
             case .healthy:
                 Label(
                     "Host healthy — peer and daemon control planes respond; no relay faults in 5 min",
@@ -1058,6 +1080,7 @@ struct PeerHostEditorView: View {
                     systemImage: "questionmark.circle"
                 )
                     .font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
     }

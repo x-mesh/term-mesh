@@ -35,11 +35,37 @@ Accepted forms:
      ./scripts/run-tests-v2.sh tests_v2/test_remote_project_restart_reattach.py'
    ```
 
-   All six are required. `STAGE_REMOTE_FIXTURE` and `REMOTE_FIXTURE_SSH_TARGET` are what
-   make the run prove the candidate: the runner stages that SHA's daemon on the peer and
-   refuses to start without them, so a stale production daemon cannot be mistaken for the
-   candidate. `TERMMESH_E2E_REMOTE_LEADER_HOST`, `_DIR` and `_HOST_PROFILE_JSON` are derived
-   by the runner once the fixture is up — do not set them by hand.
+   Run the incident-shaped bounded-output gate on the same staged candidate. It
+   requires the GUI serving socket, the daemon session-owner route, the exact
+   Project manifest, and the exact leader/member surfaces independently. A
+   daemon-only route is reported as such and fails when
+   `TERMMESH_E2E_REQUIRE_SESSION_OWNER_REDIRECT=1`; it is never accepted as a
+   GUI Project route.
+
+   ```bash
+   ssh mac-sub 'cd /Users/jinwoo/work/term-mesh && \
+     TERMMESH_E2E_REQUIRE_REMOTE_PROJECT=1 \
+     TERMMESH_E2E_REATTACH_PHASE=full \
+     TERMMESH_E2E_STAGE_REMOTE_FIXTURE=1 \
+     TERMMESH_E2E_REQUIRE_SESSION_OWNER_REDIRECT=1 \
+     TERMMESH_E2E_GUI_SESSION_OWNER_FIXTURE=1 \
+     TERMMESH_E2E_REMOTE_FIXTURE_SSH_TARGET=mac-studio-t \
+     TERMMESH_E2E_CANDIDATE_SHA=<pinned-sha> \
+     TERMMESH_E2E_PEER_RELAY_READ_DELAY_MS=5 \
+     TERMMESH_E2E_PEER_SERVER_WRITE_DELAY_MS=1000 \
+     TERMMESH_E2E_BACKPRESSURE_RECEIPT=<backpressure-receipt-path> \
+     ./scripts/run-tests-v2.sh tests_v2/test_peer_output_backpressure_recovery.py'
+   ```
+
+   The lifecycle command uses the Linux peer. The backpressure command uses the isolated E2E
+   app and candidate daemon on the same Mac host, `mac-studio-t`, in a unique temporary fixture.
+   The GUI app serves the profile socket and claims its paired daemon as session owner. Project
+   leaders run on the staged Mac daemon. Keep the strict session-owner gate enabled. The runner derives
+   `TERMMESH_E2E_REMOTE_LEADER_HOST`, `_DIR` and `_HOST_PROFILE_JSON`. Do not set them by hand.
+   The Debug peer server delays GUI loopback socket writes for the first second of output.
+   It then resumes normal writes. The gate requires a queue watermark, output completion,
+   and 15 seconds of exact remote Project leader stability. The completion marker is absent
+   from the echoed command. The leader pane runs an agent CLI, so do not send shell commands to it.
 
    The runner's checkout must be detached at the pinned SHA with `daemon` and `Proto` clean,
    or the fixture refuses to stage. The peer host needs the agent CLI already installed.
