@@ -53,6 +53,40 @@ private actor OutboundQueueSendCounter {
 }
 
 final class PeerServerOutboundQueueTests: XCTestCase {
+    func testReconnectCircuitBoundsAttemptsAndRecordsRecovery() {
+        var circuit = PeerReconnectCircuit()
+
+        XCTAssertEqual(circuit.nextAttempt()?.attempt, 1)
+        XCTAssertEqual(circuit.nextAttempt()?.delaySeconds, 2)
+        XCTAssertEqual(circuit.cooldowns, 1)
+        for _ in 0..<(PeerReconnectCircuit.maxAttempts - 2) {
+            XCTAssertNotNil(circuit.nextAttempt())
+        }
+        XCTAssertNil(circuit.nextAttempt())
+        XCTAssertEqual(circuit.state, .open)
+        XCTAssertEqual(circuit.attempts, PeerReconnectCircuit.maxAttempts)
+
+        circuit.recordRecovery()
+        XCTAssertEqual(circuit.state, .closed)
+        XCTAssertEqual(circuit.attempts, 0)
+        XCTAssertEqual(circuit.recoveries, 1)
+    }
+
+    func testOverflowEpisodeCountersDistinguishResyncAndAttachmentAbort() {
+        var counters = PeerServerOutboundEpisodeCounters()
+
+        counters.recordOverflow(canResync: true, snapshotInstalled: false)
+        counters.recordOverflow(canResync: true, snapshotInstalled: true)
+        counters.recordOverflow(canResync: false, snapshotInstalled: false)
+        counters.recordAttachmentAbort()
+
+        XCTAssertEqual(counters.overflowEpisodes, 3)
+        XCTAssertEqual(counters.firstOverflow, 2)
+        XCTAssertEqual(counters.secondOverflow, 1)
+        XCTAssertEqual(counters.noResync, 1)
+        XCTAssertEqual(counters.attachmentAborts, 1)
+    }
+
     private func drain(_ queue: PeerServerOutboundQueue) async -> [PeerServerOutboundQueueEntry] {
         var entries: [PeerServerOutboundQueueEntry] = []
         while let entry = await queue.next() {

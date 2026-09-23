@@ -2012,6 +2012,7 @@ final class PeerRelaySession {
 
     var ioSnapshot: [String: Any] {
         let c = outputHealthSnapshot
+        let reconnect = reconnectCircuit
         return [
             "bytes_received": c.bytesReceived,
             "bytes_enqueued": c.bytesDelivered,
@@ -2024,6 +2025,10 @@ final class PeerRelaySession {
             "resume_gate_buffered_bytes": c.resumeGateBufferedBytes,
             "last_host_byte_uptime_ns": c.lastHostByteUptimeNs,
             "last_delivered_byte_uptime_ns": c.lastDeliveredByteUptimeNs,
+            "reconnect_attempts": reconnect.attempts,
+            "reconnect_cooldowns": reconnect.cooldowns,
+            "reconnect_recoveries": reconnect.recoveries,
+            "reconnect_circuit": reconnect.state.rawValue,
         ]
     }
 
@@ -2112,6 +2117,7 @@ final class PeerRelaySession {
     /// distinguish those three states before it decides a pane needs no
     /// respawn, so the reconnect loop records its own presence here.
     private var reconnectInFlight = false
+    private var reconnectCircuit = PeerReconnectCircuit()
     // Stored (not just local to `startPumping`) so `performResumeHeal` can
     // read the live remote size and re-target its session after a swap.
     // Relay delivery only; callback mode never creates one.
@@ -3267,6 +3273,7 @@ final class PeerRelaySession {
                         }
                         expectedByteSeq = chunk.byteSeq + UInt64(chunk.payload.count)
                         if self.ioStats.noteReceived(chunk.payload.count) {
+                            await self.noteReconnectOutputRecovery(generation: resumeTransitionGate.currentGeneration())
                             #if DEBUG
                             // Splits the blank-pane failure space in half: with
                             // this line the host did send and any loss is
@@ -3484,6 +3491,7 @@ final class PeerRelaySession {
                         // last-host-byte timestamp.
                         if case .staleGeneration = route { break }
                         if self.ioStats.noteReceived(data.count) {
+                            await self.noteReconnectOutputRecovery(generation: currentGeneration)
                             #if DEBUG
                             dlog("peer.relay.firstByte path=owned bytes=\(data.count)")
                             #endif
@@ -4117,15 +4125,20 @@ final class PeerRelaySession {
         guard resumeTransitionGate.currentGeneration() == failedGeneration else {
             return session !== failedSession
         }
-        var attempt = 0
         while Self.shouldReconnectOwnedSession(
             ownsSession: ownsSession,
             isTorndown: isTorndown,
             isCurrentSession: session === failedSession,
             hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
         ) {
-            attempt += 1
-            let delay = Self.reconnectDelaySeconds(attempt: attempt)
+            guard let next = reconnectCircuit.nextAttempt() else {
+                RemoteWorkLog.warningOffMain(
+                    "Peer reconnect circuit open host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) attempts=\(reconnectCircuit.attempts)"
+                )
+                break
+            }
+            let attempt = next.attempt
+            let delay = next.delaySeconds
             if delay > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
@@ -4149,6 +4162,7 @@ final class PeerRelaySession {
                 )
                 return true
             }
+            reconnectCircuit.recordFailure()
             if attempt <= 3 || attempt % 10 == 0 {
                 RemoteWorkLog.warningOffMain(
                     "Peer reconnect failed host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) n=\(attempt) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
@@ -4156,6 +4170,15 @@ final class PeerRelaySession {
             }
         }
         return session !== failedSession
+    }
+
+    private func noteReconnectOutputRecovery(generation: UInt64) {
+        guard generation == resumeTransitionGate.currentGeneration(),
+              reconnectCircuit.attempts > 0 else { return }
+        reconnectCircuit.recordRecovery()
+        RemoteWorkLog.infoOffMain(
+            "Peer reconnect recovered host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) generation=\(generation)"
+        )
     }
 
     nonisolated static func shouldReconnectOwnedSession(

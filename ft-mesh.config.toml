@@ -1,0 +1,410 @@
+personality = "pragmatic"
+model = "gpt-5.6-luna"
+model_reasoning_effort = "xhigh"
+approvals_reviewer = "user"
+service_tier = "default"
+plan_mode_reasoning_effort = "xhigh"
+
+model_provider = "openai"
+
+[projects."/Users/jinwoo/work/project/cert-generator"]
+trust_level = "trusted"
+model = "gpt-5.1-codex-mini"
+model_reasoning_effort = "medium"
+
+[projects."/Users/jinwoo/work/project/ente"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/conterm"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/cmux"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/term-mesh"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/researcher"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/x-kit"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/diagram-makers"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/llm-wiki2"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/ac-rust"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/git-kit"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/aic"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/repo-mesh"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/paper-mesh"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/42tape/deployments/oci/oci-terraform"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/42tape"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/lib-mesh"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/quicsync"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/ai-mesh"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/x-backup"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/httprove"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/mem-mesh"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/diagramer"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/42tape/deployments/oci/fab-deployer"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/python_prj/oci_tools"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/space-mesh"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/ICON/0711-balanced-hack-issue"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/rca"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/.codex2"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/dctribe"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/ideas/AgentGuard"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/42tape/deployments/oci"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/temp/parameta-home"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/gk"]
+trust_level = "trusted"
+
+[projects."/private/tmp/claude-501/-Users-jinwoo-work-project-term-mesh/fe622a62-c228-4b20-a2e4-02bd943d0871/scratchpad/probe"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/tm-projects/term-mesh"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/temp/sto"]
+trust_level = "trusted"
+
+[projects."/private/tmp/ai-mesh-codex-e2e.5Lc1rj"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/headroom"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/local"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/homebrew-tap"]
+trust_level = "trusted"
+
+[projects."/Users/jinwoo/work/project/agentic/output-mesh"]
+trust_level = "trusted"
+
+[notice]
+fast_default_opt_out = true
+
+[notice.model_migrations]
+"gpt-5.1-codex-mini" = "gpt-5.2-codex"
+"gpt-5.3-codex" = "gpt-5.4"
+"gpt-5.2" = "gpt-5.4"
+
+[tui]
+status_line = ["model-with-reasoning", "current-dir", "git-branch", "branch-changes", "run-state", "context-used", "five-hour-limit", "weekly-limit", "codex-version", "used-tokens"]
+status_line_use_colors = true
+
+[tui.model_availability_nux]
+"gpt-5.5" = 4
+"gpt-5.6-sol" = 4
+gpt-6-astra = 4
+
+[hooks.state]
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:post_tool_use:0:0"]
+trusted_hash = "sha256:48145070825070207dba96fdbc0495b55f48d7b5c0e63a887cc5635e72236fac"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:pre_tool_use:1:0"]
+trusted_hash = "sha256:827f769358fbffafc241fbaf020b390adc82bb26a5ed916c52cced2f2554ae61"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:session_start:0:0"]
+trusted_hash = "sha256:a95ade6f232404be2044bc9601419b916d81f788dbfd2a6fde29942c3dab1ba5"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:stop:0:0"]
+trusted_hash = "sha256:da24bf9518b3ea100c158727ce2c05c88628027f9672c4e15267a5940896081c"
+
+[hooks.state."/Users/jinwoo/work/project/agentic/x-kit/.codex/hooks.json:pre_tool_use:0:0"]
+trusted_hash = "sha256:5121753186de1126d5a7a8817a35c84c383bd758aa6e99ff40685c0cc4418d51"
+enabled = true
+
+[hooks.state."/Users/jinwoo/work/project/agentic/x-kit/.codex/hooks.json:pre_tool_use:1:0"]
+trusted_hash = "sha256:9f21a71516a5f317ab7695cb10a3fa7f7c02f15ec02f7e69fe352b06dcdebe3c"
+enabled = true
+
+[hooks.state."/Users/jinwoo/work/project/agentic/x-kit/.codex/hooks.json:post_tool_use:0:0"]
+trusted_hash = "sha256:ad7750c4f45a0ff2621e1a2fc7d173630cd853d57f337f34fb81e03c9e5e1149"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:pre_compact:0:0"]
+trusted_hash = "sha256:6b0f8be844e9ea9a49ff58c280044e18b6978cb5d976637330cd61eff8092dad"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:user_prompt_submit:0:0"]
+trusted_hash = "sha256:d701c4f5ab2fcb3128386b3cb6d3f7e793550c94f6acabc5433f7dd944dff2c0"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:subagent_start:0:0"]
+trusted_hash = "sha256:73d4633d7f9d4a5a2d23ff79c6760f366ce60beb6835ebcc608e71b5f4fab18c"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:subagent_stop:0:0"]
+trusted_hash = "sha256:1df073688adb4e27b00b61f71585b5fc63a01daf4e17cff2c88dea5349b35a90"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:pre_tool_use:0:0"]
+trusted_hash = "sha256:31eb59bd1155f3b3f58f37016271ca8e3b6b8680504e20ea9d2a7171f9f130d1"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:post_tool_use:0:0"]
+trusted_hash = "sha256:48145070825070207dba96fdbc0495b55f48d7b5c0e63a887cc5635e72236fac"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:post_tool_use:1:0"]
+trusted_hash = "sha256:b0d4eef3fe5e66f81e49066219dea18c1695d25ad460c8f12f832cc344428a1d"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:pre_compact:0:0"]
+trusted_hash = "sha256:6b0f8be844e9ea9a49ff58c280044e18b6978cb5d976637330cd61eff8092dad"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:session_start:0:0"]
+trusted_hash = "sha256:a95ade6f232404be2044bc9601419b916d81f788dbfd2a6fde29942c3dab1ba5"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:user_prompt_submit:0:0"]
+trusted_hash = "sha256:d701c4f5ab2fcb3128386b3cb6d3f7e793550c94f6acabc5433f7dd944dff2c0"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:subagent_start:0:0"]
+trusted_hash = "sha256:73d4633d7f9d4a5a2d23ff79c6760f366ce60beb6835ebcc608e71b5f4fab18c"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:subagent_stop:0:0"]
+trusted_hash = "sha256:1df073688adb4e27b00b61f71585b5fc63a01daf4e17cff2c88dea5349b35a90"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:stop:0:0"]
+trusted_hash = "sha256:da24bf9518b3ea100c158727ce2c05c88628027f9672c4e15267a5940896081c"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:pre_tool_use:1:0"]
+trusted_hash = "sha256:827f769358fbffafc241fbaf020b390adc82bb26a5ed916c52cced2f2554ae61"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:session_start:1:0"]
+trusted_hash = "sha256:41a6918fb571b92d646a3a91fe1ebf10324f4b05c251f8c19ce375ed1bcee3d9"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:stop:0:1"]
+trusted_hash = "sha256:783687cde2544cd5587b7aed6900ec4d0669f094d7a5e516a3b9a0ae9758c531"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:stop:0:1"]
+trusted_hash = "sha256:783687cde2544cd5587b7aed6900ec4d0669f094d7a5e516a3b9a0ae9758c531"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:post_tool_use:2:0"]
+trusted_hash = "sha256:7e62b89fd641c07a3f767c3488a57b7ce3ada988ea5eb711f1d2559630c855ec"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:session_start:2:0"]
+trusted_hash = "sha256:58cee1f99cc149591f05d7550d714ebd06ac30ebe3b9458d82b56597e5f6895b"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:permission_request:0:0"]
+trusted_hash = "sha256:57a24b2fc32bb38d931731a7fe63ae8c62547954818234ee7510a08d8dfa173e"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:post_tool_use:2:0"]
+trusted_hash = "sha256:7e62b89fd641c07a3f767c3488a57b7ce3ada988ea5eb711f1d2559630c855ec"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:session_start:2:0"]
+trusted_hash = "sha256:58cee1f99cc149591f05d7550d714ebd06ac30ebe3b9458d82b56597e5f6895b"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:user_prompt_submit:1:0"]
+trusted_hash = "sha256:54ac54d09d565c2f1be049305627ec7d61e70857e0b5e14faa6fbbf50d76875d"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:subagent_start:1:0"]
+trusted_hash = "sha256:0504bceca04005d71e1034f9a737214a7185c9ceb5a1118b366e7347b32460c7"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:subagent_stop:1:0"]
+trusted_hash = "sha256:b6bc4fa97566336a4bbc572ae9f0d42289c3ecccffeadf1d1f22c7f50cfea70f"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:stop:1:0"]
+trusted_hash = "sha256:7cec114abac68b5da122e090b0e2cbf727d00d3b4beebe5ae529355cfc0cb782"
+
+[hooks.state."/Users/jinwoo/work/project/agentic/x-kit/.codex/hooks.json:post_tool_use:1:0"]
+trusted_hash = "sha256:446210b50f161dea2cfd6e15be5e859d291caf7ff6f9901f549061649355b2ae"
+
+[hooks.state."/Users/jinwoo/work/project/agentic/x-kit/.codex/hooks.json:session_start:0:0"]
+trusted_hash = "sha256:962cc613fccc64186bd0342d093974e0284f3b7067e2e05d489407333c638e0c"
+
+[hooks.state."/Users/jinwoo/work/project/agentic/x-kit/.codex/hooks.json:stop:0:0"]
+trusted_hash = "sha256:1a11e879dee752e8dd0e979c4da4079e872e4cda795cf1c898f7d38551eff2db"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:pre_tool_use:2:0"]
+trusted_hash = "sha256:827f769358fbffafc241fbaf020b390adc82bb26a5ed916c52cced2f2554ae61"
+
+[hooks.state."/Users/jinwoo/.codex2/hooks.json:session_start:1:1"]
+trusted_hash = "sha256:61607c208b19d9d5d9519f65e200deefd244c4f66cc54e01cea9e41b16859261"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:pre_tool_use:0:0"]
+trusted_hash = "sha256:99daf1e5ca446feb01d9e36c6fc2aee253e69140e6bc6bcbfd2e97358d0dd038"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:permission_request:0:0"]
+trusted_hash = "sha256:57a24b2fc32bb38d931731a7fe63ae8c62547954818234ee7510a08d8dfa173e"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:post_tool_use:1:0"]
+trusted_hash = "sha256:7e62b89fd641c07a3f767c3488a57b7ce3ada988ea5eb711f1d2559630c855ec"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:session_start:1:0"]
+trusted_hash = "sha256:61607c208b19d9d5d9519f65e200deefd244c4f66cc54e01cea9e41b16859261"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:user_prompt_submit:1:0"]
+trusted_hash = "sha256:54ac54d09d565c2f1be049305627ec7d61e70857e0b5e14faa6fbbf50d76875d"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:subagent_start:1:0"]
+trusted_hash = "sha256:0504bceca04005d71e1034f9a737214a7185c9ceb5a1118b366e7347b32460c7"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:subagent_stop:1:0"]
+trusted_hash = "sha256:b6bc4fa97566336a4bbc572ae9f0d42289c3ecccffeadf1d1f22c7f50cfea70f"
+
+[hooks.state."/Users/jinwoo/.codex/hooks.json:stop:1:0"]
+trusted_hash = "sha256:7cec114abac68b5da122e090b0e2cbf727d00d3b4beebe5ae529355cfc0cb782"
+
+[hooks.state."warp@codex-warp:hooks/hooks.json:permission_request:0:0"]
+trusted_hash = "sha256:a5f8b0ebc36bb459328ffeb5f62ff146dfb74e3d88d4c369cf0280f7b354e388"
+
+[hooks.state."warp@codex-warp:hooks/hooks.json:post_tool_use:0:0"]
+trusted_hash = "sha256:be77e14a9094af2f521258e2bff1f5d777249bc50ce8eb0574a85bea9bd79e7f"
+
+[hooks.state."warp@codex-warp:hooks/hooks.json:session_start:0:0"]
+trusted_hash = "sha256:91587043033e7831d4d154fdef2e495f3113c3552a4529d8013f5546ffb2c140"
+
+[hooks.state."warp@codex-warp:hooks/hooks.json:user_prompt_submit:0:0"]
+trusted_hash = "sha256:2480a7db650a36e05d8005aabca58b9d106f3b7a46f7094d7747d0d77773f75c"
+
+[hooks.state."warp@codex-warp:hooks/hooks.json:stop:0:0"]
+trusted_hash = "sha256:6a3b3af655efa426e920425de93a830fe25b8b5a62ef7b9a699e7ff40d9ef351"
+
+[mcp_servers.mem-mesh]
+url = "https://jinwoo.rgrg.im/mcp/sse"
+startup_timeout_sec = 20.0
+tool_timeout_sec = 60.0
+default_tools_approval_mode = "prompt"
+
+[mcp_servers.mem-mesh.http_headers]
+Authorization = "Bearer 4xyYOnyQKNpHSn5IbAR4vQJBnApBHiugWVSerpxyYv8"
+
+[mcp_servers.mem-mesh.tools.add]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.batch_operations]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.context]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.delete]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.doc_proposal_applied]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.doc_proposals]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.get_links]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.link]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.pin_add]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.pin_complete]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.pin_get]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.pin_list]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.pin_promote]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.report_anchor_status]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.search]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.session_end]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.session_resume]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.star]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.stats]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.unlink]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.unstar]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.update]
+approval_mode = "approve"
+
+[mcp_servers.mem-mesh.tools.weekly_review]
+approval_mode = "approve"
+
+[mcp_servers.openaiDeveloperDocs]
+url = "https://developers.openai.com/mcp"
+
+[plugins."xm@personal"]
+enabled = true
+
+[plugins."warp@codex-warp"]
+enabled = true
+
+[marketplaces.codex-warp]
+last_updated = "2026-08-10T15:17:28Z"
+last_revision = "f11334dc715d48f07d133db6046895cb45f4accb"
+source_type = "git"
+source = "https://github.com/warpdotdev/codex-warp.git"
+# <<< mem-mesh managed MCP

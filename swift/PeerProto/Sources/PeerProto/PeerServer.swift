@@ -514,6 +514,76 @@ public enum PeerServerError: Error, Equatable {
     case leaderSessionClosed
 }
 
+public enum PeerReconnectCircuitState: String, Sendable, Equatable {
+    case closed
+    case cooldown
+    case open
+}
+
+public struct PeerReconnectCircuit: Sendable, Equatable {
+    public static let maxAttempts = 8
+
+    public private(set) var attempts = 0
+    public private(set) var cooldowns = 0
+    public private(set) var recoveries = 0
+    public private(set) var state: PeerReconnectCircuitState = .closed
+
+    public init() {}
+
+    public mutating func nextAttempt() -> (attempt: Int, delaySeconds: Double)? {
+        guard state != .open, attempts < Self.maxAttempts else {
+            state = .open
+            return nil
+        }
+        attempts += 1
+        let delay = attempts == 1 ? 0 : min(30, pow(2, Double(min(attempts - 1, 5))))
+        if delay > 0 {
+            cooldowns += 1
+            state = .cooldown
+        }
+        return (attempts, delay)
+    }
+
+    public mutating func recordFailure() {
+        if attempts >= Self.maxAttempts {
+            state = .open
+        } else if attempts > 0 {
+            state = .cooldown
+        }
+    }
+
+    public mutating func recordRecovery() {
+        guard attempts > 0 else { return }
+        attempts = 0
+        state = .closed
+        recoveries += 1
+    }
+}
+
+public struct PeerServerOutboundEpisodeCounters: Sendable, Equatable {
+    public private(set) var overflowEpisodes = 0
+    public private(set) var firstOverflow = 0
+    public private(set) var secondOverflow = 0
+    public private(set) var noResync = 0
+    public private(set) var attachmentAborts = 0
+
+    public init() {}
+
+    public mutating func recordOverflow(canResync: Bool, snapshotInstalled: Bool) {
+        overflowEpisodes += 1
+        if snapshotInstalled {
+            secondOverflow += 1
+        } else {
+            firstOverflow += 1
+        }
+        if !canResync { noResync += 1 }
+    }
+
+    public mutating func recordAttachmentAbort() {
+        attachmentAborts += 1
+    }
+}
+
 public struct PeerServerConfig: Sendable {
     public var hostDisplayName: String
     public var hostAppVersion: String
@@ -978,7 +1048,16 @@ public actor PeerServer {
                 }
             }
             if clientFd < 0 {
-                if errno == EAGAIN || errno == EWOULDBLOCK { continue }
+                let acceptErrno = errno
+                if acceptErrno == EAGAIN || acceptErrno == EWOULDBLOCK { continue }
+                let fdPressure = acceptErrno == EMFILE || acceptErrno == ENFILE
+                PeerServerDiagnostics.record(
+                    "accept-error errno=\(acceptErrno) class=\(fdPressure ? "fd-pressure" : "listener")"
+                )
+                if fdPressure {
+                    try? await Task.sleep(for: .milliseconds(100))
+                    continue
+                }
                 break
             }
             // Gate on uid + server existence before allocating a Connection;
@@ -1676,6 +1755,7 @@ private final class PeerServerOutboundQueueDiagnostics: @unchecked Sendable {
     private let lock = NSLock()
     private var lastEmission = Date.distantPast
     private let surface: String
+    private var counters = PeerServerOutboundEpisodeCounters()
 
     init(surfaceID: Data) {
         self.surface = PeerServerDiagnostics.shortSurfaceID(surfaceID)
@@ -1689,6 +1769,35 @@ private final class PeerServerOutboundQueueDiagnostics: @unchecked Sendable {
         lastEmission = now
         PeerServerDiagnostics.record(
             "queue-drop surface=\(surface) chunks=\(drop.chunks) bytes=\(drop.bytes)"
+        )
+    }
+
+    func recordOverflow(canResync: Bool, snapshotInstalled: Bool) {
+        lock.lock()
+        counters.recordOverflow(
+            canResync: canResync, snapshotInstalled: snapshotInstalled
+        )
+        let snapshot = counters
+        let now = Date()
+        let shouldEmit = now.timeIntervalSince(lastEmission) >= 1
+        if shouldEmit { lastEmission = now }
+        lock.unlock()
+        guard shouldEmit else { return }
+        PeerServerDiagnostics.record(
+            "overflow-episode surface=\(surface) episode=\(snapshot.overflowEpisodes) "
+                + "first=\(snapshot.firstOverflow) second=\(snapshot.secondOverflow) "
+                + "no_resync=\(snapshot.noResync) resync=\(canResync) "
+                + "snapshot_installed=\(snapshotInstalled)"
+        )
+    }
+
+    func recordAttachmentAbort() {
+        lock.lock()
+        counters.recordAttachmentAbort()
+        let count = counters.attachmentAborts
+        lock.unlock()
+        PeerServerDiagnostics.record(
+            "attachment-abort surface=\(surface) count=\(count)"
         )
     }
 }
@@ -2826,19 +2935,29 @@ actor PeerServerSession {
                             continue
                         case .accepted:
                             if snapshotCount > 0 && attachments.count == 1 {
+                                diagnostics.recordOverflow(
+                                    canResync: canResync,
+                                    snapshotInstalled: true
+                                )
                                 PeerServerDiagnostics.record(
                                     "transport-close reason=second-overflow-after-snapshot surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) attachments=\(attachments.count)"
                                 )
                                 await queue.abort()
+                                diagnostics.recordAttachmentAbort()
                                 await connection.close()
                                 return false
                             }
+                            diagnostics.recordOverflow(
+                                canResync: canResync,
+                                snapshotInstalled: snapshotCount > 0
+                            )
                             attachment.invalidateInputPath()
                             guard canResync,
                                   let capture = attachment.resync,
                                   let snapshot = await capture(),
                                   await queue.installSnapshot(snapshot) else {
                                 await queue.abort()
+                                diagnostics.recordAttachmentAbort()
                                 return false
                             }
                             snapshotCount += 1
@@ -2849,6 +2968,7 @@ actor PeerServerSession {
                             continue
                         case .finished, .aborted:
                             await queue.abort()
+                            diagnostics.recordAttachmentAbort()
                             return false
                         }
                     }
