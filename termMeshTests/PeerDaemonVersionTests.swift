@@ -312,10 +312,26 @@ final class PeerDaemonVersionTests: XCTestCase {
             discovered: "/run/term-mesh/tm-peer.sock",
             discoveredVerified: true,
             connected: "/run/term-mesh/tm-peer.sock",
-            owner: nil,
+            owner: "/run/term-mesh/tm-peer.sock",
             discoveredOwner: nil
         )
         XCTAssertEqual(PeerHostEditorView.relayEndpointRole(details, hostKind: .daemon), .daemonHost)
+    }
+
+    func testMacDaemonWithNoRunningAppIsADaemonNotTheApp() {
+        let details = connectedRoute(
+            configured: "/daemon-peer.sock",
+            discovered: nil,
+            discoveredVerified: nil,
+            connected: "/daemon-peer.sock",
+            owner: "/daemon-peer.sock",
+            discoveredOwner: nil
+        )
+        XCTAssertEqual(
+            PeerHostEditorView.relayEndpointRole(details, hostKind: .app),
+            .daemonHost,
+            "hostKind .app only means macOS; the endpoint named itself as owner"
+        )
     }
 
     func testAlternateThatDoesNotNameTheConnectedSocketIsNotABypass() {

@@ -1017,7 +1017,8 @@ struct PeerHostEditorView: View {
         /// A Mac's daemon reached directly while that Mac's app is running at
         /// `appSocket`: the app's window panes are missing.
         case daemonBehindApp(appSocket: String)
-        /// A daemon host such as Linux: the sessions the daemon holds.
+        /// A daemon serving its own sessions: a Linux host, or a Mac daemon
+        /// reached while no app on that Mac claims it.
         case daemonHost
     }
 
@@ -1034,6 +1035,12 @@ struct PeerHostEditorView: View {
            details.discoveredVerified == true,
            details.discoveredSessionOwnerSocket == details.connectedSocket {
             return .daemonBehindApp(appSocket: discovered)
+        }
+        // A daemon names its own socket as session owner. `hostKind` only
+        // reports the OS, so without this a Mac daemon that outlived its app
+        // would read as the app.
+        if details.sessionOwnerSocket == details.connectedSocket {
+            return .daemonHost
         }
         switch hostKind {
         case .app: return .macApp
