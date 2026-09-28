@@ -282,8 +282,11 @@ async fn main() -> anyhow::Result<()> {
     // logger, a socket, or a second peer server.
     parse_args_or_exit();
 
+    // The app and systemd hand stdout a file or the journal; colour escapes
+    // there split `key=value` fields and defeat grep.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("term_meshd=debug".parse()?))
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
     START_TIME.get_or_init(Instant::now);
