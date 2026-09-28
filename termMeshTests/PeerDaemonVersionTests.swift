@@ -253,6 +253,108 @@ final class PeerDaemonVersionTests: XCTestCase {
         )
     }
 
+    private func connectedRoute(
+        configured: String?,
+        discovered: String?,
+        discoveredVerified: Bool?,
+        connected: String,
+        owner: String?,
+        discoveredOwner: String?
+    ) -> PeerRelayTestDetails {
+        PeerRelayTestDetails(
+            configuredSocket: configured,
+            discoveredSocket: discovered,
+            discoveredVerified: discoveredVerified,
+            connectedSocket: connected,
+            connectedVerified: true,
+            sessionOwnerSocket: owner,
+            sessionOwnerVerified: true,
+            hostDisplayName: "host",
+            hostAppVersion: "0.256.0",
+            discoveredSessionOwnerSocket: discoveredOwner
+        )
+    }
+
+    func testMacDaemonPinnedWhileItsAppRunsIsReportedAsMissingAppPanes() {
+        let details = connectedRoute(
+            configured: "/daemon-peer.sock",
+            discovered: "/tmp/term-mesh-peer-501/peer.sock",
+            discoveredVerified: true,
+            connected: "/daemon-peer.sock",
+            owner: nil,
+            discoveredOwner: "/daemon-peer.sock"
+        )
+        XCTAssertEqual(
+            PeerHostEditorView.relayEndpointRole(details, hostKind: .app),
+            .daemonBehindApp(appSocket: "/tmp/term-mesh-peer-501/peer.sock")
+        )
+        XCTAssertTrue(
+            PeerHostEditorView.relayRouteWarnings(details).isEmpty,
+            "the role line explains the alternate socket; path-mismatch lines would repeat it"
+        )
+    }
+
+    func testAppAdvertisingItsDaemonIsTheMacAppRole() {
+        let details = connectedRoute(
+            configured: nil,
+            discovered: "/tmp/term-mesh-peer-501/peer.sock",
+            discoveredVerified: true,
+            connected: "/tmp/term-mesh-peer-501/peer.sock",
+            owner: "/daemon-peer.sock",
+            discoveredOwner: nil
+        )
+        XCTAssertEqual(PeerHostEditorView.relayEndpointRole(details, hostKind: .app), .macApp)
+    }
+
+    func testLinuxDaemonIsNotMistakenForABypassedApp() {
+        let details = connectedRoute(
+            configured: nil,
+            discovered: "/run/term-mesh/tm-peer.sock",
+            discoveredVerified: true,
+            connected: "/run/term-mesh/tm-peer.sock",
+            owner: "/run/term-mesh/tm-peer.sock",
+            discoveredOwner: nil
+        )
+        XCTAssertEqual(PeerHostEditorView.relayEndpointRole(details, hostKind: .daemon), .daemonHost)
+    }
+
+    func testMacDaemonWithNoRunningAppIsADaemonNotTheApp() {
+        let details = connectedRoute(
+            configured: "/daemon-peer.sock",
+            discovered: nil,
+            discoveredVerified: nil,
+            connected: "/daemon-peer.sock",
+            owner: "/daemon-peer.sock",
+            discoveredOwner: nil
+        )
+        XCTAssertEqual(
+            PeerHostEditorView.relayEndpointRole(details, hostKind: .app),
+            .daemonHost,
+            "hostKind .app only means macOS; the endpoint named itself as owner"
+        )
+    }
+
+    func testAlternateThatDoesNotNameTheConnectedSocketIsNotABypass() {
+        let details = connectedRoute(
+            configured: "/custom.sock",
+            discovered: "/tmp/term-mesh-peer-501/peer.sock",
+            discoveredVerified: true,
+            connected: "/custom.sock",
+            owner: nil,
+            discoveredOwner: "/some-other-daemon.sock"
+        )
+        XCTAssertEqual(PeerHostEditorView.relayEndpointRole(details, hostKind: .app), .macApp)
+        XCTAssertTrue(
+            PeerHostEditorView.relayRouteWarnings(details).contains(where: {
+                $0.contains("not substituted")
+            })
+        )
+    }
+
+    func testRoleIsUnknownUntilTheHandshakeSucceeds() {
+        XCTAssertNil(PeerHostEditorView.relayEndpointRole(failedRouteDetails(), hostKind: .app))
+    }
+
     func testUnreachableSessionOwnerFailsAnOtherwiseLiveRoute() {
         let details = PeerRelayTestDetails(
             configuredSocket: "/configured.sock",

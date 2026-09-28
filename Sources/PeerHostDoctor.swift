@@ -53,6 +53,11 @@ struct PeerRelayTestDetails: Equatable, Sendable {
     var sessionOwnerVerified: Bool
     var hostDisplayName: String
     var hostAppVersion: String
+    /// The session owner the discovered endpoint advertised in its Hello.
+    /// Only read when that endpoint differs from the connected one: it is
+    /// how Test Relay tells a Mac daemon pinned in place of its running app
+    /// apart from a Linux daemon, which never names another endpoint.
+    var discoveredSessionOwnerSocket: String? = nil
 
     /// The profile-selected route and its advertised session owner are the
     /// release gate. A reachable alternate discovered socket is diagnostic
@@ -1244,11 +1249,14 @@ enum PeerHostDoctor {
                 hostSockPath: tunnel.localSockPath
             )
             let discoveredVerified: Bool?
+            var discoveredOwner: String?
             if let discoveredSocket, discoveredSocket != socketPath {
-                discoveredVerified = await verifyPeerEndpoint(
+                let probe = await verifyPeerEndpoint(
                     sshTarget: sshTarget, port: port, identityFile: identityFile,
                     remoteSocket: discoveredSocket
                 )
+                discoveredVerified = probe.reachable
+                discoveredOwner = probe.sessionOwnerSocket
             } else {
                 discoveredVerified = discoveredSocket == nil ? nil : true
             }
@@ -1300,7 +1308,8 @@ enum PeerHostDoctor {
                 sessionOwnerSocket: ownerPath,
                 sessionOwnerVerified: ownerVerified,
                 hostDisplayName: connection.hostDisplayName,
-                hostAppVersion: connection.hostAppVersion ?? "unknown"
+                hostAppVersion: connection.hostAppVersion ?? "unknown",
+                discoveredSessionOwnerSocket: discoveredOwner
             )
             await connection.cancel()
             tunnel.stop()
@@ -1319,7 +1328,7 @@ enum PeerHostDoctor {
                 discoveredVerified = await verifyPeerEndpoint(
                     sshTarget: sshTarget, port: port, identityFile: identityFile,
                     remoteSocket: discoveredSocket
-                )
+                ).reachable
             } else {
                 discoveredVerified = discoveredSocket == nil ? nil : false
             }
@@ -1361,7 +1370,7 @@ enum PeerHostDoctor {
         port: Int?,
         identityFile: String?,
         remoteSocket: String
-    ) async -> Bool {
+    ) async -> (reachable: Bool, sessionOwnerSocket: String?) {
         let tunnel = PeerSSHTunnel(
             sshTarget: sshTarget, remoteSockPath: remoteSocket,
             port: port, identityFile: identityFile
@@ -1371,12 +1380,13 @@ enum PeerHostDoctor {
             let connection = try await PeerRelaySession.connect(
                 hostSockPath: tunnel.localSockPath
             )
+            let owner = connection.sessionHostSockPath.nonEmpty
             await connection.cancel()
             tunnel.stop()
-            return true
+            return (true, owner)
         } catch {
             tunnel.stop()
-            return false
+            return (false, nil)
         }
     }
 
