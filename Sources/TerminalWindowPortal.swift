@@ -127,6 +127,15 @@ func terminalPortalBindNeedsGeometrySeed(
     !hasPreviousEntry || didChangeAnchor || requiredHostedViewAttachment
 }
 
+/// The overlay's line width for a native divider, or nil when the split view
+/// draws none. Pane zoom reports zero while the hidden siblings keep their old
+/// frames, so a divider computed from them would be a stale line over the
+/// zoomed pane.
+func terminalPortalOverlayDividerThickness(nativeThickness: CGFloat) -> CGFloat? {
+    guard nativeThickness > 0 else { return nil }
+    return max(nativeThickness, 1)
+}
+
 func terminalPortalShouldRenderDividerOverlay(
     dividerAlpha: CGFloat,
     surfaceOccludesDivider: Bool
@@ -585,14 +594,16 @@ private final class SplitDividerOverlayView: NSView {
     private func collectDividerSegments(in view: NSView, into result: inout [DividerSegment]) {
         guard !view.isHidden else { return }
 
-        if let splitView = view as? NSSplitView {
+        if let splitView = view as? NSSplitView,
+           let thickness = terminalPortalOverlayDividerThickness(
+               nativeThickness: splitView.dividerThickness
+           ) {
             let dividerCount = max(0, splitView.arrangedSubviews.count - 1)
             let sourceDividerColor = splitView.dividerColor.usingColorSpace(.deviceRGB)
                 ?? splitView.dividerColor
             let dividerColor = overlayDividerColor(for: splitView)
             for dividerIndex in 0..<dividerCount {
                 let first = splitView.arrangedSubviews[dividerIndex].frame
-                let thickness = max(splitView.dividerThickness, 1)
                 let dividerRectInSplit: NSRect
                 if splitView.isVertical {
                     dividerRectInSplit = NSRect(
