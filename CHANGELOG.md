@@ -4,6 +4,14 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.257.1] - 2026-09-28
+
+### Fixed
+
+- Zooming a pane no longer leaves the split dividers drawn across it. Zooming any pane other than the first in a split showed a vertical and a horizontal line over the zoomed pane.
+
+Thanks to @JINWOO-J for this change.
+
 ## [0.257.0] - 2026-09-28
 
 ### Added
