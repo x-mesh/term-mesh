@@ -577,6 +577,21 @@ fn styled_from_grid_keeps_gap_spaces_after_multi_character_spans() {
 }
 
 #[test]
+fn styled_from_grid_counts_one_cell_per_character_when_width_is_missing() {
+    let grid = json!({
+        "columns": 40, "rows": 1, "scrollback_rows": 0,
+        "styles": [],
+        "row_spans": [
+            { "row": 0, "column": 0, "style_id": 0, "text": "abc" },
+            { "row": 0, "column": 4, "style_id": 0, "text": "d" }
+        ]
+    });
+    let screen = styled_from_grid(&grid);
+    let line: String = screen.rows[0].iter().map(|span| span.t.as_str()).collect();
+    assert_eq!(line, "abc d");
+}
+
+#[test]
 fn styled_from_grid_trims_blank_rows_and_respects_cursor_visibility() {
     let mut grid = grid_fixture();
     let screen = styled_from_grid(&grid);
