@@ -9538,6 +9538,85 @@ final class PeerOwnedAgentSurfaceTests: XCTestCase {
         _ = hostTask
     }
 
+    @MainActor
+    func test_ownedReconnectKeepsSharedTransportAfterSingleSessionEOF() async throws {
+        let socketPath = "/tmp/peer-reconnect-session-eof-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(socketPath: socketPath, capabilities: [])
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: socketPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = host.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(
+            connection, surface: surface, ptyDelivery: .callback
+        )
+        var refreshCount = 0
+        relay.configureOwnedTransportRecovery(
+            generation: 0,
+            mayReconnect: { true },
+            handler: { generation in
+                refreshCount += 1
+                return generation + 1
+            }
+        )
+
+        let sessionClosed = expectation(description: "one peer session closed")
+        sessionClosed.assertForOverFulfill = false
+        let reconnected = expectation(description: "the pane reattached on its existing transport")
+        host.setOnConnectionClosed { sessionClosed.fulfill() }
+        relay.onReconnected = { reconnected.fulfill() }
+        try await relay.start()
+
+        host.closeActiveConnections()
+        await fulfillment(of: [sessionClosed, reconnected], timeout: 10)
+        host.setOnConnectionClosed {}
+
+        XCTAssertEqual(refreshCount, 0)
+        await relay.stop()
+        _ = hostTask
+    }
+
+    @MainActor
+    func test_ownedReconnectRefreshesTransportAfterReconnectHandshakeFails() async throws {
+        let socketPath = "/tmp/peer-reconnect-refresh-\(getpid())-\(UUID().uuidString.prefix(8)).sock"
+        let host = AgentSurfaceMockHost(socketPath: socketPath, capabilities: [])
+        let hostTask = try host.start()
+        defer { host.stop() }
+
+        let connection = try await PeerRelaySession.connect(hostSockPath: socketPath)
+        var surface = Termmesh_Peer_V1_SurfaceInfo()
+        surface.surfaceID = host.surfaceID
+        surface.cols = 80
+        surface.rows = 24
+        let relay = try await PeerRelaySession.attach(
+            connection, surface: surface, ptyDelivery: .callback
+        )
+        var refreshCount = 0
+        relay.configureOwnedTransportRecovery(
+            generation: 0,
+            mayReconnect: { true },
+            handler: { generation in
+                refreshCount += 1
+                return generation + 1
+            }
+        )
+
+        let reconnected = expectation(description: "the pane reattached after tunnel refresh")
+        relay.onReconnected = { reconnected.fulfill() }
+        try await relay.start()
+
+        host.closeNextConnectionAfterAuthentication()
+        host.closeActiveConnections()
+        await fulfillment(of: [reconnected], timeout: 15)
+
+        XCTAssertEqual(refreshCount, 1)
+        await relay.stop()
+        _ = hostTask
+    }
+
     /// Best effort, both ways: an unreachable host and an empty id are
     /// no-ops rather than a second failure stacked on the one being unwound.
     @MainActor
@@ -10951,6 +11030,7 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
     /// main actor would stall the very work it is waiting for.
     private var onAttachHeld: (@Sendable () -> Void)?
     private var onConnectionClosed: (@Sendable () -> Void)?
+    private var closesNextConnectionAfterAuthentication = false
     private let capabilities: [String]
     private let lock = NSLock()
     private var listenerFD: Int32 = -1
@@ -10984,6 +11064,15 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
 
     func setOnConnectionClosed(_ handler: @escaping @Sendable () -> Void) {
         lock.lock(); onConnectionClosed = handler; lock.unlock()
+    }
+
+    func closeActiveConnections() {
+        lock.lock(); let clients = clientFDs; lock.unlock()
+        for client in clients { Darwin.shutdown(client, SHUT_RDWR) }
+    }
+
+    func closeNextConnectionAfterAuthentication() {
+        lock.lock(); closesNextConnectionAfterAuthentication = true; lock.unlock()
     }
 
     func releaseHeldAttach() {
@@ -11112,6 +11201,10 @@ private final class AgentSurfaceMockHost: @unchecked Sendable {
         authResult.accepted = true
         authResult.sessionID = Data(repeating: 0x51, count: 16)
         try send(client) { $0.authResult = authResult }
+
+        lock.lock(); let closeAfterAuth = closesNextConnectionAfterAuthentication
+        closesNextConnectionAfterAuthentication = false; lock.unlock()
+        if closeAfterAuth { return }
 
         while true {
             let envelope = try readEnvelope(client)
