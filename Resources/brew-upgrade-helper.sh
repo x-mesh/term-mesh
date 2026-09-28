@@ -73,11 +73,14 @@ sleep 1
 # true latest cask version. Failure is non-fatal — we still try the upgrade
 # against whatever tap state exists.
 log "running: $BREW update (refresh tap so upgrade targets the true latest)"
-HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_COLOR=0 \
+# Homebrew forces colour whenever HOMEBREW_COLOR is set, even to 0, and this
+# script inherits the app's environment; drop it and ask for no colour.
+unset HOMEBREW_COLOR
+HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_COLOR=1 \
     "$BREW" update >>"$LOG" 2>&1 || log "WARN: brew update failed; upgrading against existing tap state"
 
 log "running: $BREW upgrade --cask --force $CASK"
-HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_COLOR=0 \
+HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_COLOR=1 \
     "$BREW" upgrade --cask --force "$CASK" >>"$LOG" 2>&1
 RC=$?
 log "brew upgrade exit=$RC"
