@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.257.0] - 2026-09-28
+
+### Added
+
+- Test Relay in the peer host editor now says what the connected endpoint shows: a Mac app with its window panes and projects, a Mac daemon only, or a daemon host. A Mac profile pinned to the daemon's socket while the app is running gets a warning and a "Use the App Connection" button, because that route hides the app's window panes from the viewer.
+
+### Fixed
+
+- The mobile terminal view no longer drops spaces after the first multi-character word on a line, which made Korean output run together.
+- term-meshd writes plain logs when its output goes to a file or the journal. Colour escapes had filled `/tmp/term-meshd.log` and split `key=value` fields, so searching the log by field value found nothing.
+- Homebrew update checks and upgrades no longer write colour escapes into the update logs or the update error message. Setting `HOMEBREW_COLOR=0` had forced colour on.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.256.0] - 2026-09-23
 
 ### Fixed
