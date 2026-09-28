@@ -37,7 +37,7 @@ const DEFAULT_COLS: u32 = 80;
 const DEFAULT_ROWS: u32 = 24;
 /// Ctrl-] — same convention as telnet. One keystroke, no two-step escape.
 const DETACH_KEY: u8 = 0x1d;
-const REMOTE_SOCKET_PROBE: &str = r#"sh -c 'p=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -n 1 | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^\"//;s/\"$//"); t=${TMPDIR:-}; [ -n "$t" ] || t=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null); for c in "$p" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/tm-peer.sock}" "/run/term-mesh/tm-peer.sock" "/run/user/$(id -u)/tm-peer.sock" "${t:+${t%/}/term-meshd-peer.sock}" "/tmp/term-mesh-peer-$(id -u)/peer.sock"; do [ -n "$c" ] && [ -S "$c" ] && { printf "%s" "$c"; exit 0; }; done; if (command -v systemctl >/dev/null 2>&1 && { systemctl is-active --quiet term-meshd || systemctl --user is-active --quiet term-meshd; }) || pgrep -u "$(id -u)" -x term-meshd >/dev/null 2>&1; then exit 44; fi; exit 43'"#;
+const REMOTE_SOCKET_PROBE: &str = r#"sh -c 'p=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -n 1 | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^\"//;s/\"$//"); t=${TMPDIR:-}; [ -n "$t" ] || t=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null); for c in "$p" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/tm-peer.sock}" "/run/term-mesh/tm-peer.sock" "/run/user/$(id -u)/tm-peer.sock" "/tmp/term-mesh-peer-$(id -u)/peer.sock" "${t:+${t%/}/term-meshd-peer.sock}"; do [ -n "$c" ] && [ -S "$c" ] && { printf "%s" "$c"; exit 0; }; done; if (command -v systemctl >/dev/null 2>&1 && { systemctl is-active --quiet term-meshd || systemctl --user is-active --quiet term-meshd; }) || pgrep -u "$(id -u)" -x term-meshd >/dev/null 2>&1; then exit 44; fi; exit 43'"#;
 /// The control plane is a different protocol and socket from the protobuf
 /// peer plane. A host is operational only when both pathname entries exist;
 /// checking this separately also prevents callers from ever probing the peer
@@ -2981,6 +2981,13 @@ mod tests {
     #[test]
     fn operational_socket_probes_cover_linux_user_scope_and_macos_app() {
         assert!(REMOTE_SOCKET_PROBE.contains("${t%/}/term-meshd-peer.sock"));
+        let app_socket = REMOTE_SOCKET_PROBE
+            .find("/tmp/term-mesh-peer-$(id -u)/peer.sock")
+            .unwrap();
+        let daemon_socket = REMOTE_SOCKET_PROBE
+            .find("${t:+${t%/}/term-meshd-peer.sock}")
+            .unwrap();
+        assert!(app_socket < daemon_socket);
         assert!(REMOTE_CONTROL_SOCKET_DISCOVERY.contains("/run/user/$(id -u)/term-meshd.sock"));
         assert!(REMOTE_CONTROL_SOCKET_DISCOVERY.contains("DARWIN_USER_TEMP_DIR"));
         assert!(REMOTE_CONTROL_SOCKET_DISCOVERY.contains("${t%/}/term-meshd.sock"));
