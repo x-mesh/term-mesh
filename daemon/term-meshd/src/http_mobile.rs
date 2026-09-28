@@ -1319,7 +1319,9 @@ fn place_spans(
                     inv: style.inv,
                 },
             );
-            col += chars * width;
+            // `cell_width` is the span's total width, so the next free column
+            // is its start plus that width — not width per character.
+            col = column + width;
         }
     }
 }
