@@ -1293,14 +1293,15 @@ fn place_spans(
                 col = column;
             }
             let text = span.get("text").and_then(Value::as_str).unwrap_or("");
+            let chars = text.chars().count();
+            // Without a width, count one cell per character.
             let width = span
                 .get("cell_width")
                 .and_then(Value::as_u64)
-                .unwrap_or(1)
-                .max(1) as usize;
+                .map_or(chars, |w| w as usize)
+                .max(1);
             let style_id = span.get("style_id").and_then(Value::as_u64).unwrap_or(0) as usize;
             let style = styles.get(style_id).unwrap_or(&default_style);
-            let chars = text.chars().count();
             let shown = if style.invisible {
                 " ".repeat(chars)
             } else {
@@ -1319,7 +1320,9 @@ fn place_spans(
                     inv: style.inv,
                 },
             );
-            col += chars * width;
+            // `cell_width` is the span's total width, so the next free column
+            // is its start plus that width — not width per character.
+            col = column + width;
         }
     }
 }

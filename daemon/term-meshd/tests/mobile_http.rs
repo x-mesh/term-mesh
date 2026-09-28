@@ -451,15 +451,15 @@ fn grid_fixture() -> Value {
             style(4, "#E6E6E6", "default", json!({ "invisible": true })),
         ],
         "scrollback_spans": [
-            { "row": 0, "column": 0, "style_id": 0, "cell_width": 1, "text": "old line" }
+            { "row": 0, "column": 0, "style_id": 0, "cell_width": 8, "text": "old line" }
         ],
         "row_spans": [
-            { "row": 0, "column": 0, "style_id": 1, "cell_width": 1, "text": "red" },
-            { "row": 0, "column": 3, "style_id": 0, "cell_width": 1, "text": " plain" },
-            { "row": 1, "column": 0, "style_id": 2, "cell_width": 1, "text": "dim" },
-            { "row": 1, "column": 5, "style_id": 3, "cell_width": 1, "text": "inv" },
-            { "row": 1, "column": 8, "style_id": 4, "cell_width": 1, "text": "secret" },
-            { "row": 2, "column": 0, "style_id": 0, "cell_width": 1, "text": "❯ " }
+            { "row": 0, "column": 0, "style_id": 1, "cell_width": 3, "text": "red" },
+            { "row": 0, "column": 3, "style_id": 0, "cell_width": 6, "text": " plain" },
+            { "row": 1, "column": 0, "style_id": 2, "cell_width": 3, "text": "dim" },
+            { "row": 1, "column": 5, "style_id": 3, "cell_width": 3, "text": "inv" },
+            { "row": 1, "column": 8, "style_id": 4, "cell_width": 6, "text": "secret" },
+            { "row": 2, "column": 0, "style_id": 0, "cell_width": 2, "text": "❯ " }
         ]
     })
 }
@@ -551,6 +551,44 @@ async fn styled_does_not_fall_back_when_only_the_rpc_message_mentions_method_not
         1,
         "only the typed RPC code may trigger fallback"
     );
+}
+
+/// `cell_width` is the whole span's width in cells, not one character's: a
+/// Ghostty span "curl" arrives with `cell_width: 4`, a lone "한" with 2. Reading
+/// it per character pushed the column past every later gap, so each space the
+/// grid left as a gap after the first multi-character span vanished — Korean
+/// lines on the phone ran together as "check와darwin빌드가".
+#[test]
+fn styled_from_grid_keeps_gap_spaces_after_multi_character_spans() {
+    let grid = json!({
+        "columns": 40, "rows": 1, "scrollback_rows": 0,
+        "styles": [],
+        "row_spans": [
+            { "row": 0, "column": 0, "style_id": 0, "cell_width": 5, "text": "check" },
+            { "row": 0, "column": 5, "style_id": 0, "cell_width": 2, "text": "와" },
+            { "row": 0, "column": 8, "style_id": 0, "cell_width": 6, "text": "darwin" },
+            { "row": 0, "column": 15, "style_id": 0, "cell_width": 2, "text": "빌" },
+            { "row": 0, "column": 17, "style_id": 0, "cell_width": 2, "text": "드" }
+        ]
+    });
+    let screen = styled_from_grid(&grid);
+    let line: String = screen.rows[0].iter().map(|span| span.t.as_str()).collect();
+    assert_eq!(line, "check와 darwin 빌드");
+}
+
+#[test]
+fn styled_from_grid_counts_one_cell_per_character_when_width_is_missing() {
+    let grid = json!({
+        "columns": 40, "rows": 1, "scrollback_rows": 0,
+        "styles": [],
+        "row_spans": [
+            { "row": 0, "column": 0, "style_id": 0, "text": "abc" },
+            { "row": 0, "column": 4, "style_id": 0, "text": "d" }
+        ]
+    });
+    let screen = styled_from_grid(&grid);
+    let line: String = screen.rows[0].iter().map(|span| span.t.as_str()).collect();
+    assert_eq!(line, "abc d");
 }
 
 #[test]
