@@ -26,6 +26,16 @@ final class GhosttyTerminalViewComposingTests: XCTestCase {
         ))
     }
 
+    /// A zoomed split reports a zero-thickness divider while its hidden siblings
+    /// keep their old frames. Drawing a 1px line there painted a cross over the
+    /// zoomed pane.
+    func testDividerOverlaySkipsDividersTheSplitViewDoesNotDraw() {
+        XCTAssertNil(terminalPortalOverlayDividerThickness(nativeThickness: 0))
+        XCTAssertEqual(terminalPortalOverlayDividerThickness(nativeThickness: 0.5), 1)
+        XCTAssertEqual(terminalPortalOverlayDividerThickness(nativeThickness: 1), 1)
+        XCTAssertEqual(terminalPortalOverlayDividerThickness(nativeThickness: 3), 3)
+    }
+
     func testAutoBlankRecoveryPolicyCoversHealthyConfirmationCooldownAndRebuild() {
         XCTAssertEqual(
             terminalAutoBlankRecoveryDecision(
