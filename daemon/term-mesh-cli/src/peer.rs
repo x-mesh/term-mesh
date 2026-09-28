@@ -37,7 +37,7 @@ const DEFAULT_COLS: u32 = 80;
 const DEFAULT_ROWS: u32 = 24;
 /// Ctrl-] — same convention as telnet. One keystroke, no two-step escape.
 const DETACH_KEY: u8 = 0x1d;
-const REMOTE_SOCKET_PROBE: &str = r#"sh -c 'p=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -n 1 | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^\"//;s/\"$//"); t=${TMPDIR:-}; [ -n "$t" ] || t=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null); for c in "$p" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/tm-peer.sock}" "/run/term-mesh/tm-peer.sock" "/run/user/$(id -u)/tm-peer.sock" "${t:+${t%/}/term-meshd-peer.sock}" "/tmp/term-mesh-peer-$(id -u)/peer.sock"; do [ -n "$c" ] && [ -S "$c" ] && { printf "%s" "$c"; exit 0; }; done; if (command -v systemctl >/dev/null 2>&1 && { systemctl is-active --quiet term-meshd || systemctl --user is-active --quiet term-meshd; }) || pgrep -u "$(id -u)" -x term-meshd >/dev/null 2>&1; then exit 44; fi; exit 43'"#;
+const REMOTE_SOCKET_PROBE: &str = r#"sh -c 'p=$(sed -n "s/^TERMMESH_PEER_SOCKET=//p" "$HOME/.config/term-mesh/peer.env" /etc/term-mesh/peer.env 2>/dev/null | tail -n 1 | sed "s/^[[:space:]]*//;s/[[:space:]]*$//;s/^\"//;s/\"$//"); t=${TMPDIR:-}; [ -n "$t" ] || t=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null); for c in "$p" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/tm-peer.sock}" "/run/term-mesh/tm-peer.sock" "/run/user/$(id -u)/tm-peer.sock" "/tmp/term-mesh-peer-$(id -u)/peer.sock" "${t:+${t%/}/term-meshd-peer.sock}"; do [ -n "$c" ] && [ -S "$c" ] && { printf "%s" "$c"; exit 0; }; done; if (command -v systemctl >/dev/null 2>&1 && { systemctl is-active --quiet term-meshd || systemctl --user is-active --quiet term-meshd; }) || pgrep -u "$(id -u)" -x term-meshd >/dev/null 2>&1; then exit 44; fi; exit 43'"#;
 /// The control plane is a different protocol and socket from the protobuf
 /// peer plane. A host is operational only when both pathname entries exist;
 /// checking this separately also prevents callers from ever probing the peer
@@ -899,6 +899,29 @@ fn connect_and_authenticate(
     socket_path: &Path,
     emit_banners: bool,
 ) -> anyhow::Result<(UnixStream, UnixStream, Arc<AtomicU64>, PeerCapabilities)> {
+    let handshake = connect_and_authenticate_with_owner(socket_path, emit_banners)?;
+    Ok((
+        handshake.read_stream,
+        handshake.write_stream,
+        handshake.seq,
+        handshake.capabilities,
+    ))
+}
+
+struct HostHandshake {
+    read_stream: UnixStream,
+    write_stream: UnixStream,
+    seq: Arc<AtomicU64>,
+    capabilities: PeerCapabilities,
+    /// `Hello.session_host_socket`: where this host keeps sessions that
+    /// outlive it. Empty when the host names none.
+    session_host_socket: String,
+}
+
+fn connect_and_authenticate_with_owner(
+    socket_path: &Path,
+    emit_banners: bool,
+) -> anyhow::Result<HostHandshake> {
     let stream = UnixStream::connect(socket_path)
         .map_err(|e| anyhow::anyhow!("connect {}: {e}", socket_path.display()))?;
     let read_stream = stream.try_clone()?;
@@ -945,6 +968,7 @@ fn connect_and_authenticate(
     // attach_cmd branches on it yet, but future wire changes (P8 and
     // later) need somewhere to ask "does the host support X" before
     // using it.
+    let session_host_socket = h.session_host_socket;
     let host_capabilities = PeerCapabilities::from_hello(h.capabilities);
 
     let challenge = read_envelope(&mut read_ref)?;
@@ -979,7 +1003,49 @@ fn connect_and_authenticate(
 
     // Both read halves on the same underlying socket; return one pair to the caller.
     drop(read_ref);
-    Ok((read_stream, write_stream, seq, host_capabilities))
+    Ok(HostHandshake {
+        read_stream,
+        write_stream,
+        seq,
+        capabilities: host_capabilities,
+        session_host_socket,
+    })
+}
+
+/// The socket to reconnect to for durable sessions, or None to stay.
+///
+/// A Mac app serves viewers on its own socket and names its daemon as the
+/// session owner; a surface ensured on the app dies with the app. A daemon
+/// names itself or nobody, so this redirects at most once.
+fn session_owner_redirect<'a>(connected: &str, advertised: &'a str) -> Option<&'a str> {
+    let advertised = advertised.trim();
+    (!advertised.is_empty() && advertised != connected).then_some(advertised)
+}
+
+/// Open a tunnel to the endpoint that owns durable sessions on `host`.
+///
+/// Discovery prefers a Mac app's socket so list and attach show the app's
+/// panes. Ensure and terminate address the session registry instead, so they
+/// follow the owner the app advertises, as the app's own team routes do.
+fn open_session_owner(
+    host: &str,
+    remote_socket: Option<&str>,
+) -> Result<(RemotePeer, HostHandshake), PeerCliError> {
+    let tunnel = RemotePeer::open(host, remote_socket)?;
+    let handshake =
+        connect_and_authenticate_with_owner(&tunnel.local_socket, false).map_err(handshake_error)?;
+    let Some(owner) =
+        session_owner_redirect(&tunnel.remote_socket, &handshake.session_host_socket)
+            .map(str::to_owned)
+    else {
+        return Ok((tunnel, handshake));
+    };
+    drop(handshake);
+    drop(tunnel);
+    let tunnel = RemotePeer::open(host, Some(&owner))?;
+    let handshake =
+        connect_and_authenticate_with_owner(&tunnel.local_socket, false).map_err(handshake_error)?;
+    Ok((tunnel, handshake))
 }
 
 fn list_surfaces(
@@ -1140,9 +1206,14 @@ fn ensure_remote(
             "executable must be an absolute remote path",
         ));
     }
-    let tunnel = RemotePeer::open(host, remote_socket)?;
-    let (mut read_stream, mut write_stream, seq, capabilities) =
-        connect_and_authenticate(&tunnel.local_socket, false).map_err(handshake_error)?;
+    let (_tunnel, handshake) = open_session_owner(host, remote_socket)?;
+    let HostHandshake {
+        mut read_stream,
+        mut write_stream,
+        seq,
+        capabilities,
+        ..
+    } = handshake;
     if !capabilities.has(capability::SURFACE_ENSURE_V1) {
         return Err(PeerCliError::new(
             "CAPABILITY_UNAVAILABLE",
@@ -1271,9 +1342,14 @@ fn terminate_remote(
     surface_id: &str,
 ) -> Result<Value, PeerCliError> {
     let surface_id = parse_surface_id(surface_id)?;
-    let tunnel = RemotePeer::open(host, remote_socket)?;
-    let (mut read_stream, mut write_stream, seq, capabilities) =
-        connect_and_authenticate(&tunnel.local_socket, false).map_err(handshake_error)?;
+    let (_tunnel, handshake) = open_session_owner(host, remote_socket)?;
+    let HostHandshake {
+        mut read_stream,
+        mut write_stream,
+        seq,
+        capabilities,
+        ..
+    } = handshake;
     if !capabilities.has(capability::SURFACE_TERMINATE_V1) {
         return Err(PeerCliError::new(
             "CAPABILITY_UNAVAILABLE",
@@ -2979,8 +3055,27 @@ mod tests {
     }
 
     #[test]
+    fn ensure_and_terminate_follow_an_advertised_session_owner() {
+        let app = "/tmp/term-mesh-peer-501/peer.sock";
+        let daemon = "/var/folders/xy/T/term-meshd-peer.sock";
+        // A Mac app names its daemon: follow it.
+        assert_eq!(session_owner_redirect(app, daemon), Some(daemon));
+        // A daemon names itself, and a host may name nobody: stay.
+        assert_eq!(session_owner_redirect(daemon, daemon), None);
+        assert_eq!(session_owner_redirect(app, ""), None);
+        assert_eq!(session_owner_redirect(app, "  "), None);
+    }
+
+    #[test]
     fn operational_socket_probes_cover_linux_user_scope_and_macos_app() {
         assert!(REMOTE_SOCKET_PROBE.contains("${t%/}/term-meshd-peer.sock"));
+        let app_socket = REMOTE_SOCKET_PROBE
+            .find("/tmp/term-mesh-peer-$(id -u)/peer.sock")
+            .unwrap();
+        let daemon_socket = REMOTE_SOCKET_PROBE
+            .find("${t:+${t%/}/term-meshd-peer.sock}")
+            .unwrap();
+        assert!(app_socket < daemon_socket);
         assert!(REMOTE_CONTROL_SOCKET_DISCOVERY.contains("/run/user/$(id -u)/term-meshd.sock"));
         assert!(REMOTE_CONTROL_SOCKET_DISCOVERY.contains("DARWIN_USER_TEMP_DIR"));
         assert!(REMOTE_CONTROL_SOCKET_DISCOVERY.contains("${t%/}/term-meshd.sock"));

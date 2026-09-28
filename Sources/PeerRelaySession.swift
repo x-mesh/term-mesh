@@ -1926,6 +1926,12 @@ actor RelayLeaderSessionGate {
 /// 3. After start(), pumps data between host and relay.
 @MainActor
 final class PeerRelaySession {
+    private enum OwnedReconnectAttemptResult {
+        case connected
+        case failed
+        case refreshTransport
+    }
+
     /// How host→viewer PtyData leaves this session.
     enum PtyDelivery: Sendable {
         /// Classic path: framed bytes to the term-mesh-peer-relay helper
@@ -4116,7 +4122,6 @@ final class PeerRelaySession {
             "Peer reconnect start host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) failedSession=\(Self.sessionTag(failedSession)) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
         )
         await failedSession.stopHeartbeat()
-        await refreshOwnedTransportForReconnect(reason: "owned peer session lost")
         guard Self.shouldReconnectOwnedSession(
             ownsSession: ownsSession,
             isTorndown: isTorndown,
@@ -4128,6 +4133,7 @@ final class PeerRelaySession {
         guard resumeTransitionGate.currentGeneration() == failedGeneration else {
             return session !== failedSession
         }
+        var didRefreshTransport = false
         while Self.shouldReconnectOwnedSession(
             ownsSession: ownsSession,
             isTorndown: isTorndown,
@@ -4155,9 +4161,10 @@ final class PeerRelaySession {
                 "Peer reconnect attempt host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) n=\(attempt) delay=\(delay) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
             )
             onReconnecting?(attempt)
-            if await attemptOwnedSessionReconnect(
+            let result = await attemptOwnedSessionReconnect(
                 from: failedSession, generation: failedGeneration
-            ) {
+            )
+            if case .connected = result {
                 onReconnected?()
                 RemoteWorkLog.infoOffMain("Remote pane reconnected on attempt \(attempt)")
                 RemoteWorkLog.infoOffMain(
@@ -4166,6 +4173,10 @@ final class PeerRelaySession {
                 return true
             }
             reconnectCircuit.recordFailure()
+            if case .refreshTransport = result, !didRefreshTransport {
+                didRefreshTransport = true
+                await refreshOwnedTransportForReconnect(reason: "owned peer reconnect failed")
+            }
             if attempt <= 3 || attempt % 10 == 0 {
                 RemoteWorkLog.warningOffMain(
                     "Peer reconnect failed host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) n=\(attempt) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
@@ -4198,7 +4209,7 @@ final class PeerRelaySession {
     private func attemptOwnedSessionReconnect(
         from failedSession: PeerSession,
         generation failedGeneration: UInt64
-    ) async -> Bool {
+    ) async -> OwnedReconnectAttemptResult {
         // The outer loop's predicate, re-checked at every await boundary
         // INSIDE the attempt. `connect` and `attachSurface` are exactly
         // where a Disconnect Host lands mid-flight; the original guards
@@ -4214,7 +4225,7 @@ final class PeerRelaySession {
                 hostLeaseIsActive: ownedTransportMayReconnect?() ?? true
             ) && resumeTransitionGate.currentGeneration() == failedGeneration
         }
-        guard stillEligible() else { return false }
+        guard stillEligible() else { return .failed }
         let size = await resizeCoalescer?.snapshotSize() ?? (remoteCols, remoteRows)
         let connection: PeerRelayConnection
         do {
@@ -4223,11 +4234,11 @@ final class PeerRelaySession {
             #if DEBUG
             dlog("peer.relay.reconnect.connectFailed error=\(error)")
             #endif
-            return false
+            return .refreshTransport
         }
         guard stillEligible() else {
             await connection.cancel()
-            return false
+            return .failed
         }
         // A gap capture (callback delivery) holds bytes that were never
         // delivered; the transport died before its heal ran. Anchoring the
@@ -4250,18 +4261,21 @@ final class PeerRelaySession {
             dlog("peer.relay.reconnect.attachFailed error=\(error)")
             #endif
             await connection.cancel()
-            return false
+            if case PeerSessionError.attachRejected = error {
+                return .failed
+            }
+            return .refreshTransport
         }
         guard outcome.surfaceID == surfaceID, stillEligible() else {
             await connection.cancel()
-            return false
+            return .failed
         }
 
         guard let newGeneration = resumeTransitionGate.replaceSession(
             expectedGeneration: failedGeneration
         ) else {
             await connection.cancel()
-            return false
+            return .failed
         }
         // The generation CAS and gate reset above happen before installation.
         // Old-session chunks already read by the detached pump carry the retired
@@ -4281,7 +4295,7 @@ final class PeerRelaySession {
         // This stays as the backstop for a future suspension point.
         guard currentSessionSlot.replace(connection.session) else {
             await connection.cancel()
-            return false
+            return .failed
         }
         relayTelemetry.resetRemote()
         session = connection.session
@@ -4299,7 +4313,7 @@ final class PeerRelaySession {
         #if DEBUG
         dlog("peer.relay.reconnect.committed generation=\(newGeneration) session=\(Self.sessionTag(connection.session))")
         #endif
-        return true
+        return .connected
     }
 
     static func reconnectDelaySeconds(attempt: Int) -> Double {
