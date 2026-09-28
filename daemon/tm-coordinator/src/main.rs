@@ -3,8 +3,10 @@ use tm_coordinator::{socket, Api, Config};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Colour only for a terminal: a redirected log keeps `key=value` greppable.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
     let config = Config::from_env();

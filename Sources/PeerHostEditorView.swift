@@ -875,6 +875,28 @@ struct PeerHostEditorView: View {
                         "\(details.hostDisplayName) · v\(displayVersion(details.hostAppVersion))"
                     )
                 }
+                if let role = Self.relayEndpointRole(details, hostKind: testedHostKind) {
+                    relayRouteRow("Shows", Self.relayEndpointRoleSummary(role))
+                    if case .daemonBehindApp(let appSocket) = role {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label(
+                                "This connects to the Mac's daemon directly, so the panes in its app windows are not visible here."
+                                    + " Connect to the app instead; projects still reach the daemon through it.",
+                                systemImage: "exclamationmark.triangle"
+                            )
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                            Button("Use the App Connection") {
+                                profile.remoteSocket = ""
+                                runTest()
+                            }
+                            .controlSize(.small)
+                            .disabled(doctorBusy)
+                            .help("Clear Remote Socket so auto-detect picks \(appSocket), then test again. Save to keep it.")
+                        }
+                    }
+                }
                 if let ownerPID = relayOwnerPID(details: details) {
                     relayRouteRow("Owner PID", String(ownerPID))
                 }
@@ -983,10 +1005,67 @@ struct PeerHostEditorView: View {
         return matches.filter { $0.currentListenerSockets.contains(wanted) }.count != 1
     }
 
+    /// What a viewer gets from the endpoint Test Relay connected to.
+    ///
+    /// A socket path does not say whether it belongs to a Mac app or to a
+    /// daemon, and pinning the wrong one still connects: it just shows a
+    /// different set of panes. The Hello answers it instead — an app names
+    /// its daemon as session owner, a daemon names itself or nobody.
+    enum RelayEndpointRole: Equatable {
+        /// A Mac app: its window panes, with projects redirected to its daemon.
+        case macApp
+        /// A Mac's daemon reached directly while that Mac's app is running at
+        /// `appSocket`: the app's window panes are missing.
+        case daemonBehindApp(appSocket: String)
+        /// A daemon serving its own sessions: a Linux host, or a Mac daemon
+        /// reached while no app on that Mac claims it.
+        case daemonHost
+    }
+
+    static func relayEndpointRole(
+        _ details: PeerRelayTestDetails,
+        hostKind: PeerHostKind?
+    ) -> RelayEndpointRole? {
+        guard details.connectedVerified else { return nil }
+        if let owner = details.sessionOwnerSocket, owner != details.connectedSocket {
+            return .macApp
+        }
+        if let discovered = details.discoveredSocket,
+           discovered != details.connectedSocket,
+           details.discoveredVerified == true,
+           details.discoveredSessionOwnerSocket == details.connectedSocket {
+            return .daemonBehindApp(appSocket: discovered)
+        }
+        // A daemon names its own socket as session owner. `hostKind` only
+        // reports the OS, so without this a Mac daemon that outlived its app
+        // would read as the app.
+        if details.sessionOwnerSocket == details.connectedSocket {
+            return .daemonHost
+        }
+        switch hostKind {
+        case .app: return .macApp
+        case .daemon: return .daemonHost
+        case nil: return nil
+        }
+    }
+
+    static func relayEndpointRoleSummary(_ role: RelayEndpointRole) -> String {
+        switch role {
+        case .macApp: return "Mac app — its window panes and projects"
+        case .daemonBehindApp: return "Mac daemon only — app window panes missing"
+        case .daemonHost: return "Daemon — the sessions it holds"
+        }
+    }
+
     static func relayRouteWarnings(_ details: PeerRelayTestDetails) -> [String] {
         var warnings: [String] = []
         if let configured = details.configuredSocket, configured != details.connectedSocket {
             warnings.append("Configured socket was not the endpoint that answered")
+        }
+        // The role line already says what the alternate socket is and why
+        // it matters; the generic path-mismatch lines would only restate it.
+        if case .daemonBehindApp = relayEndpointRole(details, hostKind: nil) {
+            return warnings
         }
         if let discovered = details.discoveredSocket, discovered != details.connectedSocket {
             warnings.append("Auto-detection found a different socket than the configured route")

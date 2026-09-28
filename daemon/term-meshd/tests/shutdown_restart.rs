@@ -261,6 +261,24 @@ impl Drop for Daemon {
     }
 }
 
+/// The app and systemd both hand the daemon a file or a journal, never a
+/// terminal. Colour escapes there split `key=value` fields apart, so a grep
+/// for `attachments=0` found nothing in a log full of them.
+#[test]
+fn a_journal_that_is_not_a_terminal_carries_no_colour_escapes() {
+    let host = Host::new();
+    let mut daemon = host.start(None, "plain.log");
+    host.await_ready(&daemon);
+    daemon.stop();
+    let journal = daemon.journal();
+    assert!(journal.contains("term-meshd starting"), "no journal written: {journal:?}");
+    assert!(
+        !journal.contains('\u{1b}'),
+        "journal carries ANSI escapes: {:?}",
+        journal.lines().next()
+    );
+}
+
 #[test]
 fn a_restart_costs_seconds_not_the_stop_timeout() {
     let host = Host::new();
