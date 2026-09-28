@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.257.2] - 2026-09-29
+
+### Fixed
+
+- A remote pane whose output queue overflowed no longer drops the other panes from the same host. The pane now reconnects over the existing SSH tunnel first, and the shared tunnel is reopened only when that reconnect fails.
+- `tm-agent peer list` and `attach` against a Mac host now show the app's current panes instead of the daemon's surfaces. `tm-agent peer ensure` and `terminate` follow the daemon the app advertises, so ensured surfaces still outlive the app.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.257.1] - 2026-09-28
 
 ### Fixed
