@@ -726,7 +726,10 @@ final class BrewSelfUpdater {
         env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
         env["HOMEBREW_NO_ANALYTICS"] = "1"
         env["HOMEBREW_NO_ENV_HINTS"] = "1"
-        env["HOMEBREW_COLOR"] = "0"
+        // Homebrew forces colour whenever HOMEBREW_COLOR is set, even to "0",
+        // and the escapes then land in the update log and error text.
+        env["HOMEBREW_COLOR"] = nil
+        env["HOMEBREW_NO_COLOR"] = "1"
         env["LC_ALL"] = "C"
         process.environment = env
 
