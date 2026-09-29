@@ -496,17 +496,32 @@ if last.get("delegation_floor") != "unmet":
     raise SystemExit("FAIL: legacy mode suppressed the floor: %s" % last.get("delegation_floor"))
 OFFPY
 
-# Stating the route is the recorded reason the block offers instead of a
-# dispatch, so it ends the turn without a continuation. The floor is still
-# measured as unmet.
-floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"routed direct turn","session_id":"floor-routed"}' >/dev/null \
+# A bare stated route is not a reason: it must still continue the turn once,
+# or any route would skip the floor. `--route direct --no-dispatch-reason`
+# adds a `no_dispatch` line to the marker, and only that ends the turn.
+routed_floor_turn_id() {
+    head -n 1 "$FLOOR_HOME/.term-mesh/logs/.turn-current-99999999-8888-7777-6666-555555555555"
+}
+floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"bare route turn","session_id":"floor-bare"}' >/dev/null \
+    || fail "bare-route start returned nonzero"
+bare_turn=$(routed_floor_turn_id)
+[ -n "$bare_turn" ] || fail "bare-route turn id missing"
+printf 'stated\n' > "$FLOOR_HOME/.term-mesh/logs/.turn-route-$bare_turn" || exit 1
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-bare","stop_hook_active":false}') \
+    || fail "bare-route end returned nonzero"
+case "$FLOOR_OUT" in
+    *'"decision":"block"'*"--no-dispatch-reason"*) ;;
+    *) fail "a bare stated route skipped the delegation floor: $FLOOR_OUT" ;;
+esac
+
+floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"reasoned direct turn","session_id":"floor-routed"}' >/dev/null \
     || fail "routed start returned nonzero"
-routed_floor_turn=$(head -n 1 "$FLOOR_HOME/.term-mesh/logs/.turn-current-99999999-8888-7777-6666-555555555555")
+routed_floor_turn=$(routed_floor_turn_id)
 [ -n "$routed_floor_turn" ] || fail "routed turn id missing"
-printf 'stated\n' > "$FLOOR_HOME/.term-mesh/logs/.turn-route-$routed_floor_turn" || exit 1
+printf 'stated\nno_dispatch\n' > "$FLOOR_HOME/.term-mesh/logs/.turn-route-$routed_floor_turn" || exit 1
 FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-routed","stop_hook_active":false}') \
     || fail "routed end returned nonzero"
-[ -z "$FLOOR_OUT" ] || fail "a turn that stated its route was still blocked: $FLOOR_OUT"
+[ -z "$FLOOR_OUT" ] || fail "a direct route with a no-dispatch reason was still blocked: $FLOOR_OUT"
 python3 - "$FLOOR_LOG" "$routed_floor_turn" <<'ROUTEDPY' || exit 1
 import json
 import pathlib

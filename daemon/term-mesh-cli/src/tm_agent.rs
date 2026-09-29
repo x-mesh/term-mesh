@@ -2846,6 +2846,11 @@ enum LeaderTurnCommands {
         /// Resource health result for the execution host.
         #[arg(long = "resource-health")]
         resource_health: Option<String>,
+        /// Why no eligible worker task exists in a delegated turn that
+        /// dispatched nothing. Only a `direct` route with a non-blank reason
+        /// exempts the turn from the Stop hook's one continuation.
+        #[arg(long = "no-dispatch-reason")]
+        no_dispatch_reason: Option<String>,
     },
     /// Read-only report of one Project's leader turn health, built from the
     /// same `leader_participation_health` gate the execution-host safety net
@@ -8674,6 +8679,7 @@ fn main() {
         concurrent_write_overlap,
         serial_integration,
         resource_health,
+        no_dispatch_reason,
     })) = &cli.command
     {
         // An omitted --turn-id is filled from the hook's state stack. Falling
@@ -8699,6 +8705,7 @@ fn main() {
             *concurrent_write_overlap,
             *serial_integration,
             resource_health.as_deref(),
+            no_dispatch_reason.as_deref(),
         ));
         return;
     }
@@ -19296,7 +19303,15 @@ fn turn_id_from_hook_state() -> Option<String> {
 /// stated" from "no route command ran" without parsing a concurrently
 /// appended, rotation-prone log. It is deliberately ephemeral and is removed
 /// by the hook after emitting turn_end.
-fn mark_turn_route_stated(path: &Path, turn_id: &str) -> Result<(), String> {
+/// Whether a stated route records a reason for dispatching nothing. The Stop
+/// hook honours only this, not the bare marker: any route would otherwise end
+/// a delegated turn without a dispatch or a reason.
+fn no_dispatch_exemption(route: &str, no_dispatch_reason: Option<&str>) -> bool {
+    route.trim() == "direct"
+        && no_dispatch_reason.is_some_and(|reason| !reason.trim().is_empty())
+}
+
+fn mark_turn_route_stated(path: &Path, turn_id: &str, no_dispatch: bool) -> Result<(), String> {
     let key: String = turn_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
@@ -19305,7 +19320,8 @@ fn mark_turn_route_stated(path: &Path, turn_id: &str) -> Result<(), String> {
         return Err("turn id contains no safe marker characters".to_string());
     }
     let marker = path.with_file_name(format!(".turn-route-{key}"));
-    fs::write(&marker, b"stated\n").map_err(|e| format!("write {}: {e}", marker.display()))?;
+    let contents: &[u8] = if no_dispatch { b"stated\nno_dispatch\n" } else { b"stated\n" };
+    fs::write(&marker, contents).map_err(|e| format!("write {}: {e}", marker.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -19338,6 +19354,7 @@ fn run_leader_turn_route_with_evidence(
     concurrent_write_overlap: Option<u32>,
     serial_integration: bool,
     resource_health: Option<&str>,
+    no_dispatch_reason: Option<&str>,
 ) -> Result<Value, String> {
     if turn_id.trim().is_empty() {
         return Err("--turn-id must not be blank".to_string());
@@ -19443,7 +19460,10 @@ fn run_leader_turn_route_with_evidence(
     {
         record["leader_session_id"] = json!(session);
     }
-    mark_turn_route_stated(&path, turn_id)?;
+    if let Some(reason) = no_dispatch_reason.filter(|reason| !reason.trim().is_empty()) {
+        record["no_dispatch_reason"] = json!(reason.trim());
+    }
+    mark_turn_route_stated(&path, turn_id, no_dispatch_exemption(route, no_dispatch_reason))?;
     // The marker and the log line are a small two-phase local transaction. A
     // failed append must not let Stop report a route that never reached the
     // durable measurement stream.
@@ -19503,7 +19523,7 @@ fn run_leader_turn_route(
 ) -> Result<Value, String> {
     run_leader_turn_route_with_evidence(
         team_resolution, turn_id, route, task_shape, available_workers,
-        risk_reasons, wave_id, None, None, false, false, None, false, None,
+        risk_reasons, wave_id, None, None, false, false, None, false, None, None,
     )
 }
 
@@ -19761,6 +19781,7 @@ mod leader_turn_record_tests {
                 Some(0),
                 true,
                 Some("passed"),
+                None,
             )
             .expect("route evaluation");
             assert_eq!(result["record"]["overlap_canary"], expected_overlap);
@@ -19800,6 +19821,7 @@ mod leader_turn_record_tests {
             Some(0),
             true,
             Some("passed"),
+            None,
         )
         .expect("route evaluation");
         assert_eq!(invalid_configured["record"]["policy_applied"], false);
@@ -19824,6 +19846,7 @@ mod leader_turn_record_tests {
             Some(0),
             true,
             Some("passed"),
+            None,
         )
         .expect("route evaluation");
         assert_eq!(blank_configured["record"]["policy_applied"], false);
@@ -20591,7 +20614,7 @@ mod leader_turn_record_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("logs").join("turns.log");
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-        mark_turn_route_stated(&path, "turn-42").expect("marker");
+        mark_turn_route_stated(&path, "turn-42", false).expect("marker");
         let marker = path.with_file_name(".turn-route-turn-42");
         assert_eq!(
             fs::read_to_string(&marker).expect("read marker"),
@@ -20616,6 +20639,24 @@ mod leader_turn_record_tests {
     /// A `File` cached across appends would keep writing into the renamed inode
     /// and lose every subsequent record with no error at the write site. Opening
     /// per record means the post-rotation append recreates the path instead.
+
+    #[test]
+    fn only_a_direct_route_with_a_reason_marks_the_no_dispatch_exemption() {
+        assert!(no_dispatch_exemption("direct", Some("question only; nothing to implement")));
+        assert!(!no_dispatch_exemption("direct", Some("   ")));
+        assert!(!no_dispatch_exemption("direct", None));
+        assert!(!no_dispatch_exemption("parallel", Some("a reason")));
+        assert!(!no_dispatch_exemption("delegated", Some("a reason")));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("logs").join("turns.log");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        mark_turn_route_stated(&path, "turn-43", true).expect("marker");
+        assert_eq!(
+            fs::read_to_string(path.with_file_name(".turn-route-turn-43")).expect("read marker"),
+            "stated\nno_dispatch\n"
+        );
+    }
     #[test]
     fn append_survives_a_rotation_between_records() {
         let dir = tempfile::tempdir().expect("tempdir");

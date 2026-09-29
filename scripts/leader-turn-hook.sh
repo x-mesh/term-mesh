@@ -373,10 +373,16 @@ fi
 # turn_route record. Reading a marker is safer than searching a log another
 # process may append to or that GC may rotate between the search and the end.
 ROUTE_STATUS=""
+ROUTE_NO_DISPATCH=""
 if [ "$MODE" = --end ]; then
     ROUTE_KEY="$(printf '%s' "$TURN_ID" | tr -cd 'A-Za-z0-9._-' 2>/dev/null || true)"
     if [ -n "$ROUTE_KEY" ] && [ -f "$LOG_DIR/.turn-route-$ROUTE_KEY" ]; then
         ROUTE_STATUS=stated
+        # tm-agent adds this line only for `--route direct` with a non-blank
+        # `--no-dispatch-reason`; a bare route leaves the marker at "stated".
+        if grep -qx 'no_dispatch' "$LOG_DIR/.turn-route-$ROUTE_KEY" 2>/dev/null; then
+            ROUTE_NO_DISPATCH=1
+        fi
         rm -f "$LOG_DIR/.turn-route-$ROUTE_KEY" 2>/dev/null || true
     else
         ROUTE_STATUS=unstated
@@ -529,9 +535,9 @@ fi
 
 # Stop hooks continue the current turn when they receive this JSON decision.
 # `stop_hook_active` prevents the continuation from blocking itself again. A
-# turn that stated its route has recorded why it did not dispatch, which is the
-# alternative the reason offers, so only a turn that did neither continues.
-if [ "$MODE" = --end ] && [ "$DELEGATION_FLOOR" = unmet ] && [ "$ROUTE_STATUS" != stated ]; then
+# direct route stated with a no-dispatch reason is the recorded alternative the
+# block offers; a bare route is not, or any route would skip the floor.
+if [ "$MODE" = --end ] && [ "$DELEGATION_FLOOR" = unmet ] && [ "$ROUTE_NO_DISPATCH" != 1 ]; then
     STOP_HOOK_ACTIVE=false
     if command -v python3 >/dev/null 2>&1; then
         STOP_HOOK_ACTIVE="$(printf '%s' "$PAYLOAD" | python3 -c '
@@ -545,7 +551,7 @@ print("true" if value.get("stop_hook_active") is True else "false", end="")
 ' 2>/dev/null || printf false)"
     fi
     if [ "$STOP_HOOK_ACTIVE" != true ]; then
-        printf '%s\n' '{"decision":"block","reason":"Delegated mode requires at least one eligible worker dispatch before this turn can finish. Dispatch the work, or state the route and why no eligible worker task exists with `tm-agent leader turn route`."}'
+        printf '%s\n' '{"decision":"block","reason":"Delegated mode requires at least one eligible worker dispatch before this turn can finish. Dispatch the work, or record why no eligible worker task exists with `tm-agent leader turn route --route direct --no-dispatch-reason <reason>`."}'
     fi
 fi
 
@@ -690,8 +696,8 @@ FLOORS = {
         "keep coordination, integration, and review in the leader lane. If the work is serial, "
         "use one worker. Fill every useful independent unit, but never invent units only to fill capacity. A leader mutation lane "
         "requires isolated checkout, explicit disjoint ownership, zero write overlap, and "
-        "serial integration. Implementing it yourself requires a reason recorded with "
-        "`tm-agent leader turn route`. "
+        "serial integration. Implementing it yourself requires "
+        "`tm-agent leader turn route --route direct --no-dispatch-reason <reason>`. "
         + wave_clause
     ),
 }
