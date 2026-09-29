@@ -4,6 +4,15 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.258.1] - 2026-09-29
+
+### Fixed
+
+- Clicking a host workspace in the peer sidebar opens that workspace again, with all of its panes. A workspace that held a Project's leader used to open the Project instead, so its other panes never appeared. The Project row still opens the Project with its agents, and both can be open at once.
+- Remote Project views no longer pile up as extra `[project] · host` workspaces after each relaunch. Workspaces left behind by earlier versions are ordinary local shells and must be closed once by hand.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.258.0] - 2026-09-29
 
 ### Added
