@@ -1557,16 +1557,18 @@ final class GhosttySurfaceScrollView: NSView {
 
     /// SwiftUI creates the search field's NSTextField during the hosting
     /// view's first layout pass, so the lookup can miss right after install.
-    private func focusPasteShelfSearchField(retriesRemaining: Int = 3) {
-        guard let container = pasteShelfContainerView, let window = container.window else { return }
+    /// Returns whether the field holds focus now; a miss schedules a retry.
+    @discardableResult
+    private func focusPasteShelfSearchField(retriesRemaining: Int = 3) -> Bool {
+        guard let container = pasteShelfContainerView, let window = container.window else { return false }
         if let field = Self.findSubview(of: NSTextField.self, in: container) {
-            window.makeFirstResponder(field)
-            return
+            return window.makeFirstResponder(field)
         }
-        guard retriesRemaining > 0 else { return }
+        guard retriesRemaining > 0 else { return false }
         DispatchQueue.main.async { [weak self] in
             self?.focusPasteShelfSearchField(retriesRemaining: retriesRemaining - 1)
         }
+        return false
     }
 
     private func dismissPasteShelfOverlay() {
@@ -1657,9 +1659,10 @@ final class GhosttySurfaceScrollView: NSView {
             default:
                 // Focus can land back on the terminal while the Shelf is up
                 // (the window becoming key again restores it). Plain typing
-                // belongs in the search field, never in the shell.
+                // belongs in the search field, never in the shell: when the
+                // field cannot take focus, the key is dropped instead.
                 if event.modifierFlags.intersection([.command, .control]).isEmpty {
-                    self.focusPasteShelfSearchField()
+                    return self.focusPasteShelfSearchField() ? event : nil
                 }
                 return event
             }

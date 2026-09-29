@@ -1680,8 +1680,9 @@ final class TerminalSurface: Identifiable, ObservableObject {
     @MainActor
     func pasteShelfImage(at localPath: String) {
         guard FileManager.default.fileExists(atPath: localPath) else { return }
-        // Shelf images live under "Application Support", so an unescaped
-        // local path splits into two shell arguments.
+        // Shelf images live under "Application Support", and the remote cache
+        // directory comes from the remote $XDG_CACHE_HOME or $HOME; either
+        // can hold a space that would split the path into two arguments.
         let shellLocalPath = GhosttyNSView.escapeDropForShell(localPath)
         guard let callbackContext = surfaceCallbackContext?.takeUnretainedValue(),
               let target = RemotePasteTransfer.destination(for: callbackContext)
@@ -1692,10 +1693,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
         hostedView.beginRemotePasteTransfer()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let remotePath = RemotePasteTransfer.send(localPath: localPath, to: target) ?? shellLocalPath
+            let remotePath = RemotePasteTransfer.send(localPath: localPath, to: target)
             DispatchQueue.main.async {
                 self?.hostedView.endRemotePasteTransfer()
-                self?.sendText(remotePath)
+                self?.sendText(remotePath.map(GhosttyNSView.escapeDropForShell) ?? shellLocalPath)
             }
         }
     }
