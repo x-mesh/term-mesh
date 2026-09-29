@@ -510,9 +510,13 @@ class TabManager {
         // restore; one corrupted session restored 64 Kiro runtimes and drove
         // the compressor to its hard limit. A durable project declaration is
         // the proof that this workspace is reconstructed from a peer roster.
+        // A remote Project viewer declares no project, so it is named here:
+        // it is rebuilt only from the roster, and restoring it as shells left
+        // one dead duplicate per relaunch.
         let nonTeamTabs = tabs.filter { workspace in
             !teamWorkspaceIds.contains(workspace.id)
                 && !workspace.isPeerMirror
+                && !RemoteLiveProject.ownsWorkspace(workspace.id)
                 && WorkspaceProjectNames.shared.projectID(for: workspace.id) == nil
                 && workspace.customTitle != "Host Sessions"
                 && !(

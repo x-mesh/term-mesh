@@ -53,7 +53,19 @@ final class RemoteLiveProject {
         guard let workspace = workspaceForTesting(projectID: projectID) else { return nil }
         return boardContexts[workspace.id]
     }
+
+    static func adoptForTesting(
+        host: HostEntry, project: RemoteTeamSummary, workspace: Workspace, tabManager: TabManager
+    ) {
+        viewers["\(host.paneHostSpec.hostKey)|\(project.projectID)"] = RemoteLiveProject(
+            host: host, project: project, workspace: workspace, tabManager: tabManager
+        )
+    }
     #endif
+
+    static func ownsWorkspace(_ workspaceID: UUID) -> Bool {
+        viewers.values.contains { $0.workspaceID == workspaceID }
+    }
 
     static func boardContext(for workspaceID: UUID?) -> BoardContext? {
         workspaceID.flatMap { boardContexts[$0] }
@@ -68,7 +80,7 @@ final class RemoteLiveProject {
     /// Window closure bypasses TabManager.closeWorkspace. Retained SwiftUI
     /// managers must not keep remote viewers selectable without a window.
     static func closeViewers(in manager: TabManager) {
-        for workspace in manager.tabs where boardContexts[workspace.id] != nil {
+        for workspace in manager.tabs where ownsWorkspace(workspace.id) || boardContexts[workspace.id] != nil {
             manager.closeWorkspace(workspace)
         }
     }
@@ -214,17 +226,9 @@ final class RemoteLiveProject {
         guard AppDelegate.shared?.windowId(for: tabManager) != nil else { return false }
         guard opening.insert(key).inserted else { return false }
         defer { opening.remove(key) }
-        let existing = PeerClientCoordinator.shared.mirroredWorkspace(
-            forHostKey: host.paneHostSpec.hostKey, hostWorkspaceID: project.liveWorkspaceID
-        )
-        let owner = existing.flatMap { AppDelegate.shared?.tabManagerFor(tabId: $0.id) } ?? tabManager
-        let workspace = existing ?? owner.addWorkspace(select: false)
-        if let mirror = workspace.peerMirror {
-            mirror.teardown()
-            workspace.peerMirror = nil
-        }
-        let anchor = existing == nil ? workspace.focusedPanelId : nil
-        let viewer = RemoteLiveProject(host: host, project: project, workspace: workspace, tabManager: owner)
+        let workspace = tabManager.addWorkspace(select: false)
+        let anchor = workspace.focusedPanelId
+        let viewer = RemoteLiveProject(host: host, project: project, workspace: workspace, tabManager: tabManager)
         viewers[key] = viewer
         viewer.updateBoardContext(host: host, project: project)
         workspace.setCustomTitle("[\(project.name)] · \(host.displayName)")
@@ -238,7 +242,7 @@ final class RemoteLiveProject {
             )
         }
         if select {
-            owner.selectWorkspace(workspace)
+            tabManager.selectWorkspace(workspace)
             ReviewBoardSettings.setVisible(true)
         }
         return result
@@ -255,13 +259,6 @@ final class RemoteLiveProject {
     }
 
     static func refresh(host: HostEntry) {
-        for project in host.teams where project.isGUILive && project.rosterVerified {
-            if let mirror = PeerClientCoordinator.shared.mirroredWorkspace(
-                forHostKey: host.paneHostSpec.hostKey, hostWorkspaceID: project.liveWorkspaceID
-            ), let owner = AppDelegate.shared?.tabManagerFor(tabId: mirror.id) {
-                Task { _ = await open(host: host, project: project, tabManager: owner, select: false) }
-            }
-        }
         for viewer in Array(viewers.values) {
             guard let workspace = viewer.workspace,
                   let owner = AppDelegate.shared?.tabManagerFor(tabId: workspace.id),

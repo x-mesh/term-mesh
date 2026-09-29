@@ -308,6 +308,29 @@ final class SessionRestoreIdentityTests: XCTestCase {
         XCTAssertFalse(saved.workspaces.contains { $0.id == remote.id })
     }
 
+    func test_remoteProjectViewerIsNotSerializedAsLocalShells() {
+        let tabs = manager()
+        let local = tabs.tabs[0]
+        let viewer = tabs.addWorkspace(select: false)
+        viewer.setCustomTitle("[term-mesh] · studio")
+        let host = HostEntry(
+            id: "/tmp/viewer-test.sock", displayName: "studio",
+            connectionState: .connected, workspaces: [], activeSockPath: "/tmp/viewer-test.sock"
+        )
+        let project = RemoteTeamSummary(
+            name: "term-mesh", teamUUID: "uuid", workingDirectory: "/tmp",
+            projectRootPath: nil, agentNames: [], projectID: "team:uuid"
+        )
+        RemoteLiveProject.adoptForTesting(
+            host: host, project: project, workspace: viewer, tabManager: tabs
+        )
+        defer { RemoteLiveProject.detach(workspaceID: viewer.id) }
+
+        let saved = tabs.savedSessionState()
+
+        XCTAssertEqual(saved.workspaces.map(\.id), [local.id])
+    }
+
     func test_restoreSkipsPreviouslySavedPeerProjectsAndHostSessions() {
         let project = UUID()
         let hostSessions = UUID()
