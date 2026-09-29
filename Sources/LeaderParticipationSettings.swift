@@ -1,8 +1,7 @@
 import Foundation
 
-/// Additive persisted controls for a future opt-in canary. Fresh installs stay
-/// in shadow mode with a zero-percent canary, so changing this type never
-/// changes a leader's behavior by itself.
+/// Persisted rollout fields remain for mixed-version diagnostics. They never
+/// decide whether mandatory delegated guidance applies.
 struct LeaderParticipationSettings: Equatable {
     static let e2eSuiteName = "com.termmesh.e2e"
     static let overlapCanaryCapabilityVersion = 1
@@ -82,8 +81,8 @@ struct LeaderParticipationSettings: Equatable {
         defaults.set(Array(optInProjects).sorted().joined(separator: ", "), forKey: Self.optInProjectsCSVKey)
     }
 
-    /// Stable bucket assignment permits exact canary/holdout comparison without
-    /// storing a new migration-backed assignment for every turn.
+    /// Legacy diagnostic assignment. Mandatory delegated guidance never reads
+    /// this value.
     static func cohort(projectID: String, sessionID: String, percent: Int) -> Cohort {
         let bounded = min(100, max(0, percent))
         guard bounded > 0 else { return .holdout }
@@ -92,16 +91,31 @@ struct LeaderParticipationSettings: Equatable {
         return bucket < bounded ? .canary : .holdout
     }
 
+    /// Legacy resolution remains available to older callers as a diagnostic
+    /// shape. It never activates mandatory guidance or changes the delegated
+    /// contract.
     func resolve(projectID: String, sessionID: String, supportedLeader: Bool, health: Health) -> Resolution {
         guard !killSwitch, supportedLeader else { return .staticPolicy(.staticPolicy) }
         switch mode {
         case .off: return .staticPolicy(.staticPolicy)
         case .shadow: return .shadow(.shadow)
         case .canary:
-            guard optInProjects.contains(projectID), health.passesPromotionGate else { return .staticPolicy(.staticPolicy) }
-            let assigned = Self.cohort(projectID: projectID, sessionID: sessionID, percent: canaryPercent)
+            guard optInProjects.contains(projectID), health.passesPromotionGate else {
+                return .staticPolicy(.staticPolicy)
+            }
+            let assigned = Self.cohort(
+                projectID: projectID, sessionID: sessionID, percent: canaryPercent
+            )
             return assigned == .canary ? .canary(.canary) : .staticPolicy(.holdout)
         }
+    }
+
+    /// Effective delegation and one or more available workers are the only
+    /// activation facts for mandatory delegated guidance.
+    func delegatedGuidanceApplies(
+        delegationState: ProjectDelegationState, availableWorkers: Int
+    ) -> Bool {
+        delegationState.effective == .delegated && availableWorkers > 0
     }
 
     /// `availableWorkers` and `workerNames` exist so the turn hook can state a
@@ -116,14 +130,14 @@ struct LeaderParticipationSettings: Equatable {
         executionOptions: ProjectExecutionOptions = .default,
         healthScope: HealthScope = .controlHost
     ) -> [String: Any] {
-        // The remote tm-agent re-checks this Project's own turns.log per Project
-        // when health_scope is execution_host (apply_participation_health_scope),
-        // so an executionHost payload can skip this Mac's aggregate health here
-        // without losing the health gate for peer leaders.
-        // Off means off. Overlap used to read only the delegation level, the
-        // kill switch and health, so a leader whose participation mode the user
-        // had turned off kept resolving overlap anyway and the board still read
-        // Ready. Shadow observes without changing a turn, so it stops here too.
+        let availableWorkers = max(0, availableWorkers)
+        let delegatedGuidanceRequired = delegatedGuidanceApplies(
+            delegationState: delegationState, availableWorkers: availableWorkers
+        )
+        let boundedWorkerCap = min(
+            ProjectExecutionOptions.workerBounds.upperBound,
+            max(ProjectExecutionOptions.workerBounds.lowerBound, executionOptions.maxParallelWorkers)
+        )
         let delegatedOverlapResolution = mode == .canary
             && delegationState.effective == .delegated
             && supportedLeader
@@ -145,9 +159,10 @@ struct LeaderParticipationSettings: Equatable {
             "overlap_canary_capability": delegationState.effective == .delegated,
             "overlap_canary_capability_version": Self.overlapCanaryCapabilityVersion,
             "delegated_overlap_resolution": delegatedOverlapResolution,
-            "available_workers": max(0, availableWorkers),
+            "delegated_guidance_required": delegatedGuidanceRequired,
+            "available_workers": availableWorkers,
             "worker_names": workerNames,
-            "max_parallel_workers": executionOptions.maxParallelWorkers,
+            "max_parallel_workers": boundedWorkerCap,
             "inject_directive": executionOptions.injectDirective,
             "health_scope": healthScope.rawValue,
         ]

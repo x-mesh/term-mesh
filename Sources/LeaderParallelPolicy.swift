@@ -37,7 +37,7 @@ enum ProjectDelegationLevel: String, CaseIterable, Codable, Sendable {
         case .guarded:
             return "Serial work stays with the leader; risk conditions add one read-only probe."
         case .delegated:
-            return "Workers take as many independent units as the configured limit allows; the leader integrates and verifies."
+            return "Delegated work is mandatory when a worker is available. Assign one worker to serial work, or every useful ready unit up to the configured limit; the leader coordinates, integrates, and verifies."
         }
     }
 
@@ -48,7 +48,7 @@ enum ProjectDelegationLevel: String, CaseIterable, Codable, Sendable {
         case .guarded:
             return "The leader keeps serial work and adds one read-only probe when risk requires it."
         case .delegated:
-            return "Delegated is an opt-in cohort. The overlap canary does not validate ownership automatically. Missing or unsafe evidence keeps current Policy v13 behavior."
+            return "Delegated guidance is mandatory when at least one worker is available. Assign only useful dependency-ready units, cap the wave at the available roster, the Project limit, or ten workers, and keep the leader lane ownership-disjoint with isolated writes and serial integration."
         }
     }
 
@@ -56,7 +56,7 @@ enum ProjectDelegationLevel: String, CaseIterable, Codable, Sendable {
 
     var overlapExplanation: String? {
         guard self == .delegated else { return nil }
-        return "The opt-in overlap canary applies only to healthy isolated parallel turns with reported disjoint ownership, a disjoint leader lane, zero write overlap, and serial integration. Otherwise, current Policy v13 behavior remains."
+        return "Concurrent delegated work requires isolated writes, explicit disjoint ownership, zero write overlap, and serial integration. The leader can mutate only in a separately declared disjoint lane."
     }
 }
 
@@ -73,13 +73,14 @@ struct ProjectExecutionOptions: Equatable, Sendable {
     /// Upper bound on one parallel wave. The engine still cannot exceed the
     /// number of workers actually on the roster.
     var maxParallelWorkers: Int
-    /// Whether the turn hook states a delegation floor at all. Off leaves the
-    /// leader entirely to its own judgement, which is the pre-existing
-    /// behavior.
+    /// Legacy compatibility data. The permanent delegated policy ignores this
+    /// value when it decides whether guidance applies.
     var injectDirective: Bool
 
-    static let `default` = Self(maxParallelWorkers: 3, injectDirective: true)
     static let workerBounds = 1...10
+    static let `default` = Self(
+        maxParallelWorkers: workerBounds.upperBound, injectDirective: true
+    )
 
     private static func key(_ suffix: String, teamName: String) -> String {
         guard !teamName.isEmpty else { return "team.unknown.\(suffix)" }
@@ -191,14 +192,11 @@ struct ProjectRoutingDecision: Codable, Equatable, Sendable {
         guard workers > 0 else {
             return Self(route: .direct, reasons: ["no_available_workers"], workerCount: 0)
         }
-        // A cap of one is a deliberate "never fan out", not a small wave: two
-        // is the smallest wave the policy recognises, so a cap below it has to
-        // close the gate rather than emit a one-worker "parallel" run.
         let cap = min(
             ProjectExecutionOptions.workerBounds.upperBound,
             max(ProjectExecutionOptions.workerBounds.lowerBound, maxParallelWorkers)
         )
-        if let taskShape, taskShape.supportsParallelWave, workers >= 2, cap >= 2 {
+        if level != .delegated, let taskShape, taskShape.supportsParallelWave, workers >= 2, cap >= 2 {
             return Self(
                 route: .parallel, reasons: ["parallel_ready"],
                 workerCount: min(cap, workers)
@@ -241,7 +239,7 @@ struct ProjectRoutingDecision: Codable, Equatable, Sendable {
 /// renderer consumes `renderedInstructions`; no renderer owns a fork of these
 /// scheduling rules.
 enum LeaderParallelPolicy {
-    static let version = "13"
+    static let version = "14"
     static let activation = "request-boundary-enforced"
 
     /// Ordered rules are both the canonical policy and the digest input.  Do
@@ -258,11 +256,11 @@ enum LeaderParallelPolicy {
         ),
         (
             "structured-routing-decision",
-            "Classify execution as direct, probe, or parallel before dispatch. Direct has no worker tasks. Probe has exactly one read-only task with a 60-90 second budget. Parallel has between two and the configured maximum of ten dependency-ready tasks. Delegated mode uses every useful independent task up to that maximum. Every worker task names its worker, goal, owned and forbidden paths, dependencies, verification command, mutation flag, and time estimate."
+            "Classify execution as direct, probe, parallel, or delegated before dispatch. Direct has no worker tasks. Probe has exactly one read-only task with a 60-90 second budget. Delegated serial work uses one worker. Other delegated work assigns every useful dependency-ready unit up to min(available workers, the configured limit, ten) without splitting work only to fill capacity. Every worker task names its worker, goal, owned and forbidden paths, dependencies, verification command, mutation flag, and time estimate."
         ),
         (
             "turn-route-measurement",
-            "For every supported leader turn, before dispatch or direct implementation, submit exactly one classification with `tm-agent leader turn route --route <direct|probe|parallel> --task-shape <single_unit|multi_unit|cross_subsystem|parallelizable> --available-workers <count>` and repeat `--risk-reason <reason>` for each risk; add `--wave-id <id>` only when a wave exists. Read the JSON result. A non-null `directive` is an observable tm-agent dispatch contract for an explicitly opted-in healthy canary; follow its route and dispatch_bounds. A null directive leaves the static policy unchanged. This contract does not intercept or enforce arbitrary file edits, shell commands, or other leader tool calls. Route omission remains observable and non-blocking."
+            "For every supported leader turn, before dispatch or direct implementation, submit exactly one classification with `tm-agent leader turn route --route <direct|probe|parallel|delegated> --task-shape <single_unit|multi_unit|cross_subsystem|parallelizable> --available-workers <count>` and repeat `--risk-reason <reason>` for each risk; add `--wave-id <id>` only when a wave exists. Read the JSON result. Effective delegated state with at least one available worker always returns mandatory guidance, regardless of legacy mode, percentage, cohort, health, kill-switch, opt-in, or injection fields. Follow its route and dispatch bounds. This contract does not intercept arbitrary file edits or shell commands. Route omission remains observable and non-blocking."
         ),
         (
             "dag-readiness",
@@ -282,7 +280,7 @@ enum LeaderParallelPolicy {
         ),
         (
             "leader-integration-lane",
-            "After dispatch, the leader remains active: prepare acceptance checks, inspect only unowned paths, stage integration order, and review completed evidence. Never edit a worker-owned path concurrently. Wait for named task IDs with tm-agent wait --mode any --tasks, process the first completed result, and perform at most one additional wait/collect for results still required to finish."
+            "After dispatch, the leader remains active: prepare acceptance checks, inspect only unowned paths, stage integration order, and review completed evidence. Never edit a worker-owned path concurrently. A leader mutation lane requires explicit disjoint ownership, isolated writes, zero overlap, and serial integration. Wait for named task IDs with tm-agent wait --mode any --tasks, process the first completed result, and perform at most one additional wait/collect for results still required to finish."
         ),
         (
             "actual-diff-review-gate",
@@ -351,7 +349,7 @@ enum LeaderParallelPolicy {
         Before dispatch, form this machine-readable decision internally and retain it in the task/run log when that surface is available:
         ```json
         {
-          "route": "direct|probe|parallel",
+          "route": "direct|probe|parallel|delegated",
           "reason": "positive evidence for parallel work, or the concrete constraint requiring direct or probe",
           "tasks": [
             {
@@ -378,7 +376,7 @@ enum LeaderParallelPolicy {
           ]
         }
         ```
-        Route invariants: direct has zero implementation tasks; probe has exactly one read-only implementation task (`mutates=false`) estimated at 60-90 seconds; parallel has between two and the configured maximum of ten implementation tasks whose `depends_on` prerequisites are already satisfied. Delegated mode fills useful independent tasks up to that maximum without inventing work. For implementation requests, `validation_gates` are a later wave derived from the integrated diff, never speculative implementation capacity. For explicit review-only requests, `review-only-fast-path` may start validators after bounded manifest triage against one frozen target while the leader works concurrently. Dispatch at most two gates once, collect once, and keep every gate read-only. A validator capsule covers one risk question and at most three primary files with a 90-second target. Require the normal final 5-field reply; `review_ready` without that final reply is partial evidence, not completion.
+        Route invariants: direct has zero implementation tasks; probe has exactly one read-only implementation task (`mutates=false`) estimated at 60-90 seconds; parallel has between two and the configured maximum of ten implementation tasks whose `depends_on` prerequisites are already satisfied; delegated serial work has one worker, and other delegated work assigns every useful ready unit up to min(available workers, the configured limit, ten) without inventing work. Every concurrent write needs isolated ownership, zero overlap, and serial integration. The leader can mutate only in a separately declared disjoint lane. For implementation requests, `validation_gates` are a later wave derived from the integrated diff, never speculative implementation capacity. For explicit review-only requests, `review-only-fast-path` may start validators after bounded manifest triage against one frozen target while the leader works concurrently. Dispatch at most two gates once, collect once, and keep every gate read-only. A validator capsule covers one risk question and at most three primary files with a 90-second target. Require the normal final 5-field reply; `review_ready` without that final reply is partial evidence, not completion.
 
         \(renderedRules)
         """

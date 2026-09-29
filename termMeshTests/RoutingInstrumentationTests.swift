@@ -153,6 +153,10 @@ final class RoutingInstrumentationTests: XCTestCase {
             .default,
             "an unset Project has to read as the shipped default, not as zero"
         )
+        XCTAssertEqual(
+            ProjectExecutionOptions.default.maxParallelWorkers,
+            ProjectExecutionOptions.workerBounds.upperBound
+        )
 
         ProjectExecutionOptions(maxParallelWorkers: 99, injectDirective: false)
             .save(teamName: "capped", to: defaults)

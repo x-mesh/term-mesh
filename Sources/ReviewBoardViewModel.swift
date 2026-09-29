@@ -438,7 +438,6 @@ final class ReviewBoardViewModel: ObservableObject {
         /// line cannot claim a reason the gate does not share.
         var supportedLeader = false
         var killSwitch = false
-        var canaryOptIn = false
         /// Overlap runs only in canary mode, so the line has to be able to name
         /// the mode as the reason. A panel built without one (the remote viewer
         /// path) reports the mode of nothing, so it never blames the mode.
@@ -997,10 +996,6 @@ final class ReviewBoardViewModel: ObservableObject {
         updateExecutionOptions { $0.maxParallelWorkers = count }
     }
 
-    func setInjectDirective(_ enabled: Bool) {
-        updateExecutionOptions { $0.injectDirective = enabled }
-    }
-
     /// Options live in defaults and reach the leader through its control file,
     /// so a write is only half the change — the file has to be rewritten too,
     /// or the hook keeps reading the values from before.
@@ -1053,21 +1048,6 @@ final class ReviewBoardViewModel: ObservableObject {
         refreshRemoteCollaborationIfNeeded(for: resolved)
         refreshLocalOverlapHealthIfNeeded(for: resolved)
         refreshRemoteOverlapHealthIfNeeded(for: resolved)
-    }
-
-    /// Include or drop this Project from the canary opt-in set. Goes through
-    /// the one shared save path used by Settings and the debug socket method,
-    /// so a stale Settings snapshot elsewhere cannot overwrite this write, or
-    /// vice versa.
-    func setCanaryOptIn(_ included: Bool, teamName: String) {
-        TeamOrchestrator.shared.updateLeaderParticipationSettings { settings in
-            if included {
-                settings.optInProjects.insert(teamName)
-            } else {
-                settings.optInProjects.remove(teamName)
-            }
-        }
-        refreshDelegationPanel()
     }
 
     private static let localOverlapHealthThrottleSeconds: TimeInterval = 10
@@ -1206,7 +1186,6 @@ final class ReviewBoardViewModel: ObservableObject {
             workingCount: working.count,
             supportedLeader: TeamOrchestrator.shared.leaderMeasurementCapability(for: team) == .supported,
             killSwitch: settings.killSwitch,
-            canaryOptIn: settings.optInProjects.contains(teamName),
             mode: settings.mode
         )
     }

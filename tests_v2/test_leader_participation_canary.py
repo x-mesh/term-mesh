@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Installed CLI proves canary, deterministic holdout, and next-turn kill-switch rollback."""
+"""Installed CLI proves permanent delegated guidance and safe leader overlap."""
 # The mac-sub runner uses Python 3.9, which cannot evaluate `dict | None` at def time.
 from __future__ import annotations
 
@@ -82,21 +82,22 @@ def main() -> int:
                     "TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE": str(control)})
         applied = route(cli, env, "turn-canary", route_name="parallel", evidence=True)
         if (not applied.get("directive")
-                or applied["record"].get("policy_applied")
+                or applied["record"].get("policy_applied") is not True
                 or applied["record"].get("overlap_canary") is not True
-                or applied["directive"].get("execution") != "overlap_canary"):
-            raise termmeshError(f"eligible canary did not apply: {applied}")
+                or applied["directive"].get("route") != "parallel"):
+            raise termmeshError(f"eligible delegated guidance did not apply: {applied}")
 
-        # Overlap follows the participation mode: a leader the user switched
-        # off, or left in shadow, is not running experiments.
+        # Legacy modes can stop overlap telemetry, but cannot stop guidance.
         for stopped_mode in ("shadow", "off"):
             control.write_text(json.dumps(dict(config, mode=stopped_mode)))
             control.chmod(0o600)
             stopped = route(
                 cli, env, f"turn-{stopped_mode}-overlap", route_name="parallel", evidence=True
             )
-            if stopped["record"].get("overlap_canary") is not False or stopped.get("directive"):
-                raise termmeshError(f"mode {stopped_mode} kept overlap running: {stopped}")
+            if (stopped["record"].get("overlap_canary") is not False
+                    or not stopped.get("directive")
+                    or stopped["record"].get("policy_applied") is not True):
+                raise termmeshError(f"mode {stopped_mode} suppressed guidance: {stopped}")
         control.write_text(json.dumps(config))
         control.chmod(0o600)
 
@@ -238,17 +239,15 @@ def main() -> int:
             if boundary["record"].get("overlap_canary") is not False:
                 raise termmeshError(f"{field} enabled overlap: {boundary}")
 
-        # Shadow observes and changes nothing: the ordinary canary does not
-        # apply, and overlap follows the mode, so it does not resolve either.
-        # The turn is still recorded, so `policy_mode` stays shadow.
+        # Shadow remains a telemetry label only.
         config["mode"] = "shadow"
         control.write_text(json.dumps(config))
         shadow = route(cli, env, "turn-shadow", route_name="parallel", evidence=True)
-        if (shadow.get("directive")
+        if (not shadow.get("directive")
                 or shadow["record"].get("policy_mode") != "shadow"
-                or shadow["record"].get("policy_applied")
+                or shadow["record"].get("policy_applied") is not True
                 or shadow["record"].get("overlap_canary") is not False):
-            raise termmeshError(f"Shadow mode did not stay observation-only: {shadow}")
+            raise termmeshError(f"Shadow mode suppressed guidance: {shadow}")
 
         config["mode"] = "canary"
         config["project_id"] = "missing-project"
@@ -264,8 +263,10 @@ def main() -> int:
         config["kill_switch"] = True
         control.write_text(json.dumps(config))
         killed = route(cli, env, "turn-killed", route_name="parallel", evidence=True)
-        if killed.get("directive") is not None or killed["record"].get("policy_applied"):
-            raise termmeshError(f"kill switch did not affect next turn: {killed}")
+        if (not killed.get("directive")
+                or killed["record"].get("policy_applied") is not True
+                or killed["record"].get("overlap_canary") is not False):
+            raise termmeshError(f"legacy kill switch suppressed guidance: {killed}")
 
         config.update({"kill_switch": False, "mode": "canary", "percent": 0,
                        "opt_in": True})
@@ -275,13 +276,13 @@ def main() -> int:
         cohorts = [holdout1["record"].get("cohort"), holdout2["record"].get("cohort")]
         if cohorts != ["holdout", "holdout"]:
             raise termmeshError(f"zero-percent holdout is not deterministic: {cohorts}")
-        if (holdout1["record"].get("policy_applied")
+        if (holdout1["record"].get("policy_applied") is not True
                 or holdout1["record"].get("overlap_canary") is not True):
             raise termmeshError(
                 f"general holdout changed or delegated overlap was blocked: {holdout1}"
             )
 
-    print("PASS: delegated overlap applies while ordinary holdout and kill switch stay closed")
+    print("PASS: delegated guidance ignores rollout fields while unsafe overlap stays closed")
     return 0
 
 

@@ -18436,20 +18436,40 @@ impl LeaderParticipationDirective {
         };
         let cap = max_parallel_workers.unwrap_or(3).clamp(1, 10);
         let wave = workers.min(cap);
+        if workers == 0 {
+            return Self {
+                participation: "hands_on",
+                route: "direct",
+                reasons: vec!["no_available_workers"],
+                dispatch_bounds: "no required worker dispatch".into(),
+            };
+        }
+        if delegation_level == Some("delegated")
+            && (shape.as_deref() == Some("single_unit") || wave == 1)
+        {
+            return Self {
+                participation: "coordinator",
+                route: "delegated",
+                reasons: vec!["delegated_serial_work"],
+                dispatch_bounds: "exactly one implementation worker".into(),
+            };
+        }
+        if delegation_level == Some("delegated") {
+            return Self {
+                participation: "coordinator",
+                route: "parallel",
+                reasons: vec!["delegated_max_capacity"],
+                dispatch_bounds: format!(
+                    "up to {wave} useful dependency-ready, ownership-disjoint tasks; one if serial"
+                ),
+            };
+        }
         if risk_reasons.iter().any(|reason| !reason.trim().is_empty()) {
             return Self {
                 participation: "balanced",
                 route: "probe",
                 reasons: vec!["high_risk"],
                 dispatch_bounds: "at most one read-only probe".into(),
-            };
-        }
-        if delegation_level == Some("delegated") && shape.as_deref() == Some("single_unit") {
-            return Self {
-                participation: "coordinator",
-                route: "delegated",
-                reasons: vec!["delegated_serial_work"],
-                dispatch_bounds: "exactly one implementation worker".into(),
             };
         }
         if workers >= 2
@@ -18467,17 +18487,7 @@ impl LeaderParticipationDirective {
                 ),
             };
         }
-        if delegation_level == Some("delegated") {
-            return Self {
-                participation: "coordinator",
-                route: "delegated",
-                reasons: vec!["delegated_max_capacity"],
-                dispatch_bounds: format!(
-                    "up to {wave} useful independent implementation tasks; one if serial"
-                ),
-            };
-        }
-        if workers == 0 || shape.as_deref() == Some("single_unit") {
+        if shape.as_deref() == Some("single_unit") {
             return Self {
                 participation: "hands_on",
                 route: "direct",
@@ -18571,12 +18581,18 @@ fn parse_leader_control_snapshot(
         .clone()
         .or_else(|| value["delegation_configured"].as_str().map(str::to_string));
     Some(LeaderParticipationControlSnapshot {
-        mode: value["mode"].as_str()?.trim().to_ascii_lowercase(),
-        percent: value["percent"].as_u64()?.min(100) as u8,
-        kill_switch: value["kill_switch"].as_bool()?,
-        supported: value["supported"].as_bool()?,
-        healthy: value["healthy"].as_bool()?,
-        opt_in: value["opt_in"].as_bool()?,
+        // Legacy rollout fields remain optional telemetry. They never decide
+        // whether mandatory delegated guidance applies.
+        mode: value["mode"]
+            .as_str()
+            .unwrap_or("off")
+            .trim()
+            .to_ascii_lowercase(),
+        percent: value["percent"].as_u64().unwrap_or(0).min(100) as u8,
+        kill_switch: value["kill_switch"].as_bool().unwrap_or(false),
+        supported: value["supported"].as_bool().unwrap_or(false),
+        healthy: value["healthy"].as_bool().unwrap_or(false),
+        opt_in: value["opt_in"].as_bool().unwrap_or(false),
         project_id: project_id.to_string(),
         session_id,
         delegation_level,
@@ -18948,15 +18964,32 @@ fn resolve_participation(
     config: &LeaderParticipationCanaryConfig,
     known_input: bool,
 ) -> LeaderParticipationResolution {
-    // Overlap ignores the cohort below — opt-in and the percent bucket decide
-    // the ordinary canary, not this one — but it does follow the mode. A leader
-    // the user switched off, or left in shadow, is not running experiments.
+    // The overlap canary remains a separate safety diagnostic. Mandatory
+    // delegated guidance does not read any rollout field below.
     let delegated_overlap_resolution = config.mode == "canary"
         && config.delegated_overlap_resolution
         && config.delegation_effective.as_deref() == Some("delegated")
         && config.supported
         && config.healthy
         && !config.kill_switch;
+    if config.delegation_effective.as_deref() == Some("delegated") && known_input {
+        let (mode, cohort) = match config.mode.as_str() {
+            "shadow" => ("shadow", "shadow"),
+            "canary" if config.percent == 0 => ("canary", "holdout"),
+            "canary" if !config.project_id.trim().is_empty()
+                && !config.session_id.trim().is_empty()
+                && stable_canary_bucket(&config.project_id, &config.session_id) < config.percent =>
+                ("canary", "canary"),
+            "canary" => ("canary", "holdout"),
+            _ => ("off", "static"),
+        };
+        return LeaderParticipationResolution {
+            mode,
+            cohort,
+            applied: true,
+            delegated_overlap_resolution,
+        };
+    }
     if config.mode == "shadow" {
         return LeaderParticipationResolution {
             mode: "shadow",
@@ -19125,11 +19158,14 @@ fn turn_route_record_with_policy_input(
     }
     let suggestion = LeaderParticipationDirective::from_input(
         task_shape, risk_reasons, available_workers,
-        control.and_then(|snapshot| snapshot.delegation_level.as_deref()),
+        control.and_then(|snapshot| snapshot.delegation_effective.as_deref()),
         control.and_then(|snapshot| snapshot.max_parallel_workers),
     );
     let resolution = resolve_participation_from_env(
-        available_workers.is_some(), Some(turn_id), control, control_file_invalid,
+        available_workers.is_some_and(|workers| workers > 0),
+        Some(turn_id),
+        control,
+        control_file_invalid,
     );
     record["suggested_participation"] = json!(suggestion.participation);
     record["suggested_route"] = json!(suggestion.route);
@@ -19351,7 +19387,7 @@ fn run_leader_turn_route_with_evidence(
         control_state.is_invalid(),
     );
     let resolution = resolve_participation_from_env(
-        available_workers.is_some(),
+        available_workers.is_some_and(|workers| workers > 0),
         Some(turn_id),
         control,
         control_state.is_invalid(),
@@ -19362,20 +19398,27 @@ fn run_leader_turn_route_with_evidence(
     let overlap_capability = control
         .as_ref()
         .is_some_and(|snapshot| snapshot.overlap_canary_capability());
-    let admission = OverlapCanaryAdmission::evaluate(
-        resolution.delegated_overlap_resolution,
-        overlap_capability,
-        effective_delegation.as_deref(),
-        route,
-        record.get("suggested_route").and_then(Value::as_str),
-        checkout_mode,
-        ready_mutating_slices,
-        ownership_disjoint,
-        leader_lane_disjoint,
-        concurrent_write_overlap,
-        serial_integration,
-        resource_health,
-    );
+    let admission = if available_workers.is_some_and(|workers| workers > 0) {
+        OverlapCanaryAdmission::evaluate(
+            resolution.delegated_overlap_resolution,
+            overlap_capability,
+            effective_delegation.as_deref(),
+            route,
+            record.get("suggested_route").and_then(Value::as_str),
+            checkout_mode,
+            ready_mutating_slices,
+            ownership_disjoint,
+            leader_lane_disjoint,
+            concurrent_write_overlap,
+            serial_integration,
+            resource_health,
+        )
+    } else {
+        OverlapCanaryAdmission {
+            eligible: false,
+            reasons: vec!["no_available_workers"],
+        }
+    };
     record["overlap_canary"] = json!(admission.eligible);
     record["overlap_canary_reasons"] = json!(admission.reasons);
     record["overlap_canary_evidence"] = json!({
@@ -19414,9 +19457,14 @@ fn run_leader_turn_route_with_evidence(
         .then(|| {
             let mut directive = json!({
                 "participation": record["suggested_participation"],
-                "route": record["actual_route"],
+                "route": record["suggested_route"],
                 "dispatch_bounds": record["dispatch_bounds"],
                 "overlap_canary": record["overlap_canary"],
+                "requires_isolated_checkout": true,
+                "requires_ownership_disjoint": true,
+                "requires_zero_write_overlap": true,
+                "requires_serial_integration": true,
+                "leader_lane_bounds": "coordination, integration, and verification only; mutation requires a separately declared disjoint lane",
             });
             if admission.eligible {
                 directive["execution"] = json!("overlap_canary");
@@ -19494,10 +19542,10 @@ mod leader_turn_record_tests {
         );
         assert_eq!(parallel.participation, "coordinator");
         assert_eq!(parallel.route, "parallel");
-        assert_eq!(parallel.reasons, ["parallel_ready"]);
+        assert_eq!(parallel.reasons, ["delegated_max_capacity"]);
         assert_eq!(
             parallel.dispatch_bounds,
-            "two to 5 dependency-ready, ownership-disjoint tasks"
+            "up to 5 useful dependency-ready, ownership-disjoint tasks; one if serial"
         );
 
         let risk = LeaderParticipationDirective::from_input(
@@ -19507,9 +19555,13 @@ mod leader_turn_record_tests {
             Some("delegated"),
             Some(10),
         );
-        assert_eq!(risk.participation, "balanced");
-        assert_eq!(risk.route, "probe");
-        assert_eq!(risk.dispatch_bounds, "at most one read-only probe");
+        assert_eq!(risk.participation, "coordinator");
+        assert_eq!(risk.route, "parallel");
+        assert_eq!(risk.reasons, ["delegated_max_capacity"]);
+        assert_eq!(
+            risk.dispatch_bounds,
+            "up to 3 useful dependency-ready, ownership-disjoint tasks; one if serial"
+        );
 
         let unknown = LeaderParticipationDirective::from_input(
             Some("multi_unit"), &[], None, Some("delegated"), Some(10)
@@ -19521,11 +19573,11 @@ mod leader_turn_record_tests {
         let delegated = LeaderParticipationDirective::from_input(
             None, &[], Some(12), Some("delegated"), Some(7)
         );
-        assert_eq!(delegated.route, "delegated");
+        assert_eq!(delegated.route, "parallel");
         assert_eq!(delegated.reasons, ["delegated_max_capacity"]);
         assert_eq!(
             delegated.dispatch_bounds,
-            "up to 7 useful independent implementation tasks; one if serial"
+            "up to 7 useful dependency-ready, ownership-disjoint tasks; one if serial"
         );
 
         let serial = LeaderParticipationDirective::from_input(
@@ -19534,6 +19586,13 @@ mod leader_turn_record_tests {
         assert_eq!(serial.route, "delegated");
         assert_eq!(serial.reasons, ["delegated_serial_work"]);
         assert_eq!(serial.dispatch_bounds, "exactly one implementation worker");
+
+        let one_worker = LeaderParticipationDirective::from_input(
+            Some("multi_unit"), &[], Some(1), Some("delegated"), Some(10)
+        );
+        assert_eq!(one_worker.route, "delegated");
+        assert_eq!(one_worker.reasons, ["delegated_serial_work"]);
+        assert_eq!(one_worker.dispatch_bounds, "exactly one implementation worker");
     }
 
     #[test]
@@ -19707,6 +19766,11 @@ mod leader_turn_record_tests {
             assert_eq!(result["record"]["overlap_canary"], expected_overlap);
             if expected_overlap {
                 assert_eq!(result["directive"]["execution"], "overlap_canary");
+                assert_eq!(result["directive"]["route"], "parallel");
+                assert_eq!(result["directive"]["requires_isolated_checkout"], true);
+                assert_eq!(result["directive"]["requires_ownership_disjoint"], true);
+                assert_eq!(result["directive"]["requires_zero_write_overlap"], true);
+                assert_eq!(result["directive"]["requires_serial_integration"], true);
             } else {
                 assert!(result["directive"].is_null());
                 assert_eq!(result["record"]["policy_mode"], "off");
@@ -19777,7 +19841,7 @@ mod leader_turn_record_tests {
     }
 
     #[test]
-    fn only_explicit_healthy_supported_canary_applies() {
+    fn mandatory_delegated_guidance_ignores_legacy_rollout_values() {
         let eligible = canary_config(100);
         assert_eq!(
             resolve_participation(&eligible, true),
@@ -19803,12 +19867,13 @@ mod leader_turn_record_tests {
         killed.kill_switch = true;
         cases.push(killed);
         for config in cases {
-            assert!(
-                !resolve_participation(&config, true).applied,
-                "config was {config:?}"
-            );
+            assert!(resolve_participation(&config, true).applied, "config was {config:?}");
         }
         assert!(!resolve_participation(&eligible, false).applied);
+
+        let mut zero_workers = eligible.clone();
+        zero_workers.delegation_effective = Some("delegated".to_string());
+        assert!(resolve_participation(&zero_workers, false).applied == false);
     }
 
     /// Overlap ignores the cohort — opt-in and the percent bucket decide the
@@ -19819,7 +19884,7 @@ mod leader_turn_record_tests {
         let mut config = canary_config(0);
         config.opt_in = false;
         let resolution = resolve_participation(&config, true);
-        assert!(!resolution.applied);
+        assert!(resolution.applied);
         assert!(resolution.delegated_overlap_resolution);
 
         for mode in ["shadow", "off"] {
@@ -20131,7 +20196,8 @@ mod leader_turn_record_tests {
         apply_participation_health_scope(&mut config, Some("execution_host"), None, None);
 
         assert!(!config.healthy);
-        assert!(!resolve_participation(&config, true).applied);
+        assert!(resolve_participation(&config, true).applied);
+        assert!(!resolve_participation(&config, true).delegated_overlap_resolution);
     }
 
     #[test]
@@ -20285,10 +20351,10 @@ mod leader_turn_record_tests {
     }
 
     #[test]
-    fn zero_percentage_and_deterministic_holdout_never_apply() {
+    fn zero_percentage_and_deterministic_holdout_still_apply_mandatory_guidance() {
         let zero = resolve_participation(&canary_config(0), true);
         assert_eq!(zero.cohort, "holdout");
-        assert!(!zero.applied);
+        assert!(zero.applied);
 
         let mut holdout = canary_config(1);
         for index in 0..1000 {
@@ -20301,7 +20367,7 @@ mod leader_turn_record_tests {
         let second = resolve_participation(&holdout, true);
         assert_eq!(first, second);
         assert_eq!(first.cohort, "holdout");
-        assert!(!first.applied);
+        assert!(first.applied);
     }
 
     #[test]
