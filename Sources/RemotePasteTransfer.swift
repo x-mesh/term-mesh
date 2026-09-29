@@ -111,13 +111,14 @@ enum RemotePasteTransfer {
     /// original text rather than silently pasting nothing.
     static func send(localPath: String, to destination: Destination) -> String? {
         let sshTarget = destination.sshTarget
+        if let problem = settingsProblem(in: destination) {
+            RemoteWorkLog.infoOffMain("Paste not sent: invalid SSH settings for \(sshTarget): \(problem)")
+            return nil
+        }
         guard let directoryArguments = sshArguments(
             to: destination,
             command: remoteDirectoryCommand
-        ) else {
-            RemoteWorkLog.infoOffMain("Paste not sent: invalid SSH settings for \(sshTarget)")
-            return nil
-        }
+        ) else { return nil }
         let name = uniqueName(for: localPath)
         let label = (localPath as NSString).lastPathComponent
         let started = Date()
@@ -167,13 +168,22 @@ enum RemotePasteTransfer {
         String(format: "%.1fs", Date().timeIntervalSince(start))
     }
 
-    private static func validTarget(_ target: String) -> Bool {
-        let allowed = CharacterSet(
-            charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-@[]:"
-        )
-        return !target.isEmpty
-            && target.unicodeScalars.allSatisfy(allowed.contains)
+    private static let targetPunctuation: Set<Unicode.Scalar> = [".", "_", "-", "@", "[", "]", ":"]
+
+    // Explicit scalar ranges instead of a CharacterSet allowlist: in the
+    // Release app build that allowlist rejected every valid host name
+    // (reproduced 2026-09-29), while Debug and isolated -O builds accepted it.
+    // RemoteGitCheckpointService shares this check so the two SSH allowlists
+    // cannot drift apart again.
+    static func validTarget(_ target: String) -> Bool {
+        !target.isEmpty
             && !target.hasPrefix("-")
+            && target.unicodeScalars.allSatisfy { scalar in
+                ("a"..."z").contains(scalar)
+                    || ("A"..."Z").contains(scalar)
+                    || ("0"..."9").contains(scalar)
+                    || targetPunctuation.contains(scalar)
+            }
     }
 
     private static func shellQuote(_ value: String) -> String {
@@ -216,11 +226,7 @@ enum RemotePasteTransfer {
     /// Build one SSH argv for every phase of the transfer so cache creation
     /// and byte streaming cannot disagree about port or identity.
     static func sshArguments(to destination: Destination, command: String) -> [String]? {
-        guard validTarget(destination.sshTarget) else { return nil }
-        if let port = destination.port,
-           (try? PeerSSHTunnel.validatePort(port)) == nil { return nil }
-        if let identityFile = destination.identityFile,
-           (try? PeerSSHTunnel.validateIdentityFile(identityFile)) == nil { return nil }
+        guard settingsProblem(in: destination) == nil else { return nil }
 
         var arguments: [String] = []
         if let port = destination.port {
@@ -231,6 +237,31 @@ enum RemotePasteTransfer {
         }
         arguments += ["--", destination.sshTarget, command]
         return arguments
+    }
+
+    /// Which SSH setting keeps `destination` from being dialed, with its
+    /// value, or nil when all of them are usable. A bare "invalid SSH
+    /// settings" left a failing paste with three suspects and nothing to act
+    /// on. The host name is spelled as code points because the character
+    /// that fails it can be invisible.
+    static func settingsProblem(in destination: Destination) -> String? {
+        if !validTarget(destination.sshTarget) {
+            let codePoints = destination.sshTarget.unicodeScalars
+                .map { String(format: "U+%04X", $0.value) }
+                .joined(separator: " ")
+            return "host name [\(codePoints)]"
+        }
+        do {
+            if let port = destination.port { try PeerSSHTunnel.validatePort(port) }
+            if let identityFile = destination.identityFile {
+                try PeerSSHTunnel.validateIdentityFile(identityFile)
+            }
+        } catch PeerSSHTunnelError.invalidArgument(let reason) {
+            return reason
+        } catch {
+            return String(describing: error)
+        }
+        return nil
     }
 
     private static func capture(_ executable: String, _ arguments: [String]) -> String? {
