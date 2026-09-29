@@ -1078,10 +1078,36 @@ final class PeerTerminalReplayBufferTests: XCTestCase {
         XCTAssertEqual(buffer.take()?.bytes, Data("ok".utf8))
     }
 
+    /// A resync capture lands on a raw callback boundary. While one is in
+    /// flight every append must stay a separate event, or the boundary sits
+    /// inside one merged chunk and can never be mapped.
+    func testRawOutputDrainBufferKeepsEveryBoundaryWhileTracking() {
+        var buffer = RawOutputDrainBuffer()
+        XCTAssertTrue(appendRawOutput("ab", rawEnd: 2, into: &buffer))
+        XCTAssertTrue(appendRawOutput("cd", rawEnd: 4, recordBoundary: true, into: &buffer))
+        XCTAssertTrue(appendRawOutput("ef", rawEnd: 6, recordBoundary: true, into: &buffer))
+
+        let batch = buffer.take()
+
+        XCTAssertEqual(batch?.events.map(\.rawEnd), [2, 4, 6])
+        XCTAssertEqual(batch?.events.map(\.byteCount), [2, 2, 2])
+    }
+
+    func testRawToFilteredCheckpointReportsTheFrontier() {
+        var checkpoints = RawToFilteredCheckpointStore()
+        XCTAssertNil(checkpoints.latestRawEnd)
+        checkpoints.append(rawEnd: 0, rawByteCount: 0, filteredEnd: 0)
+        checkpoints.append(rawEnd: 8, rawByteCount: 8, filteredEnd: 8)
+
+        XCTAssertEqual(checkpoints.latestRawEnd, 8)
+        XCTAssertNil(checkpoints.filteredEnd(forRawEnd: 4), "a boundary inside a merged chunk stays unmapped")
+    }
+
     private func appendRawOutput(
         _ text: String,
         rawEnd: UInt64,
         callback: PtyTapCallback? = nil,
+        recordBoundary: Bool = false,
         into buffer: inout RawOutputDrainBuffer
     ) -> Bool {
         let data = Data(text.utf8)
@@ -1090,7 +1116,8 @@ final class PeerTerminalReplayBufferTests: XCTestCase {
                 bytes.bindMemory(to: UInt8.self).baseAddress!,
                 count: bytes.count,
                 rawEnd: rawEnd,
-                callback: callback
+                callback: callback,
+                recordBoundary: recordBoundary
             )
         }
     }
