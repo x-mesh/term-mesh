@@ -64,6 +64,7 @@ enum BackportPointerStyle {
     case resizeDown
     case resizeUpDown
     case resizeLeftRight
+    case resizeBottomTrailing
 
     #if canImport(AppKit)
     @available(macOS 15, *)
@@ -81,6 +82,7 @@ enum BackportPointerStyle {
         case .resizeDown: return .frameResize(position: .top, directions: [.inward])
         case .resizeUpDown: return .frameResize(position: .top)
         case .resizeLeftRight: return .frameResize(position: .trailing)
+        case .resizeBottomTrailing: return .frameResize(position: .bottomTrailing)
         }
     }
     #endif
