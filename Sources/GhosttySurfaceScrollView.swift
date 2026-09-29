@@ -277,7 +277,7 @@ final class GhosttySurfaceScrollView: NSView {
         let f = NSTextField(labelWithString: "")
         f.translatesAutoresizingMaskIntoConstraints = false
         f.alignment = .center
-        f.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+        f.font = NSFont.systemFont(ofSize: 9, weight: .semibold)
         f.textColor = .white
         f.backgroundColor = .clear
         f.drawsBackground = false
@@ -285,13 +285,21 @@ final class GhosttySurfaceScrollView: NSView {
         f.isEditable = false
         f.isSelectable = false
         f.wantsLayer = true
-        f.layer?.backgroundColor = NSColor.systemTeal.cgColor
-        f.layer?.cornerRadius = 9
-        f.layer?.borderWidth = 1
-        f.layer?.borderColor = NSColor.white.withAlphaComponent(0.6).cgColor
+        f.layer?.backgroundColor = NSColor.systemTeal.withAlphaComponent(0.55).cgColor
+        f.layer?.cornerRadius = PeerRingStyle.badgeHeight / 2
         f.isHidden = true
         return f
     }()
+    /// The peer ring stays up for a whole mirroring session, so it is a faint
+    /// hairline that fits in Ghostty's default 2pt window padding instead of a
+    /// bright frame over the first cell column.
+    private enum PeerRingStyle {
+        static let lineWidth: CGFloat = 1
+        static let opacity: Float = 0.35
+        static let inset: CGFloat = lineWidth / 2
+        static let badgeHeight: CGFloat = 12
+        static let badgeMargin: CGFloat = 2
+    }
     private let flashOverlayView: GhosttyFlashOverlayView
     private let flashLayer: CAShapeLayer
     private let remotePasteTransferIndicator = RemotePasteTransferIndicator(frame: .zero)
@@ -491,33 +499,30 @@ final class GhosttySurfaceScrollView: NSView {
         notificationRingOverlayView.isHidden = true
         addSubview(notificationRingOverlayView)
 
-        // Peer-attached ring: teal, drawn just inside the notification
-        // ring so both can be visible simultaneously (notifications +
-        // active remote viewer).
+        // Peer-attached ring: teal, drawn along the pane edge outside the
+        // notification ring so both can be visible simultaneously
+        // (notifications + active remote viewer).
         peerRingOverlayView.wantsLayer = true
         peerRingOverlayView.layer?.backgroundColor = NSColor.clear.cgColor
         peerRingOverlayView.layer?.masksToBounds = false
         peerRingOverlayView.autoresizingMask = [.width, .height]
         peerRingLayer.fillColor = NSColor.clear.cgColor
         peerRingLayer.strokeColor = NSColor.systemTeal.cgColor
-        peerRingLayer.lineWidth = 2.5
+        peerRingLayer.lineWidth = PeerRingStyle.lineWidth
         peerRingLayer.lineJoin = .round
         peerRingLayer.lineCap = .round
-        peerRingLayer.shadowColor = NSColor.systemTeal.cgColor
-        peerRingLayer.shadowOpacity = 0.4
-        peerRingLayer.shadowRadius = 4
-        peerRingLayer.shadowOffset = .zero
         peerRingLayer.opacity = 0
         peerRingOverlayView.layer?.addSublayer(peerRingLayer)
 
         peerRingOverlayView.addSubview(peerCountBadgeLabel)
-        // Pin the badge to the top-right of the peer ring, sized just
-        // slightly bigger than the digit so it reads as a pill / dot.
+        // Pin the badge into the top-right corner, sized just slightly
+        // bigger than the digit so it covers as little of the first row
+        // as a readable pill can.
         NSLayoutConstraint.activate([
-            peerCountBadgeLabel.topAnchor.constraint(equalTo: peerRingOverlayView.topAnchor, constant: 5),
-            peerCountBadgeLabel.trailingAnchor.constraint(equalTo: peerRingOverlayView.trailingAnchor, constant: -5),
-            peerCountBadgeLabel.heightAnchor.constraint(equalToConstant: 18),
-            peerCountBadgeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 18),
+            peerCountBadgeLabel.topAnchor.constraint(equalTo: peerRingOverlayView.topAnchor, constant: PeerRingStyle.badgeMargin),
+            peerCountBadgeLabel.trailingAnchor.constraint(equalTo: peerRingOverlayView.trailingAnchor, constant: -PeerRingStyle.badgeMargin),
+            peerCountBadgeLabel.heightAnchor.constraint(equalToConstant: PeerRingStyle.badgeHeight),
+            peerCountBadgeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: PeerRingStyle.badgeHeight),
         ])
 
         peerRingOverlayView.isHidden = true
@@ -959,7 +964,7 @@ final class GhosttySurfaceScrollView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         peerRingOverlayView.isHidden = !visible
-        peerRingLayer.opacity = visible ? 1 : 0
+        peerRingLayer.opacity = visible ? PeerRingStyle.opacity : 0
         let showBadge = visible && count >= 1
         if showBadge {
             let label = count > 9 ? "9+" : "\(count)"
@@ -2472,12 +2477,10 @@ final class GhosttySurfaceScrollView: NSView {
     }
 
     private func updatePeerRingPath() {
-        // Inset slightly more than the notification ring so the two
-        // can be displayed concentrically without visual overlap.
         updateOverlayRingPath(
             layer: peerRingLayer,
             bounds: peerRingOverlayView.bounds,
-            inset: 5,
+            inset: PeerRingStyle.inset,
             radius: 5
         )
     }
