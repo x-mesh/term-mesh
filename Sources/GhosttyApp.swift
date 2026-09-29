@@ -576,9 +576,14 @@ class GhosttyApp {
                 }
                 transferIndicator?.beginRemotePasteTransfer()
                 DispatchQueue.global(qos: .userInitiated).async {
-                    let pasted = RemotePasteTransfer.send(localPath: localPath, to: target) ?? value
+                    let remotePath = RemotePasteTransfer.send(localPath: localPath, to: target)
                     DispatchQueue.main.async {
                         transferIndicator?.endRemotePasteTransfer()
+                        // `value` is already shell-escaped for a local paste.
+                        // The peer's copy keeps the original file name
+                        // ("Screenshot ... at 16.30.00.png"), so it needs the
+                        // same escaping or the shell splits it into arguments.
+                        let pasted = remotePath.map(GhosttyNSView.escapeDropForShell) ?? value
                         // `terminalSurface` is weak and its `surface` is cleared
                         // before the free, so a surviving identical pointer means
                         // the pane still owns this surface.

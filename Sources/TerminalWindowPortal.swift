@@ -1088,6 +1088,13 @@ final class WindowTerminalPortal: NSObject {
             container.addSubview(palette, positioned: .above, relativeTo: hostView)
             installationChanged = true
         }
+        // The window-wide Paste Shelf installs the same way and would be
+        // buried the same way.
+        if let shelf = container.subviews.first(where: { $0 is PasteShelfWindowContainerView }),
+           !Self.isView(shelf, above: hostView, in: container) {
+            container.addSubview(shelf, positioned: .above, relativeTo: hostView)
+            installationChanged = true
+        }
 
         // Keep the drag/mouse forwarding overlay above portal-hosted terminal views.
         if let overlay = objc_getAssociatedObject(window, &fileDropOverlayKey) as? NSView,
