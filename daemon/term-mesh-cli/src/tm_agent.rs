@@ -19325,8 +19325,12 @@ fn mark_turn_route_stated(path: &Path, turn_id: &str, no_dispatch: bool) -> Resu
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("chmod {}: {e}", marker.display()))?;
+        if let Err(e) = fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)) {
+            // The route command fails here without a record, so a marker left
+            // behind would let Stop read a route (or an exemption) never logged.
+            let _ = fs::remove_file(&marker);
+            return Err(format!("chmod {}: {e}", marker.display()));
+        }
     }
     Ok(())
 }
