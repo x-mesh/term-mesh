@@ -85,6 +85,13 @@ public enum PeerCapability {
     /// which lets this client clear stale local scrollback and reset its
     /// wire-gap baseline. Mirrors `GRID_SNAPSHOT_V1` on the Rust side.
     public static let gridSnapshotV1 = "grid.snapshot.v1"
+    /// Advertised by the HOST: it repairs its own outbound overflow on an
+    /// attachment whose client took `grid.snapshot.v1`, sending a fresh
+    /// GridSnapshot at most `PeerOverflowResync.minSnapshotInterval` apart,
+    /// and closes the connection when a repair fails. A viewer may then hold
+    /// back its own gap heal. The Rust daemon does neither, so it does not
+    /// advertise this even though it speaks `grid.snapshot.v1`.
+    public static let overflowResyncV1 = "overflow.resync.v1"
     /// Authenticated host-reported directories containing bundled CLIs.
     public static let hostCLIBinDirsV1 = "host.cli-bin-dirs.v1"
 
@@ -114,7 +121,7 @@ public enum PeerCapability {
     /// Every capability this build supports. Single source of truth for
     /// populating outgoing `Hello.capabilities` — don't hand-roll the list
     /// at each call site.
-    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, relayTelemetryV1, gridSnapshotV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, projectPresentationRepairV1, teamRouteFileV1, projectPresentationLiveV1, agentPresentationV1]
+    public static let supported: [String] = [ptyDataCoalesceV1, replayRingV1, workspaceLifecycleV1, workspaceListSubscribeV1, surfaceEnsureV1, surfaceEnsureEnvV1, surfaceTerminateV1, surfaceAgentV1, surfaceExitV1, surfaceForegroundV1, hostStatsV1, relayTelemetryV1, gridSnapshotV1, overflowResyncV1, hostCLIBinDirsV1, teamRosterV1, teamCallV1, teamLeaderV1, projectPresentationV1, projectPresentationRepairV1, teamRouteFileV1, projectPresentationLiveV1, agentPresentationV1]
 }
 
 /// Strict validation for host-controlled Hello.cli_bin_dirs. Invalid input
