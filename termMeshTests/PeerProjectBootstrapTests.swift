@@ -1153,6 +1153,30 @@ final class PeerProjectBootstrapTests: XCTestCase {
         ))
     }
 
+    func test_remote_paste_names_the_rejected_setting() {
+        XCTAssertNil(RemotePasteTransfer.settingsProblem(
+            in: .init(sshTarget: "root@jw-server", port: nil, identityFile: nil)
+        ))
+        XCTAssertEqual(
+            RemotePasteTransfer.settingsProblem(
+                in: .init(sshTarget: "a\u{200B}b", port: nil, identityFile: nil)
+            ),
+            "host name [U+0061 U+200B U+0062]"
+        )
+        XCTAssertEqual(
+            RemotePasteTransfer.settingsProblem(
+                in: .init(sshTarget: "builder", port: 0, identityFile: nil)
+            ),
+            "SSH port must be 1-65535 (got 0)"
+        )
+        XCTAssertEqual(
+            RemotePasteTransfer.settingsProblem(
+                in: .init(sshTarget: "builder", port: nil, identityFile: "-oProxyCommand=bad")
+            ),
+            "Identity file path may not start with '-'"
+        )
+    }
+
     @MainActor
     func test_remote_leader_prompt_streams_to_shared_cache_atomically() throws {
         let prompt = Data(String(repeating: "leader 정책\n", count: 1_500).utf8)

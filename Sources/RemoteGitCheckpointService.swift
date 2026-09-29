@@ -417,10 +417,7 @@ final class RemoteGitCheckpointService: RemoteGitCheckpointServicing, @unchecked
     }
 
     private static func validateTarget(_ target: String) throws {
-        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-@[]:")
-        guard !target.isEmpty,
-              target.unicodeScalars.allSatisfy(allowed.contains),
-              !target.hasPrefix("-") else {
+        guard RemotePasteTransfer.validTarget(target) else {
             throw RemoteGitCheckpointError.invalidTarget
         }
     }
