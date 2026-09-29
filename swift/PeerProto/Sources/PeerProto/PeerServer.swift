@@ -2993,6 +2993,9 @@ actor PeerServerSession {
                             guard let capture = attachment.resync,
                                   let snapshot = await capture(),
                                   await queue.installSnapshot(snapshot) else {
+                                PeerServerDiagnostics.record(
+                                    "resync-failed surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID))"
+                                )
                                 await queue.abort()
                                 return false
                             }
@@ -3036,6 +3039,9 @@ actor PeerServerSession {
                                   let capture = attachment.resync,
                                   let snapshot = await capture(),
                                   await queue.installSnapshot(snapshot) else {
+                                PeerServerDiagnostics.record(
+                                    "resync-failed surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID))"
+                                )
                                 await queue.abort()
                                 diagnostics.recordAttachmentAbort()
                                 return false
@@ -3076,6 +3082,9 @@ actor PeerServerSession {
                         }
                         guard let snapshot = await capture(),
                               await queue.installSnapshot(snapshot) else {
+                            PeerServerDiagnostics.record(
+                                "resync-failed surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID))"
+                            )
                             await queue.abort()
                             return false
                         }
@@ -3131,6 +3140,9 @@ actor PeerServerSession {
                         }
                         guard let snapshot = await capture(),
                               await queue.installSnapshot(snapshot) else {
+                            PeerServerDiagnostics.record(
+                                "resync-failed surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID))"
+                            )
                             await queue.abort()
                             return false
                         }
@@ -3167,6 +3179,16 @@ actor PeerServerSession {
             }
             if !sendSucceeded && !Task.isCancelled {
                 await detachSurface(id: surfaceID)
+                // A connection left open with nothing attached looks healthy
+                // to the viewer: heartbeats still answer, so it never learns
+                // the output stopped and never reattaches. Closing it turns
+                // the silent freeze into an EOF the viewer recovers from.
+                if attachments.isEmpty {
+                    PeerServerDiagnostics.record(
+                        "transport-close reason=attachment-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID))"
+                    )
+                    await connection.close()
+                }
             }
         }, onCancel: {
             Task { await queue.abort() }
