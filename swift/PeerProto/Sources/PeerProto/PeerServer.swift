@@ -3013,7 +3013,7 @@ actor PeerServerSession {
                                   let snapshot = await capture(),
                                   await queue.installSnapshot(snapshot) else {
                                 PeerServerDiagnostics.record(
-                                    "resync-failed surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID))"
+                                    "resync-failed surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) cancelled=\(Task.isCancelled)"
                                 )
                                 await queue.abort()
                                 return false
@@ -3049,7 +3049,7 @@ actor PeerServerSession {
                                   let snapshot = await capture(),
                                   await queue.installSnapshot(snapshot) else {
                                 PeerServerDiagnostics.record(
-                                    "resync-failed surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID))"
+                                    "resync-failed surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) cancelled=\(Task.isCancelled)"
                                 )
                                 await queue.abort()
                                 diagnostics.recordAttachmentAbort()
@@ -3093,7 +3093,7 @@ actor PeerServerSession {
                         guard let snapshot = await capture(),
                               await queue.installSnapshot(snapshot) else {
                             PeerServerDiagnostics.record(
-                                "resync-failed surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID))"
+                                "resync-failed surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) cancelled=\(Task.isCancelled)"
                             )
                             await queue.abort()
                             return false
@@ -3151,7 +3151,7 @@ actor PeerServerSession {
                         guard let snapshot = await capture(),
                               await queue.installSnapshot(snapshot) else {
                             PeerServerDiagnostics.record(
-                                "resync-failed surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID))"
+                                "resync-failed surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) cancelled=\(Task.isCancelled)"
                             )
                             await queue.abort()
                             return false
