@@ -1462,6 +1462,31 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         await coalescer.cancel()
     }
 
+    /// A GridSnapshot from the host already repainted the gap, so the pending
+    /// settle heal must not open a second connection for it.
+    func testHostResyncCancelsThePendingHeal() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let healed = HealRecorder()
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC5, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            healDebounceMs: 60,
+            healMaxWaitSeconds: 1000,
+            onHeal: { reason, _ in await healed.record(reason) }
+        )
+
+        await coalescer.noteGapForHeal()
+        await coalescer.noteHostResync()
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let reasons = await healed.all()
+        XCTAssertTrue(reasons.isEmpty, "a host resync must cancel the pending heal; got \(reasons)")
+        await coalescer.cancel()
+    }
+
     // MARK: - Orphaned mapping sweep
 
     private func sid(_ byte: UInt8) -> Data { Data([byte]) }
@@ -1746,6 +1771,12 @@ final class PeerRelayReconnectBackoffTests: XCTestCase {
         await PeerRelaySession.waitOutBackoff(seconds: 5, pollSeconds: 0.02) { !replaced }
 
         XCTAssertLessThan(Date().timeIntervalSince(started), 1)
+    }
+
+    func testSettleOutwaitsTheHostSnapshotFloorOnlyWhenTheHostResyncs() {
+        let floorMs = UInt64(PeerOverflowResync.minSnapshotInterval * 1000)
+        XCTAssertGreaterThan(PeerRelaySession.gapHealDebounceMs(hostResyncsOnOverflow: true), floorMs)
+        XCTAssertEqual(PeerRelaySession.gapHealDebounceMs(hostResyncsOnOverflow: false), 400)
     }
 
     func testBackoffRunsItsFullDelayWhileNothingChanges() async {

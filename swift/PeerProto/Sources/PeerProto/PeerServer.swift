@@ -1740,12 +1740,18 @@ enum PeerServerOutboundQueueAdmission: Sendable, Equatable {
     case aborted
 }
 
-enum PeerServerOutboundOverflowPolicy {
+/// Shared by the host's overflow policy and the viewer's gap-heal timing,
+/// which must outwait it.
+public enum PeerOverflowResync {
     /// Floor between two overflow snapshots of one attachment. A flood that
     /// outruns the link overflows again right after every snapshot; closing
     /// the transport there made the viewer reconnect every few hundred
     /// milliseconds, each time behind a fresh handshake and attach.
-    static let minSnapshotInterval: TimeInterval = 0.5
+    public static let minSnapshotInterval: TimeInterval = 0.5
+}
+
+enum PeerServerOutboundOverflowPolicy {
+    static let minSnapshotInterval = PeerOverflowResync.minSnapshotInterval
 
     static func requiresTransportReconnect(
         for admission: PeerServerOutboundQueueAdmission,

@@ -931,6 +931,14 @@ actor RelayResizeCoalescer {
         gapEpisodeStart = nil
     }
 
+    /// The host repainted the pane with a GridSnapshot, so the gaps seen so
+    /// far are already covered; a heal would only reconnect for nothing.
+    func noteHostResync() {
+        healTask?.cancel()
+        healTask = nil
+        endGapEpisode()
+    }
+
     private func performGapHeal(reason: String) async {
         guard !isCancelled else { return }
         guard generationIsCurrent(gapGeneration) else {
@@ -2259,6 +2267,10 @@ final class PeerRelaySession {
     // `resume_from_seq`, so this client gates it explicitly rather than
     // relying on the host silently ignoring an unrecognized field.
     private var hostSupportsReplayRing: Bool
+    // Whether the host advertised `grid.snapshot.v1`: such a host repairs its
+    // own outbound overflow with a GridSnapshot within
+    // `PeerOverflowResync.minSnapshotInterval`.
+    private let hostResyncsOnOverflow: Bool
     private let resumeTransitionGate = RelayResumeTransitionGate()
     /// Scrollback browse state (tmux copy-mode model). Shared with the
     /// pump task, hence a lock box rather than MainActor state.
@@ -2586,6 +2598,7 @@ final class PeerRelaySession {
             onSharedDetach: nil,
             attachInitialSeq: outcome.initialByteSeq,
             hostSupportsReplayRing: connection.hostCapabilities.has(PeerCapability.replayRingV1),
+            hostResyncsOnOverflow: connection.hostCapabilities.has(PeerCapability.gridSnapshotV1),
             ptyDelivery: ptyDelivery
         )
     }
@@ -2750,7 +2763,8 @@ final class PeerRelaySession {
                 await demux?.deregister(surfaceID: surfaceID)
             },
             attachInitialSeq: outcome.initialByteSeq,
-            hostSupportsReplayRing: hostCapabilities.has(PeerCapability.replayRingV1)
+            hostSupportsReplayRing: hostCapabilities.has(PeerCapability.replayRingV1),
+            hostResyncsOnOverflow: hostCapabilities.has(PeerCapability.gridSnapshotV1)
         )
     }
 
@@ -2790,6 +2804,7 @@ final class PeerRelaySession {
         onSharedDetach: (@Sendable () async -> Void)?,
         attachInitialSeq: UInt64,
         hostSupportsReplayRing: Bool,
+        hostResyncsOnOverflow: Bool = false,
         ptyDelivery: PtyDelivery = .relaySocket
     ) {
         self.hostSockPath = hostSockPath
@@ -2807,6 +2822,7 @@ final class PeerRelaySession {
         self.onSharedDetach = onSharedDetach
         self.attachInitialSeq = attachInitialSeq
         self.hostSupportsReplayRing = hostSupportsReplayRing
+        self.hostResyncsOnOverflow = hostResyncsOnOverflow
         self.ptyDelivery = ptyDelivery
         switch ptyDelivery {
         case .relaySocket:
@@ -3208,6 +3224,7 @@ final class PeerRelaySession {
         let resizeCoalescer: RelayResizeCoalescer?
         let gapHealScheduler: RelayGapHealScheduler?
         let noteGapForHeal: @Sendable (UInt64) async -> Void
+        let noteHostResync: @Sendable () async -> Void
         if relay != nil {
             let coalescer = RelayResizeCoalescer(
                 session: session,
@@ -3215,6 +3232,7 @@ final class PeerRelaySession {
                 initialCols: remoteCols,
                 initialRows: remoteRows,
                 authorityEligible: resizeAuthorityEligible,
+                healDebounceMs: Self.gapHealDebounceMs(hostResyncsOnOverflow: hostResyncsOnOverflow),
                 generationIsCurrent: { generation in
                     resumeTransitionGate.currentGeneration() == generation
                 },
@@ -3233,6 +3251,7 @@ final class PeerRelaySession {
             noteGapForHeal = { generation in
                 await coalescer.noteGapForHeal(generation: generation)
             }
+            noteHostResync = { await coalescer.noteHostResync() }
         } else {
             let scheduler = RelayGapHealScheduler(
                 generationIsCurrent: { generation in
@@ -3250,6 +3269,7 @@ final class PeerRelaySession {
             noteGapForHeal = { generation in
                 await scheduler.noteGap(generation: generation)
             }
+            noteHostResync = {}
         }
         // One delivery function for every PtyData exit point, so callback
         // delivery rides the exact live/replay/abort ordering the relay
@@ -3649,6 +3669,7 @@ final class PeerRelaySession {
                         // The host just proved it speaks the grid model —
                         // scrollback browsing may engage from here on.
                         scrollbackBrowse.markHostCapable()
+                        await noteHostResync()
                         // Typed fresh-attach keyframe (grid.snapshot.v1).
                         // ESC[3J first: repeated attaches used to stack one
                         // stale screen per open into the viewer's local
@@ -4274,6 +4295,16 @@ final class PeerRelaySession {
             guard let self else { return false }
             return !self.isTorndown && self.session === failedSession
         }
+    }
+
+    /// A host that repairs its own overflow sends a GridSnapshot at most
+    /// `PeerOverflowResync.minSnapshotInterval` after the drop. Settling
+    /// faster than that raced it: the viewer opened a new connection for a
+    /// gap the host was about to repaint anyway. The margin covers the
+    /// snapshot capture and its trip over the link.
+    static func gapHealDebounceMs(hostResyncsOnOverflow: Bool) -> UInt64 {
+        guard hostResyncsOnOverflow else { return 400 }
+        return UInt64(PeerOverflowResync.minSnapshotInterval * 1000) + 300
     }
 
     static func waitOutBackoff(
