@@ -1431,6 +1431,37 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         await coalescer.cancel()
     }
 
+    /// A flood that pauses just past the base debounce between bursts used to
+    /// heal on every pause, and each heal reconnected into the same flood.
+    /// Backoff doubles the quiet period per heal, so only the first pause and
+    /// the final settle heal.
+    func testSettleBackoffSkipsShortPausesWithinOneFlood() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let healed = HealRecorder()
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC4, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            healDebounceMs: 40,
+            healMaxWaitSeconds: 1000,
+            onHeal: { reason, _ in await healed.record(reason) }
+        )
+
+        for _ in 0..<6 {
+            await coalescer.noteGapForHeal()
+            try await Task.sleep(nanoseconds: 60_000_000)
+        }
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let reasons = await healed.all()
+        XCTAssertGreaterThanOrEqual(reasons.count, 2, "the flood's end must still heal; got \(reasons)")
+        XCTAssertLessThanOrEqual(reasons.count, 3, "pauses inside one flood must back off; got \(reasons)")
+        XCTAssertEqual(reasons.last, "settle")
+        await coalescer.cancel()
+    }
+
     // MARK: - Orphaned mapping sweep
 
     private func sid(_ byte: UInt8) -> Data { Data([byte]) }
@@ -1630,4 +1661,50 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         )
     }
 
+}
+
+final class RelayGapHealPacingTests: XCTestCase {
+    private let start = Date(timeIntervalSinceReferenceDate: 1_000)
+
+    func testEachHealDoublesTheQuietPeriodAndThrottleUpToEightTimes() {
+        var pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 2)
+        XCTAssertEqual(pacing.debounce, 0.4)
+        XCTAssertEqual(pacing.maxWait, 2)
+
+        for step in 1...5 {
+            pacing.noteHeal(at: start.addingTimeInterval(Double(step)))
+        }
+
+        XCTAssertEqual(pacing.level, RelayGapHealPacing.maxLevel)
+        XCTAssertEqual(pacing.debounce, 3.2, accuracy: 1e-9)
+        XCTAssertEqual(pacing.maxWait, 16, accuracy: 1e-9)
+    }
+
+    func testAGapInsideTheResetWindowKeepsTheBackoff() {
+        var pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 2, resetAfter: 20)
+        pacing.noteHeal(at: start)
+        pacing.noteHeal(at: start.addingTimeInterval(1))
+
+        pacing.noteGap(at: start.addingTimeInterval(20.9))
+
+        XCTAssertEqual(pacing.level, 2)
+    }
+
+    func testQuietSinceTheLastHealRestoresTheBasePace() {
+        var pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 2, resetAfter: 20)
+        pacing.noteHeal(at: start)
+        pacing.noteHeal(at: start.addingTimeInterval(1))
+
+        pacing.noteGap(at: start.addingTimeInterval(21))
+
+        XCTAssertEqual(pacing.level, 0)
+        XCTAssertEqual(pacing.debounce, 0.4)
+        XCTAssertEqual(pacing.maxWait, 2)
+    }
+
+    func testTheFirstGapStartsAtTheBasePace() {
+        var pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 2)
+        pacing.noteGap(at: start)
+        XCTAssertEqual(pacing.level, 0)
+    }
 }
