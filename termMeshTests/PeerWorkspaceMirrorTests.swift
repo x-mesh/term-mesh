@@ -1675,7 +1675,7 @@ final class RelayGapHealPacingTests: XCTestCase {
             pacing.noteHeal(at: start.addingTimeInterval(Double(step)))
         }
 
-        XCTAssertEqual(pacing.level, RelayGapHealPacing.maxLevel)
+        XCTAssertEqual(pacing.level, RelayGapHealPacing.terminalMaxLevel)
         XCTAssertEqual(pacing.debounce, 3.2, accuracy: 1e-9)
         XCTAssertEqual(pacing.maxWait, 16, accuracy: 1e-9)
     }
@@ -1700,6 +1700,27 @@ final class RelayGapHealPacingTests: XCTestCase {
         XCTAssertEqual(pacing.level, 0)
         XCTAssertEqual(pacing.debounce, 0.4)
         XCTAssertEqual(pacing.maxWait, 2)
+    }
+
+    func testCallbackPacingNeverBacksOff() {
+        var pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 2, maxLevel: 0)
+        pacing.noteHeal(at: start)
+        pacing.noteHeal(at: start.addingTimeInterval(1))
+
+        XCTAssertEqual(pacing.debounce, 0.4)
+        XCTAssertEqual(pacing.maxWait, 2)
+    }
+
+    func testResetWindowOutlastsTheLongestThrottle() {
+        let pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 5, resetAfter: 20)
+        XCTAssertGreaterThan(pacing.resetAfter, 5 * 8)
+    }
+
+    func testAHealThatCouldNotRunKeepsTheLevel() {
+        var pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 2)
+        pacing.noteHealAttempt(at: start)
+        XCTAssertEqual(pacing.level, 0)
+        XCTAssertEqual(pacing.lastHealAt, start)
     }
 
     func testTheFirstGapStartsAtTheBasePace() {

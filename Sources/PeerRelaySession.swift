@@ -940,11 +940,12 @@ actor RelayResizeCoalescer {
         // Update first so the throttle window advances even when there is no
         // size to heal with yet (avoids a tight retry loop before the first
         // resize/attach establishes one).
-        pacing.noteHeal(at: Date())
+        pacing.noteHealAttempt(at: Date())
         // A resume re-attach still needs a sane size to send as
         // client_cols/client_rows; a 0-sized pane (e.g. a transient 0-col
         // resize from the relay) isn't worth reconnecting for.
         guard let size = lastSize, size.cols > 0, size.rows > 0 else { return }
+        pacing.noteHeal(at: Date())
         #if DEBUG
         dlog("peer.relay.gap.heal reason=\(reason) cols=\(size.cols) rows=\(size.rows)")
         #endif
@@ -958,22 +959,31 @@ actor RelayResizeCoalescer {
 /// the link the new session lags again at once, so healing on the base cadence
 /// only adds load (one incident: eight heals in sixteen seconds of `find .`).
 /// Each heal doubles both the settle quiet period and the throttle interval,
-/// up to 8x; a quiet `resetAfter` since the last heal restores the base pace.
-/// The settle heal is never skipped, only delayed, so the pane still repaints
-/// once the flood ends.
+/// up to `2^maxLevel`; a quiet `resetAfter` since the last heal restores the
+/// base pace. `resetAfter` always exceeds the longest throttle interval, so a
+/// running flood cannot drop back to the base pace mid-flood. The settle heal
+/// is never skipped, only delayed, so the pane still repaints once the flood
+/// ends.
 struct RelayGapHealPacing {
-    static let maxLevel = 3
+    static let terminalMaxLevel = 3
 
     let baseDebounce: TimeInterval
     let baseMaxWait: TimeInterval
+    let maxLevel: Int
     let resetAfter: TimeInterval
     private(set) var level = 0
     private(set) var lastHealAt: Date = .distantPast
 
-    init(baseDebounce: TimeInterval, baseMaxWait: TimeInterval, resetAfter: TimeInterval = 20) {
+    init(
+        baseDebounce: TimeInterval,
+        baseMaxWait: TimeInterval,
+        maxLevel: Int = RelayGapHealPacing.terminalMaxLevel,
+        resetAfter: TimeInterval = 20
+    ) {
         self.baseDebounce = baseDebounce
         self.baseMaxWait = baseMaxWait
-        self.resetAfter = resetAfter
+        self.maxLevel = maxLevel
+        self.resetAfter = max(resetAfter, baseMaxWait * Double(1 << maxLevel) * 1.25)
     }
 
     var debounce: TimeInterval { baseDebounce * scale }
@@ -985,9 +995,13 @@ struct RelayGapHealPacing {
         if now.timeIntervalSince(lastHealAt) >= resetAfter { level = 0 }
     }
 
+    mutating func noteHealAttempt(at now: Date) {
+        lastHealAt = now
+    }
+
     mutating func noteHeal(at now: Date) {
         lastHealAt = now
-        level = min(level + 1, Self.maxLevel)
+        level = min(level + 1, maxLevel)
     }
 }
 
@@ -1022,9 +1036,14 @@ actor RelayGapHealScheduler {
         generationIsCurrent: @escaping @Sendable (UInt64) -> Bool = { _ in true },
         onHeal: @escaping @Sendable (String, UInt64) async -> Void
     ) {
+        // No backoff here: a callback pane buffers its post-gap stream in a
+        // bounded capture until the heal adopts it, so a longer wait both
+        // blanks the agent and lets the capture overflow, losing the gap for
+        // good.
         self.pacing = RelayGapHealPacing(
             baseDebounce: TimeInterval(healDebounceMs) / 1000.0,
-            baseMaxWait: healMaxWaitSeconds
+            baseMaxWait: healMaxWaitSeconds,
+            maxLevel: 0
         )
         self.generationIsCurrent = generationIsCurrent
         self.onHeal = onHeal
