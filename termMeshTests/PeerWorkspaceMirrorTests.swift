@@ -1015,6 +1015,19 @@ final class PeerTerminalReplayBufferTests: XCTestCase {
         XCTAssertEqual(bounded.filteredEnd(forRawEnd: 1_025), 1_025)
     }
 
+    /// One raw-drain overflow used to invalidate the store for the pane's
+    /// lifetime, so every later overflow snapshot timed out.
+    func testRawToFilteredCheckpointResumesAfterADiscontinuity() {
+        var checkpoints = RawToFilteredCheckpointStore()
+        checkpoints.append(rawEnd: 10, rawByteCount: 0, filteredEnd: 0)
+        checkpoints.append(rawEnd: 15, rawByteCount: 4, filteredEnd: 4)
+        checkpoints.append(rawEnd: 20, rawByteCount: 5, filteredEnd: 9)
+
+        XCTAssertNil(checkpoints.filteredEnd(forRawEnd: 10))
+        XCTAssertNil(checkpoints.filteredEnd(forRawEnd: 15))
+        XCTAssertEqual(checkpoints.filteredEnd(forRawEnd: 20), 9)
+    }
+
     func testRawToFilteredCheckpointRejectsDuplicateWrappedBoundary() {
         var checkpoints = RawToFilteredCheckpointStore()
         checkpoints.append(rawEnd: UInt64.max, rawByteCount: 0, filteredEnd: 0)
@@ -1065,10 +1078,36 @@ final class PeerTerminalReplayBufferTests: XCTestCase {
         XCTAssertEqual(buffer.take()?.bytes, Data("ok".utf8))
     }
 
+    /// A resync capture lands on a raw callback boundary. While one is in
+    /// flight every append must stay a separate event, or the boundary sits
+    /// inside one merged chunk and can never be mapped.
+    func testRawOutputDrainBufferKeepsEveryBoundaryWhileTracking() {
+        var buffer = RawOutputDrainBuffer()
+        XCTAssertTrue(appendRawOutput("ab", rawEnd: 2, into: &buffer))
+        XCTAssertTrue(appendRawOutput("cd", rawEnd: 4, recordBoundary: true, into: &buffer))
+        XCTAssertTrue(appendRawOutput("ef", rawEnd: 6, recordBoundary: true, into: &buffer))
+
+        let batch = buffer.take()
+
+        XCTAssertEqual(batch?.events.map(\.rawEnd), [2, 4, 6])
+        XCTAssertEqual(batch?.events.map(\.byteCount), [2, 2, 2])
+    }
+
+    func testRawToFilteredCheckpointReportsTheFrontier() {
+        var checkpoints = RawToFilteredCheckpointStore()
+        XCTAssertNil(checkpoints.latestRawEnd)
+        checkpoints.append(rawEnd: 0, rawByteCount: 0, filteredEnd: 0)
+        checkpoints.append(rawEnd: 8, rawByteCount: 8, filteredEnd: 8)
+
+        XCTAssertEqual(checkpoints.latestRawEnd, 8)
+        XCTAssertNil(checkpoints.filteredEnd(forRawEnd: 4), "a boundary inside a merged chunk stays unmapped")
+    }
+
     private func appendRawOutput(
         _ text: String,
         rawEnd: UInt64,
         callback: PtyTapCallback? = nil,
+        recordBoundary: Bool = false,
         into buffer: inout RawOutputDrainBuffer
     ) -> Bool {
         let data = Data(text.utf8)
@@ -1077,7 +1116,8 @@ final class PeerTerminalReplayBufferTests: XCTestCase {
                 bytes.bindMemory(to: UInt8.self).baseAddress!,
                 count: bytes.count,
                 rawEnd: rawEnd,
-                callback: callback
+                callback: callback,
+                recordBoundary: recordBoundary
             )
         }
     }
@@ -1431,6 +1471,62 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         await coalescer.cancel()
     }
 
+    /// A flood that pauses just past the base debounce between bursts used to
+    /// heal on every pause, and each heal reconnected into the same flood.
+    /// Backoff doubles the quiet period per heal, so only the first pause and
+    /// the final settle heal.
+    func testSettleBackoffSkipsShortPausesWithinOneFlood() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let healed = HealRecorder()
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC4, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            healDebounceMs: 40,
+            healMaxWaitSeconds: 1000,
+            onHeal: { reason, _ in await healed.record(reason) }
+        )
+
+        for _ in 0..<6 {
+            await coalescer.noteGapForHeal()
+            try await Task.sleep(nanoseconds: 60_000_000)
+        }
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        let reasons = await healed.all()
+        XCTAssertGreaterThanOrEqual(reasons.count, 2, "the flood's end must still heal; got \(reasons)")
+        XCTAssertLessThanOrEqual(reasons.count, 3, "pauses inside one flood must back off; got \(reasons)")
+        XCTAssertEqual(reasons.last, "settle")
+        await coalescer.cancel()
+    }
+
+    /// A GridSnapshot from the host already repainted the gap, so the pending
+    /// settle heal must not open a second connection for it.
+    func testHostResyncCancelsThePendingHeal() async throws {
+        let collector = ResizeColsCollector()
+        let session = makeSession(collector)
+        let healed = HealRecorder()
+        let coalescer = RelayResizeCoalescer(
+            session: session,
+            surfaceID: Data(repeating: 0xC5, count: 16),
+            initialCols: 80,
+            initialRows: 24,
+            healDebounceMs: 60,
+            healMaxWaitSeconds: 1000,
+            onHeal: { reason, _ in await healed.record(reason) }
+        )
+
+        await coalescer.noteGapForHeal()
+        await coalescer.noteHostResync()
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        let reasons = await healed.all()
+        XCTAssertTrue(reasons.isEmpty, "a host resync must cancel the pending heal; got \(reasons)")
+        await coalescer.cancel()
+    }
+
     // MARK: - Orphaned mapping sweep
 
     private func sid(_ byte: UInt8) -> Data { Data([byte]) }
@@ -1630,4 +1726,112 @@ final class RelayResizeCoalescerHealTests: XCTestCase {
         )
     }
 
+}
+
+final class RelayGapHealPacingTests: XCTestCase {
+    private let start = Date(timeIntervalSinceReferenceDate: 1_000)
+
+    func testEachHealDoublesTheQuietPeriodAndThrottleUpToEightTimes() {
+        var pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 2)
+        XCTAssertEqual(pacing.debounce, 0.4)
+        XCTAssertEqual(pacing.maxWait, 2)
+
+        for step in 1...5 {
+            pacing.noteHeal(at: start.addingTimeInterval(Double(step)))
+        }
+
+        XCTAssertEqual(pacing.level, RelayGapHealPacing.terminalMaxLevel)
+        XCTAssertEqual(pacing.debounce, 3.2, accuracy: 1e-9)
+        XCTAssertEqual(pacing.maxWait, 16, accuracy: 1e-9)
+    }
+
+    func testAGapInsideTheResetWindowKeepsTheBackoff() {
+        var pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 2, resetAfter: 20)
+        pacing.noteHeal(at: start)
+        pacing.noteHeal(at: start.addingTimeInterval(1))
+
+        pacing.noteGap(at: start.addingTimeInterval(20.9))
+
+        XCTAssertEqual(pacing.level, 2)
+    }
+
+    func testQuietSinceTheLastHealRestoresTheBasePace() {
+        var pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 2, resetAfter: 20)
+        pacing.noteHeal(at: start)
+        pacing.noteHeal(at: start.addingTimeInterval(1))
+
+        pacing.noteGap(at: start.addingTimeInterval(21))
+
+        XCTAssertEqual(pacing.level, 0)
+        XCTAssertEqual(pacing.debounce, 0.4)
+        XCTAssertEqual(pacing.maxWait, 2)
+    }
+
+    func testCallbackPacingNeverBacksOff() {
+        var pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 2, maxLevel: 0)
+        pacing.noteHeal(at: start)
+        pacing.noteHeal(at: start.addingTimeInterval(1))
+
+        XCTAssertEqual(pacing.debounce, 0.4)
+        XCTAssertEqual(pacing.maxWait, 2)
+    }
+
+    func testResetWindowOutlastsTheLongestThrottle() {
+        let pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 5, resetAfter: 20)
+        XCTAssertGreaterThan(pacing.resetAfter, 5 * 8)
+    }
+
+    func testAHealThatCouldNotRunKeepsTheLevel() {
+        var pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 2)
+        pacing.noteHealAttempt(at: start)
+        XCTAssertEqual(pacing.level, 0)
+        XCTAssertEqual(pacing.lastHealAt, start)
+    }
+
+    func testTheFirstGapStartsAtTheBasePace() {
+        var pacing = RelayGapHealPacing(baseDebounce: 0.4, baseMaxWait: 2)
+        pacing.noteGap(at: start)
+        XCTAssertEqual(pacing.level, 0)
+    }
+}
+
+@MainActor
+final class PeerRelayReconnectBackoffTests: XCTestCase {
+    /// A heal that replaces the session mid-backoff must end the wait at once;
+    /// sleeping out a 16 s backoff left the replacement unread until the host
+    /// dropped it.
+    func testBackoffEndsAsSoonAsTheSessionIsReplaced() async {
+        var replaced = false
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            replaced = true
+        }
+        let started = Date()
+
+        await PeerRelaySession.waitOutBackoff(seconds: 5, pollSeconds: 0.02) { !replaced }
+
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1)
+    }
+
+    func testSettleOutwaitsTheHostSnapshotFloorOnlyWhenTheHostResyncs() {
+        let floorMs = UInt64(PeerOverflowResync.minSnapshotInterval * 1000)
+        XCTAssertGreaterThan(PeerRelaySession.gapHealDebounceMs(hostResyncsOnOverflow: true), floorMs)
+        XCTAssertEqual(PeerRelaySession.gapHealDebounceMs(hostResyncsOnOverflow: false), 400)
+    }
+
+    /// A sick host that attaches, sends its snapshot and drops must keep
+    /// backing off; only a session that lasted may reset the circuit.
+    func testOnlyASessionThatSurvivedRecoversTheCircuit() {
+        XCTAssertFalse(PeerRelaySession.failedSessionEarnedRecovery(adoptedAt: 100, failedAt: 100.5))
+        XCTAssertFalse(PeerRelaySession.failedSessionEarnedRecovery(adoptedAt: 100, failedAt: 109.9))
+        XCTAssertTrue(PeerRelaySession.failedSessionEarnedRecovery(adoptedAt: 100, failedAt: 110))
+    }
+
+    func testBackoffRunsItsFullDelayWhileNothingChanges() async {
+        let started = Date()
+
+        await PeerRelaySession.waitOutBackoff(seconds: 0.2, pollSeconds: 0.02) { true }
+
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.19)
+    }
 }

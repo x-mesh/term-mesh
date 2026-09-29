@@ -977,9 +977,72 @@ final class PeerServerTests: XCTestCase {
         let captureCount = await provider.captureCount()
         XCTAssertEqual(captureCount, 2)
 
-        try await session.sendGoodbye(reason: "gap resync done")
+        // The host closes a connection once its only stream has ended.
+        try? await session.sendGoodbye(reason: "gap resync done")
         await transport.close()
         await server.stop()
+    }
+
+    /// A connection left open after its only stream ended still answered
+    /// heartbeats, so the viewer showed a live pane that never updated again.
+    func testConnectionWhoseOnlyStreamEndedCloses() async throws {
+        let sockPath = "/tmp/tm-peer-ended-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let provider = GapResyncTestProvider()
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+        _ = try await session.attachSurface(id: await provider.surfaceID, cols: 80, rows: 24)
+        await provider.finish()
+
+        let closed = await Task {
+            for _ in 0..<50 {
+                do { _ = try await session.receiveNextMessage() } catch { return true }
+            }
+            return false
+        }.value
+        XCTAssertTrue(closed, "the viewer must see the connection end")
+        await transport.close()
+    }
+
+    /// The same connection may carry the workspace roster; one pane's stream
+    /// ending must not take the roster down with it.
+    func testSubscribedConnectionOutlivesItsEndedStream() async throws {
+        let sockPath = "/tmp/tm-peer-ended-sub-\(UUID().uuidString.prefix(8)).sock"
+        defer { try? FileManager.default.removeItem(atPath: sockPath) }
+        let provider = GapResyncTestProvider()
+        let server = PeerServer(socketPath: sockPath, provider: provider)
+        try await server.start()
+        defer { Task { await server.stop() } }
+
+        let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+        let session = PeerSession(transport: transport)
+        _ = try await session.handshake()
+        try await session.subscribeWorkspaceList()
+        _ = try await session.attachSurface(id: await provider.surfaceID, cols: 80, rows: 24)
+        await provider.finish()
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        var workspace = Termmesh_Peer_V1_Workspace()
+        workspace.workspaceID = Data(repeating: 0xC5, count: 16)
+        workspace.title = "Still Here"
+        await server.broadcastWorkspaceListChanged([workspace])
+        let roster = try await Task { () -> [String]? in
+            for _ in 0..<20 {
+                if case .workspaceListChanged(let list) = try await session.receiveNextMessage(),
+                   !list.isEmpty {
+                    return list.map(\.title)
+                }
+            }
+            return nil
+        }.value
+        XCTAssertEqual(roster, ["Still Here"])
+        try? await session.sendGoodbye(reason: "done")
+        await transport.close()
     }
 
     /// End-to-end: real `PeerServer` dispatch of
@@ -1706,6 +1769,35 @@ final class PeerServerTests: XCTestCase {
     /// used from a host that has no teams yet, so gating it on having one was
     /// a deadlock — no capability, so no leader; no leader, so never a team.
     /// Observed as a project that never finished creating on an empty peer.
+    /// A viewer holds back its own gap heal only for a host that repairs its
+    /// overflow, and that takes a provider able to capture an atomic resync.
+    func testOverflowResyncIsAdvertisedOnlyWithAtomicResync() async throws {
+        for (provider, expected) in [
+            (GapResyncTestProvider() as PeerSurfaceProvider, true),
+            (TeamRosterProvider(teams: []) as PeerSurfaceProvider, false),
+        ] {
+            let sockPath = "/tmp/tm-peer-swift-ovr-\(UUID().uuidString.prefix(8)).sock"
+            defer { try? FileManager.default.removeItem(atPath: sockPath) }
+            let server = PeerServer(socketPath: sockPath, provider: provider)
+            try await server.start()
+            let deadline = Date().addingTimeInterval(2)
+            while !FileManager.default.fileExists(atPath: sockPath) {
+                if Date() > deadline { return XCTFail("no socket") }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            let transport = try await UnixSocketTransport.connect(socketPath: sockPath)
+            let session = PeerSession(
+                read: { try await transport.read() },
+                write: { try await transport.write($0) }
+            )
+            let hello = try await session.handshake()
+            XCTAssertEqual(hello.hasHostCapability(PeerCapability.overflowResyncV1), expected)
+            XCTAssertEqual(hello.hasHostCapability(PeerCapability.gridSnapshotV1), expected)
+            await transport.close()
+            await server.stop()
+        }
+    }
+
     func testHostWithoutTeamsAdvertisesTeamCapabilities() async throws {
         let sockPath = "/tmp/tm-peer-swift-noteams-\(UUID().uuidString.prefix(8)).sock"
         defer { try? FileManager.default.removeItem(atPath: sockPath) }

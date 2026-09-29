@@ -168,7 +168,6 @@ struct RawToFilteredCheckpointStore {
     private var nextIndex = 0
     private var count = 0
     private var lastRawEnd: UInt64?
-    private var isValid = true
 
     init() {
         positions = [:]
@@ -176,27 +175,14 @@ struct RawToFilteredCheckpointStore {
     }
 
     mutating func append(rawEnd: UInt64, rawByteCount: Int, filteredEnd: UInt64) {
-        guard isValid else { return }
         let rawStart = rawEnd &- UInt64(rawByteCount)
-        if let lastRawEnd {
-            guard lastRawEnd == rawStart else {
-                isValid = false
-                positions.removeAll(keepingCapacity: true)
-                checkpoints = Array(repeating: nil, count: Self.capacity)
-                nextIndex = 0
-                count = 0
-                return
-            }
-        } else if rawByteCount != 0 {
-            isValid = false
+        let continuous = lastRawEnd.map { $0 == rawStart } ?? (rawByteCount == 0)
+        guard continuous else {
+            restart(at: rawEnd)
             return
         }
         guard positions[rawEnd] == nil else {
-            isValid = false
-            positions.removeAll(keepingCapacity: true)
-            checkpoints = Array(repeating: nil, count: Self.capacity)
-            nextIndex = 0
-            count = 0
+            restart(at: rawEnd)
             return
         }
         self.lastRawEnd = rawEnd
@@ -210,8 +196,22 @@ struct RawToFilteredCheckpointStore {
         nextIndex = (nextIndex + 1) % Self.capacity
     }
 
+    /// Forgets every boundary and resumes mapping from the next contiguous
+    /// one. The boundary that broke continuity is never recorded, so a
+    /// resync still cannot land on it. Staying invalid forever instead left
+    /// every later atomic resync of the pane to time out after 12 s: one
+    /// raw-drain overflow in a flood disabled overflow snapshots for good.
+    private mutating func restart(at rawEnd: UInt64) {
+        positions.removeAll(keepingCapacity: true)
+        checkpoints = Array(repeating: nil, count: Self.capacity)
+        nextIndex = 0
+        count = 0
+        lastRawEnd = rawEnd
+    }
+
+    var latestRawEnd: UInt64? { lastRawEnd }
+
     func filteredEnd(forRawEnd rawEnd: UInt64) -> UInt64? {
-        guard isValid else { return nil }
         guard let index = positions[rawEnd], let checkpoint = checkpoints[index],
               checkpoint.rawEnd == rawEnd else { return nil }
         return checkpoint.filteredEnd
@@ -243,23 +243,27 @@ struct RawOutputDrainBuffer {
         bytes.reserveCapacity(64 * 1024)
     }
 
+    /// `recordBoundary` keeps this append's end as its own event even
+    /// without a callback, so the drain records a raw-to-filtered checkpoint
+    /// there instead of only at the end of the merged batch.
     mutating func append(
         _ source: UnsafePointer<UInt8>,
         count: Int,
         rawEnd: UInt64,
-        callback: PtyTapCallback? = nil
+        callback: PtyTapCallback? = nil,
+        recordBoundary: Bool = false
     ) -> Bool {
         guard count <= Self.byteLimit - bytes.count else { return false }
         let previousByteCount = bytes.count
         bytes.append(source, count: count)
         self.rawEnd = rawEnd
-        if let callback {
+        if callback != nil || recordBoundary {
             if coveredByteCount < previousByteCount {
                 events.append(
                     RawOutputDrainEvent(
                         callback: nil,
                         byteCount: previousByteCount - coveredByteCount,
-                        rawEnd: lastAppendedRawEnd ?? callback.boundary &- UInt64(count)
+                        rawEnd: lastAppendedRawEnd ?? rawEnd &- UInt64(count)
                     )
                 )
                 coveredByteCount = previousByteCount
@@ -268,7 +272,7 @@ struct RawOutputDrainBuffer {
                 RawOutputDrainEvent(
                     callback: callback,
                     byteCount: count,
-                    rawEnd: callback.boundary
+                    rawEnd: rawEnd
                 )
             )
             coveredByteCount += count
@@ -515,6 +519,10 @@ final class PtyTapHub: @unchecked Sendable {
     private var rawDrainOverflowed = false
     private var rawDrainClosed = false
     private var latestRawOutputBoundary: UInt64 = 0
+    /// Resync captures in progress. While any is, every raw append gets its
+    /// own checkpoint: a capture lands on a raw callback boundary, and a
+    /// boundary buried inside a merged 2 ms batch can never be mapped.
+    private var resyncBoundaryTrackers = 0
     /// Guarded by `rawDrainLock` so the raw-output callback reads it inside
     /// the critical section it already holds: measurement costs one branch
     /// per callback while off, not a second lock.
@@ -821,7 +829,8 @@ final class PtyTapHub: @unchecked Sendable {
                     boundary: rawEnd,
                     atNs: DispatchTime.now().uptimeNanoseconds
                 )
-                : nil
+                : nil,
+            recordBoundary: resyncBoundaryTrackers > 0
         ) {
             rawDrainOverflowed = true
         }
@@ -958,28 +967,62 @@ final class PtyTapHub: @unchecked Sendable {
         lock.unlock()
     }
 
-    func filteredSequence(forRawEnd rawEnd: UInt64) -> UInt64? {
+    enum CheckpointState {
+        case mapped(UInt64)
+        case pending
+        case skipped
+    }
+
+    func checkpointState(forRawEnd rawEnd: UInt64) -> CheckpointState {
         lock.lock()
-        let filteredEnd = rawToFilteredCheckpoints.filteredEnd(forRawEnd: rawEnd)
-        lock.unlock()
-        return filteredEnd
+        defer { lock.unlock() }
+        if let filteredEnd = rawToFilteredCheckpoints.filteredEnd(forRawEnd: rawEnd) {
+            return .mapped(filteredEnd)
+        }
+        guard let frontier = rawToFilteredCheckpoints.latestRawEnd, frontier >= rawEnd else {
+            return .pending
+        }
+        return .skipped
+    }
+
+    private func setResyncBoundaryTracking(_ on: Bool) {
+        rawDrainLock.lock()
+        resyncBoundaryTrackers += on ? 1 : -1
+        rawDrainLock.unlock()
     }
 
     func atomicResyncSnapshot(surface: ghostty_surface_t) async -> PeerSurfaceResync? {
         let retryPeriod: UInt64 = 5_000_000
         let deadline = ProcessInfo.processInfo.systemUptime + 12
-        let snapshot = await MainActor.run {
-            readPaneSnapshotWithRawOutputSequence(surface)
-        }
-        guard let snapshot else { return nil }
+        setResyncBoundaryTracking(true)
+        defer { setResyncBoundaryTracking(false) }
         while ProcessInfo.processInfo.systemUptime < deadline {
-            if let boundary = filteredSequence(forRawEnd: snapshot.rawEnd) {
-                return PeerSurfaceResync(ansi: snapshot.bytes, hostByteSeq: boundary)
+            let snapshot = await MainActor.run {
+                readPaneSnapshotWithRawOutputSequence(surface)
             }
-            do {
-                try await Task.sleep(nanoseconds: retryPeriod)
-            } catch {
-                return nil
+            guard let snapshot else { return nil }
+            // Wait for the drain to map this capture. Once the drain has
+            // moved past it without a checkpoint it never will be — it fell
+            // inside a batch merged before tracking began, on the boundary a
+            // checkpoint restart skips, or out of the store's window — so
+            // capture again. The pause keeps a stalled boundary from turning
+            // into back-to-back grid reads on the main actor.
+            while ProcessInfo.processInfo.systemUptime < deadline {
+                if case .mapped(let boundary) = checkpointState(forRawEnd: snapshot.rawEnd) {
+                    return PeerSurfaceResync(ansi: snapshot.bytes, hostByteSeq: boundary)
+                }
+                let skipped: Bool
+                if case .skipped = checkpointState(forRawEnd: snapshot.rawEnd) {
+                    skipped = true
+                } else {
+                    skipped = false
+                }
+                do {
+                    try await Task.sleep(nanoseconds: retryPeriod)
+                } catch {
+                    return nil
+                }
+                if skipped { break }
             }
         }
         return nil

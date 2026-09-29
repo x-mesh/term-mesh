@@ -641,19 +641,16 @@ actor RelayResizeCoalescer {
     /// chunks/sec — per-gap Task churn is exactly what this path exists to
     /// survive).
     private var healTask: Task<Void, Never>?
-    private let healDebounceSeconds: TimeInterval
     /// Timestamp of the most recent gap — the trailing debounce fires once this
-    /// is `healDebounceSeconds` in the past (drops have settled).
+    /// is `pacing.debounce` in the past (drops have settled).
     private var lastGapAt: Date = .distantPast
     /// Start of the current gap episode (nil = no active drops). Gates the
     /// throttle so a short burst heals only via the trailing debounce.
     private var gapEpisodeStart: Date?
-    /// Last time a heal actually ran. Bounds the throttle to one heal per
-    /// `healMaxWait` so a long CONTINUOUS-drop flood (slow network, no lull for
-    /// the trailing debounce to ever fire) still gets periodic redraws instead
-    /// of staying corrupt until the very end.
-    private var lastHealAt: Date = .distantPast
-    private let healMaxWait: TimeInterval
+    /// Bounds the throttle so a long CONTINUOUS-drop flood (slow network, no
+    /// lull for the trailing debounce to ever fire) still gets periodic
+    /// redraws, and backs both paths off while one flood keeps re-lagging.
+    private var pacing: RelayGapHealPacing
 
     init(
         session: PeerSession,
@@ -671,8 +668,10 @@ actor RelayResizeCoalescer {
         self.surfaceID = surfaceID
         self.delayNs = delayMs * 1_000_000
         self.authorityEligible = authorityEligible
-        self.healDebounceSeconds = TimeInterval(healDebounceMs) / 1000.0
-        self.healMaxWait = healMaxWaitSeconds
+        self.pacing = RelayGapHealPacing(
+            baseDebounce: TimeInterval(healDebounceMs) / 1000.0,
+            baseMaxWait: healMaxWaitSeconds
+        )
         self.generationIsCurrent = generationIsCurrent
         self.onHeal = onHeal
         // Seed so a gap heal always has a size to nudge, even before the
@@ -890,15 +889,16 @@ actor RelayResizeCoalescer {
         gapGeneration = generation
         let now = Date()
         lastGapAt = now
+        pacing.noteGap(at: now)
         if gapEpisodeStart == nil { gapEpisodeStart = now }
-        // Throttle path: once an episode has run past `healMaxWait`, heal at
-        // most once per `healMaxWait` even while drops keep streaming. A slow-
+        // Throttle path: once an episode has run past `pacing.maxWait`, heal at
+        // most once per `pacing.maxWait` even while drops keep streaming. A slow-
         // network flood produces continuous gaps with no lull, so the trailing
         // debounce below never fires until the very end — this guarantees
         // periodic redraws throughout instead of a single (or missed) one.
         if let episodeStart = gapEpisodeStart,
-           now.timeIntervalSince(episodeStart) >= healMaxWait,
-           now.timeIntervalSince(lastHealAt) >= healMaxWait {
+           now.timeIntervalSince(episodeStart) >= pacing.maxWait,
+           now.timeIntervalSince(pacing.lastHealAt) >= pacing.maxWait {
             Task { [weak self] in await self?.performGapHeal(reason: "throttle") }
         }
         // Trailing-debounce path: start exactly ONE task per episode; it
@@ -912,13 +912,12 @@ actor RelayResizeCoalescer {
 
     private func runTrailingDebounce() async {
         while true {
-            let remaining = healDebounceSeconds - Date().timeIntervalSince(lastGapAt)
+            let remaining = pacing.debounce - Date().timeIntervalSince(lastGapAt)
             guard remaining > 0 else { break }
             try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
-            if Task.isCancelled {
-                healTask = nil
-                return
-            }
+            // Whoever cancelled this task already cleared or replaced
+            // `healTask`; clearing it here could orphan a newer one.
+            if Task.isCancelled { return }
         }
         // Clear before healing so a gap arriving during the async heal starts a
         // fresh debounce task instead of being dropped.
@@ -931,6 +930,14 @@ actor RelayResizeCoalescer {
         gapEpisodeStart = nil
     }
 
+    /// The host repainted the pane with a GridSnapshot, so the gaps seen so
+    /// far are already covered; a heal would only reconnect for nothing.
+    func noteHostResync() {
+        healTask?.cancel()
+        healTask = nil
+        endGapEpisode()
+    }
+
     private func performGapHeal(reason: String) async {
         guard !isCancelled else { return }
         guard generationIsCurrent(gapGeneration) else {
@@ -940,15 +947,68 @@ actor RelayResizeCoalescer {
         // Update first so the throttle window advances even when there is no
         // size to heal with yet (avoids a tight retry loop before the first
         // resize/attach establishes one).
-        lastHealAt = Date()
+        pacing.noteHealAttempt(at: Date())
         // A resume re-attach still needs a sane size to send as
         // client_cols/client_rows; a 0-sized pane (e.g. a transient 0-col
         // resize from the relay) isn't worth reconnecting for.
         guard let size = lastSize, size.cols > 0, size.rows > 0 else { return }
+        pacing.noteHeal(at: Date())
         #if DEBUG
         dlog("peer.relay.gap.heal reason=\(reason) cols=\(size.cols) rows=\(size.rows)")
         #endif
         await onHeal(reason, gapGeneration)
+    }
+}
+
+/// Heal spacing for one pane's gap episodes.
+///
+/// A heal is a fresh connection plus attach, and during a flood that outruns
+/// the link the new session lags again at once, so healing on the base cadence
+/// only adds load (one incident: eight heals in sixteen seconds of `find .`).
+/// Each heal doubles both the settle quiet period and the throttle interval,
+/// up to `2^maxLevel`; a quiet `resetAfter` since the last heal restores the
+/// base pace. `resetAfter` always exceeds the longest throttle interval, so a
+/// running flood cannot drop back to the base pace mid-flood. The settle heal
+/// is never skipped, only delayed, so the pane still repaints once the flood
+/// ends.
+struct RelayGapHealPacing {
+    static let terminalMaxLevel = 3
+
+    let baseDebounce: TimeInterval
+    let baseMaxWait: TimeInterval
+    let maxLevel: Int
+    let resetAfter: TimeInterval
+    private(set) var level = 0
+    private(set) var lastHealAt: Date = .distantPast
+
+    init(
+        baseDebounce: TimeInterval,
+        baseMaxWait: TimeInterval,
+        maxLevel: Int = RelayGapHealPacing.terminalMaxLevel,
+        resetAfter: TimeInterval = 20
+    ) {
+        self.baseDebounce = baseDebounce
+        self.baseMaxWait = baseMaxWait
+        self.maxLevel = maxLevel
+        self.resetAfter = max(resetAfter, baseMaxWait * Double(1 << maxLevel) * 1.25)
+    }
+
+    var debounce: TimeInterval { baseDebounce * scale }
+    var maxWait: TimeInterval { baseMaxWait * scale }
+
+    private var scale: Double { Double(1 << level) }
+
+    mutating func noteGap(at now: Date) {
+        if now.timeIntervalSince(lastHealAt) >= resetAfter { level = 0 }
+    }
+
+    mutating func noteHealAttempt(at now: Date) {
+        lastHealAt = now
+    }
+
+    mutating func noteHeal(at now: Date) {
+        lastHealAt = now
+        level = min(level + 1, maxLevel)
     }
 }
 
@@ -965,8 +1025,7 @@ actor RelayResizeCoalescer {
 /// No size guard: an NDJSON stream has no geometry, and `performResumeHeal`
 /// already falls back to the attach-time size for client_cols/client_rows.
 actor RelayGapHealScheduler {
-    private let healDebounceSeconds: TimeInterval
-    private let healMaxWait: TimeInterval
+    private var pacing: RelayGapHealPacing
     private let onHeal: @Sendable (String, UInt64) async -> Void
     private let generationIsCurrent: @Sendable (UInt64) -> Bool
     private var gapGeneration: UInt64 = 0
@@ -977,7 +1036,6 @@ actor RelayGapHealScheduler {
     private var healTask: Task<Void, Never>?
     private var lastGapAt: Date = .distantPast
     private var gapEpisodeStart: Date?
-    private var lastHealAt: Date = .distantPast
 
     init(
         healDebounceMs: UInt64 = 400,
@@ -985,8 +1043,15 @@ actor RelayGapHealScheduler {
         generationIsCurrent: @escaping @Sendable (UInt64) -> Bool = { _ in true },
         onHeal: @escaping @Sendable (String, UInt64) async -> Void
     ) {
-        self.healDebounceSeconds = TimeInterval(healDebounceMs) / 1000.0
-        self.healMaxWait = healMaxWaitSeconds
+        // No backoff here: a callback pane buffers its post-gap stream in a
+        // bounded capture until the heal adopts it, so a longer wait both
+        // blanks the agent and lets the capture overflow, losing the gap for
+        // good.
+        self.pacing = RelayGapHealPacing(
+            baseDebounce: TimeInterval(healDebounceMs) / 1000.0,
+            baseMaxWait: healMaxWaitSeconds,
+            maxLevel: 0
+        )
         self.generationIsCurrent = generationIsCurrent
         self.onHeal = onHeal
     }
@@ -995,10 +1060,11 @@ actor RelayGapHealScheduler {
         gapGeneration = generation
         let now = Date()
         lastGapAt = now
+        pacing.noteGap(at: now)
         if gapEpisodeStart == nil { gapEpisodeStart = now }
         if let episodeStart = gapEpisodeStart,
-           now.timeIntervalSince(episodeStart) >= healMaxWait,
-           now.timeIntervalSince(lastHealAt) >= healMaxWait {
+           now.timeIntervalSince(episodeStart) >= pacing.maxWait,
+           now.timeIntervalSince(pacing.lastHealAt) >= pacing.maxWait {
             Task { [weak self] in await self?.performHeal(reason: "throttle") }
         }
         if healTask == nil {
@@ -1014,13 +1080,12 @@ actor RelayGapHealScheduler {
 
     private func runTrailingDebounce() async {
         while true {
-            let remaining = healDebounceSeconds - Date().timeIntervalSince(lastGapAt)
+            let remaining = pacing.debounce - Date().timeIntervalSince(lastGapAt)
             guard remaining > 0 else { break }
             try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
-            if Task.isCancelled {
-                healTask = nil
-                return
-            }
+            // Whoever cancelled this task already cleared or replaced
+            // `healTask`; clearing it here could orphan a newer one.
+            if Task.isCancelled { return }
         }
         // Clear before healing so a gap arriving during the async heal
         // starts a fresh debounce instead of being dropped.
@@ -1034,7 +1099,7 @@ actor RelayGapHealScheduler {
             gapEpisodeStart = nil
             return
         }
-        lastHealAt = Date()
+        pacing.noteHeal(at: Date())
         #if DEBUG
         dlog("peer.relay.gap.heal reason=\(reason) delivery=callback")
         #endif
@@ -2200,6 +2265,14 @@ final class PeerRelaySession {
     // `resume_from_seq`, so this client gates it explicitly rather than
     // relying on the host silently ignoring an unrecognized field.
     private var hostSupportsReplayRing: Bool
+    // Whether the host advertised `overflow.resync.v1` on a session this pane
+    // owns (whose handshake took `grid.snapshot.v1`): only then does the host
+    // repaint its own overflow and close when it cannot.
+    private let hostResyncsOnOverflow: Bool
+    /// When the current session was adopted. A session that survived
+    /// `reconnectRecoverySurvivalSeconds` before failing recovers the
+    /// circuit; one dropped sooner keeps backing off.
+    private var sessionAdoptedAtUptime = ProcessInfo.processInfo.systemUptime
     private let resumeTransitionGate = RelayResumeTransitionGate()
     /// Scrollback browse state (tmux copy-mode model). Shared with the
     /// pump task, hence a lock box rather than MainActor state.
@@ -2527,6 +2600,7 @@ final class PeerRelaySession {
             onSharedDetach: nil,
             attachInitialSeq: outcome.initialByteSeq,
             hostSupportsReplayRing: connection.hostCapabilities.has(PeerCapability.replayRingV1),
+            hostResyncsOnOverflow: connection.hostCapabilities.has(PeerCapability.overflowResyncV1),
             ptyDelivery: ptyDelivery
         )
     }
@@ -2731,6 +2805,7 @@ final class PeerRelaySession {
         onSharedDetach: (@Sendable () async -> Void)?,
         attachInitialSeq: UInt64,
         hostSupportsReplayRing: Bool,
+        hostResyncsOnOverflow: Bool = false,
         ptyDelivery: PtyDelivery = .relaySocket
     ) {
         self.hostSockPath = hostSockPath
@@ -2748,6 +2823,7 @@ final class PeerRelaySession {
         self.onSharedDetach = onSharedDetach
         self.attachInitialSeq = attachInitialSeq
         self.hostSupportsReplayRing = hostSupportsReplayRing
+        self.hostResyncsOnOverflow = hostResyncsOnOverflow
         self.ptyDelivery = ptyDelivery
         switch ptyDelivery {
         case .relaySocket:
@@ -3149,6 +3225,7 @@ final class PeerRelaySession {
         let resizeCoalescer: RelayResizeCoalescer?
         let gapHealScheduler: RelayGapHealScheduler?
         let noteGapForHeal: @Sendable (UInt64) async -> Void
+        let noteHostResync: @Sendable () async -> Void
         if relay != nil {
             let coalescer = RelayResizeCoalescer(
                 session: session,
@@ -3156,6 +3233,7 @@ final class PeerRelaySession {
                 initialCols: remoteCols,
                 initialRows: remoteRows,
                 authorityEligible: resizeAuthorityEligible,
+                healDebounceMs: Self.gapHealDebounceMs(hostResyncsOnOverflow: hostResyncsOnOverflow),
                 generationIsCurrent: { generation in
                     resumeTransitionGate.currentGeneration() == generation
                 },
@@ -3174,6 +3252,7 @@ final class PeerRelaySession {
             noteGapForHeal = { generation in
                 await coalescer.noteGapForHeal(generation: generation)
             }
+            noteHostResync = { await coalescer.noteHostResync() }
         } else {
             let scheduler = RelayGapHealScheduler(
                 generationIsCurrent: { generation in
@@ -3191,6 +3270,7 @@ final class PeerRelaySession {
             noteGapForHeal = { generation in
                 await scheduler.noteGap(generation: generation)
             }
+            noteHostResync = {}
         }
         // One delivery function for every PtyData exit point, so callback
         // delivery rides the exact live/replay/abort ordering the relay
@@ -3329,10 +3409,10 @@ final class PeerRelaySession {
                         msg = try await currentSession.receiveNextMessage()
                     } catch {
                         let failedTag = Self.sessionTag(currentSession)
-                        RemoteWorkLog.warningOffMain(
-                            "Peer receive failed host=\(hostLabel) surface=\(surfaceLabel) session=\(failedTag) sessionGen=\(currentGeneration) error=\(error)"
-                        )
                         if let swapped = await self.session, swapped !== currentSession {
+                            RemoteWorkLog.infoOffMain(
+                                "Peer heal swap host=\(hostLabel) surface=\(surfaceLabel) retired=\(failedTag) adopted=\(Self.sessionTag(swapped)) sessionGen=\(currentGeneration)"
+                            )
                             #if DEBUG
                             // The benign case: a resume-heal retired this
                             // session on purpose. Logged so the fatal case
@@ -3353,6 +3433,9 @@ final class PeerRelaySession {
                             gapCount = 0
                             continue pumpLoop
                         }
+                        RemoteWorkLog.warningOffMain(
+                            "Peer receive failed host=\(hostLabel) surface=\(surfaceLabel) session=\(failedTag) sessionGen=\(currentGeneration) error=\(error)"
+                        )
                         if ownsSession,
                            await self.reconnectOwnedSession(
                                afterLosing: currentSession, generation: currentGeneration
@@ -3576,6 +3659,7 @@ final class PeerRelaySession {
                         // The host just proved it speaks the grid model —
                         // scrollback browsing may engage from here on.
                         scrollbackBrowse.markHostCapable()
+                        await noteHostResync()
                         // Typed fresh-attach keyframe (grid.snapshot.v1).
                         // ESC[3J first: repeated attaches used to stack one
                         // stale screen per open into the viewer's local
@@ -4069,6 +4153,7 @@ final class PeerRelaySession {
         }
         relayTelemetry.resetRemote()
         session = newConnection.session
+        sessionAdoptedAtUptime = ProcessInfo.processInfo.systemUptime
         transport = newConnection.transport
         attachInitialSeq = outcome.initialByteSeq
         hostSupportsReplayRing = newConnection.hostCapabilities.has(PeerCapability.replayRingV1)
@@ -4117,11 +4202,26 @@ final class PeerRelaySession {
         // live — the distinction the workspace mirror reads before it keeps
         // a pane instead of respawning it.
         reconnectInFlight = true
+        #if DEBUG
+        let reconnectStartedAt = Date()
+        defer {
+            dlog("peer.relay.reconnect.return elapsed=\(String(format: "%.3f", Date().timeIntervalSince(reconnectStartedAt))) swapped=\(session !== failedSession) failed=\(Self.sessionTag(failedSession))")
+        }
+        #endif
         defer { reconnectInFlight = false }
         RemoteWorkLog.infoOffMain(
             "Peer reconnect start host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) failedSession=\(Self.sessionTag(failedSession)) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
         )
         await failedSession.stopHeartbeat()
+        // The circuit otherwise recovered only on the pane's first byte ever,
+        // so each host drop in a long flood lengthened the backoff until the
+        // circuit opened. Time survived, not bytes seen: a sick host that
+        // attaches, sends its snapshot and drops must keep backing off.
+        if Self.failedSessionEarnedRecovery(
+            adoptedAt: sessionAdoptedAtUptime, failedAt: ProcessInfo.processInfo.systemUptime
+        ) {
+            reconnectCircuit.recordRecovery()
+        }
         guard Self.shouldReconnectOwnedSession(
             ownsSession: ownsSession,
             isTorndown: isTorndown,
@@ -4149,7 +4249,11 @@ final class PeerRelaySession {
             let attempt = next.attempt
             let delay = next.delaySeconds
             if delay > 0 {
-                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                // The pump waits inside this call, so a heal that commits a
+                // replacement during the backoff would go unread until the
+                // delay ends; the host then drops the unread session and the
+                // next backoff is longer. Wake as soon as the session moves.
+                await sleepUnlessSessionReplaced(failedSession, seconds: delay)
             }
             guard Self.shouldReconnectOwnedSession(
                 ownsSession: ownsSession,
@@ -4184,6 +4288,41 @@ final class PeerRelaySession {
             }
         }
         return session !== failedSession
+    }
+
+    private func sleepUnlessSessionReplaced(_ failedSession: PeerSession, seconds: TimeInterval) async {
+        await Self.waitOutBackoff(seconds: seconds) {
+            !isTorndown && session === failedSession && (ownedTransportMayReconnect?() ?? true)
+        }
+    }
+
+    /// A host advertising `overflow.resync.v1` pauses its output for
+    /// `PeerOverflowResync.minSnapshotInterval` and then for the snapshot
+    /// capture. That pause reads as a lull, so a short settle reconnected into
+    /// the capture and cancelled it. Such a host closes the connection when a
+    /// repair fails, so the viewer's heal is only a backstop there.
+    static func gapHealDebounceMs(hostResyncsOnOverflow: Bool) -> UInt64 {
+        hostResyncsOnOverflow ? 2500 : 400
+    }
+
+    static let reconnectRecoverySurvivalSeconds: TimeInterval = 10
+
+    static func failedSessionEarnedRecovery(adoptedAt: TimeInterval, failedAt: TimeInterval) -> Bool {
+        failedAt - adoptedAt >= reconnectRecoverySurvivalSeconds
+    }
+
+    static func waitOutBackoff(
+        seconds: TimeInterval,
+        pollSeconds: TimeInterval = 0.1,
+        isStillWaiting: () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(seconds)
+        while isStillWaiting() {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { return }
+            try? await Task.sleep(nanoseconds: UInt64(min(remaining, pollSeconds) * 1_000_000_000))
+            if Task.isCancelled { return }
+        }
     }
 
     private func noteReconnectOutputRecovery(generation: UInt64) {
@@ -4299,6 +4438,7 @@ final class PeerRelaySession {
         }
         relayTelemetry.resetRemote()
         session = connection.session
+        sessionAdoptedAtUptime = ProcessInfo.processInfo.systemUptime
         transport = connection.transport
         attachInitialSeq = outcome.initialByteSeq
         hostSupportsReplayRing = connection.hostCapabilities.has(PeerCapability.replayRingV1)

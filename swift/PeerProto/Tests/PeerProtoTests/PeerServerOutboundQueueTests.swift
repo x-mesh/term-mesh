@@ -279,16 +279,20 @@ final class PeerServerOutboundQueueTests: XCTestCase {
                     attachmentCount: 2,
                     canResync: false
                 ))
-                XCTAssertTrue(PeerServerOutboundOverflowPolicy.requiresTransportReconnect(
-                    for: admission,
-                    attachmentCount: 1,
-                    canResync: true,
-                    snapshotInstalled: true
-                ))
                 return
             }
         }
         XCTFail("bounded outbound queue never reported an overflow")
+    }
+
+    func testRepeatedOverflowWaitsOutTheSnapshotFloorInsteadOfClosing() {
+        XCTAssertEqual(PeerServerOutboundOverflowPolicy.snapshotWait(sinceLastSnapshot: nil, now: 10), 0)
+        XCTAssertEqual(
+            PeerServerOutboundOverflowPolicy.snapshotWait(sinceLastSnapshot: 10, now: 10.2),
+            PeerServerOutboundOverflowPolicy.minSnapshotInterval - 0.2,
+            accuracy: 1e-9
+        )
+        XCTAssertEqual(PeerServerOutboundOverflowPolicy.snapshotWait(sinceLastSnapshot: 10, now: 11), 0)
     }
 
     func testAbortWakesWriterAndRejectsLaterAdmission() async {
