@@ -2363,7 +2363,9 @@ actor PeerServerSession {
                 }
             }
             if !(await provider.supportsAtomicResync()) {
-                advertisedCapabilities.removeAll { $0 == PeerCapability.gridSnapshotV1 }
+                advertisedCapabilities.removeAll {
+                    $0 == PeerCapability.gridSnapshotV1 || $0 == PeerCapability.overflowResyncV1
+                }
             }
             if config.hostStatsProvider == nil {
                 advertisedCapabilities.removeAll { $0 == PeerCapability.hostStatsV1 }
@@ -3194,17 +3196,23 @@ actor PeerServerSession {
                     "pty-writer-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) cancelled=\(Task.isCancelled)"
                 )
             }
-            // A finished producer ends the attachment as surely as a failed
-            // send: a raw-drain overflow finishes every stream of the pane.
-            if (!sendSucceeded || producerFinished) && !Task.isCancelled {
+            // Only a cancellation (client detach, goodbye, session end) is
+            // an expected stop. A failed send, an aborted producer (resync
+            // capture failure, crossing chunk) and a finished producer (a
+            // raw-drain overflow finishes every stream of the pane) all leave
+            // the attachment unable to carry output.
+            if !Task.isCancelled {
                 await detachSurface(id: surfaceID)
                 // A connection left open with nothing attached looks healthy
                 // to the viewer: heartbeats still answer, so it never learns
                 // the output stopped and never reattaches. Closing it turns
-                // the silent freeze into an EOF the viewer recovers from.
-                if attachments.isEmpty {
+                // the silent freeze into an EOF the viewer recovers from. A
+                // connection that also carries the workspace-list
+                // subscription or a leader call is left alone: closing it
+                // would take those down with the pane.
+                if attachments.isEmpty && !workspaceListSubscribed && pendingLeaderCalls.isEmpty {
                     PeerServerDiagnostics.record(
-                        "transport-close reason=attachment-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) producer_finished=\(producerFinished)"
+                        "transport-close reason=attachment-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) producer_finished=\(producerFinished) send_ok=\(sendSucceeded)"
                     )
                     await connection.close()
                 }

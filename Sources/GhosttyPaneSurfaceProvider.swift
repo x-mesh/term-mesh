@@ -1002,23 +1002,27 @@ final class PtyTapHub: @unchecked Sendable {
             }
             guard let snapshot else { return nil }
             // Wait for the drain to map this capture. Once the drain has
-            // moved past it without a checkpoint, it fell inside a batch
-            // merged before tracking began and never will be: capture again.
+            // moved past it without a checkpoint it never will be — it fell
+            // inside a batch merged before tracking began, on the boundary a
+            // checkpoint restart skips, or out of the store's window — so
+            // capture again. The pause keeps a stalled boundary from turning
+            // into back-to-back grid reads on the main actor.
             while ProcessInfo.processInfo.systemUptime < deadline {
-                switch checkpointState(forRawEnd: snapshot.rawEnd) {
-                case .mapped(let boundary):
+                if case .mapped(let boundary) = checkpointState(forRawEnd: snapshot.rawEnd) {
                     return PeerSurfaceResync(ansi: snapshot.bytes, hostByteSeq: boundary)
-                case .skipped:
-                    break
-                case .pending:
-                    do {
-                        try await Task.sleep(nanoseconds: retryPeriod)
-                    } catch {
-                        return nil
-                    }
-                    continue
                 }
-                break
+                let skipped: Bool
+                if case .skipped = checkpointState(forRawEnd: snapshot.rawEnd) {
+                    skipped = true
+                } else {
+                    skipped = false
+                }
+                do {
+                    try await Task.sleep(nanoseconds: retryPeriod)
+                } catch {
+                    return nil
+                }
+                if skipped { break }
             }
         }
         return nil
