@@ -306,7 +306,7 @@ final class GhosttySurfaceScrollView: NSView {
     private var remotePasteTransferCount = 0
     private var searchOverlayHostingView: NSHostingView<TermMeshHostedRoot<SurfaceSearchOverlay>>?
     private var scrollToBottomHostingView: NSHostingView<TermMeshHostedRoot<ScrollToBottomButton>>?
-    private var pasteShelfOverlayHostingView: NSHostingView<TermMeshHostedRoot<PasteShelfOverlay>>?
+    private var pasteShelfContainerView: PasteShelfWindowContainerView?
     private let pasteShelfOverlayState = PasteShelfOverlayState()
     private var pasteShelfKeyMonitor: Any?
     private var imeInputBarHostingView: NSHostingView<TermMeshHostedRoot<IMEInputBar>>?
@@ -791,6 +791,9 @@ final class GhosttySurfaceScrollView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if let pasteShelfContainerView, pasteShelfContainerView.window !== window {
+            dismissPasteShelfOverlay()
+        }
         windowObservers.forEach { NotificationCenter.default.removeObserver($0) }
         windowObservers.removeAll()
         guard let window else { return }
@@ -1507,8 +1510,15 @@ final class GhosttySurfaceScrollView: NSView {
         return Self.findSubview(of: IMETextView.self, in: hostingView)
     }
 
+    /// The Shelf spans the whole window, so a pane that is no longer on screen
+    /// must not leave it up as a paste target the user cannot see.
+    override func viewDidHide() {
+        super.viewDidHide()
+        dismissPasteShelfOverlay()
+    }
+
     private func togglePasteShelfOverlay() {
-        if pasteShelfOverlayHostingView != nil {
+        if pasteShelfContainerView != nil {
             dismissPasteShelfOverlay()
         } else {
             showPasteShelfOverlay()
@@ -1516,10 +1526,15 @@ final class GhosttySurfaceScrollView: NSView {
     }
 
     private func showPasteShelfOverlay() {
+        guard let window else { return }
+        // One Shelf per window: a Shelf another pane opened closes first,
+        // taking its key monitor with it.
+        PasteShelfWindowContainerView.installed(in: window)?.dismiss?()
         PasteShelfStore.shared.sweepExpired()
         // Images cannot be selected from a terminal in the same way text can.
-        // Import a freshly copied system image as the user opens Shelf instead.
-        _ = PasteShelfStore.shared.captureImageIfNeeded()
+        // Import a freshly copied system image as the user opens Shelf instead;
+        // it joins the list once it is processed off the main thread.
+        Task { await PasteShelfStore.shared.captureImageIfNeeded() }
         pasteShelfOverlayState.resetForPresentation()
         let rootView = PasteShelfOverlay(
             store: .shared,
@@ -1530,45 +1545,87 @@ final class GhosttySurfaceScrollView: NSView {
             },
             onClose: { [weak self] in self?.dismissPasteShelfOverlay() }
         )
-        let overlay = NSHostingView(rootView: TermMeshHostedRoot(rootView))
-        overlay.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(overlay, positioned: .above, relativeTo: nil)
-        NSLayoutConstraint.activate([
-            overlay.topAnchor.constraint(equalTo: topAnchor),
-            overlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-            overlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            overlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-        ])
-        pasteShelfOverlayHostingView = overlay
+        guard let container = PasteShelfWindowContainerView.install(
+            NSHostingView(rootView: TermMeshHostedRoot(rootView)),
+            in: window,
+            dismiss: { [weak self] in self?.dismissPasteShelfOverlay() }
+        ) else { return }
+        pasteShelfContainerView = container
         installPasteShelfKeyMonitor()
+        focusPasteShelfSearchField()
+    }
+
+    /// SwiftUI creates the search field's NSTextField during the hosting
+    /// view's first layout pass, so the lookup can miss right after install.
+    /// Returns whether the field holds focus now; a miss schedules a retry.
+    @discardableResult
+    private func focusPasteShelfSearchField(retriesRemaining: Int = 3) -> Bool {
+        guard let container = pasteShelfContainerView, let window = container.window else { return false }
+        if let field = Self.findSubview(of: NSTextField.self, in: container) {
+            return window.makeFirstResponder(field)
+        }
+        guard retriesRemaining > 0 else { return false }
+        DispatchQueue.main.async { [weak self] in
+            self?.focusPasteShelfSearchField(retriesRemaining: retriesRemaining - 1)
+        }
+        return false
     }
 
     private func dismissPasteShelfOverlay() {
-        pasteShelfOverlayHostingView?.removeFromSuperview()
-        pasteShelfOverlayHostingView = nil
+        let shelfHadFocus = pasteShelfContainerView.map { container in
+            (window?.firstResponder as? NSView)?.isDescendant(of: container) == true
+        } ?? false
+        pasteShelfContainerView?.removeFromSuperview()
+        pasteShelfContainerView = nil
         if let pasteShelfKeyMonitor {
             NSEvent.removeMonitor(pasteShelfKeyMonitor)
             self.pasteShelfKeyMonitor = nil
         }
+        // Removing the search field leaves focus with the window; hand it back
+        // to the pane the Shelf pastes into.
+        guard shelfHadFocus, window != nil, surfaceView.window != nil, !isHiddenOrHasHiddenAncestor else { return }
+        moveFocus()
     }
 
     private func installPasteShelfKeyMonitor() {
         pasteShelfKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self,
-                  self.pasteShelfOverlayHostingView != nil,
+                  let container = self.pasteShelfContainerView,
                   event.window === self.window
             else { return event }
+
+            // A content-view or theme-frame swap can detach the Shelf while
+            // this pane stays in the window; a Shelf that is off screen must
+            // not keep taking keys.
+            guard container.window === event.window else {
+                self.dismissPasteShelfOverlay()
+                return event
+            }
+
+            // Focus moved off both the Shelf and its target pane (keyboard pane
+            // navigation, for one): the key belongs to the newly focused view,
+            // and Enter would otherwise paste into the pane the user left.
+            if let responder = event.window?.firstResponder as? NSView,
+               !responder.isDescendant(of: container),
+               !responder.isDescendant(of: self) {
+                self.dismissPasteShelfOverlay()
+                return event
+            }
 
             let items = PasteShelfStore.shared.filteredItems(matching: self.pasteShelfOverlayState.searchQuery)
 
             // Let the native text field receive typing, cursor movement, and
             // deletion while a search query is being edited — but keep the
             // navigation keys, so a user can search and then pick a result
-            // with the keyboard, as the footer hint promises. j/k are ordinary
-            // letters here and must reach the field.
+            // with the keyboard, as the footer hint promises.
             if let responder = event.window?.firstResponder as? NSView,
-               let overlay = self.pasteShelfOverlayHostingView,
-               responder.isDescendant(of: overlay) {
+               responder.isDescendant(of: container) {
+                // Return, Esc and the arrows commit or cancel an IME
+                // composition; taking them here would paste or close on a
+                // query the user has not finished typing.
+                if let textView = responder as? NSTextView, textView.hasMarkedText() {
+                    return event
+                }
                 switch event.keyCode {
                 case 126: // Up
                     self.pasteShelfOverlayState.moveSelection(by: -1, itemCount: items.count)
@@ -1590,10 +1647,6 @@ final class GhosttySurfaceScrollView: NSView {
                 self.pasteShelfOverlayState.moveSelection(by: -1, itemCount: items.count)
             case 125: // Down
                 self.pasteShelfOverlayState.moveSelection(by: 1, itemCount: items.count)
-            case 38 where event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty: // j
-                self.pasteShelfOverlayState.moveSelection(by: 1, itemCount: items.count)
-            case 40 where event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty: // k
-                self.pasteShelfOverlayState.moveSelection(by: -1, itemCount: items.count)
             case 36: // Return
                 if items.indices.contains(self.pasteShelfOverlayState.selectedIndex) {
                     self.insertPasteShelfItem(items[self.pasteShelfOverlayState.selectedIndex])
@@ -1604,6 +1657,13 @@ final class GhosttySurfaceScrollView: NSView {
             case 9 where event.modifierFlags.intersection(.deviceIndependentFlagsMask) == [.command, .shift]: // Cmd+Shift+V
                 self.dismissPasteShelfOverlay()
             default:
+                // Focus can land back on the terminal while the Shelf is up
+                // (the window becoming key again restores it). Plain typing
+                // belongs in the search field, never in the shell: when the
+                // field cannot take focus, the key is dropped instead.
+                if event.modifierFlags.intersection([.command, .control]).isEmpty {
+                    return self.focusPasteShelfSearchField() ? event : nil
+                }
                 return event
             }
             return nil

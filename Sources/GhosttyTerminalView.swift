@@ -1680,19 +1680,23 @@ final class TerminalSurface: Identifiable, ObservableObject {
     @MainActor
     func pasteShelfImage(at localPath: String) {
         guard FileManager.default.fileExists(atPath: localPath) else { return }
+        // Shelf images live under "Application Support", and the remote cache
+        // directory comes from the remote $XDG_CACHE_HOME or $HOME; either
+        // can hold a space that would split the path into two arguments.
+        let shellLocalPath = GhosttyNSView.escapeDropForShell(localPath)
         guard let callbackContext = surfaceCallbackContext?.takeUnretainedValue(),
               let target = RemotePasteTransfer.destination(for: callbackContext)
         else {
-            sendText(localPath)
+            sendText(shellLocalPath)
             return
         }
 
         hostedView.beginRemotePasteTransfer()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let remotePath = RemotePasteTransfer.send(localPath: localPath, to: target) ?? localPath
+            let remotePath = RemotePasteTransfer.send(localPath: localPath, to: target)
             DispatchQueue.main.async {
                 self?.hostedView.endRemotePasteTransfer()
-                self?.sendText(remotePath)
+                self?.sendText(remotePath.map(GhosttyNSView.escapeDropForShell) ?? shellLocalPath)
             }
         }
     }
@@ -3082,7 +3086,7 @@ func pushTargetSurfaceSize(_ size: CGSize) {
         DispatchQueue.main.async {
             // Copy is the explicit capture gesture for Shelf. This deliberately
             // avoids observing arbitrary clipboard changes from other apps.
-            _ = PasteShelfStore.shared.capture()
+            Task { @MainActor in _ = await PasteShelfStore.shared.capture() }
         }
     }
 
