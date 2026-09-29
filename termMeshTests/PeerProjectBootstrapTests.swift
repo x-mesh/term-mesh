@@ -1153,6 +1153,72 @@ final class PeerProjectBootstrapTests: XCTestCase {
         ))
     }
 
+    func test_remote_paste_names_the_rejected_setting() {
+        XCTAssertNil(RemotePasteTransfer.settingsProblem(
+            in: .init(sshTarget: "root@jw-server", port: nil, identityFile: nil)
+        ))
+        XCTAssertEqual(
+            RemotePasteTransfer.settingsProblem(
+                in: .init(sshTarget: "a\u{200B}b", port: nil, identityFile: nil)
+            ),
+            "host name [U+0061 U+200B U+0062]"
+        )
+        XCTAssertEqual(
+            RemotePasteTransfer.settingsProblem(
+                in: .init(sshTarget: "builder", port: 0, identityFile: nil)
+            ),
+            "SSH port must be 1-65535 (got 0)"
+        )
+        XCTAssertEqual(
+            RemotePasteTransfer.settingsProblem(
+                in: .init(sshTarget: "builder", port: nil, identityFile: "-oProxyCommand=bad")
+            ),
+            "Identity file path may not start with '-'"
+        )
+    }
+
+    /// The SSH target check allows exactly ASCII letters, digits and
+    /// `._-@[]:`. Every ASCII scalar is checked, so a slip at a range edge
+    /// (`/`, `:`, `;`, `@`, `[`, `\`, `^`, `` ` ``, `{`) cannot pass unnoticed.
+    func test_remote_paste_target_allows_exactly_the_documented_ascii() {
+        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-@[]:".unicodeScalars)
+        for value in UInt32(0)...127 {
+            let scalar = Unicode.Scalar(value)!
+            XCTAssertEqual(
+                RemotePasteTransfer.validTarget("a" + String(scalar) + "b"),
+                allowed.contains(scalar),
+                String(format: "U+%04X", value)
+            )
+        }
+        for target in ["root@jwserver68", "user@host.example.com", "build_box-01", "[::1]", "user@[fe80::1]", "host-"] {
+            XCTAssertTrue(RemotePasteTransfer.validTarget(target), target)
+        }
+    }
+
+    /// ssh reads a leading `-` as an option, and look-alike or invisible
+    /// characters make a target that renders as a valid host name.
+    func test_remote_paste_target_rejects_empty_options_and_non_ascii() {
+        for target in ["", "-", "--", "-host", "-oProxyCommand=touch /tmp/x"] {
+            XCTAssertFalse(RemotePasteTransfer.validTarget(target), target)
+        }
+        let lookAlikes: [Unicode.Scalar] = [
+            "\u{00A0}", // no-break space
+            "\u{200B}", // zero-width space
+            "\u{00E9}", // é
+            "\u{0301}", // combining acute accent
+            "\u{0130}", // İ, uppercases from i in Turkish
+            "\u{212A}", // Kelvin sign, lowercases to k
+            "\u{FF48}", // fullwidth h
+            "\u{D638}", // 호
+        ]
+        for scalar in lookAlikes {
+            XCTAssertFalse(
+                RemotePasteTransfer.validTarget("host" + String(scalar)),
+                String(format: "U+%04X", scalar.value)
+            )
+        }
+    }
+
     @MainActor
     func test_remote_leader_prompt_streams_to_shared_cache_atomically() throws {
         let prompt = Data(String(repeating: "leader 정책\n", count: 1_500).utf8)

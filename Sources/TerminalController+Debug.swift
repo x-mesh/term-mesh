@@ -1896,6 +1896,32 @@ extension TerminalController {
         return result
     }
 
+    /// Test-only: paste a local file into a terminal through the same
+    /// `RemotePasteTransfer` path a Shelf image takes, so a remote-pane paste
+    /// can be reproduced without pressing Cmd+V in the app. The transfer runs
+    /// asynchronously and reports its outcome in the remote work log.
+    func v2DebugPasteRemoteFile(params: [String: Any]) -> V2CallResult {
+        guard let surfaceId = v2UUID(params, "surface_id") else {
+            return .err(code: "invalid_params", message: "Missing surface_id", data: nil)
+        }
+        guard let path = v2String(params, "path"), FileManager.default.fileExists(atPath: path) else {
+            return .err(code: "invalid_params", message: "Missing or nonexistent path", data: nil)
+        }
+        var result: V2CallResult = .err(code: "not_found", message: "Terminal surface not found", data: nil)
+        _ = v2MainExec(timeout: 5) {
+            guard let app = AppDelegate.shared else { return }
+            for windowContext in app.mainWindowContexts.values {
+                for workspace in windowContext.tabManager.tabs {
+                    guard let panel = workspace.terminalPanel(for: surfaceId) else { continue }
+                    panel.surface.pasteShelfImage(at: path)
+                    result = .ok(["started": true, "peer_pane": panel.peerPaneSession != nil])
+                    return
+                }
+            }
+        }
+        return result
+    }
+
     /// Test-only: exercise the real client-side `PeerSessionDemux` end to
     /// end so socket e2e can assert P1's PtyData isolation contract without
     /// standing up a live 2-node peer session. Runs the exact routing the

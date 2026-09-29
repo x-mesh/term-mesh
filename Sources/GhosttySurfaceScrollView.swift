@@ -277,7 +277,7 @@ final class GhosttySurfaceScrollView: NSView {
         let f = NSTextField(labelWithString: "")
         f.translatesAutoresizingMaskIntoConstraints = false
         f.alignment = .center
-        f.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+        f.font = NSFont.systemFont(ofSize: 9, weight: .semibold)
         f.textColor = .white
         f.backgroundColor = .clear
         f.drawsBackground = false
@@ -285,20 +285,28 @@ final class GhosttySurfaceScrollView: NSView {
         f.isEditable = false
         f.isSelectable = false
         f.wantsLayer = true
-        f.layer?.backgroundColor = NSColor.systemTeal.cgColor
-        f.layer?.cornerRadius = 9
-        f.layer?.borderWidth = 1
-        f.layer?.borderColor = NSColor.white.withAlphaComponent(0.6).cgColor
+        f.layer?.backgroundColor = NSColor.systemTeal.withAlphaComponent(0.55).cgColor
+        f.layer?.cornerRadius = PeerRingStyle.badgeHeight / 2
         f.isHidden = true
         return f
     }()
+    /// The peer ring stays up for a whole mirroring session, so it is a faint
+    /// hairline that fits in Ghostty's default 2pt window padding instead of a
+    /// bright frame over the first cell column.
+    private enum PeerRingStyle {
+        static let lineWidth: CGFloat = 1
+        static let opacity: Float = 0.35
+        static let inset: CGFloat = lineWidth / 2
+        static let badgeHeight: CGFloat = 12
+        static let badgeMargin: CGFloat = 2
+    }
     private let flashOverlayView: GhosttyFlashOverlayView
     private let flashLayer: CAShapeLayer
     private let remotePasteTransferIndicator = RemotePasteTransferIndicator(frame: .zero)
     private var remotePasteTransferCount = 0
     private var searchOverlayHostingView: NSHostingView<TermMeshHostedRoot<SurfaceSearchOverlay>>?
     private var scrollToBottomHostingView: NSHostingView<TermMeshHostedRoot<ScrollToBottomButton>>?
-    private var pasteShelfOverlayHostingView: NSHostingView<TermMeshHostedRoot<PasteShelfOverlay>>?
+    private var pasteShelfContainerView: PasteShelfWindowContainerView?
     private let pasteShelfOverlayState = PasteShelfOverlayState()
     private var pasteShelfKeyMonitor: Any?
     private var imeInputBarHostingView: NSHostingView<TermMeshHostedRoot<IMEInputBar>>?
@@ -491,33 +499,30 @@ final class GhosttySurfaceScrollView: NSView {
         notificationRingOverlayView.isHidden = true
         addSubview(notificationRingOverlayView)
 
-        // Peer-attached ring: teal, drawn just inside the notification
-        // ring so both can be visible simultaneously (notifications +
-        // active remote viewer).
+        // Peer-attached ring: teal, drawn along the pane edge outside the
+        // notification ring so both can be visible simultaneously
+        // (notifications + active remote viewer).
         peerRingOverlayView.wantsLayer = true
         peerRingOverlayView.layer?.backgroundColor = NSColor.clear.cgColor
         peerRingOverlayView.layer?.masksToBounds = false
         peerRingOverlayView.autoresizingMask = [.width, .height]
         peerRingLayer.fillColor = NSColor.clear.cgColor
         peerRingLayer.strokeColor = NSColor.systemTeal.cgColor
-        peerRingLayer.lineWidth = 2.5
+        peerRingLayer.lineWidth = PeerRingStyle.lineWidth
         peerRingLayer.lineJoin = .round
         peerRingLayer.lineCap = .round
-        peerRingLayer.shadowColor = NSColor.systemTeal.cgColor
-        peerRingLayer.shadowOpacity = 0.4
-        peerRingLayer.shadowRadius = 4
-        peerRingLayer.shadowOffset = .zero
         peerRingLayer.opacity = 0
         peerRingOverlayView.layer?.addSublayer(peerRingLayer)
 
         peerRingOverlayView.addSubview(peerCountBadgeLabel)
-        // Pin the badge to the top-right of the peer ring, sized just
-        // slightly bigger than the digit so it reads as a pill / dot.
+        // Pin the badge into the top-right corner, sized just slightly
+        // bigger than the digit so it covers as little of the first row
+        // as a readable pill can.
         NSLayoutConstraint.activate([
-            peerCountBadgeLabel.topAnchor.constraint(equalTo: peerRingOverlayView.topAnchor, constant: 5),
-            peerCountBadgeLabel.trailingAnchor.constraint(equalTo: peerRingOverlayView.trailingAnchor, constant: -5),
-            peerCountBadgeLabel.heightAnchor.constraint(equalToConstant: 18),
-            peerCountBadgeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 18),
+            peerCountBadgeLabel.topAnchor.constraint(equalTo: peerRingOverlayView.topAnchor, constant: PeerRingStyle.badgeMargin),
+            peerCountBadgeLabel.trailingAnchor.constraint(equalTo: peerRingOverlayView.trailingAnchor, constant: -PeerRingStyle.badgeMargin),
+            peerCountBadgeLabel.heightAnchor.constraint(equalToConstant: PeerRingStyle.badgeHeight),
+            peerCountBadgeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: PeerRingStyle.badgeHeight),
         ])
 
         peerRingOverlayView.isHidden = true
@@ -786,6 +791,9 @@ final class GhosttySurfaceScrollView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if let pasteShelfContainerView, pasteShelfContainerView.window !== window {
+            dismissPasteShelfOverlay()
+        }
         windowObservers.forEach { NotificationCenter.default.removeObserver($0) }
         windowObservers.removeAll()
         guard let window else { return }
@@ -959,7 +967,7 @@ final class GhosttySurfaceScrollView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         peerRingOverlayView.isHidden = !visible
-        peerRingLayer.opacity = visible ? 1 : 0
+        peerRingLayer.opacity = visible ? PeerRingStyle.opacity : 0
         let showBadge = visible && count >= 1
         if showBadge {
             let label = count > 9 ? "9+" : "\(count)"
@@ -1502,8 +1510,15 @@ final class GhosttySurfaceScrollView: NSView {
         return Self.findSubview(of: IMETextView.self, in: hostingView)
     }
 
+    /// The Shelf spans the whole window, so a pane that is no longer on screen
+    /// must not leave it up as a paste target the user cannot see.
+    override func viewDidHide() {
+        super.viewDidHide()
+        dismissPasteShelfOverlay()
+    }
+
     private func togglePasteShelfOverlay() {
-        if pasteShelfOverlayHostingView != nil {
+        if pasteShelfContainerView != nil {
             dismissPasteShelfOverlay()
         } else {
             showPasteShelfOverlay()
@@ -1511,10 +1526,15 @@ final class GhosttySurfaceScrollView: NSView {
     }
 
     private func showPasteShelfOverlay() {
+        guard let window else { return }
+        // One Shelf per window: a Shelf another pane opened closes first,
+        // taking its key monitor with it.
+        PasteShelfWindowContainerView.installed(in: window)?.dismiss?()
         PasteShelfStore.shared.sweepExpired()
         // Images cannot be selected from a terminal in the same way text can.
-        // Import a freshly copied system image as the user opens Shelf instead.
-        _ = PasteShelfStore.shared.captureImageIfNeeded()
+        // Import a freshly copied system image as the user opens Shelf instead;
+        // it joins the list once it is processed off the main thread.
+        Task { await PasteShelfStore.shared.captureImageIfNeeded() }
         pasteShelfOverlayState.resetForPresentation()
         let rootView = PasteShelfOverlay(
             store: .shared,
@@ -1525,45 +1545,87 @@ final class GhosttySurfaceScrollView: NSView {
             },
             onClose: { [weak self] in self?.dismissPasteShelfOverlay() }
         )
-        let overlay = NSHostingView(rootView: TermMeshHostedRoot(rootView))
-        overlay.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(overlay, positioned: .above, relativeTo: nil)
-        NSLayoutConstraint.activate([
-            overlay.topAnchor.constraint(equalTo: topAnchor),
-            overlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-            overlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            overlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-        ])
-        pasteShelfOverlayHostingView = overlay
+        guard let container = PasteShelfWindowContainerView.install(
+            NSHostingView(rootView: TermMeshHostedRoot(rootView)),
+            in: window,
+            dismiss: { [weak self] in self?.dismissPasteShelfOverlay() }
+        ) else { return }
+        pasteShelfContainerView = container
         installPasteShelfKeyMonitor()
+        focusPasteShelfSearchField()
+    }
+
+    /// SwiftUI creates the search field's NSTextField during the hosting
+    /// view's first layout pass, so the lookup can miss right after install.
+    /// Returns whether the field holds focus now; a miss schedules a retry.
+    @discardableResult
+    private func focusPasteShelfSearchField(retriesRemaining: Int = 3) -> Bool {
+        guard let container = pasteShelfContainerView, let window = container.window else { return false }
+        if let field = Self.findSubview(of: NSTextField.self, in: container) {
+            return window.makeFirstResponder(field)
+        }
+        guard retriesRemaining > 0 else { return false }
+        DispatchQueue.main.async { [weak self] in
+            self?.focusPasteShelfSearchField(retriesRemaining: retriesRemaining - 1)
+        }
+        return false
     }
 
     private func dismissPasteShelfOverlay() {
-        pasteShelfOverlayHostingView?.removeFromSuperview()
-        pasteShelfOverlayHostingView = nil
+        let shelfHadFocus = pasteShelfContainerView.map { container in
+            (window?.firstResponder as? NSView)?.isDescendant(of: container) == true
+        } ?? false
+        pasteShelfContainerView?.removeFromSuperview()
+        pasteShelfContainerView = nil
         if let pasteShelfKeyMonitor {
             NSEvent.removeMonitor(pasteShelfKeyMonitor)
             self.pasteShelfKeyMonitor = nil
         }
+        // Removing the search field leaves focus with the window; hand it back
+        // to the pane the Shelf pastes into.
+        guard shelfHadFocus, window != nil, surfaceView.window != nil, !isHiddenOrHasHiddenAncestor else { return }
+        moveFocus()
     }
 
     private func installPasteShelfKeyMonitor() {
         pasteShelfKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self,
-                  self.pasteShelfOverlayHostingView != nil,
+                  let container = self.pasteShelfContainerView,
                   event.window === self.window
             else { return event }
+
+            // A content-view or theme-frame swap can detach the Shelf while
+            // this pane stays in the window; a Shelf that is off screen must
+            // not keep taking keys.
+            guard container.window === event.window else {
+                self.dismissPasteShelfOverlay()
+                return event
+            }
+
+            // Focus moved off both the Shelf and its target pane (keyboard pane
+            // navigation, for one): the key belongs to the newly focused view,
+            // and Enter would otherwise paste into the pane the user left.
+            if let responder = event.window?.firstResponder as? NSView,
+               !responder.isDescendant(of: container),
+               !responder.isDescendant(of: self) {
+                self.dismissPasteShelfOverlay()
+                return event
+            }
 
             let items = PasteShelfStore.shared.filteredItems(matching: self.pasteShelfOverlayState.searchQuery)
 
             // Let the native text field receive typing, cursor movement, and
             // deletion while a search query is being edited — but keep the
             // navigation keys, so a user can search and then pick a result
-            // with the keyboard, as the footer hint promises. j/k are ordinary
-            // letters here and must reach the field.
+            // with the keyboard, as the footer hint promises.
             if let responder = event.window?.firstResponder as? NSView,
-               let overlay = self.pasteShelfOverlayHostingView,
-               responder.isDescendant(of: overlay) {
+               responder.isDescendant(of: container) {
+                // Return, Esc and the arrows commit or cancel an IME
+                // composition; taking them here would paste or close on a
+                // query the user has not finished typing.
+                if let textView = responder as? NSTextView, textView.hasMarkedText() {
+                    return event
+                }
                 switch event.keyCode {
                 case 126: // Up
                     self.pasteShelfOverlayState.moveSelection(by: -1, itemCount: items.count)
@@ -1585,10 +1647,6 @@ final class GhosttySurfaceScrollView: NSView {
                 self.pasteShelfOverlayState.moveSelection(by: -1, itemCount: items.count)
             case 125: // Down
                 self.pasteShelfOverlayState.moveSelection(by: 1, itemCount: items.count)
-            case 38 where event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty: // j
-                self.pasteShelfOverlayState.moveSelection(by: 1, itemCount: items.count)
-            case 40 where event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty: // k
-                self.pasteShelfOverlayState.moveSelection(by: -1, itemCount: items.count)
             case 36: // Return
                 if items.indices.contains(self.pasteShelfOverlayState.selectedIndex) {
                     self.insertPasteShelfItem(items[self.pasteShelfOverlayState.selectedIndex])
@@ -1599,6 +1657,13 @@ final class GhosttySurfaceScrollView: NSView {
             case 9 where event.modifierFlags.intersection(.deviceIndependentFlagsMask) == [.command, .shift]: // Cmd+Shift+V
                 self.dismissPasteShelfOverlay()
             default:
+                // Focus can land back on the terminal while the Shelf is up
+                // (the window becoming key again restores it). Plain typing
+                // belongs in the search field, never in the shell: when the
+                // field cannot take focus, the key is dropped instead.
+                if event.modifierFlags.intersection([.command, .control]).isEmpty {
+                    return self.focusPasteShelfSearchField() ? event : nil
+                }
                 return event
             }
             return nil
@@ -2472,12 +2537,10 @@ final class GhosttySurfaceScrollView: NSView {
     }
 
     private func updatePeerRingPath() {
-        // Inset slightly more than the notification ring so the two
-        // can be displayed concentrically without visual overlap.
         updateOverlayRingPath(
             layer: peerRingLayer,
             bounds: peerRingOverlayView.bounds,
-            inset: 5,
+            inset: PeerRingStyle.inset,
             radius: 5
         )
     }

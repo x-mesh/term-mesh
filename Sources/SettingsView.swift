@@ -157,17 +157,6 @@ struct SettingsView: View {
     @AppStorage(ReviewBoardSettings.enabledKey)
     private var reviewBoardEnabled = ReviewBoardSettings.defaultEnabled
     @AppStorage("teamDefaultLeaderMode") private var teamDefaultLeaderMode = "claude"
-    /// The two global controls (Mode, Canary percent) are back as a measurement
-    /// rollout for the leader turn hook — see
-    /// `LeaderParticipationSettingsRow`, placed after Default Work
-    /// Distribution below. Per-Project opt-in lives on the review board, not
-    /// here, and the removed Canary Projects text field stays removed. The kill
-    /// switch is stored and honored but no longer shown: it duplicated `mode ==
-    /// .off` on screen, so it is reachable only through
-    /// `debug.leader_participation.configure` now. This card, the board's
-    /// toggle, and that socket method all write through
-    /// `TeamOrchestrator.updateLeaderParticipationSettings`, so none of them
-    /// can save a stale snapshot over a field another one just wrote.
     @AppStorage(ProjectDelegationLevel.defaultLevelKey)
     private var teamDefaultDelegationLevel = ProjectDelegationLevel.leaderFirst.rawValue
 
@@ -1510,14 +1499,6 @@ struct SettingsView: View {
                             .labelsHidden()
                             .pickerStyle(.segmented)
                         }
-                        }
-
-                        if settingsMatch("leader", "participation", "shadow", "canary",
-                                         "overlap", "route", "experiment", "suggestion",
-                                         "agent", "team", "리더", "카나리", "참여", "동시 진행", "경로 제안", "실험") {
-                        SettingsCardDivider()
-
-                        LeaderParticipationSettingsRow(controlWidth: pickerColumnWidth)
                         }
 
                         if settingsMatch("directory", "working", "path", "agent", "team") {
@@ -3282,85 +3263,6 @@ struct SettingsCardDivider: View {
         Rectangle()
             .fill(Color(nsColor: NSColor.separatorColor).opacity(0.5))
             .frame(height: 1)
-    }
-}
-
-/// Loads its own snapshot from `LeaderParticipationSettings` instead of
-/// binding to `@AppStorage`. Settings, the review board's opt-in toggle, and
-/// `debug.leader_participation.configure` all have to write through
-/// `TeamOrchestrator.updateLeaderParticipationSettings`, which reloads fresh
-/// values before applying a mutation — an `@AppStorage` snapshot taken when
-/// this row last appeared could otherwise overwrite a field one of the others
-/// wrote in the meantime.
-private struct LeaderParticipationSettingsRow: View {
-    let controlWidth: CGFloat?
-
-    @State private var settings = LeaderParticipationSettings.default
-
-    var body: some View {
-        // Two cards, one stored setting. `mode` gates both experiments, but the
-        // percentage is the route suggestion cohort only — overlap never reads
-        // it. Showing it under the participation card made a control that does
-        // nothing there look like one of its dials.
-        //
-        // The kill switch used to sit here as a second control. It resolved to
-        // the same static policy `off` already resolved to and propagated
-        // through the same control-file rewrite, so the two read as duplicates
-        // of each other however the toggle was worded. It is debug-only now
-        // (`debug.leader_participation.configure`), and `off` carries its one
-        // distinct effect: the turn hook stops too.
-        VStack(spacing: 0) {
-            SettingsCardRow(
-                "Leader Participation",
-                subtitle: "How the leader takes part while its workers run. Not used turns the whole feature off — no overlap, and no delegation guidance in the leader's turns. Overlap also needs Work Distribution set to Delegated, which this setting does not change.",
-                controlWidth: controlWidth
-            ) {
-                Picker("", selection: modeBinding) {
-                    Text("Not used").tag(LeaderParticipationSettings.Mode.off)
-                    Text("Record only").tag(LeaderParticipationSettings.Mode.shadow)
-                    Text("In use").tag(LeaderParticipationSettings.Mode.canary)
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-            }
-
-            SettingsCardDivider()
-
-            SettingsCardRow(
-                "Route suggestion experiment",
-                subtitle: "How many Projects follow the leader's suggested route. It uses Leader Participation above, each Project opts in from its Review Board, and overlap ignores this percentage.",
-                controlWidth: controlWidth
-            ) {
-                // The label is the only place the percent is shown, so it stays visible.
-                Stepper(value: canaryPercentBinding, in: 0...100, step: 1) {
-                    Text(verbatim: "\(settings.canaryPercent)%")
-                        .font(.system(.body, design: .monospaced))
-                        .frame(minWidth: 44, alignment: .trailing)
-                }
-                .disabled(settings.mode != .canary)
-            }
-        }
-        .onAppear {
-            settings = LeaderParticipationSettings.load(from: LeaderParticipationSettings.defaultsForCurrentProcess())
-        }
-    }
-
-    private var modeBinding: Binding<LeaderParticipationSettings.Mode> {
-        Binding(
-            get: { settings.mode },
-            set: { newMode in
-                settings = TeamOrchestrator.shared.updateLeaderParticipationSettings { $0.mode = newMode }
-            }
-        )
-    }
-
-    private var canaryPercentBinding: Binding<Int> {
-        Binding(
-            get: { settings.canaryPercent },
-            set: { newPercent in
-                settings = TeamOrchestrator.shared.updateLeaderParticipationSettings { $0.canaryPercent = newPercent }
-            }
-        )
     }
 }
 

@@ -1497,6 +1497,8 @@ class TerminalController {
             return v2Result(id: id, self.v2DebugPeerBrowseWheel(params: params))
         case "debug.peer.inject_input":
             return v2Result(id: id, self.v2DebugPeerInjectInput(params: params))
+        case "debug.paste.remote_file":
+            return v2Result(id: id, self.v2DebugPasteRemoteFile(params: params))
         case "debug.peer.demux_probe":
             return v2Result(id: id, self.v2DebugPeerDemuxProbe(params: params))
         case "debug.peer.read_grid":
@@ -1779,6 +1781,7 @@ class TerminalController {
             "debug.flash.count",
             "debug.flash.reset",
             "debug.peer.inject_input",
+            "debug.paste.remote_file",
             "debug.peer.read_grid",
             "debug.peer.replay_probe",
             "debug.peer.coalesce_probe",

@@ -520,6 +520,10 @@ final class WindowBrowserPortal: NSObject {
            !Self.isView(palette, above: hostView, in: container) {
             container.addSubview(palette, positioned: .above, relativeTo: hostView)
         }
+        if let shelf = container.subviews.first(where: { $0 is PasteShelfWindowContainerView }),
+           !Self.isView(shelf, above: hostView, in: container) {
+            container.addSubview(shelf, positioned: .above, relativeTo: hostView)
+        }
 
         synchronizeHostFrameToReference()
         return true

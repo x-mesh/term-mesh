@@ -131,17 +131,18 @@ final class PasteShelfStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: imageURL.path))
     }
 
-    func testImportsImageClipboardOnlyOncePerChange() {
+    func testImportsImageClipboardOnlyOncePerChange() async {
         let store = store()
         let pasteboard = NSPasteboard(name: .init("term-mesh.test.paste-shelf.\(UUID().uuidString)"))
         pasteboard.clearContents()
         pasteboard.setData(onePixelPNG(), forType: .png)
 
-        guard case .added = store.captureImageIfNeeded(from: pasteboard) else {
+        guard case .added = await store.captureImageIfNeeded(from: pasteboard) else {
             return XCTFail("Expected image clipboard capture")
         }
         XCTAssertEqual(store.items.count, 1)
-        XCTAssertEqual(store.captureImageIfNeeded(from: pasteboard), .unsupported)
+        let second = await store.captureImageIfNeeded(from: pasteboard)
+        XCTAssertEqual(second, .unsupported)
         XCTAssertEqual(store.items.count, 1)
     }
 
@@ -237,7 +238,7 @@ final class PasteShelfStoreTests: XCTestCase {
 
     /// Terminal copies routinely carry tokens, so text capture must be
     /// disableable — while copied images still reach the Shelf.
-    func testCaptureSkipsTextWhenDisabledButStillTakesImages() {
+    func testCaptureSkipsTextWhenDisabledButStillTakesImages() async {
         let defaults = UserDefaults(suiteName: "paste-shelf-capture-\(UUID().uuidString)")!
         defaults.set(false, forKey: PasteShelfCaptureSettings.captureTextKey)
         XCTAssertFalse(PasteShelfCaptureSettings.captureTextEnabled(defaults: defaults))
@@ -248,31 +249,170 @@ final class PasteShelfStoreTests: XCTestCase {
 
         let store = store()
         // A text-only pasteboard yields nothing once capture is off.
-        XCTAssertEqual(store.capture(from: pasteboard, captureText: false), .unsupported)
+        let textOnly = await store.capture(from: pasteboard, captureText: false)
+        XCTAssertEqual(textOnly, .unsupported)
         XCTAssertTrue(store.items.isEmpty)
 
         pasteboard.clearContents()
         pasteboard.setData(onePixelPNG(), forType: .png)
-        guard case .added = store.capture(from: pasteboard, captureText: false) else {
+        guard case .added = await store.capture(from: pasteboard, captureText: false) else {
             return XCTFail("images must still be captured")
         }
         XCTAssertEqual(store.items.count, 1)
         XCTAssertEqual(store.items.first?.kind, .image)
     }
 
-    func testCaptureStoresTextWhenEnabled() {
+    func testCaptureStoresTextWhenEnabled() async {
         let pasteboard = NSPasteboard(name: NSPasteboard.Name("paste-shelf-test-\(UUID().uuidString)"))
         pasteboard.clearContents()
         pasteboard.setString("hello", forType: .string)
 
         let store = store()
-        guard case .added = store.capture(from: pasteboard, captureText: true) else {
+        guard case .added = await store.capture(from: pasteboard, captureText: true) else {
             return XCTFail("text must be captured when the setting is on")
         }
         XCTAssertEqual(store.items.first?.text, "hello")
     }
 
-    private func onePixelPNG() -> Data {
+    func test_panelSize_keepsStoredSizeThatFitsTheWindow() {
+        let size = PasteShelfPanelSize.clamped(CGSize(width: 700, height: 600), in: CGSize(width: 1200, height: 900))
+        XCTAssertEqual(size, CGSize(width: 700, height: 600))
+    }
+
+    func test_panelSize_shrinksToWindowMinusMargin() {
+        let size = PasteShelfPanelSize.clamped(CGSize(width: 900, height: 800), in: CGSize(width: 600, height: 500))
+        let margin = PasteShelfPanelSize.margin * 2
+        XCTAssertEqual(size, CGSize(width: 600 - margin, height: 500 - margin))
+    }
+
+    func test_panelSize_neverDropsBelowMinimumWhenPaneAllowsIt() {
+        let size = PasteShelfPanelSize.clamped(CGSize(width: 10, height: 10), in: CGSize(width: 1200, height: 900))
+        XCTAssertEqual(size, PasteShelfPanelSize.minimumSize)
+    }
+
+    func test_panelSize_fitsWindowSmallerThanMinimum() {
+        let window = CGSize(width: 300, height: 200)
+        let size = PasteShelfPanelSize.clamped(PasteShelfPanelSize.defaultSize, in: window)
+        let margin = PasteShelfPanelSize.margin * 2
+        XCTAssertEqual(size, CGSize(width: window.width - margin, height: window.height - margin))
+    }
+
+    func testCopyingSameTextAgainMovesItToTop() {
+        let store = store()
+        guard case let .added(first) = store.addText("git status") else { return XCTFail() }
+        currentDate = currentDate.addingTimeInterval(10)
+        _ = store.addText("ls -la")
+        currentDate = currentDate.addingTimeInterval(10)
+        guard case let .added(again) = store.addText("git status") else { return XCTFail() }
+
+        XCTAssertEqual(store.items.map(\.text), ["git status", "ls -la"])
+        XCTAssertEqual(again.id, first.id)
+        XCTAssertEqual(store.items.first?.createdAt, currentDate)
+    }
+
+    func testSameImageTwiceKeepsOneItemAndOneFile() throws {
+        let store = store()
+        let png = onePixelPNG()
+        guard case let .added(first) = store.addImage(png),
+              let imageURL = store.imageURL(for: first)
+        else { return XCTFail() }
+        _ = store.addText("between")
+        guard case let .added(again) = store.addImage(png) else { return XCTFail() }
+
+        XCTAssertEqual(again.id, first.id)
+        XCTAssertEqual(store.items.map(\.kind), [.image, .text])
+        let files = try FileManager.default.contentsOfDirectory(atPath: imageURL.deletingLastPathComponent().path)
+        XCTAssertEqual(files, [imageURL.lastPathComponent])
+        XCTAssertEqual(try Data(contentsOf: imageURL), png, "PNG input is stored byte for byte")
+    }
+
+    func testFailedSaveKeepsItemsAndEvictedImage() throws {
+        let store = store()
+        guard case let .added(oldestImage) = store.addImage(onePixelPNG()),
+              let imageURL = store.imageURL(for: oldestImage)
+        else { return XCTFail() }
+        for index in 1..<PasteShelfStore.maximumItems {
+            currentDate = currentDate.addingTimeInterval(1)
+            _ = store.addText("item-\(index)")
+        }
+        let before = store.items
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path) }
+
+        XCTAssertEqual(store.addText("does not fit on disk"), .storageFailed)
+        XCTAssertEqual(store.items, before)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: imageURL.path), "eviction must not delete an image the saved metadata still lists")
+    }
+
+    func testImageClearedWhilePreparingDoesNotReappear() async throws {
+        let store = store()
+        let capture = Task { await store.addImageInBackground(onePixelPNG()) }
+        await Task.yield()
+        store.deleteAll()
+        let result = await capture.value
+
+        XCTAssertEqual(result, .unsupported)
+        XCTAssertTrue(store.items.isEmpty)
+        let imagesURL = directory.appendingPathComponent("paste-shelf-images", isDirectory: true)
+        XCTAssertEqual((try? FileManager.default.contentsOfDirectory(atPath: imagesURL.path)) ?? [], [])
+    }
+
+    func testReloadDropsMissingImagesAndRemovesOrphanedFiles() throws {
+        let first = store()
+        guard case let .added(image) = first.addImage(onePixelPNG()),
+              let imageURL = first.imageURL(for: image)
+        else { return XCTFail() }
+        _ = first.addText("kept")
+        try FileManager.default.removeItem(at: imageURL)
+        let imagesURL = imageURL.deletingLastPathComponent()
+        let staleOrphanURL = imagesURL.appendingPathComponent("stale-orphan.png")
+        let freshOrphanURL = imagesURL.appendingPathComponent("fresh-orphan.png")
+        try onePixelPNG(red: 200).write(to: staleOrphanURL)
+        try onePixelPNG(red: 100).write(to: freshOrphanURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: currentDate.addingTimeInterval(-PasteShelfStore.unpinnedLifetime - 1)],
+            ofItemAtPath: staleOrphanURL.path
+        )
+        try FileManager.default.setAttributes([.modificationDate: currentDate], ofItemAtPath: freshOrphanURL.path)
+
+        let reloaded = store()
+
+        XCTAssertEqual(reloaded.items.map(\.text), ["kept"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staleOrphanURL.path))
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: freshOrphanURL.path),
+            "a recent unreferenced file can belong to another running build that shares the directory"
+        )
+    }
+
+    func testUnreadableMetadataKeepsImageFiles() throws {
+        let imagesURL = directory.appendingPathComponent("paste-shelf-images", isDirectory: true)
+        try FileManager.default.createDirectory(at: imagesURL, withIntermediateDirectories: true)
+        let imageURL = imagesURL.appendingPathComponent("\(UUID().uuidString).png")
+        try onePixelPNG().write(to: imageURL)
+        try Data("not json".utf8).write(to: directory.appendingPathComponent("paste-shelf.json"))
+
+        XCTAssertTrue(store().items.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: imageURL.path))
+    }
+
+    func testShelfFilesAreReadableOnlyByOwner() throws {
+        let store = store()
+        _ = store.addText("secret token")
+        guard case let .added(image) = store.addImage(onePixelPNG()),
+              let imageURL = store.imageURL(for: image)
+        else { return XCTFail() }
+
+        func permissions(_ url: URL) throws -> Int {
+            try XCTUnwrap(FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? Int)
+        }
+        XCTAssertEqual(try permissions(directory.appendingPathComponent("paste-shelf.json")), 0o600)
+        XCTAssertEqual(try permissions(imageURL), 0o600)
+        XCTAssertEqual(try permissions(imageURL.deletingLastPathComponent()), 0o700)
+    }
+
+    private func onePixelPNG(red: UInt8 = 0) -> Data {
         let bitmap = NSBitmapImageRep(
             bitmapDataPlanes: nil,
             pixelsWide: 1,
@@ -285,6 +425,8 @@ final class PasteShelfStoreTests: XCTestCase {
             bytesPerRow: 0,
             bitsPerPixel: 0
         )!
+        bitmap.bitmapData?[0] = red
+        bitmap.bitmapData?[3] = 255
         return bitmap.representation(using: .png, properties: [:])!
     }
 }
