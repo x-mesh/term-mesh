@@ -60,29 +60,72 @@ final class LeaderParticipationPolicyTests: XCTestCase {
         )
     }
 
-    func testFreshSettingsAreShadowWithNoCanaryAndRoundTripAdditively() {
+    func testLegacyRolloutSettingsRoundTripWithoutChangingDelegatedGuidance() {
         let defaults = UserDefaults(suiteName: "leader-participation.\(UUID().uuidString)")!
         XCTAssertEqual(LeaderParticipationSettings.load(from: defaults), .default)
         let saved = LeaderParticipationSettings(mode: .canary, canaryPercent: 17, killSwitch: false, optInProjects: ["project-a"])
         saved.save(to: defaults)
         XCTAssertEqual(LeaderParticipationSettings.load(from: defaults), saved)
+        XCTAssertTrue(
+            saved.delegatedGuidanceApplies(
+                delegationState: ProjectDelegationState(configured: .delegated, effective: .delegated),
+                availableWorkers: 1
+            )
+        )
     }
 
-    func testCohortsAreStableAndKillSwitchRollsBackImmediately() {
+    func testLegacyRolloutValuesNeverSuppressDelegatedGuidance() {
         let health = LeaderParticipationSettings.Health(supportedTurns: 500, observedDays: 0, coverage: 0.95, linkage: 0.95, unknownRate: 0.02)
-        var settings = LeaderParticipationSettings(mode: .canary, canaryPercent: 100, killSwitch: false, optInProjects: ["project"])
-        XCTAssertEqual(settings.resolve(projectID: "project", sessionID: "session", supportedLeader: true, health: health), .canary(.canary))
+        let delegationState = ProjectDelegationState(configured: .delegated, effective: .delegated)
+        let legacyValues: [(LeaderParticipationSettings.Mode, Int, Bool, Set<String>)] = [
+            (.off, 0, true, []),
+            (.shadow, 1, false, []),
+            (.canary, 100, true, ["other-project"]),
+        ]
+        for (mode, percent, killSwitch, projects) in legacyValues {
+            let settings = LeaderParticipationSettings(
+                mode: mode, canaryPercent: percent, killSwitch: killSwitch, optInProjects: projects
+            )
+            let payload = settings.controlPayload(
+                projectID: "project", sessionID: "session", supportedLeader: false, health: health,
+                delegationState: delegationState, availableWorkers: 2
+            )
+            XCTAssertEqual(payload["delegated_guidance_required"] as? Bool, true)
+        }
         XCTAssertEqual(LeaderParticipationSettings.cohort(projectID: "project", sessionID: "session", percent: 50), LeaderParticipationSettings.cohort(projectID: "project", sessionID: "session", percent: 50))
-        settings.killSwitch = true
-        XCTAssertEqual(settings.resolve(projectID: "project", sessionID: "session", supportedLeader: true, health: health), .staticPolicy(.staticPolicy))
     }
 
-    func testShadowNeverAppliesAndUnhealthyCanaryIsStaticHoldout() {
-        let unhealthy = LeaderParticipationSettings.Health(supportedTurns: 1, observedDays: 0, coverage: 1, linkage: 1, unknownRate: 0)
-        let shadow = LeaderParticipationSettings.default
-        XCTAssertEqual(shadow.resolve(projectID: "p", sessionID: "s", supportedLeader: true, health: unhealthy), .shadow(.shadow))
-        let canary = LeaderParticipationSettings(mode: .canary, canaryPercent: 100, killSwitch: false, optInProjects: ["p"])
-        XCTAssertEqual(canary.resolve(projectID: "p", sessionID: "s", supportedLeader: true, health: unhealthy), .staticPolicy(.staticPolicy))
+    func testZeroWorkersAreIneligibleAndOneWorkerIsMandatoryForSerialDelegation() {
+        let state = ProjectDelegationState(configured: .delegated, effective: .delegated)
+        XCTAssertFalse(LeaderParticipationSettings.default.delegatedGuidanceApplies(
+            delegationState: state, availableWorkers: 0
+        ))
+        XCTAssertTrue(LeaderParticipationSettings.default.delegatedGuidanceApplies(
+            delegationState: state, availableWorkers: 1
+        ))
+        XCTAssertEqual(
+            ProjectRoutingDecision.decide(
+                level: .delegated, taskShape: .singleUnit, risks: [.irreversibleOrRelease],
+                availableWorkers: 8, maxParallelWorkers: 10
+            ),
+            .init(route: .delegated, reasons: ["delegated_serial_work"], workerCount: 1)
+        )
+    }
+
+    func testDelegatedRoutingClampsCapacityWithoutInventingWork() {
+        let decision = ProjectRoutingDecision.decide(
+            level: .delegated, taskShape: .multiUnit, risks: [.repeatedFailure],
+            availableWorkers: 12, maxParallelWorkers: 99
+        )
+        XCTAssertEqual(decision.route, .parallel)
+        XCTAssertEqual(decision.reasons, ["delegated_max_capacity"])
+        XCTAssertEqual(decision.workerCount, 10)
+
+        let serial = ProjectRoutingDecision.decide(
+            level: .delegated, taskShape: .singleUnit, risks: [],
+            availableWorkers: 10, maxParallelWorkers: 10
+        )
+        XCTAssertEqual(serial.workerCount, 1)
     }
 
     /// `tm-agent`'s execution-host gate has always refused to promote on a
@@ -109,9 +152,10 @@ final class LeaderParticipationPolicyTests: XCTestCase {
             projectID: "p", sessionID: "s", supportedLeader: true, health: damaged
         )
         XCTAssertEqual(payload["healthy"] as? Bool, false)
+        XCTAssertEqual(payload["delegated_guidance_required"] as? Bool, false)
     }
 
-    func testControlPayloadFailsClosedAndCarriesImmediateKillSwitch() {
+    func testControlPayloadPreservesLegacyDiagnosticsAndBoundsWorkerCap() {
         let healthy = LeaderParticipationSettings.Health(
             supportedTurns: 500, observedDays: 0, coverage: 0.95, linkage: 0.95, unknownRate: 0.02
         )
@@ -126,6 +170,16 @@ final class LeaderParticipationPolicyTests: XCTestCase {
         XCTAssertEqual(payload["kill_switch"] as? Bool, true)
         XCTAssertEqual(payload["healthy"] as? Bool, true)
         XCTAssertEqual(payload["opt_in"] as? Bool, true)
+        XCTAssertEqual(payload["delegated_guidance_required"] as? Bool, false)
+        let delegated = settings.controlPayload(
+            projectID: "p", sessionID: "s", supportedLeader: false, health: healthy,
+            delegationState: ProjectDelegationState(configured: .delegated, effective: .delegated),
+            availableWorkers: 12,
+            executionOptions: ProjectExecutionOptions(maxParallelWorkers: 99, injectDirective: false)
+        )
+        XCTAssertEqual(delegated["delegated_guidance_required"] as? Bool, true)
+        XCTAssertEqual(delegated["max_parallel_workers"] as? Int, 10)
+        XCTAssertEqual(delegated["inject_directive"] as? Bool, false)
     }
 
     func testControlFileIsOwnerOnlyAndRemovedWithProjectCleanupPath() throws {
@@ -254,58 +308,26 @@ final class LeaderParticipationPolicyTests: XCTestCase {
         )
     }
 
-    /// Overlap ignores the cohort — the percent bucket and the opt-in set
-    /// decide the ordinary canary, not this one — but it does follow the mode.
-    /// A leader the user switched off, or left in shadow, runs no experiment.
-    func testDelegatedOverlapIgnoresCohortSettingsButFollowsTheMode() {
+    func testDelegatedGuidanceIgnoresLegacyRolloutValuesButRequiresWorkers() {
         let healthy = LeaderParticipationSettings.Health(
             supportedTurns: 500, observedDays: 0, coverage: 1, linkage: 1, unknownRate: 0
         )
         let canary = LeaderParticipationSettings(
-            mode: .canary, canaryPercent: 0, killSwitch: false, optInProjects: []
+            mode: .off, canaryPercent: 0, killSwitch: true, optInProjects: []
         )
         let delegationState = ProjectDelegationState(configured: .delegated, effective: .delegated)
         let delegated = canary.controlPayload(
             projectID: "review-board", sessionID: "s", supportedLeader: true, health: healthy,
-            delegationState: delegationState
+            delegationState: delegationState, availableWorkers: 1
         )
         XCTAssertEqual(delegated["percent"] as? Int, 0)
         XCTAssertEqual(delegated["opt_in"] as? Bool, false)
-        XCTAssertEqual(delegated["delegated_overlap_resolution"] as? Bool, true)
-
-        for stopped in [LeaderParticipationSettings.Mode.off, .shadow] {
-            var settings = canary
-            settings.mode = stopped
-            let payload = settings.controlPayload(
-                projectID: "review-board", sessionID: "s", supportedLeader: true, health: healthy,
-                delegationState: delegationState
-            )
-            XCTAssertEqual(
-                payload["delegated_overlap_resolution"] as? Bool, false,
-                "mode \(stopped.rawValue) kept overlap resolving"
-            )
-        }
-
-        let unhealthy = canary.controlPayload(
-            projectID: "review-board", sessionID: "s", supportedLeader: true,
-            health: .init(supportedTurns: 1, observedDays: 0, coverage: 1, linkage: 1, unknownRate: 0),
-            delegationState: delegationState
-        )
-        XCTAssertEqual(unhealthy["delegated_overlap_resolution"] as? Bool, false)
-
-        let unsupported = canary.controlPayload(
-            projectID: "review-board", sessionID: "s", supportedLeader: false, health: healthy,
-            delegationState: delegationState
-        )
-        XCTAssertEqual(unsupported["delegated_overlap_resolution"] as? Bool, false)
-
-        let killed = LeaderParticipationSettings(
-            mode: .canary, canaryPercent: 0, killSwitch: true, optInProjects: []
-        ).controlPayload(
+        XCTAssertEqual(delegated["delegated_overlap_resolution"] as? Bool, false)
+        let noWorkers = canary.controlPayload(
             projectID: "review-board", sessionID: "s", supportedLeader: true, health: healthy,
-            delegationState: delegationState
+            delegationState: delegationState, availableWorkers: 0
         )
-        XCTAssertEqual(killed["delegated_overlap_resolution"] as? Bool, false)
+        XCTAssertEqual(noWorkers["delegated_guidance_required"] as? Bool, false)
     }
 
     /// An executionHost payload must not fail closed on this Mac's own
@@ -316,8 +338,7 @@ final class LeaderParticipationPolicyTests: XCTestCase {
         let failingHealth = LeaderParticipationSettings.Health(
             supportedTurns: 0, observedDays: 0, coverage: 0, linkage: 0, unknownRate: 1
         )
-        // Overlap runs only in canary mode; this test is about the health
-        // scope, so it names the mode that lets the gate be reached at all.
+        // The payload keeps health for diagnostics, but it does not gate delegation.
         let settings = LeaderParticipationSettings(
             mode: .canary, canaryPercent: 0, killSwitch: false, optInProjects: []
         )
@@ -325,7 +346,7 @@ final class LeaderParticipationPolicyTests: XCTestCase {
 
         let executionHostReady = settings.controlPayload(
             projectID: "p", sessionID: "s", supportedLeader: true, health: failingHealth,
-            delegationState: delegated, healthScope: .executionHost
+            delegationState: delegated, availableWorkers: 1, healthScope: .executionHost
         )
         XCTAssertEqual(executionHostReady["delegated_overlap_resolution"] as? Bool, true)
         XCTAssertEqual(executionHostReady["healthy"] as? Bool, false)
@@ -339,7 +360,7 @@ final class LeaderParticipationPolicyTests: XCTestCase {
 
         let unsupported = settings.controlPayload(
             projectID: "p", sessionID: "s", supportedLeader: false, health: failingHealth,
-            delegationState: delegated, healthScope: .executionHost
+            delegationState: delegated, availableWorkers: 1, healthScope: .executionHost
         )
         XCTAssertEqual(unsupported["delegated_overlap_resolution"] as? Bool, false)
 
@@ -347,13 +368,13 @@ final class LeaderParticipationPolicyTests: XCTestCase {
             mode: .shadow, canaryPercent: 0, killSwitch: true, optInProjects: []
         ).controlPayload(
             projectID: "p", sessionID: "s", supportedLeader: true, health: failingHealth,
-            delegationState: delegated, healthScope: .executionHost
+            delegationState: delegated, availableWorkers: 1, healthScope: .executionHost
         )
         XCTAssertEqual(killed["delegated_overlap_resolution"] as? Bool, false)
 
         let controlHostFailing = settings.controlPayload(
             projectID: "p", sessionID: "s", supportedLeader: true, health: failingHealth,
-            delegationState: delegated, healthScope: .controlHost
+            delegationState: delegated, availableWorkers: 1, healthScope: .controlHost
         )
         XCTAssertEqual(controlHostFailing["delegated_overlap_resolution"] as? Bool, false)
 
@@ -362,9 +383,20 @@ final class LeaderParticipationPolicyTests: XCTestCase {
         )
         let controlHostPassing = settings.controlPayload(
             projectID: "p", sessionID: "s", supportedLeader: true, health: passingHealth,
-            delegationState: delegated, healthScope: .controlHost
+            delegationState: delegated, availableWorkers: 1, healthScope: .controlHost
         )
         XCTAssertEqual(controlHostPassing["delegated_overlap_resolution"] as? Bool, true)
+    }
+
+    func testDelegatedHelpTextDefinesSafeLeaderLaneContract() {
+        let text = ProjectDelegationLevel.delegated.helpText
+        XCTAssertTrue(text.localizedCaseInsensitiveContains("mandatory"))
+        XCTAssertTrue(text.localizedCaseInsensitiveContains("dependency-ready"))
+        XCTAssertTrue(text.localizedCaseInsensitiveContains("ownership-disjoint"))
+        XCTAssertTrue(text.localizedCaseInsensitiveContains("serial integration"))
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("canary"))
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("cohort"))
+        XCTAssertFalse(text.localizedCaseInsensitiveContains("opt-in"))
     }
 
     func testUpdateLeaderParticipationSettingsRoundTripsAllFieldsThroughOneSharedPath() {

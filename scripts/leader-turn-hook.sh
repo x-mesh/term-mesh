@@ -11,7 +11,8 @@
 # `stop_hook_active` and `last_assistant_message`), not the submitted prompt.
 # The two hook processes therefore correlate through one current-turn file per
 # surface. Start replaces that file with the derived ID; end consumes it, or
-# records `unknown` when no start preceded it.
+# records `unknown` when no start preceded it. An unmet mandatory delegation
+# floor asks the Stop hook to continue the turn once.
 #
 # The ID is sha256(discriminator + ":" + prompt_sha256), truncated to 16
 # hex characters. The preferred discriminator is Claude's session ID from the
@@ -77,7 +78,7 @@ value = None
 if isinstance(control, dict):
     expected = sys.argv[2]
     project_id = control.get("project_id")
-    if not expected or project_id == expected:
+    if expected and project_id == expected:
         session_value = control.get("session_id")
         if isinstance(session_value, str) and session_value:
             value = session_value
@@ -372,10 +373,16 @@ fi
 # turn_route record. Reading a marker is safer than searching a log another
 # process may append to or that GC may rotate between the search and the end.
 ROUTE_STATUS=""
+ROUTE_NO_DISPATCH=""
 if [ "$MODE" = --end ]; then
     ROUTE_KEY="$(printf '%s' "$TURN_ID" | tr -cd 'A-Za-z0-9._-' 2>/dev/null || true)"
     if [ -n "$ROUTE_KEY" ] && [ -f "$LOG_DIR/.turn-route-$ROUTE_KEY" ]; then
         ROUTE_STATUS=stated
+        # tm-agent adds this line only for `--route direct` with a non-blank
+        # `--no-dispatch-reason`; a bare route leaves the marker at "stated".
+        if grep -qx 'no_dispatch' "$LOG_DIR/.turn-route-$ROUTE_KEY" 2>/dev/null; then
+            ROUTE_NO_DISPATCH=1
+        fi
         rm -f "$LOG_DIR/.turn-route-$ROUTE_KEY" 2>/dev/null || true
     else
         ROUTE_STATUS=unstated
@@ -417,16 +424,15 @@ try:
 except Exception:
     sys.exit(0)
 
-if not isinstance(control, dict) or control.get("kill_switch") is True:
+if not isinstance(control, dict):
+    sys.exit(0)
+if not team or control.get("project_id") != team:
     sys.exit(0)
 
-# Off is the one Settings control now that the kill switch is debug-only, so it
-# has to stop the whole feature, not only the overlap route. Record-only keeps
-# measuring and keeps the floor below: observing a turn is not steering it.
-if control.get("mode") == "off":
+level = control.get("delegation_effective")
+if not isinstance(level, str):
     sys.exit(0)
 
-level = control.get("delegation_effective") or control.get("delegation_configured")
 try:
     workers = int(control.get("available_workers") or 0)
 except (TypeError, ValueError):
@@ -527,6 +533,28 @@ fi
 # retained descriptor would keep writing to the renamed inode.
 { printf '%s\n' "$LINE" >> "$LOG_FILE"; } 2>/dev/null || true
 
+# Stop hooks continue the current turn when they receive this JSON decision.
+# `stop_hook_active` prevents the continuation from blocking itself again. A
+# direct route stated with a no-dispatch reason is the recorded alternative the
+# block offers; a bare route is not, or any route would skip the floor.
+if [ "$MODE" = --end ] && [ "$DELEGATION_FLOOR" = unmet ] && [ "$ROUTE_NO_DISPATCH" != 1 ]; then
+    STOP_HOOK_ACTIVE=false
+    if command -v python3 >/dev/null 2>&1; then
+        STOP_HOOK_ACTIVE="$(printf '%s' "$PAYLOAD" | python3 -c '
+import json
+import sys
+try:
+    value = json.load(sys.stdin)
+except Exception:
+    value = {}
+print("true" if value.get("stop_hook_active") is True else "false", end="")
+' 2>/dev/null || printf false)"
+    fi
+    if [ "$STOP_HOOK_ACTIVE" != true ]; then
+        printf '%s\n' '{"decision":"block","reason":"Delegated mode requires at least one eligible worker dispatch before this turn can finish. Dispatch the work, or record why no eligible worker task exists with `tm-agent leader turn route --route direct --no-dispatch-reason <reason>`."}'
+    fi
+fi
+
 # Record where the log ends before the turn runs, so Stop can tell whether this
 # turn appended any dispatch of its own. Independent of the injection below:
 # the floor may be switched off while measurement continues.
@@ -572,7 +600,7 @@ fi
 # the control file — it never decides anything the app did not already decide.
 #
 # Every failure is silent and empty. A missing, unreadable, or malformed control
-# file, absent python3, a zero roster, or an engaged kill switch all leave stdout
+# file, absent python3, or a zero roster leave stdout
 # untouched, because a hook that garbles a leader turn costs more than a hook
 # that says nothing. Stop's stdout is not injected, so only --start emits.
 if [ "$MODE" = --start ] \
@@ -592,12 +620,7 @@ try:
 except Exception:
     sys.exit(0)
 
-if not isinstance(control, dict) or control.get("kill_switch") is True:
-    sys.exit(0)
-
-# Same reason as the floor block above: off means the leader decides unaided.
-# Record-only still injects, because it changes what is measured, not the turn.
-if control.get("mode") == "off":
+if not isinstance(control, dict):
     sys.exit(0)
 
 # Refuse an unrecognized schema or another Project's control file rather than inject its floor here.
@@ -606,16 +629,10 @@ if type(schema_version) is not int or schema_version != 1:
     sys.exit(0)
 
 expected_project = sys.argv[2] if len(sys.argv) > 2 else ""
-if expected_project and control.get("project_id") != expected_project:
+if not expected_project or control.get("project_id") != expected_project:
     sys.exit(0)
 
-# The per-Project switch for this whole block. Off restores the pre-existing
-# behavior — the leader decides unaided. Measurement is unaffected: observing
-# what a turn did is not the same as telling it what to do.
-if control.get("inject_directive") is False:
-    sys.exit(0)
-
-level = control.get("delegation_effective") or control.get("delegation_configured")
+level = control.get("delegation_effective")
 if not isinstance(level, str):
     sys.exit(0)
 
@@ -624,6 +641,10 @@ try:
 except (TypeError, ValueError):
     workers = 0
 if workers <= 0:
+    sys.exit(0)
+
+if level != "delegated":
+    # Non-delegated Projects stay closed even when legacy rollout fields are on.
     sys.exit(0)
 
 try:
@@ -646,12 +667,6 @@ if team_uuid:
         if c.isascii() and (c.isalnum() or c == "-")
     )[:48]
     route_file = os.path.expanduser("~/.term-mesh/agent-routes/" + safe + ".json")
-
-# leaderFirst only has something to say when a wave is possible at all: it
-# leaves serial work with the leader either way, so with no wave available the
-# floor would repeat the default every turn as noise.
-if level == "leaderFirst" and wave < 2:
-    sys.exit(0)
 
 if wave >= 2:
     wave_clause = (
@@ -676,10 +691,13 @@ FLOORS = {
         + wave_clause
     ),
     "delegated": (
-        "Fill every useful independent unit with workers up to the configured maximum, "
-        "and keep coordination, integration, and review in the leader lane. If the work "
-        "is serial, use one worker. Never invent units only to fill capacity. Implementing "
-        "it yourself requires a reason recorded with `tm-agent leader turn route`. "
+        "Delegated guidance is mandatory. Assign every useful dependency-ready unit up to "
+        "the available roster, configured maximum, or ten workers, whichever is lower, and "
+        "keep coordination, integration, and review in the leader lane. If the work is serial, "
+        "use one worker. Fill every useful independent unit, but never invent units only to fill capacity. A leader mutation lane "
+        "requires isolated checkout, explicit disjoint ownership, zero write overlap, and "
+        "serial integration. Implementing it yourself requires "
+        "`tm-agent leader turn route --route direct --no-dispatch-reason <reason>`. "
         + wave_clause
     ),
 }

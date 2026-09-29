@@ -326,12 +326,12 @@ final class AgentSessionTests: XCTestCase {
         let first = LeaderParallelPolicy.renderedInstructions
         let second = LeaderParallelPolicy.renderedInstructions
 
-        XCTAssertEqual(LeaderParallelPolicy.version, "13")
+        XCTAssertEqual(LeaderParallelPolicy.version, "14")
         XCTAssertEqual(LeaderParallelPolicy.activation, "request-boundary-enforced")
         XCTAssertEqual(first, second)
         XCTAssertEqual(LeaderParallelPolicy.digest.count, 64)
         XCTAssertTrue(LeaderParallelPolicy.digest.allSatisfy { $0.isHexDigit })
-        XCTAssertTrue(first.contains("policy_version: 13"))
+        XCTAssertTrue(first.contains("policy_version: 14"))
         XCTAssertTrue(first.contains("policy_digest: \(LeaderParallelPolicy.digest)"))
         XCTAssertTrue(first.contains("policy_activation: request-boundary-enforced"))
     }
@@ -381,14 +381,14 @@ final class AgentSessionTests: XCTestCase {
         XCTAssertTrue(policy.contains("constraint that prevented a useful parallel split"))
         XCTAssertTrue(policy.contains("--worktree always"))
         XCTAssertTrue(policy.contains("avoid turn-by-turn ping-pong"))
-        XCTAssertTrue(policy.contains("\"route\": \"direct|probe|parallel\""))
+        XCTAssertTrue(policy.contains("\"route\": \"direct|probe|parallel|delegated\""))
         XCTAssertTrue(policy.contains("probe has exactly one read-only implementation task"))
         XCTAssertTrue(policy.contains("parallel has between two and the configured maximum of ten implementation tasks"))
         XCTAssertTrue(policy.contains("never manufacture work solely to occupy capacity"))
         XCTAssertTrue(policy.contains("tm-agent leader turn route --route"))
         XCTAssertTrue(policy.contains("--available-workers <count>"))
-        XCTAssertTrue(policy.contains("A non-null `directive`"))
-        XCTAssertTrue(policy.contains("does not intercept or enforce arbitrary"))
+        XCTAssertTrue(policy.contains("always returns mandatory guidance"))
+        XCTAssertTrue(policy.contains("does not intercept arbitrary"))
         XCTAssertTrue(policy.contains("wait --mode any --tasks"))
         XCTAssertTrue(policy.contains("at most one additional wait/collect"))
         XCTAssertTrue(policy.contains("After the actual diff is integrated"))

@@ -356,9 +356,7 @@ cat > "$FLOOR_CTL/killed.json" <<'JSON' || exit 1
 {"schema_version":1,"delegation_effective":"delegated","available_workers":3,"kill_switch":true,
  "project_id":"floor-test"}
 JSON
-# Settings shows the mode and no longer shows the kill switch, so "off" has to
-# silence this hook exactly as the kill switch does. "Record only" must not: it
-# changes what is measured, not what the turn is told.
+# Legacy rollout fields stay diagnostic. They do not suppress delegated guidance.
 cat > "$FLOOR_CTL/mode-off.json" <<'JSON' || exit 1
 {"schema_version":1,"delegation_effective":"delegated","available_workers":3,
  "worker_names":["executor","architect","reviewer"],"kill_switch":false,
@@ -386,12 +384,12 @@ case "$FLOOR_OUT" in
     *) fail "delegated max-capacity rule missing: $FLOOR_OUT" ;;
 esac
 
-# Stop's stdout is not injected anywhere, so --end must stay silent.
-FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-1"}') \
+# A continued Stop must stay silent and avoid a continuation loop.
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-1","stop_hook_active":true}') \
     || fail "delegated end returned nonzero"
-[ -z "$FLOOR_OUT" ] || fail "--end wrote to stdout: $FLOOR_OUT"
+[ -z "$FLOOR_OUT" ] || fail "continued --end wrote to stdout: $FLOOR_OUT"
 
-for quiet in leader-first-solo killed mode-off broken missing; do
+for quiet in leader-first-solo broken missing; do
     FLOOR_OUT=$(floor_hook "$FLOOR_CTL/$quiet.json" --start "{\"prompt\":\"$quiet\"}") \
         || fail "$quiet start returned nonzero"
     [ -z "$FLOOR_OUT" ] || fail "$quiet should inject nothing, got: $FLOOR_OUT"
@@ -402,6 +400,14 @@ case "$FLOOR_OUT" in
     *"level: delegated"*) ;;
     *) fail "record-only must still inject the floor: $FLOOR_OUT" ;;
 esac
+for legacy in killed mode-off; do
+    FLOOR_OUT=$(floor_hook "$FLOOR_CTL/$legacy.json" --start "{\"prompt\":\"$legacy\"}") \
+        || fail "$legacy start returned nonzero"
+    case "$FLOOR_OUT" in
+        *"level: delegated"*) ;;
+        *) fail "$legacy must not suppress delegated guidance: $FLOOR_OUT" ;;
+    esac
+done
 
 FLOOR_OUT=$(env -u TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE HOME="$FLOOR_HOME" \
     TERMMESH_TEAM=floor-test TERMMESH_SURFACE_ID=99999999-8888-7777-6666-555555555555 \
@@ -414,8 +420,22 @@ FLOOR_OUT=$(env -u TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE HOME="$FLOOR_HOME"
 # depend on the leader reporting anything.
 floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"unmet turn","session_id":"floor-2"}' >/dev/null \
     || fail "unmet start returned nonzero"
-floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-2"}' >/dev/null \
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-2","stop_hook_active":false}') \
     || fail "unmet end returned nonzero"
+python3 - "$FLOOR_OUT" <<'BLOCKPY' || exit 1
+import json
+import sys
+
+value = json.loads(sys.argv[1])
+if value.get("decision") != "block" or "eligible worker dispatch" not in value.get("reason", ""):
+    raise SystemExit("FAIL: unmet delegation did not block Stop: %r" % value)
+BLOCKPY
+
+floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"continued turn","session_id":"floor-continued"}' >/dev/null \
+    || fail "continued start returned nonzero"
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-continued","stop_hook_active":true}') \
+    || fail "continued end returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "active Stop hook blocked recursively: $FLOOR_OUT"
 
 floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"met turn","session_id":"floor-3"}' >/dev/null \
     || fail "met start returned nonzero"
@@ -442,18 +462,16 @@ for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
         records.append(json.loads(line))
 
 ends = [r for r in records if r["event"] == "turn_end"]
-# The last three ends are, in order: delegated with no dispatch, delegated with
-# one dispatch, then leaderFirst. Checking them positionally keeps this honest
+# The last four ends are, in order: delegated with no dispatch, its continuation,
+# delegated with one dispatch, then leaderFirst. Checking them positionally keeps this honest
 # about ordering instead of counting occurrences that earlier cases also add.
-expected = ["unmet", "met", None]
-actual = [r.get("delegation_floor") for r in ends[-3:]]
+expected = ["unmet", "unmet", "met", None]
+actual = [r.get("delegation_floor") for r in ends[-4:]]
 if actual != expected:
     raise SystemExit(f"FAIL: delegation floors were {actual}, expected {expected}")
 PY
 
-# Off also stops the floor record, the half the kill switch used to own alone.
-# Run it after the positional check above so that check keeps its last-three
-# window.
+# Legacy mode does not stop the mandatory floor record.
 floor_hook "$FLOOR_CTL/mode-off.json" --start '{"prompt":"off turn","session_id":"floor-off"}' >/dev/null \
     || fail "mode-off start returned nonzero"
 floor_hook "$FLOOR_CTL/mode-off.json" --end '{"session_id":"floor-off"}' >/dev/null \
@@ -474,13 +492,52 @@ ends = [r for r in records if r["event"] == "turn_end"]
 if not ends:
     raise SystemExit("FAIL: no turn_end records")
 last = ends[-1]
-if "delegation_floor" in last:
-    raise SystemExit("FAIL: off recorded a floor: %s" % last.get("delegation_floor"))
+if last.get("delegation_floor") != "unmet":
+    raise SystemExit("FAIL: legacy mode suppressed the floor: %s" % last.get("delegation_floor"))
 OFFPY
 
+# A bare stated route is not a reason: it must still continue the turn once,
+# or any route would skip the floor. `--route direct --no-dispatch-reason`
+# adds a `no_dispatch` line to the marker, and only that ends the turn.
+routed_floor_turn_id() {
+    head -n 1 "$FLOOR_HOME/.term-mesh/logs/.turn-current-99999999-8888-7777-6666-555555555555"
+}
+floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"bare route turn","session_id":"floor-bare"}' >/dev/null \
+    || fail "bare-route start returned nonzero"
+bare_turn=$(routed_floor_turn_id)
+[ -n "$bare_turn" ] || fail "bare-route turn id missing"
+printf 'stated\n' > "$FLOOR_HOME/.term-mesh/logs/.turn-route-$bare_turn" || exit 1
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-bare","stop_hook_active":false}') \
+    || fail "bare-route end returned nonzero"
+case "$FLOOR_OUT" in
+    *'"decision":"block"'*"--no-dispatch-reason"*) ;;
+    *) fail "a bare stated route skipped the delegation floor: $FLOOR_OUT" ;;
+esac
+
+floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"reasoned direct turn","session_id":"floor-routed"}' >/dev/null \
+    || fail "routed start returned nonzero"
+routed_floor_turn=$(routed_floor_turn_id)
+[ -n "$routed_floor_turn" ] || fail "routed turn id missing"
+printf 'stated\nno_dispatch\n' > "$FLOOR_HOME/.term-mesh/logs/.turn-route-$routed_floor_turn" || exit 1
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-routed","stop_hook_active":false}') \
+    || fail "routed end returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "a direct route with a no-dispatch reason was still blocked: $FLOOR_OUT"
+python3 - "$FLOOR_LOG" "$routed_floor_turn" <<'ROUTEDPY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines() if line.strip()]
+ends = [r for r in records if r["event"] == "turn_end" and r["turn_id"] == sys.argv[2]]
+if len(ends) != 1:
+    raise SystemExit("FAIL: routed turn has %d turn_end records" % len(ends))
+if ends[0].get("route_status") != "stated" or ends[0].get("delegation_floor") != "unmet":
+    raise SystemExit("FAIL: routed turn_end was %r" % ends[0])
+ROUTEDPY
+
 # The per-Project execution options, which only reach the hook through this
-# file: a cap of one means waves are off rather than small, and the injection
-# switch has to silence the floor without silencing measurement.
+# file: a cap of one means waves are off rather than small. The legacy injection
+# switch cannot silence mandatory guidance.
 cat > "$FLOOR_CTL/capped.json" <<'JSON' || exit 1
 {"schema_version":1,"delegation_effective":"delegated","available_workers":4,
  "worker_names":["a","b","c","d"],"kill_switch":false,"project_id":"floor-test",
@@ -534,7 +591,10 @@ FLOOR_OUT=$(floor_hook "$FLOOR_CTL/no-waves.json" --start '{"prompt":"no waves"}
 
 FLOOR_OUT=$(floor_hook "$FLOOR_CTL/injection-off.json" --start '{"prompt":"off","session_id":"floor-5"}') \
     || fail "injection-off start returned nonzero"
-[ -z "$FLOOR_OUT" ] || fail "inject_directive=false must inject nothing, got: $FLOOR_OUT"
+case "$FLOOR_OUT" in
+    *"level: delegated"*) ;;
+    *) fail "inject_directive=false suppressed mandatory guidance: $FLOOR_OUT" ;;
+esac
 
 # ...but turning injection off must not turn measurement off with it.
 floor_hook "$FLOOR_CTL/injection-off.json" --end '{"session_id":"floor-5"}' >/dev/null \
@@ -561,7 +621,8 @@ PY
 # floor, even with an otherwise valid, well-formed payload.
 cat > "$FLOOR_CTL/foreign-project.json" <<'JSON' || exit 1
 {"schema_version":1,"delegation_effective":"delegated","available_workers":3,
- "worker_names":["executor"],"kill_switch":false,"project_id":"other-project"}
+ "worker_names":["executor"],"kill_switch":false,"project_id":"other-project",
+ "session_id":"foreign-session"}
 JSON
 FLOOR_OUT=$(floor_hook "$FLOOR_CTL/foreign-project.json" --start '{"prompt":"foreign"}') \
     || fail "foreign-project start returned nonzero"
@@ -577,12 +638,7 @@ FLOOR_OUT=$(floor_hook "$FLOOR_CTL/bad-schema.json" --start '{"prompt":"bad-sche
     || fail "bad-schema start returned nonzero"
 [ -z "$FLOOR_OUT" ] || fail "unrecognized schema_version should inject nothing, got: $FLOOR_OUT"
 
-# An empty TERMMESH_TEAM leaves the identity comparison off rather than
-# silencing the floor. This is deliberate and load-bearing: the app sets
-# TERMMESH_TEAM beside the request token this hook already gates on, so an
-# empty value means an environment this code cannot judge, not a foreign file.
-# Failing closed here would silently disable delegation everywhere a single
-# variable went missing, which is a worse failure than the one it prevents.
+# An empty TERMMESH_TEAM cannot prove that the control file belongs to this Project.
 FLOOR_OUT=$(HOME="$FLOOR_HOME" \
     TERMMESH_TEAM= \
     TERMMESH_SURFACE_ID=99999999-8888-7777-6666-555555555555 \
@@ -590,10 +646,51 @@ FLOOR_OUT=$(HOME="$FLOOR_HOME" \
     TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$FLOOR_CTL/delegated.json" \
     "$HOOK" --start '{"prompt":"no team name"}') \
     || fail "empty TERMMESH_TEAM start returned nonzero"
-case "$FLOOR_OUT" in
-    *"level: delegated"*) ;;
-    *) fail "an empty TERMMESH_TEAM must not silence the floor: $FLOOR_OUT" ;;
-esac
+[ -z "$FLOOR_OUT" ] || fail "an empty TERMMESH_TEAM must fail closed, got: $FLOOR_OUT"
+
+# Project identity also gates control-file session adoption and the end-side
+# delegation verdict. A foreign or unidentified Project must affect neither.
+for identity_case in foreign empty; do
+    if [ "$identity_case" = foreign ]; then
+        identity_team=floor-test
+        identity_control="$FLOOR_CTL/foreign-project.json"
+    else
+        identity_team=
+        identity_control="$FLOOR_CTL/delegated.json"
+    fi
+    env -u TERMMESH_LEADER_SESSION_ID HOME="$FLOOR_HOME" \
+        TERMMESH_TEAM="$identity_team" \
+        TERMMESH_SURFACE_ID=identity-$identity_case \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$identity_control" \
+        "$HOOK" --start "{\"prompt\":\"identity $identity_case\",\"session_id\":\"payload-$identity_case\"}" >/dev/null \
+        || fail "$identity_case identity start returned nonzero"
+    env -u TERMMESH_LEADER_SESSION_ID HOME="$FLOOR_HOME" \
+        TERMMESH_TEAM="$identity_team" \
+        TERMMESH_SURFACE_ID=identity-$identity_case \
+        TERMMESH_LEADER_REQUEST_TOKEN=leader-only-token \
+        TERMMESH_LEADER_PARTICIPATION_CONTROL_FILE="$identity_control" \
+        "$HOOK" --end "{\"session_id\":\"payload-$identity_case\"}" >/dev/null \
+        || fail "$identity_case identity end returned nonzero"
+done
+
+python3 - "$FLOOR_LOG" <<'IDENTITYPY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+starts = [record for record in records if record.get("event") == "turn_start"][-2:]
+ends = [record for record in records if record.get("event") == "turn_end"][-2:]
+if len(starts) != 2 or any("leader_session_id" in record for record in starts):
+    raise SystemExit("FAIL: unidentified Project adopted a control session: %r" % starts)
+if len(ends) != 2 or any("delegation_floor" in record for record in ends):
+    raise SystemExit("FAIL: unidentified Project recorded a delegation floor: %r" % ends)
+IDENTITYPY
 
 # A remote leader pane also carries TERMMESH_LEADER_PROJECT_ID, a display ID
 # ("team:<uuid>") distinct from the team name control payloads use as
