@@ -4297,14 +4297,15 @@ final class PeerRelaySession {
         }
     }
 
-    /// A host that repairs its own overflow sends a GridSnapshot at most
-    /// `PeerOverflowResync.minSnapshotInterval` after the drop. Settling
-    /// faster than that raced it: the viewer opened a new connection for a
-    /// gap the host was about to repaint anyway. The margin covers the
-    /// snapshot capture and its trip over the link.
+    /// A host that repairs its own overflow pauses its output for
+    /// `PeerOverflowResync.minSnapshotInterval` and then for the snapshot
+    /// capture, which waits for the flood's raw-to-filtered offsets to line
+    /// up and measured over a second under `yes`. That pause reads as a lull,
+    /// so an 800 ms settle still reconnected into the capture and cancelled
+    /// it. Such a host also closes the connection when a repair fails, so the
+    /// viewer's heal is only a backstop there.
     static func gapHealDebounceMs(hostResyncsOnOverflow: Bool) -> UInt64 {
-        guard hostResyncsOnOverflow else { return 400 }
-        return UInt64(PeerOverflowResync.minSnapshotInterval * 1000) + 300
+        hostResyncsOnOverflow ? 2500 : 400
     }
 
     static func waitOutBackoff(
