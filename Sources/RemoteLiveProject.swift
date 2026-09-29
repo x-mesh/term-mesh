@@ -80,7 +80,7 @@ final class RemoteLiveProject {
     /// Window closure bypasses TabManager.closeWorkspace. Retained SwiftUI
     /// managers must not keep remote viewers selectable without a window.
     static func closeViewers(in manager: TabManager) {
-        for workspace in manager.tabs where boardContexts[workspace.id] != nil {
+        for workspace in manager.tabs where ownsWorkspace(workspace.id) || boardContexts[workspace.id] != nil {
             manager.closeWorkspace(workspace)
         }
     }

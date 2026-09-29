@@ -511,8 +511,8 @@ class TabManager {
         // the compressor to its hard limit. A durable project declaration is
         // the proof that this workspace is reconstructed from a peer roster.
         // A remote Project viewer declares no project, so it is named here:
-        // restored as shells, every relaunch left one more beside the viewer
-        // the next roster reopens.
+        // it is rebuilt only from the roster, and restoring it as shells left
+        // one dead duplicate per relaunch.
         let nonTeamTabs = tabs.filter { workspace in
             !teamWorkspaceIds.contains(workspace.id)
                 && !workspace.isPeerMirror
