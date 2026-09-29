@@ -1015,6 +1015,19 @@ final class PeerTerminalReplayBufferTests: XCTestCase {
         XCTAssertEqual(bounded.filteredEnd(forRawEnd: 1_025), 1_025)
     }
 
+    /// One raw-drain overflow used to invalidate the store for the pane's
+    /// lifetime, so every later overflow snapshot timed out.
+    func testRawToFilteredCheckpointResumesAfterADiscontinuity() {
+        var checkpoints = RawToFilteredCheckpointStore()
+        checkpoints.append(rawEnd: 10, rawByteCount: 0, filteredEnd: 0)
+        checkpoints.append(rawEnd: 15, rawByteCount: 4, filteredEnd: 4)
+        checkpoints.append(rawEnd: 20, rawByteCount: 5, filteredEnd: 9)
+
+        XCTAssertNil(checkpoints.filteredEnd(forRawEnd: 10))
+        XCTAssertNil(checkpoints.filteredEnd(forRawEnd: 15))
+        XCTAssertEqual(checkpoints.filteredEnd(forRawEnd: 20), 9)
+    }
+
     func testRawToFilteredCheckpointRejectsDuplicateWrappedBoundary() {
         var checkpoints = RawToFilteredCheckpointStore()
         checkpoints.append(rawEnd: UInt64.max, rawByteCount: 0, filteredEnd: 0)

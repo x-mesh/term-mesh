@@ -168,7 +168,6 @@ struct RawToFilteredCheckpointStore {
     private var nextIndex = 0
     private var count = 0
     private var lastRawEnd: UInt64?
-    private var isValid = true
 
     init() {
         positions = [:]
@@ -176,27 +175,14 @@ struct RawToFilteredCheckpointStore {
     }
 
     mutating func append(rawEnd: UInt64, rawByteCount: Int, filteredEnd: UInt64) {
-        guard isValid else { return }
         let rawStart = rawEnd &- UInt64(rawByteCount)
-        if let lastRawEnd {
-            guard lastRawEnd == rawStart else {
-                isValid = false
-                positions.removeAll(keepingCapacity: true)
-                checkpoints = Array(repeating: nil, count: Self.capacity)
-                nextIndex = 0
-                count = 0
-                return
-            }
-        } else if rawByteCount != 0 {
-            isValid = false
+        let continuous = lastRawEnd.map { $0 == rawStart } ?? (rawByteCount == 0)
+        guard continuous else {
+            restart(at: rawEnd)
             return
         }
         guard positions[rawEnd] == nil else {
-            isValid = false
-            positions.removeAll(keepingCapacity: true)
-            checkpoints = Array(repeating: nil, count: Self.capacity)
-            nextIndex = 0
-            count = 0
+            restart(at: rawEnd)
             return
         }
         self.lastRawEnd = rawEnd
@@ -210,8 +196,20 @@ struct RawToFilteredCheckpointStore {
         nextIndex = (nextIndex + 1) % Self.capacity
     }
 
+    /// Forgets every boundary and resumes mapping from the next contiguous
+    /// one. The boundary that broke continuity is never recorded, so a
+    /// resync still cannot land on it. Staying invalid forever instead left
+    /// every later atomic resync of the pane to time out after 12 s: one
+    /// raw-drain overflow in a flood disabled overflow snapshots for good.
+    private mutating func restart(at rawEnd: UInt64) {
+        positions.removeAll(keepingCapacity: true)
+        checkpoints = Array(repeating: nil, count: Self.capacity)
+        nextIndex = 0
+        count = 0
+        lastRawEnd = rawEnd
+    }
+
     func filteredEnd(forRawEnd rawEnd: UInt64) -> UInt64? {
-        guard isValid else { return nil }
         guard let index = positions[rawEnd], let checkpoint = checkpoints[index],
               checkpoint.rawEnd == rawEnd else { return nil }
         return checkpoint.filteredEnd
