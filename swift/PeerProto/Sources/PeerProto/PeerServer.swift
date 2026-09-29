@@ -3194,7 +3194,9 @@ actor PeerServerSession {
                     "pty-writer-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) cancelled=\(Task.isCancelled)"
                 )
             }
-            if !sendSucceeded && !Task.isCancelled {
+            // A finished producer ends the attachment as surely as a failed
+            // send: a raw-drain overflow finishes every stream of the pane.
+            if (!sendSucceeded || producerFinished) && !Task.isCancelled {
                 await detachSurface(id: surfaceID)
                 // A connection left open with nothing attached looks healthy
                 // to the viewer: heartbeats still answer, so it never learns
@@ -3202,7 +3204,7 @@ actor PeerServerSession {
                 // the silent freeze into an EOF the viewer recovers from.
                 if attachments.isEmpty {
                     PeerServerDiagnostics.record(
-                        "transport-close reason=attachment-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID))"
+                        "transport-close reason=attachment-ended surface=\(PeerServerDiagnostics.shortSurfaceID(surfaceID)) producer_finished=\(producerFinished)"
                     )
                     await connection.close()
                 }
