@@ -496,6 +496,30 @@ if last.get("delegation_floor") != "unmet":
     raise SystemExit("FAIL: legacy mode suppressed the floor: %s" % last.get("delegation_floor"))
 OFFPY
 
+# Stating the route is the recorded reason the block offers instead of a
+# dispatch, so it ends the turn without a continuation. The floor is still
+# measured as unmet.
+floor_hook "$FLOOR_CTL/delegated.json" --start '{"prompt":"routed direct turn","session_id":"floor-routed"}' >/dev/null \
+    || fail "routed start returned nonzero"
+routed_floor_turn=$(head -n 1 "$FLOOR_HOME/.term-mesh/logs/.turn-current-99999999-8888-7777-6666-555555555555")
+[ -n "$routed_floor_turn" ] || fail "routed turn id missing"
+printf 'stated\n' > "$FLOOR_HOME/.term-mesh/logs/.turn-route-$routed_floor_turn" || exit 1
+FLOOR_OUT=$(floor_hook "$FLOOR_CTL/delegated.json" --end '{"session_id":"floor-routed","stop_hook_active":false}') \
+    || fail "routed end returned nonzero"
+[ -z "$FLOOR_OUT" ] || fail "a turn that stated its route was still blocked: $FLOOR_OUT"
+python3 - "$FLOOR_LOG" "$routed_floor_turn" <<'ROUTEDPY' || exit 1
+import json
+import pathlib
+import sys
+
+records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines() if line.strip()]
+ends = [r for r in records if r["event"] == "turn_end" and r["turn_id"] == sys.argv[2]]
+if len(ends) != 1:
+    raise SystemExit("FAIL: routed turn has %d turn_end records" % len(ends))
+if ends[0].get("route_status") != "stated" or ends[0].get("delegation_floor") != "unmet":
+    raise SystemExit("FAIL: routed turn_end was %r" % ends[0])
+ROUTEDPY
+
 # The per-Project execution options, which only reach the hook through this
 # file: a cap of one means waves are off rather than small. The legacy injection
 # switch cannot silence mandatory guidance.

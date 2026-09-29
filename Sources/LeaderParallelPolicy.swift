@@ -78,9 +78,10 @@ struct ProjectExecutionOptions: Equatable, Sendable {
     var injectDirective: Bool
 
     static let workerBounds = 1...10
-    static let `default` = Self(
-        maxParallelWorkers: workerBounds.upperBound, injectDirective: true
-    )
+    /// Three matches the fallback tm-agent and the turn hook use when the
+    /// control file carries no cap. A Project that has not chosen a limit
+    /// keeps that wave size at every delegation level.
+    static let `default` = Self(maxParallelWorkers: 3, injectDirective: true)
 
     private static func key(_ suffix: String, teamName: String) -> String {
         guard !teamName.isEmpty else { return "team.unknown.\(suffix)" }
@@ -222,14 +223,16 @@ struct ProjectRoutingDecision: Codable, Equatable, Sendable {
                 route: .probe, reasons: risks.map(\.rawValue).sorted(), workerCount: 1
             )
         case .delegated:
-            if taskShape == .singleUnit {
+            // Same classification as tm-agent's directive, which is what the
+            // leader follows: one worker is `delegated`, a wave is `parallel`.
+            let wave = min(cap, workers)
+            if taskShape == .singleUnit || wave == 1 {
                 return Self(
                     route: .delegated, reasons: ["delegated_serial_work"], workerCount: 1
                 )
             }
             return Self(
-                route: .delegated, reasons: ["delegated_max_capacity"],
-                workerCount: min(cap, workers)
+                route: .parallel, reasons: ["delegated_max_capacity"], workerCount: wave
             )
         }
     }
@@ -256,7 +259,7 @@ enum LeaderParallelPolicy {
         ),
         (
             "structured-routing-decision",
-            "Classify execution as direct, probe, parallel, or delegated before dispatch. Direct has no worker tasks. Probe has exactly one read-only task with a 60-90 second budget. Delegated serial work uses one worker. Other delegated work assigns every useful dependency-ready unit up to min(available workers, the configured limit, ten) without splitting work only to fill capacity. Every worker task names its worker, goal, owned and forbidden paths, dependencies, verification command, mutation flag, and time estimate."
+            "Classify execution as direct, probe, parallel, or delegated before dispatch. Direct has no worker tasks. Probe has exactly one read-only task with a 60-90 second budget. Delegated serial work uses route `delegated` with one worker. Other delegated work uses route `parallel` and assigns every useful dependency-ready unit up to min(available workers, the configured limit, ten) without splitting work only to fill capacity. Every worker task names its worker, goal, owned and forbidden paths, dependencies, verification command, mutation flag, and time estimate."
         ),
         (
             "turn-route-measurement",
@@ -376,7 +379,7 @@ enum LeaderParallelPolicy {
           ]
         }
         ```
-        Route invariants: direct has zero implementation tasks; probe has exactly one read-only implementation task (`mutates=false`) estimated at 60-90 seconds; parallel has between two and the configured maximum of ten implementation tasks whose `depends_on` prerequisites are already satisfied; delegated serial work has one worker, and other delegated work assigns every useful ready unit up to min(available workers, the configured limit, ten) without inventing work. Every concurrent write needs isolated ownership, zero overlap, and serial integration. The leader can mutate only in a separately declared disjoint lane. For implementation requests, `validation_gates` are a later wave derived from the integrated diff, never speculative implementation capacity. For explicit review-only requests, `review-only-fast-path` may start validators after bounded manifest triage against one frozen target while the leader works concurrently. Dispatch at most two gates once, collect once, and keep every gate read-only. A validator capsule covers one risk question and at most three primary files with a 90-second target. Require the normal final 5-field reply; `review_ready` without that final reply is partial evidence, not completion.
+        Route invariants: direct has zero implementation tasks; probe has exactly one read-only implementation task (`mutates=false`) estimated at 60-90 seconds; parallel has between two and the configured maximum of ten implementation tasks whose `depends_on` prerequisites are already satisfied; route `delegated` is serial delegated work with one worker, and other delegated work uses route `parallel` with every useful ready unit up to min(available workers, the configured limit, ten) without inventing work. Every concurrent write needs isolated ownership, zero overlap, and serial integration. The leader can mutate only in a separately declared disjoint lane. For implementation requests, `validation_gates` are a later wave derived from the integrated diff, never speculative implementation capacity. For explicit review-only requests, `review-only-fast-path` may start validators after bounded manifest triage against one frozen target while the leader works concurrently. Dispatch at most two gates once, collect once, and keep every gate read-only. A validator capsule covers one risk question and at most three primary files with a 90-second target. Require the normal final 5-field reply; `review_ready` without that final reply is partial evidence, not completion.
 
         \(renderedRules)
         """

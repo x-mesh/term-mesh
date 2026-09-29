@@ -88,7 +88,7 @@ final class RoutingInstrumentationTests: XCTestCase {
             ProjectRoutingDecision.decide(
                 level: .delegated, taskShape: nil, risks: [], availableWorkers: 1
             ),
-            .init(route: .delegated, reasons: ["delegated_max_capacity"], workerCount: 1),
+            .init(route: .delegated, reasons: ["delegated_serial_work"], workerCount: 1),
             "delegated must not need a stated shape to hand work over"
         )
         XCTAssertEqual(
@@ -96,7 +96,7 @@ final class RoutingInstrumentationTests: XCTestCase {
                 level: .delegated, taskShape: nil, risks: [],
                 availableWorkers: 12, maxParallelWorkers: 99
             ),
-            .init(route: .delegated, reasons: ["delegated_max_capacity"], workerCount: 10),
+            .init(route: .parallel, reasons: ["delegated_max_capacity"], workerCount: 10),
             "delegated fills useful capacity but never exceeds the global limit"
         )
         XCTAssertEqual(
@@ -154,8 +154,8 @@ final class RoutingInstrumentationTests: XCTestCase {
             "an unset Project has to read as the shipped default, not as zero"
         )
         XCTAssertEqual(
-            ProjectExecutionOptions.default.maxParallelWorkers,
-            ProjectExecutionOptions.workerBounds.upperBound
+            ProjectExecutionOptions.default.maxParallelWorkers, 3,
+            "an unset Project must keep the cap tm-agent and the turn hook fall back to"
         )
 
         ProjectExecutionOptions(maxParallelWorkers: 99, injectDirective: false)
@@ -188,7 +188,7 @@ final class RoutingInstrumentationTests: XCTestCase {
             return XCTFail("expected the request to be created")
         }
         XCTAssertNil(request.taskShape, "an omitted shape must stay unstated")
-        XCTAssertEqual(request.selectedRoute, .delegated)
+        XCTAssertEqual(request.selectedRoute, .parallel)
         XCTAssertEqual(request.selectedWorkerCount, 2)
     }
 
@@ -236,7 +236,7 @@ final class RoutingInstrumentationTests: XCTestCase {
             teamName: team, content: "third", requestId: "third"
         ) else { return XCTFail("third request missing") }
         XCTAssertEqual(third.delegationLevel, .delegated)
-        XCTAssertEqual(third.selectedRoute, .delegated)
+        XCTAssertEqual(third.selectedRoute, .parallel)
     }
 
     func testMembershipReregistrationPreservesConfiguredDelegation() throws {

@@ -528,8 +528,10 @@ fi
 { printf '%s\n' "$LINE" >> "$LOG_FILE"; } 2>/dev/null || true
 
 # Stop hooks continue the current turn when they receive this JSON decision.
-# `stop_hook_active` prevents the continuation from blocking itself again.
-if [ "$MODE" = --end ] && [ "$DELEGATION_FLOOR" = unmet ]; then
+# `stop_hook_active` prevents the continuation from blocking itself again. A
+# turn that stated its route has recorded why it did not dispatch, which is the
+# alternative the reason offers, so only a turn that did neither continues.
+if [ "$MODE" = --end ] && [ "$DELEGATION_FLOOR" = unmet ] && [ "$ROUTE_STATUS" != stated ]; then
     STOP_HOOK_ACTIVE=false
     if command -v python3 >/dev/null 2>&1; then
         STOP_HOOK_ACTIVE="$(printf '%s' "$PAYLOAD" | python3 -c '
@@ -543,7 +545,7 @@ print("true" if value.get("stop_hook_active") is True else "false", end="")
 ' 2>/dev/null || printf false)"
     fi
     if [ "$STOP_HOOK_ACTIVE" != true ]; then
-        printf '%s\n' '{"decision":"block","reason":"Delegated mode requires at least one eligible worker dispatch before this turn can finish. Dispatch the work, or record why no eligible worker task exists."}'
+        printf '%s\n' '{"decision":"block","reason":"Delegated mode requires at least one eligible worker dispatch before this turn can finish. Dispatch the work, or state the route and why no eligible worker task exists with `tm-agent leader turn route`."}'
     fi
 fi
 

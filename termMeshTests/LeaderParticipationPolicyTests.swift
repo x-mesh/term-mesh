@@ -117,7 +117,7 @@ final class LeaderParticipationPolicyTests: XCTestCase {
             level: .delegated, taskShape: .multiUnit, risks: [.repeatedFailure],
             availableWorkers: 12, maxParallelWorkers: 99
         )
-        XCTAssertEqual(decision.route, .delegated)
+        XCTAssertEqual(decision.route, .parallel)
         XCTAssertEqual(decision.reasons, ["delegated_max_capacity"])
         XCTAssertEqual(decision.workerCount, 10)
 
