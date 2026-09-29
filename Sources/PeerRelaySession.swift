@@ -915,10 +915,9 @@ actor RelayResizeCoalescer {
             let remaining = pacing.debounce - Date().timeIntervalSince(lastGapAt)
             guard remaining > 0 else { break }
             try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
-            if Task.isCancelled {
-                healTask = nil
-                return
-            }
+            // Whoever cancelled this task already cleared or replaced
+            // `healTask`; clearing it here could orphan a newer one.
+            if Task.isCancelled { return }
         }
         // Clear before healing so a gap arriving during the async heal starts a
         // fresh debounce task instead of being dropped.
@@ -1084,10 +1083,9 @@ actor RelayGapHealScheduler {
             let remaining = pacing.debounce - Date().timeIntervalSince(lastGapAt)
             guard remaining > 0 else { break }
             try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
-            if Task.isCancelled {
-                healTask = nil
-                return
-            }
+            // Whoever cancelled this task already cleared or replaced
+            // `healTask`; clearing it here could orphan a newer one.
+            if Task.isCancelled { return }
         }
         // Clear before healing so a gap arriving during the async heal
         // starts a fresh debounce instead of being dropped.
@@ -2267,10 +2265,14 @@ final class PeerRelaySession {
     // `resume_from_seq`, so this client gates it explicitly rather than
     // relying on the host silently ignoring an unrecognized field.
     private var hostSupportsReplayRing: Bool
-    // Whether the host advertised `grid.snapshot.v1`: such a host repairs its
-    // own outbound overflow with a GridSnapshot within
-    // `PeerOverflowResync.minSnapshotInterval`.
+    // Whether the host advertised `overflow.resync.v1` on a session this pane
+    // owns (whose handshake took `grid.snapshot.v1`): only then does the host
+    // repaint its own overflow and close when it cannot.
     private let hostResyncsOnOverflow: Bool
+    /// When the current session was adopted. A session that survived
+    /// `reconnectRecoverySurvivalSeconds` before failing recovers the
+    /// circuit; one dropped sooner keeps backing off.
+    private var sessionAdoptedAtUptime = ProcessInfo.processInfo.systemUptime
     private let resumeTransitionGate = RelayResumeTransitionGate()
     /// Scrollback browse state (tmux copy-mode model). Shared with the
     /// pump task, hence a lock box rather than MainActor state.
@@ -2598,7 +2600,7 @@ final class PeerRelaySession {
             onSharedDetach: nil,
             attachInitialSeq: outcome.initialByteSeq,
             hostSupportsReplayRing: connection.hostCapabilities.has(PeerCapability.replayRingV1),
-            hostResyncsOnOverflow: connection.hostCapabilities.has(PeerCapability.gridSnapshotV1),
+            hostResyncsOnOverflow: connection.hostCapabilities.has(PeerCapability.overflowResyncV1),
             ptyDelivery: ptyDelivery
         )
     }
@@ -2763,8 +2765,7 @@ final class PeerRelaySession {
                 await demux?.deregister(surfaceID: surfaceID)
             },
             attachInitialSeq: outcome.initialByteSeq,
-            hostSupportsReplayRing: hostCapabilities.has(PeerCapability.replayRingV1),
-            hostResyncsOnOverflow: hostCapabilities.has(PeerCapability.gridSnapshotV1)
+            hostSupportsReplayRing: hostCapabilities.has(PeerCapability.replayRingV1)
         )
     }
 
@@ -3402,12 +3403,6 @@ final class PeerRelaySession {
                 // real disconnect or a deliberate swap to pump up next.
                 var currentSession = session
                 var currentGeneration = resumeTransitionGate.currentGeneration()
-                // `ioStats.noteReceived` reports only the pane's first byte
-                // ever, so it cannot mark a replacement session as working.
-                // Without this the reconnect circuit never recovered: every
-                // host drop during a long flood lengthened the backoff until
-                // the circuit opened and the pane closed.
-                var awaitingReplacementOutput = false
                 pumpLoop: while !Task.isCancelled {
                     let msg: PeerIncomingMessage
                     do {
@@ -3436,7 +3431,6 @@ final class PeerRelaySession {
                             expectedByteSeq = nil
                             gapBytesTotal = 0
                             gapCount = 0
-                            awaitingReplacementOutput = true
                             continue pumpLoop
                         }
                         RemoteWorkLog.warningOffMain(
@@ -3455,7 +3449,6 @@ final class PeerRelaySession {
                             expectedByteSeq = nil
                             gapBytesTotal = 0
                             gapCount = 0
-                            awaitingReplacementOutput = true
                             continue pumpLoop
                         }
                         if let writer {
@@ -3594,9 +3587,6 @@ final class PeerRelaySession {
                             #if DEBUG
                             dlog("peer.relay.firstByte path=owned bytes=\(data.count)")
                             #endif
-                        } else if awaitingReplacementOutput {
-                            awaitingReplacementOutput = false
-                            await self.noteReconnectOutputRecovery(generation: currentGeneration)
                         }
                         // While a scrollback window is on display, live
                         // bytes must not paint over it. They are DROPPED,
@@ -4163,6 +4153,7 @@ final class PeerRelaySession {
         }
         relayTelemetry.resetRemote()
         session = newConnection.session
+        sessionAdoptedAtUptime = ProcessInfo.processInfo.systemUptime
         transport = newConnection.transport
         attachInitialSeq = outcome.initialByteSeq
         hostSupportsReplayRing = newConnection.hostCapabilities.has(PeerCapability.replayRingV1)
@@ -4222,6 +4213,15 @@ final class PeerRelaySession {
             "Peer reconnect start host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) failedSession=\(Self.sessionTag(failedSession)) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
         )
         await failedSession.stopHeartbeat()
+        // The circuit otherwise recovered only on the pane's first byte ever,
+        // so each host drop in a long flood lengthened the backoff until the
+        // circuit opened. Time survived, not bytes seen: a sick host that
+        // attaches, sends its snapshot and drops must keep backing off.
+        if Self.failedSessionEarnedRecovery(
+            adoptedAt: sessionAdoptedAtUptime, failedAt: ProcessInfo.processInfo.systemUptime
+        ) {
+            reconnectCircuit.recordRecovery()
+        }
         guard Self.shouldReconnectOwnedSession(
             ownsSession: ownsSession,
             isTorndown: isTorndown,
@@ -4291,21 +4291,24 @@ final class PeerRelaySession {
     }
 
     private func sleepUnlessSessionReplaced(_ failedSession: PeerSession, seconds: TimeInterval) async {
-        await Self.waitOutBackoff(seconds: seconds) { [weak self] in
-            guard let self else { return false }
-            return !self.isTorndown && self.session === failedSession
+        await Self.waitOutBackoff(seconds: seconds) {
+            !isTorndown && session === failedSession && (ownedTransportMayReconnect?() ?? true)
         }
     }
 
-    /// A host that repairs its own overflow pauses its output for
+    /// A host advertising `overflow.resync.v1` pauses its output for
     /// `PeerOverflowResync.minSnapshotInterval` and then for the snapshot
-    /// capture, which waits for the flood's raw-to-filtered offsets to line
-    /// up and measured over a second under `yes`. That pause reads as a lull,
-    /// so an 800 ms settle still reconnected into the capture and cancelled
-    /// it. Such a host also closes the connection when a repair fails, so the
-    /// viewer's heal is only a backstop there.
+    /// capture. That pause reads as a lull, so a short settle reconnected into
+    /// the capture and cancelled it. Such a host closes the connection when a
+    /// repair fails, so the viewer's heal is only a backstop there.
     static func gapHealDebounceMs(hostResyncsOnOverflow: Bool) -> UInt64 {
         hostResyncsOnOverflow ? 2500 : 400
+    }
+
+    static let reconnectRecoverySurvivalSeconds: TimeInterval = 10
+
+    static func failedSessionEarnedRecovery(adoptedAt: TimeInterval, failedAt: TimeInterval) -> Bool {
+        failedAt - adoptedAt >= reconnectRecoverySurvivalSeconds
     }
 
     static func waitOutBackoff(
@@ -4435,6 +4438,7 @@ final class PeerRelaySession {
         }
         relayTelemetry.resetRemote()
         session = connection.session
+        sessionAdoptedAtUptime = ProcessInfo.processInfo.systemUptime
         transport = connection.transport
         attachInitialSeq = outcome.initialByteSeq
         hostSupportsReplayRing = connection.hostCapabilities.has(PeerCapability.replayRingV1)

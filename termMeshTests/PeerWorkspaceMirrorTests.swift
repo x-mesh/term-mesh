@@ -1819,6 +1819,14 @@ final class PeerRelayReconnectBackoffTests: XCTestCase {
         XCTAssertEqual(PeerRelaySession.gapHealDebounceMs(hostResyncsOnOverflow: false), 400)
     }
 
+    /// A sick host that attaches, sends its snapshot and drops must keep
+    /// backing off; only a session that lasted may reset the circuit.
+    func testOnlyASessionThatSurvivedRecoversTheCircuit() {
+        XCTAssertFalse(PeerRelaySession.failedSessionEarnedRecovery(adoptedAt: 100, failedAt: 100.5))
+        XCTAssertFalse(PeerRelaySession.failedSessionEarnedRecovery(adoptedAt: 100, failedAt: 109.9))
+        XCTAssertTrue(PeerRelaySession.failedSessionEarnedRecovery(adoptedAt: 100, failedAt: 110))
+    }
+
     func testBackoffRunsItsFullDelayWhileNothingChanges() async {
         let started = Date()
 
