@@ -3382,6 +3382,12 @@ final class PeerRelaySession {
                 // real disconnect or a deliberate swap to pump up next.
                 var currentSession = session
                 var currentGeneration = resumeTransitionGate.currentGeneration()
+                // `ioStats.noteReceived` reports only the pane's first byte
+                // ever, so it cannot mark a replacement session as working.
+                // Without this the reconnect circuit never recovered: every
+                // host drop during a long flood lengthened the backoff until
+                // the circuit opened and the pane closed.
+                var awaitingReplacementOutput = false
                 pumpLoop: while !Task.isCancelled {
                     let msg: PeerIncomingMessage
                     do {
@@ -3410,6 +3416,7 @@ final class PeerRelaySession {
                             expectedByteSeq = nil
                             gapBytesTotal = 0
                             gapCount = 0
+                            awaitingReplacementOutput = true
                             continue pumpLoop
                         }
                         RemoteWorkLog.warningOffMain(
@@ -3428,6 +3435,7 @@ final class PeerRelaySession {
                             expectedByteSeq = nil
                             gapBytesTotal = 0
                             gapCount = 0
+                            awaitingReplacementOutput = true
                             continue pumpLoop
                         }
                         if let writer {
@@ -3566,6 +3574,9 @@ final class PeerRelaySession {
                             #if DEBUG
                             dlog("peer.relay.firstByte path=owned bytes=\(data.count)")
                             #endif
+                        } else if awaitingReplacementOutput {
+                            awaitingReplacementOutput = false
+                            await self.noteReconnectOutputRecovery(generation: currentGeneration)
                         }
                         // While a scrollback window is on display, live
                         // bytes must not paint over it. They are DROPPED,
@@ -4179,6 +4190,12 @@ final class PeerRelaySession {
         // live — the distinction the workspace mirror reads before it keeps
         // a pane instead of respawning it.
         reconnectInFlight = true
+        #if DEBUG
+        let reconnectStartedAt = Date()
+        defer {
+            dlog("peer.relay.reconnect.return elapsed=\(String(format: "%.3f", Date().timeIntervalSince(reconnectStartedAt))) swapped=\(session !== failedSession) failed=\(Self.sessionTag(failedSession))")
+        }
+        #endif
         defer { reconnectInFlight = false }
         RemoteWorkLog.infoOffMain(
             "Peer reconnect start host=\(hostKey?.description ?? hostDisplayName) surface=\(surfaceID.base64EncodedString().prefix(12)) failedSession=\(Self.sessionTag(failedSession)) sessionGen=\(failedGeneration) transportGen=\(ownedTransportGeneration)"
@@ -4211,7 +4228,11 @@ final class PeerRelaySession {
             let attempt = next.attempt
             let delay = next.delaySeconds
             if delay > 0 {
-                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                // The pump waits inside this call, so a heal that commits a
+                // replacement during the backoff would go unread until the
+                // delay ends; the host then drops the unread session and the
+                // next backoff is longer. Wake as soon as the session moves.
+                await sleepUnlessSessionReplaced(failedSession, seconds: delay)
             }
             guard Self.shouldReconnectOwnedSession(
                 ownsSession: ownsSession,
@@ -4246,6 +4267,27 @@ final class PeerRelaySession {
             }
         }
         return session !== failedSession
+    }
+
+    private func sleepUnlessSessionReplaced(_ failedSession: PeerSession, seconds: TimeInterval) async {
+        await Self.waitOutBackoff(seconds: seconds) { [weak self] in
+            guard let self else { return false }
+            return !self.isTorndown && self.session === failedSession
+        }
+    }
+
+    static func waitOutBackoff(
+        seconds: TimeInterval,
+        pollSeconds: TimeInterval = 0.1,
+        isStillWaiting: () -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(seconds)
+        while isStillWaiting() {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { return }
+            try? await Task.sleep(nanoseconds: UInt64(min(remaining, pollSeconds) * 1_000_000_000))
+            if Task.isCancelled { return }
+        }
     }
 
     private func noteReconnectOutputRecovery(generation: UInt64) {

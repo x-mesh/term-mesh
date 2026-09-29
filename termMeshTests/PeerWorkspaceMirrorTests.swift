@@ -1729,3 +1729,30 @@ final class RelayGapHealPacingTests: XCTestCase {
         XCTAssertEqual(pacing.level, 0)
     }
 }
+
+@MainActor
+final class PeerRelayReconnectBackoffTests: XCTestCase {
+    /// A heal that replaces the session mid-backoff must end the wait at once;
+    /// sleeping out a 16 s backoff left the replacement unread until the host
+    /// dropped it.
+    func testBackoffEndsAsSoonAsTheSessionIsReplaced() async {
+        var replaced = false
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            replaced = true
+        }
+        let started = Date()
+
+        await PeerRelaySession.waitOutBackoff(seconds: 5, pollSeconds: 0.02) { !replaced }
+
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1)
+    }
+
+    func testBackoffRunsItsFullDelayWhileNothingChanges() async {
+        let started = Date()
+
+        await PeerRelaySession.waitOutBackoff(seconds: 0.2, pollSeconds: 0.02) { true }
+
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.19)
+    }
+}
