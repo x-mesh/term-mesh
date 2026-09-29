@@ -4,6 +4,31 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.258.0] - 2026-09-29
+
+### Added
+
+- `tm-agent leader turn route --route direct --no-dispatch-reason <reason>` records why a delegated turn has no worker task. The leader Stop hook now continues a delegated turn once when the turn neither dispatched a worker nor recorded that reason.
+
+### Changed
+
+- Paste Shelf now opens over the whole window instead of inside the pane that opened it. Drag the corner grip to resize it, and double-click the grip to reset it. The size is saved.
+- Paste Shelf puts the cursor in its search field when it opens, so typed keys no longer reach the shell. Arrow keys and Enter pick an item. j and k no longer move the selection.
+- Paste Shelf moves a repeated text or image to the top instead of adding a duplicate. Multi-line items show their line count and a tooltip, and rows highlight on hover.
+- Paste Shelf files are now readable only by your user account.
+- Work Distribution set to Delegated now always sends eligible requests to workers. The Leader Participation and Route suggestion experiment settings, and the matching Review Board toggles, are removed.
+- The ring on a pane that a remote viewer mirrors is now a thin line at the pane edge and no longer covers the first column. The viewer-count badge is smaller and sits in the top-right corner.
+
+### Fixed
+
+- Pasting a file into a remote pane works again in the released app. Every valid SSH host name was rejected with `Paste not sent: invalid SSH settings`.
+- A file whose name has spaces, such as a default macOS screenshot, now pastes into a remote pane as one escaped path. The remote shell had split it into several arguments.
+- A Paste Shelf image pasted into a local pane now has an escaped path.
+- Enter pressed in another pane no longer pastes the selected Shelf item into the pane that opened the Shelf.
+- Capturing a large image into Paste Shelf no longer freezes the app for up to half a second.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.257.2] - 2026-09-29
 
 ### Fixed
