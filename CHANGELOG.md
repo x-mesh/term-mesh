@@ -4,6 +4,17 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.258.2] - 2026-09-29
+
+### Fixed
+
+- A remote pane showing a flood of output, such as a long `find .` or `yes`, no longer freezes or keeps disconnecting. The host now repaints the pane about twice a second while the flood runs, instead of closing the connection each time the viewer falls behind. The host must run this version.
+- A remote pane no longer stays frozen with no error after the host stops sending its output. The viewer now reconnects within a fraction of a second.
+- A remote pane no longer freezes for up to 30 seconds and then closes when the host drops it during a flood. Reconnecting backs off only when the host keeps failing, not after every brief drop.
+- The Remote Work log no longer reports a routine pane repair as `Peer receive failed`. Repairs appear as `Peer heal swap`, and the warning is kept for real connection losses.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.258.1] - 2026-09-29
 
 ### Fixed
