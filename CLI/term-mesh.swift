@@ -4484,7 +4484,7 @@ struct TermMeshCLI {
                     cwd: parsedInput.cwd
                 )
             }
-            reportClaudeInbox(surfaceId: surfaceId, parsedInput: parsedInput, client: client)
+            reportClaudeInbox(surfaceArg: surfaceArg, workspaceId: workspaceId, parsedInput: parsedInput, client: client)
             try setClaudeStatus(
                 client: client,
                 workspaceId: workspaceId,
@@ -4495,9 +4495,7 @@ struct TermMeshCLI {
             print("OK")
 
         case "inbox-register":
-            if let surfaceId = fallbackSurfaceId {
-                reportClaudeInbox(surfaceId: surfaceId, parsedInput: parsedInput, client: client)
-            }
+            reportClaudeInbox(surfaceArg: surfaceArg, workspaceId: fallbackWorkspaceId, parsedInput: parsedInput, client: client)
             print("OK")
 
         case "stop", "idle":
@@ -4638,9 +4636,13 @@ struct TermMeshCLI {
     /// Claude Code exports its inbox socket and token only to its own hooks and
     /// Bash children, so SessionStart is the one place term-mesh can learn them.
     /// The token is sent to the app and never written to the on-disk session store.
-    private func reportClaudeInbox(surfaceId: String, parsedInput: ClaudeHookParsedInput, client: SocketClient) {
+    /// Only a surface the hook names is used: the focused-surface fallback the
+    /// other hooks accept would bind this session's inbox to someone else's pane.
+    private func reportClaudeInbox(surfaceArg: String?, workspaceId: String, parsedInput: ClaudeHookParsedInput, client: SocketClient) {
         let env = ProcessInfo.processInfo.environment
-        guard let socketPath = env["CLAUDE_CODE_MESSAGING_SOCKET"], !socketPath.isEmpty,
+        guard let surfaceArg, !surfaceArg.isEmpty,
+              let surfaceId = try? resolveSurfaceId(surfaceArg, workspaceId: workspaceId, client: client),
+              let socketPath = env["CLAUDE_CODE_MESSAGING_SOCKET"], !socketPath.isEmpty,
               let token = env["CLAUDE_CODE_MESSAGING_TOKEN"], !token.isEmpty,
               let sessionId = parsedInput.sessionId else { return }
         var params: [String: Any] = [
