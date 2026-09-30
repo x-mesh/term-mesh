@@ -2504,11 +2504,12 @@ class TerminalController {
         callerTTYDevice: UInt32? = nil
     ) -> String {
         // An adopted leader already existed when the team was created, so no
-        // bearer can be injected into its environment. Authenticate metrics
-        // against the live PTY instead: the socket peer and leader surface must
-        // resolve to the same kernel device. Only this identity snapshot touches
-        // MainActor; the store read remains on teamDataQueue.
-        if method == "team.task.metrics", callerTTYDevice != nil {
+        // bearer can be injected into its environment. Authenticate its metrics
+        // and durable-request calls against the live PTY instead: the socket
+        // peer and leader surface must resolve to the same kernel device. Only
+        // this identity snapshot touches MainActor; the store read remains on
+        // teamDataQueue.
+        if Self.adoptedLeaderPTYMethods.contains(method), callerTTYDevice != nil {
             let semaphore = DispatchSemaphore(value: 0)
             nonisolated(unsafe) var leaderTTYDevice: UInt32?
             Task {
@@ -2532,11 +2533,27 @@ class TerminalController {
                 return "{\"ok\":false,\"error\":{\"code\":\"timeout\",\"message\":\"team command timed out\"}}"
             }
             return teamDataQueue.sync {
-                teamDataTaskMetrics(
-                    params: params, id: id, store: TeamDataStore.shared,
-                    callerTTYDevice: callerTTYDevice,
-                    adoptedLeaderTTYDevice: leaderTTYDevice
-                )
+                let store = TeamDataStore.shared
+                switch method {
+                case "team.leader.request.list":
+                    return teamDataLeaderRequestList(
+                        params: params, id: id, store: store,
+                        callerTTYDevice: callerTTYDevice, adoptedLeaderTTYDevice: leaderTTYDevice)
+                case "team.leader.request.take":
+                    return teamDataLeaderRequestTake(
+                        params: params, id: id, store: store,
+                        callerTTYDevice: callerTTYDevice, adoptedLeaderTTYDevice: leaderTTYDevice)
+                case "team.leader.request.complete":
+                    return teamDataLeaderRequestComplete(
+                        params: params, id: id, store: store,
+                        callerTTYDevice: callerTTYDevice, adoptedLeaderTTYDevice: leaderTTYDevice)
+                default:
+                    return teamDataTaskMetrics(
+                        params: params, id: id, store: store,
+                        callerTTYDevice: callerTTYDevice,
+                        adoptedLeaderTTYDevice: leaderTTYDevice
+                    )
+                }
             }
         }
 
@@ -5497,6 +5514,13 @@ class TerminalController {
     // MARK: - V2 Team Data Dispatch (Approach C: Dual Queue)
 
     /// Data-only team commands that are safe to run off the main thread.
+    static let adoptedLeaderPTYMethods: Set<String> = [
+        "team.task.metrics",
+        "team.leader.request.list",
+        "team.leader.request.take",
+        "team.leader.request.complete",
+    ]
+
     private static let teamDataCommands: Set<String> = [
         "team.leader.request.list",
         "team.leader.request.take",
@@ -5605,14 +5629,16 @@ class TerminalController {
 
     // MARK: - Team Data Command Handlers (off-main-thread safe)
 
-    private func teamDataLeaderRequestList(
-        params: [String: Any], id: Any?, store: TeamDataStore
+    func teamDataLeaderRequestList(
+        params: [String: Any], id: Any?, store: TeamDataStore,
+        callerTTYDevice: UInt32? = nil, adoptedLeaderTTYDevice: UInt32? = nil
     ) -> String {
         guard let teamName = params["team_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
-        guard store.isAuthorizedLeaderRequestToken(
-            teamName: teamName, token: params["leader_request_token"] as? String
+        guard store.isAuthorizedLeaderMetrics(
+            teamName: teamName, token: params["leader_request_token"] as? String,
+            callerTTYDevice: callerTTYDevice, adoptedLeaderTTYDevice: adoptedLeaderTTYDevice
         ) else {
             return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
         }
@@ -5629,15 +5655,17 @@ class TerminalController {
         ])
     }
 
-    private func teamDataLeaderRequestTake(
-        params: [String: Any], id: Any?, store: TeamDataStore
+    func teamDataLeaderRequestTake(
+        params: [String: Any], id: Any?, store: TeamDataStore,
+        callerTTYDevice: UInt32? = nil, adoptedLeaderTTYDevice: UInt32? = nil
     ) -> String {
         guard let teamName = params["team_name"] as? String,
               let requestId = params["request_id"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name or request_id")
         }
-        guard store.isAuthorizedLeaderRequestToken(
-            teamName: teamName, token: params["leader_request_token"] as? String
+        guard store.isAuthorizedLeaderMetrics(
+            teamName: teamName, token: params["leader_request_token"] as? String,
+            callerTTYDevice: callerTTYDevice, adoptedLeaderTTYDevice: adoptedLeaderTTYDevice
         ) else {
             return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
         }
@@ -5656,15 +5684,17 @@ class TerminalController {
         }
     }
 
-    private func teamDataLeaderRequestComplete(
-        params: [String: Any], id: Any?, store: TeamDataStore
+    func teamDataLeaderRequestComplete(
+        params: [String: Any], id: Any?, store: TeamDataStore,
+        callerTTYDevice: UInt32? = nil, adoptedLeaderTTYDevice: UInt32? = nil
     ) -> String {
         guard let teamName = params["team_name"] as? String,
               let requestId = params["request_id"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name or request_id")
         }
-        guard store.isAuthorizedLeaderRequestToken(
-            teamName: teamName, token: params["leader_request_token"] as? String
+        guard store.isAuthorizedLeaderMetrics(
+            teamName: teamName, token: params["leader_request_token"] as? String,
+            callerTTYDevice: callerTTYDevice, adoptedLeaderTTYDevice: adoptedLeaderTTYDevice
         ) else {
             return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
         }

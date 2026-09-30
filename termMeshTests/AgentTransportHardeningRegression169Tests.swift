@@ -643,6 +643,64 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
         ))
     }
 
+    /// An adopted leader was already running when its team was created, so the
+    /// request token never reached its environment; its pane's PTY is what
+    /// identifies it. A caller on any other terminal is still refused.
+    func testAdoptedLeaderTakesAndCompletesDurableRequestsByItsPTY() throws {
+        let store = TeamDataStore.shared
+        let team = "adopted-leader-request-\(UUID().uuidString)"
+        let requestId = "request-\(UUID().uuidString)"
+        store.registerTeam(team, agentNames: [])
+        store.updateBoardUuids([team: UUID().uuidString])
+        defer { store.unregisterTeam(team) }
+        _ = store.prepareLeaderRequestToken(teamName: team)
+        guard case .created = store.enqueueLeaderRequest(
+            teamName: team, content: "adopted leader work", requestId: requestId
+        ) else { return XCTFail("request was not created") }
+
+        let controller = TerminalController.shared
+        let leaderPTY: UInt32 = 0x1234
+        let request: [String: Any] = ["team_name": team, "request_id": requestId]
+        func reply(_ json: String) throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        }
+        func errorCode(_ json: String) throws -> String? {
+            (try reply(json)["error"] as? [String: Any])?["code"] as? String
+        }
+
+        XCTAssertEqual(try errorCode(controller.teamDataLeaderRequestTake(
+            params: request, id: 1, store: store,
+            callerTTYDevice: 0x5678, adoptedLeaderTTYDevice: leaderPTY
+        )), "unauthorized", "a caller on another terminal")
+        XCTAssertEqual(try errorCode(controller.teamDataLeaderRequestTake(
+            params: request, id: 1, store: store
+        )), "unauthorized", "no token and no terminal identity")
+
+        let list = try reply(controller.teamDataLeaderRequestList(
+            params: ["team_name": team], id: 1, store: store,
+            callerTTYDevice: leaderPTY, adoptedLeaderTTYDevice: leaderPTY))
+        XCTAssertEqual((list["result"] as? [String: Any])?["count"] as? Int, 1)
+
+        let take = try reply(controller.teamDataLeaderRequestTake(
+            params: request, id: 1, store: store,
+            callerTTYDevice: leaderPTY, adoptedLeaderTTYDevice: leaderPTY))
+        XCTAssertEqual(take["ok"] as? Bool, true, "\(take)")
+
+        let complete = try reply(controller.teamDataLeaderRequestComplete(
+            params: request, id: 1, store: store,
+            callerTTYDevice: leaderPTY, adoptedLeaderTTYDevice: leaderPTY))
+        XCTAssertEqual(complete["ok"] as? Bool, true, "\(complete)")
+    }
+
+    func testDurableRequestCallsTakeTheAdoptedLeaderPTYPath() {
+        XCTAssertEqual(TerminalController.adoptedLeaderPTYMethods, [
+            "team.task.metrics",
+            "team.leader.request.list",
+            "team.leader.request.take",
+            "team.leader.request.complete",
+        ])
+    }
+
     func testTerminalDeviceNumberUsesCharacterDeviceIdentity() {
         var info = stat()
         XCTAssertEqual(lstat("/dev/null", &info), 0)
