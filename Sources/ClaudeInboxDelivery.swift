@@ -82,6 +82,10 @@ enum ClaudeInboxDelivery {
     }
 
     static let enqueueConfirmTimeout: TimeInterval = 3
+    /// A session can create its transcript seconds after it accepts its first
+    /// message: a launched leader's first wake waited 2.85 s for the file in
+    /// three of three runs, against the 3 s window above.
+    static let firstMessageConfirmTimeout: TimeInterval = 12
     static let sessionsDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/sessions", isDirectory: true)
 
@@ -100,7 +104,8 @@ enum ClaudeInboxDelivery {
         text: String,
         to record: ClaudeInboxRecord,
         sessionsDirectory: URL = sessionsDirectory,
-        confirmTimeout: TimeInterval = enqueueConfirmTimeout
+        confirmTimeout: TimeInterval = enqueueConfirmTimeout,
+        firstMessageConfirmTimeout: TimeInterval = firstMessageConfirmTimeout
     ) -> Outcome {
         if isStale(record, sessionsDirectory: sessionsDirectory) {
             return .notDelivered("stale_session")
@@ -108,6 +113,8 @@ enum ClaudeInboxDelivery {
         guard let transcriptPath = record.transcriptPath else {
             return .notDelivered("no_transcript_path")
         }
+        let window = FileManager.default.fileExists(atPath: transcriptPath)
+            ? confirmTimeout : max(confirmTimeout, firstMessageConfirmTimeout)
         let offset = fileSize(atPath: transcriptPath)
         do {
             let payload = try messageLines(token: record.token, text: text, messageId: UUID().uuidString)
@@ -115,7 +122,7 @@ enum ClaudeInboxDelivery {
         } catch {
             return .notDelivered("post: \(error)")
         }
-        switch transcriptVerdict(of: text, atPath: transcriptPath, after: offset, timeout: confirmTimeout) {
+        switch transcriptVerdict(of: text, atPath: transcriptPath, after: offset, timeout: window) {
         case .enqueued: return .delivered
         case .held: return .unconfirmed("held_for_approval")
         case .silent: return .unconfirmed("not_enqueued")

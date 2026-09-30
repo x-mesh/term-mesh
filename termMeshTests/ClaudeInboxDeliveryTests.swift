@@ -205,6 +205,26 @@ final class ClaudeInboxDeliveryTests: XCTestCase {
         XCTAssertFalse(received.wait().isEmpty)
     }
 
+    func testASessionThatHasNotWrittenItsTranscriptYetIsGivenTheLongerWindow() throws {
+        let inbox = try FakeInbox()
+        let transcript = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cib-\(UUID().uuidString).jsonl")
+        addTeardownBlock { try? FileManager.default.removeItem(at: transcript) }
+        let record = try inboxRecord(socket: inbox.path, transcript: transcript.path)
+        let text = "first wake"
+        let received = inbox.readOnce { _ in
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+                try? Data().write(to: transcript)
+                Self.append(transcript, ["type": "queue-operation", "operation": "enqueue", "content": text])
+            }
+        }
+        let outcome = ClaudeInboxDelivery.deliverNow(
+            text: text, to: record, sessionsDirectory: try sessionsDirectory(),
+            confirmTimeout: 0.2, firstMessageConfirmTimeout: 3)
+        XCTAssertEqual(outcome, .delivered, "the file appeared after the ordinary window had run out")
+        XCTAssertFalse(received.wait().isEmpty)
+    }
+
     func testASilentSessionLeavesTheDeliveryUnconfirmedRatherThanFailed() throws {
         let inbox = try FakeInbox()
         let transcript = try temporaryTranscript()
