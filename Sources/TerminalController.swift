@@ -950,6 +950,8 @@ class TerminalController {
             ])
         case "system.identify":
             return v2Ok(id: id, result: v2Identify(params: params))
+        case "claude.inbox.register":
+            return v2ClaudeInboxRegister(params: params, id: id)
         case "auth.login":
             return v2Ok(
                 id: id,
@@ -1588,6 +1590,7 @@ class TerminalController {
             "system.ping",
             "system.capabilities",
             "system.identify",
+            "claude.inbox.register",
             "auth.login",
             "fleet.state",
             "window.list",
@@ -1955,6 +1958,27 @@ class TerminalController {
             return false
         }
         return true
+    }
+
+    private func v2ClaudeInboxRegister(params: [String: Any], id: Any?) -> String {
+        switch ClaudeInboxRegistry.record(from: params) {
+        case .success(let record):
+            ClaudeInboxRegistry.shared.register(record)
+            #if DEBUG
+            dlog("claude.inbox.register surface=\(record.surfaceId.uuidString.prefix(8)) pid=\(record.claudePid.map { String($0) } ?? "-") socket=\(record.socketPath)")
+            #endif
+            return v2Ok(id: id, result: ["registered": true])
+        case .failure(.notInteractive(let entrypoint)):
+            #if DEBUG
+            dlog("claude.inbox.register.skip reason=not_interactive entrypoint=\(entrypoint)")
+            #endif
+            return v2Ok(id: id, result: ["registered": false, "reason": "not_interactive"])
+        case .failure(let error):
+            #if DEBUG
+            dlog("claude.inbox.register.REJECTED reason=\(error)")
+            #endif
+            return v2Error(id: id, code: "invalid_params", message: "claude.inbox.register: \(error)")
+        }
     }
 
     func v2Ok(id: Any?, result: Any) -> String {

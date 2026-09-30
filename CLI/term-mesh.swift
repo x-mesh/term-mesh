@@ -4482,6 +4482,7 @@ struct TermMeshCLI {
                     cwd: parsedInput.cwd
                 )
             }
+            reportClaudeInbox(surfaceId: surfaceId, parsedInput: parsedInput, client: client)
             try setClaudeStatus(
                 client: client,
                 workspaceId: workspaceId,
@@ -4624,6 +4625,26 @@ struct TermMeshCLI {
             return candidate
         }
         return try resolveSurfaceId(nil, workspaceId: workspaceId, client: client)
+    }
+
+    /// Claude Code exports its inbox socket and token only to its own hooks and
+    /// Bash children, so SessionStart is the one place term-mesh can learn them.
+    /// The token is sent to the app and never written to the on-disk session store.
+    private func reportClaudeInbox(surfaceId: String, parsedInput: ClaudeHookParsedInput, client: SocketClient) {
+        let env = ProcessInfo.processInfo.environment
+        guard let socketPath = env["CLAUDE_CODE_MESSAGING_SOCKET"], !socketPath.isEmpty,
+              let token = env["CLAUDE_CODE_MESSAGING_TOKEN"], !token.isEmpty,
+              let sessionId = parsedInput.sessionId else { return }
+        var params: [String: Any] = [
+            "surface_id": surfaceId,
+            "socket_path": socketPath,
+            "token": token,
+            "session_id": sessionId,
+            "entrypoint": env["CLAUDE_CODE_ENTRYPOINT"] ?? "",
+        ]
+        if let pid = env["CLAUDE_PID"], !pid.isEmpty { params["claude_pid"] = pid }
+        if let transcriptPath = parsedInput.transcriptPath { params["transcript_path"] = transcriptPath }
+        _ = try? client.sendV2(method: "claude.inbox.register", params: params)
     }
 
     private func parseClaudeHookInput(rawInput: String) -> ClaudeHookParsedInput {
