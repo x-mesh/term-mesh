@@ -82,9 +82,10 @@ enum ClaudeInboxDelivery {
     }
 
     static let enqueueConfirmTimeout: TimeInterval = 3
-    /// A session can create its transcript seconds after it accepts its first
-    /// message: a launched leader's first wake waited 2.85 s for the file in
-    /// three of three runs, against the 3 s window above.
+    /// A session creates its transcript only after its first turn's
+    /// UserPromptSubmit hooks finish. A launched leader's turn hook took about
+    /// 2.5 s there, and its first wake waited 2.85 s for the file, against the
+    /// 3 s window above. 12 s covers a hook that runs to its 10 s timeout.
     static let firstMessageConfirmTimeout: TimeInterval = 12
     static let sessionsDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/sessions", isDirectory: true)
