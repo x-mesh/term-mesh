@@ -5742,7 +5742,7 @@ final class TeamOrchestrator: ObservableObject {
     /// When multiple agents share the same name, round-robins across them.
     /// Maintains an in-flight counter and a panelId snapshot so a concurrent
     /// hard restart can either drain (preferred) or detect mid-flight migration.
-    func sendToAgent(teamName: String, agentName: String, agentInstanceId: String? = nil, text: String, tabManager: TabManager, withReturn: Bool = true, completion: ((Bool) -> Void)? = nil, disposition: ((AgentSession.SendDisposition) -> Void)? = nil) -> Bool {
+    func sendToAgent(teamName: String, agentName: String, agentInstanceId: String? = nil, text: String, tabManager: TabManager, withReturn: Bool = true, allowClaudeInbox: Bool = true, completion: ((Bool) -> Void)? = nil, disposition: ((AgentSession.SendDisposition) -> Void)? = nil) -> Bool {
         guard let team = teams[teamName] else {
             #if DEBUG
             dlog("[team.sendToAgent] DROP reason=team_not_found team=\(teamName) agent=\(agentName)")
@@ -5821,6 +5821,12 @@ final class TeamOrchestrator: ObservableObject {
         #if DEBUG
         dlog("[team.sendToAgent] enter team=\(teamName) agent=\(agentName) panelId=\(pid.uuidString.prefix(8)) withReturn=\(withReturn) textLen=\(text.count)")
         #endif
+        if allowClaudeInbox, let record = claudeInboxRecord(forPanel: pid) {
+            return deliverViaClaudeInbox(
+                record, teamAgentKey: teamAgentKey, workspaceId: agent.workspaceId,
+                panelId: pid, text: text, tabManager: tabManager, completion: completion
+            )
+        }
         activeSends[teamAgentKey, default: 0] += 1
         if !withReturn, let identity = agentIdentity(for: agent) {
             pendingReturnTargets[teamAgentKey] = identity
@@ -5917,6 +5923,14 @@ final class TeamOrchestrator: ObservableObject {
                 return false
             }
         }
+        if let record = claudeInboxRecord(forPanel: panelId) {
+            let teamAgentKey = teams[teamName]?.agents.first(where: { $0.panelId == panelId })
+                .map { agentOperationKey(teamName: teamName, agentInstanceId: $0.agentInstanceId) }
+            return deliverViaClaudeInbox(
+                record, teamAgentKey: teamAgentKey, workspaceId: workspaceId,
+                panelId: panelId, text: text, tabManager: tabManager, completion: completion
+            )
+        }
         if !withReturn,
            agentName != nil,
            let team = teams[teamName],
@@ -5982,6 +5996,17 @@ final class TeamOrchestrator: ObservableObject {
               let located = AppDelegate.shared?.locateSurface(surfaceId: pid) else {
             completion?(false)
             return false
+        }
+        // Notifications and auto-claimed tasks reach the same agent as sends
+        // and delegates; typing them while those go to the inbox would split
+        // one conversation across two queues with no order between them.
+        if let record = claudeInboxRecord(forPanel: pid) {
+            return deliverViaClaudeInbox(
+                record,
+                teamAgentKey: agentOperationKey(teamName: teamName, agentInstanceId: agent.agentInstanceId),
+                workspaceId: agent.workspaceId, panelId: pid, text: text,
+                tabManager: located.tabManager, completion: completion
+            )
         }
         return sendTextToPanel(
             workspaceId: agent.workspaceId,
@@ -7154,15 +7179,15 @@ final class TeamOrchestrator: ObservableObject {
     /// answering it authoritatively (`no_keyboard`) for every caller that
     /// never learned the field. The hint is an optimization — the Return-time
     /// answer remains the contract of record.
-    func agentNeedsReturn(teamName: String, agentName: String, agentInstanceId: String? = nil) -> Bool {
+    func agentNeedsReturn(teamName: String, agentName: String, agentInstanceId: String? = nil, allowClaudeInbox: Bool = true) -> Bool {
         guard let team = teams[teamName],
               let agent = agentInstanceId.flatMap({
                   resolveAgentForRPC(teamName: teamName, agentName: agentName, agentInstanceId: $0).agent
               }) ?? selectAgent(in: team.agents, name: agentName),
-              let panelId = agent.panelId,
-              nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) != nil
+              let panelId = agent.panelId
         else { return true }
-        return false
+        if nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) != nil { return false }
+        return !allowClaudeInbox || claudeInboxRecord(forPanel: panelId) == nil
     }
 
     /// Whether this specific pane holds a native agent.
@@ -7174,7 +7199,99 @@ final class TeamOrchestrator: ObservableObject {
     /// delegate answers it per creation site, on the member it chose.
     func memberNeedsReturn(_ member: AgentMember) -> Bool {
         guard let panelId = member.panelId else { return true }
-        return !agentPanelIsNative(workspaceId: member.workspaceId, panelId: panelId)
+        if agentPanelIsNative(workspaceId: member.workspaceId, panelId: panelId) { return false }
+        return claudeInboxRecord(forPanel: panelId) == nil
+    }
+
+    /// Whether a turn acknowledged as a paste is still waiting in a composer:
+    /// true for any terminal pane, including one whose Claude inbox appeared
+    /// after the paste. Only a native pane has no composer to submit.
+    func pastedTurnStillInComposer(teamName: String, agentName: String, agentInstanceId: String) -> Bool {
+        guard let agent = resolveAgentForRPC(
+                  teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+              ).agent,
+              let panelId = agent.panelId
+        else { return false }
+        return nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) == nil
+    }
+
+    private func claudeInboxRecord(forPanel panelId: UUID) -> ClaudeInboxRecord? {
+        guard ClaudeInboxDelivery.isEnabled() else { return nil }
+        return ClaudeInboxRegistry.shared.record(for: panelId)
+    }
+
+    /// Hands the turn to the Claude session's own inbox instead of its composer.
+    ///
+    /// The caller was already told no Return follows, so a post the session
+    /// provably did not take falls back to a paste that presses its own Return
+    /// and never schedules an owed one: an app-pressed Return would submit
+    /// whatever the user left typed. An unconfirmed post reports failure and
+    /// quarantines the pane instead; see `ClaudeInboxDelivery.Outcome`.
+    private func deliverViaClaudeInbox(
+        _ record: ClaudeInboxRecord,
+        teamAgentKey: String?,
+        workspaceId: UUID,
+        panelId: UUID,
+        text: String,
+        tabManager: TabManager,
+        completion: ((Bool) -> Void)?
+    ) -> Bool {
+        if ClaudeInboxRegistry.shared.isQuarantined(surfaceId: panelId) {
+            Logger.team.warning(
+                "claude inbox for panel \(panelId.uuidString.prefix(8), privacy: .public) is quarantined after an unconfirmed delivery; not sending until its session restarts"
+            )
+            #if DEBUG
+            dlog("claude.inbox.deliver.QUARANTINED panel=\(panelId.uuidString.prefix(8))")
+            #endif
+            completion?(false)
+            return false
+        }
+        if let teamAgentKey { activeSends[teamAgentKey, default: 0] += 1 }
+        let finish: (Bool) -> Void = { [weak self] sent in
+            if let self, let teamAgentKey {
+                let remaining = (self.activeSends[teamAgentKey] ?? 0) - 1
+                if remaining <= 0 {
+                    self.activeSends.removeValue(forKey: teamAgentKey)
+                } else {
+                    self.activeSends[teamAgentKey] = remaining
+                }
+            }
+            completion?(sent)
+        }
+        let startedAt = Date()
+        ClaudeInboxDelivery.deliver(text: text, to: record) { [weak self] outcome in
+            let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+            switch outcome {
+            case .delivered:
+                #if DEBUG
+                dlog("claude.inbox.deliver ok panel=\(panelId.uuidString.prefix(8)) chars=\(text.count) ms=\(elapsedMs)")
+                #endif
+                finish(true)
+            case .unconfirmed(let reason):
+                ClaudeInboxRegistry.shared.quarantine(record)
+                Logger.team.error(
+                    "claude inbox delivery unconfirmed for panel \(panelId.uuidString.prefix(8), privacy: .public): \(reason, privacy: .public); not pasting"
+                )
+                #if DEBUG
+                dlog("claude.inbox.deliver.UNCONFIRMED panel=\(panelId.uuidString.prefix(8)) reason=\(reason) ms=\(elapsedMs)")
+                #endif
+                finish(false)
+            case .notDelivered(let reason):
+                ClaudeInboxRegistry.shared.removeIfCurrent(record)
+                Logger.team.warning(
+                    "claude inbox delivery failed for panel \(panelId.uuidString.prefix(8), privacy: .public): \(reason, privacy: .public); pasting instead"
+                )
+                #if DEBUG
+                dlog("claude.inbox.deliver.FALLBACK panel=\(panelId.uuidString.prefix(8)) reason=\(reason) ms=\(elapsedMs)")
+                #endif
+                guard let self else { finish(false); return }
+                _ = self.sendTextToPanel(
+                    workspaceId: workspaceId, panelId: panelId, text: text,
+                    tabManager: tabManager, withReturn: true
+                ) { finish($0) }
+            }
+        }
+        return true
     }
 
     /// Whether every pool candidate for this agent name is natively held.
@@ -9839,10 +9956,18 @@ final class TeamOrchestrator: ObservableObject {
 
         parts += Self.effortLaunchArgs(cli: "claude", effort: effort)
 
-        if !instructions.isEmpty {
+        let inboxEnabled = ClaudeInboxDelivery.isEnabled()
+        let systemPrompt = inboxEnabled
+            ? ClaudeInboxDelivery.workerSystemPrompt(roleInstructions: instructions)
+            : instructions
+        if !systemPrompt.isEmpty {
             // Escape single quotes for shell and pass as --append-system-prompt
-            let escaped = instructions.replacingOccurrences(of: "'", with: "'\\''")
+            let escaped = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
             parts.append("--append-system-prompt '\(escaped)'")
+        }
+
+        if inboxEnabled {
+            parts.append("--settings '\(ClaudeInboxDelivery.registerHookSettingsJSON)'")
         }
 
         parts += extraArgs.map { shellQuote($0) }

@@ -950,6 +950,8 @@ class TerminalController {
             ])
         case "system.identify":
             return v2Ok(id: id, result: v2Identify(params: params))
+        case "claude.inbox.register":
+            return v2ClaudeInboxRegister(params: params, id: id)
         case "auth.login":
             return v2Ok(
                 id: id,
@@ -1588,6 +1590,7 @@ class TerminalController {
             "system.ping",
             "system.capabilities",
             "system.identify",
+            "claude.inbox.register",
             "auth.login",
             "fleet.state",
             "window.list",
@@ -1955,6 +1958,27 @@ class TerminalController {
             return false
         }
         return true
+    }
+
+    private func v2ClaudeInboxRegister(params: [String: Any], id: Any?) -> String {
+        switch ClaudeInboxRegistry.record(from: params) {
+        case .success(let record):
+            ClaudeInboxRegistry.shared.register(record)
+            #if DEBUG
+            dlog("claude.inbox.register surface=\(record.surfaceId.uuidString.prefix(8)) pid=\(record.claudePid.map { String($0) } ?? "-") socket=\(record.socketPath)")
+            #endif
+            return v2Ok(id: id, result: ["registered": true])
+        case .failure(.notInteractive(let entrypoint)):
+            #if DEBUG
+            dlog("claude.inbox.register.skip reason=not_interactive entrypoint=\(entrypoint)")
+            #endif
+            return v2Ok(id: id, result: ["registered": false, "reason": "not_interactive"])
+        case .failure(let error):
+            #if DEBUG
+            dlog("claude.inbox.register.REJECTED reason=\(error)")
+            #endif
+            return v2Error(id: id, code: "invalid_params", message: "claude.inbox.register: \(error)")
+        }
     }
 
     func v2Ok(id: Any?, result: Any) -> String {
@@ -3393,6 +3417,7 @@ class TerminalController {
             return v2Error(id: id, code: "not_found", message: "Agent not found")
         }
         let sendSequenceAware = params["send_sequence_aware"] as? Bool ?? false
+        let allowClaudeInbox = params["claude_inbox"] as? Bool ?? true
         // Per-agent send serialization: wait for the preceding paste+Return cycle to
         // finish (including 250 ms post-Return cooldown) before pasting new text.
         // This prevents rapid consecutive sends from racing inside the codex TUI
@@ -3471,7 +3496,8 @@ class TerminalController {
                 // across that gap could get a terminal paste answered with
                 // return_required=false, losing the turn.
                 deliveredNatively = !TeamOrchestrator.shared.agentNeedsReturn(
-                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId,
+                    allowClaudeInbox: allowClaudeInbox
                 )
                 // Keep only the durable instance across the stagger/queue wait.
                 // sendToAgent resolves its current panel, transport and host here,
@@ -3483,6 +3509,7 @@ class TerminalController {
                     text: text,
                     tabManager: tabManager,
                     withReturn: false, // Return is sent separately by Rust CLI via team.send_key
+                    allowClaudeInbox: allowClaudeInbox,
                     completion: { ack in resume(ack) },
                     // Fires before the completion above, so the scope is
                     // always set by the time the continuation resumes.
@@ -5166,7 +5193,16 @@ class TerminalController {
         // turn, not a stale terminal paste.
         if key.lowercased() == "return",
            await MainActor.run(body: {
-               !TeamOrchestrator.shared.agentNeedsReturn(
+               let orchestrator = TeamOrchestrator.shared
+               // A Claude pane can register its inbox after its first turn was
+               // pasted and acknowledged; that paste still sits in the composer.
+               if claimedGate != nil,
+                  orchestrator.pastedTurnStillInComposer(
+                      teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+                  ) {
+                   return false
+               }
+               return !orchestrator.agentNeedsReturn(
                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
                )
            }) {

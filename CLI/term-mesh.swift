@@ -3835,7 +3835,7 @@ struct TermMeshCLI {
             """
         case "claude-hook":
             return """
-            Usage: term-mesh claude-hook <session-start|stop|notification> [flags]
+            Usage: term-mesh claude-hook <session-start|stop|notification|inbox-register> [flags]
 
             Hook for Claude Code integration. Reads JSON from stdin.
 
@@ -3843,6 +3843,7 @@ struct TermMeshCLI {
               session-start   Signal that a Claude session has started
               stop            Signal that a Claude session has stopped
               notification    Forward a Claude notification
+              inbox-register  Report the session's cross-session inbox only
 
             Flags:
               --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
@@ -4453,6 +4454,7 @@ struct TermMeshCLI {
         // up as "Tab not found" — silently return "OK" and exit 0 instead.
         let isBestEffort = subcommand == "stop" || subcommand == "idle"
             || subcommand == "notification" || subcommand == "notify"
+            || subcommand == "inbox-register"
 
         let fallbackWorkspaceId: String
         do {
@@ -4482,6 +4484,7 @@ struct TermMeshCLI {
                     cwd: parsedInput.cwd
                 )
             }
+            reportClaudeInbox(surfaceArg: surfaceArg, workspaceId: workspaceId, parsedInput: parsedInput, client: client)
             try setClaudeStatus(
                 client: client,
                 workspaceId: workspaceId,
@@ -4489,6 +4492,10 @@ struct TermMeshCLI {
                 icon: "bolt.fill",
                 color: "#4C8DFF"
             )
+            print("OK")
+
+        case "inbox-register":
+            reportClaudeInbox(surfaceArg: surfaceArg, workspaceId: fallbackWorkspaceId, parsedInput: parsedInput, client: client)
             print("OK")
 
         case "stop", "idle":
@@ -4624,6 +4631,30 @@ struct TermMeshCLI {
             return candidate
         }
         return try resolveSurfaceId(nil, workspaceId: workspaceId, client: client)
+    }
+
+    /// Claude Code exports its inbox socket and token only to its own hooks and
+    /// Bash children, so SessionStart is the one place term-mesh can learn them.
+    /// The token is sent to the app and never written to the on-disk session store.
+    /// Only a surface the hook names is used: the focused-surface fallback the
+    /// other hooks accept would bind this session's inbox to someone else's pane.
+    private func reportClaudeInbox(surfaceArg: String?, workspaceId: String, parsedInput: ClaudeHookParsedInput, client: SocketClient) {
+        let env = ProcessInfo.processInfo.environment
+        guard let surfaceArg, !surfaceArg.isEmpty,
+              let surfaceId = try? resolveSurfaceId(surfaceArg, workspaceId: workspaceId, client: client),
+              let socketPath = env["CLAUDE_CODE_MESSAGING_SOCKET"], !socketPath.isEmpty,
+              let token = env["CLAUDE_CODE_MESSAGING_TOKEN"], !token.isEmpty,
+              let sessionId = parsedInput.sessionId else { return }
+        var params: [String: Any] = [
+            "surface_id": surfaceId,
+            "socket_path": socketPath,
+            "token": token,
+            "session_id": sessionId,
+            "entrypoint": env["CLAUDE_CODE_ENTRYPOINT"] ?? "",
+        ]
+        if let pid = env["CLAUDE_PID"], !pid.isEmpty { params["claude_pid"] = pid }
+        if let transcriptPath = parsedInput.transcriptPath { params["transcript_path"] = transcriptPath }
+        _ = try? client.sendV2(method: "claude.inbox.register", params: params)
     }
 
     private func parseClaudeHookInput(rawInput: String) -> ClaudeHookParsedInput {
