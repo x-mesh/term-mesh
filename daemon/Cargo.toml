@@ -15,3 +15,6 @@ members = [
 # which crashes on machines without Homebrew (e.g. DMG installs on user machines).
 [workspace.dependencies]
 libz-sys = { version = "1", features = ["static"] }
+
+[patch.crates-io]
+vt100 = { path = "../vendor/vt100" }
