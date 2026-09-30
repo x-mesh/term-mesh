@@ -270,8 +270,8 @@ final class AutoReplyPoller {
                     // FIX 2: revalidate identity — agent/panel may have been detached
                     // between read and apply; surface may have been detached+reattached.
                     guard let team = TeamOrchestrator.shared.teams[r.teamName],
-                          let agent = team.agents.first(where: { $0.name == r.agentName }),
-                          agent.panelId == r.panelId else {
+                          let agent = Self.paneOwner(panelId: r.panelId, in: team.agents),
+                          agent.name == r.agentName else {
 #if DEBUG
                         dlog("autoreply.dropped reason=agent_gone panelId=\(r.panelId.uuidString.prefix(8))")
 #endif
@@ -293,6 +293,7 @@ final class AutoReplyPoller {
                         panelId: r.panelId,
                         teamName: r.teamName,
                         agentName: r.agentName,
+                        agentInstanceId: agent.agentInstanceId,
                         snapshot: r.snapshot,
                         delta: r.delta,
                         at: r.readAt
@@ -333,6 +334,7 @@ final class AutoReplyPoller {
     /// Apply one background read result to the per-panel detector state.
     /// All PanelState mutations happen here, on MainActor.
     private func applyResult(panelId: UUID, teamName: String, agentName: String,
+                              agentInstanceId: String,
                               snapshot: String?, delta: String, at now: Date) {
         guard let state = perPanel[panelId] else { return }  // panel GC'd between read and apply
         let previousText = state.lastScrollbackText
@@ -370,12 +372,12 @@ final class AutoReplyPoller {
         if !feed.isEmpty, let data = feed.data(using: .utf8) {
             if let ev = state.detector.pushBytes(data, at: now) {
                 tryEmit(panelId: panelId, state: state, event: ev,
-                        teamName: teamName, agentName: agentName)
+                        identity: (teamName, agentName, agentInstanceId))
             }
         }
         if let ev = state.detector.tick(at: now) {
             tryEmit(panelId: panelId, state: state, event: ev,
-                    teamName: teamName, agentName: agentName)
+                    identity: (teamName, agentName, agentInstanceId))
         }
     }
 
@@ -553,7 +555,7 @@ final class AutoReplyPoller {
     // MARK: - Emit
 
     private func tryEmit(panelId: UUID, state: PanelState, event: AutoReplyEvent,
-                         teamName: String? = nil, agentName: String? = nil) {
+                         identity: (team: String, agent: String, instance: String)? = nil) {
         let hash = event.contentHash()
         if state.lastFiredHash == hash {
             return
@@ -561,28 +563,35 @@ final class AutoReplyPoller {
         state.lastFiredHash = hash
 
         // Resolve agent identity if not supplied (flush path)
-        let (resolvedTeam, resolvedAgent): (String, String)
-        if let t = teamName, let a = agentName {
-            (resolvedTeam, resolvedAgent) = (t, a)
-        } else {
-            guard let pair = Self.resolveIdentity(panelId: panelId) else { return }
-            (resolvedTeam, resolvedAgent) = pair
-        }
+        guard let resolved = identity ?? Self.resolveIdentity(panelId: panelId) else { return }
 
         let updated = AutoReplyEmit.emit(
-            teamName: resolvedTeam,
-            agentName: resolvedAgent,
-            event: event
+            teamName: resolved.team,
+            agentName: resolved.agent,
+            event: event,
+            agentInstanceId: resolved.instance
         )
         NSLog("[auto-reply] gui emit team=%@ agent=%@ status=%@ task_updated=%d",
-              resolvedTeam, resolvedAgent, event.status, updated ? 1 : 0)
+              resolved.team, resolved.agent, event.status, updated ? 1 : 0)
+        #if DEBUG
+        dlog("autoreply.emit team=\(resolved.team) agent=\(resolved.agent) status=\(event.status) updated=\(updated)")
+        #endif
         _ = updated
     }
 
-    private static func resolveIdentity(panelId: UUID) -> (String, String)? {
+    /// The agent whose scrollback this pane is. Found by the pane, not by role
+    /// name: names repeat in a pool, and delegated tasks are pinned to one
+    /// instance, so a reply read off a pane files only as that instance.
+    nonisolated static func paneOwner(
+        panelId: UUID, in agents: [TeamOrchestrator.AgentMember]
+    ) -> TeamOrchestrator.AgentMember? {
+        agents.first { $0.panelId == panelId }
+    }
+
+    private static func resolveIdentity(panelId: UUID) -> (team: String, agent: String, instance: String)? {
         for team in TeamOrchestrator.shared.teams.values {
-            if let agent = team.agents.first(where: { $0.panelId == panelId }) {
-                return (team.id, agent.name)
+            if let agent = paneOwner(panelId: panelId, in: team.agents) {
+                return (team.id, agent.name, agent.agentInstanceId)
             }
         }
         return nil

@@ -696,3 +696,94 @@ final class AgentPipeCompletionTests: XCTestCase {
         XCTAssertEqual(third.index, 1)
     }
 }
+
+/// Replies the poller reads off a pane.
+///
+/// Every delegated task is pinned to the assignee's instance, and the poller
+/// filed what it read with no instance at all, so the reply was refused as
+/// possibly a sibling's. A worker that printed its header instead of running
+/// `tm-agent reply` — the only way a relay (remote) worker can answer — left
+/// its task open for good.
+@MainActor
+final class ScrollbackReplyIdentityTests: XCTestCase {
+
+    private let header = AutoReplyEvent(status: "DONE", files: "none", verify: "n/a",
+                                        next: "NONE", fullReport: "n/a", body: "", raw: "")
+
+    private func member(name: String, panelId: UUID, instance: String) -> TeamOrchestrator.AgentMember {
+        var member = TeamOrchestrator.AgentMember(
+            id: "\(name)@scrollback-test",
+            name: name,
+            teamName: "scrollback-test",
+            cli: "claude",
+            launchCommand: "claude",
+            model: "sonnet",
+            agentType: "executor",
+            color: "green",
+            instructions: "",
+            workspaceId: UUID(),
+            panelId: panelId,
+            parentSessionId: nil,
+            claudeSessionId: nil,
+            claudeSessionIdCapturedAt: nil,
+            createdAt: Date(),
+            worktreeName: nil,
+            worktreePath: nil,
+            worktreeBranch: nil,
+            remoteSurfaceID: nil,
+            remoteSurfaceSpawned: false,
+            hostKey: nil,
+            originalSpawnCommand: nil,
+            originalAgentWorkDir: nil,
+            autoRecycleEvery: nil,
+            completedTaskCount: 0
+        )
+        member.agentInstanceId = instance
+        return member
+    }
+
+    func testThePaneOwnerIsFoundByPaneNotByRoleName() {
+        let first = UUID(), second = UUID()
+        let agents = [
+            member(name: "executor", panelId: first, instance: "instance-a"),
+            member(name: "executor", panelId: second, instance: "instance-b"),
+        ]
+        XCTAssertEqual(AutoReplyPoller.paneOwner(panelId: second, in: agents)?.agentInstanceId, "instance-b")
+        XCTAssertNil(AutoReplyPoller.paneOwner(panelId: UUID(), in: agents))
+    }
+
+    func testAHeaderOnTheAssigneesPaneClosesItsTaskAndOnASiblingsPaneDoesNot() throws {
+        let team = "scrollback-reply-test-\(UUID().uuidString)"
+        let store = TeamDataStore.shared
+        store.registerTeam(team, agents: [
+            .init(name: "executor", instanceId: "instance-a"),
+            .init(name: "executor", instanceId: "instance-b"),
+        ])
+        defer { store.clearResults(teamName: team); store.unregisterTeam(team) }
+        let task = try XCTUnwrap(store.createTask(
+            teamName: team, title: "delegated", assignee: "executor", assigneeInstanceId: "instance-a"
+        ))
+        let assigneePane = UUID(), siblingPane = UUID()
+        let agents = [
+            member(name: "executor", panelId: assigneePane, instance: "instance-a"),
+            member(name: "executor", panelId: siblingPane, instance: "instance-b"),
+        ]
+
+        let sibling = try XCTUnwrap(AutoReplyPoller.paneOwner(panelId: siblingPane, in: agents))
+        XCTAssertFalse(AutoReplyEmit.emit(
+            teamName: team, agentName: sibling.name, event: header,
+            agentInstanceId: sibling.agentInstanceId, store: store
+        ), "a header on the sibling's pane must not close another instance's task")
+
+        let owner = try XCTUnwrap(AutoReplyPoller.paneOwner(panelId: assigneePane, in: agents))
+        XCTAssertTrue(AutoReplyEmit.emit(
+            teamName: team, agentName: owner.name, event: header,
+            agentInstanceId: owner.agentInstanceId, store: store
+        ))
+        let closed = store.listTasks(
+            teamName: team, status: nil, assignee: "executor", needsAttention: false,
+            priority: nil, staleOnly: false, dependsOn: nil
+        ).first { $0.id == task.id }
+        XCTAssertEqual(closed?.status, "completed")
+    }
+}

@@ -12896,6 +12896,10 @@ fn run_create(
                         "panel_id": panel_id,
                         "text": format!("{init_text}\n"),
                         "send_sequence_aware": true,
+                        // The role briefing must arrive as the user's own turn; a
+                        // Claude inbox frames it as another session's message, and
+                        // an agent can reject its own role as an injection.
+                        "claude_inbox": false,
                     }),
                     3,
                 ) {
