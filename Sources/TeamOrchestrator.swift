@@ -9845,6 +9845,10 @@ final class TeamOrchestrator: ObservableObject {
             parts.append("--append-system-prompt '\(escaped)'")
         }
 
+        if ClaudeInboxDelivery.isEnabled() {
+            parts.append("--settings '\(ClaudeInboxDelivery.registerHookSettingsJSON)'")
+        }
+
         parts += extraArgs.map { shellQuote($0) }
 
         return parts.joined(separator: " ")

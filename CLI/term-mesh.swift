@@ -3835,7 +3835,7 @@ struct TermMeshCLI {
             """
         case "claude-hook":
             return """
-            Usage: term-mesh claude-hook <session-start|stop|notification> [flags]
+            Usage: term-mesh claude-hook <session-start|stop|notification|inbox-register> [flags]
 
             Hook for Claude Code integration. Reads JSON from stdin.
 
@@ -3843,6 +3843,7 @@ struct TermMeshCLI {
               session-start   Signal that a Claude session has started
               stop            Signal that a Claude session has stopped
               notification    Forward a Claude notification
+              inbox-register  Report the session's cross-session inbox only
 
             Flags:
               --workspace <id|ref>   Target workspace (default: $TERMMESH_WORKSPACE_ID)
@@ -4453,6 +4454,7 @@ struct TermMeshCLI {
         // up as "Tab not found" — silently return "OK" and exit 0 instead.
         let isBestEffort = subcommand == "stop" || subcommand == "idle"
             || subcommand == "notification" || subcommand == "notify"
+            || subcommand == "inbox-register"
 
         let fallbackWorkspaceId: String
         do {
@@ -4490,6 +4492,12 @@ struct TermMeshCLI {
                 icon: "bolt.fill",
                 color: "#4C8DFF"
             )
+            print("OK")
+
+        case "inbox-register":
+            if let surfaceId = fallbackSurfaceId {
+                reportClaudeInbox(surfaceId: surfaceId, parsedInput: parsedInput, client: client)
+            }
             print("OK")
 
         case "stop", "idle":

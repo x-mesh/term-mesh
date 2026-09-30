@@ -85,6 +85,27 @@ final class ClaudeInboxDeliveryTests: XCTestCase {
         XCTAssertEqual(registry.record(for: surface), second)
     }
 
+    func testDeliveryIsOffUnlessTheOptionIsSet() throws {
+        let suite = "ClaudeInboxDeliveryTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertFalse(ClaudeInboxDelivery.isEnabled(defaults: defaults))
+        defaults.set(true, forKey: ClaudeInboxDelivery.enabledKey)
+        XCTAssertTrue(ClaudeInboxDelivery.isEnabled(defaults: defaults))
+    }
+
+    func testWorkerLaunchHookRegistersThroughThisAppsCLI() throws {
+        let json = ClaudeInboxDelivery.registerHookSettingsJSON
+        XCTAssertFalse(json.contains("'"), "the settings are passed inside single quotes on the launch line")
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        let hooks = try XCTUnwrap(object["hooks"] as? [String: Any])
+        let sessionStart = try XCTUnwrap(hooks["SessionStart"] as? [[String: Any]])
+        let entry = try XCTUnwrap((sessionStart.first?["hooks"] as? [[String: Any]])?.first)
+        XCTAssertEqual(entry["command"] as? String,
+                       "\"$TERMMESH_APP_BIN/term-mesh\" claude-hook inbox-register")
+    }
+
     func testRecordsAreKeptPerPaneAndRemovable() throws {
         let registry = ClaudeInboxRegistry()
         let other = UUID()

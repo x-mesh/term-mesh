@@ -1,5 +1,19 @@
 import Foundation
 
+enum ClaudeInboxDelivery {
+    static let enabledKey = "claudeInbox.enabled"
+
+    static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: enabledKey)
+    }
+
+    // Team agents are launched by the resolved claude binary, not through
+    // Resources/bin/claude, so its SessionStart hook never runs for them.
+    // `$TERMMESH_APP_BIN` names this app's CLI; a PATH lookup can reach another
+    // installed build that talks to a different socket.
+    static let registerHookSettingsJSON = "{\"hooks\":{\"SessionStart\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"\\\"$TERMMESH_APP_BIN/term-mesh\\\" claude-hook inbox-register\",\"timeout\":10}]}]}}"
+}
+
 /// The cross-session inbox of a Claude Code session running in a terminal pane,
 /// as that session's SessionStart hook reported it.
 struct ClaudeInboxRecord: Equatable {
