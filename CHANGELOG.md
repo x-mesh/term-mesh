@@ -4,6 +4,20 @@ All notable changes to term-mesh are documented here.
 
 ## [Unreleased]
 
+## [0.259.0] - 2026-09-30
+
+### Added
+
+- A new opt-in setting delivers leader messages to local Claude workers through Claude Code's own session inbox, instead of typing them into the worker's prompt. A half-typed draft in the prompt is kept, and multi-line messages arrive unchanged. It applies when Settings > Agent Panes is set to Terminal. Native panes, Codex and other CLIs, and remote workers are unchanged. Turn it on with `defaults write com.termmesh.app claudeInbox.enabled -bool true`, then recreate the team. Tested with Claude Code 2.1.285.
+- If Claude Code holds such a message for approval, term-mesh reports the send as failed and does not type it. That worker gets no more inbox messages until its Claude session restarts.
+
+### Fixed
+
+- A remote worker that ends a delegated task by printing its report header now closes that task. A remote worker cannot run `tm-agent reply` back to this app, so its tasks used to stay assigned after it reported. Local workers that print the header instead of running `tm-agent reply` are fixed the same way.
+- When two workers share a role name, the second worker's printed report is no longer dropped.
+
+Thanks to @JINWOO-J for these changes.
+
 ## [0.258.2] - 2026-09-29
 
 ### Fixed
