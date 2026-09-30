@@ -626,19 +626,19 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
 
         let token = store.prepareLeaderRequestToken(teamName: team)
         XCTAssertTrue(store.isAuthorizedLeaderMetrics(
-            teamName: team, token: token, callerTTYDevice: nil,
+            teamName: team, token: token, callerTTYDevices: [],
             adoptedLeaderTTYDevice: nil
         ))
         XCTAssertTrue(store.isAuthorizedLeaderMetrics(
-            teamName: team, token: nil, callerTTYDevice: 0x1234,
+            teamName: team, token: nil, callerTTYDevices: [0x1234],
             adoptedLeaderTTYDevice: 0x1234
         ))
         XCTAssertFalse(store.isAuthorizedLeaderMetrics(
-            teamName: team, token: nil, callerTTYDevice: 0x5678,
+            teamName: team, token: nil, callerTTYDevices: [0x5678],
             adoptedLeaderTTYDevice: 0x1234
         ))
         XCTAssertFalse(store.isAuthorizedLeaderMetrics(
-            teamName: team, token: "wrong", callerTTYDevice: nil,
+            teamName: team, token: "wrong", callerTTYDevices: [],
             adoptedLeaderTTYDevice: nil
         ))
     }
@@ -660,6 +660,7 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
 
         let controller = TerminalController.shared
         let leaderPTY: UInt32 = 0x1234
+        let nestedPTY: UInt32 = 0x2222
         let request: [String: Any] = ["team_name": team, "request_id": requestId]
         func reply(_ json: String) throws -> [String: Any] {
             try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
@@ -670,7 +671,7 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
 
         XCTAssertEqual(try errorCode(controller.teamDataLeaderRequestTake(
             params: request, id: 1, store: store,
-            callerTTYDevice: 0x5678, adoptedLeaderTTYDevice: leaderPTY
+            callerTTYDevices: [0x5678, 0x5679], adoptedLeaderTTYDevice: leaderPTY
         )), "unauthorized", "a caller on another terminal")
         XCTAssertEqual(try errorCode(controller.teamDataLeaderRequestTake(
             params: request, id: 1, store: store
@@ -678,18 +679,44 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
 
         let list = try reply(controller.teamDataLeaderRequestList(
             params: ["team_name": team], id: 1, store: store,
-            callerTTYDevice: leaderPTY, adoptedLeaderTTYDevice: leaderPTY))
+            callerTTYDevices: [nestedPTY, leaderPTY], adoptedLeaderTTYDevice: leaderPTY))
         XCTAssertEqual((list["result"] as? [String: Any])?["count"] as? Int, 1)
 
         let take = try reply(controller.teamDataLeaderRequestTake(
             params: request, id: 1, store: store,
-            callerTTYDevice: leaderPTY, adoptedLeaderTTYDevice: leaderPTY))
+            callerTTYDevices: [nestedPTY, leaderPTY], adoptedLeaderTTYDevice: leaderPTY))
         XCTAssertEqual(take["ok"] as? Bool, true, "\(take)")
 
         let complete = try reply(controller.teamDataLeaderRequestComplete(
             params: request, id: 1, store: store,
-            callerTTYDevice: leaderPTY, adoptedLeaderTTYDevice: leaderPTY))
+            callerTTYDevices: [nestedPTY, leaderPTY], adoptedLeaderTTYDevice: leaderPTY))
         XCTAssertEqual(complete["ok"] as? Bool, true, "\(complete)")
+    }
+
+    /// Measured shape of an adopted leader pane with kiro-cli-term: the Bash
+    /// tool has no terminal, claude and the shell sit on a nested PTY, and only
+    /// the wrapper and `login` are on the pane PTY Ghostty reports.
+    func testAncestorTerminalsReachThePanePTYThroughANestedOne() {
+        let parents: [pid_t: pid_t] = [900: 800, 800: 700, 700: 600, 600: 500, 500: 400, 400: 1]
+        let ttys: [pid_t: UInt32] = [800: 72, 700: 72, 600: 57, 500: 57]
+        XCTAssertEqual(TerminalController.ancestorTTYDevices(
+            of: 900, parent: { parents[$0] }, tty: { ttys[$0] }
+        ), [72, 57])
+    }
+
+    func testAncestorTerminalsStopAtLaunchdLoopsAndTheDepthLimit() {
+        XCTAssertEqual(TerminalController.ancestorTTYDevices(
+            of: 1, parent: { _ in nil }, tty: { _ in 9 }
+        ), [], "launchd is never a caller's terminal owner")
+        XCTAssertEqual(TerminalController.ancestorTTYDevices(
+            of: 10, parent: { $0 == 10 ? 11 : 10 }, tty: { $0 == 10 ? 3 : nil }
+        ), [3], "a parent loop ends the walk")
+        XCTAssertEqual(TerminalController.ancestorTTYDevices(
+            of: 1000, parent: { $0 - 1 }, tty: { $0 == 900 ? 5 : nil }, maxDepth: 32
+        ), [], "a terminal beyond the depth limit is not reached")
+        XCTAssertEqual(TerminalController.ancestorTTYDevices(
+            of: 42, parent: { _ in nil }, tty: { _ in 7 }
+        ), [7], "the caller's own terminal counts")
     }
 
     func testDurableRequestCallsTakeTheAdoptedLeaderPTYPath() {

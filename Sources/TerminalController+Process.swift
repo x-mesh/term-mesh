@@ -89,6 +89,31 @@ extension TerminalController {
         return info.kp_eproc.e_ppid
     }
 
+    /// Controlling terminals of `pid` and of every ancestor up to launchd.
+    ///
+    /// A caller's own terminal is not enough to find the pane it runs in:
+    /// Claude Code runs its Bash tool with no controlling terminal, and shell
+    /// wrappers such as kiro-cli-term put the interactive shell on a PTY nested
+    /// inside the pane's, while Ghostty reports the pane's outer PTY. Ancestry
+    /// is kernel-maintained and every pane's process tree starts at this app,
+    /// so no process in another pane has this pane's PTY in its ancestry.
+    nonisolated static func ancestorTTYDevices(
+        of pid: pid_t,
+        parent: (pid_t) -> pid_t?,
+        tty: (pid_t) -> UInt32?,
+        maxDepth: Int = 32
+    ) -> Set<UInt32> {
+        var devices: Set<UInt32> = []
+        var visited: Set<pid_t> = []
+        var current: pid_t? = pid
+        while let process = current, process > 1, visited.count < maxDepth,
+              visited.insert(process).inserted {
+            if let device = tty(process) { devices.insert(device) }
+            current = parent(process)
+        }
+        return devices
+    }
+
     /// Kernel-assigned controlling TTY device for a socket client process.
     /// Unlike an environment variable or RPC parameter, callers cannot forge
     /// this without actually running inside that terminal session.

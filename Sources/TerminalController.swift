@@ -408,7 +408,6 @@ class TerminalController {
     func handleClient(_ socket: Int32, peerPid: pid_t? = nil) {
         defer { close(socket) }
         let clientPID = peerPid ?? getPeerPid(socket)
-        let clientTTYDevice = clientPID.flatMap(Self.controllingTTYDevice(of:))
 
         // In termMeshOnly mode, verify the connecting process is a descendant of term-mesh.
         // Other modes allow external clients and apply separate auth controls.
@@ -471,7 +470,7 @@ class TerminalController {
                     continue
                 }
 
-                let response = processCommand(trimmed, callerTTYDevice: clientTTYDevice)
+                let response = processCommand(trimmed, callerPID: clientPID)
                 writeSocketResponse(response, to: socket)
             }
         }
@@ -529,13 +528,13 @@ class TerminalController {
         return frames
     }
 
-    private func processCommand(_ command: String, callerTTYDevice: UInt32? = nil) -> String {
+    private func processCommand(_ command: String, callerPID: pid_t? = nil) -> String {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "ERROR: Empty command" }
 
         // v2 protocol: newline-delimited JSON.
         if trimmed.hasPrefix("{") {
-            return processV2Command(trimmed, callerTTYDevice: callerTTYDevice)
+            return processV2Command(trimmed, callerPID: callerPID)
         }
 
         let parts = trimmed.split(separator: " ", maxSplits: 1).map(String.init)
@@ -869,7 +868,7 @@ class TerminalController {
     // MARK: - V2 JSON Socket Protocol
 
     private func processV2Command(
-        _ jsonLine: String, callerTTYDevice: UInt32? = nil
+        _ jsonLine: String, callerPID: pid_t? = nil
     ) -> String {
         // v1 access-mode gating applies to v2 as well. We can't know which v2 method maps
         // to which v1 command without parsing, so parse first and then apply allow-list.
@@ -913,7 +912,7 @@ class TerminalController {
         if method.hasPrefix("team.") {
             return dispatchTeamCommandAsync(
                 method: method, params: params, id: id,
-                callerTTYDevice: callerTTYDevice
+                callerPID: callerPID
             )
         }
 
@@ -2501,7 +2500,7 @@ class TerminalController {
 
     private func dispatchTeamCommandAsync(
         method: String, params: [String: Any], id: Any?,
-        callerTTYDevice: UInt32? = nil
+        callerPID: pid_t? = nil
     ) -> String {
         // An adopted leader already existed when the team was created, so no
         // bearer can be injected into its environment. Authenticate its metrics
@@ -2509,7 +2508,15 @@ class TerminalController {
         // peer and leader surface must resolve to the same kernel device. Only
         // this identity snapshot touches MainActor; the store read remains on
         // teamDataQueue.
-        if Self.adoptedLeaderPTYMethods.contains(method), callerTTYDevice != nil {
+        if Self.adoptedLeaderPTYMethods.contains(method), let callerPID {
+            let callerTTYDevices = Self.ancestorTTYDevices(
+                of: callerPID,
+                parent: { [self] pid in
+                    let parent = parentPid(of: pid)
+                    return parent > 0 ? parent : nil
+                },
+                tty: Self.controllingTTYDevice(of:)
+            )
             let semaphore = DispatchSemaphore(value: 0)
             nonisolated(unsafe) var leaderTTYDevice: UInt32?
             Task {
@@ -2538,19 +2545,19 @@ class TerminalController {
                 case "team.leader.request.list":
                     return teamDataLeaderRequestList(
                         params: params, id: id, store: store,
-                        callerTTYDevice: callerTTYDevice, adoptedLeaderTTYDevice: leaderTTYDevice)
+                        callerTTYDevices: callerTTYDevices, adoptedLeaderTTYDevice: leaderTTYDevice)
                 case "team.leader.request.take":
                     return teamDataLeaderRequestTake(
                         params: params, id: id, store: store,
-                        callerTTYDevice: callerTTYDevice, adoptedLeaderTTYDevice: leaderTTYDevice)
+                        callerTTYDevices: callerTTYDevices, adoptedLeaderTTYDevice: leaderTTYDevice)
                 case "team.leader.request.complete":
                     return teamDataLeaderRequestComplete(
                         params: params, id: id, store: store,
-                        callerTTYDevice: callerTTYDevice, adoptedLeaderTTYDevice: leaderTTYDevice)
+                        callerTTYDevices: callerTTYDevices, adoptedLeaderTTYDevice: leaderTTYDevice)
                 default:
                     return teamDataTaskMetrics(
                         params: params, id: id, store: store,
-                        callerTTYDevice: callerTTYDevice,
+                        callerTTYDevices: callerTTYDevices,
                         adoptedLeaderTTYDevice: leaderTTYDevice
                     )
                 }
@@ -5631,14 +5638,14 @@ class TerminalController {
 
     func teamDataLeaderRequestList(
         params: [String: Any], id: Any?, store: TeamDataStore,
-        callerTTYDevice: UInt32? = nil, adoptedLeaderTTYDevice: UInt32? = nil
+        callerTTYDevices: Set<UInt32> = [], adoptedLeaderTTYDevice: UInt32? = nil
     ) -> String {
         guard let teamName = params["team_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
         guard store.isAuthorizedLeaderMetrics(
             teamName: teamName, token: params["leader_request_token"] as? String,
-            callerTTYDevice: callerTTYDevice, adoptedLeaderTTYDevice: adoptedLeaderTTYDevice
+            callerTTYDevices: callerTTYDevices, adoptedLeaderTTYDevice: adoptedLeaderTTYDevice
         ) else {
             return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
         }
@@ -5657,7 +5664,7 @@ class TerminalController {
 
     func teamDataLeaderRequestTake(
         params: [String: Any], id: Any?, store: TeamDataStore,
-        callerTTYDevice: UInt32? = nil, adoptedLeaderTTYDevice: UInt32? = nil
+        callerTTYDevices: Set<UInt32> = [], adoptedLeaderTTYDevice: UInt32? = nil
     ) -> String {
         guard let teamName = params["team_name"] as? String,
               let requestId = params["request_id"] as? String else {
@@ -5665,7 +5672,7 @@ class TerminalController {
         }
         guard store.isAuthorizedLeaderMetrics(
             teamName: teamName, token: params["leader_request_token"] as? String,
-            callerTTYDevice: callerTTYDevice, adoptedLeaderTTYDevice: adoptedLeaderTTYDevice
+            callerTTYDevices: callerTTYDevices, adoptedLeaderTTYDevice: adoptedLeaderTTYDevice
         ) else {
             return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
         }
@@ -5686,7 +5693,7 @@ class TerminalController {
 
     func teamDataLeaderRequestComplete(
         params: [String: Any], id: Any?, store: TeamDataStore,
-        callerTTYDevice: UInt32? = nil, adoptedLeaderTTYDevice: UInt32? = nil
+        callerTTYDevices: Set<UInt32> = [], adoptedLeaderTTYDevice: UInt32? = nil
     ) -> String {
         guard let teamName = params["team_name"] as? String,
               let requestId = params["request_id"] as? String else {
@@ -5694,7 +5701,7 @@ class TerminalController {
         }
         guard store.isAuthorizedLeaderMetrics(
             teamName: teamName, token: params["leader_request_token"] as? String,
-            callerTTYDevice: callerTTYDevice, adoptedLeaderTTYDevice: adoptedLeaderTTYDevice
+            callerTTYDevices: callerTTYDevices, adoptedLeaderTTYDevice: adoptedLeaderTTYDevice
         ) else {
             return v2Error(id: id, code: "unauthorized", message: "Leader request capability required")
         }
@@ -6037,14 +6044,14 @@ class TerminalController {
     /// controlling TTY. Request bodies and claim operations remain token-only.
     private func teamDataTaskMetrics(
         params: [String: Any], id: Any?, store: TeamDataStore,
-        callerTTYDevice: UInt32? = nil, adoptedLeaderTTYDevice: UInt32? = nil
+        callerTTYDevices: Set<UInt32> = [], adoptedLeaderTTYDevice: UInt32? = nil
     ) -> String {
         guard let teamName = params["team_name"] as? String else {
             return v2Error(id: id, code: "invalid_params", message: "Missing team_name")
         }
         guard store.isAuthorizedLeaderMetrics(
             teamName: teamName, token: params["leader_request_token"] as? String,
-            callerTTYDevice: callerTTYDevice,
+            callerTTYDevices: callerTTYDevices,
             adoptedLeaderTTYDevice: adoptedLeaderTTYDevice
         ) else {
             return v2Error(id: id, code: "unauthorized", message: "Leader metrics capability required")
