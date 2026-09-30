@@ -7,6 +7,37 @@ enum ClaudeInboxDelivery {
         defaults.bool(forKey: enabledKey)
     }
 
+    /// Separate from the worker option: the leader is usually the user's own
+    /// session, where inbox turns are shown as another session's.
+    static let leaderEnabledKey = "claudeInbox.leader.enabled"
+
+    static func isLeaderEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: leaderEnabledKey)
+    }
+
+    /// The `--settings` a leader launched by term-mesh starts with: `base`
+    /// unchanged when the inbox is off, otherwise `base` with the inbox
+    /// SessionStart hook added beside the hooks it already has.
+    static func leaderSettingsJSON(base: String?, registerInbox: Bool) -> String? {
+        guard registerInbox else { return base }
+        var settings: [String: Any] = [:]
+        var hooks: [String: [Any]] = [:]
+        for json in [base, registerHookSettingsJSON].compactMap({ $0 }) {
+            guard let data = json.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            for (key, value) in object where key != "hooks" { settings[key] = value }
+            for (event, entries) in object["hooks"] as? [String: Any] ?? [:] {
+                hooks[event, default: []] += entries as? [Any] ?? []
+            }
+        }
+        settings["hooks"] = hooks
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: settings, options: [.sortedKeys, .withoutEscapingSlashes]
+        ) else { return base }
+        return String(data: data, encoding: .utf8)
+    }
+
     // Team agents are launched by the resolved claude binary, not through
     // Resources/bin/claude, so its SessionStart hook never runs for them.
     // `$TERMMESH_APP_BIN` names this app's CLI; a PATH lookup can reach another

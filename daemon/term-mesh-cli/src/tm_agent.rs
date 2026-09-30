@@ -5103,6 +5103,159 @@ fn rpc_call(sock: &PathBuf, method: &str, params: Value) -> Result<Value, String
 /// The durable request body crosses a file/RPC boundary before it reaches the
 /// leader. Refuse to expose it to the model unless both integrity fields match
 /// the bytes actually returned by the owning app.
+/// Leader-side commands an adopted leader runs early and often: its inbox is
+/// registered from them because term-mesh did not launch that session and so
+/// could not give it a SessionStart hook.
+fn reports_claude_inbox(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Create { adopt: true, .. }
+            | Commands::Wait { .. }
+            | Commands::Leader(LeaderCommands::Request(LeaderRequestCommands::Take { .. }))
+    )
+}
+
+fn claude_config_dir() -> Option<PathBuf> {
+    match env::var("CLAUDE_CONFIG_DIR") {
+        Ok(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => env::var("HOME").ok().map(|home| PathBuf::from(home).join(".claude")),
+    }
+}
+
+/// What `claude.inbox.register` needs, from the environment Claude Code gives
+/// its Bash children. `None` outside an interactive Claude session in a
+/// term-mesh pane. The transcript and pid are looked up by session id: the
+/// app confirms delivery from the transcript and detects `/clear` from the pid.
+fn claude_inbox_params(env_var: &dyn Fn(&str) -> Option<String>, config_dir: &Path) -> Option<Value> {
+    let get = |name: &str| env_var(name).filter(|value| !value.is_empty());
+    let surface = get("TERMMESH_SURFACE_ID")?;
+    let socket = get("CLAUDE_CODE_MESSAGING_SOCKET")?;
+    let token = get("CLAUDE_CODE_MESSAGING_TOKEN")?;
+    let session = get("CLAUDE_CODE_SESSION_ID")?;
+    let mut params = json!({
+        "surface_id": surface,
+        "socket_path": socket,
+        "token": token,
+        "session_id": session,
+        "entrypoint": get("CLAUDE_CODE_ENTRYPOINT").unwrap_or_default(),
+    });
+    let transcript_name = format!("{session}.jsonl");
+    if let Ok(projects) = fs::read_dir(config_dir.join("projects")) {
+        if let Some(path) = projects
+            .flatten()
+            .map(|project| project.path().join(&transcript_name))
+            .find(|path| path.is_file())
+        {
+            params["transcript_path"] = json!(path.to_string_lossy());
+        }
+    }
+    if let Ok(sessions) = fs::read_dir(config_dir.join("sessions")) {
+        for entry in sessions.flatten() {
+            let path = entry.path();
+            let Some(pid) = path.file_stem().and_then(|stem| stem.to_str()).map(str::to_owned) else { continue };
+            let Ok(text) = fs::read_to_string(&path) else { continue };
+            let Ok(record) = serde_json::from_str::<Value>(&text) else { continue };
+            if record.get("sessionId").and_then(Value::as_str) == Some(session.as_str()) {
+                params["claude_pid"] = json!(pid);
+                break;
+            }
+        }
+    }
+    Some(params)
+}
+
+/// Best effort and silent: the token is sent only to an app that says the
+/// leader inbox is on, and is never printed.
+fn report_claude_inbox(sock: &PathBuf) {
+    let Some(config_dir) = claude_config_dir() else { return };
+    let Some(params) = claude_inbox_params(&|name| env::var(name).ok(), &config_dir) else { return };
+    let enabled = rpc_call_timeout(sock, "claude.inbox.status", json!({}), 2)
+        .ok()
+        .and_then(|response| response["result"]["leader_enabled"].as_bool())
+        .unwrap_or(false);
+    if enabled {
+        let _ = rpc_call_timeout(sock, "claude.inbox.register", params, 2);
+    }
+}
+
+#[cfg(test)]
+mod claude_inbox_report_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const SESSION: &str = "14adb8a2-baf0-4435-9eaa-2a95cbc4490c";
+
+    fn claude_env() -> HashMap<&'static str, String> {
+        HashMap::from([
+            ("TERMMESH_SURFACE_ID", "6216B81F-D848-4AB9-9222-0939A37E6753".to_string()),
+            ("CLAUDE_CODE_MESSAGING_SOCKET", "/tmp/cc-socks/4242.sock".to_string()),
+            ("CLAUDE_CODE_MESSAGING_TOKEN", "t".repeat(64)),
+            ("CLAUDE_CODE_SESSION_ID", SESSION.to_string()),
+            ("CLAUDE_CODE_ENTRYPOINT", "cli".to_string()),
+        ])
+    }
+
+    fn params(env: &HashMap<&'static str, String>, dir: &Path) -> Option<Value> {
+        claude_inbox_params(&|name| env.get(name).cloned(), dir)
+    }
+
+    #[test]
+    fn an_interactive_session_reports_its_inbox_transcript_and_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("projects/-Users-me-work");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join(format!("{SESSION}.jsonl")), "{}\n").unwrap();
+        fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        fs::write(dir.path().join("sessions/111.json"), r#"{"sessionId":"another"}"#).unwrap();
+        fs::write(dir.path().join("sessions/4242.json"), format!(r#"{{"sessionId":"{SESSION}"}}"#)).unwrap();
+
+        let params = params(&claude_env(), dir.path()).unwrap();
+        assert_eq!(params["socket_path"], "/tmp/cc-socks/4242.sock");
+        assert_eq!(params["session_id"], SESSION);
+        assert_eq!(params["entrypoint"], "cli");
+        assert_eq!(params["claude_pid"], "4242");
+        assert_eq!(
+            params["transcript_path"],
+            project.join(format!("{SESSION}.jsonl")).to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn a_session_without_its_transcript_or_registry_entry_still_reports_the_inbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let params = params(&claude_env(), dir.path()).unwrap();
+        assert!(params.get("transcript_path").is_none());
+        assert!(params.get("claude_pid").is_none());
+    }
+
+    #[test]
+    fn nothing_is_reported_outside_a_claude_session_in_a_term_mesh_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        for missing in [
+            "TERMMESH_SURFACE_ID",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_CODE_SESSION_ID",
+        ] {
+            let mut env = claude_env();
+            env.insert(missing, String::new());
+            assert!(params(&env, dir.path()).is_none(), "{missing} empty");
+            env.remove(missing);
+            assert!(params(&env, dir.path()).is_none(), "{missing} unset");
+        }
+    }
+
+    #[test]
+    fn only_leader_side_commands_report() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+        assert!(reports_claude_inbox(&parse(&["tm-agent", "wait"])));
+        assert!(reports_claude_inbox(&parse(&["tm-agent", "create", "0", "--adopt"])));
+        assert!(reports_claude_inbox(&parse(&["tm-agent", "leader", "request", "take", "lr-1"])));
+        assert!(!reports_claude_inbox(&parse(&["tm-agent", "create", "2"])));
+        assert!(!reports_claude_inbox(&parse(&["tm-agent", "status"])));
+    }
+}
+
 fn verify_leader_request_response(response: Value) -> Result<Value, String> {
     // Integrity fields exist only on a successful claim. Preserve an RPC
     // failure envelope verbatim so the caller sees `invalid_state`,
@@ -8735,6 +8888,10 @@ fn main() {
 
     let team = resolve_team_name(cli.team.as_deref());
     let agent = env::var("TERMMESH_AGENT_NAME").unwrap_or_else(|_| "anonymous".into());
+
+    if reports_claude_inbox(&cli.command) {
+        report_claude_inbox(&sock);
+    }
 
     let result = match cli.command {
         // ── Agent-side commands ──────────────────────────────────
