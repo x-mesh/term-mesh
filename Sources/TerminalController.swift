@@ -3417,6 +3417,7 @@ class TerminalController {
             return v2Error(id: id, code: "not_found", message: "Agent not found")
         }
         let sendSequenceAware = params["send_sequence_aware"] as? Bool ?? false
+        let allowClaudeInbox = params["claude_inbox"] as? Bool ?? true
         // Per-agent send serialization: wait for the preceding paste+Return cycle to
         // finish (including 250 ms post-Return cooldown) before pasting new text.
         // This prevents rapid consecutive sends from racing inside the codex TUI
@@ -3495,7 +3496,8 @@ class TerminalController {
                 // across that gap could get a terminal paste answered with
                 // return_required=false, losing the turn.
                 deliveredNatively = !TeamOrchestrator.shared.agentNeedsReturn(
-                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId,
+                    allowClaudeInbox: allowClaudeInbox
                 )
                 // Keep only the durable instance across the stagger/queue wait.
                 // sendToAgent resolves its current panel, transport and host here,
@@ -3507,6 +3509,7 @@ class TerminalController {
                     text: text,
                     tabManager: tabManager,
                     withReturn: false, // Return is sent separately by Rust CLI via team.send_key
+                    allowClaudeInbox: allowClaudeInbox,
                     completion: { ack in resume(ack) },
                     // Fires before the completion above, so the scope is
                     // always set by the time the continuation resumes.

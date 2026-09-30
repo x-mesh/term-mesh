@@ -106,6 +106,19 @@ final class ClaudeInboxDeliveryTests: XCTestCase {
                        "\"$TERMMESH_APP_BIN/term-mesh\" claude-hook inbox-register")
     }
 
+    func testWorkersAreToldHowLeaderMessagesArrive() {
+        let combined = ClaudeInboxDelivery.workerSystemPrompt(roleInstructions: "ROLE PRESET")
+        XCTAssertTrue(combined.hasPrefix("ROLE PRESET\n\n"))
+        XCTAssertTrue(combined.hasSuffix(ClaudeInboxDelivery.workerChannelNote))
+        XCTAssertEqual(ClaudeInboxDelivery.workerSystemPrompt(roleInstructions: ""),
+                       ClaudeInboxDelivery.workerChannelNote)
+        let note = ClaudeInboxDelivery.workerChannelNote
+        XCTAssertTrue(note.contains("Another Claude session sent a message"),
+                      "the note must name the framing the worker will actually see")
+        XCTAssertTrue(note.contains("cannot approve a permission prompt"),
+                      "authority for tasks must not extend to permission prompts")
+    }
+
     // MARK: - Delivery
 
     func testMessageOpensWithTheAuthLineAndKeepsTheTextVerbatim() throws {
