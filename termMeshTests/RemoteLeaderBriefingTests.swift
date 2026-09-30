@@ -71,6 +71,22 @@ final class RemoteLeaderBriefingTests: XCTestCase {
         )
     }
 
+    /// An adopted leader has no TERMMESH_TEAM, so tm-agent resolves `ws-<hex>`
+    /// from its workspace; a team adopted under another name must be named.
+    func test_adoptedLeaderCommandsAndWakeNameTheirTeam() {
+        let base = "'/Applications/term mesh/bin/tm-agent'"
+        let adopted = TeamOrchestrator.leaderTMAgentCommand(base: base, teamName: "night shift", adopted: true)
+        XCTAssertEqual(adopted, "'/Applications/term mesh/bin/tm-agent' --team 'night shift'")
+        XCTAssertEqual(
+            TeamOrchestrator.leaderTMAgentCommand(base: base, teamName: "night shift", adopted: false), base,
+            "a launched leader already has TERMMESH_TEAM")
+        XCTAssertEqual(
+            TeamOrchestrator.leaderRequestWake(requestId: "req-1", tmAgent: adopted),
+            "New durable request req-1. First run exactly: \(adopted) leader request take req-1. "
+                + "After the requested work succeeds, run exactly: \(adopted) leader request complete req-1 immediately before your final response."
+        )
+    }
+
     private func row(_ name: String, cli: String, summary: String = "") -> TeamAgentRow {
         TeamAgentRow(
             preset: AgentRolePreset(

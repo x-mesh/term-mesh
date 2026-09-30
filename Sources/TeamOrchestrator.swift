@@ -5052,6 +5052,13 @@ final class TeamOrchestrator: ObservableObject {
         return FileManager.default.isExecutableFile(atPath: bundled) ? shellQuoted(bundled) : "tm-agent"
     }
 
+    /// An adopted leader was running before its team existed, so it has no
+    /// TERMMESH_TEAM and tm-agent falls back to the workspace-derived `ws-<hex>`
+    /// name; a team adopted under any other name is only reached with `--team`.
+    static func leaderTMAgentCommand(base: String, teamName: String, adopted: Bool) -> String {
+        adopted ? "\(base) --team \(shellQuoted(teamName))" : base
+    }
+
     static func remoteLeaderNonClaudeSystemPrompt(
         teamName: String,
         rows: [TeamAgentRow],
@@ -5191,7 +5198,10 @@ final class TeamOrchestrator: ObservableObject {
         let agentList = agents.enumerated().map { Self.leaderRosterLine(index: $0.offset, agent: $0.element) }
             .joined(separator: "\n")
 
-        let tmAgent = Self.localTMAgentCommand()
+        let tmAgent = Self.leaderTMAgentCommand(
+            base: Self.localTMAgentCommand(), teamName: teamName,
+            adopted: teams[teamName]?.leaderMode == "adopted"
+        )
         let runbookSection = Self.runbookLeaderSection(
             workingDirectory: workingDirectory,
             roles: agents.map(\.agentType)
@@ -6209,7 +6219,10 @@ final class TeamOrchestrator: ObservableObject {
     func leaderRequestWake(teamName: String, requestId: String) -> String {
         let tmAgent: String
         if let team = teams[teamName], case .local = team.leaderEndpoint {
-            tmAgent = Self.localTMAgentCommand()
+            tmAgent = Self.leaderTMAgentCommand(
+                base: Self.localTMAgentCommand(), teamName: teamName,
+                adopted: team.leaderMode == "adopted"
+            )
         } else {
             tmAgent = "tm-agent"
         }
