@@ -15,7 +15,12 @@ enum ClaudeInboxDelivery {
 
     enum Outcome: Equatable {
         case delivered
-        case failed(String)
+        /// The session provably did not take the message; typing it instead is safe.
+        case notDelivered(String)
+        /// The message was written but its fate is unknown: it may be held
+        /// behind an approval dialog that would swallow a paste, or accepted
+        /// late, which a paste would duplicate. Neither allows a fallback.
+        case unconfirmed(String)
     }
 
     enum PostError: Error, Equatable {
@@ -23,7 +28,13 @@ enum ClaudeInboxDelivery {
         case syscall(String, Int32)
     }
 
-    static let enqueueConfirmTimeout: TimeInterval = 1.5
+    enum TranscriptVerdict: Equatable {
+        case enqueued
+        case held
+        case silent
+    }
+
+    static let enqueueConfirmTimeout: TimeInterval = 3
     static let sessionsDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/sessions", isDirectory: true)
 
@@ -45,21 +56,23 @@ enum ClaudeInboxDelivery {
         confirmTimeout: TimeInterval = enqueueConfirmTimeout
     ) -> Outcome {
         if isStale(record, sessionsDirectory: sessionsDirectory) {
-            return .failed("stale_session")
+            return .notDelivered("stale_session")
         }
         guard let transcriptPath = record.transcriptPath else {
-            return .failed("no_transcript_path")
+            return .notDelivered("no_transcript_path")
         }
         let offset = fileSize(atPath: transcriptPath)
         do {
             let payload = try messageLines(token: record.token, text: text, messageId: UUID().uuidString)
             try post(payload, toSocket: record.socketPath)
         } catch {
-            return .failed("post: \(error)")
+            return .notDelivered("post: \(error)")
         }
-        return transcriptRecordsEnqueue(of: text, atPath: transcriptPath, after: offset, timeout: confirmTimeout)
-            ? .delivered
-            : .failed("not_enqueued")
+        switch transcriptVerdict(of: text, atPath: transcriptPath, after: offset, timeout: confirmTimeout) {
+        case .enqueued: return .delivered
+        case .held: return .unconfirmed("held_for_approval")
+        case .silent: return .unconfirmed("not_enqueued")
+        }
     }
 
     static func messageLines(token: String, text: String, messageId: String) throws -> Data {
@@ -136,13 +149,17 @@ enum ClaudeInboxDelivery {
         return (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
     }
 
-    static func transcriptRecordsEnqueue(
+    /// Reads what the session appended after `offset` until it either accepts
+    /// the message or reports holding one. A held message's preview is cut, so
+    /// any hold notice after our write is taken as ours: we just posted, and
+    /// reading someone else's hold as ours only withholds a paste.
+    static func transcriptVerdict(
         of content: String,
         atPath path: String,
         after offset: UInt64,
         timeout: TimeInterval,
         pollInterval: TimeInterval = 0.05
-    ) -> Bool {
+    ) -> TranscriptVerdict {
         let expected = content.trimmingCharacters(in: .whitespacesAndNewlines)
         let deadline = Date().addingTimeInterval(timeout)
         var cursor = offset
@@ -157,22 +174,31 @@ enum ClaudeInboxDelivery {
                 while let newline = pending.firstIndex(of: 0x0A) {
                     let line = pending[pending.startIndex..<newline]
                     pending.removeSubrange(pending.startIndex...newline)
-                    if isEnqueue(line, of: expected) { return true }
+                    if let verdict = verdict(for: line, expecting: expected) { return verdict }
                 }
             }
-            if Date() >= deadline { return false }
+            if Date() >= deadline { return .silent }
             Thread.sleep(forTimeInterval: pollInterval)
         }
     }
 
-    private static func isEnqueue(_ line: Data, of expected: String) -> Bool {
-        guard line.range(of: Data("queue-operation".utf8)) != nil,
-              let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              object["type"] as? String == "queue-operation",
-              object["operation"] as? String == "enqueue",
-              let content = object["content"] as? String
-        else { return false }
-        return content.trimmingCharacters(in: .whitespacesAndNewlines) == expected
+    private static func verdict(for line: Data, expecting expected: String) -> TranscriptVerdict? {
+        let mayEnqueue = line.range(of: Data("queue-operation".utf8)) != nil
+        let mayHold = line.range(of: Data("Held peer message".utf8)) != nil
+        guard mayEnqueue || mayHold,
+              let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any]
+        else { return nil }
+        if object["type"] as? String == "queue-operation",
+           object["operation"] as? String == "enqueue",
+           let content = object["content"] as? String,
+           content.trimmingCharacters(in: .whitespacesAndNewlines) == expected {
+            return .enqueued
+        }
+        if object["type"] as? String == "system",
+           (object["content"] as? String)?.hasPrefix("Held peer message") == true {
+            return .held
+        }
+        return nil
     }
 }
 
@@ -210,6 +236,7 @@ final class ClaudeInboxRegistry {
 
     private let lock = NSLock()
     private var records: [UUID: ClaudeInboxRecord] = [:]
+    private var quarantined: Set<UUID> = []
 
     init() {}
 
@@ -217,6 +244,24 @@ final class ClaudeInboxRegistry {
         lock.lock()
         defer { lock.unlock() }
         records[record.surfaceId] = record
+        quarantined.remove(record.surfaceId)
+    }
+
+    /// After an unconfirmed delivery the pane may show an approval dialog that
+    /// would swallow typed text, so neither the inbox nor a paste is safe until
+    /// the session starts again and registers a fresh record.
+    func quarantine(_ record: ClaudeInboxRecord) {
+        lock.lock()
+        defer { lock.unlock() }
+        if records[record.surfaceId] == record {
+            quarantined.insert(record.surfaceId)
+        }
+    }
+
+    func isQuarantined(surfaceId: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return quarantined.contains(surfaceId)
     }
 
     func record(for surfaceId: UUID) -> ClaudeInboxRecord? {
@@ -229,6 +274,7 @@ final class ClaudeInboxRegistry {
     func remove(surfaceId: UUID) -> ClaudeInboxRecord? {
         lock.lock()
         defer { lock.unlock() }
+        quarantined.remove(surfaceId)
         return records.removeValue(forKey: surfaceId)
     }
 

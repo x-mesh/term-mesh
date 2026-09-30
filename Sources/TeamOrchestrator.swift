@@ -7211,9 +7211,11 @@ final class TeamOrchestrator: ObservableObject {
 
     /// Hands the turn to the Claude session's own inbox instead of its composer.
     ///
-    /// The caller was already told no Return follows, so a failed post falls
-    /// back to a paste that presses its own Return and never schedules an owed
-    /// one: an app-pressed Return would submit whatever the user left typed.
+    /// The caller was already told no Return follows, so a post the session
+    /// provably did not take falls back to a paste that presses its own Return
+    /// and never schedules an owed one: an app-pressed Return would submit
+    /// whatever the user left typed. An unconfirmed post reports failure and
+    /// quarantines the pane instead; see `ClaudeInboxDelivery.Outcome`.
     private func deliverViaClaudeInbox(
         _ record: ClaudeInboxRecord,
         teamAgentKey: String?,
@@ -7223,6 +7225,16 @@ final class TeamOrchestrator: ObservableObject {
         tabManager: TabManager,
         completion: ((Bool) -> Void)?
     ) -> Bool {
+        if ClaudeInboxRegistry.shared.isQuarantined(surfaceId: panelId) {
+            Logger.team.warning(
+                "claude inbox for panel \(panelId.uuidString.prefix(8), privacy: .public) is quarantined after an unconfirmed delivery; not sending until its session restarts"
+            )
+            #if DEBUG
+            dlog("claude.inbox.deliver.QUARANTINED panel=\(panelId.uuidString.prefix(8))")
+            #endif
+            completion?(false)
+            return false
+        }
         if let teamAgentKey { activeSends[teamAgentKey, default: 0] += 1 }
         let finish: (Bool) -> Void = { [weak self] sent in
             if let self, let teamAgentKey {
@@ -7244,7 +7256,16 @@ final class TeamOrchestrator: ObservableObject {
                 dlog("claude.inbox.deliver ok panel=\(panelId.uuidString.prefix(8)) chars=\(text.count) ms=\(elapsedMs)")
                 #endif
                 finish(true)
-            case .failed(let reason):
+            case .unconfirmed(let reason):
+                ClaudeInboxRegistry.shared.quarantine(record)
+                Logger.team.error(
+                    "claude inbox delivery unconfirmed for panel \(panelId.uuidString.prefix(8), privacy: .public): \(reason, privacy: .public); not pasting"
+                )
+                #if DEBUG
+                dlog("claude.inbox.deliver.UNCONFIRMED panel=\(panelId.uuidString.prefix(8)) reason=\(reason) ms=\(elapsedMs)")
+                #endif
+                finish(false)
+            case .notDelivered(let reason):
                 ClaudeInboxRegistry.shared.removeIfCurrent(record)
                 Logger.team.warning(
                     "claude inbox delivery failed for panel \(panelId.uuidString.prefix(8), privacy: .public): \(reason, privacy: .public); pasting instead"

@@ -149,14 +149,32 @@ final class ClaudeInboxDeliveryTests: XCTestCase {
         XCTAssertFalse(received.wait().isEmpty)
     }
 
-    func testAHeldMessageIsReportedAsNotEnqueued() throws {
+    func testASilentSessionLeavesTheDeliveryUnconfirmedRatherThanFailed() throws {
         let inbox = try FakeInbox()
         let transcript = try temporaryTranscript()
         let record = try inboxRecord(socket: inbox.path, transcript: transcript.path)
         let received = inbox.readOnce()
         let outcome = ClaudeInboxDelivery.deliverNow(
             text: "held", to: record, sessionsDirectory: try sessionsDirectory(), confirmTimeout: 0.3)
-        XCTAssertEqual(outcome, .failed("not_enqueued"))
+        XCTAssertEqual(outcome, .unconfirmed("not_enqueued"))
+        XCTAssertFalse(received.wait().isEmpty)
+    }
+
+    func testAHoldNoticeEndsTheWaitAsUnconfirmed() throws {
+        let inbox = try FakeInbox()
+        let transcript = try temporaryTranscript()
+        let record = try inboxRecord(socket: inbox.path, transcript: transcript.path)
+        let received = inbox.readOnce { _ in
+            Self.append(transcript, [
+                "type": "system", "subtype": "informational",
+                "content": "Held peer message — from an unidentified session; preview: «## Task» — not delivered to Claude (1 held).",
+            ])
+        }
+        let started = Date()
+        let outcome = ClaudeInboxDelivery.deliverNow(
+            text: "## Task\nbody", to: record, sessionsDirectory: try sessionsDirectory(), confirmTimeout: 5)
+        XCTAssertEqual(outcome, .unconfirmed("held_for_approval"))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2, "the hold notice should end the wait early")
         XCTAssertFalse(received.wait().isEmpty)
     }
 
@@ -164,20 +182,41 @@ final class ClaudeInboxDeliveryTests: XCTestCase {
         let transcript = try temporaryTranscript()
         Self.append(transcript, ["type": "queue-operation", "operation": "enqueue", "content": "same"])
         let offset = ClaudeInboxDelivery.fileSize(atPath: transcript.path)
-        XCTAssertFalse(ClaudeInboxDelivery.transcriptRecordsEnqueue(
-            of: "same", atPath: transcript.path, after: offset, timeout: 0.2))
+        XCTAssertEqual(ClaudeInboxDelivery.transcriptVerdict(
+            of: "same", atPath: transcript.path, after: offset, timeout: 0.2), .silent)
         Self.append(transcript, ["type": "queue-operation", "operation": "enqueue", "content": "same"])
-        XCTAssertTrue(ClaudeInboxDelivery.transcriptRecordsEnqueue(
-            of: "same", atPath: transcript.path, after: offset, timeout: 0.2))
+        XCTAssertEqual(ClaudeInboxDelivery.transcriptVerdict(
+            of: "same", atPath: transcript.path, after: offset, timeout: 0.2), .enqueued)
     }
 
-    func testMissingSocketFailsWithoutWaitingForTheTranscript() throws {
+    func testMissingSocketIsNotDeliveredWithoutWaitingForTheTranscript() throws {
         let transcript = try temporaryTranscript()
         let record = try inboxRecord(socket: "/tmp/cib-missing-\(UUID().uuidString.prefix(8)).sock", transcript: transcript.path)
         let outcome = ClaudeInboxDelivery.deliverNow(
             text: "x", to: record, sessionsDirectory: try sessionsDirectory(), confirmTimeout: 5)
-        guard case .failed(let reason) = outcome else { return XCTFail("expected failure, got \(outcome)") }
+        guard case .notDelivered(let reason) = outcome else { return XCTFail("expected notDelivered, got \(outcome)") }
         XCTAssertTrue(reason.hasPrefix("post:"), reason)
+    }
+
+    func testQuarantineHoldsUntilTheSessionRegistersAgain() throws {
+        let registry = ClaudeInboxRegistry()
+        let record = try ClaudeInboxRegistry.record(from: params()).get()
+        registry.register(record)
+        registry.quarantine(record)
+        XCTAssertTrue(registry.isQuarantined(surfaceId: surface))
+        XCTAssertEqual(registry.record(for: surface), record, "the record stays so no Return is owed")
+        let restarted = try ClaudeInboxRegistry.record(from: params(["session_id": "after-clear"])).get()
+        registry.register(restarted)
+        XCTAssertFalse(registry.isQuarantined(surfaceId: surface))
+    }
+
+    func testQuarantiningAReplacedRecordDoesNothing() throws {
+        let registry = ClaudeInboxRegistry()
+        let old = try ClaudeInboxRegistry.record(from: params()).get()
+        let new = try ClaudeInboxRegistry.record(from: params(["session_id": "newer"])).get()
+        registry.register(new)
+        registry.quarantine(old)
+        XCTAssertFalse(registry.isQuarantined(surfaceId: surface))
     }
 
     func testARecordIsStaleOnlyWhenItsProcessRunsAnotherSession() throws {
