@@ -5190,7 +5190,16 @@ class TerminalController {
         // turn, not a stale terminal paste.
         if key.lowercased() == "return",
            await MainActor.run(body: {
-               !TeamOrchestrator.shared.agentNeedsReturn(
+               let orchestrator = TeamOrchestrator.shared
+               // A Claude pane can register its inbox after its first turn was
+               // pasted and acknowledged; that paste still sits in the composer.
+               if claimedGate != nil,
+                  orchestrator.pastedTurnStillInComposer(
+                      teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+                  ) {
+                   return false
+               }
+               return !orchestrator.agentNeedsReturn(
                    teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
                )
            }) {

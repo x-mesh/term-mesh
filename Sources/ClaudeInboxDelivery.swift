@@ -12,6 +12,168 @@ enum ClaudeInboxDelivery {
     // `$TERMMESH_APP_BIN` names this app's CLI; a PATH lookup can reach another
     // installed build that talks to a different socket.
     static let registerHookSettingsJSON = "{\"hooks\":{\"SessionStart\":[{\"matcher\":\"\",\"hooks\":[{\"type\":\"command\",\"command\":\"\\\"$TERMMESH_APP_BIN/term-mesh\\\" claude-hook inbox-register\",\"timeout\":10}]}]}}"
+
+    enum Outcome: Equatable {
+        case delivered
+        case failed(String)
+    }
+
+    enum PostError: Error, Equatable {
+        case socketPathTooLong
+        case syscall(String, Int32)
+    }
+
+    static let enqueueConfirmTimeout: TimeInterval = 1.5
+    static let sessionsDirectory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".claude/sessions", isDirectory: true)
+
+    static func deliver(text: String, to record: ClaudeInboxRecord, completion: @escaping @MainActor (Outcome) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let outcome = deliverNow(text: text, to: record)
+            Task { @MainActor in completion(outcome) }
+        }
+    }
+
+    /// A write that succeeds proves nothing: a receiver that does not accept the
+    /// token holds the message for its user and says so only on its own screen.
+    /// The session's transcript records an `enqueue` the moment the message is
+    /// accepted, idle or mid-turn, so that is what counts as delivered.
+    static func deliverNow(
+        text: String,
+        to record: ClaudeInboxRecord,
+        sessionsDirectory: URL = sessionsDirectory,
+        confirmTimeout: TimeInterval = enqueueConfirmTimeout
+    ) -> Outcome {
+        if isStale(record, sessionsDirectory: sessionsDirectory) {
+            return .failed("stale_session")
+        }
+        guard let transcriptPath = record.transcriptPath else {
+            return .failed("no_transcript_path")
+        }
+        let offset = fileSize(atPath: transcriptPath)
+        do {
+            let payload = try messageLines(token: record.token, text: text, messageId: UUID().uuidString)
+            try post(payload, toSocket: record.socketPath)
+        } catch {
+            return .failed("post: \(error)")
+        }
+        return transcriptRecordsEnqueue(of: text, atPath: transcriptPath, after: offset, timeout: confirmTimeout)
+            ? .delivered
+            : .failed("not_enqueued")
+    }
+
+    static func messageLines(token: String, text: String, messageId: String) throws -> Data {
+        let auth = try JSONSerialization.data(withJSONObject: ["type": "auth", "token": token])
+        let message = try JSONSerialization.data(withJSONObject: [
+            "msgV": 1,
+            "msg_id": messageId,
+            "type": "user",
+            "message": ["role": "user", "content": text],
+        ] as [String: Any])
+        return auth + Data([0x0A]) + message + Data([0x0A])
+    }
+
+    /// The pid in a record can outlive its session: `/clear` starts a new
+    /// session in the same process, and a reused pid can name a different one.
+    /// Only an entry naming a different session counts as stale. A missing or
+    /// unreadable entry is not evidence: sessions started as team agents
+    /// (`--agent-id`) bind an inbox but write no entry, and a process that
+    /// exited fails the connect anyway.
+    static func isStale(_ record: ClaudeInboxRecord, sessionsDirectory: URL) -> Bool {
+        guard let pid = record.claudePid else { return false }
+        let entry = sessionsDirectory.appendingPathComponent("\(pid).json")
+        guard let data = FileManager.default.contents(atPath: entry.path) else { return false }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sessionId = object["sessionId"] as? String else { return false }
+        return sessionId != record.sessionId
+    }
+
+    static func post(_ payload: Data, toSocket socketPath: String) throws {
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw PostError.syscall("socket", errno) }
+        defer { Darwin.close(fd) }
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        var sendTimeout = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
+
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let path = Array(socketPath.utf8)
+        let capacity = MemoryLayout.size(ofValue: address.sun_path)
+        guard path.count < capacity else { throw PostError.socketPathTooLong }
+        withUnsafeMutablePointer(to: &address.sun_path) { pointer in
+            pointer.withMemoryRebound(to: CChar.self, capacity: capacity) { bytes in
+                for (offset, byte) in path.enumerated() {
+                    bytes[offset] = CChar(bitPattern: byte)
+                }
+            }
+        }
+        let rc = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard rc == 0 else { throw PostError.syscall("connect", errno) }
+
+        try payload.withUnsafeBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
+            var sent = 0
+            while sent < buffer.count {
+                let written = Darwin.write(fd, base.advanced(by: sent), buffer.count - sent)
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    throw PostError.syscall("write", errno)
+                }
+                sent += written
+            }
+        }
+        Darwin.shutdown(fd, SHUT_WR)
+    }
+
+    static func fileSize(atPath path: String) -> UInt64 {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        return (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+    }
+
+    static func transcriptRecordsEnqueue(
+        of content: String,
+        atPath path: String,
+        after offset: UInt64,
+        timeout: TimeInterval,
+        pollInterval: TimeInterval = 0.05
+    ) -> Bool {
+        let expected = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let deadline = Date().addingTimeInterval(timeout)
+        var cursor = offset
+        var pending = Data()
+        while true {
+            if let handle = FileHandle(forReadingAtPath: path) {
+                if (try? handle.seek(toOffset: cursor)) != nil, let chunk = try? handle.readToEnd() {
+                    cursor += UInt64(chunk.count)
+                    pending.append(chunk)
+                }
+                try? handle.close()
+                while let newline = pending.firstIndex(of: 0x0A) {
+                    let line = pending[pending.startIndex..<newline]
+                    pending.removeSubrange(pending.startIndex...newline)
+                    if isEnqueue(line, of: expected) { return true }
+                }
+            }
+            if Date() >= deadline { return false }
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+    }
+
+    private static func isEnqueue(_ line: Data, of expected: String) -> Bool {
+        guard line.range(of: Data("queue-operation".utf8)) != nil,
+              let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              object["type"] as? String == "queue-operation",
+              object["operation"] as? String == "enqueue",
+              let content = object["content"] as? String
+        else { return false }
+        return content.trimmingCharacters(in: .whitespacesAndNewlines) == expected
+    }
 }
 
 /// The cross-session inbox of a Claude Code session running in a terminal pane,
@@ -68,6 +230,15 @@ final class ClaudeInboxRegistry {
         lock.lock()
         defer { lock.unlock() }
         return records.removeValue(forKey: surfaceId)
+    }
+
+    /// Drops a record only if no later SessionStart replaced it meanwhile.
+    func removeIfCurrent(_ record: ClaudeInboxRecord) {
+        lock.lock()
+        defer { lock.unlock() }
+        if records[record.surfaceId] == record {
+            records.removeValue(forKey: record.surfaceId)
+        }
     }
 
     static func record(from params: [String: Any]) -> Result<ClaudeInboxRecord, ClaudeInboxRegistrationError> {

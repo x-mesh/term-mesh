@@ -5821,6 +5821,12 @@ final class TeamOrchestrator: ObservableObject {
         #if DEBUG
         dlog("[team.sendToAgent] enter team=\(teamName) agent=\(agentName) panelId=\(pid.uuidString.prefix(8)) withReturn=\(withReturn) textLen=\(text.count)")
         #endif
+        if let record = claudeInboxRecord(forPanel: pid) {
+            return deliverViaClaudeInbox(
+                record, teamAgentKey: teamAgentKey, workspaceId: agent.workspaceId,
+                panelId: pid, text: text, tabManager: tabManager, completion: completion
+            )
+        }
         activeSends[teamAgentKey, default: 0] += 1
         if !withReturn, let identity = agentIdentity(for: agent) {
             pendingReturnTargets[teamAgentKey] = identity
@@ -5916,6 +5922,14 @@ final class TeamOrchestrator: ObservableObject {
                 completion?(false)
                 return false
             }
+        }
+        if let record = claudeInboxRecord(forPanel: panelId) {
+            let teamAgentKey = teams[teamName]?.agents.first(where: { $0.panelId == panelId })
+                .map { agentOperationKey(teamName: teamName, agentInstanceId: $0.agentInstanceId) }
+            return deliverViaClaudeInbox(
+                record, teamAgentKey: teamAgentKey, workspaceId: workspaceId,
+                panelId: panelId, text: text, tabManager: tabManager, completion: completion
+            )
         }
         if !withReturn,
            agentName != nil,
@@ -7159,10 +7173,10 @@ final class TeamOrchestrator: ObservableObject {
               let agent = agentInstanceId.flatMap({
                   resolveAgentForRPC(teamName: teamName, agentName: agentName, agentInstanceId: $0).agent
               }) ?? selectAgent(in: team.agents, name: agentName),
-              let panelId = agent.panelId,
-              nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) != nil
+              let panelId = agent.panelId
         else { return true }
-        return false
+        if nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) != nil { return false }
+        return claudeInboxRecord(forPanel: panelId) == nil
     }
 
     /// Whether this specific pane holds a native agent.
@@ -7174,7 +7188,78 @@ final class TeamOrchestrator: ObservableObject {
     /// delegate answers it per creation site, on the member it chose.
     func memberNeedsReturn(_ member: AgentMember) -> Bool {
         guard let panelId = member.panelId else { return true }
-        return !agentPanelIsNative(workspaceId: member.workspaceId, panelId: panelId)
+        if agentPanelIsNative(workspaceId: member.workspaceId, panelId: panelId) { return false }
+        return claudeInboxRecord(forPanel: panelId) == nil
+    }
+
+    /// Whether a turn acknowledged as a paste is still waiting in a composer:
+    /// true for any terminal pane, including one whose Claude inbox appeared
+    /// after the paste. Only a native pane has no composer to submit.
+    func pastedTurnStillInComposer(teamName: String, agentName: String, agentInstanceId: String) -> Bool {
+        guard let agent = resolveAgentForRPC(
+                  teamName: teamName, agentName: agentName, agentInstanceId: agentInstanceId
+              ).agent,
+              let panelId = agent.panelId
+        else { return false }
+        return nativeAgentPanel(workspaceId: agent.workspaceId, panelId: panelId) == nil
+    }
+
+    private func claudeInboxRecord(forPanel panelId: UUID) -> ClaudeInboxRecord? {
+        guard ClaudeInboxDelivery.isEnabled() else { return nil }
+        return ClaudeInboxRegistry.shared.record(for: panelId)
+    }
+
+    /// Hands the turn to the Claude session's own inbox instead of its composer.
+    ///
+    /// The caller was already told no Return follows, so a failed post falls
+    /// back to a paste that presses its own Return and never schedules an owed
+    /// one: an app-pressed Return would submit whatever the user left typed.
+    private func deliverViaClaudeInbox(
+        _ record: ClaudeInboxRecord,
+        teamAgentKey: String?,
+        workspaceId: UUID,
+        panelId: UUID,
+        text: String,
+        tabManager: TabManager,
+        completion: ((Bool) -> Void)?
+    ) -> Bool {
+        if let teamAgentKey { activeSends[teamAgentKey, default: 0] += 1 }
+        let finish: (Bool) -> Void = { [weak self] sent in
+            if let self, let teamAgentKey {
+                let remaining = (self.activeSends[teamAgentKey] ?? 0) - 1
+                if remaining <= 0 {
+                    self.activeSends.removeValue(forKey: teamAgentKey)
+                } else {
+                    self.activeSends[teamAgentKey] = remaining
+                }
+            }
+            completion?(sent)
+        }
+        let startedAt = Date()
+        ClaudeInboxDelivery.deliver(text: text, to: record) { [weak self] outcome in
+            let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+            switch outcome {
+            case .delivered:
+                #if DEBUG
+                dlog("claude.inbox.deliver ok panel=\(panelId.uuidString.prefix(8)) chars=\(text.count) ms=\(elapsedMs)")
+                #endif
+                finish(true)
+            case .failed(let reason):
+                ClaudeInboxRegistry.shared.removeIfCurrent(record)
+                Logger.team.warning(
+                    "claude inbox delivery failed for panel \(panelId.uuidString.prefix(8), privacy: .public): \(reason, privacy: .public); pasting instead"
+                )
+                #if DEBUG
+                dlog("claude.inbox.deliver.FALLBACK panel=\(panelId.uuidString.prefix(8)) reason=\(reason) ms=\(elapsedMs)")
+                #endif
+                guard let self else { finish(false); return }
+                _ = self.sendTextToPanel(
+                    workspaceId: workspaceId, panelId: panelId, text: text,
+                    tabManager: tabManager, withReturn: true
+                ) { finish($0) }
+            }
+        }
+        return true
     }
 
     /// Whether every pool candidate for this agent name is natively held.
