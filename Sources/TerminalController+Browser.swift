@@ -32,8 +32,10 @@ extension TerminalController {
             result = body(tabManager, ws, surfaceId, browserPanel)
             // Other commands run during the body's WebKit waits, and a closed panel keeps
             // answering JavaScript, so a success here could describe a surface that is gone.
+            // A workspace moved to another window is still open; look it up in every window.
+            let workspaceManager = AppDelegate.shared?.tabManagerFor(tabId: ws.id) ?? tabManager
             if ws.browserPanel(for: surfaceId) !== browserPanel
-                || !tabManager.tabs.contains(where: { $0 === ws }) {
+                || !workspaceManager.tabs.contains(where: { $0 === ws }) {
                 result = .err(
                     code: "not_found",
                     message: "Browser surface closed during the command",
