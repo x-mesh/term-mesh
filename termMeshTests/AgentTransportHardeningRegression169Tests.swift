@@ -719,6 +719,28 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
         ), [7], "the caller's own terminal counts")
     }
 
+    func testACallerPidThatNowNamesAnotherProcessMatchesNoTerminal() {
+        let caller = TerminalController.SocketCaller(pid: 900, startTime: 1_000)
+        let parents: [pid_t: pid_t] = [900: 500, 500: 1]
+        let ttys: [pid_t: UInt32] = [500: 57]
+        XCTAssertEqual(TerminalController.callerTTYDevices(
+            of: caller, startTime: { _ in 1_000 }, parent: { parents[$0] }, tty: { ttys[$0] }
+        ), [57], "the connector itself is walked")
+        XCTAssertEqual(TerminalController.callerTTYDevices(
+            of: caller, startTime: { _ in 2_000 }, parent: { parents[$0] }, tty: { ttys[$0] }
+        ), [], "a later process that reused the pid is not the connector")
+        XCTAssertEqual(TerminalController.callerTTYDevices(
+            of: caller, startTime: { _ in nil }, parent: { parents[$0] }, tty: { ttys[$0] }
+        ), [], "an exited connector has no terminal")
+    }
+
+    func testProcessStartTimeIdentifiesALiveProcess() {
+        let current = TerminalController.processStartTime(of: getpid())
+        XCTAssertNotNil(current)
+        XCTAssertEqual(TerminalController.processStartTime(of: getpid()), current)
+        XCTAssertNil(TerminalController.processStartTime(of: 0))
+    }
+
     func testDurableRequestCallsTakeTheAdoptedLeaderPTYPath() {
         XCTAssertEqual(TerminalController.adoptedLeaderPTYMethods, [
             "team.task.metrics",

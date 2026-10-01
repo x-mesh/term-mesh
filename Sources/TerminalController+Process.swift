@@ -114,6 +114,34 @@ extension TerminalController {
         return devices
     }
 
+    /// A socket peer pinned to one process lifetime. A connection outlives its
+    /// connector, so by the time a later command on it is authorized, the bare
+    /// pid can name an unrelated process.
+    struct SocketCaller: Equatable, Sendable {
+        let pid: pid_t
+        let startTime: UInt64
+    }
+
+    nonisolated static func processStartTime(of pid: pid_t) -> UInt64? {
+        guard pid > 0 else { return nil }
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+        return info.pbi_start_tvsec &* 1_000_000 &+ info.pbi_start_tvusec
+    }
+
+    /// Ancestor terminals of a socket caller, or none once its pid names
+    /// another process.
+    nonisolated static func callerTTYDevices(
+        of caller: SocketCaller,
+        startTime: (pid_t) -> UInt64?,
+        parent: (pid_t) -> pid_t?,
+        tty: (pid_t) -> UInt32?
+    ) -> Set<UInt32> {
+        guard startTime(caller.pid) == caller.startTime else { return [] }
+        return ancestorTTYDevices(of: caller.pid, parent: parent, tty: tty)
+    }
+
     /// Kernel-assigned controlling TTY device for a socket client process.
     /// Unlike an environment variable or RPC parameter, callers cannot forge
     /// this without actually running inside that terminal session.

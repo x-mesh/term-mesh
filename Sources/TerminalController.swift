@@ -408,6 +408,9 @@ class TerminalController {
     func handleClient(_ socket: Int32, peerPid: pid_t? = nil) {
         defer { close(socket) }
         let clientPID = peerPid ?? getPeerPid(socket)
+        let caller = clientPID.flatMap { pid in
+            Self.processStartTime(of: pid).map { SocketCaller(pid: pid, startTime: $0) }
+        }
 
         // In termMeshOnly mode, verify the connecting process is a descendant of term-mesh.
         // Other modes allow external clients and apply separate auth controls.
@@ -470,7 +473,7 @@ class TerminalController {
                     continue
                 }
 
-                let response = processCommand(trimmed, callerPID: clientPID)
+                let response = processCommand(trimmed, caller: caller)
                 writeSocketResponse(response, to: socket)
             }
         }
@@ -528,13 +531,13 @@ class TerminalController {
         return frames
     }
 
-    private func processCommand(_ command: String, callerPID: pid_t? = nil) -> String {
+    private func processCommand(_ command: String, caller: SocketCaller? = nil) -> String {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "ERROR: Empty command" }
 
         // v2 protocol: newline-delimited JSON.
         if trimmed.hasPrefix("{") {
-            return processV2Command(trimmed, callerPID: callerPID)
+            return processV2Command(trimmed, caller: caller)
         }
 
         let parts = trimmed.split(separator: " ", maxSplits: 1).map(String.init)
@@ -868,7 +871,7 @@ class TerminalController {
     // MARK: - V2 JSON Socket Protocol
 
     private func processV2Command(
-        _ jsonLine: String, callerPID: pid_t? = nil
+        _ jsonLine: String, caller: SocketCaller? = nil
     ) -> String {
         // v1 access-mode gating applies to v2 as well. We can't know which v2 method maps
         // to which v1 command without parsing, so parse first and then apply allow-list.
@@ -912,7 +915,7 @@ class TerminalController {
         if method.hasPrefix("team.") {
             return dispatchTeamCommandAsync(
                 method: method, params: params, id: id,
-                callerPID: callerPID
+                caller: caller
             )
         }
 
@@ -2500,7 +2503,7 @@ class TerminalController {
 
     private func dispatchTeamCommandAsync(
         method: String, params: [String: Any], id: Any?,
-        callerPID: pid_t? = nil
+        caller: SocketCaller? = nil
     ) -> String {
         // An adopted leader already existed when the team was created, so no
         // bearer can be injected into its environment. Authenticate its metrics
@@ -2508,9 +2511,10 @@ class TerminalController {
         // peer and leader surface must resolve to the same kernel device. Only
         // this identity snapshot touches MainActor; the store read remains on
         // teamDataQueue.
-        if Self.adoptedLeaderPTYMethods.contains(method), let callerPID {
-            let callerTTYDevices = Self.ancestorTTYDevices(
-                of: callerPID,
+        if Self.adoptedLeaderPTYMethods.contains(method), let caller {
+            let callerTTYDevices = Self.callerTTYDevices(
+                of: caller,
+                startTime: Self.processStartTime(of:),
                 parent: { [self] pid in
                     let parent = parentPid(of: pid)
                     return parent > 0 ? parent : nil
@@ -2537,7 +2541,7 @@ class TerminalController {
                 semaphore.signal()
             }
             if semaphore.wait(timeout: .now() + 5) == .timedOut {
-                return "{\"ok\":false,\"error\":{\"code\":\"timeout\",\"message\":\"team command timed out\"}}"
+                return v2Error(id: id, code: "timeout", message: "team command timed out")
             }
             return teamDataQueue.sync {
                 let store = TeamDataStore.shared
