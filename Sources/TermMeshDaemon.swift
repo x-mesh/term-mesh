@@ -603,7 +603,7 @@ final class TermMeshDaemon: ObservableObject {
             // Find the daemon binary next to the app bundle, or in the daemon build dir
             let binaryPath = self.daemonBinaryPath()
             guard let binaryPath, FileManager.default.fileExists(atPath: binaryPath) else {
-                Logger.daemon.info("daemon binary not found, skipping launch")
+                Logger.daemon.error("daemon binary not found, skipping launch — set TERMMESH_DAEMON_BINARY_PATH for a build without a bundled daemon")
                 return
             }
 
@@ -1862,12 +1862,6 @@ final class TermMeshDaemon: ObservableObject {
         // Option 5: ~/bin/term-meshd (user install via make deploy)
         let homeBin = (NSHomeDirectory() as NSString).appendingPathComponent("bin/term-meshd")
         if fm.fileExists(atPath: homeBin) { return homeBin }
-
-        // Option 6: Hardcoded project path (development fallback)
-        for config in ["release", "debug"] {
-            let path = "/Users/jinwoo/work/project/term-mesh/daemon/target/\(config)/term-meshd"
-            if fm.fileExists(atPath: path) { return path }
-        }
 
         return nil
     }

@@ -18,6 +18,14 @@ After making code changes, always run the build:
 xcodebuild -project GhosttyTabs.xcodeproj -scheme term-mesh -configuration Debug -destination 'platform=macOS' -clonedSourcePackagesDirPath "$HOME/Library/Caches/term-mesh/SourcePackages" build
 ```
 
+This build does not put `term-meshd` in the app bundle. If you run it without a
+tag, the app uses the daemon that already runs on the socket. It does not start
+or replace a daemon unless `TERMMESH_DAEMON_BINARY_PATH`, `TERMMESH_PROJECT_DIR`,
+or `~/bin/term-meshd` supplies a binary. To test a daemon change, use
+`./scripts/reload.sh --tag <tag>`. If you set `TERMMESH_DAEMON_BINARY_PATH`,
+also set an isolated `TERMMESH_DAEMON_UNIX_PATH`. Otherwise, the app can replace
+the production daemon.
+
 Swift unit tests belong to the `term-mesh-unit` scheme; the `term-mesh` scheme contains
 `termMeshUITests`, not `termMeshTests`. Use `term-mesh-unit` with
 `-only-testing:termMeshTests/...`. A new test file must also be registered in

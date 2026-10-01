@@ -2603,7 +2603,7 @@ struct SettingsView: View {
         }
         if !status.connected {
             if !status.binaryExists {
-                return LanguageSettings.localized("Binary not found. Build the daemon first.")
+                return LanguageSettings.localized("Binary not found. Launch a dev build with ./scripts/reload.sh --tag, or set TERMMESH_DAEMON_BINARY_PATH.")
             }
             if !status.socketExists {
                 return LanguageSettings.localized("Socket missing. Daemon may not be running.")
