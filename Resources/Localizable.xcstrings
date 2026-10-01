@@ -5384,6 +5384,26 @@
         }
       }
     },
+    "Not listening: the mobile listener did not start. See the daemon log.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "연결을 받지 않음: 모바일 연결이 시작되지 않았습니다. 데몬 로그를 확인하세요."
+          }
+        }
+      }
+    },
+    "The background service could not start its mobile listener at %@. Another process may be using the port; see the daemon log. Restart the daemon to try again. Restarting ends the sessions this daemon runs.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "백그라운드 서비스가 %@에서 모바일 연결을 받지 못했습니다. 다른 프로세스가 포트를 쓰고 있을 수 있으니 데몬 로그를 확인하세요. 데몬을 재시작하면 다시 시도하고, 이 데몬에서 진행 중인 세션은 끝납니다."
+          }
+        }
+      }
+    },
     "The background service has no mobile listener, but these settings expect one at %@. Restart the daemon to apply the settings. Restarting ends the sessions this daemon runs.": {
       "localizations": {
         "ko": {

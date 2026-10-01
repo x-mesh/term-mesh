@@ -1950,6 +1950,9 @@ struct SettingsView: View {
         case .unreadable?:
             return LanguageSettings.localized("Could not read the mobile listener from the background service.")
         case .read(let state, _)?:
+            if state.enabled, state.serving == false {
+                return LanguageSettings.localized("Not listening: the mobile listener did not start. See the daemon log.")
+            }
             guard state.enabled, let addr = state.addr else {
                 return LanguageSettings.localized("Disabled. Panes exposed with /rc stay unreachable until the listener is on.")
             }
@@ -1979,6 +1982,11 @@ struct SettingsView: View {
             return String(
                 format: LanguageSettings.localized("The background service accepts mobile connections at %@, but these settings expect %@. Restart the daemon to apply the settings. Restarting ends the sessions this daemon runs."),
                 actualAddr, expectedAddr
+            )
+        case .listenerFailed(let addr):
+            return String(
+                format: LanguageSettings.localized("The background service could not start its mobile listener at %@. Another process may be using the port; see the daemon log. Restart the daemon to try again. Restarting ends the sessions this daemon runs."),
+                addr
             )
         }
     }

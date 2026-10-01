@@ -664,10 +664,12 @@ extension TerminalController {
                 var inWindow: Any = NSNull()
                 var portal: Any = NSNull()
                 var viewDepth: Any = NSNull()
+                var started: Any = NSNull()
                 if let tp = panel as? TerminalPanel {
                     inWindow = tp.surface.isViewInWindow
                     portal = self.isPortalHosted(tp.hostedView)
                     viewDepth = self.viewDepth(of: tp.hostedView)
+                    started = tp.surface.surface != nil
                 } else if let bp = panel as? BrowserPanel {
                     inWindow = bp.webView.window != nil
                 }
@@ -678,7 +680,8 @@ extension TerminalController {
                     "type": panel.panelType.rawValue,
                     "in_window": inWindow,
                     "portal": portal,
-                    "view_depth": viewDepth
+                    "view_depth": viewDepth,
+                    "started": started
                 ]
             }
             let windowId = self.v2ResolveWindowId(tabManager: tabManager)
@@ -788,8 +791,13 @@ extension TerminalController {
                 result = .err(code: "internal_error", message: "Terminal rejected the turn", data: nil)
                 return
             }
-            panel.surface.forceRefresh()
-            result = .ok(["surface_id": surfaceId.uuidString, "submitted": true])
+            let queued = panel.surface.surface == nil
+            if queued {
+                panel.surface.requestBackgroundSurfaceStartIfNeeded()
+            } else {
+                panel.surface.forceRefresh()
+            }
+            result = .ok(["surface_id": surfaceId.uuidString, "submitted": true, "queued": queued])
         }
         return completed ? result : .err(code: "timeout", message: "Main thread busy", data: nil)
     }

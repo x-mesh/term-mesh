@@ -1696,3 +1696,37 @@ async fn a_resolved_pane_forwards_interrupt_as_ctrl_c() {
         "a resolved pane is not a native agent, so the stop is a key, not team.interrupt"
     );
 }
+
+#[tokio::test]
+async fn listener_serving_reports_whether_the_bind_held() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = MobileConfig {
+        addr: taken.local_addr().unwrap(),
+        auth: AuthMode::Loopback,
+        allowed_logins: BTreeSet::new(),
+    };
+    let (_tx, rx) = watch::channel(false);
+    assert!(http_mobile::serve(config, remote::new_registry(), None, rx)
+        .await
+        .is_err());
+    assert!(!remote::listener_serving());
+
+    let config = MobileConfig {
+        addr: "127.0.0.1:0".parse().unwrap(),
+        auth: AuthMode::Loopback,
+        allowed_logins: BTreeSet::new(),
+    };
+    let (tx, rx) = watch::channel(false);
+    let task = tokio::spawn(http_mobile::serve(config, remote::new_registry(), None, rx));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !remote::listener_serving() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "listener never reported serving"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    assert!(!remote::listener_serving());
+}

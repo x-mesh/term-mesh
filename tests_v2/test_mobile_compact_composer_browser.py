@@ -18,6 +18,10 @@ PANE = {
     "surface_id": "pane-1", "kind": "pane", "chat_capable": False,
     "agent_cli": "shell", "title": "Shell", "cwd": "/work", "keys": "safe",
 }
+CHAT_PANE = {
+    "surface_id": "pane-2", "kind": "pane", "chat_capable": True,
+    "agent_cli": "claude", "title": "Claude", "cwd": "/work", "keys": "safe",
+}
 AGENT = {
     "surface_id": "agent-1", "kind": "agent", "chat_capable": True,
     "team_name": "team", "agent_name": "worker", "agent_cli": "codex",
@@ -40,7 +44,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/app.css":
             return self.file("app.css", "text/css; charset=utf-8")
         if path == "/api/targets":
-            return self.json({"targets": [PANE, AGENT]})
+            return self.json({"targets": [PANE, CHAT_PANE, AGENT]})
         if path.endswith("/screen"):
             return self.json({"surface_id": "pane-1", "format": "text", "text": "TERMINAL_MARKER"})
         if path.endswith("/transcript"):
@@ -108,6 +112,31 @@ def wait_for_post(route: str, label: str) -> dict:
     raise termmeshError(f"{label}: no POST to {route}")
 
 
+def assert_no_post(routes: tuple[str, ...], label: str, settle_s: float = 0.5):
+    deadline = time.monotonic() + settle_s
+    while time.monotonic() < deadline:
+        with POSTS_LOCK:
+            extra = [(path, body) for path, body in POSTS if path.endswith(routes)]
+        if extra:
+            raise termmeshError(f"{label}: unexpected POST {extra}")
+        time.sleep(0.05)
+
+
+def select_target(c: termmesh, browser: str, surface_id: str):
+    c._call("browser.eval", {
+        "surface_id": browser,
+        "script": "(() => { const s = document.querySelector('#target'); "
+                  f"s.value = {json.dumps(surface_id)}; s.dispatchEvent(new Event('change')); return 'ok'; }})()",
+    })
+
+
+def click_send(c: termmesh, browser: str, text: str):
+    c._call("browser.eval", {
+        "surface_id": browser,
+        "script": f"document.querySelector('#text').value = {json.dumps(text)}; document.querySelector('#send').click(); 'ok'",
+    })
+
+
 KEYS_STATE = (
     "(() => { const t = document.querySelector('#keys-toggle'), k = document.querySelector('#keys');"
     " return [t.hidden, k.hidden, t.getAttribute('aria-expanded')].join(':'); })()"
@@ -130,27 +159,31 @@ def main() -> int:
             c._call("browser.click", {"surface_id": browser, "selector": "#keys-toggle"})
             wait(c, browser, KEYS_STATE, "false:true:false", "toggle closes the key row")
 
-            c._call("browser.eval", {
-                "surface_id": browser,
-                "script": "document.querySelector('#text').value = 'echo hi'; document.querySelector('#send').click(); 'ok'",
-            })
+            click_send(c, browser, "echo hi")
             sent = wait_for_post("/text", "Send with text")
             if sent.get("submit") is not True or sent.get("mode") != "terminal" or sent.get("text") != "echo hi":
                 raise termmeshError(f"terminal Send must submit text and Enter in one request: {sent}")
-
             wait(c, browser, "document.querySelector('#send').disabled", False, "Send re-enabled")
-            c._call("browser.eval", {
-                "surface_id": browser,
-                "script": "document.querySelector('#text').value = ''; document.querySelector('#send').click(); 'ok'",
-            })
+            assert_no_post(("/key",), "terminal Send must not add a separate Enter")
+
+            click_send(c, browser, "")
             key = wait_for_post("/key", "Send with empty input")
             if key != {"key": "Enter"}:
                 raise termmeshError(f"empty Send must press Enter only: {key}")
+            wait(c, browser, "document.querySelector('#send').disabled", False, "Send re-enabled after Enter")
+            assert_no_post(("/text",), "empty Send must not send text")
 
-            c._call("browser.eval", {
-                "surface_id": browser,
-                "script": "const s = document.querySelector('#target'); s.value = 'agent-1'; s.dispatchEvent(new Event('change')); 'ok'",
-            })
+            select_target(c, browser, "pane-2")
+            wait(c, browser, "document.querySelector('#keys-toggle').hidden", True, "no key toggle in Chat mode")
+            click_send(c, browser, "hello")
+            chat = wait_for_post("/text", "Chat Send with text")
+            if chat.get("mode") != "chat" or "submit" in chat or chat.get("text") != "hello":
+                raise termmeshError(f"Chat Send must send a chat turn without submit: {chat}")
+            wait(c, browser, "document.querySelector('#send').disabled", False, "Send re-enabled in Chat mode")
+            click_send(c, browser, "")
+            assert_no_post(("/text", "/key"), "empty Send in Chat mode must send nothing")
+
+            select_target(c, browser, "agent-1")
             wait(c, browser, "document.querySelector('#keys-toggle').hidden", True, "no key toggle for a native agent")
 
             c.close_surface(browser)
