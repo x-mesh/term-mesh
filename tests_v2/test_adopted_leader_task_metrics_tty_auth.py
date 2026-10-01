@@ -104,6 +104,13 @@ def main() -> int:
                     f"failed to create a distinct sibling terminal: "
                     f"leader={leader_surface} sibling={sibling_surface}"
                 )
+            # A non-Claude adopted leader gets its policy directive typed into
+            # the pane five seconds after team.create, with Return sent after
+            # the text. A command typed in between would join the directive's
+            # line, so capture it before anything else runs in the pane.
+            directive = root / "leader.directive"
+            client.send_surface(leader_surface, f"cat > {shlex.quote(str(directive))}\n")
+            _wait_text(directive)
             client._call("team.create", {
                 "team_name": team,
                 "leader_mode": "adopted",
@@ -120,6 +127,9 @@ def main() -> int:
                 }],
             })
             try:
+                _wait_contains(directive, f"/tmp/term-mesh-leader-{team}.md", timeout=20.0)
+                client.send_key_surface(leader_surface, "ctrl-c")
+
                 leader_tty = root / "leader.tty"
                 sibling_tty = root / "sibling.tty"
                 _run_in_surface(client, leader_surface, "tty", leader_tty)
