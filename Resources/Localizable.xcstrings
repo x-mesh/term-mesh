@@ -5364,6 +5364,56 @@
     "Disabled. Panes exposed with /rc stay unreachable until the listener is on.": {
       "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "모바일 연결이 꺼져 있습니다. /rc로 공개한 패널도 연결할 수 없습니다." } } }
     },
+    "Mobile Listener Differs From Settings": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "모바일 연결 설정 불일치"
+          }
+        }
+      }
+    },
+    "Could not read the mobile listener from the background service.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "백그라운드 서비스에서 모바일 연결 상태를 읽지 못했습니다."
+          }
+        }
+      }
+    },
+    "The background service has no mobile listener, but these settings expect one at %@. Restart the daemon to apply the settings. Restarting ends the sessions this daemon runs.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "백그라운드 서비스에 모바일 연결이 없지만, 이 설정은 %@에서 연결을 받도록 되어 있습니다. 데몬을 재시작하면 설정이 적용되고, 이 데몬에서 진행 중인 세션은 끝납니다."
+          }
+        }
+      }
+    },
+    "The background service still accepts mobile connections at %@ although these settings turn them off. Restart the daemon to apply the settings. Restarting ends the sessions this daemon runs.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 설정은 모바일 연결을 끄도록 되어 있지만, 백그라운드 서비스는 %@에서 계속 연결을 받습니다. 데몬을 재시작하면 설정이 적용되고, 이 데몬에서 진행 중인 세션은 끝납니다."
+          }
+        }
+      }
+    },
+    "The background service accepts mobile connections at %@, but these settings expect %@. Restart the daemon to apply the settings. Restarting ends the sessions this daemon runs.": {
+      "localizations": {
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "백그라운드 서비스는 %@에서 모바일 연결을 받지만, 이 설정의 주소는 %@입니다. 데몬을 재시작하면 설정이 적용되고, 이 데몬에서 진행 중인 세션은 끝납니다."
+          }
+        }
+      }
+    },
     "Discard uncommitted work?": {
       "localizations": { "ko": { "stringUnit": { "state": "translated", "value": "커밋하지 않은 변경을 버릴까요?" } } }
     },

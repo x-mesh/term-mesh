@@ -288,6 +288,69 @@ final class RemoteExposureStoreTests: XCTestCase {
     }
 }
 
+// MARK: - Mobile listener versus settings
+
+/// An adopted daemon keeps the listener environment it was started with, so
+/// the settings can say one thing while the daemon serves another.
+final class MobileListenerMismatchTests: XCTestCase {
+    private let defaultAddr = "127.0.0.1:9877"
+    private let on = ["TERM_MESH_MOBILE_ENABLED": "1", "TERM_MESH_MOBILE_ADDR": "127.0.0.1:9877"]
+
+    private func state(_ json: String) -> RemoteExposureStore.MobileListenerState? {
+        RemoteExposureStore.listenerState(fromStatusReply: json)
+    }
+
+    func testAnOffDaemonReportingItsDefaultAddressMatchesOffSettings() throws {
+        let reported = try XCTUnwrap(state(#"{"listener_enabled": false, "listener_addr": "127.0.0.1:9877"}"#))
+        XCTAssertEqual(RemoteExposureStore.mobileListenerMismatch(expected: nil, reported: reported), .consistent)
+    }
+
+    func testSettingsOnAndDaemonOffIsTheIncidentShape() throws {
+        let reported = try XCTUnwrap(state(#"{"listener_enabled": false, "listener_addr": "127.0.0.1:9877"}"#))
+        XCTAssertEqual(
+            RemoteExposureStore.mobileListenerMismatch(expected: on, reported: reported),
+            .daemonOff(expectedAddr: defaultAddr)
+        )
+    }
+
+    func testSettingsOffAndDaemonOnNamesTheServingAddress() throws {
+        let reported = try XCTUnwrap(state(#"{"listener_enabled": true, "listener_addr": "127.0.0.1:9877"}"#))
+        XCTAssertEqual(
+            RemoteExposureStore.mobileListenerMismatch(expected: nil, reported: reported),
+            .daemonOn(actualAddr: defaultAddr)
+        )
+    }
+
+    func testADifferentPortIsAMismatch() throws {
+        let reported = try XCTUnwrap(state(#"{"listener_enabled": true, "listener_addr": "127.0.0.1:9900"}"#))
+        XCTAssertEqual(
+            RemoteExposureStore.mobileListenerMismatch(expected: on, reported: reported),
+            .addressDiffers(expected: defaultAddr, actual: "127.0.0.1:9900")
+        )
+    }
+
+    func testAnEnabledDaemonWithoutAnAddressIsNotServing() throws {
+        let reported = try XCTUnwrap(state(#"{"listener_enabled": true, "listener_addr": null}"#))
+        XCTAssertEqual(
+            RemoteExposureStore.mobileListenerMismatch(expected: on, reported: reported),
+            .daemonOff(expectedAddr: defaultAddr)
+        )
+    }
+
+    func testATaggedBuildComparesAgainstItsOwnPort() throws {
+        let tagged = ["TERM_MESH_MOBILE_ENABLED": "1", "TERM_MESH_MOBILE_ADDR": "127.0.0.1:21234"]
+        let reported = try XCTUnwrap(state(#"{"listener_enabled": true, "listener_addr": "127.0.0.1:21234"}"#))
+        XCTAssertEqual(RemoteExposureStore.mobileListenerMismatch(expected: tagged, reported: reported), .consistent)
+    }
+
+    func testAnUnreadableReplyIsNotASettingsMatch() {
+        XCTAssertNil(RemoteExposureStore.listenerState(fromStatusReply: nil))
+        XCTAssertNil(state("not json"))
+        XCTAssertNil(state(#"{"error": "unknown method: remote.status"}"#))
+        XCTAssertNil(state(#"{"status": "ok", "count": 0}"#), "a reply without listener_enabled says nothing")
+    }
+}
+
 // MARK: - EnableSpec
 
 @MainActor

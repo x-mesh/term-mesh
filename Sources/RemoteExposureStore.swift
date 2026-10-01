@@ -265,6 +265,58 @@ final class RemoteExposureStore: ObservableObject {
     }
 }
 
+// MARK: - The running daemon's mobile listener
+
+extension RemoteExposureStore {
+    /// What `remote.status` reports about the listener of the daemon that
+    /// answers now. `enabled` is the environment the daemon started with, not
+    /// proof that its bind succeeded.
+    struct MobileListenerState: Equatable, Sendable {
+        let enabled: Bool
+        let addr: String?
+    }
+
+    enum MobileListenerMismatch: Equatable, Sendable {
+        case consistent
+        case daemonOff(expectedAddr: String)
+        case daemonOn(actualAddr: String)
+        case addressDiffers(expected: String, actual: String)
+    }
+
+    nonisolated static func listenerState(fromStatusReply raw: String?) -> MobileListenerState? {
+        guard let raw, let data = raw.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              object["error"] == nil,
+              let enabled = object["listener_enabled"] as? Bool
+        else { return nil }
+        return MobileListenerState(enabled: enabled, addr: object["listener_addr"] as? String)
+    }
+
+    /// `expected` is the environment this app would hand a daemon it spawns,
+    /// nil when it keeps the listener off. A daemon reports its default address
+    /// even with the listener off, and a null address when the configured one
+    /// did not parse, so only an enabled daemon with an address is serving.
+    nonisolated static func mobileListenerMismatch(
+        expected: [String: String]?,
+        reported: MobileListenerState
+    ) -> MobileListenerMismatch {
+        let expectedAddr = expected.map { $0["TERM_MESH_MOBILE_ADDR"] ?? "" }
+        let servingAddr = reported.enabled ? reported.addr : nil
+        switch (expectedAddr, servingAddr) {
+        case (nil, nil):
+            return .consistent
+        case let (expectedAddr?, nil):
+            return .daemonOff(expectedAddr: expectedAddr)
+        case let (nil, actualAddr?):
+            return .daemonOn(actualAddr: actualAddr)
+        case let (expectedAddr?, actualAddr?):
+            return expectedAddr == actualAddr
+                ? .consistent
+                : .addressDiffers(expected: expectedAddr, actual: actualAddr)
+        }
+    }
+}
+
 // MARK: - Building the daemon's EnableSpec
 
 extension RemoteExposureStore {
