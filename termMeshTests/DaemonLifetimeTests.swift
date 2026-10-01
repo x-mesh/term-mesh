@@ -89,23 +89,136 @@ final class DaemonLifetimeTests: XCTestCase {
     }
 
     func test_automaticUpgradeRequiresAuthoritativeEmptySurfaceInventory() {
-        XCTAssertEqual(
-            TermMeshDaemon.automaticUpgradeDecision(
-                requiresUpgrade: true, replacementReady: true, liveProjectSurfaces: 0
+        XCTAssertEqual(upgradeDecision(owner: .nobody, liveProjectSurfaces: 0), .replace)
+        XCTAssertEqual(upgradeDecision(owner: .nobody, liveProjectSurfaces: 5), .preserveLiveSurfaces(5))
+        XCTAssertEqual(upgradeDecision(owner: .nobody, liveProjectSurfaces: nil), .preserveUnknownInventory)
+    }
+
+    // MARK: - Replacing a daemon another live process owns
+
+    private let selfPID: Int32 = 19240
+    private let foreignPID: Int32 = 85764
+
+    private func upgradeDecision(
+        runningVersion: String = "0.258.1",
+        appVersion: String = "0.259.0",
+        replacementReady: Bool = true,
+        owner: TermMeshDaemon.DaemonOwner,
+        aliveOwners: Set<Int32> = [],
+        liveProjectSurfaces: Int?
+    ) -> TermMeshDaemon.AutomaticUpgradeDecision {
+        TermMeshDaemon.automaticUpgradeDecision(
+            requiresUpgrade: TermMeshDaemon.daemonRequiresUpgrade(
+                runningVersion: runningVersion, appVersion: appVersion
             ),
-            .replace
+            replacementReady: replacementReady,
+            owner: owner,
+            selfPID: selfPID,
+            isProcessAlive: { aliveOwners.contains($0) },
+            liveProjectSurfaces: liveProjectSurfaces
+        )
+    }
+
+    /// 2026-09-30: an untagged DEV unit-test host (0.259.0) replaced the
+    /// production daemon (0.258.1) that the production app still owned.
+    func test_aLiveForeignOwnerBlocksReplacementInEitherVersionDirection() {
+        XCTAssertEqual(
+            upgradeDecision(owner: .pid(foreignPID), aliveOwners: [foreignPID], liveProjectSurfaces: 0),
+            .preserveLiveOwner(foreignPID)
         )
         XCTAssertEqual(
-            TermMeshDaemon.automaticUpgradeDecision(
-                requiresUpgrade: true, replacementReady: true, liveProjectSurfaces: 5
+            upgradeDecision(
+                runningVersion: "0.259.0", appVersion: "0.258.1",
+                owner: .pid(foreignPID), aliveOwners: [foreignPID], liveProjectSurfaces: 0
             ),
-            .preserveLiveSurfaces(5)
+            .preserveLiveOwner(foreignPID)
         )
+    }
+
+    func test_aLiveForeignOwnerOutranksLiveSurfaces() {
         XCTAssertEqual(
-            TermMeshDaemon.automaticUpgradeDecision(
-                requiresUpgrade: true, replacementReady: true, liveProjectSurfaces: nil
+            upgradeDecision(owner: .pid(foreignPID), aliveOwners: [foreignPID], liveProjectSurfaces: 3),
+            .preserveLiveOwner(foreignPID)
+        )
+    }
+
+    /// The daemon grants the claim under its owner lock, so an app that claimed
+    /// the daemon after the status read surfaces here as a refusal.
+    func test_aClaimRefusedForALiveOwnerStopsTheReplacement() {
+        XCTAssertEqual(
+            TermMeshDaemon.replacementClaim(errorMessage: "daemon is owned by live pid 4242"),
+            .ownedBy(4242)
+        )
+    }
+
+    func test_otherClaimAnswersLetTheReplacementProceed() {
+        XCTAssertEqual(TermMeshDaemon.replacementClaim(errorMessage: nil), .proceed)
+        for refusal in [
+            "durable peer listener is unavailable (daemon started without a working TERMMESH_PEER_SOCKET)",
+            "daemon shutdown is already committed",
+            "could not send daemon request",
+        ] {
+            XCTAssertEqual(TermMeshDaemon.replacementClaim(errorMessage: refusal), .proceed, refusal)
+        }
+    }
+
+    func test_anOwnerThatConsentsLetsTheUpgradeProceed() {
+        XCTAssertEqual(
+            upgradeDecision(owner: .pid(selfPID), aliveOwners: [selfPID], liveProjectSurfaces: 0),
+            .replace,
+            "this process already owns the daemon"
+        )
+        XCTAssertEqual(upgradeDecision(owner: .nobody, liveProjectSurfaces: 0), .replace, "the previous app released it")
+        XCTAssertEqual(
+            upgradeDecision(owner: .pid(foreignPID), aliveOwners: [], liveProjectSurfaces: 0),
+            .replace,
+            "the previous app died without releasing it"
+        )
+    }
+
+    func test_anUnreportedOwnerNeverAuthorizesReplacement() {
+        XCTAssertEqual(upgradeDecision(owner: .unreported, liveProjectSurfaces: 0), .preserveUnreportedOwner)
+    }
+
+    func test_aMatchingVersionStillAdoptsWhateverOwnsTheDaemon() {
+        XCTAssertEqual(
+            upgradeDecision(
+                runningVersion: "0.259.0",
+                owner: .pid(foreignPID), aliveOwners: [foreignPID], liveProjectSurfaces: 0
             ),
             .preserveUnknownInventory
+        )
+    }
+
+    func test_statusOwnerDistinguishesNullFromAMissingOrUnusableValue() {
+        XCTAssertEqual(TermMeshDaemon.daemonOwner(from: ["version": "0.259.0"]), .unreported)
+        XCTAssertEqual(TermMeshDaemon.daemonOwner(from: nil), .unreported)
+        XCTAssertEqual(TermMeshDaemon.daemonOwner(from: ["owner_pid": NSNull()]), .nobody)
+        XCTAssertEqual(TermMeshDaemon.daemonOwner(from: ["owner_pid": NSNumber(value: 85764)]), .pid(85764))
+        for unusable: Any in [
+            "85764", NSNumber(value: 0), NSNumber(value: 1), NSNumber(value: -5),
+            NSNumber(value: Int64(Int32.max) + 1), NSNumber(value: 12.5), NSNumber(value: true),
+        ] {
+            XCTAssertEqual(
+                TermMeshDaemon.daemonOwner(from: ["owner_pid": unusable]),
+                .unreported,
+                "\(unusable)"
+            )
+        }
+    }
+
+    func test_statusSnapshotReadsTheWireFields() throws {
+        let json = #"{"pid": 29119, "version": "0.259.0", "owner_pid": 85764, "live_project_surfaces": 0}"#
+        let response = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(
+            TermMeshDaemon.daemonStatusSnapshot(from: response),
+            TermMeshDaemon.DaemonStatusSnapshot(version: "0.259.0", owner: .pid(85764), liveProjectSurfaces: 0)
+        )
+        XCTAssertEqual(
+            TermMeshDaemon.daemonStatusSnapshot(from: ["version": ""]),
+            TermMeshDaemon.DaemonStatusSnapshot(version: nil, owner: .unreported, liveProjectSurfaces: nil)
         )
     }
 
@@ -375,4 +488,171 @@ final class SessionHostAdvertisementDecisionTests: XCTestCase {
         XCTAssertFalse(TermMeshDaemon.isListening(atUnixSocketPath: "term-meshd-peer.sock"))
     }
 
+}
+
+/// A spawn used to empty a daemon log over the cap, erasing the record of why
+/// the previous daemon stopped. These run real file-system calls in a private
+/// temporary directory, never against /tmp/term-meshd*.log.
+final class DaemonLogRotationTests: XCTestCase {
+    private var directory: URL!
+    private let cap: Int64 = 8
+
+    private var log: String { directory.appendingPathComponent("term-meshd.log").path }
+    private var generation: String { log + ".1" }
+
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DaemonLogRotationTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private func put(_ text: String, at path: String) throws {
+        try Data(text.utf8).write(to: URL(fileURLWithPath: path))
+    }
+
+    private func contents(_ path: String) -> String? {
+        FileManager.default.contents(atPath: path).map { String(decoding: $0, as: UTF8.self) }
+    }
+
+    private func inode(_ path: String) throws -> UInt64 {
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        return try XCTUnwrap((attributes[.systemFileNumber] as? NSNumber)?.uint64Value)
+    }
+
+    private func inode(fd: Int32) -> UInt64 {
+        var info = stat()
+        XCTAssertEqual(fstat(fd, &info), 0)
+        return UInt64(info.st_ino)
+    }
+
+    private func open(_ maxBytes: Int64? = nil) -> TermMeshDaemon.DaemonLogOpen {
+        TermMeshDaemon.openDaemonLog(path: log, maxBytes: maxBytes ?? cap)
+    }
+
+    private func close(_ result: TermMeshDaemon.DaemonLogOpen) {
+        switch result {
+        case .appended(let fd), .rotated(let fd, _), .rotationFailed(let fd, _):
+            Darwin.close(fd)
+        case .openFailed:
+            break
+        }
+    }
+
+    func test_aLogAtTheCapKeepsAppending() throws {
+        try put("12345678", at: log)
+        let result = open()
+        defer { close(result) }
+        guard case .appended = result else { return XCTFail("\(result)") }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: generation))
+        XCTAssertEqual(contents(log), "12345678")
+    }
+
+    func test_aLogOverTheCapBecomesTheGenerationAndANewFileTakesTheWrites() throws {
+        try put("123456789", at: log)
+        let result = open()
+        defer { close(result) }
+        guard case .rotated(let fd, let bytes) = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(bytes, 9)
+        XCTAssertEqual(contents(generation), "123456789")
+        XCTAssertNotEqual(inode(fd: fd), try inode(generation))
+        XCTAssertEqual("next".withCString { Darwin.write(fd, $0, 4) }, 4)
+        XCTAssertEqual(contents(log), "next")
+    }
+
+    func test_anOlderGenerationIsReplaced() throws {
+        try put("old", at: generation)
+        try put("123456789", at: log)
+        let result = open()
+        defer { close(result) }
+        guard case .rotated = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(contents(generation), "123456789")
+    }
+
+    func test_aSymlinkAtTheGenerationIsReplacedNotFollowed() throws {
+        let target = directory.appendingPathComponent("target").path
+        try put("keep", at: target)
+        try FileManager.default.createSymbolicLink(atPath: generation, withDestinationPath: target)
+        try put("123456789", at: log)
+        let result = open()
+        defer { close(result) }
+        guard case .rotated = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(contents(target), "keep")
+        let type = try FileManager.default.attributesOfItem(atPath: generation)[.type] as? FileAttributeType
+        XCTAssertEqual(type, .typeRegular)
+        XCTAssertEqual(contents(generation), "123456789")
+    }
+
+    func test_aSymlinkAtTheLogPathIsRefused() throws {
+        let target = directory.appendingPathComponent("target").path
+        try put("keep", at: target)
+        try FileManager.default.createSymbolicLink(atPath: log, withDestinationPath: target)
+        let result = open(0)
+        defer { close(result) }
+        XCTAssertEqual(result, .openFailed(errno: ELOOP))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: generation))
+        XCTAssertEqual(contents(target), "keep")
+    }
+
+    /// Someone else's `.1` in sticky /tmp fails with EPERM, which needs a second
+    /// user to reproduce; a directory in the way takes the same failure path.
+    func test_aFailedRotationKeepsAppendingWithoutTruncating() throws {
+        try FileManager.default.createDirectory(atPath: generation, withIntermediateDirectories: true)
+        try put("x", at: generation + "/keep")
+        try put("123456789", at: log)
+        let result = open()
+        defer { close(result) }
+        guard case .rotationFailed(let fd, let code) = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(code, EISDIR)
+        XCTAssertEqual(contents(log), "123456789")
+        XCTAssertEqual(inode(fd: fd), try inode(log))
+    }
+
+    func test_aFreshLogIsNotRotatedAgain() throws {
+        try put("123456789", at: log)
+        close(open())
+        let generationInode = try inode(generation)
+        let second = open()
+        defer { close(second) }
+        guard case .appended = second else { return XCTFail("\(second)") }
+        XCTAssertEqual(try inode(generation), generationInode)
+        XCTAssertEqual(contents(generation), "123456789")
+    }
+
+    /// Two apps opened the same oversized log; the first rotated while the
+    /// second waited for the lock. The second must append to the new log, not
+    /// move it over the generation the first just kept.
+    func test_aLogAnotherAppAlreadyRotatedIsAppendedTo() throws {
+        try put("123456789", at: log)
+        let staleFD = Darwin.open(log, O_WRONLY | O_APPEND)
+        XCTAssertGreaterThanOrEqual(staleFD, 0)
+        XCTAssertEqual(rename(log, generation), 0)
+        try put("fresh", at: log)
+        let freshInode = try inode(log)
+
+        let result = TermMeshDaemon.rotateDaemonLog(openFD: staleFD, size: 9, path: log)
+        defer { close(result) }
+        guard case .appended(let fd) = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(inode(fd: fd), freshInode)
+        XCTAssertEqual(contents(generation), "123456789")
+        XCTAssertEqual("+next".withCString { Darwin.write(fd, $0, 5) }, 5)
+        XCTAssertEqual(contents(log), "fresh+next")
+    }
+
+    /// The descriptor of a failed rotation becomes the daemon's stdout, so a
+    /// lock left on it would block every later rotation while the daemon runs.
+    func test_aFailedRotationLeavesTheLogUnlocked() throws {
+        try FileManager.default.createDirectory(atPath: generation, withIntermediateDirectories: true)
+        try put("x", at: generation + "/keep")
+        try put("123456789", at: log)
+        let result = open()
+        defer { close(result) }
+        guard case .rotationFailed = result else { return XCTFail("\(result)") }
+        let other = Darwin.open(log, O_WRONLY | O_APPEND)
+        defer { Darwin.close(other) }
+        XCTAssertEqual(flock(other, LOCK_EX | LOCK_NB), 0)
+    }
 }

@@ -265,6 +265,85 @@ final class RemoteExposureStore: ObservableObject {
     }
 }
 
+// MARK: - The running daemon's mobile listener
+
+extension RemoteExposureStore {
+    /// What `remote.status` reports about the listener of the daemon that
+    /// answers now. `enabled` is the environment the daemon started with, not
+    /// proof that its bind succeeded. `serving` says whether the bind held, and
+    /// is nil from a daemon too old to report it.
+    struct MobileListenerState: Equatable, Sendable {
+        let enabled: Bool
+        let addr: String?
+        let serving: Bool?
+
+        init(enabled: Bool, addr: String?, serving: Bool? = nil) {
+            self.enabled = enabled
+            self.addr = addr
+            self.serving = serving
+        }
+    }
+
+    enum MobileListenerMismatch: Equatable, Sendable {
+        case consistent
+        case daemonOff(expectedAddr: String)
+        case daemonOn(actualAddr: String)
+        case addressDiffers(expected: String, actual: String)
+        case listenerFailed(addr: String)
+    }
+
+    nonisolated static func listenerState(fromStatusReply raw: String?) -> MobileListenerState? {
+        guard let raw, let data = raw.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              object["error"] == nil,
+              let enabled = object["listener_enabled"] as? Bool
+        else { return nil }
+        return MobileListenerState(
+            enabled: enabled,
+            addr: object["listener_addr"] as? String,
+            serving: object["listener_serving"] as? Bool
+        )
+    }
+
+    /// `expected` is the environment this app would hand a daemon it spawns,
+    /// nil when it keeps the listener off. A daemon reports its default address
+    /// even with the listener off, and a null address when the configured one
+    /// did not parse, so only an enabled daemon with an address is serving,
+    /// and only while its bind holds.
+    nonisolated static func mobileListenerMismatch(
+        expected: [String: String]?,
+        reported: MobileListenerState
+    ) -> MobileListenerMismatch {
+        let expectedAddr = expected.map { normalizedListenerAddress($0["TERM_MESH_MOBILE_ADDR"] ?? "") }
+        let bindFailed = reported.enabled && reported.serving == false
+        let servingAddr = reported.enabled && !bindFailed ? reported.addr : nil
+        switch (expectedAddr, servingAddr) {
+        case (nil, nil):
+            return .consistent
+        case let (expectedAddr?, nil):
+            return bindFailed
+                ? .listenerFailed(addr: reported.addr ?? expectedAddr)
+                : .daemonOff(expectedAddr: expectedAddr)
+        case let (nil, actualAddr?):
+            return .daemonOn(actualAddr: actualAddr)
+        case let (expectedAddr?, actualAddr?):
+            return expectedAddr == normalizedListenerAddress(actualAddr)
+                ? .consistent
+                : .addressDiffers(expected: expectedAddr, actual: actualAddr)
+        }
+    }
+
+    /// The daemon trims `TERM_MESH_MOBILE_ADDR` and reports the parsed socket
+    /// address, so the raw environment value can differ from the reply in
+    /// surrounding spaces and a zero-padded port while naming the same listener.
+    nonisolated static func normalizedListenerAddress(_ addr: String) -> String {
+        let trimmed = addr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let colon = trimmed.lastIndex(of: ":"),
+              let port = Int(trimmed[trimmed.index(after: colon)...]) else { return trimmed }
+        return "\(trimmed[..<colon]):\(port)"
+    }
+}
+
 // MARK: - Building the daemon's EnableSpec
 
 extension RemoteExposureStore {

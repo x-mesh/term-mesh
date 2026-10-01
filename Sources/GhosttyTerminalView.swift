@@ -1118,6 +1118,10 @@ final class TerminalSurface: Identifiable, ObservableObject {
             let surface = Unmanaged<TerminalSurface>.fromOpaque(userdata).takeUnretainedValue()
             surface.recordPtyOutput(byteCount: Int(len))
         }, surfaceRef)
+        // A paste made before the surface existed went back into the queue, and only
+        // a later paste would drain it otherwise. Its cold-start gate needs the
+        // callback above.
+        drainPasteQueue()
 
 #if DEBUG
         let runtimeFontText = termMeshCurrentSurfaceFontSizePoints(createdSurface).map {

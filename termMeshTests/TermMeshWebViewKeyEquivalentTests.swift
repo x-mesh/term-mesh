@@ -87,6 +87,73 @@ final class AppLaunchEnvironmentTests: XCTestCase {
     }
 }
 
+final class PeerHostAutoStartTests: XCTestCase {
+    func testPeerAutoStartIgnoresPreferenceUnderXCTestButKeepsExplicitPath() {
+        let xctest = ["XCTestConfigurationFilePath": "/tmp/config.xctestconfiguration"]
+        let normal = ["HOME": "/Users/example"]
+        let preferencePath = "/tmp/preference.sock"
+        let cases: [(name: String, environment: [String: String], preferenceEnabled: Bool, expected: String?)] = [
+            ("XCTest ignores the preference", xctest, true, nil),
+            (
+                "XCTest keeps the explicit path",
+                xctest.merging(["TERMMESH_PEER_SERVER_PATH": "/tmp/env.sock"]) { $1 },
+                true,
+                "/tmp/env.sock"
+            ),
+            (
+                "XCTest keeps the legacy explicit path",
+                xctest.merging(["TERMMESH_DEBUG_PEER_SERVER_PATH": "/tmp/legacy.sock"]) { $1 },
+                false,
+                "/tmp/legacy.sock"
+            ),
+            ("normal launch follows the preference", normal, true, preferencePath),
+            ("normal launch without the preference stays stopped", normal, false, nil),
+            (
+                "explicit path wins over the preference",
+                normal.merging(["TERMMESH_PEER_SERVER_PATH": "/tmp/env.sock"]) { $1 },
+                true,
+                "/tmp/env.sock"
+            ),
+        ]
+
+        for testCase in cases {
+            XCTAssertEqual(
+                PeerHostCoordinator.autoStartSocketPath(
+                    environment: testCase.environment,
+                    preferenceEnabled: testCase.preferenceEnabled,
+                    preferencePath: preferencePath
+                ),
+                testCase.expected,
+                testCase.name
+            )
+        }
+    }
+
+    func testPreferencePathIsReadOnlyWhenItIsUsed() {
+        var reads = 0
+        func preferencePath() -> String {
+            reads += 1
+            return "/tmp/preference.sock"
+        }
+
+        _ = PeerHostCoordinator.autoStartSocketPath(
+            environment: ["TERMMESH_PEER_SERVER_PATH": "/tmp/env.sock"], preferenceEnabled: true, preferencePath: preferencePath()
+        )
+        _ = PeerHostCoordinator.autoStartSocketPath(
+            environment: ["XCTestConfigurationFilePath": "/tmp/config"], preferenceEnabled: true, preferencePath: preferencePath()
+        )
+        _ = PeerHostCoordinator.autoStartSocketPath(
+            environment: [:], preferenceEnabled: false, preferencePath: preferencePath()
+        )
+        XCTAssertEqual(reads, 0)
+
+        _ = PeerHostCoordinator.autoStartSocketPath(
+            environment: [:], preferenceEnabled: true, preferencePath: preferencePath()
+        )
+        XCTAssertEqual(reads, 1)
+    }
+}
+
 @MainActor
 final class NativeWindowRestorationPolicyTests: XCTestCase {
     func testDisablePersistsBothNativeRestorationGuards() throws {

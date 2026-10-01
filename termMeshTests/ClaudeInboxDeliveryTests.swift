@@ -94,6 +94,49 @@ final class ClaudeInboxDeliveryTests: XCTestCase {
         XCTAssertTrue(ClaudeInboxDelivery.isEnabled(defaults: defaults))
     }
 
+    func testLeaderDeliveryHasItsOwnOptionAndIsOffUnlessSet() throws {
+        let suite = "ClaudeInboxDeliveryTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(true, forKey: ClaudeInboxDelivery.enabledKey)
+        XCTAssertFalse(ClaudeInboxDelivery.isLeaderEnabled(defaults: defaults),
+                       "turning on worker delivery does not reach the user's leader session")
+        defaults.set(true, forKey: ClaudeInboxDelivery.leaderEnabledKey)
+        XCTAssertTrue(ClaudeInboxDelivery.isLeaderEnabled(defaults: defaults))
+    }
+
+    @MainActor
+    func testLeaderLaunchSettingsAreUnchangedWhileTheLeaderOptionIsOff() {
+        let turnHooks = TeamOrchestrator.leaderTurnHookSettingsJSON
+        XCTAssertEqual(ClaudeInboxDelivery.leaderSettingsJSON(base: turnHooks, registerInbox: false), turnHooks)
+        XCTAssertNil(ClaudeInboxDelivery.leaderSettingsJSON(base: nil, registerInbox: false))
+    }
+
+    @MainActor
+    func testLeaderLaunchSettingsCarryTheInboxHookBesideTheTurnHooks() throws {
+        let json = try XCTUnwrap(ClaudeInboxDelivery.leaderSettingsJSON(
+            base: TeamOrchestrator.leaderTurnHookSettingsJSON, registerInbox: true))
+        XCTAssertFalse(json.contains("'"), "the settings are passed inside single quotes on the launch line")
+        let hooks = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])?["hooks"] as? [String: Any])
+        XCTAssertEqual(Set(hooks.keys), ["UserPromptSubmit", "Stop", "SessionStart"])
+        let commands = { (event: String) -> [String] in
+            ((hooks[event] as? [[String: Any]]) ?? []).flatMap { entry in
+                ((entry["hooks"] as? [[String: Any]]) ?? []).compactMap { $0["command"] as? String }
+            }
+        }
+        XCTAssertEqual(commands("SessionStart"), ["\"$TERMMESH_APP_BIN/term-mesh\" claude-hook inbox-register"])
+        XCTAssertEqual(commands("UserPromptSubmit"), ["\"$TERMMESH_LEADER_TURN_HOOK\" --start"])
+        XCTAssertEqual(commands("Stop"), ["\"$TERMMESH_LEADER_TURN_HOOK\" --end"])
+    }
+
+    func testALeaderWithoutTurnHooksGetsOnlyTheInboxHook() throws {
+        let json = try XCTUnwrap(ClaudeInboxDelivery.leaderSettingsJSON(base: nil, registerInbox: true))
+        let hooks = try XCTUnwrap(
+            (try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])?["hooks"] as? [String: Any])
+        XCTAssertEqual(Set(hooks.keys), ["SessionStart"])
+    }
+
     func testWorkerLaunchHookRegistersThroughThisAppsCLI() throws {
         let json = ClaudeInboxDelivery.registerHookSettingsJSON
         XCTAssertFalse(json.contains("'"), "the settings are passed inside single quotes on the launch line")
@@ -159,6 +202,26 @@ final class ClaudeInboxDeliveryTests: XCTestCase {
         let outcome = ClaudeInboxDelivery.deliverNow(
             text: text, to: record, sessionsDirectory: try sessionsDirectory(), confirmTimeout: 2)
         XCTAssertEqual(outcome, .delivered)
+        XCTAssertFalse(received.wait().isEmpty)
+    }
+
+    func testASessionThatHasNotWrittenItsTranscriptYetIsGivenTheLongerWindow() throws {
+        let inbox = try FakeInbox()
+        let transcript = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cib-\(UUID().uuidString).jsonl")
+        addTeardownBlock { try? FileManager.default.removeItem(at: transcript) }
+        let record = try inboxRecord(socket: inbox.path, transcript: transcript.path)
+        let text = "first wake"
+        let received = inbox.readOnce { _ in
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+                try? Data().write(to: transcript)
+                Self.append(transcript, ["type": "queue-operation", "operation": "enqueue", "content": text])
+            }
+        }
+        let outcome = ClaudeInboxDelivery.deliverNow(
+            text: text, to: record, sessionsDirectory: try sessionsDirectory(),
+            confirmTimeout: 0.2, firstMessageConfirmTimeout: 3)
+        XCTAssertEqual(outcome, .delivered, "the file appeared after the ordinary window had run out")
         XCTAssertFalse(received.wait().isEmpty)
     }
 

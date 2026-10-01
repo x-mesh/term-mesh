@@ -242,6 +242,8 @@ struct SettingsView: View {
     @State private var shellHealthEntries: [ShellHealthEntry] = []
     @State private var shellFixCopied = false
     @State private var mobileSetupCopiedCommand: String?
+    /// nil until the running daemon has been asked.
+    @State private var mobileListenerReport: MobileListenerReport?
     @State private var peerFederationPeerIDHex = "Loading..."
     @State private var peerFederationPeerIDStatusMessage: String?
     @State private var peerFederationPeerIDStatusIsError = false
@@ -1835,12 +1837,7 @@ struct SettingsView: View {
         SettingsCard {
             SettingsCardRow(
                 "Mobile Remote Control",
-                verbatimSubtitle: mobileEnabled
-                    ? String(
-                        format: LanguageSettings.localized("Loopback listener at 127.0.0.1:%@. Expose it to your tailnet with `tailscale serve --bg %@`."),
-                        String(resolvedMobilePort), String(resolvedMobilePort)
-                      )
-                    : LanguageSettings.localized("Disabled. Panes exposed with /rc stay unreachable until the listener is on.")
+                verbatimSubtitle: mobileListenerSubtitle
             ) {
                 Toggle("", isOn: $mobileEnabled)
                     .labelsHidden()
@@ -1848,6 +1845,24 @@ struct SettingsView: View {
                     .onChange(of: mobileEnabled) { _ in
                         scheduleDaemonRestart(delay: 0)
                     }
+            }
+
+            if case .read(_, let mismatch)? = mobileListenerReport,
+               mismatch != .consistent,
+               !isDaemonRestarting {
+                SettingsCardDivider()
+
+                SettingsCardRow(
+                    "Mobile Listener Differs From Settings",
+                    verbatimSubtitle: mobileListenerMismatchMessage(mismatch)
+                ) {
+                    Button("Restart Daemon") {
+                        scheduleDaemonRestart(delay: 0)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(isDaemonRestarting)
+                }
             }
 
             if mobileEnabled {
@@ -1917,6 +1932,91 @@ struct SettingsView: View {
                 SettingsCardNote("Run the first two commands in a Mac terminal. Run /rc on inside the term-mesh pane you want to open on your phone, then use the URL it prints.")
             }
         }
+        }
+        .onAppear { refreshMobileListenerState() }
+    }
+
+    private enum MobileListenerReport: Sendable {
+        case unreadable
+        case read(RemoteExposureStore.MobileListenerState, RemoteExposureStore.MobileListenerMismatch)
+    }
+
+    /// What the running daemon serves, not what the settings ask for: an
+    /// adopted daemon keeps the listener it was started with.
+    private var mobileListenerSubtitle: String {
+        switch mobileListenerReport {
+        case nil:
+            return LanguageSettings.localized("Checking...")
+        case .unreadable?:
+            return LanguageSettings.localized("Could not read the mobile listener from the background service.")
+        case .read(let state, _)?:
+            if state.enabled, state.serving == false {
+                return LanguageSettings.localized("Not listening: the mobile listener did not start. See the daemon log.")
+            }
+            guard state.enabled, let addr = state.addr else {
+                return LanguageSettings.localized("Disabled. Panes exposed with /rc stay unreachable until the listener is on.")
+            }
+            let port = addr.split(separator: ":").last.map(String.init) ?? addr
+            return String(
+                format: LanguageSettings.localized("Loopback listener at 127.0.0.1:%@. Expose it to your tailnet with `tailscale serve --bg %@`."),
+                port, port
+            )
+        }
+    }
+
+    private func mobileListenerMismatchMessage(_ mismatch: RemoteExposureStore.MobileListenerMismatch) -> String {
+        switch mismatch {
+        case .consistent:
+            return ""
+        case .daemonOff(let expectedAddr):
+            return String(
+                format: LanguageSettings.localized("The background service has no mobile listener, but these settings expect one at %@. Restart the daemon to apply the settings. Restarting ends the sessions this daemon runs."),
+                expectedAddr
+            )
+        case .daemonOn(let actualAddr):
+            return String(
+                format: LanguageSettings.localized("The background service still accepts mobile connections at %@ although these settings turn them off. Restart the daemon to apply the settings. Restarting ends the sessions this daemon runs."),
+                actualAddr
+            )
+        case let .addressDiffers(expectedAddr, actualAddr):
+            return String(
+                format: LanguageSettings.localized("The background service accepts mobile connections at %@, but these settings expect %@. Restart the daemon to apply the settings. Restarting ends the sessions this daemon runs."),
+                actualAddr, expectedAddr
+            )
+        case .listenerFailed(let addr):
+            return String(
+                format: LanguageSettings.localized("The background service could not start its mobile listener at %@. Another process may be using the port; see the daemon log. Restart the daemon to try again. Restarting ends the sessions this daemon runs."),
+                addr
+            )
+        }
+    }
+
+    private static let mobileListenerRefreshQueue = DispatchQueue(
+        label: "com.termmesh.settings.mobile-listener", qos: .userInitiated
+    )
+    private static let mobileListenerRefreshes = LatestRequest()
+
+    /// Off-main: `rpcCallRaw` blocks for up to its timeout, and the expected
+    /// environment logs for a tagged build, so neither runs in a view body.
+    /// Only the newest refresh reads and lands: a slow read from before a
+    /// restart cannot overwrite the read made after it, and refreshes queued
+    /// behind a daemon that does not answer do not each wait out the timeout.
+    private func refreshMobileListenerState() {
+        let daemon = resolvedDaemon
+        let request = Self.mobileListenerRefreshes.begin()
+        Self.mobileListenerRefreshQueue.async {
+            guard Self.mobileListenerRefreshes.isLatest(request) else { return }
+            let reported = RemoteExposureStore.listenerState(
+                fromStatusReply: daemon?.rpcCallRaw(method: "remote.status", params: [:])
+            )
+            let expected = TermMeshDaemon.shared.expectedMobileListenerEnvironment()
+            let report: MobileListenerReport = reported.map {
+                .read($0, RemoteExposureStore.mobileListenerMismatch(expected: expected, reported: $0))
+            } ?? .unreadable
+            DispatchQueue.main.async {
+                guard Self.mobileListenerRefreshes.isLatest(request) else { return }
+                mobileListenerReport = report
+            }
         }
     }
 
@@ -2603,7 +2703,7 @@ struct SettingsView: View {
         }
         if !status.connected {
             if !status.binaryExists {
-                return LanguageSettings.localized("Binary not found. Build the daemon first.")
+                return LanguageSettings.localized("Binary not found. Launch a dev build with ./scripts/reload.sh --tag, or set TERMMESH_DAEMON_BINARY_PATH.")
             }
             if !status.socketExists {
                 return LanguageSettings.localized("Socket missing. Daemon may not be running.")
@@ -2633,6 +2733,7 @@ struct SettingsView: View {
             isDaemonRestarting = true
             resolvedDaemon?.restartDaemon {
                 refreshDaemonStatus()
+                refreshMobileListenerState()
                 isDaemonRestarting = false
             }
             return
@@ -2641,6 +2742,7 @@ struct SettingsView: View {
             isDaemonRestarting = true
             resolvedDaemon?.restartDaemon {
                 refreshDaemonStatus()
+                refreshMobileListenerState()
                 isDaemonRestarting = false
             }
         }
@@ -3074,6 +3176,25 @@ struct SettingsView: View {
 
     private func saveBrowserInsecureHTTPAllowlist() {
         browserInsecureHTTPAllowlist = browserInsecureHTTPAllowlistDraft
+    }
+}
+
+/// Numbers requests so a caller can drop work and replies that a newer request superseded.
+private final class LatestRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var latest = 0
+
+    func begin() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        latest += 1
+        return latest
+    }
+
+    func isLatest(_ request: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return request == latest
     }
 }
 

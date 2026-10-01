@@ -15,6 +15,36 @@ final class GhosttyConfigTests: XCTestCase {
         let blue: Int
     }
 
+    func testCodexWrapperKeepsPaneIdentityOutOfTheSharedDaemon() async throws {
+        let sourceRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let wrapper = sourceRoot.appendingPathComponent("Resources/bin/codex")
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("term-mesh-codex-wrapper-\(UUID().uuidString)")
+        let realDir = root.appendingPathComponent("real")
+        try FileManager.default.createDirectory(at: realDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let real = realDir.appendingPathComponent("codex")
+        try "#!/bin/sh\nprintf '%s\\n' \"$@\"\n".write(to: real, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: real.path)
+
+        let output = try await ProcessRun.capture(
+            executable: wrapper.path,
+            arguments: ["exec", "task"],
+            environment: [
+                "PATH": realDir.path + ":/usr/bin:/bin",
+                "TERMMESH_SURFACE_ID": "surface-1",
+            ],
+            timeout: 10
+        )
+
+        XCTAssertEqual(output.status, 0, output.stderrText)
+        XCTAssertEqual(output.stdoutText.split(separator: "\n").map(String.init), [
+            "--no-daemon", "exec", "task"
+        ])
+    }
+
     func testPeerRelayTerminalLinkRoutesEmbeddedBrowserTargetExternally() throws {
         let url = try XCTUnwrap(URL(string: "https://example.com/relay-link"))
 

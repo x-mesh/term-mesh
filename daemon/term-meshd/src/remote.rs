@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -386,6 +387,30 @@ pub fn parse_loopback_addr(raw: &str) -> Result<SocketAddr, String> {
         ));
     }
     Ok(addr)
+}
+
+static LISTENERS_SERVING: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a mobile listener holds its bound socket now. `listener_enabled`
+/// reports only the environment, which stays on when the bind fails.
+pub fn listener_serving() -> bool {
+    LISTENERS_SERVING.load(Ordering::SeqCst) > 0
+}
+
+/// Counts one mobile listener as serving until it is dropped.
+pub struct ListenerServing(());
+
+impl ListenerServing {
+    pub fn begin() -> Self {
+        LISTENERS_SERVING.fetch_add(1, Ordering::SeqCst);
+        Self(())
+    }
+}
+
+impl Drop for ListenerServing {
+    fn drop(&mut self) {
+        LISTENERS_SERVING.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Where the mobile page for one surface lives on the loopback listener.

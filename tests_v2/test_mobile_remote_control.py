@@ -11,6 +11,7 @@ exports the listener address as TERMMESH_E2E_MOBILE_ADDR.
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -189,6 +190,19 @@ def check_pane_flow(c: termmesh, cli: Path) -> None:
     if MARKER not in screen.get("text", ""):
         raise termmeshError("listener screen does not show the marker")
 
+    # The page's Send: one /text with submit runs the command, no /key Enter.
+    submitted = f"{MARKER}-SUBMIT"
+    _, turn = http("POST", f"/api/targets/{sid}/text",
+                   {"text": f"echo {submitted}", "request_id": f"e2e-{os.getpid()}-2",
+                    "mode": "terminal", "submit": True}, expect=200)
+    if not turn.get("delivered") or turn.get("deduplicated"):
+        raise termmeshError(f"submit should deliver: {turn}")
+    wait_for(lambda: any(l.strip() == submitted for l in read_text(c, sid).splitlines()) or None, 10,
+             "echo output after one submit (surface.send_turn)")
+    outputs = [l for l in read_text(c, sid).splitlines() if l.strip() == submitted]
+    if len(outputs) != 1:
+        raise termmeshError(f"submit must run the command exactly once, got {len(outputs)} output lines")
+
     # Allowlist and policy.
     status, payload = http("POST", f"/api/targets/{sid}/key", {"key": "q"})
     if status != 403 or error_code(payload) != "key_not_allowed":
@@ -268,6 +282,23 @@ def check_leader_flow(c: termmesh, cli: Path) -> None:
             pass
 
 
+def daemon_rpc(method: str, params: dict) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(5)
+        sock.connect(DAEMON_SOCK)
+        sock.sendall((json.dumps({"id": 1, "method": method, "params": params}) + "\n").encode())
+        reply = b""
+        while not reply.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            reply += chunk
+    payload = json.loads(reply)
+    if payload.get("error"):
+        raise termmeshError(f"{method} failed: {payload['error']}")
+    return payload.get("result") or {}
+
+
 def main() -> int:
     if not MOBILE_ADDR:
         raise termmeshError("TERMMESH_E2E_MOBILE_ADDR is not set; run through scripts/run-tests-v2.sh")
@@ -278,6 +309,9 @@ def main() -> int:
     _, health = http("GET", "/api/health", expect=200)
     if not health.get("ok") or health.get("auth_mode") != "loopback":
         raise termmeshError(f"unexpected health payload: {health}")
+    listener = daemon_rpc("remote.status", {})
+    if listener.get("listener_enabled") is not True or listener.get("listener_serving") is not True:
+        raise termmeshError(f"remote.status must report the listener that answered /api/health as serving: {listener}")
     status, _ = http("GET", "/api/agents/spawn")
     if status != 404:
         raise termmeshError(f"dashboard routes must not exist on the mobile listener: {status}")

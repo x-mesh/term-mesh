@@ -626,21 +626,128 @@ final class AgentTransportHardeningRegression169Tests: XCTestCase {
 
         let token = store.prepareLeaderRequestToken(teamName: team)
         XCTAssertTrue(store.isAuthorizedLeaderMetrics(
-            teamName: team, token: token, callerTTYDevice: nil,
+            teamName: team, token: token, callerTTYDevices: [],
             adoptedLeaderTTYDevice: nil
         ))
         XCTAssertTrue(store.isAuthorizedLeaderMetrics(
-            teamName: team, token: nil, callerTTYDevice: 0x1234,
+            teamName: team, token: nil, callerTTYDevices: [0x1234],
             adoptedLeaderTTYDevice: 0x1234
         ))
         XCTAssertFalse(store.isAuthorizedLeaderMetrics(
-            teamName: team, token: nil, callerTTYDevice: 0x5678,
+            teamName: team, token: nil, callerTTYDevices: [0x5678],
             adoptedLeaderTTYDevice: 0x1234
         ))
         XCTAssertFalse(store.isAuthorizedLeaderMetrics(
-            teamName: team, token: "wrong", callerTTYDevice: nil,
+            teamName: team, token: "wrong", callerTTYDevices: [],
             adoptedLeaderTTYDevice: nil
         ))
+    }
+
+    /// An adopted leader was already running when its team was created, so the
+    /// request token never reached its environment; its pane's PTY is what
+    /// identifies it. A caller on any other terminal is still refused.
+    func testAdoptedLeaderTakesAndCompletesDurableRequestsByItsPTY() throws {
+        let store = TeamDataStore.shared
+        let team = "adopted-leader-request-\(UUID().uuidString)"
+        let requestId = "request-\(UUID().uuidString)"
+        store.registerTeam(team, agentNames: [])
+        store.updateBoardUuids([team: UUID().uuidString])
+        defer { store.unregisterTeam(team) }
+        _ = store.prepareLeaderRequestToken(teamName: team)
+        guard case .created = store.enqueueLeaderRequest(
+            teamName: team, content: "adopted leader work", requestId: requestId
+        ) else { return XCTFail("request was not created") }
+
+        let controller = TerminalController.shared
+        let leaderPTY: UInt32 = 0x1234
+        let nestedPTY: UInt32 = 0x2222
+        let request: [String: Any] = ["team_name": team, "request_id": requestId]
+        func reply(_ json: String) throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        }
+        func errorCode(_ json: String) throws -> String? {
+            (try reply(json)["error"] as? [String: Any])?["code"] as? String
+        }
+
+        XCTAssertEqual(try errorCode(controller.teamDataLeaderRequestTake(
+            params: request, id: 1, store: store,
+            callerTTYDevices: [0x5678, 0x5679], adoptedLeaderTTYDevice: leaderPTY
+        )), "unauthorized", "a caller on another terminal")
+        XCTAssertEqual(try errorCode(controller.teamDataLeaderRequestTake(
+            params: request, id: 1, store: store
+        )), "unauthorized", "no token and no terminal identity")
+
+        let list = try reply(controller.teamDataLeaderRequestList(
+            params: ["team_name": team], id: 1, store: store,
+            callerTTYDevices: [nestedPTY, leaderPTY], adoptedLeaderTTYDevice: leaderPTY))
+        XCTAssertEqual((list["result"] as? [String: Any])?["count"] as? Int, 1)
+
+        let take = try reply(controller.teamDataLeaderRequestTake(
+            params: request, id: 1, store: store,
+            callerTTYDevices: [nestedPTY, leaderPTY], adoptedLeaderTTYDevice: leaderPTY))
+        XCTAssertEqual(take["ok"] as? Bool, true, "\(take)")
+
+        let complete = try reply(controller.teamDataLeaderRequestComplete(
+            params: request, id: 1, store: store,
+            callerTTYDevices: [nestedPTY, leaderPTY], adoptedLeaderTTYDevice: leaderPTY))
+        XCTAssertEqual(complete["ok"] as? Bool, true, "\(complete)")
+    }
+
+    /// Measured shape of an adopted leader pane with kiro-cli-term: the Bash
+    /// tool has no terminal, claude and the shell sit on a nested PTY, and only
+    /// the wrapper and `login` are on the pane PTY Ghostty reports.
+    func testAncestorTerminalsReachThePanePTYThroughANestedOne() {
+        let parents: [pid_t: pid_t] = [900: 800, 800: 700, 700: 600, 600: 500, 500: 400, 400: 1]
+        let ttys: [pid_t: UInt32] = [800: 72, 700: 72, 600: 57, 500: 57]
+        XCTAssertEqual(TerminalController.ancestorTTYDevices(
+            of: 900, parent: { parents[$0] }, tty: { ttys[$0] }
+        ), [72, 57])
+    }
+
+    func testAncestorTerminalsStopAtLaunchdLoopsAndTheDepthLimit() {
+        XCTAssertEqual(TerminalController.ancestorTTYDevices(
+            of: 1, parent: { _ in nil }, tty: { _ in 9 }
+        ), [], "launchd is never a caller's terminal owner")
+        XCTAssertEqual(TerminalController.ancestorTTYDevices(
+            of: 10, parent: { $0 == 10 ? 11 : 10 }, tty: { $0 == 10 ? 3 : nil }
+        ), [3], "a parent loop ends the walk")
+        XCTAssertEqual(TerminalController.ancestorTTYDevices(
+            of: 1000, parent: { $0 - 1 }, tty: { $0 == 900 ? 5 : nil }, maxDepth: 32
+        ), [], "a terminal beyond the depth limit is not reached")
+        XCTAssertEqual(TerminalController.ancestorTTYDevices(
+            of: 42, parent: { _ in nil }, tty: { _ in 7 }
+        ), [7], "the caller's own terminal counts")
+    }
+
+    func testACallerPidThatNowNamesAnotherProcessMatchesNoTerminal() {
+        let caller = TerminalController.SocketCaller(pid: 900, startTime: 1_000)
+        let parents: [pid_t: pid_t] = [900: 500, 500: 1]
+        let ttys: [pid_t: UInt32] = [500: 57]
+        XCTAssertEqual(TerminalController.callerTTYDevices(
+            of: caller, startTime: { _ in 1_000 }, parent: { parents[$0] }, tty: { ttys[$0] }
+        ), [57], "the connector itself is walked")
+        XCTAssertEqual(TerminalController.callerTTYDevices(
+            of: caller, startTime: { _ in 2_000 }, parent: { parents[$0] }, tty: { ttys[$0] }
+        ), [], "a later process that reused the pid is not the connector")
+        XCTAssertEqual(TerminalController.callerTTYDevices(
+            of: caller, startTime: { _ in nil }, parent: { parents[$0] }, tty: { ttys[$0] }
+        ), [], "an exited connector has no terminal")
+    }
+
+    func testProcessStartTimeIdentifiesALiveProcess() {
+        let current = TerminalController.processStartTime(of: getpid())
+        XCTAssertNotNil(current)
+        XCTAssertEqual(TerminalController.processStartTime(of: getpid()), current)
+        XCTAssertNil(TerminalController.processStartTime(of: 0))
+    }
+
+    func testDurableRequestCallsTakeTheAdoptedLeaderPTYPath() {
+        XCTAssertEqual(TerminalController.adoptedLeaderPTYMethods, [
+            "team.task.metrics",
+            "team.leader.request.list",
+            "team.leader.request.take",
+            "team.leader.request.complete",
+        ])
     }
 
     func testTerminalDeviceNumberUsesCharacterDeviceIdentity() {

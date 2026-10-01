@@ -55,25 +55,23 @@
 </main>
 
 <footer id="composer" class="composer" hidden>
-  <details id="keys" class="keys-panel">
-    <summary>Quick keys</summary>
-    <div class="keys-row" aria-label="quick keys">
-      <button type="button" data-key="Enter">Enter</button>
-      <button type="button" data-key="Escape">Esc</button>
-      <button type="button" data-key="y">y</button>
-      <button type="button" data-key="n">n</button>
-      <button type="button" data-key="1">1</button>
-      <button type="button" data-key="2">2</button>
-      <button type="button" data-key="3">3</button>
-      <button type="button" data-key="Up">↑</button>
-      <button type="button" data-key="Down">↓</button>
-      <button type="button" data-key="Tab">Tab</button>
-      <button type="button" data-key="Backspace">⌫</button>
-      <button type="button" data-key="C-c" class="danger">^C</button>
-    </div>
-  </details>
+  <div id="keys" class="keys-row" aria-label="quick keys" hidden>
+    <button type="button" data-key="Enter">Enter</button>
+    <button type="button" data-key="Escape">Esc</button>
+    <button type="button" data-key="y">y</button>
+    <button type="button" data-key="n">n</button>
+    <button type="button" data-key="1">1</button>
+    <button type="button" data-key="2">2</button>
+    <button type="button" data-key="3">3</button>
+    <button type="button" data-key="Up">↑</button>
+    <button type="button" data-key="Down">↓</button>
+    <button type="button" data-key="Tab">Tab</button>
+    <button type="button" data-key="Backspace">⌫</button>
+    <button type="button" data-key="C-c" class="danger">^C</button>
+  </div>
   <form id="send-form" class="send-form">
-    <textarea id="text" rows="2" placeholder="메시지…" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+    <button id="keys-toggle" type="button" class="icon" aria-controls="keys" aria-expanded="false" aria-label="빠른 키" title="빠른 키" hidden>⌨</button>
+    <textarea id="text" rows="1" placeholder="메시지…" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
     <button id="send" type="submit">보내기</button>
   </form>
   <div id="send-status" class="send-status muted"></div>

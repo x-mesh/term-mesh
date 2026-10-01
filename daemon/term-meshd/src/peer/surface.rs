@@ -3742,6 +3742,19 @@ fn hex_short(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn screen_model_survives_resize_clipping_a_wide_character() {
+        let mut model = super::ScreenModel::new(70, 3);
+        let initial = "\x1b[1;69H한".as_bytes();
+        model.feed(initial, initial.len() as u64);
+        model.parser.screen_mut().set_size(3, 69);
+        let redraw = b"\x1b[1;69H\x1b[X\x1b[2;1Halive";
+        let end_seq = (initial.len() + redraw.len()) as u64;
+        model.feed(redraw, end_seq);
+        assert_eq!(model.fed_through, end_seq);
+        assert!(model.parser.screen().contents().contains("alive"));
+    }
+
     use super::*;
 
     #[test]

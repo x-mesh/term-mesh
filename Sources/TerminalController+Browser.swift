@@ -11,7 +11,7 @@ extension TerminalController {
         _ body: (_ tabManager: TabManager, _ workspace: Workspace, _ surfaceId: UUID, _ browserPanel: BrowserPanel) -> V2CallResult
     ) -> V2CallResult {
         var result: V2CallResult = .err(code: "internal_error", message: "Browser operation failed", data: nil)
-        v2MainSync {
+        v2BrowserMainSync {
             guard let tabManager = v2ResolveTabManager(params: params) else {
                 result = .err(code: "unavailable", message: "TabManager not available", data: nil)
                 return
@@ -30,8 +30,48 @@ extension TerminalController {
                 return
             }
             result = body(tabManager, ws, surfaceId, browserPanel)
+            // Other commands run during the body's WebKit waits, and a closed panel keeps
+            // answering JavaScript, so a success here could describe a surface that is gone.
+            // A workspace moved to another window is still open; look it up in every window.
+            let workspaceManager = AppDelegate.shared?.tabManagerFor(tabId: ws.id) ?? tabManager
+            if ws.browserPanel(for: surfaceId) !== browserPanel
+                || !workspaceManager.tabs.contains(where: { $0 === ws }) {
+                result = .err(
+                    code: "not_found",
+                    message: "Browser surface closed during the command",
+                    data: ["surface_id": surfaceId.uuidString]
+                )
+            }
         }
         return result
+    }
+
+    /// Browser bodies wait for WebKit callbacks in a nested run loop. Inside a
+    /// `DispatchQueue.main.sync` block that loop cannot drain the main queue, so the first
+    /// `evaluateJavaScript` after a browser opened waited out its full timeout.
+    private func v2BrowserMainSync(_ body: () -> Void) {
+        if Thread.isMainThread {
+            body()
+            return
+        }
+        // The wait below lets other main work run. This queue keeps another client's browser
+        // command from starting inside that wait and holding this one until it finishes.
+        v2BrowserCommandQueue.sync {
+            withoutActuallyEscaping(body) { body in
+                let work = V2BrowserMainWork(body)
+                let finished = DispatchSemaphore(value: 0)
+                // The hop keeps FIFO order with main-queue work queued before this command.
+                DispatchQueue.main.async {
+                    let mainLoop = CFRunLoopGetMain()
+                    CFRunLoopPerformBlock(mainLoop, CFRunLoopMode.commonModes.rawValue) {
+                        work.run()
+                        finished.signal()
+                    }
+                    CFRunLoopWakeUp(mainLoop)
+                }
+                finished.wait()
+            }
+        }
     }
 
     func v2JSONLiteral(_ value: Any) -> String {
@@ -1649,4 +1689,21 @@ extension TerminalController {
         return .ok(["focused": focused])
     }
 
+}
+
+private let v2BrowserCommandQueue = DispatchQueue(label: "com.termmesh.browser-commands")
+
+// The run loop keeps its block copy until after the block returns, which is after the waiting
+// thread resumed; dropping the body here keeps `withoutActuallyEscaping` from seeing it escape.
+private final class V2BrowserMainWork: @unchecked Sendable {
+    private var body: (() -> Void)?
+
+    init(_ body: @escaping () -> Void) {
+        self.body = body
+    }
+
+    func run() {
+        body?()
+        body = nil
+    }
 }

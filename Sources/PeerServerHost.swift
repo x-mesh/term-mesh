@@ -143,20 +143,39 @@ final class PeerHostCoordinator: NSObject {
     /// `TERMMESH_PEER_SERVER_PATH` (or legacy
     /// `TERMMESH_DEBUG_PEER_SERVER_PATH`) env var is set or the
     /// "Auto-start" preference is on. Env wins on path conflict.
+    /// Under XCTest the preference is ignored: the untagged DEV test host
+    /// shares the production daemon socket, so bringing the server up there
+    /// can replace or claim the production daemon.
     static func autoStartIfConfigured() {
-        let env = ProcessInfo.processInfo.environment
-        let envPath = env["TERMMESH_PEER_SERVER_PATH"]
-            ?? env["TERMMESH_DEBUG_PEER_SERVER_PATH"]
-        let path: String?
-        if let envPath, !envPath.isEmpty {
-            path = envPath
-        } else if PeerFederationSettings.autoStart {
-            path = PeerFederationSettings.socketPath
-        } else {
-            path = nil
+        let preferenceEnabled = PeerFederationSettings.autoStart
+        let path = autoStartSocketPath(
+            environment: ProcessInfo.processInfo.environment,
+            preferenceEnabled: preferenceEnabled,
+            preferencePath: PeerFederationSettings.socketPath
+        )
+        guard let path else {
+            if preferenceEnabled {
+                RemoteWorkLog.info("Peer server auto-start skipped under XCTest; the test host shares this machine's daemon socket")
+            }
+            return
         }
-        guard let path else { return }
         Task { await PeerHostCoordinator.shared.bringUp(at: path, silent: true) }
+    }
+
+    nonisolated static func autoStartSocketPath(
+        environment: [String: String],
+        preferenceEnabled: Bool,
+        preferencePath: @autoclosure () -> String
+    ) -> String? {
+        let envPath = environment["TERMMESH_PEER_SERVER_PATH"]
+            ?? environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
+        if let envPath, !envPath.isEmpty {
+            return envPath
+        }
+        guard preferenceEnabled, !AppLaunchEnvironment.isRunningUnderXCTest(environment) else {
+            return nil
+        }
+        return preferencePath()
     }
 
     /// Toggle the server on/off without showing any UI. Used by the

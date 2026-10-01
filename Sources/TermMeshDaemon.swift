@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Combine
 import os
@@ -182,6 +183,58 @@ final class TermMeshDaemon: ObservableObject {
             "TERM_MESH_MOBILE_AUTH": processEnv["TERM_MESH_MOBILE_AUTH"] ?? mobileAuthMode,
             "TERM_MESH_MOBILE_ALLOWED_LOGINS": processEnv["TERM_MESH_MOBILE_ALLOWED_LOGINS"] ?? mobileAllowedLogins,
         ]
+    }
+
+    /// The listener environment a daemon spawned by this app now would get,
+    /// from the same inputs the spawn uses.
+    func expectedMobileListenerEnvironment() -> [String: String]? {
+        mobileListenerEnvironment(
+            processEnv: ProcessInfo.processInfo.environment,
+            isTaggedBuild: termMeshEnv("TAG") != nil
+        )
+    }
+
+    /// An adopted daemon keeps the listener environment it was started with:
+    /// a daemon an untagged DEV build spawned ran without the production
+    /// listener for hours while Settings showed it on. Only a restart applies
+    /// the settings, and that ends live sessions, so this warns instead.
+    private func warnIfAdoptedMobileListenerDiffersFromSettings() {
+        telemetryQueue.async { [weak self] in
+            guard let self else { return }
+            let expected = self.expectedMobileListenerEnvironment()
+            let reported = RemoteExposureStore.listenerState(
+                fromStatusReply: self.rpcCallRaw(method: "remote.status", params: [:], timeout: 2)
+            )
+            let apply = "restart the daemon from Settings > Mobile Remote Control to apply the settings"
+            guard let reported else {
+                if expected != nil {
+                    RemoteWorkLog.warningOffMain(
+                        "Could not confirm the adopted daemon's mobile listener; if phones cannot connect, \(apply)"
+                    )
+                }
+                return
+            }
+            switch RemoteExposureStore.mobileListenerMismatch(expected: expected, reported: reported) {
+            case .consistent:
+                return
+            case .daemonOff(let expectedAddr):
+                RemoteWorkLog.warningOffMain(
+                    "The adopted daemon has no mobile listener, but settings expect one at \(expectedAddr); \(apply)"
+                )
+            case .daemonOn(let actualAddr):
+                RemoteWorkLog.warningOffMain(
+                    "The adopted daemon serves a mobile listener at \(actualAddr) although settings turn it off; \(apply)"
+                )
+            case let .addressDiffers(expectedAddr, actualAddr):
+                RemoteWorkLog.warningOffMain(
+                    "The adopted daemon serves its mobile listener at \(actualAddr), but settings expect \(expectedAddr); \(apply)"
+                )
+            case .listenerFailed(let addr):
+                RemoteWorkLog.warningOffMain(
+                    "The adopted daemon's mobile listener at \(addr) did not start; another process may hold the port. See the daemon log, then \(apply)"
+                )
+            }
+        }
     }
 
     // MARK: - Keychain Helpers (Dashboard Password)
@@ -405,20 +458,95 @@ final class TermMeshDaemon: ObservableObject {
         case replace
         case preserveLiveSurfaces(Int)
         case preserveUnknownInventory
+        case preserveLiveOwner(Int32)
+        case preserveUnreportedOwner
     }
 
+    /// The runtime owner `daemon.status` reports. A daemon that omits the
+    /// field, or sends a value that is not a usable pid, is `unreported`:
+    /// only an explicit JSON null means nobody owns it.
+    enum DaemonOwner: Equatable {
+        case unreported
+        case nobody
+        case pid(Int32)
+    }
+
+    struct DaemonStatusSnapshot: Equatable {
+        let version: String?
+        let owner: DaemonOwner
+        let liveProjectSurfaces: Int?
+    }
+
+    /// One `daemon.status` answer, read once so the owner that authorizes a
+    /// replacement is the owner of the same snapshot as its version.
+    static func daemonStatusSnapshot(from response: [String: Any]?) -> DaemonStatusSnapshot {
+        let version = (response?["version"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let surfaces = (response?["live_project_surfaces"] as? NSNumber)?.intValue
+        return DaemonStatusSnapshot(
+            version: version,
+            owner: daemonOwner(from: response),
+            liveProjectSurfaces: surfaces
+        )
+    }
+
+    static func daemonOwner(from response: [String: Any]?) -> DaemonOwner {
+        guard let response, let value = response["owner_pid"] else { return .unreported }
+        if value is NSNull { return .nobody }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              Double(number.int64Value) == number.doubleValue,
+              (2...Int64(Int32.max)).contains(number.int64Value)
+        else { return .unreported }
+        return .pid(Int32(number.int64Value))
+    }
+
+    /// The daemon's own liveness rule: EPERM still means the pid exists.
+    /// NSRunningApplication cannot decide this, because it returns nil for
+    /// an owner that is not an app.
+    static func processIsAlive(_ pid: Int32) -> Bool {
+        kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    enum ReplacementClaim: Equatable {
+        case proceed
+        case ownedBy(Int32)
+    }
+
+    /// Reads the answer to the claim made just before a replacement; nil is a
+    /// granted claim. Only a live owner stops the replacement. Every other
+    /// refusal (no peer listener, shutdown already committed, no answer) means
+    /// no other app can hold the daemon either.
+    static func replacementClaim(errorMessage: String?) -> ReplacementClaim {
+        let marker = "owned by live pid "
+        guard let errorMessage, let range = errorMessage.range(of: marker) else { return .proceed }
+        let digits = errorMessage[range.upperBound...].prefix { $0.isNumber }
+        return .ownedBy(Int32(digits) ?? 0)
+    }
+
+    /// A replacement stops the daemon for every app on its socket, so it needs
+    /// the owner's consent before the version or inventory is considered:
+    /// nobody owns it, this process owns it, or its owner is gone. A live
+    /// foreign owner blocks it in either version direction — the production
+    /// daemon was the older one when a unit-test host replaced it.
     static func automaticUpgradeDecision(
-        requiresUpgrade: Bool, replacementReady: Bool, liveProjectSurfaces: Int?
+        requiresUpgrade: Bool,
+        replacementReady: Bool,
+        owner: DaemonOwner,
+        selfPID: Int32,
+        isProcessAlive: (Int32) -> Bool,
+        liveProjectSurfaces: Int?
     ) -> AutomaticUpgradeDecision {
         guard requiresUpgrade, replacementReady else { return .preserveUnknownInventory }
+        switch owner {
+        case .unreported:
+            return .preserveUnreportedOwner
+        case .pid(let pid) where pid != selfPID && isProcessAlive(pid):
+            return .preserveLiveOwner(pid)
+        case .nobody, .pid:
+            break
+        }
         guard let liveProjectSurfaces else { return .preserveUnknownInventory }
         return liveProjectSurfaces == 0 ? .replace : .preserveLiveSurfaces(liveProjectSurfaces)
-    }
-
-    func liveProjectSurfaceCount() -> Int? {
-        guard let response = rpcCall(method: "daemon.status", params: [:]) as? [String: Any],
-              let count = response["live_project_surfaces"] as? NSNumber else { return nil }
-        return count.intValue
     }
 
     /// Whether the subscribe loop's consecutive connect failures warrant
@@ -436,10 +564,63 @@ final class TermMeshDaemon: ObservableObject {
     static let watchdogFailureThreshold = 3
     static let watchdogRespawnIntervalNanos: UInt64 = 30 * 1_000_000_000
 
-    /// Cap on the appended daemon log before it is truncated on the next
-    /// spawn. Sized for weeks of ordinary output (a busy session writes a
-    /// few MB) while bounding what an append-only file in /tmp can grow to.
+    /// Size past which the next spawn moves the daemon log to `<log>.1`. The
+    /// daemon writes without a limit while it runs (about 71 MB in 20 hours
+    /// at the default filter), so this bounds the number of generations, not
+    /// the size of one.
     static let daemonLogMaxBytes: Int64 = 50 * 1024 * 1024
+
+    enum DaemonLogOpen: Equatable {
+        case appended(fd: Int32)
+        case rotated(fd: Int32, bytes: Int64)
+        case rotationFailed(fd: Int32, errno: Int32)
+        case openFailed(errno: Int32)
+    }
+
+    /// Opens the daemon log for appending and keeps one previous generation.
+    /// Emptying a log over the cap erased the record of why the previous
+    /// daemon stopped, so it moves to `<log>.1` instead. The name is
+    /// predictable in sticky /tmp: `O_NOFOLLOW` refuses a symlink at the log
+    /// path, and `rename` replaces a symlink at `<log>.1` without following
+    /// it. A failed rename keeps appending to the old file rather than
+    /// truncating it.
+    static func openDaemonLog(path: String, maxBytes: Int64) -> DaemonLogOpen {
+        let fd = open(path, daemonLogFlags, 0o644)
+        guard fd >= 0 else { return .openFailed(errno: errno) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_size > maxBytes else { return .appended(fd: fd) }
+        return rotateDaemonLog(openFD: fd, size: Int64(info.st_size), path: path)
+    }
+
+    /// `O_CLOEXEC` keeps a locked log descriptor out of unrelated children; the
+    /// daemon still gets its log, because spawning dups it onto stdout.
+    private static let daemonLogFlags = O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC
+
+    /// Rotates the oversized log that `fd` opened. Apps sharing a log path can
+    /// spawn at once: the lock makes the second wait, and when the path no
+    /// longer names the file it opened, the first already rotated, so it
+    /// appends to the new log instead of moving it over the generation.
+    static func rotateDaemonLog(openFD fd: Int32, size: Int64, path: String) -> DaemonLogOpen {
+        guard flock(fd, LOCK_EX) == 0 else { return .rotationFailed(fd: fd, errno: errno) }
+        var opened = stat()
+        var current = stat()
+        let stillCurrent = fstat(fd, &opened) == 0
+            && lstat(path, &current) == 0
+            && opened.st_dev == current.st_dev
+            && opened.st_ino == current.st_ino
+        if stillCurrent, rename(path, path + ".1") != 0 {
+            let renameErrno = errno
+            // The caller hands this descriptor to the daemon, and a lock on it
+            // would outlive this call for as long as the daemon runs.
+            flock(fd, LOCK_UN)
+            return .rotationFailed(fd: fd, errno: renameErrno)
+        }
+        let freshFD = open(path, daemonLogFlags, 0o644)
+        let freshErrno = errno
+        close(fd)
+        guard freshFD >= 0 else { return .openFailed(errno: freshErrno) }
+        return stillCurrent ? .rotated(fd: freshFD, bytes: size) : .appended(fd: freshFD)
+    }
 
     static func watchdogShouldRespawn(
         consecutiveFailures: Int,
@@ -455,19 +636,6 @@ final class TermMeshDaemon: ObservableObject {
     /// This build's marketing version, or nil when the bundle has none.
     static var appMarketingVersion: String? {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
-    }
-
-    /// Version of whatever daemon currently answers on the socket.
-    ///
-    /// Asks `daemon.status` rather than `ping`, which answers only `pong`.
-    /// A daemon too old to carry the field, or one that does not answer,
-    /// reports nil — treated as "unknown", never as a mismatch.
-    func runningDaemonVersion() -> String? {
-        guard let response = rpcCall(method: "daemon.status", params: [:]) as? [String: Any],
-              let version = response["version"] as? String,
-              !version.isEmpty
-        else { return nil }
-        return version
     }
 
     /// Spawn the term-meshd daemon process if not already running.
@@ -496,7 +664,13 @@ final class TermMeshDaemon: ObservableObject {
 
             // Daemon from a previous app launch?
             if self.ping() {
-                let runningVersion = self.runningDaemonVersion()
+                // `daemon.status` rather than `ping`, which answers only
+                // `pong`. A daemon too old to carry a field, or one that does
+                // not answer, reports it missing — never a mismatch.
+                let status = Self.daemonStatusSnapshot(
+                    from: self.rpcCall(method: "daemon.status", params: [:]) as? [String: Any]
+                )
+                let runningVersion = status.version
                 let requiresUpgrade = Self.daemonRequiresUpgrade(
                     runningVersion: runningVersion,
                     appVersion: Self.appMarketingVersion
@@ -518,14 +692,33 @@ final class TermMeshDaemon: ObservableObject {
                         "This machine's daemon (\(runningVersion ?? "unknown")) is older than the app, but this build bundles no replacement — keeping the running daemon"
                     )
                 }
-                let upgradeDecision: AutomaticUpgradeDecision
-                if requiresUpgrade && replacementReady {
-                    upgradeDecision = Self.automaticUpgradeDecision(
-                        requiresUpgrade: requiresUpgrade, replacementReady: replacementReady,
-                        liveProjectSurfaces: self.liveProjectSurfaceCount()
+                var upgradeDecision = Self.automaticUpgradeDecision(
+                    requiresUpgrade: requiresUpgrade,
+                    replacementReady: replacementReady,
+                    owner: status.owner,
+                    selfPID: ProcessInfo.processInfo.processIdentifier,
+                    isProcessAlive: Self.processIsAlive,
+                    liveProjectSurfaces: status.liveProjectSurfaces
+                )
+                // Another app can claim an ownerless daemon after the status read.
+                // The daemon grants a claim under its owner lock, so claiming before
+                // the stop leaves no window for that.
+                if upgradeDecision == .replace,
+                   case .ownedBy(let ownerPID) = Self.replacementClaim(
+                       errorMessage: self.claimDaemonForReplacement()
+                   ) {
+                    upgradeDecision = .preserveLiveOwner(ownerPID)
+                }
+                if case .preserveLiveOwner(let ownerPID) = upgradeDecision {
+                    let owner = NSRunningApplication(processIdentifier: ownerPID)?.bundleIdentifier
+                        ?? "a process that is not an app"
+                    Logger.daemon.warning(
+                        "not replacing daemon \(runningVersion ?? "unknown", privacy: .public) with \(Self.appMarketingVersion ?? "unknown", privacy: .public): live pid \(ownerPID, privacy: .public) (\(owner, privacy: .public)) owns it"
                     )
-                } else {
-                    upgradeDecision = .preserveUnknownInventory
+                    RemoteWorkLog.warningOffMain(
+                        "This machine's daemon \(runningVersion ?? "unknown") belongs to pid \(ownerPID) (\(owner)); keeping it instead of updating to \(Self.appMarketingVersion ?? "unknown") until that process exits"
+                    )
+                    return
                 }
                 if upgradeDecision == .replace {
                     Logger.daemon.warning(
@@ -545,6 +738,11 @@ final class TermMeshDaemon: ObservableObject {
                         deferredLiveProjectSurfaceCount = count
                         Logger.daemon.warning(
                             "deferring daemon upgrade; \(count, privacy: .public) live peer surface(s) are still running"
+                        )
+                    } else if upgradeDecision == .preserveUnreportedOwner {
+                        deferredLiveProjectSurfaceCount = nil
+                        Logger.daemon.warning(
+                            "deferring daemon upgrade because the daemon does not report its owner"
                         )
                     } else {
                         deferredLiveProjectSurfaceCount = nil
@@ -587,6 +785,7 @@ final class TermMeshDaemon: ObservableObject {
                             "This machine has \(count) live Project surface(s); keeping daemon \(runningVersion ?? "unknown"); restart it after the Project finishes to upgrade"
                         )
                     }
+                    self.warnIfAdoptedMobileListenerDiffersFromSettings()
                     if let pid = self.getDaemonPeerPid() {
                         DispatchQueue.main.async {
                             TerminalController.shared.trustedDaemonPid = pid
@@ -603,7 +802,7 @@ final class TermMeshDaemon: ObservableObject {
             // Find the daemon binary next to the app bundle, or in the daemon build dir
             let binaryPath = self.daemonBinaryPath()
             guard let binaryPath, FileManager.default.fileExists(atPath: binaryPath) else {
-                Logger.daemon.info("daemon binary not found, skipping launch")
+                Logger.daemon.error("daemon binary not found, skipping launch — set TERMMESH_DAEMON_BINARY_PATH for a build without a bundled daemon")
                 return
             }
 
@@ -680,23 +879,28 @@ final class TermMeshDaemon: ObservableObject {
             let logPath = tag.isEmpty ? "/tmp/term-meshd.log" : "/tmp/term-meshd-\(tag).log"
             // Append, never truncate: every launch used to REPLACE this file
             // (`createFile`), destroying exactly the evidence a "why was the
-            // daemon down" investigation needs. O_NOFOLLOW because the name
-            // is predictable in sticky /tmp — a pre-planted symlink must not
-            // redirect daemon output into an arbitrary file (open fails and
-            // the daemon logs to null instead). The size cap is what makes
-            // append-forever safe: one bounded truncation at the cap beats
-            // losing the log on every spawn, and beats filling /tmp.
-            let fd = open(logPath, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0o644)
+            // daemon down" investigation needs. Past the cap the log moves to
+            // one previous generation; see `openDaemonLog` for the /tmp rules.
             let logHandle: FileHandle?
-            if fd >= 0 {
-                var info = stat()
-                if fstat(fd, &info) == 0, info.st_size > Self.daemonLogMaxBytes {
-                    ftruncate(fd, 0)
-                }
+            switch Self.openDaemonLog(path: logPath, maxBytes: Self.daemonLogMaxBytes) {
+            case .appended(let fd):
                 logHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
-            } else {
+            case .rotated(let fd, let bytes):
+                logHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+                RemoteWorkLog.infoOffMain(
+                    "Daemon log rotate: kept \(bytes) bytes of the previous daemon's log at \(logPath).1"
+                )
+            case .rotationFailed(let fd, let code):
+                logHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
                 Logger.daemon.error(
-                    "could not open daemon log at \(logPath, privacy: .public) (errno \(errno, privacy: .public)) — daemon output goes to /dev/null"
+                    "could not rotate daemon log \(logPath, privacy: .public) (errno \(code, privacy: .public)); appending to it without truncating"
+                )
+                RemoteWorkLog.warningOffMain(
+                    "Daemon log rotate failed for \(logPath) (errno \(code)); appending to it without truncating"
+                )
+            case .openFailed(let code):
+                Logger.daemon.error(
+                    "could not open daemon log at \(logPath, privacy: .public) (errno \(code, privacy: .public)) — daemon output goes to /dev/null"
                 )
                 logHandle = nil
             }
@@ -747,6 +951,18 @@ final class TermMeshDaemon: ObservableObject {
     }
 
     @discardableResult
+    /// Claims the running daemon before replacing it; returns the daemon's
+    /// refusal, or nil when the claim was granted.
+    private func claimDaemonForReplacement() -> String? {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        switch rpcCallResult(method: "daemon.owner.claim", params: ["pid": pid], timeout: 2) {
+        case .success:
+            return nil
+        case .failure(let error):
+            return error.description
+        }
+    }
+
     private func claimDaemonOwner() -> Bool {
         let pid = ProcessInfo.processInfo.processIdentifier
         guard let response = rpcCall(
@@ -876,12 +1092,16 @@ final class TermMeshDaemon: ObservableObject {
             // Brief pause so the socket file is fully released
             Thread.sleep(forTimeInterval: 0.3)
             self.startDaemon()
-            // Wait for the daemon to become responsive
-            for _ in 0..<20 {
-                if self.ping() { break }
-                Thread.sleep(forTimeInterval: 0.25)
+            // startDaemon enqueues the spawn behind this block on the serial
+            // `queue`, so waiting here only watched an empty socket and called
+            // `completion` before the new daemon existed. Wait off the queue.
+            self.telemetryQueue.async { [weak self] in
+                for _ in 0..<20 {
+                    if self?.ping() == true { break }
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                DispatchQueue.main.async { completion() }
             }
-            DispatchQueue.main.async { completion() }
         }
     }
 
@@ -1862,12 +2082,6 @@ final class TermMeshDaemon: ObservableObject {
         // Option 5: ~/bin/term-meshd (user install via make deploy)
         let homeBin = (NSHomeDirectory() as NSString).appendingPathComponent("bin/term-meshd")
         if fm.fileExists(atPath: homeBin) { return homeBin }
-
-        // Option 6: Hardcoded project path (development fallback)
-        for config in ["release", "debug"] {
-            let path = "/Users/jinwoo/work/project/term-mesh/daemon/target/\(config)/term-meshd"
-            if fm.fileExists(atPath: path) { return path }
-        }
 
         return nil
     }

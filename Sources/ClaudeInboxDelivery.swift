@@ -7,6 +7,37 @@ enum ClaudeInboxDelivery {
         defaults.bool(forKey: enabledKey)
     }
 
+    /// Separate from the worker option: the leader is usually the user's own
+    /// session, where inbox turns are shown as another session's.
+    static let leaderEnabledKey = "claudeInbox.leader.enabled"
+
+    static func isLeaderEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: leaderEnabledKey)
+    }
+
+    /// The `--settings` a leader launched by term-mesh starts with: `base`
+    /// unchanged when the inbox is off, otherwise `base` with the inbox
+    /// SessionStart hook added beside the hooks it already has.
+    static func leaderSettingsJSON(base: String?, registerInbox: Bool) -> String? {
+        guard registerInbox else { return base }
+        var settings: [String: Any] = [:]
+        var hooks: [String: [Any]] = [:]
+        for json in [base, registerHookSettingsJSON].compactMap({ $0 }) {
+            guard let data = json.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            for (key, value) in object where key != "hooks" { settings[key] = value }
+            for (event, entries) in object["hooks"] as? [String: Any] ?? [:] {
+                hooks[event, default: []] += entries as? [Any] ?? []
+            }
+        }
+        settings["hooks"] = hooks
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: settings, options: [.sortedKeys, .withoutEscapingSlashes]
+        ) else { return base }
+        return String(data: data, encoding: .utf8)
+    }
+
     // Team agents are launched by the resolved claude binary, not through
     // Resources/bin/claude, so its SessionStart hook never runs for them.
     // `$TERMMESH_APP_BIN` names this app's CLI; a PATH lookup can reach another
@@ -51,6 +82,11 @@ enum ClaudeInboxDelivery {
     }
 
     static let enqueueConfirmTimeout: TimeInterval = 3
+    /// A session creates its transcript only after its first turn's
+    /// UserPromptSubmit hooks finish. A launched leader's turn hook took about
+    /// 2.5 s there, and its first wake waited 2.85 s for the file, against the
+    /// 3 s window above. 12 s covers a hook that runs to its 10 s timeout.
+    static let firstMessageConfirmTimeout: TimeInterval = 12
     static let sessionsDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/sessions", isDirectory: true)
 
@@ -69,7 +105,8 @@ enum ClaudeInboxDelivery {
         text: String,
         to record: ClaudeInboxRecord,
         sessionsDirectory: URL = sessionsDirectory,
-        confirmTimeout: TimeInterval = enqueueConfirmTimeout
+        confirmTimeout: TimeInterval = enqueueConfirmTimeout,
+        firstMessageConfirmTimeout: TimeInterval = firstMessageConfirmTimeout
     ) -> Outcome {
         if isStale(record, sessionsDirectory: sessionsDirectory) {
             return .notDelivered("stale_session")
@@ -77,6 +114,8 @@ enum ClaudeInboxDelivery {
         guard let transcriptPath = record.transcriptPath else {
             return .notDelivered("no_transcript_path")
         }
+        let window = FileManager.default.fileExists(atPath: transcriptPath)
+            ? confirmTimeout : max(confirmTimeout, firstMessageConfirmTimeout)
         let offset = fileSize(atPath: transcriptPath)
         do {
             let payload = try messageLines(token: record.token, text: text, messageId: UUID().uuidString)
@@ -84,7 +123,7 @@ enum ClaudeInboxDelivery {
         } catch {
             return .notDelivered("post: \(error)")
         }
-        switch transcriptVerdict(of: text, atPath: transcriptPath, after: offset, timeout: confirmTimeout) {
+        switch transcriptVerdict(of: text, atPath: transcriptPath, after: offset, timeout: window) {
         case .enqueued: return .delivered
         case .held: return .unconfirmed("held_for_approval")
         case .silent: return .unconfirmed("not_enqueued")

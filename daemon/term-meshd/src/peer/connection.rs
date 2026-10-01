@@ -2320,11 +2320,17 @@ async fn send_surface_input_error(
     .await
 }
 
+/// vt100 panics when a two-column character is written to a one-column
+/// screen (`Screen::text` subtracts the character's width from the column
+/// count), and the panic ends the surface's PTY reader. Two columns is the
+/// narrowest width every character fits in.
+const MIN_PTY_COLS: u32 = 2;
+
 fn clamp_pty_size(cols: u32, rows: u32) -> Option<(u16, u16)> {
     if cols == 0 || rows == 0 {
         return None;
     }
-    let cols = cols.min(1000) as u16;
+    let cols = cols.clamp(MIN_PTY_COLS, 1000) as u16;
     let rows = rows.min(1000) as u16;
     Some((cols, rows))
 }
@@ -3165,6 +3171,29 @@ mod hostname_tests {
     fn hostname_or_prefers_real_hostname_over_fallback() {
         let result = hostname_or("unreachable-fallback-sentinel");
         assert_ne!(result, "unreachable-fallback-sentinel");
+    }
+}
+
+#[cfg(test)]
+mod pty_size_tests {
+    use super::clamp_pty_size;
+
+    #[test]
+    fn a_one_column_client_still_leaves_room_for_a_two_column_character() {
+        let (cols, rows) = clamp_pty_size(1, 3).expect("a positive size is accepted");
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process("한글".as_bytes());
+        assert_eq!((cols, rows), (2, 3));
+        let lines: Vec<String> = parser.screen().rows(0, cols).collect();
+        assert_eq!(lines, ["한", "글", ""]);
+    }
+
+    #[test]
+    fn a_zero_size_is_rejected_and_an_oversized_one_is_capped() {
+        assert_eq!(clamp_pty_size(0, 24), None);
+        assert_eq!(clamp_pty_size(80, 0), None);
+        assert_eq!(clamp_pty_size(80, 24), Some((80, 24)));
+        assert_eq!(clamp_pty_size(5000, 5000), Some((1000, 1000)));
     }
 }
 

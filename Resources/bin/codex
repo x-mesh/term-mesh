@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# term-mesh codex wrapper
+
+find_real_codex() {
+    local self_dir
+    self_dir="$(cd "$(dirname "$0")" && pwd)"
+    local IFS=:
+    for d in $PATH; do
+        [[ "$d" == "$self_dir" ]] && continue
+        if [[ -x "$d/codex" ]]; then
+            head -2 "$d/codex" 2>/dev/null | grep -q "term-mesh codex wrapper" && continue
+            printf '%s' "$d/codex"
+            return 0
+        fi
+    done
+    return 1
+}
+
+REAL_CODEX="$(find_real_codex)" || { echo "Error: codex not found in PATH" >&2; exit 127; }
+
+if [[ -z "${TERMMESH_SURFACE_ID:-${CMUX_SURFACE_ID:-}}" ]]; then
+    exec "$REAL_CODEX" "$@"
+fi
+
+case "${1:-}" in
+    agents|app|app-server|apply|archive|cloud|completion|delete|doctor|features|login|logout|mcp|migrate-rollouts|plugin|queue|remote-control|sandbox|unarchive|update)
+        exec "$REAL_CODEX" "$@"
+        ;;
+esac
+
+for arg in "$@"; do
+    case "$arg" in
+        --no-daemon|--remote|--remote=*) exec "$REAL_CODEX" "$@" ;;
+    esac
+done
+
+exec "$REAL_CODEX" --no-daemon "$@"
