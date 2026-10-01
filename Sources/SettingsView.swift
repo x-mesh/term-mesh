@@ -1991,11 +1991,17 @@ struct SettingsView: View {
         }
     }
 
+    private static let mobileListenerRefreshQueue = DispatchQueue(
+        label: "com.termmesh.settings.mobile-listener", qos: .userInitiated
+    )
+
     /// Off-main: `rpcCallRaw` blocks for up to its timeout, and the expected
     /// environment logs for a tagged build, so neither runs in a view body.
+    /// A serial queue lands replies in request order, so a slow read from
+    /// before a restart cannot overwrite the read made after it.
     private func refreshMobileListenerState() {
         let daemon = resolvedDaemon
-        DispatchQueue.global(qos: .userInitiated).async {
+        Self.mobileListenerRefreshQueue.async {
             let reported = RemoteExposureStore.listenerState(
                 fromStatusReply: daemon?.rpcCallRaw(method: "remote.status", params: [:])
             )

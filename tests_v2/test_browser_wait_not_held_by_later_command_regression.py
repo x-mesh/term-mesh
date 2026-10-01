@@ -58,20 +58,23 @@ def main() -> int:
             READY_AT["monotonic"] = begin + READY_AFTER_S
             try:
                 c1._call("browser.wait", {"surface_id": browser, "function": READY_CONDITION, "timeout_ms": 5000})
-                outcome["first"] = time.monotonic() - begin
+                outcome["first_end"] = time.monotonic()
+                outcome["first"] = outcome["first_end"] - begin
             except termmeshError as error:
                 outcome["first_error"] = f"{error} after {time.monotonic() - begin:.2f}s"
 
     def second_wait(browser: str) -> None:
         with termmesh() as c2:
             begin = time.monotonic()
+            outcome["second_start"] = begin
             try:
                 c2._call("browser.wait", {"surface_id": browser, "function": "false", "timeout_ms": SECOND_TIMEOUT_MS})
                 outcome["second_error"] = "wait on a false condition returned success"
             except termmeshError as error:
                 if "timeout" not in str(error):
                     outcome["second_error"] = f"expected timeout, got {error}"
-            outcome["second"] = time.monotonic() - begin
+            outcome["second_end"] = time.monotonic()
+            outcome["second"] = outcome["second_end"] - begin
 
     try:
         with termmesh() as c:
@@ -102,6 +105,13 @@ def main() -> int:
         raise termmeshError(
             f"expected the first wait within {FIRST_BOUND_S}s of its condition at {READY_AFTER_S}s, "
             f"took {first_took:.2f}s (second wait took {float(outcome['second']):.2f}s)"
+        )
+
+    # Without the overlap the first wait has nothing to be held by, and a pass proves nothing.
+    if not float(outcome["second_start"]) < float(outcome["first_end"]) < float(outcome["second_end"]):
+        raise termmeshError(
+            "expected the second wait to start before the first returned and end after it: "
+            f"second_start={outcome['second_start']}, first_end={outcome['first_end']}, second_end={outcome['second_end']}"
         )
 
     print(f"PASS: browser.wait returns at its condition ({first_took:.2f}s) while another client's wait is pending")
