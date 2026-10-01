@@ -165,7 +165,7 @@ final class PeerHostCoordinator: NSObject {
     nonisolated static func autoStartSocketPath(
         environment: [String: String],
         preferenceEnabled: Bool,
-        preferencePath: String
+        preferencePath: @autoclosure () -> String
     ) -> String? {
         let envPath = environment["TERMMESH_PEER_SERVER_PATH"]
             ?? environment["TERMMESH_DEBUG_PEER_SERVER_PATH"]
@@ -175,7 +175,7 @@ final class PeerHostCoordinator: NSObject {
         guard preferenceEnabled, !AppLaunchEnvironment.isRunningUnderXCTest(environment) else {
             return nil
         }
-        return preferencePath
+        return preferencePath()
     }
 
     /// Toggle the server on/off without showing any UI. Used by the

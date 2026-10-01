@@ -85,7 +85,9 @@ final class AppLaunchEnvironmentTests: XCTestCase {
             ])
         )
     }
+}
 
+final class PeerHostAutoStartTests: XCTestCase {
     func testPeerAutoStartIgnoresPreferenceUnderXCTestButKeepsExplicitPath() {
         let xctest = ["XCTestConfigurationFilePath": "/tmp/config.xctestconfiguration"]
         let normal = ["HOME": "/Users/example"]
@@ -125,6 +127,30 @@ final class AppLaunchEnvironmentTests: XCTestCase {
                 testCase.name
             )
         }
+    }
+
+    func testPreferencePathIsReadOnlyWhenItIsUsed() {
+        var reads = 0
+        func preferencePath() -> String {
+            reads += 1
+            return "/tmp/preference.sock"
+        }
+
+        _ = PeerHostCoordinator.autoStartSocketPath(
+            environment: ["TERMMESH_PEER_SERVER_PATH": "/tmp/env.sock"], preferenceEnabled: true, preferencePath: preferencePath()
+        )
+        _ = PeerHostCoordinator.autoStartSocketPath(
+            environment: ["XCTestConfigurationFilePath": "/tmp/config"], preferenceEnabled: true, preferencePath: preferencePath()
+        )
+        _ = PeerHostCoordinator.autoStartSocketPath(
+            environment: [:], preferenceEnabled: false, preferencePath: preferencePath()
+        )
+        XCTAssertEqual(reads, 0)
+
+        _ = PeerHostCoordinator.autoStartSocketPath(
+            environment: [:], preferenceEnabled: true, preferencePath: preferencePath()
+        )
+        XCTAssertEqual(reads, 1)
     }
 }
 
