@@ -507,6 +507,22 @@ final class TermMeshDaemon: ObservableObject {
         kill(pid, 0) == 0 || errno == EPERM
     }
 
+    enum ReplacementClaim: Equatable {
+        case proceed
+        case ownedBy(Int32)
+    }
+
+    /// Reads the answer to the claim made just before a replacement; nil is a
+    /// granted claim. Only a live owner stops the replacement. Every other
+    /// refusal (no peer listener, shutdown already committed, no answer) means
+    /// no other app can hold the daemon either.
+    static func replacementClaim(errorMessage: String?) -> ReplacementClaim {
+        let marker = "owned by live pid "
+        guard let errorMessage, let range = errorMessage.range(of: marker) else { return .proceed }
+        let digits = errorMessage[range.upperBound...].prefix { $0.isNumber }
+        return .ownedBy(Int32(digits) ?? 0)
+    }
+
     /// A replacement stops the daemon for every app on its socket, so it needs
     /// the owner's consent before the version or inventory is considered:
     /// nobody owns it, this process owns it, or its owner is gone. A live
@@ -569,19 +585,41 @@ final class TermMeshDaemon: ObservableObject {
     /// it. A failed rename keeps appending to the old file rather than
     /// truncating it.
     static func openDaemonLog(path: String, maxBytes: Int64) -> DaemonLogOpen {
-        let flags = O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW
-        let fd = open(path, flags, 0o644)
+        let fd = open(path, daemonLogFlags, 0o644)
         guard fd >= 0 else { return .openFailed(errno: errno) }
         var info = stat()
         guard fstat(fd, &info) == 0, info.st_size > maxBytes else { return .appended(fd: fd) }
-        guard rename(path, path + ".1") == 0 else {
-            return .rotationFailed(fd: fd, errno: errno)
+        return rotateDaemonLog(openFD: fd, size: Int64(info.st_size), path: path)
+    }
+
+    /// `O_CLOEXEC` keeps a locked log descriptor out of unrelated children; the
+    /// daemon still gets its log, because spawning dups it onto stdout.
+    private static let daemonLogFlags = O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC
+
+    /// Rotates the oversized log that `fd` opened. Apps sharing a log path can
+    /// spawn at once: the lock makes the second wait, and when the path no
+    /// longer names the file it opened, the first already rotated, so it
+    /// appends to the new log instead of moving it over the generation.
+    static func rotateDaemonLog(openFD fd: Int32, size: Int64, path: String) -> DaemonLogOpen {
+        guard flock(fd, LOCK_EX) == 0 else { return .rotationFailed(fd: fd, errno: errno) }
+        var opened = stat()
+        var current = stat()
+        let stillCurrent = fstat(fd, &opened) == 0
+            && lstat(path, &current) == 0
+            && opened.st_dev == current.st_dev
+            && opened.st_ino == current.st_ino
+        if stillCurrent, rename(path, path + ".1") != 0 {
+            let renameErrno = errno
+            // The caller hands this descriptor to the daemon, and a lock on it
+            // would outlive this call for as long as the daemon runs.
+            flock(fd, LOCK_UN)
+            return .rotationFailed(fd: fd, errno: renameErrno)
         }
-        let freshFD = open(path, flags, 0o644)
+        let freshFD = open(path, daemonLogFlags, 0o644)
         let freshErrno = errno
         close(fd)
         guard freshFD >= 0 else { return .openFailed(errno: freshErrno) }
-        return .rotated(fd: freshFD, bytes: Int64(info.st_size))
+        return stillCurrent ? .rotated(fd: freshFD, bytes: size) : .appended(fd: freshFD)
     }
 
     static func watchdogShouldRespawn(
@@ -654,7 +692,7 @@ final class TermMeshDaemon: ObservableObject {
                         "This machine's daemon (\(runningVersion ?? "unknown")) is older than the app, but this build bundles no replacement — keeping the running daemon"
                     )
                 }
-                let upgradeDecision = Self.automaticUpgradeDecision(
+                var upgradeDecision = Self.automaticUpgradeDecision(
                     requiresUpgrade: requiresUpgrade,
                     replacementReady: replacementReady,
                     owner: status.owner,
@@ -662,6 +700,15 @@ final class TermMeshDaemon: ObservableObject {
                     isProcessAlive: Self.processIsAlive,
                     liveProjectSurfaces: status.liveProjectSurfaces
                 )
+                // Another app can claim an ownerless daemon after the status read.
+                // The daemon grants a claim under its owner lock, so claiming before
+                // the stop leaves no window for that.
+                if upgradeDecision == .replace,
+                   case .ownedBy(let ownerPID) = Self.replacementClaim(
+                       errorMessage: self.claimDaemonForReplacement()
+                   ) {
+                    upgradeDecision = .preserveLiveOwner(ownerPID)
+                }
                 if case .preserveLiveOwner(let ownerPID) = upgradeDecision {
                     let owner = NSRunningApplication(processIdentifier: ownerPID)?.bundleIdentifier
                         ?? "a process that is not an app"
@@ -904,6 +951,18 @@ final class TermMeshDaemon: ObservableObject {
     }
 
     @discardableResult
+    /// Claims the running daemon before replacing it; returns the daemon's
+    /// refusal, or nil when the claim was granted.
+    private func claimDaemonForReplacement() -> String? {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        switch rpcCallResult(method: "daemon.owner.claim", params: ["pid": pid], timeout: 2) {
+        case .success:
+            return nil
+        case .failure(let error):
+            return error.description
+        }
+    }
+
     private func claimDaemonOwner() -> Bool {
         let pid = ProcessInfo.processInfo.processIdentifier
         guard let response = rpcCall(

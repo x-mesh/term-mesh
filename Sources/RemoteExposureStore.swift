@@ -314,7 +314,7 @@ extension RemoteExposureStore {
         expected: [String: String]?,
         reported: MobileListenerState
     ) -> MobileListenerMismatch {
-        let expectedAddr = expected.map { $0["TERM_MESH_MOBILE_ADDR"] ?? "" }
+        let expectedAddr = expected.map { normalizedListenerAddress($0["TERM_MESH_MOBILE_ADDR"] ?? "") }
         let bindFailed = reported.enabled && reported.serving == false
         let servingAddr = reported.enabled && !bindFailed ? reported.addr : nil
         switch (expectedAddr, servingAddr) {
@@ -327,10 +327,20 @@ extension RemoteExposureStore {
         case let (nil, actualAddr?):
             return .daemonOn(actualAddr: actualAddr)
         case let (expectedAddr?, actualAddr?):
-            return expectedAddr == actualAddr
+            return expectedAddr == normalizedListenerAddress(actualAddr)
                 ? .consistent
                 : .addressDiffers(expected: expectedAddr, actual: actualAddr)
         }
+    }
+
+    /// The daemon trims `TERM_MESH_MOBILE_ADDR` and reports the parsed socket
+    /// address, so the raw environment value can differ from the reply in
+    /// surrounding spaces and a zero-padded port while naming the same listener.
+    nonisolated static func normalizedListenerAddress(_ addr: String) -> String {
+        let trimmed = addr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let colon = trimmed.lastIndex(of: ":"),
+              let port = Int(trimmed[trimmed.index(after: colon)...]) else { return trimmed }
+        return "\(trimmed[..<colon]):\(port)"
     }
 }
 

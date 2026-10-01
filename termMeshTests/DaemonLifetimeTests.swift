@@ -142,6 +142,26 @@ final class DaemonLifetimeTests: XCTestCase {
         )
     }
 
+    /// The daemon grants the claim under its owner lock, so an app that claimed
+    /// the daemon after the status read surfaces here as a refusal.
+    func test_aClaimRefusedForALiveOwnerStopsTheReplacement() {
+        XCTAssertEqual(
+            TermMeshDaemon.replacementClaim(errorMessage: "daemon is owned by live pid 4242"),
+            .ownedBy(4242)
+        )
+    }
+
+    func test_otherClaimAnswersLetTheReplacementProceed() {
+        XCTAssertEqual(TermMeshDaemon.replacementClaim(errorMessage: nil), .proceed)
+        for refusal in [
+            "durable peer listener is unavailable (daemon started without a working TERMMESH_PEER_SOCKET)",
+            "daemon shutdown is already committed",
+            "could not send daemon request",
+        ] {
+            XCTAssertEqual(TermMeshDaemon.replacementClaim(errorMessage: refusal), .proceed, refusal)
+        }
+    }
+
     func test_anOwnerThatConsentsLetsTheUpgradeProceed() {
         XCTAssertEqual(
             upgradeDecision(owner: .pid(selfPID), aliveOwners: [selfPID], liveProjectSurfaces: 0),
@@ -600,5 +620,39 @@ final class DaemonLogRotationTests: XCTestCase {
         guard case .appended = second else { return XCTFail("\(second)") }
         XCTAssertEqual(try inode(generation), generationInode)
         XCTAssertEqual(contents(generation), "123456789")
+    }
+
+    /// Two apps opened the same oversized log; the first rotated while the
+    /// second waited for the lock. The second must append to the new log, not
+    /// move it over the generation the first just kept.
+    func test_aLogAnotherAppAlreadyRotatedIsAppendedTo() throws {
+        try put("123456789", at: log)
+        let staleFD = Darwin.open(log, O_WRONLY | O_APPEND)
+        XCTAssertGreaterThanOrEqual(staleFD, 0)
+        XCTAssertEqual(rename(log, generation), 0)
+        try put("fresh", at: log)
+        let freshInode = try inode(log)
+
+        let result = TermMeshDaemon.rotateDaemonLog(openFD: staleFD, size: 9, path: log)
+        defer { close(result) }
+        guard case .appended(let fd) = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(inode(fd: fd), freshInode)
+        XCTAssertEqual(contents(generation), "123456789")
+        XCTAssertEqual("+next".withCString { Darwin.write(fd, $0, 5) }, 5)
+        XCTAssertEqual(contents(log), "fresh+next")
+    }
+
+    /// The descriptor of a failed rotation becomes the daemon's stdout, so a
+    /// lock left on it would block every later rotation while the daemon runs.
+    func test_aFailedRotationLeavesTheLogUnlocked() throws {
+        try FileManager.default.createDirectory(atPath: generation, withIntermediateDirectories: true)
+        try put("x", at: generation + "/keep")
+        try put("123456789", at: log)
+        let result = open()
+        defer { close(result) }
+        guard case .rotationFailed = result else { return XCTFail("\(result)") }
+        let other = Darwin.open(log, O_WRONLY | O_APPEND)
+        defer { Darwin.close(other) }
+        XCTAssertEqual(flock(other, LOCK_EX | LOCK_NB), 0)
     }
 }
