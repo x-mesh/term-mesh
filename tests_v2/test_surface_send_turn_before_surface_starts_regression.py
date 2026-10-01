@@ -37,7 +37,7 @@ def main() -> int:
             c._call("surface.send_turn", {
                 "workspace_id": workspace,
                 "surface_id": health["id"],
-                "text": f"echo delivered > {marker}",
+                "text": f"echo delivered >> {marker}",
             })
             c.select_workspace(workspace)
 
@@ -52,6 +52,11 @@ def main() -> int:
                 time.sleep(0.2)
             if not marker.exists():
                 raise termmeshError(f"the queued turn did not run within {DELIVERY_TIMEOUT_S}s after the terminal started")
+            # A replayed paste or a doubled Return would append a second line.
+            time.sleep(1.0)
+            runs = marker.read_text().splitlines()
+            if runs != ["delivered"]:
+                raise termmeshError(f"expected the queued turn to run exactly once, got {runs!r}")
         finally:
             c.select_workspace(original)
             c.close_workspace(workspace)

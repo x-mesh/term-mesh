@@ -11,6 +11,7 @@ exports the listener address as TERMMESH_E2E_MOBILE_ADDR.
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -281,6 +282,23 @@ def check_leader_flow(c: termmesh, cli: Path) -> None:
             pass
 
 
+def daemon_rpc(method: str, params: dict) -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(5)
+        sock.connect(DAEMON_SOCK)
+        sock.sendall((json.dumps({"id": 1, "method": method, "params": params}) + "\n").encode())
+        reply = b""
+        while not reply.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            reply += chunk
+    payload = json.loads(reply)
+    if payload.get("error"):
+        raise termmeshError(f"{method} failed: {payload['error']}")
+    return payload.get("result") or {}
+
+
 def main() -> int:
     if not MOBILE_ADDR:
         raise termmeshError("TERMMESH_E2E_MOBILE_ADDR is not set; run through scripts/run-tests-v2.sh")
@@ -291,6 +309,9 @@ def main() -> int:
     _, health = http("GET", "/api/health", expect=200)
     if not health.get("ok") or health.get("auth_mode") != "loopback":
         raise termmeshError(f"unexpected health payload: {health}")
+    listener = daemon_rpc("remote.status", {})
+    if listener.get("listener_enabled") is not True or listener.get("listener_serving") is not True:
+        raise termmeshError(f"remote.status must report the listener that answered /api/health as serving: {listener}")
     status, _ = http("GET", "/api/agents/spawn")
     if status != 404:
         raise termmeshError(f"dashboard routes must not exist on the mobile listener: {status}")
