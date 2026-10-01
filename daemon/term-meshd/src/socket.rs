@@ -4078,6 +4078,7 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
                     let now = crate::remote::now_unix();
                     let reg = ctx.remote_registry.lock().await;
                     let listener_enabled = crate::remote::listener_enabled();
+                    let listener_serving = crate::remote::listener_serving();
                     let listener_addr = crate::remote::listener_addr().ok();
                     match p.surface_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                         Some(id) => {
@@ -4091,6 +4092,7 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
                                 "entry": entry,
                                 "url": entry.as_ref().and_then(|e| listener_addr.as_ref().map(|a| crate::remote::target_url(a, &e.surface_id))),
                                 "listener_enabled": listener_enabled,
+                                "listener_serving": listener_serving,
                                 "now": now,
                             }))
                         }
@@ -4099,6 +4101,7 @@ async fn dispatch(req: &Request, ctx: &Context, peer_pid: Option<u32>) -> Respon
                             "count": reg.len(),
                             "entries": reg.list(),
                             "listener_enabled": listener_enabled,
+                            "listener_serving": listener_serving,
                             "listener_addr": listener_addr.map(|a| a.to_string()),
                             "now": now,
                         })),

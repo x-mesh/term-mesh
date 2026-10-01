@@ -235,6 +235,7 @@ pub async fn serve(
     shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.addr).await?;
+    let _serving = crate::remote::ListenerServing::begin();
     serve_listener(
         listener,
         new_state(config, registry, session_resolver),

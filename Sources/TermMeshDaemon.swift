@@ -229,6 +229,10 @@ final class TermMeshDaemon: ObservableObject {
                 RemoteWorkLog.warningOffMain(
                     "The adopted daemon serves its mobile listener at \(actualAddr), but settings expect \(expectedAddr); \(apply)"
                 )
+            case .listenerFailed(let addr):
+                RemoteWorkLog.warningOffMain(
+                    "The adopted daemon's mobile listener at \(addr) did not start; another process may hold the port. See the daemon log, then \(apply)"
+                )
             }
         }
     }

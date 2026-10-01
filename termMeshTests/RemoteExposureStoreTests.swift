@@ -343,6 +343,30 @@ final class MobileListenerMismatchTests: XCTestCase {
         XCTAssertEqual(RemoteExposureStore.mobileListenerMismatch(expected: tagged, reported: reported), .consistent)
     }
 
+    func testAFailedBindIsNotReportedAsMatchingSettings() throws {
+        let reported = try XCTUnwrap(state(
+            #"{"listener_enabled": true, "listener_serving": false, "listener_addr": "127.0.0.1:9877"}"#
+        ))
+        XCTAssertEqual(reported.serving, false)
+        XCTAssertEqual(
+            RemoteExposureStore.mobileListenerMismatch(expected: on, reported: reported),
+            .listenerFailed(addr: defaultAddr)
+        )
+    }
+
+    func testAFailedBindMatchesOffSettings() throws {
+        let reported = try XCTUnwrap(state(
+            #"{"listener_enabled": true, "listener_serving": false, "listener_addr": "127.0.0.1:9877"}"#
+        ))
+        XCTAssertEqual(RemoteExposureStore.mobileListenerMismatch(expected: nil, reported: reported), .consistent)
+    }
+
+    func testADaemonTooOldToReportServingKeepsTheEnvironmentAnswer() throws {
+        let reported = try XCTUnwrap(state(#"{"listener_enabled": true, "listener_addr": "127.0.0.1:9877"}"#))
+        XCTAssertNil(reported.serving)
+        XCTAssertEqual(RemoteExposureStore.mobileListenerMismatch(expected: on, reported: reported), .consistent)
+    }
+
     func testAnUnreadableReplyIsNotASettingsMatch() {
         XCTAssertNil(RemoteExposureStore.listenerState(fromStatusReply: nil))
         XCTAssertNil(state("not json"))

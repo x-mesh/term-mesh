@@ -120,7 +120,7 @@ daemon control socket RPC. 이름은 `watch.*`를 따른다.
 |---|---|---|
 | `remote.on` | `{surface_id, kind, team_name?, app_socket?, agent_cli?, title?, cwd?, keys?, ttl_secs?, owner?}` | `{entry, url, listener_enabled}` |
 | `remote.off` | `{surface_id}` | `{removed: bool}` |
-| `remote.status` | `{surface_id?}` | entry 또는 전체 목록 |
+| `remote.status` | `{surface_id?}` | entry 또는 전체 목록과 `listener_enabled`, `listener_serving`. `listener_enabled`는 daemon이 받은 환경 값이고, `listener_serving`은 listener가 바인드에 성공해 지금 연결을 받는지다 |
 | `remote.list` | `{}` | 만료 entry와 app socket이 사라진 entry를 prune한 뒤 반환(`pruned` 포함). surface 자체의 소멸은 listener가 app의 `not_found`로 관찰해 lazy하게 제거 |
 
 `app_socket`은 `tm-agent remote on`이 pane env의 `TERMMESH_SOCKET_PATH`에서 읽어
