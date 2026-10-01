@@ -952,6 +952,13 @@ class TerminalController {
             return v2Ok(id: id, result: v2Identify(params: params))
         case "claude.inbox.register":
             return v2ClaudeInboxRegister(params: params, id: id)
+        case "claude.inbox.status":
+            // Asked before a session's token is sent, so an app with the
+            // options off never receives one.
+            return v2Ok(id: id, result: [
+                "worker_enabled": ClaudeInboxDelivery.isEnabled(),
+                "leader_enabled": ClaudeInboxDelivery.isLeaderEnabled(),
+            ])
         case "auth.login":
             return v2Ok(
                 id: id,
@@ -1591,6 +1598,7 @@ class TerminalController {
             "system.capabilities",
             "system.identify",
             "claude.inbox.register",
+            "claude.inbox.status",
             "auth.login",
             "fleet.state",
             "window.list",

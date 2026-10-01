@@ -3288,8 +3288,11 @@ final class TeamOrchestrator: ObservableObject {
                     let escaped = systemPrompt.replacingOccurrences(of: "'", with: "'\\''")
                     let quotedPath = claudePath.contains(" ") ? "\"\(claudePath)\"" : claudePath
                     var claudeLeaderParts = ["\(quotedPath)", "--system-prompt '\(escaped)'", "--dangerously-skip-permissions"]
-                    if leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil {
-                        claudeLeaderParts.append("--settings '\(Self.leaderTurnHookSettingsJSON)'")
+                    if let settings = ClaudeInboxDelivery.leaderSettingsJSON(
+                        base: leaderEnv["TERMMESH_LEADER_TURN_HOOK"] != nil ? Self.leaderTurnHookSettingsJSON : nil,
+                        registerInbox: ClaudeInboxDelivery.isLeaderEnabled()
+                    ) {
+                        claudeLeaderParts.append("--settings '\(settings)'")
                     }
                     if !leaderModel.isEmpty && leaderModel != "sonnet" {
                         claudeLeaderParts.append("--model '\(Self.resolveClaudeModelArg(leaderModel))'")
@@ -6249,7 +6252,7 @@ final class TeamOrchestrator: ObservableObject {
             }
             return true
         }
-        func sendLocalLeader(
+        func pasteToLocalLeader(
             workspaceId: UUID, panelId: UUID, manager: TabManager
         ) -> Bool {
             sendTextToPanel(
@@ -6269,6 +6272,16 @@ final class TeamOrchestrator: ObservableObject {
                         on: panel.surface, keyName: "return"
                     ) { _, _ in }
                 }
+            }
+        }
+        func sendLocalLeader(
+            workspaceId: UUID, panelId: UUID, manager: TabManager
+        ) -> Bool {
+            guard let record = claudeInboxLeaderRecord(forPanel: panelId) else {
+                return pasteToLocalLeader(workspaceId: workspaceId, panelId: panelId, manager: manager)
+            }
+            return deliverToLeaderInbox(record, panelId: panelId, text: text) {
+                _ = pasteToLocalLeader(workspaceId: workspaceId, panelId: panelId, manager: manager)
             }
         }
         // Adopted mode: leader lives in a different workspace than the agent workspace.
@@ -7218,6 +7231,62 @@ final class TeamOrchestrator: ObservableObject {
     private func claudeInboxRecord(forPanel panelId: UUID) -> ClaudeInboxRecord? {
         guard ClaudeInboxDelivery.isEnabled() else { return nil }
         return ClaudeInboxRegistry.shared.record(for: panelId)
+    }
+
+    private func claudeInboxLeaderRecord(forPanel panelId: UUID) -> ClaudeInboxRecord? {
+        guard ClaudeInboxDelivery.isLeaderEnabled() else { return nil }
+        return ClaudeInboxRegistry.shared.record(for: panelId)
+    }
+
+    /// Hands a leader wake or routing request to the leader session's inbox, so
+    /// it neither joins what the user left typed in the composer nor depends on
+    /// a Return landing. Outcomes follow `deliverViaClaudeInbox`: a post the
+    /// session provably did not take is typed the usual way; an unconfirmed one
+    /// is not, since the session may be showing the approval dialog a paste
+    /// would answer.
+    private func deliverToLeaderInbox(
+        _ record: ClaudeInboxRecord,
+        panelId: UUID,
+        text: String,
+        paste: @escaping @MainActor () -> Void
+    ) -> Bool {
+        if ClaudeInboxRegistry.shared.isQuarantined(surfaceId: panelId) {
+            Logger.team.warning(
+                "claude inbox for leader panel \(panelId.uuidString.prefix(8), privacy: .public) is quarantined after an unconfirmed delivery; not sending until its session registers again"
+            )
+            #if DEBUG
+            dlog("claude.inbox.leader.QUARANTINED panel=\(panelId.uuidString.prefix(8))")
+            #endif
+            return false
+        }
+        let startedAt = Date()
+        ClaudeInboxDelivery.deliver(text: text, to: record) { outcome in
+            let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+            switch outcome {
+            case .delivered:
+                #if DEBUG
+                dlog("claude.inbox.leader.deliver ok panel=\(panelId.uuidString.prefix(8)) chars=\(text.count) ms=\(elapsedMs)")
+                #endif
+            case .unconfirmed(let reason):
+                ClaudeInboxRegistry.shared.quarantine(record)
+                Logger.team.error(
+                    "claude inbox delivery to leader panel \(panelId.uuidString.prefix(8), privacy: .public) unconfirmed: \(reason, privacy: .public); not pasting"
+                )
+                #if DEBUG
+                dlog("claude.inbox.leader.deliver.UNCONFIRMED panel=\(panelId.uuidString.prefix(8)) reason=\(reason) ms=\(elapsedMs)")
+                #endif
+            case .notDelivered(let reason):
+                ClaudeInboxRegistry.shared.removeIfCurrent(record)
+                Logger.team.warning(
+                    "claude inbox delivery to leader panel \(panelId.uuidString.prefix(8), privacy: .public) failed: \(reason, privacy: .public); pasting instead"
+                )
+                #if DEBUG
+                dlog("claude.inbox.leader.deliver.FALLBACK panel=\(panelId.uuidString.prefix(8)) reason=\(reason) ms=\(elapsedMs)")
+                #endif
+                paste()
+            }
+        }
+        return true
     }
 
     /// Hands the turn to the Claude session's own inbox instead of its composer.
