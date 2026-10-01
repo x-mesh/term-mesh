@@ -702,6 +702,63 @@ async fn pane_text_is_typed_once_per_request_id() {
 }
 
 #[tokio::test]
+async fn terminal_submit_sends_text_and_return_as_one_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = FakeApp::spawn(dir.path());
+    app.fail("surface.send_turn", "timeout", "app busy");
+    let h = start_tailscale().await;
+    expose(&h, &app, "pane-1", TargetKind::Pane, KeysPolicy::Safe).await;
+    expose(&h, &app, "locked", TargetKind::Pane, KeysPolicy::None).await;
+
+    let locked = post(
+        &h,
+        "/api/targets/locked/text",
+        json!({ "text": "no", "mode": "terminal", "submit": true, "request_id": "s-0" }),
+    )
+    .await;
+    assert_eq!(locked.status, 403);
+    assert_eq!(locked.error_code(), "keys_disabled");
+    assert!(app.calls().is_empty(), "keys=none must not reach the app");
+
+    let failed = post(
+        &h,
+        "/api/targets/pane-1/text",
+        json!({ "text": "ls", "mode": "terminal", "submit": true, "request_id": "s-1" }),
+    )
+    .await;
+    assert_ne!(failed.status, 200, "{}", failed.body);
+
+    app.reply("surface.send_turn", json!({ "submitted": true }));
+    let first = post(
+        &h,
+        "/api/targets/pane-1/text",
+        json!({ "text": "ls", "mode": "terminal", "submit": true, "request_id": "s-1" }),
+    )
+    .await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    assert_eq!(first.json()["deduplicated"], false);
+    let retry = post(
+        &h,
+        "/api/targets/pane-1/text",
+        json!({ "text": "ls", "mode": "terminal", "submit": true, "request_id": "s-1" }),
+    )
+    .await;
+    assert_eq!(retry.status, 200);
+    assert_eq!(retry.json()["deduplicated"], true);
+
+    let calls = app.calls();
+    assert_eq!(calls.len(), 2, "a failed turn is retried once, then deduplicated: {calls:?}");
+    for (method, params) in &calls {
+        assert_eq!(method, "surface.send_turn");
+        assert_eq!(params, &json!({ "surface_id": "pane-1", "text": "ls" }));
+    }
+    assert!(
+        calls.iter().all(|(method, _)| method != "surface.send_key"),
+        "Return travels inside the turn, never as a second request"
+    );
+}
+
+#[tokio::test]
 async fn leader_text_goes_to_the_durable_board_and_returns_202() {
     let dir = tempfile::tempdir().unwrap();
     let app = FakeApp::spawn(dir.path());

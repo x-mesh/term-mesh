@@ -1531,6 +1531,11 @@ struct TextBody {
     request_id: Option<String>,
     #[serde(default)]
     mode: Option<String>,
+    /// Terminal mode only types unless the page asks to submit; then the text
+    /// and its Return travel as one `surface.send_turn`, so a separate Enter
+    /// cannot race the paste it belongs to.
+    #[serde(default)]
+    submit: bool,
 }
 
 async fn text_handler(
@@ -1682,7 +1687,7 @@ async fn text_handler(
                     }
                 }
             }
-            let delivery = if chat_mode {
+            let delivery = if chat_mode || body.submit {
                 app_call(
                     &state,
                     &entry,

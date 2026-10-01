@@ -228,6 +228,13 @@ refresh, 사용자가 하단에 있을 때만 자동 scroll.
 채팅으로 보여 주는 편이 맞는 방향이라 판단했다(§11). 하단에 composer, 키 버튼 행(Enter, Esc,
 y, n, 1–9, ↑, ↓, Tab, Ctrl-C), 리더면 최근 request 상태. 상태 저장은 없다.
 
+composer는 한 줄로 시작한다. 입력창은 1행에서 시작해 최대 128px까지 늘고, 보낸 뒤 1행으로
+돌아간다. 키 버튼 행은 기본으로 숨기고 입력창 왼쪽 ⌨ 버튼으로 연다. 키를 쓸 수 없는
+대상(Chat 모드, native agent, `keys=none`)에서는 버튼도 숨긴다. 상태 줄은 메시지가 있을
+때만 보이고, 오류가 아닌 완료 메시지는 3초 뒤 지운다. Terminal 모드 pane에서 보내기는
+텍스트와 Enter를 한 번에 보낸다(`/text`의 `submit`). 빈 입력으로 보내기를 누르면 Enter만
+보낸다.
+
 ## 5. 대상별 경로
 
 | 대상 | 읽기 | 텍스트 | 키 | Phase |
@@ -268,7 +275,7 @@ frame-ancestors 'none'; base-uri 'none'; form-action 'none'`. CORS 없음. POST�
 | GET | `/api/targets` | | `{targets: [{surface_id, kind, team_name, agent_cli, title, cwd, source: gui\|headless, keys, owner, created_at, expires_at}], now}`. 호출 시 만료·dead socket entry를 prune |
 | GET | `/api/targets/{id}/screen?lines=200` | `lines` 20..1000 | `{surface_id, kind, lines, text, captured_at}` |
 | GET | `/api/targets/{id}/screen?lines=200&format=styled` | 위와 같음 | `{format: "styled", columns, rows: [[{t, fg?, bg?, b?, d?, i?, u?, inv?}]], cursor: {row, col}\|null, captured_at}`. 앱 `surface.read_screen_grid`(Ghostty render-grid 프레임)의 span을 daemon이 행별로 배치(열 간격은 공백으로 채움, invisible은 공백, scrollback 행 다음에 active 행, 커서·마지막 내용 아래의 빈 행은 제거). fg/bg는 `#rrggbb`(터미널 기본색이면 생략). 구형 앱이면 `format: "text"`로 내려감 |
-| POST | `/api/targets/{id}/text` | `{text, request_id?}` | leader: 202 `{request_id, stored, wake_dispatched, request_replayed, claimed_by_leader}` / pane: 200 `{delivered, deduplicated, request_id}` / agent: 202 `{delivered, delivery_scope}` (`team.send`로 한 턴 전달, request_id 10분 dedupe) |
+| POST | `/api/targets/{id}/text` | `{text, request_id?, mode?, submit?}` | leader: 202 `{request_id, stored, wake_dispatched, request_replayed, claimed_by_leader}` / pane: 200 `{delivered, deduplicated, request_id, mode}` / agent: 202 `{delivered, delivery_scope}` (`team.send`로 한 턴 전달, request_id 10분 dedupe) |
 | GET | `/api/targets/{id}/requests` | leader만(아니면 409 `not_leader`) | `{count, requests}` (`team.leader.request.list`, 본문 미포함) |
 | GET | `/api/targets/{id}/transcript?limit=200` | agent만(아니면 409 `not_an_agent`) | `{running, thinking, in_flight, summary, total, entries: [{id, kind: said\|answered\|thought\|tool\|turn_ended\|notice, …}]}` (`team.agent.transcript`). entry는 id가 안정적이고 답변·tool 결과는 제자리에서 바뀌므로 페이지는 id별로 다시 그림 |
 | POST | `/api/targets/{id}/interrupt` | agent만 | 202 아님, 200 `{interrupted}` (`team.interrupt`) |
@@ -290,6 +297,13 @@ terminal-backed pane에서 `keys=none`이면 `/key`, `/text`, Chat turn/interrup
 
 멱등성: 리더 텍스트는 durable board가 `request_id`로 중복 실행을 막는다. pane
 텍스트는 listener가 `request_id`를 10분간 기억해 재시도 중복 타이핑을 막는다.
+
+pane `/text`: `mode: "chat"` 또는 `submit: true`이면 앱 `surface.send_turn`으로 텍스트와
+Return을 한 작업으로 보낸다. 별도 `/key Enter`가 끝나지 않은 붙여넣기와 경쟁하지 않는다.
+여러 줄 텍스트는 붙여넣은 뒤 Return을 한 번 누른다(`surface.send_text`는 줄마다 Return을
+누른다). `send_turn`은 큐에 넣는 시점에 성공을 반환하므로, 그 뒤 붙여넣기가 버려지면
+daemon과 페이지는 알 수 없고 화면 미러로만 확인한다. 이 surface의 첫 붙여넣기는 앱이
+출력이 멈출 때까지 최대 약 4초 미룬다. 둘 다 아니면 지금처럼 `surface.send_text`로 입력만 한다.
 
 | 코드 | 경우 (`error.code`) |
 |---|---|

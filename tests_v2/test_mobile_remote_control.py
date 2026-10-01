@@ -189,6 +189,19 @@ def check_pane_flow(c: termmesh, cli: Path) -> None:
     if MARKER not in screen.get("text", ""):
         raise termmeshError("listener screen does not show the marker")
 
+    # The page's Send: one /text with submit runs the command, no /key Enter.
+    submitted = f"{MARKER}-SUBMIT"
+    _, turn = http("POST", f"/api/targets/{sid}/text",
+                   {"text": f"echo {submitted}", "request_id": f"e2e-{os.getpid()}-2",
+                    "mode": "terminal", "submit": True}, expect=200)
+    if not turn.get("delivered") or turn.get("deduplicated"):
+        raise termmeshError(f"submit should deliver: {turn}")
+    wait_for(lambda: any(l.strip() == submitted for l in read_text(c, sid).splitlines()) or None, 10,
+             "echo output after one submit (surface.send_turn)")
+    outputs = [l for l in read_text(c, sid).splitlines() if l.strip() == submitted]
+    if len(outputs) != 1:
+        raise termmeshError(f"submit must run the command exactly once, got {len(outputs)} output lines")
+
     # Allowlist and policy.
     status, payload = http("POST", f"/api/targets/{sid}/key", {"key": "q"})
     if status != 403 or error_code(payload) != "key_not_allowed":
