@@ -185,6 +185,54 @@ final class TermMeshDaemon: ObservableObject {
         ]
     }
 
+    /// The listener environment a daemon spawned by this app now would get,
+    /// from the same inputs the spawn uses.
+    func expectedMobileListenerEnvironment() -> [String: String]? {
+        mobileListenerEnvironment(
+            processEnv: ProcessInfo.processInfo.environment,
+            isTaggedBuild: termMeshEnv("TAG") != nil
+        )
+    }
+
+    /// An adopted daemon keeps the listener environment it was started with:
+    /// a daemon an untagged DEV build spawned ran without the production
+    /// listener for hours while Settings showed it on. Only a restart applies
+    /// the settings, and that ends live sessions, so this warns instead.
+    private func warnIfAdoptedMobileListenerDiffersFromSettings() {
+        telemetryQueue.async { [weak self] in
+            guard let self else { return }
+            let expected = self.expectedMobileListenerEnvironment()
+            let reported = RemoteExposureStore.listenerState(
+                fromStatusReply: self.rpcCallRaw(method: "remote.status", params: [:], timeout: 2)
+            )
+            let apply = "restart the daemon from Settings > Mobile Remote Control to apply the settings"
+            guard let reported else {
+                if expected != nil {
+                    RemoteWorkLog.warningOffMain(
+                        "Could not confirm the adopted daemon's mobile listener; if phones cannot connect, \(apply)"
+                    )
+                }
+                return
+            }
+            switch RemoteExposureStore.mobileListenerMismatch(expected: expected, reported: reported) {
+            case .consistent:
+                return
+            case .daemonOff(let expectedAddr):
+                RemoteWorkLog.warningOffMain(
+                    "The adopted daemon has no mobile listener, but settings expect one at \(expectedAddr); \(apply)"
+                )
+            case .daemonOn(let actualAddr):
+                RemoteWorkLog.warningOffMain(
+                    "The adopted daemon serves a mobile listener at \(actualAddr) although settings turn it off; \(apply)"
+                )
+            case let .addressDiffers(expectedAddr, actualAddr):
+                RemoteWorkLog.warningOffMain(
+                    "The adopted daemon serves its mobile listener at \(actualAddr), but settings expect \(expectedAddr); \(apply)"
+                )
+            }
+        }
+    }
+
     // MARK: - Keychain Helpers (Dashboard Password)
 
     private static let keychainService = "com.termmesh.dashboard"
@@ -655,6 +703,7 @@ final class TermMeshDaemon: ObservableObject {
                             "This machine has \(count) live Project surface(s); keeping daemon \(runningVersion ?? "unknown"); restart it after the Project finishes to upgrade"
                         )
                     }
+                    self.warnIfAdoptedMobileListenerDiffersFromSettings()
                     if let pid = self.getDaemonPeerPid() {
                         DispatchQueue.main.async {
                             TerminalController.shared.trustedDaemonPid = pid
@@ -944,12 +993,16 @@ final class TermMeshDaemon: ObservableObject {
             // Brief pause so the socket file is fully released
             Thread.sleep(forTimeInterval: 0.3)
             self.startDaemon()
-            // Wait for the daemon to become responsive
-            for _ in 0..<20 {
-                if self.ping() { break }
-                Thread.sleep(forTimeInterval: 0.25)
+            // startDaemon enqueues the spawn behind this block on the serial
+            // `queue`, so waiting here only watched an empty socket and called
+            // `completion` before the new daemon existed. Wait off the queue.
+            self.telemetryQueue.async { [weak self] in
+                for _ in 0..<20 {
+                    if self?.ping() == true { break }
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                DispatchQueue.main.async { completion() }
             }
-            DispatchQueue.main.async { completion() }
         }
     }
 
