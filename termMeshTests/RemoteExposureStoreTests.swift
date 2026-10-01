@@ -367,6 +367,27 @@ final class MobileListenerMismatchTests: XCTestCase {
         XCTAssertEqual(RemoteExposureStore.mobileListenerMismatch(expected: on, reported: reported), .consistent)
     }
 
+    func testTheSameListenerWrittenWithSpacesOrAPaddedPortMatches() throws {
+        let reported = try XCTUnwrap(state(#"{"listener_enabled": true, "listener_serving": true, "listener_addr": "127.0.0.1:9877"}"#))
+        for raw in [" 127.0.0.1:9877 ", "127.0.0.1:09877", "127.0.0.1:9877\n"] {
+            let expected = ["TERM_MESH_MOBILE_ENABLED": "1", "TERM_MESH_MOBILE_ADDR": raw]
+            XCTAssertEqual(
+                RemoteExposureStore.mobileListenerMismatch(expected: expected, reported: reported),
+                .consistent,
+                raw.debugDescription
+            )
+        }
+    }
+
+    func testANormalizedAddressStillCatchesADifferentPort() throws {
+        let reported = try XCTUnwrap(state(#"{"listener_enabled": true, "listener_serving": true, "listener_addr": "127.0.0.1:9900"}"#))
+        let expected = ["TERM_MESH_MOBILE_ENABLED": "1", "TERM_MESH_MOBILE_ADDR": " 127.0.0.1:9877 "]
+        XCTAssertEqual(
+            RemoteExposureStore.mobileListenerMismatch(expected: expected, reported: reported),
+            .addressDiffers(expected: defaultAddr, actual: "127.0.0.1:9900")
+        )
+    }
+
     func testAnUnreadableReplyIsNotASettingsMatch() {
         XCTAssertNil(RemoteExposureStore.listenerState(fromStatusReply: nil))
         XCTAssertNil(state("not json"))
