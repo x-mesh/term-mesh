@@ -18,8 +18,8 @@ SECOND_TIMEOUT_MS = 3000
 FIRST_BOUND_S = 2.5
 
 
-# The condition reads the server's clock: page timers and Date.now() barely advanced in a
-# background runner app, so a page-side clock could not make the condition come true.
+# The condition reads the server's clock: WebKit throttles timers in the runner's hidden page
+# to about once a second, and page globals set right after open did not always survive.
 READY_AT = {"monotonic": float("inf")}
 READY_CONDITION = (
     "(() => { const r = new XMLHttpRequest(); r.open('GET', '/ready', false); r.send(); "

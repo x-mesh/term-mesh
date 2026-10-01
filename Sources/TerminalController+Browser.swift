@@ -42,8 +42,8 @@ extension TerminalController {
             body()
             return
         }
-        // The wait below now lets other main work run. Without this queue another client's
-        // browser command would run inside it and hold this one until that command finished.
+        // The wait below lets other main work run. This queue keeps another client's browser
+        // command from starting inside that wait and holding this one until it finishes.
         v2BrowserCommandQueue.sync {
             withoutActuallyEscaping(body) { body in
                 let work = V2BrowserMainWork(body)
