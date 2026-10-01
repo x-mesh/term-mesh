@@ -170,8 +170,12 @@ def main() -> int:
                 detach = root / "detach.py"
                 detach.write_text(DETACH)
                 detached = f"{shlex.quote(sys.executable)} {shlex.quote(str(detach))}"
-                output = _run_in_surface(client, leader_surface, f"{detached} tty", root / "detached.tty")
-                if "not a tty" not in output:
+                # `tty` names stdin, which the detached child still shares with
+                # the pane; ps reports the controlling terminal itself.
+                output = _run_in_surface(
+                    client, leader_surface, f"{detached} sh -c 'ps -o tty= -p $$'", root / "detached.tty"
+                )
+                if output.strip() != "??":
                     raise termmeshError(f"detached caller still has a controlling terminal: {output!r}")
                 output = _run_in_surface(
                     client, leader_surface, f"{detached} {take_missing}", root / "detached.take-missing"
