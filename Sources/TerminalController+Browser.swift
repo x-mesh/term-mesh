@@ -36,25 +36,29 @@ extension TerminalController {
 
     /// Browser bodies wait for WebKit callbacks in a nested run loop. Inside a
     /// `DispatchQueue.main.sync` block that loop cannot drain the main queue, so the first
-    /// `evaluateJavaScript` after a browser opened timed out on work WebKit had queued there.
+    /// `evaluateJavaScript` after a browser opened waited out its full timeout.
     private func v2BrowserMainSync(_ body: () -> Void) {
         if Thread.isMainThread {
             body()
             return
         }
-        withoutActuallyEscaping(body) { body in
-            let work = V2BrowserMainWork(body)
-            let finished = DispatchSemaphore(value: 0)
-            // The hop keeps FIFO order with main-queue work queued before this command.
-            DispatchQueue.main.async {
-                let mainLoop = CFRunLoopGetMain()
-                CFRunLoopPerformBlock(mainLoop, CFRunLoopMode.commonModes.rawValue) {
-                    work.run()
-                    finished.signal()
+        // The wait below now lets other main work run. Without this queue another client's
+        // browser command would run inside it and hold this one until that command finished.
+        v2BrowserCommandQueue.sync {
+            withoutActuallyEscaping(body) { body in
+                let work = V2BrowserMainWork(body)
+                let finished = DispatchSemaphore(value: 0)
+                // The hop keeps FIFO order with main-queue work queued before this command.
+                DispatchQueue.main.async {
+                    let mainLoop = CFRunLoopGetMain()
+                    CFRunLoopPerformBlock(mainLoop, CFRunLoopMode.commonModes.rawValue) {
+                        work.run()
+                        finished.signal()
+                    }
+                    CFRunLoopWakeUp(mainLoop)
                 }
-                CFRunLoopWakeUp(mainLoop)
+                finished.wait()
             }
-            finished.wait()
         }
     }
 
@@ -1674,6 +1678,8 @@ extension TerminalController {
     }
 
 }
+
+private let v2BrowserCommandQueue = DispatchQueue(label: "com.termmesh.browser-commands")
 
 // The run loop keeps its block copy until after the block returns, which is after the waiting
 // thread resumed; dropping the body here keeps `withoutActuallyEscaping` from seeing it escape.
