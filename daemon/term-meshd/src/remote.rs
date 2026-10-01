@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -389,27 +389,27 @@ pub fn parse_loopback_addr(raw: &str) -> Result<SocketAddr, String> {
     Ok(addr)
 }
 
-static LISTENER_SERVING: AtomicBool = AtomicBool::new(false);
+static LISTENERS_SERVING: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether the mobile listener holds its bound socket now. `listener_enabled`
+/// Whether a mobile listener holds its bound socket now. `listener_enabled`
 /// reports only the environment, which stays on when the bind fails.
 pub fn listener_serving() -> bool {
-    LISTENER_SERVING.load(Ordering::SeqCst)
+    LISTENERS_SERVING.load(Ordering::SeqCst) > 0
 }
 
-/// Marks the mobile listener as serving until it is dropped.
+/// Counts one mobile listener as serving until it is dropped.
 pub struct ListenerServing(());
 
 impl ListenerServing {
     pub fn begin() -> Self {
-        LISTENER_SERVING.store(true, Ordering::SeqCst);
+        LISTENERS_SERVING.fetch_add(1, Ordering::SeqCst);
         Self(())
     }
 }
 
 impl Drop for ListenerServing {
     fn drop(&mut self) {
-        LISTENER_SERVING.store(false, Ordering::SeqCst);
+        LISTENERS_SERVING.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
